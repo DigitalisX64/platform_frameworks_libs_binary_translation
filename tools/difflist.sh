@@ -55,7 +55,7 @@ for file in "${files[@]}"; do
       git log -n 1 "$aosp_change" | grep Change-Id: || true
     )"
     if ! [[ -z "${aosp_change_id}" ]]; then
-      aosp_changes_map["$aosp_change_id"]=https://googleplex-android-review.googlesource.com/q/commit:"$aosp_change"
+      aosp_changes_map["$aosp_change_id"]=https://r.android.com/q/commit:"$aosp_change"
     fi
   done
   readarray -t goog_changes < <(

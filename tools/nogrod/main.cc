@@ -761,6 +761,12 @@ const TypeInfo* ParseClass(const char* kind,
       continue;
     }
 
+    if (child->tag() == DW_TAG_variable && child->GetBoolAttributeOr(DW_AT_external, false)) {
+      // Static data members of structures/classes are represented by variable entries flagged as
+      // external. Since static data members do not affect class layout it is safe to ignore them.
+      continue;
+    }
+
     if (child->tag() != DW_TAG_member) {  // see if this is the case...
       error("Unexpected tag 0x%x for the die at offset 0x%" PRIx64 ", expected DW_TAG_member",
             child->tag(),

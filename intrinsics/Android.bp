@@ -81,6 +81,39 @@ genrule {
     cmd: "$(location gen_asm) --text-assembler $(out) $(in)",
 }
 
+genrule {
+    name: "libberberis_verifier_assembler_gen_headers_riscv64",
+    out: [
+        "gen_verifier_assembler_common_riscv-inl.h",
+        "gen_verifier_assembler_riscv64-inl.h",
+    ],
+    srcs: [":libberberis_assembler_gen_inputs_riscv64"],
+    tools: ["gen_asm"],
+    cmd: "$(location gen_asm) --verifier-assembler $(out) $(in)",
+}
+
+genrule {
+    name: "libberberis_verifier_assembler_gen_headers_x86_32",
+    out: [
+        "gen_verifier_assembler_common_x86-inl.h",
+        "gen_verifier_assembler_x86_32-inl.h",
+    ],
+    srcs: [":libberberis_assembler_gen_inputs_x86_32"],
+    tools: ["gen_asm"],
+    cmd: "$(location gen_asm) --verifier-assembler $(out) $(in)",
+}
+
+genrule {
+    name: "libberberis_verifier_assembler_gen_headers_x86_64",
+    out: [
+        "gen_verifier_assembler_common_x86-inl.h",
+        "gen_verifier_assembler_x86_64-inl.h",
+    ],
+    srcs: [":libberberis_assembler_gen_inputs_x86_64"],
+    tools: ["gen_asm"],
+    cmd: "$(location gen_asm) --verifier-assembler $(out) $(in)",
+}
+
 filegroup {
     name: "libberberis_machine_ir_intrinsic_binding_riscv64_to_x86_64",
     srcs: ["riscv64_to_x86_64/machine_ir_intrinsic_binding.json"],
@@ -192,6 +225,7 @@ cc_binary_host {
                 "libberberis_intrinsics_gen_public_headers_riscv64_to_x86_64",
                 "libberberis_macro_assembler_gen_intrinsics_headers_riscv64_to_x86_64",
                 "libberberis_text_assembler_gen_headers_x86_64",
+                "libberberis_verifier_assembler_gen_headers_x86_64",
             ],
             header_libs: ["libberberis_macro_assembler_headers_riscv64_to_x86_64"],
             static_libs: ["libberberis_macro_assembler_riscv64_to_x86_64"],

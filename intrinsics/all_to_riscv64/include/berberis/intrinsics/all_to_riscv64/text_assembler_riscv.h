@@ -191,10 +191,6 @@ class TextAssembler {
 
   TextAssembler(int indent, FILE* out) : indent_(indent), out_(out) {}
 
-  // Verify CPU vendor and SSE restrictions.
-  template <typename CPUIDRestriction>
-  void CheckCPUIDRestriction() {}
-
   // Translate CPU restrictions into string.
   template <typename CPUIDRestriction>
   static constexpr const char* kCPUIDRestrictionString =

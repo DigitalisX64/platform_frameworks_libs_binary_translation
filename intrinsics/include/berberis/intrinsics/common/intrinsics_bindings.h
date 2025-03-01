@@ -23,7 +23,9 @@
 #include "berberis/intrinsics/intrinsics_args.h"
 #include "berberis/intrinsics/type_traits.h"
 
-namespace berberis::intrinsics::bindings {
+namespace berberis {
+
+namespace intrinsics::bindings {
 
 class FLAGS {
  public:
@@ -170,6 +172,127 @@ class AsmCallInfo<kIntrinsicTemplateName,
                                       BindingsTypes...>;
 };
 
-}  // namespace berberis::intrinsics::bindings
+}  // namespace intrinsics::bindings
+
+template <typename AsmCallInfo>
+constexpr void AssignRegisterNumbers(int* register_numbers) {
+  // Assign number for output (and temporary) arguments.
+  std::size_t id = 0;
+  int arg_counter = 0;
+  AsmCallInfo::ProcessBindings([&id, &arg_counter, &register_numbers](auto arg) {
+    if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
+      using RegisterClass = typename decltype(arg)::RegisterClass;
+      if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+        if constexpr (!std::is_same_v<typename decltype(arg)::Usage, intrinsics::bindings::Use>) {
+          register_numbers[arg_counter] = id++;
+        }
+        ++arg_counter;
+      }
+    }
+  });
+  // Assign numbers for input arguments.
+  arg_counter = 0;
+  AsmCallInfo::ProcessBindings([&id, &arg_counter, &register_numbers](auto arg) {
+    if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
+      using RegisterClass = typename decltype(arg)::RegisterClass;
+      if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+        if constexpr (std::is_same_v<typename decltype(arg)::Usage, intrinsics::bindings::Use>) {
+          register_numbers[arg_counter] = id++;
+        }
+        ++arg_counter;
+      }
+    }
+  });
+}
+
+template <typename AsmCallInfo>
+constexpr void CheckIntrinsicHasFlagsBinding(bool& expect_flags) {
+  AsmCallInfo::ProcessBindings([&expect_flags](auto arg) {
+    if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
+      using RegisterClass = typename decltype(arg)::RegisterClass;
+      if constexpr (std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+        expect_flags = true;
+      }
+    }
+  });
+}
+
+template <typename AsmCallInfo, typename AssemblerType>
+constexpr void CallAssembler(AssemblerType* as, int* register_numbers) {
+  int arg_counter = 0;
+  AsmCallInfo::ProcessBindings([&arg_counter, &as, register_numbers](auto arg) {
+    if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
+      using RegisterClass = typename decltype(arg)::RegisterClass;
+      if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+        if constexpr (RegisterClass::kAsRegister != 'm') {
+          if constexpr (RegisterClass::kIsImplicitReg) {
+            if constexpr (RegisterClass::kAsRegister == 'a') {
+              as->gpr_a = typename AssemblerType::Register(register_numbers[arg_counter]);
+            } else if constexpr (RegisterClass::kAsRegister == 'b') {
+              as->gpr_b = typename AssemblerType::Register(register_numbers[arg_counter]);
+            } else if constexpr (RegisterClass::kAsRegister == 'c') {
+              as->gpr_c = typename AssemblerType::Register(register_numbers[arg_counter]);
+            } else {
+              static_assert(RegisterClass::kAsRegister == 'd');
+              as->gpr_d = typename AssemblerType::Register(register_numbers[arg_counter]);
+            }
+          }
+        }
+        ++arg_counter;
+      }
+    }
+  });
+  as->gpr_macroassembler_constants = typename AssemblerType::Register(arg_counter);
+  arg_counter = 0;
+  int scratch_counter = 0;
+  std::apply(
+      AsmCallInfo::kMacroInstruction,
+      std::tuple_cat(
+          std::tuple<AssemblerType&>{*as},
+          AsmCallInfo::MakeTuplefromBindings(
+              [&as, &arg_counter, &scratch_counter, register_numbers](auto arg) {
+                if constexpr (IsImmediate(decltype(arg)::arg_info)) {
+                  // TODO(b/394278175): We don't have access to the value of the immediate argument
+                  // here. The value of the immediate argument often decides which instructions in
+                  // an intrinsic are called, by being used in conditional statements. We need to
+                  // make sure that all possible instructions in the intrinsic are executed when
+                  // using VerifierAssembler on inline-only intrinsics. For now, we set immediate
+                  // argument to 2, since it generally covers most instructions in inline-only
+                  // intrinsics.
+                  return std::tuple{2};
+                } else {
+                  using RegisterClass = typename decltype(arg)::RegisterClass;
+                  if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+                    if constexpr (RegisterClass::kAsRegister == 'm') {
+                      if (scratch_counter == 0) {
+                        as->gpr_macroassembler_scratch =
+                            typename AssemblerType::Register(arg_counter++);
+                      } else if (scratch_counter == 1) {
+                        as->gpr_macroassembler_scratch2 =
+                            typename AssemblerType::Register(arg_counter++);
+                      } else {
+                        FATAL("Only two scratch registers are supported for now");
+                      }
+                      // Note: as->gpr_scratch in combination with offset is treated by text
+                      // assembler specially.  We rely on offset set here to be the same as
+                      // scratch2 address in scratch buffer.
+                      return std::tuple{typename AssemblerType::Operand{
+                          .base = as->gpr_scratch,
+                          .disp = static_cast<int32_t>(config::kScratchAreaSlotSize *
+                                                       scratch_counter++)}};
+                    } else if constexpr (RegisterClass::kIsImplicitReg) {
+                      ++arg_counter;
+                      return std::tuple{};
+                    } else {
+                      return std::tuple{register_numbers[arg_counter++]};
+                    }
+                  } else {
+                    return std::tuple{};
+                  }
+                }
+              })));
+}
+
+}  // namespace berberis
 
 #endif  // BERBERIS_INTRINSICS_COMMON_INTRINSICS_BINDINGS_H_
