@@ -27,6 +27,7 @@
 #include "berberis/base/config.h"
 #include "berberis/base/dependent_false.h"
 #include "berberis/intrinsics/all_to_riscv64/intrinsics_bindings.h"
+#include "berberis/intrinsics/common/intrinsics_bindings.h"
 
 namespace berberis {
 
@@ -51,6 +52,10 @@ class VerifierAssembler {
    public:
     constexpr Register() : arg_no_(kNoRegister) {}
     constexpr Register(int arg_no) : arg_no_(arg_no) {}
+    constexpr Register(int arg_no,
+                       [[maybe_unused]] intrinsics::bindings::RegBindingKind binding_kind)
+        : arg_no_(arg_no) {}
+
     int arg_no() const {
       CHECK_NE(arg_no_, kNoRegister);
       return arg_no_;
@@ -112,6 +117,8 @@ class VerifierAssembler {
   using SImmediate = riscv::SImmediate;
   using UImmediate = riscv::UImmediate;
 
+  using XRegister = Register;
+
   constexpr VerifierAssembler() {}
 
   // Verify CPU vendor and SSE restrictions.
@@ -119,6 +126,8 @@ class VerifierAssembler {
   constexpr void CheckCPUIDRestriction() {}
 
   constexpr void CheckFlagsBinding([[maybe_unused]] bool expect_flags) {}
+
+  constexpr void CheckAppropriateDefEarlyClobbers() {}
 
   // Translate CPU restrictions into string.
   template <typename CPUIDRestriction>
@@ -134,6 +143,7 @@ class VerifierAssembler {
       LOG_ALWAYS_FATAL("Registers of the class “%c” don't exist on RISC-V", kConstraint);
     }
   };
+
   UnsupportedRegister<'a'> gpr_a;
   UnsupportedRegister<'b'> gpr_b;
   UnsupportedRegister<'c'> gpr_c;
@@ -197,19 +207,11 @@ class VerifierAssembler {
   bool need_gpr_macroassembler_constants_ = false;
   bool need_gpr_macroassembler_scratch_ = false;
 
-  template <typename... Args>
-  constexpr void Instruction(const char* name, Condition cond, const Args&... args);
+  template <typename Arg>
+  constexpr void RegisterDef([[maybe_unused]] Arg reg) {}
 
-  template <typename... Args>
-  constexpr void Instruction(const char* name, const Args&... args);
-
-  constexpr void EmitString() {}
-
-  constexpr void EmitString([[maybe_unused]] const std::string& s) {}
-
-  template <typename... Args>
-  constexpr void EmitString([[maybe_unused]] const std::string& s,
-                            [[maybe_unused]] const Args&... args) {}
+  template <typename Arg>
+  constexpr void RegisterUse([[maybe_unused]] Arg reg) {}
 
  private:
   Label label_;
@@ -219,19 +221,6 @@ class VerifierAssembler {
   void operator=(const VerifierAssembler&) = delete;
   void operator=(VerifierAssembler&&) = delete;
 };
-
-template <typename DerivedAssemblerType>
-template <typename... Args>
-constexpr void VerifierAssembler<DerivedAssemblerType>::Instruction(
-    [[maybe_unused]] const char* name,
-    [[maybe_unused]] Condition cond,
-    [[maybe_unused]] const Args&... args) {}
-
-template <typename DerivedAssemblerType>
-template <typename... Args>
-constexpr void VerifierAssembler<DerivedAssemblerType>::Instruction(
-    [[maybe_unused]] const char* name,
-    [[maybe_unused]] const Args&... args) {}
 
 }  // namespace riscv
 

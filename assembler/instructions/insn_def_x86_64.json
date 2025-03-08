@@ -172,7 +172,7 @@
         "Bzhiq": { "feature": "BMI2", "opcodes": [ "C4", "02", "80", "F5" ] }
       },
       "args": [
-        { "class": "GeneralReg64", "usage": "use_def" },
+        { "class": "GeneralReg64", "usage": "def" },
         { "class": "GeneralReg64/Mem64", "usage": "use" },
         { "class": "GeneralReg64", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }

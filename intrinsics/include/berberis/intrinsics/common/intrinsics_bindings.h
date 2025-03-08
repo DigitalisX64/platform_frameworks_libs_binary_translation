@@ -89,6 +89,8 @@ constexpr auto ToRegKind() {
 template <typename Tag, typename MachineRegKind>
 inline constexpr auto kRegKind = ToRegKind<Tag, MachineRegKind>();
 
+enum RegBindingKind { kDef, kDefEarlyClobber, kUse, kUseDef, kUndefined };
+
 // Tag classes. They are never instantioned, only used as tags to pass information about
 // bindings.
 class NoCPUIDRestriction;  // All CPUs have at least “no CPUID restriction” mode.
@@ -218,7 +220,7 @@ constexpr void CheckIntrinsicHasFlagsBinding(bool& expect_flags) {
 }
 
 template <typename AsmCallInfo, typename AssemblerType>
-constexpr void CallAssembler(AssemblerType* as, int* register_numbers) {
+constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
   int arg_counter = 0;
   AsmCallInfo::ProcessBindings([&arg_counter, &as, register_numbers](auto arg) {
     if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
@@ -227,14 +229,26 @@ constexpr void CallAssembler(AssemblerType* as, int* register_numbers) {
         if constexpr (RegisterClass::kAsRegister != 'm') {
           if constexpr (RegisterClass::kIsImplicitReg) {
             if constexpr (RegisterClass::kAsRegister == 'a') {
-              as->gpr_a = typename AssemblerType::Register(register_numbers[arg_counter]);
+              as->gpr_a = typename AssemblerType::Register(
+                  register_numbers[arg_counter],
+                  intrinsics::bindings::ToRegKind<typename decltype(arg)::Usage,
+                                                  intrinsics::bindings::RegBindingKind>());
             } else if constexpr (RegisterClass::kAsRegister == 'b') {
-              as->gpr_b = typename AssemblerType::Register(register_numbers[arg_counter]);
+              as->gpr_b = typename AssemblerType::Register(
+                  register_numbers[arg_counter],
+                  intrinsics::bindings::ToRegKind<typename decltype(arg)::Usage,
+                                                  intrinsics::bindings::RegBindingKind>());
             } else if constexpr (RegisterClass::kAsRegister == 'c') {
-              as->gpr_c = typename AssemblerType::Register(register_numbers[arg_counter]);
+              as->gpr_c = typename AssemblerType::Register(
+                  register_numbers[arg_counter],
+                  intrinsics::bindings::ToRegKind<typename decltype(arg)::Usage,
+                                                  intrinsics::bindings::RegBindingKind>());
             } else {
               static_assert(RegisterClass::kAsRegister == 'd');
-              as->gpr_d = typename AssemblerType::Register(register_numbers[arg_counter]);
+              as->gpr_d = typename AssemblerType::Register(
+                  register_numbers[arg_counter],
+                  intrinsics::bindings::ToRegKind<typename decltype(arg)::Usage,
+                                                  intrinsics::bindings::RegBindingKind>());
             }
           }
         }
@@ -249,48 +263,63 @@ constexpr void CallAssembler(AssemblerType* as, int* register_numbers) {
       AsmCallInfo::kMacroInstruction,
       std::tuple_cat(
           std::tuple<AssemblerType&>{*as},
-          AsmCallInfo::MakeTuplefromBindings(
-              [&as, &arg_counter, &scratch_counter, register_numbers](auto arg) {
-                if constexpr (IsImmediate(decltype(arg)::arg_info)) {
-                  // TODO(b/394278175): We don't have access to the value of the immediate argument
-                  // here. The value of the immediate argument often decides which instructions in
-                  // an intrinsic are called, by being used in conditional statements. We need to
-                  // make sure that all possible instructions in the intrinsic are executed when
-                  // using VerifierAssembler on inline-only intrinsics. For now, we set immediate
-                  // argument to 2, since it generally covers most instructions in inline-only
-                  // intrinsics.
-                  return std::tuple{2};
-                } else {
-                  using RegisterClass = typename decltype(arg)::RegisterClass;
-                  if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
-                    if constexpr (RegisterClass::kAsRegister == 'm') {
-                      if (scratch_counter == 0) {
-                        as->gpr_macroassembler_scratch =
-                            typename AssemblerType::Register(arg_counter++);
-                      } else if (scratch_counter == 1) {
-                        as->gpr_macroassembler_scratch2 =
-                            typename AssemblerType::Register(arg_counter++);
-                      } else {
-                        FATAL("Only two scratch registers are supported for now");
-                      }
-                      // Note: as->gpr_scratch in combination with offset is treated by text
-                      // assembler specially.  We rely on offset set here to be the same as
-                      // scratch2 address in scratch buffer.
-                      return std::tuple{typename AssemblerType::Operand{
-                          .base = as->gpr_scratch,
-                          .disp = static_cast<int32_t>(config::kScratchAreaSlotSize *
-                                                       scratch_counter++)}};
-                    } else if constexpr (RegisterClass::kIsImplicitReg) {
-                      ++arg_counter;
-                      return std::tuple{};
-                    } else {
-                      return std::tuple{register_numbers[arg_counter++]};
-                    }
+          AsmCallInfo::MakeTuplefromBindings([&as,
+                                              &arg_counter,
+                                              &scratch_counter,
+                                              register_numbers](auto arg) {
+            if constexpr (IsImmediate(decltype(arg)::arg_info)) {
+              // TODO(b/394278175): We don't have access to the value of the immediate argument
+              // here. The value of the immediate argument often decides which instructions in
+              // an intrinsic are called, by being used in conditional statements. We need to
+              // make sure that all possible instructions in the intrinsic are executed when
+              // using VerifierAssembler on inline-only intrinsics. For now, we set immediate
+              // argument to 2, since it generally covers most instructions in inline-only
+              // intrinsics.
+              return std::tuple{2};
+            } else {
+              using RegisterClass = typename decltype(arg)::RegisterClass;
+              if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+                if constexpr (RegisterClass::kAsRegister == 'm') {
+                  if (scratch_counter == 0) {
+                    as->gpr_macroassembler_scratch =
+                        typename AssemblerType::Register(arg_counter++);
+                  } else if (scratch_counter == 1) {
+                    as->gpr_macroassembler_scratch2 =
+                        typename AssemblerType::Register(arg_counter++);
                   } else {
-                    return std::tuple{};
+                    FATAL("Only two scratch registers are supported for now");
+                  }
+                  // Note: as->gpr_scratch in combination with offset is treated by text
+                  // assembler specially.  We rely on offset set here to be the same as
+                  // scratch2 address in scratch buffer.
+                  return std::tuple{typename AssemblerType::Operand{
+                      .base = as->gpr_scratch,
+                      .disp =
+                          static_cast<int32_t>(config::kScratchAreaSlotSize * scratch_counter++)}};
+                } else if constexpr (RegisterClass::kIsImplicitReg) {
+                  ++arg_counter;
+                  return std::tuple{};
+                } else {
+                  if constexpr (RegisterClass::kAsRegister == 'q' ||
+                                RegisterClass::kAsRegister == 'r') {
+                    return std::tuple{typename AssemblerType::Register(
+                        register_numbers[arg_counter++],
+                        intrinsics::bindings::ToRegKind<typename decltype(arg)::Usage,
+                                                        intrinsics::bindings::RegBindingKind>())};
+                  } else if constexpr (RegisterClass::kAsRegister == 'x') {
+                    return std::tuple{typename AssemblerType::XRegister(
+                        register_numbers[arg_counter++],
+                        intrinsics::bindings::ToRegKind<typename decltype(arg)::Usage,
+                                                        intrinsics::bindings::RegBindingKind>())};
+                  } else {
+                    static_assert(kDependentValueFalse<RegisterClass::kAsRegister>);
                   }
                 }
-              })));
+              } else {
+                return std::tuple{};
+              }
+            }
+          })));
 }
 
 }  // namespace berberis

@@ -438,6 +438,8 @@ def _gen_interpreter_hook(f, name, intr, option):
     lines = [INDENT + l for l in lines]
     print('\n'.join(lines), file=f)
   else:
+    if intr.get('class') == 'template':
+      _gen_template_parameters_verifier(f, intr)
     # TODO(b/363057506): Add float support and clean up the logic here.
     arm64_allowlist = ['AmoAdd', 'AmoAnd', 'AmoMax', 'AmoMin', 'AmoOr', 'AmoSwap', 'AmoXor', 'Bclr',
                        'Bclri', 'Bext', 'Bexti', 'Binv', 'Binvi', 'Bset', 'Bseti', 'Div', 'Max',
@@ -482,6 +484,8 @@ def _gen_translator_hook(f, name, intr):
     lines = [INDENT + l for l in lines]
     print('\n'.join(lines), file=f)
   else:
+    if intr.get('class') == 'template':
+      _gen_template_parameters_verifier(f, intr)
     print(INDENT + _get_translator_hook_return_stmt(name, intr), file=f)
 
   print('}\n', file=f)
@@ -510,6 +514,26 @@ def _gen_mock_semantics_listener_hook(f, name, intr):
           argument)
       for argument in _get_template_spec_arguments(intr.get('variants'))] + [args])
   print('MOCK_METHOD((%s), %s, (%s));' % (result, name, args), file=f)
+
+
+def _gen_template_parameters_verifier(f, intr):
+      received_params = ', '.join(
+        param
+          if not param.strip().startswith('Type') else
+        f'intrinsics::kEnumFromTemplateType<{param}>'
+        for param in _get_template_spec_arguments(intr.get('variants')))
+      print('%sstatic_assert(%s);' % (
+       INDENT,
+       ' || '.join(
+        'std::tuple{%s} == std::tuple{%s}' % (
+          received_params,
+          ', '.join(
+            param
+              if param.strip() in ['true', 'false'] + _ROUNDING_MODES or
+                 not re.search('[_a-zA-Z]', param) else
+            f'intrinsics::kEnumFromTemplateType<{param}>'
+            for param in variant.split(',')))
+         for variant in intr.get('variants'))), file=f)
 
 
 def _check_signed_variant(variant, desc):
