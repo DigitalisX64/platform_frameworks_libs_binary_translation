@@ -171,7 +171,7 @@ inline WrappedFloatType<FloatType> FPRoundTiesAway(WrappedFloatType<FloatType> v
   return FPRound(value, FE_TONEAREST);
 }
 
-inline Float32 FPRound(const Float32& value, uint32_t round_control) {
+inline Float32 FPRound(const Float32& value, int round_control) {
   Float32 result;
   switch (round_control) {
     case FE_HOSTROUND:
@@ -199,7 +199,7 @@ inline Float32 FPRound(const Float32& value, uint32_t round_control) {
   return result;
 }
 
-inline Float64 FPRound(const Float64& value, uint32_t round_control) {
+inline Float64 FPRound(const Float64& value, int round_control) {
   Float64 result;
   switch (round_control) {
     case FE_HOSTROUND:

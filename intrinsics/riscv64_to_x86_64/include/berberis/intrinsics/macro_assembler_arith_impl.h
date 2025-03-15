@@ -131,7 +131,7 @@ constexpr void MacroAssembler<Assembler>::MacroRem(Register src) {
   } else {
     // We need to zero-extend eax into dx/edx/rdx to ensure 32-bit/64-bit/128-bit dividend is
     // correct.
-    Xor<uint64_t>(gpr_d, gpr_d);
+    Xor<uint32_t>(gpr_d, gpr_d);
   }
 
   Div<IntType>(src);

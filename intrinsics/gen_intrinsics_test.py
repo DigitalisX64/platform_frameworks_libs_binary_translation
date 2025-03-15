@@ -108,8 +108,8 @@ class GenIntrinsicsTests(unittest.TestCase):
     self.assertEqual(out,
                      "intrinsics::Foo(GPRRegToInteger<uint32_t>(arg0), "
                                      "GPRRegToInteger<uint8_t>(arg1), "
-                                     "FPRegToFloat<intrinsics::Float32>(arg2), "
-                                     "FPRegToFloat<intrinsics::Float64>(arg3), "
+                                     "FPRegToFloat<Float32>(arg2), "
+                                     "FPRegToFloat<Float64>(arg3), "
                                      "arg4, "
                                      "GPRRegToInteger<uint8_t>(arg5))" ) # pyforman: disable
 
@@ -215,7 +215,7 @@ class GenIntrinsicsTests(unittest.TestCase):
                              ("auto format = intrinsics::GetVectorFormatFP(elem_size, elem_num);",
                               "switch (format) {",
                               "  case intrinsics::kVectorF32x4:" ,
-                              "    return std::get<0>(intrinsics::Foo<intrinsics::Float32, 4>(arg0, arg1));",
+                              "    return std::get<0>(intrinsics::Foo<Float32, 4>(arg0, arg1));",
                               "  default:",
                               "    LOG_ALWAYS_FATAL(\"Unsupported format\");",
                               "}")) # pyformat: disable

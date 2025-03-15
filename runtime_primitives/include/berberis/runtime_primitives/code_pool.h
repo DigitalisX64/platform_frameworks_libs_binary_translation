@@ -22,7 +22,9 @@
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/base/arena_alloc.h"
+#include "berberis/base/config_globals.h"
 #include "berberis/base/exec_region.h"
+#include "berberis/base/tracing.h"
 #include "berberis/runtime_primitives/exec_region_anonymous.h"
 #include "berberis/runtime_primitives/host_code.h"
 
@@ -37,7 +39,10 @@ namespace berberis {
 template <typename ExecRegionFactory>
 class CodePool {
  public:
-  CodePool() = default;
+  CodePool()
+      : exec_(ExecRegionFactory::Create(ExecRegionFactory::kExecRegionSize)),
+        current_address_{exec_.begin()},
+        detached_size_{0} {};
 
   // Not copyable or movable
   CodePool(const CodePool&) = delete;
@@ -57,6 +62,8 @@ class CodePool {
     // lite-translated regions.
     current_address_ = AlignUp(current_address_, 64);
 
+    // Note that pointer arithmetic on nullptr is undefined behavior.
+    CHECK_NE(current_address_, nullptr);
     if (exec_.end() < current_address_ + size) {
       ResetExecRegion(size);
     }
@@ -65,6 +72,11 @@ class CodePool {
     current_address_ += size;
 
     code->Install(&exec_, result, &recovery_map_);
+
+    if (IsConfigFlagSet(kPrintCodePoolSize)) {
+      TRACE("Code pool %p: new size %zu", this, GetTotalSize());
+    }
+
     return AsHostCodeAddr(result);
   }
 
@@ -78,17 +90,21 @@ class CodePool {
   }
 
   void ResetExecRegion(uint32_t size = ExecRegionFactory::kExecRegionSize) {
+    detached_size_ += exec_.size();
     exec_.Detach();
     exec_ = ExecRegionFactory::Create(std::max(size, ExecRegionFactory::kExecRegionSize));
     current_address_ = exec_.begin();
   }
 
+  size_t GetTotalSize() const { return detached_size_ + (current_address_ - exec_.begin()); }
+
  private:
   ExecRegion exec_;
-  const uint8_t* current_address_ = nullptr;
+  const uint8_t* current_address_;
   // TODO(b/232598137): have recovery map for each region instead!
   RecoveryMap recovery_map_;
   mutable std::mutex mutex_;
+  size_t detached_size_;
 };
 
 // Stored data for generated code.
@@ -116,6 +132,9 @@ void ResetAllExecRegions();
 
 // Returns default code pool.
 [[nodiscard]] CodePool<ExecRegionAnonymousFactory>* GetDefaultCodePoolInstance();
+// Use cold code pool to avoid interleaving cold code with hot code, as it induces more cache and
+// TLB misses (see go/ndkt-two-gear-overhead).
+[[nodiscard]] CodePool<ExecRegionAnonymousFactory>* GetColdCodePoolInstance();
 
 #if defined(__BIONIC__)
 [[nodiscard]] CodePool<ExecRegionElfBackedFactory>* GetFunctionWrapperCodePoolInstance();

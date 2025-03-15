@@ -43,6 +43,7 @@ HostCodeAddr InstallEntryTrampoline(HostCode target_function_ptr) {
   x86_64::Assembler as(&mc);
   as.Jmp(target_function_ptr);
   as.Finalize();
+  // TODO(b/232598137): maybe use ColdPool?
   return GetDefaultCodePoolInstance()->Add(&mc);
 #else
   return AsHostCodeAddr(target_function_ptr);

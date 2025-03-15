@@ -445,7 +445,10 @@ cc_test_library {
     name: "libberberis_intrinsics_unit_tests",
     defaults: ["berberis_defaults"],
     host_supported: true,
-    srcs: ["simd_register_test.cc"],
+    srcs: [
+        "enum_from_template_type_test.cc",
+        "simd_register_test.cc",
+    ],
     arch: {
         x86: {
             srcs: [

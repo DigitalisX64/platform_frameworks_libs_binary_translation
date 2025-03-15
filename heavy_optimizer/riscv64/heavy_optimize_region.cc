@@ -58,7 +58,7 @@ std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(GuestAddr pc,
   auto stop_pc = frontend.GetInsnAddr();
   frontend.Finalize(stop_pc);
 
-  if (IsConfigFlagSet(kVerboseTranslation)) {
+  if (IsConfigFlagSet(kVerboseTranslation) || IsConfigFlagSet(kPrintTranslatedAddrs)) {
     // Trace only after all the potential failure points.
     TRACE("Heavy optimizing 0x%lx (%lu bytes)", pc, stop_pc - pc);
   }

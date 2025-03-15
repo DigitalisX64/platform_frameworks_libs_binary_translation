@@ -76,7 +76,7 @@
     {
       "encodings": {
         "Adcl": { "opcode": "11", "type": "reg_to_rm" },
-        "Sbbl": { "opcode": "19", "type": "reg_to_rm" }
+        "Sbbl": { "opcode": "19", "type": "reg_to_rm", "dependency_breaking": "true" }
       },
       "args": [
         { "class": "GeneralReg32/Mem32", "usage": "use_def" },
@@ -245,8 +245,8 @@
         "Btrl": { "opcodes": [ "0F", "B3" ], "type": "reg_to_rm" },
         "Btsl": { "opcodes": [ "0F", "AB" ], "type": "reg_to_rm" },
         "Orl": { "opcode": "09", "type": "reg_to_rm" },
-        "Subl": { "opcode": "29", "type": "reg_to_rm" },
-        "Xorl": { "opcode": "31", "type": "reg_to_rm" }
+        "Subl": { "opcode": "29", "type": "reg_to_rm", "dependency_breaking": "true" },
+        "Xorl": { "opcode": "31", "type": "reg_to_rm", "dependency_breaking": "true" }
       },
       "args": [
         { "class": "GeneralReg32/Mem32", "usage": "use_def" },
@@ -671,7 +671,7 @@
     {
       "encodings": {
         "Btl": { "opcodes": [ "0F", "A3" ], "type": "reg_to_rm" },
-        "Cmpl": { "opcode": "39", "type": "reg_to_rm" },
+        "Cmpl": { "opcode": "39", "type": "reg_to_rm", "dependency_breaking": "true" },
         "Testl": { "opcode": "85", "type": "reg_to_rm" }
       },
       "args": [

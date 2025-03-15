@@ -106,7 +106,7 @@ class WrappedFloatType {
   friend inline WrappedFloatType Absolute(const WrappedFloatType& v);
   friend inline WrappedFloatType Negative(const WrappedFloatType& v);
   friend inline FPInfo FPClassify(const WrappedFloatType& v);
-  friend inline WrappedFloatType FPRound(const WrappedFloatType& value, uint32_t round_control);
+  friend inline WrappedFloatType FPRound(const WrappedFloatType& value, int round_control);
   friend inline int IsNan(const WrappedFloatType& v);
   friend inline int SignBit(const WrappedFloatType& v);
   friend inline WrappedFloatType Sqrt(const WrappedFloatType& v);

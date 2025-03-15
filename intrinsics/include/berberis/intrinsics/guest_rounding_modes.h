@@ -28,8 +28,8 @@ namespace berberis {
 
 // Special rounding mode value to tell intrinsics
 // and interpreter to use rounding mode stored on host.
-const uint32_t FE_HOSTROUND = static_cast<uint32_t>(-1);
-const uint32_t FE_TIESAWAY = static_cast<uint32_t>(-2);
+const int FE_HOSTROUND = -1;
+const int FE_TIESAWAY = -2;
 static_assert(FE_HOSTROUND != FE_TONEAREST);
 static_assert(FE_HOSTROUND != FE_UPWARD);
 static_assert(FE_HOSTROUND != FE_DOWNWARD);

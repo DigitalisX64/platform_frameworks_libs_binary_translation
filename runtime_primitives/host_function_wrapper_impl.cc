@@ -22,7 +22,6 @@
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/runtime_primitives/checks.h"
 #include "berberis/runtime_primitives/code_pool.h"
-#include "berberis/runtime_primitives/exec_region_anonymous.h"
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/runtime_primitives/translation_cache.h"
 
@@ -49,8 +48,11 @@ void MakeTrampolineCallable(GuestAddr pc,
   if (entry) {
     MachineCode mc;
     GenTrampolineAdaptor(&mc, pc, AsHostCode(func), arg, name);
-    cache->SetWrappedAndUnlock(
-        pc, entry, is_host_func, {GetDefaultCodePoolInstance()->Add(&mc), mc.install_size()});
+    cache->SetWrappedAndUnlock(pc,
+                               entry,
+                               is_host_func,
+                               // TODO(b/232598137): Maybe use ColdCodePool?
+                               {GetDefaultCodePoolInstance()->Add(&mc), mc.install_size()});
   }
 }
 

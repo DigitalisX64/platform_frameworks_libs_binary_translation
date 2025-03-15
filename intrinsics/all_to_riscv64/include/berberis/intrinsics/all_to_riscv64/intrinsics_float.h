@@ -146,7 +146,7 @@ inline Float64 Negative(const Float64& v) {
   return result;
 }
 
-inline Float32 FPRound(const Float32& value, uint32_t round_control) {
+inline Float32 FPRound(const Float32& value, int round_control) {
   // RISC-V doesn't have any instructions that can be used used to implement FPRound efficiently
   // because conversion to integer returns an actual int (int32_t or int64_t) and that fails for
   // values that are larger than 1/ϵ – but all such values couldn't have fraction parts which means
@@ -224,7 +224,7 @@ inline Float32 FPRound(const Float32& value, uint32_t round_control) {
   return result;
 }
 
-inline Float64 FPRound(const Float64& value, uint32_t round_control) {
+inline Float64 FPRound(const Float64& value, int round_control) {
   // RISC-V doesn't have any instructions that can be used used to implement FPRound efficiently
   // because conversion to integer returns an actual int (int32_t or int64_t) and that fails for
   // values that are larger than 1/ϵ – but all such values couldn't have fraction parts which means

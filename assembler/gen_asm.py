@@ -122,6 +122,36 @@ def _get_template_name(insn):
       'typename' if re.search('[_a-zA-Z]', param) else 'int'
       for param in name.split('<',1)[1][:-1].split(',')), name.split('<')[0]
 
+def _check_insn_is_dependency_breaking(insn):
+  if "dependency_breaking" in insn:
+    return True
+
+def _handle_def_register_reset(name, insn, arch, f):
+  """
+  'def'/'def_early_clobber' registers in an intrinsic must be defined before they can be used.
+  Verifier assembler checks intrinsics to ensure that this is the case.
+  However, there are a number of special instructions where it is valid for a 'def'
+  register to be both read and written when it's first defined.
+  Example: A Xor instruction, using the same register as both input and output arguments sets this
+  register to 0, regardless of its initial value, effectively resetting the register.
+  Thus, it is valid for this instruction to read and write a 'def' register, even if it hasn't
+  been written to yet in the intrinsic.
+  """
+  if not _check_insn_is_dependency_breaking(insn):
+    return
+  arg_count = 0
+  general_registers = []
+  for arg in insn.get('args'):
+      if asm_defs.is_implicit_reg(arg.get('class')):
+        continue
+      if (_get_arg_type_name(arg, insn.get('type', None)) == 'Register'
+          and 'x86' in arch):
+        general_registers.append(arg_count)
+      arg_count += 1
+  if len(general_registers) == 2:
+    print('  HandleDefOrDefEarlyClobberRegisterReset(arg%d, arg%d);' %
+    (general_registers[0], general_registers[1]), file=f)
+
 def _get_implicit_fixed_register(arg_class):
   if arg_class in ["AL", "AX", "EAX", "RAX"]:
     return "gpr_a"
@@ -252,6 +282,7 @@ def _gen_generic_functions_h(f, insns, arch, assembler_mode):
         if arg["class"] == "FLAGS":
           print('  SetDefinesFLAGS();', file=f)
           break
+      _handle_def_register_reset(name, insn, arch, f)
       for register_read_write in _gen_register_read_write_info(insn, arch):
         print(register_read_write, file=f)
       print('}', file=f)

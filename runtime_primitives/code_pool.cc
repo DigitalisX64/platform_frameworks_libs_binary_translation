@@ -41,12 +41,18 @@ void* DataPool::AddRaw(const void* ptr, uint32_t size) {
 
 void ResetAllExecRegions() {
   GetDefaultCodePoolInstance()->ResetExecRegion();
+  GetColdCodePoolInstance()->ResetExecRegion();
   GetFunctionWrapperCodePoolInstance()->ResetExecRegion();
 }
 
 CodePool<ExecRegionAnonymousFactory>* GetDefaultCodePoolInstance() {
   static auto* g_code_pool = NewForever<CodePool<ExecRegionAnonymousFactory>>();
   return g_code_pool;
+}
+
+CodePool<ExecRegionAnonymousFactory>* GetColdCodePoolInstance() {
+  static auto* g_cold_code_pool = NewForever<CodePool<ExecRegionAnonymousFactory>>();
+  return g_cold_code_pool;
 }
 
 #if defined(__BIONIC__)

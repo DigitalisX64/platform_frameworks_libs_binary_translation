@@ -36,7 +36,7 @@ namespace berberis::x86_64 {
 
 void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodeParams& params) {
   CHECK_EQ(CheckMachineIR(*machine_ir), kMachineIRCheckSuccess);
-  if (IsConfigFlagSet(kVerboseTranslation)) {
+  if (IsConfigFlagSet(kVerboseTranslation) || IsConfigFlagSet(kPrintIRs)) {
     TRACE("MachineIR before optimizations {\n");
     TRACE("%s", machine_ir->GetDebugString().c_str());
     TRACE("}\n\n");
@@ -65,7 +65,7 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
 
   CHECK_EQ(CheckMachineIR(*machine_ir), kMachineIRCheckSuccess);
 
-  if (IsConfigFlagSet(kVerboseTranslation)) {
+  if (IsConfigFlagSet(kVerboseTranslation) || IsConfigFlagSet(kPrintIRs)) {
     TRACE("MachineIR before emit {\n");
     TRACE("%s", machine_ir->GetDebugString().c_str());
     TRACE("}\n\n");

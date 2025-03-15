@@ -183,12 +183,12 @@ def _gen_template_intr_decl(f, name, intr):
   comment = intr.get('comment')
   if comment:
     print('// %s.' % (comment), file=f)
-  print('template <%s>' % _get_template_arguments(
+  print('template <%s>' % _get_template_parameters(
       intr.get('variants'), intr.get('precise_nans', False)), file=f)
   print('%s %s(%s);' % (retval, name, ', '.join(params)), file=f)
 
 
-def _get_template_arguments(
+def _get_template_parameters(
     variants,
     precise_nans = False,
     extra = ['enum PreferredIntrinsicsImplementation = kUseAssemblerImplementationIfPossible']):
@@ -202,7 +202,7 @@ def _get_template_arguments(
     new_template = ', '.join(
       (["bool kPreciseNaNOperationsHandling"] if precise_nans else []) +
       ['bool kBool%s' % get_counter() if param.strip() in ('true', 'false') else
-       'uint32_t kInt%s' % get_counter() if param.strip() in _ROUNDING_MODES else
+       'int kInt%s' % get_counter() if param.strip() in _ROUNDING_MODES else
        'typename Type%d' % get_counter() if re.search('[_a-zA-Z]', param) else
        'int kInt%s' % get_counter()
        for param in variant.split(',')] + extra)
@@ -223,15 +223,15 @@ def _gen_vector_intr_decl(f, name, intr):
   if comment:
     print('// %s.' % (comment), file=f)
   if intr.get('precise_nans', False):
-    template_arguments = 'bool precise_nan_operations_handling, '
+    template_parameters = 'bool precise_nan_operations_handling, '
   else:
-    template_arguments = ''
+    template_parameters = ''
   if not 'raw' in intr['variants']:
-    template_arguments += 'typename Type, '
-  template_arguments += 'int size, '
-  template_arguments += 'enum PreferredIntrinsicsImplementation'
-  template_arguments += ' = kUseAssemblerImplementationIfPossible'
-  print('template <%s>' % template_arguments, file=f)
+    template_parameters += 'typename Type, '
+  template_parameters += 'int size, '
+  template_parameters += 'enum PreferredIntrinsicsImplementation'
+  template_parameters += ' = kUseAssemblerImplementationIfPossible'
+  print('template <%s>' % template_parameters, file=f)
   print('%s %s(%s);' % (retval, name, ', '.join(params)), file=f)
 
 
@@ -286,7 +286,7 @@ def _get_semantics_player_hook_proto(name, intr):
   result, name, args = _get_semantics_player_hook_proto_components(name, intr)
   if intr.get('class') == 'template':
     return 'template<%s>\n%s %s(%s)' % (
-      _get_template_arguments(intr.get('variants'), False, []), result, name, args)
+      _get_template_parameters(intr.get('variants'), extra = []), result, name, args)
   return '%s %s(%s)' % (result, name, args)
 
 
@@ -309,8 +309,7 @@ def _get_interpreter_hook_call_expr(name, intr, desc=None):
       call_params.append('GPRRegToInteger<%s>(%s)' % (_get_c_type(op), arg))
 
   call_expr = 'intrinsics::%s%s(%s)' % (
-      name, _get_desc_specializations(intr, desc).replace(
-          'Float', 'intrinsics::Float'), ', '.join(call_params))
+      name, _get_desc_specializations(intr, desc), ', '.join(call_params))
 
   if len(outs) == 1:
     # Unwrap tuple for single result.
@@ -454,8 +453,7 @@ def _gen_interpreter_hook(f, name, intr, option):
 
 
 def _get_translator_hook_call_expr(name, intr, desc = None):
-  desc_spec = _get_desc_specializations(intr, desc).replace(
-      'Float', 'intrinsics::Float')
+  desc_spec = _get_desc_specializations(intr, desc)
   args = [('arg%d' % n) for n, _ in enumerate(intr['in'])]
   template_params = ['&intrinsics::' + name + desc_spec]
   template_params += [_get_semantics_player_hook_result(intr)]
@@ -494,25 +492,24 @@ def _gen_translator_hook(f, name, intr):
 def _gen_mock_semantics_listener_hook(f, name, intr):
   result, name, args = _get_semantics_player_hook_proto_components(name, intr)
   if intr.get('class') == 'template':
+    template_parameters = _get_template_parameters(
+      intr.get('variants'), extra = [])
+    arguments = ', '.join(
+       [('arg%d' % n) for n, _ in enumerate(intr['in'])] +
+       ['intrinsics::kEnumFromTemplateType<%s>' % arg if arg.startswith('Type') else arg
+        for arg in _get_template_spec_arguments(intr.get('variants'))])
     print('template<%s>\n%s %s(%s) {\n  return %s(%s);\n}' % (
-      _get_template_arguments(intr.get('variants'), False, []),
-      result,
-      name,
-      args,
-      name,
-      ', '.join([
-        'intrinsics::kEnumFromTemplateType<%s>' % arg if arg.startswith('Type') else arg
-        for arg in _get_template_spec_arguments(intr.get('variants'))] +
-      [('arg%d' % n) for n, _ in enumerate(intr['in'])])), file=f)
-    args = ', '.join([
-      '%s %s' % (
+      template_parameters, result, name, args, name, arguments), file=f)
+    args = ', '.join(
+      [args] +
+      ['%s %s' % (
           {
               'kBoo': 'bool',
               'kInt': 'int',
               'Type': 'intrinsics::EnumFromTemplateType'
           }[argument[0:4]],
           argument)
-      for argument in _get_template_spec_arguments(intr.get('variants'))] + [args])
+      for argument in _get_template_spec_arguments(intr.get('variants'))])
   print('MOCK_METHOD((%s), %s, (%s));' % (result, name, args), file=f)
 
 
@@ -656,7 +653,7 @@ def _get_cast_from_simd128(var, target_type, ptr_bits):
 
   c_type = _get_c_type(target_type)
   if c_type in ('Float16', 'Float32', 'Float64'):
-    return 'FPRegToFloat<intrinsics::%s>(%s)' % (c_type, var)
+    return 'FPRegToFloat<%s>(%s)' % (c_type, var)
 
   cast_map = {
       'int8_t': '.Get<int8_t>(0)',
@@ -854,6 +851,9 @@ template <typename MacroAssembler,
           typename... Args>
 constexpr void ProcessAllBindings([[maybe_unused]] Callback callback,
                         [[maybe_unused]] Args&&... args) {
+  using intrinsics::Float16;
+  using intrinsics::Float32;
+  using intrinsics::Float64;
   using namespace process_all_bindings_strings;""",
     file=f)
   for line in callback_lines:
@@ -1113,8 +1113,7 @@ def _gen_c_intrinsic(name,
 
 def _get_c_type_tuple(arguments):
     return 'std::tuple<%s>' % ', '.join(
-        _get_c_type(argument) for argument in arguments).replace(
-            'Float', 'intrinsics::Float')
+        _get_c_type(argument) for argument in arguments)
 
 
 def _get_asm_type(asm, prefix=''):

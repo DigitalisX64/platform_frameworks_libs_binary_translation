@@ -60,8 +60,13 @@ uintptr_t FindRecoveryCode(uintptr_t fault_addr, ThreadState* state) {
   // signal). If a signal interrupts CodePool::Add then calling FindRecoveryCode
   // in this state can cause deadlock.
   if (GetResidence(*state) == kInsideGeneratedCode) {
-    // TODO(b/228188293): we might need to traverse all code pool instances.
+    // TODO(b/232598137): Add an interface that we'll traverse all existing code pools, and
+    // hide these implementation details from the caller.
     recovery_addr = GetDefaultCodePoolInstance()->FindRecoveryCode(fault_addr);
+    if (recovery_addr) {
+      return recovery_addr;
+    }
+    recovery_addr = GetColdCodePoolInstance()->FindRecoveryCode(fault_addr);
     if (recovery_addr) {
       return recovery_addr;
     }

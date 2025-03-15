@@ -67,6 +67,7 @@ class ExecRegion {
 
   [[nodiscard]] const uint8_t* begin() const { return exec_; }
   [[nodiscard]] const uint8_t* end() const { return exec_ + size_; }
+  [[nodiscard]] size_t size() const { return size_; }
 
   void Write(const uint8_t* dst, const void* src, size_t size);
 

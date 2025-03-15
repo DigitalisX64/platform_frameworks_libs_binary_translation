@@ -49,16 +49,10 @@ constexpr EnumFromTemplateType EnumFromTemplateTypeToFloat(EnumFromTemplateType 
   return EnumFromTemplateType{static_cast<uint8_t>((value & 0x6) + 8)};
 }
 
-template <EnumFromTemplateType kValue>
-EnumFromTemplateType kFloat = EnumFromTemplateTypeToFloat(kValue);
-
 constexpr EnumFromTemplateType EnumFromTemplateTypeToInt(EnumFromTemplateType value) {
   DCHECK((value >= kFloat16 && value <= kFloat64) && !(value & 1));
   return EnumFromTemplateType{static_cast<uint8_t>(value - 8)};
 }
-
-template <EnumFromTemplateType kValue>
-EnumFromTemplateType kInt = EnumFromTemplateTypeToInt(kValue);
 
 constexpr EnumFromTemplateType EnumFromTemplateTypeToNarrow(EnumFromTemplateType value) {
   DCHECK((value >= kUInt16T && value <= kInt64T) ||
@@ -66,32 +60,27 @@ constexpr EnumFromTemplateType EnumFromTemplateTypeToNarrow(EnumFromTemplateType
   return EnumFromTemplateType{static_cast<uint8_t>(value - 2)};
 }
 
-template <EnumFromTemplateType kValue>
-EnumFromTemplateType kNarrow = EnumFromTemplateTypeToNarrow(kValue);
-
 constexpr EnumFromTemplateType EnumFromTemplateTypeToSigned(EnumFromTemplateType value) {
   DCHECK(value <= kInt64T);
   return EnumFromTemplateType{static_cast<uint8_t>(value | 1)};
 }
 
-template <EnumFromTemplateType kValue>
-EnumFromTemplateType kSigned = EnumFromTemplateTypeToSigned(kValue);
+constexpr int EnumFromTemplateTypeSizeOf(EnumFromTemplateType value) {
+  if (value == kSIMD128Register) {
+    return 16;
+  }
+  return 1 << ((value & 0b110) >> 1);
+}
 
 constexpr EnumFromTemplateType EnumFromTemplateTypeToUnsigned(EnumFromTemplateType value) {
   DCHECK(value <= kInt64T);
   return EnumFromTemplateType{static_cast<uint8_t>(value & ~1)};
 }
 
-template <EnumFromTemplateType kValue>
-EnumFromTemplateType kUnsigned = EnumFromTemplateTypeToUnsigned(kValue);
-
 constexpr EnumFromTemplateType EnumFromTemplateTypeToWide(EnumFromTemplateType value) {
   DCHECK(value <= kInt32T || ((value >= kFloat16 && value <= kFloat32) && !(value & 1)));
   return EnumFromTemplateType{static_cast<uint8_t>(value + 2)};
 }
-
-template <EnumFromTemplateType kValue>
-EnumFromTemplateType kWide = EnumFromTemplateTypeToWide(kValue);
 
 template <typename Type>
 constexpr EnumFromTemplateType TypeToEnumFromTemplateType() {
@@ -100,15 +89,15 @@ constexpr EnumFromTemplateType TypeToEnumFromTemplateType() {
   } else if constexpr (std::is_same_v<uint8_t, std::decay_t<Type>>) {
     return EnumFromTemplateType::kUInt8T;
   } else if constexpr (std::is_same_v<int16_t, std::decay_t<Type>>) {
-    return EnumFromTemplateType::kUInt16T;
+    return EnumFromTemplateType::kInt16T;
   } else if constexpr (std::is_same_v<uint16_t, std::decay_t<Type>>) {
     return EnumFromTemplateType::kUInt16T;
   } else if constexpr (std::is_same_v<int32_t, std::decay_t<Type>>) {
-    return EnumFromTemplateType::kUInt32T;
+    return EnumFromTemplateType::kInt32T;
   } else if constexpr (std::is_same_v<uint32_t, std::decay_t<Type>>) {
     return EnumFromTemplateType::kUInt32T;
   } else if constexpr (std::is_same_v<int64_t, std::decay_t<Type>>) {
-    return EnumFromTemplateType::kUInt64T;
+    return EnumFromTemplateType::kInt64T;
   } else if constexpr (std::is_same_v<uint64_t, std::decay_t<Type>>) {
     return EnumFromTemplateType::kUInt64T;
   } else if constexpr (std::is_same_v<Float16, std::decay_t<Type>>) {
@@ -117,7 +106,7 @@ constexpr EnumFromTemplateType TypeToEnumFromTemplateType() {
     return EnumFromTemplateType::kFloat32;
   } else if constexpr (std::is_same_v<Float64, std::decay_t<Type>>) {
     return EnumFromTemplateType::kFloat64;
-  } else if constexpr (std::is_same_v<Float64, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<SIMD128Register, std::decay_t<Type>>) {
     return EnumFromTemplateType::kSIMD128Register;
   } else {
     static_assert(kDependentTypeFalse<Type>);
