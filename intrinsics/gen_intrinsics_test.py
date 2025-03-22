@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import io
 import sys
 import unittest
 
@@ -48,6 +49,17 @@ class GenIntrinsicsTests(unittest.TestCase):
                                   "Register arg3, "
                                   "SimdRegister arg4, "
                                   "uint8_t arg5)" ) # pyformat: disable
+    out = gen_intrinsics._get_semantics_player_hook_proto("Foo", intr["Foo"], use_type_id=True)
+    self.assertEqual(out,
+                     "template<intrinsics::TemplateTypeId Type0, intrinsics::TemplateTypeId Type1>\n"
+                     "Register Foo(Register arg0, "
+                                  "Register arg1, "
+                                  "FpRegister arg2, "
+                                  "Register arg3, "
+                                  "SimdRegister arg4, "
+                                  "uint8_t arg5, "
+                                  "intrinsics::Value<Type0>, "
+                                  "intrinsics::Value<Type1>)" ) # pyformat: disable
 
   def test_get_semantics_player_hook_proto_operand_types(self):
     out = gen_intrinsics._get_semantics_player_hook_proto(
@@ -96,6 +108,18 @@ class GenIntrinsicsTests(unittest.TestCase):
             "GPRRegToInteger<uint8_t>(arg1), "
             "FPRegToFloat<Type0>(arg2), "
             "GPRRegToInteger<Type1>(arg3), "
+            "arg4, "
+            "GPRRegToInteger<uint8_t>(arg5))))" ) # pyforman: disable
+    out = gen_intrinsics._get_interpreter_hook_call_expr("Foo", intr["Foo"], use_type_id=True)
+    self.maxDiff = None
+    self.assertEqual(
+        out,
+        "IntegerToGPRReg(std::get<0>(intrinsics::Foo<"
+                "intrinsics::TypeFromId<Type0>, intrinsics::TypeFromId<Type1>>("
+            "GPRRegToInteger<uint32_t>(arg0), "
+            "GPRRegToInteger<uint8_t>(arg1), "
+            "FPRegToFloat<intrinsics::TypeFromId<Type0>>(arg2), "
+            "GPRRegToInteger<intrinsics::TypeFromId<Type1>>(arg3), "
             "arg4, "
             "GPRRegToInteger<uint8_t>(arg5))))" ) # pyforman: disable
 
@@ -379,6 +403,29 @@ class GenIntrinsicsTests(unittest.TestCase):
                               "  default:",
                               "    LOG_ALWAYS_FATAL(\"Unsupported format\");",
                               "}")) # pyformat: disable
+
+
+  def test_gen_template_parameters_verifier(self):
+    intrinsic = {
+            "class": "template",
+            "variants": [ "int32_t", "int64_t" ],
+            "in": [ "Type0", "int8_t" ],
+            "out": [ "Type0" ]
+        }
+    out = io.StringIO()
+    gen_intrinsics._gen_template_parameters_verifier(out, intrinsic)
+    self.assertSequenceEqual(out.getvalue(),
+                             "  static_assert(std::tuple{intrinsics::kIdFromType<Type0>} == "
+                             "std::tuple{intrinsics::kIdFromType<int32_t>} || "
+                             "std::tuple{intrinsics::kIdFromType<Type0>} == "
+                             "std::tuple{intrinsics::kIdFromType<int64_t>});\n") # pyformat: disable
+    out = io.StringIO()
+    gen_intrinsics._gen_template_parameters_verifier(out, intrinsic, use_type_id=True)
+    self.assertSequenceEqual(out.getvalue(),
+                             "  static_assert(std::tuple{Type0} == "
+                             "std::tuple{intrinsics::kIdFromType<int32_t>} || std::tuple{Type0} == "
+                             "std::tuple{intrinsics::kIdFromType<int64_t>});\n") # pyformat: disable
+
 
 if __name__ == "__main__":
   unittest.main(verbosity=2)

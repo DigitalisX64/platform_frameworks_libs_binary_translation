@@ -253,6 +253,8 @@ class MachineInsn {
         kind_(kind),
         recovery_info_{nullptr, kNullGuestAddr} {}
 
+  void SetRegs(MachineReg* regs) { regs_ = regs; }
+
  private:
   // We either recover by building explicit recovery blocks or by storing recovery pc.
   // TODO(b/200327919): Convert this to union? We'll need to know which one is used during
@@ -593,6 +595,7 @@ class PseudoReadFlags : public MachineInsn {
   };
 
   PseudoReadFlags(WithOverflowEnum with_overflow, MachineReg dst, MachineReg flags);
+  PseudoReadFlags(const PseudoReadFlags& other);
 
   std::string GetDebugString() const override;
   void Emit(CodeEmitter* as) const override;

@@ -535,6 +535,7 @@ constexpr void VerifyIntrinsic() {
   CheckIntrinsicHasFlagsBinding<AsmCallInfo>(expect_flags);
   as.CheckFlagsBinding(expect_flags);
   as.CheckAppropriateDefEarlyClobbers();
+  as.CheckLabelsAreBound();
 }
 
 constexpr bool VerifyTextAsmIntrinsics() {

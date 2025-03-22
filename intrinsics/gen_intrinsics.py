@@ -190,8 +190,13 @@ def _gen_template_intr_decl(f, name, intr):
 
 def _get_template_parameters(
     variants,
-    precise_nans = False,
-    extra = ['enum PreferredIntrinsicsImplementation = kUseAssemblerImplementationIfPossible']):
+    precise_nans=False,
+    use_type_id=False,
+    extra=['enum PreferredIntrinsicsImplementation = kUseAssemblerImplementationIfPossible']):
+  if use_type_id:
+    typename = 'intrinsics::TemplateTypeId'
+  else:
+    typename = 'typename'
   template = None
   for variant in variants:
     counter = -1
@@ -203,7 +208,7 @@ def _get_template_parameters(
       (["bool kPreciseNaNOperationsHandling"] if precise_nans else []) +
       ['bool kBool%s' % get_counter() if param.strip() in ('true', 'false') else
        'int kInt%s' % get_counter() if param.strip() in _ROUNDING_MODES else
-       'typename Type%d' % get_counter() if re.search('[_a-zA-Z]', param) else
+       '%s Type%d' % (typename, get_counter()) if re.search('[_a-zA-Z]', param) else
        'int kInt%s' % get_counter()
        for param in variant.split(',')] + extra)
     assert template is None or template == new_template
@@ -282,15 +287,22 @@ def _get_semantics_player_hook_proto_components(name, intr):
   return result, name, ', '.join(args)
 
 
-def _get_semantics_player_hook_proto(name, intr):
-  result, name, args = _get_semantics_player_hook_proto_components(name, intr)
+def _get_semantics_player_hook_proto(name, intr, use_type_id=False):
+  result, name, params = _get_semantics_player_hook_proto_components(name, intr)
   if intr.get('class') == 'template':
-    return 'template<%s>\n%s %s(%s)' % (
-      _get_template_parameters(intr.get('variants'), extra = []), result, name, args)
-  return '%s %s(%s)' % (result, name, args)
+    template_parameters = _get_template_parameters(
+      intr.get('variants'), use_type_id=use_type_id, extra = [])
+    values = ''
+    if use_type_id:
+      spec_arguments = _get_template_spec_arguments(intr.get('variants'))
+      values = ', ' + ', '.join(
+          ['intrinsics::Value<%s>' % argument for argument in spec_arguments])
+    return 'template<%s>\n%s %s(%s%s)' % (
+      template_parameters, result, name, params, values)
+  return '%s %s(%s)' % (result, name, params)
 
 
-def _get_interpreter_hook_call_expr(name, intr, desc=None):
+def _get_interpreter_hook_call_expr(name, intr, desc=None, use_type_id=False):
   ins = intr['in']
   outs = intr['out']
 
@@ -300,16 +312,21 @@ def _get_interpreter_hook_call_expr(name, intr, desc=None):
     semantic_player_type = _get_semantic_player_type(
         op, intr.get('sem-player-types'))
     if semantic_player_type == 'FpRegister':
+      if op.startswith('Type') and use_type_id:
+        op = 'intrinsics::TypeFromId<%s>' % op
       call_params.append('FPRegToFloat<%s>(%s)' % (op, arg))
     elif semantic_player_type == 'SimdRegister':
       call_params.append(_get_cast_from_simd128(arg, op, ptr_bits=64))
     elif '*' in _get_c_type(op):
       call_params.append('berberis::bit_cast<%s>(%s)' % (_get_c_type(op), arg))
     else:
-      call_params.append('GPRRegToInteger<%s>(%s)' % (_get_c_type(op), arg))
+      c_type = _get_c_type(op)
+      if c_type.startswith('Type') and use_type_id:
+        c_type = 'intrinsics::TypeFromId<%s>' % c_type
+      call_params.append('GPRRegToInteger<%s>(%s)' % (c_type, arg))
 
   call_expr = 'intrinsics::%s%s(%s)' % (
-      name, _get_desc_specializations(intr, desc), ', '.join(call_params))
+      name, _get_desc_specializations(intr, desc, use_type_id), ', '.join(call_params))
 
   if len(outs) == 1:
     # Unwrap tuple for single result.
@@ -340,8 +357,8 @@ def _get_interpreter_hook_call_expr(name, intr, desc=None):
   return call_expr
 
 
-def _get_interpreter_hook_return_stmt(name, intr, desc=None):
-  return 'return ' + _get_interpreter_hook_call_expr(name, intr, desc) + ';'
+def _get_interpreter_hook_return_stmt(name, intr, desc=None, use_type_id=False):
+  return 'return ' + _get_interpreter_hook_call_expr(name, intr, desc, use_type_id) + ';'
 
 def _get_unused(intr):
   call_expr = 'UNUSED(%s);' % ', '.join('arg%d' % (num) for num, _ in enumerate(intr['in']))
@@ -421,8 +438,8 @@ def _get_interpreter_hook_vector_body(name, intr):
       name, intr, _get_interpreter_hook_return_stmt)
 
 
-def _gen_interpreter_hook(f, name, intr, option):
-  print('%s const {' % (_get_semantics_player_hook_proto(name, intr)), file=f)
+def _gen_interpreter_hook(f, name, intr, option, use_type_id=False):
+  print('%s const {' % (_get_semantics_player_hook_proto(name, intr, use_type_id)), file=f)
 
   if _is_vector_class(intr):
     if 'raw' in intr['variants']:
@@ -438,7 +455,7 @@ def _gen_interpreter_hook(f, name, intr, option):
     print('\n'.join(lines), file=f)
   else:
     if intr.get('class') == 'template':
-      _gen_template_parameters_verifier(f, intr)
+      _gen_template_parameters_verifier(f, intr, use_type_id)
     # TODO(b/363057506): Add float support and clean up the logic here.
     arm64_allowlist = ['AmoAdd', 'AmoAnd', 'AmoMax', 'AmoMin', 'AmoOr', 'AmoSwap', 'AmoXor', 'Bclr',
                        'Bclri', 'Bext', 'Bexti', 'Binv', 'Binvi', 'Bset', 'Bseti', 'Div', 'Max',
@@ -447,25 +464,25 @@ def _gen_interpreter_hook(f, name, intr, option):
     if (option == 'arm64') and (name not in arm64_allowlist):
       _get_placeholder_return_stmt(intr, f)
     else:
-      print(INDENT + _get_interpreter_hook_return_stmt(name, intr), file=f)
+      print(INDENT + _get_interpreter_hook_return_stmt(name, intr, use_type_id=use_type_id), file=f)
 
   print('}\n', file=f)
 
 
-def _get_translator_hook_call_expr(name, intr, desc = None):
-  desc_spec = _get_desc_specializations(intr, desc)
+def _get_translator_hook_call_expr(name, intr, desc=None, use_type_id=False):
+  desc_spec = _get_desc_specializations(intr, desc, use_type_id)
   args = [('arg%d' % n) for n, _ in enumerate(intr['in'])]
   template_params = ['&intrinsics::' + name + desc_spec]
   template_params += [_get_semantics_player_hook_result(intr)]
   return 'CallIntrinsic<%s>(%s)' % (', '.join(template_params), ', '.join(args))
 
 
-def _get_translator_hook_return_stmt(name, intr, desc=None):
-  return 'return ' + _get_translator_hook_call_expr(name, intr, desc) + ';'
+def _get_translator_hook_return_stmt(name, intr, desc=None, use_type_id=False):
+  return 'return ' + _get_translator_hook_call_expr(name, intr, desc, use_type_id) + ';'
 
 
-def _gen_translator_hook(f, name, intr):
-  print('%s {' % (_get_semantics_player_hook_proto(name, intr)), file=f)
+def _gen_translator_hook(f, name, intr, use_type_id=False):
+  print('%s {' % (_get_semantics_player_hook_proto(name, intr, use_type_id)), file=f)
 
   if _is_vector_class(intr):
     if 'raw' in intr['variants']:
@@ -483,54 +500,62 @@ def _gen_translator_hook(f, name, intr):
     print('\n'.join(lines), file=f)
   else:
     if intr.get('class') == 'template':
-      _gen_template_parameters_verifier(f, intr)
-    print(INDENT + _get_translator_hook_return_stmt(name, intr), file=f)
+      _gen_template_parameters_verifier(f, intr, use_type_id)
+    print(INDENT + _get_translator_hook_return_stmt(name, intr, use_type_id=use_type_id), file=f)
 
   print('}\n', file=f)
 
 
 def _gen_mock_semantics_listener_hook(f, name, intr):
-  result, name, args = _get_semantics_player_hook_proto_components(name, intr)
+  result, name, params = _get_semantics_player_hook_proto_components(name, intr)
   if intr.get('class') == 'template':
-    template_parameters = _get_template_parameters(
-      intr.get('variants'), extra = [])
-    arguments = ', '.join(
-       [('arg%d' % n) for n, _ in enumerate(intr['in'])] +
-       ['intrinsics::kEnumFromTemplateType<%s>' % arg if arg.startswith('Type') else arg
-        for arg in _get_template_spec_arguments(intr.get('variants'))])
-    print('template<%s>\n%s %s(%s) {\n  return %s(%s);\n}' % (
-      template_parameters, result, name, args, name, arguments), file=f)
-    args = ', '.join(
-      [args] +
+    spec_arguments = _get_template_spec_arguments(intr.get('variants'))
+    for use_type_id in [True, False]:
+      template_parameters = _get_template_parameters(
+        intr.get('variants'), use_type_id=use_type_id, extra = [])
+      args = ', '.join(
+         [('arg%d' % n) for n, _ in enumerate(intr['in'])] +
+         [arg
+            if use_type_id or not arg.startswith('Type') else
+          'intrinsics::kIdFromType<%s>' % arg
+          for arg in spec_arguments])
+      values = ''
+      if use_type_id:
+        values = ', ' + ', '.join(
+            ['intrinsics::Value<%s>' % argument for argument in spec_arguments])
+      print('template<%s>\n%s %s(%s%s) {\n  return %s(%s);\n}' % (
+        template_parameters, result, name, params, values, name, args), file=f)
+    params = ', '.join(
+      [params] +
       ['%s %s' % (
           {
               'kBoo': 'bool',
               'kInt': 'int',
-              'Type': 'intrinsics::EnumFromTemplateType'
+              'Type': 'intrinsics::TemplateTypeId'
           }[argument[0:4]],
           argument)
-      for argument in _get_template_spec_arguments(intr.get('variants'))])
-  print('MOCK_METHOD((%s), %s, (%s));' % (result, name, args), file=f)
+      for argument in spec_arguments])
+  print('MOCK_METHOD((%s), %s, (%s));' % (result, name, params), file=f)
 
 
-def _gen_template_parameters_verifier(f, intr):
-      received_params = ', '.join(
+def _gen_template_parameters_verifier(f, intr, use_type_id=False):
+  received_params = ', '.join(
+    param
+      if not param.strip().startswith('Type') or use_type_id else
+    f'intrinsics::kIdFromType<{param}>'
+    for param in _get_template_spec_arguments(intr.get('variants')))
+  print('%sstatic_assert(%s);' % (
+   INDENT,
+   ' || '.join(
+    'std::tuple{%s} == std::tuple{%s}' % (
+      received_params,
+      ', '.join(
         param
-          if not param.strip().startswith('Type') else
-        f'intrinsics::kEnumFromTemplateType<{param}>'
-        for param in _get_template_spec_arguments(intr.get('variants')))
-      print('%sstatic_assert(%s);' % (
-       INDENT,
-       ' || '.join(
-        'std::tuple{%s} == std::tuple{%s}' % (
-          received_params,
-          ', '.join(
-            param
-              if param.strip() in ['true', 'false'] + _ROUNDING_MODES or
-                 not re.search('[_a-zA-Z]', param) else
-            f'intrinsics::kEnumFromTemplateType<{param}>'
-            for param in variant.split(',')))
-         for variant in intr.get('variants'))), file=f)
+          if param.strip() in ['true', 'false'] + _ROUNDING_MODES or
+             not re.search('[_a-zA-Z]', param) else
+        f'intrinsics::kIdFromType<{param}>'
+        for param in variant.split(',')))
+     for variant in intr.get('variants'))), file=f)
 
 
 def _check_signed_variant(variant, desc):
@@ -669,9 +694,9 @@ def _get_cast_from_simd128(var, target_type, ptr_bits):
   return '%s%s' % (var, cast_map[c_type])
 
 
-def _get_desc_specializations(intr, desc=None):
+def _get_desc_specializations(intr, desc=None, use_type_id=False):
   if intr.get('class') == 'template':
-    spec = _get_template_spec_arguments(intr.get('variants'))
+    spec = _get_template_spec_arguments(intr.get('variants'), use_type_id)
   elif hasattr(desc, 'c_type'):
     spec = [desc.c_type, str(desc.num_elements)]
   elif hasattr(desc, 'num_elements'):
@@ -685,7 +710,7 @@ def _get_desc_specializations(intr, desc=None):
   return '<%s>' % ', '.join(spec)
 
 
-def _get_template_spec_arguments(variants):
+def _get_template_spec_arguments(variants, use_type_id=False):
   spec = None
   for variant in variants:
     counter = -1
@@ -696,7 +721,10 @@ def _get_template_spec_arguments(variants):
     new_spec = [
       'kBool%s' % get_counter() if param.strip() in ('true', 'false') else
       'kInt%s' % get_counter() if param.strip() in _ROUNDING_MODES else
-      'Type%d' % get_counter() if re.search('[_a-zA-Z]', param) else
+      ('intrinsics::TypeFromId<Type%d>' % get_counter()
+          if use_type_id else
+       'Type%d' % get_counter())
+          if re.search('[_a-zA-Z]', param) else
       'kInt%s' % get_counter()
       for param in variant.split(',')]
     assert spec is None or spec == new_spec
@@ -771,12 +799,18 @@ def _gen_semantic_player_types(intrs):
 def _gen_interpreter_intrinsics_hooks_impl_inl_h(f, intrs, option):
   print(AUTOGEN, file=f)
   for name, intr in intrs:
+    if intr.get('class') == 'template':
+      _gen_interpreter_hook(
+          f, name, intr, option, use_type_id=True)
     _gen_interpreter_hook(f, name, intr, option)
 
 
 def _gen_translator_intrinsics_hooks_impl_inl_h(f, intrs):
   print(AUTOGEN, file=f)
   for name, intr in intrs:
+    if intr.get('class') == 'template':
+      _gen_translator_hook(
+          f, name, intr, use_type_id=True)
     _gen_translator_hook(f, name, intr)
 
 

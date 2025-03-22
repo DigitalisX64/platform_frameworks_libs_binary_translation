@@ -163,6 +163,10 @@ class TranslationCache {
   // Invalidate region of entries.
   void InvalidateGuestRange(GuestAddr start, GuestAddr end);
 
+  // Schedules gear shift translation for all lite-translated regions that are within range from
+  // target.
+  void TriggerGearShift(GuestAddr target, size_t range);
+
   [[nodiscard]] const std::atomic<std::atomic<HostCodeAddr>*>* main_table_ptr() const {
     return address_map_.main_table();
   }

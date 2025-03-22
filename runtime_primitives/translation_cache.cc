@@ -20,7 +20,9 @@
 #include <map>
 #include <mutex>  // std::lock_guard, std::mutex
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/checks.h"
+#include "berberis/base/config.h"
 #include "berberis/base/forever_alloc.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/runtime_primitives/host_code.h"
@@ -298,6 +300,25 @@ void TranslationCache::InvalidateGuestRange(GuestAddr start, GuestAddr end) {
     } else {
       entry->host_code->store(kEntryNotTranslated);
       guest_entries_.erase(curr);
+    }
+  }
+}
+
+void TranslationCache::TriggerGearShift(GuestAddr target, size_t range) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  GuestAddr start = (target > range) ? target - range : kNullGuestAddr;
+
+  for (auto it = guest_entries_.lower_bound(start); it != guest_entries_.end(); ++it) {
+    auto& [guest_pc, entry] = *it;
+    CHECK_GT(entry.guest_size, 0);
+    if ((guest_pc > target) && ((guest_pc - target) > range)) {
+      break;
+    }
+    if (entry.kind == GuestCodeEntry::Kind::kLiteTranslated) {
+      // Lite translator may update the counter non-atomically for efficiency, but here
+      // we can be more strict.
+      auto* counter = bit_cast<std::atomic<uint32_t>*>(&entry.invocation_counter);
+      *counter = config::kGearSwitchThreshold;
     }
   }
 }

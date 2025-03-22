@@ -19,15 +19,23 @@
 
 #include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
+#include "berberis/backend/x86_64/machine_ir_analysis.h"
 #include "berberis/base/arena_vector.h"
 
 namespace berberis::x86_64 {
+
+using InsnGenerator = MachineInsn* (*)(MachineIR*, MachineInsn*);
 
 bool CheckRegsUnusedWithinInsnRange(MachineInsnList::iterator insn_it,
                                     MachineInsnList::iterator end,
                                     ArenaVector<MachineReg>& regs);
 bool CheckPostLoopNode(MachineBasicBlock* block, const ArenaVector<MachineReg>& regs);
-
+bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* block, ArenaVector<MachineReg>& regs);
+std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode);
+bool RegsLiveInBasicBlock(MachineBasicBlock* bb, const ArenaVector<MachineReg>& regs);
+std::optional<MachineInsnList::iterator> FindFlagSettingInsn(MachineInsnList::iterator insn_it,
+                                                             MachineInsnList::iterator begin,
+                                                             MachineReg reg);
 }  // namespace berberis::x86_64
 
 #endif  // BERBERIS_BACKEND_X86_64_READ_FLAGS_OPTIMIZER_H_

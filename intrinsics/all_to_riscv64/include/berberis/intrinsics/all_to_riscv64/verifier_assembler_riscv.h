@@ -129,6 +129,8 @@ class VerifierAssembler {
 
   constexpr void CheckAppropriateDefEarlyClobbers() {}
 
+  constexpr void CheckLabelsAreBound() {}
+
   // Translate CPU restrictions into string.
   template <typename CPUIDRestriction>
   static constexpr const char* kCPUIDRestrictionString =
@@ -212,6 +214,8 @@ class VerifierAssembler {
 
   template <typename Arg>
   constexpr void RegisterUse([[maybe_unused]] Arg reg) {}
+
+  constexpr void EndInstruction() {}
 
  private:
   Label label_;

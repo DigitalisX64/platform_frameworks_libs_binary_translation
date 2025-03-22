@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <array>
+
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/logging.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -224,6 +226,15 @@ PseudoReadFlags::PseudoReadFlags(WithOverflowEnum with_overflow, MachineReg dst,
                   kMachineInsnDefault),
       regs_{dst, flags},
       with_overflow_(with_overflow == kWithOverflow) {}
+
+PseudoReadFlags::PseudoReadFlags(const PseudoReadFlags& other) : MachineInsn(other) {
+  with_overflow_ = other.with_overflow_;
+  for (size_t i = 0; i < std::size(regs_); i++) {
+    regs_[i] = other.regs_[i];
+  }
+
+  SetRegs(regs_);
+}
 
 const MachineOpcode PseudoWriteFlags::kOpcode = kMachineOpPseudoWriteFlags;
 

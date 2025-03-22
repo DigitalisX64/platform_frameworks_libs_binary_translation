@@ -138,17 +138,24 @@ void ProfilerLogGeneratedCode(const void* start,
 
   MappedNameBuffer mapped_name_buf = ConstructMappedNameBuffer(guest_start);
 
+  char guest_range_buf[64];
+
+  if (IsConfigFlagSet(kMergeProfilesForSameModeRegions)) {
+    guest_range_buf[0] = '\0';
+  } else {
+    FormatBuffer(guest_range_buf, sizeof(guest_range_buf), "_0x%lx+%zu", guest_start, guest_size);
+  }
+
   char buf[128];
   // start size symbol-name
   size_t n = FormatBuffer(buf,
                           sizeof(buf),
-                          "%p 0x%zx %s%s_0x%lx+%zu\n",
+                          "%p 0x%zx %s%s%s\n",
                           start,
                           size,
                           mapped_name_buf.data(),
                           jit_suffix,
-                          guest_start,
-                          guest_size);
+                          guest_range_buf);
   UNUSED(write(fd, buf, n));
 }
 

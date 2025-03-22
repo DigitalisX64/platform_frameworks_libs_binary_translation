@@ -55,6 +55,7 @@ enum ConfigFlag {
   kVerboseTranslation,
   kAccurateSigsegv,
   kDisableIntrinsicInlining,
+  kMergeProfilesForSameModeRegions,
   kPrintTranslatedAddrs,
   kPrintIRs,
   kPrintCodePoolSize,

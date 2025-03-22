@@ -141,6 +141,18 @@ class MachineInsnX86_64 : public MachineInsn {
   static constexpr const auto kXmmReg = x86_64::kXmmReg;
   static constexpr const auto kFLAGS = x86_64::kFLAGS;
 
+  MachineInsnX86_64(const MachineInsnX86_64& other) : MachineInsn(other) {
+    for (int i = 0; i < kMaxMachineRegOperands; i++) {
+      regs_[i] = other.regs_[i];
+    }
+    scale_ = other.scale_;
+    disp_ = other.disp_;
+    imm_ = other.imm_;
+    cond_ = other.cond_;
+
+    SetRegs(regs_);
+  }
+
   ~MachineInsnX86_64() override {
     // No code here - will never be called!
   }

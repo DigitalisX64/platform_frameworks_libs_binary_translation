@@ -122,6 +122,22 @@ def _get_template_name(insn):
       'typename' if re.search('[_a-zA-Z]', param) else 'int'
       for param in name.split('<',1)[1][:-1].split(',')), name.split('<')[0]
 
+def _handle_jump(insn, jump_is_conditional, f):
+  arg_count = 0
+  for arg in insn.get('args'):
+    if _get_arg_type_name(arg, insn.get('type', None)) ==  "const Label&":
+      if jump_is_conditional:
+        print('  HandleConditionalJump(arg%d);' %
+        arg_count, file=f)
+        return
+      print('  HandleUnconditionalJump(arg%d);' %
+        arg_count, file=f)
+      return
+    if _get_arg_type_name(arg, insn.get('type', None)) ==  "Register":
+      assert(not jump_is_conditional)
+      print('  HandleUnconditionalJumpRegister();', file=f)
+    arg_count += 1
+
 def _check_insn_is_dependency_breaking(insn):
   if "dependency_breaking" in insn:
     return True
@@ -139,18 +155,28 @@ def _handle_def_register_reset(name, insn, arch, f):
   """
   if not _check_insn_is_dependency_breaking(insn):
     return
+  if name.startswith("P") or name.startswith("V") or name.endswith("pd") or name.endswith("ps"):
+    register_type = "XMMRegister"
+  else:
+    register_type = "Register"
+  num_registers = 3 if name.startswith("V") else 2
   arg_count = 0
-  general_registers = []
+  registers = []
   for arg in insn.get('args'):
       if asm_defs.is_implicit_reg(arg.get('class')):
         continue
-      if (_get_arg_type_name(arg, insn.get('type', None)) == 'Register'
+      if (_get_arg_type_name(arg, insn.get('type', None)) == register_type
           and 'x86' in arch):
-        general_registers.append(arg_count)
+        registers.append(arg_count)
       arg_count += 1
-  if len(general_registers) == 2:
+  if (len(registers) != num_registers):
+    return
+  if num_registers == 2:
     print('  HandleDefOrDefEarlyClobberRegisterReset(arg%d, arg%d);' %
-    (general_registers[0], general_registers[1]), file=f)
+    (registers[0], registers[1]), file=f)
+  else:
+    print('  HandleDefOrDefEarlyClobberRegisterReset(arg%d, arg%d, arg%d);' %
+    (registers[0], registers[1], registers[2]), file=f)
 
 def _get_implicit_fixed_register(arg_class):
   if arg_class in ["AL", "AX", "EAX", "RAX"]:
@@ -181,6 +207,11 @@ def _gen_register_read_write_info(insn, arch):
           yield '  Register%s(arg%d);' % (usage.capitalize(), arg_count)
       arg_count += 1
 
+def _check_insn_uses_xmm(insn, arch):
+  for arg in insn.get('args'):
+    if (asm_defs.is_xreg(arg.get('class')) and 'x86' in arch):
+      return True
+  return False
 
 def _gen_generic_functions_h(f, insns, arch, assembler_mode):
   template_names = set()
@@ -276,8 +307,17 @@ def _gen_generic_functions_h(f, insns, arch, assembler_mode):
 
     else: # verifier_assembler
       print('constexpr void %s(%s) {' % (name, params), file=f)
+      if (name == "Jcc" or name == "Jmp") and 'x86' in arch:
+        jump_is_conditional = name == "Jcc"
+        _handle_jump(insn, jump_is_conditional, f)
+        print(' EndInstruction();', file=f)
+        print('}', file=f)
+        continue
       if 'feature' in insn:
         print('  SetRequiredFeature%s();' % insn['feature'], file=f)
+      else:
+        if _check_insn_uses_xmm(insn, arch):
+          print('  SetRequiredFeatureSSEOrSSE2();', file=f)
       for arg in insn.get('args'):
         if arg["class"] == "FLAGS":
           print('  SetDefinesFLAGS();', file=f)
@@ -285,6 +325,7 @@ def _gen_generic_functions_h(f, insns, arch, assembler_mode):
       _handle_def_register_reset(name, insn, arch, f)
       for register_read_write in _gen_register_read_write_info(insn, arch):
         print(register_read_write, file=f)
+      print('  EndInstruction();', file=f)
       print('}', file=f)
 
 
