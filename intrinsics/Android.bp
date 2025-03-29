@@ -162,6 +162,7 @@ genrule {
         "berberis/intrinsics/intrinsics_process_bindings-inl.h",
         "berberis/intrinsics/interpreter_intrinsics_hooks-inl.h",
         "berberis/intrinsics/translator_intrinsics_hooks-inl.h",
+        "berberis/intrinsics/demultiplexer_intrinsics_hooks-inl.h",
         "berberis/intrinsics/mock_semantics_listener_intrinsics_hooks-inl.h",
     ],
     srcs: [
@@ -187,6 +188,7 @@ genrule {
     out: [
         "berberis/intrinsics/intrinsics-inl.h",
         "berberis/intrinsics/interpreter_intrinsics_hooks-inl.h",
+        "berberis/intrinsics/demultiplexer_intrinsics_hooks-inl.h",
     ],
     srcs: [
         ":libberberis_intrinsics_gen_inputs_riscv64_to_all",
@@ -331,10 +333,26 @@ cc_library_headers {
             export_include_dirs: [
                 "all_to_x86_32_or_x86_64/include",
             ],
+            generated_headers: [
+                "libberberis_verifier_assembler_gen_headers_x86_32",
+                "libberberis_verifier_assembler_gen_headers_x86_64",
+            ],
+            export_generated_headers: [
+                "libberberis_verifier_assembler_gen_headers_x86_32",
+                "libberberis_verifier_assembler_gen_headers_x86_64",
+            ],
         },
         x86_64: {
             export_include_dirs: [
                 "all_to_x86_32_or_x86_64/include",
+            ],
+            generated_headers: [
+                "libberberis_verifier_assembler_gen_headers_x86_32",
+                "libberberis_verifier_assembler_gen_headers_x86_64",
+            ],
+            export_generated_headers: [
+                "libberberis_verifier_assembler_gen_headers_x86_32",
+                "libberberis_verifier_assembler_gen_headers_x86_64",
             ],
         },
         riscv64: {
@@ -453,12 +471,14 @@ cc_test_library {
         x86: {
             srcs: [
                 "all_to_x86_32_or_x86_64/intrinsics_float_test.cc",
+                "all_to_x86_32_or_x86_64/verifier_assembler_test.cc",
             ],
         },
         x86_64: {
             cflags: ["-mssse3"],
             srcs: [
                 "all_to_x86_32_or_x86_64/intrinsics_float_test.cc",
+                "all_to_x86_32_or_x86_64/verifier_assembler_test.cc",
                 "all_to_x86_64/tuple_test.cc",
                 // Note that these two tests technically should work on any platform that supports
                 // risv64 to something translation, but currently that's only x86-64.

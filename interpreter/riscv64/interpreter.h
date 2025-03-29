@@ -73,6 +73,17 @@ class Interpreter {
   using Float32 = intrinsics::Float32;
   using Float64 = intrinsics::Float64;
 
+  using TemplateTypeId = intrinsics::TemplateTypeId;
+  template <typename Type>
+  static constexpr auto kIdFromType = intrinsics::kIdFromType<Type>;
+  template <auto kEnumValue>
+  using TypeFromId = intrinsics::TypeFromId<kEnumValue>;
+  template <auto ValueParam>
+  using Value = intrinsics::Value<ValueParam>;
+  static constexpr TemplateTypeId IntSizeToTemplateTypeId(uint8_t size, bool is_signed = false) {
+    return intrinsics::IntSizeToTemplateTypeId(size, is_signed);
+  }
+
   explicit Interpreter(ThreadState* state)
       : state_(state), branch_taken_(false), exception_raised_(false) {}
 
@@ -167,24 +178,25 @@ class Interpreter {
   }
 #endif
 
-  template <typename IntType, bool aq, bool rl>
-  Register Lr(int64_t addr) {
-    static_assert(std::is_integral_v<IntType>, "Lr: IntType must be integral");
-    static_assert(std::is_signed_v<IntType>, "Lr: IntType must be signed");
+  template <intrinsics::TemplateTypeId IntType, bool aq, bool rl>
+  Register Lr(int64_t addr, Value<IntType>, Value<aq>, Value<rl>) {
+    static_assert(std::is_integral_v<TypeFromId<IntType>>, "Lr: IntType must be integral");
+    static_assert(std::is_signed_v<TypeFromId<IntType>>, "Lr: IntType must be signed");
     CHECK(!exception_raised_);
     // Address must be aligned on size of IntType.
-    CHECK((addr % sizeof(IntType)) == 0ULL);
-    return MemoryRegionReservation::Load<IntType>(&state_->cpu, addr, AqRlToStdMemoryOrder(aq, rl));
+    CHECK((addr % sizeof(TypeFromId<IntType>)) == 0ULL);
+    return MemoryRegionReservation::Load<TypeFromId<IntType>>(
+        &state_->cpu, addr, AqRlToStdMemoryOrder(aq, rl));
   }
 
-  template <typename IntType, bool aq, bool rl>
-  Register Sc(int64_t addr, IntType val) {
-    static_assert(std::is_integral_v<IntType>, "Sc: IntType must be integral");
-    static_assert(std::is_signed_v<IntType>, "Sc: IntType must be signed");
+  template <intrinsics::TemplateTypeId IntType, bool aq, bool rl>
+  Register Sc(int64_t addr, TypeFromId<IntType> val, Value<IntType>, Value<aq>, Value<rl>) {
+    static_assert(std::is_integral_v<TypeFromId<IntType>>, "Sc: IntType must be integral");
+    static_assert(std::is_signed_v<TypeFromId<IntType>>, "Sc: IntType must be signed");
     CHECK(!exception_raised_);
     // Address must be aligned on size of IntType.
     CHECK((addr % sizeof(IntType)) == 0ULL);
-    return static_cast<Register>(MemoryRegionReservation::Store<IntType>(
+    return static_cast<Register>(MemoryRegionReservation::Store<TypeFromId<IntType>>(
         &state_->cpu, addr, val, AqRlToStdMemoryOrder(aq, rl)));
   }
 
@@ -4455,6 +4467,11 @@ class Interpreter {
     }
   }
 
+#ifdef BERBERIS_INTRINSICS_HOOKS_INLINE_DEMULTIPLEXER
+#define BERBERIS_INTRINSICS_HOOKS_CONST const
+#include "berberis/intrinsics/demultiplexer_intrinsics_hooks-inl.h"
+#undef BERBERIS_INTRINSICS_HOOKS_CONST
+#endif
 #include "berberis/intrinsics/interpreter_intrinsics_hooks-inl.h"
 
  private:
@@ -4788,7 +4805,7 @@ template <>
 #else
   CheckFpRegIsValid(reg);
   FpRegister value = state_->cpu.f[reg];
-  return UnboxNan<Float32>(value);
+  return UnboxNan(value, Value<intrinsics::kFloat32>{});
 #endif
 }
 
@@ -4812,7 +4829,7 @@ void inline Interpreter::NanBoxAndSetFpReg<Interpreter::Float32>(uint8_t reg, Fp
     return;
   }
   CheckFpRegIsValid(reg);
-  state_->cpu.f[reg] = NanBox<Float32>(value);
+  state_->cpu.f[reg] = NanBox(value, Value<intrinsics::kFloat32>{});
 }
 
 template <>

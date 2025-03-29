@@ -18,12 +18,8 @@
     "comment": "Averaging add (scalar).",
     "class": "template",
     "variants": [
-      "int8_t",
-      "int16_t",
       "int32_t",
       "int64_t",
-      "uint8_t",
-      "uint16_t",
       "uint32_t",
       "uint64_t"
     ],
@@ -182,12 +178,8 @@
     "comment": "Averaging subtract (scalar).",
     "class": "template",
     "variants": [
-      "int8_t",
-      "int16_t",
       "int32_t",
       "int64_t",
-      "uint8_t",
-      "uint16_t",
       "uint32_t",
       "uint64_t"
     ],
@@ -280,12 +272,8 @@
     "comment": "Integer division",
     "class": "template",
     "variants": [
-      "int8_t",
-      "int16_t",
       "int32_t",
       "int64_t",
-      "uint8_t",
-      "uint16_t",
       "uint32_t",
       "uint64_t"
     ],
@@ -650,12 +638,8 @@
     "comment": "Integer remainder",
     "class": "template",
     "variants": [
-      "int8_t",
-      "int16_t",
       "int32_t",
       "int64_t",
-      "uint8_t",
-      "uint16_t",
       "uint32_t",
       "uint64_t"
     ],
@@ -686,12 +670,8 @@
     "comment": "Fixed point conversion with rounding (but without narrowing).",
     "class": "template",
     "variants": [
-      "int8_t",
-      "int16_t",
       "int32_t",
       "int64_t",
-      "uint8_t",
-      "uint16_t",
       "uint32_t",
       "uint64_t"
     ],

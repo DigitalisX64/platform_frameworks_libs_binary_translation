@@ -261,17 +261,17 @@ class VerifierAssembler {
     constexpr void CheckValidRegisterUse(bool is_fixed) {
       if (intrinsic_defined_def_general_register ||
           (intrinsic_defined_def_fixed_register && !is_fixed)) {
-        printf(
+        FATAL(
             "error: intrinsic used a 'use' general register after writing to a 'def' general  "
-            "register\n");
+            "register");
       }
     }
 
     constexpr void CheckValidXMMRegisterUse() {
       if (intrinsic_defined_def_xmm_register) {
-        printf(
+        FATAL(
             "error: intrinsic used a 'use' xmm register after writing to a 'def' xmm  "
-            "register\n");
+            "register");
       }
     }
 
@@ -279,19 +279,19 @@ class VerifierAssembler {
       for (int i = 0; i < kMaxRegisters; i++) {
         if (intrinsic_defined_def_early_clobber_fixed_register[i] &&
             !valid_def_early_clobber_register[i]) {
-          printf(
+          FATAL(
               "error: intrinsic never used a 'use' general register after writing to a "
               "'def_early_clobber' fixed register");
         }
         if (intrinsic_defined_def_early_clobber_general_register[i] &&
             !valid_def_early_clobber_register[i]) {
-          printf(
+          FATAL(
               "error: intrinsic never used a 'use' general/fixed register after writing to a "
               "'def_early_clobber' general register");
         }
         if (intrinsic_defined_def_early_clobber_xmm_register[i] &&
             !valid_def_early_clobber_register[i]) {
-          printf(
+          FATAL(
               "error: intrinsic never used a 'use' xmm register after writing to a "
               "'def_early_clobber' xmm register");
         }
@@ -300,7 +300,7 @@ class VerifierAssembler {
 
     constexpr void CheckValidDefOrDefEarlyClobberRegisterUse(int reg_arg_no) {
       if (!intrinsic_defined_def_or_def_early_clobber_register[reg_arg_no]) {
-        printf("error: intrinsic read a def/def_early_clobber register before writing to it");
+        FATAL("error: intrinsic read a def/def_early_clobber register before writing to it");
       }
     }
 
@@ -415,7 +415,7 @@ class VerifierAssembler {
     for (int i = 0; i < current_instruction; i++) {
       if (instructions[i].is_conditional_jump || instructions[i].is_unconditional_jump) {
         if (instructions[i].jump_target->bound == false) {
-          printf("error: intrinsic jumps to a label that was never bound\n");
+          FATAL("error: intrinsic jumps to a label that was never bound");
         }
       }
     }
@@ -462,7 +462,7 @@ class VerifierAssembler {
     // penalty. Thus, we first ensure that AVX-using intrinsics don't use SSE instructions, before
     // propagating required feature dependencies correctly.
     if (need_avx && need_sse_or_sse2) {
-      printf("error: intrinsic used both AVX and SSE instructions\n");
+      FATAL("error: intrinsic used both AVX and SSE instructions");
     }
 
     constexpr bool expect_bmi = std::is_same_v<CPUIDRestriction, intrinsics::bindings::HasBMI>;
@@ -497,61 +497,61 @@ class VerifierAssembler {
     // Note that we don't check SSE or SSE2, since we assume SSE2 is always available.
 
     if (expect_aesavx != need_aesavx) {
-      printf("error: expect_aesavx != need_aesavx\n");
+      FATAL("error: expect_aesavx != need_aesavx");
     }
     if (expect_aes != need_aes) {
-      printf("error: expect_aes != need_aes\n");
+      FATAL("error: expect_aes != need_aes");
     }
     if (expect_avx != need_avx) {
-      printf("error: expect_avx != need_avx\n");
+      FATAL("error: expect_avx != need_avx");
     }
     if (expect_bmi != need_bmi) {
-      printf("error: expect_bmi != need_bmi\n");
+      FATAL("error: expect_bmi != need_bmi");
     }
     if (expect_clmulavx != need_clmulavx) {
-      printf("error: expect_clmulavx != need_clmulavx\n");
+      FATAL("error: expect_clmulavx != need_clmulavx");
     }
     if (expect_clmul != need_clmul) {
-      printf("error: expect_clmul != need_clmul\n");
+      FATAL("error: expect_clmul != need_clmul");
     }
     if (expect_f16c != need_f16c) {
-      printf("error: expect_f16c != need_f16c\n");
+      FATAL("error: expect_f16c != need_f16c");
     }
     if (expect_fma != need_fma) {
-      printf("error: expect_fma != need_fma\n");
+      FATAL("error: expect_fma != need_fma");
     }
     if (expect_fma4 != need_fma4) {
-      printf("error: expect_fma4 != need_fma4\n");
+      FATAL("error: expect_fma4 != need_fma4");
     }
     if (expect_lzcnt != need_lzcnt) {
-      printf("error: expect_lzcnt != need_lzcnt\n");
+      FATAL("error: expect_lzcnt != need_lzcnt");
     }
     if (expect_popcnt != need_popcnt) {
-      printf("error: expect_popcnt != need_popcnt\n");
+      FATAL("error: expect_popcnt != need_popcnt");
     }
     if (expect_sse3 != need_sse3) {
-      printf("error: expect_sse3 != need_sse3\n");
+      FATAL("error: expect_sse3 != need_sse3");
     }
     if (expect_ssse3 != need_ssse3) {
-      printf("error: expect_ssse3 != need_ssse3\n");
+      FATAL("error: expect_ssse3 != need_ssse3");
     }
     if (expect_sse4_1 != need_sse4_1) {
-      printf("error: expect_sse4_1 != need_sse4_1\n");
+      FATAL("error: expect_sse4_1 != need_sse4_1");
     }
     if (expect_sse4_2 != need_sse4_2) {
-      printf("error: expect_sse4_2 != need_sse4_2\n");
+      FATAL("error: expect_sse4_2 != need_sse4_2");
     }
     if (expect_vaes != need_vaes) {
-      printf("error: expect_vaes != need_vaes\n");
+      FATAL("error: expect_vaes != need_vaes");
     }
     if (expect_vpclmulqd != need_vpclmulqd) {
-      printf("error: expect_vpclmulqd != need_vpclmulqd\n");
+      FATAL("error: expect_vpclmulqd != need_vpclmulqd");
     }
   }
 
   constexpr void CheckFlagsBinding(bool expect_flags) {
     if (expect_flags != defines_flags) {
-      printf("error: expect_flags != defines_flags\n");
+      FATAL("error: expect_flags != defines_flags");
     }
   }
 
@@ -700,7 +700,7 @@ class VerifierAssembler {
                                                                   RegisterIsFixed(reg));
     }
     if (reg.get_binding_kind() == intrinsics::bindings::kUse) {
-      printf("error: intrinsic defined a 'use' register\n");
+      FATAL("error: intrinsic defined a 'use' register");
     }
   }
 
@@ -716,7 +716,7 @@ class VerifierAssembler {
       register_usage_flags.UpdateIntrinsicXMMRegisterDefEarlyClobber(reg.arg_no());
     }
     if (reg.get_binding_kind() == intrinsics::bindings::kUse) {
-      printf("error: intrinsic defined a 'use' XMM register\n");
+      FATAL("error: intrinsic defined a 'use' XMM register");
     }
   }
 
@@ -785,7 +785,7 @@ class VerifierAssembler {
   }
 
   constexpr void HandleUnconditionalJumpRegister() {
-    printf("error: intrinsic does jump to register\n");
+    FATAL("error: intrinsic does jump to register");
   }
 
   constexpr void EndInstruction() { current_instruction++; }

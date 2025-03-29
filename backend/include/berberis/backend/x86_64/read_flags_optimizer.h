@@ -20,11 +20,20 @@
 #include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_analysis.h"
+#include "berberis/base/arena_map.h"
 #include "berberis/base/arena_vector.h"
 
 namespace berberis::x86_64 {
 
 using InsnGenerator = MachineInsn* (*)(MachineIR*, MachineInsn*);
+
+struct ReadFlagsOptContext {
+  MachineBasicBlock* bb;
+  // Original readflag instruction.
+  MachineInsn* readflags_insn;
+  // Original instruction that set flag register.
+  MachineInsn* flag_set_insn;
+};
 
 bool CheckRegsUnusedWithinInsnRange(MachineInsnList::iterator insn_it,
                                     MachineInsnList::iterator end,
@@ -33,9 +42,17 @@ bool CheckPostLoopNode(MachineBasicBlock* block, const ArenaVector<MachineReg>& 
 bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* block, ArenaVector<MachineReg>& regs);
 std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode);
 bool RegsLiveInBasicBlock(MachineBasicBlock* bb, const ArenaVector<MachineReg>& regs);
+void FindEligibleReadFlagsInLoopTree(MachineIR* machine_ir,
+                                     LoopTreeNode* loop_tree_node,
+                                     ArenaMap<MachineReg, ReadFlagsOptContext>& read_flags_map);
 std::optional<MachineInsnList::iterator> FindFlagSettingInsn(MachineInsnList::iterator insn_it,
                                                              MachineInsnList::iterator begin,
                                                              MachineReg reg);
+std::optional<MachineInsn*> IsEligibleReadFlag(MachineIR* machine_ir,
+                                               Loop* loop,
+                                               MachineBasicBlock* block,
+                                               MachineInsnList::iterator insn_it);
+
 }  // namespace berberis::x86_64
 
 #endif  // BERBERIS_BACKEND_X86_64_READ_FLAGS_OPTIMIZER_H_

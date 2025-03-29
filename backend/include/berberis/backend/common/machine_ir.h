@@ -81,6 +81,10 @@ class MachineReg {
 
   constexpr friend bool operator!=(MachineReg left, MachineReg right) { return !(left == right); }
 
+  constexpr friend bool operator<(MachineReg left, MachineReg right) {
+    return left.reg_ < right.reg_;
+  }
+
   [[nodiscard]] static constexpr MachineReg CreateVRegFromIndex(uint32_t index) {
     CHECK_LE(index, std::numeric_limits<int>::max() - kFirstVRegNumber);
     return MachineReg{kFirstVRegNumber + static_cast<int>(index)};

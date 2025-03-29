@@ -128,6 +128,7 @@ cc_test_library {
     srcs: [
         "code_pool_test.cc",
         "exec_region_anonymous_test.cc",
+        "guest_code_region_test.cc",
         "signal_queue_test.cc",
         "table_of_tables_test.cc",
     ],

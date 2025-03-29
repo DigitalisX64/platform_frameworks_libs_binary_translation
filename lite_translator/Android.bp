@@ -49,6 +49,7 @@ cc_library_static {
     srcs: [
         "riscv64_to_x86_64/lite_translate_region.cc",
         "riscv64_to_x86_64/lite_translator.cc",
+        "riscv64_to_x86_64/lite_translator_demultiplexers.cc",
     ],
 }
 

@@ -49,6 +49,7 @@ cc_library_static {
             ],
             srcs: [
                 "riscv64/faulty_memory_accesses_x86_64.cc",
+                "riscv64/interpreter-demultiplexers.cc",
                 "riscv64/interpreter-VLoadIndexedArgs.cc",
                 "riscv64/interpreter-VLoadStrideArgs.cc",
                 "riscv64/interpreter-VLoadUnitStrideArgs.cc",

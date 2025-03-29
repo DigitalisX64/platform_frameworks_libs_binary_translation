@@ -18,6 +18,7 @@
 #define BERBERIS_INTRINSICS_COMMON_INTRINSICS_H_
 
 #include <cstdint>
+#include <type_traits>
 
 #include "berberis/base/checks.h"
 #include "berberis/base/dependent_false.h"
@@ -220,6 +221,18 @@ DEFINE_VALUE_OPERATOR(&&)
 DEFINE_VALUE_OPERATOR(||)
 
 #pragma pop_macro("DEFINE_VALUE_OPERATOR")
+
+// Note: this is very simple demultiplexer and it's NOT guaranteed to always work (especially if
+// someone would use it with more than 8 parameters), but it would start producing collisions then
+// we wouldn't really have any runtime issues because we use these values in a switch – and in C++
+// an attempt to have to different case's in a switch is a compile-time error.
+template <typename... Param>
+constexpr int TrivialDemultiplexer(Param... param) {
+  int variant_index = 0;
+  int index = 0;
+  ((variant_index ^= param << index, index += 4), ...);
+  return variant_index;
+}
 
 // A solution for the inability to call generic implementation from specialization.
 // Declaration:

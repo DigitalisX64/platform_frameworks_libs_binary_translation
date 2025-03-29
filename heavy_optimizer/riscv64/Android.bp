@@ -47,6 +47,7 @@ cc_library_static {
     ],
     srcs: [
         "frontend.cc",
+        "frontend_demultiplexers.cc",
         "heavy_optimize_region.cc",
     ],
 }

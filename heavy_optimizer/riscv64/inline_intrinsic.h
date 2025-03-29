@@ -334,6 +334,10 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
       if (!host_platform::kHasBMI) {
         return {};
       }
+    } else if constexpr (std::is_same_v<CPUIDRestriction, intrinsics::bindings::HasFMA>) {
+      if (!host_platform::kHasFMA) {
+        return {};
+      }
     } else if constexpr (std::is_same_v<CPUIDRestriction, intrinsics::bindings::HasLZCNT>) {
       if (!host_platform::kHasLZCNT) {
         return {};

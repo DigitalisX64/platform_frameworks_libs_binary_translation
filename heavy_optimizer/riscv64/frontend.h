@@ -49,6 +49,17 @@ class HeavyOptimizerFrontend {
   using Float32 = intrinsics::Float32;
   using Float64 = intrinsics::Float64;
 
+  using TemplateTypeId = intrinsics::TemplateTypeId;
+  template <typename Type>
+  static constexpr auto kIdFromType = intrinsics::kIdFromType<Type>;
+  template <auto kEnumValue>
+  using TypeFromId = intrinsics::TypeFromId<kEnumValue>;
+  template <auto ValueParam>
+  using Value = intrinsics::Value<ValueParam>;
+  static constexpr TemplateTypeId IntSizeToTemplateTypeId(uint8_t size, bool is_signed = false) {
+    return intrinsics::IntSizeToTemplateTypeId(size, is_signed);
+  }
+
   struct MemoryOperand {
     Register base{0};
     // We call the following field "index" even though we do not scale it at the
@@ -172,8 +183,8 @@ class HeavyOptimizerFrontend {
   // Atomic extensions.
   //
 
-  template <typename IntType, bool aq, bool rl>
-  Register Lr(Register addr) {
+  template <intrinsics::TemplateTypeId IntType, bool aq, bool rl>
+  Register Lr(Register addr, Value<IntType>, Value<aq>, Value<rl>) {
     Register aligned_addr = AllocTempReg();
     Gen<PseudoCopy>(aligned_addr, addr, 8);
     // The immediate is sign extended to 64-bit.
@@ -186,14 +197,14 @@ class HeavyOptimizerFrontend {
     Gen<x86_64::SubqRegReg>(addr_offset, aligned_addr, GetFlagsRegister());
 
     // Load the requested part from CPUState.
-    return LoadWithoutRecovery(ToLoadOperandType<IntType>(),
+    return LoadWithoutRecovery(ToLoadOperandType<TypeFromId<IntType>>(),
                                x86_64::kMachineRegRBP,
                                addr_offset,
                                GetThreadStateReservationValueOffset());
   }
 
-  template <typename IntType, bool aq, bool rl>
-  Register Sc(Register addr, Register data) {
+  template <intrinsics::TemplateTypeId IntType, bool aq, bool rl>
+  Register Sc(Register addr, Register data, Value<IntType>, Value<aq>, Value<rl>) {
     // Compute aligned_addr.
     auto aligned_addr = AllocTempReg();
     Gen<PseudoCopy>(aligned_addr, addr, 8);
@@ -209,7 +220,7 @@ class HeavyOptimizerFrontend {
     Gen<x86_64::SubqRegReg>(addr_offset, aligned_addr, GetFlagsRegister());
     // It's okay to clobber reservation_value since we clear out reservation_address in
     // MemoryRegionReservationExchange anyway.
-    StoreWithoutRecovery(ToMemoryDataOperandType<IntType>(),
+    StoreWithoutRecovery(ToMemoryDataOperandType<TypeFromId<IntType>>(),
                          x86_64::kMachineRegRBP,
                          addr_offset,
                          value_offset,
@@ -322,6 +333,9 @@ class HeavyOptimizerFrontend {
   // Intrinsic proxy methods.
   //
 
+#ifdef BERBERIS_INTRINSICS_HOOKS_INLINE_DEMULTIPLEXER
+#include "berberis/intrinsics/demultiplexer_intrinsics_hooks-inl.h"
+#endif
 #include "berberis/intrinsics/translator_intrinsics_hooks-inl.h"
 
   //

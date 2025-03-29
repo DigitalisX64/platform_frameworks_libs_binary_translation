@@ -36,6 +36,24 @@ class SemanticsPlayer {
   using FpRegister = typename SemanticsListener::FpRegister;
   static constexpr FpRegister no_fp_register = SemanticsListener::no_fp_register;
 
+  // Note: this is part of the machinery that makes it possible to pick between High demultiplexer
+  // and Low demultiplexer approach.  More info on go/berberis-intrinsic-demultiplexing
+  using TemplateTypeId = SemanticsListener::TemplateTypeId;
+  template <typename TypeName>
+  using Type = SemanticsListener::template Value<SemanticsListener::template kIdFromType<TypeName>>;
+  // Syntax sugar to eliminate {} from type conversion.
+  template <typename TypeName>
+  static constexpr Type<TypeName> kType{};
+  template <auto kEnumValue>
+  using TypeFromId = SemanticsListener::template TypeFromId<kEnumValue>;
+  template <auto ValueParam>
+  using Value = SemanticsListener::template Value<ValueParam>;
+  // Syntax sugar to eliminate {} from value conversion.
+  template <auto ValueParam>
+  static constexpr Value<ValueParam> kValue{};
+  template <typename TypeName>
+  static constexpr Value<static_cast<int>(sizeof(TypeName))> kSize{};
+
   explicit SemanticsPlayer(SemanticsListener* listener) : listener_(listener) {}
 
   // Decoder's InsnConsumer implementation.
@@ -79,27 +97,27 @@ class SemanticsPlayer {
   Register Amo(typename Decoder::AmoOpcode opcode, Register arg1, Register arg2) {
     switch (opcode) {
       case Decoder::AmoOpcode::kLr:
-        return listener_->template Lr<IntType, aq, rl>(arg1);
+        return listener_->Lr(arg1, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kSc:
-        return listener_->template Sc<IntType, aq, rl>(arg1, arg2);
+        return listener_->Sc(arg1, arg2, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmoswap:
-        return listener_->template AmoSwap<IntType, aq, rl>(arg1, arg2);
+        return listener_->AmoSwap(arg1, arg2, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmoadd:
-        return listener_->template AmoAdd<IntType, aq, rl>(arg1, arg2);
+        return listener_->AmoAdd(arg1, arg2, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmoxor:
-        return listener_->template AmoXor<IntType, aq, rl>(arg1, arg2);
+        return listener_->AmoXor(arg1, arg2, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmoand:
-        return listener_->template AmoAnd<IntType, aq, rl>(arg1, arg2);
+        return listener_->AmoAnd(arg1, arg2, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmoor:
-        return listener_->template AmoOr<IntType, aq, rl>(arg1, arg2);
+        return listener_->AmoOr(arg1, arg2, kType<IntType>, kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmomin:
-        return listener_->template AmoMin<std::make_signed_t<IntType>, aq, rl>(arg1, arg2);
+        return listener_->AmoMin(arg1, arg2, ToSigned(kType<IntType>), kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmomax:
-        return listener_->template AmoMax<std::make_signed_t<IntType>, aq, rl>(arg1, arg2);
+        return listener_->AmoMax(arg1, arg2, ToSigned(kType<IntType>), kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmominu:
-        return listener_->template AmoMin<std::make_unsigned_t<IntType>, aq, rl>(arg1, arg2);
+        return listener_->AmoMin(arg1, arg2, ToUnsigned(kType<IntType>), kValue<aq>, kValue<rl>);
       case Decoder::AmoOpcode::kAmomaxu:
-        return listener_->template AmoMax<std::make_unsigned_t<IntType>, aq, rl>(arg1, arg2);
+        return listener_->AmoMax(arg1, arg2, ToUnsigned(kType<IntType>), kValue<aq>, kValue<rl>);
       default:
         Undefined();
         return no_register;
@@ -181,13 +199,15 @@ class SemanticsPlayer {
         args.src_type == Decoder::FloatOperandType::kDouble) {
       FpRegister arg = GetFRegAndUnboxNan<Float64>(args.src);
       Register frm = listener_->template GetCsr<CsrName::kFrm>();
-      FpRegister result = listener_->template FCvtFloatToFloat<Float32, Float64>(args.rm, frm, arg);
+      FpRegister result =
+          listener_->FCvtFloatToFloat(args.rm, frm, arg, kType<Float32>, kType<Float64>);
       NanBoxAndSetFpReg<Float32>(args.dst, result);
     } else if (args.dst_type == Decoder::FloatOperandType::kDouble &&
                args.src_type == Decoder::FloatOperandType::kFloat) {
       FpRegister arg = GetFRegAndUnboxNan<Float32>(args.src);
       Register frm = listener_->template GetCsr<CsrName::kFrm>();
-      FpRegister result = listener_->template FCvtFloatToFloat<Float64, Float32>(args.rm, frm, arg);
+      FpRegister result =
+          listener_->FCvtFloatToFloat(args.rm, frm, arg, kType<Float64>, kType<Float32>);
       NanBoxAndSetFpReg<Float64>(args.dst, result);
     } else {
       Undefined();
@@ -216,16 +236,16 @@ class SemanticsPlayer {
     Register result = no_register;
     switch (dst_type) {
       case Decoder::FcvtOperandType::k32bitSigned:
-        result = listener_->template FCvtFloatToInteger<int32_t, FLoatType>(rm, frm, arg);
+        result = listener_->FCvtFloatToInteger(rm, frm, arg, kType<int32_t>, kType<FLoatType>);
         break;
       case Decoder::FcvtOperandType::k32bitUnsigned:
-        result = listener_->template FCvtFloatToInteger<uint32_t, FLoatType>(rm, frm, arg);
+        result = listener_->FCvtFloatToInteger(rm, frm, arg, kType<uint32_t>, kType<FLoatType>);
         break;
       case Decoder::FcvtOperandType::k64bitSigned:
-        result = listener_->template FCvtFloatToInteger<int64_t, FLoatType>(rm, frm, arg);
+        result = listener_->FCvtFloatToInteger(rm, frm, arg, kType<int64_t>, kType<FLoatType>);
         break;
       case Decoder::FcvtOperandType::k64bitUnsigned:
-        result = listener_->template FCvtFloatToInteger<uint64_t, FLoatType>(rm, frm, arg);
+        result = listener_->FCvtFloatToInteger(rm, frm, arg, kType<uint64_t>, kType<FLoatType>);
         break;
       default:
         return Undefined();
@@ -254,16 +274,16 @@ class SemanticsPlayer {
     FpRegister result = no_fp_register;
     switch (src_type) {
       case Decoder::FcvtOperandType::k32bitSigned:
-        result = listener_->template FCvtIntegerToFloat<FloatType, int32_t>(rm, frm, arg);
+        result = listener_->FCvtIntegerToFloat(rm, frm, arg, kType<FloatType>, kType<int32_t>);
         break;
       case Decoder::FcvtOperandType::k32bitUnsigned:
-        result = listener_->template FCvtIntegerToFloat<FloatType, uint32_t>(rm, frm, arg);
+        result = listener_->FCvtIntegerToFloat(rm, frm, arg, kType<FloatType>, kType<uint32_t>);
         break;
       case Decoder::FcvtOperandType::k64bitSigned:
-        result = listener_->template FCvtIntegerToFloat<FloatType, int64_t>(rm, frm, arg);
+        result = listener_->FCvtIntegerToFloat(rm, frm, arg, kType<FloatType>, kType<int64_t>);
         break;
       case Decoder::FcvtOperandType::k64bitUnsigned:
-        result = listener_->template FCvtIntegerToFloat<FloatType, uint64_t>(rm, frm, arg);
+        result = listener_->FCvtIntegerToFloat(rm, frm, arg, kType<FloatType>, kType<uint64_t>);
         break;
       default:
         Undefined();
@@ -299,10 +319,10 @@ class SemanticsPlayer {
     FpRegister result = no_fp_register;
     switch (opcode) {
       case Decoder::FmaOpcode::kFmadd:
-        result = listener_->template FMAdd<FloatType>(rm, frm, arg1, arg2, arg3);
+        result = listener_->FMAdd(rm, frm, arg1, arg2, arg3, kType<FloatType>);
         break;
       case Decoder::FmaOpcode::kFmsub:
-        result = listener_->template FMSub<FloatType>(rm, frm, arg1, arg2, arg3);
+        result = listener_->FMSub(rm, frm, arg1, arg2, arg3, kType<FloatType>);
         break;
       // Note (from RISC-V manual): The FNMSUB and FNMADD instructions are counterintuitively named,
       // owing to the naming of the corresponding instructions in MIPS-IV. The MIPS instructions
@@ -315,10 +335,10 @@ class SemanticsPlayer {
       // Since even official documentation calls the names “counterintuitive” it's better to use x86
       // ones for intrinsics.
       case Decoder::FmaOpcode::kFnmsub:
-        result = listener_->template FNMAdd<FloatType>(rm, frm, arg1, arg2, arg3);
+        result = listener_->FNMAdd(rm, frm, arg1, arg2, arg3, kType<FloatType>);
         break;
       case Decoder::FmaOpcode::kFnmadd:
-        result = listener_->template FNMSub<FloatType>(rm, frm, arg1, arg2, arg3);
+        result = listener_->FNMSub(rm, frm, arg1, arg2, arg3, kType<FloatType>);
         break;
       default:
         return Undefined();
@@ -414,25 +434,25 @@ class SemanticsPlayer {
     Register result = Overloaded{[&](const typename Decoder::OpArgs& args) {
                                    switch (args.opcode) {
                                      case Decoder::OpOpcode::kDiv:
-                                       return listener_->template Div<int64_t>(arg1, arg2);
+                                       return listener_->Div(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kDivu:
-                                       return listener_->template Div<uint64_t>(arg1, arg2);
+                                       return listener_->Div(arg1, arg2, kType<uint64_t>);
                                      case Decoder::OpOpcode::kRem:
-                                       return listener_->template Rem<int64_t>(arg1, arg2);
+                                       return listener_->Rem(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kRemu:
-                                       return listener_->template Rem<uint64_t>(arg1, arg2);
+                                       return listener_->Rem(arg1, arg2, kType<uint64_t>);
                                      case Decoder::OpOpcode::kMax:
-                                       return listener_->template Max<int64_t>(arg1, arg2);
+                                       return listener_->Max(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kMaxu:
-                                       return listener_->template Max<uint64_t>(arg1, arg2);
+                                       return listener_->Max(arg1, arg2, kType<uint64_t>);
                                      case Decoder::OpOpcode::kMin:
-                                       return listener_->template Min<int64_t>(arg1, arg2);
+                                       return listener_->Min(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kMinu:
-                                       return listener_->template Min<uint64_t>(arg1, arg2);
+                                       return listener_->Min(arg1, arg2, kType<uint64_t>);
                                      case Decoder::OpOpcode::kRol:
-                                       return listener_->template Rol<int64_t>(arg1, arg2);
+                                       return listener_->Rol(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kRor:
-                                       return listener_->template Ror<int64_t>(arg1, arg2);
+                                       return listener_->Ror(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kSh1add:
                                        return listener_->Sh1add(arg1, arg2);
                                      case Decoder::OpOpcode::kSh2add:
@@ -456,17 +476,17 @@ class SemanticsPlayer {
                                      case Decoder::Op32Opcode::kAdduw:
                                        return listener_->Adduw(arg1, arg2);
                                      case Decoder::Op32Opcode::kDivw:
-                                       return listener_->template Div<int32_t>(arg1, arg2);
+                                       return listener_->Div(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kDivuw:
-                                       return listener_->template Div<uint32_t>(arg1, arg2);
+                                       return listener_->Div(arg1, arg2, kType<uint32_t>);
                                      case Decoder::Op32Opcode::kRemw:
-                                       return listener_->template Rem<int32_t>(arg1, arg2);
+                                       return listener_->Rem(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kRemuw:
-                                       return listener_->template Rem<uint32_t>(arg1, arg2);
+                                       return listener_->Rem(arg1, arg2, kType<uint32_t>);
                                      case Decoder::Op32Opcode::kRolw:
-                                       return listener_->template Rol<int32_t>(arg1, arg2);
+                                       return listener_->Rol(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kRorw:
-                                       return listener_->template Ror<int32_t>(arg1, arg2);
+                                       return listener_->Ror(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kSh1adduw:
                                        return listener_->Sh1adduw(arg1, arg2);
                                      case Decoder::Op32Opcode::kSh2adduw:
@@ -485,19 +505,19 @@ class SemanticsPlayer {
     Register result = no_register;
     switch (args.opcode) {
       case Decoder::OpSingleInputOpcode::kZextb:
-        result = listener_->template Zext<uint8_t>(arg);
+        result = listener_->Zext(arg, kType<uint8_t>);
         break;
       case Decoder::OpSingleInputOpcode::kZexth:
-        result = listener_->template Zext<uint16_t>(arg);
+        result = listener_->Zext(arg, kType<uint16_t>);
         break;
       case Decoder::OpSingleInputOpcode::kZextw:
-        result = listener_->template Zext<uint32_t>(arg);
+        result = listener_->Zext(arg, kType<uint32_t>);
         break;
       case Decoder::OpSingleInputOpcode::kSextb:
-        result = listener_->template Sext<int8_t>(arg);
+        result = listener_->Sext(arg, kType<int8_t>);
         break;
       case Decoder::OpSingleInputOpcode::kSexth:
-        result = listener_->template Sext<int16_t>(arg);
+        result = listener_->Sext(arg, kType<int16_t>);
         break;
       default:
         Undefined();
@@ -525,16 +545,16 @@ class SemanticsPlayer {
     FpRegister result = no_fp_register;
     switch (opcode) {
       case Decoder::OpFpOpcode::kFAdd:
-        result = listener_->template FAdd<FloatType>(rm, frm, arg1, arg2);
+        result = listener_->FAdd(rm, frm, arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpOpcode::kFSub:
-        result = listener_->template FSub<FloatType>(rm, frm, arg1, arg2);
+        result = listener_->FSub(rm, frm, arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpOpcode::kFMul:
-        result = listener_->template FMul<FloatType>(rm, frm, arg1, arg2);
+        result = listener_->FMul(rm, frm, arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpOpcode::kFDiv:
-        result = listener_->template FDiv<FloatType>(rm, frm, arg1, arg2);
+        result = listener_->FDiv(rm, frm, arg1, arg2, kType<FloatType>);
         break;
       default:
         return Undefined();
@@ -565,13 +585,13 @@ class SemanticsPlayer {
     Register result = no_register;
     switch (opcode) {
       case Decoder::OpFpGpRegisterTargetNoRoundingOpcode::kFle:
-        result = listener_->template Fle<FloatType>(arg1, arg2);
+        result = listener_->Fle(arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpGpRegisterTargetNoRoundingOpcode::kFlt:
-        result = listener_->template Flt<FloatType>(arg1, arg2);
+        result = listener_->Flt(arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpGpRegisterTargetNoRoundingOpcode::kFeq:
-        result = listener_->template Feq<FloatType>(arg1, arg2);
+        result = listener_->Feq(arg1, arg2, kType<FloatType>);
         break;
       default:
         return Undefined();
@@ -600,7 +620,7 @@ class SemanticsPlayer {
     Register result = no_register;
     switch (opcode) {
       case Decoder::OpFpGpRegisterTargetSingleInputNoRoundingOpcode::kFclass:
-        result = listener_->template FClass<FloatType>(arg);
+        result = listener_->FClass(arg, kType<FloatType>);
         break;
       default:
         return Undefined();
@@ -645,19 +665,19 @@ class SemanticsPlayer {
     }
     switch (opcode) {
       case Decoder::OpFpNoRoundingOpcode::kFSgnj:
-        result = listener_->template FSgnj<FloatType>(arg1, arg2);
+        result = listener_->FSgnj(arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpNoRoundingOpcode::kFSgnjn:
-        result = listener_->template FSgnjn<FloatType>(arg1, arg2);
+        result = listener_->FSgnjn(arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpNoRoundingOpcode::kFSgnjx:
-        result = listener_->template FSgnjx<FloatType>(arg1, arg2);
+        result = listener_->FSgnjx(arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpNoRoundingOpcode::kFMin:
-        result = listener_->template FMin<FloatType>(arg1, arg2);
+        result = listener_->FMin(arg1, arg2, kType<FloatType>);
         break;
       case Decoder::OpFpNoRoundingOpcode::kFMax:
-        result = listener_->template FMax<FloatType>(arg1, arg2);
+        result = listener_->FMax(arg1, arg2, kType<FloatType>);
         break;
       default:
         Undefined();
@@ -674,10 +694,10 @@ class SemanticsPlayer {
     Register result = no_register;
     switch (args.operand_type) {
       case Decoder::FloatOperandType::kFloat:
-        result = listener_->template FmvFloatToInteger<int32_t, Float32>(arg);
+        result = listener_->FmvFloatToInteger(arg, kType<int32_t>, kType<Float32>);
         break;
       case Decoder::FloatOperandType::kDouble:
-        result = listener_->template FmvFloatToInteger<int64_t, Float64>(arg);
+        result = listener_->FmvFloatToInteger(arg, kType<int64_t>, kType<Float64>);
         break;
       default:
         Undefined();
@@ -691,11 +711,11 @@ class SemanticsPlayer {
     FpRegister result = no_fp_register;
     switch (args.operand_type) {
       case Decoder::FloatOperandType::kFloat:
-        result = listener_->template FmvIntegerToFloat<Float32, int32_t>(arg);
+        result = listener_->FmvIntegerToFloat(arg, kType<Float32>, kType<int32_t>);
         NanBoxAndSetFpReg<Float32>(args.dst, result);
         break;
       case Decoder::FloatOperandType::kDouble:
-        result = listener_->template FmvIntegerToFloat<Float64, int64_t>(arg);
+        result = listener_->FmvIntegerToFloat(arg, kType<Float64>, kType<int64_t>);
         NanBoxAndSetFpReg<Float64>(args.dst, result);
         break;
       default:
@@ -725,7 +745,7 @@ class SemanticsPlayer {
     Register frm = listener_->template GetCsr<CsrName::kFrm>();
     switch (opcode) {
       case Decoder::OpFpSingleInputOpcode::kFSqrt:
-        result = listener_->template FSqrt<FloatType>(rm, frm, arg);
+        result = listener_->FSqrt(rm, frm, arg, kType<FloatType>);
         break;
       default:
         return Undefined();
@@ -791,15 +811,15 @@ class SemanticsPlayer {
                                  [&](const typename Decoder::BitmanipImmArgs& args) {
                                    switch (args.opcode) {
                                      case Decoder::BitmanipImmOpcode::kClz:
-                                       return listener_->template Clz<int64_t>(arg);
+                                       return listener_->Clz(arg, kType<int64_t>);
                                      case Decoder::BitmanipImmOpcode::kCpop:
-                                       return listener_->template Cpop<int64_t>(arg);
+                                       return listener_->Cpop(arg, kType<int64_t>);
                                      case Decoder::BitmanipImmOpcode::kCtz:
-                                       return listener_->template Ctz<int64_t>(arg);
+                                       return listener_->Ctz(arg, kType<int64_t>);
                                      case Decoder::BitmanipImmOpcode::kSextb:
-                                       return listener_->template Sext<int8_t>(arg);
+                                       return listener_->Sext(arg, kType<int8_t>);
                                      case Decoder::BitmanipImmOpcode::kSexth:
-                                       return listener_->template Sext<int16_t>(arg);
+                                       return listener_->Sext(arg, kType<int16_t>);
                                      case Decoder::BitmanipImmOpcode::kOrcb:
                                        return listener_->Orcb(arg);
                                      case Decoder::BitmanipImmOpcode::kRev8:
@@ -822,11 +842,11 @@ class SemanticsPlayer {
                                  [&](const typename Decoder::BitmanipImm32Args& args) {
                                    switch (args.opcode) {
                                      case Decoder::BitmanipImm32Opcode::kClzw:
-                                       return listener_->template Clz<int32_t>(arg);
+                                       return listener_->Clz(arg, kType<int32_t>);
                                      case Decoder::BitmanipImm32Opcode::kCpopw:
-                                       return listener_->template Cpop<int32_t>(arg);
+                                       return listener_->Cpop(arg, kType<int32_t>);
                                      case Decoder::BitmanipImm32Opcode::kCtzw:
-                                       return listener_->template Ctz<int32_t>(arg);
+                                       return listener_->Ctz(arg, kType<int32_t>);
                                      case Decoder::BitmanipImm32Opcode::kRoriw:
                                        return listener_->Roriw(arg, args.shamt);
                                      case Decoder::BitmanipImm32Opcode::kSlliuw:
@@ -969,6 +989,35 @@ class SemanticsPlayer {
 
   void Undefined() { listener_->Undefined(); };
 
+  template <typename ValueType>
+  static constexpr auto ToFloat(ValueType value) {
+    return TemplateTypeIdToFloat(value);
+  }
+  template <typename ValueType>
+  static constexpr auto ToInt(ValueType value) {
+    return TemplateTypeIdToInt(value);
+  }
+  template <typename ValueType>
+  static constexpr auto ToNarrow(ValueType value) {
+    return TemplateTypeIdToNarrow(value);
+  }
+  template <typename ValueType>
+  static constexpr auto ToSigned(ValueType value) {
+    return TemplateTypeIdToSigned(value);
+  }
+  template <typename ValueType>
+  static constexpr auto SizeOf(ValueType value) {
+    return TemplateTypeIdSizeOf(value);
+  }
+  template <typename ValueType>
+  static constexpr auto ToUnsigned(ValueType value) {
+    return TemplateTypeIdToUnsigned(value);
+  }
+  template <typename ValueType>
+  static constexpr auto ToWide(ValueType value) {
+    return TemplateTypeIdToWide(value);
+  }
+
  private:
   Register GetRegOrZero(uint8_t reg) {
     return reg == 0 ? listener_->GetImm(0) : listener_->GetReg(reg);
@@ -1085,7 +1134,7 @@ class SemanticsPlayer {
   // Step #3.
   template <typename FloatType>
   FpRegister CanonicalizeNan(FpRegister value) {
-    return listener_->template CanonicalizeNan<FloatType>(value);
+    return listener_->CanonicalizeNan(value, kType<FloatType>);
   }
 
   // Step #4. Note the assymetry: step #1 may skip the NaN unboxing (would use GetFpReg if so),
