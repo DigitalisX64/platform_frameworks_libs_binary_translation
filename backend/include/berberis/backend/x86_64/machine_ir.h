@@ -161,6 +161,8 @@ class MachineInsnX86_64 : public MachineInsn {
 
   uint32_t disp() const { return disp_; }
 
+  uint32_t disp2() const { return disp2_; }
+
   Assembler::Condition cond() const { return cond_; }
 
   uint64_t imm() const { return imm_; }
@@ -220,16 +222,19 @@ class MachineInsnX86_64 : public MachineInsn {
 
   void set_disp(uint32_t disp) { disp_ = disp; }
 
+  void set_disp2(uint32_t disp2) { disp2_ = disp2; }
+
   void set_cond(Assembler::Condition cond) { cond_ = cond; }
 
   void set_imm(uint64_t imm) { imm_ = imm; }
 
  private:
   MachineReg regs_[kMaxMachineRegOperands];
-  MachineMemOperandScale scale_;
   uint32_t disp_;
-  uint64_t imm_;
+  MachineMemOperandScale scale_;
   Assembler::Condition cond_;
+  uint32_t disp2_;
+  uint64_t imm_;
 };
 
 // Syntax sugar.

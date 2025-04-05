@@ -193,7 +193,7 @@ inline constexpr bool CsrWritable(CsrName name) {
 }
 
 template <typename Processor>
-bool ProcessCsrNameAsTemplateParameter(CsrName name, Processor& processor) {
+bool ProcessCsrNameAsTemplateParameter(CsrName name, Processor&& processor) {
 #define BERBERIS_RISV64_PROCESS_CSR(EnumName, field_name, field_mask) CsrName::k##EnumName,
 #define BERBERIS_RISV64_PROCESS_NOSTORAGE_CSR(EnumName) CsrName::k##EnumName
   return ProcessCsrNameAsTemplateParameterImpl<BERBERIS_RISV64_PROCESS_ALL_SUPPORTED_CSRS>(

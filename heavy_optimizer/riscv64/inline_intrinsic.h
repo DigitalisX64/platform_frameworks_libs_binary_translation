@@ -273,7 +273,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
   template <auto kIntrinsicTemplateName,
             auto kMacroInstructionTemplateName,
             auto kMnemo,
-            typename GetOpcode,
+            auto GetOpcode,
             typename CPUIDRestrictionTemplateValue,
             typename PreciseNanOperationsHandlingTemplateValue,
             bool kSideEffectsTemplateValue,
@@ -359,11 +359,9 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
     using MachineInsn = typename AsmCallInfo::template MachineInsn<berberis::x86_64::MachineInsn,
                                                                    x86_64::constructor_args_t,
                                                                    MachineOpcode>;
-    std::apply(MachineInsn::kGenFunc,
-               std::tuple_cat(std::tuple<x86_64::MachineIRBuilder&>{*builder_},
-                              UnwrapSimdReg(AsmCallInfo::template MakeTuplefromBindings<
-                                            TryBindingBasedInlineIntrinsicForHeavyOptimizer&>(
-                                  *this, asm_call_info))));
+    (builder_->*MachineInsn::kGenFunc)(std::tuple_cat(
+        UnwrapSimdReg(AsmCallInfo::template MakeTuplefromBindings<
+                      TryBindingBasedInlineIntrinsicForHeavyOptimizer&>(*this, asm_call_info))));
     ProcessBindingsResults<AsmCallInfo>(type_wrapper<typename AsmCallInfo::Bindings>());
     return true;
   }

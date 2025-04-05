@@ -118,8 +118,8 @@ template <typename AsmCallInfo,
           auto kOpcode,
           typename... CtorArgs,
           typename... Bindings>
-class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, Bindings...> final
-    : public MachineInsnX86_64 {
+class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tuple<Bindings...>>
+    final : public MachineInsnX86_64 {
  private:
   template <typename>
   struct GenMachineInsnInfoT;
@@ -128,11 +128,15 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, Binding
 
  public:
   // This static simplifies constructing this MachineInsn in intrinsic implementations.
-  static constexpr MachineInsn* (MachineIRBuilder::*kGenFunc)(CtorArgs...) =
+  static constexpr MachineInsn* (MachineIRBuilder::*kGenFunc)(std::tuple<CtorArgs...>) =
       &MachineIRBuilder::template Gen<MachineInsn>;
 
-  explicit MachineInsn(CtorArgs... args) : MachineInsnX86_64(&kInfo) {
-    ProcessArgs<0 /* reg_idx */, 0 /* disp_idx */, Bindings...>(args...);
+  explicit MachineInsn(std::tuple<CtorArgs...> args) : MachineInsnX86_64(&kInfo) {
+    std::apply(
+        [this](auto... args) {
+          this->ProcessArgs<0 /* reg_idx */, 0 /* disp_idx */, Bindings...>(args...);
+        },
+        args);
   }
 
   static constexpr MachineInsnInfo kInfo = GenMachineInsnInfoT<RegBindings>::value;
@@ -142,22 +146,103 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, Binding
 
   std::string GetDebugString() const override {
     std::string s(kMnemo);
-    ProcessDebugString<Bindings...>(&s);
+    // Code below assumes that we have at most two memory operands.
+    static_assert(([]<typename Binding> {
+                    if constexpr (!ArgTraits<Binding>::Class::kIsImmediate) {
+                      return ArgTraits<Binding>::Class::kAsRegister == 'm';
+                    }
+                    return false;
+                  }.template operator()<Bindings>() +
+                   ... + 0) <= 2);
+    size_t arg_idx{}, reg_idx{}, disp_idx{};
+    (
+        [&s, &arg_idx, &reg_idx, &disp_idx, this]<typename Binding> {
+          s += " ";
+          if (arg_idx > 0) {
+            s += ", ";
+          }
+          if constexpr (ArgTraits<Binding>::Class::kIsImmediate) {
+            // Without static_cast here compilation fails with extemely criptic error message:
+            // error: implicit instantiation of undefined template 'berberis::InOutArg<0, 0, …>'
+            //   …
+            // machine_insn_intrinsics.h:161:18: note: in instantiation of template class
+            //  'std::tuple<berberis::InOutArg<0, 0, …>, berberis::InArg<1, …>' requested here
+            // 161            s += GetImmOperandDebugString(this);
+            //
+            // Same below.
+            s += GetImmOperandDebugString(static_cast<const MachineInsnX86_64*>(this));
+            arg_idx++;
+          } else if constexpr (ArgTraits<Binding>::Class::kAsRegister == 'm') {
+            if (disp_idx == 0) {
+              s += GetBaseDispMemOperandDebugString(static_cast<const MachineInsnX86_64*>(this),
+                                                    reg_idx);
+            } else /* disp_idx == 1 */ {
+              s += StringPrintf(
+                  "[%s + 0x%x]",
+                  GetRegOperandDebugString(static_cast<const MachineInsnX86_64*>(this), reg_idx)
+                      .c_str(),
+                  disp2());
+            }
+            arg_idx++, reg_idx++, disp_idx++;
+          } else if constexpr (ArgTraits<Binding>::RegisterClass::kIsImplicitReg) {
+            s += GetImplicitRegOperandDebugString(static_cast<const MachineInsnX86_64*>(this),
+                                                  reg_idx);
+            arg_idx++, reg_idx++;
+          } else {
+            s += GetRegOperandDebugString(static_cast<const MachineInsnX86_64*>(this), reg_idx);
+            arg_idx++, reg_idx++;
+          }
+        }.template operator()<Bindings>(),
+        ...);
+
+    if (this->recovery_pc()) {
+      s += StringPrintf(" <0x%" PRIxPTR ">", this->recovery_pc());
+    }
     return s;
   }
 
   void Emit(CodeEmitter* as) const override {
-    std::apply(AsmCallInfo::kMacroInstruction,
-               std::tuple_cat(std::tuple<CodeEmitter&>{*as},
-                              EmitArgs<0 /* reg_idx */, 0 /* disp_idx */, Bindings...>()));
+    // Code below assumes that we have at most two memory operands.
+    static_assert(([]<typename Binding> {
+                    if constexpr (!ArgTraits<Binding>::Class::kIsImmediate) {
+                      return ArgTraits<Binding>::Class::kAsRegister == 'm';
+                    }
+                    return false;
+                  }.template operator()<Bindings>() +
+                   ... + 0) <= 2);
+    size_t reg_idx{}, disp_idx{};
+    std::apply(
+        AsmCallInfo::kMacroInstruction,
+        std::tuple_cat(
+            std::tuple<CodeEmitter&>{*as}, [&reg_idx, &disp_idx, this]<typename Binding> {
+              if constexpr (ArgTraits<Binding>::Class::kIsImmediate) {
+                return std::tuple{
+                    static_cast<constructor_one_arg_t<Binding>>(MachineInsnX86_64::imm())};
+              } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'x') {
+                return std::tuple{GetXReg(this->RegAt(reg_idx++))};
+              } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'r' ||
+                                   ArgTraits<Binding>::RegisterClass::kAsRegister == 'q') {
+                return std::tuple{GetGReg(this->RegAt(reg_idx++))};
+              } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'm' &&
+                                   std::is_same_v<typename ArgTraits<Binding>::Usage,
+                                                  intrinsics::bindings::DefEarlyClobber>) {
+                disp_idx++;
+                if (disp_idx == 1) {
+                  return std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx++)),
+                                                       .disp = static_cast<int32_t>(disp())}};
+                } else /* disp_idx == 2 */ {
+                  return std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx++)),
+                                                       .disp = static_cast<int32_t>(disp2())}};
+                }
+              } else if constexpr (ArgTraits<Binding>::RegisterClass::kIsImplicitReg) {
+                return std::tuple{};
+              } else {
+                static_assert(kDependentTypeFalse<Binding>);
+              }
+            }.template operator()<Bindings>()...));
   }
 
-  int32_t disp2() const { return disp2_; }
-  void set_disp2(int32_t val) { disp2_ = val; }
-
  private:
-  int32_t disp2_;
-
   template <size_t, size_t, typename...>
   void ProcessArgs() {}
 
@@ -235,94 +320,6 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, Binding
     static constexpr MachineInsnInfo value = MachineInsnInfo(
         {kOpcode, sizeof...(T), {{RegInfo<T>::kRegClass, RegInfo<T>::kRegKind}...}, GetInsnKind()});
   };
-
-  template <typename... Args>
-  void ProcessDebugString(std::string* s) const {
-    *s +=
-        " " + ProcessDebugStringArgs<0 /* arg_idx */, 0 /* reg_idx */, 0 /* disp_idx */, Args...>();
-    if (this->recovery_pc()) {
-      *s += StringPrintf(" <0x%" PRIxPTR ">", this->recovery_pc());
-    }
-  }
-
-  // TODO(b/260725458): Use inline template lambda instead after C++20 becomes available.
-  template <>
-  void ProcessDebugString<>(std::string*) const {}
-
-  template <size_t arg_idx, size_t reg_idx, size_t disp_idx, typename T, typename... Args>
-  std::string ProcessDebugStringArgs() const {
-    std::string prefix;
-    if constexpr (arg_idx > 0) {
-      prefix = ", ";
-    }
-    if constexpr (ArgTraits<T>::Class::kIsImmediate) {
-      return prefix + GetImmOperandDebugString(this) +
-             ProcessDebugStringArgs<arg_idx + 1, reg_idx, disp_idx, Args...>();
-    } else if constexpr (ArgTraits<T>::Class::kAsRegister == 'm') {
-      if constexpr (disp_idx == 0) {
-        return prefix + GetBaseDispMemOperandDebugString(this, reg_idx) +
-               ProcessDebugStringArgs<arg_idx + 1, reg_idx + 1, disp_idx + 1, Args...>();
-      } else if constexpr (disp_idx == 1) {
-        return prefix +
-               StringPrintf(
-                   "[%s + 0x%x]", GetRegOperandDebugString(this, reg_idx).c_str(), disp2()) +
-               ProcessDebugStringArgs<arg_idx + 1, reg_idx + 1, disp_idx + 1, Args...>();
-      } else {
-        static_assert(kDependentValueFalse<disp_idx>);
-      }
-    } else if constexpr (ArgTraits<T>::RegisterClass::kIsImplicitReg) {
-      return prefix + GetImplicitRegOperandDebugString(this, reg_idx) +
-             ProcessDebugStringArgs<arg_idx + 1, reg_idx + 1, disp_idx, Args...>();
-    } else {
-      return prefix + GetRegOperandDebugString(this, reg_idx) +
-             ProcessDebugStringArgs<arg_idx + 1, reg_idx + 1, disp_idx, Args...>();
-    }
-  }
-
-  template <size_t, size_t, size_t>
-  std::string ProcessDebugStringArgs() const {
-    return "";
-  }
-
-  // TODO(b/260725458): Use inline template lambda instead after C++20 becomes available.
-  template <size_t, size_t>
-  auto EmitArgs() const {
-    return std::tuple{};
-  }
-
-  template <size_t reg_idx, size_t disp_idx, typename T, typename... Args>
-  auto EmitArgs() const {
-    if constexpr (ArgTraits<T>::Class::kIsImmediate) {
-      return std::tuple_cat(
-          std::tuple{static_cast<constructor_one_arg_t<T>>(MachineInsnX86_64::imm())},
-          EmitArgs<reg_idx, disp_idx, Args...>());
-    } else if constexpr (ArgTraits<T>::RegisterClass::kAsRegister == 'x') {
-      return std::tuple_cat(std::tuple{GetXReg(this->RegAt(reg_idx))},
-                            EmitArgs<reg_idx + 1, disp_idx, Args...>());
-    } else if constexpr (ArgTraits<T>::RegisterClass::kAsRegister == 'r' ||
-                         ArgTraits<T>::RegisterClass::kAsRegister == 'q') {
-      return std::tuple_cat(std::tuple{GetGReg(this->RegAt(reg_idx))},
-                            EmitArgs<reg_idx + 1, disp_idx, Args...>());
-    } else if constexpr (ArgTraits<T>::RegisterClass::kAsRegister == 'm' &&
-                         std::is_same_v<typename ArgTraits<T>::Usage,
-                                        intrinsics::bindings::DefEarlyClobber>) {
-      if constexpr (disp_idx == 0) {
-        return std::tuple_cat(std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx)),
-                                                            .disp = static_cast<int32_t>(disp())}},
-                              EmitArgs<reg_idx + 1, disp_idx + 1, Args...>());
-      } else if constexpr (disp_idx == 1) {
-        return std::tuple_cat(std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx)),
-                                                            .disp = static_cast<int32_t>(disp2())}},
-                              EmitArgs<reg_idx + 1, disp_idx + 1, Args...>());
-      } else {
-        static_assert(kDependentTypeFalse<T>);
-      }
-    } else if constexpr (ArgTraits<T>::RegisterClass::kIsImplicitReg) {
-      return EmitArgs<reg_idx, disp_idx, Args...>();
-    } else {
-      static_assert(kDependentTypeFalse<T>);
-    }
-  }
 };
 
 }  // namespace berberis::x86_64

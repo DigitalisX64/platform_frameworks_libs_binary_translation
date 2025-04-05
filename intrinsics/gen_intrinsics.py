@@ -884,15 +884,18 @@ def _gen_mock_semantics_listener_intrinsics_hooks_impl_inl_h(f, intrs):
 def _get_reg_operand_info(arg, info_prefix=None):
   need_tmp = arg['class'] in ('EAX', 'EDX', 'CL', 'ECX')
   if info_prefix is None:
-    class_info = 'void'
+    class_info = ''
   else:
-    class_info = '%s::%s' % (info_prefix, arg['class'])
+    class_info = ', %s::%s' % (info_prefix, arg['class'])
   if arg['class'] == 'Imm8':
-    return 'ImmArg<%d, int8_t, %s>' % (arg['ir_arg'], class_info)
+    if  info_prefix is None:
+      return 'ImmArg<%d, int8_t>' % (arg['ir_arg'])
+    else:
+      return 'ImmArg<%d, int8_t%s>' % (arg['ir_arg'], class_info)
   if info_prefix is None:
-    using_info = 'void'
+    using_info = ''
   else:
-    using_info = '%s::%s' % (info_prefix, {
+    using_info = ', %s::%s' % (info_prefix, {
         'def': 'Def',
         'def_early_clobber': 'DefEarlyClobber',
         'use': 'Use',
@@ -900,24 +903,33 @@ def _get_reg_operand_info(arg, info_prefix=None):
     }[arg['usage']])
   if arg['usage'] == 'use':
     if need_tmp:
-      return 'InTmpArg<%d, %s, %s>' % (arg['ir_arg'], class_info, using_info)
-    return 'InArg<%d, %s, %s>' % (arg['ir_arg'], class_info, using_info)
+      return 'InTmpArg<%d%s%s>' % (arg['ir_arg'], class_info, using_info)
+    return 'InArg<%d%s%s>' % (arg['ir_arg'], class_info, using_info)
   if arg['usage'] in ('def', 'def_early_clobber'):
     assert 'ir_arg' not in arg
     if 'ir_res' in arg:
       if need_tmp:
-        return 'OutTmpArg<%d, %s, %s>' % (arg['ir_res'], class_info, using_info)
-      return 'OutArg<%d, %s, %s>' % (arg['ir_res'], class_info, using_info)
-    return 'TmpArg<%s, %s>' % (class_info, using_info)
+        return 'OutTmpArg<%d%s%s>' % (arg['ir_res'], class_info, using_info)
+      return 'OutArg<%d%s%s>' % (arg['ir_res'], class_info, using_info)
+    if info_prefix is None:
+      return 'TmpArg'
+    else:
+      return 'TmpArg<%s%s>' % (class_info[2:], using_info)
   if arg['usage'] == 'use_def':
     if 'ir_res' in arg:
       if need_tmp:
-        return 'InOutTmpArg<%s, %s, %s, %s>' % (arg['ir_arg'], arg['ir_res'],
+        return 'InOutTmpArg<%s, %s%s%s>' % (arg['ir_arg'], arg['ir_res'],
                                                 class_info, using_info)
-      return 'InOutArg<%s, %s, %s, %s>' % (arg['ir_arg'], arg['ir_res'],
+      return 'InOutArg<%s, %s%s%s>' % (arg['ir_arg'], arg['ir_res'],
                                            class_info, using_info)
-    return 'InTmpArg<%s, %s, %s>' % (arg['ir_arg'], class_info, using_info)
+    return 'InTmpArg<%s%s%s>' % (arg['ir_arg'], class_info, using_info)
   assert False, 'unknown operand usage %s' % (arg['usage'])
+
+
+def _get_reg_operands_info(args, info_prefix=None):
+  return 'std::tuple<%s>' % ', '.join(
+    _get_reg_operand_info(arg, info_prefix)
+    for arg in args)
 
 
 def _gen_make_intrinsics(f, intrs, archs):
@@ -955,56 +967,6 @@ constexpr void ProcessAllBindings([[maybe_unused]] Callback callback,
     print(line, file=f)
   print('}', file=f)
 
-def _gen_opcode_generators_f(f, intrs):
-  for line in _gen_opcode_generators(intrs):
-    print(line, file=f)
-
-def _gen_opcode_generators(intrs):
-  opcode_generators = {}
-  for name, intr in intrs:
-    if 'asm' not in intr:
-      continue
-    if 'variants' in intr:
-      variants = _get_formats_with_descriptions(intr)
-      variants = sorted(variants, key=lambda variant: variant[1].index)
-      # Collect intr_asms for all variants of intrinsic.
-      # Note: not all variants are guaranteed to have an asm variant!
-      # If that happens the list of intr_asms for that variant will be empty.
-      variants = [[
-          intr_asm for intr_asm in _gen_sorted_asms(intr)
-          if fmt in intr_asm['variants']
-      ] for fmt, _ in variants]
-      # Print intrinsic generator
-      for intr_asms in variants:
-        if len(intr_asms) > 0:
-          for intr_asm in intr_asms:
-            if not _is_translator_compatible_assembler(intr_asm):
-              continue
-            for line in _gen_opcode_generator(intr_asm, opcode_generators):
-              yield line
-    else:
-      for intr_asm in _gen_sorted_asms(intr):
-        if not _is_translator_compatible_assembler(intr_asm):
-          continue
-        for line in _gen_opcode_generator(intr_asm, opcode_generators):
-          yield line
-
-def _gen_opcode_generator(asm, opcode_generators):
-  name = asm['name']
-  num_mem_args = sum(1 for arg in asm['args'] if arg.get('class').startswith("Mem") and arg.get('usage') == 'def_early_clobber')
-  opcode = 'Undefined' if num_mem_args > 2 else (asm_defs.get_mem_macro_name(asm, '').replace("Mem", "MemBaseDisp")) if num_mem_args > 0 else name
-
-  if name not in opcode_generators:
-    opcode_generators[name] = True
-    yield """
-// TODO(b/260725458): Pass lambda as template argument after C++20 becomes available.
-class GetOpcode%s {
- public:
-  template <typename Opcode>
-  constexpr auto operator()() {
-    return Opcode::kMachineOp%s;
-  }
-};""" % (name, opcode)
 
 def _gen_process_bindings(f, intrs, archs):
   print("%s" % AUTOGEN, file=f)
@@ -1026,7 +988,6 @@ Once we can use C++23, these can be declared locally in ProcessBindings.*/""", f
   for static_mnemo in static_mnemos:
     print("   %s" % static_mnemo, file=f)
   print("} // process_bindings_strings", file = f)
-  _gen_opcode_generators_f(f, intrs)
 
   print("""
 template <auto kFunc,
@@ -1190,14 +1151,13 @@ def _gen_c_intrinsic(name,
         [name_label,
          _get_asm_reference(asm),
          mnemo_label,
-         _get_builder_reference(intr, asm) if gen_builder else 'void',
+         _get_builder_reference(intr, asm),
          cpuid_restriction,
          nan_restriction,
          'true' if _intr_has_side_effects(intr) else 'false',
          _get_c_type_tuple(intr['in']),
-         _get_c_type_tuple(intr['out'])] +
-        [_get_reg_operand_info(arg, 'intrinsics::bindings')
-         for arg in asm['args']]))
+         _get_c_type_tuple(intr['out']),
+         _get_reg_operands_info(asm['args'], 'intrinsics::bindings')]))
   if check_compatible_assembler == _is_translator_compatible_assembler:
     yield '          std::forward<Args>(args)...); result.has_value()) {'
     yield '      return *std::move(result);'
@@ -1260,7 +1220,19 @@ def _get_asm_reference(asm):
       asm['asm'])
 
 def _get_builder_reference(intr, asm):
-  return 'GetOpcode%s' % (asm['name'])
+  name = asm['name']
+  num_mem_args = sum(
+    1
+    for arg in asm['args']
+      if arg.get('class').startswith("Mem") and
+         arg.get('usage') == 'def_early_clobber')
+  if num_mem_args > 2:
+    opcode = 'Undefined'
+  elif num_mem_args > 0:
+    opcode = asm_defs.get_mem_macro_name(asm, '').replace("Mem", "MemBaseDisp")
+  else:
+    opcode = name
+  return f'[]<typename Opcode>{{ return Opcode::kMachineOp{opcode}; }}'
 
 def _load_intrs_def_files(intrs_def_files):
   result = {}

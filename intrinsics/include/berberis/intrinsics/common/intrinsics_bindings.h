@@ -104,7 +104,7 @@ class ImpreciseNanOperationsHandling;
 template <auto kIntrinsicTemplateName,
           auto kMacroInstructionTemplateName,
           auto kMnemo,
-          typename GetOpcode,
+          auto GetOpcode,
           typename CPUIDRestrictionTemplateValue,
           typename PreciseNanOperationsHandlingTemplateValue,
           bool kSideEffectsTemplateValue,
@@ -114,7 +114,7 @@ class AsmCallInfo;
 template <auto kIntrinsicTemplateName,
           auto kMacroInstructionTemplateName,
           auto kMnemo,
-          typename GetOpcode,
+          auto GetOpcode,
           typename CPUIDRestrictionTemplateValue,
           typename PreciseNanOperationsHandlingTemplateValue,
           bool kSideEffectsTemplateValue,
@@ -130,14 +130,13 @@ class AsmCallInfo<kIntrinsicTemplateName,
                   kSideEffectsTemplateValue,
                   std::tuple<InputArgumentsTypes...>,
                   std::tuple<OutputArgumentsTypes...>,
-                  BindingsTypes...>
+                  std::tuple<BindingsTypes...>>
     final {
  public:
   static constexpr auto kIntrinsic = kIntrinsicTemplateName;
   static constexpr auto kMacroInstruction = kMacroInstructionTemplateName;
-  // TODO(b/260725458): Use lambda template argument after C++20 becomes available.
   template <typename Opcode>
-  static constexpr auto kOpcode = GetOpcode{}.template operator()<Opcode>();
+  static constexpr auto kOpcode = GetOpcode.template operator()<Opcode>();
   using CPUIDRestriction = CPUIDRestrictionTemplateValue;
   using PreciseNanOperationsHandling = PreciseNanOperationsHandlingTemplateValue;
   static constexpr bool kSideEffects = kSideEffectsTemplateValue;
@@ -164,14 +163,13 @@ class AsmCallInfo<kIntrinsicTemplateName,
                                            void (*)(InputArgumentsTypes...),
                                            OutputArguments (*)(InputArgumentsTypes...)>;
   template <template <typename, auto, auto, typename...> typename MachineInsnType,
-            template <typename...>
-            typename ConstructorArgs,
+            template <typename...> typename ConstructorArgs,
             typename Opcode>
   using MachineInsn = MachineInsnType<AsmCallInfo,
                                       kMnemo,
                                       kOpcode<Opcode>,
                                       ConstructorArgs<BindingsTypes...>,
-                                      BindingsTypes...>;
+                                      std::tuple<BindingsTypes...>>;
 };
 
 }  // namespace intrinsics::bindings

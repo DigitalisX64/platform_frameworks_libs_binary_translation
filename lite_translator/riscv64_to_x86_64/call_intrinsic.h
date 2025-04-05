@@ -46,10 +46,7 @@ constexpr int8_t kRegIsNotOnStack = -1;
 // Map from register number to offset in CallIntrinsic save area. Counted in 8-byte slots.
 inline constexpr auto kRegOffsetsOnStack = []() {
   std::array<int8_t, 16> regs_on_stack = {};
-  // regs_on_stack.fill(kRegIsNotOnStack); - needs C++20
-  for (auto& num : regs_on_stack) {
-    num = kRegIsNotOnStack;
-  }
+  regs_on_stack.fill(kRegIsNotOnStack);
 
   int8_t stack_allocation_size = 0;
   for (auto reg : kCallerSavedRegs) {
@@ -81,10 +78,7 @@ constexpr x86_64::Assembler::XMMRegister kCallerSavedXMMRegs[] = {
 // Map from register number to offset in CallIntrinsic save area. Counted in 8-byte slots.
 inline constexpr auto kSimdRegOffsetsOnStack = []() {
   std::array<int8_t, 16> simd_regs_on_stack = {};
-  // simd_regs_on_stack.fill(kRegIsNotOnStack); - needs C++20
-  for (auto& num : simd_regs_on_stack) {
-    num = kRegIsNotOnStack;
-  }
+  simd_regs_on_stack.fill(kRegIsNotOnStack);
 
   int8_t stack_allocation_size = AlignUp(std::size(kCallerSavedRegs), 2);
   for (auto reg : kCallerSavedXMMRegs) {

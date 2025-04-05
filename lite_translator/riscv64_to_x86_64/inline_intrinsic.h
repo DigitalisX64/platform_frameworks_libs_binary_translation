@@ -211,7 +211,7 @@ class TryBindingBasedInlineIntrinsic {
   template <auto kIntrinsicTemplateName,
             auto kMacroInstructionTemplateName,
             auto kMnemo,
-            typename GetOpcode,
+            auto GetOpcode,
             typename kCPUIDRestrictionTemplateValue,
             typename kPreciseNanOperationsHandlingTemplateValue,
             bool kSideEffectsTemplateValue,
