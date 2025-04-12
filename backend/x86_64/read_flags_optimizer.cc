@@ -30,7 +30,7 @@ namespace berberis::x86_64 {
 // Returns true iff we reach the end without encountering any uses of regs.
 bool CheckRegsUnusedWithinInsnRange(MachineInsnList::iterator insn_it,
                                     MachineInsnList::iterator end,
-                                    ArenaVector<MachineReg>& regs) {
+                                    MachineRegVector& regs) {
   for (; insn_it != end; ++insn_it) {
     for (auto i = 0; i < (*insn_it)->NumRegOperands(); i++) {
       if (Contains(regs, (*insn_it)->RegAt(i))) {
@@ -54,7 +54,7 @@ bool CheckRegsUnusedWithinInsnRange(MachineInsnList::iterator insn_it,
 //   original node with readflags instruction
 //
 // Returns true iff this node doesn't stop us from using the optimization.
-bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* bb, ArenaVector<MachineReg>& regs) {
+bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* bb, MachineRegVector& regs) {
   // If the node doesn't actually use any of regs we can just skip it.
   if (!RegsLiveInBasicBlock(bb, regs)) {
     return true;
@@ -103,7 +103,7 @@ bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* bb, ArenaVector<MachineRe
 // * the node must have only one in_edge - this guarantees the register is coming
 // from the readflags
 // * nothing in regs should be in live_out
-bool CheckPostLoopNode(MachineBasicBlock* bb, const ArenaVector<MachineReg>& regs) {
+bool CheckPostLoopNode(MachineBasicBlock* bb, const MachineRegVector& regs) {
   // If the node doesn't actually use any of regs we can just skip it.
   if (!RegsLiveInBasicBlock(bb, regs)) {
     return true;
@@ -123,7 +123,7 @@ bool CheckPostLoopNode(MachineBasicBlock* bb, const ArenaVector<MachineReg>& reg
 }
 
 // Checks if anything in regs is in bb->live_in().
-bool RegsLiveInBasicBlock(MachineBasicBlock* bb, const ArenaVector<MachineReg>& regs) {
+bool RegsLiveInBasicBlock(MachineBasicBlock* bb, const MachineRegVector& regs) {
   for (auto r : bb->live_in()) {
     if (Contains(regs, r)) {
       return true;
@@ -212,6 +212,50 @@ std::optional<MachineInsnList::iterator> FindFlagSettingInsn(MachineInsnList::it
   return std::nullopt;
 }
 
+void InsertFlagGenInstructions(MachineIR* machine_ir,
+                               ReadFlagsOptContext& context,
+                               MachineInsnList::iterator insn_it,
+                               const ArenaMap<MachineReg, MachineReg>& reg_map,
+                               MachineReg reg) {
+  MachineReg flag_reg;
+  // First add instruction that sets flags register.
+  auto insn_opt = GetInsnGen(context.flag_set_insn->opcode());
+  CHECK(insn_opt.has_value());
+  auto insn = insn_opt.value()(machine_ir, context.flag_set_insn);
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (insn->RegKindAt(i).IsInput()) {
+      CHECK(reg_map.contains(insn->RegAt(i)));
+      MachineReg input_reg;
+      if (insn->RegKindAt(i).IsDef()) {
+        // If it gets overwritten by the instruction, we need to make a new copy.
+        input_reg = machine_ir->AllocVReg();
+        context.bb->insn_list().insert(
+            insn_it, machine_ir->NewInsn<PseudoCopy>(input_reg, reg_map.at(insn->RegAt(i)), 8));
+      } else {
+        // if it's not def we can just reuse the copy from before.
+        input_reg = reg_map.at(insn->RegAt(i));
+      }
+      insn->SetRegAt(i, input_reg);
+    } else {
+      // Allocate new registers for non-input as original ones are
+      // probably not in scope.
+      insn->SetRegAt(i, machine_ir->AllocVReg());
+      if (insn->RegKindAt(i).RegClass()->IsSubsetOf(&kFLAGS)) {
+        // Save the flag register to set PSEUDO_READFLAGS.
+        flag_reg = insn->RegAt(i);
+      }
+    }
+  }
+  CHECK(!flag_reg.IsInvalidReg());
+  context.bb->insn_list().insert(insn_it, insn);
+
+  // Now add readflags instruction.
+  insn = GetInsnGen(context.readflags_insn->opcode()).value()(machine_ir, context.readflags_insn);
+  insn->SetRegAt(0, reg);
+  insn->SetRegAt(1, flag_reg);
+  context.bb->insn_list().insert(insn_it, insn);
+}
+
 // Given an iterator that points to a READFLAGS instruction, checks if the
 // instruction can be optimized away.
 //
@@ -245,7 +289,7 @@ std::optional<MachineInsn*> IsEligibleReadFlag(MachineIR* machine_ir,
   // We use a set here because the original register will be pseudocopy'd when
   // used as live_out. So long as these new registers adhere to the same
   // constraints this is fine.
-  ArenaVector<MachineReg> regs({(*insn_it)->RegAt(0)}, machine_ir->arena());
+  MachineRegVector regs({(*insn_it)->RegAt(0)}, machine_ir->arena());
   insn_it++;
   if (!CheckRegsUnusedWithinInsnRange(insn_it, bb->insn_list().end(), regs)) {
     return std::nullopt;
@@ -277,6 +321,99 @@ std::optional<MachineInsn*> IsEligibleReadFlag(MachineIR* machine_ir,
     return *flag_setter.value();
   }
   return std::nullopt;
+}
+
+// Removes all elements of regs_to_remove from remove_from_regs. Returns true if anything was
+// removed.
+bool RemoveRegs(MachineRegVector& remove_from_regs, const MachineRegVector& regs_to_remove) {
+  bool ret = false;
+  if (remove_from_regs.empty()) {
+    return ret;
+  }
+  auto it = remove_from_regs.end();
+  do {
+    it--;
+    if (Contains(regs_to_remove, *it)) {
+      it = remove_from_regs.erase(it);
+      ret = true;
+    }
+  } while (it != remove_from_regs.begin());
+  return ret;
+}
+
+// Propagates the copied input registers, and regenerates the EFLAGs register if
+// we find an instruction that uses it. Updates live_in/live_out of blocks to
+// include copied input registers.
+//
+// Params:
+// * context - ReadFlagsOptContext generated from where the readflags
+// instruction was found.
+// * insn_it - iterator for MachineInsn in block for where we should begin
+// reading instructions. Should be begin() except when called from
+// RemoveReadFlags
+// * flags_regs - set of flags register and its PSEUDOCOPY's
+// * reg_map - the mapping from the original input registers to their copies
+// * insn - Original instruction which created the EFLAGS register.
+void ReplaceFlagRegisters(MachineIR* machine_ir,
+                          ReadFlagsOptContext context,
+                          MachineInsnList::iterator insn_it,
+                          MachineRegVector flags_regs,
+                          const ArenaMap<MachineReg, MachineReg>& reg_map,
+                          MachineInsn* insn) {
+  while (insn_it != context.bb->insn_list().end()) {
+    if (AsMachineInsnX86_64(*insn_it)->opcode() == kMachineOpPseudoCopy &&
+        Contains(flags_regs, (*insn_it)->RegAt(1))) {
+      // If flags register was copied we add the copy to flags_regs and delete instruction.
+      flags_regs.push_back((*insn_it)->RegAt(0));
+      insn_it = context.bb->insn_list().erase(insn_it);
+      continue;
+    }
+    // Check if we use the register.
+    for (int i = 0; i < (*insn_it)->NumRegOperands(); i++) {
+      if (!Contains(flags_regs, (*insn_it)->RegAt(i))) {
+        continue;
+      }
+      InsertFlagGenInstructions(machine_ir, context, insn_it, reg_map, (*insn_it)->RegAt(i));
+    }
+    insn_it++;
+  }
+
+  // Add copied registers to live_in if needed.
+  for (auto reg : context.bb->live_in()) {
+    if (Contains(flags_regs, reg)) {
+      for (auto mapping : reg_map) {
+        context.bb->live_in().push_back(mapping.second);
+      }
+      break;
+    }
+  }
+
+  // Remove flags_regs from live_in and live_out.
+  RemoveRegs(context.bb->live_in(), flags_regs);
+  auto was_live_out = RemoveRegs(context.bb->live_out(), flags_regs);
+  // Update live_out with our copied input registers if flags_regs was in
+  // live_out.
+  if (was_live_out) {
+    for (auto mapping : reg_map) {
+      context.bb->live_out().push_back(mapping.second);
+    }
+  }
+
+  // Recurse on neighbors where flags registers are live_in.
+  for (auto* out_edge : context.bb->out_edges()) {
+    for (auto live_in_reg : out_edge->dst()->live_in()) {
+      if (Contains(flags_regs, live_in_reg)) {
+        ReplaceFlagRegisters(
+            machine_ir,
+            ReadFlagsOptContext{out_edge->dst(), context.readflags_insn, context.flag_set_insn},
+            out_edge->dst()->insn_list().begin(),
+            flags_regs,
+            reg_map,
+            insn);
+        break;
+      }
+    }
+  }
 }
 
 }  // namespace berberis::x86_64

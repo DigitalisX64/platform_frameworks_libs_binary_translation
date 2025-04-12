@@ -42,6 +42,7 @@ cc_library_static {
         "code_pool.cc",
         "crash_reporter.cc",
         "exec_region_anonymous.cc",
+        "guest_code_region.cc",
         "guest_function_wrapper_impl.cc",
         "host_entries.cc",
         "host_function_wrapper_impl.cc",

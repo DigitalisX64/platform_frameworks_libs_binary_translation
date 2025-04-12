@@ -51,7 +51,7 @@ uintptr_t GetEntryPointOverride();
 enum ConfigFlag {
   kTopByteIgnore,
   kDisableRegMap,
-  kEnableDisjointRegionsTranslation,
+  kDisableAdjacentRegionsTranslation,
   kVerboseTranslation,
   kAccurateSigsegv,
   kDisableIntrinsicInlining,

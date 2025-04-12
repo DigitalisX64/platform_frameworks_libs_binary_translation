@@ -131,6 +131,8 @@ class VerifierAssembler {
 
   constexpr void CheckLabelsAreBound() {}
 
+  constexpr void CheckNonLinearIntrinsicsUseDefRegisters() {}
+
   // Translate CPU restrictions into string.
   template <typename CPUIDRestriction>
   static constexpr const char* kCPUIDRestrictionString =

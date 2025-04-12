@@ -39,8 +39,8 @@ std::string ToString(ConfigFlag flag) {
       return "top-byte-ignore";
     case kDisableRegMap:
       return "disable-reg-map";
-    case kEnableDisjointRegionsTranslation:
-      return "enable-disjoint-regions-translation";
+    case kDisableAdjacentRegionsTranslation:
+      return "disable-adjacent-regions-translation";
     case kDisableIntrinsicInlining:
       return "disable-intrinsic-inlining";
     case kMergeProfilesForSameModeRegions:

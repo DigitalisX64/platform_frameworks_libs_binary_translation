@@ -277,6 +277,8 @@ constexpr uint16_t DW_AT_loclists_base = 0x8c;
 
 constexpr uint16_t DW_AT_MAX_VALUE = DW_AT_loclists_base;
 
+constexpr uint16_t DW_AT_MIPS_linkage_name = 0x2007;
+
 // GNU extension attributes
 constexpr uint16_t DW_AT_GNU_vector = 0x2107;
 constexpr uint16_t DW_AT_GNU_template_name = 0x2110;

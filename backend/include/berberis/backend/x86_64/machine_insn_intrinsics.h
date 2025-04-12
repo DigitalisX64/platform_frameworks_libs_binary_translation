@@ -69,8 +69,7 @@ struct ConstructorArg<ArgTraits<T>,
                       std::enable_if_t<!ArgTraits<T>::Class::kIsImmediate &&
                                            ArgTraits<T>::RegisterClass::kAsRegister == 'm',
                                        void>> {
-  static_assert(
-      std::is_same_v<typename ArgTraits<T>::Usage, intrinsics::bindings::DefEarlyClobber>);
+  static_assert(ArgTraits<T>::kUsage == intrinsics::bindings::kDefEarlyClobber);
   // Need to emit base register AND disp.
   using type = std::tuple<MachineReg, int32_t>;
 };
@@ -87,8 +86,7 @@ struct ConstructorArg<ArgTraits<T>,
 template <typename T>
 using constructor_one_arg_t = typename ConstructorArg<ArgTraits<T>>::type;
 
-// Use this alias to generate constructor Args from bindings via the AsmCallInfo::MachineInsn
-// alias. The tuple args will be extracted by the tuple specialization on MachineInsn below.
+// Use this alias to generate constructor Args from bindings.
 template <typename... T>
 using constructor_args_t = tuple_cat_t<constructor_one_arg_t<T>...>;
 
@@ -109,16 +107,30 @@ constexpr size_t mem_count_v = std::tuple_size_v<filter_t<is_mem_t, ArgTraits<Bi
 template <size_t N, typename... Bindings>
 constexpr bool has_n_mem_v = mem_count_v<Bindings...> > (N - 1);
 
-template <typename AsmCallInfo, auto kMnemo, auto kOpcode, typename Args, typename... Bindings>
+template <typename IntrinsicBindingInfo>
 class MachineInsn;
 
 // Use specialization to extract the tuple parameter pack generated from constructor_args_t above.
-template <typename AsmCallInfo,
+template <auto kIntrinsic,
+          auto kMacroInstruction,
           auto kMnemo,
-          auto kOpcode,
-          typename... CtorArgs,
+          auto GetOpcode,
+          typename CPUIDRestriction,
+          typename PreciseNanOperationsHandling,
+          bool kSideEffects,
+          typename... InputArguments,
+          typename... OutputArguments,
           typename... Bindings>
-class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tuple<Bindings...>>
+class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
+                                                             kMacroInstruction,
+                                                             kMnemo,
+                                                             GetOpcode,
+                                                             CPUIDRestriction,
+                                                             PreciseNanOperationsHandling,
+                                                             kSideEffects,
+                                                             std::tuple<InputArguments...>,
+                                                             std::tuple<OutputArguments...>,
+                                                             std::tuple<Bindings...>>>
     final : public MachineInsnX86_64 {
  private:
   template <typename>
@@ -128,10 +140,10 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tu
 
  public:
   // This static simplifies constructing this MachineInsn in intrinsic implementations.
-  static constexpr MachineInsn* (MachineIRBuilder::*kGenFunc)(std::tuple<CtorArgs...>) =
+  static constexpr MachineInsn* (MachineIRBuilder::*kGenFunc)(constructor_args_t<Bindings...>) =
       &MachineIRBuilder::template Gen<MachineInsn>;
 
-  explicit MachineInsn(std::tuple<CtorArgs...> args) : MachineInsnX86_64(&kInfo) {
+  explicit MachineInsn(constructor_args_t<Bindings...> args) : MachineInsnX86_64(&kInfo) {
     std::apply(
         [this](auto... args) {
           this->ProcessArgs<0 /* reg_idx */, 0 /* disp_idx */, Bindings...>(args...);
@@ -167,7 +179,7 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tu
             //   …
             // machine_insn_intrinsics.h:161:18: note: in instantiation of template class
             //  'std::tuple<berberis::InOutArg<0, 0, …>, berberis::InArg<1, …>' requested here
-            // 161            s += GetImmOperandDebugString(this);
+            // 187            s += GetImmOperandDebugString(this);
             //
             // Same below.
             s += GetImmOperandDebugString(static_cast<const MachineInsnX86_64*>(this));
@@ -212,7 +224,7 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tu
                    ... + 0) <= 2);
     size_t reg_idx{}, disp_idx{};
     std::apply(
-        AsmCallInfo::kMacroInstruction,
+        kMacroInstruction,
         std::tuple_cat(
             std::tuple<CodeEmitter&>{*as}, [&reg_idx, &disp_idx, this]<typename Binding> {
               if constexpr (ArgTraits<Binding>::Class::kIsImmediate) {
@@ -224,8 +236,8 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tu
                                    ArgTraits<Binding>::RegisterClass::kAsRegister == 'q') {
                 return std::tuple{GetGReg(this->RegAt(reg_idx++))};
               } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'm' &&
-                                   std::is_same_v<typename ArgTraits<Binding>::Usage,
-                                                  intrinsics::bindings::DefEarlyClobber>) {
+                                   ArgTraits<Binding>::kUsage ==
+                                       intrinsics::bindings::kDefEarlyClobber) {
                 disp_idx++;
                 if (disp_idx == 1) {
                   return std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx++)),
@@ -293,7 +305,7 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tu
   }
 
   static constexpr auto GetInsnKind() {
-    if constexpr (AsmCallInfo::kSideEffects) {
+    if constexpr (kSideEffects) {
       return kMachineInsnSideEffects;
     } else {
       return kMachineInsnDefault;
@@ -305,20 +317,30 @@ class MachineInsn<AsmCallInfo, kMnemo, kOpcode, std::tuple<CtorArgs...>, std::tu
   template <typename T>
   struct RegInfo<T, std::enable_if_t<T::RegisterClass::kAsRegister != 'm', void>> {
     static constexpr auto kRegClass = &T::RegisterClass::template kRegClass<MachineInsnX86_64>;
-    static constexpr auto kRegKind =
-        intrinsics::bindings::kRegKind<typename T::Usage, berberis::MachineRegKind>;
+    static constexpr auto kRegKind = static_cast<MachineRegKind::StandardAccess>(T::kUsage);
+    static_assert(MachineRegKind::kDef ==
+                  static_cast<MachineRegKind::StandardAccess>(intrinsics::bindings::kDef));
+    static_assert(MachineRegKind::kDefEarlyClobber == static_cast<MachineRegKind::StandardAccess>(
+                                                          intrinsics::bindings::kDefEarlyClobber));
+    static_assert(MachineRegKind::kUse ==
+                  static_cast<MachineRegKind::StandardAccess>(intrinsics::bindings::kUse));
+    static_assert(MachineRegKind::kUseDef ==
+                  static_cast<MachineRegKind::StandardAccess>(intrinsics::bindings::kUseDef));
   };
   template <typename T>
   struct RegInfo<T, std::enable_if_t<T::RegisterClass::kAsRegister == 'm', void>> {
-    static_assert(std::is_same_v<typename T::Usage, intrinsics::bindings::DefEarlyClobber>);
+    static_assert(T::kUsage == intrinsics::bindings::kDefEarlyClobber);
     static constexpr auto kRegClass = &kGeneralReg32;
     static constexpr auto kRegKind = MachineRegKind::kUse;
   };
 
   template <typename... T>
   struct GenMachineInsnInfoT<std::tuple<T...>> {
-    static constexpr MachineInsnInfo value = MachineInsnInfo(
-        {kOpcode, sizeof...(T), {{RegInfo<T>::kRegClass, RegInfo<T>::kRegKind}...}, GetInsnKind()});
+    static constexpr MachineInsnInfo value =
+        MachineInsnInfo({GetOpcode.template operator()<MachineOpcode>(),
+                         sizeof...(T),
+                         {{RegInfo<T>::kRegClass, RegInfo<T>::kRegKind}...},
+                         GetInsnKind()});
   };
 };
 

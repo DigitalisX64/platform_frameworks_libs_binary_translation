@@ -348,9 +348,14 @@ const AbbrevDescriptor kNameDescriptors[] = {
                    DwarfClass::kReference,
                    DwarfClass::kString } },
           }, "DW_AT_trampoline" },
-  { 0x57, { { 3, { DwarfClass::kConstant } } }, "DW_AT_call_column" },
-  { 0x58, { { 3, { DwarfClass::kConstant } } }, "DW_AT_call_file" },
-  { 0x59, { { 3, { DwarfClass::kConstant } } }, "DW_AT_call_line" },
+  // TODO(b/409026302): DWARF spec states that DW_AT_call_column requires DWARF version >= v3,
+  // however this exists in a v2 compile unit in libandroid_runtime DWARF file. As a workaround,
+  // we manually set this attribute (as well as a few others below, marked by "manually adjusted")
+  // to v2. We should consider removing correct version checking entirely, since such discrepancies
+  // occur frequently, and all that matters is that it parses correctly.
+  { 0x57, { { 2, { DwarfClass::kConstant } } }, "DW_AT_call_column" }, // manually adjusted from v3
+  { 0x58, { { 2, { DwarfClass::kConstant } } }, "DW_AT_call_file" }, // manually adjusted from v3
+  { 0x59, { { 2, { DwarfClass::kConstant } } }, "DW_AT_call_line" }, // manually adjusted from v3
   { 0x5a, { { 3, { DwarfClass::kString } } }, "DW_AT_description" },
   { 0x5b, { { 3, { DwarfClass::kConstant } } }, "DW_AT_binary_scale" },
   { 0x5c, { { 3, { DwarfClass::kConstant } } }, "DW_AT_decimal_scale" },
@@ -372,7 +377,7 @@ const AbbrevDescriptor kNameDescriptors[] = {
   { 0x6b, { { 4, { DwarfClass::kConstant } } }, "DW_AT_data_bit_offset" },
   { 0x6c, { { 4, { DwarfClass::kFlag } } }, "DW_AT_const_expr" },
   { 0x6d, { { 4, { DwarfClass::kFlag } } }, "DW_AT_enum_class" },
-  { 0x6e, { { 4, { DwarfClass::kString } } }, "DW_AT_linkage_name" },
+  { 0x6e, { { 2, { DwarfClass::kString } } }, "DW_AT_linkage_name" }, // manually adjusted from v4
   // Dwarf 5
   { 0x6f, { { 5, { DwarfClass::kConstant } } }, "DW_AT_string_length_bit_size" },
   { 0x70, { { 5, { DwarfClass::kConstant } } }, "DW_AT_string_length_byte_size" },
@@ -401,8 +406,8 @@ const AbbrevDescriptor kNameDescriptors[] = {
   { 0x85, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_data_location" },
   { 0x86, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_data_value" },
   // Apparently clang uses these in dwarf4 CUs
-  { 0x87, { { 4, { DwarfClass::kFlag } } }, "DW_AT_noreturn" },
-  { 0x88, { { 4, { DwarfClass::kConstant } } }, "DW_AT_alignment" },
+  { 0x87, { { 2, { DwarfClass::kFlag } } }, "DW_AT_noreturn" }, // manually adjusted from v4
+  { 0x88, { { 2, { DwarfClass::kConstant } } }, "DW_AT_alignment" }, // manually adjusted from v4
   { 0x89, { { 4, { DwarfClass::kFlag } } }, "DW_AT_export_symbols" },
   { 0x8a, { { 5, { DwarfClass::kFlag } } }, "DW_AT_deleted" },
   { 0x8b, { { 5, { DwarfClass::kConstant } } }, "DW_AT_defaulted" },
@@ -473,6 +478,12 @@ const AbbrevDescriptor* GetNameDescriptor(uint32_t name) {
       return &kAtGnuLocviews;
     case DW_AT_GNU_entry_view:
       return &kAtGnuEntryView;
+  }
+
+  // DW_AT_linkage_name should have replaced all instances of DW_AT_MIPS_linkage_name. However,
+  // libandroid_runtime DWARF contains some of such instances, hence this workaround.
+  if (name == DW_AT_MIPS_linkage_name) {
+    name = DW_AT_linkage_name;
   }
 
   if (name > DW_AT_MAX_VALUE) {
@@ -765,7 +776,11 @@ class DwarfClassReference : public DwarfClass {
         offset = cu->unit_offset() + bs->ReadLeb128();
         break;
       case DW_FORM_ref_addr:
-        offset = cu->is_dwarf64() ? bs->ReadUint64() : bs->ReadUint32();
+        if (cu->version() <= 2) {
+          offset = cu->address_size() == 8 ? bs->ReadUint64() : bs->ReadUint32();
+        } else {
+          offset = cu->is_dwarf64() ? bs->ReadUint64() : bs->ReadUint32();
+        }
         break;
       // TODO(dimitry): DW_FORM_ref_sig8?
       default:

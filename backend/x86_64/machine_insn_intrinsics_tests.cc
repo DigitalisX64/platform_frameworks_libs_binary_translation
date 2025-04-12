@@ -27,36 +27,36 @@ namespace {
 // TEST(MachineInsnIntrinsicsTest, HasNMem)
 static_assert(x86_64::has_n_mem_v<
               1,
-              TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::DefEarlyClobber>>);
+              TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kDefEarlyClobber>>);
 static_assert(!x86_64::has_n_mem_v<1>);
 static_assert(!x86_64::has_n_mem_v<
               1,
-              TmpArg<intrinsics::bindings::GeneralReg32, intrinsics::bindings::DefEarlyClobber>>);
+              TmpArg<intrinsics::bindings::GeneralReg32, intrinsics::bindings::kDefEarlyClobber>>);
 static_assert(x86_64::has_n_mem_v<2,
-                                  TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::Use>,
-                                  TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::Def>>);
+                                  TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kUse>,
+                                  TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kDef>>);
 static_assert(!x86_64::has_n_mem_v<
               2,
-              TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::DefEarlyClobber>>);
+              TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kDefEarlyClobber>>);
 
 // TEST(MachineInsnIntrinsicsTest, ConstructorArgs)
 static_assert(
     std::is_same_v<x86_64::constructor_args_t<
-                       TmpArg<intrinsics::bindings::Mem64, intrinsics::bindings::DefEarlyClobber>>,
+                       TmpArg<intrinsics::bindings::Mem64, intrinsics::bindings::kDefEarlyClobber>>,
                    std::tuple<MachineReg, int32_t>>);
 static_assert(
     std::is_same_v<x86_64::constructor_args_t<TmpArg<intrinsics::bindings::GeneralReg64,
-                                                     intrinsics::bindings::DefEarlyClobber>>,
+                                                     intrinsics::bindings::kDefEarlyClobber>>,
                    std::tuple<MachineReg>>);
 static_assert(std::is_same_v<x86_64::constructor_args_t<
-                                 InArg<0, intrinsics::bindings::Imm32, intrinsics::bindings::Use>>,
+                                 InArg<0, intrinsics::bindings::Imm32, intrinsics::bindings::kUse>>,
                              std::tuple<int32_t>>);
 static_assert(
     std::is_same_v<
         x86_64::constructor_args_t<
-            InArg<0, intrinsics::bindings::Imm16, intrinsics::bindings::Use>,
-            TmpArg<intrinsics::bindings::Mem64, intrinsics::bindings::DefEarlyClobber>,
-            TmpArg<intrinsics::bindings::GeneralReg64, intrinsics::bindings::DefEarlyClobber>>,
+            InArg<0, intrinsics::bindings::Imm16, intrinsics::bindings::kUse>,
+            TmpArg<intrinsics::bindings::Mem64, intrinsics::bindings::kDefEarlyClobber>,
+            TmpArg<intrinsics::bindings::GeneralReg64, intrinsics::bindings::kDefEarlyClobber>>,
         std::tuple<int16_t, MachineReg, int32_t, MachineReg>>);
 
 }  // namespace

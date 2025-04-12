@@ -216,7 +216,7 @@ class TryBindingBasedInlineIntrinsic {
             typename kPreciseNanOperationsHandlingTemplateValue,
             bool kSideEffectsTemplateValue,
             typename... Types>
-  friend class intrinsics::bindings::AsmCallInfo;
+  friend class intrinsics::bindings::IntrinsicBindingInfo;
 
   TryBindingBasedInlineIntrinsic() = delete;
   TryBindingBasedInlineIntrinsic(const TryBindingBasedInlineIntrinsic&) = delete;
@@ -241,12 +241,13 @@ class TryBindingBasedInlineIntrinsic {
                  TryBindingBasedInlineIntrinsic&>(*this, false)) {}
   operator bool() { return success_; }
 
-  template <typename AsmCallInfo>
-  std::optional<bool> /*ProcessBindingsClient*/ operator()(AsmCallInfo asm_call_info) {
-    static_assert(std::is_same_v<decltype(kFunction), typename AsmCallInfo::IntrinsicType>);
-    static_assert(std::is_same_v<typename AsmCallInfo::PreciseNanOperationsHandling,
+  template <typename IntrinsicBindingInfo>
+  std::optional<bool> /*ProcessBindingsClient*/ operator()(IntrinsicBindingInfo asm_call_info) {
+    static_assert(
+        std::is_same_v<decltype(kFunction), typename IntrinsicBindingInfo::IntrinsicType>);
+    static_assert(std::is_same_v<typename IntrinsicBindingInfo::PreciseNanOperationsHandling,
                                  intrinsics::bindings::NoNansOperation>);
-    using CPUIDRestriction = AsmCallInfo::CPUIDRestriction;
+    using CPUIDRestriction = IntrinsicBindingInfo::CPUIDRestriction;
     if constexpr (std::is_same_v<CPUIDRestriction, intrinsics::bindings::HasAVX>) {
       if (!host_platform::kHasAVX) {
         return {};
@@ -271,17 +272,18 @@ class TryBindingBasedInlineIntrinsic {
                                         intrinsics::bindings::NoCPUIDRestriction>) {
       // No restrictions. Do nothing.
     } else {
-      static_assert(kDependentValueFalse<AsmCallInfo::kCPUIDRestriction>);
+      static_assert(kDependentValueFalse<IntrinsicBindingInfo::kCPUIDRestriction>);
     }
     std::apply(
-        AsmCallInfo::kMacroInstruction,
-        std::tuple_cat(std::tuple<MacroAssembler<x86_64::Assembler>&>{as_},
-                       AsmCallInfo::template MakeTuplefromBindings<TryBindingBasedInlineIntrinsic&>(
-                           *this, asm_call_info)));
-    if constexpr (std::tuple_size_v<typename AsmCallInfo::OutputArguments> == 0) {
+        IntrinsicBindingInfo::kMacroInstruction,
+        std::tuple_cat(
+            std::tuple<MacroAssembler<x86_64::Assembler>&>{as_},
+            IntrinsicBindingInfo::template MakeTuplefromBindings<TryBindingBasedInlineIntrinsic&>(
+                *this, asm_call_info)));
+    if constexpr (std::tuple_size_v<typename IntrinsicBindingInfo::OutputArguments> == 0) {
       // No return value. Do nothing.
-    } else if constexpr (std::tuple_size_v<typename AsmCallInfo::OutputArguments> == 1) {
-      using ReturnType = std::tuple_element_t<0, typename AsmCallInfo::OutputArguments>;
+    } else if constexpr (std::tuple_size_v<typename IntrinsicBindingInfo::OutputArguments> == 1) {
+      using ReturnType = std::tuple_element_t<0, typename IntrinsicBindingInfo::OutputArguments>;
       if constexpr (std::is_integral_v<ReturnType>) {
         if (result_reg_ != x86_64::Assembler::no_register) {
           Mov<ReturnType>(as_, result_, result_reg_);
@@ -312,82 +314,86 @@ class TryBindingBasedInlineIntrinsic {
         static_assert(kDependentTypeFalse<ReturnType>);
       }
     } else {
-      static_assert(kDependentTypeFalse<typename AsmCallInfo::OutputArguments>);
+      static_assert(kDependentTypeFalse<typename IntrinsicBindingInfo::OutputArguments>);
     }
     return {true};
   }
 
-  template <typename ArgBinding, typename AsmCallInfo>
-  auto /*MakeTuplefromBindingsClient*/ operator()(ArgTraits<ArgBinding>, AsmCallInfo) {
+  template <typename ArgBinding, typename IntrinsicBindingInfo>
+  auto /*MakeTuplefromBindingsClient*/ operator()(ArgTraits<ArgBinding>, IntrinsicBindingInfo) {
     static constexpr const auto& arg_info = ArgTraits<ArgBinding>::arg_info;
     if constexpr (arg_info.arg_type == ArgInfo::IMM_ARG) {
-      return ProcessArgInput<ArgBinding, AsmCallInfo>(reg_alloc_);
+      return ProcessArgInput<ArgBinding, IntrinsicBindingInfo>(reg_alloc_);
     } else {
       using RegisterClass = typename ArgTraits<ArgBinding>::RegisterClass;
       if constexpr (RegisterClass::kAsRegister == 'x') {
-        return ProcessArgInput<ArgBinding, AsmCallInfo>(simd_reg_alloc_);
+        return ProcessArgInput<ArgBinding, IntrinsicBindingInfo>(simd_reg_alloc_);
       } else {
-        return ProcessArgInput<ArgBinding, AsmCallInfo>(reg_alloc_);
+        return ProcessArgInput<ArgBinding, IntrinsicBindingInfo>(reg_alloc_);
       }
     }
   }
 
-  template <typename ArgBinding, typename AsmCallInfo, typename RegAllocForArg>
+  template <typename ArgBinding, typename IntrinsicBindingInfo, typename RegAllocForArg>
   auto ProcessArgInput(RegAllocForArg&& reg_alloc) {
     static constexpr const auto& arg_info = ArgTraits<ArgBinding>::arg_info;
     if constexpr (arg_info.arg_type == ArgInfo::IMM_ARG) {
       return std::tuple{std::get<arg_info.from>(input_args_)};
     } else {
       using RegisterClass = typename ArgTraits<ArgBinding>::RegisterClass;
-      using Usage = typename ArgTraits<ArgBinding>::Usage;
+      static constexpr auto kUsage = ArgTraits<ArgBinding>::kUsage;
       if constexpr (arg_info.arg_type == ArgInfo::IN_ARG) {
-        using Type = std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>;
+        using Type =
+            std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>;
         if constexpr (RegisterClass::kAsRegister == 'x' && std::is_integral_v<Type>) {
           auto reg = reg_alloc();
           Mov<typename TypeTraits<int64_t>::Float>(as_, reg, std::get<arg_info.from>(input_args_));
           return std::tuple{reg};
         } else {
-          static_assert(std::is_same_v<Usage, intrinsics::bindings::Use>);
+          static_assert(kUsage == intrinsics::bindings::kUse);
           static_assert(!RegisterClass::kIsImplicitReg);
           return std::tuple{std::get<arg_info.from>(input_args_)};
         }
       } else if constexpr (arg_info.arg_type == ArgInfo::IN_OUT_ARG) {
-        using Type = std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>;
-        static_assert(std::is_same_v<Usage, intrinsics::bindings::UseDef>);
+        using Type =
+            std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>;
+        static_assert(kUsage == intrinsics::bindings::kUseDef);
         static_assert(!RegisterClass::kIsImplicitReg);
         if constexpr (RegisterClass::kAsRegister == 'x' && std::is_integral_v<Type>) {
           static_assert(std::is_integral_v<
-                        std::tuple_element_t<arg_info.to, typename AsmCallInfo::OutputArguments>>);
+                        std::tuple_element_t<arg_info.to,
+                                             typename IntrinsicBindingInfo::OutputArguments>>);
           CHECK_EQ(result_xmm_reg_, x86_64::Assembler::no_xmm_register);
           result_xmm_reg_ = reg_alloc();
           Mov<typename TypeTraits<int64_t>::Float>(
               as_, result_xmm_reg_, std::get<arg_info.from>(input_args_));
           return std::tuple{result_xmm_reg_};
         } else {
-          Mov<std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>>(
+          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
               as_, result_, std::get<arg_info.from>(input_args_));
           return std::tuple{result_};
         }
       } else if constexpr (arg_info.arg_type == ArgInfo::IN_TMP_ARG) {
         if constexpr (RegisterClass::kAsRegister == 'c') {
-          Mov<std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>>(
+          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
               as_, as_.rcx, std::get<arg_info.from>(input_args_));
           return std::tuple{};
         } else if constexpr (RegisterClass::kAsRegister == 'a') {
-          Mov<std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>>(
+          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
               as_, as_.rax, std::get<arg_info.from>(input_args_));
           return std::tuple{};
         } else {
-          static_assert(std::is_same_v<Usage, intrinsics::bindings::UseDef>);
+          static_assert(kUsage == intrinsics::bindings::kUseDef);
           static_assert(!RegisterClass::kIsImplicitReg);
           auto reg = reg_alloc();
-          Mov<std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>>(
+          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
               as_, reg, std::get<arg_info.from>(input_args_));
           return std::tuple{reg};
         }
       } else if constexpr (arg_info.arg_type == ArgInfo::IN_OUT_TMP_ARG) {
-        using Type = std::tuple_element_t<arg_info.from, typename AsmCallInfo::InputArguments>;
-        static_assert(std::is_same_v<Usage, intrinsics::bindings::UseDef>);
+        using Type =
+            std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>;
+        static_assert(kUsage == intrinsics::bindings::kUseDef);
         static_assert(RegisterClass::kIsImplicitReg);
         if constexpr (RegisterClass::kAsRegister == 'a') {
           CHECK_EQ(result_reg_, x86_64::Assembler::no_register);
@@ -398,9 +404,10 @@ class TryBindingBasedInlineIntrinsic {
           static_assert(kDependentValueFalse<arg_info.arg_type>);
         }
       } else if constexpr (arg_info.arg_type == ArgInfo::OUT_ARG) {
-        using Type = std::tuple_element_t<arg_info.to, typename AsmCallInfo::OutputArguments>;
-        static_assert(std::is_same_v<Usage, intrinsics::bindings::Def> ||
-                      std::is_same_v<Usage, intrinsics::bindings::DefEarlyClobber>);
+        using Type =
+            std::tuple_element_t<arg_info.to, typename IntrinsicBindingInfo::OutputArguments>;
+        static_assert(kUsage == intrinsics::bindings::kDef ||
+                      kUsage == intrinsics::bindings::kDefEarlyClobber);
         if constexpr (RegisterClass::kAsRegister == 'a') {
           CHECK_EQ(result_reg_, x86_64::Assembler::no_register);
           result_reg_ = as_.rax;
@@ -427,8 +434,8 @@ class TryBindingBasedInlineIntrinsic {
           static_assert(kDependentValueFalse<arg_info.arg_type>);
         }
       } else if constexpr (arg_info.arg_type == ArgInfo::TMP_ARG) {
-        static_assert(std::is_same_v<Usage, intrinsics::bindings::Def> ||
-                      std::is_same_v<Usage, intrinsics::bindings::DefEarlyClobber>);
+        static_assert(kUsage == intrinsics::bindings::kDef ||
+                      kUsage == intrinsics::bindings::kDefEarlyClobber);
         if constexpr (RegisterClass::kAsRegister == 'm') {
           if (scratch_arg_ >= config::kScratchAreaSize / config::kScratchAreaSlotSize) {
             FATAL("Only two scratch registers are supported for now");

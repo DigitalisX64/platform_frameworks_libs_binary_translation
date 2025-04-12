@@ -118,84 +118,84 @@ struct ArgInfo {
   const int to = 0;
 };
 
-template <int N, typename RegisterClass = void, typename Usage = void>
+template <int N, typename RegisterClass, auto kUsage>
 class InArg;
 
-template <int N, typename RegisterClass = void, typename Usage = void>
+template <int N, typename RegisterClass, auto kUsage>
 class OutArg;
 
-template <int N, typename RegisterClass = void, typename Usage = void>
+template <int N, typename RegisterClass, auto kUsage>
 class OutTmpArg;
 
-template <int N, int M, typename RegisterClass = void, typename Usage = void>
+template <int N, int M, typename RegisterClass, auto kUsage>
 class InOutArg;
 
-template <int N, int M, typename RegisterClass = void, typename Usage = void>
+template <int N, int M, typename RegisterClass, auto kUsage>
 class InOutTmpArg;
 
-template <int N, typename RegisterClass = void, typename Usage = void>
+template <int N, typename RegisterClass, auto kUsage>
 class InTmpArg;
 
-template <int N, typename ImmType, typename ImmediateClass = void>
+template <int N, typename ImmType, typename ImmediateClass>
 class ImmArg;
 
-template <typename RegisterClass = void, typename Usage = void>
+template <typename RegisterClass, auto kUsage>
 class TmpArg;
 
 template <typename ArgInfo>
 class ArgTraits;
 
-template <int N, typename RegisterClassType, typename UsageType>
-class ArgTraits<InArg<N, RegisterClassType, UsageType>> {
+template <int N, typename RegisterClassType, auto kUsageParam>
+class ArgTraits<InArg<N, RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::IN_ARG, .from = N};
 };
 
-template <int N, typename RegisterClassType, typename UsageType>
-class ArgTraits<OutArg<N, RegisterClassType, UsageType>> {
+template <int N, typename RegisterClassType, auto kUsageParam>
+class ArgTraits<OutArg<N, RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::OUT_ARG, .to = N};
 };
 
-template <int N, typename RegisterClassType, typename UsageType>
-class ArgTraits<OutTmpArg<N, RegisterClassType, UsageType>> {
+template <int N, typename RegisterClassType, auto kUsageParam>
+class ArgTraits<OutTmpArg<N, RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::OUT_TMP_ARG, .to = N};
 };
 
-template <int N, int M, typename RegisterClassType, typename UsageType>
-class ArgTraits<InOutArg<N, M, RegisterClassType, UsageType>> {
+template <int N, int M, typename RegisterClassType, auto kUsageParam>
+class ArgTraits<InOutArg<N, M, RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::IN_OUT_ARG, .from = N, .to = M};
 };
 
-template <int N, int M, typename RegisterClassType, typename UsageType>
-class ArgTraits<InOutTmpArg<N, M, RegisterClassType, UsageType>> {
+template <int N, int M, typename RegisterClassType, auto kUsageParam>
+class ArgTraits<InOutTmpArg<N, M, RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::IN_OUT_TMP_ARG, .from = N, .to = M};
 };
 
-template <int N, typename RegisterClassType, typename UsageType>
-class ArgTraits<InTmpArg<N, RegisterClassType, UsageType>> {
+template <int N, typename RegisterClassType, auto kUsageParam>
+class ArgTraits<InTmpArg<N, RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::IN_TMP_ARG, .from = N};
 };
 
@@ -207,12 +207,12 @@ class ArgTraits<ImmArg<N, ImmType, ImmediateClassType>> {
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::IMM_ARG, .from = N};
 };
 
-template <typename RegisterClassType, typename UsageType>
-class ArgTraits<TmpArg<RegisterClassType, UsageType>> {
+template <typename RegisterClassType, auto kUsageParam>
+class ArgTraits<TmpArg<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
-  using Usage = UsageType;
+  static constexpr auto kUsage = kUsageParam;
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::TMP_ARG};
 };
 
