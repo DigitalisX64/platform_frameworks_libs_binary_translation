@@ -20,7 +20,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "berberis/base/page_size.h"
+
 namespace berberis::config {
+
+// Guest page size
+inline const size_t kGuestPageSize = berberis::kPageSize;
 
 // Size of the stack frame allocated in translated code prologue.
 // As translated code ('slow') prologue executes much less frequently than
@@ -47,8 +52,6 @@ inline constexpr bool kLinkJumpsBetweenRegions = !kAllJumpsExitGeneratedCode;
 // Generate local jumps if jump's target address falls within the
 // current region. If false dispatch to another region instead.
 inline constexpr bool kLinkJumpsWithinRegion = !kAllJumpsExitGeneratedCode;
-// Guest page size. Always 4K for now.
-inline constexpr size_t kGuestPageSize = 4096;
 // Number of hard registers assumed by the register allocator.
 inline constexpr uint32_t kMaxHardRegs = 64u;
 // Threshold for switching between gears

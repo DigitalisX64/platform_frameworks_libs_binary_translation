@@ -195,8 +195,7 @@ class DwarfParser {
     // Even though in .so files abbrev codes is a sequence [1..n]
     // the spec does not specify this as a requirement. Therefore
     // it is safer to use unordered_map.
-    std::unordered_map<uint64_t, DwarfAbbrev>* abbrev_map =
-        ReadAbbrev(version, abbrev_offset, error_msg);
+    std::unordered_map<uint64_t, DwarfAbbrev>* abbrev_map = ReadAbbrev(abbrev_offset, error_msg);
 
     if (abbrev_map == nullptr) {
       *error_msg =
@@ -230,9 +229,7 @@ class DwarfParser {
     return cu;
   }
 
-  std::unordered_map<uint64_t, DwarfAbbrev>* ReadAbbrev(uint16_t version,
-                                                        uint64_t offset,
-                                                        std::string* error_msg) {
+  std::unordered_map<uint64_t, DwarfAbbrev>* ReadAbbrev(uint64_t offset, std::string* error_msg) {
     auto it = abbrevs_.find(offset);
     if (it != abbrevs_.end()) {
       return &it->second;
@@ -280,8 +277,7 @@ class DwarfParser {
         }
 
         std::unique_ptr<const DwarfAbbrevAttribute> abbrev_attribute =
-            DwarfAbbrevAttribute::CreateAbbrevAttribute(
-                version, attr_name, attr_form, value, error_msg);
+            DwarfAbbrevAttribute::CreateAbbrevAttribute(attr_name, attr_form, value, error_msg);
 
         if (!abbrev_attribute) {
           *error_msg =

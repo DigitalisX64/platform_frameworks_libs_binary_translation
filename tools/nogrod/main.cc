@@ -569,6 +569,54 @@ std::string UpdateName(std::string original, bool is_first, std::string base_nam
   return original;
 }
 
+const TypeInfo* ParseDie(const nogrod::DwarfDie* start,
+                         const nogrod::DwarfDie* referenced_by,
+                         const nogrod::DwarfInfo* dwarf_info,
+                         std::unordered_map<uint64_t, std::unique_ptr<TypeInfo>>* types);
+
+void GenerateClassTemplateParameter(std::string& template_params,
+                                    const nogrod::DwarfDie* child,
+                                    const nogrod::DwarfDie* die,
+                                    const nogrod::DwarfInfo* dwarf_info,
+                                    std::unordered_map<uint64_t, std::unique_ptr<TypeInfo>>* types,
+                                    bool is_first_template_parameter) {
+  auto child_type_die = GetAtTypeDie(child, dwarf_info);
+  if (child_type_die == nullptr) {
+    return;
+  }
+
+  if (child->tag() == DW_TAG_template_type_parameter) {
+    auto child_type_info = ParseDie(child_type_die, die, dwarf_info, types);
+    template_params = UpdateName(
+        template_params, is_first_template_parameter, (child_type_info->base_name()).c_str());
+    return;
+  }
+
+  if (child->tag() != DW_TAG_template_value_parameter) {
+    return;
+  }
+
+  auto child_type_info = ParseDie(child_type_die, die, dwarf_info, types);
+
+  auto num = child->GetUint64Attribute(DW_AT_const_value);
+  if (num) {
+    if (std::string_view{child_type_info->base_name()}.find("bool") != std::string_view::npos) {
+      std::string bool_val = num.value() == 0 ? "false" : "true";
+      template_params = UpdateName(template_params, is_first_template_parameter, bool_val);
+    } else {
+      template_params =
+          UpdateName(template_params, is_first_template_parameter, std::to_string(num.value()));
+    }
+  } else {
+    // Dwarf spec states that DW_TAG_value_parameter entries have a DW_AT_const_value or
+    // DW_AT_location attribute, which gives the value of the value parameter. However, in practice
+    // we often see parameter values which have neither attribute (e.g function pointers.) In such
+    // cases, we use the type of the parameter, as we do in DW_TAG_template_type_parameter entries.
+    template_params = UpdateName(
+        template_params, is_first_template_parameter, (child_type_info->base_name()).c_str());
+  }
+}
+
 std::string GenerateClassName(const auto& children,
                               auto class_name,
                               const nogrod::DwarfDie* die,
@@ -581,42 +629,13 @@ std::string GenerateClassName(const auto& children,
     if (child->tag() == DW_TAG_GNU_template_parameter_pack) {
       const auto& parameter_pack_children = child->children();
       for (auto child_child : parameter_pack_children) {
-        if (child_child->tag() == DW_TAG_template_type_parameter ||
-            child_child->tag() == DW_TAG_template_value_parameter) {
-          auto temp_type_die = GetAtTypeDie(child_child, dwarf_info);
-          if (temp_type_die == nullptr) {
-            continue;
-          }
-          auto template_type_info = ParseDie(temp_type_die, child, dwarf_info, types);
-          template_params =
-              UpdateName(template_params, i == 0, (template_type_info->base_name()).c_str());
-          continue;
-        }
+        GenerateClassTemplateParameter(
+            template_params, child_child, child, dwarf_info, types, i == 0);
       }
       continue;
     }
 
-    if (child->tag() == DW_TAG_template_type_parameter ||
-        child->tag() == DW_TAG_template_value_parameter) {
-      auto child_type_die = GetAtTypeDie(child, dwarf_info);
-      if (child_type_die == nullptr) {
-        continue;
-      }
-      auto child_type_info = ParseDie(child_type_die, die, dwarf_info, types);
-
-      if (std::string_view{child_type_info->base_name()}.find("bool") != std::string_view::npos) {
-        auto num = child->GetUint64Attribute(DW_AT_const_value);
-        if (num) {
-          // Using the value of bool to avoid dedup failure
-          std::string bool_val = num.value() == 0 ? "false" : "true";
-          template_params = UpdateName(template_params, i == 0, bool_val);
-        }
-      } else {
-        template_params =
-            UpdateName(template_params, i == 0, (child_type_info->base_name()).c_str());
-      }
-      continue;
-    }
+    GenerateClassTemplateParameter(template_params, child, die, dwarf_info, types, i == 0);
   }
 
   if (!template_params.empty()) {
@@ -625,11 +644,6 @@ std::string GenerateClassName(const auto& children,
 
   return class_name;
 }
-
-const TypeInfo* ParseDie(const nogrod::DwarfDie* start,
-                         const nogrod::DwarfDie* referenced_by,
-                         const nogrod::DwarfInfo* dwarf_info,
-                         std::unordered_map<uint64_t, std::unique_ptr<TypeInfo>>* types);
 
 const TypeInfo* ParseClass(const char* kind,
                            const nogrod::DwarfDie* die,

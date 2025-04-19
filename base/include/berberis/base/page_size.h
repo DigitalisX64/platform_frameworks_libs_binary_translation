@@ -17,8 +17,6 @@
 #ifndef BERBERIS_BASE_PAGESIZE_H_
 #define BERBERIS_BASE_PAGESIZE_H_
 
-#include "berberis/base/checks.h"
-
 #include <unistd.h>
 
 namespace berberis {
@@ -37,7 +35,6 @@ struct PageSize {
     if (value_ == 0) {
       return getpagesize();
     }
-    CHECK((value_ & (value_ - 1)) == 0);  // Power of 2
     return value_;
   }
 

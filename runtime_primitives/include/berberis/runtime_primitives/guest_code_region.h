@@ -47,6 +47,8 @@ class GuestCodeBasicBlock {
   [[nodiscard]] const ArenaVector<GuestAddr>& out_edges() const { return out_edges_; }
   [[nodiscard]] const ArenaVector<GuestAddr>& in_edges() const { return in_edges_; }
 
+  [[nodiscard]] std::string GetDebugString() const;
+
  private:
   const GuestAddr start_addr_;
   size_t size_;
@@ -72,8 +74,16 @@ class GuestCodeRegion {
 
   [[nodiscard]] const ArenaSet<GuestAddr>& branch_targets() const { return branch_targets_; }
 
+  [[nodiscard]] std::string GetDebugString() const;
+
  private:
+  // Collects targets reachable from the first basic_block.
+  // The first block is included in the result iff it's reachable from
+  // some other block (through a back edge). The resulted set contains
+  // external reachable branch_targets as well as internal ones.
+  ArenaSet<GuestAddr> CollectReachableBranchTargets() const;
   void SplitBasicBlocks();
+  void RemoveUnreachableBlocks();
   void ResolveInEdges();
   void ValidateRegionBeforeFinalize() const;
 

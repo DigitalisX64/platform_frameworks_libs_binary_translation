@@ -164,16 +164,12 @@ std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode) {
   }
 }
 
-// Finds all read flags we can optimize away and adds them to read_flags_map
-// with the basic block where it's found.
-void FindEligibleReadFlagsInLoopTree(MachineIR* machine_ir,
-                                     LoopTreeNode* loop_tree_node,
-                                     ArenaMap<MachineReg, ReadFlagsOptContext>& read_flags_map) {
-  if (loop_tree_node->loop() == nullptr || loop_tree_node->NumInnerloops() > 0) {
+// Finds all read flags we can optimize away and removes them.
+void RemoveEligibleReadFlagsInLoopTree(MachineIR* machine_ir, LoopTreeNode* loop_tree_node) {
+  if (loop_tree_node->NumInnerloops() > 0) {
     // Find inner loops.
     for (size_t i = 0; i < loop_tree_node->NumInnerloops(); i++) {
-      FindEligibleReadFlagsInLoopTree(
-          machine_ir, loop_tree_node->GetInnerloopNode(i), read_flags_map);
+      RemoveEligibleReadFlagsInLoopTree(machine_ir, loop_tree_node->GetInnerloopNode(i));
     }
   } else if (loop_tree_node->loop() == nullptr) {
     // Root loop without innerloops - nothing can be found.
@@ -186,8 +182,7 @@ void FindEligibleReadFlagsInLoopTree(MachineIR* machine_ir,
         if (AsMachineInsnX86_64(*insn_it)->opcode() == kMachineOpPseudoReadFlags) {
           auto flag_set_opt = IsEligibleReadFlag(machine_ir, loop, bb, insn_it);
           if (flag_set_opt.has_value()) {
-            read_flags_map[(*insn_it)->RegAt(0)] =
-                ReadFlagsOptContext{bb, *insn_it, flag_set_opt.value()};
+            RemoveReadFlags(machine_ir, ReadFlagsOptContext{bb, insn_it, flag_set_opt.value()});
           }
         }
       }
@@ -219,9 +214,9 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
                                MachineReg reg) {
   MachineReg flag_reg;
   // First add instruction that sets flags register.
-  auto insn_opt = GetInsnGen(context.flag_set_insn->opcode());
+  auto insn_opt = GetInsnGen((*context.flag_set_insn)->opcode());
   CHECK(insn_opt.has_value());
-  auto insn = insn_opt.value()(machine_ir, context.flag_set_insn);
+  auto insn = insn_opt.value()(machine_ir, *context.flag_set_insn);
   for (int i = 0; i < insn->NumRegOperands(); i++) {
     if (insn->RegKindAt(i).IsInput()) {
       CHECK(reg_map.contains(insn->RegAt(i)));
@@ -250,7 +245,8 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
   context.bb->insn_list().insert(insn_it, insn);
 
   // Now add readflags instruction.
-  insn = GetInsnGen(context.readflags_insn->opcode()).value()(machine_ir, context.readflags_insn);
+  insn =
+      GetInsnGen((*context.readflags_insn)->opcode()).value()(machine_ir, *context.readflags_insn);
   insn->SetRegAt(0, reg);
   insn->SetRegAt(1, flag_reg);
   context.bb->insn_list().insert(insn_it, insn);
@@ -280,10 +276,10 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
 //         ^             |
 //         |             v
 //   (LOOP NODE) <-  (EXIT NODE) ---> (NEIGHBOR'S POST LOOP NODE)
-std::optional<MachineInsn*> IsEligibleReadFlag(MachineIR* machine_ir,
-                                               Loop* loop,
-                                               MachineBasicBlock* bb,
-                                               MachineInsnList::iterator insn_it) {
+std::optional<MachineInsnList::iterator> IsEligibleReadFlag(MachineIR* machine_ir,
+                                                            Loop* loop,
+                                                            MachineBasicBlock* bb,
+                                                            MachineInsnList::iterator insn_it) {
   CHECK_EQ(AsMachineInsnX86_64(*insn_it)->opcode(), kMachineOpPseudoReadFlags);
   auto flag_register = (*insn_it)->RegAt(1);
   // We use a set here because the original register will be pseudocopy'd when
@@ -318,27 +314,61 @@ std::optional<MachineInsn*> IsEligibleReadFlag(MachineIR* machine_ir,
   // Make sure we know how to copy this instruction.
   auto flag_setter = FindFlagSettingInsn(insn_it, bb->insn_list().begin(), flag_register);
   if (flag_setter.has_value() && GetInsnGen((*flag_setter.value())->opcode()).has_value()) {
-    return *flag_setter.value();
+    return flag_setter.value();
   }
   return std::nullopt;
 }
 
+void OptimizeReadFlags(MachineIR* machine_ir) {
+  auto loop_tree = BuildLoopTree(machine_ir);
+  RemoveEligibleReadFlagsInLoopTree(machine_ir, loop_tree.root());
+}
+
 // Removes all elements of regs_to_remove from remove_from_regs. Returns true if anything was
 // removed.
+//
+// Note this ideally only be used for small vectors as it's O(n^2).
 bool RemoveRegs(MachineRegVector& remove_from_regs, const MachineRegVector& regs_to_remove) {
-  bool ret = false;
-  if (remove_from_regs.empty()) {
-    return ret;
-  }
-  auto it = remove_from_regs.end();
-  do {
-    it--;
-    if (Contains(regs_to_remove, *it)) {
-      it = remove_from_regs.erase(it);
-      ret = true;
+  auto orig_size = remove_from_regs.size();
+  for (auto rit = remove_from_regs.rbegin(); rit != remove_from_regs.rend();
+       /* Incremented in loop */) {
+    if (Contains(regs_to_remove, *rit)) {
+      // erase only takes forward iterator so we create one from rit.
+      rit = EraseFromReverseIterator(remove_from_regs, rit);
+    } else {
+      rit++;
     }
-  } while (it != remove_from_regs.begin());
-  return ret;
+  }
+  return orig_size != remove_from_regs.size();
+}
+
+// Removes the READFLAGS instruction, finds the instruction which generated the
+// flags, and creates copies of the registers.
+void RemoveReadFlags(MachineIR* machine_ir, ReadFlagsOptContext context) {
+  auto insn_it = context.readflags_insn;
+  auto flags_reg = (*insn_it)->RegAt(0);
+  MachineReg flags_register = (*insn_it)->RegAt(1);
+  // Delete READFLAGS instruction
+  context.bb->insn_list().erase(insn_it);
+
+  insn_it = context.flag_set_insn;
+
+  MachineInsn* insn = *insn_it;
+  insn_it++;
+
+  // Create copies of input registers.
+  ArenaMap<MachineReg, MachineReg> reg_map(machine_ir->arena());
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (insn->RegKindAt(i).IsInput()) {
+      MachineReg copy = machine_ir->AllocVReg();
+      reg_map[insn->RegAt(i)] = copy;
+      context.bb->insn_list().insert(insn_it,
+                                     machine_ir->NewInsn<PseudoCopy>(copy, insn->RegAt(i), 8));
+    }
+  }
+
+  ArenaVector<MachineReg> reg_vec({flags_reg}, machine_ir->arena());
+  ReplaceFlagRegisters(machine_ir, context, insn_it, reg_vec, reg_map, insn);
 }
 
 // Propagates the copied input registers, and regenerates the EFLAGs register if

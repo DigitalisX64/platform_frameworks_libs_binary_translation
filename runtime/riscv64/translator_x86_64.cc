@@ -91,7 +91,7 @@ enum class TranslationGear {
 };
 
 size_t GetExecutableRegionSize(GuestAddr pc) {
-  // With kGuestPageSize=4k we scan at least 1k instructions, which should be enough for a single
+  // With kGuestPageSize>=4k we scan at least 1k instructions, which should be enough for a single
   // region.
   auto [is_exec, exec_size] =
       GuestMapShadow::GetInstance()->GetExecutableRegionSize(pc, config::kGuestPageSize);

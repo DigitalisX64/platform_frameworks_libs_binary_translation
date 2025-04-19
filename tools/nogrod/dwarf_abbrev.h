@@ -164,8 +164,7 @@ class DwarfClass {
 
 class DwarfAbbrevAttribute {
  public:
-  static std::unique_ptr<const DwarfAbbrevAttribute> CreateAbbrevAttribute(uint16_t version,
-                                                                           uint32_t name,
+  static std::unique_ptr<const DwarfAbbrevAttribute> CreateAbbrevAttribute(uint32_t name,
                                                                            uint32_t form,
                                                                            int64_t value,
                                                                            std::string* error_msg);

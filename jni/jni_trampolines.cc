@@ -26,6 +26,7 @@
 #include <jni.h>  // NOLINT [build/include_order]
 
 #include "berberis/base/checks.h"
+#include "berberis/base/gettid.h"
 #include "berberis/base/logging.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_abi/function_wrappers.h"
@@ -237,14 +238,20 @@ struct KnownMethodTrampoline {
 //
 // It is likely that the new JNIEnv instance for the thread supersedes the
 // previous one but the code below does not make this assumption.
-std::mutex g_java_vm_guard_mutex;
+struct JNIEnvMapping {
+  std::deque<JNIEnv> guest_jni_envs;
+  std::map<GuestType<JNIEnv*>, JNIEnv*> guest_to_host_jni_env;
+  std::map<JNIEnv*, GuestType<JNIEnv*>> host_to_guest_jni_env;
+};
+
+std::mutex g_jni_guard_mutex;
 
 JavaVM g_guest_java_vm;
 JavaVM* g_host_java_vm;
 
-thread_local std::deque<JNIEnv> g_guest_jni_envs;
-thread_local std::map<GuestType<JNIEnv*>, JNIEnv*> g_guest_to_host_jni_env;
-thread_local std::map<JNIEnv*, GuestType<JNIEnv*>> g_host_to_guest_jni_env;
+// TODO(b/399909631): Add a callback from GuestThread::Destroy to remove entries
+// from this map.
+std::map<pid_t, JNIEnvMapping> g_jni_env_mappings;
 
 void DoJavaVMTrampoline_DestroyJavaVM(HostCode /* callee */, ProcessState* state) {
   using PFN_callee = decltype(std::declval<JavaVM>().functions->DestroyJavaVM);
@@ -354,28 +361,36 @@ GuestType<JNIEnv*> ToGuestJNIEnv(JNIEnv* host_jni_env) {
     std::atomic_store_explicit(&g_jni_env_wrapped, 1U, std::memory_order_release);
   }
 
-  auto it = g_host_to_guest_jni_env.find(host_jni_env);
-  if (it != g_host_to_guest_jni_env.end()) {
+  std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
+  pid_t thread_id = GettidSyscall();
+  JNIEnvMapping& mapping = g_jni_env_mappings[thread_id];
+
+  auto it = mapping.host_to_guest_jni_env.find(host_jni_env);
+  if (it != mapping.host_to_guest_jni_env.end()) {
     return it->second;
   }
 
-  g_guest_jni_envs.emplace_back(*host_jni_env);
-  JNIEnv* guest_jni_env = &g_guest_jni_envs.back();
+  mapping.guest_jni_envs.emplace_back(*host_jni_env);
+  JNIEnv* guest_jni_env = &mapping.guest_jni_envs.back();
   auto [unused_it1, host_to_guest_inserted] =
-      g_host_to_guest_jni_env.try_emplace(host_jni_env, guest_jni_env);
+      mapping.host_to_guest_jni_env.try_emplace(host_jni_env, guest_jni_env);
   CHECK(host_to_guest_inserted);
 
   auto [unused_it2, guest_to_host_inserted] =
-      g_guest_to_host_jni_env.try_emplace(guest_jni_env, host_jni_env);
+      mapping.guest_to_host_jni_env.try_emplace(guest_jni_env, host_jni_env);
   CHECK(guest_to_host_inserted);
 
   return guest_jni_env;
 }
 
 JNIEnv* ToHostJNIEnv(GuestType<JNIEnv*> guest_jni_env) {
-  auto it = g_guest_to_host_jni_env.find(guest_jni_env);
+  std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
+  pid_t thread_id = GettidSyscall();
+  JNIEnvMapping& mapping = g_jni_env_mappings[thread_id];
 
-  if (it == g_guest_to_host_jni_env.end()) {
+  auto it = mapping.guest_to_host_jni_env.find(guest_jni_env);
+
+  if (it == mapping.guest_to_host_jni_env.end()) {
     ALOGE("Unexpected guest JNIEnv: %p (it was never passed to guest), passing to host 'as is'",
           ToHostAddr(guest_jni_env));
     TRACE("Unexpected guest JNIEnv: %p (it was never passed to guest), passing to host 'as is'",
@@ -393,7 +408,7 @@ GuestType<JavaVM*> ToGuestJavaVM(JavaVM* host_java_vm) {
     std::atomic_store_explicit(&g_java_vm_wrapped, 1U, std::memory_order_release);
   }
 
-  std::lock_guard<std::mutex> lock(g_java_vm_guard_mutex);
+  std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
   if (g_host_java_vm == nullptr) {
     g_guest_java_vm = *host_java_vm;
     g_host_java_vm = host_java_vm;
@@ -410,7 +425,7 @@ GuestType<JavaVM*> ToGuestJavaVM(JavaVM* host_java_vm) {
 }
 
 JavaVM* ToHostJavaVM(GuestType<JavaVM*> guest_java_vm) {
-  std::lock_guard<std::mutex> lock(g_java_vm_guard_mutex);
+  std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
   if (ToHostAddr(guest_java_vm) == &g_guest_java_vm) {
     return g_host_java_vm;
   }

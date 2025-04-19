@@ -18,11 +18,13 @@
 
 #include <sys/mman.h>
 #include <climits>  // CHAR_BIT
+#include <cmath>
 #include <cstddef>
 #include <mutex>
 #include <tuple>
 
 #include "berberis/base/bit_util.h"
+#include "berberis/base/config.h"  // kGuestPageSize
 #include "berberis/base/forever_alloc.h"
 #include "berberis/base/large_mmap.h"
 #include "berberis/base/logging.h"
@@ -34,8 +36,6 @@ namespace berberis {
 
 namespace {
 
-// One bit per each 4K page.
-constexpr size_t kGuestPageSizeLog2 = 12;
 #if defined(BERBERIS_GUEST_LP64)
 // On LP64 the address space is limited to 48 bits
 constexpr size_t kGuestAddressSizeLog2 = 48;
@@ -44,8 +44,11 @@ constexpr size_t kMaxGuestAddress{0xffff'ffff'ffff};
 constexpr size_t kGuestAddressSizeLog2 = sizeof(GuestAddr) * CHAR_BIT;
 constexpr size_t kMaxGuestAddress{0xffff'ffff};
 #endif
-constexpr size_t kGuestPageSize = 1 << kGuestPageSizeLog2;  // 4096
-constexpr size_t kShadowSize = 1UL << (kGuestAddressSizeLog2 - kGuestPageSizeLog2 - 3);
+
+const size_t kGuestPageSize = config::kGuestPageSize;
+// One bit per each page.
+const size_t kGuestPageSizeLog2 = std::log2(kGuestPageSize);
+const size_t kShadowSize = 1UL << (kGuestAddressSizeLog2 - kGuestPageSizeLog2 - 3);
 
 inline GuestAddr AlignDownGuestPageSize(GuestAddr addr) {
   return AlignDown(addr, kGuestPageSize);

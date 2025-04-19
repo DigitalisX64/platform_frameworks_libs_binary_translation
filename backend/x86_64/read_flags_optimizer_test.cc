@@ -16,6 +16,8 @@
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
+
 #include "berberis/backend/x86_64/read_flags_optimizer.h"
 
 #include "berberis/backend/common/machine_ir.h"
@@ -495,7 +497,7 @@ TEST(MachineIRReadFlagsOptimizer, IsEligibleReadFlagReturnsSetter) {
   auto res = IsEligibleReadFlag(
       &machine_ir, loop_tree.root()->GetInnerloopNode(0)->loop(), testloop.loop_exit, insn_it);
   ASSERT_TRUE(res.has_value());
-  ASSERT_EQ(res.value()->opcode(), kMachineOpAddqRegReg);
+  ASSERT_EQ((*res.value())->opcode(), kMachineOpAddqRegReg);
 }
 
 TEST(MachineIRReadFlagsOptimizer, FindFlagSettingInsn) {
@@ -534,16 +536,16 @@ TEST(MachineIRReadFlagsOptimizer, FindFlagSettingInsn) {
   ASSERT_FALSE(flag_setter.has_value());
 }
 
-TEST(MachineIRReadFlagsOptimizer, FindEligibleReadFlagsInLoopTree) {
+TEST(MachineIRReadFlagsOptimizer, RemoveEligibleReadFlagsInLoopTree) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
   x86_64::MachineIRBuilder builder(&machine_ir);
 
   MachineReg scratch = machine_ir.AllocVReg();
-  // flags0 used in bb1 which is not in inner loop so should fail.
+  // flags0 used in bb1 which is not in inner loop so should not be removed..
   MachineReg flags0 = machine_ir.AllocVReg();
   MachineReg flags00 = machine_ir.AllocVReg();
-  // flags1 used in bb3 should pass.
+  // flags1 used in bb3 should be removed..
   MachineReg flags1 = machine_ir.AllocVReg();
   MachineReg flags11 = machine_ir.AllocVReg();
 
@@ -597,11 +599,66 @@ TEST(MachineIRReadFlagsOptimizer, FindEligibleReadFlagsInLoopTree) {
 
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
   auto loop_tree = BuildLoopTree(&machine_ir);
-  ArenaMap<MachineReg, ReadFlagsOptContext> read_flags_map(machine_ir.arena());
-  FindEligibleReadFlagsInLoopTree(&machine_ir, loop_tree.root(), read_flags_map);
+  RemoveEligibleReadFlagsInLoopTree(&machine_ir, loop_tree.root());
 
-  ASSERT_FALSE(read_flags_map.contains(flags0));
-  ASSERT_TRUE(read_flags_map.contains(flags1));
+  // flags0 should still be there since it's not eligible.
+  auto insn_it = std::next(bb1->insn_list().begin());
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+
+  // pseudoreadflags flags1 should be removed.
+  insn_it = std::next(bb3->insn_list().begin());
+  ASSERT_NE((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+}
+
+TEST(MachineIRReadFlagsOptimizer, OptimizeReadFlags) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  auto testloop = BuildBasicLoop(&machine_ir);
+
+  MachineReg flags_copy = machine_ir.AllocVReg();
+
+  testloop.postloop->live_in().push_back(testloop.flags_reg);
+  testloop.postloop->insn_list().push_front(
+      machine_ir.NewInsn<MovqRegReg>(machine_ir.AllocVReg(), testloop.flags_reg));
+
+  testloop.successor->live_in().push_back(testloop.flags_reg);
+  testloop.successor->insn_list().push_front(
+      machine_ir.NewInsn<PseudoCopy>(flags_copy, testloop.flags_reg, 8));
+  testloop.successor->live_out().push_back(flags_copy);
+
+  testloop.succ_postloop->live_in().push_back(flags_copy);
+  testloop.succ_postloop->insn_list().push_front(
+      machine_ir.NewInsn<MovqRegReg>(machine_ir.AllocVReg(), flags_copy));
+
+  OptimizeReadFlags(&machine_ir);
+
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  // Check that original PSEUDOREADFLAGS instruction is gone.
+  ASSERT_TRUE(
+      std::none_of(testloop.loop_exit->insn_list().begin(),
+                   testloop.loop_exit->insn_list().end(),
+                   [](MachineInsn* insn) { return insn->opcode() == kMachineOpPseudoReadFlags; }));
+
+  // Check that postloop inserted the original instruction.
+  auto insn_it = testloop.postloop->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+
+  // Check that successor removes pseudocopy.
+  insn_it = testloop.successor->insn_list().begin();
+  ASSERT_NE((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+
+  // Check that succ_postloop also has original instruction.
+  insn_it = testloop.succ_postloop->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
 }
 
 TEST(MachineIRReadFlagsOptimizer, RemoveRegs) {
@@ -624,6 +681,123 @@ TEST(MachineIRReadFlagsOptimizer, RemoveRegs) {
   ASSERT_FALSE(RemoveRegs(regs, disallowed));
 }
 
+TEST(MachineIRReadFlagsOptimizer, RemoveReadFlags) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  MachineReg flags0 = machine_ir.AllocVReg();
+  MachineReg flags00 = machine_ir.AllocVReg();
+  MachineReg flags000 = machine_ir.AllocVReg();
+  MachineReg flags1 = machine_ir.AllocVReg();
+  MachineReg input_flag0 = machine_ir.AllocVReg();
+  MachineReg input_flag1 = machine_ir.AllocVReg();
+
+  // bb0 --> bb1 --> bb2 --> bb3
+  //          ^       |
+  //          |       v
+  //          -------bb4 --> bb5
+  auto bb0 = machine_ir.NewBasicBlock();
+  auto bb1 = machine_ir.NewBasicBlock();
+  auto bb2 = machine_ir.NewBasicBlock();
+  auto bb3 = machine_ir.NewBasicBlock();
+  auto bb4 = machine_ir.NewBasicBlock();
+  auto bb5 = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(bb0, bb1);
+  machine_ir.AddEdge(bb1, bb2);
+  machine_ir.AddEdge(bb2, bb3);
+  machine_ir.AddEdge(bb2, bb4);
+  machine_ir.AddEdge(bb4, bb1);
+  machine_ir.AddEdge(bb4, bb5);
+
+  builder.StartBasicBlock(bb0);
+  builder.Gen<PseudoBranch>(bb1);
+
+  builder.StartBasicBlock(bb1);
+  builder.Gen<PseudoBranch>(bb2);
+
+  builder.StartBasicBlock(bb2);
+  builder.Gen<AddqRegReg>(input_flag0, input_flag1, kMachineRegFLAGS);
+  auto* readflag_insn =
+      builder.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS);
+  builder.Gen<PseudoCopy>(flags00, flags0, 8);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb3, bb4, kMachineRegFLAGS);
+  bb2->live_out().push_back(flags00);
+
+  builder.StartBasicBlock(bb3);
+  builder.Gen<MovqRegReg>(flags1, flags00);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+  bb3->live_in().push_back(flags00);
+
+  builder.StartBasicBlock(bb4);
+  builder.Gen<PseudoCopy>(flags000, flags00, 8);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb1, bb5, kMachineRegFLAGS);
+  bb4->live_in().push_back(flags00);
+  bb4->live_out().push_back(flags000);
+
+  builder.StartBasicBlock(bb5);
+  builder.Gen<MovqRegReg>(flags1, flags000);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+  bb5->live_in().push_back(flags000);
+
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  RemoveReadFlags(&machine_ir,
+                  ReadFlagsOptContext{
+                      bb2,
+                      std::find(bb2->insn_list().begin(), bb2->insn_list().end(), readflag_insn),
+                      bb2->insn_list().begin()});
+
+  // Check ReadFlags gone.
+  ASSERT_TRUE(std::none_of(bb2->insn_list().begin(), bb2->insn_list().end(), [](MachineInsn* insn) {
+    return insn->opcode() == kMachineOpPseudoReadFlags;
+  }));
+  // Check that we created copies of input flags.
+  auto insn_it = bb2->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  insn_it++;
+  ASSERT_TRUE((*insn_it)->opcode() == kMachineOpPseudoCopy && (*insn_it)->RegAt(1) == input_flag0);
+  insn_it++;
+  ASSERT_TRUE((*insn_it)->opcode() == kMachineOpPseudoCopy && (*insn_it)->RegAt(1) == input_flag1);
+
+  // Check live_in/live_out.
+  ASSERT_EQ(bb2->live_out().size(), 2UL);
+  ASSERT_EQ(std::find(bb2->live_out().begin(), bb2->live_out().end(), flags0),
+            bb2->live_out().end());
+  ASSERT_EQ(bb3->live_in().size(), 2UL);
+  ASSERT_EQ(bb4->live_in().size(), 2UL);
+  ASSERT_EQ(bb4->live_out().size(), 2UL);
+  ASSERT_EQ(bb5->live_in().size(), 2UL);
+  ASSERT_EQ(bb1->live_in().size(), 0UL);
+
+  // Check that we create the instruction to set flags.
+  insn_it = bb3->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  ASSERT_TRUE(Contains(bb3->live_in(), (*insn_it)->RegAt(1)));
+  auto input_copy = (*insn_it)->RegAt(0);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  ASSERT_FALSE(Contains(bb3->live_in(), (*insn_it)->RegAt(0)));
+  ASSERT_EQ(input_copy, (*insn_it)->RegAt(0));
+  ASSERT_TRUE(Contains(bb3->live_in(), (*insn_it)->RegAt(1)));
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  ASSERT_EQ((*insn_it)->RegAt(0), flags00);
+
+  insn_it = bb5->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  ASSERT_TRUE(Contains(bb5->live_in(), (*insn_it)->RegAt(1)));
+  input_copy = (*insn_it)->RegAt(0);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  ASSERT_FALSE(Contains(bb5->live_in(), (*insn_it)->RegAt(0)));
+  ASSERT_EQ(input_copy, (*insn_it)->RegAt(0));
+  ASSERT_TRUE(Contains(bb5->live_in(), (*insn_it)->RegAt(1)));
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  ASSERT_EQ((*insn_it)->RegAt(0), flags000);
+}
+
 TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersRecursesOnNeighbors) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
@@ -644,7 +818,7 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersRecursesOnNeighbors) {
   machine_ir.AddEdge(bb2, bb0);
 
   builder.StartBasicBlock(bb0);
-  auto flag_set_insn = builder.Gen<SubqRegImm>(input0, 12, kMachineRegFLAGS);
+  auto* flag_set_insn = builder.Gen<SubqRegImm>(input0, 12, kMachineRegFLAGS);
   builder.Gen<PseudoCopy>(input00, input0, 8);
   builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb1, bb2, kMachineRegFLAGS);
 
@@ -658,17 +832,20 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersRecursesOnNeighbors) {
   builder.Gen<PseudoWriteFlags>(flags0, kMachineRegFLAGS);
   builder.Gen<PseudoBranch>(bb0);
 
-  ReplaceFlagRegisters(&machine_ir,
-                       ReadFlagsOptContext{
-                           bb0,
-                           machine_ir.NewInsn<PseudoReadFlags>(
-                               PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS),
-                           flag_set_insn,
-                       },
-                       bb0->insn_list().begin(),
-                       MachineRegVector({flags0}, machine_ir.arena()),
-                       ArenaMap<MachineReg, MachineReg>({{input0, input00}}, machine_ir.arena()),
-                       flag_set_insn);
+  ReplaceFlagRegisters(
+      &machine_ir,
+      ReadFlagsOptContext{
+          bb0,
+          MachineInsnList{{machine_ir.NewInsn<PseudoReadFlags>(
+                              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+          bb0->insn_list().begin(),
+      },
+      bb0->insn_list().begin(),
+      MachineRegVector({flags0}, machine_ir.arena()),
+      ArenaMap<MachineReg, MachineReg>({{input0, input00}}, machine_ir.arena()),
+      flag_set_insn);
 
   // Make sure that ReplaceFlagRegisters modifies bb1 and bb2.
   ASSERT_EQ((*std::next(bb1->insn_list().begin()))->opcode(), kMachineOpSubqRegImm);
@@ -689,7 +866,7 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersReplacesInstructions) {
   machine_ir.AddEdge(bb0, bb1);
 
   builder.StartBasicBlock(bb0);
-  auto flag_set_insn = builder.Gen<SubqRegImm>(input0, 12, kMachineRegFLAGS);
+  auto* flag_set_insn = builder.Gen<SubqRegImm>(input0, 12, kMachineRegFLAGS);
   builder.Gen<PseudoCopy>(input00, input0, 8);
   builder.Gen<PseudoBranch>(bb1);
 
@@ -699,17 +876,20 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersReplacesInstructions) {
   builder.Gen<PseudoWriteFlags>(flags00, kMachineRegFLAGS);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  ReplaceFlagRegisters(&machine_ir,
-                       ReadFlagsOptContext{
-                           bb0,
-                           machine_ir.NewInsn<PseudoReadFlags>(
-                               PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS),
-                           flag_set_insn,
-                       },
-                       bb0->insn_list().begin(),
-                       MachineRegVector({flags0}, machine_ir.arena()),
-                       ArenaMap<MachineReg, MachineReg>({{input0, input00}}, machine_ir.arena()),
-                       flag_set_insn);
+  ReplaceFlagRegisters(
+      &machine_ir,
+      ReadFlagsOptContext{
+          bb0,
+          MachineInsnList{{machine_ir.NewInsn<PseudoReadFlags>(
+                              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+          bb0->insn_list().begin(),
+      },
+      bb0->insn_list().begin(),
+      MachineRegVector({flags0}, machine_ir.arena()),
+      ArenaMap<MachineReg, MachineReg>({{input0, input00}}, machine_ir.arena()),
+      flag_set_insn);
 
   auto insns = bb1->insn_list().begin();
   ASSERT_EQ((*insns)->opcode(), kMachineOpPseudoCopy);
@@ -751,9 +931,13 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersUpdatesLiveInOut) {
       &machine_ir,
       ReadFlagsOptContext{
           bb0,
-          machine_ir.NewInsn<PseudoReadFlags>(
-              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS),
-          machine_ir.NewInsn<AddqRegReg>(input0, input1, kMachineRegFLAGS),
+          MachineInsnList{{machine_ir.NewInsn<PseudoReadFlags>(
+                              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+          MachineInsnList{{machine_ir.NewInsn<AddqRegReg>(input0, input1, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
       },
       bb0->insn_list().begin(),
       MachineRegVector({flags0}, machine_ir.arena()),
@@ -785,17 +969,22 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersDeletesCopies) {
 
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
-  ReplaceFlagRegisters(&machine_ir,
-                       ReadFlagsOptContext{
-                           bb0,
-                           machine_ir.NewInsn<PseudoReadFlags>(
-                               PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS),
-                           machine_ir.NewInsn<AddqRegReg>(flags0, flags0, kMachineRegFLAGS),
-                       },
-                       bb0->insn_list().begin(),
-                       MachineRegVector({flags0}, machine_ir.arena()),
-                       ArenaMap<MachineReg, MachineReg>(machine_ir.arena()),
-                       nullptr);
+  ReplaceFlagRegisters(
+      &machine_ir,
+      ReadFlagsOptContext{
+          bb0,
+          MachineInsnList{{machine_ir.NewInsn<PseudoReadFlags>(
+                              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+          MachineInsnList{{machine_ir.NewInsn<AddqRegReg>(flags0, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+      },
+      bb0->insn_list().begin(),
+      MachineRegVector({flags0}, machine_ir.arena()),
+      ArenaMap<MachineReg, MachineReg>(machine_ir.arena()),
+      nullptr);
   ASSERT_TRUE(std::none_of(bb0->insn_list().begin(), bb0->insn_list().end(), [](MachineInsn* insn) {
     return insn->opcode() == kMachineOpPseudoCopy;
   }));
@@ -823,22 +1012,27 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersCopiesDefRegisters) {
 
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
-  ReplaceFlagRegisters(&machine_ir,
-                       ReadFlagsOptContext{
-                           bb0,
-                           machine_ir.NewInsn<PseudoReadFlags>(
-                               PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS),
-                           machine_ir.NewInsn<AddqRegReg>(input0, input1, kMachineRegFLAGS),
-                       },
-                       bb0->insn_list().begin(),
-                       MachineRegVector({flags0}, machine_ir.arena()),
-                       ArenaMap<MachineReg, MachineReg>(
-                           {
-                               {input0, input00},
-                               {input1, input11},
-                           },
-                           machine_ir.arena()),
-                       nullptr);
+  ReplaceFlagRegisters(
+      &machine_ir,
+      ReadFlagsOptContext{
+          bb0,
+          MachineInsnList{{machine_ir.NewInsn<PseudoReadFlags>(
+                              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+          MachineInsnList{{machine_ir.NewInsn<AddqRegReg>(input0, input1, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+      },
+      bb0->insn_list().begin(),
+      MachineRegVector({flags0}, machine_ir.arena()),
+      ArenaMap<MachineReg, MachineReg>(
+          {
+              {input0, input00},
+              {input1, input11},
+          },
+          machine_ir.arena()),
+      nullptr);
 
   auto insns = bb0->insn_list().begin();
   ASSERT_EQ((*insns)->opcode(), kMachineOpPseudoCopy);

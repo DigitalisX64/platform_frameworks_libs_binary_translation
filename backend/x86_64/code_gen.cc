@@ -26,6 +26,7 @@
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_check.h"
 #include "berberis/backend/x86_64/machine_ir_opt.h"
+#include "berberis/backend/x86_64/read_flags_optimizer.h"
 #include "berberis/backend/x86_64/rename_copy_uses.h"
 #include "berberis/backend/x86_64/rename_vregs.h"
 #include "berberis/base/checks.h"
@@ -57,6 +58,7 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
   RemoveDeadCode(machine_ir);
 
   FoldWriteFlags(machine_ir);
+  OptimizeReadFlags(machine_ir);
 
   AllocRegs(machine_ir);
 

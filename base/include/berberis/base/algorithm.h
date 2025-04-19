@@ -18,12 +18,18 @@
 #define BERBERIS_BASE_ALGORITHM_H_
 
 #include <algorithm>
+#include <iterator>
 
 namespace berberis {
 
 //
 // Non-const container versions.
 //
+
+template <class Container>
+auto EraseFromReverseIterator(Container& container, typename Container::reverse_iterator rit) {
+  return std::reverse_iterator(container.erase(std::prev(rit.base())));
+}
 
 template <class Container, class Value>
 auto Find(Container& container, const Value& value) {

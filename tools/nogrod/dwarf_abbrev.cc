@@ -32,36 +32,16 @@ using berberis::StringPrintf;
 
 class DwarfClasses {
  public:
-  DwarfClasses() { classes_[0] = {}; }
+  DwarfClasses() { classes_ = {}; }
 
   DwarfClasses(std::initializer_list<const DwarfClass*> classes) {
-    classes_[0] = std::vector(classes);
+    classes_ = std::vector(classes);
   }
 
-  DwarfClasses(
-      std::initializer_list<std::map<uint16_t, std::vector<const DwarfClass*>>::value_type> classes)
-      : classes_(classes) {}
-
-  [[nodiscard]] const std::vector<const DwarfClass*>* get(uint16_t version) const {
-    auto candidate = classes_.find(version);
-    if (candidate != classes_.end()) {
-      return &candidate->second;
-    }
-
-    for (auto it = classes_.begin(), end = classes_.end(); it != end; ++it) {
-      if (it->first <= version) {
-        candidate = it;
-      } else {
-        break;
-      }
-    }
-
-    return candidate != classes_.end() ? &candidate->second : nullptr;
-  }
+  [[nodiscard]] const std::vector<const DwarfClass*>* get() const { return &classes_; }
 
  private:
-  // classes for every version
-  std::map<uint16_t, std::vector<const DwarfClass*>> classes_;
+  std::vector<const DwarfClass*> classes_;
 };
 
 struct AbbrevDescriptor {
@@ -130,288 +110,300 @@ const AbbrevDescriptor kFormDescriptors[] = {
 
 const AbbrevDescriptor kNameDescriptors[] = {
   { 0x00, { }, "null" },
-  { 0x01, { { 2, { DwarfClass::kReference } } }, "DW_AT_sibling" },
+  { 0x01, { DwarfClass::kReference }, "DW_AT_sibling" },
   { 0x02, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, DwarfClass::kLoclist } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            DwarfClass::kLoclist,
           }, "DW_AT_location" },
-  { 0x03, { { 2, { DwarfClass::kString } } }, "DW_AT_name" },
+  { 0x03, { DwarfClass::kString }, "DW_AT_name" },
   { 0x04, { }, "Reserved 0x04" },
   { 0x05, { }, "Reserved 0x05" },
   { 0x06, { }, "Reserved 0x06" },
   { 0x07, { }, "Reserved 0x07" },
   { 0x08, { }, "Reserved 0x08" },
-  { 0x09, { { 2, { DwarfClass::kConstant } } }, "DW_AT_ordering" },
+  { 0x09, { DwarfClass::kConstant }, "DW_AT_ordering" },
   { 0x0a, { }, "Reserved 0x0a" },
-  { 0x0b, {
-            { 2, { DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock,
-                   DwarfClass::kConstant,
-                   DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant,
-                   DwarfClass::kExprloc,
-                   DwarfClass::kReference } },
+  { 0x0b, { DwarfClass::kConstant,
+            DwarfClass::kBlock,
+            DwarfClass::kReference,
+            DwarfClass::kExprloc,
           }, "DW_AT_byte_size" },
   { 0x0c, {
-            { 2, { DwarfClass::kConstant } },
-            { 3, { DwarfClass::kConstant,
-                   DwarfClass::kBlock,
-                   DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant,
-                   DwarfClass::kExprloc,
-                   DwarfClass::kReference } },
+            DwarfClass::kConstant,
+            DwarfClass::kBlock,
+            DwarfClass::kExprloc,
+            DwarfClass::kReference,
           }, "DW_AT_bit_offset" }, // Removed in dwarf5??
   { 0x0d, {
-            { 2, { DwarfClass::kConstant } },
-            { 3, { DwarfClass::kConstant,
-                   DwarfClass::kBlock,
-                   DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant,
-                   DwarfClass::kExprloc,
-                   DwarfClass::kReference } },
+            DwarfClass::kConstant,
+            DwarfClass::kBlock,
+            DwarfClass::kExprloc,
+            DwarfClass::kReference,
           }, "DW_AT_bit_size" },
   { 0x0e, { }, "Reserved 0x0e" },
   { 0x0f, { }, "Reserved 0x0f" },
   { 0x10, {
-            { 2, { DwarfClass::kConstant } },
-            { 3, { DwarfClass::kLineptr } },
+            DwarfClass::kConstant,
+            DwarfClass::kLineptr,
           }, "DW_AT_stmt_list" },
-  { 0x11, { { 2, { DwarfClass::kAddress } } }, "DW_AT_low_pc" },
+  { 0x11, { DwarfClass::kAddress }, "DW_AT_low_pc" },
   { 0x12, {
-            { 2, { DwarfClass::kAddress } },
-            { 4, { DwarfClass::kAddress, DwarfClass::kConstant } },
+            DwarfClass::kAddress,
+            DwarfClass::kConstant,
           }, "DW_AT_high_pc" },
-  { 0x13, { { 2, { DwarfClass::kConstant } } }, "DW_AT_language" },
+  { 0x13, { DwarfClass::kConstant }, "DW_AT_language" },
   { 0x14, { }, "Reserved 0x14" },
-  { 0x15, { { 2, { DwarfClass::kReference } } }, "DW_AT_discr" },
-  { 0x16, { { 2, { DwarfClass::kConstant } } }, "DW_AT_discr_value" },
-  { 0x17, { { 2, { DwarfClass::kConstant } } }, "DW_AT_visibility" },
-  { 0x18, { { 2, { DwarfClass::kReference } } }, "DW_AT_import" },
+  { 0x15, { DwarfClass::kReference }, "DW_AT_discr" },
+  { 0x16, { DwarfClass::kConstant }, "DW_AT_discr_value" },
+  { 0x17, { DwarfClass::kConstant }, "DW_AT_visibility" },
+  { 0x18, { DwarfClass::kReference }, "DW_AT_import" },
   { 0x19, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc/*, DwarfClass::kLoclist */, DwarfClass::kReference } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /*, DwarfClass::kLoclist */
+            DwarfClass::kReference,
           }, "DW_AT_string_length" },
-  { 0x1a, { { 2, { DwarfClass::kReference } } }, "DW_AT_common_reference" },
-  { 0x1b, { { 2, { DwarfClass::kString } } }, "DW_AT_comp_dir" },
+  { 0x1a, { DwarfClass::kReference }, "DW_AT_common_reference" },
+  { 0x1b, { DwarfClass::kString }, "DW_AT_comp_dir" },
   { 0x1c, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kString } }
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kString,
           }, "DW_AT_const_value" },
-  { 0x1d, { { 2, { DwarfClass::kReference } } }, "DW_AT_containing_type" },
+  { 0x1d, { DwarfClass::kReference }, "DW_AT_containing_type" },
   { 0x1e, {
-            { 2, { DwarfClass::kReference } },
-            { 5, { DwarfClass::kConstant,
-                   DwarfClass::kReference,
-                   DwarfClass::kFlag } }
-          }, "DW_AT_default_value" },
+            DwarfClass::kReference,
+            DwarfClass::kConstant,
+            DwarfClass::kFlag
+          }, "DW_AT_default_value" }, // manually adjusted from v5
   { 0x1f, { }, "Reserved 0x1f" },
-  { 0x20, { { 2, { DwarfClass::kConstant } } }, "DW_AT_inline" },
-  { 0x21, { { 2, { DwarfClass::kFlag } } }, "DW_AT_is_optional" },
+  { 0x20, { DwarfClass::kConstant }, "DW_AT_inline" },
+  { 0x21, { DwarfClass::kFlag }, "DW_AT_is_optional" },
   { 0x22, {
-            { 2, { DwarfClass::kConstant, DwarfClass::kReference } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kConstant,
+            DwarfClass::kReference,
+            DwarfClass::kBlock,
+            DwarfClass::kExprloc,
           }, "DW_AT_lower_bound" },
   { 0x23, { }, "Reserved 0x23" },
   { 0x24, { }, "Reserved 0x24" },
-  { 0x25, { { 2, { DwarfClass::kString } } }, "DW_AT_producer" },
+  { 0x25, { DwarfClass::kString }, "DW_AT_producer" },
   { 0x26, { }, "Reserved 0x26" },
-  { 0x27, { { 2, { DwarfClass::kFlag } } }, "DW_AT_prototyped" },
+  { 0x27, { DwarfClass::kFlag }, "DW_AT_prototyped" },
   { 0x28, { }, "Reserved 0x28" },
   { 0x29, { }, "Reserved 0x29" },
   { 0x2a, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, /* DwarfClass::kLoclist */ } }
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /* DwarfClass::kLoclist */
           }, "DW_AT_return_addr" },
   { 0x2b, { }, "Reserved 0x2b" },
   { 0x2c, {
-            { 2, { DwarfClass::kConstant } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kRnglistsptr } },
-            { 5, { DwarfClass::kConstant, /* DwarfClass::kRnglist */ } }
+            DwarfClass::kRnglistsptr,
+            DwarfClass::kConstant,
+            /* DwarfClass::kRnglist */
           }, "DW_AT_start_scope" },
   { 0x2d, { }, "Reserved 0x2d" },
   { 0x2e, {
-            { 2, { DwarfClass::kConstant } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kConstant,
+            DwarfClass::kExprloc,
+            DwarfClass::kReference,
           }, "DW_AT_bit_stride" },  // called "DW_AT_stride_size" in dwarf2
   { 0x2f, {
-            { 2, { DwarfClass::kConstant, DwarfClass::kReference } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kConstant,
+            DwarfClass::kReference,
+            DwarfClass::kBlock,
+            DwarfClass::kExprloc,
           }, "DW_AT_upper_bound" },
   { 0x30, { }, "Reserved 0x30" },
-  { 0x31, { { 2, { DwarfClass::kReference } } }, "DW_AT_abstract_origin" },
-  { 0x32, { { 2, { DwarfClass::kConstant } } }, "DW_AT_accessibility" },
-  { 0x33, { { 2, { DwarfClass::kConstant } } }, "DW_AT_address_class" },
-  { 0x34, { { 2, { DwarfClass::kFlag } } }, "DW_AT_artificial" },
-  { 0x35, { { 2, { DwarfClass::kReference } } }, "DW_AT_base_types" },
-  { 0x36, { { 2, { DwarfClass::kConstant } } }, "DW_AT_calling_convention" },
+  { 0x31, { DwarfClass::kReference }, "DW_AT_abstract_origin" },
+  { 0x32, { DwarfClass::kConstant }, "DW_AT_accessibility" },
+  { 0x33, { DwarfClass::kConstant }, "DW_AT_address_class" },
+  { 0x34, { DwarfClass::kFlag }, "DW_AT_artificial" },
+  { 0x35, { DwarfClass::kReference }, "DW_AT_base_types" },
+  { 0x36, { DwarfClass::kConstant }, "DW_AT_calling_convention" },
   { 0x37, {
-            { 2, { DwarfClass::kConstant, DwarfClass::kReference } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kConstant,
+            DwarfClass::kReference,
+            DwarfClass::kBlock,
+            DwarfClass::kExprloc,
           }, "DW_AT_count" },
   { 0x38, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kReference } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kConstant, DwarfClass::kExprloc /*, DwarfClass::kLoclist */ } },
+            DwarfClass::kBlock,
+            DwarfClass::kReference,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /*, DwarfClass::kLoclist */
           }, "DW_AT_data_member_location" },
-  { 0x39, { { 2, { DwarfClass::kConstant } } }, "DW_AT_decl_column" },
-  { 0x3a, { { 2, { DwarfClass::kConstant } } }, "DW_AT_decl_file" },
-  { 0x3b, { { 2, { DwarfClass::kConstant } } }, "DW_AT_decl_line" },
-  { 0x3c, { { 2, { DwarfClass::kFlag } } }, "DW_AT_declaration" },
-  { 0x3d, { { 2, { DwarfClass::kBlock } } }, "DW_AT_discr_list" },
-  { 0x3e, { { 2, { DwarfClass::kConstant } } }, "DW_AT_encoding" },
-  { 0x3f, { { 2, { DwarfClass::kFlag } } }, "DW_AT_external" },
+  { 0x39, { DwarfClass::kConstant }, "DW_AT_decl_column" },
+  { 0x3a, { DwarfClass::kConstant }, "DW_AT_decl_file" },
+  { 0x3b, { DwarfClass::kConstant }, "DW_AT_decl_line" },
+  { 0x3c, { DwarfClass::kFlag }, "DW_AT_declaration" },
+  { 0x3d, { DwarfClass::kBlock }, "DW_AT_discr_list" },
+  { 0x3e, { DwarfClass::kConstant }, "DW_AT_encoding" },
+  { 0x3f, { DwarfClass::kFlag }, "DW_AT_external" },
   { 0x40, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, /* DwarfClass::kLoclist */ } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /* DwarfClass::kLoclist */
           }, "DW_AT_frame_base" },
-  { 0x41, { { 2, { DwarfClass::kReference } } }, "DW_AT_friend" },
-  { 0x42, { { 2, { DwarfClass::kConstant } } }, "DW_AT_identifier_case" },
+  { 0x41, { DwarfClass::kReference }, "DW_AT_friend" },
+  { 0x42, { DwarfClass::kConstant }, "DW_AT_identifier_case" },
   { 0x43, {
-            { 2, { DwarfClass::kConstant } },
-            { 3, { DwarfClass::kMacptr } },
+            DwarfClass::kConstant,
+            DwarfClass::kMacptr,
           }, "DW_AT_macro_info" }, // Removed in dwarf5??
   { 0x44, {
-            { 2, { DwarfClass::kBlock } },
-            { 4, { DwarfClass::kReference } },
+            DwarfClass::kBlock,
+            DwarfClass::kReference,
           }, "DW_AT_namelist_item" },
-  { 0x45, { { 2, { DwarfClass::kReference } } }, "DW_AT_priority" },
+  { 0x45, { DwarfClass::kReference }, "DW_AT_priority" },
   { 0x46, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, /* DwarfClass::kLoclist */ } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /* DwarfClass::kLoclist */
           }, "DW_AT_segment" },
-  { 0x47, { { 2, { DwarfClass::kReference } } }, "DW_AT_specification" },
+  { 0x47, { DwarfClass::kReference }, "DW_AT_specification" },
   { 0x48, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, /* DwarfClass::kLoclist */ } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /* DwarfClass::kLoclist */
           }, "DW_AT_static_link" },
-  { 0x49, { { 2, { DwarfClass::kReference } } }, "DW_AT_type" },
+  { 0x49, { DwarfClass::kReference }, "DW_AT_type" },
   { 0x4a, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kConstant } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, /* DwarfClass::kLoclist */ } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /* DwarfClass::kLoclist */
           }, "DW_AT_use_location" },
-  { 0x4b, { { 2, { DwarfClass::kFlag } } }, "DW_AT_variable_parameter" },
-  { 0x4c, { { 2, { DwarfClass::kConstant } } }, "DW_AT_virtuality" },
+  { 0x4b, { DwarfClass::kFlag }, "DW_AT_variable_parameter" },
+  { 0x4c, { DwarfClass::kConstant }, "DW_AT_virtuality" },
   { 0x4d, {
-            { 2, { DwarfClass::kBlock, DwarfClass::kReference } },
-            { 3, { DwarfClass::kBlock, DwarfClass::kLoclistsptr } },
-            { 4, { DwarfClass::kExprloc, DwarfClass::kLoclistsptr } },
-            { 5, { DwarfClass::kExprloc, /* DwarfClass::kLoclist */ } },
+            DwarfClass::kBlock,
+            DwarfClass::kReference,
+            DwarfClass::kLoclistsptr,
+            DwarfClass::kExprloc,
+            /* DwarfClass::kLoclist */
           }, "DW_AT_vtable_elem_location" },
   // Dwarf 3
   { 0x4e, {
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kExprloc,
+            DwarfClass::kReference,
           }, "DW_AT_allocated" },
   { 0x4f, {
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kBlock,
+            DwarfClass::kReference,
+            DwarfClass::kConstant,
+            DwarfClass::kExprloc,
           }, "DW_AT_associated" },
   { 0x50, {
-            { 3, { DwarfClass::kBlock } },
-            { 4, { DwarfClass::kExprloc } },
+            DwarfClass::kBlock,
+            DwarfClass::kExprloc,
           }, "DW_AT_data_location" },
   { 0x51, {
-            { 3, { DwarfClass::kBlock, DwarfClass::kConstant, DwarfClass::kReference } },
-            { 4, { DwarfClass::kConstant, DwarfClass::kExprloc, DwarfClass::kReference } },
+            DwarfClass::kBlock,
+            DwarfClass::kConstant,
+            DwarfClass::kReference,
+            DwarfClass::kExprloc,
           }, "DW_AT_byte_stride" },
   { 0x52, {
-            { 3, { DwarfClass::kAddress } },
-            { 5, { DwarfClass::kAddress, DwarfClass::kConstant } },
+            DwarfClass::kAddress,
+            DwarfClass::kConstant,
           }, "DW_AT_entry_pc" },
-  { 0x53, { { 3, { DwarfClass::kFlag } } }, "DW_AT_use_UTF8" },
-  { 0x54, { { 3, { DwarfClass::kReference } } }, "DW_AT_extension" },
+  { 0x53, { DwarfClass::kFlag }, "DW_AT_use_UTF8" },
+  { 0x54, { DwarfClass::kReference }, "DW_AT_extension" },
   { 0x55, {
-            { 2, { DwarfClass::kConstant } },  // not in spec, but clang uses this in dwarf2??
-            { 3, { DwarfClass::kRnglistsptr } },
-            { 5, { DwarfClass::kRnglist } },
+            DwarfClass::kConstant,  // not in spec, but clang uses this in dwarf2??
+            DwarfClass::kRnglistsptr,
+            DwarfClass::kRnglist,
           }, "DW_AT_ranges" },
   { 0x56, {
-            { 3, { DwarfClass::kAddress,
-                   DwarfClass::kFlag,
-                   DwarfClass::kReference,
-                   DwarfClass::kString } },
+            DwarfClass::kAddress,
+            DwarfClass::kFlag,
+            DwarfClass::kReference,
+            DwarfClass::kString,
           }, "DW_AT_trampoline" },
   // TODO(b/409026302): DWARF spec states that DW_AT_call_column requires DWARF version >= v3,
   // however this exists in a v2 compile unit in libandroid_runtime DWARF file. As a workaround,
   // we manually set this attribute (as well as a few others below, marked by "manually adjusted")
   // to v2. We should consider removing correct version checking entirely, since such discrepancies
   // occur frequently, and all that matters is that it parses correctly.
-  { 0x57, { { 2, { DwarfClass::kConstant } } }, "DW_AT_call_column" }, // manually adjusted from v3
-  { 0x58, { { 2, { DwarfClass::kConstant } } }, "DW_AT_call_file" }, // manually adjusted from v3
-  { 0x59, { { 2, { DwarfClass::kConstant } } }, "DW_AT_call_line" }, // manually adjusted from v3
-  { 0x5a, { { 3, { DwarfClass::kString } } }, "DW_AT_description" },
-  { 0x5b, { { 3, { DwarfClass::kConstant } } }, "DW_AT_binary_scale" },
-  { 0x5c, { { 3, { DwarfClass::kConstant } } }, "DW_AT_decimal_scale" },
-  { 0x5d, { { 3, { DwarfClass::kReference } } }, "DW_AT_small" },
-  { 0x5e, { { 3, { DwarfClass::kConstant } } }, "DW_AT_decimal_sign" },
-  { 0x5f, { { 3, { DwarfClass::kConstant } } }, "DW_AT_digit_count" },
-  { 0x60, { { 3, { DwarfClass::kString } } }, "DW_AT_picture_string" },
-  { 0x61, { { 3, { DwarfClass::kFlag } } }, "DW_AT_mutable" },
-  { 0x62, { { 3, { DwarfClass::kFlag } } }, "DW_AT_thread_scaled" },
-  { 0x63, { { 3, { DwarfClass::kFlag } } }, "DW_AT_explicit" },
-  { 0x64, { { 3, { DwarfClass::kReference } } }, "DW_AT_object_pointer" },
-  { 0x65, { { 3, { DwarfClass::kConstant } } }, "DW_AT_endianity" },
-  { 0x66, { { 3, { DwarfClass::kFlag } } }, "DW_AT_elemental" },
-  { 0x67, { { 3, { DwarfClass::kFlag } } }, "DW_AT_pure" },
-  { 0x68, { { 3, { DwarfClass::kFlag } } }, "DW_AT_recursive" },
+  { 0x57, {DwarfClass::kConstant }, "DW_AT_call_column" }, // manually adjusted from v3
+  { 0x58, {DwarfClass::kConstant }, "DW_AT_call_file" }, // manually adjusted from v3
+  { 0x59, {DwarfClass::kConstant }, "DW_AT_call_line" }, // manually adjusted from v3
+  { 0x5a, {DwarfClass::kString }, "DW_AT_description" },
+  { 0x5b, {DwarfClass::kConstant }, "DW_AT_binary_scale" },
+  { 0x5c, {DwarfClass::kConstant }, "DW_AT_decimal_scale" },
+  { 0x5d, {DwarfClass::kReference }, "DW_AT_small" },
+  { 0x5e, {DwarfClass::kConstant }, "DW_AT_decimal_sign" },
+  { 0x5f, {DwarfClass::kConstant }, "DW_AT_digit_count" },
+  { 0x60, {DwarfClass::kString }, "DW_AT_picture_string" },
+  { 0x61, {DwarfClass::kFlag }, "DW_AT_mutable" },
+  { 0x62, {DwarfClass::kFlag }, "DW_AT_thread_scaled" },
+  { 0x63, {DwarfClass::kFlag }, "DW_AT_explicit" },
+  { 0x64, {DwarfClass::kReference }, "DW_AT_object_pointer" },
+  { 0x65, {DwarfClass::kConstant }, "DW_AT_endianity" },
+  { 0x66, {DwarfClass::kFlag }, "DW_AT_elemental" },
+  { 0x67, {DwarfClass::kFlag }, "DW_AT_pure" },
+  { 0x68, {DwarfClass::kFlag }, "DW_AT_recursive" },
   // Dwarf 4
-  { 0x69, { { 4, { DwarfClass::kReference } } }, "DW_AT_signature" },
-  { 0x6a, { { 4, { DwarfClass::kFlag } } }, "DW_AT_main_subprogram" },
-  { 0x6b, { { 4, { DwarfClass::kConstant } } }, "DW_AT_data_bit_offset" },
-  { 0x6c, { { 4, { DwarfClass::kFlag } } }, "DW_AT_const_expr" },
-  { 0x6d, { { 4, { DwarfClass::kFlag } } }, "DW_AT_enum_class" },
-  { 0x6e, { { 2, { DwarfClass::kString } } }, "DW_AT_linkage_name" }, // manually adjusted from v4
+  { 0x69, { DwarfClass::kReference }, "DW_AT_signature" },
+  { 0x6a, { DwarfClass::kFlag }, "DW_AT_main_subprogram" },
+  { 0x6b, { DwarfClass::kConstant }, "DW_AT_data_bit_offset" },
+  { 0x6c, { DwarfClass::kFlag }, "DW_AT_const_expr" },
+  { 0x6d, { DwarfClass::kFlag }, "DW_AT_enum_class" },
+  { 0x6e, { DwarfClass::kString }, "DW_AT_linkage_name" }, // manually adjusted from v4
   // Dwarf 5
-  { 0x6f, { { 5, { DwarfClass::kConstant } } }, "DW_AT_string_length_bit_size" },
-  { 0x70, { { 5, { DwarfClass::kConstant } } }, "DW_AT_string_length_byte_size" },
-  { 0x71, { { 5, { DwarfClass::kConstant, DwarfClass::kExprloc } } }, "DW_AT_rank" },
-  { 0x72, { { 5, { DwarfClass::kStroffsetsptr } } }, "DW_AT_str_offset_base" },
-  { 0x73, { { 5, { DwarfClass::kAddrptr } } }, "DW_AT_addr_base" },
-  { 0x74, { { 5, { DwarfClass::kRnglistsptr } } }, "DW_AT_rnglists_base" },
+  { 0x6f, { DwarfClass::kConstant }, "DW_AT_string_length_bit_size" },
+  { 0x70, { DwarfClass::kConstant }, "DW_AT_string_length_byte_size" },
+  { 0x71, { DwarfClass::kConstant, DwarfClass::kExprloc }, "DW_AT_rank" },
+  { 0x72, { DwarfClass::kStroffsetsptr }, "DW_AT_str_offset_base" },
+  { 0x73, { DwarfClass::kAddrptr }, "DW_AT_addr_base" },
+  { 0x74, { DwarfClass::kRnglistsptr }, "DW_AT_rnglists_base" },
   { 0x75, { }, "Unused 0x75" },
-  { 0x76, { { 5, { DwarfClass::kString } } }, "DW_AT_dwo_name" },
+  { 0x76, { DwarfClass::kString }, "DW_AT_dwo_name" },
   // The following are dwarf 5 by spec but clang still injects it to dwarf4
-  { 0x77, { { 4, { DwarfClass::kFlag } } }, "DW_AT_reference" },
-  { 0x78, { { 4, { DwarfClass::kFlag } } }, "DW_AT_rvalue_reference" },
-  { 0x79, { { 5, { DwarfClass::kMacptr } } }, "DW_AT_macros" },
-  { 0x7a, { { 5, { DwarfClass::kFlag } } }, "DW_AT_call_all_calls" },
-  { 0x7b, { { 5, { DwarfClass::kFlag } } }, "DW_AT_call_all_source_calls" },
-  { 0x7c, { { 5, { DwarfClass::kFlag } } }, "DW_AT_call_all_tail_calls" },
-  { 0x7d, { { 5, { DwarfClass::kAddress } } }, "DW_AT_call_return_pc" },
-  { 0x7e, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_value" },
+  { 0x77, { DwarfClass::kFlag }, "DW_AT_reference" },
+  { 0x78, { DwarfClass::kFlag }, "DW_AT_rvalue_reference" },
+  { 0x79, { DwarfClass::kMacptr }, "DW_AT_macros" },
+  { 0x7a, { DwarfClass::kFlag }, "DW_AT_call_all_calls" },
+  { 0x7b, { DwarfClass::kFlag }, "DW_AT_call_all_source_calls" },
+  { 0x7c, { DwarfClass::kFlag }, "DW_AT_call_all_tail_calls" },
+  { 0x7d, { DwarfClass::kAddress }, "DW_AT_call_return_pc" },
+  { 0x7e, { DwarfClass::kExprloc }, "DW_AT_call_value" },
   // kReference is not allowed for DW_AT_call_origin by DWARF5 standard, but it is used by clang
-  { 0x7f, { { 5, { DwarfClass::kExprloc, DwarfClass::kReference } } }, "DW_AT_call_origin" },
-  { 0x80, { { 5, { DwarfClass::kReference } } }, "DW_AT_call_parameter" },
-  { 0x81, { { 5, { DwarfClass::kAddress } } }, "DW_AT_call_pc" },
-  { 0x82, { { 5, { DwarfClass::kFlag } } }, "DW_AT_call_tail_call" },
-  { 0x83, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_target" },
-  { 0x84, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_target_clobbered" },
-  { 0x85, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_data_location" },
-  { 0x86, { { 5, { DwarfClass::kExprloc } } }, "DW_AT_call_data_value" },
+  { 0x7f, { DwarfClass::kExprloc, DwarfClass::kReference }, "DW_AT_call_origin" },
+  { 0x80, { DwarfClass::kReference }, "DW_AT_call_parameter" },
+  { 0x81, { DwarfClass::kAddress }, "DW_AT_call_pc" },
+  { 0x82, { DwarfClass::kFlag }, "DW_AT_call_tail_call" },
+  { 0x83, { DwarfClass::kExprloc }, "DW_AT_call_target" },
+  { 0x84, { DwarfClass::kExprloc }, "DW_AT_call_target_clobbered" },
+  { 0x85, { DwarfClass::kExprloc }, "DW_AT_call_data_location" },
+  { 0x86, { DwarfClass::kExprloc }, "DW_AT_call_data_value" },
   // Apparently clang uses these in dwarf4 CUs
-  { 0x87, { { 2, { DwarfClass::kFlag } } }, "DW_AT_noreturn" }, // manually adjusted from v4
-  { 0x88, { { 2, { DwarfClass::kConstant } } }, "DW_AT_alignment" }, // manually adjusted from v4
-  { 0x89, { { 4, { DwarfClass::kFlag } } }, "DW_AT_export_symbols" },
-  { 0x8a, { { 5, { DwarfClass::kFlag } } }, "DW_AT_deleted" },
-  { 0x8b, { { 5, { DwarfClass::kConstant } } }, "DW_AT_defaulted" },
-  { 0x8c, { { 5, { DwarfClass::kLoclistsptr } } }, "DW_AT_loclists_base" },
+  { 0x87, { DwarfClass::kFlag }, "DW_AT_noreturn" }, // manually adjusted from v4
+  { 0x88, { DwarfClass::kConstant }, "DW_AT_alignment" }, // manually adjusted from v4
+  { 0x89, { DwarfClass::kFlag }, "DW_AT_export_symbols" },
+  { 0x8a, { DwarfClass::kFlag }, "DW_AT_deleted" },
+  { 0x8b, { DwarfClass::kConstant }, "DW_AT_defaulted" },
+  { 0x8c, { DwarfClass::kLoclistsptr }, "DW_AT_loclists_base" },
 };
 // clang-format on
 
@@ -843,10 +835,7 @@ class DwarfClassString : public DwarfClass {
   }
 };
 
-const DwarfClass* FindDwarfClass(uint16_t version,
-                                 uint32_t name,
-                                 uint32_t form,
-                                 std::string* error_msg) {
+const DwarfClass* FindDwarfClass(uint32_t name, uint32_t form, std::string* error_msg) {
   if (form > DW_FORM_MAX_VALUE) {
     *error_msg = StringPrintf("Invalid abbrev attribute form: 0x%x", form);
     return nullptr;
@@ -858,19 +847,18 @@ const DwarfClass* FindDwarfClass(uint16_t version,
     return nullptr;
   }
 
-  auto name_classes = name_descriptor->classes.get(version);
+  auto name_classes = name_descriptor->classes.get();
   if (name_classes == nullptr) {
-    *error_msg = StringPrintf(
-        "failed to lookup classes for %s (0x%x) version=%d", name_descriptor->name, name, version);
+    *error_msg =
+        StringPrintf("failed to lookup classes for %s (0x%x)", name_descriptor->name, name);
     return nullptr;
   }
 
   auto& form_descriptor = kFormDescriptors[form];
-  auto form_classes = form_descriptor.classes.get(version);
+  auto form_classes = form_descriptor.classes.get();
 
   if (form_classes == nullptr) {
-    *error_msg = StringPrintf(
-        "failed to lookup classes for %s (0x%x) version=%d", form_descriptor.name, form, version);
+    *error_msg = StringPrintf("failed to lookup classes for %s (0x%x)", form_descriptor.name, form);
     return nullptr;
   }
 
@@ -899,12 +887,11 @@ const DwarfClass* FindDwarfClass(uint16_t version,
   }
 
   if (result == nullptr) {
-    *error_msg = StringPrintf("form %s (0x%x) is not applicable to the name %s (0x%x) version=%d.",
+    *error_msg = StringPrintf("form %s (0x%x) is not applicable to the name %s (0x%x)",
                               form_descriptor.name,
                               form,
                               name_descriptor->name,
-                              name,
-                              version);
+                              name);
   }
 
   return result;
@@ -975,6 +962,11 @@ std::optional<std::string> DwarfAttributeValue<std::string>::StringValue() const
 }
 
 template <>
+std::optional<uint64_t> DwarfAttributeValue<int64_t>::Uint64Value() const {
+  return value_;
+}
+
+template <>
 std::optional<uint64_t> DwarfAttributeValue<uint64_t>::Uint64Value() const {
   return value_;
 }
@@ -1007,7 +999,6 @@ void DwarfStrXAttribute::Resolve(DwarfContext* context) {
 }
 
 std::unique_ptr<const DwarfAbbrevAttribute> DwarfAbbrevAttribute::CreateAbbrevAttribute(
-    uint16_t version,
     uint32_t name,
     uint32_t form,
     int64_t value,
@@ -1018,7 +1009,7 @@ std::unique_ptr<const DwarfAbbrevAttribute> DwarfAbbrevAttribute::CreateAbbrevAt
     return nullptr;
   }
 
-  const DwarfClass* dwarf_class = FindDwarfClass(version, name, form, error_msg);
+  const DwarfClass* dwarf_class = FindDwarfClass(name, form, error_msg);
 
   if (dwarf_class == nullptr) {
     return nullptr;
