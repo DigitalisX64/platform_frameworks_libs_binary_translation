@@ -14,19 +14,16 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_INTRINSICS_BINDINGS_H_
-#define BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_INTRINSICS_BINDINGS_H_
+#ifndef BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
+#define BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
 
 #include <xmmintrin.h>
 
 #include <cstdint>
 
-#include "berberis/base/dependent_false.h"
-#include "berberis/intrinsics/common/intrinsics_bindings.h"
-#include "berberis/intrinsics/intrinsics_args.h"
-#include "berberis/intrinsics/type_traits.h"
+#include "berberis/intrinsics/common/machine_insn_info.h"
 
-namespace berberis::intrinsics::bindings {
+namespace berberis::machine_insn_info {
 
 class Imm2 {
  public:
@@ -342,6 +339,6 @@ class HasX87;
 class HasCustomCapability;
 class IsAuthenticAMD;
 
-}  // namespace berberis::intrinsics::bindings
+}  // namespace berberis::machine_insn_info
 
-#endif  // BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_INTRINSICS_BINDINGS_H_
+#endif  // BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_

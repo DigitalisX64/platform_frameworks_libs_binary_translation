@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
-#define BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
+#ifndef BERBERIS_INTRINSICS_MACHINE_INSN_INFO_H_
+#define BERBERIS_INTRINSICS_MACHINE_INSN_INFO_H_
 
-#include "berberis/intrinsics/common/intrinsics_bindings.h"
-#include "berberis/intrinsics/machine_insn_info.h"
+#include "berberis/intrinsics/all_to_x86_32_or_x86_64/machine_insn_info.h"
+#include "berberis/intrinsics/common/machine_insn_info.h"
 
-#endif  // BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
+#endif  // BERBERIS_INTRINSICS_MACHINE_INSN_INFO_H_

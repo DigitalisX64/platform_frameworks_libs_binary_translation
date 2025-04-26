@@ -58,33 +58,34 @@ template <typename T, typename = void>
 struct ConstructorArg;
 
 // Immediates expand into their class type.
-template <typename T>
-struct ConstructorArg<ArgTraits<T>, std::enable_if_t<ArgTraits<T>::Class::kIsImmediate, void>> {
-  using type = std::tuple<typename ArgTraits<T>::Class::Type>;
+template <typename T, typename O>
+struct ConstructorArg<ArgTraits<T, O>,
+                      std::enable_if_t<ArgTraits<T, O>::Class::kIsImmediate, void>> {
+  using type = std::tuple<typename ArgTraits<T, O>::Class::Type>;
 };
 
 // Mem ops expand into base register and disp.
-template <typename T>
-struct ConstructorArg<ArgTraits<T>,
-                      std::enable_if_t<!ArgTraits<T>::Class::kIsImmediate &&
-                                           ArgTraits<T>::RegisterClass::kAsRegister == 'm',
+template <typename T, typename O>
+struct ConstructorArg<ArgTraits<T, O>,
+                      std::enable_if_t<!ArgTraits<T, O>::Class::kIsImmediate &&
+                                           ArgTraits<T, O>::RegisterClass::kAsRegister == 'm',
                                        void>> {
-  static_assert(ArgTraits<T>::kUsage == intrinsics::bindings::kDefEarlyClobber);
+  static_assert(ArgTraits<T, O>::kUsage == machine_insn_info::kDefEarlyClobber);
   // Need to emit base register AND disp.
   using type = std::tuple<MachineReg, int32_t>;
 };
 
 // Everything else expands into a MachineReg.
-template <typename T>
-struct ConstructorArg<ArgTraits<T>,
-                      std::enable_if_t<!ArgTraits<T>::Class::kIsImmediate &&
-                                           ArgTraits<T>::RegisterClass::kAsRegister != 'm',
+template <typename T, typename O>
+struct ConstructorArg<ArgTraits<T, O>,
+                      std::enable_if_t<!ArgTraits<T, O>::Class::kIsImmediate &&
+                                           ArgTraits<T, O>::RegisterClass::kAsRegister != 'm',
                                        void>> {
   using type = std::tuple<MachineReg>;
 };
 
 template <typename T>
-using constructor_one_arg_t = typename ConstructorArg<ArgTraits<T>>::type;
+using constructor_one_arg_t = typename ConstructorArg<T>::type;
 
 // Use this alias to generate constructor Args from bindings.
 template <typename... T>
@@ -102,7 +103,7 @@ template <typename T>
 using is_mem_t = is_mem_impl<T>;
 
 template <typename... Bindings>
-constexpr size_t mem_count_v = std::tuple_size_v<filter_t<is_mem_t, ArgTraits<Bindings>...>>;
+constexpr size_t mem_count_v = std::tuple_size_v<filter_t<is_mem_t, Bindings...>>;
 
 template <size_t N, typename... Bindings>
 constexpr bool has_n_mem_v = mem_count_v<Bindings...> > (N - 1);
@@ -136,7 +137,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
   template <typename>
   struct GenMachineInsnInfoT;
   // We want to filter out any bindings that are not used for Register args.
-  using RegBindings = filter_t<has_reg_class_t, ArgTraits<Bindings>...>;
+  using RegBindings = filter_t<has_reg_class_t, Bindings...>;
 
  public:
   // This static simplifies constructing this MachineInsn in intrinsic implementations.
@@ -160,8 +161,8 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
     std::string s(kMnemo);
     // Code below assumes that we have at most two memory operands.
     static_assert(([]<typename Binding> {
-                    if constexpr (!ArgTraits<Binding>::Class::kIsImmediate) {
-                      return ArgTraits<Binding>::Class::kAsRegister == 'm';
+                    if constexpr (!Binding::Class::kIsImmediate) {
+                      return Binding::Class::kAsRegister == 'm';
                     }
                     return false;
                   }.template operator()<Bindings>() +
@@ -173,7 +174,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
           if (arg_idx > 0) {
             s += ", ";
           }
-          if constexpr (ArgTraits<Binding>::Class::kIsImmediate) {
+          if constexpr (Binding::Class::kIsImmediate) {
             // Without static_cast here compilation fails with extemely criptic error message:
             // error: implicit instantiation of undefined template 'berberis::InOutArg<0, 0, …>'
             //   …
@@ -184,7 +185,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
             // Same below.
             s += GetImmOperandDebugString(static_cast<const MachineInsnX86_64*>(this));
             arg_idx++;
-          } else if constexpr (ArgTraits<Binding>::Class::kAsRegister == 'm') {
+          } else if constexpr (Binding::Class::kAsRegister == 'm') {
             if (disp_idx == 0) {
               s += GetBaseDispMemOperandDebugString(static_cast<const MachineInsnX86_64*>(this),
                                                     reg_idx);
@@ -196,7 +197,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
                   disp2());
             }
             arg_idx++, reg_idx++, disp_idx++;
-          } else if constexpr (ArgTraits<Binding>::RegisterClass::kIsImplicitReg) {
+          } else if constexpr (Binding::RegisterClass::kIsImplicitReg) {
             s += GetImplicitRegOperandDebugString(static_cast<const MachineInsnX86_64*>(this),
                                                   reg_idx);
             arg_idx++, reg_idx++;
@@ -216,8 +217,8 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
   void Emit(CodeEmitter* as) const override {
     // Code below assumes that we have at most two memory operands.
     static_assert(([]<typename Binding> {
-                    if constexpr (!ArgTraits<Binding>::Class::kIsImmediate) {
-                      return ArgTraits<Binding>::Class::kAsRegister == 'm';
+                    if constexpr (!Binding::Class::kIsImmediate) {
+                      return Binding::Class::kAsRegister == 'm';
                     }
                     return false;
                   }.template operator()<Bindings>() +
@@ -227,17 +228,16 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
         kMacroInstruction,
         std::tuple_cat(
             std::tuple<CodeEmitter&>{*as}, [&reg_idx, &disp_idx, this]<typename Binding> {
-              if constexpr (ArgTraits<Binding>::Class::kIsImmediate) {
+              if constexpr (Binding::Class::kIsImmediate) {
                 return std::tuple{
                     static_cast<constructor_one_arg_t<Binding>>(MachineInsnX86_64::imm())};
-              } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'x') {
+              } else if constexpr (Binding::RegisterClass::kAsRegister == 'x') {
                 return std::tuple{GetXReg(this->RegAt(reg_idx++))};
-              } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'r' ||
-                                   ArgTraits<Binding>::RegisterClass::kAsRegister == 'q') {
+              } else if constexpr (Binding::RegisterClass::kAsRegister == 'r' ||
+                                   Binding::RegisterClass::kAsRegister == 'q') {
                 return std::tuple{GetGReg(this->RegAt(reg_idx++))};
-              } else if constexpr (ArgTraits<Binding>::RegisterClass::kAsRegister == 'm' &&
-                                   ArgTraits<Binding>::kUsage ==
-                                       intrinsics::bindings::kDefEarlyClobber) {
+              } else if constexpr (Binding::RegisterClass::kAsRegister == 'm' &&
+                                   Binding::kUsage == machine_insn_info::kDefEarlyClobber) {
                 disp_idx++;
                 if (disp_idx == 1) {
                   return std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx++)),
@@ -246,7 +246,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
                   return std::tuple{Assembler::Operand{.base = GetGReg(this->RegAt(reg_idx++)),
                                                        .disp = static_cast<int32_t>(disp2())}};
                 }
-              } else if constexpr (ArgTraits<Binding>::RegisterClass::kIsImplicitReg) {
+              } else if constexpr (Binding::RegisterClass::kIsImplicitReg) {
                 return std::tuple{};
               } else {
                 static_assert(kDependentTypeFalse<Binding>);
@@ -264,7 +264,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
             typename... BindingsRest,
             typename T,
             typename... Args>
-  auto ProcessArgs(T arg, Args... args) -> std::enable_if_t<ArgTraits<B>::Class::kIsImmediate> {
+  auto ProcessArgs(T arg, Args... args) -> std::enable_if_t<B::Class::kIsImmediate> {
     this->set_imm(arg);
     ProcessArgs<reg_idx, disp_idx, BindingsRest...>(args...);
   }
@@ -275,8 +275,7 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
             typename... BindingsRest,
             typename T,
             typename... Args>
-  auto ProcessArgs(T arg, Args... args)
-      -> std::enable_if_t<ArgTraits<B>::RegisterClass::kAsRegister != 'm'> {
+  auto ProcessArgs(T arg, Args... args) -> std::enable_if_t<B::RegisterClass::kAsRegister != 'm'> {
     static_assert(std::is_same_v<MachineReg, T>);
     this->SetRegAt(reg_idx, arg);
     ProcessArgs<reg_idx + 1, disp_idx, BindingsRest...>(args...);
@@ -289,10 +288,11 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
             typename T1,
             typename T2,
             typename... Args>
-  auto ProcessArgs(T1 base, T2 disp, Args... args)
-      -> std::enable_if_t<ArgTraits<B>::RegisterClass::kAsRegister == 'm'> {
+  auto ProcessArgs(T1 base,
+                   T2 disp,
+                   Args... args) -> std::enable_if_t<B::RegisterClass::kAsRegister == 'm'> {
     // Only tmp memory args are supported.
-    static_assert(ArgTraits<B>::arg_info.arg_type == ArgInfo::TMP_ARG);
+    static_assert(B::arg_info.arg_type == ArgInfo::TMP_ARG);
     this->SetRegAt(reg_idx, base);
     if constexpr (disp_idx == 0) {
       this->set_disp(disp);
@@ -319,17 +319,17 @@ class MachineInsn<intrinsics::bindings::IntrinsicBindingInfo<kIntrinsic,
     static constexpr auto kRegClass = &T::RegisterClass::template kRegClass<MachineInsnX86_64>;
     static constexpr auto kRegKind = static_cast<MachineRegKind::StandardAccess>(T::kUsage);
     static_assert(MachineRegKind::kDef ==
-                  static_cast<MachineRegKind::StandardAccess>(intrinsics::bindings::kDef));
-    static_assert(MachineRegKind::kDefEarlyClobber == static_cast<MachineRegKind::StandardAccess>(
-                                                          intrinsics::bindings::kDefEarlyClobber));
+                  static_cast<MachineRegKind::StandardAccess>(machine_insn_info::kDef));
+    static_assert(MachineRegKind::kDefEarlyClobber ==
+                  static_cast<MachineRegKind::StandardAccess>(machine_insn_info::kDefEarlyClobber));
     static_assert(MachineRegKind::kUse ==
-                  static_cast<MachineRegKind::StandardAccess>(intrinsics::bindings::kUse));
+                  static_cast<MachineRegKind::StandardAccess>(machine_insn_info::kUse));
     static_assert(MachineRegKind::kUseDef ==
-                  static_cast<MachineRegKind::StandardAccess>(intrinsics::bindings::kUseDef));
+                  static_cast<MachineRegKind::StandardAccess>(machine_insn_info::kUseDef));
   };
   template <typename T>
   struct RegInfo<T, std::enable_if_t<T::RegisterClass::kAsRegister == 'm', void>> {
-    static_assert(T::kUsage == intrinsics::bindings::kDefEarlyClobber);
+    static_assert(T::kUsage == machine_insn_info::kDefEarlyClobber);
     static constexpr auto kRegClass = &kGeneralReg32;
     static constexpr auto kRegKind = MachineRegKind::kUse;
   };

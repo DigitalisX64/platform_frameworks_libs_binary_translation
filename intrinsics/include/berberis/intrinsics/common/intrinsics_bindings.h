@@ -20,55 +20,13 @@
 #include <cstdint>
 
 #include "berberis/base/dependent_false.h"
+#include "berberis/intrinsics/common/machine_insn_info.h"
 #include "berberis/intrinsics/intrinsics_args.h"
 #include "berberis/intrinsics/type_traits.h"
 
 namespace berberis {
 
 namespace intrinsics::bindings {
-
-class FLAGS {
- public:
-  static constexpr bool kIsImmediate = false;
-  static constexpr bool kIsImplicitReg = true;
-  static constexpr char kAsRegister = 0;
-  template <typename MachineInsnArch>
-  static constexpr auto kRegClass = MachineInsnArch::kFLAGS;
-};
-
-class Mem8 {
- public:
-  using Type = uint8_t;
-  static constexpr bool kIsImmediate = false;
-  static constexpr char kAsRegister = 'm';
-};
-
-class Mem16 {
- public:
-  using Type = uint16_t;
-  static constexpr bool kIsImmediate = false;
-  static constexpr char kAsRegister = 'm';
-};
-
-class Mem32 {
- public:
-  using Type = uint32_t;
-  static constexpr bool kIsImmediate = false;
-  static constexpr char kAsRegister = 'm';
-};
-
-class Mem64 {
- public:
-  using Type = uint64_t;
-  static constexpr bool kIsImmediate = false;
-  static constexpr char kAsRegister = 'm';
-};
-
-enum RegBindingKind { kDef = 2, kDefEarlyClobber = 3, kUse = 5, kUseDef = 7 };
-
-// Tag classes. They are never instantioned, only used as tags to pass information about
-// bindings.
-class NoCPUIDRestriction;  // All CPUs have at least “no CPUID restriction” mode.
 
 // Tag classes. They are never instantioned, only used as tags to pass information about
 // bindings.
@@ -121,15 +79,15 @@ class IntrinsicBindingInfo<kIntrinsicTemplateName,
       TypeTraits<OutputArgumentsTypes>::kName...};
   template <typename Callback, typename... Args>
   constexpr static void ProcessBindings(Callback&& callback, Args&&... args) {
-    (callback(ArgTraits<BindingsTypes>(), std::forward<Args>(args)...), ...);
+    (callback(BindingsTypes(), std::forward<Args>(args)...), ...);
   }
   template <typename Callback, typename... Args>
   constexpr static bool VerifyBindings(Callback&& callback, Args&&... args) {
-    return (callback(ArgTraits<BindingsTypes>(), std::forward<Args>(args)...) && ...);
+    return (callback(BindingsTypes(), std::forward<Args>(args)...) && ...);
   }
   template <typename Callback, typename... Args>
   constexpr static auto MakeTuplefromBindings(Callback&& callback, Args&&... args) {
-    return std::tuple_cat(callback(ArgTraits<BindingsTypes>(), std::forward<Args>(args)...)...);
+    return std::tuple_cat(callback(BindingsTypes(), std::forward<Args>(args)...)...);
   }
   using InputArguments = std::tuple<InputArgumentsTypes...>;
   using OutputArguments = std::tuple<OutputArgumentsTypes...>;
@@ -149,8 +107,8 @@ constexpr void AssignRegisterNumbers(int* register_numbers) {
   IntrinsicBindingInfo::ProcessBindings([&id, &arg_counter, &register_numbers](auto arg) {
     if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
       using RegisterClass = typename decltype(arg)::RegisterClass;
-      if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
-        if constexpr (decltype(arg)::kUsage != intrinsics::bindings::kUse) {
+      if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
+        if constexpr (decltype(arg)::kUsage != machine_insn_info::kUse) {
           register_numbers[arg_counter] = id++;
         }
         ++arg_counter;
@@ -162,8 +120,8 @@ constexpr void AssignRegisterNumbers(int* register_numbers) {
   IntrinsicBindingInfo::ProcessBindings([&id, &arg_counter, &register_numbers](auto arg) {
     if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
       using RegisterClass = typename decltype(arg)::RegisterClass;
-      if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
-        if constexpr (decltype(arg)::kUsage == intrinsics::bindings::kUse) {
+      if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
+        if constexpr (decltype(arg)::kUsage == machine_insn_info::kUse) {
           register_numbers[arg_counter] = id++;
         }
         ++arg_counter;
@@ -178,7 +136,7 @@ constexpr bool CheckIntrinsicHasFlagsBinding() {
   AsmCallInfo::ProcessBindings([&expect_flags](auto arg) constexpr {
     if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
       using RegisterClass = typename decltype(arg)::RegisterClass;
-      if constexpr (std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+      if constexpr (std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
         expect_flags = true;
       }
     }
@@ -192,7 +150,7 @@ constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
   IntrinsicBindingInfo::ProcessBindings([&arg_counter, &as, register_numbers](auto arg) {
     if constexpr (!IsImmediate(decltype(arg)::arg_info)) {
       using RegisterClass = typename decltype(arg)::RegisterClass;
-      if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+      if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
         if constexpr (RegisterClass::kAsRegister != 'm') {
           if constexpr (RegisterClass::kIsImplicitReg) {
             if constexpr (RegisterClass::kAsRegister == 'a') {
@@ -218,7 +176,7 @@ constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
   // Macroassembler constants register points to the constant pool. Intrinsics can read from it
   // but shouldn't change it's address, that's why it's always kUse.
   as->gpr_macroassembler_constants =
-      typename AssemblerType::Register{arg_counter, intrinsics::bindings::kUse};
+      typename AssemblerType::Register{arg_counter, machine_insn_info::kUse};
   arg_counter = 0;
   int scratch_counter = 0;
   std::apply(
@@ -240,15 +198,15 @@ constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
               return std::tuple{2};
             } else {
               using RegisterClass = typename decltype(arg)::RegisterClass;
-              if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+              if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
                 if constexpr (RegisterClass::kAsRegister == 'm') {
-                  static_assert(decltype(arg)::kUsage == intrinsics::bindings::kDefEarlyClobber);
+                  static_assert(decltype(arg)::kUsage == machine_insn_info::kDefEarlyClobber);
                   if (scratch_counter == 0) {
                     as->gpr_macroassembler_scratch = typename AssemblerType::Register(
-                        arg_counter++, intrinsics::bindings::kDefEarlyClobber);
+                        arg_counter++, machine_insn_info::kDefEarlyClobber);
                   } else if (scratch_counter == 1) {
                     as->gpr_macroassembler_scratch2 = typename AssemblerType::Register(
-                        arg_counter++, intrinsics::bindings::kDefEarlyClobber);
+                        arg_counter++, machine_insn_info::kDefEarlyClobber);
                   } else {
                     FATAL("Only two scratch registers are supported for now");
                   }

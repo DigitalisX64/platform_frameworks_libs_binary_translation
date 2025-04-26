@@ -21,6 +21,7 @@
 #include <cstdio>
 
 #include "berberis/base/checks.h"
+#include "berberis/intrinsics/common/machine_insn_info.h"
 
 namespace berberis {
 
@@ -118,35 +119,34 @@ struct ArgInfo {
   const int to = 0;
 };
 
-template <int N, typename RegisterClass, auto kUsage>
+template <int N>
 class InArg;
 
-template <int N, typename RegisterClass, auto kUsage>
+template <int N>
 class OutArg;
 
-template <int N, typename RegisterClass, auto kUsage>
+template <int N>
 class OutTmpArg;
 
-template <int N, int M, typename RegisterClass, auto kUsage>
+template <int N, int M>
 class InOutArg;
 
-template <int N, int M, typename RegisterClass, auto kUsage>
+template <int N, int M>
 class InOutTmpArg;
 
-template <int N, typename RegisterClass, auto kUsage>
+template <int N>
 class InTmpArg;
 
-template <int N, typename ImmType, typename ImmediateClass>
+template <int N, typename ImmType = void>
 class ImmArg;
 
-template <typename RegisterClass, auto kUsage>
 class TmpArg;
 
-template <typename ArgInfo>
+template <typename ArgInfo, typename OperandInfo>
 class ArgTraits;
 
 template <int N, typename RegisterClassType, auto kUsageParam>
-class ArgTraits<InArg<N, RegisterClassType, kUsageParam>> {
+class ArgTraits<InArg<N>, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -155,7 +155,7 @@ class ArgTraits<InArg<N, RegisterClassType, kUsageParam>> {
 };
 
 template <int N, typename RegisterClassType, auto kUsageParam>
-class ArgTraits<OutArg<N, RegisterClassType, kUsageParam>> {
+class ArgTraits<OutArg<N>, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -164,7 +164,7 @@ class ArgTraits<OutArg<N, RegisterClassType, kUsageParam>> {
 };
 
 template <int N, typename RegisterClassType, auto kUsageParam>
-class ArgTraits<OutTmpArg<N, RegisterClassType, kUsageParam>> {
+class ArgTraits<OutTmpArg<N>, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -173,7 +173,7 @@ class ArgTraits<OutTmpArg<N, RegisterClassType, kUsageParam>> {
 };
 
 template <int N, int M, typename RegisterClassType, auto kUsageParam>
-class ArgTraits<InOutArg<N, M, RegisterClassType, kUsageParam>> {
+class ArgTraits<InOutArg<N, M>, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -182,7 +182,7 @@ class ArgTraits<InOutArg<N, M, RegisterClassType, kUsageParam>> {
 };
 
 template <int N, int M, typename RegisterClassType, auto kUsageParam>
-class ArgTraits<InOutTmpArg<N, M, RegisterClassType, kUsageParam>> {
+class ArgTraits<InOutTmpArg<N, M>, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -191,7 +191,7 @@ class ArgTraits<InOutTmpArg<N, M, RegisterClassType, kUsageParam>> {
 };
 
 template <int N, typename RegisterClassType, auto kUsageParam>
-class ArgTraits<InTmpArg<N, RegisterClassType, kUsageParam>> {
+class ArgTraits<InTmpArg<N>, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -199,8 +199,9 @@ class ArgTraits<InTmpArg<N, RegisterClassType, kUsageParam>> {
   static constexpr ArgInfo arg_info{.arg_type = ArgInfo::IN_TMP_ARG, .from = N};
 };
 
-template <int N, typename ImmType, typename ImmediateClassType>
-class ArgTraits<ImmArg<N, ImmType, ImmediateClassType>> {
+template <int N, typename ImmediateClassType>
+class ArgTraits<ImmArg<N>,
+                machine_insn_info::OperandInfo<ImmediateClassType, machine_insn_info::kUse>> {
  public:
   using Class = ImmediateClassType;
   using ImmediateClass = ImmediateClassType;
@@ -208,7 +209,7 @@ class ArgTraits<ImmArg<N, ImmType, ImmediateClassType>> {
 };
 
 template <typename RegisterClassType, auto kUsageParam>
-class ArgTraits<TmpArg<RegisterClassType, kUsageParam>> {
+class ArgTraits<TmpArg, machine_insn_info::OperandInfo<RegisterClassType, kUsageParam>> {
  public:
   using Class = RegisterClassType;
   using RegisterClass = RegisterClassType;
@@ -274,9 +275,9 @@ constexpr bool IsCompatible(const ArgInfo* arguments) {
   return true;
 }
 
-template <typename MachineInsn, typename... Args>
+template <typename MachineInsn, typename... Args, typename... Operands>
 constexpr bool IsCompatible() {
-  const ArgInfo arguments[] = {ArgTraits<Args>::arg_info...};
+  const ArgInfo arguments[] = {ArgTraits<Args, Operands>::arg_info...};
   // Note: we couldn't pass arguments as an array into IsCompatible by reference
   // because this would cause compilation error in case where we have no arguments.
   //

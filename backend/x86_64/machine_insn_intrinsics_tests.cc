@@ -17,8 +17,8 @@
 #include "gtest/gtest.h"
 
 #include "berberis/backend/x86_64/machine_insn_intrinsics.h"
-#include "berberis/intrinsics/all_to_x86_32_or_x86_64/intrinsics_bindings.h"
 #include "berberis/intrinsics/intrinsics_args.h"
+#include "berberis/intrinsics/intrinsics_bindings.h"
 
 namespace berberis {
 
@@ -27,37 +27,60 @@ namespace {
 // TEST(MachineInsnIntrinsicsTest, HasNMem)
 static_assert(x86_64::has_n_mem_v<
               1,
-              TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kDefEarlyClobber>>);
+              ArgTraits<TmpArg,
+                        machine_insn_info::OperandInfo<machine_insn_info::Mem32,
+                                                       machine_insn_info::kDefEarlyClobber>>>);
 static_assert(!x86_64::has_n_mem_v<1>);
 static_assert(!x86_64::has_n_mem_v<
               1,
-              TmpArg<intrinsics::bindings::GeneralReg32, intrinsics::bindings::kDefEarlyClobber>>);
-static_assert(x86_64::has_n_mem_v<2,
-                                  TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kUse>,
-                                  TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kDef>>);
+              ArgTraits<TmpArg,
+                        machine_insn_info::OperandInfo<machine_insn_info::GeneralReg32,
+                                                       machine_insn_info::kDefEarlyClobber>>>);
+static_assert(
+    x86_64::has_n_mem_v<2,
+                        ArgTraits<TmpArg,
+                                  machine_insn_info::OperandInfo<machine_insn_info::Mem32,
+                                                                 machine_insn_info::kUse>>,
+                        ArgTraits<TmpArg,
+                                  machine_insn_info::OperandInfo<machine_insn_info::Mem32,
+                                                                 machine_insn_info::kDef>>>);
 static_assert(!x86_64::has_n_mem_v<
               2,
-              TmpArg<intrinsics::bindings::Mem32, intrinsics::bindings::kDefEarlyClobber>>);
+              ArgTraits<TmpArg,
+                        machine_insn_info::OperandInfo<machine_insn_info::Mem32,
+                                                       machine_insn_info::kDefEarlyClobber>>>);
 
 // TEST(MachineInsnIntrinsicsTest, ConstructorArgs)
 static_assert(
-    std::is_same_v<x86_64::constructor_args_t<
-                       TmpArg<intrinsics::bindings::Mem64, intrinsics::bindings::kDefEarlyClobber>>,
+    std::is_same_v<x86_64::constructor_args_t<ArgTraits<
+                       TmpArg,
+                       machine_insn_info::OperandInfo<machine_insn_info::Mem64,
+                                                      machine_insn_info::kDefEarlyClobber>>>,
                    std::tuple<MachineReg, int32_t>>);
 static_assert(
-    std::is_same_v<x86_64::constructor_args_t<TmpArg<intrinsics::bindings::GeneralReg64,
-                                                     intrinsics::bindings::kDefEarlyClobber>>,
+    std::is_same_v<x86_64::constructor_args_t<ArgTraits<
+                       TmpArg,
+                       machine_insn_info::OperandInfo<machine_insn_info::GeneralReg64,
+                                                      machine_insn_info::kDefEarlyClobber>>>,
                    std::tuple<MachineReg>>);
-static_assert(std::is_same_v<x86_64::constructor_args_t<
-                                 InArg<0, intrinsics::bindings::Imm32, intrinsics::bindings::kUse>>,
-                             std::tuple<int32_t>>);
 static_assert(
     std::is_same_v<
-        x86_64::constructor_args_t<
-            InArg<0, intrinsics::bindings::Imm16, intrinsics::bindings::kUse>,
-            TmpArg<intrinsics::bindings::Mem64, intrinsics::bindings::kDefEarlyClobber>,
-            TmpArg<intrinsics::bindings::GeneralReg64, intrinsics::bindings::kDefEarlyClobber>>,
-        std::tuple<int16_t, MachineReg, int32_t, MachineReg>>);
+        x86_64::constructor_args_t<ArgTraits<
+            InArg<0>,
+            machine_insn_info::OperandInfo<machine_insn_info::Imm32, machine_insn_info::kUse>>>,
+        std::tuple<int32_t>>);
+static_assert(std::is_same_v<
+              x86_64::constructor_args_t<
+                  ArgTraits<InArg<0>,
+                            machine_insn_info::OperandInfo<machine_insn_info::Imm16,
+                                                           machine_insn_info::kUse>>,
+                  ArgTraits<TmpArg,
+                            machine_insn_info::OperandInfo<machine_insn_info::Mem64,
+                                                           machine_insn_info::kDefEarlyClobber>>,
+                  ArgTraits<TmpArg,
+                            machine_insn_info::OperandInfo<machine_insn_info::GeneralReg64,
+                                                           machine_insn_info::kDefEarlyClobber>>>,
+              std::tuple<int16_t, MachineReg, int32_t, MachineReg>>);
 
 }  // namespace
 

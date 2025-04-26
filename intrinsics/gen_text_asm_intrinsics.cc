@@ -101,7 +101,7 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
   int arg_counter = 0;
   IntrinsicBindingInfo::ProcessBindings([&arg_counter, &as, register_numbers](auto arg) {
     using RegisterClass = typename decltype(arg)::RegisterClass;
-    if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
       if constexpr (RegisterClass::kAsRegister != 'm') {
         if constexpr (RegisterClass::kIsImplicitReg) {
           if constexpr (RegisterClass::kAsRegister == 'a') {
@@ -132,7 +132,7 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
                  IntrinsicBindingInfo::MakeTuplefromBindings(
                      [&as, &arg_counter, &scratch_counter, register_numbers](auto arg) {
                        using RegisterClass = typename decltype(arg)::RegisterClass;
-                       if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+                       if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
                          if constexpr (RegisterClass::kAsRegister == 'm') {
                            if (scratch_counter == 0) {
                              as->gpr_macroassembler_scratch =
@@ -224,10 +224,10 @@ void GenerateTemporaries(FILE* out, int indent) {
   std::size_t id = 0;
   IntrinsicBindingInfo::ProcessBindings([out, &id, indent](auto arg) {
     using RegisterClass = typename decltype(arg)::RegisterClass;
-    if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
+    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
       if constexpr (!HaveInput(arg.arg_info) && !HaveOutput(arg.arg_info)) {
-        static_assert(decltype(arg)::kUsage == intrinsics::bindings::kDef ||
-                      decltype(arg)::kUsage == intrinsics::bindings::kDefEarlyClobber);
+        static_assert(decltype(arg)::kUsage == machine_insn_info::kDef ||
+                      decltype(arg)::kUsage == machine_insn_info::kDefEarlyClobber);
         fprintf(out,
                 "%*s%s tmp%zd;\n",
                 indent,
@@ -336,10 +336,10 @@ void GenerateAssemblerOuts(FILE* out, int indent) {
   int tmp_id = 0;
   IntrinsicBindingInfo::ProcessBindings([&outs, &tmp_id](auto arg) {
     using RegisterClass = typename decltype(arg)::RegisterClass;
-    if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS> &&
-                  decltype(arg)::kUsage != intrinsics::bindings::kUse) {
+    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS> &&
+                  decltype(arg)::kUsage != machine_insn_info::kUse) {
       std::string out = "\"=";
-      if constexpr (decltype(arg)::kUsage == intrinsics::bindings::kDefEarlyClobber) {
+      if constexpr (decltype(arg)::kUsage == machine_insn_info::kDefEarlyClobber) {
         out += "&";
       }
       out += RegisterClass::kAsRegister;
@@ -367,8 +367,8 @@ void GenerateAssemblerIns(FILE* out,
   std::vector<std::string> ins;
   IntrinsicBindingInfo::ProcessBindings([&ins](auto arg) {
     using RegisterClass = typename decltype(arg)::RegisterClass;
-    if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS> &&
-                  decltype(arg)::kUsage == intrinsics::bindings::kUse) {
+    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS> &&
+                  decltype(arg)::kUsage == machine_insn_info::kUse) {
       ins.push_back("\"" + std::string(1, RegisterClass::kAsRegister) + "\"(in" +
                     std::to_string(arg.arg_info.from) +
                     (NeedInputShadow<IntrinsicBindingInfo>(arg) ? "_shadow)" : ")"));
@@ -384,9 +384,8 @@ void GenerateAssemblerIns(FILE* out,
   int arg_counter = 0;
   IntrinsicBindingInfo::ProcessBindings([&ins, &arg_counter, register_numbers](auto arg) {
     using RegisterClass = typename decltype(arg)::RegisterClass;
-    if constexpr (!std::is_same_v<RegisterClass, intrinsics::bindings::FLAGS>) {
-      if constexpr (HaveInput(arg.arg_info) &&
-                    decltype(arg)::kUsage != intrinsics::bindings::kUse) {
+    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
+      if constexpr (HaveInput(arg.arg_info) && decltype(arg)::kUsage != machine_insn_info::kUse) {
         ins.push_back("\"" + std::to_string(register_numbers[arg_counter]) + "\"(in" +
                       std::to_string(arg.arg_info.from) +
                       (NeedInputShadow<IntrinsicBindingInfo>(arg) ? "_shadow)" : ")"));
@@ -599,7 +598,7 @@ void GenerateTextAsmIntrinsics(FILE* out) {
         using CPUIDRestriction = IntrinsicBindingInfo::CPUIDRestriction;
         // Note: this series of "if constexpr" expressions is the only place where cpuid_restriction
         // may get a concrete non-zero value;
-        if constexpr (std::is_same_v<CPUIDRestriction, intrinsics::bindings::NoCPUIDRestriction>) {
+        if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::NoCPUIDRestriction>) {
           if (cpuid_restriction) {
             fprintf(out, "  } else {\n");
             cpuid_restriction = nullptr;

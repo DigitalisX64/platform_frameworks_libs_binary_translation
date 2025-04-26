@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 The Android Open Source Project
+ * Copyright (C) 2025 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_INTRINSICS_COMMON_TO_RISCV_INTRINSICS_BINDINGS_H_
-#define BERBERIS_INTRINSICS_COMMON_TO_RISCV_INTRINSICS_BINDINGS_H_
+#ifndef BERBERIS_INTRINSICS_COMMON_TO_RISCV_MACHINE_INSN_INFO_H_
+#define BERBERIS_INTRINSICS_COMMON_TO_RISCV_MACHINE_INSN_INFO_H_
 
 #include <cstdint>
 
 #include "berberis/assembler/riscv.h"
-#include "berberis/base/dependent_false.h"
-#include "berberis/intrinsics/common/intrinsics_bindings.h"
-#include "berberis/intrinsics/intrinsics_args.h"
-#include "berberis/intrinsics/type_traits.h"
+#include "berberis/intrinsics/common/machine_insn_info.h"
 
-namespace berberis::intrinsics::bindings {
+namespace berberis::machine_insn_info {
 
 class BImm {
  public:
@@ -95,6 +92,6 @@ class UImm {
 // bindings.
 class NoCPUIDRestriction;
 
-}  // namespace berberis::intrinsics::bindings
+}  // namespace berberis::machine_insn_info
 
-#endif  // BERBERIS_INTRINSICS_COMMON_TO_RISCV_INTRINSICS_BINDINGS_H_
+#endif  // BERBERIS_INTRINSICS_COMMON_TO_RISCV_MACHINE_INSN_INFO_H_

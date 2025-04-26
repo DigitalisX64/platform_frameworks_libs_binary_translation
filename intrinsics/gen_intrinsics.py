@@ -886,12 +886,13 @@ def _get_reg_operand_info(arg, info_prefix=None):
   if info_prefix is None:
     class_info = ''
   else:
-    class_info = ', %s::%s' % (info_prefix, arg['class'])
+    class_info = '%s::%s' % (info_prefix, arg['class'])
   if arg['class'] == 'Imm8':
     if  info_prefix is None:
       return 'ImmArg<%d, int8_t>' % (arg['ir_arg'])
     else:
-      return 'ImmArg<%d, int8_t%s>' % (arg['ir_arg'], class_info)
+      return 'ImmArg<%d>, machine_insn_info::OperandInfo<%s, %s::kUse>' % (
+         arg['ir_arg'], class_info, info_prefix)
   if info_prefix is None:
     using_info = ''
   else:
@@ -901,34 +902,37 @@ def _get_reg_operand_info(arg, info_prefix=None):
         'use': 'kUse',
         'use_def': 'kUseDef'
     }[arg['usage']])
+  if info_prefix is None:
+    operand_info = ''
+  else:
+    operand_info = ', machine_insn_info::OperandInfo<%s%s>' % (
+        class_info, using_info)
   if arg['usage'] == 'use':
     if need_tmp:
-      return 'InTmpArg<%d%s%s>' % (arg['ir_arg'], class_info, using_info)
-    return 'InArg<%d%s%s>' % (arg['ir_arg'], class_info, using_info)
+      return 'InTmpArg<%d>%s' % (arg['ir_arg'], operand_info)
+    return 'InArg<%d>%s' % (arg['ir_arg'], operand_info)
   if arg['usage'] in ('def', 'def_early_clobber'):
     assert 'ir_arg' not in arg
     if 'ir_res' in arg:
       if need_tmp:
-        return 'OutTmpArg<%d%s%s>' % (arg['ir_res'], class_info, using_info)
-      return 'OutArg<%d%s%s>' % (arg['ir_res'], class_info, using_info)
-    if info_prefix is None:
-      return 'TmpArg'
-    else:
-      return 'TmpArg<%s%s>' % (class_info[2:], using_info)
+        return 'OutTmpArg<%d>%s' % (arg['ir_res'], operand_info)
+      return 'OutArg<%d>%s' % (arg['ir_res'], operand_info)
+    return 'TmpArg%s' % operand_info
   if arg['usage'] == 'use_def':
     if 'ir_res' in arg:
       if need_tmp:
-        return 'InOutTmpArg<%s, %s%s%s>' % (arg['ir_arg'], arg['ir_res'],
-                                                class_info, using_info)
-      return 'InOutArg<%s, %s%s%s>' % (arg['ir_arg'], arg['ir_res'],
-                                           class_info, using_info)
-    return 'InTmpArg<%s%s%s>' % (arg['ir_arg'], class_info, using_info)
+        return 'InOutTmpArg<%s, %s>%s' % (
+          arg['ir_arg'], arg['ir_res'], operand_info)
+      return 'InOutArg<%s, %s>%s' % (
+          arg['ir_arg'], arg['ir_res'], operand_info)
+    return 'InTmpArg<%s>%s' % (
+        arg['ir_arg'], operand_info)
   assert False, 'unknown operand usage %s' % (arg['usage'])
 
 
 def _get_reg_operands_info(args, info_prefix=None):
   return 'std::tuple<%s>' % ', '.join(
-    _get_reg_operand_info(arg, info_prefix)
+    'ArgTraits<%s>' % _get_reg_operand_info(arg, info_prefix)
     for arg in args)
 
 
@@ -1105,12 +1109,12 @@ def _gen_c_intrinsic(name,
   if not check_compatible_assembler(asm):
     return
 
-  cpuid_restriction = 'intrinsics::bindings::NoCPUIDRestriction'
+  cpuid_restriction = 'machine_insn_info::NoCPUIDRestriction'
   if 'feature' in asm:
     if asm['feature'] == 'AuthenticAMD':
-      cpuid_restriction = 'intrinsics::bindings::IsAuthenticAMD'
+      cpuid_restriction = 'machine_insn_info::IsAuthenticAMD'
     else:
-      cpuid_restriction = 'intrinsics::bindings::Has%s' % asm['feature']
+      cpuid_restriction = 'machine_insn_info::Has%s' % asm['feature']
 
   nan_restriction = 'intrinsics::bindings::NoNansOperation'
   if 'nan' in asm:
@@ -1157,7 +1161,7 @@ def _gen_c_intrinsic(name,
          'true' if _intr_has_side_effects(intr) else 'false',
          _get_c_type_tuple(intr['in']),
          _get_c_type_tuple(intr['out']),
-         _get_reg_operands_info(asm['args'], 'intrinsics::bindings')]))
+         _get_reg_operands_info(asm['args'], 'machine_insn_info')]))
   if check_compatible_assembler == _is_translator_compatible_assembler:
     yield '          std::forward<Args>(args)...); result.has_value()) {'
     yield '      return *std::move(result);'
