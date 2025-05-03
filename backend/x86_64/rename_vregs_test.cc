@@ -28,6 +28,8 @@ namespace berberis {
 
 namespace {
 
+constexpr auto kMachineRegRAX = x86_64::MachineRegs::kRAX;
+
 TEST(MachineRenameVRegsTest, AssignNewVRegsInSameBasicBlock) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
@@ -39,7 +41,7 @@ TEST(MachineRenameVRegsTest, AssignNewVRegsInSameBasicBlock) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<x86_64::MovqRegImm>(vreg, 0);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   x86_64::VRegMap vreg_map(&machine_ir);
@@ -52,7 +54,7 @@ TEST(MachineRenameVRegsTest, AssignNewVRegsInSameBasicBlock) {
   it++;
   EXPECT_EQ(new_vreg, (*it)->RegAt(1));
   // Hard regs remain unrenamed.
-  EXPECT_EQ(x86_64::kMachineRegRAX, (*it)->RegAt(0));
+  EXPECT_EQ(kMachineRegRAX, (*it)->RegAt(0));
 }
 
 TEST(MachineRenameVRegsTest, AssignNewVRegsAcrossBasicBlocks) {
@@ -72,7 +74,7 @@ TEST(MachineRenameVRegsTest, AssignNewVRegsAcrossBasicBlocks) {
   builder.Gen<PseudoBranch>(bb2);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   x86_64::VRegMap vreg_map(&machine_ir);
@@ -89,7 +91,7 @@ TEST(MachineRenameVRegsTest, AssignNewVRegsAcrossBasicBlocks) {
   EXPECT_NE(vreg, vreg_in_bb2);
   EXPECT_NE(vreg_in_bb1, vreg_in_bb2);
   // Hard regs remain unrenamed.
-  EXPECT_EQ(x86_64::kMachineRegRAX, (*it)->RegAt(0));
+  EXPECT_EQ(kMachineRegRAX, (*it)->RegAt(0));
 }
 
 TEST(MachineRenameVRegsTest, DataFlowAcrossBasicBlocks) {

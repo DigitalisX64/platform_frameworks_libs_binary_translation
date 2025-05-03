@@ -68,17 +68,49 @@ class Mem64 {
 // error.
 enum RegBindingKind { kDef = 2, kDefEarlyClobber = 3, kUse = 5, kUseDef = 7 };
 
-template <typename RegisterClassTemplateName, RegBindingKind kUsageTemplateName>
+template <typename OperandClass, RegBindingKind kUsageTemplateName>
 class OperandInfo {
  public:
-  using RegisterClass = RegisterClassTemplateName;
+  using Class = OperandClass;
   static constexpr RegBindingKind kUsage = kUsageTemplateName;
-  static_assert(!RegisterClass::kIsImmediate || kUsage == kUse);
+  static_assert(!Class::kIsImmediate || kUsage == kUse);
 };
 
 // Tag classes. They are never instantioned, only used as tags to pass information about
 // bindings.
 class NoCPUIDRestriction;  // All CPUs have at least “no CPUID restriction” mode.
+
+template <auto kMacroInstructionTemplateName, auto kMnemo, auto GetOpcode, typename... Types>
+class AsmCallInfo;
+
+template <auto kMacroInstructionTemplateName,
+          auto kMnemo,
+          auto GetOpcode,
+          typename CPUIDRestrictionTemplateValue,
+          typename... OperandsTypes>
+class AsmCallInfo<kMacroInstructionTemplateName,
+                  kMnemo,
+                  GetOpcode,
+                  CPUIDRestrictionTemplateValue,
+                  std::tuple<OperandsTypes...>>
+    final {
+ public:
+  static constexpr auto kMacroInstruction = kMacroInstructionTemplateName;
+  using CPUIDRestriction = CPUIDRestrictionTemplateValue;
+  template <typename Callback, typename... Args>
+  constexpr static void ProcessOperands(Callback&& callback, Args&&... args) {
+    (callback(OperandsTypes{}, std::forward<Args>(args)...), ...);
+  }
+  template <typename Callback, typename... Args>
+  constexpr static bool VerifyOperands(Callback&& callback, Args&&... args) {
+    return (callback(OperandsTypes{}, std::forward<Args>(args)...) && ...);
+  }
+  template <typename Callback, typename... Args>
+  constexpr static auto MakeTuplefromOperands(Callback&& callback, Args&&... args) {
+    return std::tuple_cat(callback(OperandsTypes{}, std::forward<Args>(args)...)...);
+  }
+  using Operands = std::tuple<OperandsTypes...>;
+};
 
 }  // namespace berberis::machine_insn_info
 

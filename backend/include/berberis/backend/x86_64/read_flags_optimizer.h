@@ -53,6 +53,8 @@ std::optional<MachineInsnList::iterator> IsEligibleReadFlag(MachineIR* machine_i
                                                             Loop* loop,
                                                             MachineBasicBlock* bb,
                                                             MachineInsnList::iterator insn_it);
+std::optional<MachineReg> NeedsToSaveFlags(MachineBasicBlock* bb,
+                                           MachineInsnList::iterator insn_it);
 void OptimizeReadFlags(MachineIR* machine_ir);
 bool RegsLiveInBasicBlock(MachineBasicBlock* bb, const MachineRegVector& regs);
 void RemoveEligibleReadFlagsInLoopTree(MachineIR* machine_ir, LoopTreeNode* loop_tree_node);

@@ -18,21 +18,19 @@
 
 def gen_machine_reg_class_inc(f, reg_classes):
   for reg_class in reg_classes:
+    print(f'class {reg_class.get('name')};', file=f)
+  for reg_class in reg_classes:
     name = reg_class.get('name')
     regs = reg_class.get('regs')
-    print('inline constexpr uint64_t k%sMask =' % (name), file=f)
-    for r in regs[: -1]:
-      print('    (1ULL << kMachineReg%s.reg()) |' % (r), file=f)
-    print('    (1ULL << kMachineReg%s.reg());' % (regs[-1]), file=f)
-    print('inline constexpr MachineRegClass k%s = {' % (name), file=f)
-    print('    "%s",' % (name), file=f)
-    print('    %d,' % (reg_class.get('size')), file=f)
-    print('    k%sMask,' % (name), file=f)
-    print('    %d,' % (len(regs)), file=f)
-    print('    {', file=f)
-    for r in regs:
-      print('      kMachineReg%s,' % (r), file=f)
-    print('    }', file=f)
+    print(f'class {name} {{', file=f)
+    print(' public:', file=f)
+    print(f'  static constexpr const char* kName = "{name}";', file=f)
+    print('  static constexpr size_t kSizeInBits = %d;' %
+        (reg_class.get('size') * 8), file=f)
+    print('  using RegistersList = std::tuple<%s>;' % ', '.join(regs), file=f)
+    print('  template <typename MachineRegDefinitions>', file=f)
+    print('  static constexpr auto kMachineRegId = '
+          f'MachineRegDefinitions::k{name};', file=f)
     print('};', file=f)
 
 

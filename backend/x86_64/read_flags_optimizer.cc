@@ -212,6 +212,15 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
                                MachineInsnList::iterator insn_it,
                                const ArenaMap<MachineReg, MachineReg>& reg_map,
                                MachineReg reg) {
+  auto flag_reg_used = NeedsToSaveFlags(context.bb, insn_it);
+  MachineReg flag_copy;
+  if (flag_reg_used.has_value()) {
+    flag_copy = machine_ir->AllocVReg();
+    context.bb->insn_list().insert(
+        insn_it,
+        machine_ir->NewInsn<PseudoReadFlags>(
+            PseudoReadFlags::kWithOverflow, flag_copy, flag_reg_used.value()));
+  }
   MachineReg flag_reg;
   // First add instruction that sets flags register.
   auto insn_opt = GetInsnGen((*context.flag_set_insn)->opcode());
@@ -250,6 +259,11 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
   insn->SetRegAt(0, reg);
   insn->SetRegAt(1, flag_reg);
   context.bb->insn_list().insert(insn_it, insn);
+
+  if (flag_reg_used.has_value()) {
+    context.bb->insn_list().insert(
+        insn_it, machine_ir->NewInsn<PseudoWriteFlags>(flag_copy, flag_reg_used.value()));
+  }
 }
 
 // Given an iterator that points to a READFLAGS instruction, checks if the
@@ -316,6 +330,29 @@ std::optional<MachineInsnList::iterator> IsEligibleReadFlag(MachineIR* machine_i
   if (flag_setter.has_value() && GetInsnGen((*flag_setter.value())->opcode()).has_value()) {
     return flag_setter.value();
   }
+  return std::nullopt;
+}
+
+// Check if we need to save the flag register because a later instruction uses it. If so, returns
+// the flag MachineReg that's used.
+std::optional<MachineReg> NeedsToSaveFlags(MachineBasicBlock* bb,
+                                           MachineInsnList::iterator insn_it) {
+  for (; insn_it != bb->insn_list().end(); ++insn_it) {
+    for (int i = 0; i < (*insn_it)->NumRegOperands(); i++) {
+      auto reg_kind = (*insn_it)->RegKindAt(i);
+      if (!reg_kind.RegClass()->IsSubsetOf(&kFLAGS)) {
+        continue;
+      }
+      if (reg_kind.IsInput()) {
+        return (*insn_it)->RegAt(i);
+      }
+      // Instruction clobbers it so we don't need to worry about rest of instructions.
+      return std::nullopt;
+    }
+  }
+  // Host flags should never be live_out across basic blocks.
+  // It would be better to do a CHECK but currently there's no way to know
+  // whether a virtual register is a flag or not.
   return std::nullopt;
 }
 

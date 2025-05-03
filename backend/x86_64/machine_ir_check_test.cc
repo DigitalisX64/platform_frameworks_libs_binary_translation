@@ -29,6 +29,8 @@ namespace berberis {
 
 namespace {
 
+constexpr auto kMachineRegRAX = x86_64::MachineRegs::kRAX;
+
 TEST(MachineIRCheckTest, BasicBlockNotDstOfInEdgeLists) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
@@ -190,7 +192,7 @@ TEST(MachineIRCheckTest, MisplacedJump) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<PseudoJump>(kNullGuestAddr);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
 
   EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckFail);
 }
@@ -206,7 +208,7 @@ TEST(MachineIRCheckTest, MisplacedIndirectJump) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<PseudoIndirectJump>(vreg);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
 
   EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckFail);
 }
@@ -228,7 +230,7 @@ TEST(MachineIRCheckTest, MisplacedPseudoBranch) {
   builder.Gen<x86_64::MovqRegImm>(vreg, 0);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckFail);
@@ -253,7 +255,7 @@ TEST(MachineIRCheckTest, MisplacedPseudoCondBranch) {
   builder.Gen<x86_64::MovqRegImm>(vreg, 0);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   builder.StartBasicBlock(bb3);
@@ -278,7 +280,7 @@ TEST(MachineIRCheckTest, NoThenEdgePseudoBranch) {
   builder.Gen<PseudoBranch>(bb2);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckDanglingBasicBlock);
@@ -302,7 +304,7 @@ TEST(MachineIRCheckTest, NoThenEdgePseudoCondBranch) {
   builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb2, bb3, x86_64::kMachineRegFLAGS);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   builder.StartBasicBlock(bb3);
@@ -330,7 +332,7 @@ TEST(MachineIRCheckTest, NoElseEdgePseudoCondBranch) {
   builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb2, bb3, x86_64::kMachineRegFLAGS);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   builder.StartBasicBlock(bb3);

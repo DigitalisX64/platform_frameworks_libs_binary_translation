@@ -25,6 +25,10 @@
 
 namespace berberis::x86_64 {
 
+constexpr auto kMachineRegRAX = MachineRegs::kRAX;
+constexpr auto kMachineRegRCX = MachineRegs::kRCX;
+constexpr auto kMachineRegRBX = MachineRegs::kRBX;
+
 namespace {
 
 TEST(MachineIRRenameCopyUsesMapTest, Basic) {

@@ -26,6 +26,8 @@
 
 namespace berberis {
 
+constexpr auto kMachineRegRAX = x86_64::MachineRegs::kRAX;
+
 std::tuple<const MachineBasicBlock*,
            const MachineBasicBlock*,
            const MachineBasicBlock*,
@@ -49,11 +51,11 @@ BuildDataFlowAcrossBasicBlocks(x86_64::MachineIR* machine_ir) {
   builder.Gen<PseudoBranch>(bb2);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg2);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg2);
   builder.Gen<PseudoBranch>(bb3);
 
   builder.StartBasicBlock(bb3);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg1);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg1);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   return {bb1, bb2, bb3, vreg1, vreg2};
@@ -84,7 +86,7 @@ BuildDataFlowFromTwoPreds(x86_64::MachineIR* machine_ir) {
   builder.Gen<PseudoBranch>(bb3);
 
   builder.StartBasicBlock(bb3);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   return {bb1, bb2, bb3, vreg};
@@ -111,11 +113,11 @@ BuildDataFlowToTwoSuccs(x86_64::MachineIR* machine_ir) {
   builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb2, bb3, x86_64::kMachineRegFLAGS);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   builder.StartBasicBlock(bb3);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   return {bb1, bb2, bb3, vreg};
@@ -199,7 +201,7 @@ BuildDataFlowAcrossEmptyLoop(x86_64::MachineIR* machine_ir) {
   builder.Gen<PseudoBranch>(bb2);
 
   builder.StartBasicBlock(bb4);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   return {bb1, bb2, bb3, bb4, vreg};

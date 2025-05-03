@@ -28,6 +28,8 @@ namespace berberis {
 
 namespace {
 
+constexpr auto kMachineRegRAX = x86_64::MachineRegs::kRAX;
+
 template <typename... VRegs>
 void ExpectNoLiveIns(const x86_64::LivenessAnalyzer* liveness,
                      const MachineBasicBlock* bb,
@@ -72,7 +74,7 @@ TEST(MachineLivenessAnalyzerTest, UseProducesLiveIn) {
   auto* bb = machine_ir.NewBasicBlock();
 
   builder.StartBasicBlock(bb);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   x86_64::LivenessAnalyzer liveness(&machine_ir);
@@ -128,7 +130,7 @@ TEST(MachineLivenessAnalyzerTest, DefKillsUse) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<x86_64::MovqRegImm>(vreg, 0);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   x86_64::LivenessAnalyzer liveness(&machine_ir);
@@ -168,7 +170,7 @@ TEST(MachineLivenessAnalyzerTest, DefDoesNotKillAnotherVReg) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<x86_64::MovqRegImm>(vreg1, 0);
-  builder.Gen<x86_64::MovqRegReg>(x86_64::kMachineRegRAX, vreg2);
+  builder.Gen<x86_64::MovqRegReg>(kMachineRegRAX, vreg2);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   x86_64::LivenessAnalyzer liveness(&machine_ir);

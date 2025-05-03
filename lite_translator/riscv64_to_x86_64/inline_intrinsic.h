@@ -209,10 +209,6 @@ class TryBindingBasedInlineIntrinsic {
                                                                 Result def_result,
                                                                 Args&&... args);
   template <auto kIntrinsicTemplateName,
-            auto kMacroInstructionTemplateName,
-            auto kMnemo,
-            auto GetOpcode,
-            typename kCPUIDRestrictionTemplateValue,
             typename kPreciseNanOperationsHandlingTemplateValue,
             bool kSideEffectsTemplateValue,
             typename... Types>
@@ -319,13 +315,11 @@ class TryBindingBasedInlineIntrinsic {
   }
 
   template <typename ArgBinding, typename OperandInfo, typename IntrinsicBindingInfo>
-  auto /*MakeTuplefromBindingsClient*/ operator()(ArgTraits<ArgBinding, OperandInfo>,
-                                                  IntrinsicBindingInfo) {
-    static constexpr const auto& arg_info = ArgTraits<ArgBinding, OperandInfo>::arg_info;
-    if constexpr (arg_info.arg_type == ArgInfo::IMM_ARG) {
+  auto /*MakeTuplefromBindingsClient*/ operator()(IntrinsicBindingInfo) {
+    if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IMM_ARG) {
       return ProcessArgInput<ArgBinding, OperandInfo, IntrinsicBindingInfo>(reg_alloc_);
     } else {
-      using RegisterClass = typename ArgTraits<ArgBinding, OperandInfo>::RegisterClass;
+      using RegisterClass = typename OperandInfo::Class;
       if constexpr (RegisterClass::kAsRegister == 'x') {
         return ProcessArgInput<ArgBinding, OperandInfo, IntrinsicBindingInfo>(simd_reg_alloc_);
       } else {
@@ -339,76 +333,80 @@ class TryBindingBasedInlineIntrinsic {
             typename IntrinsicBindingInfo,
             typename RegAllocForArg>
   auto ProcessArgInput(RegAllocForArg&& reg_alloc) {
-    static constexpr const auto& arg_info = ArgTraits<ArgBinding, OperandInfo>::arg_info;
-    if constexpr (arg_info.arg_type == ArgInfo::IMM_ARG) {
-      return std::tuple{std::get<arg_info.from>(input_args_)};
+    if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IMM_ARG) {
+      return std::tuple{std::get<ArgBinding::kArgInfo.from>(input_args_)};
     } else {
-      using RegisterClass = typename ArgTraits<ArgBinding, OperandInfo>::RegisterClass;
-      static constexpr auto kUsage = ArgTraits<ArgBinding, OperandInfo>::kUsage;
-      if constexpr (arg_info.arg_type == ArgInfo::IN_ARG) {
-        using Type =
-            std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>;
+      using RegisterClass = typename OperandInfo::Class;
+      static constexpr auto kUsage = OperandInfo::kUsage;
+      if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_ARG) {
+        using Type = std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                          typename IntrinsicBindingInfo::InputArguments>;
         if constexpr (RegisterClass::kAsRegister == 'x' && std::is_integral_v<Type>) {
           auto reg = reg_alloc();
-          Mov<typename TypeTraits<int64_t>::Float>(as_, reg, std::get<arg_info.from>(input_args_));
+          Mov<typename TypeTraits<int64_t>::Float>(
+              as_, reg, std::get<ArgBinding::kArgInfo.from>(input_args_));
           return std::tuple{reg};
         } else {
           static_assert(kUsage == machine_insn_info::kUse);
           static_assert(!RegisterClass::kIsImplicitReg);
-          return std::tuple{std::get<arg_info.from>(input_args_)};
+          return std::tuple{std::get<ArgBinding::kArgInfo.from>(input_args_)};
         }
-      } else if constexpr (arg_info.arg_type == ArgInfo::IN_OUT_ARG) {
-        using Type =
-            std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>;
+      } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_ARG) {
+        using Type = std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                          typename IntrinsicBindingInfo::InputArguments>;
         static_assert(kUsage == machine_insn_info::kUseDef);
         static_assert(!RegisterClass::kIsImplicitReg);
         if constexpr (RegisterClass::kAsRegister == 'x' && std::is_integral_v<Type>) {
           static_assert(std::is_integral_v<
-                        std::tuple_element_t<arg_info.to,
+                        std::tuple_element_t<ArgBinding::kArgInfo.to,
                                              typename IntrinsicBindingInfo::OutputArguments>>);
           CHECK_EQ(result_xmm_reg_, x86_64::Assembler::no_xmm_register);
           result_xmm_reg_ = reg_alloc();
           Mov<typename TypeTraits<int64_t>::Float>(
-              as_, result_xmm_reg_, std::get<arg_info.from>(input_args_));
+              as_, result_xmm_reg_, std::get<ArgBinding::kArgInfo.from>(input_args_));
           return std::tuple{result_xmm_reg_};
         } else {
-          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
-              as_, result_, std::get<arg_info.from>(input_args_));
+          Mov<std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                   typename IntrinsicBindingInfo::InputArguments>>(
+              as_, result_, std::get<ArgBinding::kArgInfo.from>(input_args_));
           return std::tuple{result_};
         }
-      } else if constexpr (arg_info.arg_type == ArgInfo::IN_TMP_ARG) {
+      } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_TMP_ARG) {
         if constexpr (RegisterClass::kAsRegister == 'c') {
-          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
-              as_, as_.rcx, std::get<arg_info.from>(input_args_));
+          Mov<std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                   typename IntrinsicBindingInfo::InputArguments>>(
+              as_, as_.rcx, std::get<ArgBinding::kArgInfo.from>(input_args_));
           return std::tuple{};
         } else if constexpr (RegisterClass::kAsRegister == 'a') {
-          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
-              as_, as_.rax, std::get<arg_info.from>(input_args_));
+          Mov<std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                   typename IntrinsicBindingInfo::InputArguments>>(
+              as_, as_.rax, std::get<ArgBinding::kArgInfo.from>(input_args_));
           return std::tuple{};
         } else {
           static_assert(kUsage == machine_insn_info::kUseDef);
           static_assert(!RegisterClass::kIsImplicitReg);
           auto reg = reg_alloc();
-          Mov<std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>>(
-              as_, reg, std::get<arg_info.from>(input_args_));
+          Mov<std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                   typename IntrinsicBindingInfo::InputArguments>>(
+              as_, reg, std::get<ArgBinding::kArgInfo.from>(input_args_));
           return std::tuple{reg};
         }
-      } else if constexpr (arg_info.arg_type == ArgInfo::IN_OUT_TMP_ARG) {
-        using Type =
-            std::tuple_element_t<arg_info.from, typename IntrinsicBindingInfo::InputArguments>;
+      } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_TMP_ARG) {
+        using Type = std::tuple_element_t<ArgBinding::kArgInfo.from,
+                                          typename IntrinsicBindingInfo::InputArguments>;
         static_assert(kUsage == machine_insn_info::kUseDef);
         static_assert(RegisterClass::kIsImplicitReg);
         if constexpr (RegisterClass::kAsRegister == 'a') {
           CHECK_EQ(result_reg_, x86_64::Assembler::no_register);
-          Mov<Type>(as_, as_.rax, std::get<arg_info.from>(input_args_));
+          Mov<Type>(as_, as_.rax, std::get<ArgBinding::kArgInfo.from>(input_args_));
           result_reg_ = as_.rax;
           return std::tuple{};
         } else {
-          static_assert(kDependentValueFalse<arg_info.arg_type>);
+          static_assert(kDependentValueFalse<ArgBinding::kArgInfo>);
         }
-      } else if constexpr (arg_info.arg_type == ArgInfo::OUT_ARG) {
-        using Type =
-            std::tuple_element_t<arg_info.to, typename IntrinsicBindingInfo::OutputArguments>;
+      } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_ARG) {
+        using Type = std::tuple_element_t<ArgBinding::kArgInfo.to,
+                                          typename IntrinsicBindingInfo::OutputArguments>;
         static_assert(kUsage == machine_insn_info::kDef ||
                       kUsage == machine_insn_info::kDefEarlyClobber);
         if constexpr (RegisterClass::kAsRegister == 'a') {
@@ -429,14 +427,14 @@ class TryBindingBasedInlineIntrinsic {
             return std::tuple{result_};
           }
         }
-      } else if constexpr (arg_info.arg_type == ArgInfo::OUT_TMP_ARG) {
+      } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_TMP_ARG) {
         if constexpr (RegisterClass::kAsRegister == 'd') {
           result_reg_ = as_.rdx;
           return std::tuple{};
         } else {
-          static_assert(kDependentValueFalse<arg_info.arg_type>);
+          static_assert(kDependentValueFalse<ArgBinding::kArgInfo>);
         }
-      } else if constexpr (arg_info.arg_type == ArgInfo::TMP_ARG) {
+      } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::TMP_ARG) {
         static_assert(kUsage == machine_insn_info::kDef ||
                       kUsage == machine_insn_info::kDefEarlyClobber);
         if constexpr (RegisterClass::kAsRegister == 'm') {
@@ -453,7 +451,7 @@ class TryBindingBasedInlineIntrinsic {
           return std::tuple{reg_alloc()};
         }
       } else {
-        static_assert(kDependentValueFalse<arg_info.arg_type>);
+        static_assert(kDependentValueFalse<ArgBinding::kArgInfo>);
       }
     }
   }

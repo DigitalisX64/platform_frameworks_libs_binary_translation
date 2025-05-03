@@ -881,59 +881,49 @@ def _gen_mock_semantics_listener_intrinsics_hooks_impl_inl_h(f, intrs):
     _gen_mock_semantics_listener_hook(f, name, intr)
 
 
-def _get_reg_operand_info(arg, info_prefix=None):
+def _get_binding_info(arg):
   need_tmp = arg['class'] in ('EAX', 'EDX', 'CL', 'ECX')
-  if info_prefix is None:
-    class_info = ''
-  else:
-    class_info = '%s::%s' % (info_prefix, arg['class'])
   if arg['class'] == 'Imm8':
-    if  info_prefix is None:
-      return 'ImmArg<%d, int8_t>' % (arg['ir_arg'])
-    else:
-      return 'ImmArg<%d>, machine_insn_info::OperandInfo<%s, %s::kUse>' % (
-         arg['ir_arg'], class_info, info_prefix)
-  if info_prefix is None:
-    using_info = ''
-  else:
-    using_info = ', %s::%s' % (info_prefix, {
-        'def': 'kDef',
-        'def_early_clobber': 'kDefEarlyClobber',
-        'use': 'kUse',
-        'use_def': 'kUseDef'
-    }[arg['usage']])
-  if info_prefix is None:
-    operand_info = ''
-  else:
-    operand_info = ', machine_insn_info::OperandInfo<%s%s>' % (
-        class_info, using_info)
+    return 'ImmArg<%d>' % (arg['ir_arg'])
   if arg['usage'] == 'use':
     if need_tmp:
-      return 'InTmpArg<%d>%s' % (arg['ir_arg'], operand_info)
-    return 'InArg<%d>%s' % (arg['ir_arg'], operand_info)
+      return 'InTmpArg<%d>' % arg['ir_arg']
+    return 'InArg<%d>' % arg['ir_arg']
   if arg['usage'] in ('def', 'def_early_clobber'):
     assert 'ir_arg' not in arg
     if 'ir_res' in arg:
       if need_tmp:
-        return 'OutTmpArg<%d>%s' % (arg['ir_res'], operand_info)
-      return 'OutArg<%d>%s' % (arg['ir_res'], operand_info)
-    return 'TmpArg%s' % operand_info
+        return 'OutTmpArg<%d>' % arg['ir_res']
+      return 'OutArg<%d>' % arg['ir_res']
+    return 'TmpArg'
   if arg['usage'] == 'use_def':
     if 'ir_res' in arg:
       if need_tmp:
-        return 'InOutTmpArg<%s, %s>%s' % (
-          arg['ir_arg'], arg['ir_res'], operand_info)
-      return 'InOutArg<%s, %s>%s' % (
-          arg['ir_arg'], arg['ir_res'], operand_info)
-    return 'InTmpArg<%s>%s' % (
-        arg['ir_arg'], operand_info)
+        return 'InOutTmpArg<%s, %s>' % (arg['ir_arg'], arg['ir_res'])
+      return 'InOutArg<%s, %s>' % (arg['ir_arg'], arg['ir_res'])
+    return 'InTmpArg<%s>' % (arg['ir_arg'])
   assert False, 'unknown operand usage %s' % (arg['usage'])
 
 
-def _get_reg_operands_info(args, info_prefix=None):
-  return 'std::tuple<%s>' % ', '.join(
-    'ArgTraits<%s>' % _get_reg_operand_info(arg, info_prefix)
-    for arg in args)
+def _get_reg_operand_info(arg):
+  class_info = 'machine_insn_info::%s' % arg['class']
+  if arg['class'] == 'Imm8':
+    return 'machine_insn_info::OperandInfo<%s, machine_insn_info::kUse>' % class_info
+  using_info = ', machine_insn_info::%s' % {
+      'def': 'kDef',
+      'def_early_clobber': 'kDefEarlyClobber',
+      'use': 'kUse',
+      'use_def': 'kUseDef'
+  }[arg['usage']]
+  return 'machine_insn_info::OperandInfo<%s%s>' % (class_info, using_info)
+
+
+def _get_bindings_info(args):
+  return 'std::tuple<%s>' % ', '.join(_get_binding_info(arg) for arg in args)
+
+
+def _get_reg_operands_info(args):
+  return 'std::tuple<%s>' % ', '.join(_get_reg_operand_info(arg) for arg in args)
 
 
 def _gen_make_intrinsics(f, intrs, archs):
@@ -1150,18 +1140,21 @@ def _gen_c_intrinsic(name,
   else:
     yield '    callback('
   yield '          intrinsics::bindings::IntrinsicBindingInfo<'
-  yield '              %s>(),' % (
+  yield '              %s,' % (
     ',\n              '.join(
         [name_label,
-         _get_asm_reference(asm),
-         mnemo_label,
-         _get_builder_reference(intr, asm),
-         cpuid_restriction,
          nan_restriction,
          'true' if _intr_has_side_effects(intr) else 'false',
          _get_c_type_tuple(intr['in']),
          _get_c_type_tuple(intr['out']),
-         _get_reg_operands_info(asm['args'], 'machine_insn_info')]))
+         _get_bindings_info(asm['args'])]))
+  yield '              machine_insn_info::AsmCallInfo<%s>>(),' % (
+    ',\n                  '.join(
+        [_get_asm_reference(asm),
+         mnemo_label,
+         _get_builder_reference(intr, asm),
+         cpuid_restriction,
+         _get_reg_operands_info(asm['args'])]))
   if check_compatible_assembler == _is_translator_compatible_assembler:
     yield '          std::forward<Args>(args)...); result.has_value()) {'
     yield '      return *std::move(result);'

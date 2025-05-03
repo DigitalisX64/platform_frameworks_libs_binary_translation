@@ -201,9 +201,9 @@ Assembler::XMMRegister GetXReg(MachineReg r) {
       Assembler::xmm14,
       Assembler::xmm15,
   };
-  CHECK_GE(r.reg(), kMachineRegXMM0.reg());
-  CHECK_LT(static_cast<unsigned>(r.reg() - kMachineRegXMM0.reg()), std::size(kHardRegs));
-  return kHardRegs[r.reg() - kMachineRegXMM0.reg()];
+  CHECK_GE(r.reg(), MachineRegs::kXMM0.reg());
+  CHECK_LT(static_cast<unsigned>(r.reg() - MachineRegs::kXMM0.reg()), std::size(kHardRegs));
+  return kHardRegs[r.reg() - MachineRegs::kXMM0.reg()];
 }
 
 Assembler::YMMRegister GetYReg(MachineReg r) {

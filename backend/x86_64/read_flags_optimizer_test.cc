@@ -374,6 +374,51 @@ TEST(MachineIRReadFlagsOptimizer, GetInsnGen) {
           PseudoReadFlags::kWithOverflow, machine_ir.AllocVReg(), kMachineRegFLAGS));
 }
 
+TEST(MachineIRReadFlagsOptimizer, InsertFlagGenInstructionsSavesFlagReg) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  auto testloop = BuildBasicLoop(&machine_ir);
+
+  // register we save flags to in BuildBasicLoop.
+  auto flags = (*std::next(testloop.loop_exit->insn_list().begin()))->RegAt(0);
+  auto input0 = (*testloop.loop_exit->insn_list().begin())->RegAt(0);
+  auto input1 = (*testloop.loop_exit->insn_list().begin())->RegAt(1);
+
+  // Note the instructions are inserted in reverse order.
+  testloop.postloop->insn_list().push_front(machine_ir.NewInsn<PseudoReadFlags>(
+      PseudoReadFlags::kWithOverflow, machine_ir.AllocVReg(), kMachineRegFLAGS));
+  testloop.postloop->insn_list().push_front(machine_ir.NewInsn<MovqRegReg>(flags, flags));
+
+  auto context = ReadFlagsOptContext{testloop.postloop,
+                                     std::next(testloop.loop_exit->insn_list().begin()),
+                                     testloop.loop_exit->insn_list().begin()};
+  InsertFlagGenInstructions(
+      &machine_ir,
+      context,
+      testloop.postloop->insn_list().begin(),
+      ArenaMap<MachineReg, MachineReg>({{input0, input0}, {input1, input1}}, machine_ir.arena()),
+      flags);
+
+  // Check that read and write flags instructions inserted.
+  ASSERT_EQ((*testloop.postloop->insn_list().begin())->opcode(), kMachineOpPseudoReadFlags);
+  ASSERT_EQ((*std::next(testloop.postloop->insn_list().begin(), 4))->opcode(),
+            kMachineOpPseudoWriteFlags);
+
+  // Now test that we don't insert read/write flags when we don't need to.
+  testloop.postloop->insn_list().clear();
+  testloop.postloop->insn_list().push_front(machine_ir.NewInsn<PseudoJump>(kNullGuestAddr));
+  testloop.postloop->insn_list().push_front(machine_ir.NewInsn<MovqRegReg>(flags, flags));
+
+  InsertFlagGenInstructions(
+      &machine_ir,
+      context,
+      testloop.postloop->insn_list().begin(),
+      ArenaMap<MachineReg, MachineReg>({{input0, input0}, {input1, input1}}, machine_ir.arena()),
+      flags);
+
+  ASSERT_EQ((*testloop.postloop->insn_list().begin())->opcode(), kMachineOpPseudoCopy);
+}
+
 // Tests that IsEligibleReadFlags makes sure the flag register isn't used in the
 // exit node.
 TEST(MachineIRReadFlagsOptimizer, IsEligibleReadFlagChecksFlagsNotUsedInExitNode) {
@@ -534,6 +579,38 @@ TEST(MachineIRReadFlagsOptimizer, FindFlagSettingInsn) {
   insn_it--;
   flag_setter = FindFlagSettingInsn(insn_it, bb->insn_list().begin(), flags1);
   ASSERT_FALSE(flag_setter.has_value());
+}
+
+TEST(MachineIRReadFlagsOptimizer, NeedsToSaveFlags) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  // Not used so shouldn't need to save.
+  auto bb0 = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb0);
+  builder.Gen<MovqRegReg>(machine_ir.AllocVReg(), machine_ir.AllocVReg());
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+  ASSERT_FALSE(NeedsToSaveFlags(bb0, bb0->insn_list().begin()).has_value());
+
+  // Flags are read so should be saved.
+  auto bb1 = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb1);
+  builder.Gen<MovqRegReg>(machine_ir.AllocVReg(), machine_ir.AllocVReg());
+  builder.Gen<PseudoReadFlags>(
+      PseudoReadFlags::kWithOverflow, machine_ir.AllocVReg(), kMachineRegFLAGS);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+  ASSERT_EQ(NeedsToSaveFlags(bb1, bb1->insn_list().begin()).value(), kMachineRegFLAGS);
+
+  // Flags used but clobbered beforehand so shouldn't need to be saved.
+  auto bb2 = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb2);
+  builder.Gen<MovqRegReg>(machine_ir.AllocVReg(), machine_ir.AllocVReg());
+  builder.Gen<SubqRegImm>(machine_ir.AllocVReg(), 1, kMachineRegFLAGS);
+  builder.Gen<PseudoReadFlags>(
+      PseudoReadFlags::kWithOverflow, machine_ir.AllocVReg(), kMachineRegFLAGS);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+  ASSERT_FALSE(NeedsToSaveFlags(bb2, bb2->insn_list().begin()).has_value());
 }
 
 TEST(MachineIRReadFlagsOptimizer, RemoveEligibleReadFlagsInLoopTree) {

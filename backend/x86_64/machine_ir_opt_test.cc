@@ -31,6 +31,10 @@ namespace berberis {
 
 namespace {
 
+constexpr auto kMachineRegRAX = x86_64::MachineRegs::kRAX;
+constexpr auto kMachineRegRCX = x86_64::MachineRegs::kRCX;
+constexpr auto kMachineRegRBX = x86_64::MachineRegs::kRBX;
+
 TEST(MachineIRRemoveDeadCodeTest, DefKilledByAnotherDef) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
@@ -213,7 +217,7 @@ TEST(MachineIRRemoveDeadCodeTest, HardRegisterAccess) {
   x86_64::MachineIRBuilder builder(&machine_ir);
 
   builder.StartBasicBlock(bb);
-  builder.Gen<x86_64::AddbRegImm>(x86_64::kMachineRegRAX, 3, x86_64::kMachineRegFLAGS);
+  builder.Gen<x86_64::AddbRegImm>(kMachineRegRAX, 3, x86_64::kMachineRegFLAGS);
   builder.Gen<PseudoBranch>(bb);
 
   x86_64::RemoveDeadCode(&machine_ir);
@@ -545,7 +549,7 @@ TEST(MachineIR, ForwardingPseudoBranch) {
   machine_ir.AddEdge(bb1, bb2);
 
   builder.StartBasicBlock(bb0);
-  builder.Gen<x86_64::MovlRegImm>(x86_64::kMachineRegRAX, 23);
+  builder.Gen<x86_64::MovlRegImm>(kMachineRegRAX, 23);
   builder.Gen<PseudoBranch>(bb1);
 
   // Create a forwarder block
@@ -611,7 +615,7 @@ TEST(MachineIR, ForwardingPseudoCondBranchThen) {
   builder.Gen<PseudoBranch>(bb2);
 
   builder.StartBasicBlock(bb2);
-  builder.Gen<x86_64::MovlRegImm>(x86_64::kMachineRegRAX, 23);
+  builder.Gen<x86_64::MovlRegImm>(kMachineRegRAX, 23);
   builder.Gen<PseudoBranch>(bb3);
 
   builder.StartBasicBlock(bb3);
@@ -672,7 +676,7 @@ TEST(MachineIR, ForwardingPseudoCondBranchElse) {
   builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb1, bb2, x86_64::kMachineRegFLAGS);
 
   builder.StartBasicBlock(bb1);
-  builder.Gen<x86_64::MovlRegImm>(x86_64::kMachineRegRAX, 23);
+  builder.Gen<x86_64::MovlRegImm>(kMachineRegRAX, 23);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   // Create a forwarder block
@@ -731,7 +735,7 @@ TEST(MachineIR, EntryForwarderIsNotRemoved) {
 
   // Create a forwarder block
   builder.StartBasicBlock(bb1);
-  builder.Gen<x86_64::MovlRegImm>(x86_64::kMachineRegRAX, 29);
+  builder.Gen<x86_64::MovlRegImm>(kMachineRegRAX, 29);
   builder.Gen<PseudoBranch>(bb2);
 
   builder.StartBasicBlock(bb2);
@@ -876,13 +880,13 @@ TEST(MachineIR, RemoveConsecutiveForwarderBlocks) {
   builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb1, bb3, x86_64::kMachineRegFLAGS);
 
   builder.StartBasicBlock(bb1);
-  builder.Gen<x86_64::MovlRegImm>(x86_64::kMachineRegRAX, 23);
+  builder.Gen<x86_64::MovlRegImm>(kMachineRegRAX, 23);
   builder.Gen<PseudoBranch>(bb2);
 
   // Create a forwarder block.
   builder.StartBasicBlock(bb2);
-  builder.Gen<PseudoCopy>(x86_64::kMachineRegRAX, x86_64::kMachineRegRAX, 4);
-  builder.Gen<PseudoCopy>(x86_64::kMachineRegRBX, x86_64::kMachineRegRBX, 4);
+  builder.Gen<PseudoCopy>(kMachineRegRAX, kMachineRegRAX, 4);
+  builder.Gen<PseudoCopy>(kMachineRegRBX, kMachineRegRBX, 4);
   builder.Gen<PseudoBranch>(bb3);
 
   // Create another forwarder block.
@@ -890,7 +894,7 @@ TEST(MachineIR, RemoveConsecutiveForwarderBlocks) {
   builder.Gen<PseudoBranch>(bb4);
 
   builder.StartBasicBlock(bb4);
-  builder.Gen<x86_64::MovlRegImm>(x86_64::kMachineRegRBX, 7);
+  builder.Gen<x86_64::MovlRegImm>(kMachineRegRBX, 7);
   builder.Gen<PseudoBranch>(bb5);
 
   builder.StartBasicBlock(bb5);
@@ -946,8 +950,8 @@ TEST(MachineIR, RemoveNopPseudoCopy) {
   x86_64::MachineIRBuilder builder(&machine_ir);
 
   builder.StartBasicBlock(bb0);
-  builder.Gen<PseudoCopy>(x86_64::kMachineRegRAX, x86_64::kMachineRegRAX, 4);
-  builder.Gen<PseudoCopy>(x86_64::kMachineRegRBX, x86_64::kMachineRegRCX, 4);
+  builder.Gen<PseudoCopy>(kMachineRegRAX, kMachineRegRAX, 4);
+  builder.Gen<PseudoCopy>(kMachineRegRBX, kMachineRegRCX, 4);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -967,8 +971,8 @@ TEST(MachineIR, RemoveNopPseudoCopy) {
   // to EBX.
   MachineInsn* insn0 = *insn_it;
   EXPECT_EQ(kMachineOpPseudoCopy, insn0->opcode());
-  EXPECT_EQ(x86_64::kMachineRegRBX, insn0->RegAt(0));
-  EXPECT_EQ(x86_64::kMachineRegRCX, insn0->RegAt(1));
+  EXPECT_EQ(kMachineRegRBX, insn0->RegAt(0));
+  EXPECT_EQ(kMachineRegRCX, insn0->RegAt(1));
 
   // Verify that the next instruction is PseudoJump.
   MachineInsn* insn1 = *(++insn_it);

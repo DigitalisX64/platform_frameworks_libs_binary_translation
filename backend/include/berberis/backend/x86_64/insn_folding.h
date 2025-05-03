@@ -28,34 +28,39 @@ namespace berberis::x86_64 {
 class DefMap {
  public:
   DefMap(size_t size, Arena* arena)
-      : def_map_(size, {nullptr, 0}, arena), flags_reg_(kInvalidMachineReg), index_(0) {}
-  [[nodiscard]] std::pair<const MachineInsn*, int> Get(MachineReg reg) const {
+      : def_map_(size, {std::nullopt, 0}, arena), flags_reg_(kInvalidMachineReg), index_(0) {}
+  [[nodiscard]] std::pair<std::optional<MachineInsnList::iterator>, int> Get(MachineReg reg) const {
     if (!reg.IsVReg()) {
-      return {nullptr, 0};
-    }
-    return def_map_.at(reg.GetVRegIndex());
-  }
-  [[nodiscard]] std::pair<const MachineInsn*, int> Get(MachineReg reg, int use_index) const {
-    if (!reg.IsVReg()) {
-      return {nullptr, 0};
+      return {std::nullopt, 0};
     }
     auto [def_insn, def_insn_index] = def_map_.at(reg.GetVRegIndex());
-    if (!def_insn || def_insn_index > use_index) {
-      return {nullptr, 0};
+    if (!def_insn) {
+      return {std::nullopt, 0};
     }
     return {def_insn, def_insn_index};
   }
-  void ProcessInsn(const MachineInsn* insn);
+  [[nodiscard]] std::pair<std::optional<MachineInsnList::iterator>, int> Get(MachineReg reg,
+                                                                             int use_index) const {
+    if (!reg.IsVReg()) {
+      return {std::nullopt, 0};
+    }
+    auto [def_insn, def_insn_index] = def_map_.at(reg.GetVRegIndex());
+    if (!def_insn || def_insn_index >= use_index) {
+      return {std::nullopt, 0};
+    }
+    return {def_insn, def_insn_index};
+  }
+  void ProcessInsn(MachineInsnList::iterator insn_it);
   void Initialize();
 
  private:
-  void Set(MachineReg reg, const MachineInsn* insn) {
+  void Set(MachineReg reg, MachineInsnList::iterator insn_it) {
     if (reg.IsVReg()) {
-      def_map_.at(reg.GetVRegIndex()) = std::pair(insn, index_);
+      def_map_.at(reg.GetVRegIndex()) = std::pair(insn_it, index_);
     }
   }
-  void MapDefRegs(const MachineInsn* insn);
-  ArenaVector<std::pair<const MachineInsn*, int>> def_map_;
+  void MapDefRegs(MachineInsnList::iterator insn_it);
+  ArenaVector<std::pair<std::optional<MachineInsnList::iterator>, int>> def_map_;
   MachineReg flags_reg_;
   int index_;
 };
@@ -65,16 +70,21 @@ class InsnFolding {
   explicit InsnFolding(DefMap& def_map, MachineIR* machine_ir)
       : def_map_(def_map), machine_ir_(machine_ir) {}
 
-  std::tuple<bool, MachineInsn*> TryFoldInsn(const MachineInsn* insn);
+  std::tuple<bool, MachineInsn*> TryFoldInsn(const MachineInsnList::iterator insn,
+                                             const MachineBasicBlock* bb);
 
  private:
   DefMap& def_map_;
   MachineIR* machine_ir_;
   bool IsRegImm(MachineReg reg, uint64_t* imm) const;
-  bool IsWritingSameFlagsValue(const MachineInsn* insn) const;
+  bool IsWritingSameFlagsValue(MachineInsnList::iterator insn_it) const;
+  std::tuple<std::optional<MachineInsnList::iterator>, int> FindNonPseudoCopyDef(
+      MachineReg src_reg) const;
   template <bool is_input_64bit>
-  std::tuple<bool, MachineInsn*> TryFoldImmediateInput(const MachineInsn* insn);
-  std::tuple<bool, MachineInsn*> TryFoldRedundantMovl(const MachineInsn* insn);
+  std::tuple<bool, MachineInsn*> TryFoldImmediateInput(MachineInsnList::iterator insn_it);
+  std::tuple<bool, MachineInsn*> TryFoldRedundantMovl(MachineInsnList::iterator insn_it);
+  std::tuple<bool, MachineInsn*> TryFoldCountLeadingZeroes(MachineInsnList::iterator insn_it,
+                                                           const MachineBasicBlock* bb);
   MachineInsn* NewImmInsnFromRegInsn(const MachineInsn* insn, int32_t imm);
 };
 
