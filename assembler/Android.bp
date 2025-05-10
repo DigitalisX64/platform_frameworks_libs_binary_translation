@@ -130,7 +130,7 @@ genrule {
 genrule {
     name: "libberberis_assembler_gen_public_headers_x86_32",
     out: [
-        "berberis/assembler/gen_assembler_x86_32_and_x86_64-inl.h",
+        "berberis/assembler/gen_assembler_x86_32_or_x86_64-inl.h",
         "berberis/assembler/gen_assembler_x86_32-inl.h",
     ],
     srcs: [":libberberis_assembler_gen_inputs_x86_32"],
@@ -149,7 +149,7 @@ genrule {
 genrule {
     name: "libberberis_assembler_gen_public_headers_x86_64",
     out: [
-        "berberis/assembler/gen_assembler_x86_32_and_x86_64-inl.h",
+        "berberis/assembler/gen_assembler_x86_32_or_x86_64-inl.h",
         "berberis/assembler/gen_assembler_x86_64-inl.h",
     ],
     srcs: [":libberberis_assembler_gen_inputs_x86_64"],

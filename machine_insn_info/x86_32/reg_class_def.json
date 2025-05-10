@@ -1,0 +1,252 @@
+{
+  "License": [
+    "Copyright (C) 2023 The Android Open Source Project",
+    "",
+    "Licensed under the Apache License, Version 2.0 (the “License”);",
+    "you may not use this file except in compliance with the License.",
+    "You may obtain a copy of the License at",
+    "",
+    "     http://www.apache.org/licenses/LICENSE-2.0",
+    "",
+    "Unless required by applicable law or agreed to in writing, software",
+    "distributed under the License is distributed on an “AS IS” BASIS,",
+    "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.",
+    "See the License for the specific language governing permissions and",
+    "limitations under the License."
+  ],
+  "reg_classes": [
+    {
+      "name": "GeneralReg32",
+      "size": 4,
+      "comment": ["EAX, ECX and EDX are often implicit operands, allocate them at the end"],
+      "regs": [
+        "EDI",
+        "ESI",
+        "EBX",
+        "EDX",
+        "ECX",
+        "EAX"
+      ],
+      "gcc_asm_name": "r"
+    },
+    {
+      "name": "XmmReg",
+      "size": 16,
+      "comment": ["XMM0 can be an implicit operand in some instructions, allocate it at the end"],
+      "regs": [
+        "XMM1",
+        "XMM2",
+        "XMM3",
+        "XMM4",
+        "XMM5",
+        "XMM6",
+        "XMM7",
+        "XMM0"
+      ],
+      "gcc_asm_name": "x"
+    },
+    {
+      "name": "YmmReg",
+      "size": 32,
+      "regs": [
+        "XmmReg"
+      ],
+      "gcc_asm_name": "x"
+    },
+    {
+      "name": "Reg32",
+      "size": 4,
+      "regs": [
+        "GeneralReg32",
+        "XmmReg"
+      ]
+    },
+    {
+      "name": "GeneralReg16",
+      "size": 2,
+      "regs": [
+        "GeneralReg32"
+      ],
+      "gcc_asm_name": "r"
+    },
+    {
+      "name": "GeneralReg8",
+      "size": 1,
+      "regs": [
+        "EBX",
+        "EDX",
+        "ECX",
+        "EAX"
+      ],
+      "gcc_asm_name": "r"
+    },
+    {
+      "name": "FpReg64",
+      "size": 8,
+      "regs": [
+        "XmmReg"
+      ],
+      "gcc_asm_name": "x"
+    },
+    {
+      "name": "FpReg32",
+      "size": 4,
+      "regs": [
+        "XmmReg"
+      ],
+      "gcc_asm_name": "x"
+    },
+    {
+      "name": "VecReg128",
+      "size": 16,
+      "regs": [
+        "XmmReg"
+      ],
+      "gcc_asm_name": "x"
+    },
+    {
+      "name": "VecReg256",
+      "size": 32,
+      "regs": [
+        "XmmReg"
+      ],
+      "gcc_asm_name": "x"
+    },
+    {
+      "name": "EAX",
+      "size": 4,
+      "regs": [
+        "EAX"
+      ],
+      "gcc_asm_name": "a"
+    },
+    {
+      "name": "AX",
+      "size": 2,
+      "regs": [
+        "EAX"
+      ],
+      "gcc_asm_name": "a"
+    },
+    {
+      "name": "AL",
+      "size": 1,
+      "regs": [
+        "EAX"
+      ],
+      "gcc_asm_name": "a"
+    },
+    {
+      "name": "EBX",
+      "size": 4,
+      "regs": [
+        "EBX"
+      ],
+      "gcc_asm_name": "b"
+    },
+    {
+      "name": "ECX",
+      "size": 4,
+      "regs": [
+        "ECX"
+      ],
+      "gcc_asm_name": "c"
+    },
+    {
+      "name": "CL",
+      "size": 1,
+      "regs": [
+        "ECX"
+      ],
+      "gcc_asm_name": "c"
+    },
+    {
+      "name": "EDX",
+      "size": 4,
+      "regs": [
+        "EDX"
+      ],
+      "gcc_asm_name": "d"
+    },
+    {
+      "name": "DX",
+      "size": 2,
+      "regs": [
+        "EDX"
+      ],
+      "gcc_asm_name": "d"
+    },
+    {
+      "name": "ESI",
+      "size": 4,
+      "regs": [
+        "ESI"
+      ],
+      "gcc_asm_name": "S"
+    },
+    {
+      "name": "EDI",
+      "size": 4,
+      "regs": [
+        "EDI"
+      ],
+      "gcc_asm_name": "D"
+    },
+    {
+      "name": "XMM0",
+      "size": 16,
+      "regs": [
+        "XMM0"
+      ]
+    },
+    {
+      "name": "XMM1",
+      "size": 16,
+      "regs": [
+        "XMM1"
+      ]
+    },
+    {
+      "name": "XMM2",
+      "size": 16,
+      "regs": [
+        "XMM2"
+      ]
+    },
+    {
+      "name": "XMM3",
+      "size": 16,
+      "regs": [
+        "XMM3"
+      ]
+    },
+    {
+      "name": "XMM4",
+      "size": 16,
+      "regs": [
+        "XMM4"
+      ]
+    },
+    {
+      "name": "XMM5",
+      "size": 16,
+      "regs": [
+        "XMM5"
+      ]
+    },
+    {
+      "name": "XMM6",
+      "size": 16,
+      "regs": [
+        "XMM6"
+      ]
+    },
+    {
+      "name": "XMM7",
+      "size": 16,
+      "regs": [
+        "XMM7"
+      ]
+    }
+  ]
+}

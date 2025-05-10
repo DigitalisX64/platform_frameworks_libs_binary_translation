@@ -150,6 +150,16 @@ class GuestThread {
   size_t sig_alt_stack_size_ = 0;
 };
 
+using GuestThreadExitListenerFn = void (*)(pid_t);
+
+// This function is supposed to be called during BerberisInit() to
+// register a listener to be called during GuestThread exit.
+//
+// Returns:
+//  Old guest thread listener (which could be nullptr), new listener is supposed
+//  to call the old one if it is not nullptr.
+GuestThreadExitListenerFn RegisterGuestThreadExitListener(GuestThreadExitListenerFn new_listener);
+
 }  // namespace berberis
 
 #endif  // BERBERIS_GUEST_OS_PRIMITIVES_GUEST_THREAD_H_

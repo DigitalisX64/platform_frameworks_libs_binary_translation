@@ -61,6 +61,8 @@ class AL {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'a';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_a;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kAL;
 };
@@ -71,6 +73,8 @@ class AX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'a';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_a;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kAX;
 };
@@ -81,6 +85,8 @@ class EAX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'a';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_a;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kEAX;
 };
@@ -91,6 +97,8 @@ class RAX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'a';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_a;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kRAX;
 };
@@ -101,6 +109,8 @@ class EBX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'b';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_b;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kEBX;
 };
@@ -111,6 +121,8 @@ class RBX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'b';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_b;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kRBX;
 };
@@ -121,6 +133,8 @@ class CL {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'c';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_c;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kCL;
 };
@@ -139,6 +153,8 @@ class ECX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'c';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_c;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kECX;
 };
@@ -149,6 +165,8 @@ class RCX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'c';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_c;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kRCX;
 };
@@ -167,6 +185,8 @@ class DX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'd';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_d;
 };
 
 class EDX {
@@ -175,6 +195,8 @@ class EDX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'd';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_d;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kEDX;
 };
@@ -185,6 +207,8 @@ class RDX {
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 'd';
+  template <typename Assembler>
+  static constexpr auto kAssemblerRegisterPointer = &Assembler::gpr_d;
   template <typename MachineInsnArch>
   static constexpr auto kRegClass = MachineInsnArch::kRDX;
 };
@@ -271,6 +295,10 @@ class XmmReg {
 
 class MemX87 {
  public:
+  // MemX87 can only be used as temporary argument, but having type here simplifies metaprogramming:
+  // it can not be used as actual type of variable or parameter, but can be used with
+  // std::conditional_t to pick some other type.
+  using Type = void;
   static constexpr bool kIsImmediate = false;
   static constexpr char kAsRegister = 'm';
 };

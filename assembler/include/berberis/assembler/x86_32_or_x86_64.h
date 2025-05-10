@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_ASSEMBLER_X86_32_AND_X86_64_H_
-#define BERBERIS_ASSEMBLER_X86_32_AND_X86_64_H_
+#ifndef BERBERIS_ASSEMBLER_X86_32_OR_X86_64_H_
+#define BERBERIS_ASSEMBLER_X86_32_OR_X86_64_H_
 
 #include <cstddef>  // std::size_t
 #include <cstdint>
@@ -52,7 +52,7 @@ class Assembler;
 
 }  // namespace x86_64
 
-namespace x86_32_and_x86_64 {
+namespace x86_32_or_x86_64 {
 
 template <typename DerivedAssemblerType>
 class Assembler : public AssemblerBase {
@@ -283,7 +283,7 @@ class Assembler : public AssemblerBase {
   }
 
 // Instructions.
-#include "berberis/assembler/gen_assembler_x86_32_and_x86_64-inl.h"  // NOLINT generated file
+#include "berberis/assembler/gen_assembler_x86_32_or_x86_64-inl.h"  // NOLINT generated file
 
   // Flow control.
   void JmpRel(int32_t offset) {
@@ -938,8 +938,8 @@ constexpr inline void Assembler<DerivedAssemblerType>::Xchgl(Register dest, Regi
   }
 }
 
-}  // namespace x86_32_and_x86_64
+}  // namespace x86_32_or_x86_64
 
 }  // namespace berberis
 
-#endif  // BERBERIS_ASSEMBLER_X86_32_AND_X86_64_H_
+#endif  // BERBERIS_ASSEMBLER_X86_32_OR_X86_64_H_

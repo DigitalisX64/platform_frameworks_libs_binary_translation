@@ -28,6 +28,13 @@ def gen_machine_reg_class_inc(f, reg_classes):
     print('  static constexpr size_t kSizeInBits = %d;' %
         (reg_class.get('size') * 8), file=f)
     print('  using RegistersList = std::tuple<%s>;' % ', '.join(regs), file=f)
+    if 'gcc_asm_name' in reg_class:
+      gcc_asm_name = reg_class.get('gcc_asm_name')
+      print(f'  static constexpr char kAsRegister = \'{gcc_asm_name}\';', file=f)
+      if len(regs) == 1:
+        print('  template <typename Assembler>', file=f)
+        print('  static constexpr auto kAssemblerRegisterPointer = '
+              f'&Assembler::gpr_{gcc_asm_name};', file=f)
     print('  template <typename MachineRegDefinitions>', file=f)
     print('  static constexpr auto kMachineRegId = '
           f'MachineRegDefinitions::k{name};', file=f)

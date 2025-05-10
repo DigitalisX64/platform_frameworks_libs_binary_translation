@@ -16,6 +16,7 @@
 
 #include "berberis/backend/x86_64/read_flags_optimizer.h"
 
+#include <iterator>
 #include <optional>
 
 #include "berberis/backend/common/machine_ir.h"
@@ -391,7 +392,6 @@ void RemoveReadFlags(MachineIR* machine_ir, ReadFlagsOptContext context) {
   insn_it = context.flag_set_insn;
 
   MachineInsn* insn = *insn_it;
-  insn_it++;
 
   // Create copies of input registers.
   ArenaMap<MachineReg, MachineReg> reg_map(machine_ir->arena());
@@ -405,7 +405,8 @@ void RemoveReadFlags(MachineIR* machine_ir, ReadFlagsOptContext context) {
   }
 
   ArenaVector<MachineReg> reg_vec({flags_reg}, machine_ir->arena());
-  ReplaceFlagRegisters(machine_ir, context, insn_it, reg_vec, reg_map, insn);
+  ReplaceFlagRegisters(
+      machine_ir, context, std::next(context.flag_set_insn), reg_vec, reg_map, insn);
 }
 
 // Propagates the copied input registers, and regenerates the EFLAGs register if

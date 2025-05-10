@@ -19,13 +19,13 @@
 
 #include <stdio.h>
 
-#include "berberis/intrinsics/all_to_x86_32_or_x86_64/text_assembler_x86_32_and_x86_64.h"
+#include "berberis/intrinsics/all_to_x86_32_or_x86_64/text_assembler_x86_32_or_x86_64.h"
 
 namespace berberis {
 
-class TextAssembler : public x86_32_and_x86_64::TextAssembler<TextAssembler> {
+class TextAssembler : public x86_32_or_x86_64::TextAssembler<TextAssembler> {
  public:
-  using BaseAssembler = x86_32_and_x86_64::TextAssembler<TextAssembler>;
+  using BaseAssembler = x86_32_or_x86_64::TextAssembler<TextAssembler>;
   using FinalAssembler = TextAssembler;
 
   TextAssembler(int indent, FILE* out) : BaseAssembler(indent, out) {}

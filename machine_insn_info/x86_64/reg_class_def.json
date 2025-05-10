@@ -35,7 +35,8 @@
         "R12",
         "RCX",
         "RAX"
-      ]
+      ],
+      "gcc_asm_name": "r"
     },
     {
       "name": "XmmReg",
@@ -59,14 +60,16 @@
         "XMM14",
         "XMM15",
         "XMM0"
-      ]
+      ],
+      "gcc_asm_name": "x"
     },
     {
       "name": "YmmReg",
       "size": 32,
       "regs": [
         "XmmReg"
-      ]
+      ],
+      "gcc_asm_name": "x"
     },
     {
       "name": "Reg64",
@@ -88,147 +91,168 @@
       "size": 4,
       "regs": [
         "GeneralReg64"
-      ]
+      ],
+      "gcc_asm_name": "r"
     },
     {
       "name": "GeneralReg16",
       "size": 2,
       "regs": [
         "GeneralReg64"
-      ]
+      ],
+      "gcc_asm_name": "r"
     },
     {
       "name": "GeneralReg8",
       "size": 1,
       "regs": [
         "GeneralReg64"
-      ]
+      ],
+      "gcc_asm_name": "r"
     },
     {
       "name": "FpReg64",
       "size": 8,
       "regs": [
         "XmmReg"
-      ]
+      ],
+      "gcc_asm_name": "x"
     },
     {
       "name": "FpReg32",
       "size": 4,
       "regs": [
         "XmmReg"
-      ]
+      ],
+      "gcc_asm_name": "x"
     },
     {
       "name": "VecReg128",
       "size": 16,
       "regs": [
         "XmmReg"
-      ]
+      ],
+      "gcc_asm_name": "x"
     },
     {
       "name": "VecReg256",
       "size": 32,
       "regs": [
         "XmmReg"
-      ]
+      ],
+      "gcc_asm_name": "x"
     },
     {
       "name": "RAX",
       "size": 8,
       "regs": [
         "RAX"
-      ]
+      ],
+      "gcc_asm_name": "a"
     },
     {
       "name": "EAX",
       "size": 4,
       "regs": [
         "RAX"
-      ]
+      ],
+      "gcc_asm_name": "a"
     },
     {
       "name": "AX",
       "size": 2,
       "regs": [
         "RAX"
-      ]
+      ],
+      "gcc_asm_name": "a"
     },
     {
       "name": "AL",
       "size": 1,
       "regs": [
         "RAX"
-      ]
+      ],
+      "gcc_asm_name": "a"
     },
     {
       "name": "RBX",
       "size": 8,
       "regs": [
         "RBX"
-      ]
+      ],
+      "gcc_asm_name": "b"
     },
     {
       "name": "EBX",
       "size": 4,
       "regs": [
         "RBX"
-      ]
+      ],
+      "gcc_asm_name": "b"
     },
     {
       "name": "RCX",
       "size": 8,
       "regs": [
         "RCX"
-      ]
+      ],
+      "gcc_asm_name": "c"
     },
     {
       "name": "ECX",
       "size": 4,
       "regs": [
         "RCX"
-      ]
+      ],
+      "gcc_asm_name": "c"
     },
     {
       "name": "CL",
       "size": 1,
       "regs": [
         "RCX"
-      ]
+      ],
+      "gcc_asm_name": "c"
     },
     {
       "name": "RDX",
       "size": 8,
       "regs": [
         "RDX"
-      ]
+      ],
+      "gcc_asm_name": "d"
     },
     {
       "name": "EDX",
       "size": 4,
       "regs": [
         "RDX"
-      ]
+      ],
+      "gcc_asm_name": "d"
     },
     {
       "name": "DX",
       "size": 2,
       "regs": [
         "RDX"
-      ]
+      ],
+      "gcc_asm_name": "d"
     },
     {
       "name": "RSI",
       "size": 8,
       "regs": [
         "RSI"
-      ]
+      ],
+      "gcc_asm_name": "S"
     },
     {
       "name": "RDI",
       "size": 8,
       "regs": [
         "RDI"
-      ]
+      ],
+      "gcc_asm_name": "D"
     },
     {
       "name": "R8",
@@ -403,7 +427,8 @@
       "size": 0,
       "regs": [
         "FLAGS"
-      ]
+      ],
+      "gcc_asm_name": 0
     }
   ]
 }

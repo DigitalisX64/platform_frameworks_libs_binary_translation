@@ -27,6 +27,7 @@
 #include "berberis/backend/common/machine_ir.h"
 #include "berberis/base/arena_alloc.h"
 #include "berberis/guest_state/guest_state_arch.h"
+#include "berberis/machine_insn_info/x86_64/machine_insn_info.h"
 
 namespace berberis {
 
@@ -53,10 +54,6 @@ enum MachineOpcode : int {
 };
 
 namespace x86_64 {
-
-namespace machine_insn_info_backend {
-#include "machine_reg_class_x86_64-inl.h"  // NOLINT generated file!
-}
 
 class MachineRegs {
  public:

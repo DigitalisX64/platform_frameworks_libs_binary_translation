@@ -35,6 +35,8 @@ pthread_key_t g_guest_thread_key;
 
 namespace {
 
+GuestThreadExitListenerFn g_guest_thread_exit_listener = nullptr;
+
 void GuestThreadDtor(void* /* arg */) {
   // TLS cache was cleared by pthread_exit.
   // TODO(b/280671643): Postpone detach to last pthread destructor iteration.
@@ -43,6 +45,13 @@ void GuestThreadDtor(void* /* arg */) {
 }
 
 }  // namespace
+
+GuestThreadExitListenerFn RegisterGuestThreadExitListener(GuestThreadExitListenerFn new_listener) {
+  CHECK(new_listener != nullptr);
+  auto old_listener = g_guest_thread_exit_listener;
+  g_guest_thread_exit_listener = new_listener;
+  return old_listener;
+}
 
 // Not thread safe, not async signals safe!
 void InitGuestThreadManager() {
@@ -99,6 +108,10 @@ void ExitCurrentThread(int status) {
   GuestThread* thread = GuestThreadMap::GetInstance()->RemoveThread(tid);
   if (kInstrumentGuestThread) {
     OnRemoveGuestThread(tid, thread);
+  }
+
+  if (g_guest_thread_exit_listener != nullptr) {
+    g_guest_thread_exit_listener(tid);
   }
 
   TRACE("guest thread exited %d", tid);

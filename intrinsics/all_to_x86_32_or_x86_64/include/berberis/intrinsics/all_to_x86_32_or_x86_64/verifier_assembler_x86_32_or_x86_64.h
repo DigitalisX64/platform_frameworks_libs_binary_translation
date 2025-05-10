@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_VERIFIER_ASSEMBLER_COMMON_H_
-#define BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_VERIFIER_ASSEMBLER_COMMON_H_
+#ifndef BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_X86_64_VERIFIER_ASSEMBLER_COMMON_H_
+#define BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_X86_64_VERIFIER_ASSEMBLER_COMMON_H_
 
 #include <array>
 #include <cstdint>
@@ -31,7 +31,7 @@
 
 namespace berberis {
 
-namespace x86_32_and_x86_64 {
+namespace x86_32_or_x86_64 {
 
 template <typename DerivedAssemblerType>
 class VerifierAssembler {
@@ -898,8 +898,8 @@ class VerifierAssembler {
   void operator=(VerifierAssembler&&) = delete;
 };
 
-}  // namespace x86_32_and_x86_64
+}  // namespace x86_32_or_x86_64
 
 }  // namespace berberis
 
-#endif  // BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_VERIFIER_ASSEMBLER_COMMON_H_
+#endif  // BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_X86_64_VERIFIER_ASSEMBLER_COMMON_H_

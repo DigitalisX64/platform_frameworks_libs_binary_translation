@@ -471,7 +471,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::TMP_ARG) {
       static_assert(kUsage == machine_insn_info::kDef ||
                     kUsage == machine_insn_info::kDefEarlyClobber);
-      if constexpr (RegisterClass::kAsRegister == 'm') {
+      if constexpr (machine_insn_info::kIsMemoryOperand<OperandInfo>) {
         static_assert(kUsage == machine_insn_info::kDefEarlyClobber);
         if (scratch_arg_ >= 2) {
           FATAL("Only two scratch registers are supported for now");
@@ -533,11 +533,12 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
 
   template <typename ArgBinding, typename OperandInfo, typename IntrinsicBindingInfo>
   void ProcessBindingResult() {
-    if constexpr (OperandInfo::Class::kIsImmediate) {
+    if constexpr (machine_insn_info::kIsImmediate<OperandInfo> ||
+                  machine_insn_info::kIsMemoryOperand<OperandInfo>) {
       return;
     } else {
       using RegisterClass = typename OperandInfo::Class;
-      if constexpr (RegisterClass::kAsRegister == 'm' || RegisterClass::kAsRegister == 0) {
+      if constexpr (!RegisterClass::kAsRegister) {
         return;
       } else if constexpr ((ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_ARG ||
                             ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_ARG) &&

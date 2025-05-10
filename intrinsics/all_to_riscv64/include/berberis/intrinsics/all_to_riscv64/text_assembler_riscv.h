@@ -197,19 +197,6 @@ class TextAssembler {
   static constexpr const char* kCPUIDRestrictionString =
       DerivedAssemblerType::template CPUIDRestrictionToString<CPUIDRestriction>();
 
-  // RISC-V doesn't have “a”, “b”, “c”, or “d” registers, but we need these to be able to compile
-  // the code generator.
-  template <char kConstraint>
-  class UnsupportedRegister {
-   public:
-    UnsupportedRegister operator=(Register) {
-      LOG_ALWAYS_FATAL("Registers of the class “%c” don't exist on RISC-V", kConstraint);
-    }
-  };
-  UnsupportedRegister<'a'> gpr_a;
-  UnsupportedRegister<'b'> gpr_b;
-  UnsupportedRegister<'c'> gpr_c;
-  UnsupportedRegister<'d'> gpr_d;
   // Note: stack pointer is not reflected in list of arguments, intrinsics use
   // it implicitly.
   Register gpr_s{Register::kStackPointer};

@@ -103,24 +103,11 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
                                          &as,
                                          register_numbers]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-      if constexpr (RegisterClass::kAsRegister != 'm') {
-        if constexpr (RegisterClass::kIsImplicitReg) {
-          if constexpr (RegisterClass::kAsRegister == 'a') {
-            as->gpr_a =
-                typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
-          } else if constexpr (RegisterClass::kAsRegister == 'b') {
-            as->gpr_b =
-                typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
-          } else if constexpr (RegisterClass::kAsRegister == 'c') {
-            as->gpr_c =
-                typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
-          } else {
-            static_assert(RegisterClass::kAsRegister == 'd');
-            as->gpr_d =
-                typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
-          }
-        }
+    if constexpr (machine_insn_info::kIsRegister<Operand> &&
+                  !std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
+      if constexpr (RegisterClass::kIsImplicitReg) {
+        as->*(RegisterClass::template kAssemblerRegisterPointer<MacroAssembler<TextAssembler>>) =
+            typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
       }
       ++arg_counter;
     }
@@ -128,43 +115,44 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
   as->gpr_macroassembler_constants = typename MacroAssembler<TextAssembler>::Register(arg_counter);
   arg_counter = 0;
   int scratch_counter = 0;
-  std::apply(IntrinsicBindingInfo::kMacroInstruction,
-             std::tuple_cat(
-                 std::tuple<MacroAssembler<TextAssembler>&>{*as},
-                 IntrinsicBindingInfo::MakeTuplefromBindings(
-                     [&as,
-                      &arg_counter,
-                      &scratch_counter,
-                      register_numbers]<typename Binding, typename Operand> {
-                       using RegisterClass = Operand::Class;
-                       if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-                         if constexpr (RegisterClass::kAsRegister == 'm') {
-                           if (scratch_counter == 0) {
-                             as->gpr_macroassembler_scratch =
-                                 typename MacroAssembler<TextAssembler>::Register(arg_counter++);
-                           } else if (scratch_counter == 1) {
-                             as->gpr_macroassembler_scratch2 =
-                                 typename MacroAssembler<TextAssembler>::Register(arg_counter++);
+  std::apply(
+      IntrinsicBindingInfo::kMacroInstruction,
+      std::tuple_cat(std::tuple<MacroAssembler<TextAssembler>&>{*as},
+                     IntrinsicBindingInfo::MakeTuplefromBindings(
+                         [&as,
+                          &arg_counter,
+                          &scratch_counter,
+                          register_numbers]<typename Binding, typename Operand> {
+                           if constexpr (machine_insn_info::kIsMemoryOperand<Operand>) {
+                             if (scratch_counter == 0) {
+                               as->gpr_macroassembler_scratch =
+                                   typename MacroAssembler<TextAssembler>::Register(arg_counter++);
+                             } else if (scratch_counter == 1) {
+                               as->gpr_macroassembler_scratch2 =
+                                   typename MacroAssembler<TextAssembler>::Register(arg_counter++);
+                             } else {
+                               FATAL("Only two scratch registers are supported for now");
+                             }
+                             // Note: as->gpr_scratch in combination with offset is treated by text
+                             // assembler specially.  We rely on offset set here to be the same as
+                             // scratch2 address in scratch buffer.
+                             return std::tuple{typename MacroAssembler<TextAssembler>::Operand{
+                                 .base = as->gpr_scratch,
+                                 .disp = static_cast<int32_t>(config::kScratchAreaSlotSize *
+                                                              scratch_counter++)}};
+                           } else if constexpr (machine_insn_info::kIsRegister<Operand> &&
+                                                !std::is_same_v<typename Operand::Class,
+                                                                machine_insn_info::FLAGS>) {
+                             if constexpr (Operand::Class::kIsImplicitReg) {
+                               ++arg_counter;
+                               return std::tuple{};
+                             } else {
+                               return std::tuple{register_numbers[arg_counter++]};
+                             }
                            } else {
-                             FATAL("Only two scratch registers are supported for now");
+                             return std::tuple{};
                            }
-                           // Note: as->gpr_scratch in combination with offset is treated by text
-                           // assembler specially.  We rely on offset set here to be the same as
-                           // scratch2 address in scratch buffer.
-                           return std::tuple{typename MacroAssembler<TextAssembler>::Operand{
-                               .base = as->gpr_scratch,
-                               .disp = static_cast<int32_t>(config::kScratchAreaSlotSize *
-                                                            scratch_counter++)}};
-                         } else if constexpr (RegisterClass::kIsImplicitReg) {
-                           ++arg_counter;
-                           return std::tuple{};
-                         } else {
-                           return std::tuple{register_numbers[arg_counter++]};
-                         }
-                       } else {
-                         return std::tuple{};
-                       }
-                     })));
+                         })));
 }
 
 template <typename IntrinsicBindingInfo>
@@ -248,7 +236,7 @@ template <typename IntrinsicBindingInfo>
 void GenerateInShadows(FILE* out, int indent) {
   IntrinsicBindingInfo::ProcessBindings([out, indent]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (RegisterClass::kAsRegister == 'm') {
+    if constexpr (machine_insn_info::kIsMemoryOperand<Operand>) {
       // Only temporary memory scratch area is supported.
       static_assert(!HaveInput(Binding::kArgInfo) && !HaveOutput(Binding::kArgInfo));
     } else if constexpr (RegisterClass::kAsRegister == 'r') {

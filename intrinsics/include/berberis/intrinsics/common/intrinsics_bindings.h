@@ -110,7 +110,7 @@ constexpr void AssignRegisterNumbers(int* register_numbers) {
   int arg_counter = 0;
   IntrinsicBindingInfo::ProcessBindings(
       [&id, &arg_counter, &register_numbers]<typename Binding, typename Operand> {
-        if constexpr (!Operand::Class::kIsImmediate) {
+        if constexpr (!machine_insn_info::kIsImmediate<Operand>) {
           using RegisterClass = Operand::Class;
           if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
             if constexpr (Operand::kUsage != machine_insn_info::kUse) {
@@ -124,7 +124,7 @@ constexpr void AssignRegisterNumbers(int* register_numbers) {
   arg_counter = 0;
   IntrinsicBindingInfo::ProcessBindings(
       [&id, &arg_counter, &register_numbers]<typename Binding, typename Operand> {
-        if constexpr (!Operand::Class::kIsImmediate) {
+        if constexpr (!machine_insn_info::kIsImmediate<Operand>) {
           using RegisterClass = Operand::Class;
           if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
             if constexpr (Operand::kUsage == machine_insn_info::kUse) {
@@ -140,7 +140,7 @@ template <typename AsmCallInfo>
 constexpr bool CheckIntrinsicHasFlagsBinding() {
   bool expect_flags = false;
   AsmCallInfo::ProcessBindings([&expect_flags]<typename Binding, typename Operand> {
-    if constexpr (!Operand::Class::kIsImmediate) {
+    if constexpr (!machine_insn_info::kIsImmediate<Operand>) {
       using RegisterClass = Operand::Class;
       if constexpr (std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
         expect_flags = true;
@@ -153,13 +153,11 @@ constexpr bool CheckIntrinsicHasFlagsBinding() {
 template <typename IntrinsicBindingInfo, typename AssemblerType>
 constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
   int arg_counter = 0;
-  IntrinsicBindingInfo::ProcessBindings([&arg_counter,
-                                         &as,
-                                         register_numbers]<typename Binding, typename Operand> {
-    if constexpr (!Operand::Class::kIsImmediate) {
-      using RegisterClass = Operand::Class;
-      if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-        if constexpr (RegisterClass::kAsRegister != 'm') {
+  IntrinsicBindingInfo::ProcessBindings(
+      [&arg_counter, &as, register_numbers]<typename Binding, typename Operand> {
+        if constexpr (machine_insn_info::kIsRegister<Operand> &&
+                      !std::is_same_v<typename Operand::Class, machine_insn_info::FLAGS>) {
+          using RegisterClass = Operand::Class;
           if constexpr (RegisterClass::kIsImplicitReg) {
             if constexpr (RegisterClass::kAsRegister == 'a') {
               as->gpr_a =
@@ -176,11 +174,9 @@ constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
                   typename AssemblerType::Register{register_numbers[arg_counter], Operand::kUsage};
             }
           }
+          ++arg_counter;
         }
-        ++arg_counter;
-      }
-    }
-  });
+      });
   // Macroassembler constants register points to the constant pool. Intrinsics can read from it
   // but shouldn't change it's address, that's why it's always kUse.
   as->gpr_macroassembler_constants =
@@ -191,24 +187,21 @@ constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
       IntrinsicBindingInfo::kMacroInstruction,
       std::tuple_cat(
           std::tuple<AssemblerType&>{*as},
-          IntrinsicBindingInfo::MakeTuplefromBindings([&as,
-                                                       &arg_counter,
-                                                       &scratch_counter,
-                                                       register_numbers]<typename Binding,
-                                                                         typename Operand> {
-            if constexpr (Operand::Class::kIsImmediate) {
-              // TODO(b/394278175): We don't have access to the value of the immediate argument
-              // here. The value of the immediate argument often decides which instructions in
-              // an intrinsic are called, by being used in conditional statements. We need to
-              // make sure that all possible instructions in the intrinsic are executed when
-              // using VerifierAssembler on inline-only intrinsics. For now, we set immediate
-              // argument to 2, since it generally covers most instructions in inline-only
-              // intrinsics.
-              return std::tuple{2};
-            } else {
-              using RegisterClass = Operand::Class;
-              if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-                if constexpr (RegisterClass::kAsRegister == 'm') {
+          IntrinsicBindingInfo::MakeTuplefromBindings(
+              [&as,
+               &arg_counter,
+               &scratch_counter,
+               register_numbers]<typename Binding, typename Operand> {
+                if constexpr (machine_insn_info::kIsImmediate<Operand>) {
+                  // TODO(b/394278175): We don't have access to the value of the immediate argument
+                  // here. The value of the immediate argument often decides which instructions in
+                  // an intrinsic are called, by being used in conditional statements. We need to
+                  // make sure that all possible instructions in the intrinsic are executed when
+                  // using VerifierAssembler on inline-only intrinsics. For now, we set immediate
+                  // argument to 2, since it generally covers most instructions in inline-only
+                  // intrinsics.
+                  return std::tuple{2};
+                } else if constexpr (machine_insn_info::kIsMemoryOperand<Operand>) {
                   static_assert(Operand::kUsage == machine_insn_info::kDefEarlyClobber);
                   if (scratch_counter == 0) {
                     as->gpr_macroassembler_scratch = typename AssemblerType::Register(
@@ -226,26 +219,29 @@ constexpr void CallVerifierAssembler(AssemblerType* as, int* register_numbers) {
                       .base = as->gpr_scratch,
                       .disp =
                           static_cast<int32_t>(config::kScratchAreaSlotSize * scratch_counter++)}};
-                } else if constexpr (RegisterClass::kIsImplicitReg) {
-                  ++arg_counter;
-                  return std::tuple{};
                 } else {
-                  if constexpr (RegisterClass::kAsRegister == 'q' ||
-                                RegisterClass::kAsRegister == 'r') {
-                    return std::tuple{typename AssemblerType::Register{
-                        register_numbers[arg_counter++], Operand::kUsage}};
-                  } else if constexpr (RegisterClass::kAsRegister == 'x') {
-                    return std::tuple{typename AssemblerType::XRegister{
-                        register_numbers[arg_counter++], Operand::kUsage}};
+                  using RegisterClass = Operand::Class;
+                  if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
+                    if constexpr (RegisterClass::kIsImplicitReg) {
+                      ++arg_counter;
+                      return std::tuple{};
+                    } else {
+                      if constexpr (RegisterClass::kAsRegister == 'q' ||
+                                    RegisterClass::kAsRegister == 'r') {
+                        return std::tuple{typename AssemblerType::Register{
+                            register_numbers[arg_counter++], Operand::kUsage}};
+                      } else if constexpr (RegisterClass::kAsRegister == 'x') {
+                        return std::tuple{typename AssemblerType::XRegister{
+                            register_numbers[arg_counter++], Operand::kUsage}};
+                      } else {
+                        static_assert(kDependentValueFalse<RegisterClass::kAsRegister>);
+                      }
+                    }
                   } else {
-                    static_assert(kDependentValueFalse<RegisterClass::kAsRegister>);
+                    return std::tuple{};
                   }
                 }
-              } else {
-                return std::tuple{};
-              }
-            }
-          })));
+              })));
 }
 
 }  // namespace berberis

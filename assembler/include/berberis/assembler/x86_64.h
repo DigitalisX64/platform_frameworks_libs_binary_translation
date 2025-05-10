@@ -21,7 +21,7 @@
 
 #include <type_traits>  // std::is_same
 
-#include "berberis/assembler/x86_32_and_x86_64.h"
+#include "berberis/assembler/x86_32_or_x86_64.h"
 #include "berberis/base/logging.h"
 
 namespace berberis {
@@ -30,9 +30,9 @@ class MachindeCode;
 
 namespace x86_64 {
 
-class Assembler : public x86_32_and_x86_64::Assembler<Assembler> {
+class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
  public:
-  using BaseAssembler = x86_32_and_x86_64::Assembler<Assembler>;
+  using BaseAssembler = x86_32_or_x86_64::Assembler<Assembler>;
   using FinalAssembler = Assembler;
 
   explicit Assembler(MachineCode* code) : BaseAssembler(code) {}

@@ -437,7 +437,7 @@ class TryBindingBasedInlineIntrinsic {
       } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::TMP_ARG) {
         static_assert(kUsage == machine_insn_info::kDef ||
                       kUsage == machine_insn_info::kDefEarlyClobber);
-        if constexpr (RegisterClass::kAsRegister == 'm') {
+        if constexpr (machine_insn_info::kIsMemoryOperand<OperandInfo>) {
           if (scratch_arg_ >= config::kScratchAreaSize / config::kScratchAreaSlotSize) {
             FATAL("Only two scratch registers are supported for now");
           }

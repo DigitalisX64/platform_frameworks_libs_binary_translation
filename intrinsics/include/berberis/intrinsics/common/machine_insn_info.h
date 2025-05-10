@@ -23,6 +23,10 @@ namespace berberis::machine_insn_info {
 
 class FLAGS {
  public:
+  // FLAGS can not be passed as arguments (at least not in a traditional sense), but having type
+  // here simplifies metaprogramming: it can not be used as actual type of variable or parameter,
+  // but can be used with std::conditional_t to pick some other type.
+  using Type = void;
   static constexpr bool kIsImmediate = false;
   static constexpr bool kIsImplicitReg = true;
   static constexpr char kAsRegister = 0;
@@ -58,6 +62,44 @@ class Mem64 {
   static constexpr char kAsRegister = 'm';
 };
 
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsImmediate = false;
+
+template <typename ImmediateClass>
+inline constexpr bool
+    kIsImmediate<ImmediateClass, std::enable_if_t<sizeof(ImmediateClass::kIsImmediate) >= 1>> =
+        ImmediateClass::kIsImmediate;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsImmediate<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsImmediate<typename OperandClass::Class>;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsRegister = false;
+
+template <typename RegisterClass>
+inline constexpr bool
+    kIsRegister<RegisterClass, std::enable_if_t<RegisterClass::kAsRegister != 'm'>> = true;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsRegister<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsRegister<typename OperandClass::Class>;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsMemoryOperand = false;
+
+template <typename MemoryOperandClass>
+inline constexpr bool
+    kIsMemoryOperand<MemoryOperandClass, std::enable_if_t<MemoryOperandClass::kAsRegister == 'm'>> =
+        true;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsMemoryOperand<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsMemoryOperand<typename OperandClass::Class>;
+
 // Note: value of RegBindingKind and MachineRegKind have to be the same since we convert one to
 // another with a static_cast in berberis/backend/x86_64/machine_insn_intrinsics.h. We don't care
 // about these values in intrinsics module, but for optimizations it's important to have LSB set
@@ -73,7 +115,7 @@ class OperandInfo {
  public:
   using Class = OperandClass;
   static constexpr RegBindingKind kUsage = kUsageTemplateName;
-  static_assert(!Class::kIsImmediate || kUsage == kUse);
+  static_assert(!kIsImmediate<Class> || kUsage == kUse);
 };
 
 // Tag classes. They are never instantioned, only used as tags to pass information about

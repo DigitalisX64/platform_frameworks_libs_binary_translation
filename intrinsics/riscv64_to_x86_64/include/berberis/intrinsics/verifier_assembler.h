@@ -19,13 +19,13 @@
 
 #include <stdio.h>
 
-#include "berberis/intrinsics/all_to_x86_32_or_x86_64/verifier_assembler_x86_32_and_x86_64.h"
+#include "berberis/intrinsics/all_to_x86_32_or_x86_64/verifier_assembler_x86_32_or_x86_64.h"
 
 namespace berberis {
 
-class VerifierAssembler : public x86_32_and_x86_64::VerifierAssembler<VerifierAssembler> {
+class VerifierAssembler : public x86_32_or_x86_64::VerifierAssembler<VerifierAssembler> {
  public:
-  using BaseAssembler = x86_32_and_x86_64::VerifierAssembler<VerifierAssembler>;
+  using BaseAssembler = x86_32_or_x86_64::VerifierAssembler<VerifierAssembler>;
   using FinalAssembler = VerifierAssembler;
 
   constexpr VerifierAssembler([[maybe_unused]] int indent, [[maybe_unused]] FILE* out)

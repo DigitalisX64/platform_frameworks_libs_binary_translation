@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_TEXT_ASSEMBLER_COMMON_H_
-#define BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_TEXT_ASSEMBLER_COMMON_H_
+#ifndef BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_X86_64_TEXT_ASSEMBLER_COMMON_H_
+#define BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_X86_64_TEXT_ASSEMBLER_COMMON_H_
 
 #include <array>
 #include <cstdint>
@@ -48,7 +48,7 @@ inline int32_t GetOffset(int32_t address) {
 
 }  // namespace constants_pool
 
-namespace x86_32_and_x86_64 {
+namespace x86_32_or_x86_64 {
 
 template <typename DerivedAssemblerType>
 class TextAssembler {
@@ -610,8 +610,8 @@ inline void TextAssembler<DerivedAssemblerType>::Instruction(const char* name,
   fprintf(out_, "\\n\"\n");
 }
 
-}  // namespace x86_32_and_x86_64
+}  // namespace x86_32_or_x86_64
 
 }  // namespace berberis
 
-#endif  // BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_x86_64_TEXT_ASSEMBLER_COMMON_H_
+#endif  // BERBERIS_INTRINSICS_ALL_TO_X86_32_OR_X86_64_TEXT_ASSEMBLER_COMMON_H_

@@ -18,7 +18,7 @@
 
 #include "berberis/intrinsics/all_to_x86_32_or_x86_64/intrinsics_float.h"
 #include "berberis/intrinsics/all_to_x86_32_or_x86_64/machine_insn_info.h"
-#include "berberis/intrinsics/all_to_x86_32_or_x86_64/verifier_assembler_x86_32_and_x86_64.h"
+#include "berberis/intrinsics/all_to_x86_32_or_x86_64/verifier_assembler_x86_32_or_x86_64.h"
 #include "berberis/intrinsics/common/intrinsics_bindings.h"
 
 namespace berberis {
@@ -158,9 +158,9 @@ class MacroAssembler : public Assembler {
   }
 };
 
-class VerifierAssembler : public x86_32_and_x86_64::VerifierAssembler<VerifierAssembler> {
+class VerifierAssembler : public x86_32_or_x86_64::VerifierAssembler<VerifierAssembler> {
  public:
-  using BaseAssembler = x86_32_and_x86_64::VerifierAssembler<VerifierAssembler>;
+  using BaseAssembler = x86_32_or_x86_64::VerifierAssembler<VerifierAssembler>;
   using FinalAssembler = VerifierAssembler;
 
   constexpr VerifierAssembler() : BaseAssembler() {}

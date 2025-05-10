@@ -831,11 +831,11 @@ TEST(MachineIRReadFlagsOptimizer, RemoveReadFlags) {
   }));
   // Check that we created copies of input flags.
   auto insn_it = bb2->insn_list().begin();
-  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
-  insn_it++;
   ASSERT_TRUE((*insn_it)->opcode() == kMachineOpPseudoCopy && (*insn_it)->RegAt(1) == input_flag0);
   insn_it++;
   ASSERT_TRUE((*insn_it)->opcode() == kMachineOpPseudoCopy && (*insn_it)->RegAt(1) == input_flag1);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
 
   // Check live_in/live_out.
   ASSERT_EQ(bb2->live_out().size(), 2UL);
