@@ -20,8 +20,8 @@
 #include <optional>
 #include <tuple>
 
-#include "berberis/assembler/rv32.h"
-#include "berberis/assembler/rv64.h"
+#include "berberis/assembler/riscv32.h"
+#include "berberis/assembler/riscv64.h"
 
 namespace berberis {
 
@@ -73,10 +73,10 @@ class Riscv64ImmediatesTest : public ::testing::Test {
               uint32_t raw_immediate_value = result->EncodedValue();
               // RISC-V I-ImmediateType and S-Immediate support the same set of values and could be
               // converted from one to another, but other types of immediates are unique.
-              if constexpr (std::is_same_v<ImmediateType, rv64::Assembler::Immediate>) {
-                EXPECT_EQ(ImmediateType(rv64::Assembler::SImmediate(typed_source)), *result);
-              } else if constexpr (std::is_same_v<ImmediateType, rv64::Assembler::SImmediate>) {
-                EXPECT_EQ(ImmediateType(rv64::Assembler::Immediate(typed_source)), *result);
+              if constexpr (std::is_same_v<ImmediateType, riscv64::Assembler::Immediate>) {
+                EXPECT_EQ(ImmediateType(riscv64::Assembler::SImmediate(typed_source)), *result);
+              } else if constexpr (std::is_same_v<ImmediateType, riscv64::Assembler::SImmediate>) {
+                EXPECT_EQ(ImmediateType(riscv64::Assembler::Immediate(typed_source)), *result);
               }
               EXPECT_EQ(raw_immediate_value, *expected_result);
               ImmediateType result = ImmediateType(source);
@@ -503,15 +503,15 @@ TEST_F(Riscv64ImmediatesTest, TestPImmediate) {
 
 TEST_F(Riscv64ImmediatesTest, TestShiftImmediate) {
   using T = std::tuple<uint32_t, std::optional<uint32_t>>;
-  TestConversion<rv32::Assembler::ShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate,
-                 rv32::Assembler::MakeShiftImmediate>(std::array{
+  TestConversion<riscv32::Assembler::ShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate,
+                 riscv32::Assembler::MakeShiftImmediate>(std::array{
       T{0b000000000000000000000'000000'0000'0, 0b0'00000000000'00000'000'00000'0000000},
       //  31                 11 10   5 4  1 0   31 30       20 19 15     11  7 6     0
       T{0b000000000000000000000'000000'0000'1, 0b0'00000000001'00000'000'00000'0000000},
@@ -580,15 +580,15 @@ TEST_F(Riscv64ImmediatesTest, TestShiftImmediate) {
       T{0b110000000000000000000'000000'0000'0, {}},
       T{0b100000000000000000000'000000'0000'0, {}},
   });
-  TestConversion<rv64::Assembler::ShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate,
-                 rv64::Assembler::MakeShiftImmediate>(std::array{
+  TestConversion<riscv64::Assembler::ShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate,
+                 riscv64::Assembler::MakeShiftImmediate>(std::array{
       T{0b000000000000000000000'000000'0000'0, 0b0'00000000000'00000'000'00000'0000000},
       //  31                 11 10   5 4  1 0   31 30       20 19 15     11  7 6     0
       T{0b000000000000000000000'000000'0000'1, 0b0'00000000001'00000'000'00000'0000000},

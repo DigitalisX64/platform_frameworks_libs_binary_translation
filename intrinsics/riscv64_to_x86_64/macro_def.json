@@ -41,7 +41,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FpReg32", "usage": "use_def" }
       ],
-      "asm": "MacroCanonicalizeNan<intrinsics::Float32>",
+      "asm": "MacroCanonicalizeNan<Float32>",
       "mnemo": "MACRO_CANONICALIZE_F32"
     },
     {
@@ -50,7 +50,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FpReg32", "usage": "use_def" }
       ],
-      "asm": "MacroCanonicalizeNanAVX<intrinsics::Float32>",
+      "asm": "MacroCanonicalizeNanAVX<Float32>",
       "mnemo": "MACRO_CANONICALIZE_F32"
     },
     {
@@ -59,7 +59,7 @@
         { "class": "FpReg64", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroCanonicalizeNan<intrinsics::Float64>",
+      "asm": "MacroCanonicalizeNan<Float64>",
       "mnemo": "MACRO_CANONICALIZE_F64"
     },
     {
@@ -68,7 +68,7 @@
         { "class": "FpReg64", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroCanonicalizeNanAVX<intrinsics::Float64>",
+      "asm": "MacroCanonicalizeNanAVX<Float64>",
       "mnemo": "MACRO_CANONICALIZE_F64"
     },
     {
@@ -203,7 +203,7 @@
         { "class": "GeneralReg64", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroFCvtFloatToInteger<int32_t, intrinsics::Float32>",
+      "asm": "MacroFCvtFloatToInteger<int32_t, Float32>",
       "mnemo": "MACRO_FCvtFloatToInteger"
     },
     {
@@ -212,7 +212,7 @@
         { "class": "GeneralReg64", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroFCvtFloatToInteger<int64_t, intrinsics::Float32>",
+      "asm": "MacroFCvtFloatToInteger<int64_t, Float32>",
       "mnemo": "MACRO_FCvtFloatToInteger"
     },
     {
@@ -221,7 +221,7 @@
         { "class": "GeneralReg64", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroFCvtFloatToInteger<int32_t, intrinsics::Float64>",
+      "asm": "MacroFCvtFloatToInteger<int32_t, Float64>",
       "mnemo": "MACRO_FCvtFloatToInteger"
     },
     {
@@ -230,7 +230,7 @@
         { "class": "GeneralReg64", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroFCvtFloatToInteger<int64_t, intrinsics::Float64>",
+      "asm": "MacroFCvtFloatToInteger<int64_t, Float64>",
       "mnemo": "MACRO_FCvtFloatToInteger"
     },
     {
@@ -311,7 +311,7 @@
         { "class": "FpReg32", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFeq<intrinsics::Float32>",
+      "asm": "MacroFeq<Float32>",
       "mnemo": "MACRO_FEQ_F32"
     },
     {
@@ -323,7 +323,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFeqAVX<intrinsics::Float32>",
+      "asm": "MacroFeqAVX<Float32>",
       "mnemo": "MACRO_FEQ_F32"
     },
     {
@@ -334,7 +334,7 @@
         { "class": "FpReg64", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFeq<intrinsics::Float64>",
+      "asm": "MacroFeq<Float64>",
       "mnemo": "MACRO_FEQ_F64"
     },
     {
@@ -346,7 +346,7 @@
         { "class": "FpReg64", "usage": "def" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFeqAVX<intrinsics::Float64>",
+      "asm": "MacroFeqAVX<Float64>",
       "mnemo": "MACRO_FEQ_F64"
     },
     {
@@ -357,7 +357,7 @@
         { "class": "FpReg32", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFle<intrinsics::Float32>",
+      "asm": "MacroFle<Float32>",
       "mnemo": "MACRO_FLE_F32"
     },
     {
@@ -369,7 +369,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFleAVX<intrinsics::Float32>",
+      "asm": "MacroFleAVX<Float32>",
       "mnemo": "MACRO_FLE_F32"
     },
     {
@@ -380,7 +380,7 @@
         { "class": "FpReg64", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFle<intrinsics::Float64>",
+      "asm": "MacroFle<Float64>",
       "mnemo": "MACRO_FLE_F64"
     },
     {
@@ -392,7 +392,7 @@
         { "class": "FpReg64", "usage": "def" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFleAVX<intrinsics::Float64>",
+      "asm": "MacroFleAVX<Float64>",
       "mnemo": "MACRO_FLE_F64"
     },
     {
@@ -403,7 +403,7 @@
         { "class": "FpReg32", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFlt<intrinsics::Float32>",
+      "asm": "MacroFlt<Float32>",
       "mnemo": "MACRO_FLT_F32"
     },
     {
@@ -415,7 +415,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFltAVX<intrinsics::Float32>",
+      "asm": "MacroFltAVX<Float32>",
       "mnemo": "MACRO_FLT_F32"
     },
     {
@@ -426,7 +426,7 @@
         { "class": "FpReg64", "usage": "use" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFlt<intrinsics::Float64>",
+      "asm": "MacroFlt<Float64>",
       "mnemo": "MACRO_FLT_F64"
     },
     {
@@ -438,7 +438,7 @@
         { "class": "FpReg64", "usage": "def" },
         { "class": "FLAGS", "usage": "def" }
       ],
-      "asm": "MacroFltAVX<intrinsics::Float64>",
+      "asm": "MacroFltAVX<Float64>",
       "mnemo": "MACRO_FLT_F64"
     },
     {
@@ -446,7 +446,7 @@
       "args": [
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroNanBox<intrinsics::Float32>",
+      "asm": "MacroNanBox<Float32>",
       "mnemo": "MACRO_BOX_F32"
     },
     {
@@ -455,7 +455,7 @@
         { "class": "FpReg64", "usage": "def" },
         { "class": "FpReg32", "usage": "use" }
       ],
-      "asm": "MacroNanBoxAVX<intrinsics::Float32>",
+      "asm": "MacroNanBoxAVX<Float32>",
       "mnemo": "MACRO_BOX_F32"
     },
     {
@@ -464,7 +464,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroUnboxNan<intrinsics::Float32>",
+      "asm": "MacroUnboxNan<Float32>",
       "mnemo": "MACRO_UNBOX_F32"
     },
     {
@@ -473,7 +473,7 @@
         { "class": "FpReg32", "usage": "def" },
         { "class": "FpReg64", "usage": "use_def" }
       ],
-      "asm": "MacroUnboxNanAVX<intrinsics::Float32>",
+      "asm": "MacroUnboxNanAVX<Float32>",
       "mnemo": "MACRO_UNBOX_F32"
     },
     {

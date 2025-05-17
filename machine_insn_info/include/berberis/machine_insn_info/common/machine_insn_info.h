@@ -19,28 +19,139 @@
 
 #include <cstdint>
 
-namespace berberis::machine_insn_info_backend {
+namespace berberis::machine_insn_info {
 
 class Mem8 {
  public:
   using Type = uint8_t;
+  static constexpr char kAsRegister = 'm';
 };
 
 class Mem16 {
  public:
   using Type = uint16_t;
+  static constexpr char kAsRegister = 'm';
 };
 
 class Mem32 {
  public:
   using Type = uint32_t;
+  static constexpr char kAsRegister = 'm';
 };
 
 class Mem64 {
  public:
   using Type = uint64_t;
+  static constexpr char kAsRegister = 'm';
 };
 
-}  // namespace berberis::machine_insn_info_backend
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsFLAGS = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsImmediate = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsMemoryOperand = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsRegister = !kIsImmediate<OperandClass> && !kIsMemoryOperand<OperandClass>;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsImplicitReg = false;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsFLAGS<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsFLAGS<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsImmediate<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsImmediate<typename OperandClass::Class>;
+
+template <typename RegisterClass>
+inline constexpr bool kIsImplicitReg<
+    RegisterClass,
+    std::enable_if_t<kIsRegister<RegisterClass> &&
+                     std::tuple_size_v<typename RegisterClass::RegistersList> == 1>> = true;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsImplicitReg<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsImplicitReg<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsMemoryOperand<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsMemoryOperand<typename OperandClass::Class>;
+
+template <>
+inline constexpr bool kIsMemoryOperand<Mem8> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<Mem16> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<Mem32> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<Mem64> = true;
+
+// Note: value of RegBindingKind and MachineRegKind have to be the same since we convert one to
+// another with a static_cast in berberis/backend/x86_64/machine_insn_intrinsics.h. We don't care
+// about these values in intrinsics module, but for optimizations it's important to have LSB set
+// when an instruction uses the value (which is true for kDefEarlyClobber: in that case the
+// instruction sets the value and then uses it), the next bit is set when register is output and MSB
+// bit is set when register is input. We have static_assert in the aforemetioned header that ensures
+// that an attempt to change these two enums and make them different would lead to a compile-time
+// error.
+enum RegBindingKind { kDef = 2, kDefEarlyClobber = 3, kUse = 5, kUseDef = 7 };
+
+template <typename OperandClass, RegBindingKind kUsageTemplateName>
+class OperandInfo {
+ public:
+  using Class = OperandClass;
+  static constexpr RegBindingKind kUsage = kUsageTemplateName;
+  static_assert(!kIsImmediate<Class> || kUsage == kUse);
+};
+
+// Tag classes. They are never instantioned, only used as tags to pass information about
+// bindings.
+class NoCPUIDRestriction;  // All CPUs have at least “no CPUID restriction” mode.
+
+template <auto kMacroInstructionTemplateName, auto kMnemo, auto GetOpcode, typename... Types>
+class AsmCallInfo;
+
+template <auto kMacroInstructionTemplateName,
+          auto kMnemo,
+          auto GetOpcode,
+          typename CPUIDRestrictionTemplateValue,
+          typename... OperandsTypes>
+class AsmCallInfo<kMacroInstructionTemplateName,
+                  kMnemo,
+                  GetOpcode,
+                  CPUIDRestrictionTemplateValue,
+                  std::tuple<OperandsTypes...>>
+    final {
+ public:
+  static constexpr auto kMacroInstruction = kMacroInstructionTemplateName;
+  using CPUIDRestriction = CPUIDRestrictionTemplateValue;
+  template <typename Callback, typename... Args>
+  constexpr static void ProcessOperands(Callback&& callback, Args&&... args) {
+    (callback(OperandsTypes{}, std::forward<Args>(args)...), ...);
+  }
+  template <typename Callback, typename... Args>
+  constexpr static bool VerifyOperands(Callback&& callback, Args&&... args) {
+    return (callback(OperandsTypes{}, std::forward<Args>(args)...) && ...);
+  }
+  template <typename Callback, typename... Args>
+  constexpr static auto MakeTuplefromOperands(Callback&& callback, Args&&... args) {
+    return std::tuple_cat(callback(OperandsTypes{}, std::forward<Args>(args)...)...);
+  }
+  using Operands = std::tuple<OperandsTypes...>;
+};
+
+}  // namespace berberis::machine_insn_info
 
 #endif  // BERBERIS_MACHINE_INSN_INFO_COMMON_MACHINE_INSN_INFO_H_

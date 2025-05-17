@@ -22,19 +22,35 @@ def gen_machine_reg_class_inc(f, reg_classes):
   for reg_class in reg_classes:
     name = reg_class.get('name')
     regs = reg_class.get('regs')
+    size = reg_class.get('size') * 8
     print(f'class {name} {{', file=f)
     print(' public:', file=f)
     print(f'  static constexpr const char* kName = "{name}";', file=f)
-    print('  static constexpr size_t kSizeInBits = %d;' %
-        (reg_class.get('size') * 8), file=f)
+    print('  static constexpr size_t kSizeInBits = %d;' % size, file=f)
     print('  using RegistersList = std::tuple<%s>;' % ', '.join(regs), file=f)
     if 'gcc_asm_name' in reg_class:
+      if 'type' in reg_class:
+        print('  using Type = %s;' % reg_class['type'], file=f)
+      elif size == 128:
+        print('  using Type = __m128;', file=f)
+      elif size == 256:
+        print('#ifdef __AVX__', file=f)
+        print('  using Type = __m256;', file=f)
+        print('#endif', file=f)
+      else:
+        print('  using Type = uint%d_t;' % size, file=f)
       gcc_asm_name = reg_class.get('gcc_asm_name')
       print(f'  static constexpr char kAsRegister = \'{gcc_asm_name}\';', file=f)
-      if len(regs) == 1:
-        print('  template <typename Assembler>', file=f)
-        print('  static constexpr auto kAssemblerRegisterPointer = '
-              f'&Assembler::gpr_{gcc_asm_name};', file=f)
+    else:
+      # std::conditional_t requires type even for branch that wouldn't be taken.
+      # Use of `void` as type here means it would be compatible with that logic,
+      # but would exclude most accidental uses of it because `void` can not be used
+      # to declare arguments of functions, or local variables.
+      print('  using Type = void;', file=f)
+    if len(regs) == 1:
+      print('  template <typename Assembler>', file=f)
+      print('  static constexpr auto kAssemblerRegisterPointer = '
+            f'&Assembler::gpr_{gcc_asm_name};', file=f)
     print('  template <typename MachineRegDefinitions>', file=f)
     print('  static constexpr auto kMachineRegId = '
           f'MachineRegDefinitions::k{name};', file=f)

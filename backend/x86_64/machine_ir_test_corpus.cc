@@ -19,7 +19,6 @@
 #include <tuple>
 
 #include "berberis/backend/code_emitter.h"
-#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_builder.h"
 #include "berberis/guest_state/guest_addr.h"

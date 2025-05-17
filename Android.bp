@@ -300,6 +300,20 @@ cc_test_host {
     },
 }
 
+filegroup {
+    name: "berberis_host_tests_data_32",
+    srcs: [
+        "tiny_loader/tests/files/32/*",
+    ],
+}
+
+filegroup {
+    name: "berberis_host_tests_data_64",
+    srcs: [
+        "tiny_loader/tests/files/64/*",
+    ],
+}
+
 // Clang violates psABI: https://groups.google.com/g/x86-64-abi/c/BjOOyihHuqg
 // We want to esnrue that possible fix of this bug wouldn't be unnoticed: b/382703210
 cc_test_host {
@@ -478,4 +492,10 @@ berberis_phony_rule {
             },
         },
     },
+}
+
+python_binary_host {
+    name: "berberis_gen_gtest_failure_template",
+    main: "tests/gen_gtest_failure_template.py",
+    srcs: ["tests/gen_gtest_failure_template.py"],
 }

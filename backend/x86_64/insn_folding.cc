@@ -19,7 +19,6 @@
 #include <cstdint>
 #include <tuple>
 
-#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 
 #include "berberis/backend/code_emitter.h"  // for CodeEmitter::Condition

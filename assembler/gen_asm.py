@@ -526,7 +526,7 @@ def _gen_emit_instruction(f, insn, arch, rip_operand=False, dyn_rm=False):
       continue
     # Note: in RISC-V there is never any ambiguity about whether full register or its part is used.
     # Instead size of operand is always encoded in the name, e.g. addw vs add or fadd.s vs fadd.d
-    if arch in ['common_riscv', 'rv32', 'rv64']:
+    if arch in ['riscv', 'riscv32', 'riscv64']:
       if dyn_rm and arg['class'] == 'Rm':
         result.append('Rounding::kDyn')
       else:

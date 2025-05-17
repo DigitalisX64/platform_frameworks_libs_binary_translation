@@ -21,16 +21,16 @@
 
 #include <type_traits>  // std::is_same
 
-#include "berberis/assembler/rv32.h"
+#include "berberis/assembler/riscv32.h"
 
 namespace berberis::rv32e {
 
-class Assembler : public ::berberis::rv32::Assembler {
+class Assembler : public ::berberis::riscv32::Assembler {
  public:
-  using BaseAssembler = riscv::Assembler<::berberis::rv32::Assembler>;
-  using FinalAssembler = berberis::rv32::Assembler;
+  using BaseAssembler = riscv::Assembler<::berberis::riscv32::Assembler>;
+  using FinalAssembler = berberis::riscv32::Assembler;
 
-  explicit Assembler(MachineCode* code) : berberis::rv32::Assembler(code) {}
+  explicit Assembler(MachineCode* code) : berberis::riscv32::Assembler(code) {}
 
   // Registers available used on “small” CPUs (with 16 general purpose registers) and “big” CPUs (32
   // general purpose registers).

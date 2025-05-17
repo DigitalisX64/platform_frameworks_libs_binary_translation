@@ -1,0 +1,537 @@
+{
+  "License": [
+    "Copyright (C) 2025 The Android Open Source Project",
+    "",
+    "Licensed under the Apache License, Version 2.0 (the “License”);",
+    "you may not use this file except in compliance with the License.",
+    "You may obtain a copy of the License at",
+    "",
+    "     http://www.apache.org/licenses/LICENSE-2.0",
+    "",
+    "Unless required by applicable law or agreed to in writing, software",
+    "distributed under the License is distributed on an “AS IS” BASIS,",
+    "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.",
+    "See the License for the specific language governing permissions and",
+    "limitations under the License."
+  ],
+  "reg_classes": [
+    {
+      "name": "GeneralReg",
+      "size": 8,
+      "regs": [
+        "X1",
+        "X2",
+        "X3",
+        "X4",
+        "X5",
+        "X6",
+        "X7",
+        "X8",
+        "X9",
+        "X10",
+        "X11",
+        "X12",
+        "X13",
+        "X14",
+        "X15",
+        "X16",
+        "X17",
+        "X18",
+        "X19",
+        "X20",
+        "X21",
+        "X22",
+        "X23",
+        "X24",
+        "X25",
+        "X26",
+        "X27",
+        "X28",
+        "X29",
+        "X30",
+        "X31"
+      ],
+      "gcc_asm_name": "r"
+    },
+    {
+      "name": "FpReg",
+      "size": 8,
+      "regs": [
+        "F0",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+        "F13",
+        "F14",
+        "F15",
+        "F16",
+        "F17",
+        "F18",
+        "F19",
+        "F20",
+        "F21",
+        "F22",
+        "F23",
+        "F24",
+        "F25",
+        "F26",
+        "F27",
+        "F29",
+        "F29",
+        "F30",
+        "F31"
+      ],
+      "gcc_asm_name": "f"
+    },
+    {
+      "name": "X1",
+      "size": 8,
+      "regs": [
+        "X1"
+      ]
+    },
+    {
+      "name": "X2",
+      "size": 8,
+      "regs": [
+        "X2"
+      ]
+    },
+    {
+      "name": "X3",
+      "size": 8,
+      "regs": [
+        "X3"
+      ]
+    },
+    {
+      "name": "X4",
+      "size": 8,
+      "regs": [
+        "X4"
+      ]
+    },
+    {
+      "name": "X5",
+      "size": 8,
+      "regs": [
+        "X5"
+      ]
+    },
+    {
+      "name": "X6",
+      "size": 8,
+      "regs": [
+        "X6"
+      ]
+    },
+    {
+      "name": "X7",
+      "size": 8,
+      "regs": [
+        "X7"
+      ]
+    },
+    {
+      "name": "X8",
+      "size": 8,
+      "regs": [
+        "X8"
+      ]
+    },
+    {
+      "name": "X9",
+      "size": 8,
+      "regs": [
+        "X9"
+      ]
+    },
+    {
+      "name": "X10",
+      "size": 8,
+      "regs": [
+        "X10"
+      ]
+    },
+    {
+      "name": "X11",
+      "size": 8,
+      "regs": [
+        "X11"
+      ]
+    },
+    {
+      "name": "X12",
+      "size": 8,
+      "regs": [
+        "X12"
+      ]
+    },
+    {
+      "name": "X13",
+      "size": 8,
+      "regs": [
+        "X13"
+      ]
+    },
+    {
+      "name": "X14",
+      "size": 8,
+      "regs": [
+        "X14"
+      ]
+    },
+    {
+      "name": "X15",
+      "size": 8,
+      "regs": [
+        "X15"
+      ]
+    },
+    {
+      "name": "X16",
+      "size": 8,
+      "regs": [
+        "X16"
+      ]
+    },
+    {
+      "name": "X17",
+      "size": 8,
+      "regs": [
+        "X17"
+      ]
+    },
+    {
+      "name": "X18",
+      "size": 8,
+      "regs": [
+        "X18"
+      ]
+    },
+    {
+      "name": "X19",
+      "size": 8,
+      "regs": [
+        "X19"
+      ]
+    },
+    {
+      "name": "X20",
+      "size": 8,
+      "regs": [
+        "X20"
+      ]
+    },
+    {
+      "name": "X21",
+      "size": 8,
+      "regs": [
+        "X21"
+      ]
+    },
+    {
+      "name": "X22",
+      "size": 8,
+      "regs": [
+        "X22"
+      ]
+    },
+    {
+      "name": "X23",
+      "size": 8,
+      "regs": [
+        "X23"
+      ]
+    },
+    {
+      "name": "X24",
+      "size": 8,
+      "regs": [
+        "X24"
+      ]
+    },
+    {
+      "name": "X25",
+      "size": 8,
+      "regs": [
+        "X25"
+      ]
+    },
+    {
+      "name": "X26",
+      "size": 8,
+      "regs": [
+        "X26"
+      ]
+    },
+    {
+      "name": "X27",
+      "size": 8,
+      "regs": [
+        "X27"
+      ]
+    },
+    {
+      "name": "X28",
+      "size": 8,
+      "regs": [
+        "X28"
+      ]
+    },
+    {
+      "name": "X29",
+      "size": 8,
+      "regs": [
+        "X29"
+      ]
+    },
+    {
+      "name": "X30",
+      "size": 8,
+      "regs": [
+        "X30"
+      ]
+    },
+    {
+      "name": "X31",
+      "size": 8,
+      "regs": [
+        "X31"
+      ]
+    },
+    {
+      "name": "F0",
+      "size": 8,
+      "regs": [
+        "F0"
+      ]
+    },
+    {
+      "name": "F1",
+      "size": 8,
+      "regs": [
+        "F1"
+      ]
+    },
+    {
+      "name": "F2",
+      "size": 8,
+      "regs": [
+        "F2"
+      ]
+    },
+    {
+      "name": "F3",
+      "size": 8,
+      "regs": [
+        "F3"
+      ]
+    },
+    {
+      "name": "F4",
+      "size": 8,
+      "regs": [
+        "F4"
+      ]
+    },
+    {
+      "name": "F5",
+      "size": 8,
+      "regs": [
+        "F5"
+      ]
+    },
+    {
+      "name": "F6",
+      "size": 8,
+      "regs": [
+        "F6"
+      ]
+    },
+    {
+      "name": "F7",
+      "size": 8,
+      "regs": [
+        "F7"
+      ]
+    },
+    {
+      "name": "F8",
+      "size": 8,
+      "regs": [
+        "F8"
+      ]
+    },
+    {
+      "name": "F9",
+      "size": 8,
+      "regs": [
+        "F9"
+      ]
+    },
+    {
+      "name": "F10",
+      "size": 8,
+      "regs": [
+        "F10"
+      ]
+    },
+    {
+      "name": "F11",
+      "size": 8,
+      "regs": [
+        "F11"
+      ]
+    },
+    {
+      "name": "F12",
+      "size": 8,
+      "regs": [
+        "F12"
+      ]
+    },
+    {
+      "name": "F13",
+      "size": 8,
+      "regs": [
+        "F13"
+      ]
+    },
+    {
+      "name": "F14",
+      "size": 8,
+      "regs": [
+        "F14"
+      ]
+    },
+    {
+      "name": "F15",
+      "size": 8,
+      "regs": [
+        "F15"
+      ]
+    },
+    {
+      "name": "F16",
+      "size": 8,
+      "regs": [
+        "F16"
+      ]
+    },
+    {
+      "name": "F17",
+      "size": 8,
+      "regs": [
+        "F17"
+      ]
+    },
+    {
+      "name": "F18",
+      "size": 8,
+      "regs": [
+        "F18"
+      ]
+    },
+    {
+      "name": "F19",
+      "size": 8,
+      "regs": [
+        "F19"
+      ]
+    },
+    {
+      "name": "F20",
+      "size": 8,
+      "regs": [
+        "F20"
+      ]
+    },
+    {
+      "name": "F21",
+      "size": 8,
+      "regs": [
+        "F21"
+      ]
+    },
+    {
+      "name": "F22",
+      "size": 8,
+      "regs": [
+        "F22"
+      ]
+    },
+    {
+      "name": "F23",
+      "size": 8,
+      "regs": [
+        "F23"
+      ]
+    },
+    {
+      "name": "F24",
+      "size": 8,
+      "regs": [
+        "F24"
+      ]
+    },
+    {
+      "name": "F25",
+      "size": 8,
+      "regs": [
+        "F25"
+      ]
+    },
+    {
+      "name": "F26",
+      "size": 8,
+      "regs": [
+        "F26"
+      ]
+    },
+    {
+      "name": "F27",
+      "size": 8,
+      "regs": [
+        "F27"
+      ]
+    },
+    {
+      "name": "F28",
+      "size": 8,
+      "regs": [
+        "F28"
+      ]
+    },
+    {
+      "name": "F29",
+      "size": 8,
+      "regs": [
+        "F29"
+      ]
+    },
+    {
+      "name": "F30",
+      "size": 8,
+      "regs": [
+        "F30"
+      ]
+    },
+    {
+      "name": "F31",
+      "size": 8,
+      "regs": [
+        "F31"
+      ]
+    }
+  ]
+}

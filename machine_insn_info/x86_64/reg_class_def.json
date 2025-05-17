@@ -113,6 +113,7 @@
     {
       "name": "FpReg64",
       "size": 8,
+      "type": "__m128",
       "regs": [
         "XmmReg"
       ],
@@ -121,6 +122,7 @@
     {
       "name": "FpReg32",
       "size": 4,
+      "type": "__m128",
       "regs": [
         "XmmReg"
       ],
@@ -427,8 +429,7 @@
       "size": 0,
       "regs": [
         "FLAGS"
-      ],
-      "gcc_asm_name": 0
+      ]
     }
   ]
 }

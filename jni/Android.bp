@@ -63,6 +63,7 @@ cc_defaults {
         "libberberis_guest_loader_headers",
         "libberberis_jni_headers",
         "libberberis_native_bridge_headers",
+        "libberberis_guest_os_primitives_headers",
         "libberberis_guest_state_headers",
         "libberberis_runtime_primitives_headers",
     ],

@@ -17,13 +17,20 @@
 #ifndef BERBERIS_MACHINE_INSN_INFO_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
 #define BERBERIS_MACHINE_INSN_INFO_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
 
-#include <xmmintrin.h>
+#include <x86intrin.h>
 
 #include <cstdint>
 
 #include "berberis/machine_insn_info/common/machine_insn_info.h"
 
-namespace berberis::x86_32_or_x86_64::machine_insn_info_backend {
+// Note: normally using namespace is forbidden in headers, but these two namespaces literally
+// only exist to be imported here (and in other device CPU-specific headers).
+
+namespace berberis {
+
+namespace x86_32_or_x86_64::machine_insn_info {
+
+using namespace berberis::machine_insn_info;
 
 class Imm2 {
  public:
@@ -50,9 +57,18 @@ class Imm64 {
   using Type = int64_t;
 };
 
+class MemX87 {
+ public:
+  // MemX87 can only be used as temporary argument, but having type here simplifies metaprogramming:
+  // it can not be used as actual type of variable or parameter, but can be used with
+  // std::conditional_t to pick some other type.
+  using Type = void;
+  static constexpr bool kIsImmediate = false;
+  static constexpr char kAsRegister = 'm';
+};
+
 // Tag classes. They are never instantioned, only used as tags to pass information about
 // bindings.
-class NoCPUIDRestriction;
 class Has3DNOW;
 class Has3DNOWP;
 class HasADX;
@@ -114,6 +130,30 @@ class HasX87;
 class HasCustomCapability;
 class IsAuthenticAMD;
 
-}  // namespace berberis::x86_32_or_x86_64::machine_insn_info_backend
+}  // namespace x86_32_or_x86_64::machine_insn_info
+
+namespace machine_insn_info {
+
+template <>
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm2> = true;
+
+template <>
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm8> = true;
+
+template <>
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm16> = true;
+
+template <>
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm32> = true;
+
+template <>
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm64> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::machine_insn_info::MemX87> = true;
+
+}  // namespace machine_insn_info
+
+}  // namespace berberis
 
 #endif  // BERBERIS_MACHINE_INSN_INFO_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_

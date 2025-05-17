@@ -21,18 +21,18 @@
 
 #include <type_traits>  // std::is_same
 
-#include "berberis/assembler/rv64.h"
+#include "berberis/assembler/riscv64.h"
 
 namespace berberis {
 
 namespace rv64i {
 
-class Assembler : public ::berberis::rv64::Assembler {
+class Assembler : public ::berberis::riscv64::Assembler {
  public:
-  using BaseAssembler = riscv::Assembler<::berberis::rv64::Assembler>;
-  using FinalAssembler = ::berberis::rv64::Assembler;
+  using BaseAssembler = riscv::Assembler<::berberis::riscv64::Assembler>;
+  using FinalAssembler = ::berberis::riscv64::Assembler;
 
-  explicit Assembler(MachineCode* code) : berberis::rv64::Assembler(code) {}
+  explicit Assembler(MachineCode* code) : berberis::riscv64::Assembler(code) {}
 
   static constexpr Register ra{1};
   static constexpr Register sp{2};

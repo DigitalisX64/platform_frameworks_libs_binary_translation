@@ -17,9 +17,9 @@
 #include "gtest/gtest.h"
 
 #include "berberis/intrinsics/all_to_x86_32_or_x86_64/intrinsics_float.h"
-#include "berberis/intrinsics/all_to_x86_32_or_x86_64/machine_insn_info.h"
 #include "berberis/intrinsics/all_to_x86_32_or_x86_64/verifier_assembler_x86_32_or_x86_64.h"
-#include "berberis/intrinsics/common/intrinsics_bindings.h"
+#include "berberis/intrinsics/intrinsics_bindings.h"
+#include "berberis/machine_insn_info/x86_64/machine_insn_info.h"
 
 namespace berberis {
 
@@ -28,14 +28,17 @@ namespace {
 using intrinsics::bindings::IntrinsicBindingInfo;
 using intrinsics::bindings::NoNansOperation;
 
-using machine_insn_info::FLAGS;
-using machine_insn_info::GeneralReg32;
-using machine_insn_info::HasSSE3;
+using x86_64::machine_insn_info::FLAGS;
+using x86_64::machine_insn_info::GeneralReg32;
+using x86_64::machine_insn_info::XmmReg;
+
+using x86_32_or_x86_64::machine_insn_info::HasSSE3;
+
 using machine_insn_info::NoCPUIDRestriction;
+
 template <typename RegisterClassTemplateName, machine_insn_info::RegBindingKind kUsageTemplateName>
 using Operand = machine_insn_info::OperandInfo<RegisterClassTemplateName, kUsageTemplateName>;
 using machine_insn_info::AsmCallInfo;
-using machine_insn_info::XmmReg;
 
 constexpr auto kDef = machine_insn_info::kDef;
 constexpr auto kDefEarlyClobber = machine_insn_info::kDefEarlyClobber;

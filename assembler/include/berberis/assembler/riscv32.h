@@ -16,14 +16,14 @@
 
 // Assembler to produce RV32 instructions (no ABI version). Somewhat influenced by V8 assembler.
 
-#ifndef BERBERIS_ASSEMBLER_RV32_H_
-#define BERBERIS_ASSEMBLER_RV32_H_
+#ifndef BERBERIS_ASSEMBLER_RISCV32_H_
+#define BERBERIS_ASSEMBLER_RISCV32_H_
 
 #include <type_traits>  // std::is_same
 
 #include "berberis/assembler/riscv.h"
 
-namespace berberis::rv32 {
+namespace berberis::riscv32 {
 
 class Assembler : public riscv::Assembler<Assembler> {
  public:
@@ -52,7 +52,7 @@ class Assembler : public riscv::Assembler<Assembler> {
   friend BaseAssembler;
 
 // Instructions.
-#include "berberis/assembler/gen_assembler_rv32-inl.h"  // NOLINT generated file!
+#include "berberis/assembler/gen_assembler_riscv32-inl.h"  // NOLINT generated file!
 
  private:
   Assembler() = delete;
@@ -63,6 +63,6 @@ class Assembler : public riscv::Assembler<Assembler> {
   friend BaseAssembler;
 };
 
-}  // namespace berberis::rv32
+}  // namespace berberis::riscv32
 
-#endif  // BERBERIS_ASSEMBLER_RV32_H_
+#endif  // BERBERIS_ASSEMBLER_RISCV32_H_

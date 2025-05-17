@@ -26,8 +26,8 @@
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
 #include "berberis/base/dependent_false.h"
-#include "berberis/intrinsics/all_to_riscv64/machine_insn_info.h"
 #include "berberis/intrinsics/common/intrinsics_bindings.h"
+#include "berberis/machine_insn_info/riscv64/machine_insn_info.h"
 
 namespace berberis {
 

@@ -148,9 +148,9 @@ NdktNativeBridge::~NdktNativeBridge() {}
 
 bool NdktNativeBridge::Initialize(std::string* error_msg) {
   guest_loader_ = berberis::GuestLoader::StartAppProcessInNewThread(error_msg);
-  berberis::RegisterKnownGuestFunctionWrapper("JNI_OnLoad", berberis::WrapGuestJNIOnLoad);
   berberis::RegisterKnownGuestFunctionWrapper("ANativeActivity_onCreate",
                                               berberis::WrapGuestNativeActivityOnCreate);
+  berberis::InitializeJNI();
   return guest_loader_ != nullptr;
 }
 

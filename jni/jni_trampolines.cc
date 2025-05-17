@@ -33,10 +33,12 @@
 #include "berberis/guest_abi/guest_arguments.h"
 #include "berberis/guest_abi/guest_params.h"
 #include "berberis/guest_abi/guest_type.h"
+#include "berberis/guest_os_primitives/guest_thread.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/native_bridge/jmethod_shorty.h"
 #include "berberis/runtime_primitives/host_code.h"
+#include "berberis/runtime_primitives/known_guest_function_wrapper.h"
 #include "berberis/runtime_primitives/runtime_library.h"
 
 #include "guest_jni_trampolines.h"
@@ -253,6 +255,11 @@ JavaVM* g_host_java_vm;
 // from this map.
 std::map<pid_t, JNIEnvMapping> g_jni_env_mappings;
 
+void RemoveJNIEnvMappingForTid(pid_t tid) {
+  std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
+  g_jni_env_mappings.erase(tid);
+}
+
 void DoJavaVMTrampoline_DestroyJavaVM(HostCode /* callee */, ProcessState* state) {
   using PFN_callee = decltype(std::declval<JavaVM>().functions->DestroyJavaVM);
   auto [arg_vm] = GuestParamsValues<PFN_callee>(state);
@@ -435,6 +442,25 @@ JavaVM* ToHostJavaVM(GuestType<JavaVM*> guest_java_vm) {
         &g_guest_java_vm);
 
   return ToHostAddr(guest_java_vm);
+}
+
+namespace {
+
+GuestThreadExitListenerFn g_next_guest_thread_exit_listener = nullptr;
+
+void JNIGuestThreadListener(pid_t tid) {
+  RemoveJNIEnvMappingForTid(tid);
+  if (g_next_guest_thread_exit_listener != nullptr) {
+    g_next_guest_thread_exit_listener(tid);
+  }
+}
+
+}  // namespace
+
+void InitializeJNI() {
+  RegisterKnownGuestFunctionWrapper("JNI_OnLoad", WrapGuestJNIOnLoad);
+  CHECK(g_next_guest_thread_exit_listener == nullptr);
+  g_next_guest_thread_exit_listener = RegisterGuestThreadExitListener(JNIGuestThreadListener);
 }
 
 }  // namespace berberis

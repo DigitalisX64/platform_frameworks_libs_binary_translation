@@ -19,7 +19,6 @@
 #include <iterator>
 #include <optional>
 
-#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/algorithm.h"
 #include "berberis/base/arena_vector.h"
@@ -104,6 +103,8 @@ bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* bb, MachineRegVector& reg
 // * the node must have only one in_edge - this guarantees the register is coming
 // from the readflags
 // * nothing in regs should be in live_out
+// * does not redefine registers in regs - this simplifies the logic of figuring out when to
+// insert instructions (see b/417321580 for more context)
 bool CheckPostLoopNode(MachineBasicBlock* bb, const MachineRegVector& regs) {
   // If the node doesn't actually use any of regs we can just skip it.
   if (!RegsLiveInBasicBlock(bb, regs)) {
@@ -120,6 +121,15 @@ bool CheckPostLoopNode(MachineBasicBlock* bb, const MachineRegVector& regs) {
       return false;
     }
   }
+
+  for (auto insn : bb->insn_list()) {
+    for (int i = 0; i < insn->NumRegOperands(); i++) {
+      if (Contains(regs, insn->RegAt(i)) && insn->RegKindAt(i).IsDef()) {
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 
@@ -194,14 +204,22 @@ void RemoveEligibleReadFlagsInLoopTree(MachineIR* machine_ir, LoopTreeNode* loop
 // Finds the instruction which sets a flag register.
 // insn_it should point to one past the element we first want to check
 // (typically it should point to the readflags instruction).
-std::optional<MachineInsnList::iterator> FindFlagSettingInsn(MachineInsnList::iterator insn_it,
-                                                             MachineInsnList::iterator begin,
-                                                             MachineReg reg) {
+std::optional<FlagSettingInsn> FindFlagSettingInsn(MachineInsnList::iterator insn_it,
+                                                   MachineInsnList::iterator begin,
+                                                   MachineReg reg) {
+  bool cmc = false;
   while (insn_it != begin) {
     insn_it--;
     for (int i = 0; i < (*insn_it)->NumRegOperands(); i++) {
       if ((*insn_it)->RegAt(i) == reg && (*insn_it)->RegKindAt(i).IsDef()) {
-        return insn_it;
+        if ((*insn_it)->opcode() == kMachineOpCmc) {
+          // CMC just inverts the carry flag so we still need to find what sets the original EFLAGS.
+          cmc = true;
+          // We need to go to the previous instruction, but since we know that CMC has just one
+          // operand simple "continue" here immediately exits the loop over operands.
+          continue;
+        }
+        return FlagSettingInsn{insn_it, cmc};
       }
     }
   }
@@ -224,9 +242,9 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
   }
   MachineReg flag_reg;
   // First add instruction that sets flags register.
-  auto insn_opt = GetInsnGen((*context.flag_set_insn)->opcode());
+  auto insn_opt = GetInsnGen((*context.flag_set_insn.insn)->opcode());
   CHECK(insn_opt.has_value());
-  auto insn = insn_opt.value()(machine_ir, *context.flag_set_insn);
+  auto insn = insn_opt.value()(machine_ir, *context.flag_set_insn.insn);
   for (int i = 0; i < insn->NumRegOperands(); i++) {
     if (insn->RegKindAt(i).IsInput()) {
       CHECK(reg_map.contains(insn->RegAt(i)));
@@ -253,6 +271,9 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
   }
   CHECK(!flag_reg.IsInvalidReg());
   context.bb->insn_list().insert(insn_it, insn);
+  if (context.flag_set_insn.cmc) {
+    context.bb->insn_list().insert(insn_it, machine_ir->NewInsn<Cmc>(flag_reg));
+  }
 
   // Now add readflags instruction.
   insn =
@@ -291,10 +312,10 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
 //         ^             |
 //         |             v
 //   (LOOP NODE) <-  (EXIT NODE) ---> (NEIGHBOR'S POST LOOP NODE)
-std::optional<MachineInsnList::iterator> IsEligibleReadFlag(MachineIR* machine_ir,
-                                                            Loop* loop,
-                                                            MachineBasicBlock* bb,
-                                                            MachineInsnList::iterator insn_it) {
+std::optional<FlagSettingInsn> IsEligibleReadFlag(MachineIR* machine_ir,
+                                                  Loop* loop,
+                                                  MachineBasicBlock* bb,
+                                                  MachineInsnList::iterator insn_it) {
   CHECK_EQ(AsMachineInsnX86_64(*insn_it)->opcode(), kMachineOpPseudoReadFlags);
   auto flag_register = (*insn_it)->RegAt(1);
   // We use a set here because the original register will be pseudocopy'd when
@@ -328,7 +349,7 @@ std::optional<MachineInsnList::iterator> IsEligibleReadFlag(MachineIR* machine_i
 
   // Make sure we know how to copy this instruction.
   auto flag_setter = FindFlagSettingInsn(insn_it, bb->insn_list().begin(), flag_register);
-  if (flag_setter.has_value() && GetInsnGen((*flag_setter.value())->opcode()).has_value()) {
+  if (flag_setter.has_value() && GetInsnGen((*flag_setter.value().insn)->opcode()).has_value()) {
     return flag_setter.value();
   }
   return std::nullopt;
@@ -389,7 +410,7 @@ void RemoveReadFlags(MachineIR* machine_ir, ReadFlagsOptContext context) {
   // Delete READFLAGS instruction
   context.bb->insn_list().erase(insn_it);
 
-  insn_it = context.flag_set_insn;
+  insn_it = context.flag_set_insn.insn;
 
   MachineInsn* insn = *insn_it;
 
@@ -406,7 +427,7 @@ void RemoveReadFlags(MachineIR* machine_ir, ReadFlagsOptContext context) {
 
   ArenaVector<MachineReg> reg_vec({flags_reg}, machine_ir->arena());
   ReplaceFlagRegisters(
-      machine_ir, context, std::next(context.flag_set_insn), reg_vec, reg_map, insn);
+      machine_ir, context, std::next(context.flag_set_insn.insn), reg_vec, reg_map, insn);
 }
 
 // Propagates the copied input registers, and regenerates the EFLAGs register if

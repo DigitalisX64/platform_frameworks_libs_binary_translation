@@ -16,7 +16,7 @@
 
 #include "gtest/gtest.h"
 
-#include "xmmintrin.h"
+#include <x86intrin.h>
 
 #include <array>
 #include <cstdint>

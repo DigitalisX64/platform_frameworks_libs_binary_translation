@@ -16,7 +16,6 @@
 
 #include "berberis/backend/x86_64/rename_copy_uses.h"
 
-#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 
 namespace berberis::x86_64 {

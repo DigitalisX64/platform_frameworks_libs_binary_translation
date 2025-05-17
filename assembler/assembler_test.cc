@@ -37,7 +37,7 @@ using CodeEmitter = berberis::x86_32::Assembler;
 #elif defined(__amd64__)
 using CodeEmitter = berberis::x86_64::Assembler;
 #elif defined(__riscv)
-using CodeEmitter = berberis::rv64::Assembler;
+using CodeEmitter = berberis::riscv64::Assembler;
 #else
 #error "Unsupported platform"
 #endif
@@ -115,7 +115,7 @@ inline bool CompareCode(const ParcelInt* code_template_begin,
   return true;
 }
 
-namespace rv32 {
+namespace riscv32 {
 
 bool AssemblerTest() {
   MachineCode code;
@@ -311,9 +311,9 @@ bool AssemblerTest() {
   return CompareCode(std::begin(kCodeTemplate), std::end(kCodeTemplate), code, CPUArch::kRiscv64);
 }
 
-}  // namespace rv32
+}  // namespace riscv32
 
-namespace rv64 {
+namespace riscv64 {
 
 bool AssemblerTest() {
   MachineCode code;
@@ -507,7 +507,7 @@ bool AssemblerTest() {
   return CompareCode(std::begin(kCodeTemplate), std::end(kCodeTemplate), code, CPUArch::kRiscv64);
 }
 
-}  // namespace rv64
+}  // namespace riscv64
 
 namespace x86_32 {
 
@@ -1309,8 +1309,8 @@ bool MixedAssembler() {
 }  // namespace berberis
 
 TEST(Assembler, AssemblerTest) {
-  EXPECT_TRUE(berberis::rv32::AssemblerTest());
-  EXPECT_TRUE(berberis::rv64::AssemblerTest());
+  EXPECT_TRUE(berberis::riscv32::AssemblerTest());
+  EXPECT_TRUE(berberis::riscv64::AssemblerTest());
   EXPECT_TRUE(berberis::x86_32::AssemblerTest());
   EXPECT_TRUE(berberis::x86_64::AssemblerTest());
 #if defined(__i386__)

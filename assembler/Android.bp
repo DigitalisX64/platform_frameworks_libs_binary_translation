@@ -43,7 +43,7 @@ filegroup {
     name: "libberberis_assembler_gen_inputs_riscv32",
     srcs: [
         "instructions/insn_def_riscv.json",
-        "instructions/insn_def_rv32.json",
+        "instructions/insn_def_riscv32.json",
     ],
 }
 
@@ -51,7 +51,7 @@ filegroup {
     name: "libberberis_assembler_gen_inputs_riscv64",
     srcs: [
         "instructions/insn_def_riscv.json",
-        "instructions/insn_def_rv64.json",
+        "instructions/insn_def_riscv64.json",
     ],
 }
 
@@ -85,7 +85,7 @@ genrule {
     name: "libberberis_assembler_gen_public_headers_riscv32",
     out: [
         "berberis/assembler/gen_assembler_common_riscv-inl.h",
-        "berberis/assembler/gen_assembler_rv32-inl.h",
+        "berberis/assembler/gen_assembler_riscv32-inl.h",
     ],
     srcs: [":libberberis_assembler_gen_inputs_riscv32"],
     tools: ["gen_asm"],
@@ -94,7 +94,7 @@ genrule {
 
 genrule {
     name: "libberberis_assembler_gen_public_headers_using_riscv32",
-    out: ["berberis/assembler/gen_assembler_rv32-using-inl.h"],
+    out: ["berberis/assembler/gen_assembler_riscv32-using-inl.h"],
     srcs: [":libberberis_assembler_gen_inputs_riscv32"],
     tools: ["gen_asm"],
     cmd: "$(location gen_asm) --using $(out) $(in)",
@@ -104,7 +104,7 @@ genrule {
     name: "libberberis_assembler_gen_public_headers_riscv64",
     out: [
         "berberis/assembler/gen_assembler_common_riscv-inl.h",
-        "berberis/assembler/gen_assembler_rv64-inl.h",
+        "berberis/assembler/gen_assembler_riscv64-inl.h",
     ],
     srcs: [":libberberis_assembler_gen_inputs_riscv64"],
     tools: ["gen_asm"],
@@ -113,7 +113,7 @@ genrule {
 
 genrule {
     name: "libberberis_assembler_gen_public_headers_using_riscv64",
-    out: ["berberis/assembler/gen_assembler_rv64-using-inl.h"],
+    out: ["berberis/assembler/gen_assembler_riscv64-using-inl.h"],
     srcs: [":libberberis_assembler_gen_inputs_riscv64"],
     tools: ["gen_asm"],
     cmd: "$(location gen_asm) --using $(out) $(in)",

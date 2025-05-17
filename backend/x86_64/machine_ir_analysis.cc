@@ -18,7 +18,6 @@
 
 #include <algorithm>
 
-#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/algorithm.h"
 #include "berberis/base/arena_alloc.h"

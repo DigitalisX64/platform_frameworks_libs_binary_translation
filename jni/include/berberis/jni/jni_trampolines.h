@@ -29,13 +29,14 @@ HostCode WrapGuestJNIFunction(GuestAddr pc,
                               const char* shorty,
                               const char* name,
                               bool has_jnienv_and_jobject);
-HostCode WrapGuestJNIOnLoad(GuestAddr pc);
 
 GuestType<JNIEnv*> ToGuestJNIEnv(JNIEnv* host_jni_env);
 JNIEnv* ToHostJNIEnv(GuestType<JNIEnv*> guest_jni_env);
 
 GuestType<JavaVM*> ToGuestJavaVM(JavaVM* host_java_vm);
 JavaVM* ToHostJavaVM(GuestType<JavaVM*> guest_java_vm);
+
+void InitializeJNI();
 
 }  // namespace berberis
 

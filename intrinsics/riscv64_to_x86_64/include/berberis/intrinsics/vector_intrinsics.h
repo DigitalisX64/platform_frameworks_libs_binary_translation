@@ -17,8 +17,7 @@
 #ifndef RISCV64_TO_X86_64_BERBERIS_INTRINSICS_VECTOR_INTRINSICS_H_
 #define RISCV64_TO_X86_64_BERBERIS_INTRINSICS_VECTOR_INTRINSICS_H_
 
-#include <tmmintrin.h>
-#include <xmmintrin.h>
+#include <x86intrin.h>
 
 #include "berberis/base/dependent_false.h"
 #include "berberis/intrinsics/common/intrinsics.h"

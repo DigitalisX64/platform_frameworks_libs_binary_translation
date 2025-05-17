@@ -19,7 +19,6 @@
 #include <cstddef>
 
 #include "berberis/assembler/x86_64.h"
-#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"

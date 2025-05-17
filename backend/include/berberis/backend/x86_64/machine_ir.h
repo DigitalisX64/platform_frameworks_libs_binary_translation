@@ -24,7 +24,7 @@
 
 #include "berberis/assembler/x86_64.h"
 #include "berberis/backend/code_emitter.h"
-#include "berberis/backend/common/machine_ir.h"
+#include "berberis/backend/common/machine_ir.h"  // IWYU pragma: export.
 #include "berberis/base/arena_alloc.h"
 #include "berberis/guest_state/guest_state_arch.h"
 #include "berberis/machine_insn_info/x86_64/machine_insn_info.h"
@@ -115,6 +115,24 @@ struct MachineInsnInfo {
   int num_reg_operands;
   MachineRegKind reg_kinds[kMaxMachineRegOperands];
   MachineInsnKind kind;
+  constexpr int InputRegistersCount() const {
+    int result = 0;
+    for (int index = 0; index < num_reg_operands; ++index) {
+      if (reg_kinds[index].IsInput()) {
+        result++;
+      }
+    }
+    return result;
+  }
+  constexpr int OutputRegistersCount() const {
+    int result = 0;
+    for (int index = 0; index < num_reg_operands; ++index) {
+      if (reg_kinds[index].IsDef()) {
+        result++;
+      }
+    }
+    return result;
+  }
 };
 
 enum class MachineMemOperandScale {
@@ -141,70 +159,16 @@ template <typename MachineInsnInfoClass>
 inline constexpr MachineRegClass kRegisterClass =
     MachineRegClassFromMachineInsnInfoClass<MachineInsnInfoClass>();
 
-inline constexpr auto kRAX = kRegisterClass<machine_insn_info_backend::RAX>;
-inline constexpr auto kGeneralReg64 = kRegisterClass<machine_insn_info_backend::GeneralReg64>;
-inline constexpr auto kReg32 = kRegisterClass<machine_insn_info_backend::Reg32>;
-inline constexpr auto kReg64 = kRegisterClass<machine_insn_info_backend::Reg64>;
-inline constexpr auto kXmmReg = kRegisterClass<machine_insn_info_backend::XmmReg>;
-inline constexpr auto kFLAGS = kRegisterClass<machine_insn_info_backend::FLAGS>;
+inline constexpr auto& kRAX = kRegisterClass<machine_insn_info::RAX>;
+inline constexpr auto& kGeneralReg32 = kRegisterClass<machine_insn_info::GeneralReg32>;
+inline constexpr auto& kGeneralReg64 = kRegisterClass<machine_insn_info::GeneralReg64>;
+inline constexpr auto& kReg32 = kRegisterClass<machine_insn_info::Reg32>;
+inline constexpr auto& kReg64 = kRegisterClass<machine_insn_info::Reg64>;
+inline constexpr auto& kXmmReg = kRegisterClass<machine_insn_info::XmmReg>;
+inline constexpr auto& kFLAGS = kRegisterClass<machine_insn_info::FLAGS>;
 
 class MachineInsnX86_64 : public MachineInsn {
  public:
-  // TODO(b/399130034): remove imports after auto-generated code would start using kRegisterClass
-  static constexpr MachineRegClass kAL = kRegisterClass<machine_insn_info_backend::AL>;
-  static constexpr MachineRegClass kAX = kRegisterClass<machine_insn_info_backend::AX>;
-  static constexpr MachineRegClass kCL = kRegisterClass<machine_insn_info_backend::CL>;
-  static constexpr MachineRegClass kDX = kRegisterClass<machine_insn_info_backend::DX>;
-  static constexpr MachineRegClass kEAX = kRegisterClass<machine_insn_info_backend::EAX>;
-  static constexpr MachineRegClass kEBX = kRegisterClass<machine_insn_info_backend::EBX>;
-  static constexpr MachineRegClass kECX = kRegisterClass<machine_insn_info_backend::ECX>;
-  static constexpr MachineRegClass kEDX = kRegisterClass<machine_insn_info_backend::EDX>;
-  static constexpr MachineRegClass kFLAGS = kRegisterClass<machine_insn_info_backend::FLAGS>;
-  static constexpr MachineRegClass kFpReg32 = kRegisterClass<machine_insn_info_backend::FpReg32>;
-  static constexpr MachineRegClass kFpReg64 = kRegisterClass<machine_insn_info_backend::FpReg64>;
-  static constexpr MachineRegClass kGeneralReg8 =
-      kRegisterClass<machine_insn_info_backend::GeneralReg8>;
-  static constexpr MachineRegClass kGeneralReg16 =
-      kRegisterClass<machine_insn_info_backend::GeneralReg16>;
-  static constexpr MachineRegClass kGeneralReg32 =
-      kRegisterClass<machine_insn_info_backend::GeneralReg32>;
-  static constexpr MachineRegClass kGeneralReg64 =
-      kRegisterClass<machine_insn_info_backend::GeneralReg64>;
-  static constexpr MachineRegClass kR8 = kRegisterClass<machine_insn_info_backend::R8>;
-  static constexpr MachineRegClass kR9 = kRegisterClass<machine_insn_info_backend::R9>;
-  static constexpr MachineRegClass kR10 = kRegisterClass<machine_insn_info_backend::R10>;
-  static constexpr MachineRegClass kR11 = kRegisterClass<machine_insn_info_backend::R11>;
-  static constexpr MachineRegClass kRAX = kRegisterClass<machine_insn_info_backend::RAX>;
-  static constexpr MachineRegClass kRBX = kRegisterClass<machine_insn_info_backend::RBX>;
-  static constexpr MachineRegClass kRCX = kRegisterClass<machine_insn_info_backend::RCX>;
-  static constexpr MachineRegClass kRDI = kRegisterClass<machine_insn_info_backend::RDI>;
-  static constexpr MachineRegClass kRDX = kRegisterClass<machine_insn_info_backend::RDX>;
-  static constexpr MachineRegClass kReg32 = kRegisterClass<machine_insn_info_backend::Reg32>;
-  static constexpr MachineRegClass kReg64 = kRegisterClass<machine_insn_info_backend::Reg64>;
-  static constexpr MachineRegClass kRSI = kRegisterClass<machine_insn_info_backend::RSI>;
-  static constexpr MachineRegClass kVecReg128 =
-      kRegisterClass<machine_insn_info_backend::VecReg128>;
-  static constexpr MachineRegClass kVecReg256 =
-      kRegisterClass<machine_insn_info_backend::VecReg256>;
-  static constexpr MachineRegClass kXMM0 = kRegisterClass<machine_insn_info_backend::XMM0>;
-  static constexpr MachineRegClass kXMM1 = kRegisterClass<machine_insn_info_backend::XMM1>;
-  static constexpr MachineRegClass kXMM2 = kRegisterClass<machine_insn_info_backend::XMM2>;
-  static constexpr MachineRegClass kXMM3 = kRegisterClass<machine_insn_info_backend::XMM3>;
-  static constexpr MachineRegClass kXMM4 = kRegisterClass<machine_insn_info_backend::XMM4>;
-  static constexpr MachineRegClass kXMM5 = kRegisterClass<machine_insn_info_backend::XMM5>;
-  static constexpr MachineRegClass kXMM6 = kRegisterClass<machine_insn_info_backend::XMM6>;
-  static constexpr MachineRegClass kXMM7 = kRegisterClass<machine_insn_info_backend::XMM7>;
-  static constexpr MachineRegClass kXMM8 = kRegisterClass<machine_insn_info_backend::XMM8>;
-  static constexpr MachineRegClass kXMM9 = kRegisterClass<machine_insn_info_backend::XMM9>;
-  static constexpr MachineRegClass kXmmReg = kRegisterClass<machine_insn_info_backend::XmmReg>;
-  static constexpr MachineRegClass kYmmReg = kRegisterClass<machine_insn_info_backend::YmmReg>;
-  static constexpr MachineRegClass kXMM10 = kRegisterClass<machine_insn_info_backend::XMM10>;
-  static constexpr MachineRegClass kXMM11 = kRegisterClass<machine_insn_info_backend::XMM11>;
-  static constexpr MachineRegClass kXMM12 = kRegisterClass<machine_insn_info_backend::XMM12>;
-  static constexpr MachineRegClass kXMM13 = kRegisterClass<machine_insn_info_backend::XMM13>;
-  static constexpr MachineRegClass kXMM14 = kRegisterClass<machine_insn_info_backend::XMM14>;
-  static constexpr MachineRegClass kXMM15 = kRegisterClass<machine_insn_info_backend::XMM15>;
-
   MachineInsnX86_64(const MachineInsnX86_64& other) : MachineInsn(other) {
     for (int i = 0; i < kMaxMachineRegOperands; i++) {
       regs_[i] = other.regs_[i];

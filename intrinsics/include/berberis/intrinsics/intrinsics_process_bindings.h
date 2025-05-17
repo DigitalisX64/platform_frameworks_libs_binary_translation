@@ -33,8 +33,8 @@ namespace berberis::intrinsics::bindings {
 template <auto kFunction>
 class FunctionCompareTag;
 
-#include "berberis/intrinsics/intrinsics_process_bindings-inl.h"
-
 }  // namespace berberis::intrinsics::bindings
+
+#include "berberis/intrinsics/intrinsics_process_bindings-inl.h"
 
 #endif  // BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_

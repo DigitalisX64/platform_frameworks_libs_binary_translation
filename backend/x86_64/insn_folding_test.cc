@@ -54,28 +54,14 @@ void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
     builder.Gen<MovlRegImm>(vreg1, imm);
   }
   builder.Gen<InsnTypeRegReg>(vreg2, vreg1, flags);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  bb->live_out().push_back(vreg2);
-
-  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
-  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
-    def_map.ProcessInsn(insn_it);
-  }
-
-  InsnFolding insn_folding(def_map, &machine_ir);
-
-  auto insn_it = bb->insn_list().begin();
-  ++insn_it;
-  const MachineInsn* insn = *insn_it;
-
-  auto [is_folded, folded_insn] = insn_folding.TryFoldInsn(insn_it, bb);
-
-  if (!is_folded) {
-    EXPECT_FALSE(kExpectSuccess);
+  FoldInsns(&machine_ir);
+  auto insn_it = std::prev(bb->insn_list().end());
+  MachineInsn* folded_insn = *insn_it;
+  if (!kExpectSuccess) {
+    EXPECT_EQ(InsnTypeRegReg::kInfo.opcode, folded_insn->opcode());
     return;
   }
-  EXPECT_TRUE(kExpectSuccess);
   EXPECT_EQ(InsnTypeRegImm::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg2, folded_insn->RegAt(0));
   EXPECT_EQ(flags, folded_insn->RegAt(1));
@@ -133,24 +119,11 @@ void TryMovInsnFolding(bool is_64bit_mov_imm, uint64_t imm) {
     builder.Gen<MovlRegImm>(vreg1, imm);
   }
   builder.Gen<InsnTypeRegReg>(vreg2, vreg1);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  bb->live_out().push_back(vreg2);
+  FoldInsns(&machine_ir);
+  auto insn_it = std::prev(bb->insn_list().end());
+  MachineInsn* folded_insn = *insn_it;
 
-  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
-  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
-    def_map.ProcessInsn(insn_it);
-  }
-
-  InsnFolding insn_folding(def_map, &machine_ir);
-
-  auto insn_it = bb->insn_list().begin();
-  ++insn_it;
-  const MachineInsn* insn = *insn_it;
-
-  auto [is_folded, folded_insn] = insn_folding.TryFoldInsn(insn_it, bb);
-
-  EXPECT_TRUE(is_folded);
   EXPECT_EQ(InsnTypeRegImm::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg2, folded_insn->RegAt(0));
   // MovqRegReg is the only instruction that can take full 64-bit imm.
@@ -316,20 +289,11 @@ TEST(InsnFoldingTest, SingleMovqMemBaseDispImm32Folding) {
   builder.Gen<MovqMemBaseDispReg>(kMachineRegRAX, 4, vreg1);
   builder.SetRecoveryPointAtLastInsn(recovery_bb);
   builder.SetRecoveryWithGuestPCAtLastInsn(42);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
-  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
-    def_map.ProcessInsn(insn_it);
-  }
+  FoldInsns(&machine_ir);
+  auto insn_it = std::prev(bb->insn_list().end());
+  MachineInsn* folded_insn = *insn_it;
 
-  InsnFolding insn_folding(def_map, &machine_ir);
-
-  auto insn_it = bb->insn_list().begin();
-  ++insn_it;
-  const MachineInsn* insn = *insn_it;
-
-  auto [_, folded_insn] = insn_folding.TryFoldInsn(insn_it, bb);
   EXPECT_EQ(kMachineOpMovqMemBaseDispImm, folded_insn->opcode());
   EXPECT_EQ(kMachineRegRAX, folded_insn->RegAt(0));
   EXPECT_EQ(2UL, AsMachineInsnX86_64(folded_insn)->imm());
@@ -354,20 +318,11 @@ TEST(InsnFoldingTest, SingleMovlMemBaseDispImm32Folding) {
   builder.Gen<MovlMemBaseDispReg>(kMachineRegRAX, 4, vreg1);
   builder.SetRecoveryPointAtLastInsn(recovery_bb);
   builder.SetRecoveryWithGuestPCAtLastInsn(42);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
-  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
-    def_map.ProcessInsn(insn_it);
-  }
+  FoldInsns(&machine_ir);
+  auto insn_it = std::prev(bb->insn_list().end());
+  MachineInsn* folded_insn = *insn_it;
 
-  InsnFolding insn_folding(def_map, &machine_ir);
-
-  auto insn_it = bb->insn_list().begin();
-  ++insn_it;
-  const MachineInsn* insn = *insn_it;
-
-  auto [_, folded_insn] = insn_folding.TryFoldInsn(insn_it, bb);
   EXPECT_EQ(kMachineOpMovlMemBaseDispImm, folded_insn->opcode());
   EXPECT_EQ(kMachineRegRAX, folded_insn->RegAt(0));
   EXPECT_EQ(3UL, AsMachineInsnX86_64(folded_insn)->imm());
@@ -392,19 +347,11 @@ TEST(InsnFoldingTest, RedundantMovlFolding) {
   builder.StartBasicBlock(bb);
   builder.Gen<AddlRegReg>(vreg2, vreg3, flags);
   builder.Gen<MovlRegReg>(vreg1, vreg2);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
-  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
-    def_map.ProcessInsn(insn_it);
-  }
+  FoldInsns(&machine_ir);
+  auto insn_it = std::prev(bb->insn_list().end());
+  MachineInsn* folded_insn = *insn_it;
 
-  InsnFolding insn_folding(def_map, &machine_ir);
-
-  auto insn_it = bb->insn_list().begin();
-  ++insn_it;
-
-  auto [_, folded_insn] = insn_folding.TryFoldInsn(insn_it, bb);
   EXPECT_EQ(kMachineOpPseudoCopy, folded_insn->opcode());
   EXPECT_EQ(vreg1, folded_insn->RegAt(0));
   EXPECT_EQ(vreg2, folded_insn->RegAt(1));
@@ -425,19 +372,14 @@ TEST(InsnFoldingTest, GracefulHandlingOfVRegDefinedInPreviousBasicBlock) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<MovlRegReg>(vreg1, vreg2);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
 
-  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
-  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
-    def_map.ProcessInsn(insn_it);
-  }
+  FoldInsns(&machine_ir);
+  auto insn_it = std::prev(bb->insn_list().end());
+  MachineInsn* folded_insn = *insn_it;
 
-  InsnFolding insn_folding(def_map, &machine_ir);
-
-  auto insn_it = bb->insn_list().begin();
-
-  auto [success, _] = insn_folding.TryFoldInsn(insn_it, bb);
-  EXPECT_FALSE(success);
+  EXPECT_EQ(folded_insn->opcode(), kMachineOpMovlRegReg);
+  EXPECT_EQ(vreg1, folded_insn->RegAt(0));
+  EXPECT_EQ(vreg2, folded_insn->RegAt(1));
 }
 
 TEST(InsnFoldingTest, RegRegInsnTypeFolding) {

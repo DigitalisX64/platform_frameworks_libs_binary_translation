@@ -14,7 +14,7 @@
     "See the License for the specific language governing permissions and",
     "limitations under the License."
   ],
-  "arch": "rv32",
+  "arch": "riscv32",
   "insns": [
     {
       "encodings": {

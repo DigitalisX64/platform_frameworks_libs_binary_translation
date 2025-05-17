@@ -205,9 +205,9 @@ class TryBindingBasedInlineIntrinsic {
             typename Result,
             typename Callback,
             typename... Args>
-  friend constexpr Result intrinsics::bindings::ProcessBindings(Callback callback,
-                                                                Result def_result,
-                                                                Args&&... args);
+  friend constexpr Result x86_64::intrinsics::bindings::ProcessBindings(Callback callback,
+                                                                        Result def_result,
+                                                                        Args&&... args);
   template <auto kIntrinsicTemplateName,
             typename kPreciseNanOperationsHandlingTemplateValue,
             bool kSideEffectsTemplateValue,
@@ -244,27 +244,32 @@ class TryBindingBasedInlineIntrinsic {
     static_assert(std::is_same_v<typename IntrinsicBindingInfo::PreciseNanOperationsHandling,
                                  intrinsics::bindings::NoNansOperation>);
     using CPUIDRestriction = IntrinsicBindingInfo::CPUIDRestriction;
-    if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasAVX>) {
+    if constexpr (std::is_same_v<CPUIDRestriction, x86_32_or_x86_64::machine_insn_info::HasAVX>) {
       if (!host_platform::kHasAVX) {
         return {};
       }
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasBMI>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction,
+                                        x86_32_or_x86_64::machine_insn_info::HasBMI>) {
       if (!host_platform::kHasBMI) {
         return {};
       }
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasFMA>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction,
+                                        x86_32_or_x86_64::machine_insn_info::HasFMA>) {
       if (!host_platform::kHasFMA) {
         return {};
       }
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasLZCNT>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction,
+                                        x86_32_or_x86_64::machine_insn_info::HasLZCNT>) {
       if (!host_platform::kHasLZCNT) {
         return {};
       }
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasPOPCNT>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction,
+                                        x86_32_or_x86_64::machine_insn_info::HasPOPCNT>) {
       if (!host_platform::kHasPOPCNT) {
         return {};
       }
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::NoCPUIDRestriction>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction,
+                                        x86_32_or_x86_64::machine_insn_info::NoCPUIDRestriction>) {
       // No restrictions. Do nothing.
     } else {
       static_assert(kDependentValueFalse<IntrinsicBindingInfo::kCPUIDRestriction>);
@@ -320,7 +325,9 @@ class TryBindingBasedInlineIntrinsic {
       return ProcessArgInput<ArgBinding, OperandInfo, IntrinsicBindingInfo>(reg_alloc_);
     } else {
       using RegisterClass = typename OperandInfo::Class;
-      if constexpr (RegisterClass::kAsRegister == 'x') {
+      if constexpr (machine_insn_info::kIsFLAGS<OperandInfo>) {
+        return ProcessArgInput<ArgBinding, OperandInfo, IntrinsicBindingInfo>(nullptr);
+      } else if constexpr (RegisterClass::kAsRegister == 'x') {
         return ProcessArgInput<ArgBinding, OperandInfo, IntrinsicBindingInfo>(simd_reg_alloc_);
       } else {
         return ProcessArgInput<ArgBinding, OperandInfo, IntrinsicBindingInfo>(reg_alloc_);
@@ -348,14 +355,14 @@ class TryBindingBasedInlineIntrinsic {
           return std::tuple{reg};
         } else {
           static_assert(kUsage == machine_insn_info::kUse);
-          static_assert(!RegisterClass::kIsImplicitReg);
+          static_assert(!machine_insn_info::kIsImplicitReg<OperandInfo>);
           return std::tuple{std::get<ArgBinding::kArgInfo.from>(input_args_)};
         }
       } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_ARG) {
         using Type = std::tuple_element_t<ArgBinding::kArgInfo.from,
                                           typename IntrinsicBindingInfo::InputArguments>;
         static_assert(kUsage == machine_insn_info::kUseDef);
-        static_assert(!RegisterClass::kIsImplicitReg);
+        static_assert(!machine_insn_info::kIsImplicitReg<OperandInfo>);
         if constexpr (RegisterClass::kAsRegister == 'x' && std::is_integral_v<Type>) {
           static_assert(std::is_integral_v<
                         std::tuple_element_t<ArgBinding::kArgInfo.to,
@@ -384,7 +391,7 @@ class TryBindingBasedInlineIntrinsic {
           return std::tuple{};
         } else {
           static_assert(kUsage == machine_insn_info::kUseDef);
-          static_assert(!RegisterClass::kIsImplicitReg);
+          static_assert(!machine_insn_info::kIsImplicitReg<OperandInfo>);
           auto reg = reg_alloc();
           Mov<std::tuple_element_t<ArgBinding::kArgInfo.from,
                                    typename IntrinsicBindingInfo::InputArguments>>(
@@ -395,7 +402,7 @@ class TryBindingBasedInlineIntrinsic {
         using Type = std::tuple_element_t<ArgBinding::kArgInfo.from,
                                           typename IntrinsicBindingInfo::InputArguments>;
         static_assert(kUsage == machine_insn_info::kUseDef);
-        static_assert(RegisterClass::kIsImplicitReg);
+        static_assert(machine_insn_info::kIsImplicitReg<OperandInfo>);
         if constexpr (RegisterClass::kAsRegister == 'a') {
           CHECK_EQ(result_reg_, x86_64::Assembler::no_register);
           Mov<Type>(as_, as_.rax, std::get<ArgBinding::kArgInfo.from>(input_args_));
@@ -418,7 +425,7 @@ class TryBindingBasedInlineIntrinsic {
           result_reg_ = as_.rcx;
           return std::tuple{};
         } else {
-          static_assert(!RegisterClass::kIsImplicitReg);
+          static_assert(!machine_insn_info::kIsImplicitReg<OperandInfo>);
           if constexpr (RegisterClass::kAsRegister == 'x' && std::is_integral_v<Type>) {
             CHECK_EQ(result_xmm_reg_, x86_64::Assembler::no_xmm_register);
             result_xmm_reg_ = reg_alloc();
@@ -445,7 +452,7 @@ class TryBindingBasedInlineIntrinsic {
               .base = as_.rbp,
               .disp = static_cast<int>(offsetof(ThreadState, intrinsics_scratch_area) +
                                        config::kScratchAreaSlotSize * scratch_arg_++)}};
-        } else if constexpr (RegisterClass::kIsImplicitReg) {
+        } else if constexpr (machine_insn_info::kIsImplicitReg<OperandInfo>) {
           return std::tuple{};
         } else {
           return std::tuple{reg_alloc()};

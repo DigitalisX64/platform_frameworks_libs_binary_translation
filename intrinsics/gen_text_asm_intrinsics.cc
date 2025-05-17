@@ -102,11 +102,10 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
   IntrinsicBindingInfo::ProcessBindings([&arg_counter,
                                          &as,
                                          register_numbers]<typename Binding, typename Operand> {
-    using RegisterClass = Operand::Class;
     if constexpr (machine_insn_info::kIsRegister<Operand> &&
-                  !std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-      if constexpr (RegisterClass::kIsImplicitReg) {
-        as->*(RegisterClass::template kAssemblerRegisterPointer<MacroAssembler<TextAssembler>>) =
+                  !machine_insn_info::kIsFLAGS<Operand>) {
+      if constexpr (machine_insn_info::kIsImplicitReg<Operand>) {
+        as->*(Operand::Class::template kAssemblerRegisterPointer<MacroAssembler<TextAssembler>>) =
             typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
       }
       ++arg_counter;
@@ -141,9 +140,8 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
                                  .disp = static_cast<int32_t>(config::kScratchAreaSlotSize *
                                                               scratch_counter++)}};
                            } else if constexpr (machine_insn_info::kIsRegister<Operand> &&
-                                                !std::is_same_v<typename Operand::Class,
-                                                                machine_insn_info::FLAGS>) {
-                             if constexpr (Operand::Class::kIsImplicitReg) {
+                                                !machine_insn_info::kIsFLAGS<Operand>) {
+                             if constexpr (machine_insn_info::kIsImplicitReg<Operand>) {
                                ++arg_counter;
                                return std::tuple{};
                              } else {
@@ -217,17 +215,16 @@ void GenerateTemporaries(FILE* out, int indent) {
   std::size_t id = 0;
   IntrinsicBindingInfo::ProcessBindings([out, &id, indent]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-      if constexpr (!HaveInput(Binding::kArgInfo) && !HaveOutput(Binding::kArgInfo)) {
-        static_assert(Operand::kUsage == machine_insn_info::kDef ||
-                      Operand::kUsage == machine_insn_info::kDefEarlyClobber);
-        fprintf(out,
-                "%*s%s tmp%zd;\n",
-                indent,
-                "",
-                TypeTraits<typename RegisterClass::Type>::kName,
-                id++);
-      }
+    if constexpr (!machine_insn_info::kIsFLAGS<Operand> && !HaveInput(Binding::kArgInfo) &&
+                  !HaveOutput(Binding::kArgInfo)) {
+      static_assert(Operand::kUsage == machine_insn_info::kDef ||
+                    Operand::kUsage == machine_insn_info::kDefEarlyClobber);
+      fprintf(out,
+              "%*s%s tmp%zd;\n",
+              indent,
+              "",
+              TypeTraits<typename RegisterClass::Type>::kName,
+              id++);
     }
   });
 }
@@ -239,6 +236,8 @@ void GenerateInShadows(FILE* out, int indent) {
     if constexpr (machine_insn_info::kIsMemoryOperand<Operand>) {
       // Only temporary memory scratch area is supported.
       static_assert(!HaveInput(Binding::kArgInfo) && !HaveOutput(Binding::kArgInfo));
+    } else if constexpr (machine_insn_info::kIsFLAGS<Operand>) {
+      // Flags don't require any special variables.
     } else if constexpr (RegisterClass::kAsRegister == 'r') {
       // TODO(b/138439904): remove when clang handling of 'r' constraint would be fixed.
       if constexpr (NeedInputShadow<IntrinsicBindingInfo, Binding, Operand>()) {
@@ -333,7 +332,7 @@ void GenerateAssemblerOuts(FILE* out, int indent) {
   int tmp_id = 0;
   IntrinsicBindingInfo::ProcessBindings([&outs, &tmp_id]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS> &&
+    if constexpr (!machine_insn_info::kIsFLAGS<Operand> &&
                   Operand::kUsage != machine_insn_info::kUse) {
       std::string out = "\"=";
       if constexpr (Operand::kUsage == machine_insn_info::kDefEarlyClobber) {
@@ -364,7 +363,7 @@ void GenerateAssemblerIns(FILE* out,
   std::vector<std::string> ins;
   IntrinsicBindingInfo::ProcessBindings([&ins]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS> &&
+    if constexpr (!machine_insn_info::kIsFLAGS<Operand> &&
                   Operand::kUsage == machine_insn_info::kUse) {
       ins.push_back("\"" + std::string(1, RegisterClass::kAsRegister) + "\"(in" +
                     std::to_string(Binding::kArgInfo.from) +
@@ -379,20 +378,17 @@ void GenerateAssemblerIns(FILE* out,
         "\"m\"(*reinterpret_cast<const char*>(&constants_pool::kBerberisMacroAssemblerConstants))");
   }
   int arg_counter = 0;
-  IntrinsicBindingInfo::ProcessBindings(
-      [&ins, &arg_counter, register_numbers]<typename Binding, typename Operand> {
-        using RegisterClass = Operand::Class;
-        if constexpr (!std::is_same_v<RegisterClass, machine_insn_info::FLAGS>) {
-          if constexpr (HaveInput(Binding::kArgInfo) &&
-                        Operand::kUsage != machine_insn_info::kUse) {
-            ins.push_back(
-                "\"" + std::to_string(register_numbers[arg_counter]) + "\"(in" +
-                std::to_string(Binding::kArgInfo.from) +
-                (NeedInputShadow<IntrinsicBindingInfo, Binding, Operand>() ? "_shadow)" : ")"));
-          }
-          ++arg_counter;
-        }
-      });
+  IntrinsicBindingInfo::ProcessBindings([&ins,
+                                         &arg_counter,
+                                         register_numbers]<typename Binding, typename Operand> {
+    if constexpr (!machine_insn_info::kIsFLAGS<Operand> && HaveInput(Binding::kArgInfo) &&
+                  Operand::kUsage != machine_insn_info::kUse) {
+      ins.push_back("\"" + std::to_string(register_numbers[arg_counter]) + "\"(in" +
+                    std::to_string(Binding::kArgInfo.from) +
+                    (NeedInputShadow<IntrinsicBindingInfo, Binding, Operand>() ? "_shadow)" : ")"));
+    }
+    ++arg_counter;
+  });
   GenerateElementsList<IntrinsicBindingInfo>(out, indent, "  : ", "", ins);
 }
 
@@ -400,7 +396,9 @@ template <typename IntrinsicBindingInfo>
 void GenerateOutShadows(FILE* out, int indent) {
   IntrinsicBindingInfo::ProcessBindings([out, indent]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (RegisterClass::kAsRegister == 'r') {
+    if constexpr (machine_insn_info::kIsFLAGS<Operand>) {
+      // Flags don't require shadows.
+    } else if constexpr (RegisterClass::kAsRegister == 'r') {
       // TODO(b/138439904): remove when clang handling of 'r' constraint would be fixed.
       if constexpr (HaveOutput(Binding::kArgInfo)) {
         using Type = std::tuple_element_t<Binding::kArgInfo.to,
@@ -653,7 +651,7 @@ int main(int argc, char* argv[]) {
 #define %2$s_%3$s_INTRINSICS_INTRINSICS_H_
 
 #if defined(__i386__) || defined(__x86_64__)
-#include <xmmintrin.h>
+#include <x86intrin.h>
 #endif
 
 #include "berberis/base/config.h"

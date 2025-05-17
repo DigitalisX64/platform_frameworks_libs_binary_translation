@@ -16,15 +16,15 @@
 
 // Assembler to produce RV64 instructions (no ABI version). Somewhat influenced by V8 assembler.
 
-#ifndef BERBERIS_ASSEMBLER_RV64_H_
-#define BERBERIS_ASSEMBLER_RV64_H_
+#ifndef BERBERIS_ASSEMBLER_RISCV64_H_
+#define BERBERIS_ASSEMBLER_RISCV64_H_
 
 #include <bit>          // std::countr_zero
 #include <type_traits>  // std::is_same
 
 #include "berberis/assembler/riscv.h"
 
-namespace berberis::rv64 {
+namespace berberis::riscv64 {
 
 class Assembler : public riscv::Assembler<Assembler> {
  public:
@@ -53,7 +53,7 @@ class Assembler : public riscv::Assembler<Assembler> {
   friend BaseAssembler;
 
 // Instructions.
-#include "berberis/assembler/gen_assembler_rv64-inl.h"  // NOLINT generated file!
+#include "berberis/assembler/gen_assembler_riscv64-inl.h"  // NOLINT generated file!
 
  private:
   Assembler() = delete;
@@ -130,6 +130,6 @@ constexpr inline void Assembler::Negw(Register arg0, Register arg1) {
   Subw(arg0, zero, arg1);
 }
 
-}  // namespace berberis::rv64
+}  // namespace berberis::riscv64
 
-#endif  // BERBERIS_ASSEMBLER_RV64_H_
+#endif  // BERBERIS_ASSEMBLER_RISCV64_H_

@@ -926,7 +926,7 @@ def _get_reg_operands_info(args):
   return 'std::tuple<%s>' % ', '.join(_get_reg_operand_info(arg) for arg in args)
 
 
-def _gen_make_intrinsics(f, intrs, archs):
+def _gen_process_all_bindings(f, intrs, archs):
   print("%s" % AUTOGEN, file=f)
   callback_lines = []
   static_names = []
@@ -934,6 +934,8 @@ def _gen_make_intrinsics(f, intrs, archs):
   for line in _gen_c_intrinsics_generator(
       intrs, _is_interpreter_compatible_assembler, False, static_names, static_mnemos):
     callback_lines.append(line)
+  # Put implementation into arch-specific namespace to access bindings.
+  print("namespace %s {\n" % archs[-1], file = f)
   print(
 """
 /* Note: we generate binding names and binding mnemos used by callbacks in ProcessAllBindings
@@ -952,14 +954,20 @@ template <typename MacroAssembler,
           typename... Args>
 constexpr void ProcessAllBindings([[maybe_unused]] Callback callback,
                         [[maybe_unused]] Args&&... args) {
-  using intrinsics::Float16;
-  using intrinsics::Float32;
-  using intrinsics::Float64;
+  using berberis::intrinsics::Float16;
+  using berberis::intrinsics::Float32;
+  using berberis::intrinsics::Float64;
   using namespace process_all_bindings_strings;""",
     file=f)
   for line in callback_lines:
     print(line, file=f)
-  print('}', file=f)
+  print("""
+}
+
+}  // namespace %s
+
+using %s::ProcessAllBindings;
+""" % (archs[-1], archs[-1]), file=f)
 
 
 def _gen_process_bindings(f, intrs, archs):
@@ -970,6 +978,10 @@ def _gen_process_bindings(f, intrs, archs):
   for line in _gen_c_intrinsics_generator(
       intrs, _is_translator_compatible_assembler, True, static_names, static_mnemos):
     callback_lines.append(line)
+  # Include definitions of registers for appropriate type of bindings
+  print('#include "berberis/machine_insn_info/%s/machine_insn_info.h"' % archs[-1], file = f)
+  # Put implementation into arch-specific namespace to access bindings.
+  print('namespace berberis{\n\nnamespace %s::intrinsics::bindings {' % archs[-1], file = f)
   print(
 """
 /* Note: we generate binding names and binding mnemos used by callbacks in ProcessBindings
@@ -984,19 +996,36 @@ Once we can use C++23, these can be declared locally in ProcessBindings.*/""", f
   print("} // process_bindings_strings", file = f)
 
   print("""
+template <auto kFunction>
+using FunctionCompareTag = berberis::intrinsics::bindings::FunctionCompareTag<kFunction>;
+
 template <auto kFunc,
           typename MacroAssembler,
           typename Result,
           typename Callback,
           typename... Args>
 constexpr Result ProcessBindings(Callback callback, Result def_result, Args&&... args) {
+  using berberis::intrinsics::Float16;
+  using berberis::intrinsics::Float32;
+  using berberis::intrinsics::Float64;
   using namespace process_bindings_strings;""",
     file=f)
   for line in callback_lines:
     print(line, file=f)
   print("""  }
   return std::forward<Result>(def_result);
-}""", file=f)
+}
+
+}  // namespace %s::intrinsics::bindings
+
+namespace intrinsics::bindings {
+
+using %s::intrinsics::bindings::ProcessBindings;
+
+}  // namespace intrinsics::bindings
+
+}  // namespace berberis
+""" % (archs[-1], archs[-1]), file=f)
 
 
 def _gen_c_intrinsics_generator(
@@ -1106,9 +1135,9 @@ def _gen_c_intrinsic(name,
     else:
       cpuid_restriction = 'machine_insn_info::Has%s' % asm['feature']
 
-  nan_restriction = 'intrinsics::bindings::NoNansOperation'
+  nan_restriction = 'berberis::intrinsics::bindings::NoNansOperation'
   if 'nan' in asm:
-    nan_restriction = 'intrinsics::bindings::%sNanOperationsHandling' % asm['nan']
+    nan_restriction = 'berberis::intrinsics::bindings::%sNanOperationsHandling' % asm['nan']
     template_arg = 'true' if asm['nan'] == "Precise" else "false"
     if '<' in name:
       template_pos = name.index('<')
@@ -1123,7 +1152,7 @@ def _gen_c_intrinsic(name,
       yield ' %s if constexpr (std::is_same_v<FunctionCompareTag<kFunc>,' % (
         '' if name_label == 'BINDING_NAME0' else ' } else'
       )
-      yield '                                      FunctionCompareTag<%s>>) {' % name
+      yield '%s FunctionCompareTag<berberis::intrinsics::%s>>) {' % (' ' * 36, name)
     static_names.append('static constexpr const char %s[] = "%s";' % (name_label, name))
   else:
     name_label = string_labels[name]
@@ -1139,7 +1168,7 @@ def _gen_c_intrinsic(name,
     yield '    if (auto result = callback('
   else:
     yield '    callback('
-  yield '          intrinsics::bindings::IntrinsicBindingInfo<'
+  yield '          berberis::intrinsics::bindings::IntrinsicBindingInfo<'
   yield '              %s,' % (
     ',\n              '.join(
         [name_label,
@@ -1331,21 +1360,20 @@ def _add_asm_insn(intrs, arch_intr, insn):
   intrs[name]['asm'].append(insn)
 
 
-def _open_asm_def_files(def_files, arch_def_files, asm_def_files, need_archs=True):
+def _open_asm_def_files(def_files, arch_def_files, asm_def_files):
   intrs = _load_intrs_def_files(def_files)
   expanded_intrs = _expand_template_intrinsics(intrs)
   arch_intrs = _load_intrs_arch_def(arch_def_files)
   archs = []
-  macro_assemblers = 0
+  assemblers = 0
   for macro_def in asm_def_files:
-    arch, arch_intrs = _load_macro_def(expanded_intrs, arch_intrs, macro_def, macro_assemblers)
-    macro_assemblers += 1
+    arch, arch_intrs = _load_macro_def(expanded_intrs, arch_intrs, macro_def, assemblers)
+    if arch is not None:
+      archs.append(arch)
+    assemblers += 1
   # Make sure that all intrinsics were found during processing of arch_intrs.
   assert arch_intrs == []
-  if need_archs:
-    return archs, sorted(intrs.items()), sorted(expanded_intrs.items())
-  else:
-    return sorted(intrs.items())
+  return archs, sorted(intrs.items()), sorted(expanded_intrs.items())
 
 
 def _expand_template_intrinsics(intrs):
@@ -1442,10 +1470,9 @@ def main(argv):
     archs, intrs, expanded_intrs = _open_asm_def_files(
       argv[out_files_end:def_files_end],
       argv[def_files_end:arch_def_files_end],
-      argv[arch_def_files_end:],
-      True)
+      argv[arch_def_files_end:])
     if mode == '--text_asm_intrinsics_bindings':
-      _gen_make_intrinsics(open_out_file(argv[2]), expanded_intrs, archs)
+      _gen_process_all_bindings(open_out_file(argv[2]), expanded_intrs, archs)
     else:
       _gen_intrinsics_inl_h(open_out_file(argv[2]), intrs)
       _gen_process_bindings(open_out_file(argv[3]), expanded_intrs, archs)

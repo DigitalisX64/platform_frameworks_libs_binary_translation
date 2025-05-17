@@ -78,11 +78,12 @@
         "ECX",
         "EAX"
       ],
-      "gcc_asm_name": "r"
+      "gcc_asm_name": "q"
     },
     {
       "name": "FpReg64",
       "size": 8,
+      "type": "__m128",
       "regs": [
         "XmmReg"
       ],
@@ -91,6 +92,7 @@
     {
       "name": "FpReg32",
       "size": 4,
+      "type": "__m128",
       "regs": [
         "XmmReg"
       ],
@@ -246,6 +248,13 @@
       "size": 16,
       "regs": [
         "XMM7"
+      ]
+    },
+    {
+      "name": "FLAGS",
+      "size": 0,
+      "regs": [
+        "FLAGS"
       ]
     }
   ]
