@@ -363,22 +363,84 @@ cc_test_host {
     },
 }
 
+// This module is used as a workaround to define those deps of berberis_all_deps_defaults which are native_bridge only.
+ndk_translation_package {
+    name: "berberis_all_deps_intermediate_package",
+    compile_multilib: "both",
+    native_bridge_supported: true,
+    native_bridge_deps: [
+        "berberis_hello_world",
+        "berberis_hello_world_static",
+        "berberis_ndk_program_tests",
+        "berberis_perf_tests_static",
+    ],
+    generate_build_files: false,
+}
+
 phony_rule_defaults {
     name: "berberis_all_deps_defaults",
     phony_deps: [
-        "berberis_hello_world.native_bridge",
-        "berberis_hello_world_static.native_bridge",
         "berberis_host_tests",
         "berberis_host_tests_avx",
         "berberis_host_tests_no_avx",
         "berberis_ndk_program_tests",
-        "berberis_ndk_program_tests.native_bridge",
-        "berberis_perf_tests_static.native_bridge",
         "dwarf_reader",
         "libberberis_emulated_libcamera2ndk_api_checker",
         "nogrod_unit_tests",
         "gen_intrinsics_tests",
+        // The intermediate packages to declare those deps which are native_bridge variant.
+        "berberis_all_deps_intermediate_package",
     ],
+}
+
+// This module is used as a workaround to define those deps of berberis_all_deps_defaults which are native_bridge only.
+ndk_translation_package {
+    name: "berberis_all_riscv64_to_x86_64_intermediate_package",
+    compile_multilib: "both",
+    native_bridge_supported: true,
+    native_bridge_deps: [
+        // NATIVE_BRIDGE_PRODUCT_PACKAGES
+        "libnative_bridge_vdso",
+        "native_bridge_guest_app_process",
+        "native_bridge_guest_linker",
+        "libandroidicu",
+        "libcompiler_rt",
+        "libcrypto",
+        "libcutils",
+        "libdl",
+        "libdl_android",
+        "libicu",
+        "liblog",
+        "libm",
+        "libsqlite",
+        "libssl",
+        "libstdc++",
+        "libsync",
+        "libutils",
+        "libz",
+        // NATIVE_BRIDGE_MODIFIED_GUEST_LIBS
+        "libnative_bridge_guest_libaaudio",
+        "libnative_bridge_guest_libamidi",
+        "libnative_bridge_guest_libandroid",
+        "libnative_bridge_guest_libandroid_runtime",
+        "libnative_bridge_guest_libbinder_ndk",
+        "//frameworks/libs/native_bridge_support/android_api/libc:libnative_bridge_guest_libc",
+        "libnative_bridge_guest_libcamera2ndk",
+        "libnative_bridge_guest_libEGL",
+        "libnative_bridge_guest_libGLESv1_CM",
+        "libnative_bridge_guest_libGLESv2",
+        "libnative_bridge_guest_libGLESv3",
+        "libnative_bridge_guest_libjnigraphics",
+        "libnative_bridge_guest_libmediandk",
+        "libnative_bridge_guest_libnativehelper",
+        "libnative_bridge_guest_libnativewindow",
+        "libnative_bridge_guest_libneuralnetworks",
+        "libnative_bridge_guest_libOpenMAXAL",
+        "libnative_bridge_guest_libOpenSLES",
+        "libnative_bridge_guest_libvulkan",
+        "libnative_bridge_guest_libwebviewchromium_plat_support",
+    ],
+    generate_build_files: false,
 }
 
 // Note: Keep in sync with variables from `berberis_config.mk` and
@@ -411,47 +473,8 @@ phony_rule_defaults {
         "berberis_program_runner_binfmt_misc_riscv64",
         "berberis_program_runner_riscv64",
         "libberberis_riscv64",
-        // NATIVE_BRIDGE_PRODUCT_PACKAGES
-        "libnative_bridge_vdso.native_bridge",
-        "native_bridge_guest_app_process.native_bridge",
-        "native_bridge_guest_linker.native_bridge",
-        // $(addsuffix .native_bridge,$(NATIVE_BRIDGE_ORIG_GUEST_LIBS))
-        "libandroidicu.bootstrap.native_bridge",
-        "libcompiler_rt.native_bridge",
-        "libcrypto.native_bridge",
-        "libcutils.native_bridge",
-        "libdl.bootstrap.native_bridge",
-        "libdl_android.bootstrap.native_bridge",
-        "libicu.bootstrap.native_bridge",
-        "liblog.native_bridge",
-        "libm.bootstrap.native_bridge",
-        "libsqlite.native_bridge",
-        "libssl.native_bridge",
-        "libstdc++.native_bridge",
-        "libsync.native_bridge",
-        "libutils.native_bridge",
-        "libz.native_bridge",
-        // NATIVE_BRIDGE_MODIFIED_GUEST_LIBS
-        "libnative_bridge_guest_libaaudio.native_bridge",
-        "libnative_bridge_guest_libamidi.native_bridge",
-        "libnative_bridge_guest_libandroid.native_bridge",
-        "libnative_bridge_guest_libandroid_runtime.native_bridge",
-        "libnative_bridge_guest_libbinder_ndk.native_bridge",
-        "libnative_bridge_guest_libc.native_bridge",
-        "libnative_bridge_guest_libcamera2ndk.native_bridge",
-        "libnative_bridge_guest_libEGL.native_bridge",
-        "libnative_bridge_guest_libGLESv1_CM.native_bridge",
-        "libnative_bridge_guest_libGLESv2.native_bridge",
-        "libnative_bridge_guest_libGLESv3.native_bridge",
-        "libnative_bridge_guest_libjnigraphics.native_bridge",
-        "libnative_bridge_guest_libmediandk.native_bridge",
-        "libnative_bridge_guest_libnativehelper.native_bridge",
-        "libnative_bridge_guest_libnativewindow.native_bridge",
-        "libnative_bridge_guest_libneuralnetworks.native_bridge",
-        "libnative_bridge_guest_libOpenMAXAL.native_bridge",
-        "libnative_bridge_guest_libOpenSLES.native_bridge",
-        "libnative_bridge_guest_libvulkan.native_bridge",
-        "libnative_bridge_guest_libwebviewchromium_plat_support.native_bridge",
+        // The intermediate packages to declare those deps which are native_bridge variant.
+        "berberis_all_riscv64_to_x86_64_intermediate_package",
         // Everything else.
         "berberis_guest_loader_riscv64_tests",
     ],

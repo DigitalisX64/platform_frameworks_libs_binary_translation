@@ -24,6 +24,8 @@
 #include <tuple>
 #include <utility>
 
+#include "berberis/intrinsics//all_to_x86_32_or_x86_64/macro_assembler.h"
+#include "berberis/intrinsics//all_to_x86_64/macro_assembler.h"
 // Don't include arch-dependent parts because macro-assembler doesn't depend on implementation of
 // Float32/Float64 types but can be compiled for different architecture (soong's host architecture,
 // not device architecture AKA berberis' host architecture).
@@ -32,15 +34,31 @@
 
 namespace berberis {
 
+// Note: MacroAssembler specifies the full inheritance plan for all mixed-in assemblers.
+// Details at go/berberis-macroassembler-mixins
 template <typename Assembler>
-class MacroAssembler : public Assembler {
+class MacroAssembler
+    : public MacroAssemblerX86_64GuestAgnostic<
+          Assembler,
+          MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
+          MacroAssembler<Assembler>> {
  public:
-  using MacroAssemblers = std::tuple<MacroAssembler<Assembler>,
-                                     typename Assembler::BaseAssembler,
-                                     typename Assembler::FinalAssembler>;
+  using MacroAssemblers = std::tuple<
+      MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
+      MacroAssemblerX86_64GuestAgnostic<
+          Assembler,
+          MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
+          MacroAssembler<Assembler>>,
+      MacroAssembler<Assembler>,
+      typename Assembler::BaseAssembler,
+      typename Assembler::FinalAssembler>;
 
   template <typename... Args>
-  constexpr explicit MacroAssembler(Args&&... args) : Assembler(std::forward<Args>(args)...) {}
+  constexpr explicit MacroAssembler(Args&&... args)
+      : MacroAssemblerX86_64GuestAgnostic<
+            Assembler,
+            MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
+            MacroAssembler<Assembler>>(std::forward<Args>(args)...) {}
 
 #define IMPORT_ASSEMBLER_FUNCTIONS
 #include "berberis/assembler/gen_assembler_x86_64-using-inl.h"
@@ -58,7 +76,7 @@ class MacroAssembler : public Assembler {
     Vpandn(result, src, {.disp = constants_offsets::kVectorConst<uint8_t{0b1111'1111}>});
   }
 
-#include "berberis/intrinsics/macro_assembler_interface-inl.h"  // NOLINT generated file
+#include "berberis/intrinsics/riscv64_to_x86_64/macro_assembler_interface-inl.h"  // NOLINT generated file
 
  private:
 
@@ -71,6 +89,8 @@ class MacroAssembler : public Assembler {
 }  // namespace berberis
 
 // Macro specializations.
+#include "berberis/intrinsics/all_to_x86_32_or_x86_64/macro_assembler-impl.h"
+#include "berberis/intrinsics/all_to_x86_64/macro_assembler-impl.h"
 #include "berberis/intrinsics/macro_assembler_arith_impl.h"
 #include "berberis/intrinsics/macro_assembler_bitmanip_impl.h"
 #include "berberis/intrinsics/macro_assembler_floating_point_impl.h"

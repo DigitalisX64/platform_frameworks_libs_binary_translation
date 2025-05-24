@@ -434,13 +434,13 @@ class SemanticsPlayer {
     Register result = Overloaded{[&](const typename Decoder::OpArgs& args) {
                                    switch (args.opcode) {
                                      case Decoder::OpOpcode::kDiv:
-                                       return listener_->Div(arg1, arg2, kType<int64_t>);
+                                       return listener_->DivRiscV(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kDivu:
-                                       return listener_->Div(arg1, arg2, kType<uint64_t>);
+                                       return listener_->DivRiscV(arg1, arg2, kType<uint64_t>);
                                      case Decoder::OpOpcode::kRem:
-                                       return listener_->Rem(arg1, arg2, kType<int64_t>);
+                                       return listener_->RemRiscV(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kRemu:
-                                       return listener_->Rem(arg1, arg2, kType<uint64_t>);
+                                       return listener_->RemRiscV(arg1, arg2, kType<uint64_t>);
                                      case Decoder::OpOpcode::kMax:
                                        return listener_->Max(arg1, arg2, kType<int64_t>);
                                      case Decoder::OpOpcode::kMaxu:
@@ -476,13 +476,13 @@ class SemanticsPlayer {
                                      case Decoder::Op32Opcode::kAdduw:
                                        return listener_->Adduw(arg1, arg2);
                                      case Decoder::Op32Opcode::kDivw:
-                                       return listener_->Div(arg1, arg2, kType<int32_t>);
+                                       return listener_->DivRiscV(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kDivuw:
-                                       return listener_->Div(arg1, arg2, kType<uint32_t>);
+                                       return listener_->DivRiscV(arg1, arg2, kType<uint32_t>);
                                      case Decoder::Op32Opcode::kRemw:
-                                       return listener_->Rem(arg1, arg2, kType<int32_t>);
+                                       return listener_->RemRiscV(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kRemuw:
-                                       return listener_->Rem(arg1, arg2, kType<uint32_t>);
+                                       return listener_->RemRiscV(arg1, arg2, kType<uint32_t>);
                                      case Decoder::Op32Opcode::kRolw:
                                        return listener_->Rol(arg1, arg2, kType<int32_t>);
                                      case Decoder::Op32Opcode::kRorw:

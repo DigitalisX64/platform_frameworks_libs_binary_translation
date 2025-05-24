@@ -1225,16 +1225,16 @@ DEFINE_2OP_ARITHMETIC_INTRINSIC_VX(mulhsu, auto [arg1, arg2] = std::tuple{args..
                                                  Widen(BitCastToUnsigned(arg2))))
 DEFINE_2OP_ARITHMETIC_INTRINSIC_VV(
     div,
-    ElementType{std::get<0>(Div(static_cast<typename ElementType::BaseType>(args)...))})
+    ElementType{std::get<0>(DivRiscV(static_cast<typename ElementType::BaseType>(args)...))})
 DEFINE_2OP_ARITHMETIC_INTRINSIC_VX(
     div,
-    ElementType{std::get<0>(Div(static_cast<typename ElementType::BaseType>(args)...))})
+    ElementType{std::get<0>(DivRiscV(static_cast<typename ElementType::BaseType>(args)...))})
 DEFINE_2OP_ARITHMETIC_INTRINSIC_VV(
     rem,
-    ElementType{std::get<0>(Rem(static_cast<typename ElementType::BaseType>(args)...))})
+    ElementType{std::get<0>(RemRiscV(static_cast<typename ElementType::BaseType>(args)...))})
 DEFINE_2OP_ARITHMETIC_INTRINSIC_VX(
     rem,
-    ElementType{std::get<0>(Rem(static_cast<typename ElementType::BaseType>(args)...))})
+    ElementType{std::get<0>(RemRiscV(static_cast<typename ElementType::BaseType>(args)...))})
 
 DEFINE_2OP_WIDEN_ARITHMETIC_INTRINSIC_VV(add, (args + ...))
 DEFINE_2OP_WIDEN_ARITHMETIC_INTRINSIC_VX(add, (args + ...))

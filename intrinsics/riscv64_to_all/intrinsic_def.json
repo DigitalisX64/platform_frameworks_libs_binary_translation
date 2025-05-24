@@ -17,12 +17,7 @@
   "Aadd": {
     "comment": "Averaging add (scalar).",
     "class": "template",
-    "variants": [
-      "int32_t",
-      "int64_t",
-      "uint32_t",
-      "uint64_t"
-    ],
+    "variants": [ "int32_t", "int64_t", "uint32_t", "uint64_t" ],
     "in": [ "int8_t", "Type0", "Type0" ],
     "out": [ "Type0" ]
   },
@@ -177,12 +172,7 @@
   "Asub": {
     "comment": "Averaging subtract (scalar).",
     "class": "template",
-    "variants": [
-      "int32_t",
-      "int64_t",
-      "uint32_t",
-      "uint64_t"
-    ],
+    "variants": [ "int32_t", "int64_t", "uint32_t", "uint64_t" ],
     "in": [ "int8_t", "Type0", "Type0" ],
     "out": [ "Type0" ]
   },
@@ -268,15 +258,10 @@
     "in": [ "Type0" ],
     "out": [ "int64_t" ]
   },
-  "Div": {
+  "DivRiscV": {
     "comment": "Integer division",
     "class": "template",
-    "variants": [
-      "int32_t",
-      "int64_t",
-      "uint32_t",
-      "uint64_t"
-    ],
+    "variants": [ "int32_t", "int64_t", "uint32_t", "uint64_t" ],
     "in": [ "Type0", "Type0" ],
     "out": [ "Type0" ]
   },
@@ -634,15 +619,10 @@
     "in": [ "uint64_t" ],
     "out": [ "uint64_t" ]
   },
-  "Rem": {
+  "RemRiscV": {
     "comment": "Integer remainder",
     "class": "template",
-    "variants": [
-      "int32_t",
-      "int64_t",
-      "uint32_t",
-      "uint64_t"
-    ],
+    "variants": [ "int32_t", "int64_t", "uint32_t", "uint64_t" ],
     "in": [ "Type0", "Type0" ],
     "out": [ "Type0" ]
   },
@@ -669,12 +649,7 @@
   "Roundoff": {
     "comment": "Fixed point conversion with rounding (but without narrowing).",
     "class": "template",
-    "variants": [
-      "int32_t",
-      "int64_t",
-      "uint32_t",
-      "uint64_t"
-    ],
+    "variants": [ "int32_t", "int64_t", "uint32_t", "uint64_t" ],
     "in": [ "int8_t", "Type0", "Type0" ],
     "out": [ "Type0" ]
   },

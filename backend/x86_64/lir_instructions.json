@@ -76,6 +76,7 @@
         "ShlqRegImm",
         "ShlqRegReg",
         "ShrbRegImm",
+        "ShrdlRegRegImm",
         "ShrlRegImm",
         "ShrlRegReg",
         "ShrqRegImm",

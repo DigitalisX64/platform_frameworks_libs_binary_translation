@@ -33,9 +33,9 @@ namespace berberis {
 
 // TODO(b/280544942): Consider moving these paths to native_bridge_support.
 // Define these path constants for the target guest architecture.
-extern const char* kAppProcessPath;
-extern const char* kPtInterpPath;
-extern const char* kVdsoPath;
+extern const char* kAppProcessRelativePath;
+extern const char* kPtInterpRelativePath;
+extern const char* kVdsoRelativePath;
 extern const char* kProxyPrefix;
 
 GuestAddr InitKernelArgs(GuestAddr guest_sp,

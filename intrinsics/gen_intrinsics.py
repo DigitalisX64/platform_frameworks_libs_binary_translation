@@ -469,8 +469,8 @@ def _gen_interpreter_hook(f, name, intr, option):
   else:
     # TODO(b/363057506): Add float support and clean up the logic here.
     arm64_allowlist = ['AmoAdd', 'AmoAnd', 'AmoMax', 'AmoMin', 'AmoOr', 'AmoSwap', 'AmoXor', 'Bclr',
-                       'Bclri', 'Bext', 'Bexti', 'Binv', 'Binvi', 'Bset', 'Bseti', 'Div', 'Max',
-                       'Min', 'Rem', 'Rev8', 'Rol', 'Ror', 'Sext', 'Sh1add', 'Sh1adduw', 'Sh2add',
+                       'Bclri', 'Bext', 'Bexti', 'Binv', 'Binvi', 'Bset', 'Bseti', 'DivRiscV', 'Max',
+                       'Min', 'RemRiscV', 'Rev8', 'Rol', 'Ror', 'Sext', 'Sh1add', 'Sh1adduw', 'Sh2add',
                        'Sh2adduw', 'Sh3add', 'Sh3adduw', 'Zext', 'UnboxNan']
     if (option == 'arm64') and (name not in arm64_allowlist):
       _get_placeholder_return_stmt(intr, f)
@@ -1390,7 +1390,7 @@ def _expand_template_intrinsics(intrs):
      # are needed for #2.
      # This hack helps us to resolve it. If we would have more such intrinsics
      # we may need to extend JSON capabilities.
-     if name in ('Aadd', 'Asub', 'Div', 'Rem', 'Roundoff'):
+     if name in ('Aadd', 'Asub', 'DivRiscV', 'RemRiscV', 'Roundoff'):
        if 'int8_t' not in variants: variants += ['int8_t']
        if 'uint8_t' not in variants: variants += ['uint8_t']
        if 'int16_t' not in variants: variants += ['int16_t']

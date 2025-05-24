@@ -152,9 +152,9 @@ void GenWrapGuestFunction(MachineCode* mc,
         if (signature[i] == 'f') {
           // LP64D requires 32-bit floats to be NaN boxed.
           if (host_platform::kHasAVX) {
-            as.MacroNanBoxAVX<intrinsics::Float32>(kFpParamRegs[fp_argc], kFpParamRegs[fp_argc]);
+            as.NanBoxAVX<intrinsics::Float32>(kFpParamRegs[fp_argc], kFpParamRegs[fp_argc]);
           } else {
-            as.MacroNanBox<intrinsics::Float32>(kFpParamRegs[fp_argc]);
+            as.NanBox<intrinsics::Float32>(kFpParamRegs[fp_argc]);
           }
         }
         if (host_platform::kHasAVX) {

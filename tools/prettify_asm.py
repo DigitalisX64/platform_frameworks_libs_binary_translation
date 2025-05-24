@@ -90,9 +90,9 @@ def main(argv):
       return match
 
   # Make short lists one-liners
-  text = re.sub('[\[{][^][{}]*[]}]', replace_if_short, text)
+  text = re.sub('[\\[{][^][{}]*[]}]', replace_if_short, text)
   # Allow opcodes list.
-  text = re.sub('[\[{][^][{}]*"opcodes"[^][{}]*[\[{][^][{}]*[]}][^][{}]*[]}]', replace_if_short, text)
+  text = re.sub('[\\[{][^][{}]*"opcodes"[^][{}]*[\\[{][^][{}]*[]}][^][{}]*[]}]', replace_if_short, text)
 
   # Remove trailing spaces
   text = re.sub(' $', '', text, flags=re.MULTILINE)

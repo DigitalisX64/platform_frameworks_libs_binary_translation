@@ -72,35 +72,40 @@ TEST(Intrinsics, Asub) {
   Verify.operator()<uint8_t>(ROD);
 }
 
-TEST(Intrinsics, Div) {
-  ASSERT_EQ(std::get<0>(Div<int8_t>(int8_t{-128}, int8_t{0})), int8_t{-1});
-  ASSERT_EQ(std::get<0>(Div<int8_t>(int8_t{-128}, int8_t{-1})), int8_t{-128});
-  ASSERT_EQ(std::get<0>(Div<int8_t>(int8_t{-128}, int8_t{-2})), int8_t{64});
-  ASSERT_EQ(std::get<0>(Div<uint8_t>(uint8_t{128}, uint8_t{0})), uint8_t{255});
-  ASSERT_EQ(std::get<0>(Div<uint8_t>(uint8_t{128}, uint8_t{1})), uint8_t{128});
-  ASSERT_EQ(std::get<0>(Div<uint8_t>(uint8_t{128}, uint8_t{2})), uint8_t{64});
-  ASSERT_EQ(std::get<0>(Div<int16_t>(int16_t{-32768}, int16_t{0})), int16_t{-1});
-  ASSERT_EQ(std::get<0>(Div<int16_t>(int16_t{-32768}, int16_t{-1})), int16_t{-32768});
-  ASSERT_EQ(std::get<0>(Div<int16_t>(int16_t{-32768}, int16_t{-2})), int16_t{16384});
-  ASSERT_EQ(std::get<0>(Div<uint16_t>(uint16_t{32768}, uint16_t{0})), uint16_t{65535});
-  ASSERT_EQ(std::get<0>(Div<uint16_t>(uint16_t{32768}, uint16_t{1})), uint16_t{32768});
-  ASSERT_EQ(std::get<0>(Div<uint16_t>(uint16_t{32768}, uint16_t{2})), uint16_t{16384});
-  ASSERT_EQ(std::get<0>(Div<int32_t>(int32_t{-2147483648}, int32_t{0})), int32_t{-1});
-  ASSERT_EQ(std::get<0>(Div<int32_t>(int32_t{-2147483648}, int32_t{-1})), int32_t{-2147483648});
-  ASSERT_EQ(std::get<0>(Div<int32_t>(int32_t{-2147483648}, int32_t{-2})), int32_t{1073741824});
-  ASSERT_EQ(std::get<0>(Div<uint32_t>(uint32_t{2147483648}, uint32_t{0})), uint32_t{4294967295});
-  ASSERT_EQ(std::get<0>(Div<uint32_t>(uint32_t{2147483648}, uint32_t{1})), uint32_t{2147483648});
-  ASSERT_EQ(std::get<0>(Div<uint32_t>(uint32_t{2147483648}, uint32_t{2})), uint32_t{1073741824});
-  ASSERT_EQ(std::get<0>(Div<int64_t>(int64_t{-9223372036854775807 - 1}, int64_t{0})), int64_t{-1});
-  ASSERT_EQ(std::get<0>(Div<int64_t>(int64_t{-9223372036854775807 - 1}, int64_t{-1})),
+TEST(Intrinsics, DivRiscV) {
+  ASSERT_EQ(std::get<0>(DivRiscV<int8_t>(int8_t{-128}, int8_t{0})), int8_t{-1});
+  ASSERT_EQ(std::get<0>(DivRiscV<int8_t>(int8_t{-128}, int8_t{-1})), int8_t{-128});
+  ASSERT_EQ(std::get<0>(DivRiscV<int8_t>(int8_t{-128}, int8_t{-2})), int8_t{64});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint8_t>(uint8_t{128}, uint8_t{0})), uint8_t{255});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint8_t>(uint8_t{128}, uint8_t{1})), uint8_t{128});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint8_t>(uint8_t{128}, uint8_t{2})), uint8_t{64});
+  ASSERT_EQ(std::get<0>(DivRiscV<int16_t>(int16_t{-32768}, int16_t{0})), int16_t{-1});
+  ASSERT_EQ(std::get<0>(DivRiscV<int16_t>(int16_t{-32768}, int16_t{-1})), int16_t{-32768});
+  ASSERT_EQ(std::get<0>(DivRiscV<int16_t>(int16_t{-32768}, int16_t{-2})), int16_t{16384});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint16_t>(uint16_t{32768}, uint16_t{0})), uint16_t{65535});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint16_t>(uint16_t{32768}, uint16_t{1})), uint16_t{32768});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint16_t>(uint16_t{32768}, uint16_t{2})), uint16_t{16384});
+  ASSERT_EQ(std::get<0>(DivRiscV<int32_t>(int32_t{-2147483648}, int32_t{0})), int32_t{-1});
+  ASSERT_EQ(std::get<0>(DivRiscV<int32_t>(int32_t{-2147483648}, int32_t{-1})),
+            int32_t{-2147483648});
+  ASSERT_EQ(std::get<0>(DivRiscV<int32_t>(int32_t{-2147483648}, int32_t{-2})), int32_t{1073741824});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint32_t>(uint32_t{2147483648}, uint32_t{0})),
+            uint32_t{4294967295});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint32_t>(uint32_t{2147483648}, uint32_t{1})),
+            uint32_t{2147483648});
+  ASSERT_EQ(std::get<0>(DivRiscV<uint32_t>(uint32_t{2147483648}, uint32_t{2})),
+            uint32_t{1073741824});
+  ASSERT_EQ(std::get<0>(DivRiscV<int64_t>(int64_t{-9223372036854775807 - 1}, int64_t{0})),
+            int64_t{-1});
+  ASSERT_EQ(std::get<0>(DivRiscV<int64_t>(int64_t{-9223372036854775807 - 1}, int64_t{-1})),
             int64_t{-9223372036854775807 - 1});
-  ASSERT_EQ(std::get<0>(Div<int64_t>(int64_t{-9223372036854775807 - 1}, int64_t{-2})),
+  ASSERT_EQ(std::get<0>(DivRiscV<int64_t>(int64_t{-9223372036854775807 - 1}, int64_t{-2})),
             int64_t{4611686018427387904});
-  ASSERT_EQ(std::get<0>(Div<uint64_t>(uint64_t{9223372036854775808U}, uint64_t{0})),
+  ASSERT_EQ(std::get<0>(DivRiscV<uint64_t>(uint64_t{9223372036854775808U}, uint64_t{0})),
             uint64_t{18446744073709551615U});
-  ASSERT_EQ(std::get<0>(Div<uint64_t>(uint64_t{9223372036854775808U}, uint64_t{1})),
+  ASSERT_EQ(std::get<0>(DivRiscV<uint64_t>(uint64_t{9223372036854775808U}, uint64_t{1})),
             uint64_t{9223372036854775808U});
-  ASSERT_EQ(std::get<0>(Div<uint64_t>(uint64_t{9223372036854775808U}, uint64_t{2})),
+  ASSERT_EQ(std::get<0>(DivRiscV<uint64_t>(uint64_t{9223372036854775808U}, uint64_t{2})),
             uint64_t{4611686018427387904});
 }
 

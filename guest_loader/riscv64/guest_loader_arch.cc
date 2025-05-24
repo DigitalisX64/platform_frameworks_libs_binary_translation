@@ -28,9 +28,9 @@ namespace berberis {
 
 // TODO(b/279068747): Ensure these paths are correct.
 // Paths required by guest_loader_impl.h.
-const char* kAppProcessPath = "/system/bin/riscv64/app_process64";
-const char* kPtInterpPath = "/system/bin/riscv64/linker64";
-const char* kVdsoPath = "/system/lib64/riscv64/libnative_bridge_vdso.so";
+const char* kAppProcessRelativePath = "riscv64/app_process64";
+const char* kPtInterpRelativePath = "riscv64/linker64";
+const char* kVdsoRelativePath = "riscv64/libnative_bridge_vdso.so";
 const char* kProxyPrefix = "libberberis_proxy_";
 
 GuestAddr InitKernelArgs(GuestAddr guest_sp,

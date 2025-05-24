@@ -1214,6 +1214,58 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersCopiesDefRegisters) {
   ASSERT_NE((*insns)->RegAt(1), input1);
 }
 
+// Test that ReplaceFlagRegisters won't insert instructions multiple times for
+// the same register.
+TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersWithDuplicates) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  MachineReg flags0 = machine_ir.AllocVReg();
+  MachineReg input0 = machine_ir.AllocVReg();
+
+  auto bb0 = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb0);
+  builder.Gen<SubqRegReg>(flags0, flags0, kMachineRegFLAGS);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  ReplaceFlagRegisters(
+      &machine_ir,
+      ReadFlagsOptContext{
+          bb0,
+          MachineInsnList{{machine_ir.NewInsn<PseudoReadFlags>(
+                              PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS)},
+                          machine_ir.arena()}
+              .begin(),
+          FlagSettingInsn{
+              MachineInsnList{{machine_ir.NewInsn<AddqRegReg>(input0, input0, kMachineRegFLAGS)},
+                              machine_ir.arena()}
+                  .begin(),
+              false},
+      },
+      bb0->insn_list().begin(),
+      MachineRegVector({flags0}, machine_ir.arena()),
+      ArenaMap<MachineReg, MachineReg>(
+          {
+              {input0, input0},
+          },
+          machine_ir.arena()),
+      nullptr);
+
+  auto insn_it = bb0->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpSubqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoJump);
+}
+
 }  // namespace
 
 }  // namespace berberis::x86_64

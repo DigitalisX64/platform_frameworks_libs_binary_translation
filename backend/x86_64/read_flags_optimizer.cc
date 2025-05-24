@@ -21,6 +21,7 @@
 
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/algorithm.h"
+#include "berberis/base/arena_set.h"
 #include "berberis/base/arena_vector.h"
 
 namespace berberis::x86_64 {
@@ -449,6 +450,7 @@ void ReplaceFlagRegisters(MachineIR* machine_ir,
                           MachineRegVector flags_regs,
                           const ArenaMap<MachineReg, MachineReg>& reg_map,
                           MachineInsn* insn) {
+  ArenaSet<MachineReg> used_flags{machine_ir->arena()};
   while (insn_it != context.bb->insn_list().end()) {
     if (AsMachineInsnX86_64(*insn_it)->opcode() == kMachineOpPseudoCopy &&
         Contains(flags_regs, (*insn_it)->RegAt(1))) {
@@ -458,11 +460,15 @@ void ReplaceFlagRegisters(MachineIR* machine_ir,
       continue;
     }
     // Check if we use the register.
+    used_flags.clear();
     for (int i = 0; i < (*insn_it)->NumRegOperands(); i++) {
-      if (!Contains(flags_regs, (*insn_it)->RegAt(i))) {
-        continue;
+      if (Contains(flags_regs, (*insn_it)->RegAt(i))) {
+        used_flags.insert((*insn_it)->RegAt(i));
       }
-      InsertFlagGenInstructions(machine_ir, context, insn_it, reg_map, (*insn_it)->RegAt(i));
+    }
+    // Insert instructions for any flags we used.
+    for (auto reg : used_flags) {
+      InsertFlagGenInstructions(machine_ir, context, insn_it, reg_map, reg);
     }
     insn_it++;
   }

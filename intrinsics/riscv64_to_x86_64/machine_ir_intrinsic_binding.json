@@ -70,7 +70,7 @@
   },
   {
     "name": "Clz<int32_t>",
-    "insn": "ClzInt32",
+    "insn": "CountLeadingZerosU32",
     "in": [ 1 ],
     "out": [ 0 ]
   },
@@ -83,7 +83,7 @@
   },
   {
     "name": "Clz<int64_t>",
-    "insn": "ClzInt64",
+    "insn": "CountLeadingZerosU64",
     "in": [ 1 ],
     "out": [ 0 ]
   },
@@ -110,7 +110,7 @@
   },
   {
     "name": "Ctz<int32_t>",
-    "insn": "CtzInt32",
+    "insn": "CountTrailingZerosU32",
     "in": [ 1 ],
     "out": [ 0 ]
   },
@@ -123,7 +123,7 @@
   },
   {
     "name": "Ctz<int64_t>",
-    "insn": "CtzInt64",
+    "insn": "CountTrailingZerosU64",
     "in": [ 1 ],
     "out": [ 0 ]
   },
@@ -135,50 +135,50 @@
     "out": [ 0 ]
   },
   {
-    "name": "Div<int8_t>",
-    "insn": "DivInt8",
+    "name": "DivRiscV<int8_t>",
+    "insn": "DivI8RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<int16_t>",
-    "insn": "DivInt16",
+    "name": "DivRiscV<int16_t>",
+    "insn": "DivI16RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<int32_t>",
-    "insn": "DivInt32",
+    "name": "DivRiscV<int32_t>",
+    "insn": "DivI32RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<int64_t>",
-    "insn": "DivInt64",
+    "name": "DivRiscV<int64_t>",
+    "insn": "DivI64RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<uint8_t>",
-    "insn": "DivUInt8",
+    "name": "DivRiscV<uint8_t>",
+    "insn": "DivU8RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<uint16_t>",
-    "insn": "DivUInt16",
+    "name": "DivRiscV<uint16_t>",
+    "insn": "DivU16RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<uint32_t>",
-    "insn": "DivUInt32",
+    "name": "DivRiscV<uint32_t>",
+    "insn": "DivU32RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Div<uint64_t>",
-    "insn": "DivUInt64",
+    "name": "DivRiscV<uint64_t>",
+    "insn": "DivU64RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
@@ -210,25 +210,25 @@
   },
   {
     "name": "FCvtFloatToIntegerHostRounding<int32_t, Float32>",
-    "insn": "MacroFCvtFloat32ToInt32",
+    "insn": "FCvtFloat32ToInt32",
     "in": [ 1 ],
     "out": [ 0 ]
   },
   {
     "name": "FCvtFloatToIntegerHostRounding<int32_t, Float64>",
-    "insn": "MacroFCvtFloat64ToInt32",
+    "insn": "FCvtFloat64ToInt32",
     "in": [ 1 ],
     "out": [ 0 ]
   },
   {
     "name": "FCvtFloatToIntegerHostRounding<int64_t, Float32>",
-    "insn": "MacroFCvtFloat32ToInt64",
+    "insn": "FCvtFloat32ToInt64",
     "in": [ 1 ],
     "out": [ 0 ]
   },
   {
     "name": "FCvtFloatToIntegerHostRounding<int64_t, Float64>",
-    "insn": "MacroFCvtFloat64ToInt64",
+    "insn": "FCvtFloat64ToInt64",
     "in": [ 1 ],
     "out": [ 0 ]
   },
@@ -368,133 +368,133 @@
   },
   {
     "name": "FeGetExceptions",
-    "insn": "MacroFeGetExceptionsTranslate",
+    "insn": "FeGetExceptionsTranslate",
     "usage": "inline-only",
     "in": [],
     "out": [ 1 ]
   },
   {
     "name": "FeSetExceptionsAndRoundImm",
-    "insn": "MacroFeSetExceptionsAndRoundImmTranslate",
+    "insn": "FeSetExceptionsAndRoundImmTranslate",
     "usage": "inline-only",
     "in": [ 1 ],
     "out": []
   },
   {
     "name": "FeSetExceptionsAndRound",
-    "insn": "MacroFeSetExceptionsAndRoundTranslate",
+    "insn": "FeSetExceptionsAndRoundTranslate",
     "usage": "inline-only",
     "in": [ 0, 3 ],
     "out": []
   },
   {
     "name": "FeSetExceptionsImm",
-    "insn": "MacroFeSetExceptionsImmTranslate",
+    "insn": "FeSetExceptionsImmTranslate",
     "usage": "inline-only",
     "in": [ 1 ],
     "out": []
   },
   {
     "name": "FeSetExceptions",
-    "insn": "MacroFeSetExceptionsTranslate",
+    "insn": "FeSetExceptionsTranslate",
     "usage": "inline-only",
     "in": [ 0 ],
     "out": []
   },
   {
     "name": "FeSetRound",
-    "insn": "MacroFeSetRound",
+    "insn": "FeSetRound",
     "in": [ 3 ],
     "out": []
   },
   {
     "name": "FeSetRoundImm",
-    "insn": "MacroFeSetRoundImmTranslate",
+    "insn": "FeSetRoundImmTranslate",
     "usage": "inline-only",
     "in": [ 2 ],
     "out": []
   },
   {
     "name": "FeSetRoundImm",
-    "insn": "MacroFeSetRound",
+    "insn": "FeSetRound",
     "usage": "no-inline",
     "in": [ 3 ],
     "out": []
   },
   {
     "name": "Feq<Float32>",
-    "insn": "MacroFeqFloat32",
+    "insn": "FeqFloat32",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Feq<Float32>",
-    "insn": "MacroFeqFloat32AVX",
+    "insn": "FeqFloat32AVX",
     "feature": "AVX",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Feq<Float64>",
-    "insn": "MacroFeqFloat64",
+    "insn": "FeqFloat64",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Feq<Float64>",
-    "insn": "MacroFeqFloat64AVX",
+    "insn": "FeqFloat64AVX",
     "feature": "AVX",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Fle<Float32>",
-    "insn": "MacroFleFloat32",
+    "insn": "FleFloat32",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Fle<Float32>",
-    "insn": "MacroFleFloat32AVX",
+    "insn": "FleFloat32AVX",
     "feature": "AVX",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Fle<Float64>",
-    "insn": "MacroFleFloat64",
+    "insn": "FleFloat64",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Fle<Float64>",
-    "insn": "MacroFleFloat64AVX",
+    "insn": "FleFloat64AVX",
     "feature": "AVX",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Flt<Float32>",
-    "insn": "MacroFltFloat32",
+    "insn": "FltFloat32",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Flt<Float32>",
-    "insn": "MacroFltFloat32AVX",
+    "insn": "FltFloat32AVX",
     "feature": "AVX",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Flt<Float64>",
-    "insn": "MacroFltFloat64",
+    "insn": "FltFloat64",
     "in": [ 1, 2 ],
     "out": [ 0 ]
   },
   {
     "name": "Flt<Float64>",
-    "insn": "MacroFltFloat64AVX",
+    "insn": "FltFloat64AVX",
     "feature": "AVX",
     "in": [ 1, 2 ],
     "out": [ 0 ]
@@ -577,13 +577,13 @@
   },
   {
     "name": "NanBox<Float32>",
-    "insn": "MacroNanBoxFloat32",
+    "insn": "NanBoxFloat32",
     "in": [ 0 ],
     "out": [ 0 ]
   },
   {
     "name": "NanBox<Float32>",
-    "insn": "MacroNanBoxFloat32AVX",
+    "insn": "NanBoxFloat32AVX",
     "feature": "AVX",
     "in": [ 1 ],
     "out": [ 0 ]
@@ -602,50 +602,50 @@
     "out": [ 0 ]
   },
   {
-    "name": "Rem<int8_t>",
-    "insn": "RemInt8",
+    "name": "RemRiscV<int8_t>",
+    "insn": "RemI8RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Rem<int16_t>",
-    "insn": "RemInt16",
+    "name": "RemRiscV<int16_t>",
+    "insn": "RemI16RiscV",
     "in": [ 1, 0 ],
     "out": [ 2 ]
   },
   {
-    "name": "Rem<int32_t>",
-    "insn": "RemInt32",
+    "name": "RemRiscV<int32_t>",
+    "insn": "RemI32RiscV",
     "in": [ 1, 0 ],
     "out": [ 2 ]
   },
   {
-    "name": "Rem<int64_t>",
-    "insn": "RemInt64",
+    "name": "RemRiscV<int64_t>",
+    "insn": "RemI64RiscV",
     "in": [ 1, 0 ],
     "out": [ 2 ]
   },
   {
-    "name": "Rem<uint8_t>",
-    "insn": "RemUInt8",
+    "name": "RemRiscV<uint8_t>",
+    "insn": "RemU8RiscV",
     "in": [ 1, 0 ],
     "out": [ 1 ]
   },
   {
-    "name": "Rem<uint16_t>",
-    "insn": "RemUInt16",
+    "name": "RemRiscV<uint16_t>",
+    "insn": "RemU16RiscV",
     "in": [ 1, 0 ],
     "out": [ 2 ]
   },
   {
-    "name": "Rem<uint32_t>",
-    "insn": "RemUInt32",
+    "name": "RemRiscV<uint32_t>",
+    "insn": "RemU32RiscV",
     "in": [ 1, 0 ],
     "out": [ 2 ]
   },
   {
-    "name": "Rem<uint64_t>",
-    "insn": "RemUInt64",
+    "name": "RemRiscV<uint64_t>",
+    "insn": "RemU64RiscV",
     "in": [ 1, 0 ],
     "out": [ 2 ]
   },
@@ -729,13 +729,13 @@
   },
   {
     "name": "UnboxNan<Float32>",
-    "insn": "MacroUnboxNanFloat32",
+    "insn": "UnboxNanFloat32",
     "in": [ 1 ],
     "out": [ 0 ]
   },
   {
     "name": "UnboxNan<Float32>",
-    "insn": "MacroUnboxNanFloat32AVX",
+    "insn": "UnboxNanFloat32AVX",
     "feature": "AVX",
     "in": [ 1 ],
     "out": [ 0 ]

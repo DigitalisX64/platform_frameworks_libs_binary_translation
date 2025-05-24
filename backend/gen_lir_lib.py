@@ -467,14 +467,14 @@ def _expand_mem_insns(insns):
   return result
 
 
-def _load_lir_def(allowlist_looked, allowlist_found, asm_def):
+def _load_lir_def(allowlist_referenced, allowlist_defined, asm_def):
   arch, insns = asm_defs.load_asm_defs(asm_def)
   insns = _expand_mem_insns(insns)
   # Mark all instructions to remove and remember instructions we kept
   for insn in insns:
     insn_name = insn.get('mem_group_name', insn['name'])
-    if insn_name in allowlist_looked:
-      allowlist_found.add(insn_name)
+    if insn_name in allowlist_referenced:
+      allowlist_defined.add(insn_name)
     else:
       insn['skip_lir'] = 1
   # Filter out disabled instructions.
@@ -501,14 +501,14 @@ def _allowlist_instructions(allowlist_files, machine_ir_intrinsic_binding_files)
 
 
 def load_all_lir_defs(allowlist_files, machine_ir_intrinsic_binding_files, lir_defs):
-  allowlist_looked = _allowlist_instructions(
+  allowlist_referenced = _allowlist_instructions(
       allowlist_files, machine_ir_intrinsic_binding_files)
-  allowlist_found = set()
+  allowlist_defined = set()
   arch = None
   insns = []
   macro_insns = []
   for lir_def in lir_defs:
-    def_arch, def_insns = _load_lir_def(allowlist_looked, allowlist_found, lir_def)
+    def_arch, def_insns = _load_lir_def(allowlist_referenced, allowlist_defined, lir_def)
     if arch and not arch.startswith('common_'):
       assert def_arch is None or arch == def_arch
     else:
@@ -521,5 +521,7 @@ def load_all_lir_defs(allowlist_files, machine_ir_intrinsic_binding_files, lir_d
     _check_insn_defs(insn)
   # Some macroinstructions can only be used in Lite translator for now. Ignore them here.
   insns.extend(insn for insn in macro_insns if _check_insn_defs(insn, True))
-  assert allowlist_looked == allowlist_found
+  assert allowlist_referenced == allowlist_defined, \
+      "Intrinsics referenced in bindings and not defined: " + \
+      string(allowlist_referenced - allowlist_defined)
   return arch, insns

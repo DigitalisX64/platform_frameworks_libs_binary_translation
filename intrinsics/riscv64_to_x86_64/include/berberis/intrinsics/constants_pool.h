@@ -20,6 +20,7 @@
 #include <cinttypes>
 
 #include "berberis/base/dependent_false.h"
+#include "berberis/intrinsics/all_to_x86_64/constants_pool.h"
 #include "berberis/intrinsics/common/constants_pool.h"
 #include "berberis/intrinsics/common/intrinsics_float.h"
 
@@ -98,58 +99,27 @@ VECTOR_CONST_ALIAS(int64_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
 #pragma pop_macro("VECTOR_CONST_EXTERN")
 #pragma pop_macro("VECTOR_CONST_ALIAS")
 
-// 64 bit constants for use with arithmetic operations.
-// Used because only 32 bit immediates are supported on x86-64.
+BERBERIS_CONST_ALIAS(int8_t{0x00}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(uint8_t{0x00}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(int16_t{0x0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(uint16_t{0x0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(int32_t{0x0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(uint32_t{0x0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(int64_t{0x0000'0000'0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
+BERBERIS_CONST_ALIAS(uint64_t{0x0000'0000'0000'0000},
+                     kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
 
-template <auto Value>
-struct Const {};
+BERBERIS_CONST_EXTERN(uint64_t{0x8000'0000'0000'00ff});
 
-// Specialize Const<Value> using an out-of-line definition.
-#pragma push_macro("CONST_EXTERN")
-#define CONST_EXTERN(Value)      \
-  template <>                    \
-  struct Const<Value> {          \
-    static const int32_t kValue; \
-  }
-
-// Specialize Const<Value> using a reference to another constant's int32_t address.
-#pragma push_macro("CONST_ALIAS")
-#define CONST_ALIAS(Value, Alias)                   \
-  template <>                                       \
-  struct Const<Value> {                             \
-    static constexpr const int32_t& kValue = Alias; \
-  }
-
-template <auto Value>
-inline const int32_t& kConst = Const<Value>::kValue;
-
-CONST_EXTERN(uint32_t{32});
-CONST_EXTERN(uint32_t{63});
-CONST_EXTERN(uint64_t{64});
-CONST_EXTERN(uint64_t{127});
-
-CONST_ALIAS(int8_t{0x00}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(uint8_t{0x00}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(int16_t{0x0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(uint16_t{0x0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(int32_t{0x0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(uint32_t{0x0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(int64_t{0x0000'0000'0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-CONST_ALIAS(uint64_t{0x0000'0000'0000'0000}, kVectorConst<uint64_t{0x0000'0000'0000'0000}>);
-
-CONST_EXTERN(uint64_t{0x8000'0000'0000'00ff});
-
-CONST_ALIAS(int8_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(uint8_t{0xff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(int16_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(uint16_t{0xffff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(int32_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(uint32_t{0xffff'ffff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(int64_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-CONST_ALIAS(uint64_t{0xffff'ffff'ffff'ffff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
-
-#pragma pop_macro("CONST_EXTERN")
-#pragma pop_macro("CONST_ALIAS")
+BERBERIS_CONST_ALIAS(int8_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(uint8_t{0xff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(int16_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(uint16_t{0xffff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(int32_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(uint32_t{0xffff'ffff}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(int64_t{-1}, kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
+BERBERIS_CONST_ALIAS(uint64_t{0xffff'ffff'ffff'ffff},
+                     kVectorConst<uint64_t{0xffff'ffff'ffff'ffff}>);
 
 // Constant suitable for NaN boxing of RISC-V 32bit float with PXor.
 // Note: technically we only need to Nan-box Float32 since we don't support Float16 yet.
@@ -176,22 +146,6 @@ template <>
 inline const int32_t& kCanonicalNans<intrinsics::Float64> =
     kVectorConst<uint64_t{0x7ff8'0000'0000'0000}>;
 
-// Helper constant for BsrToClz conversion. 63 for int32_t, 127 for int64_t.
-template <typename IntType>
-inline constexpr int32_t kBsrToClz = kImpossibleTypeConst<IntType>;
-template <>
-inline const int32_t kBsrToClz<int32_t> = kConst<uint32_t{63}>;
-template <>
-inline const int32_t kBsrToClz<int64_t> = kConst<uint64_t{127}>;
-
-// Helper constant for width of the type. 32 for int32_t, 64 for int64_t.
-template <typename IntType>
-inline constexpr int32_t kWidthInBits = kImpossibleTypeConst<IntType>;
-template <>
-inline const int32_t kWidthInBits<int32_t> = kConst<uint32_t{32}>;
-template <>
-inline const int32_t kWidthInBits<int64_t> = kConst<uint64_t{64}>;
-
 extern const int32_t kRiscVToX87Exceptions;
 extern const int32_t kX87ToRiscVExceptions;
 
@@ -217,9 +171,6 @@ inline constexpr ConstantAccessor<&constants_pool::kRiscVToX87Exceptions> kRiscV
 
 inline constexpr ConstantAccessor<&constants_pool::kX87ToRiscVExceptions> kX87ToRiscVExceptions;
 
-template <typename IntType>
-inline constexpr TypeConstantAccessor<&constants_pool::kBsrToClz<IntType>> kBsrToClz{};
-
 template <typename FloatType>
 inline constexpr TypeConstantAccessor<&constants_pool::kCanonicalNans<FloatType>> kCanonicalNans{};
 
@@ -228,9 +179,6 @@ inline constexpr TypeConstantAccessor<&constants_pool::kNanBox<FloatType>> kNanB
 
 template <typename FloatType>
 inline constexpr TypeConstantAccessor<&constants_pool::kNanBoxedNans<FloatType>> kNanBoxedNans{};
-
-template <typename IntType>
-inline constexpr TypeConstantAccessor<&constants_pool::kWidthInBits<IntType>> kWidthInBits{};
 
 template <auto Value>
 inline constexpr VectorConstantAccessor<Value> kVectorConst{};

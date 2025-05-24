@@ -172,6 +172,7 @@ DEFINE_EXPAND_INSTRUCTION(Register dest, Register src)
       Assembler::asm_name##q##insn_siffix arguments;                                 \
     }                                                                                \
   }
+DEFINE_INT_INSTRUCTION(Bswap, Bswap, , kIntTypeLQ, (Register op), (op))
 DEFINE_INT_INSTRUCTION(CmpXchg, CmpXchg, , kIntType, (Operand dest, Register src), (dest, src))
 DEFINE_INT_INSTRUCTION(CmpXchg, CmpXchg, , kIntType, (Register dest, Register src), (dest, src))
 DEFINE_INT_INSTRUCTION(Lea, Lea, , kIntTypeWLQ, (Register dest, Operand src), (dest, src))

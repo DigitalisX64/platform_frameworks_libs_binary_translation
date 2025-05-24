@@ -252,11 +252,9 @@ class HeavyOptimizerFrontend {
     builder_.GenGetSimd<8>(result.machine_reg(), GetThreadStateFRegOffset(reg));
     FpRegister unboxed_result = AllocTempSimdReg();
     if (host_platform::kHasAVX) {
-      builder_.Gen<x86_64::MacroUnboxNanFloat32AVX>(unboxed_result.machine_reg(),
-                                                    result.machine_reg());
+      builder_.Gen<x86_64::UnboxNanFloat32AVX>(unboxed_result.machine_reg(), result.machine_reg());
     } else {
-      builder_.Gen<x86_64::MacroUnboxNanFloat32>(unboxed_result.machine_reg(),
-                                                 result.machine_reg());
+      builder_.Gen<x86_64::UnboxNanFloat32>(unboxed_result.machine_reg(), result.machine_reg());
     }
     return unboxed_result;
   }
@@ -264,9 +262,9 @@ class HeavyOptimizerFrontend {
   template <typename FloatType>
   void NanBoxFpReg(FpRegister value) {
     if (host_platform::kHasAVX) {
-      builder_.Gen<x86_64::MacroNanBoxFloat32AVX>(value.machine_reg(), value.machine_reg());
+      builder_.Gen<x86_64::NanBoxFloat32AVX>(value.machine_reg(), value.machine_reg());
     } else {
-      builder_.Gen<x86_64::MacroNanBoxFloat32>(value.machine_reg());
+      builder_.Gen<x86_64::NanBoxFloat32>(value.machine_reg());
     }
   }
 

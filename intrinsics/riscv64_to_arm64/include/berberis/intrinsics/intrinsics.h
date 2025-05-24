@@ -56,18 +56,6 @@ inline std::tuple<uint64_t> Bset(uint64_t in1, uint64_t in2) {
 };
 
 template <typename T, enum PreferredIntrinsicsImplementation>
-inline std::tuple<T> Div(T in1, T in2) {
-  static_assert(std::is_integral_v<T>);
-
-  if (in2 == 0) {
-    return ~T{0};
-  } else if (std::is_signed_v<T> && in2 == -1 && in1 == std::numeric_limits<T>::min()) {
-    return {std::numeric_limits<T>::min()};
-  }
-  return {in1 / in2};
-};
-
-template <typename T, enum PreferredIntrinsicsImplementation>
 inline std::tuple<T> Max(T in1, T in2) {
   static_assert(std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>);
   return {std::max(in1, in2)};
@@ -80,7 +68,19 @@ inline std::tuple<T> Min(T in1, T in2) {
 };
 
 template <typename T, enum PreferredIntrinsicsImplementation>
-inline std::tuple<T> Rem(T in1, T in2) {
+inline std::tuple<T> DivRiscV(T in1, T in2) {
+  static_assert(std::is_integral_v<T>);
+
+  if (in2 == 0) {
+    return ~T{0};
+  } else if (std::is_signed_v<T> && in2 == -1 && in1 == std::numeric_limits<T>::min()) {
+    return {std::numeric_limits<T>::min()};
+  }
+  return {in1 / in2};
+};
+
+template <typename T, enum PreferredIntrinsicsImplementation>
+inline std::tuple<T> RemRiscV(T in1, T in2) {
   static_assert(std::is_integral_v<T>);
 
   if (in2 == 0) {

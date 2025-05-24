@@ -262,9 +262,9 @@ class LiteTranslator {
     SimdRegister result = GetFpReg(reg);
     SimdRegister unboxed_result = AllocTempSimdReg();
     if (host_platform::kHasAVX) {
-      as_.MacroUnboxNanAVX<FloatType>(unboxed_result, result);
+      as_.UnboxNanAVX<FloatType>(unboxed_result, result);
     } else {
-      as_.MacroUnboxNan<FloatType>(unboxed_result, result);
+      as_.UnboxNan<FloatType>(unboxed_result, result);
     }
     return unboxed_result;
   }
@@ -272,10 +272,10 @@ class LiteTranslator {
   template <typename FloatType>
   void NanBoxFpReg(FpRegister value) {
     if (host_platform::kHasAVX) {
-      as_.MacroNanBoxAVX<FloatType>(value, value);
+      as_.NanBoxAVX<FloatType>(value, value);
       return;
     }
-    as_.MacroNanBox<FloatType>(value);
+    as_.NanBox<FloatType>(value);
   }
 
   template <typename FloatType>
@@ -552,7 +552,7 @@ inline void LiteTranslator::SetCsr<CsrName::kFCsr>(uint8_t imm) {
   // to rely on that: it's very subtle and it only affects code generation speed.
   as_.Mov<uint8_t>({.base = Assembler::rbp, .disp = kCsrFieldOffset<CsrName::kFrm>},
                    static_cast<int8_t>(imm >> 5));
-  as_.MacroFeSetExceptionsAndRoundImmTranslate(
+  as_.FeSetExceptionsAndRoundImmTranslate(
       {Assembler::rbp, .disp = static_cast<int>(offsetof(ThreadState, intrinsics_scratch_area))},
       imm);
 }
@@ -567,7 +567,7 @@ inline void LiteTranslator::SetCsr<CsrName::kFCsr>(Register arg) {
   as_.And<uint8_t>(Assembler::rcx, kCsrMask<CsrName::kFrm>);
   as_.Mov<uint8_t>({.base = Assembler::rbp, .disp = kCsrFieldOffset<CsrName::kFrm>},
                    Assembler::rcx);
-  as_.MacroFeSetExceptionsAndRoundTranslate(
+  as_.FeSetExceptionsAndRoundTranslate(
       Assembler::rax,
       {Assembler::rbp, .disp = static_cast<int>(offsetof(ThreadState, intrinsics_scratch_area))},
       Assembler::rax);

@@ -120,8 +120,24 @@ filegroup {
 }
 
 filegroup {
+    name: "libberberis_macro_assembler_gen_inputs_all_to_x86_32_or_x86_64",
+    srcs: ["all_to_x86_32_or_x86_64/macro_def.json"],
+}
+
+filegroup {
+    name: "libberberis_macro_assembler_gen_inputs_all_to_x86_64",
+    srcs: [
+        ":libberberis_macro_assembler_gen_inputs_all_to_x86_32_or_x86_64",
+        "all_to_x86_64/macro_def.json",
+    ],
+}
+
+filegroup {
     name: "libberberis_macro_assembler_gen_inputs_riscv64_to_x86_64",
-    srcs: ["riscv64_to_x86_64/macro_def.json"],
+    srcs: [
+        ":libberberis_macro_assembler_gen_inputs_all_to_x86_64",
+        "riscv64_to_x86_64/macro_def.json",
+    ],
 }
 
 filegroup {
@@ -177,7 +193,11 @@ genrule {
 
 genrule {
     name: "libberberis_macro_assembler_gen_headers_riscv64_to_x86_64",
-    out: ["berberis/intrinsics/macro_assembler_interface-inl.h"],
+    out: [
+        "berberis/intrinsics/all_to_x86_32_or_x86_64/macro_assembler_interface-inl.h",
+        "berberis/intrinsics/all_to_x86_64/macro_assembler_interface-inl.h",
+        "berberis/intrinsics/riscv64_to_x86_64/macro_assembler_interface-inl.h",
+    ],
     srcs: [":libberberis_macro_assembler_gen_inputs_riscv64_to_x86_64"],
     tools: ["gen_asm"],
     cmd: "$(location gen_asm) --binary-assembler $(out) $(in)",
@@ -348,6 +368,7 @@ cc_library_headers {
         x86_64: {
             export_include_dirs: [
                 "all_to_x86_32_or_x86_64/include",
+                "all_to_x86_64/include",
             ],
             generated_headers: [
                 "libberberis_verifier_assembler_gen_headers_x86_32",

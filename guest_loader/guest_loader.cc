@@ -21,6 +21,7 @@
 #include <climits>     // CHAR_BIT
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>  // std::ref
 #include <random>
 #include <thread>
@@ -357,13 +358,42 @@ void GuestLoader::StartGuestMainThread() {
   WaitForAppProcess();
 }
 
+std::filesystem::path GetSystemPath(const char* subdir, const char* relative_path) {
+  std::filesystem::path result("/system");
+  result.append(subdir);
+  // Prefer alternative location if exists.
+  std::filesystem::path alt_result = result / "berberis";
+  if (std::filesystem::exists(alt_result) && std::filesystem::is_directory(alt_result)) {
+    return alt_result / relative_path;
+  }
+  return result / relative_path;
+}
+
+std::string GetPtInterpPath() {
+  return GetSystemPath("bin", kPtInterpRelativePath).string();
+}
+
+std::string GetAppProcessPath() {
+  return GetSystemPath("bin", kAppProcessRelativePath).string();
+}
+
+std::string GetVdsoPath() {
+#if defined(BERBERIS_GUEST_LP64)
+  const char* lib_dir = "lib64";
+#else
+  const char* lib_dir = "lib";
+#endif
+  return GetSystemPath(lib_dir, kVdsoRelativePath).string();
+}
+
 void GuestLoader::StartGuestExecutable(size_t argc, const char* argv[], char* envp[]) {
   StartGuestExecutableImpl(
       argc, argv, envp, &linker_elf_file_, &executable_elf_file_, &vdso_elf_file_);
 }
 
 GuestLoader* GuestLoader::StartAppProcessInNewThread(std::string* error_msg) {
-  GuestLoader* instance = CreateInstance(kAppProcessPath, kVdsoPath, kPtInterpPath, error_msg);
+  GuestLoader* instance = CreateInstance(
+      GetAppProcessPath().c_str(), GetVdsoPath().c_str(), GetPtInterpPath().c_str(), error_msg);
   if (instance) {
     instance->StartGuestMainThread();
   }
@@ -378,8 +408,8 @@ void GuestLoader::StartExecutable(const char* main_executable_path,
                                   char* envp[],
                                   std::string* error_msg) {
   GuestLoader* instance = CreateInstance(main_executable_path,
-                                         vdso_path ? vdso_path : kVdsoPath,
-                                         loader_path ? loader_path : kPtInterpPath,
+                                         vdso_path ? vdso_path : GetVdsoPath().c_str(),
+                                         loader_path ? loader_path : GetPtInterpPath().c_str(),
                                          error_msg);
   if (instance) {
     instance->StartGuestExecutable(argc, argv, envp);
