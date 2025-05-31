@@ -19,7 +19,7 @@ package {
 }
 
 python_binary_host {
-    name: "berberis_gen_jni_trampolines",
+    name: "gen_jni_trampolines",
     main: "gen_jni_trampolines.py",
     srcs: ["gen_jni_trampolines.py"],
 }
@@ -28,8 +28,8 @@ genrule {
     name: "libberberis_jni_gen_headers",
     out: ["jni_trampolines-inl.h"],
     srcs: ["api.json"],
-    tools: ["berberis_gen_jni_trampolines"],
-    cmd: "$(location berberis_gen_jni_trampolines) $(out) $(in)",
+    tools: ["gen_jni_trampolines"],
+    cmd: "$(location gen_jni_trampolines) $(out) $(in)",
 }
 
 cc_library_headers {

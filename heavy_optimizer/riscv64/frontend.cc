@@ -692,32 +692,25 @@ Register HeavyOptimizerFrontend::LoadWithoutRecovery(Decoder::LoadOperandType op
   auto res = AllocTempReg();
   switch (operand_type) {
     case Decoder::LoadOperandType::k8bitUnsigned:
-      Gen<x86_64::MovzxblRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovzxblRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     case Decoder::LoadOperandType::k16bitUnsigned:
-      Gen<x86_64::MovzxwlRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovzxwlRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     case Decoder::LoadOperandType::k32bitUnsigned:
-      Gen<x86_64::MovlRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovlRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     case Decoder::LoadOperandType::k64bit:
-      Gen<x86_64::MovqRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     case Decoder::LoadOperandType::k8bitSigned:
-      Gen<x86_64::MovsxbqRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovsxbqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     case Decoder::LoadOperandType::k16bitSigned:
-      Gen<x86_64::MovsxwqRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovsxwqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     case Decoder::LoadOperandType::k32bitSigned:
-      Gen<x86_64::MovsxlqRegMemBaseIndexDisp>(
-          res, base, index, x86_64::MachineMemOperandScale::kOne, disp);
+      Gen<x86_64::MovsxlqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
       break;
     default:
       Undefined();
@@ -801,20 +794,16 @@ void HeavyOptimizerFrontend::StoreWithoutRecovery(Decoder::MemoryDataOperandType
                                                   Register data) {
   switch (operand_type) {
     case Decoder::MemoryDataOperandType::k8bit:
-      Gen<x86_64::MovbMemBaseIndexDispReg>(
-          base, index, x86_64::MachineMemOperandScale::kOne, disp, data);
+      Gen<x86_64::MovbMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
       break;
     case Decoder::MemoryDataOperandType::k16bit:
-      Gen<x86_64::MovwMemBaseIndexDispReg>(
-          base, index, x86_64::MachineMemOperandScale::kOne, disp, data);
+      Gen<x86_64::MovwMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
       break;
     case Decoder::MemoryDataOperandType::k32bit:
-      Gen<x86_64::MovlMemBaseIndexDispReg>(
-          base, index, x86_64::MachineMemOperandScale::kOne, disp, data);
+      Gen<x86_64::MovlMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
       break;
     case Decoder::MemoryDataOperandType::k64bit:
-      Gen<x86_64::MovqMemBaseIndexDispReg>(
-          base, index, x86_64::MachineMemOperandScale::kOne, disp, data);
+      Gen<x86_64::MovqMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
       break;
     default:
       return Undefined();

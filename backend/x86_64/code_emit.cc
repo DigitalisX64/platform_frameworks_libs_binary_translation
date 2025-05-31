@@ -210,19 +210,6 @@ Assembler::YMMRegister GetYReg(MachineReg r) {
   return GetXReg(r).To256Bit();
 }
 
-Assembler::ScaleFactor ToScaleFactor(MachineMemOperandScale scale) {
-  switch (scale) {
-    case MachineMemOperandScale::kOne:
-      return Assembler::kTimesOne;
-    case MachineMemOperandScale::kTwo:
-      return Assembler::kTimesTwo;
-    case MachineMemOperandScale::kFour:
-      return Assembler::kTimesFour;
-    case MachineMemOperandScale::kEight:
-      return Assembler::kTimesEight;
-  }
-}
-
 void CallImm::Emit(CodeEmitter* as) const {
   as->Call(AsHostCode(imm()));
   if (custom_avx256_abi_) {

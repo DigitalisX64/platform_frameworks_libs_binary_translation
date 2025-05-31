@@ -52,6 +52,7 @@ are usually written before all input operands are read, so it makes sense to
 describe scratch operands as output-only-early-clobber.
 """
 
+import asm_defs
 import gen_lir_lib
 import sys
 
@@ -92,7 +93,14 @@ def main(argv):
       argv[arch_def_files_end:])
     gen_lir_lib.gen_code_2_cc(argv[2], arch, insns)
     gen_lir_lib.gen_machine_info_h(argv[3], arch, insns)
-    gen_lir_lib.gen_machine_opcode_h(argv[4], arch, insns)
+    # Produce opcodes for all instructions, even the ones not supported as
+    # instruction in backend, since they could be generated as intrinsics,
+    # instead.
+    insns4opcodes = []
+    for def_file in argv[arch_def_files_end:]:
+      _, asm_insns = asm_defs.load_asm_defs(def_file)
+      insns4opcodes.extend(gen_lir_lib._expand_mem_insns(asm_insns))
+    gen_lir_lib.gen_machine_opcode_h(argv[4], arch, insns4opcodes)
     gen_lir_lib.gen_machine_ir_h(argv[5], arch, insns)
   elif mode == '--sources':
     arch, insns = gen_lir_lib.load_all_lir_defs(

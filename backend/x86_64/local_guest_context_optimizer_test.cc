@@ -144,6 +144,68 @@ TEST(MachineIRLocalGuestContextOptimizer, DoNotRemoveAccessToMonitorValue) {
   ASSERT_EQ(x86_64::AsMachineInsnX86_64(store_insn_2)->disp(), offset);
 }
 
+TEST(MachineIRLocalGuestContextOptimizer, LimitRegisters) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  auto bb = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb);
+  builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(1));
+  builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(1));
+  builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
+  builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
+  builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
+
+  if (DoesCpuStateHaveDedicatedSimdRegs()) {
+    builder.GenGet(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(5));
+    builder.GenGet(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(2));
+    builder.GenGet(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(5));
+    builder.GenGet(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(2));
+    builder.GenGet(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(0));
+    builder.GenGet(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(5));
+  }
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  x86_64::RemoveLocalGuestContextAccesses(&machine_ir,
+                                          x86_64::OptimizeLocalParams{
+                                              .general_reg_limit = 1,
+                                              .simd_reg_limit = 2,
+                                          });
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  // Check instructions with general regs replaced.
+  auto insn_it = bb->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegMemBaseDisp);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegMemBaseDisp);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegMemBaseDisp);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+
+  // Check instructions with simd regs replaced.
+  if (DoesCpuStateHaveDedicatedSimdRegs()) {
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegMemBaseDisp);
+    insn_it++;
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegMemBaseDisp);
+    insn_it++;
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+    insn_it++;
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+    insn_it++;
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegMemBaseDisp);
+    insn_it++;
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+    insn_it++;
+    ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoJump);
+  }
+}
+
 }  // namespace
 
 }  // namespace berberis

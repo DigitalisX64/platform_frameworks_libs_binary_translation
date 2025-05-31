@@ -706,10 +706,10 @@ TEST(MachineIRReadFlagsOptimizer, RemoveEligibleReadFlagsInLoopTree) {
   x86_64::MachineIRBuilder builder(&machine_ir);
 
   MachineReg scratch = machine_ir.AllocVReg();
-  // flags0 used in bb1 which is not in inner loop so should not be removed..
+  // flags0 used to test whether we remove from outer loops.
   MachineReg flags0 = machine_ir.AllocVReg();
   MachineReg flags00 = machine_ir.AllocVReg();
-  // flags1 used in bb3 should be removed..
+  // flags1 used to test whether we remove from inner loop.
   MachineReg flags1 = machine_ir.AllocVReg();
   MachineReg flags11 = machine_ir.AllocVReg();
 
@@ -765,13 +765,101 @@ TEST(MachineIRReadFlagsOptimizer, RemoveEligibleReadFlagsInLoopTree) {
   auto loop_tree = BuildLoopTree(&machine_ir);
   RemoveEligibleReadFlagsInLoopTree(&machine_ir, loop_tree.root());
 
-  // flags0 should still be there since it's not eligible.
+  // flags0 should be removed if we correctly optimize outer loops.
   auto insn_it = std::next(bb1->insn_list().begin());
-  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  ASSERT_NE((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
 
   // pseudoreadflags flags1 should be removed.
   insn_it = std::next(bb3->insn_list().begin());
   ASSERT_NE((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+
+  // Check that bb4 and bb5 have the correct instructions added.
+  insn_it = bb4->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+
+  insn_it = bb5->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpAddqRegReg);
+}
+
+TEST(MachineIRReadFlagsOptimizer, RemoveEligibleReadFlagsExitsToOuterLoop) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  MachineReg scratch = machine_ir.AllocVReg();
+  // flags0 used to test whether we remove from outer loops.
+  MachineReg flags0 = machine_ir.AllocVReg();
+  MachineReg flags00 = machine_ir.AllocVReg();
+
+  //         |-------------|
+  // bb0 -> bb1 -> bb2 -> bb3 -> bb4
+  //                ^--|
+  auto bb0 = machine_ir.NewBasicBlock();
+  auto bb1 = machine_ir.NewBasicBlock();
+  auto bb2 = machine_ir.NewBasicBlock();
+  auto bb3 = machine_ir.NewBasicBlock();
+  auto bb4 = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(bb0, bb1);
+  machine_ir.AddEdge(bb1, bb2);
+  machine_ir.AddEdge(bb2, bb2);
+  machine_ir.AddEdge(bb2, bb3);
+  machine_ir.AddEdge(bb3, bb1);
+  machine_ir.AddEdge(bb3, bb4);
+
+  builder.StartBasicBlock(bb0);
+  builder.Gen<PseudoBranch>(bb1);
+
+  builder.StartBasicBlock(bb1);
+  builder.Gen<PseudoBranch>(bb2);
+
+  builder.StartBasicBlock(bb2);
+  builder.Gen<x86_64::SubqRegReg>(scratch, scratch, kMachineRegFLAGS);
+  builder.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, flags0, kMachineRegFLAGS);
+  builder.Gen<PseudoCopy>(flags00, flags0, 8);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb2, bb3, kMachineRegFLAGS);
+  bb2->live_out().push_back(flags00);
+
+  bb3->live_in().push_back(flags00);
+  builder.StartBasicBlock(bb3);
+  builder.Gen<x86_64::MovqRegReg>(machine_ir.AllocVReg(), flags00);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb1, bb4, machine_ir.AllocVReg());
+
+  builder.StartBasicBlock(bb4);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+  auto loop_tree = BuildLoopTree(&machine_ir);
+  RemoveEligibleReadFlagsInLoopTree(&machine_ir, loop_tree.root());
+
+  // flags0 should be removed if we correctly optimize outer loops.
+  auto insn_it = std::next(bb2->insn_list().begin());
+  ASSERT_NE((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+
+  // Check that bb3 has instructions added.
+  insn_it = bb3->insn_list().begin();
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoCopy);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpSubqRegReg);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoReadFlags);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpPseudoWriteFlags);
+  insn_it++;
+  ASSERT_EQ((*insn_it)->opcode(), kMachineOpMovqRegReg);
 }
 
 TEST(MachineIRReadFlagsOptimizer, OptimizeReadFlags) {

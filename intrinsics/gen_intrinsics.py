@@ -1173,7 +1173,6 @@ def _gen_c_intrinsic(name,
     ',\n              '.join(
         [name_label,
          nan_restriction,
-         'true' if _intr_has_side_effects(intr) else 'false',
          _get_c_type_tuple(intr['in']),
          _get_c_type_tuple(intr['out']),
          _get_bindings_info(asm['args'])]))
@@ -1181,6 +1180,7 @@ def _gen_c_intrinsic(name,
     ',\n                  '.join(
         [_get_asm_reference(asm),
          mnemo_label,
+         'true' if _intr_has_side_effects(intr) else 'false',
          _get_builder_reference(intr, asm),
          cpuid_restriction,
          _get_reg_operands_info(asm['args'])]))

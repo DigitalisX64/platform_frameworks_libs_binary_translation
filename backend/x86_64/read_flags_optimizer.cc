@@ -179,23 +179,22 @@ std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode) {
 // Finds all read flags we can optimize away and removes them.
 void RemoveEligibleReadFlagsInLoopTree(MachineIR* machine_ir, LoopTreeNode* loop_tree_node) {
   if (loop_tree_node->NumInnerloops() > 0) {
-    // Find inner loops.
+    // Remove from inner loops first.
     for (size_t i = 0; i < loop_tree_node->NumInnerloops(); i++) {
       RemoveEligibleReadFlagsInLoopTree(machine_ir, loop_tree_node->GetInnerloopNode(i));
     }
-  } else if (loop_tree_node->loop() == nullptr) {
-    // Root loop without innerloops - nothing can be found.
+  }
+  auto loop = loop_tree_node->loop();
+  if (loop == nullptr) {
     return;
-  } else {
-    // Currently we only look for read-flags in the innermost loops.
-    auto loop = loop_tree_node->loop();
-    for (auto* bb : *loop) {
-      for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); insn_it++) {
-        if (AsMachineInsnX86_64(*insn_it)->opcode() == kMachineOpPseudoReadFlags) {
-          auto flag_set_opt = IsEligibleReadFlag(machine_ir, loop, bb, insn_it);
-          if (flag_set_opt.has_value()) {
-            RemoveReadFlags(machine_ir, ReadFlagsOptContext{bb, insn_it, flag_set_opt.value()});
-          }
+  }
+  // TODO(b/417284998): We could skip the nodes which were already scanned in inner loops.
+  for (auto* bb : *loop) {
+    for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); insn_it++) {
+      if (AsMachineInsnX86_64(*insn_it)->opcode() == kMachineOpPseudoReadFlags) {
+        auto flag_set_opt = IsEligibleReadFlag(machine_ir, loop, bb, insn_it);
+        if (flag_set_opt.has_value()) {
+          RemoveReadFlags(machine_ir, ReadFlagsOptContext{bb, insn_it, flag_set_opt.value()});
         }
       }
     }

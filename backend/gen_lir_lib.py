@@ -112,11 +112,11 @@ def _make_imm_operand(bits):
 
 def _make_scale_operand():
   op = Operand()
-  op.type = 'MachineMemOperandScale'
+  op.type = 'Assembler::ScaleFactor'
   op.name = 'scale'
   op.reg_operand_info = None
   op.initializer = 'set_scale(scale)'
-  op.asm_arg = 'ToScaleFactor(scale())'
+  op.asm_arg = 'scale()'
   return op
 
 
@@ -418,29 +418,10 @@ def gen_machine_opcode_h(out, arch, insns):
       print('kMachineOp%s,' % (name), file=f)
 
 
-def _gen_mem_insn_groups(f, insns):
-  # Build a dictionary to map a memory insn group name to another dictionary,
-  # which in turn maps an addressing mode to an individual memory insn.
-  groups = {}
-  for i in insns:
-    group_name = i.get('mem_group_name')
-    if group_name:
-      groups.setdefault(group_name, {})[i.get('addr_mode')] = i.get('name')
-
-  for group_name in sorted(groups):
-    # The order of the addressing modes here is important.  It must
-    # match what MemInsns expects.
-    mem_insns = [groups[group_name][addr_mode]
-                 for addr_mode in ('Absolute', 'BaseDisp', 'IndexDisp', 'BaseIndexDisp')]
-    print('using %s = MemInsns<%s>;' % (group_name, ', '.join(mem_insns)), file=f)
-
-
 def gen_machine_ir_h(out, arch, insns):
   with open(out, 'w') as f:
     for insn in insns:
       _gen_insn_class(f, insn)
-    print('', file=f)
-    _gen_mem_insn_groups(f, insns)
 
 
 def _contains_mem(insn):

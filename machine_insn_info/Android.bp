@@ -18,7 +18,7 @@ package {
 }
 
 python_binary_host {
-    name: "berberis_gen_reg_class",
+    name: "gen_reg_class",
     main: "gen_reg_class.py",
     srcs: ["gen_reg_class.py"],
     libs: ["gen_reg_class_lib"],
@@ -48,24 +48,24 @@ genrule {
     name: "libberberis_machine_insn_info_reg_class_gen_headers_riscv64",
     out: ["berberis/machine_insn_info/riscv64/machine_reg_class-inl.h"],
     srcs: [":libberberis_machine_insn_info_reg_class_gen_inputs_riscv64"],
-    tools: ["berberis_gen_reg_class"],
-    cmd: "$(location berberis_gen_reg_class) $(out) $(in)",
+    tools: ["gen_reg_class"],
+    cmd: "$(location gen_reg_class) $(out) $(in)",
 }
 
 genrule {
     name: "libberberis_machine_insn_info_reg_class_gen_headers_x86_32",
     out: ["berberis/machine_insn_info/x86_32/machine_reg_class-inl.h"],
     srcs: [":libberberis_machine_insn_info_reg_class_gen_inputs_x86_32"],
-    tools: ["berberis_gen_reg_class"],
-    cmd: "$(location berberis_gen_reg_class) $(out) $(in)",
+    tools: ["gen_reg_class"],
+    cmd: "$(location gen_reg_class) $(out) $(in)",
 }
 
 genrule {
     name: "libberberis_machine_insn_info_reg_class_gen_headers_x86_64",
     out: ["berberis/machine_insn_info/x86_64/machine_reg_class-inl.h"],
     srcs: [":libberberis_machine_insn_info_reg_class_gen_inputs_x86_64"],
-    tools: ["berberis_gen_reg_class"],
-    cmd: "$(location berberis_gen_reg_class) $(out) $(in)",
+    tools: ["gen_reg_class"],
+    cmd: "$(location gen_reg_class) $(out) $(in)",
 }
 
 cc_library_headers {

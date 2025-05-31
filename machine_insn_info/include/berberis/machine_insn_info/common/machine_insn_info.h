@@ -120,22 +120,29 @@ class OperandInfo {
 // bindings.
 class NoCPUIDRestriction;  // All CPUs have at least “no CPUID restriction” mode.
 
-template <auto kMacroInstructionTemplateName, auto kMnemo, auto GetOpcode, typename... Types>
+template <auto kMacroInstructionTemplateName,
+          auto kMnemo,
+          bool kSideEffects,
+          auto GetOpcode,
+          typename... Types>
 class AsmCallInfo;
 
 template <auto kMacroInstructionTemplateName,
           auto kMnemo,
+          bool kSideEffectsTemplateValue,
           auto GetOpcode,
           typename CPUIDRestrictionTemplateValue,
           typename... OperandsTypes>
 class AsmCallInfo<kMacroInstructionTemplateName,
                   kMnemo,
+                  kSideEffectsTemplateValue,
                   GetOpcode,
                   CPUIDRestrictionTemplateValue,
                   std::tuple<OperandsTypes...>>
     final {
  public:
   static constexpr auto kMacroInstruction = kMacroInstructionTemplateName;
+  static constexpr bool kSideEffects = kSideEffectsTemplateValue;
   using CPUIDRestriction = CPUIDRestrictionTemplateValue;
   template <typename Callback, typename... Args>
   constexpr static void ProcessOperands(Callback&& callback, Args&&... args) {

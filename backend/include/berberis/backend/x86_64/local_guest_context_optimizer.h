@@ -21,7 +21,13 @@
 
 namespace berberis::x86_64 {
 
-void RemoveLocalGuestContextAccesses(x86_64::MachineIR* machine_ir);
+struct OptimizeLocalParams {
+  size_t general_reg_limit = 12;
+  size_t simd_reg_limit = 12;
+};
+
+void RemoveLocalGuestContextAccesses(x86_64::MachineIR* machine_ir,
+                                     const OptimizeLocalParams& params = OptimizeLocalParams());
 
 }  // namespace berberis::x86_64
 

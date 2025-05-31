@@ -164,8 +164,8 @@ genrule {
     srcs: [
         ":libberberis_intrinsics_gen_inputs_riscv64_to_all",
         ":libberberis_machine_ir_intrinsic_binding_riscv64_to_x86_64",
-        ":libberberis_macro_assembler_gen_inputs_riscv64_to_x86_64",
         ":libberberis_assembler_gen_inputs_x86_64",
+        ":libberberis_macro_assembler_gen_inputs_riscv64_to_x86_64",
     ],
     tools: ["gen_intrinsics"],
     cmd: "$(location gen_intrinsics) --text_asm_intrinsics_bindings $(out) $(in)",
@@ -184,8 +184,8 @@ genrule {
     srcs: [
         ":libberberis_intrinsics_gen_inputs_riscv64_to_all",
         ":libberberis_machine_ir_intrinsic_binding_riscv64_to_x86_64",
-        ":libberberis_macro_assembler_gen_inputs_riscv64_to_x86_64",
         ":libberberis_assembler_gen_inputs_x86_64",
+        ":libberberis_macro_assembler_gen_inputs_riscv64_to_x86_64",
     ],
     tools: ["gen_intrinsics"],
     cmd: "$(location gen_intrinsics) --public_headers $(out) $(in)",

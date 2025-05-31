@@ -34,10 +34,7 @@ class NoNansOperation;
 class PreciseNanOperationsHandling;
 class ImpreciseNanOperationsHandling;
 
-template <auto kIntrinsicTemplateName,
-          typename PreciseNanOperationsHandlingTemplateValue,
-          bool kSideEffectsTemplateValue,
-          typename... Types>
+template <auto kIntrinsicTemplateName, typename... Types>
 class IntrinsicBindingInfo;
 
 template <auto kIntrinsicTemplateName,
@@ -53,12 +50,12 @@ template <auto kIntrinsicTemplateName,
           typename... OperandsTypes>
 class IntrinsicBindingInfo<kIntrinsicTemplateName,
                            PreciseNanOperationsHandlingTemplateValue,
-                           kSideEffectsTemplateValue,
                            std::tuple<InputArgumentsTypes...>,
                            std::tuple<OutputArgumentsTypes...>,
                            std::tuple<BindingsTypes...>,
                            machine_insn_info::AsmCallInfo<kMacroInstructionTemplateName,
                                                           kMnemo,
+                                                          kSideEffectsTemplateValue,
                                                           GetOpcode,
                                                           CPUIDRestrictionTemplateValue,
                                                           std::tuple<OperandsTypes...>>>
@@ -97,8 +94,12 @@ class IntrinsicBindingInfo<kIntrinsicTemplateName,
   using IntrinsicType = std::conditional_t<std::tuple_size_v<OutputArguments> == 0,
                                            void (*)(InputArgumentsTypes...),
                                            OutputArguments (*)(InputArgumentsTypes...)>;
-  using AsmCallInfo = machine_insn_info::
-      AsmCallInfo<kMacroInstruction, kMnemo, GetOpcode, CPUIDRestriction, Operands>;
+  using AsmCallInfo = machine_insn_info::AsmCallInfo<kMacroInstruction,
+                                                     kMnemo,
+                                                     kSideEffectsTemplateValue,
+                                                     GetOpcode,
+                                                     CPUIDRestriction,
+                                                     Operands>;
 };
 
 }  // namespace intrinsics::bindings

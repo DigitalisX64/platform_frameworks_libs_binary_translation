@@ -45,17 +45,8 @@ namespace x86_64 {
 
 namespace {
 
-int ScaleToInt(MachineMemOperandScale scale) {
-  switch (scale) {
-    case MachineMemOperandScale::kOne:
-      return 1;
-    case MachineMemOperandScale::kTwo:
-      return 2;
-    case MachineMemOperandScale::kFour:
-      return 4;
-    case MachineMemOperandScale::kEight:
-      return 8;
-  }
+int ScaleToInt(Assembler::ScaleFactor scale) {
+  return 1 << scale;
 }
 
 }  // namespace

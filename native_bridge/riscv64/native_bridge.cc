@@ -23,8 +23,8 @@ const char* kGuestIsa = "riscv64";
 const char* kSupportedLibraryPathSubstring = "/lib/riscv64";
 
 const android::NativeBridgeRuntimeValues kNativeBridgeRuntimeValues = {
-    .os_arch = "riscv64",
-    .cpu_abi = "riscv64",
+    .os_arch = nullptr,
+    .cpu_abi = nullptr,
     .cpu_abi2 = nullptr,
     .supported_abis = nullptr,
     .abi_count = 0,

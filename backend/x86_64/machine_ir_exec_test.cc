@@ -31,8 +31,6 @@
 #include "berberis/code_gen_lib/code_gen_lib.h"  // EmitFreeStackFrame
 #include "berberis/test_utils/scoped_exec_region.h"
 
-#include "x86_64/mem_operand.h"
-
 namespace berberis {
 
 namespace {
@@ -456,75 +454,6 @@ TEST(ExecMachineIR, SmokeRegAlloc) {
 
 TEST(ExecMachineIR, RegAllocWithCallImm) {
   TestRegAlloc<true>();
-}
-
-TEST(ExecMachineIR, MemOperand) {
-  struct Data {
-    uint64_t in_base_disp;
-    uint64_t in_index_disp;
-    uint64_t in_base_index_disp[3];
-
-    uint64_t out_base_disp;
-    uint64_t out_index_disp;
-    uint64_t out_base_index_disp;
-  } data = {};
-
-  Arena arena;
-  x86_64::MachineIR machine_ir(&arena);
-
-  x86_64::MachineIRBuilder builder(&machine_ir);
-  builder.StartBasicBlock(machine_ir.NewBasicBlock());
-
-  data.in_base_disp = 0xaaaabbbbccccddddULL;
-  data.in_index_disp = 0xdeadbeefdeadbeefULL;
-  data.in_base_index_disp[2] = 0xcafefeedf00dfeedULL;
-
-  // Base address.
-  MachineReg base_reg = machine_ir.AllocVReg();
-  builder.Gen<x86_64::MovqRegImm>(base_reg, reinterpret_cast<uintptr_t>(&data));
-
-  MachineReg data_reg;
-
-  // BaseDisp
-  x86_64::MemOperand mem_base_disp =
-      x86_64::MemOperand::MakeBaseDisp(base_reg, offsetof(Data, in_base_disp));
-  data_reg = machine_ir.AllocVReg();
-  x86_64::GenArgsMem<x86_64::MovzxblRegMemInsns>(&builder, mem_base_disp, data_reg);
-  builder.Gen<x86_64::MovqMemBaseDispReg>(base_reg, offsetof(Data, out_base_disp), data_reg);
-
-  // IndexDisp
-  MachineReg index_reg = machine_ir.AllocVReg();
-  static_assert(alignof(struct Data) >= 2);
-  builder.Gen<x86_64::MovqRegImm>(index_reg, reinterpret_cast<uintptr_t>(&data) / 2);
-  x86_64::MemOperand mem_index_disp =
-      x86_64::MemOperand::MakeIndexDisp<x86_64::MachineMemOperandScale::kTwo>(
-          index_reg, offsetof(Data, in_index_disp));
-  data_reg = machine_ir.AllocVReg();
-  x86_64::GenArgsMem<x86_64::MovzxblRegMemInsns>(&builder, mem_index_disp, data_reg);
-  builder.Gen<x86_64::MovqMemBaseDispReg>(base_reg, offsetof(Data, out_index_disp), data_reg);
-
-  // BaseIndexDisp
-  MachineReg tmp_base_reg = machine_ir.AllocVReg();
-  builder.Gen<x86_64::MovqRegImm>(tmp_base_reg,
-                                  reinterpret_cast<uintptr_t>(&data.in_base_index_disp[0]));
-  MachineReg tmp_index_reg = machine_ir.AllocVReg();
-  builder.Gen<x86_64::MovqRegImm>(tmp_index_reg, 2);
-  x86_64::MemOperand mem_base_index_disp =
-      x86_64::MemOperand::MakeBaseIndexDisp<x86_64::MachineMemOperandScale::kFour>(
-          tmp_base_reg, tmp_index_reg, 8);
-  data_reg = machine_ir.AllocVReg();
-  x86_64::GenArgsMem<x86_64::MovzxblRegMemInsns>(&builder, mem_base_index_disp, data_reg);
-  builder.Gen<x86_64::MovqMemBaseDispReg>(base_reg, offsetof(Data, out_base_index_disp), data_reg);
-
-  AllocRegs(&machine_ir);
-
-  ExecTest test;
-  test.Init(machine_ir);
-
-  test.Exec();
-  EXPECT_EQ(data.out_base_disp, 0xddU);
-  EXPECT_EQ(data.out_index_disp, 0xefU);
-  EXPECT_EQ(data.out_base_index_disp, 0xedU);
 }
 
 const MachineReg kGRegs[]{

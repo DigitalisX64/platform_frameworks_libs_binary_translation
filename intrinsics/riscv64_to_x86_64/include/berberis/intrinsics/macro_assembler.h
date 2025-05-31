@@ -43,15 +43,15 @@ class MacroAssembler
           MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
           MacroAssembler<Assembler>> {
  public:
-  using MacroAssemblers = std::tuple<
+  using Assemblers = std::tuple<
+      typename Assembler::BaseAssembler,
+      typename Assembler::FinalAssembler,
       MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
       MacroAssemblerX86_64GuestAgnostic<
           Assembler,
           MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
           MacroAssembler<Assembler>>,
-      MacroAssembler<Assembler>,
-      typename Assembler::BaseAssembler,
-      typename Assembler::FinalAssembler>;
+      MacroAssembler<Assembler>>;
 
   template <typename... Args>
   constexpr explicit MacroAssembler(Args&&... args)

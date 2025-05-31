@@ -269,10 +269,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
                                                                         Result def_result,
                                                                         Args&&... args);
 
-  template <auto kIntrinsicTemplateName,
-            typename PreciseNanOperationsHandlingTemplateValue,
-            bool kSideEffectsTemplateValue,
-            typename... Types>
+  template <auto kIntrinsicTemplateName, typename... Types>
   friend class intrinsics::bindings::IntrinsicBindingInfo;
 
   TryBindingBasedInlineIntrinsicForHeavyOptimizer() = delete;
@@ -296,7 +293,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
         input_args_(std::tuple{args...}),
         success_(intrinsics::bindings::ProcessBindings<
                  kFunction,
-                 typename MacroAssembler<x86_64::Assembler>::MacroAssemblers,
+                 typename MacroAssembler<x86_64::Assembler>::Assemblers,
                  bool,
                  TryBindingBasedInlineIntrinsicForHeavyOptimizer&>(*this, false)) {}
 
@@ -354,8 +351,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
       static_assert(berberis::kDependentValueFalse<IntrinsicBindingInfo::kCPUIDRestriction>);
     }
 
-    (builder_->*berberis::x86_64::MachineInsn<typename IntrinsicBindingInfo::AsmCallInfo,
-                                              IntrinsicBindingInfo::kSideEffects>::
+    (builder_->*berberis::x86_64::MachineInsn<typename IntrinsicBindingInfo::AsmCallInfo>::
                     template kGenFunc<x86_64::MachineIRBuilder>)(std::tuple_cat(
         UnwrapSimdReg(IntrinsicBindingInfo::template MakeTuplefromBindings<
                       TryBindingBasedInlineIntrinsicForHeavyOptimizer&>(*this, asm_call_info))));

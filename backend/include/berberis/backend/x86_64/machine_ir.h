@@ -44,12 +44,6 @@ enum MachineOpcode : int {
   kMachineOpPseudoJump,
   kMachineOpPseudoReadFlags,
   kMachineOpPseudoWriteFlags,
-// Some frontends may need additional opcodes currently.
-// Ideally we may want to separate froentend and backend, but for now only include
-// berberis/backend/x86_64/machine_opcode_guest-inl.h if it exists.
-#if __has_include("berberis/backend/x86_64/machine_opcode_guest-inl.h")
-#include "berberis/backend/x86_64/machine_opcode_guest-inl.h"
-#endif  // __has_include("berberis/backend/x86_64/machine_opcode_guest-inl.h")
 #include "machine_opcode_x86_64-inl.h"  // NOLINT generated file!
 };
 
@@ -135,13 +129,6 @@ struct MachineInsnInfo {
   }
 };
 
-enum class MachineMemOperandScale {
-  kOne,
-  kTwo,
-  kFour,
-  kEight,
-};
-
 template <typename MachineInsnInfoClass>
 constexpr MachineRegClass MachineRegClassFromMachineInsnInfoClass() {
   return []<typename... RegisterClass>(const std::tuple<RegisterClass...>&) -> MachineRegClass {
@@ -185,7 +172,7 @@ class MachineInsnX86_64 : public MachineInsn {
     // No code here - will never be called!
   }
 
-  MachineMemOperandScale scale() const { return scale_; }
+  Assembler::ScaleFactor scale() const { return scale_; }
 
   uint32_t disp() const { return disp_; }
 
@@ -244,9 +231,9 @@ class MachineInsnX86_64 : public MachineInsn {
  protected:
   explicit MachineInsnX86_64(const MachineInsnInfo* info)
       : MachineInsn(info->opcode, info->num_reg_operands, info->reg_kinds, regs_, info->kind),
-        scale_(MachineMemOperandScale::kOne) {}
+        scale_(Assembler::kTimesOne) {}
 
-  void set_scale(MachineMemOperandScale scale) { scale_ = scale; }
+  void set_scale(Assembler::ScaleFactor scale) { scale_ = scale; }
 
   void set_disp(uint32_t disp) { disp_ = disp; }
 
@@ -259,7 +246,7 @@ class MachineInsnX86_64 : public MachineInsn {
  private:
   MachineReg regs_[kMaxMachineRegOperands];
   uint32_t disp_;
-  MachineMemOperandScale scale_;
+  Assembler::ScaleFactor scale_;
   Assembler::Condition cond_;
   uint32_t disp2_;
   uint64_t imm_;
@@ -320,17 +307,6 @@ class CallImmArg : public MachineInsnX86_64 {
   void Emit(CodeEmitter*) const override{
       // It's an auxiliary instruction. Do not emit.
   };
-};
-
-// This template is syntax sugar to group memory instructions with
-// different addressing modes.
-template <typename Absolute_, typename BaseDisp_, typename IndexDisp_, typename BaseIndexDisp_>
-class MemInsns {
- public:
-  using Absolute = Absolute_;
-  using BaseDisp = BaseDisp_;
-  using IndexDisp = IndexDisp_;
-  using BaseIndexDisp = BaseIndexDisp_;
 };
 
 using MachineInsnForArch = MachineInsnX86_64;

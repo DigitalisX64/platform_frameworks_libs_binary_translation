@@ -34,7 +34,7 @@
 
 namespace berberis::x86_64 {
 
-template <typename IntrinsicBindingInfo, bool kSideEffects>
+template <typename IntrinsicBindingInfo>
 class MachineInsn;
 
 // Use specialization to extract the tuple parameter pack generated from constructor_args_t above.
@@ -46,10 +46,10 @@ template <auto kMacroInstruction,
           bool kSideEffects>
 class MachineInsn<machine_insn_info::AsmCallInfo<kMacroInstruction,
                                                  kMnemo,
+                                                 kSideEffects,
                                                  GetOpcode,
                                                  CPUIDRestriction,
-                                                 std::tuple<Operands...>>,
-                  kSideEffects>
+                                                 std::tuple<Operands...>>>
     final : public MachineInsnX86_64 {
  private:
   template <typename>
