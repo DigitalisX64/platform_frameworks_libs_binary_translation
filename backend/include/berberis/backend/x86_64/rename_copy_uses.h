@@ -30,9 +30,9 @@ class RenameCopyUsesMap {
   explicit RenameCopyUsesMap(MachineIR* machine_ir)
       : map_(machine_ir->NumVReg(), {kInvalidMachineReg, 0, 0}, machine_ir->arena()) {}
 
-  void RenameUseIfMapped(MachineInsn* insn, int i);
-  void ProcessDef(MachineInsn* insn, int i);
-  void ProcessCopy(MachineInsn* copy);
+  void RenameUseIfMapped(berberis::MachineInsn* insn, int i);
+  void ProcessDef(berberis::MachineInsn* insn, int i);
+  void ProcessCopy(berberis::MachineInsn* copy);
   void Tick() { time_++; }
   void StartBasicBlock(MachineBasicBlock* bb);
 

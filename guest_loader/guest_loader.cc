@@ -289,7 +289,6 @@ GuestLoader* GuestLoader::CreateInstance(const char* main_executable_path,
   // For readlink(/proc/self/exe).
   SetMainExecutableRealPath(main_executable_path);
 
-  instance->main_executable_path_ = main_executable_path;
   // Initialize caller_addr_ to executable entry point.
   instance->caller_addr_ = instance->executable_elf_file_.entry_point();
 
@@ -349,7 +348,7 @@ GuestLoader* GuestLoader::GetInstance() {
 void GuestLoader::StartGuestMainThread() {
   std::thread t(StartGuestExecutableImpl,
                 1,
-                &main_executable_path_,
+                GetMainExecutableRealPathPointer(),
                 environ,
                 &linker_elf_file_,
                 &executable_elf_file_,

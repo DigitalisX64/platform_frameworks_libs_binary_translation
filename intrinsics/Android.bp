@@ -21,7 +21,10 @@ python_binary_host {
     name: "gen_intrinsics",
     main: "gen_intrinsics.py",
     srcs: ["gen_intrinsics.py"],
-    libs: ["asm_defs_lib"],
+    libs: [
+        "asm_defs_lib",
+        "gen_device_insn_info_lib",
+    ],
 }
 
 python_library_host {
@@ -36,7 +39,10 @@ python_test_host {
         "gen_intrinsics_test.py",
         "gen_intrinsics.py",
     ],
-    libs: ["asm_defs_lib"],
+    libs: [
+        "asm_defs_lib",
+        "gen_device_insn_info_lib",
+    ],
     test_suites: ["device-tests"],
     test_options: {
         unit_test: true,
@@ -285,7 +291,7 @@ cc_defaults {
             header_libs: [
                 "libberberis_assembler_headers", // Immediates.
                 "libberberis_base_headers",
-                "libberberis_machine_insn_info_headers",
+                "libberberis_device_arch_info_headers",
                 "libberberis_runtime_primitives_headers",
             ],
             shared_libs: ["liblog"],
@@ -306,14 +312,14 @@ cc_library_headers {
     host_supported: true,
     header_libs: [
         "libberberis_base_headers",
+        "libberberis_device_arch_info_headers",
         "libberberis_intrinsics_headers",
-        "libberberis_machine_insn_info_headers",
         "libberberis_runtime_primitives_headers", // for platform.h
     ],
     export_header_lib_headers: [
         "libberberis_base_headers",
+        "libberberis_device_arch_info_headers",
         "libberberis_intrinsics_headers",
-        "libberberis_machine_insn_info_headers",
         "libberberis_runtime_primitives_headers", // for platform.h
     ],
     export_include_dirs: [
@@ -513,8 +519,8 @@ cc_test_library {
     },
     header_libs: [
         "libberberis_base_headers",
+        "libberberis_device_arch_info_headers",
         "libberberis_intrinsics_riscv64_headers",
-        "libberberis_machine_insn_info_headers",
     ],
     shared: {
         enabled: false,

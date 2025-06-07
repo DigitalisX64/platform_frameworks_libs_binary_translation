@@ -69,7 +69,7 @@ class Operand(object):
 
 
 def _get_reg_operand_info(usage, kind):
-  kind = 'kRegisterClass<machine_insn_info::%s>' % kind
+  kind = 'kRegisterClass<device_arch_info::%s>' % kind
   if usage == 'use':
     return '{ &%s, MachineRegKind::kUse }' % (kind)
   if usage == 'def':

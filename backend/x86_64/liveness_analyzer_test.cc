@@ -90,7 +90,7 @@ class FakeInsnWithDefEarlyClobber : public MachineInsn {
   static constexpr x86_64::MachineInsnInfo kInfo =
       x86_64::MachineInsnInfo({MachineOpcode{0},
                                1,
-                               {{&x86_64::kRegisterClass<x86_64::machine_insn_info::GeneralReg32>,
+                               {{&x86_64::kRegisterClass<x86_64::device_arch_info::GeneralReg32>,
                                  MachineRegKind::kDefEarlyClobber}},
                                kMachineInsnDefault});
   [[nodiscard]] std::string GetDebugString() const override {

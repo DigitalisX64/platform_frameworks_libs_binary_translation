@@ -50,8 +50,8 @@ class LocalGuestContextOptimizer {
 ArenaVector<int> CountGuestRegAccesses(const MachineIR* ir, MachineBasicBlock* bb) {
   ArenaVector<int> guest_access_count(sizeof(CPUState), 0, ir->arena());
   for (auto* base_insn : bb->insn_list()) {
-    auto insn = AsMachineInsnX86_64(base_insn);
-    if (insn->IsCPUStateGet() || insn->IsCPUStatePut()) {
+    if (ir->IsCPUStateGet(base_insn) || ir->IsCPUStatePut(base_insn)) {
+      auto insn = AsMachineInsnX86_64(base_insn);
       guest_access_count.at(insn->disp())++;
     }
   }

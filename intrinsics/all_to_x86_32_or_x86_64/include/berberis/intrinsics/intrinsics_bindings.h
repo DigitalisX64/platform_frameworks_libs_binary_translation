@@ -17,7 +17,7 @@
 #ifndef BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
 #define BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
 
+#include "berberis/device_arch_info/x86_32_or_x86_64/device_arch_info.h"
 #include "berberis/intrinsics/common/intrinsics_bindings.h"
-#include "berberis/machine_insn_info/x86_32_or_x86_64/machine_insn_info.h"
 
 #endif  // BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_

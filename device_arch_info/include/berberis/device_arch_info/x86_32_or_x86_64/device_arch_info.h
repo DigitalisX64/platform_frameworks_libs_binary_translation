@@ -14,23 +14,23 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_MACHINE_INSN_INFO_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
-#define BERBERIS_MACHINE_INSN_INFO_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
+#ifndef BERBERIS_DEVICE_ARCH_INFO_ALL_TO_X86_32_OR_x86_64_DEVICE_ARCH_INFO_H_
+#define BERBERIS_DEVICE_ARCH_INFO_ALL_TO_X86_32_OR_x86_64_DEVICE_ARCH_INFO_H_
 
 #include <x86intrin.h>
 
 #include <cstdint>
 
-#include "berberis/machine_insn_info/common/machine_insn_info.h"
+#include "berberis/device_arch_info/common/device_arch_info.h"
 
 // Note: normally using namespace is forbidden in headers, but these two namespaces literally
 // only exist to be imported here (and in other device CPU-specific headers).
 
 namespace berberis {
 
-namespace x86_32_or_x86_64::machine_insn_info {
+namespace x86_32_or_x86_64::device_arch_info {
 
-using namespace berberis::machine_insn_info;
+using namespace berberis::device_arch_info;
 
 class Imm2 {
  public:
@@ -66,6 +66,50 @@ class MemX87 {
   static constexpr bool kIsImmediate = false;
   static constexpr char kAsRegister = 'm';
 };
+
+class VecMem32 {
+ public:
+  using Type = uint32_t;
+  static constexpr char kAsRegister = 'm';
+};
+
+class VecMem64 {
+ public:
+  using Type = uint64_t;
+  static constexpr char kAsRegister = 'm';
+};
+
+class VecMem128 {
+ public:
+  using Type = __m128;
+  static constexpr char kAsRegister = 'm';
+};
+
+class VecMem256 {
+ public:
+#ifdef __AVX__
+  using Type = __m256;
+#endif
+  static constexpr char kAsRegister = 'm';
+};
+
+// We don't currently have use-cases where instructions that use these register classes can be used
+// with MachineIR.
+// We would need to make this classes “real” to be able to do that, but also would probably need
+// other changes.
+class CC;
+class GeneralReg;
+class Label;
+class Mem;
+class MemX8716;
+class MemX8732;
+class MemX8764;
+class MemX8780;
+class RSP;
+class RegX87;
+class SW;
+class ST;
+class ST1;
 
 // Tag classes. They are never instantioned, only used as tags to pass information about
 // bindings.
@@ -130,30 +174,42 @@ class HasX87;
 class HasCustomCapability;
 class IsAuthenticAMD;
 
-}  // namespace x86_32_or_x86_64::machine_insn_info
+}  // namespace x86_32_or_x86_64::device_arch_info
 
-namespace machine_insn_info {
-
-template <>
-inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm2> = true;
+namespace device_arch_info {
 
 template <>
-inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm8> = true;
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::device_arch_info::Imm2> = true;
 
 template <>
-inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm16> = true;
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::device_arch_info::Imm8> = true;
 
 template <>
-inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm32> = true;
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::device_arch_info::Imm16> = true;
 
 template <>
-inline constexpr bool kIsImmediate<x86_32_or_x86_64::machine_insn_info::Imm64> = true;
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::device_arch_info::Imm32> = true;
 
 template <>
-inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::machine_insn_info::MemX87> = true;
+inline constexpr bool kIsImmediate<x86_32_or_x86_64::device_arch_info::Imm64> = true;
 
-}  // namespace machine_insn_info
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::MemX87> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::VecMem32> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::VecMem64> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::VecMem128> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::VecMem256> = true;
+
+}  // namespace device_arch_info
 
 }  // namespace berberis
 
-#endif  // BERBERIS_MACHINE_INSN_INFO_ALL_TO_X86_32_OR_x86_64_MACHINE_INSN_INFO_H_
+#endif  // BERBERIS_DEVICE_ARCH_INFO_ALL_TO_X86_32_OR_x86_64_DEVICE_ARCH_INFO_H_

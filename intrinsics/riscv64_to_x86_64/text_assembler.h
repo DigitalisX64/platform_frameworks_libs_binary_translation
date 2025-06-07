@@ -19,8 +19,8 @@
 
 #include <stdio.h>
 
+#include "berberis/device_arch_info/x86_64/device_arch_info.h"
 #include "berberis/intrinsics/all_to_x86_32_or_x86_64/text_assembler_x86_32_or_x86_64.h"
-#include "berberis/machine_insn_info/x86_64/machine_insn_info.h"
 
 namespace berberis {
 

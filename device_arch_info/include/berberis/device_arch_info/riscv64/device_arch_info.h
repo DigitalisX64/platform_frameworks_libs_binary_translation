@@ -14,22 +14,22 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_MACHINE_INSN_INFO_RISCV64_MACHINE_INSN_INFO_H_
-#define BERBERIS_MACHINE_INSN_INFO_RISCV64_MACHINE_INSN_INFO_H_
+#ifndef BERBERIS_DEVICE_ARCH_INFO_RISCV64_DEVICE_ARCH_INFO_H_
+#define BERBERIS_DEVICE_ARCH_INFO_RISCV64_DEVICE_ARCH_INFO_H_
 
 #include <cstdint>
 
 #include "berberis/assembler/riscv.h"
-#include "berberis/machine_insn_info/common/machine_insn_info.h"
+#include "berberis/device_arch_info/common/device_arch_info.h"
 
 namespace berberis {
 
-namespace riscv64::machine_insn_info {
+namespace riscv64::device_arch_info {
 
 // Note: normally using namespace is forbidden in headers, but these two namespaces literally
 // only exist to be imported here (and in other device CPU-specific headers).
 
-using namespace berberis::machine_insn_info;
+using namespace berberis::device_arch_info;
 
 class BImm {
  public:
@@ -76,41 +76,41 @@ class UImm {
   using Type = riscv::UImmediate;
 };
 
-#include "berberis/machine_insn_info/riscv64/machine_reg_class-inl.h"
+#include "berberis/device_arch_info/riscv64/machine_reg_class-inl.h"
 
-}  // namespace riscv64::machine_insn_info
+}  // namespace riscv64::device_arch_info
 
-namespace machine_insn_info {
-
-template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::BImm> = true;
+namespace device_arch_info {
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::CsrImm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::BImm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::IImm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::CsrImm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::JImm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::IImm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::PImm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::JImm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::SImm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::PImm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::Shift32Imm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::SImm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::Shift64Imm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::Shift32Imm> = true;
 
 template <>
-inline constexpr bool kIsImmediate<riscv64::machine_insn_info::UImm> = true;
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::Shift64Imm> = true;
 
-}  // namespace machine_insn_info
+template <>
+inline constexpr bool kIsImmediate<riscv64::device_arch_info::UImm> = true;
+
+}  // namespace device_arch_info
 
 }  // namespace berberis
 
-#endif  // BERBERIS_MACHINE_INSN_INFO_RISCV64_MACHINE_INSN_INFO_H_
+#endif  // BERBERIS_DEVICE_ARCH_INFO_RISCV64_DEVICE_ARCH_INFO_H_

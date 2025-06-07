@@ -113,12 +113,12 @@ cc_library_headers {
     header_libs: [
         "libberberis_assembler_headers",
         "libberberis_base_headers",
-        "libberberis_machine_insn_info_headers",
+        "libberberis_device_arch_info_headers",
     ],
     export_header_lib_headers: [
         "libberberis_assembler_headers",
         "libberberis_base_headers",
-        "libberberis_machine_insn_info_headers",
+        "libberberis_device_arch_info_headers",
     ],
 }
 

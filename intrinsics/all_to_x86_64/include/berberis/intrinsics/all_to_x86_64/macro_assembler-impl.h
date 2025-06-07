@@ -23,6 +23,20 @@
 namespace berberis {
 
 template <typename Assembler, typename AssemblerBase, typename SpecificMacroAssembler>
+template <typename IntType>
+constexpr void MacroAssemblerX86_64GuestAgnostic<Assembler, AssemblerBase, SpecificMacroAssembler>::
+    CountLeadingZeros(Register result, Register src) {
+  AssemblerBase::template CountLeadingZeros<IntType>(result, src);
+}
+
+template <typename Assembler, typename AssemblerBase, typename SpecificMacroAssembler>
+template <typename IntType>
+constexpr void MacroAssemblerX86_64GuestAgnostic<Assembler, AssemblerBase, SpecificMacroAssembler>::
+    CountTrailingZeros(Register result, Register src) {
+  AssemblerBase::template CountTrailingZeros<IntType>(result, src);
+}
+
+template <typename Assembler, typename AssemblerBase, typename SpecificMacroAssembler>
 constexpr void
 MacroAssemblerX86_64GuestAgnostic<Assembler, AssemblerBase, SpecificMacroAssembler>::ReverseBitsU64(
     Register dst,

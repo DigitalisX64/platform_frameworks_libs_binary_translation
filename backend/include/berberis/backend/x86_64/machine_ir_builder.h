@@ -21,6 +21,7 @@
 #include <iterator>
 
 #include "berberis/backend/common/machine_ir_builder.h"
+#include "berberis/backend/x86_64/machine_insn_intrinsics.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/logging.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -97,6 +98,249 @@ class MachineIRBuilder : public MachineIRBuilderBase<MachineIR> {
   template <typename InsnType, typename... Args>
   /*may_discard*/ InsnType* Gen(Args... args) {
     return MachineIRBuilderBase::Gen<InsnType, Args...>(args...);
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen()
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 0,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>>();
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen(
+      std::tuple_element_t<
+          0,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg0)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 1,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>,
+        std::tuple_element_t<
+            0,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>>(arg0);
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen(
+      std::tuple_element_t<
+          0,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg0,
+      std::tuple_element_t<
+          1,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg1)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 2,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>,
+        std::tuple_element_t<
+            0,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            1,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>>(arg0,
+                                                                                           arg1);
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen(
+      std::tuple_element_t<
+          0,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg0,
+      std::tuple_element_t<
+          1,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg1,
+      std::tuple_element_t<
+          2,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg2)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 3,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>,
+        std::tuple_element_t<
+            0,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            1,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            2,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>>(
+        arg0, arg1, arg2);
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen(
+      std::tuple_element_t<
+          0,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg0,
+      std::tuple_element_t<
+          1,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg1,
+      std::tuple_element_t<
+          2,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg2,
+      std::tuple_element_t<
+          3,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg3)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 4,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>,
+        std::tuple_element_t<
+            0,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            1,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            2,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            3,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>>(
+        arg0, arg1, arg2, arg3);
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen(
+      std::tuple_element_t<
+          0,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg0,
+      std::tuple_element_t<
+          1,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg1,
+      std::tuple_element_t<
+          2,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg2,
+      std::tuple_element_t<
+          3,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg3,
+      std::tuple_element_t<
+          4,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg4)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 5,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>,
+        std::tuple_element_t<
+            0,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            1,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            2,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            3,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            4,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>>(
+        arg0, arg1, arg2, arg3, arg4);
+  }
+
+  template <template <typename> typename InsnType>
+  /*may_discard*/ auto Gen(
+      std::tuple_element_t<
+          0,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg0,
+      std::tuple_element_t<
+          1,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg1,
+      std::tuple_element_t<
+          2,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg2,
+      std::tuple_element_t<
+          3,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg3,
+      std::tuple_element_t<
+          4,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg4,
+      std::tuple_element_t<
+          5,
+          typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> arg5)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 6,
+          MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*> {
+    return MachineIRBuilderBase::Gen<
+        MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>,
+        std::tuple_element_t<
+            0,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            1,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            2,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            3,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            4,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>,
+        std::tuple_element_t<
+            5,
+            typename MachineInsnOperandsHelper<typename InsnType<
+                typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>>(
+        arg0, arg1, arg2, arg3, arg4, arg5);
   }
 
   template <auto kFunc, auto kTupleMergePlan, typename... Args, std::size_t... kIndex>

@@ -204,7 +204,10 @@ def _gen_register_read_write_info(insn, arch):
       if (_get_arg_type_name(arg, insn.get('type', None)) in register_types_to_gen
           and 'x86' in arch):
         if arg.get('usage') == usage or arg.get('usage') == "use_def":
-          yield '  Register%s(arg%d);' % (usage.capitalize(), arg_count)
+          if usage == 'def' and arg.get('class') == "GeneralReg32":
+            yield '  Register%s(arg%d, true);' % (usage.capitalize(), arg_count)
+          else:
+            yield '  Register%s(arg%d);' % (usage.capitalize(), arg_count)
       arg_count += 1
 
 def _check_insn_uses_xmm(insn, arch):

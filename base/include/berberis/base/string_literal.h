@@ -14,10 +14,24 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
-#define BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
+#ifndef BERBERIS_BASE_STRING_LITERAL_H_
+#define BERBERIS_BASE_STRING_LITERAL_H_
 
-#include "berberis/intrinsics/common/intrinsics_bindings.h"
-#include "berberis/intrinsics/device_arch_info.h"
+#include <algorithm>
+#include <cstddef>
 
-#endif  // BERBERIS_INTRINSICS_INTRINSICS_BINDINGS_H_
+namespace berberis {
+
+// Note: we use that type as argument of template which means that “all base classes and non-static
+// data members should be public and non-mutable”.
+template <size_t N>
+struct StringLiteral {
+  constexpr StringLiteral(const char (&str)[N]) { std::copy_n(str, N, value); }
+  constexpr operator const char*() const { return value; }
+
+  char value[N];
+};
+
+}  // namespace berberis
+
+#endif  // BERBERIS_BASE_STRING_LITERAL_H_

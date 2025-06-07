@@ -23,6 +23,7 @@
 #include "berberis/assembler/machine_code.h"
 #include "berberis/backend/code_emitter.h"
 #include "berberis/backend/common/reg_alloc.h"
+#include "berberis/backend/x86_64/machine_insn_intrinsics.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_builder.h"
 #include "berberis/backend/x86_64/machine_ir_check.h"
@@ -130,7 +131,8 @@ TEST(ExecMachineIR, Smoke) {
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
   // Let RBP point to 'data'.
-  builder.Gen<x86_64::MovqRegImm>(kMachineRegRBP, reinterpret_cast<uintptr_t>(&data));
+  builder.Gen<x86_64::device_arch_info::MovqRegImm>(kMachineRegRBP,
+                                                    reinterpret_cast<uintptr_t>(&data));
 
   // data.y = data.x;
   builder.Gen<x86_64::MovqRegMemBaseDisp>(kMachineRegRAX, kMachineRegRBP, offsetof(Data, x));
@@ -454,6 +456,83 @@ TEST(ExecMachineIR, SmokeRegAlloc) {
 
 TEST(ExecMachineIR, RegAllocWithCallImm) {
   TestRegAlloc<true>();
+}
+
+TEST(ExecMachineIR, MemoryOperand) {
+  using MovzxblRegMemInsns = device_arch_info::DeviceInsnInfo<
+      static_cast<void (x86_32_or_x86_64::Assembler<x86_64::Assembler>::*)(
+          CodeEmitter::Register, const CodeEmitter::Operand&)>(
+          &x86_32_or_x86_64::Assembler<x86_64::Assembler>::Movzxbl),
+      "MOVZXBL",
+      false,
+      []<typename Opcode> { return Opcode::kMachineOpMovzxblRegOp; },
+      device_arch_info::NoCPUIDRestriction,
+      std::tuple<device_arch_info::OperandInfo<x86_64::device_arch_info::GeneralReg32,
+                                               device_arch_info::kDef>,
+                 device_arch_info::OperandInfo<device_arch_info::Mem8, device_arch_info::kUse>>>;
+  struct Data {
+    uint64_t in_base_disp;
+    uint64_t in_index_disp;
+    uint64_t in_base_index_disp[3];
+
+    uint64_t out_base_disp;
+    uint64_t out_index_disp;
+    uint64_t out_base_index_disp;
+  } data = {};
+
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  x86_64::MachineIRBuilder builder(&machine_ir);
+  builder.StartBasicBlock(machine_ir.NewBasicBlock());
+
+  data.in_base_disp = 0xaaaabbbbccccddddULL;
+  data.in_index_disp = 0xdeadbeefdeadbeefULL;
+  data.in_base_index_disp[2] = 0xcafefeedf00dfeedULL;
+
+  // Base address.
+  MachineReg base_reg = machine_ir.AllocVReg();
+  builder.Gen<x86_64::MovqRegImm>(base_reg, reinterpret_cast<uintptr_t>(&data));
+
+  MachineReg data_reg;
+
+  // BaseDisp
+  x86_64::MemoryOperand mem_base_disp{.base = base_reg, .disp = offsetof(Data, in_base_disp)};
+  data_reg = machine_ir.AllocVReg();
+  builder.Gen<x86_64::MachineInsn<MovzxblRegMemInsns>>(data_reg, mem_base_disp);
+  builder.Gen<x86_64::MovqMemBaseDispReg>(base_reg, offsetof(Data, out_base_disp), data_reg);
+
+  // IndexDisp
+  MachineReg index_reg = machine_ir.AllocVReg();
+  static_assert(alignof(struct Data) >= 2);
+  builder.Gen<x86_64::MovqRegImm>(index_reg, reinterpret_cast<uintptr_t>(&data) / 2);
+  x86_64::MemoryOperand mem_index_disp = {
+      .index = index_reg, .scale = CodeEmitter::kTimesTwo, offsetof(Data, in_index_disp)};
+  data_reg = machine_ir.AllocVReg();
+  builder.Gen<x86_64::MachineInsn<MovzxblRegMemInsns>>(data_reg, mem_index_disp);
+  builder.Gen<x86_64::MovqMemBaseDispReg>(base_reg, offsetof(Data, out_index_disp), data_reg);
+
+  // BaseIndexDisp
+  MachineReg tmp_base_reg = machine_ir.AllocVReg();
+  builder.Gen<x86_64::MovqRegImm>(tmp_base_reg,
+                                  reinterpret_cast<uintptr_t>(&data.in_base_index_disp[0]));
+  MachineReg tmp_index_reg = machine_ir.AllocVReg();
+  builder.Gen<x86_64::MovqRegImm>(tmp_index_reg, 2);
+  x86_64::MemoryOperand mem_base_index_disp = {
+      .base = tmp_base_reg, .index = tmp_index_reg, .scale = CodeEmitter::kTimesFour, .disp = 8};
+  data_reg = machine_ir.AllocVReg();
+  builder.Gen<x86_64::MachineInsn<MovzxblRegMemInsns>>(data_reg, mem_base_index_disp);
+  builder.Gen<x86_64::MovqMemBaseDispReg>(base_reg, offsetof(Data, out_base_index_disp), data_reg);
+
+  AllocRegs(&machine_ir);
+
+  ExecTest test;
+  test.Init(machine_ir);
+
+  test.Exec();
+  EXPECT_EQ(data.out_base_disp, 0xddU);
+  EXPECT_EQ(data.out_index_disp, 0xefU);
+  EXPECT_EQ(data.out_base_index_disp, 0xedU);
 }
 
 const MachineReg kGRegs[]{

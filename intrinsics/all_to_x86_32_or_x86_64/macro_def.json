@@ -11,16 +11,6 @@
       "mnemo": "CLZ_I32"
     },
     {
-      "name": "CountLeadingZerosU64",
-      "args": [
-        { "class": "GeneralReg64", "usage": "def" },
-        { "class": "GeneralReg64", "usage": "use" },
-        { "class": "FLAGS", "usage": "def" }
-      ],
-      "asm": "CountLeadingZeros<int64_t>",
-      "mnemo": "CLZ_I64"
-    },
-    {
       "name": "CountTrailingZerosU32",
       "args": [
         { "class": "GeneralReg32", "usage": "def" },
@@ -31,20 +21,10 @@
       "mnemo": "CTZ_I32"
     },
     {
-      "name": "CountTrailingZerosU64",
-      "args": [
-        { "class": "GeneralReg64", "usage": "def" },
-        { "class": "GeneralReg64", "usage": "use" },
-        { "class": "FLAGS", "usage": "def" }
-      ],
-      "asm": "CountTrailingZeros<int64_t>",
-      "mnemo": "CTZ_I64"
-    },
-    {
       "name": "ReverseBitsU32",
       "args": [
-        { "class": "GeneralReg64", "usage": "def" },
-        { "class": "GeneralReg64", "usage": "use_def" },
+        { "class": "GeneralReg32", "usage": "def" },
+        { "class": "GeneralReg32", "usage": "use_def" },
         { "class": "FLAGS", "usage": "def" }
       ],
       "asm": "ReverseBits<uint32_t>",

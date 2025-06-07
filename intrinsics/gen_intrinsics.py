@@ -20,6 +20,7 @@
 from collections import OrderedDict
 
 import asm_defs
+import gen_device_insn_info_lib
 import json
 import os
 import re
@@ -905,59 +906,27 @@ def _get_binding_info(arg):
   assert False, 'unknown operand usage %s' % (arg['usage'])
 
 
-def _get_reg_operand_info(arg):
-  class_info = 'machine_insn_info::%s' % arg['class']
-  if arg['class'] == 'Imm8':
-    return 'machine_insn_info::OperandInfo<%s, machine_insn_info::kUse>' % class_info
-  using_info = ', machine_insn_info::%s' % {
-      'def': 'kDef',
-      'def_early_clobber': 'kDefEarlyClobber',
-      'use': 'kUse',
-      'use_def': 'kUseDef'
-  }[arg['usage']]
-  return 'machine_insn_info::OperandInfo<%s%s>' % (class_info, using_info)
-
-
 def _get_bindings_info(args):
   return 'std::tuple<%s>' % ', '.join(_get_binding_info(arg) for arg in args)
-
-
-def _get_reg_operands_info(args):
-  return 'std::tuple<%s>' % ', '.join(_get_reg_operand_info(arg) for arg in args)
 
 
 def _gen_process_all_bindings(f, intrs, archs):
   print("%s" % AUTOGEN, file=f)
   callback_lines = []
-  static_names = []
-  static_mnemos = []
   for line in _gen_c_intrinsics_generator(
-      intrs, _is_interpreter_compatible_assembler, False, static_names, static_mnemos):
+      intrs, _is_interpreter_compatible_assembler, False):
     callback_lines.append(line)
   # Put implementation into arch-specific namespace to access bindings.
   print("namespace %s {\n" % archs[-1], file = f)
-  print(
-"""
-/* Note: we generate binding names and binding mnemos used by callbacks in ProcessAllBindings
-globally so that ProcessAllBindings can be constexpr.
-
-Once we can use C++23, these can be declared locally in ProcessAllBindings.*/""", file=f)
-  print("namespace process_all_bindings_strings {", file = f)
-  for static_name in static_names:
-    print("   %s" % static_name, file=f)
-  for static_mnemo in static_mnemos:
-    print("   %s" % static_mnemo, file=f)
-  print("} // process_all_bindings_strings", file = f)
   print("""
-template <typename MacroAssembler,
+template <typename MacroAssemblers,
           typename Callback,
           typename... Args>
 constexpr void ProcessAllBindings([[maybe_unused]] Callback callback,
                         [[maybe_unused]] Args&&... args) {
   using berberis::intrinsics::Float16;
   using berberis::intrinsics::Float32;
-  using berberis::intrinsics::Float64;
-  using namespace process_all_bindings_strings;""",
+  using berberis::intrinsics::Float64;""",
     file=f)
   for line in callback_lines:
     print(line, file=f)
@@ -973,42 +942,26 @@ using %s::ProcessAllBindings;
 def _gen_process_bindings(f, intrs, archs):
   print("%s" % AUTOGEN, file=f)
   callback_lines = []
-  static_names = []
-  static_mnemos = []
   for line in _gen_c_intrinsics_generator(
-      intrs, _is_translator_compatible_assembler, True, static_names, static_mnemos):
+      intrs, _is_translator_compatible_assembler, True):
     callback_lines.append(line)
   # Include definitions of registers for appropriate type of bindings
-  print('#include "berberis/machine_insn_info/%s/machine_insn_info.h"' % archs[-1], file = f)
+  print('#include "berberis/device_arch_info/%s/device_arch_info.h"' % archs[-1], file = f)
   # Put implementation into arch-specific namespace to access bindings.
   print('namespace berberis{\n\nnamespace %s::intrinsics::bindings {' % archs[-1], file = f)
-  print(
-"""
-/* Note: we generate binding names and binding mnemos used by callbacks in ProcessBindings
-globally so that ProcessBindings can be constexpr.
-
-Once we can use C++23, these can be declared locally in ProcessBindings.*/""", file=f)
-  print("namespace process_bindings_strings {", file = f)
-  for static_name in static_names:
-    print("   %s" % static_name, file=f)
-  for static_mnemo in static_mnemos:
-    print("   %s" % static_mnemo, file=f)
-  print("} // process_bindings_strings", file = f)
-
   print("""
 template <auto kFunction>
 using FunctionCompareTag = berberis::intrinsics::bindings::FunctionCompareTag<kFunction>;
 
 template <auto kFunc,
-          typename MacroAssembler,
+          typename MacroAssemblers,
           typename Result,
           typename Callback,
           typename... Args>
 constexpr Result ProcessBindings(Callback callback, Result def_result, Args&&... args) {
   using berberis::intrinsics::Float16;
   using berberis::intrinsics::Float32;
-  using berberis::intrinsics::Float64;
-  using namespace process_bindings_strings;""",
+  using berberis::intrinsics::Float64;""",
     file=f)
   for line in callback_lines:
     print(line, file=f)
@@ -1028,10 +981,8 @@ using %s::intrinsics::bindings::ProcessBindings;
 """ % (archs[-1], archs[-1]), file=f)
 
 
-def _gen_c_intrinsics_generator(
-    intrs, check_compatible_assembler, gen_builder, static_names, static_mnemos):
-  string_labels = {}
-  mnemo_idx = [0]
+def _gen_c_intrinsics_generator(intrs, check_compatible_assembler, gen_builder):
+  processed_names = set()
   for name, intr in intrs:
     ins = intr.get('in')
     outs = intr.get('out')
@@ -1062,24 +1013,18 @@ def _gen_c_intrinsics_generator(
             for line in _gen_c_intrinsic('%s<%s>' % (name, spec),
                                          intr,
                                          intr_asm,
-                                         string_labels,
-                                         mnemo_idx,
+                                         processed_names,
                                          check_compatible_assembler,
-                                         gen_builder,
-                                         static_names,
-                                         static_mnemos):
+                                         gen_builder):
               yield line
     else:
       for intr_asm in _gen_sorted_asms(intr):
         for line in _gen_c_intrinsic(name,
                                      intr,
                                      intr_asm,
-                                     string_labels,
-                                     mnemo_idx,
+                                     processed_names,
                                      check_compatible_assembler,
-                                     gen_builder,
-                                     static_names,
-                                     static_mnemos):
+                                     gen_builder):
           yield line
 
 
@@ -1116,24 +1061,12 @@ _KNOWN_FEATURES_KEYS = {
 }
 
 
-def _gen_c_intrinsic(name,
-                     intr,
-                     asm,
-                     string_labels,
-                     mnemo_idx,
-                     check_compatible_assembler,
-                     gen_builder,
-                     static_names,
-                     static_mnemos):
+def _gen_c_intrinsic(
+    name, intr, asm, processed_names, check_compatible_assembler, gen_builder):
   if not check_compatible_assembler(asm):
     return
 
-  cpuid_restriction = 'machine_insn_info::NoCPUIDRestriction'
-  if 'feature' in asm:
-    if asm['feature'] == 'AuthenticAMD':
-      cpuid_restriction = 'machine_insn_info::IsAuthenticAMD'
-    else:
-      cpuid_restriction = 'machine_insn_info::Has%s' % asm['feature']
+  cpuid_restriction = gen_device_insn_info_lib._get_cpuid_restriction(asm)
 
   nan_restriction = 'berberis::intrinsics::bindings::NoNansOperation'
   if 'nan' in asm:
@@ -1145,46 +1078,37 @@ def _gen_c_intrinsic(name,
     else:
       name += '<' + template_arg + '>'
 
-  if name not in string_labels:
-    name_label = 'BINDING_NAME%d' % len(string_labels)
-    string_labels[name] = name_label
-    if check_compatible_assembler == _is_translator_compatible_assembler:
+  if name not in processed_names:
+    if gen_builder:
       yield ' %s if constexpr (std::is_same_v<FunctionCompareTag<kFunc>,' % (
-        '' if name_label == 'BINDING_NAME0' else ' } else'
+        '' if len(processed_names) == 0 else ' } else'
       )
       yield '%s FunctionCompareTag<berberis::intrinsics::%s>>) {' % (' ' * 36, name)
-    static_names.append('static constexpr const char %s[] = "%s";' % (name_label, name))
-  else:
-    name_label = string_labels[name]
-
-  mnemo = asm['mnemo']
-  mnemo_label = 'BINDING_MNEMO%d' % mnemo_idx[0]
-  mnemo_idx[0] += 1
-  static_mnemos.append('static constexpr const char %s[] = "%s";' % (mnemo_label, mnemo))
+    processed_names.add(name)
 
   restriction = [cpuid_restriction, nan_restriction]
 
-  if check_compatible_assembler == _is_translator_compatible_assembler:
+  if gen_builder:
     yield '    if (auto result = callback('
   else:
     yield '    callback('
   yield '          berberis::intrinsics::bindings::IntrinsicBindingInfo<'
   yield '              %s,' % (
     ',\n              '.join(
-        [name_label,
+        ['"%s"' % name,
          nan_restriction,
          _get_c_type_tuple(intr['in']),
          _get_c_type_tuple(intr['out']),
          _get_bindings_info(asm['args'])]))
-  yield '              machine_insn_info::AsmCallInfo<%s>>(),' % (
+  yield '              device_arch_info::DeviceInsnInfo<%s>>(),' % (
     ',\n                  '.join(
-        [_get_asm_reference(asm),
-         mnemo_label,
+        [gen_device_insn_info_lib._get_asm_reference(asm),
+         '"%s"' % asm['mnemo'],
          'true' if _intr_has_side_effects(intr) else 'false',
-         _get_builder_reference(intr, asm),
+         gen_device_insn_info_lib._get_opcode_reference(asm),
          cpuid_restriction,
-         _get_reg_operands_info(asm['args'])]))
-  if check_compatible_assembler == _is_translator_compatible_assembler:
+         gen_device_insn_info_lib._get_reg_operands_info(asm['args'])]))
+  if gen_builder:
     yield '          std::forward<Args>(args)...); result.has_value()) {'
     yield '      return *std::move(result);'
     yield '    }'
@@ -1196,69 +1120,6 @@ def _get_c_type_tuple(arguments):
     return 'std::tuple<%s>' % ', '.join(
         _get_c_type(argument) for argument in arguments)
 
-
-def _get_asm_type(asm, prefix=''):
-  args = filter(
-    lambda arg: not asm_defs.is_implicit_reg(arg['class']), asm['args'])
-  return ', '.join(_get_asm_operand_type(arg, prefix) for arg in args)
-
-
-def _get_asm_operand_type(arg, prefix=''):
-  cls = arg.get('class')
-  if asm_defs.is_x87reg(cls):
-    return prefix + 'X87Register'
-  if asm_defs.is_greg(cls):
-    return prefix + 'Register'
-  if asm_defs.is_xreg(cls):
-    return prefix + 'XMMRegister'
-  if asm_defs.is_mem_op(cls):
-    return 'const ' + prefix + 'Operand&'
-  if asm_defs.is_imm(cls):
-    if cls == 'Imm2':
-      return 'int8_t'
-    return 'int' + cls[3:] + '_t'
-  assert False
-
-
-def _get_asm_reference(asm):
-  # Because of misfeature of Itanium C++ ABI we couldn't just use MacroAssembler
-  # to static cast these references if we want to use them as template argument:
-  # https://ibob.bg/blog/2018/08/18/a-bug-in-the-cpp-standard/
-
-  # Thankfully there are usually no need to use the same trick for MacroInstructions
-  # since we may always rename these, except when immediates are involved.
-
-  # But for assembler we need to use actual type from where these
-  # instructions come from!
-  #
-  # E.g. LZCNT have to be processed like this:
-  #   static_cast<void (Assembler_common_x86::*)(
-  #     typename Assembler_common_x86::Register,
-  #     typename Assembler_common_x86::Register)>(
-  #       &Assembler_common_x86::Lzcntl)
-  assembler = 'std::tuple_element_t<%s, MacroAssembler>' % asm['macroassembler']
-  return 'static_cast<void (%s::*)(%s)>(%s&%s::%s%s)' % (
-      assembler,
-      _get_asm_type(asm, 'typename %s::' % assembler),
-      '\n                  ',
-      assembler,
-      'template ' if '<' in asm['asm'] else '',
-      asm['asm'])
-
-def _get_builder_reference(intr, asm):
-  name = asm['name']
-  num_mem_args = sum(
-    1
-    for arg in asm['args']
-      if arg.get('class').startswith("Mem") and
-         arg.get('usage') == 'def_early_clobber')
-  if num_mem_args > 2:
-    opcode = 'Undefined'
-  elif num_mem_args > 0:
-    opcode = asm_defs.get_mem_macro_name(asm, '').replace("Mem", "MemBaseDisp")
-  else:
-    opcode = name
-  return f'[]<typename Opcode>{{ return Opcode::kMachineOp{opcode}; }}'
 
 def _load_intrs_def_files(intrs_def_files):
   result = {}

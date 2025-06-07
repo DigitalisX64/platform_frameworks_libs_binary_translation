@@ -26,8 +26,8 @@
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
 #include "berberis/base/dependent_false.h"
+#include "berberis/device_arch_info/x86_32_or_x86_64/device_arch_info.h"
 #include "berberis/intrinsics/common/intrinsics_bindings.h"
-#include "berberis/machine_insn_info/x86_32_or_x86_64/machine_insn_info.h"
 
 namespace berberis {
 
@@ -85,7 +85,7 @@ class VerifierAssembler {
    public:
     constexpr Register(std::optional<Register> reg)
         : Register(reg.has_value() ? *reg : (FATAL("attempt to use undeclared register"), *reg)) {}
-    constexpr Register(int arg_no, machine_insn_info::RegBindingKind binding_kind)
+    constexpr Register(int arg_no, device_arch_info::RegBindingKind binding_kind)
         : arg_no_(arg_no), binding_kind_(binding_kind) {}
 
     constexpr int arg_no() const {
@@ -103,7 +103,7 @@ class VerifierAssembler {
     // Used in Operand to deal with references to scratch area.
     static constexpr int kScratchPointer = -3;
 
-    constexpr machine_insn_info::RegBindingKind get_binding_kind() const { return binding_kind_; }
+    constexpr device_arch_info::RegBindingKind get_binding_kind() const { return binding_kind_; }
 
    private:
     friend struct Operand;
@@ -113,7 +113,7 @@ class VerifierAssembler {
     //
     // Default value (-1) means it's not assigned yet (thus couldn't be used).
     int arg_no_;
-    machine_insn_info::RegBindingKind binding_kind_;
+    device_arch_info::RegBindingKind binding_kind_;
   };
 
   class X87Register {
@@ -141,7 +141,7 @@ class VerifierAssembler {
    public:
     friend class SIMDRegister<384 - kBits>;
 
-    constexpr SIMDRegister(int arg_no, machine_insn_info::RegBindingKind binding_kind)
+    constexpr SIMDRegister(int arg_no, device_arch_info::RegBindingKind binding_kind)
         : arg_no_(arg_no), binding_kind_(binding_kind) {}
 
     constexpr int arg_no() const {
@@ -163,7 +163,7 @@ class VerifierAssembler {
       return std::enable_if_t<kBits != 256, SIMDRegister<256>>{arg_no_, binding_kind_};
     }
 
-    constexpr machine_insn_info::RegBindingKind get_binding_kind() const { return binding_kind_; }
+    constexpr device_arch_info::RegBindingKind get_binding_kind() const { return binding_kind_; }
 
    private:
     // Register number created during creation of assembler call.
@@ -172,7 +172,7 @@ class VerifierAssembler {
     // Default value (-1) means it's not assigned yet (thus couldn't be used).
     static constexpr int kNoRegister = -1;
     int arg_no_;
-    machine_insn_info::RegBindingKind binding_kind_;
+    device_arch_info::RegBindingKind binding_kind_;
   };
 
   using XMMRegister = SIMDRegister<128>;
@@ -200,7 +200,7 @@ class VerifierAssembler {
   // It's also always defined on the entrance to intrinsics and, if modified, has to be restored.
   // But kUse/kDef is not precise enough to describe “this register could be touched but has to be
   // restored” requirement, thus we define it as kUseDef.
-  Register gpr_s{Register::kStackPointer, machine_insn_info::kUseDef};
+  Register gpr_s{Register::kStackPointer, device_arch_info::kUseDef};
   // Used in Operand as pseudo-register to temporary operand.
   std::optional<Register> gpr_scratch{};
 
@@ -346,6 +346,14 @@ class VerifierAssembler {
       }
     }
 
+    constexpr void Update32BitRegisterExtension(int reg_arg_no, bool is_zero_extended) {
+      if (is_zero_extended) {
+        zero_extended_32_bit_register.at(reg_arg_no) = true;
+      } else {
+        zero_extended_32_bit_register.at(reg_arg_no) = false;
+      }
+    }
+
     enum {
       kFixedRegisterShift,
       kGeneralRegisterShift,
@@ -367,6 +375,12 @@ class VerifierAssembler {
       return state;
     }
 
+    constexpr void Check32BitRegisterIsZeroExtended(int reg_no) {
+      if (!zero_extended_32_bit_register.at(reg_no)) {
+        FATAL("error: intrinsic didn't zero extend 32 bit output register");
+      }
+    }
+
    private:
     bool intrinsic_defined_def_fixed_register = false;
     bool intrinsic_defined_def_general_register = false;
@@ -379,6 +393,8 @@ class VerifierAssembler {
     std::array<bool, kMaxRegisters> intrinsic_defined_def_early_clobber_xmm_register{};
 
     std::array<bool, kMaxRegisters> valid_def_early_clobber_register{};
+
+    std::array<bool, kMaxRegisters> zero_extended_32_bit_register{};
   };
 
   RegisterUsageFlags register_usage_flags;
@@ -462,6 +478,13 @@ class VerifierAssembler {
       return;
     }
     register_usage_flags.CheckAppropriateDefEarlyClobbers();
+  }
+
+  constexpr void Check32BitRegisterIsZeroExtended(int reg_no) {
+    if (intrinsic_is_non_linear) {
+      return;
+    }
+    register_usage_flags.Check32BitRegisterIsZeroExtended(reg_no);
   }
 
   constexpr void CheckLabelsAreBound() {
@@ -557,32 +580,32 @@ class VerifierAssembler {
       FATAL("error: intrinsic used both AVX and SSE instructions");
     }
 
-    constexpr bool expect_bmi = std::is_same_v<CPUIDRestriction, machine_insn_info::HasBMI>;
-    constexpr bool expect_f16c = std::is_same_v<CPUIDRestriction, machine_insn_info::HasF16C>;
-    constexpr bool expect_fma = std::is_same_v<CPUIDRestriction, machine_insn_info::HasFMA>;
-    constexpr bool expect_fma4 = std::is_same_v<CPUIDRestriction, machine_insn_info::HasFMA4>;
-    constexpr bool expect_lzcnt = std::is_same_v<CPUIDRestriction, machine_insn_info::HasLZCNT>;
-    constexpr bool expect_vaes = std::is_same_v<CPUIDRestriction, machine_insn_info::HasVAES>;
+    constexpr bool expect_bmi = std::is_same_v<CPUIDRestriction, device_arch_info::HasBMI>;
+    constexpr bool expect_f16c = std::is_same_v<CPUIDRestriction, device_arch_info::HasF16C>;
+    constexpr bool expect_fma = std::is_same_v<CPUIDRestriction, device_arch_info::HasFMA>;
+    constexpr bool expect_fma4 = std::is_same_v<CPUIDRestriction, device_arch_info::HasFMA4>;
+    constexpr bool expect_lzcnt = std::is_same_v<CPUIDRestriction, device_arch_info::HasLZCNT>;
+    constexpr bool expect_vaes = std::is_same_v<CPUIDRestriction, device_arch_info::HasVAES>;
     constexpr bool expect_vpclmulqd =
-        std::is_same_v<CPUIDRestriction, machine_insn_info::HasVPCLMULQD>;
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasVPCLMULQD>;
     constexpr bool expect_aesavx =
-        std::is_same_v<CPUIDRestriction, machine_insn_info::HasAESAVX> || expect_vaes;
-    constexpr bool expect_aes = std::is_same_v<CPUIDRestriction, machine_insn_info::HasAES>;
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasAESAVX> || expect_vaes;
+    constexpr bool expect_aes = std::is_same_v<CPUIDRestriction, device_arch_info::HasAES>;
     constexpr bool expect_clmulavx =
-        std::is_same_v<CPUIDRestriction, machine_insn_info::HasCLMULAVX> || expect_vpclmulqd;
-    constexpr bool expect_clmul = std::is_same_v<CPUIDRestriction, machine_insn_info::HasCLMUL>;
-    constexpr bool expect_popcnt = std::is_same_v<CPUIDRestriction, machine_insn_info::HasPOPCNT>;
-    constexpr bool expect_avx = std::is_same_v<CPUIDRestriction, machine_insn_info::HasAVX> ||
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMULAVX> || expect_vpclmulqd;
+    constexpr bool expect_clmul = std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMUL>;
+    constexpr bool expect_popcnt = std::is_same_v<CPUIDRestriction, device_arch_info::HasPOPCNT>;
+    constexpr bool expect_avx = std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX> ||
                                 expect_aesavx || expect_clmulavx || expect_f16c || expect_fma ||
                                 expect_fma4;
-    constexpr bool expect_sse4_2 = std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSE4_2> ||
-                                   expect_aes || expect_clmul;
+    constexpr bool expect_sse4_2 =
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE4_2> || expect_aes || expect_clmul;
     constexpr bool expect_sse4_1 =
-        std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSE4_1> || expect_sse4_2;
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE4_1> || expect_sse4_2;
     constexpr bool expect_ssse3 =
-        std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSSE3> || expect_sse4_1;
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasSSSE3> || expect_sse4_1;
     constexpr bool expect_sse3 =
-        std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSE3> || expect_ssse3;
+        std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE3> || expect_ssse3;
 
     // Note that we don't check SSE or SSE2, since we assume SSE2 is always available.
 
@@ -774,83 +797,87 @@ class VerifierAssembler {
     if (gpr_d.has_value()) {
       if (reg == gpr_d) return true;
     }
+    if (reg == gpr_s) return true;
     return false;
   }
 
-  constexpr void RegisterDef(Register reg) {
-    if (reg.get_binding_kind() == machine_insn_info::kDef ||
-        reg.get_binding_kind() == machine_insn_info::kDefEarlyClobber) {
+  constexpr void RegisterDef(Register reg, bool is_zero_extended = false) {
+    if (reg.get_binding_kind() == device_arch_info::kUse) {
+      FATAL("error: intrinsic defined a 'use' register");
+    }
+    if (reg.get_binding_kind() == device_arch_info::kDef ||
+        reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.UpdateIntrinsicDefOrDefEarlyClobberRegister(reg.arg_no());
     }
-    if (reg.get_binding_kind() == machine_insn_info::kDef) {
+    if (reg.get_binding_kind() == device_arch_info::kDef) {
       instructions.at(num_instructions_).UpdateInstructionRegisterDef(RegisterIsFixed(reg));
       register_usage_flags.UpdateIntrinsicRegisterDef(RegisterIsFixed(reg));
-    } else if (reg.get_binding_kind() == machine_insn_info::kDefEarlyClobber) {
+    } else if (reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.UpdateIntrinsicRegisterDefEarlyClobber(reg.arg_no(),
                                                                   RegisterIsFixed(reg));
     }
-    if (reg.get_binding_kind() == machine_insn_info::kUse) {
-      FATAL("error: intrinsic defined a 'use' register");
+    if (!RegisterIsFixed(reg)) {
+      register_usage_flags.Update32BitRegisterExtension(reg.arg_no(), is_zero_extended);
     }
   }
 
-  constexpr void RegisterDef(XMMRegister reg) {
-    if (reg.get_binding_kind() == machine_insn_info::kDef ||
-        reg.get_binding_kind() == machine_insn_info::kDefEarlyClobber) {
+  constexpr void RegisterDef(XMMRegister reg, [[maybe_unused]] bool is_zero_extended = false) {
+    if (reg.get_binding_kind() == device_arch_info::kUse) {
+      FATAL("error: intrinsic defined a 'use' XMM register");
+    }
+    if (reg.get_binding_kind() == device_arch_info::kDef ||
+        reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.UpdateIntrinsicDefOrDefEarlyClobberRegister(reg.arg_no());
     }
-    if (reg.get_binding_kind() == machine_insn_info::kDef) {
+    if (reg.get_binding_kind() == device_arch_info::kDef) {
       instructions.at(num_instructions_).UpdateInstructionXMMRegisterDef();
       register_usage_flags.UpdateIntrinsicXMMRegisterDef();
-    } else if (reg.get_binding_kind() == machine_insn_info::kDefEarlyClobber) {
+    } else if (reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.UpdateIntrinsicXMMRegisterDefEarlyClobber(reg.arg_no());
-    }
-    if (reg.get_binding_kind() == machine_insn_info::kUse) {
-      FATAL("error: intrinsic defined a 'use' XMM register");
     }
   }
 
   constexpr void RegisterUse(Register reg) {
-    if (reg.get_binding_kind() == machine_insn_info::kUse) {
+    if (reg.get_binding_kind() == device_arch_info::kUse) {
       instructions.at(num_instructions_).UpdateInstructionRegisterUse(RegisterIsFixed(reg));
     }
     if (intrinsic_is_non_linear) {
       return;
     }
-    if (reg.get_binding_kind() == machine_insn_info::kUse) {
+    if (reg.get_binding_kind() == device_arch_info::kUse) {
       register_usage_flags.CheckValidRegisterUse(RegisterIsFixed(reg));
       register_usage_flags.UpdateIntrinsicRegisterUse(RegisterIsFixed(reg));
     }
-    if (reg.get_binding_kind() == machine_insn_info::kDef ||
-        reg.get_binding_kind() == machine_insn_info::kDefEarlyClobber) {
+    if (reg.get_binding_kind() == device_arch_info::kDef ||
+        reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.CheckValidDefOrDefEarlyClobberRegisterUse(reg.arg_no());
     }
   }
 
   constexpr void RegisterUse(XMMRegister reg) {
-    if (reg.get_binding_kind() == machine_insn_info::kUse) {
+    if (reg.get_binding_kind() == device_arch_info::kUse) {
       instructions.at(num_instructions_).UpdateInstructionXMMRegisterUse();
     }
     if (intrinsic_is_non_linear) {
       return;
     }
-    if (reg.get_binding_kind() == machine_insn_info::kUse) {
+    if (reg.get_binding_kind() == device_arch_info::kUse) {
       register_usage_flags.CheckValidXMMRegisterUse();
       register_usage_flags.UpdateIntrinsicXMMRegisterUse();
     }
     if (!kCheckDefOrDefEarlyClobberXMMRegistersAreWrittenBeforeRead) {
       return;
     }
-    if (reg.get_binding_kind() == machine_insn_info::kDef ||
-        reg.get_binding_kind() == machine_insn_info::kDefEarlyClobber) {
+    if (reg.get_binding_kind() == device_arch_info::kDef ||
+        reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.CheckValidDefOrDefEarlyClobberRegisterUse(reg.arg_no());
     }
   }
 
   template <typename RegisterType>
   constexpr void HandleDefOrDefEarlyClobberRegisterReset(RegisterType reg1, RegisterType reg2) {
-    if (reg1 == reg2 && (reg1.get_binding_kind() == machine_insn_info::kDef ||
-                         reg1.get_binding_kind() == machine_insn_info::kDefEarlyClobber)) {
+    if (reg1 == reg2 && (reg1.get_binding_kind() == device_arch_info::kDef ||
+                         reg1.get_binding_kind() == device_arch_info::kDefEarlyClobber)) {
       register_usage_flags.UpdateIntrinsicDefOrDefEarlyClobberRegister(reg1.arg_no());
     }
   }
@@ -858,8 +885,8 @@ class VerifierAssembler {
   constexpr void HandleDefOrDefEarlyClobberRegisterReset(XMMRegister reg1,
                                                          XMMRegister reg2,
                                                          XMMRegister reg3) {
-    if (reg2 == reg3 && (reg1.get_binding_kind() == machine_insn_info::kDef ||
-                         reg1.get_binding_kind() == machine_insn_info::kDefEarlyClobber)) {
+    if (reg2 == reg3 && (reg1.get_binding_kind() == device_arch_info::kDef ||
+                         reg1.get_binding_kind() == device_arch_info::kDefEarlyClobber)) {
       register_usage_flags.UpdateIntrinsicDefOrDefEarlyClobberRegister(reg1.arg_no());
     }
   }

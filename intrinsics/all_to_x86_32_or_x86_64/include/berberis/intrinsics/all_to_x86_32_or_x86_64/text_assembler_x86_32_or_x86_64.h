@@ -334,47 +334,47 @@ class TextAssembler {
  protected:
   template <typename CPUIDRestriction>
   static constexpr const char* CPUIDRestrictionToString() {
-    if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::NoCPUIDRestriction>) {
+    if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::NoCPUIDRestriction>) {
       return nullptr;
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::IsAuthenticAMD>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::IsAuthenticAMD>) {
       return "host_platform::kIsAuthenticAMD";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasAES>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasAES>) {
       return "host_platform::kHasAES";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasAESAVX>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasAESAVX>) {
       return "host_platform::kHasAES && host_platform::kHasAVX";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasAVX>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX>) {
       return "host_platform::kHasAVX";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasBMI>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasBMI>) {
       return "host_platform::kHasBMI";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasF16C>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasF16C>) {
       return "host_platform::kHasF16C";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasCLMUL>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMUL>) {
       return "host_platform::kHasCLMUL";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasCLMULAVX>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMULAVX>) {
       return "host_platform::kHasCLMUL && host_platform::kHasAVX";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasFMA>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasFMA>) {
       return "host_platform::kHasFMA";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasFMA4>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasFMA4>) {
       return "host_platform::kHasFMA4";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasLZCNT>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasLZCNT>) {
       return "host_platform::kHasLZCNT";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasPOPCNT>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasPOPCNT>) {
       return "host_platform::kHasPOPCNT";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSE3>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE3>) {
       return "host_platform::kHasSSE3";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSSE3>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasSSSE3>) {
       return "host_platform::kHasSSSE3";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSE4_1>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE4_1>) {
       return "host_platform::kHasSSE4_1";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSE4_2>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE4_2>) {
       return "host_platform::kHasSSE4_2";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasSSSE3>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasSSSE3>) {
       return "host_platform::kHasSSSE3";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasVAES>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasVAES>) {
       return "host_platform::kHasVAES";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasVPCLMULQD>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasVPCLMULQD>) {
       return "host_platform::kHasVPCLMULQD";
-    } else if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::HasCustomCapability>) {
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasCustomCapability>) {
       return "host_platform::kHasCustomCapability";
     } else {
       static_assert(kDependentTypeFalse<CPUIDRestriction>);

@@ -147,7 +147,6 @@ class GuestLoader {
   std::string dl_error_holder_;
   const char* dl_error_;
 
-  const char* main_executable_path_;
   LoadedElfFile executable_elf_file_;
   LoadedElfFile linker_elf_file_;
   LoadedElfFile vdso_elf_file_;

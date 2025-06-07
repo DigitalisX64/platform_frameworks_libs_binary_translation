@@ -102,9 +102,8 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
   IntrinsicBindingInfo::ProcessBindings([&arg_counter,
                                          &as,
                                          register_numbers]<typename Binding, typename Operand> {
-    if constexpr (machine_insn_info::kIsRegister<Operand> &&
-                  !machine_insn_info::kIsFLAGS<Operand>) {
-      if constexpr (machine_insn_info::kIsImplicitReg<Operand>) {
+    if constexpr (device_arch_info::kIsRegister<Operand> && !device_arch_info::kIsFLAGS<Operand>) {
+      if constexpr (device_arch_info::kIsImplicitReg<Operand>) {
         as->*(Operand::Class::template kAssemblerRegisterPointer<MacroAssembler<TextAssembler>>) =
             typename MacroAssembler<TextAssembler>::Register(register_numbers[arg_counter]);
       }
@@ -115,14 +114,14 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
   arg_counter = 0;
   int scratch_counter = 0;
   std::apply(
-      IntrinsicBindingInfo::kMacroInstruction,
+      IntrinsicBindingInfo::kEmitInsnFunc,
       std::tuple_cat(std::tuple<MacroAssembler<TextAssembler>&>{*as},
                      IntrinsicBindingInfo::MakeTuplefromBindings(
                          [&as,
                           &arg_counter,
                           &scratch_counter,
                           register_numbers]<typename Binding, typename Operand> {
-                           if constexpr (machine_insn_info::kIsMemoryOperand<Operand>) {
+                           if constexpr (device_arch_info::kIsMemoryOperand<Operand>) {
                              if (scratch_counter == 0) {
                                as->gpr_macroassembler_scratch =
                                    typename MacroAssembler<TextAssembler>::Register(arg_counter++);
@@ -139,9 +138,9 @@ constexpr void CallAssembler(MacroAssembler<TextAssembler>* as, int* register_nu
                                  .base = as->gpr_scratch,
                                  .disp = static_cast<int32_t>(config::kScratchAreaSlotSize *
                                                               scratch_counter++)}};
-                           } else if constexpr (machine_insn_info::kIsRegister<Operand> &&
-                                                !machine_insn_info::kIsFLAGS<Operand>) {
-                             if constexpr (machine_insn_info::kIsImplicitReg<Operand>) {
+                           } else if constexpr (device_arch_info::kIsRegister<Operand> &&
+                                                !device_arch_info::kIsFLAGS<Operand>) {
+                             if constexpr (device_arch_info::kIsImplicitReg<Operand>) {
                                ++arg_counter;
                                return std::tuple{};
                              } else {
@@ -215,10 +214,10 @@ void GenerateTemporaries(FILE* out, int indent) {
   std::size_t id = 0;
   IntrinsicBindingInfo::ProcessBindings([out, &id, indent]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!machine_insn_info::kIsFLAGS<Operand> && !HaveInput(Binding::kArgInfo) &&
+    if constexpr (!device_arch_info::kIsFLAGS<Operand> && !HaveInput(Binding::kArgInfo) &&
                   !HaveOutput(Binding::kArgInfo)) {
-      static_assert(Operand::kUsage == machine_insn_info::kDef ||
-                    Operand::kUsage == machine_insn_info::kDefEarlyClobber);
+      static_assert(Operand::kUsage == device_arch_info::kDef ||
+                    Operand::kUsage == device_arch_info::kDefEarlyClobber);
       fprintf(out,
               "%*s%s tmp%zd;\n",
               indent,
@@ -233,10 +232,10 @@ template <typename IntrinsicBindingInfo>
 void GenerateInShadows(FILE* out, int indent) {
   IntrinsicBindingInfo::ProcessBindings([out, indent]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (machine_insn_info::kIsMemoryOperand<Operand>) {
+    if constexpr (device_arch_info::kIsMemoryOperand<Operand>) {
       // Only temporary memory scratch area is supported.
       static_assert(!HaveInput(Binding::kArgInfo) && !HaveOutput(Binding::kArgInfo));
-    } else if constexpr (machine_insn_info::kIsFLAGS<Operand>) {
+    } else if constexpr (device_arch_info::kIsFLAGS<Operand>) {
       // Flags don't require any special variables.
     } else if constexpr (RegisterClass::kAsRegister == 'r') {
       // TODO(b/138439904): remove when clang handling of 'r' constraint would be fixed.
@@ -332,10 +331,10 @@ void GenerateAssemblerOuts(FILE* out, int indent) {
   int tmp_id = 0;
   IntrinsicBindingInfo::ProcessBindings([&outs, &tmp_id]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!machine_insn_info::kIsFLAGS<Operand> &&
-                  Operand::kUsage != machine_insn_info::kUse) {
+    if constexpr (!device_arch_info::kIsFLAGS<Operand> &&
+                  Operand::kUsage != device_arch_info::kUse) {
       std::string out = "\"=";
-      if constexpr (Operand::kUsage == machine_insn_info::kDefEarlyClobber) {
+      if constexpr (Operand::kUsage == device_arch_info::kDefEarlyClobber) {
         out += "&";
       }
       out += RegisterClass::kAsRegister;
@@ -363,8 +362,8 @@ void GenerateAssemblerIns(FILE* out,
   std::vector<std::string> ins;
   IntrinsicBindingInfo::ProcessBindings([&ins]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (!machine_insn_info::kIsFLAGS<Operand> &&
-                  Operand::kUsage == machine_insn_info::kUse) {
+    if constexpr (!device_arch_info::kIsFLAGS<Operand> &&
+                  Operand::kUsage == device_arch_info::kUse) {
       ins.push_back("\"" + std::string(1, RegisterClass::kAsRegister) + "\"(in" +
                     std::to_string(Binding::kArgInfo.from) +
                     (NeedInputShadow<IntrinsicBindingInfo, Binding, Operand>() ? "_shadow)" : ")"));
@@ -381,8 +380,8 @@ void GenerateAssemblerIns(FILE* out,
   IntrinsicBindingInfo::ProcessBindings([&ins,
                                          &arg_counter,
                                          register_numbers]<typename Binding, typename Operand> {
-    if constexpr (!machine_insn_info::kIsFLAGS<Operand> && HaveInput(Binding::kArgInfo) &&
-                  Operand::kUsage != machine_insn_info::kUse) {
+    if constexpr (!device_arch_info::kIsFLAGS<Operand> && HaveInput(Binding::kArgInfo) &&
+                  Operand::kUsage != device_arch_info::kUse) {
       ins.push_back("\"" + std::to_string(register_numbers[arg_counter]) + "\"(in" +
                     std::to_string(Binding::kArgInfo.from) +
                     (NeedInputShadow<IntrinsicBindingInfo, Binding, Operand>() ? "_shadow)" : ")"));
@@ -396,7 +395,7 @@ template <typename IntrinsicBindingInfo>
 void GenerateOutShadows(FILE* out, int indent) {
   IntrinsicBindingInfo::ProcessBindings([out, indent]<typename Binding, typename Operand> {
     using RegisterClass = Operand::Class;
-    if constexpr (machine_insn_info::kIsFLAGS<Operand>) {
+    if constexpr (device_arch_info::kIsFLAGS<Operand>) {
       // Flags don't require shadows.
     } else if constexpr (RegisterClass::kAsRegister == 'r') {
       // TODO(b/138439904): remove when clang handling of 'r' constraint would be fixed.
@@ -535,6 +534,10 @@ constexpr void VerifyIntrinsic() {
   bool expect_flags = CheckIntrinsicHasFlagsBinding<IntrinsicBindingInfo>();
   as.CheckFlagsBinding(expect_flags);
   as.CheckAppropriateDefEarlyClobbers();
+  if (sizeof(MacroAssembler<VerifierAssembler>::AddressType) == sizeof(int64_t)) {
+    Check32BitRegistersAreZeroExtended<IntrinsicBindingInfo, MacroAssembler<VerifierAssembler>>(
+        &as);
+  }
   as.CheckLabelsAreBound();
   as.CheckNonLinearIntrinsicsUseDefRegisters();
 }
@@ -595,7 +598,7 @@ void GenerateTextAsmIntrinsics(FILE* out) {
         using CPUIDRestriction = IntrinsicBindingInfo::CPUIDRestriction;
         // Note: this series of "if constexpr" expressions is the only place where cpuid_restriction
         // may get a concrete non-zero value;
-        if constexpr (std::is_same_v<CPUIDRestriction, machine_insn_info::NoCPUIDRestriction>) {
+        if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::NoCPUIDRestriction>) {
           if (cpuid_restriction) {
             fprintf(out, "  } else {\n");
             cpuid_restriction = nullptr;

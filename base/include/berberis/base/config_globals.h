@@ -33,6 +33,7 @@ class ConfigStr {
 
 void SetMainExecutableRealPath(std::string_view path);
 const char* GetMainExecutableRealPath();
+const char** GetMainExecutableRealPathPointer();
 
 void SetAppPackageName(std::string_view name);
 const char* GetAppPackageName();

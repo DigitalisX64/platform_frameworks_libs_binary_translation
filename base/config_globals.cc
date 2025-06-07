@@ -103,6 +103,10 @@ const char* GetMainExecutableRealPath() {
   return g_main_executable_real_path;
 }
 
+const char** GetMainExecutableRealPathPointer() {
+  return &g_main_executable_real_path;
+}
+
 void SetAppPackageName(std::string_view name) {
   CHECK(!name.empty());
   g_app_package_name = MakeForeverCStr(name);

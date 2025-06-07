@@ -231,17 +231,17 @@ void Mov(x86_64::MachineIRBuilder* builder, MachineReg dest, MachineReg src) {
 template <typename DestRegClass, typename SrcReg>
 void MovFromInput(x86_64::MachineIRBuilder* builder, MachineReg dest, SrcReg src) {
   if constexpr (std::is_same_v<SrcReg, SimdReg>) {
-    Mov<DestRegClass, x86_64::machine_insn_info::XmmReg>(builder, dest, src.machine_reg());
+    Mov<DestRegClass, x86_64::device_arch_info::XmmReg>(builder, dest, src.machine_reg());
   } else {
-    Mov<DestRegClass, x86_64::machine_insn_info::GeneralReg64>(builder, dest, src);
+    Mov<DestRegClass, x86_64::device_arch_info::GeneralReg64>(builder, dest, src);
   }
 }
 template <typename SrcRegClass, typename DestReg>
 void MovToResult(x86_64::MachineIRBuilder* builder, DestReg dest, MachineReg src) {
   if constexpr (std::is_same_v<DestReg, SimdReg>) {
-    Mov<x86_64::machine_insn_info::XmmReg, SrcRegClass>(builder, dest.machine_reg(), src);
+    Mov<x86_64::device_arch_info::XmmReg, SrcRegClass>(builder, dest.machine_reg(), src);
   } else {
-    Mov<x86_64::machine_insn_info::GeneralReg64, SrcRegClass>(builder, dest, src);
+    Mov<x86_64::device_arch_info::GeneralReg64, SrcRegClass>(builder, dest, src);
   }
 }
 
@@ -269,7 +269,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
                                                                         Result def_result,
                                                                         Args&&... args);
 
-  template <auto kIntrinsicTemplateName, typename... Types>
+  template <StringLiteral kIntrinsic, typename... Types>
   friend class intrinsics::bindings::IntrinsicBindingInfo;
 
   TryBindingBasedInlineIntrinsicForHeavyOptimizer() = delete;
@@ -320,41 +320,43 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
     static_assert(std::is_same_v<typename IntrinsicBindingInfo::PreciseNanOperationsHandling,
                                  intrinsics::bindings::NoNansOperation>);
     using CPUIDRestriction = IntrinsicBindingInfo::CPUIDRestriction;
-    if constexpr (std::is_same_v<CPUIDRestriction, x86_32_or_x86_64::machine_insn_info::HasAVX>) {
+    if constexpr (std::is_same_v<CPUIDRestriction, x86_32_or_x86_64::device_arch_info::HasAVX>) {
       if (!host_platform::kHasAVX) {
         return {};
       }
     } else if constexpr (std::is_same_v<CPUIDRestriction,
-                                        x86_32_or_x86_64::machine_insn_info::HasBMI>) {
+                                        x86_32_or_x86_64::device_arch_info::HasBMI>) {
       if (!host_platform::kHasBMI) {
         return {};
       }
     } else if constexpr (std::is_same_v<CPUIDRestriction,
-                                        x86_32_or_x86_64::machine_insn_info::HasFMA>) {
+                                        x86_32_or_x86_64::device_arch_info::HasFMA>) {
       if (!host_platform::kHasFMA) {
         return {};
       }
     } else if constexpr (std::is_same_v<CPUIDRestriction,
-                                        x86_32_or_x86_64::machine_insn_info::HasLZCNT>) {
+                                        x86_32_or_x86_64::device_arch_info::HasLZCNT>) {
       if (!host_platform::kHasLZCNT) {
         return {};
       }
     } else if constexpr (std::is_same_v<CPUIDRestriction,
-                                        x86_32_or_x86_64::machine_insn_info::HasPOPCNT>) {
+                                        x86_32_or_x86_64::device_arch_info::HasPOPCNT>) {
       if (!host_platform::kHasPOPCNT) {
         return {};
       }
     } else if constexpr (std::is_same_v<CPUIDRestriction,
-                                        x86_32_or_x86_64::machine_insn_info::NoCPUIDRestriction>) {
+                                        x86_32_or_x86_64::device_arch_info::NoCPUIDRestriction>) {
       // No restrictions. Do nothing.
     } else {
       static_assert(berberis::kDependentValueFalse<IntrinsicBindingInfo::kCPUIDRestriction>);
     }
 
-    (builder_->*berberis::x86_64::MachineInsn<typename IntrinsicBindingInfo::AsmCallInfo>::
-                    template kGenFunc<x86_64::MachineIRBuilder>)(std::tuple_cat(
-        UnwrapSimdReg(IntrinsicBindingInfo::template MakeTuplefromBindings<
-                      TryBindingBasedInlineIntrinsicForHeavyOptimizer&>(*this, asm_call_info))));
+    std::apply(berberis::x86_64::MachineInsn<typename IntrinsicBindingInfo::DeviceInsnInfo>::
+                   template kGenFunc<x86_64::MachineIRBuilder>,
+               std::tuple_cat(std::tuple<x86_64::MachineIRBuilder&>{*builder_},
+                              UnwrapSimdReg(IntrinsicBindingInfo::template MakeTuplefromBindings<
+                                            TryBindingBasedInlineIntrinsicForHeavyOptimizer&>(
+                                  *this, asm_call_info))));
     ProcessBindingsResults<IntrinsicBindingInfo>(
         type_wrapper<typename IntrinsicBindingInfo::Bindings>(),
         type_wrapper<typename IntrinsicBindingInfo::Operands>());
@@ -379,8 +381,8 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
         std::tuple_size_v<typename IntrinsicBindingInfo::OutputArguments>;
 
     if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_ARG) {
-      static_assert(kUsage == machine_insn_info::kUse);
-      static_assert(!machine_insn_info::kIsImplicitReg<OperandInfo>);
+      static_assert(kUsage == device_arch_info::kUse);
+      static_assert(!device_arch_info::kIsImplicitReg<OperandInfo>);
       if constexpr (RegisterClass::kAsRegister == 'x' &&
                     std::is_same_v<
                         std::tuple_element_t<ArgBinding::kArgInfo.from, std::tuple<ArgType...>>,
@@ -394,8 +396,8 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
       }
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_ARG) {
       static_assert(!std::is_same_v<ResType, std::monostate>);
-      static_assert(kUsage == machine_insn_info::kUseDef);
-      static_assert(!machine_insn_info::kIsImplicitReg<OperandInfo>);
+      static_assert(kUsage == device_arch_info::kUseDef);
+      static_assert(!device_arch_info::kIsImplicitReg<OperandInfo>);
       if constexpr (RegisterClass::kAsRegister == 'x') {
         if constexpr (kNumOut > 1) {
           static_assert(kDependentTypeFalse<ArgBinding>);
@@ -418,8 +420,8 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
       }
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_TMP_ARG) {
       static_assert(!std::is_same_v<ResType, std::monostate>);
-      static_assert(kUsage == machine_insn_info::kUseDef);
-      static_assert(machine_insn_info::kIsImplicitReg<OperandInfo>);
+      static_assert(kUsage == device_arch_info::kUseDef);
+      static_assert(device_arch_info::kIsImplicitReg<OperandInfo>);
       if constexpr (kNumOut > 1) {
         static_assert(kDependentTypeFalse<ArgBinding>);
       } else {
@@ -430,13 +432,13 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
         return std::tuple{implicit_result_reg_};
       }
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::IN_TMP_ARG) {
-      if constexpr (machine_insn_info::kIsImplicitReg<OperandInfo>) {
+      if constexpr (device_arch_info::kIsImplicitReg<OperandInfo>) {
         auto implicit_reg = AllocVReg();
         MovFromInput<RegisterClass>(
             builder_, implicit_reg, std::get<ArgBinding::kArgInfo.from>(input_args_));
         return std::tuple{implicit_reg};
       } else {
-        static_assert(kUsage == machine_insn_info::kUseDef);
+        static_assert(kUsage == device_arch_info::kUseDef);
         return std::tuple{std::get<ArgBinding::kArgInfo.from>(input_args_)};
       }
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_TMP_ARG) {
@@ -449,9 +451,9 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
       }
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_ARG) {
       static_assert(!std::is_same_v<ResType, std::monostate>);
-      static_assert(kUsage == machine_insn_info::kDef ||
-                    kUsage == machine_insn_info::kDefEarlyClobber);
-      if constexpr (machine_insn_info::kIsFLAGS<OperandInfo>) {
+      static_assert(kUsage == device_arch_info::kDef ||
+                    kUsage == device_arch_info::kDefEarlyClobber);
+      if constexpr (device_arch_info::kIsFLAGS<OperandInfo>) {
         return std::tuple{flag_register_};
       } else if constexpr (RegisterClass::kAsRegister == 'x') {
         CHECK(xmm_result_reg_.IsInvalidReg());
@@ -459,7 +461,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
         return std::tuple{xmm_result_reg_};
       } else if constexpr (kNumOut > 1) {
         return std::tuple{std::get<ArgBinding::kArgInfo.to>(result_)};
-      } else if constexpr (machine_insn_info::kIsImplicitReg<OperandInfo>) {
+      } else if constexpr (device_arch_info::kIsImplicitReg<OperandInfo>) {
         CHECK(implicit_result_reg_.IsInvalidReg());
         implicit_result_reg_ = AllocVReg();
         return std::tuple{implicit_result_reg_};
@@ -467,18 +469,19 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
         return std::tuple{result_};
       }
     } else if constexpr (ArgBinding::kArgInfo.arg_type == ArgInfo::TMP_ARG) {
-      static_assert(kUsage == machine_insn_info::kDef ||
-                    kUsage == machine_insn_info::kDefEarlyClobber);
-      if constexpr (machine_insn_info::kIsFLAGS<OperandInfo>) {
+      static_assert(kUsage == device_arch_info::kDef ||
+                    kUsage == device_arch_info::kDefEarlyClobber);
+      if constexpr (device_arch_info::kIsFLAGS<OperandInfo>) {
         return std::tuple{flag_register_};
-      } else if constexpr (machine_insn_info::kIsMemoryOperand<OperandInfo>) {
-        static_assert(kUsage == machine_insn_info::kDefEarlyClobber);
+      } else if constexpr (device_arch_info::kIsMemoryOperand<OperandInfo>) {
+        static_assert(kUsage == device_arch_info::kDefEarlyClobber);
         if (scratch_arg_ >= 2) {
           FATAL("Only two scratch registers are supported for now");
         }
-        return std::tuple{x86_64::kMachineRegRBP,
-                          static_cast<int32_t>(offsetof(ThreadState, intrinsics_scratch_area) +
-                                               config::kScratchAreaSlotSize * scratch_arg_++)};
+        return std::tuple{x86_64::MemoryOperand{
+            .base = x86_64::kMachineRegRBP,
+            .disp = static_cast<int32_t>(offsetof(ThreadState, intrinsics_scratch_area) +
+                                         config::kScratchAreaSlotSize * scratch_arg_++)}};
       } else {
         auto reg = AllocVReg();
         return std::tuple{reg};
@@ -526,9 +529,9 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
 
   template <typename ArgBinding, typename OperandInfo, typename IntrinsicBindingInfo>
   void ProcessBindingResult() {
-    if constexpr (machine_insn_info::kIsImmediate<OperandInfo> ||
-                  machine_insn_info::kIsFLAGS<OperandInfo> ||
-                  machine_insn_info::kIsMemoryOperand<OperandInfo>) {
+    if constexpr (device_arch_info::kIsImmediate<OperandInfo> ||
+                  device_arch_info::kIsFLAGS<OperandInfo> ||
+                  device_arch_info::kIsMemoryOperand<OperandInfo>) {
       return;
     } else {
       using RegisterClass = typename OperandInfo::Class;
@@ -540,7 +543,7 @@ class TryBindingBasedInlineIntrinsicForHeavyOptimizer {
       } else if constexpr ((ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_ARG ||
                             ArgBinding::kArgInfo.arg_type == ArgInfo::IN_OUT_TMP_ARG ||
                             ArgBinding::kArgInfo.arg_type == ArgInfo::OUT_TMP_ARG) &&
-                           machine_insn_info::kIsImplicitReg<OperandInfo>) {
+                           device_arch_info::kIsImplicitReg<OperandInfo>) {
         CHECK(!implicit_result_reg_.IsInvalidReg());
         MovToResult<RegisterClass>(builder_, result_, implicit_result_reg_);
       }

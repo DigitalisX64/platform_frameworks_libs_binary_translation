@@ -78,6 +78,8 @@ class MacroAssembler
 
 #include "berberis/intrinsics/riscv64_to_x86_64/macro_assembler_interface-inl.h"  // NOLINT generated file
 
+  using AddressType = int64_t;
+
  private:
 
   // Useful constants for PshufXXX instructions.

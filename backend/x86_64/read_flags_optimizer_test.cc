@@ -359,7 +359,7 @@ TEST(MachineIRReadFlagsOptimizer, CheckSuccessorNodeLiveIn) {
 }
 
 // Helper function to check that two instructions are the same.
-void TestCopiedInstruction(MachineIR* machine_ir, MachineInsn* insn) {
+void TestCopiedInstruction(MachineIR* machine_ir, berberis::MachineInsn* insn) {
   MachineReg reg = machine_ir->AllocVReg();
 
   auto gen = GetInsnGen(insn->opcode());
@@ -887,10 +887,10 @@ TEST(MachineIRReadFlagsOptimizer, OptimizeReadFlags) {
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
   // Check that original PSEUDOREADFLAGS instruction is gone.
-  ASSERT_TRUE(
-      std::none_of(testloop.loop_exit->insn_list().begin(),
-                   testloop.loop_exit->insn_list().end(),
-                   [](MachineInsn* insn) { return insn->opcode() == kMachineOpPseudoReadFlags; }));
+  ASSERT_TRUE(std::none_of(
+      testloop.loop_exit->insn_list().begin(),
+      testloop.loop_exit->insn_list().end(),
+      [](berberis::MachineInsn* insn) { return insn->opcode() == kMachineOpPseudoReadFlags; }));
 
   // Check that postloop inserted the original instruction.
   auto insn_it = testloop.postloop->insn_list().begin();
@@ -1001,9 +1001,10 @@ TEST(MachineIRReadFlagsOptimizer, RemoveReadFlags) {
                       FlagSettingInsn{bb2->insn_list().begin(), false}});
 
   // Check ReadFlags gone.
-  ASSERT_TRUE(std::none_of(bb2->insn_list().begin(), bb2->insn_list().end(), [](MachineInsn* insn) {
-    return insn->opcode() == kMachineOpPseudoReadFlags;
-  }));
+  ASSERT_TRUE(std::none_of(
+      bb2->insn_list().begin(), bb2->insn_list().end(), [](berberis::MachineInsn* insn) {
+        return insn->opcode() == kMachineOpPseudoReadFlags;
+      }));
   // Check that we created copies of input flags.
   auto insn_it = bb2->insn_list().begin();
   ASSERT_TRUE((*insn_it)->opcode() == kMachineOpPseudoCopy && (*insn_it)->RegAt(1) == input_flag0);
@@ -1241,12 +1242,14 @@ TEST(MachineIRReadFlagsOptimizer, ReplaceFlagRegistersDeletesCopies) {
       MachineRegVector({flags0}, machine_ir.arena()),
       ArenaMap<MachineReg, MachineReg>(machine_ir.arena()),
       nullptr);
-  ASSERT_TRUE(std::none_of(bb0->insn_list().begin(), bb0->insn_list().end(), [](MachineInsn* insn) {
-    return insn->opcode() == kMachineOpPseudoCopy;
-  }));
-  ASSERT_TRUE(std::any_of(bb0->insn_list().begin(), bb0->insn_list().end(), [](MachineInsn* insn) {
-    return insn->opcode() == kMachineOpPseudoReadFlags;
-  }));
+  ASSERT_TRUE(std::none_of(
+      bb0->insn_list().begin(), bb0->insn_list().end(), [](berberis::MachineInsn* insn) {
+        return insn->opcode() == kMachineOpPseudoCopy;
+      }));
+  ASSERT_TRUE(std::any_of(
+      bb0->insn_list().begin(), bb0->insn_list().end(), [](berberis::MachineInsn* insn) {
+        return insn->opcode() == kMachineOpPseudoReadFlags;
+      }));
 }
 
 // Make sure we make copies of any registers which are written to.
