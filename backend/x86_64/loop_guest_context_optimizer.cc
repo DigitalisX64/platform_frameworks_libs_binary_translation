@@ -95,7 +95,7 @@ void ReplacePutAndUpdateMap(MachineIR* ir,
 
   auto src = insn->RegAt(1);
   auto copy_size = insn->opcode() == kMachineOpMovdqaMemBaseDispXReg ? 16 : 8;
-  auto* new_insn = static_cast<MachineInsn*>(
+  auto* new_insn = static_cast<berberis::MachineInsn*>(
       ir->NewInsn<PseudoCopy>(mem_reg_map[disp].value().reg, src, copy_size));
   *insn_it = new_insn;
 }
@@ -105,7 +105,8 @@ void GenerateGetInsns(MachineIR* ir, MachineBasicBlock* bb, const MemRegMap& mem
   CHECK_EQ(bb->out_edges().size(), 1);
 
   auto insert_it = std::prev(bb->insn_list().end());
-  for (unsigned long disp = 0; disp < mem_reg_map.size(); disp++) {
+  CHECK(mem_reg_map.size() <= std::numeric_limits<int32_t>::max());
+  for (int32_t disp = 0; disp < static_cast<int32_t>(mem_reg_map.size()); disp++) {
     if (!mem_reg_map[disp].has_value()) {
       continue;
     }
@@ -118,19 +119,19 @@ void GenerateGetInsns(MachineIR* ir, MachineBasicBlock* bb, const MemRegMap& mem
     // TODO(b/203826752) Do not generate the Get insn if the initialization of the mapped
     // register is not needed.
     auto reg_info = mem_reg_map[disp].value();
-    MachineInsn* get_insn;
+    berberis::MachineInsn* get_insn;
     switch (reg_info.mov_type) {
       case MovType::kMovq:
-        get_insn = ir->NewInsn<MovqRegMemBaseDisp>(reg_info.reg, kMachineRegRBP, disp);
+        get_insn = ir->NewInsn<MovqRegOp>(reg_info.reg, {.base = kMachineRegRBP, .disp = disp});
         break;
       case MovType::kMovdqa:
-        get_insn = ir->NewInsn<MovdqaXRegMemBaseDisp>(reg_info.reg, kMachineRegRBP, disp);
+        get_insn = ir->NewInsn<MovdqaXRegOp>(reg_info.reg, {.base = kMachineRegRBP, .disp = disp});
         break;
       case MovType::kMovw:
-        get_insn = ir->NewInsn<MovwRegMemBaseDisp>(reg_info.reg, kMachineRegRBP, disp);
+        get_insn = ir->NewInsn<MovwRegOp>(reg_info.reg, {.base = kMachineRegRBP, .disp = disp});
         break;
       case MovType::kMovsd:
-        get_insn = ir->NewInsn<MovsdXRegMemBaseDisp>(reg_info.reg, kMachineRegRBP, disp);
+        get_insn = ir->NewInsn<MovsdXRegOp>(reg_info.reg, {.base = kMachineRegRBP, .disp = disp});
         break;
     }
 
@@ -143,7 +144,8 @@ void GeneratePutInsns(MachineIR* ir, MachineBasicBlock* bb, const MemRegMap& mem
   CHECK_EQ(bb->in_edges().size(), 1);
 
   auto insert_it = bb->insn_list().begin();
-  for (unsigned long disp = 0; disp < mem_reg_map.size(); disp++) {
+  CHECK(static_cast<size_t>(static_cast<int32_t>(mem_reg_map.size())) == mem_reg_map.size());
+  for (int32_t disp = 0; disp < static_cast<int32_t>(mem_reg_map.size()); disp++) {
     if (!mem_reg_map[disp].has_value()) {
       continue;
     }
@@ -153,19 +155,19 @@ void GeneratePutInsns(MachineIR* ir, MachineBasicBlock* bb, const MemRegMap& mem
       continue;
     }
 
-    MachineInsn* put_insn;
+    berberis::MachineInsn* put_insn;
     switch (reg_info.mov_type) {
       case MovType::kMovq:
-        put_insn = ir->NewInsn<MovqMemBaseDispReg>(kMachineRegRBP, disp, reg_info.reg);
+        put_insn = ir->NewInsn<MovqOpReg>({.base = kMachineRegRBP, .disp = disp}, reg_info.reg);
         break;
       case MovType::kMovdqa:
-        put_insn = ir->NewInsn<MovdqaMemBaseDispXReg>(kMachineRegRBP, disp, reg_info.reg);
+        put_insn = ir->NewInsn<MovdqaOpXReg>({.base = kMachineRegRBP, .disp = disp}, reg_info.reg);
         break;
       case MovType::kMovw:
-        put_insn = ir->NewInsn<MovwMemBaseDispReg>(kMachineRegRBP, disp, reg_info.reg);
+        put_insn = ir->NewInsn<MovwOpReg>({.base = kMachineRegRBP, .disp = disp}, reg_info.reg);
         break;
       case MovType::kMovsd:
-        put_insn = ir->NewInsn<MovsdMemBaseDispXReg>(kMachineRegRBP, disp, reg_info.reg);
+        put_insn = ir->NewInsn<MovsdOpXReg>({.base = kMachineRegRBP, .disp = disp}, reg_info.reg);
         break;
     }
 

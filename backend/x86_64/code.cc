@@ -160,8 +160,6 @@ CallImmArg::CallImmArg(MachineReg arg, CallImm::RegType reg_type)
   SetRegAt(0, arg);
 }
 
-#include "insn-inl_x86_64.h"  // NOLINT generated file!
-
 }  // namespace x86_64
 
 const MachineOpcode PseudoBranch::kOpcode = kMachineOpPseudoBranch;

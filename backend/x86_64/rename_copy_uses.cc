@@ -31,7 +31,7 @@ MachineReg RenameCopyUsesMap::Get(MachineReg reg) {
   return renamed;
 }
 
-void RenameCopyUsesMap::RenameUseIfMapped(MachineInsn* insn, int i) {
+void RenameCopyUsesMap::RenameUseIfMapped(berberis::MachineInsn* insn, int i) {
   // Narrow type uses may require a copy for register allocator to successfully handle them.
   // TODO(b/200327919): It'd better to make CallImmArg specify the exact narrow class for
   // the corresponding call argument. Then we wouldn't need to special case it.
@@ -49,7 +49,7 @@ void RenameCopyUsesMap::RenameUseIfMapped(MachineInsn* insn, int i) {
   }
 }
 
-void RenameCopyUsesMap::ProcessDef(MachineInsn* insn, int i) {
+void RenameCopyUsesMap::ProcessDef(berberis::MachineInsn* insn, int i) {
   MachineReg reg = insn->RegAt(i);
 
   if (!reg.IsVReg()) {
@@ -59,7 +59,7 @@ void RenameCopyUsesMap::ProcessDef(MachineInsn* insn, int i) {
   RenameDataForReg(reg) = {kInvalidMachineReg, 0, time_};
 }
 
-void RenameCopyUsesMap::ProcessCopy(MachineInsn* copy) {
+void RenameCopyUsesMap::ProcessCopy(berberis::MachineInsn* copy) {
   auto dst = copy->RegAt(0);
   auto src = copy->RegAt(1);
   if (!dst.IsVReg() || !src.IsVReg()) {
@@ -90,7 +90,7 @@ void RenameCopyUses(MachineIR* machine_ir) {
   for (auto* bb : machine_ir->bb_list()) {
     map.StartBasicBlock(bb);
 
-    for (MachineInsn* insn : bb->insn_list()) {
+    for (berberis::MachineInsn* insn : bb->insn_list()) {
       for (int i = 0; i < insn->NumRegOperands(); ++i) {
         // Note that Def-Use operands cannot be renamed, so we handle them as Defs.
         if (insn->RegKindAt(i).IsDef()) {

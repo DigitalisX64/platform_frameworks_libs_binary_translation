@@ -59,7 +59,7 @@ class ESP;
 namespace device_arch_info {
 
 template <>
-inline constexpr bool kIsImmediate<x86_32::device_arch_info::Cond> = true;
+inline constexpr bool kIsCondition<x86_32::device_arch_info::Cond> = true;
 
 template <>
 inline constexpr bool kIsGeneralReg32<x86_32::device_arch_info::GeneralReg32> = true;

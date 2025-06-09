@@ -232,8 +232,9 @@ void HeavyOptimizerFrontend::ReplaceJumpWithBranch(MachineBasicBlock* bb,
     // fall-through jump for the current bb. At the same time exit_bb can be a fall-through jump
     // and benchmarks benefit from it.
     const size_t offset = offsetof(ThreadState, pending_signals_status);
-    auto* cmpb = ir->NewInsn<x86_64::CmpbMemBaseDispImm>(
-        x86_64::kMachineRegRBP, offset, kPendingSignalsPresent, GetFlagsRegister());
+    auto* cmpb = ir->NewInsn<x86_64::CmpbOpImm>({.base = x86_64::kMachineRegRBP, .disp = offset},
+                                                kPendingSignalsPresent,
+                                                GetFlagsRegister());
     *jump_it = cmpb;
     auto* cond_branch = ir->NewInsn<PseudoCondBranch>(
         x86_64::Assembler::Condition::kEqual, exit_bb, target_bb, GetFlagsRegister());
@@ -657,25 +658,25 @@ Register HeavyOptimizerFrontend::LoadWithoutRecovery(Decoder::LoadOperandType op
   auto res = AllocTempReg();
   switch (operand_type) {
     case Decoder::LoadOperandType::k8bitUnsigned:
-      Gen<x86_64::MovzxblRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovzxblRegOp>(res, {.base = base, .disp = disp});
       break;
     case Decoder::LoadOperandType::k16bitUnsigned:
-      Gen<x86_64::MovzxwlRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovzxwlRegOp>(res, {.base = base, .disp = disp});
       break;
     case Decoder::LoadOperandType::k32bitUnsigned:
-      Gen<x86_64::MovlRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovlRegOp>(res, {.base = base, .disp = disp});
       break;
     case Decoder::LoadOperandType::k64bit:
-      Gen<x86_64::MovqRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovqRegOp>(res, {.base = base, .disp = disp});
       break;
     case Decoder::LoadOperandType::k8bitSigned:
-      Gen<x86_64::MovsxbqRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovsxbqRegOp>(res, {.base = base, .disp = disp});
       break;
     case Decoder::LoadOperandType::k16bitSigned:
-      Gen<x86_64::MovsxwqRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovsxwqRegOp>(res, {.base = base, .disp = disp});
       break;
     case Decoder::LoadOperandType::k32bitSigned:
-      Gen<x86_64::MovsxlqRegMemBaseDisp>(res, base, disp);
+      Gen<x86_64::MovsxlqRegOp>(res, {.base = base, .disp = disp});
       break;
     default:
       Undefined();
@@ -692,25 +693,32 @@ Register HeavyOptimizerFrontend::LoadWithoutRecovery(Decoder::LoadOperandType op
   auto res = AllocTempReg();
   switch (operand_type) {
     case Decoder::LoadOperandType::k8bitUnsigned:
-      Gen<x86_64::MovzxblRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovzxblRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     case Decoder::LoadOperandType::k16bitUnsigned:
-      Gen<x86_64::MovzxwlRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovzxwlRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     case Decoder::LoadOperandType::k32bitUnsigned:
-      Gen<x86_64::MovlRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovlRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     case Decoder::LoadOperandType::k64bit:
-      Gen<x86_64::MovqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovqRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     case Decoder::LoadOperandType::k8bitSigned:
-      Gen<x86_64::MovsxbqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovsxbqRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     case Decoder::LoadOperandType::k16bitSigned:
-      Gen<x86_64::MovsxwqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovsxwqRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     case Decoder::LoadOperandType::k32bitSigned:
-      Gen<x86_64::MovsxlqRegMemBaseIndexDisp>(res, base, index, x86_64::Assembler::kTimesOne, disp);
+      Gen<x86_64::MovsxlqRegOp>(
+          res, {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp});
       break;
     default:
       Undefined();
@@ -771,16 +779,16 @@ void HeavyOptimizerFrontend::StoreWithoutRecovery(Decoder::MemoryDataOperandType
                                                   Register data) {
   switch (operand_type) {
     case Decoder::MemoryDataOperandType::k8bit:
-      Gen<x86_64::MovbMemBaseDispReg>(base, disp, data);
+      Gen<x86_64::MovbOpReg>({.base = base, .disp = disp}, data);
       break;
     case Decoder::MemoryDataOperandType::k16bit:
-      Gen<x86_64::MovwMemBaseDispReg>(base, disp, data);
+      Gen<x86_64::MovwOpReg>({.base = base, .disp = disp}, data);
       break;
     case Decoder::MemoryDataOperandType::k32bit:
-      Gen<x86_64::MovlMemBaseDispReg>(base, disp, data);
+      Gen<x86_64::MovlOpReg>({.base = base, .disp = disp}, data);
       break;
     case Decoder::MemoryDataOperandType::k64bit:
-      Gen<x86_64::MovqMemBaseDispReg>(base, disp, data);
+      Gen<x86_64::MovqOpReg>({.base = base, .disp = disp}, data);
       break;
     default:
       return Undefined();
@@ -794,16 +802,20 @@ void HeavyOptimizerFrontend::StoreWithoutRecovery(Decoder::MemoryDataOperandType
                                                   Register data) {
   switch (operand_type) {
     case Decoder::MemoryDataOperandType::k8bit:
-      Gen<x86_64::MovbMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
+      Gen<x86_64::MovbOpReg>(
+          {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp}, data);
       break;
     case Decoder::MemoryDataOperandType::k16bit:
-      Gen<x86_64::MovwMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
+      Gen<x86_64::MovwOpReg>(
+          {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp}, data);
       break;
     case Decoder::MemoryDataOperandType::k32bit:
-      Gen<x86_64::MovlMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
+      Gen<x86_64::MovlOpReg>(
+          {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp}, data);
       break;
     case Decoder::MemoryDataOperandType::k64bit:
-      Gen<x86_64::MovqMemBaseIndexDispReg>(base, index, x86_64::Assembler::kTimesOne, disp, data);
+      Gen<x86_64::MovqOpReg>(
+          {.base = base, .index = index, x86_64::Assembler::kTimesOne, .disp = disp}, data);
       break;
     default:
       return Undefined();
@@ -844,7 +856,7 @@ void HeavyOptimizerFrontend::Fence(Decoder::FenceOpcode /* opcode */,
 void HeavyOptimizerFrontend::MemoryRegionReservationLoad(Register aligned_addr) {
   // Store aligned_addr in CPUState.
   int32_t address_offset = GetThreadStateReservationAddressOffset();
-  Gen<x86_64::MovqMemBaseDispReg>(x86_64::kMachineRegRBP, address_offset, aligned_addr);
+  Gen<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = address_offset}, aligned_addr);
 
   // MemoryRegionReservation::SetOwner(aligned_addr, &(state->cpu)).
   builder_.GenCallImm(bit_cast<uint64_t>(&MemoryRegionReservation::SetOwner),
@@ -856,9 +868,9 @@ void HeavyOptimizerFrontend::MemoryRegionReservationLoad(Register aligned_addr) 
 
   // Load reservation value and store it in CPUState.
   auto reservation = AllocTempReg();
-  Gen<x86_64::MovqRegMemBaseDisp>(reservation, aligned_addr, 0);
+  Gen<x86_64::MovqRegOp>(reservation, {.base = aligned_addr});
   int32_t value_offset = GetThreadStateReservationValueOffset();
-  Gen<x86_64::MovqMemBaseDispReg>(x86_64::kMachineRegRBP, value_offset, reservation);
+  Gen<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = value_offset}, reservation);
 }
 
 Register HeavyOptimizerFrontend::MemoryRegionReservationExchange(Register aligned_addr,
@@ -876,8 +888,9 @@ Register HeavyOptimizerFrontend::MemoryRegionReservationExchange(Register aligne
   // MemoryRegionReservation::Clear.
   Register stored_aligned_addr = AllocTempReg();
   int32_t address_offset = GetThreadStateReservationAddressOffset();
-  Gen<x86_64::MovqRegMemBaseDisp>(stored_aligned_addr, x86_64::kMachineRegRBP, address_offset);
-  Gen<x86_64::MovqMemBaseDispImm>(x86_64::kMachineRegRBP, address_offset, kNullGuestAddr);
+  Gen<x86_64::MovqRegOp>(stored_aligned_addr,
+                         {.base = x86_64::kMachineRegRBP, .disp = address_offset});
+  Gen<x86_64::MovqOpImm>({.base = x86_64::kMachineRegRBP, .disp = address_offset}, kNullGuestAddr);
   // Compare aligned_addr to the one in CPUState.
   Gen<x86_64::CmpqRegReg>(stored_aligned_addr, aligned_addr, GetFlagsRegister());
   Gen<PseudoCondBranch>(
@@ -887,7 +900,8 @@ Register HeavyOptimizerFrontend::MemoryRegionReservationExchange(Register aligne
   // Load new reservation value into integer register where CmpXchgq expects it.
   Register new_reservation_value = AllocTempReg();
   int32_t value_offset = GetThreadStateReservationValueOffset();
-  Gen<x86_64::MovqRegMemBaseDisp>(new_reservation_value, x86_64::kMachineRegRBP, value_offset);
+  Gen<x86_64::MovqRegOp>(new_reservation_value,
+                         {.base = x86_64::kMachineRegRBP, .disp = value_offset});
 
   MemoryRegionReservationSwapWithLockedOwner(
       aligned_addr, curr_reservation_value, new_reservation_value, failure_bb);
@@ -937,11 +951,11 @@ void HeavyOptimizerFrontend::MemoryRegionReservationSwapWithLockedOwner(
   builder_.StartBasicBlock(lock_success_bb);
   auto rax = AllocTempReg();
   Gen<PseudoCopy>(rax, curr_reservation_value, 8);
-  Gen<x86_64::LockCmpXchgqRegMemBaseDispReg>(
-      rax, aligned_addr, 0, new_reservation_value, GetFlagsRegister());
+  Gen<x86_64::LockCmpXchgqRegOpReg>(
+      rax, {.base = aligned_addr}, new_reservation_value, GetFlagsRegister());
 
   // MemoryRegionReservation::Unlock(lock_entry)
-  Gen<x86_64::MovqMemBaseDispImm>(lock_entry, 0, 0);
+  Gen<x86_64::MovqOpImm>({.base = lock_entry}, 0);
   // Zero-flag is set if CmpXchg is successful.
   Gen<PseudoCondBranch>(
       x86_64::Assembler::Condition::kNotZero, failure_bb, swap_success_bb, GetFlagsRegister());

@@ -416,6 +416,10 @@ def gen_machine_opcode_h(out, arch, insns):
     for insn in insns:
       name = insn.get('name')
       print('kMachineOp%s,' % (name), file=f)
+    for insn in _expand_mem_insns(insns):
+      name = insn.get('name')
+      opcode = insn.get('opcode_name')
+      print('kMachineOp%s = kMachineOp%s ,' % (name, opcode), file=f)
 
 
 def gen_machine_ir_h(out, arch, insns):
@@ -428,13 +432,14 @@ def _contains_mem(insn):
   return any(asm_defs.is_mem_op(arg['class']) for arg in insn.get('args'))
 
 
-def _create_mem_insn(insn, addr_mode):
+def _create_mem_insn(insn, addr_index, addr_mode):
   new_insn = insn.copy()
   macro_name = asm_defs.get_mem_macro_name(insn, addr_mode)
   new_insn['name'] = macro_name
   new_insn['addr_mode'] = addr_mode
   new_insn['asm'] = macro_name
   new_insn['mem_group_name'] = asm_defs.get_mem_macro_name(insn, '') + 'Insns'
+  new_insn['opcode_name'] = insn['name'] + ' | (%s << kLowMachineOpcodeBits)' % addr_index
   return new_insn
 
 
@@ -442,15 +447,16 @@ def _expand_mem_insns(insns):
   result = []
   for insn in insns:
     if _contains_mem(insn):
-      result.extend([_create_mem_insn(insn, addr_mode)
-                     for addr_mode in ('Absolute', 'BaseDisp', 'IndexDisp', 'BaseIndexDisp')])
-    result.append(insn)
+      result.extend([
+          _create_mem_insn(insn, addr_index, addr_mode)
+          for addr_index, addr_mode in
+              enumerate(('Absolute', 'BaseDisp', 'IndexDisp', 'BaseIndexDisp'))])
   return result
 
 
 def _load_lir_def(allowlist_referenced, allowlist_defined, asm_def):
   arch, insns = asm_defs.load_asm_defs(asm_def)
-  insns = _expand_mem_insns(insns)
+  insns.extend(_expand_mem_insns(insns))
   # Mark all instructions to remove and remember instructions we kept
   for insn in insns:
     insn_name = insn.get('mem_group_name', insn['name'])

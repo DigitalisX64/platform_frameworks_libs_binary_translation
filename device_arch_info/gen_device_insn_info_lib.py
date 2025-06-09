@@ -72,7 +72,9 @@ class %s {
        # Int3, Lfence, Mfence, Sfence, and UD2 have side effects not related to arguments.
        # TODO: decide if we still need it (currently MachineIR treats all instructions without
        # operands as volatile).
-       'true' if insn['name'] in ('Int3', 'Lfence', 'Mfence', 'Sfence', 'UD2') else 'false',
+       'true' if insn['name'] in ('Int3', 'Lfence', 'Mfence', 'Sfence', 'UD2') or
+                 any(asm_defs.is_mem_op(arg['class']) and arg['usage'] != 'use'
+                     for arg in insn['args']) else 'false',
        _get_opcode_reference(insn),
        _get_cpuid_restriction(insn),
        _get_reg_operands_info(insn['args'])])),  file=f)

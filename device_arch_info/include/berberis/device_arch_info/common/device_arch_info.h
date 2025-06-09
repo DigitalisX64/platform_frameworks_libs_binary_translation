@@ -48,10 +48,13 @@ class Mem64 {
 };
 
 template <typename OperandClass, typename = void>
-inline constexpr bool kIsGeneralReg32 = false;
+inline constexpr bool kIsCondition = false;
 
 template <typename OperandClass, typename = void>
 inline constexpr bool kIsFLAGS = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsGeneralReg32 = false;
 
 template <typename OperandClass, typename = void>
 inline constexpr bool kIsImmediate = false;
@@ -60,20 +63,26 @@ template <typename OperandClass, typename = void>
 inline constexpr bool kIsMemoryOperand = false;
 
 template <typename OperandClass, typename = void>
-inline constexpr bool kIsRegister = !kIsImmediate<OperandClass> && !kIsMemoryOperand<OperandClass>;
+inline constexpr bool kIsRegister =
+    !kIsCondition<OperandClass> && !kIsImmediate<OperandClass> && !kIsMemoryOperand<OperandClass>;
 
 template <typename OperandClass, typename = void>
 inline constexpr bool kIsImplicitReg = false;
 
 template <typename OperandClass>
 inline constexpr bool
-    kIsGeneralReg32<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
-        kIsGeneralReg32<typename OperandClass::Class>;
+    kIsCondition<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsCondition<typename OperandClass::Class>;
 
 template <typename OperandClass>
 inline constexpr bool
     kIsFLAGS<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
         kIsFLAGS<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsGeneralReg32<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsGeneralReg32<typename OperandClass::Class>;
 
 template <typename OperandClass>
 inline constexpr bool

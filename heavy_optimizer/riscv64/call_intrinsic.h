@@ -134,11 +134,12 @@ void LoadCallIntrinsicResult(x86_64::MachineIRBuilder* builder,
     auto second_reg = std::get<1>(result);
 
     if constexpr (std::is_same_v<FirstElementType, SIMD128Register>) {
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(first_reg.machine_reg(), result_ptr, 0);
+      builder->Gen<x86_64::MovdquXRegOp>(first_reg.machine_reg(), {.base = result_ptr});
       if constexpr (std::is_same_v<SecondElementType, SIMD128Register>) {
-        builder->Gen<x86_64::MovdquXRegMemBaseDisp>(second_reg.machine_reg(), result_ptr, 16);
+        builder->Gen<x86_64::MovdquXRegOp>(second_reg.machine_reg(),
+                                           {.base = result_ptr, .disp = 16});
       } else if constexpr (std::is_integral_v<SecondElementType>) {
-        builder->Gen<x86_64::MovqRegMemBaseDisp>(second_reg, result_ptr, 16);
+        builder->Gen<x86_64::MovqRegOp>(second_reg, {.base = result_ptr, .disp = 16});
       } else {
         static_assert(kDependentTypeFalse<IntrinsicResType>, "Unsupported intrinsic return type.");
       }
@@ -153,12 +154,12 @@ void LoadCallIntrinsicResult(x86_64::MachineIRBuilder* builder,
     if constexpr (std::is_same_v<FirstElementType, SIMD128Register> &&
                   std::is_same_v<SecondElementType, SIMD128Register> &&
                   std::is_same_v<ThirdElementType, SIMD128Register>) {
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<0>(result).machine_reg(), result_ptr, 0 * 16);
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<1>(result).machine_reg(), result_ptr, 1 * 16);
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<2>(result).machine_reg(), result_ptr, 2 * 16);
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<0>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 0 * 16});
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<1>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 1 * 16});
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<2>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 2 * 16});
     } else {
       static_assert(kDependentTypeFalse<IntrinsicResType>, "Unsupported intrinsic return type.");
     }
@@ -172,14 +173,14 @@ void LoadCallIntrinsicResult(x86_64::MachineIRBuilder* builder,
                   std::is_same_v<SecondElementType, SIMD128Register> &&
                   std::is_same_v<ThirdElementType, SIMD128Register> &&
                   std::is_same_v<FourthElementType, SIMD128Register>) {
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<0>(result).machine_reg(), result_ptr, 0 * 16);
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<1>(result).machine_reg(), result_ptr, 1 * 16);
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<2>(result).machine_reg(), result_ptr, 2 * 16);
-      builder->Gen<x86_64::MovdquXRegMemBaseDisp>(
-          std::get<3>(result).machine_reg(), result_ptr, 3 * 16);
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<0>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 0 * 16});
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<1>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 1 * 16});
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<2>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 2 * 16});
+      builder->Gen<x86_64::MovdquXRegOp>(std::get<3>(result).machine_reg(),
+                                         {.base = result_ptr, .disp = 3 * 16});
     } else {
       static_assert(kDependentTypeFalse<IntrinsicResType>, "Unsupported intrinsic return type.");
     }

@@ -291,7 +291,7 @@ TEST(MachineIRLoopGuestContextOptimizerRiscv64, ReplaceGetMovwAndUpdateMap) {
   builder.StartBasicBlock(bb);
   auto reg1 = machine_ir.AllocVReg();
   auto offset = 0;
-  builder.Gen<MovwRegMemBaseDisp>(reg1, kMachineRegRBP, offset);
+  builder.Gen<MovwRegOp>(reg1, {.base = kMachineRegRBP, .disp = offset});
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   auto insn_it = bb->insn_list().begin();
@@ -315,7 +315,7 @@ TEST(MachineIRLoopGuestContextOptimizerRiscv64, ReplacePutMovwAndUpdateMap) {
   builder.StartBasicBlock(bb);
   auto reg1 = machine_ir.AllocVReg();
   auto offset = 0;
-  builder.Gen<MovwMemBaseDispReg>(kMachineRegRBP, offset, reg1);
+  builder.Gen<MovwOpReg>({.base = kMachineRegRBP, .disp = offset}, reg1);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   auto insn_it = bb->insn_list().begin();
@@ -1077,7 +1077,7 @@ TEST(MachineIRLoopGuestContextOptimizer, ReplaceGetFlagsAndUpdateMap) {
   builder.StartBasicBlock(bb);
   auto reg1 = machine_ir.AllocVReg();
   auto offset = GetThreadStateFlagOffset();
-  builder.Gen<MovwRegMemBaseDisp>(reg1, kMachineRegRBP, offset);
+  builder.Gen<MovwRegOp>(reg1, {.base = kMachineRegRBP, .disp = static_cast<int32_t>(offset)});
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   auto insn_it = bb->insn_list().begin();
@@ -1104,7 +1104,7 @@ TEST(MachineIRLoopGuestContextOptimizer, ReplacePutFlagsAndUpdateMap) {
   builder.StartBasicBlock(bb);
   auto reg1 = machine_ir.AllocVReg();
   auto offset = GetThreadStateFlagOffset();
-  builder.Gen<MovwMemBaseDispReg>(kMachineRegRBP, offset, reg1);
+  builder.Gen<MovwOpReg>({.base = kMachineRegRBP, .disp = static_cast<int32_t>(offset)}, reg1);
   builder.Gen<PseudoJump>(kNullGuestAddr);
 
   auto insn_it = bb->insn_list().begin();

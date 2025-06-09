@@ -40,7 +40,9 @@ MachineInsnList::iterator FoldInsnsAndGetLastInsnIt(MachineIR* machine_ir, Machi
 
 // By default for the successful folding the immediate must be sign-extended from 32-bit to the same
 // 64-bit integer number.
-template <typename InsnTypeRegReg, typename InsnTypeRegImm, bool kExpectSuccess = true>
+template <template <typename> typename InsnTypeRegReg,
+          template <typename> typename InsnTypeRegImm,
+          bool kExpectSuccess = true>
 void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -62,17 +64,17 @@ void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
 
   berberis::MachineInsn* folded_insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
   if (!kExpectSuccess) {
-    EXPECT_EQ(InsnTypeRegReg::kInfo.opcode, folded_insn->opcode());
+    EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegReg>::kInfo.opcode, folded_insn->opcode());
     return;
   }
-  EXPECT_EQ(InsnTypeRegImm::kInfo.opcode, folded_insn->opcode());
+  EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg2, folded_insn->RegAt(0));
   EXPECT_EQ(flags, folded_insn->RegAt(1));
   EXPECT_EQ(static_cast<uint64_t>(static_cast<int32_t>(imm)),
             AsMachineInsnX86_64(folded_insn)->imm());
 }
 
-template <typename InsnTypeRegReg, typename InsnTypeRegImm>
+template <template <typename> typename InsnTypeRegReg, template <typename> typename InsnTypeRegImm>
 void TryRegRegInsnFoldingExtraPseudoCopy(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -96,7 +98,7 @@ void TryRegRegInsnFoldingExtraPseudoCopy(bool is_64bit_mov_imm, uint64_t imm = 0
 
   MachineInsnList::iterator folded_insn_it = FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
   berberis::MachineInsn* folded_insn = *folded_insn_it;
-  EXPECT_EQ(InsnTypeRegImm::kInfo.opcode, folded_insn->opcode());
+  EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg3, folded_insn->RegAt(0));
   EXPECT_EQ(flags, folded_insn->RegAt(1));
   EXPECT_EQ(static_cast<uint64_t>(static_cast<int32_t>(imm)),
@@ -107,7 +109,7 @@ void TryRegRegInsnFoldingExtraPseudoCopy(bool is_64bit_mov_imm, uint64_t imm = 0
   EXPECT_EQ(prev_insn->opcode(), kMachineOpPseudoCopy);
 }
 
-template <typename InsnTypeRegReg, typename InsnTypeRegImm>
+template <template <typename> typename InsnTypeRegReg, template <typename> typename InsnTypeRegImm>
 void TryMovInsnFolding(bool is_64bit_mov_imm, uint64_t imm) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -127,10 +129,11 @@ void TryMovInsnFolding(bool is_64bit_mov_imm, uint64_t imm) {
   builder.Gen<InsnTypeRegReg>(vreg2, vreg1);
 
   berberis::MachineInsn* folded_insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
-  EXPECT_EQ(InsnTypeRegImm::kInfo.opcode, folded_insn->opcode());
+  EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg2, folded_insn->RegAt(0));
   // MovqRegReg is the only instruction that can take full 64-bit imm.
-  if (InsnTypeRegReg::kInfo.opcode == MovqRegReg::kInfo.opcode) {
+  if (MachineIR::MachineInsnType<InsnTypeRegReg>::kInfo.opcode ==
+      MachineIR::MachineInsnType<MovqRegReg>::kInfo.opcode) {
     // Take into account zero-extension when MOVL.
     EXPECT_EQ(is_64bit_mov_imm ? imm : static_cast<uint32_t>(imm),
               AsMachineInsnX86_64(folded_insn)->imm());
@@ -140,7 +143,7 @@ void TryMovInsnFolding(bool is_64bit_mov_imm, uint64_t imm) {
   }
 }
 
-template <typename InsnTypeRegImm, bool kInsnIs64Bit>
+template <template <typename> typename InsnTypeRegImm, bool kInsnIs64Bit>
 void TryTwoImmediatesRegImmInsnFolding(uint64_t imm1, int32_t imm2, uint64_t expected_op_result) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -174,10 +177,10 @@ void TryTwoImmediatesRegImmInsnFolding(uint64_t imm1, int32_t imm2, uint64_t exp
   }
   auto prev_insn_it = std::prev(insn_it);
   berberis::MachineInsn* prev_insn = *prev_insn_it;
-  EXPECT_EQ(prev_insn->opcode(), InsnTypeRegImm::kInfo.opcode);
+  EXPECT_EQ(prev_insn->opcode(), MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode);
 }
 
-template <typename InsnTypeRegReg, bool kInsnIs64Bit>
+template <template <typename> typename InsnTypeRegReg, bool kInsnIs64Bit>
 void TryTwoImmediatesRegRegInsnFolding(uint64_t imm1, uint64_t imm2, uint64_t expected_op_result) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -212,7 +215,7 @@ void TryTwoImmediatesRegRegInsnFolding(uint64_t imm1, uint64_t imm2, uint64_t ex
   }
   auto prev_insn_it = std::prev(insn_it);
   berberis::MachineInsn* prev_insn = *prev_insn_it;
-  EXPECT_EQ(prev_insn->opcode(), InsnTypeRegReg::kInfo.opcode);
+  EXPECT_EQ(prev_insn->opcode(), MachineIR::MachineInsnType<InsnTypeRegReg>::kInfo.opcode);
 }
 
 TEST(InsnFoldingTest, DefMapGetsLatestDef) {
@@ -314,7 +317,7 @@ TEST(InsnFoldingTest, SingleMovqMemBaseDispImm32Folding) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<MovlRegImm>(vreg1, 2);
-  builder.Gen<MovqMemBaseDispReg>(kMachineRegRAX, 4, vreg1);
+  builder.Gen<MovqOpReg>({.base = kMachineRegRAX, .disp = 4}, vreg1);
   builder.SetRecoveryPointAtLastInsn(recovery_bb);
   builder.SetRecoveryWithGuestPCAtLastInsn(42);
 
@@ -340,7 +343,7 @@ TEST(InsnFoldingTest, SingleMovlMemBaseDispImm32Folding) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<MovqRegImm>(vreg1, 0x3'0000'0003);
-  builder.Gen<MovlMemBaseDispReg>(kMachineRegRAX, 4, vreg1);
+  builder.Gen<MovlOpReg>({.base = kMachineRegRAX, .disp = 4}, vreg1);
   builder.SetRecoveryPointAtLastInsn(recovery_bb);
   builder.SetRecoveryWithGuestPCAtLastInsn(42);
 
@@ -678,45 +681,6 @@ TEST(InsnFoldingTest, FoldWriteFlags) {
   TestFoldCond(Cond::kNoOverflow, Cond::kEqual, PseudoWriteFlags::Flags::kOverflow);
 }
 
-class MacroReverseBitsU64 : public MachineInsnForArch {
- public:
-  MacroReverseBitsU64(MachineReg r0, MachineReg r1, MachineReg r2, MachineReg r3)
-      : MachineInsnForArch(&kInfo) {
-    SetRegAt(0, r0);
-    SetRegAt(1, r1);
-    SetRegAt(2, r2);
-    SetRegAt(3, r3);
-  }
-  static constexpr MachineInsnInfo kInfo =
-      MachineInsnInfo({kMachineOpReverseBitsU64,
-                       4,
-                       {{&kGeneralReg64, MachineRegKind::kDef},
-                        {&kGeneralReg64, MachineRegKind::kUseDef},
-                        {&kGeneralReg64, MachineRegKind::kDef},
-                        {&kFLAGS, MachineRegKind::kDef}},
-                       kMachineInsnDefault});
-  std::string GetDebugString() const override { return ""; }
-  void Emit([[maybe_unused]] CodeEmitter* as) const override {}
-};
-
-class MacroReverseBitsU32 : public MachineInsnForArch {
- public:
-  MacroReverseBitsU32(MachineReg r0, MachineReg r1, MachineReg r2) : MachineInsnForArch(&kInfo) {
-    SetRegAt(0, r0);
-    SetRegAt(1, r1);
-    SetRegAt(2, r2);
-  }
-  static constexpr MachineInsnInfo kInfo =
-      MachineInsnInfo({kMachineOpReverseBitsU32,
-                       3,
-                       {{&kGeneralReg64, MachineRegKind::kDef},
-                        {&kGeneralReg64, MachineRegKind::kUseDef},
-                        {&kFLAGS, MachineRegKind::kDef}},
-                       kMachineInsnDefault});
-  std::string GetDebugString() const override { return ""; }
-  void Emit([[maybe_unused]] CodeEmitter* as) const override {}
-};
-
 TEST(InsnFoldingTest, CountTrailingZeroesFolding64) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -736,7 +700,36 @@ TEST(InsnFoldingTest, CountTrailingZeroesFolding64) {
   builder.StartBasicBlock(bb);
   builder.Gen<MovqRegImm>(vreg1, 3);
   builder.Gen<PseudoCopy>(vreg2, vreg1, 8);
-  builder.Gen<MacroReverseBitsU64>(vreg3, vreg2, vreg4, flags);
+  builder.Gen<ReverseBitsU64>(vreg3, vreg2, vreg4, flags);
+  builder.Gen<PseudoCopy>(vreg5, vreg3, 8);
+  builder.Gen<CountLeadingZerosU64>(vreg6, vreg5, flags);
+
+  berberis::MachineInsn* insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
+  EXPECT_EQ(insn->opcode(), kMachineOpCountTrailingZerosU64);
+  EXPECT_EQ(insn->RegAt(0), vreg6);
+  EXPECT_EQ(insn->RegAt(1), vreg1);
+}
+
+TEST(InsnFoldingTest, CountTrailingZeroesFolding64MBI) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  MachineIRBuilder builder(&machine_ir);
+
+  auto* bb = machine_ir.NewBasicBlock();
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+  MachineReg vreg2 = machine_ir.AllocVReg();
+  MachineReg vreg3 = machine_ir.AllocVReg();
+  MachineReg vreg4 = machine_ir.AllocVReg();
+  MachineReg vreg5 = machine_ir.AllocVReg();
+  MachineReg vreg6 = machine_ir.AllocVReg();
+  MachineReg flags = machine_ir.AllocVReg();
+
+  builder.StartBasicBlock(bb);
+  builder.Gen<MovqRegImm>(vreg1, 3);
+  builder.Gen<PseudoCopy>(vreg2, vreg1, 8);
+  builder.Gen<ReverseBitsU64>(vreg3, vreg2, vreg4, flags);
   builder.Gen<PseudoCopy>(vreg5, vreg3, 8);
   builder.Gen<LzcntqRegReg>(vreg6, vreg5, flags);
 
@@ -764,7 +757,35 @@ TEST(InsnFoldingTest, CountTrailingZeroesFolding32) {
   builder.StartBasicBlock(bb);
   builder.Gen<MovqRegImm>(vreg1, 3);
   builder.Gen<PseudoCopy>(vreg2, vreg1, 8);
-  builder.Gen<MacroReverseBitsU32>(vreg3, vreg2, flags);
+  builder.Gen<ReverseBitsU32>(vreg3, vreg2, flags);
+  builder.Gen<PseudoCopy>(vreg4, vreg3, 8);
+  builder.Gen<CountLeadingZerosU32>(vreg5, vreg4, flags);
+
+  berberis::MachineInsn* insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
+  EXPECT_EQ(insn->opcode(), kMachineOpCountTrailingZerosU32);
+  EXPECT_EQ(insn->RegAt(0), vreg5);
+  EXPECT_EQ(insn->RegAt(1), vreg1);
+}
+
+TEST(InsnFoldingTest, CountTrailingZeroesFolding32BMI) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  MachineIRBuilder builder(&machine_ir);
+
+  auto* bb = machine_ir.NewBasicBlock();
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+  MachineReg vreg2 = machine_ir.AllocVReg();
+  MachineReg vreg3 = machine_ir.AllocVReg();
+  MachineReg vreg4 = machine_ir.AllocVReg();
+  MachineReg vreg5 = machine_ir.AllocVReg();
+  MachineReg flags = machine_ir.AllocVReg();
+
+  builder.StartBasicBlock(bb);
+  builder.Gen<MovqRegImm>(vreg1, 3);
+  builder.Gen<PseudoCopy>(vreg2, vreg1, 8);
+  builder.Gen<ReverseBitsU32>(vreg3, vreg2, flags);
   builder.Gen<PseudoCopy>(vreg4, vreg3, 8);
   builder.Gen<LzcntlRegReg>(vreg5, vreg4, flags);
 
@@ -793,7 +814,7 @@ TEST(InsnFoldingTest, CountTrailingZeroesFoldingCancelledIfArgNotAlive) {
   builder.StartBasicBlock(bb);
   builder.Gen<MovqRegImm>(vreg1, 3);
   builder.Gen<PseudoCopy>(vreg2, vreg1, 8);
-  builder.Gen<MacroReverseBitsU64>(vreg3, vreg2, vreg4, flags);
+  builder.Gen<ReverseBitsU64>(vreg3, vreg2, vreg4, flags);
   builder.Gen<MovqRegImm>(vreg1, 4);  // invalidates vreg1
   builder.Gen<PseudoCopy>(vreg5, vreg3, 8);
   builder.Gen<LzcntqRegReg>(vreg6, vreg5, flags);

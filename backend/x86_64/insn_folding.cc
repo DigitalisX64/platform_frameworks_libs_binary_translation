@@ -29,7 +29,7 @@
 namespace berberis::x86_64 {
 
 void DefMap::MapDefRegs(MachineInsnList::iterator insn_it) {
-  const MachineInsn* insn = *insn_it;
+  const berberis::MachineInsn* insn = *insn_it;
   for (int op = 0; op < insn->NumRegOperands(); ++op) {
     MachineReg reg = insn->RegAt(op);
     if (insn->RegKindAt(op).RegClass()->IsSubsetOf(&x86_64::kFLAGS)) {
@@ -61,7 +61,7 @@ std::optional<uint64_t> InsnFolding::GetImmValueIfPossible(MachineReg reg) const
   if (!general_insn_it.has_value()) {
     return std::nullopt;
   }
-  const MachineInsn* general_insn = *general_insn_it.value();
+  const berberis::MachineInsn* general_insn = *general_insn_it.value();
   const auto* insn = AsMachineInsnX86_64(general_insn);
   if (insn->opcode() == kMachineOpMovqRegImm) {
     return insn->imm();
@@ -72,8 +72,9 @@ std::optional<uint64_t> InsnFolding::GetImmValueIfPossible(MachineReg reg) const
   return std::nullopt;
 }
 
-MachineInsn* InsnFolding::NewImmInsnFromRegInsn(const MachineInsn* insn, int32_t imm32) {
-  MachineInsn* folded_insn;
+berberis::MachineInsn* InsnFolding::NewImmInsnFromRegInsn(const berberis::MachineInsn* insn,
+                                                          int32_t imm32) {
+  berberis::MachineInsn* folded_insn;
   switch (insn->opcode()) {
     case kMachineOpAddqRegReg:
       folded_insn = machine_ir_->NewInsn<AddqRegImm>(insn->RegAt(0), imm32, insn->RegAt(2));
@@ -133,12 +134,14 @@ MachineInsn* InsnFolding::NewImmInsnFromRegInsn(const MachineInsn* insn, int32_t
       folded_insn = machine_ir_->NewInsn<ShrlRegImm>(insn->RegAt(0), imm32, insn->RegAt(2));
       break;
     case kMachineOpMovlMemBaseDispReg:
-      folded_insn = machine_ir_->NewInsn<MovlMemBaseDispImm>(
-          insn->RegAt(0), AsMachineInsnX86_64(insn)->disp(), imm32);
+      folded_insn = machine_ir_->NewInsn<MovlOpImm>(
+          {.base = insn->RegAt(0), .disp = static_cast<int32_t>(AsMachineInsnX86_64(insn)->disp())},
+          imm32);
       break;
     case kMachineOpMovqMemBaseDispReg:
-      folded_insn = machine_ir_->NewInsn<MovqMemBaseDispImm>(
-          insn->RegAt(0), AsMachineInsnX86_64(insn)->disp(), imm32);
+      folded_insn = machine_ir_->NewInsn<MovqOpImm>(
+          {.base = insn->RegAt(0), .disp = static_cast<int32_t>(AsMachineInsnX86_64(insn)->disp())},
+          imm32);
       break;
     default:
       LOG_ALWAYS_FATAL("unexpected opcode");
@@ -153,7 +156,7 @@ std::tuple<std::optional<MachineInsnList::iterator>, int> InsnFolding::FindNonPs
     MachineReg src_reg) const {
   auto [def_insn_it, def_insn_pos] = def_map_.Get(src_reg);
   while (def_insn_it.has_value()) {
-    const MachineInsn* def_insn = *def_insn_it.value();
+    const berberis::MachineInsn* def_insn = *def_insn_it.value();
     if (def_insn->opcode() != kMachineOpPseudoCopy) {
       return {def_insn_it, def_insn_pos};
     }
@@ -163,14 +166,14 @@ std::tuple<std::optional<MachineInsnList::iterator>, int> InsnFolding::FindNonPs
 }
 
 bool InsnFolding::IsWritingSameFlagsValue(MachineInsnList::iterator write_flags_insn_it) const {
-  const MachineInsn* write_flags_insn = *write_flags_insn_it;
+  const berberis::MachineInsn* write_flags_insn = *write_flags_insn_it;
   CHECK(write_flags_insn && write_flags_insn->opcode() == kMachineOpPseudoWriteFlags);
   MachineReg src_reg = write_flags_insn->RegAt(0);
   auto [def_insn_it, def_insn_pos] = FindNonPseudoCopyDef(src_reg);
   if (!def_insn_it.has_value()) {
     return false;
   }
-  const MachineInsn* def_insn = *def_insn_it.value();
+  const berberis::MachineInsn* def_insn = *def_insn_it.value();
   if (def_insn->opcode() != kMachineOpPseudoReadFlags) {
     return false;
   }
@@ -183,9 +186,9 @@ bool InsnFolding::IsWritingSameFlagsValue(MachineInsnList::iterator write_flags_
 }
 
 template <bool kIsInput64Bit>
-std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldImmediateInput(
+std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldImmediateInput(
     MachineInsnList::iterator insn_it) {
-  const MachineInsn* insn = *insn_it;
+  const berberis::MachineInsn* insn = *insn_it;
   auto src1 = insn->RegAt(1);
   std::optional<uint64_t> imm64_1 = GetImmValueIfPossible(src1);
   if (!imm64_1.has_value()) {
@@ -231,9 +234,10 @@ std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldImmediateInput(
   return {FoldingType::kImpossible, nullptr};
 }
 
-MachineInsn* InsnFolding::NewInsnFromTwoImmediatesOperation(const MachineInsn* insn,
-                                                            uint64_t imm1,
-                                                            uint64_t imm2) {
+berberis::MachineInsn* InsnFolding::NewInsnFromTwoImmediatesOperation(
+    const berberis::MachineInsn* insn,
+    uint64_t imm1,
+    uint64_t imm2) {
   switch (insn->opcode()) {
     case kMachineOpShllRegImm:
     case kMachineOpShllRegReg:
@@ -289,9 +293,9 @@ MachineInsn* InsnFolding::NewInsnFromTwoImmediatesOperation(const MachineInsn* i
   }
 }
 
-std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldTwoImmediates(
+std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldTwoImmediates(
     MachineInsnList::iterator insn_it) {
-  const MachineInsn* insn = *insn_it;
+  const berberis::MachineInsn* insn = *insn_it;
   CHECK_GE(insn->NumRegOperands(), 2);
   MachineReg imm1_reg = insn->RegAt(0);
   std::optional<uint64_t> imm1 = GetImmValueIfPossible(imm1_reg);
@@ -307,16 +311,16 @@ std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldTwoImmediates(
   return {FoldingType::kInsertInsn, NewInsnFromTwoImmediatesOperation(insn, imm1.value(), imm2)};
 }
 
-std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldRedundantMovl(
+std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldRedundantMovl(
     MachineInsnList::iterator insn_it) {
-  const MachineInsn* insn = *insn_it;
+  const berberis::MachineInsn* insn = *insn_it;
   CHECK_EQ(insn->opcode(), kMachineOpMovlRegReg);
   auto src = insn->RegAt(1);
   auto [def_insn_it, _] = FindNonPseudoCopyDef(src);
   if (!def_insn_it.has_value()) {
     return {FoldingType::kImpossible, nullptr};
   }
-  const MachineInsn* def_insn = *def_insn_it.value();
+  const berberis::MachineInsn* def_insn = *def_insn_it.value();
 
   // If the definition of src clears its upper half, then we can replace MOVL with PseudoCopy.
   switch (def_insn->opcode()) {
@@ -338,10 +342,10 @@ std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldRedundantMovl(
 }
 
 template <bool kBMI, bool kIsInput64Bit>
-std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldCountLeadingZeros(
+std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldCountLeadingZeros(
     MachineInsnList::iterator insn_it,
     const MachineBasicBlock* bb) {
-  const MachineInsn* insn = *insn_it;
+  const berberis::MachineInsn* insn = *insn_it;
   const MachineOpcode clz_insn_opcode =
       kBMI            ? kIsInput64Bit ? kMachineOpLzcntqRegReg : kMachineOpLzcntlRegReg
       : kIsInput64Bit ? kMachineOpCountLeadingZerosU64
@@ -355,19 +359,19 @@ std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldCountLeadingZeros(
   if (def_insn_it == bb->insn_list().begin()) {
     return {FoldingType::kImpossible, nullptr};
   }
-  const MachineInsn* def_insn = *def_insn_it.value();
+  const berberis::MachineInsn* def_insn = *def_insn_it.value();
   const MachineOpcode reverse_bits_insn_opcode =
       kIsInput64Bit ? kMachineOpReverseBitsU64 : kMachineOpReverseBitsU32;
   if (def_insn->opcode() != reverse_bits_insn_opcode) {
     return {FoldingType::kImpossible, nullptr};
   }
-  const MachineInsn* reverse_bits_insn = def_insn;
+  const berberis::MachineInsn* reverse_bits_insn = def_insn;
   MachineInsnList::iterator insn_before_reverse_bits_it = std::prev(def_insn_it.value());
-  const MachineInsn* insn_before_reverse_bits = *insn_before_reverse_bits_it;
+  const berberis::MachineInsn* insn_before_reverse_bits = *insn_before_reverse_bits_it;
   if (insn_before_reverse_bits->opcode() != kMachineOpPseudoCopy) {
     return {FoldingType::kImpossible, nullptr};
   }
-  const MachineInsn* pseudo_copy = insn_before_reverse_bits;
+  const berberis::MachineInsn* pseudo_copy = insn_before_reverse_bits;
   if (pseudo_copy->RegAt(0) != reverse_bits_insn->RegAt(1) ||
       pseudo_copy->RegAt(0) == pseudo_copy->RegAt(1)) {
     return {FoldingType::kImpossible, nullptr};
@@ -377,7 +381,7 @@ std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldCountLeadingZeros(
   if (std::get<0>(def_map_.Get(pseudo_copy->RegAt(1), def_insn_pos)) == std::nullopt) {
     return {FoldingType::kImpossible, nullptr};
   }
-  MachineInsn* new_insn;
+  berberis::MachineInsn* new_insn;
   if (kBMI) {
     if (kIsInput64Bit) {
       new_insn =
@@ -398,10 +402,10 @@ std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldCountLeadingZeros(
   return {FoldingType::kReplaceInsn, new_insn};
 }
 
-std::tuple<FoldingType, MachineInsn*> InsnFolding::TryFoldInsn(
+std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldInsn(
     const MachineInsnList::iterator insn_it,
     const MachineBasicBlock* bb) {
-  const MachineInsn* insn = *insn_it;
+  const berberis::MachineInsn* insn = *insn_it;
   switch (insn->opcode()) {
     case kMachineOpMovqMemBaseDispReg:
     case kMachineOpMovqRegReg:
@@ -565,7 +569,7 @@ void FoldWriteFlags(MachineIR* machine_ir) {
     }
 
     MachineReg flags_src = write_flags->RegAt(0);
-    MachineInsn* new_write_flags =
+    berberis::MachineInsn* new_write_flags =
         machine_ir->NewInsn<x86_64::TestwRegImm>(flags_src, flags_mask, flags);
     insn_it = bb->insn_list().erase(insn_it);
     bb->insn_list().insert(insn_it, new_write_flags);

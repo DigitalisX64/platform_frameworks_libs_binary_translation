@@ -72,8 +72,8 @@ class InsnFolding {
   explicit InsnFolding(DefMap& def_map, MachineIR* machine_ir)
       : def_map_(def_map), machine_ir_(machine_ir) {}
 
-  std::tuple<FoldingType, MachineInsn*> TryFoldInsn(const MachineInsnList::iterator insn,
-                                                    const MachineBasicBlock* bb);
+  std::tuple<FoldingType, berberis::MachineInsn*> TryFoldInsn(const MachineInsnList::iterator insn,
+                                                              const MachineBasicBlock* bb);
 
  private:
   DefMap& def_map_;
@@ -83,16 +83,20 @@ class InsnFolding {
   std::tuple<std::optional<MachineInsnList::iterator>, int> FindNonPseudoCopyDef(
       MachineReg src_reg) const;
   template <bool kIsInput64Bit>
-  std::tuple<FoldingType, MachineInsn*> TryFoldImmediateInput(MachineInsnList::iterator insn_it);
-  std::tuple<FoldingType, MachineInsn*> TryFoldTwoImmediates(MachineInsnList::iterator insn_it);
-  std::tuple<FoldingType, MachineInsn*> TryFoldRedundantMovl(MachineInsnList::iterator insn_it);
+  std::tuple<FoldingType, berberis::MachineInsn*> TryFoldImmediateInput(
+      MachineInsnList::iterator insn_it);
+  std::tuple<FoldingType, berberis::MachineInsn*> TryFoldTwoImmediates(
+      MachineInsnList::iterator insn_it);
+  std::tuple<FoldingType, berberis::MachineInsn*> TryFoldRedundantMovl(
+      MachineInsnList::iterator insn_it);
   template <bool kBMI, bool kIsInput64Bit>
-  std::tuple<FoldingType, MachineInsn*> TryFoldCountLeadingZeros(MachineInsnList::iterator insn_it,
-                                                                 const MachineBasicBlock* bb);
-  MachineInsn* NewImmInsnFromRegInsn(const MachineInsn* insn, int32_t imm);
-  MachineInsn* NewInsnFromTwoImmediatesOperation(const MachineInsn* insn,
-                                                 uint64_t imm1,
-                                                 uint64_t imm2);
+  std::tuple<FoldingType, berberis::MachineInsn*> TryFoldCountLeadingZeros(
+      MachineInsnList::iterator insn_it,
+      const MachineBasicBlock* bb);
+  berberis::MachineInsn* NewImmInsnFromRegInsn(const berberis::MachineInsn* insn, int32_t imm);
+  berberis::MachineInsn* NewInsnFromTwoImmediatesOperation(const berberis::MachineInsn* insn,
+                                                           uint64_t imm1,
+                                                           uint64_t imm2);
 };
 
 void FoldInsns(MachineIR* machine_ir);

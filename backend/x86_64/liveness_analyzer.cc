@@ -63,7 +63,7 @@ bool LivenessAnalyzer::VisitBasicBlock(const MachineBasicBlock* bb) {
 
   // Traverse instructions backward, updating liveness.
   for (auto insn_it = bb->insn_list().rbegin(); insn_it != bb->insn_list().rend(); ++insn_it) {
-    const MachineInsn* insn = *insn_it;
+    const berberis::MachineInsn* insn = *insn_it;
     // Same reg can be def and use, so process all defs first.
     for (int i = 0; i < insn->NumRegOperands(); ++i) {
       if (insn->RegAt(i).IsVReg() && insn->RegKindAt(i).IsDef()) {

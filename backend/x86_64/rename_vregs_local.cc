@@ -52,7 +52,7 @@ void TryRenameRegOperand(int operand_index,
                          MachineInsnList::const_iterator insn_it,
                          MachineIR* machine_ir,
                          MachineInsnList& insn_list) {
-  MachineInsn* insn = *insn_it;
+  berberis::MachineInsn* insn = *insn_it;
   MachineReg reg = insn->RegAt(operand_index);
 
   if (!reg.IsVReg()) {
@@ -87,7 +87,7 @@ void TryRenameRegOperand(int operand_index,
 
 void RenameInsnListRegs(VRegMap& vreg_map, MachineInsnList& insn_list, MachineIR* machine_ir) {
   for (auto insn_it = insn_list.begin(); insn_it != insn_list.end(); ++insn_it) {
-    MachineInsn* insn = *insn_it;
+    berberis::MachineInsn* insn = *insn_it;
     for (int i = 0; i < insn->NumRegOperands(); ++i) {
       // Renames current register, if necessary - has various criteria depending on the type of the
       // register (i.e., register is a USE and/or DEF).

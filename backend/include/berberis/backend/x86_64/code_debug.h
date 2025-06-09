@@ -27,6 +27,8 @@ namespace berberis {
 
 namespace x86_64 {
 
+class MachineInsnX86_64;
+
 std::string GetImplicitRegOperandDebugString(const MachineInsnX86_64* insn, int i);
 std::string GetAbsoluteMemOperandDebugString(const MachineInsnX86_64* insn);
 std::string GetBaseDispMemOperandDebugString(const MachineInsnX86_64* insn, int i);

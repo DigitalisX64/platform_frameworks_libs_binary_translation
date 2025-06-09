@@ -25,7 +25,6 @@
 #include <variant>
 
 #include "berberis/assembler/x86_64.h"
-#include "berberis/backend/x86_64/machine_insn_intrinsics.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_builder.h"
 #include "berberis/base/checks.h"

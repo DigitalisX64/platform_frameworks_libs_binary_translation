@@ -24,7 +24,7 @@
 
 namespace berberis::x86_64 {
 
-using InsnGenerator = MachineInsn* (*)(MachineIR*, MachineInsn*);
+using InsnGenerator = berberis::MachineInsn* (*)(MachineIR*, berberis::MachineInsn*);
 
 struct FlagSettingInsn {
   MachineInsnList::iterator insn;
@@ -72,7 +72,7 @@ void ReplaceFlagRegisters(MachineIR* machine_ir,
                           MachineInsnList::iterator insn_it,
                           MachineRegVector flags_regs,
                           const ArenaMap<MachineReg, MachineReg>& reg_map,
-                          MachineInsn* insn);
+                          berberis::MachineInsn* insn);
 
 }  // namespace berberis::x86_64
 

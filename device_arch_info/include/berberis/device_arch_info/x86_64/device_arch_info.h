@@ -50,19 +50,19 @@ class Mem128 {
 
 #include "berberis/device_arch_info/x86_64/machine_reg_class-inl.h"
 
+}  // namespace device_arch_info
+
 #include "berberis/device_arch_info/all_to_x86_32_or_x86_64/device_insn_info-inl.h"
 #include "berberis/device_arch_info/all_to_x86_64/device_insn_info-inl.h"
 #include "berberis/device_arch_info/x86_32_or_x86_64/device_insn_info-inl.h"
 #include "berberis/device_arch_info/x86_64/device_insn_info-inl.h"
-
-}  // namespace device_arch_info
 
 }  // namespace x86_64
 
 namespace device_arch_info {
 
 template <>
-inline constexpr bool kIsImmediate<x86_64::device_arch_info::Cond> = true;
+inline constexpr bool kIsCondition<x86_64::device_arch_info::Cond> = true;
 
 template <>
 inline constexpr bool kIsGeneralReg32<x86_64::device_arch_info::GeneralReg32> = true;

@@ -63,7 +63,7 @@ class RegUsageBitSet {
   VRegBitSet reg_set_;
 };
 
-bool AreResultsUsed(const MachineInsn* insn, const RegUsageBitSet& is_reg_used) {
+bool AreResultsUsed(const berberis::MachineInsn* insn, const RegUsageBitSet& is_reg_used) {
   for (int i = 0; i < insn->NumRegOperands(); ++i) {
     if (insn->RegKindAt(i).IsDef() && is_reg_used[insn->RegAt(i)]) {
       return true;
@@ -72,7 +72,7 @@ bool AreResultsUsed(const MachineInsn* insn, const RegUsageBitSet& is_reg_used) 
   return false;
 }
 
-void SetInsnResultsUnused(const MachineInsn* insn, RegUsageBitSet& is_reg_used) {
+void SetInsnResultsUnused(const berberis::MachineInsn* insn, RegUsageBitSet& is_reg_used) {
   for (int i = 0; i < insn->NumRegOperands(); ++i) {
     if (insn->RegKindAt(i).IsDef()) {
       is_reg_used.Reset(insn->RegAt(i));
@@ -80,7 +80,7 @@ void SetInsnResultsUnused(const MachineInsn* insn, RegUsageBitSet& is_reg_used) 
   }
 }
 
-void SetInsnArgumentsUsed(const MachineInsn* insn, RegUsageBitSet& is_reg_used) {
+void SetInsnArgumentsUsed(const berberis::MachineInsn* insn, RegUsageBitSet& is_reg_used) {
   for (int i = 0; i < insn->NumRegOperands(); ++i) {
     if (insn->RegKindAt(i).IsUse()) {
       is_reg_used.Set(insn->RegAt(i));
@@ -102,7 +102,7 @@ void RemoveDeadCode(MachineIR* machine_ir) {
 
     // Go from end to begin removing all unused instructions.
     for (auto insn_it = bb->insn_list().rbegin(); insn_it != bb->insn_list().rend();) {
-      MachineInsn* insn = *insn_it++;
+      berberis::MachineInsn* insn = *insn_it++;
 
       if (!insn->has_side_effects() && !AreResultsUsed(insn, is_reg_used)) {
         // Note non trivial way in which reverse_iterator is erased.
@@ -247,7 +247,7 @@ bool IsForwarderBlock(MachineBasicBlock* bb) {
     return false;
   }
 
-  const MachineInsn* last_insn = bb->insn_list().back();
+  const berberis::MachineInsn* last_insn = bb->insn_list().back();
   return last_insn->opcode() == PseudoBranch::kOpcode;
 }
 
