@@ -20,13 +20,13 @@
 #define BERBERIS_BACKEND_X86_64_MACHINE_IR_H_
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <string>
 
 #include "berberis/assembler/x86_64.h"
 #include "berberis/backend/code_emitter.h"
 #include "berberis/backend/common/machine_ir.h"  // IWYU pragma: export.
-#include "berberis/backend/x86_64/code_debug.h"
 #include "berberis/backend/x86_64/code_emit.h"
 #include "berberis/base/arena_alloc.h"
 #include "berberis/base/stringprintf.h"
@@ -196,52 +196,6 @@ class MachineInsnX86_64 : public MachineInsn {
 
   uint64_t imm() const { return imm_; }
 
-  bool IsCPUStateGet() {
-    if (opcode() != kMachineOpMovqRegMemBaseDisp && opcode() != kMachineOpMovdqaXRegMemBaseDisp &&
-        opcode() != kMachineOpMovwRegMemBaseDisp && opcode() != kMachineOpMovsdXRegMemBaseDisp) {
-      return false;
-    }
-
-    // Check that it is not for ThreadState fields outside of CPUState.
-    if (disp() >= sizeof(CPUState)) {
-      return false;
-    }
-
-    // reservation_value is loaded in HeavyOptimizerFrontend::AtomicLoad and written
-    // in HeavyOptimizerFrontend::AtomicStore partially (for performance
-    // reasons), which is not supported by our context optimizer.
-    auto reservation_value_offset = offsetof(ThreadState, cpu.reservation_value);
-    if (disp() >= reservation_value_offset &&
-        disp() < reservation_value_offset + sizeof(Reservation)) {
-      return false;
-    }
-
-    return RegAt(1) == kCPUStatePointer;
-  }
-
-  bool IsCPUStatePut() {
-    if (opcode() != kMachineOpMovqMemBaseDispReg && opcode() != kMachineOpMovdqaMemBaseDispXReg &&
-        opcode() != kMachineOpMovwMemBaseDispReg && opcode() != kMachineOpMovsdMemBaseDispXReg) {
-      return false;
-    }
-
-    // Check that it is not for ThreadState fields outside of CPUState.
-    if (disp() >= sizeof(CPUState)) {
-      return false;
-    }
-
-    // reservation_value is loaded in HeavyOptimizerFrontend::AtomicLoad and written
-    // in HeavyOptimizerFrontend::AtomicStore partially (for performance
-    // reasons), which is not supported by our context optimizer.
-    auto reservation_value_offset = offsetof(ThreadState, cpu.reservation_value);
-    if (disp() >= reservation_value_offset &&
-        disp() < reservation_value_offset + sizeof(Reservation)) {
-      return false;
-    }
-
-    return RegAt(0) == kCPUStatePointer;
-  }
-
  protected:
   explicit MachineInsnX86_64(const MachineInsnInfo* info)
       : MachineInsn(info->opcode, info->num_reg_operands, info->reg_kinds, regs_, info->kind),
@@ -325,8 +279,6 @@ class CallImmArg : public MachineInsnX86_64 {
       // It's an auxiliary instruction. Do not emit.
   };
 };
-
-using MachineInsnForArch = MachineInsnX86_64;
 
 struct MemoryOperand {
   MachineReg base = kInvalidMachineReg;
@@ -465,8 +417,11 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
 
   int NumRegOperands() {
     constexpr int kMemoryOperandsCount = (device_arch_info::kIsMemoryOperand<Operands> + ... + 0);
-    constexpr int kMemoryOperandsCountMask = (1 << (2 * kMemoryOperandsCount)) - 1;
-    return kInfos[(opcode() >> kLowMachineOpcodeBits) & kMemoryOperandsCountMask].num_reg_operands;
+    if constexpr (kMemoryOperandsCount == 0) {
+      return kInfo.num_reg_operands;
+    } else {
+      return kInfo.num_reg_operands + std::popcount(opcode() >> kLowMachineOpcodeBits);
+    }
   }
 
   const MachineRegKind& RegKindAt(int i) {
@@ -482,53 +437,45 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
     size_t arg_idx{}, reg_idx{}, mem_idx{};
     (
         [&s, &arg_idx, &reg_idx, &mem_idx, this]<typename Operand> {
-          s += " ";
-          if (arg_idx > 0) {
+          if (arg_idx == 0) {
+            s += " ";
+          } else {
             s += ", ";
           }
           if constexpr (device_arch_info::kIsCondition<Operand>) {
-            s += GetCondOperandDebugString(this);
+            s += GetCondName(cond());
           } else if constexpr (device_arch_info::kIsImmediate<Operand>) {
-            s += GetImmOperandDebugString(this);
+            s += StringPrintf("0x%" PRIx64, imm());
           } else if constexpr (device_arch_info::kIsMemoryOperand<Operand>) {
             auto [has_base, has_index] = OpcodeHasMemoryBaseIndex(mem_idx++);
-            if (mem_idx == 1) {
-              if (has_base) {
-                if (has_index) {
-                  s += GetBaseIndexDispMemOperandDebugString(this, reg_idx);
-                  reg_idx += 2;
-                } else {
-                  s += GetBaseDispMemOperandDebugString(this, reg_idx++);
-                }
-              } else if (has_index) {
-                s += GetIndexDispMemOperandDebugString(this, reg_idx++);
+            int32_t scale;
+            if (has_index) {
+              scale =
+                  1 << (mem_idx == 1 ? MachineInsnX86_64::scale() : MachineInsnX86_64::scale2());
+            }
+            int32_t disp = mem_idx == 1 ? MachineInsnX86_64::disp() : MachineInsnX86_64::disp2();
+            if (has_base) {
+              if (has_index) {
+                s += StringPrintf("[%s + %s * %d + 0x%x]",
+                                  GetRegOperandDebugString(this, reg_idx).c_str(),
+                                  GetRegOperandDebugString(this, reg_idx + 1).c_str(),
+                                  scale,
+                                  disp);
+                reg_idx += 2;
               } else {
-                s += GetAbsoluteMemOperandDebugString(this);
+                s += StringPrintf(
+                    "[%s + 0x%x]", GetRegOperandDebugString(this, reg_idx++).c_str(), disp);
               }
-            } else /* mem_idx == 2 */ {
-              if (has_base) {
-                if (has_index) {
-                  s += StringPrintf("[%s + %s * %d + 0x%x]",
-                                    GetRegOperandDebugString(this, reg_idx).c_str(),
-                                    GetRegOperandDebugString(this, reg_idx + 1).c_str(),
-                                    1 << MachineInsnX86_64::scale2(),
-                                    MachineInsnX86_64::disp2());
-                  reg_idx += 2;
-                } else {
-                  s += StringPrintf(
-                      "[%s + 0x%x]", GetRegOperandDebugString(this, reg_idx++).c_str(), disp2());
-                }
-              } else if (has_index) {
-                s += StringPrintf("[%s * %d + 0x%x]",
-                                  GetRegOperandDebugString(this, reg_idx++).c_str(),
-                                  1 << MachineInsnX86_64::scale2(),
-                                  MachineInsnX86_64::disp2());
-              } else {
-                s += StringPrintf("[0x%x]", MachineInsnX86_64::disp2());
-              }
+            } else if (has_index) {
+              s += StringPrintf("[%s * %d + 0x%x]",
+                                GetRegOperandDebugString(this, reg_idx++).c_str(),
+                                scale,
+                                disp);
+            } else {
+              s += StringPrintf("[0x%x]", disp);
             }
           } else if constexpr (device_arch_info::kIsImplicitReg<Operand>) {
-            s += GetImplicitRegOperandDebugString(this, reg_idx++);
+            s += StringPrintf("(%s)", GetRegOperandDebugString(this, reg_idx++).c_str());
           } else {
             s += GetRegOperandDebugString(this, reg_idx++);
           }
@@ -769,7 +716,7 @@ class MachineIR : public berberis::MachineIR {
     bb_order_ = BasicBlockOrder::kUnordered;
   }
 
-  [[nodiscard]] bool IsCPUStateGet(berberis::MachineInsn* insn) const {
+  [[nodiscard]] static bool IsCPUStateGet(berberis::MachineInsn* insn) {
     if (insn->opcode() != kMachineOpMovqRegMemBaseDisp &&
         insn->opcode() != kMachineOpMovdqaXRegMemBaseDisp &&
         insn->opcode() != kMachineOpMovwRegMemBaseDisp &&
@@ -796,7 +743,7 @@ class MachineIR : public berberis::MachineIR {
     return x86_insn->RegAt(1) == kCPUStatePointer;
   }
 
-  [[nodiscard]] bool IsCPUStatePut(berberis::MachineInsn* insn) const {
+  [[nodiscard]] static bool IsCPUStatePut(berberis::MachineInsn* insn) {
     if (insn->opcode() != kMachineOpMovqMemBaseDispReg &&
         insn->opcode() != kMachineOpMovdqaMemBaseDispXReg &&
         insn->opcode() != kMachineOpMovwMemBaseDispReg &&

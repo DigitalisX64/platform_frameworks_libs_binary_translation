@@ -217,11 +217,11 @@ void RemoveRedundantPut(MachineIR* ir) {
 
     seen_get.reset();
     for (auto insn_it = bb->insn_list().rbegin(); insn_it != bb->insn_list().rend();) {
-      auto* insn = AsMachineInsnX86_64(*insn_it);
-      if (insn->IsCPUStatePut()) {
+      if (ir->IsCPUStatePut(*insn_it)) {
         insn_it = RemovePutIfDead(&analyzer, bb, insn_it, seen_get);
       } else {
-        if (insn->IsCPUStateGet()) {
+        if (ir->IsCPUStateGet(*insn_it)) {
+          auto* insn = AsMachineInsnX86_64(*insn_it);
           seen_get.set(insn->disp(), true);
         }
         insn_it++;

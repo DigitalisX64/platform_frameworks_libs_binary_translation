@@ -205,6 +205,15 @@ class MachineIRBuilder : public MachineIRBuilderBase<MachineIR> {
                                      GenArg<InsnType, 5>>(arg0, arg1, arg2, arg3, arg4, arg5);
   }
 
+  template <template <typename> typename InsnType, typename... Args>
+  /*may_discard*/ auto Gen(Args... args)
+      -> std::enable_if_t<
+          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> >= 7,
+          MachineInsnType<InsnType>*> {
+    return MachineIRBuilderBase::Gen<MachineInsnType<InsnType>, Args...>(args...);
+  }
+
   template <auto kFunc, auto kTupleMergePlan, typename... Args, std::size_t... kIndex>
   auto Gen(std::tuple<Args...> args, std::index_sequence<kIndex...>) {
     return std::apply(

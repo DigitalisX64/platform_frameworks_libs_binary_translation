@@ -35,11 +35,6 @@ namespace device_arch_info {
 
 using namespace berberis::x86_32_or_x86_64::device_arch_info;
 
-class Cond {
- public:
-  using Type = x86_32_or_x86_64::Assembler<x86_64::Assembler>::Condition;
-};
-
 class Mem128 {
  public:
 #if defined(__LP64__)
@@ -62,10 +57,19 @@ class Mem128 {
 namespace device_arch_info {
 
 template <>
-inline constexpr bool kIsCondition<x86_64::device_arch_info::Cond> = true;
+inline constexpr bool kIsGeneralReg32<x86_64::device_arch_info::GeneralReg32> = true;
 
 template <>
-inline constexpr bool kIsGeneralReg32<x86_64::device_arch_info::GeneralReg32> = true;
+inline constexpr bool kIsEAX<x86_64::device_arch_info::EAX> = true;
+
+template <>
+inline constexpr bool kIsEBX<x86_64::device_arch_info::EBX> = true;
+
+template <>
+inline constexpr bool kIsECX<x86_64::device_arch_info::ECX> = true;
+
+template <>
+inline constexpr bool kIsEDX<x86_64::device_arch_info::EDX> = true;
 
 template <>
 inline constexpr bool kIsFLAGS<x86_64::device_arch_info::FLAGS> = true;

@@ -28,6 +28,10 @@ namespace {
 using intrinsics::bindings::IntrinsicBindingInfo;
 using intrinsics::bindings::NoNansOperation;
 
+using x86_64::device_arch_info::EAX;
+using x86_64::device_arch_info::EBX;
+using x86_64::device_arch_info::ECX;
+using x86_64::device_arch_info::EDX;
 using x86_64::device_arch_info::FLAGS;
 using x86_64::device_arch_info::GeneralReg32;
 using x86_64::device_arch_info::XmmReg;
@@ -167,6 +171,46 @@ class MacroAssembler : public Assembler {
     // execute/maintain zero extension.
     Movl(dst, src1);
     Addb(dst, dst);
+  }
+
+  // dst: DEF_EARLY_CLOBBER, src1: USE, EAX: DEF
+  constexpr void IntrinsicWithEAXNotZeroExtended(Register dst, Register src1) {
+    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
+    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
+    // execute/maintain zero extension.
+    Movl(dst, src1);
+    Movl(gpr_a, src1);
+    Addb(gpr_a, dst);
+  }
+
+  // dst: DEF_EARLY_CLOBBER, src1: USE, EBX: DEF
+  constexpr void IntrinsicWithEBXNotZeroExtended(Register dst, Register src1) {
+    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
+    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
+    // execute/maintain zero extension.
+    Movl(dst, src1);
+    Movl(gpr_b, src1);
+    Addb(gpr_b, dst);
+  }
+
+  // dst: DEF_EARLY_CLOBBER, src1: USE, ECX: DEF
+  constexpr void IntrinsicWithECXNotZeroExtended(Register dst, Register src1) {
+    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
+    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
+    // execute/maintain zero extension.
+    Movl(dst, src1);
+    Movl(gpr_c, src1);
+    Addb(gpr_c, dst);
+  }
+
+  // dst: DEF_EARLY_CLOBBER, src1: USE, EDX: DEF
+  constexpr void IntrinsicWithEDXNotZeroExtended(Register dst, Register src1) {
+    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
+    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
+    // execute/maintain zero extension.
+    Movl(dst, src1);
+    Movl(gpr_d, src1);
+    Addb(gpr_d, dst);
   }
 
   using AddressType = int64_t;
@@ -488,6 +532,110 @@ TEST(VerifierAssembler, Test32BitOutputWithNoZeroExtensionIntrinsic) {
 
   ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
                "error: intrinsic didn't zero extend 32 bit output register");
+}
+
+TEST(VerifierAssembler, TestEAXOutputWithNoZeroExtensionNotBindedToOutputIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, TmpArg, TmpArg>,
+      DeviceInsnInfo<&std::tuple_element_t<0, Assemblers>::IntrinsicWithEAXNotZeroExtended,
+                     kBindingMnemo,
+                     false,
+                     nullptr,
+                     NoCPUIDRestriction,
+                     std::tuple<Operand<GeneralReg32, kDefEarlyClobber>,
+                                Operand<GeneralReg32, kUse>,
+                                Operand<EAX, kDef>,
+                                Operand<FLAGS, kDef>>>>;
+
+  VerifyIntrinsic<IntrinsicBindingInfo>();
+}
+
+TEST(VerifierAssembler, TestEAXOutputWithNoZeroExtensionBindedToOutputIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t, uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, OutTmpArg<1>, TmpArg>,
+      DeviceInsnInfo<&std::tuple_element_t<0, Assemblers>::IntrinsicWithEAXNotZeroExtended,
+                     kBindingMnemo,
+                     false,
+                     nullptr,
+                     NoCPUIDRestriction,
+                     std::tuple<Operand<GeneralReg32, kDefEarlyClobber>,
+                                Operand<GeneralReg32, kUse>,
+                                Operand<EAX, kDef>,
+                                Operand<FLAGS, kDef>>>>;
+
+  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
+               "error: intrinsic didn't zero extend 32 bit EAX output");
+}
+
+TEST(VerifierAssembler, TestEBXOutputWithNoZeroExtensionBindedToOutputIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t, uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, OutTmpArg<1>, TmpArg>,
+      DeviceInsnInfo<&std::tuple_element_t<0, Assemblers>::IntrinsicWithEBXNotZeroExtended,
+                     kBindingMnemo,
+                     false,
+                     nullptr,
+                     NoCPUIDRestriction,
+                     std::tuple<Operand<GeneralReg32, kDefEarlyClobber>,
+                                Operand<GeneralReg32, kUse>,
+                                Operand<EBX, kDef>,
+                                Operand<FLAGS, kDef>>>>;
+
+  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
+               "error: intrinsic didn't zero extend 32 bit EBX output");
+}
+
+TEST(VerifierAssembler, TestECXOutputWithNoZeroExtensionBindedToOutputIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t, uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, OutTmpArg<1>, TmpArg>,
+      DeviceInsnInfo<&std::tuple_element_t<0, Assemblers>::IntrinsicWithECXNotZeroExtended,
+                     kBindingMnemo,
+                     false,
+                     nullptr,
+                     NoCPUIDRestriction,
+                     std::tuple<Operand<GeneralReg32, kDefEarlyClobber>,
+                                Operand<GeneralReg32, kUse>,
+                                Operand<ECX, kDef>,
+                                Operand<FLAGS, kDef>>>>;
+
+  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
+               "error: intrinsic didn't zero extend 32 bit ECX output");
+}
+
+TEST(VerifierAssembler, TestEDXOutputWithNoZeroExtensionBindedToOutputIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t, uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, OutTmpArg<1>, TmpArg>,
+      DeviceInsnInfo<&std::tuple_element_t<0, Assemblers>::IntrinsicWithEDXNotZeroExtended,
+                     kBindingMnemo,
+                     false,
+                     nullptr,
+                     NoCPUIDRestriction,
+                     std::tuple<Operand<GeneralReg32, kDefEarlyClobber>,
+                                Operand<GeneralReg32, kUse>,
+                                Operand<EDX, kDef>,
+                                Operand<FLAGS, kDef>>>>;
+
+  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
+               "error: intrinsic didn't zero extend 32 bit EDX output");
 }
 
 }  // namespace

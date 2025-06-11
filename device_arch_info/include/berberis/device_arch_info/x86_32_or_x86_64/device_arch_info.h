@@ -21,16 +21,22 @@
 
 #include <cstdint>
 
+#include "berberis/assembler/x86_32_or_x86_64.h"
 #include "berberis/device_arch_info/common/device_arch_info.h"
-
-// Note: normally using namespace is forbidden in headers, but these two namespaces literally
-// only exist to be imported here (and in other device CPU-specific headers).
 
 namespace berberis {
 
 namespace x86_32_or_x86_64::device_arch_info {
 
+// Note: normally using namespace is forbidden in headers, but these two namespaces literally
+// only exist to be imported here (and in other device CPU-specific headers).
+
 using namespace berberis::device_arch_info;
+
+class Cond {
+ public:
+  using Type = Condition;
+};
 
 class Imm2 {
  public:
@@ -177,6 +183,9 @@ class IsAuthenticAMD;
 }  // namespace x86_32_or_x86_64::device_arch_info
 
 namespace device_arch_info {
+
+template <>
+inline constexpr bool kIsCondition<x86_32_or_x86_64::device_arch_info::Cond> = true;
 
 template <>
 inline constexpr bool kIsImmediate<x86_32_or_x86_64::device_arch_info::Imm2> = true;

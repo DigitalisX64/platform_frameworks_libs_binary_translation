@@ -58,10 +58,11 @@ bool ContextLivenessAnalyzer::VisitBasicBlock(const MachineBasicBlock* bb) {
   }
 
   for (auto insn_it = bb->insn_list().rbegin(); insn_it != bb->insn_list().rend(); insn_it++) {
-    auto* insn = AsMachineInsnX86_64(*insn_it);
-    if (insn->IsCPUStatePut()) {
+    if (machine_ir_->IsCPUStatePut(*insn_it)) {
+      auto* insn = AsMachineInsnX86_64(*insn_it);
       running_liveness.reset(insn->disp());
-    } else if (insn->IsCPUStateGet()) {
+    } else if (machine_ir_->IsCPUStateGet(*insn_it)) {
+      auto* insn = AsMachineInsnX86_64(*insn_it);
       running_liveness.set(insn->disp());
     }
   }

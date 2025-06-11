@@ -54,85 +54,88 @@ class Assembler;
 
 namespace x86_32_or_x86_64 {
 
+enum class Condition : int8_t {
+  kInvalidCondition = -1,
+
+  kOverflow = 0,
+  kNoOverflow = 1,
+  kBelow = 2,
+  kAboveEqual = 3,
+  kEqual = 4,
+  kNotEqual = 5,
+  kBelowEqual = 6,
+  kAbove = 7,
+  kNegative = 8,
+  kPositiveOrZero = 9,
+  kParityEven = 10,
+  kParityOdd = 11,
+  kLess = 12,
+  kGreaterEqual = 13,
+  kLessEqual = 14,
+  kGreater = 15,
+  kAlways = 16,
+  kNever = 17,
+
+  // aka...
+  kCarry = kBelow,
+  kNotCarry = kAboveEqual,
+  kZero = kEqual,
+  kNotZero = kNotEqual,
+  kSign = kNegative,
+  kNotSign = kPositiveOrZero
+};
+
+constexpr const char* GetCondName(Condition cond) {
+  switch (cond) {
+    case Condition::kOverflow:
+      return "O";
+    case Condition::kNoOverflow:
+      return "NO";
+    case Condition::kBelow:
+      return "B";
+    case Condition::kAboveEqual:
+      return "AE";
+    case Condition::kEqual:
+      return "Z";
+    case Condition::kNotEqual:
+      return "NZ";
+    case Condition::kBelowEqual:
+      return "BE";
+    case Condition::kAbove:
+      return "A";
+    case Condition::kNegative:
+      return "N";
+    case Condition::kPositiveOrZero:
+      return "PL";
+    case Condition::kParityEven:
+      return "PE";
+    case Condition::kParityOdd:
+      return "PO";
+    case Condition::kLess:
+      return "LS";
+    case Condition::kGreaterEqual:
+      return "GE";
+    case Condition::kLessEqual:
+      return "LE";
+    case Condition::kGreater:
+      return "GT";
+    default:
+      return "??";
+  }
+}
+
+enum ScaleFactor : int8_t { kTimesOne = 0, kTimesTwo = 1, kTimesFour = 2, kTimesEight = 3 };
+
 template <typename DerivedAssemblerType>
 class Assembler : public AssemblerBase {
  public:
   explicit Assembler(MachineCode* code) : AssemblerBase(code) {}
 
-  enum class Condition {
-    kInvalidCondition = -1,
-
-    kOverflow = 0,
-    kNoOverflow = 1,
-    kBelow = 2,
-    kAboveEqual = 3,
-    kEqual = 4,
-    kNotEqual = 5,
-    kBelowEqual = 6,
-    kAbove = 7,
-    kNegative = 8,
-    kPositiveOrZero = 9,
-    kParityEven = 10,
-    kParityOdd = 11,
-    kLess = 12,
-    kGreaterEqual = 13,
-    kLessEqual = 14,
-    kGreater = 15,
-    kAlways = 16,
-    kNever = 17,
-
-    // aka...
-    kCarry = kBelow,
-    kNotCarry = kAboveEqual,
-    kZero = kEqual,
-    kNotZero = kNotEqual,
-    kSign = kNegative,
-    kNotSign = kPositiveOrZero
-  };
-
-  friend constexpr const char* GetCondName(Condition cond) {
-    switch (cond) {
-      case Condition::kOverflow:
-        return "O";
-      case Condition::kNoOverflow:
-        return "NO";
-      case Condition::kBelow:
-        return "B";
-      case Condition::kAboveEqual:
-        return "AE";
-      case Condition::kEqual:
-        return "Z";
-      case Condition::kNotEqual:
-        return "NZ";
-      case Condition::kBelowEqual:
-        return "BE";
-      case Condition::kAbove:
-        return "A";
-      case Condition::kNegative:
-        return "N";
-      case Condition::kPositiveOrZero:
-        return "PL";
-      case Condition::kParityEven:
-        return "PE";
-      case Condition::kParityOdd:
-        return "PO";
-      case Condition::kLess:
-        return "LS";
-      case Condition::kGreaterEqual:
-        return "GE";
-      case Condition::kLessEqual:
-        return "LE";
-      case Condition::kGreater:
-        return "GT";
-      default:
-        return "??";
-    }
-  }
+  using Condition = x86_32_or_x86_64::Condition;
 
   class Register {
    public:
-    constexpr bool operator==(const Register& reg) const { return num_ == reg.num_; }
-    constexpr bool operator!=(const Register& reg) const { return num_ != reg.num_; }
+    constexpr bool operator==(const Register&) const = default;
     constexpr uint8_t GetPhysicalIndex() { return num_; }
     friend constexpr uint8_t ValueForFmtSpec(Register value) { return value.num_; }
     friend class Assembler<DerivedAssemblerType>;
@@ -146,8 +149,7 @@ class Assembler : public AssemblerBase {
 
   class X87Register {
    public:
-    constexpr bool operator==(const Register& reg) const { return num_ == reg.num_; }
-    constexpr bool operator!=(const Register& reg) const { return num_ != reg.num_; }
+    constexpr bool operator==(const X87Register&) const = default;
     constexpr uint8_t GetPhysicalIndex() { return num_; }
     friend constexpr uint8_t ValueForFmtSpec(X87Register value) { return value.num_; }
     friend class Assembler<DerivedAssemblerType>;
@@ -172,8 +174,7 @@ class Assembler : public AssemblerBase {
   template <int kBits>
   class SIMDRegister {
    public:
-    constexpr bool operator==(const SIMDRegister& reg) const { return num_ == reg.num_; }
-    constexpr bool operator!=(const SIMDRegister& reg) const { return num_ != reg.num_; }
+    constexpr bool operator==(const SIMDRegister&) const = default;
     constexpr uint8_t GetPhysicalIndex() { return num_; }
     friend constexpr uint8_t ValueForFmtSpec(SIMDRegister value) { return value.num_; }
     friend class Assembler<DerivedAssemblerType>;
@@ -182,10 +183,10 @@ class Assembler : public AssemblerBase {
     friend class SIMDRegister<384 - kBits>;
 
     constexpr auto To128Bit() const {
-      return std::enable_if_t<kBits != 128, SIMDRegister<128>>{num_};
+      return std::enable_if_t < kBits != 128, SIMDRegister < 128 >> {num_};
     }
     constexpr auto To256Bit() const {
-      return std::enable_if_t<kBits != 256, SIMDRegister<256>>{num_};
+      return std::enable_if_t < kBits != 256, SIMDRegister < 256 >> {num_};
     }
 
    private:
@@ -196,9 +197,14 @@ class Assembler : public AssemblerBase {
   using XMMRegister = SIMDRegister<128>;
   using YMMRegister = SIMDRegister<256>;
 
-  enum ScaleFactor { kTimesOne = 0, kTimesTwo = 1, kTimesFour = 2, kTimesEight = 3 };
+  using ScaleFactor = x86_32_or_x86_64::ScaleFactor;
+  static constexpr ScaleFactor kTimesOne = ScaleFactor::kTimesOne;
+  static constexpr ScaleFactor kTimesTwo = ScaleFactor::kTimesTwo;
+  static constexpr ScaleFactor kTimesFour = ScaleFactor::kTimesFour;
+  static constexpr ScaleFactor kTimesEight = ScaleFactor::kTimesEight;
 
   struct Operand {
+    constexpr bool operator==(const Operand&) const = default;
     constexpr uint8_t rex() const {
       return DerivedAssemblerType::kIsX86_64
                  ? ((index.num_ & 0x08) >> 2) | ((base.num_ & 0x08) >> 3)

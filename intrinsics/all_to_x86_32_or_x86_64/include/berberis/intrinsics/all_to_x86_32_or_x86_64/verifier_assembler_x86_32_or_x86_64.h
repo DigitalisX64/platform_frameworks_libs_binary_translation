@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 
+#include "berberis/assembler/x86_32_or_x86_64.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
 #include "berberis/base/dependent_false.h"
@@ -36,42 +37,13 @@ namespace x86_32_or_x86_64 {
 template <typename DerivedAssemblerType>
 class VerifierAssembler {
  public:
-  // Condition class - 16 x86 conditions.
-  enum class Condition {
-    kOverflow = 0,
-    kNoOverflow = 1,
-    kBelow = 2,
-    kAboveEqual = 3,
-    kEqual = 4,
-    kNotEqual = 5,
-    kBelowEqual = 6,
-    kAbove = 7,
-    kNegative = 8,
-    kPositiveOrZero = 9,
-    kParityEven = 10,
-    kParityOdd = 11,
-    kLess = 12,
-    kGreaterEqual = 13,
-    kLessEqual = 14,
-    kGreater = 15,
+  using Condition = x86_32_or_x86_64::Condition;
 
-    // aka...
-    kCarry = kBelow,
-    kNotCarry = kAboveEqual,
-    kZero = kEqual,
-    kNotZero = kNotEqual,
-    kSign = kNegative,
-    kNotSign = kPositiveOrZero
-  };
-
-  enum ScaleFactor {
-    kTimesOne = 0,
-    kTimesTwo = 1,
-    kTimesFour = 2,
-    kTimesEight = 3,
-    // All our target systems use 32-bit pointers.
-    kTimesPointerSize = kTimesFour
-  };
+  using ScaleFactor = x86_32_or_x86_64::ScaleFactor;
+  static constexpr ScaleFactor kTimesOne = ScaleFactor::kTimesOne;
+  static constexpr ScaleFactor kTimesTwo = ScaleFactor::kTimesTwo;
+  static constexpr ScaleFactor kTimesFour = ScaleFactor::kTimesFour;
+  static constexpr ScaleFactor kTimesEight = ScaleFactor::kTimesEight;
 
   struct Label {
     size_t id;
@@ -354,6 +326,15 @@ class VerifierAssembler {
       }
     }
 
+    constexpr void UpdateFixedRegister32BitRegisterExtension(int fixed_reg_index,
+                                                             bool is_zero_extended) {
+      if (is_zero_extended) {
+        zero_extended_fixed_register.at(fixed_reg_index) = true;
+      } else {
+        zero_extended_fixed_register.at(fixed_reg_index) = false;
+      }
+    }
+
     enum {
       kFixedRegisterShift,
       kGeneralRegisterShift,
@@ -381,6 +362,23 @@ class VerifierAssembler {
       }
     }
 
+    constexpr void Check32BitFixedRegisterIsZeroExtended(int fixed_reg_index) {
+      if (!zero_extended_fixed_register.at(fixed_reg_index)) {
+        if (fixed_reg_index == 0) {
+          FATAL("error: intrinsic didn't zero extend 32 bit EAX output");
+        }
+        if (fixed_reg_index == 1) {
+          FATAL("error: intrinsic didn't zero extend 32 bit EBX output");
+        }
+        if (fixed_reg_index == 2) {
+          FATAL("error: intrinsic didn't zero extend 32 bit ECX output");
+        }
+        if (fixed_reg_index == 3) {
+          FATAL("error: intrinsic didn't zero extend 32 bit EDX output");
+        }
+      }
+    }
+
    private:
     bool intrinsic_defined_def_fixed_register = false;
     bool intrinsic_defined_def_general_register = false;
@@ -395,6 +393,7 @@ class VerifierAssembler {
     std::array<bool, kMaxRegisters> valid_def_early_clobber_register{};
 
     std::array<bool, kMaxRegisters> zero_extended_32_bit_register{};
+    std::array<bool, 4> zero_extended_fixed_register{};  // {gpr_a, gpr_b, gpr_c, gpr_d}
   };
 
   RegisterUsageFlags register_usage_flags;
@@ -485,6 +484,13 @@ class VerifierAssembler {
       return;
     }
     register_usage_flags.Check32BitRegisterIsZeroExtended(reg_no);
+  }
+
+  constexpr void Check32BitFixedRegisterIsZeroExtended(int fixed_reg_index) {
+    if (intrinsic_is_non_linear) {
+      return;
+    }
+    register_usage_flags.Check32BitFixedRegisterIsZeroExtended(fixed_reg_index);
   }
 
   constexpr void CheckLabelsAreBound() {
@@ -801,6 +807,23 @@ class VerifierAssembler {
     return false;
   }
 
+  constexpr bool GetFixedRegisterIndex(Register reg) {
+    if (gpr_a.has_value()) {
+      if (reg == gpr_a) return 0;
+    }
+    if (gpr_b.has_value()) {
+      if (reg == gpr_b) return 1;
+    }
+    if (gpr_c.has_value()) {
+      if (reg == gpr_c) return 2;
+    }
+    if (gpr_d.has_value()) {
+      if (reg == gpr_d) return 3;
+    }
+    if (reg == gpr_s) return 4;
+    FATAL("Register is not fixed or is not permitted for use in this intrinsic");
+  }
+
   constexpr void RegisterDef(Register reg, bool is_zero_extended = false) {
     if (reg.get_binding_kind() == device_arch_info::kUse) {
       FATAL("error: intrinsic defined a 'use' register");
@@ -818,6 +841,14 @@ class VerifierAssembler {
     }
     if (!RegisterIsFixed(reg)) {
       register_usage_flags.Update32BitRegisterExtension(reg.arg_no(), is_zero_extended);
+    } else {
+      int fixed_reg_index = GetFixedRegisterIndex(reg);
+      // The stack pointer (gpr_s) is also a fixed register, but it is not part of the
+      // zero_extended_fixed_register array, and we don't handle it here.
+      if (fixed_reg_index < 4) {
+        register_usage_flags.UpdateFixedRegister32BitRegisterExtension(fixed_reg_index,
+                                                                       is_zero_extended);
+      }
     }
   }
 

@@ -61,7 +61,7 @@ namespace riscv {
 template <typename DerivedAssemblerType>
 class Assembler;
 
-enum class Condition {
+enum class Condition : int8_t {
   kInvalidCondition = -1,
 
   kEqual = 0,
@@ -80,7 +80,7 @@ enum class Condition {
   kNotZero = kNotEqual
 };
 
-enum class Csr {
+enum class Csr : int16_t {
   kFFlags = 0b00'00'0000'0001,
   kFrm = 0b00'00'0000'0010,
   kFCsr = 0b00'00'0000'0011,
@@ -94,7 +94,7 @@ enum class Csr {
   kVlenb = 0b11'00'0010'0010,
 };
 
-enum class Rounding { kRne = 0, kRtz = 1, kRdn = 2, kRup = 3, kRmm = 4, kDyn = 7 };
+enum class Rounding : int8_t { kRne = 0, kRtz = 1, kRdn = 2, kRup = 3, kRmm = 4, kDyn = 7 };
 
 // Immediates are kept in a form ready to be used with emitter.
 class BImmediate;
@@ -811,6 +811,7 @@ class Assembler : public AssemblerBase {
 
   template <typename RegisterType, typename ImmediateType>
   struct Operand {
+    constexpr bool operator==(const Operand&) const = default;
     RegisterType base{0};
     ImmediateType disp = 0;
   };

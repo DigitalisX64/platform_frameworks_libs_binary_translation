@@ -130,6 +130,8 @@ class VerifierAssembler {
 
   constexpr void Check32BitRegisterIsZeroExtended([[maybe_unused]] int reg_no) {}
 
+  constexpr void Check32BitFixedRegisterIsZeroExtended([[maybe_unused]] int fixed_reg_index) {}
+
   constexpr void CheckLabelsAreBound() {}
 
   constexpr void CheckNonLinearIntrinsicsUseDefRegisters() {}

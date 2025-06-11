@@ -202,6 +202,7 @@ filegroup {
         "x86_64/loop_guest_context_optimizer_test.cc",
         "x86_64/machine_ir_analysis_test.cc",
         "x86_64/machine_ir_check_test.cc",
+        "x86_64/machine_ir_debug_test.cc",
         "x86_64/machine_ir_exec_test.cc",
         "x86_64/machine_ir_opt_test.cc",
         "x86_64/machine_ir_test.cc",

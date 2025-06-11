@@ -51,6 +51,18 @@ template <typename OperandClass, typename = void>
 inline constexpr bool kIsCondition = false;
 
 template <typename OperandClass, typename = void>
+inline constexpr bool kIsEAX = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsEBX = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsECX = false;
+
+template <typename OperandClass, typename = void>
+inline constexpr bool kIsEDX = false;
+
+template <typename OperandClass, typename = void>
 inline constexpr bool kIsFLAGS = false;
 
 template <typename OperandClass, typename = void>
@@ -73,6 +85,26 @@ template <typename OperandClass>
 inline constexpr bool
     kIsCondition<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
         kIsCondition<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsEAX<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsEAX<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsEBX<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsEBX<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsECX<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsECX<typename OperandClass::Class>;
+
+template <typename OperandClass>
+inline constexpr bool
+    kIsEDX<OperandClass, std::enable_if_t<sizeof(typename OperandClass::Class) >= 1>> =
+        kIsEDX<typename OperandClass::Class>;
 
 template <typename OperandClass>
 inline constexpr bool
