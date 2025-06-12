@@ -84,7 +84,11 @@ def main(argv):
     match = match.group()
     replace = ' '.join(match.split())
     if len(replace) < 100 or (
-       len(replace) < 120 and 'optimizable_using_commutation' in replace):
+       len(replace) < 140 and 
+         'optimizable_using_commutation' in replace and
+         'dependency_breaking' in replace or
+       len(replace) < 120 and 
+         'optimizable_using_commutation' in replace):
       return replace
     else:
       return match

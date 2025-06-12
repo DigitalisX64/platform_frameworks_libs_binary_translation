@@ -137,7 +137,6 @@
         "AddqImm8": { "opcodes": [ "83", "0" ] },
         "AndqImm8": { "opcodes": [ "83", "4" ] },
         "Btcq": { "opcodes": [ "0F", "BA", "7" ] },
-        "Btq": { "opcodes": [ "0F", "BA", "4" ] },
         "Btrq": { "opcodes": [ "0F", "BA", "6" ] },
         "Btsq": { "opcodes": [ "0F", "BA", "5" ] },
         "OrqImm8": { "opcodes": [ "83", "1" ] },
@@ -212,6 +211,17 @@
       "args": [
         { "class": "GeneralReg64/Mem64", "usage": "use" },
         { "class": "GeneralReg64", "usage": "use" },
+        { "class": "FLAGS", "usage": "def" }
+      ]
+    },
+    {
+      "encodings": {
+        "Btq": { "opcodes": [ "0F", "BA", "4" ] },
+        "CmpqImm8": { "opcodes": [ "83", "7" ] }
+      },
+      "args": [
+        { "class": "GeneralReg64/Mem64", "usage": "use" },
+        { "class": "Imm8" },
         { "class": "FLAGS", "usage": "def" }
       ]
     },
@@ -301,16 +311,6 @@
       "args": [
         { "class": "RAX", "usage": "use" },
         { "class": "Imm32" },
-        { "class": "FLAGS", "usage": "def" }
-      ]
-    },
-    {
-      "encodings": {
-        "CmpqImm8": { "opcodes": [ "83", "7" ] }
-      },
-      "args": [
-        { "class": "GeneralReg64/Mem64", "usage": "use" },
-        { "class": "Imm8" },
         { "class": "FLAGS", "usage": "def" }
       ]
     },
@@ -762,8 +762,8 @@
     },
     {
       "encodings": {
-        "Vzeroupper": { "feature": "AVX", "opcodes": [ "C4", "01", "00", "77" ]},
-        "Vzeroall": { "feature": "AVX", "opcodes": [ "C4", "01", "04", "77" ]}
+        "Vzeroall": { "feature": "AVX", "opcodes": [ "C4", "01", "04", "77" ] },
+        "Vzeroupper": { "feature": "AVX", "opcodes": [ "C4", "01", "00", "77" ] }
       },
       "args": []
     },

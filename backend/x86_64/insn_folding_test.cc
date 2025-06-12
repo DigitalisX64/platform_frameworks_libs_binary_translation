@@ -33,6 +33,10 @@ namespace {
 constexpr auto kMachineRegRAX = MachineRegs::kRAX;
 constexpr auto kMachineRegRDI = MachineRegs::kRDI;
 
+template <template <typename> typename InsnType>
+using MachineInsnType =
+    MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>;
+
 MachineInsnList::iterator FoldInsnsAndGetLastInsnIt(MachineIR* machine_ir, MachineBasicBlock* bb) {
   FoldInsns(machine_ir);
   return std::prev(bb->insn_list().end());
@@ -64,10 +68,10 @@ void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
 
   berberis::MachineInsn* folded_insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
   if (!kExpectSuccess) {
-    EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegReg>::kInfo.opcode, folded_insn->opcode());
+    EXPECT_EQ(MachineInsnType<InsnTypeRegReg>::kInfo.opcode, folded_insn->opcode());
     return;
   }
-  EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
+  EXPECT_EQ(MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg2, folded_insn->RegAt(0));
   EXPECT_EQ(flags, folded_insn->RegAt(1));
   EXPECT_EQ(static_cast<uint64_t>(static_cast<int32_t>(imm)),
@@ -98,7 +102,7 @@ void TryRegRegInsnFoldingExtraPseudoCopy(bool is_64bit_mov_imm, uint64_t imm = 0
 
   MachineInsnList::iterator folded_insn_it = FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
   berberis::MachineInsn* folded_insn = *folded_insn_it;
-  EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
+  EXPECT_EQ(MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg3, folded_insn->RegAt(0));
   EXPECT_EQ(flags, folded_insn->RegAt(1));
   EXPECT_EQ(static_cast<uint64_t>(static_cast<int32_t>(imm)),
@@ -129,11 +133,10 @@ void TryMovInsnFolding(bool is_64bit_mov_imm, uint64_t imm) {
   builder.Gen<InsnTypeRegReg>(vreg2, vreg1);
 
   berberis::MachineInsn* folded_insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
-  EXPECT_EQ(MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
+  EXPECT_EQ(MachineInsnType<InsnTypeRegImm>::kInfo.opcode, folded_insn->opcode());
   EXPECT_EQ(vreg2, folded_insn->RegAt(0));
   // MovqRegReg is the only instruction that can take full 64-bit imm.
-  if (MachineIR::MachineInsnType<InsnTypeRegReg>::kInfo.opcode ==
-      MachineIR::MachineInsnType<MovqRegReg>::kInfo.opcode) {
+  if (MachineInsnType<InsnTypeRegReg>::kInfo.opcode == MachineInsnType<MovqRegReg>::kInfo.opcode) {
     // Take into account zero-extension when MOVL.
     EXPECT_EQ(is_64bit_mov_imm ? imm : static_cast<uint32_t>(imm),
               AsMachineInsnX86_64(folded_insn)->imm());
@@ -177,7 +180,7 @@ void TryTwoImmediatesRegImmInsnFolding(uint64_t imm1, int32_t imm2, uint64_t exp
   }
   auto prev_insn_it = std::prev(insn_it);
   berberis::MachineInsn* prev_insn = *prev_insn_it;
-  EXPECT_EQ(prev_insn->opcode(), MachineIR::MachineInsnType<InsnTypeRegImm>::kInfo.opcode);
+  EXPECT_EQ(prev_insn->opcode(), MachineInsnType<InsnTypeRegImm>::kInfo.opcode);
 }
 
 template <template <typename> typename InsnTypeRegReg, bool kInsnIs64Bit>
@@ -215,7 +218,7 @@ void TryTwoImmediatesRegRegInsnFolding(uint64_t imm1, uint64_t imm2, uint64_t ex
   }
   auto prev_insn_it = std::prev(insn_it);
   berberis::MachineInsn* prev_insn = *prev_insn_it;
-  EXPECT_EQ(prev_insn->opcode(), MachineIR::MachineInsnType<InsnTypeRegReg>::kInfo.opcode);
+  EXPECT_EQ(prev_insn->opcode(), MachineInsnType<InsnTypeRegReg>::kInfo.opcode);
 }
 
 TEST(InsnFoldingTest, DefMapGetsLatestDef) {

@@ -169,11 +169,11 @@ TEST(MachineIRDebugTest, AbsoluteAbsoluteOperands) {
                         CodeEmitter::Condition::kOverflow,
                         kMachineRegRCX,
                         kMachineRegXMM0,
-                        x86_64::MemoryOperand{.disp = 1},
+                        {.disp = 1},
                         0x4242'4242'4242'4242,
                         kMachineRegRBX,
                         kMachineRegXMM1,
-                        x86_64::MemoryOperand{.disp = 2},
+                        {.disp = 2},
                         kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
@@ -201,11 +201,11 @@ TEST(MachineIRDebugTest, AbsoluteBaseOperands) {
                         CodeEmitter::Condition::kNoOverflow,
                         kMachineRegRCX,
                         kMachineRegXMM0,
-                        x86_64::MemoryOperand{.disp = 1},
+                        {.disp = 1},
                         0x4242'4242'4242'4242,
                         kMachineRegRBX,
                         kMachineRegXMM1,
-                        x86_64::MemoryOperand{.base = kMachineRegR8, .disp = 2},
+                        {.base = kMachineRegR8, .disp = 2},
                         kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
@@ -229,19 +229,17 @@ TEST(MachineIRDebugTest, AbsoluteBaseIndexOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(kMachineRegRAX,
-                        CodeEmitter::Condition::kBelow,
-                        kMachineRegRCX,
-                        kMachineRegXMM0,
-                        x86_64::MemoryOperand{.disp = 1},
-                        0x4242'4242'4242'4242,
-                        kMachineRegRBX,
-                        kMachineRegXMM1,
-                        x86_64::MemoryOperand{.base = kMachineRegR8,
-                                              .index = kMachineRegRDI,
-                                              .scale = CodeEmitter::kTimesFour,
-                                              .disp = 2},
-                        kMachineRegFLAGS);
+  builder.Gen<TestInsn>(
+      kMachineRegRAX,
+      CodeEmitter::Condition::kBelow,
+      kMachineRegRCX,
+      kMachineRegXMM0,
+      {.disp = 1},
+      0x4242'4242'4242'4242,
+      kMachineRegRBX,
+      kMachineRegXMM1,
+      {.base = kMachineRegR8, .index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+      kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -267,17 +265,16 @@ TEST(MachineIRDebugTest, AbsoluteIndexOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(
-      kMachineRegRAX,
-      CodeEmitter::Condition::kAboveEqual,
-      kMachineRegRCX,
-      kMachineRegXMM0,
-      x86_64::MemoryOperand{.disp = 1},
-      0x4242'4242'4242'4242,
-      kMachineRegRBX,
-      kMachineRegXMM1,
-      x86_64::MemoryOperand{.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
-      kMachineRegFLAGS);
+  builder.Gen<TestInsn>(kMachineRegRAX,
+                        CodeEmitter::Condition::kAboveEqual,
+                        kMachineRegRCX,
+                        kMachineRegXMM0,
+                        {.disp = 1},
+                        0x4242'4242'4242'4242,
+                        kMachineRegRBX,
+                        kMachineRegXMM1,
+                        {.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+                        kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -304,11 +301,11 @@ TEST(MachineIRDebugTest, BaseAbsoluteOperands) {
                         CodeEmitter::Condition::kEqual,
                         kMachineRegRCX,
                         kMachineRegXMM0,
-                        x86_64::MemoryOperand{.base = kMachineRegRDX, .disp = 1},
+                        {.base = kMachineRegRDX, .disp = 1},
                         0x4242'4242'4242'4242,
                         kMachineRegRBX,
                         kMachineRegXMM1,
-                        x86_64::MemoryOperand{.disp = 2},
+                        {.disp = 2},
                         kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
@@ -336,11 +333,11 @@ TEST(MachineIRDebugTest, BaseBaseOperands) {
                         CodeEmitter::Condition::kNotEqual,
                         kMachineRegRCX,
                         kMachineRegXMM0,
-                        x86_64::MemoryOperand{.base = kMachineRegRDX, .disp = 1},
+                        {.base = kMachineRegRDX, .disp = 1},
                         0x4242'4242'4242'4242,
                         kMachineRegRBX,
                         kMachineRegXMM1,
-                        x86_64::MemoryOperand{.base = kMachineRegR8, .disp = 2},
+                        {.base = kMachineRegR8, .disp = 2},
                         kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
@@ -364,19 +361,17 @@ TEST(MachineIRDebugTest, BaseBaseIndexOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(kMachineRegRAX,
-                        CodeEmitter::Condition::kBelowEqual,
-                        kMachineRegRCX,
-                        kMachineRegXMM0,
-                        x86_64::MemoryOperand{.base = kMachineRegRDX, .disp = 1},
-                        0x4242'4242'4242'4242,
-                        kMachineRegRBX,
-                        kMachineRegXMM1,
-                        x86_64::MemoryOperand{.base = kMachineRegR8,
-                                              .index = kMachineRegRDI,
-                                              .scale = CodeEmitter::kTimesFour,
-                                              .disp = 2},
-                        kMachineRegFLAGS);
+  builder.Gen<TestInsn>(
+      kMachineRegRAX,
+      CodeEmitter::Condition::kBelowEqual,
+      kMachineRegRCX,
+      kMachineRegXMM0,
+      {.base = kMachineRegRDX, .disp = 1},
+      0x4242'4242'4242'4242,
+      kMachineRegRBX,
+      kMachineRegXMM1,
+      {.base = kMachineRegR8, .index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+      kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -402,17 +397,16 @@ TEST(MachineIRDebugTest, BaseIndexOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(
-      kMachineRegRAX,
-      CodeEmitter::Condition::kAbove,
-      kMachineRegRCX,
-      kMachineRegXMM0,
-      x86_64::MemoryOperand{.base = kMachineRegRDX, .disp = 1},
-      0x4242'4242'4242'4242,
-      kMachineRegRBX,
-      kMachineRegXMM1,
-      x86_64::MemoryOperand{.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
-      kMachineRegFLAGS);
+  builder.Gen<TestInsn>(kMachineRegRAX,
+                        CodeEmitter::Condition::kAbove,
+                        kMachineRegRCX,
+                        kMachineRegXMM0,
+                        {.base = kMachineRegRDX, .disp = 1},
+                        0x4242'4242'4242'4242,
+                        kMachineRegRBX,
+                        kMachineRegXMM1,
+                        {.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+                        kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -435,17 +429,16 @@ TEST(MachineIRDebugTest, IndexAbsoluteOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(
-      kMachineRegRAX,
-      CodeEmitter::Condition::kNegative,
-      kMachineRegRCX,
-      kMachineRegXMM0,
-      x86_64::MemoryOperand{.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
-      0x4242'4242'4242'4242,
-      kMachineRegRBX,
-      kMachineRegXMM1,
-      x86_64::MemoryOperand{.disp = 2},
-      kMachineRegFLAGS);
+  builder.Gen<TestInsn>(kMachineRegRAX,
+                        CodeEmitter::Condition::kNegative,
+                        kMachineRegRCX,
+                        kMachineRegXMM0,
+                        {.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+                        0x4242'4242'4242'4242,
+                        kMachineRegRBX,
+                        kMachineRegXMM1,
+                        {.disp = 2},
+                        kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -468,17 +461,16 @@ TEST(MachineIRDebugTest, IndexBaseOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(
-      kMachineRegRAX,
-      CodeEmitter::Condition::kPositiveOrZero,
-      kMachineRegRCX,
-      kMachineRegXMM0,
-      x86_64::MemoryOperand{.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
-      0x4242'4242'4242'4242,
-      kMachineRegRBX,
-      kMachineRegXMM1,
-      x86_64::MemoryOperand{.disp = 2},
-      kMachineRegFLAGS);
+  builder.Gen<TestInsn>(kMachineRegRAX,
+                        CodeEmitter::Condition::kPositiveOrZero,
+                        kMachineRegRCX,
+                        kMachineRegXMM0,
+                        {.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+                        0x4242'4242'4242'4242,
+                        kMachineRegRBX,
+                        kMachineRegXMM1,
+                        {.disp = 2},
+                        kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -506,14 +498,11 @@ TEST(MachineIRDebugTest, IndexBaseIndexOperands) {
       CodeEmitter::Condition::kParityEven,
       kMachineRegRCX,
       kMachineRegXMM0,
-      x86_64::MemoryOperand{.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+      {.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
       0x4242'4242'4242'4242,
       kMachineRegRBX,
       kMachineRegXMM1,
-      x86_64::MemoryOperand{.base = kMachineRegR8,
-                            .index = kMachineRegRDI,
-                            .scale = CodeEmitter::kTimesFour,
-                            .disp = 2},
+      {.base = kMachineRegR8, .index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
       kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
@@ -540,17 +529,16 @@ TEST(MachineIRDebugTest, IndexIndexOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(
-      kMachineRegRAX,
-      CodeEmitter::Condition::kParityOdd,
-      kMachineRegRCX,
-      kMachineRegXMM0,
-      x86_64::MemoryOperand{.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
-      0x4242'4242'4242'4242,
-      kMachineRegRBX,
-      kMachineRegXMM1,
-      x86_64::MemoryOperand{.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
-      kMachineRegFLAGS);
+  builder.Gen<TestInsn>(kMachineRegRAX,
+                        CodeEmitter::Condition::kParityOdd,
+                        kMachineRegRCX,
+                        kMachineRegXMM0,
+                        {.index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+                        0x4242'4242'4242'4242,
+                        kMachineRegRBX,
+                        kMachineRegXMM1,
+                        {.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+                        kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -573,19 +561,17 @@ TEST(MachineIRDebugTest, BaseIndexAbsoluteOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(kMachineRegRAX,
-                        CodeEmitter::Condition::kLess,
-                        kMachineRegRCX,
-                        kMachineRegXMM0,
-                        x86_64::MemoryOperand{.base = kMachineRegRDX,
-                                              .index = kMachineRegRSI,
-                                              .scale = CodeEmitter::kTimesTwo,
-                                              .disp = 1},
-                        0x4242'4242'4242'4242,
-                        kMachineRegRBX,
-                        kMachineRegXMM1,
-                        x86_64::MemoryOperand{.disp = 2},
-                        kMachineRegFLAGS);
+  builder.Gen<TestInsn>(
+      kMachineRegRAX,
+      CodeEmitter::Condition::kLess,
+      kMachineRegRCX,
+      kMachineRegXMM0,
+      {.base = kMachineRegRDX, .index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+      0x4242'4242'4242'4242,
+      kMachineRegRBX,
+      kMachineRegXMM1,
+      {.disp = 2},
+      kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -611,19 +597,17 @@ TEST(MachineIRDebugTest, BaseIndexBaseOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(kMachineRegRAX,
-                        CodeEmitter::Condition::kGreaterEqual,
-                        kMachineRegRCX,
-                        kMachineRegXMM0,
-                        x86_64::MemoryOperand{.base = kMachineRegRDX,
-                                              .index = kMachineRegRSI,
-                                              .scale = CodeEmitter::kTimesTwo,
-                                              .disp = 1},
-                        0x4242'4242'4242'4242,
-                        kMachineRegRBX,
-                        kMachineRegXMM1,
-                        x86_64::MemoryOperand{.base = kMachineRegR8, .disp = 2},
-                        kMachineRegFLAGS);
+  builder.Gen<TestInsn>(
+      kMachineRegRAX,
+      CodeEmitter::Condition::kGreaterEqual,
+      kMachineRegRCX,
+      kMachineRegXMM0,
+      {.base = kMachineRegRDX, .index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+      0x4242'4242'4242'4242,
+      kMachineRegRBX,
+      kMachineRegXMM1,
+      {.base = kMachineRegR8, .disp = 2},
+      kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -649,22 +633,17 @@ TEST(MachineIRDebugTest, BaseIndexBaseIndexOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  builder.Gen<TestInsn>(kMachineRegRAX,
-                        CodeEmitter::Condition::kLessEqual,
-                        kMachineRegRCX,
-                        kMachineRegXMM0,
-                        x86_64::MemoryOperand{.base = kMachineRegRDX,
-                                              .index = kMachineRegRSI,
-                                              .scale = CodeEmitter::kTimesTwo,
-                                              .disp = 1},
-                        0x4242'4242'4242'4242,
-                        kMachineRegRBX,
-                        kMachineRegXMM1,
-                        x86_64::MemoryOperand{.base = kMachineRegR8,
-                                              .index = kMachineRegRDI,
-                                              .scale = CodeEmitter::kTimesFour,
-                                              .disp = 2},
-                        kMachineRegFLAGS);
+  builder.Gen<TestInsn>(
+      kMachineRegRAX,
+      CodeEmitter::Condition::kLessEqual,
+      kMachineRegRCX,
+      kMachineRegXMM0,
+      {.base = kMachineRegRDX, .index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
+      0x4242'4242'4242'4242,
+      kMachineRegRBX,
+      kMachineRegXMM1,
+      {.base = kMachineRegR8, .index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+      kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
                 R"( 0 MachineBasicBlock live_in=[] live_out=[]
@@ -698,14 +677,11 @@ TEST(MachineIRDebugTest, BaseIndexIndexOperands) {
       CodeEmitter::Condition::kGreater,
       kMachineRegRCX,
       kMachineRegXMM0,
-      x86_64::MemoryOperand{.base = kMachineRegRDX,
-                            .index = kMachineRegRSI,
-                            .scale = CodeEmitter::kTimesTwo,
-                            .disp = 1},
+      {.base = kMachineRegRDX, .index = kMachineRegRSI, .scale = CodeEmitter::kTimesTwo, .disp = 1},
       0x4242'4242'4242'4242,
       kMachineRegRBX,
       kMachineRegXMM1,
-      x86_64::MemoryOperand{.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
+      {.index = kMachineRegRDI, .scale = CodeEmitter::kTimesFour, .disp = 2},
       kMachineRegFLAGS);
   Verifier verifier;
   verifier.Init(machine_ir,
@@ -748,12 +724,11 @@ TEST(MachineIRDebugTest, VirtualRegisters) {
       CodeEmitter::Condition::kEqual,
       reg1,
       xmm0,
-      x86_64::MemoryOperand{
-          .base = base0, .index = index0, .scale = CodeEmitter::kTimesOne, .disp = 1},
+      {.base = base0, .index = index0, .scale = CodeEmitter::kTimesOne, .disp = 1},
       0x4242'4242'4242'4242,
       reg2,
       xmm1,
-      x86_64::MemoryOperand{.base = base1, .index = index1, CodeEmitter::kTimesEight, .disp = 2},
+      {.base = base1, .index = index1, CodeEmitter::kTimesEight, .disp = 2},
       flags);
   EXPECT_EQ(machine_ir.GetDebugString(), R"( 0 MachineBasicBlock live_in=[] live_out=[]
     TEST_INSN (RBX v0), Z, GeneralReg64 v1, FpReg64 v3, [GeneralReg64 v5 + GeneralReg64 v6 * 1 + 0x1], 0x4242424242424242, GeneralReg32 v2, FpReg32 v4, [GeneralReg64 v7 + GeneralReg64 v8 * 8 + 0x2], (FLAGS v9)

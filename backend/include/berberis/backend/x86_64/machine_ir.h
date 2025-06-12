@@ -28,6 +28,7 @@
 #include "berberis/backend/code_emitter.h"
 #include "berberis/backend/common/machine_ir.h"  // IWYU pragma: export.
 #include "berberis/backend/x86_64/code_emit.h"
+#include "berberis/backend/x86_64/memory_operand.h"
 #include "berberis/base/arena_alloc.h"
 #include "berberis/base/stringprintf.h"
 #include "berberis/device_arch_info/x86_64/device_arch_info.h"
@@ -280,17 +281,6 @@ class CallImmArg : public MachineInsnX86_64 {
   };
 };
 
-struct MemoryOperand {
-  MachineReg base = kInvalidMachineReg;
-  MachineReg index = kInvalidMachineReg;
-  Assembler::ScaleFactor scale = Assembler::kTimesOne;
-  // Note: x86-64 only supports 64bit offset in one instruction: movabs – and that one may only be
-  // be used to move a value to or from RAX. We don't use it in our code anywhere and it would be
-  // better to treat it as a special case, rather than pretend that other instruction may support
-  // 64bit offset.
-  int32_t disp = 0;
-};
-
 template <typename IntrinsicBindingInfo>
 class MachineInsnOperandsHelper;
 
@@ -324,11 +314,25 @@ class MachineInsnOperandsHelper<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                       std::conditional_t<device_arch_info::kIsRegister<Operands>,
                                                          std::tuple<MachineReg>,
                                                          std::tuple<const MemoryOperand&>>>>()...));
+  // The same as ConstructorArgsTuple, but first all register operands are list and then all
+  // non-register operands. This makes it easier to process them in some circumstances.
+  using ConstructorAutoArgsTuple = decltype(std::tuple_cat(
+      std::declval<std::conditional_t<device_arch_info::kIsRegister<Operands>,
+                                      std::tuple<MachineReg>,
+                                      std::tuple<>>>()...,
+      std::declval<std::conditional_t<device_arch_info::kIsCondition<Operands> ||
+                                          device_arch_info::kIsImmediate<Operands>,
+                                      std::tuple<typename Operands::Class::Type>,
+                                      std::conditional_t<!device_arch_info::kIsRegister<Operands>,
+                                                         std::tuple<const MemoryOperand&>,
+                                                         std::tuple<>>>>()...));
 };
 
 template <typename IntrinsicBindingInfo,
           typename = typename MachineInsnOperandsHelper<IntrinsicBindingInfo>::RegOperandsTuple,
-          typename = typename MachineInsnOperandsHelper<IntrinsicBindingInfo>::ConstructorArgsTuple>
+          typename = typename MachineInsnOperandsHelper<IntrinsicBindingInfo>::ConstructorArgsTuple,
+          typename =
+              typename MachineInsnOperandsHelper<IntrinsicBindingInfo>::ConstructorAutoArgsTuple>
 class MachineInsn;
 
 template <auto kEmitInsnFunc,
@@ -338,6 +342,7 @@ template <auto kEmitInsnFunc,
           typename... Operands,
           typename... RegOperands,
           typename... ConstructorArgs,
+          typename... ConstructorAutoArgs,
           bool kSideEffects>
 class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                                    kMnemo,
@@ -346,7 +351,8 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                                    CPUIDRestriction,
                                                    std::tuple<Operands...>>,
                   std::tuple<RegOperands...>,
-                  std::tuple<ConstructorArgs...>>
+                  std::tuple<ConstructorArgs...>,
+                  std::tuple<ConstructorAutoArgs...>>
     final : public MachineInsnX86_64 {
  private:
   template <auto>
@@ -360,6 +366,9 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
   template <typename MachineIRBuilder>
   static constexpr MachineInsn* (MachineIRBuilder::*kGenFunc)(ConstructorArgs...) =
       &MachineIRBuilder::template Gen<MachineInsn>;
+  template <typename MachineIRBuilder>
+  static constexpr MachineInsn* (MachineIRBuilder::*kGenAutoFunc)(ConstructorAutoArgs...) =
+      &MachineIRBuilder::template Gen<MachineInsn>;
 
   using DeviceInsnInfo = device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                                           kMnemo,
@@ -367,42 +376,65 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                                           GetOpcode,
                                                           CPUIDRestriction,
                                                           std::tuple<Operands...>>;
+  using InputArgsTuple = decltype(std::tuple_cat(
+      std::declval<std::conditional_t<
+          device_arch_info::kIsCondition<Operands> || device_arch_info::kIsImmediate<Operands>,
+          std::tuple<typename Operands::Class::Type>,
+          std::conditional_t<device_arch_info::kIsRegister<Operands>,
+                             std::conditional_t<Operands::kUsage == device_arch_info::kUse ||
+                                                    Operands::kUsage == device_arch_info::kUseDef,
+                                                std::tuple<MachineReg>,
+                                                std::tuple<>>,
+                             std::tuple<const MemoryOperand&>>>>()...));
+  using OutputArgsTuple = std::array<MachineReg,
+                                     ((device_arch_info::kIsRegister<Operands> &&
+                                       Operands::kUsage != device_arch_info::kUse) +
+                                      ... + 0)>;
 
-  explicit MachineInsn(ConstructorArgs... args) : MachineInsnX86_64(&GenMachineInsnInfo(args...)) {
+  explicit MachineInsn(ConstructorArgs... args)
+      : MachineInsnX86_64(&GenMachineInsnInfo<ConstructorArgs...>(args...)) {
     constexpr int kConditionalsOperandsCount = (device_arch_info::kIsCondition<Operands> + ... + 0);
     static_assert(kConditionalsOperandsCount <= 1);
     constexpr int kImmediateOperandsCount = (device_arch_info::kIsImmediate<Operands> + ... + 0);
     static_assert(kImmediateOperandsCount <= 1);
     constexpr int kMemoryOperandsCount = (device_arch_info::kIsMemoryOperand<Operands> + ... + 0);
     static_assert(kMemoryOperandsCount <= 2);
-    size_t reg_idx{}, mem_idx{};
-    (
-        [&reg_idx, &mem_idx, this]<typename Operand, typename ConstructorArg>(ConstructorArg arg) {
-          if constexpr (device_arch_info::kIsCondition<Operand>) {
-            MachineInsnX86_64::set_cond(arg);
-          } else if constexpr (device_arch_info::kIsImmediate<Operand>) {
-            MachineInsnX86_64::set_imm(arg);
-          } else if constexpr (device_arch_info::kIsRegister<Operand>) {
-            static_assert(std::is_same_v<MachineReg, ConstructorArg>);
-            MachineInsnX86_64::SetRegAt(reg_idx++, arg);
-          } else if constexpr (device_arch_info::kIsMemoryOperand<Operand>) {
-            static_assert(std::is_same_v<const MemoryOperand&, ConstructorArg>);
-            if (arg.base != kInvalidMachineReg) {
-              MachineInsnX86_64::SetRegAt(reg_idx++, arg.base);
-            }
-            if (arg.index != kInvalidMachineReg) {
-              MachineInsnX86_64::SetRegAt(reg_idx++, arg.index);
-            }
-            if (++mem_idx == 1) {
-              MachineInsnX86_64::set_disp(arg.disp);
-              MachineInsnX86_64::set_scale(arg.scale);
-            } else if (mem_idx == 2) {
-              MachineInsnX86_64::set_disp2(arg.disp);
-              MachineInsnX86_64::set_scale2(arg.scale);
-            }
-          }
-        }.template operator()<Operands, ConstructorArgs>(args),
-        ...);
+    size_t reg_idx = 0, mem_idx = 0;
+    (ProcessConstructorArg<ConstructorArgs>(reg_idx, mem_idx, args), ...);
+  }
+
+  // Note: we ask for Extra arguments here, but only to postpone instantiation of constructor,
+  // Nothing is supposed to be passed besides ConstructorAutoArgs, but if we wouldn't add this
+  // bogus argument instantiation would happen too early.
+  template <
+      typename... Extra,
+      typename = std::enable_if_t<!std::is_same_v<std::tuple<ConstructorArgs..., Extra...>,
+                                                  std::tuple<ConstructorAutoArgs..., Extra...>>>>
+  explicit MachineInsn(ConstructorAutoArgs... args, Extra...)
+      : MachineInsnX86_64(&GenMachineInsnInfo<ConstructorAutoArgs...>(args...)) {
+    // Ensure that nothing is passed as Extra arguments.
+    static_assert(sizeof...(Extra) == 0);
+    constexpr int kConditionalsOperandsCount = (device_arch_info::kIsCondition<Operands> + ... + 0);
+    static_assert(kConditionalsOperandsCount <= 1);
+    constexpr int kImmediateOperandsCount = (device_arch_info::kIsImmediate<Operands> + ... + 0);
+    static_assert(kImmediateOperandsCount <= 1);
+    constexpr int kMemoryOperandsCount = (device_arch_info::kIsMemoryOperand<Operands> + ... + 0);
+    static_assert(kMemoryOperandsCount <= 2);
+    constexpr int kRegisterOperandsCount = (device_arch_info::kIsRegister<Operands> + ... + 0);
+    // If we have only registers or only memory operands (but not both) then processing them in
+    // ConstructorAutoArgs order is always correct, otherwise we pull the args into arrays to
+    // process in ConstructorArgs order in the 2nd pass.
+    if constexpr (kMemoryOperandsCount == 0 || kRegisterOperandsCount == 0) {
+      size_t reg_idx = 0, mem_idx = 0;
+      (ProcessConstructorArg<ConstructorAutoArgs>(reg_idx, mem_idx, args), ...);
+    } else {
+      MachineReg regs[kRegisterOperandsCount];
+      MemoryOperand ops[kMemoryOperandsCount];
+      size_t reg_idx = 0, mem_idx = 0;
+      (ProcessConstructorArg<ConstructorAutoArgs>(reg_idx, mem_idx, regs, ops, args), ...);
+      size_t reg_in = 0, reg_out = mem_idx = 0;
+      (ProcessConstructorArg<ConstructorArgs>(reg_in, reg_out, mem_idx, regs, ops), ...);
+    }
   }
 
   static constexpr std::array<MachineInsnInfo,
@@ -539,6 +571,77 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
   }
 
  private:
+  template <typename ConstructorArg>
+  void ProcessConstructorArg(size_t& reg_idx, size_t& mem_idx, ConstructorArg arg) {
+    if constexpr (std::is_same_v<ConstructorArg, Assembler::Condition>) {
+      MachineInsnX86_64::set_cond(arg);
+    } else if constexpr (std::is_integral_v<ConstructorArg>) {
+      MachineInsnX86_64::set_imm(arg);
+    } else if constexpr (std::is_same_v<ConstructorArg, MachineReg>) {
+      MachineInsnX86_64::SetRegAt(reg_idx++, arg);
+    } else if constexpr (std::is_same_v<ConstructorArg, const MemoryOperand&>) {
+      if (arg.base != kInvalidMachineReg) {
+        MachineInsnX86_64::SetRegAt(reg_idx++, arg.base);
+      }
+      if (arg.index != kInvalidMachineReg) {
+        MachineInsnX86_64::SetRegAt(reg_idx++, arg.index);
+      }
+      if (++mem_idx == 1) {
+        MachineInsnX86_64::set_disp(arg.disp);
+        MachineInsnX86_64::set_scale(arg.scale);
+      } else if (mem_idx == 2) {
+        MachineInsnX86_64::set_disp2(arg.disp);
+        MachineInsnX86_64::set_scale2(arg.scale);
+      }
+    } else {
+      static_assert(kDependentTypeFalse<ConstructorArg>);
+    }
+  }
+
+  template <typename ConstructorArg>
+  void ProcessConstructorArg(size_t& reg_idx,
+                             size_t& mem_idx,
+                             MachineReg regs[],
+                             MemoryOperand ops[],
+                             ConstructorArg arg) {
+    if constexpr (std::is_same_v<ConstructorArg, Assembler::Condition>) {
+      MachineInsnX86_64::set_cond(arg);
+    } else if constexpr (std::is_integral_v<ConstructorArg>) {
+      MachineInsnX86_64::set_imm(arg);
+    } else if constexpr (std::is_same_v<ConstructorArg, MachineReg>) {
+      regs[reg_idx++] = arg;
+    } else if constexpr (std::is_same_v<ConstructorArg, const MemoryOperand&>) {
+      ops[mem_idx++] = arg;
+    } else {
+      static_assert(kDependentTypeFalse<ConstructorArg>);
+    }
+  }
+
+  template <typename ConstructorArg>
+  void ProcessConstructorArg(size_t& reg_in,
+                             size_t& reg_out,
+                             size_t& mem_idx,
+                             MachineReg regs[],
+                             MemoryOperand ops[]) {
+    if constexpr (std::is_same_v<ConstructorArg, MachineReg>) {
+      MachineInsnX86_64::SetRegAt(reg_out++, regs[reg_in++]);
+    } else if constexpr (std::is_same_v<ConstructorArg, const MemoryOperand&>) {
+      if (ops[mem_idx].base != kInvalidMachineReg) {
+        MachineInsnX86_64::SetRegAt(reg_out++, ops[mem_idx].base);
+      }
+      if (ops[mem_idx].index != kInvalidMachineReg) {
+        MachineInsnX86_64::SetRegAt(reg_out++, ops[mem_idx].index);
+      }
+      if (++mem_idx == 1) {
+        MachineInsnX86_64::set_disp(ops[0].disp);
+        MachineInsnX86_64::set_scale(ops[0].scale);
+      } else if (mem_idx == 2) {
+        MachineInsnX86_64::set_disp2(ops[1].disp);
+        MachineInsnX86_64::set_scale2(ops[1].scale);
+      }
+    }
+  }
+
   // Ensure that bits that we are using to split opcodes are not used by opcode already.
   // Note: we need to do that with all opcodes, including opcodes without memory operands,
   // to guarantee that memory-using opcodes don't clash with memory non-using opcodes.
@@ -558,7 +661,8 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
     return {base_index_info & 1, base_index_info & 2};
   }
 
-  static const MachineInsnInfo& GenMachineInsnInfo(ConstructorArgs... args) {
+  template <typename... Args>
+  static const MachineInsnInfo& GenMachineInsnInfo(Args... args) {
     constexpr int kMemoryOperandsCount =
         (std::is_same_v<ConstructorArgs, const MemoryOperand&> + ... + 0);
     static_assert(kMemoryOperandsCount <= 2);
@@ -568,8 +672,8 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
       size_t index = 0;
       size_t current_bit = 1;
       (
-          [&index, &current_bit]<typename ConstructorArg>(ConstructorArg arg) {
-            if constexpr (std::is_same_v<ConstructorArg, const MemoryOperand&>) {
+          [&index, &current_bit]<typename Arg>(Arg arg) {
+            if constexpr (std::is_same_v<Arg, const MemoryOperand&>) {
               if (arg.base != kInvalidMachineReg) {
                 index |= current_bit;
               }
@@ -579,7 +683,7 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
               }
               current_bit <<= 1;
             }
-          }.template operator()<ConstructorArgs>(args),
+          }.template operator()<const Args&>(args),
           ...);
       return kInfos[index];
     }
@@ -593,6 +697,7 @@ template <auto kEmitInsnFunc,
           typename... Operands,
           typename... RegOperands,
           typename... ConstructorArgs,
+          typename... ConstructorAutoArgs,
           bool kSideEffects>
 template <auto BaseIndexRegistersUsed>
 constexpr MachineInsnInfo MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
@@ -602,7 +707,8 @@ constexpr MachineInsnInfo MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsn
                                                                        CPUIDRestriction,
                                                                        std::tuple<Operands...>>,
                                       std::tuple<RegOperands...>,
-                                      std::tuple<ConstructorArgs...>>::GenMachineInsnInfo() {
+                                      std::tuple<ConstructorArgs...>,
+                                      std::tuple<ConstructorAutoArgs...>>::GenMachineInsnInfo() {
   MachineInsnInfo result = {
     .opcode = GetOpcode.template operator()<MachineOpcode>(),
     .kind = GetInsnKind()
@@ -658,6 +764,7 @@ template <auto kEmitInsnFunc,
           typename... Operands,
           typename... RegOperands,
           typename... ConstructorArgs,
+          typename... ConstructorAutoArgs,
           bool kSideEffects>
 constexpr std::array<MachineInsnInfo,
                      1 << (2 * (device_arch_info::kIsMemoryOperand<Operands> + ... + 0))>
@@ -668,7 +775,8 @@ MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                              CPUIDRestriction,
                                              std::tuple<Operands...>>,
             std::tuple<RegOperands...>,
-            std::tuple<ConstructorArgs...>>::GenMachineInsnInfos() {
+            std::tuple<ConstructorArgs...>,
+            std::tuple<ConstructorAutoArgs...>>::GenMachineInsnInfos() {
   constexpr int kMemoryOperandsCount = (device_arch_info::kIsMemoryOperand<Operands> + ... + 0);
   if constexpr (kMemoryOperandsCount == 0) {
     return {GenMachineInsnInfo<std::array<bool, 0>{}>()};
@@ -812,115 +920,12 @@ class MachineIR : public berberis::MachineIR {
     return berberis::MachineIR::template NewInsn<T, Args...>(args...);
   }
 
-  template <template <typename> typename InsnType>
-  using MachineInsnType =
-      MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>;
-
-  template <template <typename> typename InsnType, size_t N>
-  using GenArg = std::tuple_element_t<
-      N,
-      typename MachineInsnOperandsHelper<typename InsnType<
-          typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple>;
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn()
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 0,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>>();
-  }
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn(GenArg<InsnType, 0> arg0)
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 1,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>, GenArg<InsnType, 0>>(arg0);
-  }
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn(GenArg<InsnType, 0> arg0, GenArg<InsnType, 1> arg1)
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 2,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>, GenArg<InsnType, 0>, GenArg<InsnType, 1>>(arg0, arg1);
-  }
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn(GenArg<InsnType, 0> arg0,
-                             GenArg<InsnType, 1> arg1,
-                             GenArg<InsnType, 2> arg2)
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 3,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>,
-                   GenArg<InsnType, 0>,
-                   GenArg<InsnType, 1>,
-                   GenArg<InsnType, 2>>(arg0, arg1, arg2);
-  }
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn(GenArg<InsnType, 0> arg0,
-                             GenArg<InsnType, 1> arg1,
-                             GenArg<InsnType, 2> arg2,
-                             GenArg<InsnType, 3> arg3)
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 4,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>,
-                   GenArg<InsnType, 0>,
-                   GenArg<InsnType, 1>,
-                   GenArg<InsnType, 2>,
-                   GenArg<InsnType, 3>>(arg0, arg1, arg2, arg3);
-  }
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn(GenArg<InsnType, 0> arg0,
-                             GenArg<InsnType, 1> arg1,
-                             GenArg<InsnType, 2> arg2,
-                             GenArg<InsnType, 3> arg3,
-                             GenArg<InsnType, 4> arg4)
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 5,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>,
-                   GenArg<InsnType, 0>,
-                   GenArg<InsnType, 1>,
-                   GenArg<InsnType, 2>,
-                   GenArg<InsnType, 3>,
-                   GenArg<InsnType, 4>>(arg0, arg1, arg2, arg3, arg4);
-  }
-
-  template <template <typename> typename InsnType>
-  [[nodiscard]] auto NewInsn(GenArg<InsnType, 0> arg0,
-                             GenArg<InsnType, 1> arg1,
-                             GenArg<InsnType, 2> arg2,
-                             GenArg<InsnType, 3> arg3,
-                             GenArg<InsnType, 4> arg4,
-                             GenArg<InsnType, 5> arg5)
-      -> std::enable_if_t<
-          std::tuple_size_v<typename MachineInsnOperandsHelper<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>::ConstructorArgsTuple> == 6,
-          MachineInsnType<InsnType>*> {
-    return NewInsn<MachineInsnType<InsnType>,
-                   GenArg<InsnType, 0>,
-                   GenArg<InsnType, 1>,
-                   GenArg<InsnType, 2>,
-                   GenArg<InsnType, 3>,
-                   GenArg<InsnType, 4>,
-                   GenArg<InsnType, 5>>(arg0, arg1, arg2, arg3, arg4, arg5);
-  }
-
-  template <template <typename> typename InsnType, typename... Args>
-  [[nodiscard]] MachineInsnType<InsnType>* NewInsn(Args... args) {
-    return NewInsn<MachineInsnType<InsnType>, Args...>(args...);
-  }
+  BERBERIS_DECLARE_MACHINE_INSN_ADAPTER(
+      [[nodiscard]] auto NewInsn,
+      MachineInsnOperandsHelper,
+      ConstructorArgsTuple,
+      MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*,
+      NewInsn)
 
  private:
   BasicBlockOrder bb_order_;

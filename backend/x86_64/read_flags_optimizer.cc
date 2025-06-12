@@ -151,7 +151,9 @@ berberis::MachineInsn* CopyInstruction(MachineIR* machine_ir, berberis::MachineI
 
 template <template <typename> typename T>
 berberis::MachineInsn* CopyInstruction(MachineIR* machine_ir, berberis::MachineInsn* insn) {
-  return machine_ir->NewInsn<T>(*static_cast<MachineIR::MachineInsnType<T>*>(insn));
+  return machine_ir->NewInsn<T>(
+      *static_cast<MachineInsn<typename T<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*>(
+          insn));
 }
 
 std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode) {
