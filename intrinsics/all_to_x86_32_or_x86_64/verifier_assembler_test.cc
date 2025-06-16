@@ -169,15 +169,13 @@ class MacroAssembler : public Assembler {
     // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
     // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
     // execute/maintain zero extension.
+    // Same applies to all other test intrinsics below testing zero extension.
     Movl(dst, src1);
     Addb(dst, dst);
   }
 
   // dst: DEF_EARLY_CLOBBER, src1: USE, EAX: DEF
   constexpr void IntrinsicWithEAXNotZeroExtended(Register dst, Register src1) {
-    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
-    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
-    // execute/maintain zero extension.
     Movl(dst, src1);
     Movl(gpr_a, src1);
     Addb(gpr_a, dst);
@@ -185,9 +183,6 @@ class MacroAssembler : public Assembler {
 
   // dst: DEF_EARLY_CLOBBER, src1: USE, EBX: DEF
   constexpr void IntrinsicWithEBXNotZeroExtended(Register dst, Register src1) {
-    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
-    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
-    // execute/maintain zero extension.
     Movl(dst, src1);
     Movl(gpr_b, src1);
     Addb(gpr_b, dst);
@@ -195,9 +190,6 @@ class MacroAssembler : public Assembler {
 
   // dst: DEF_EARLY_CLOBBER, src1: USE, ECX: DEF
   constexpr void IntrinsicWithECXNotZeroExtended(Register dst, Register src1) {
-    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
-    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
-    // execute/maintain zero extension.
     Movl(dst, src1);
     Movl(gpr_c, src1);
     Addb(gpr_c, dst);
@@ -205,12 +197,18 @@ class MacroAssembler : public Assembler {
 
   // dst: DEF_EARLY_CLOBBER, src1: USE, EDX: DEF
   constexpr void IntrinsicWithEDXNotZeroExtended(Register dst, Register src1) {
-    // TODO(b/421334152): This intrinsic, is actually, technically valid since Addb maintains the
-    // zero extended bits from Addl. However, current implementation assumes that only 32 bit insns
-    // execute/maintain zero extension.
     Movl(dst, src1);
     Movl(gpr_d, src1);
     Addb(gpr_d, dst);
+  }
+
+  // dst: DEF, src1: USE
+  constexpr void NonLinearIntrinsicWith32BitOutputNotZeroExtended(Register dst, Register src1) {
+    Label* out = MakeLabel();
+    Movb(dst, src1);
+    Jcc(Assembler::Condition::kZero, *out);
+    Addl(dst, dst);
+    Bind(out);
   }
 
   using AddressType = int64_t;
@@ -636,6 +634,27 @@ TEST(VerifierAssembler, TestEDXOutputWithNoZeroExtensionBindedToOutputIntrinsic)
 
   ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
                "error: intrinsic didn't zero extend 32 bit EDX output");
+}
+
+TEST(VerifierAssembler, Test32BitOutputWithNoZeroExtensionNonLinearIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, TmpArg>,
+      DeviceInsnInfo<
+          &std::tuple_element_t<0, Assemblers>::NonLinearIntrinsicWith32BitOutputNotZeroExtended,
+          kBindingMnemo,
+          false,
+          nullptr,
+          NoCPUIDRestriction,
+          std::tuple<Operand<GeneralReg32, kDef>,
+                     Operand<GeneralReg32, kUse>,
+                     Operand<FLAGS, kDef>>>>;
+
+  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
+               "error: intrinsic didn't zero extend 32 bit output register");
 }
 
 }  // namespace
