@@ -485,6 +485,11 @@ class VerifierAssembler {
       }
     }
 
+    constexpr void ResetZeroExtensionVisitedState() {
+      zero_extension_register_checked.at(0) = false;
+      zero_extension_register_checked.at(1) = false;
+    }
+
     bool instruction_defined_def_fixed_register = false;
     bool instruction_defined_def_general_register = false;
     bool instruction_defined_def_xmm_register = false;
@@ -524,6 +529,11 @@ class VerifierAssembler {
       register_usage_flags.Check32BitRegisterIsZeroExtended(reg_no);
     } else {
       CheckInstructionZeroExtensionRecursive(0, false, reg_no);
+      // If an intrinsic has multiple 32 bit outputs, this recursive check will be run more than
+      // once. Therefore, the visited state is reset at the end of a check.
+      for (int i = 0; i < num_instructions_; i++) {
+        instructions.at(i).ResetZeroExtensionVisitedState();
+      }
     }
   }
 

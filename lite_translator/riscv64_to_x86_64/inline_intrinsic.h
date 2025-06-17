@@ -435,6 +435,9 @@ class TryBindingBasedInlineIntrinsic {
         if constexpr (RegisterClass::kAsRegister == 'd') {
           result_reg_ = as_.rdx;
           return std::tuple{};
+        } else if constexpr (RegisterClass::kAsRegister == 'a') {
+          result_reg_ = as_.rax;
+          return std::tuple{};
         } else {
           static_assert(kDependentValueFalse<ArgBinding::kArgInfo>);
         }

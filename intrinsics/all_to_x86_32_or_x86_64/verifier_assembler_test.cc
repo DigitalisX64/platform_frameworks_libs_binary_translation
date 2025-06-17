@@ -202,12 +202,15 @@ class MacroAssembler : public Assembler {
     Addb(gpr_d, dst);
   }
 
-  // dst: DEF, src1: USE
-  constexpr void NonLinearIntrinsicWith32BitOutputNotZeroExtended(Register dst, Register src1) {
+  // dst1: DEF, dst2: DEF src1: USE
+  constexpr void NonLinearIntrinsicWith32BitOutputNotZeroExtended(Register dst1,
+                                                                  Register dst2,
+                                                                  Register src1) {
     Label* out = MakeLabel();
-    Movb(dst, src1);
+    Movl(dst1, src1);
+    Movb(dst2, dst1);
     Jcc(Assembler::Condition::kZero, *out);
-    Addl(dst, dst);
+    Addl(dst2, dst2);
     Bind(out);
   }
 
@@ -641,8 +644,8 @@ TEST(VerifierAssembler, Test32BitOutputWithNoZeroExtensionNonLinearIntrinsic) {
       kBindingName,
       NoNansOperation,
       std::tuple<uint32_t>,
-      std::tuple<uint32_t>,
-      std::tuple<OutArg<0>, InArg<0>, TmpArg>,
+      std::tuple<uint32_t, uint32_t>,
+      std::tuple<OutArg<0>, OutArg<1>, InArg<0>, TmpArg>,
       DeviceInsnInfo<
           &std::tuple_element_t<0, Assemblers>::NonLinearIntrinsicWith32BitOutputNotZeroExtended,
           kBindingMnemo,
@@ -650,6 +653,7 @@ TEST(VerifierAssembler, Test32BitOutputWithNoZeroExtensionNonLinearIntrinsic) {
           nullptr,
           NoCPUIDRestriction,
           std::tuple<Operand<GeneralReg32, kDef>,
+                     Operand<GeneralReg32, kDef>,
                      Operand<GeneralReg32, kUse>,
                      Operand<FLAGS, kDef>>>>;
 

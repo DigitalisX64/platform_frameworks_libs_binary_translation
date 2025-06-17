@@ -36,29 +36,33 @@ namespace berberis {
 
 // Note: MacroAssembler specifies the full inheritance plan for all mixed-in assemblers.
 // Details at go/berberis-macroassembler-mixins
-template <typename Assembler>
+template <typename Assembler_, typename AssemblerBase_ = void>
 class MacroAssembler
-    : public MacroAssemblerX86_64GuestAgnostic<
-          Assembler,
-          MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
-          MacroAssembler<Assembler>> {
+    : public std::conditional_t<
+          std::is_same_v<AssemblerBase_, void>,
+          MacroAssemblerX86_64GuestAgnostic<
+              Assembler_,
+              MacroAssemblerX86GuestAgnostic<Assembler_, Assembler_, MacroAssembler<Assembler_>>,
+              MacroAssembler<Assembler_>>,
+          AssemblerBase_> {
  public:
-  using Assemblers = std::tuple<
-      typename Assembler::BaseAssembler,
-      typename Assembler::FinalAssembler,
-      MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
-      MacroAssemblerX86_64GuestAgnostic<
-          Assembler,
-          MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
-          MacroAssembler<Assembler>>,
-      MacroAssembler<Assembler>>;
+  using Assembler = Assembler_;
+  using AssemblerBase =
+      std::conditional_t<std::is_same_v<AssemblerBase_, void>,
+                         MacroAssemblerX86_64GuestAgnostic<
+                             Assembler,
+                             MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler>,
+                             MacroAssembler>,
+                         AssemblerBase_>;
+  using Assemblers =
+      std::tuple<typename Assembler::BaseAssembler,
+                 typename Assembler::FinalAssembler,
+                 MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler>,
+                 AssemblerBase,
+                 MacroAssembler>;
 
   template <typename... Args>
-  constexpr explicit MacroAssembler(Args&&... args)
-      : MacroAssemblerX86_64GuestAgnostic<
-            Assembler,
-            MacroAssemblerX86GuestAgnostic<Assembler, Assembler, MacroAssembler<Assembler>>,
-            MacroAssembler<Assembler>>(std::forward<Args>(args)...) {}
+  constexpr explicit MacroAssembler(Args&&... args) : AssemblerBase(std::forward<Args>(args)...) {}
 
 #define IMPORT_ASSEMBLER_FUNCTIONS
 #include "berberis/assembler/gen_assembler_x86_64-using-inl.h"

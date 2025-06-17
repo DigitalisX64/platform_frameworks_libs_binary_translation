@@ -27,9 +27,9 @@ namespace berberis {
 
 // Divisor comes in "src", dividend comes in gpr_a, result is returned in gpr_a.
 // gpr_d and FLAGS are clobbered by that macroinstruction.
-template <typename Assembler>
+template <typename Assembler, typename AssemblerBase>
 template <typename IntType>
-constexpr void MacroAssembler<Assembler>::DivRiscV(Register src) {
+constexpr void MacroAssembler<Assembler, AssemblerBase>::DivRiscV(Register src) {
   Label* zero = MakeLabel();
   Label* done = MakeLabel();
   Test<IntType>(src, src);
@@ -86,9 +86,9 @@ constexpr void MacroAssembler<Assembler>::DivRiscV(Register src) {
 // Divisor comes in "src", dividend comes in gpr_a.
 // For 16/32/64-bit: remainder is returned in gpr_d. gpr_a and FLAGS are clobbered.
 // For 8-bit: remainder is returned in gpr_a. FLAGS are clobbered.
-template <typename Assembler>
+template <typename Assembler, typename AssemblerBase>
 template <typename IntType>
-constexpr void MacroAssembler<Assembler>::RemRiscV(Register src) {
+constexpr void MacroAssembler<Assembler, AssemblerBase>::RemRiscV(Register src) {
   Label* zero = MakeLabel();
   Label* overflow = MakeLabel();
   Label* done = MakeLabel();

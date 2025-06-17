@@ -883,7 +883,7 @@ def _gen_mock_semantics_listener_intrinsics_hooks_impl_inl_h(f, intrs):
 
 
 def _get_binding_info(arg):
-  need_tmp = arg['class'] in ('EAX', 'EDX', 'CL', 'ECX')
+  need_tmp = arg['class'] in ('EAX', 'EDX', 'CL', 'ECX', 'RAX', 'RDX')
   if arg['class'] == 'Imm8':
     return 'ImmArg<%d>' % (arg['ir_arg'])
   if arg['usage'] == 'use':
