@@ -70,16 +70,27 @@ class Interpreter {
   static constexpr Register no_register = 0;
   using FpRegister = uint64_t;
   static constexpr FpRegister no_fp_register = 0;
+  using Float16 = intrinsics::Float16;
   using Float32 = intrinsics::Float32;
   using Float64 = intrinsics::Float64;
 
   using TemplateTypeId = intrinsics::TemplateTypeId;
   template <typename Type>
   static constexpr auto kIdFromType = intrinsics::kIdFromType<Type>;
+  template <typename TypeName>
+  using Type = intrinsics::Value<kIdFromType<TypeName>>;
+  // Syntax sugar to eliminate {} from type conversion.
+  template <typename TypeName>
+  static constexpr Type<TypeName> kType{};
   template <auto kEnumValue>
   using TypeFromId = intrinsics::TypeFromId<kEnumValue>;
+  template <auto kEnumValue>
+  using WrappedTypeFromId = intrinsics::WrappedTypeFromId<kEnumValue>;
   template <auto ValueParam>
   using Value = intrinsics::Value<ValueParam>;
+  // Syntax sugar to eliminate {} from value conversion.
+  template <auto ValueParam>
+  static constexpr Value<ValueParam> kValue{};
   static constexpr TemplateTypeId IntSizeToTemplateTypeId(uint8_t size, bool is_signed = false) {
     return intrinsics::IntSizeToTemplateTypeId(size, is_signed);
   }
@@ -635,13 +646,13 @@ class Interpreter {
                   std::is_same_v<VOpArgs, Decoder::VStoreUnitStrideArgs>) {
       switch (args.width) {
         case Decoder::MemoryDataOperandType::k8bit:
-          return OpVector<UInt8>(args, vtype, extra_args...);
+          return OpVectorWithElementTypeNoVlMul(args, vtype, kType<UInt8>, extra_args...);
         case Decoder::MemoryDataOperandType::k16bit:
-          return OpVector<UInt16>(args, vtype, extra_args...);
+          return OpVectorWithElementTypeNoVlMul(args, vtype, kType<UInt16>, extra_args...);
         case Decoder::MemoryDataOperandType::k32bit:
-          return OpVector<UInt32>(args, vtype, extra_args...);
+          return OpVectorWithElementTypeNoVlMul(args, vtype, kType<UInt32>, extra_args...);
         case Decoder::MemoryDataOperandType::k64bit:
-          return OpVector<UInt64>(args, vtype, extra_args...);
+          return OpVectorWithElementTypeNoVlMul(args, vtype, kType<UInt64>, extra_args...);
         default:
           return Undefined();
       }
@@ -652,32 +663,34 @@ class Interpreter {
         switch (static_cast<VectorSelectElementWidth>((vtype >> 3) & 0b111)) {
           case VectorSelectElementWidth::k16bit:
             if constexpr (sizeof...(extra_args) == 0) {
-              return OpVector<intrinsics::Float16>(args, vlmul, vtype);
+              return OpVectorWithElementType(args, vlmul, vtype, kType<Float16>);
             } else {
               return Undefined();
             }
           case VectorSelectElementWidth::k32bit:
-            return OpVector<Float32>(
+            return OpVectorWithElementType(
                 args,
                 vlmul,
                 vtype,
+                kType<Float32>,
                 std::get<0>(intrinsics::UnboxNan<Float32>(bit_cast<Float64>(extra_args)))...);
           case VectorSelectElementWidth::k64bit:
             // Note: if arguments are 64bit floats then we don't need to do any unboxing.
-            return OpVector<Float64>(args, vlmul, vtype, bit_cast<Float64>(extra_args)...);
+            return OpVectorWithElementType(
+                args, vlmul, vtype, kType<Float64>, bit_cast<Float64>(extra_args)...);
           default:
             return Undefined();
         }
       } else {
         switch (static_cast<VectorSelectElementWidth>((vtype >> 3) & 0b111)) {
           case VectorSelectElementWidth::k8bit:
-            return OpVector<UInt8>(args, vlmul, vtype, extra_args...);
+            return OpVectorWithElementType(args, vlmul, vtype, kType<UInt8>, extra_args...);
           case VectorSelectElementWidth::k16bit:
-            return OpVector<UInt16>(args, vlmul, vtype, extra_args...);
+            return OpVectorWithElementType(args, vlmul, vtype, kType<UInt16>, extra_args...);
           case VectorSelectElementWidth::k32bit:
-            return OpVector<UInt32>(args, vlmul, vtype, extra_args...);
+            return OpVectorWithElementType(args, vlmul, vtype, kType<UInt32>, extra_args...);
           case VectorSelectElementWidth::k64bit:
-            return OpVector<UInt64>(args, vlmul, vtype, extra_args...);
+            return OpVectorWithElementType(args, vlmul, vtype, kType<UInt64>, extra_args...);
           default:
             return Undefined();
         }
@@ -685,8 +698,11 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, typename VOpArgs, typename... ExtraArgs>
-  void OpVector(const VOpArgs& args, Register vtype, ExtraArgs... extra_args) {
+  template <TemplateTypeId ElementType, typename VOpArgs, typename... ExtraArgs>
+  void OpVectorWithElementTypeNoVlMul(const VOpArgs& args,
+                                      Register vtype,
+                                      const Value<ElementType> kElementType,
+                                      ExtraArgs... extra_args) {
     auto vemul = Decoder::SignExtend<3>(vtype & 0b111);
     vemul -= ((vtype >> 3) & 0b111);  // Divide by SEW.
     vemul +=
@@ -700,65 +716,106 @@ class Interpreter {
     if ((vemul > 0) && ((args.nf + 1) * (1 << vemul) > 8)) {
       return Undefined();
     }
-    return OpVector<ElementType>(
-        args, static_cast<VectorRegisterGroupMultiplier>(vemul & 0b111), vtype, extra_args...);
+    return OpVectorWithElementType(args,
+                                   static_cast<VectorRegisterGroupMultiplier>(vemul & 0b111),
+                                   vtype,
+                                   kElementType,
+                                   extra_args...);
   }
 
-  template <typename ElementType, typename VOpArgs, typename... ExtraArgs>
-  void OpVector(const VOpArgs& args,
-                VectorRegisterGroupMultiplier vlmul,
-                Register vtype,
-                ExtraArgs... extra_args) {
+  template <TemplateTypeId ElementType, typename VOpArgs, typename... ExtraArgs>
+  void OpVectorWithElementType(const VOpArgs& args,
+                               VectorRegisterGroupMultiplier vlmul,
+                               Register vtype,
+                               const Value<ElementType> kElementType,
+                               ExtraArgs... extra_args) {
     switch (vlmul) {
       case VectorRegisterGroupMultiplier::k1register:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::k1register>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(args,
+                                               vtype,
+                                               kElementType,
+                                               kValue<VectorRegisterGroupMultiplier::k1register>,
+                                               extra_args...);
       case VectorRegisterGroupMultiplier::k2registers:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::k2registers>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(args,
+                                               vtype,
+                                               kElementType,
+                                               kValue<VectorRegisterGroupMultiplier::k2registers>,
+                                               extra_args...);
       case VectorRegisterGroupMultiplier::k4registers:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::k4registers>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(args,
+                                               vtype,
+                                               kElementType,
+                                               kValue<VectorRegisterGroupMultiplier::k4registers>,
+                                               extra_args...);
       case VectorRegisterGroupMultiplier::k8registers:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::k8registers>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(args,
+                                               vtype,
+                                               kElementType,
+                                               kValue<VectorRegisterGroupMultiplier::k8registers>,
+                                               extra_args...);
       case VectorRegisterGroupMultiplier::kEigthOfRegister:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::kEigthOfRegister>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(
+            args,
+            vtype,
+            kElementType,
+            kValue<VectorRegisterGroupMultiplier::kEigthOfRegister>,
+            extra_args...);
       case VectorRegisterGroupMultiplier::kQuarterOfRegister:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::kQuarterOfRegister>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(
+            args,
+            vtype,
+            kElementType,
+            kValue<VectorRegisterGroupMultiplier::kQuarterOfRegister>,
+            extra_args...);
       case VectorRegisterGroupMultiplier::kHalfOfRegister:
-        return OpVector<ElementType, VectorRegisterGroupMultiplier::kHalfOfRegister>(
-            args, vtype, extra_args...);
+        return OpVectorWithElementTypeAndVlMul(
+            args,
+            vtype,
+            kElementType,
+            kValue<VectorRegisterGroupMultiplier::kHalfOfRegister>,
+            extra_args...);
       default:
         return Undefined();
     }
   }
 
-  template <typename ElementType,
+  template <TemplateTypeId ElementType,
             VectorRegisterGroupMultiplier vlmul,
             typename VOpArgs,
             typename... ExtraArgs>
-  void OpVector(const VOpArgs& args, Register vtype, ExtraArgs... extra_args) {
+  void OpVectorWithElementTypeAndVlMul(const VOpArgs& args,
+                                       Register vtype,
+                                       const Value<ElementType> kElementType,
+                                       const Value<vlmul> kVlmul,
+                                       ExtraArgs... extra_args) {
     if (args.vm) {
-      return OpVector<ElementType, vlmul, intrinsics::NoInactiveProcessing{}>(
-          args, vtype, extra_args...);
+      return OpVectorWithElementTypeVlmulAndVma(args,
+                                                vtype,
+                                                kElementType,
+                                                kVlmul,
+                                                kValue<intrinsics::NoInactiveProcessing{}>,
+                                                extra_args...);
     }
     if (vtype >> 7) {
-      return OpVector<ElementType, vlmul, InactiveProcessing::kAgnostic>(
-          args, vtype, extra_args...);
+      return OpVectorWithElementTypeVlmulAndVma(
+          args, vtype, kElementType, kVlmul, kValue<InactiveProcessing::kAgnostic>, extra_args...);
     }
-    return OpVector<ElementType, vlmul, InactiveProcessing::kUndisturbed>(
-        args, vtype, extra_args...);
+    return OpVectorWithElementTypeVlmulAndVma(
+        args, vtype, kElementType, kVlmul, kValue<InactiveProcessing::kUndisturbed>, extra_args...);
   }
 
-  template <typename ElementType,
+  template <TemplateTypeId ElementType,
             VectorRegisterGroupMultiplier vlmul,
             auto vma,
             typename VOpArgs,
             typename... ExtraArgs>
-  void OpVector(const VOpArgs& args, Register vtype, ExtraArgs... extra_args) {
+  void OpVectorWithElementTypeVlmulAndVma(const VOpArgs& args,
+                                          Register vtype,
+                                          const Value<ElementType> kElementType,
+                                          const Value<vlmul> kVlmul,
+                                          const Value<vma> kVma,
+                                          ExtraArgs... extra_args) {
     if constexpr (std::is_same_v<VOpArgs, Decoder::VLoadIndexedArgs> ||
                   std::is_same_v<VOpArgs, Decoder::VLoadStrideArgs> ||
                   std::is_same_v<VOpArgs, Decoder::VLoadUnitStrideArgs> ||
@@ -770,65 +827,82 @@ class Interpreter {
       // separately above anyway, because they also ignore vtype and all the information in it!
       switch (args.nf) {
         case 0:
-          return OpVector<ElementType, 1, vlmul, vma>(args, vtype, extra_args...);
+          return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+              args, vtype, kElementType, kValue<size_t{1}>, kVlmul, kVma, extra_args...);
         case 1:
           if constexpr (kRegistersInvolved > 4) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 2, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{2}>, kVlmul, kVma, extra_args...);
           }
         case 2:
           if constexpr (kRegistersInvolved > 2) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 3, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{3}>, kVlmul, kVma, extra_args...);
           }
         case 3:
           if constexpr (kRegistersInvolved > 2) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 4, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{4}>, kVlmul, kVma, extra_args...);
           }
         case 4:
           if constexpr (kRegistersInvolved > 1) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 5, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{5}>, kVlmul, kVma, extra_args...);
           }
         case 5:
           if constexpr (kRegistersInvolved > 1) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 6, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{6}>, kVlmul, kVma, extra_args...);
           }
         case 6:
           if constexpr (kRegistersInvolved > 1) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 7, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{7}>, kVlmul, kVma, extra_args...);
           }
         case 7:
           if constexpr (kRegistersInvolved > 1) {
             return Undefined();
           } else {
-            return OpVector<ElementType, 8, vlmul, vma>(args, vtype, extra_args...);
+            return OpVectorWithElementTypeSegmentSizeVlmulAndVma(
+                args, vtype, kElementType, kValue<size_t{8}>, kVlmul, kVma, extra_args...);
           }
       }
     } else {
       if ((vtype >> 6) & 1) {
-        return OpVector<ElementType, vlmul, TailProcessing::kAgnostic, vma>(args, extra_args...);
+        return OpVectorWithElementTypeVlmulVtaAndVma(
+            args, kElementType, kVlmul, kValue<TailProcessing::kAgnostic>, kVma, extra_args...);
       }
-      return OpVector<ElementType, vlmul, TailProcessing::kUndisturbed, vma>(args, extra_args...);
+      return OpVectorWithElementTypeVlmulVtaAndVma(
+          args, kElementType, kVlmul, kValue<TailProcessing::kUndisturbed>, kVma, extra_args...);
     }
   }
 
-  template <typename ElementType,
-            size_t kSegmentSize,
+  template <TemplateTypeId ElementType,
+            size_t segment_size,
             VectorRegisterGroupMultiplier vlmul,
             auto vma,
             typename VOpArgs,
             typename... ExtraArgs>
-  void OpVector(const VOpArgs& args, Register vtype, ExtraArgs... extra_args) {
+  void OpVectorWithElementTypeSegmentSizeVlmulAndVma(const VOpArgs& args,
+                                                     Register vtype,
+                                                     const Value<ElementType> kElementType,
+                                                     const Value<segment_size> kSegmentSize,
+                                                     Value<vlmul>,
+                                                     const Value<vma> kVma,
+                                                     ExtraArgs... extra_args) {
+    using ElementTypе = WrappedTypeFromId<kElementType>;
     // Indexed loads and stores have two operands with different ElementType's and lmul sizes,
     // pass vtype to do further selection.
     if constexpr (std::is_same_v<VOpArgs, Decoder::VLoadIndexedArgs> ||
@@ -837,37 +911,53 @@ class Interpreter {
       // convert elmul to anything else we can immediately turn it into kIndexRegistersInvolved
       // here.
       if ((vtype >> 6) & 1) {
-        return OpVector<kSegmentSize,
-                        ElementType,
-                        NumberOfRegistersInvolved(vlmul),
-                        TailProcessing::kAgnostic,
-                        vma>(args, vtype, extra_args...);
+        return OpVectorWithSegmentSizeIndexTypeIndexRegistersCountVtaAndVma(
+            args,
+            vtype,
+            kSegmentSize,
+            kElementType,
+            kValue<NumberOfRegistersInvolved(vlmul)>,
+            kValue<TailProcessing::kAgnostic>,
+            kVma,
+            extra_args...);
       }
-      return OpVector<kSegmentSize,
-                      ElementType,
-                      NumberOfRegistersInvolved(vlmul),
-                      TailProcessing::kUndisturbed,
-                      vma>(args, vtype, extra_args...);
+      return OpVectorWithSegmentSizeIndexTypeIndexRegistersCountVtaAndVma(
+          args,
+          vtype,
+          kSegmentSize,
+          kElementType,
+          kValue<NumberOfRegistersInvolved(vlmul)>,
+          kValue<TailProcessing::kUndisturbed>,
+          kVma,
+          extra_args...);
     } else {
       // For other instruction we have parsed all the information from vtype and only need to pass
       // args and extra_args.
       if ((vtype >> 6) & 1) {
-        return OpVector<ElementType, kSegmentSize, vlmul, TailProcessing::kAgnostic, vma>(
+        return OpVector<ElementTypе, kSegmentSize, vlmul, TailProcessing::kAgnostic, vma>(
             args, extra_args...);
       }
-      return OpVector<ElementType, kSegmentSize, vlmul, TailProcessing::kUndisturbed, vma>(
+      return OpVector<ElementTypе, kSegmentSize, vlmul, TailProcessing::kUndisturbed, vma>(
           args, extra_args...);
     }
   }
 
   template <size_t kSegmentSize,
-            typename IndexElementType,
+            TemplateTypeId kIndexElementType,
             size_t kIndexRegistersInvolved,
             TailProcessing vta,
             auto vma,
             typename VOpArgs,
             typename... ExtraArgs>
-  void OpVector(const VOpArgs& args, Register vtype, ExtraArgs... extra_args) {
+  void OpVectorWithSegmentSizeIndexTypeIndexRegistersCountVtaAndVma(const VOpArgs& args,
+                                                                    Register vtype,
+                                                                    Value<kSegmentSize>,
+                                                                    Value<kIndexElementType>,
+                                                                    Value<kIndexRegistersInvolved>,
+                                                                    Value<vta>,
+                                                                    Value<vma>,
+                                                                    ExtraArgs... extra_args) {
+    using IndexElementType = WrappedTypeFromId<kIndexElementType>;
     VectorRegisterGroupMultiplier vlmul = static_cast<VectorRegisterGroupMultiplier>(vtype & 0b111);
     switch (static_cast<VectorSelectElementWidth>((vtype >> 3) & 0b111)) {
       case VectorSelectElementWidth::k8bit:
@@ -1338,8 +1428,17 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpFVfArgs& args, ElementType arg2) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpFVfArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>,
+                                             WrappedTypeFromId<kElementType> arg2) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = Wrapping<std::make_signed_t<typename TypeTraits<ElementType>::Int>>;
     if constexpr (sizeof(ElementType) == sizeof(Float32)) {
       // Keep cases sorted in opcode order to match RISC-V V manual.
@@ -1550,8 +1649,16 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpFVvArgs& args) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpFVvArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = Wrapping<std::make_signed_t<typename TypeTraits<ElementType>::Int>>;
     using UnsignedType = Wrapping<std::make_unsigned_t<typename TypeTraits<ElementType>::Int>>;
     // Floating point IEEE 754 value -0.0 includes 1 top bit set and the other bits not set:
@@ -2086,8 +2193,16 @@ class Interpreter {
     return Undefined();
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpIViArgs& args) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpIViArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = berberis::SignedType<ElementType>;
     using UnsignedType = berberis::UnsignedType<ElementType>;
     using SaturatingSignedType = SaturatingType<SignedType>;
@@ -2239,8 +2354,16 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpIVvArgs& args) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpIVvArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = berberis::SignedType<ElementType>;
     using UnsignedType = berberis::UnsignedType<ElementType>;
     using SaturatingSignedType = SaturatingType<SignedType>;
@@ -2416,8 +2539,17 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpIVxArgs& args, Register arg2) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpIVxArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>,
+                                             Register arg2) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = berberis::SignedType<ElementType>;
     using UnsignedType = berberis::UnsignedType<ElementType>;
     using SaturatingSignedType = SaturatingType<SignedType>;
@@ -2588,8 +2720,16 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpMVvArgs& args) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpMVvArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = berberis::SignedType<ElementType>;
     using UnsignedType = berberis::UnsignedType<ElementType>;
     if constexpr (std::is_same_v<decltype(vma), intrinsics::NoInactiveProcessing>) {
@@ -2852,8 +2992,17 @@ class Interpreter {
     }
   }
 
-  template <typename ElementType, VectorRegisterGroupMultiplier vlmul, TailProcessing vta, auto vma>
-  void OpVector(const Decoder::VOpMVxArgs& args, Register arg2) {
+  template <TemplateTypeId kElementType,
+            VectorRegisterGroupMultiplier vlmul,
+            TailProcessing vta,
+            auto vma>
+  void OpVectorWithElementTypeVlmulVtaAndVma(const Decoder::VOpMVxArgs& args,
+                                             const Value<kElementType>,
+                                             const Value<vlmul>,
+                                             const Value<vta>,
+                                             const Value<vma>,
+                                             Register arg2) {
+    using ElementType = WrappedTypeFromId<kElementType>;
     using SignedType = berberis::SignedType<ElementType>;
     using UnsignedType = berberis::UnsignedType<ElementType>;
     // Keep cases sorted in opcode order to match RISC-V V manual.

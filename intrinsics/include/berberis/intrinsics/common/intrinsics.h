@@ -98,21 +98,29 @@ constexpr TemplateTypeId TemplateTypeIdToWide(TemplateTypeId value) {
 
 template <typename Type>
 constexpr TemplateTypeId IdFromType() {
-  if constexpr (std::is_same_v<int8_t, std::decay_t<Type>>) {
+  if constexpr (std::is_same_v<int8_t, std::decay_t<Type>> ||
+                std::is_same_v<Int8, std::decay_t<Type>>) {
     return TemplateTypeId::kInt8T;
-  } else if constexpr (std::is_same_v<uint8_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<uint8_t, std::decay_t<Type>> ||
+                       std::is_same_v<UInt8, std::decay_t<Type>>) {
     return TemplateTypeId::kUInt8T;
-  } else if constexpr (std::is_same_v<int16_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<int16_t, std::decay_t<Type>> ||
+                       std::is_same_v<Int16, std::decay_t<Type>>) {
     return TemplateTypeId::kInt16T;
-  } else if constexpr (std::is_same_v<uint16_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<uint16_t, std::decay_t<Type>> ||
+                       std::is_same_v<UInt16, std::decay_t<Type>>) {
     return TemplateTypeId::kUInt16T;
-  } else if constexpr (std::is_same_v<int32_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<int32_t, std::decay_t<Type>> ||
+                       std::is_same_v<Int32, std::decay_t<Type>>) {
     return TemplateTypeId::kInt32T;
-  } else if constexpr (std::is_same_v<uint32_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<uint32_t, std::decay_t<Type>> ||
+                       std::is_same_v<UInt32, std::decay_t<Type>>) {
     return TemplateTypeId::kUInt32T;
-  } else if constexpr (std::is_same_v<int64_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<int64_t, std::decay_t<Type>> ||
+                       std::is_same_v<Int64, std::decay_t<Type>>) {
     return TemplateTypeId::kInt64T;
-  } else if constexpr (std::is_same_v<uint64_t, std::decay_t<Type>>) {
+  } else if constexpr (std::is_same_v<uint64_t, std::decay_t<Type>> ||
+                       std::is_same_v<UInt64, std::decay_t<Type>>) {
     return TemplateTypeId::kUInt64T;
   } else if constexpr (std::is_same_v<Float16, std::decay_t<Type>>) {
     return TemplateTypeId::kFloat16;
@@ -139,32 +147,43 @@ constexpr TemplateTypeId IntSizeToTemplateTypeId(uint8_t size, bool is_signed = 
 template <enum TemplateTypeId>
 class TypeFromIdHelper;
 
+template <enum TemplateTypeId>
+class WrappedTypeFromIdHelper;
+
 #pragma push_macro("DEFINE_TEMPLATE_TYPE_FROM_ENUM")
 #undef DEFINE_TEMPLATE_TYPE_FROM_ENUM
-#define DEFINE_TEMPLATE_TYPE_FROM_ENUM(kEnumValue, TemplateType) \
-  template <>                                                    \
-  class TypeFromIdHelper<kEnumValue> {                           \
-   public:                                                       \
-    using Type = TemplateType;                                   \
+#define DEFINE_TEMPLATE_TYPE_FROM_ENUM(kEnumValue, TemplateType, WrappedTemplateType) \
+  template <>                                                                         \
+  class TypeFromIdHelper<kEnumValue> {                                                \
+   public:                                                                            \
+    using Type = TemplateType;                                                        \
+  };                                                                                  \
+  template <>                                                                         \
+  class WrappedTypeFromIdHelper<kEnumValue> {                                         \
+   public:                                                                            \
+    using Type = WrappedTemplateType;                                                 \
   }
 
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt8T, int8_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt8T, uint8_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt16T, int16_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt16T, uint16_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt32T, int32_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt32T, uint32_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt64T, int64_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt64T, uint64_t);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kFloat16, Float16);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kFloat32, Float32);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kFloat64, Float64);
-DEFINE_TEMPLATE_TYPE_FROM_ENUM(kSIMD128Register, SIMD128Register);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt8T, int8_t, Int8);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt8T, uint8_t, UInt8);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt16T, int16_t, Int16);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt16T, uint16_t, UInt16);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt32T, int32_t, Int32);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt32T, uint32_t, UInt32);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kInt64T, int64_t, Int64);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kUInt64T, uint64_t, UInt64);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kFloat16, Float16, Float16);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kFloat32, Float32, Float32);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kFloat64, Float64, Float64);
+DEFINE_TEMPLATE_TYPE_FROM_ENUM(kSIMD128Register, SIMD128Register, SIMD128Register);
 
 #pragma pop_macro("DEFINE_TEMPLATE_TYPE_FROM_ENUM")
 
 template <enum TemplateTypeId kEnumValue>
 using TypeFromId = TypeFromIdHelper<kEnumValue>::Type;
+
+template <enum TemplateTypeId kEnumValue>
+using WrappedTypeFromId = WrappedTypeFromIdHelper<kEnumValue>::Type;
 
 // If we carry TemplateTypeId then we can do the exact same manipulations wuth it as with
 // normal value, but also can get actual type from it and do appropriate operations:
@@ -173,6 +192,7 @@ template <TemplateTypeId ValueParam>
 class Value<ValueParam> {
  public:
   using Type = TypeFromId<ValueParam>;
+  using WrappedType = WrappedTypeFromId<ValueParam>;
   using ValueType = TemplateTypeId;
   static constexpr auto kValue = ValueParam;
   constexpr operator TemplateTypeId() const { return kValue; }
