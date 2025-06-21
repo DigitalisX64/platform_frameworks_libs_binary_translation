@@ -214,6 +214,16 @@ class MacroAssembler : public Assembler {
     Bind(out);
   }
 
+  // dst: DEF, src1: USE
+  constexpr void NonLinearIntrinsicWithECXOutputNotZeroExtended(Register dst, Register src1) {
+    Label* out = MakeLabel();
+    Movl(dst, src1);
+    Movb(gpr_c, src1);
+    Jcc(Assembler::Condition::kZero, *out);
+    Addl(gpr_c, dst);
+    Bind(out);
+  }
+
   using AddressType = int64_t;
 };
 
@@ -658,7 +668,29 @@ TEST(VerifierAssembler, Test32BitOutputWithNoZeroExtensionNonLinearIntrinsic) {
                      Operand<FLAGS, kDef>>>>;
 
   ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
-               "error: intrinsic didn't zero extend 32 bit output register");
+               "error: intrinsic didn't zero extend 32 bit output general register");
+}
+
+TEST(VerifierAssembler, TestECXOutputWithNoZeroExtensionBindedToOutputNonLinearIntrinsic) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t, uint32_t>,
+      std::tuple<OutArg<0>, InArg<0>, OutTmpArg<1>, TmpArg>,
+      DeviceInsnInfo<
+          &std::tuple_element_t<0, Assemblers>::NonLinearIntrinsicWithECXOutputNotZeroExtended,
+          kBindingMnemo,
+          false,
+          nullptr,
+          NoCPUIDRestriction,
+          std::tuple<Operand<GeneralReg32, kDefEarlyClobber>,
+                     Operand<GeneralReg32, kUse>,
+                     Operand<ECX, kDef>,
+                     Operand<FLAGS, kDef>>>>;
+
+  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
+               "error: intrinsic didn't zero extend 32 bit ECX output");
 }
 
 }  // namespace

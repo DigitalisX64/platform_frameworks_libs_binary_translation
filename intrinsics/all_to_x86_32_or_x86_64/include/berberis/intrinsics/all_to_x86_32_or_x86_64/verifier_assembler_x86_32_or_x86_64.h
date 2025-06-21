@@ -320,9 +320,9 @@ class VerifierAssembler {
 
     constexpr void Update32BitGeneralRegisterExtension(int reg_arg_no, bool is_zero_extended) {
       if (is_zero_extended) {
-        zero_extended_32_bit_register.at(reg_arg_no) = true;
+        zero_extended_general_register.at(reg_arg_no) = true;
       } else {
-        zero_extended_32_bit_register.at(reg_arg_no) = false;
+        zero_extended_general_register.at(reg_arg_no) = false;
       }
     }
 
@@ -355,8 +355,8 @@ class VerifierAssembler {
       return state;
     }
 
-    constexpr void Check32BitRegisterIsZeroExtended(int reg_no) {
-      if (!zero_extended_32_bit_register.at(reg_no)) {
+    constexpr void Check32BitGeneralRegisterIsZeroExtended(int reg_no) {
+      if (!zero_extended_general_register.at(reg_no)) {
         FATAL("error: intrinsic didn't zero extend 32 bit output register");
       }
     }
@@ -391,7 +391,7 @@ class VerifierAssembler {
 
     std::array<bool, kMaxRegisters> valid_def_early_clobber_register{};
 
-    std::array<bool, kMaxRegisters> zero_extended_32_bit_register{};
+    std::array<bool, kMaxRegisters> zero_extended_general_register{};
     std::array<bool, 4> zero_extended_fixed_register{};  // {gpr_a, gpr_b, gpr_c, gpr_d}
   };
 
@@ -426,6 +426,14 @@ class VerifierAssembler {
         instruction_zero_extended_general_register.at(reg_no) = true;
       } else {
         instruction_defined_general_register_no_zero_extension.at(reg_no) = true;
+      }
+    }
+
+    constexpr void UpdateInstructionFixedRegisterZeroExtension(int reg_no, bool is_zero_extended) {
+      if (is_zero_extended) {
+        instruction_zero_extended_fixed_register.at(reg_no) = true;
+      } else {
+        instruction_defined_fixed_register_no_zero_extension.at(reg_no) = true;
       }
     }
 
@@ -475,7 +483,18 @@ class VerifierAssembler {
     }
 
     constexpr void ProcessInstructionZeroExtension(bool& register_currently_zero_extended,
-                                                   int reg_no) {
+                                                   int reg_no,
+                                                   bool register_is_fixed) {
+      if (register_is_fixed) {
+        if (instruction_defined_fixed_register_no_zero_extension.at(reg_no)) {
+          register_currently_zero_extended = false;
+          return;
+        }
+        if (instruction_zero_extended_fixed_register.at(reg_no)) {
+          register_currently_zero_extended = true;
+        }
+        return;
+      }
       if (instruction_defined_general_register_no_zero_extension.at(reg_no)) {
         register_currently_zero_extended = false;
         return;
@@ -500,6 +519,8 @@ class VerifierAssembler {
 
     std::array<bool, kMaxRegisters> instruction_defined_general_register_no_zero_extension{};
     std::array<bool, kMaxRegisters> instruction_zero_extended_general_register{};
+    std::array<bool, 4> instruction_defined_fixed_register_no_zero_extension{};
+    std::array<bool, 4> instruction_zero_extended_fixed_register{};
 
     bool is_unconditional_jump = false;
     bool is_conditional_jump = false;
@@ -524,11 +545,11 @@ class VerifierAssembler {
     register_usage_flags.CheckAppropriateDefEarlyClobbers();
   }
 
-  constexpr void Check32BitRegisterIsZeroExtended(int reg_no) {
+  constexpr void Check32BitGeneralRegisterIsZeroExtended(int reg_no) {
     if (!intrinsic_is_non_linear) {
-      register_usage_flags.Check32BitRegisterIsZeroExtended(reg_no);
+      register_usage_flags.Check32BitGeneralRegisterIsZeroExtended(reg_no);
     } else {
-      CheckInstructionZeroExtensionRecursive(0, false, reg_no);
+      CheckInstructionZeroExtensionRecursive(0, false, reg_no, false);
       // If an intrinsic has multiple 32 bit outputs, this recursive check will be run more than
       // once. Therefore, the visited state is reset at the end of a check.
       for (int i = 0; i < num_instructions_; i++) {
@@ -538,10 +559,16 @@ class VerifierAssembler {
   }
 
   constexpr void Check32BitFixedRegisterIsZeroExtended(int fixed_reg_index) {
-    if (intrinsic_is_non_linear) {
-      return;
+    if (!intrinsic_is_non_linear) {
+      register_usage_flags.Check32BitFixedRegisterIsZeroExtended(fixed_reg_index);
+    } else {
+      CheckInstructionZeroExtensionRecursive(0, false, fixed_reg_index, true);
+      // If an intrinsic has multiple 32 bit outputs, this recursive check will be run more than
+      // once. Therefore, the visited state is reset at the end of a check.
+      for (int i = 0; i < num_instructions_; i++) {
+        instructions.at(i).ResetZeroExtensionVisitedState();
+      }
     }
-    register_usage_flags.Check32BitFixedRegisterIsZeroExtended(fixed_reg_index);
   }
 
   constexpr void CheckLabelsAreBound() {
@@ -595,12 +622,28 @@ class VerifierAssembler {
 
   constexpr void CheckInstructionZeroExtensionRecursive(int current_instruction,
                                                         bool register_currently_zero_extended,
-                                                        int reg_no) {
+                                                        int reg_no,
+                                                        bool register_is_fixed) {
     CHECK_LE(current_instruction, num_instructions_);
     if (current_instruction == num_instructions_) {
       // Reached end of intrinsic. Check if register has ended up zero extended.
       if (!register_currently_zero_extended) {
-        FATAL("error: intrinsic didn't zero extend 32 bit output register");
+        if (register_is_fixed) {
+          if (reg_no == 0) {
+            FATAL("error: intrinsic didn't zero extend 32 bit EAX output");
+          }
+          if (reg_no == 1) {
+            FATAL("error: intrinsic didn't zero extend 32 bit EBX output");
+          }
+          if (reg_no == 2) {
+            FATAL("error: intrinsic didn't zero extend 32 bit ECX output");
+          }
+          if (reg_no == 3) {
+            FATAL("error: intrinsic didn't zero extend 32 bit EDX output");
+          }
+        } else {
+          FATAL("error: intrinsic didn't zero extend 32 bit output general register");
+        }
       }
       return;
     }
@@ -610,21 +653,23 @@ class VerifierAssembler {
     }
     instructions.at(current_instruction).SetVisited(register_currently_zero_extended);
     instructions.at(current_instruction)
-        .ProcessInstructionZeroExtension(register_currently_zero_extended, reg_no);
+        .ProcessInstructionZeroExtension(
+            register_currently_zero_extended, reg_no, register_is_fixed);
     if (instructions.at(current_instruction).is_unconditional_jump ||
         instructions.at(current_instruction).is_conditional_jump) {
       // Explore execution path given that jump is taken.
       CheckInstructionZeroExtensionRecursive(
           instructions.at(current_instruction).jump_target->index,
           register_currently_zero_extended,
-          reg_no);
+          reg_no,
+          register_is_fixed);
     }
     if (instructions.at(current_instruction).is_unconditional_jump) {
       return;
     }
     // Explore execution path given that we move to the next instruction.
     CheckInstructionZeroExtensionRecursive(
-        current_instruction + 1, register_currently_zero_extended, reg_no);
+        current_instruction + 1, register_currently_zero_extended, reg_no, register_is_fixed);
   }
 
   constexpr void Bind(Label* label) {
@@ -892,7 +937,7 @@ class VerifierAssembler {
     return false;
   }
 
-  constexpr bool GetFixedRegisterIndex(Register reg) {
+  constexpr int GetFixedRegisterIndex(Register reg) {
     if (gpr_a.has_value()) {
       if (reg == gpr_a) return 0;
     }
@@ -934,6 +979,8 @@ class VerifierAssembler {
       // zero_extended_fixed_register array, and we don't handle it here.
       if (fixed_reg_index < 4) {
         register_usage_flags.Update32BitFixedRegisterExtension(fixed_reg_index, is_zero_extended);
+        instructions.at(num_instructions_)
+            .UpdateInstructionFixedRegisterZeroExtension(fixed_reg_index, is_zero_extended);
       }
     }
   }

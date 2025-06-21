@@ -110,7 +110,7 @@ constexpr void Check32BitRegistersAreZeroExtended(AssemblerType* as) {
       if constexpr (HaveOutput(Binding::kArgInfo)) {
         static_assert(Operand::kUsage != device_arch_info::kUse);
         if constexpr (device_arch_info::kIsGeneralReg32<Operand>) {
-          as->Check32BitRegisterIsZeroExtended(id);
+          as->Check32BitGeneralRegisterIsZeroExtended(id);
         } else if constexpr (device_arch_info::kIsEAX<Operand>) {
           as->Check32BitFixedRegisterIsZeroExtended(0);
         } else if constexpr (device_arch_info::kIsEBX<Operand>) {

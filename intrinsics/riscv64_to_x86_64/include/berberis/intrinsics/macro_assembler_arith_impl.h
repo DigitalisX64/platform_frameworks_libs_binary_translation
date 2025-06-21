@@ -81,6 +81,10 @@ constexpr void MacroAssembler<Assembler, AssemblerBase>::DivRiscV(Register src) 
   Mov<IntType>(gpr_a, int64_t{-1});
 
   Bind(done);
+  if constexpr (sizeof(IntType) == sizeof(uint32_t)) {
+    // Ensure EAX is zero extended
+    Movl(gpr_a, gpr_a);
+  }
 }
 
 // Divisor comes in "src", dividend comes in gpr_a.

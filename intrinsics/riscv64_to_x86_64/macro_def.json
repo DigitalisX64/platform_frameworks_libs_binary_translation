@@ -147,8 +147,8 @@
       "name": "DivI64RiscV",
       "args": [
         { "class": "GeneralReg64", "usage": "use" },
-        { "class": "EAX", "usage": "use_def" },
-        { "class": "EDX", "usage": "def_early_clobber" },
+        { "class": "RAX", "usage": "use_def" },
+        { "class": "RDX", "usage": "def_early_clobber" },
         { "class": "FLAGS", "usage": "def" }
       ],
       "asm": "DivRiscV<int64_t>",
@@ -190,8 +190,8 @@
       "name": "DivU64RiscV",
       "args": [
         { "class": "GeneralReg64", "usage": "use" },
-        { "class": "EAX", "usage": "use_def" },
-        { "class": "EDX", "usage": "def_early_clobber" },
+        { "class": "RAX", "usage": "use_def" },
+        { "class": "RDX", "usage": "def_early_clobber" },
         { "class": "FLAGS", "usage": "def" }
       ],
       "asm": "DivRiscV<uint64_t>",
@@ -555,8 +555,8 @@
       "name": "RemI64RiscV",
       "args": [
         { "class": "GeneralReg64", "usage": "use" },
-        { "class": "EAX", "usage": "use_def" },
-        { "class": "EDX", "usage": "def_early_clobber" },
+        { "class": "RAX", "usage": "use_def" },
+        { "class": "RDX", "usage": "def_early_clobber" },
         { "class": "FLAGS", "usage": "def" }
       ],
       "asm": "RemRiscV<int64_t>",
@@ -598,8 +598,8 @@
       "name": "RemU64RiscV",
       "args": [
         { "class": "GeneralReg64", "usage": "use" },
-        { "class": "EAX", "usage": "use_def" },
-        { "class": "EDX", "usage": "def_early_clobber" },
+        { "class": "RAX", "usage": "use_def" },
+        { "class": "RDX", "usage": "def_early_clobber" },
         { "class": "FLAGS", "usage": "def" }
       ],
       "asm": "RemRiscV<uint64_t>",

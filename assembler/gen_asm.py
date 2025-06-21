@@ -189,6 +189,9 @@ def _get_implicit_fixed_register(arg_class):
     return "gpr_d"
   return False
 
+def _is_32_bit_implicit_fixed_register(arg_class):
+  return arg_class in ["EAX", "EBX", "ECX", "EDX"]
+
 def _gen_register_read_write_info(insn, arch):
   # Process register uses before register defs. This ensures valid register uses are verified
   # against register definitions that occurred only before the current instruction.
@@ -199,7 +202,10 @@ def _gen_register_read_write_info(insn, arch):
       if asm_defs.is_implicit_reg(arg.get('class')):
         implicit_fixed_reg = _get_implicit_fixed_register(arg.get('class'))
         if implicit_fixed_reg and (arg.get('usage') == usage or arg.get('usage') == "use_def"):
-          yield '  Register%s(%s);' % (usage.capitalize(), implicit_fixed_reg)
+          if usage == "def" and _is_32_bit_implicit_fixed_register(arg.get('class')):
+            yield  '  Register%s(%s, true);' % (usage.capitalize(), implicit_fixed_reg)
+          else:
+            yield '  Register%s(%s);' % (usage.capitalize(), implicit_fixed_reg)
         continue
       if (_get_arg_type_name(arg, insn.get('type', None)) in register_types_to_gen
           and 'x86' in arch):

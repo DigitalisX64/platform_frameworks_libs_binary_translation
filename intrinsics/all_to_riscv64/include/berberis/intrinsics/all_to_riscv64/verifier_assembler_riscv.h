@@ -128,7 +128,7 @@ class VerifierAssembler {
 
   constexpr void CheckAppropriateDefEarlyClobbers() {}
 
-  constexpr void Check32BitRegisterIsZeroExtended([[maybe_unused]] int reg_no) {}
+  constexpr void Check32BitGeneralRegisterIsZeroExtended([[maybe_unused]] int reg_no) {}
 
   constexpr void Check32BitFixedRegisterIsZeroExtended([[maybe_unused]] int fixed_reg_index) {}
 
