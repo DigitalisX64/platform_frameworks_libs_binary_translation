@@ -873,6 +873,12 @@ template <typename BaseType>
 template <typename T>
 using FloatType = decltype(BitCastToFloat(std::declval<T>()));
 
+// When input type is exactly the same as output type we just return value without doing anything.
+template <typename ResultType>
+[[nodiscard]] ResultType constexpr MaybeTruncateTo(ResultType src) {
+  return src;
+}
+
 template <typename ResultType, typename IntType>
 [[nodiscard]] auto constexpr MaybeTruncateTo(IntType src)
     -> std::enable_if_t<std::is_integral_v<IntType> &&
