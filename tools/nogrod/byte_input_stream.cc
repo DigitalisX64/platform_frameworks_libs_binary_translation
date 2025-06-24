@@ -16,11 +16,14 @@
 
 #include "byte_input_stream.h"
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/checks.h"
 
 #include "leb128.h"
 
 namespace nogrod {
+
+using berberis::bit_cast;
 
 ByteInputStream::ByteInputStream(const uint8_t* buffer, size_t size)
     : buffer_(buffer), size_(size), offset_(0) {}
@@ -104,7 +107,7 @@ std::vector<uint8_t> ByteInputStream::ReadBytes(uint64_t size) {
 std::string ByteInputStream::ReadString() {
   CHECK_LT(offset_, size_);  // there should be a place for at least one 0
 
-  const char* candidate = reinterpret_cast<const char*>(buffer_ + offset_);
+  const char* candidate = bit_cast<const char*>(buffer_ + offset_);
   while (buffer_[offset_++] != 0) {
     CHECK_LT(offset_, size_);
   }

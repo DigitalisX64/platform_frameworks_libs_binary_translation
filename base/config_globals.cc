@@ -39,7 +39,7 @@ const char* g_app_package_name = nullptr;
 const char* g_app_private_dir = nullptr;
 
 const char* MakeForeverCStr(std::string_view view) {
-  auto str = reinterpret_cast<char*>(AllocateForever(view.size() + 1, alignof(char)));
+  auto str = std::bit_cast<char*>(AllocateForever(view.size() + 1, alignof(char)));
   memcpy(str, view.data(), view.size());
   str[view.size()] = '\0';
   return str;
@@ -55,7 +55,7 @@ bool TryReadBionicSystemPropertyImpl(const std::string_view prop_name, const cha
   __system_property_read_callback(
       pi,
       [](void* cookie, const char*, const char* value, unsigned) {
-        *reinterpret_cast<const char**>(cookie) = MakeForeverCStr(value);
+        *std::bit_cast<const char**>(cookie) = MakeForeverCStr(value);
       },
       value_ptr);
   return true;

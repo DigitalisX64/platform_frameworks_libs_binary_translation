@@ -40,6 +40,8 @@
   (MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) | MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
    MAYBE_MAP_FLAG((x), PF_W, PROT_WRITE))
 
+using berberis::bit_cast;
+
 namespace {
 
 void set_error_msg(std::string* error_msg, const char* format, ...) {
@@ -344,7 +346,7 @@ bool TinyElfLoader::ReadProgramHeadersFromMemory(const ElfEhdr* header, uintptr_
     return false;
   }
 
-  *phdr_table = reinterpret_cast<const ElfPhdr*>(load_addr + header->e_phoff);
+  *phdr_table = bit_cast<const ElfPhdr*>(load_addr + header->e_phoff);
   *phdr_num = phnum;
   return true;
 }
@@ -357,7 +359,7 @@ uint8_t* TinyElfLoader::Reserve(void* hint, size_t size, TinyLoader::mmap64_fn_t
     return nullptr;
   }
 
-  return reinterpret_cast<uint8_t*>(mmap_ptr);
+  return bit_cast<uint8_t*>(mmap_ptr);
 }
 
 bool TinyElfLoader::ReserveAddressSpace(ElfHalf e_type, const ElfPhdr* phdr_table, size_t phdr_num,
@@ -371,7 +373,7 @@ bool TinyElfLoader::ReserveAddressSpace(ElfHalf e_type, const ElfPhdr* phdr_tabl
     return false;
   }
 
-  uint8_t* addr = reinterpret_cast<uint8_t*>(min_vaddr);
+  uint8_t* addr = bit_cast<uint8_t*>(min_vaddr);
   uint8_t* start;
 
   if (e_type == ET_EXEC) {
@@ -458,8 +460,11 @@ bool TinyElfLoader::LoadSegments(int fd, size_t file_size, ElfHalf e_type,
       set_error_msg(&error_msg_,
                     "invalid ELF file \"%s\" load segment[%zd]:"
                     " p_offset (%p) + p_filesz (%p) ( = %p) past end of file (0x%" PRIx64 ")",
-                    name_, i, reinterpret_cast<void*>(phdr->p_offset),
-                    reinterpret_cast<void*>(phdr->p_filesz), reinterpret_cast<void*>(file_end),
+                    name_,
+                    i,
+                    bit_cast<void*>(phdr->p_offset),
+                    bit_cast<void*>(phdr->p_filesz),
+                    bit_cast<void*>(file_end),
                     file_size);
       return false;
     }
@@ -471,8 +476,12 @@ bool TinyElfLoader::LoadSegments(int fd, size_t file_size, ElfHalf e_type,
         return false;
       }
 
-      void* seg_addr = mmap64_fn(reinterpret_cast<void*>(seg_page_start), file_length, prot,
-                                 MAP_FIXED | MAP_PRIVATE, fd, file_page_start);
+      void* seg_addr = mmap64_fn(bit_cast<void*>(seg_page_start),
+                                 file_length,
+                                 prot,
+                                 MAP_FIXED | MAP_PRIVATE,
+                                 fd,
+                                 file_page_start);
       if (seg_addr == MAP_FAILED) {
         set_error_msg(&error_msg_, "couldn't map \"%s\" segment %zd: %s", name_, i,
                       strerror(errno));
@@ -483,9 +492,7 @@ bool TinyElfLoader::LoadSegments(int fd, size_t file_size, ElfHalf e_type,
     // if the segment is writable, and does not end on a page boundary,
     // zero-fill it until the page limit.
     if ((phdr->p_flags & PF_W) != 0 && page_offset(seg_file_end) > 0) {
-      memset(reinterpret_cast<void*>(seg_file_end),
-             0,
-             berberis::kPageSize - page_offset(seg_file_end));
+      memset(bit_cast<void*>(seg_file_end), 0, berberis::kPageSize - page_offset(seg_file_end));
     }
 
     seg_file_end = page_align_up(seg_file_end);
@@ -496,9 +503,12 @@ bool TinyElfLoader::LoadSegments(int fd, size_t file_size, ElfHalf e_type,
     // map for all extra pages.
     if (seg_page_end > seg_file_end) {
       size_t zeromap_size = seg_page_end - seg_file_end;
-      void* zeromap =
-          mmap64_fn(reinterpret_cast<void*>(seg_file_end), zeromap_size,
-                    PFLAGS_TO_PROT(phdr->p_flags), MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+      void* zeromap = mmap64_fn(bit_cast<void*>(seg_file_end),
+                                zeromap_size,
+                                PFLAGS_TO_PROT(phdr->p_flags),
+                                MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE,
+                                -1,
+                                0);
       if (zeromap == MAP_FAILED) {
         set_error_msg(&error_msg_, "couldn't zero fill \"%s\" gap: %s", name_, strerror(errno));
         return false;
@@ -521,7 +531,7 @@ bool TinyElfLoader::FindDynamicSegment(const ElfEhdr* header) {
     const ElfPhdr& phdr = loaded_phdr_[i];
     if (phdr.p_type == PT_DYNAMIC) {
       // TODO(dimitry): Check all addresses and sizes referencing loaded segments.
-      dynamic_ = reinterpret_cast<ElfDyn*>(load_bias_ + phdr.p_vaddr);
+      dynamic_ = bit_cast<ElfDyn*>(load_bias_ + phdr.p_vaddr);
       return true;
     }
   }
@@ -532,7 +542,7 @@ bool TinyElfLoader::FindDynamicSegment(const ElfEhdr* header) {
 
 bool TinyElfLoader::InitializeFields(const ElfEhdr* header) {
   if (header->e_entry != 0) {
-    entry_point_ = reinterpret_cast<void*>(load_bias_ + header->e_entry);
+    entry_point_ = bit_cast<void*>(load_bias_ + header->e_entry);
   }
 
   // There is nothing else to do for a static executable.
@@ -543,13 +553,12 @@ bool TinyElfLoader::InitializeFields(const ElfEhdr* header) {
   for (const ElfDyn* d = dynamic_; d->d_tag != DT_NULL; ++d) {
     if (d->d_tag == DT_GNU_HASH) {
       has_gnu_hash_ = true;
-      gnu_nbucket_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[0];
-      gnu_maskwords_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[2];
-      gnu_shift2_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[3];
-      gnu_bloom_filter_ = reinterpret_cast<ElfAddr*>(load_bias_ + d->d_un.d_ptr + 16);
-      gnu_bucket_ = reinterpret_cast<uint32_t*>(gnu_bloom_filter_ + gnu_maskwords_);
-      gnu_chain_ =
-          gnu_bucket_ + gnu_nbucket_ - reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[1];
+      gnu_nbucket_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[0];
+      gnu_maskwords_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[2];
+      gnu_shift2_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[3];
+      gnu_bloom_filter_ = bit_cast<ElfAddr*>(load_bias_ + d->d_un.d_ptr + 16);
+      gnu_bucket_ = bit_cast<uint32_t*>(gnu_bloom_filter_ + gnu_maskwords_);
+      gnu_chain_ = gnu_bucket_ + gnu_nbucket_ - bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[1];
 
       if (!powerof2(gnu_maskwords_)) {
         set_error_msg(&error_msg_,
@@ -561,14 +570,14 @@ bool TinyElfLoader::InitializeFields(const ElfEhdr* header) {
 
       --gnu_maskwords_;
     } else if (d->d_tag == DT_HASH) {
-      sysv_nbucket_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[0];
-      sysv_nchain_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[1];
-      sysv_bucket_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr + 8);
-      sysv_chain_ = reinterpret_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr + 8 + sysv_nbucket_ * 4);
+      sysv_nbucket_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[0];
+      sysv_nchain_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr)[1];
+      sysv_bucket_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr + 8);
+      sysv_chain_ = bit_cast<uint32_t*>(load_bias_ + d->d_un.d_ptr + 8 + sysv_nbucket_ * 4);
     } else if (d->d_tag == DT_SYMTAB) {
-      symtab_ = reinterpret_cast<ElfSym*>(load_bias_ + d->d_un.d_ptr);
+      symtab_ = bit_cast<ElfSym*>(load_bias_ + d->d_un.d_ptr);
     } else if (d->d_tag == DT_STRTAB) {
-      strtab_ = reinterpret_cast<const char*>(load_bias_ + d->d_un.d_ptr);
+      strtab_ = bit_cast<const char*>(load_bias_ + d->d_un.d_ptr);
     } else if (d->d_tag == DT_STRSZ) {
       strtab_size_ = d->d_un.d_val;
     }
@@ -593,8 +602,8 @@ bool TinyElfLoader::InitializeFields(const ElfEhdr* header) {
 }
 
 bool TinyElfLoader::Parse(void* load_ptr, size_t load_size, LoadedElfFile* loaded_elf_file) {
-  uintptr_t load_addr = reinterpret_cast<uintptr_t>(load_ptr);
-  const ElfEhdr* header = reinterpret_cast<const ElfEhdr*>(load_addr);
+  uintptr_t load_addr = bit_cast<uintptr_t>(load_ptr);
+  const ElfEhdr* header = bit_cast<const ElfEhdr*>(load_addr);
   if (!CheckElfHeader(header)) {
     return false;
   }

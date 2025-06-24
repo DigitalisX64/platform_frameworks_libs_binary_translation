@@ -24,9 +24,12 @@
 
 #include <sys/user.h>
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/file.h"
 #include "berberis/base/page_size.h"
 #include "berberis/base/stringprintf.h"
+
+using berberis::bit_cast;
 
 namespace {
 
@@ -89,7 +92,7 @@ void TestLoadLibrary(const char* test_library_name) {
   void* base_addr = loaded_elf_file.base_addr();
   ElfAddr load_bias = loaded_elf_file.load_bias();
   ASSERT_TRUE(base_addr != nullptr);
-  ASSERT_TRUE(reinterpret_cast<void*>(load_bias) == base_addr);
+  ASSERT_TRUE(bit_cast<void*>(load_bias) == base_addr);
   ASSERT_TRUE(loaded_elf_file.phdr_table() != nullptr);
   ASSERT_EQ(loaded_elf_file.phdr_count(), 9U);
   void* symbol_addr = loaded_elf_file.FindSymbol(kTestSymbolName);
@@ -169,7 +172,7 @@ TEST(tiny_loader, binary) {
   ASSERT_TRUE(TinyLoader::LoadFromFile(elf_filepath.c_str(), &loaded_elf_file, &error_msg))
       << error_msg;
 
-  ASSERT_EQ(reinterpret_cast<void*>(kStaticExecutableEntryPoint), loaded_elf_file.entry_point());
+  ASSERT_EQ(bit_cast<void*>(kStaticExecutableEntryPoint), loaded_elf_file.entry_point());
   ASSERT_EQ(ET_EXEC, loaded_elf_file.e_type());
 
   ASSERT_NE(nullptr, loaded_elf_file.phdr_table());

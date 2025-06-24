@@ -24,6 +24,9 @@
 
 namespace berberis::config {
 
+// Pick faster or smaller codegeneration.
+inline constexpr bool kUseLowDemultiplexer = true;
+
 // Guest page size
 inline const size_t kGuestPageSize = berberis::kPageSize;
 

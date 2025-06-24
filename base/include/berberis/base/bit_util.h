@@ -17,6 +17,7 @@
 #ifndef BERBERIS_BASE_BIT_UTIL_H_
 #define BERBERIS_BASE_BIT_UTIL_H_
 
+#include <bit>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -282,21 +283,7 @@ template <typename T>
   return {Popcount(x.value)};
 }
 
-// bit_cast<Dest, Source> is a well-defined equivalent of address-casting:
-//   *reinterpret_cast<Dest*>(&source)
-// See chromium base/macros.h for details.
-template <class Dest, class Source>
-inline Dest bit_cast(const Source& source) {
-  static_assert(sizeof(Dest) == sizeof(Source),
-                "bit_cast: source and destination must be of same size");
-  static_assert(std::is_trivially_copyable_v<Dest>,
-                "bit_cast: destination must be trivially copyable");
-  static_assert(std::is_trivially_copyable_v<Source>,
-                "bit_cast: source must be trivially copyable");
-  Dest dest;
-  memcpy(&dest, &source, sizeof(dest));
-  return dest;
-}
+using std::bit_cast;
 
 namespace intrinsics {
 

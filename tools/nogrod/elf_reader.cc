@@ -130,7 +130,7 @@ class ElfFileImpl : public ElfFile {
       return std::nullopt;
     }
 
-    const typename ElfT::Chrd* chrd = reinterpret_cast<const ElfT::Chrd*>(section_data);
+    const typename ElfT::Chrd* chrd = bit_cast<const typename ElfT::Chrd*>(section_data);
     if (chrd->ch_type != ELFCOMPRESS_ZSTD) {
       *error_msg = StringPrintf("Unsupported compression type: %d, expected ELFCOMPRESS_ZSTD(2)",
                                 chrd->ch_type);
@@ -143,9 +143,9 @@ class ElfFileImpl : public ElfFile {
     size_t compressed_size = section_size - kChdrSize;
     std::vector<T> uncompressed_data(uncompressed_size);
 
-    size_t result = ZSTD_decompress(reinterpret_cast<uint8_t*>(uncompressed_data.data()),
+    size_t result = ZSTD_decompress(bit_cast<uint8_t*>(uncompressed_data.data()),
                                     uncompressed_data.size(),
-                                    reinterpret_cast<const uint8_t*>(compressed_data),
+                                    bit_cast<const uint8_t*>(compressed_data),
                                     compressed_size);
 
     if (ZSTD_isError(result)) {
