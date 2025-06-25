@@ -37,20 +37,20 @@ class ForeverAllocator {
   template <typename T>
   T* Allocate() {
     static_assert(sizeof(T) < kPageSize, "ForeverAllocator: bad type");
-    return reinterpret_cast<T*>(AllocateImpl(sizeof(T), alignof(T)));
+    return bit_cast<T*>(AllocateImpl(sizeof(T), alignof(T)));
   }
 
   void* Allocate(size_t size, size_t align) {
     CHECK_GT(size, 0);
     CHECK_LT(size, static_cast<size_t>(kPageSize));
     CHECK(IsPowerOf2(align));
-    return reinterpret_cast<void*>(AllocateImpl(size, align));
+    return bit_cast<void*>(AllocateImpl(size, align));
   }
 
  private:
   uintptr_t AllocatePage() {
     void* ptr = MmapOrDie(kPageSize);
-    uintptr_t page = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t page = bit_cast<uintptr_t>(ptr);
     CHECK(IsAlignedPageSize(page));
 
     uintptr_t curr = 0;

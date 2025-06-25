@@ -52,7 +52,7 @@ struct PointerAndCounter {
 
   // ATTENTION: counter might get truncated!
   static uint64_t PackUnsafe(T* p, uint64_t cnt) {
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(p);
+    uintptr_t ptr = bit_cast<uintptr_t>(p);
     return (static_cast<uint64_t>(ptr) >> kAlignBits) | (cnt << kRealPointerBits);
   }
 
@@ -63,7 +63,7 @@ struct PointerAndCounter {
 
   static T* UnpackPointer(uint64_t v) {
     uintptr_t ptr = static_cast<uintptr_t>((v & kRealPointerMask) << kAlignBits);
-    return reinterpret_cast<T*>(ptr);
+    return bit_cast<T*>(ptr);
   }
 
   static uint64_t UnpackCounter(uint64_t v) { return v >> kRealPointerBits; }

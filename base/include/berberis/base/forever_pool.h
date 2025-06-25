@@ -19,6 +19,7 @@
 
 #include <cstddef>
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/forever_alloc.h"
 #include "berberis/base/lock_free_stack.h"
 
@@ -34,12 +35,12 @@ class ForeverPool {
   static T* Alloc() {
     Node* p = g_free_list_.Pop();
     if (p) {
-      return reinterpret_cast<T*>(p);
+      return bit_cast<T*>(p);
     }
-    return reinterpret_cast<T*>(AllocateForever(sizeof(Node), alignof(Node)));
+    return bit_cast<T*>(AllocateForever(sizeof(Node), alignof(Node)));
   }
 
-  static void Free(T* p) { g_free_list_.Push(reinterpret_cast<Node*>(p)); }
+  static void Free(T* p) { g_free_list_.Push(bit_cast<Node*>(p)); }
 
  private:
   // LockFreeStack requires 'next' data member.

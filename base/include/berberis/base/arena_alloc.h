@@ -42,8 +42,8 @@ struct ArenaBlock {
   const size_t size;
   ArenaBlock* next;
 
-  uint8_t* data() { return reinterpret_cast<uint8_t*>(this) + sizeof(ArenaBlock); }
-  uint8_t* data_end() { return reinterpret_cast<uint8_t*>(this) + size; }
+  uint8_t* data() { return bit_cast<uint8_t*>(this) + sizeof(ArenaBlock); }
+  uint8_t* data_end() { return bit_cast<uint8_t*>(this) + size; }
 };
 
 inline ArenaBlock* AllocArenaBlock(size_t size, size_t align, ArenaBlock* blocks) {
@@ -146,7 +146,7 @@ class ArenaAllocator {
 
   T* allocate(size_t n) {
     size_t size = n * sizeof(T);
-    return reinterpret_cast<T*>(arena()->Alloc(size, alignof(T)));
+    return bit_cast<T*>(arena()->Alloc(size, alignof(T)));
   }
 
   void deallocate(T*, size_t) {}

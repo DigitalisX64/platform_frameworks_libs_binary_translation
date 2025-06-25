@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <random>  // for old versions of GLIBC only (see below)
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/checks.h"
 
 namespace berberis {
@@ -80,7 +81,7 @@ void* TryMmap32Bit(MmapImplArgs args) {
   for (size_t i = 0; i < kMaxMapAttempts; i++) {
     // PROT_NONE, MAP_NORESERVE to make it faster since this may take several attempts.
     // We'll do another mmap() with proper flags on top of this one below.
-    void* addr = mmap(reinterpret_cast<void*>(hint),
+    void* addr = mmap(bit_cast<void*>(hint),
                       args.size,
                       PROT_NONE,
                       MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
@@ -90,7 +91,7 @@ void* TryMmap32Bit(MmapImplArgs args) {
       return MAP_FAILED;
     }
 
-    uintptr_t start = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t start = bit_cast<uintptr_t>(addr);
     uintptr_t end = start + args.size;
 
     if (end <= kMaxAddress) {

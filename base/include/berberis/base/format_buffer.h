@@ -339,7 +339,7 @@ class FormatBufferVaListArgs {
   explicit FormatBufferVaListArgs(va_list ap) { va_copy(ap_, ap); }
 
   const char* GetCStr() { return va_arg(ap_, const char*); }
-  uintmax_t GetPtrAsUInt() { return reinterpret_cast<uintptr_t>(va_arg(ap_, void*)); }
+  uintmax_t GetPtrAsUInt() { return va_arg(ap_, uintptr_t); }
   intmax_t GetInt() { return va_arg(ap_, int); }
   intmax_t GetLong() { return va_arg(ap_, long); }
   intmax_t GetLongLong() { return va_arg(ap_, long long); }

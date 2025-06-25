@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "berberis/base/bit_util.h"
 #include "gtest/gtest.h"
 
 namespace berberis {
@@ -42,8 +43,7 @@ TEST(RawSyscall, SyscallWith2Args) {
   EXPECT_EQ(ret, 0);
 
   struct timespec ts2;
-  ret = RawSyscall(
-      __NR_clock_gettime, static_cast<long>(CLOCK_REALTIME), reinterpret_cast<long>(&ts2));
+  ret = RawSyscall(__NR_clock_gettime, static_cast<long>(CLOCK_REALTIME), bit_cast<long>(&ts2));
   EXPECT_EQ(ret, 0);
   EXPECT_LE(ts2.tv_sec - ts2.tv_sec, 1)
       << "clib call and raw call should be within 1 second of each other";

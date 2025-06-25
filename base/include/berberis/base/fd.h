@@ -43,7 +43,7 @@ inline void FtruncateOrDie(int fd, off64_t size) {
 }
 
 inline void WriteFullyOrDie(int fd, const void* data, size_t size) {
-  auto* curr = reinterpret_cast<const uint8_t*>(data);
+  auto* curr = bit_cast<const uint8_t*>(data);
   auto* end = curr + size;
   while (curr < end) {
     auto written = RawSyscall(__NR_write, fd, bit_cast<long>(curr), end - curr);
