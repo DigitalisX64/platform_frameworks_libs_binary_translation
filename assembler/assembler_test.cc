@@ -1068,7 +1068,7 @@ bool XmmMemTest() {
 
   using TestFunc = uint64_t(char* p);
   uint64_t result = exec.get<TestFunc>()(p);
-  uint64_t doubled = *reinterpret_cast<uint64_t*>(p);
+  uint64_t doubled = *bit_cast<uint64_t*>(p);
   return result == 0x406de00000000000ULL && doubled == 0x407de00000000000ULL;
 }
 

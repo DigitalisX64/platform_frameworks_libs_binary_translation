@@ -19,6 +19,7 @@
 
 #include <string_view>
 
+#include "berberis/base/bit_util.h"
 #include "berberis/runtime_primitives/code_pool.h"
 
 namespace berberis {
@@ -45,7 +46,7 @@ MockExecRegionFactory* MockExecRegionFactory::impl_ = nullptr;
 namespace {
 
 uint8_t* AllocWritableRegion() {
-  return reinterpret_cast<uint8_t*>(MmapImplOrDie({
+  return bit_cast<uint8_t*>(MmapImplOrDie({
       .size = MockExecRegionFactory::kExecRegionSize,
       .prot = PROT_READ | PROT_WRITE,
       .flags = MAP_PRIVATE | MAP_ANONYMOUS,
@@ -53,7 +54,7 @@ uint8_t* AllocWritableRegion() {
 }
 
 uint8_t* AllocExecutableRegion() {
-  return reinterpret_cast<uint8_t*>(MmapImplOrDie({
+  return bit_cast<uint8_t*>(MmapImplOrDie({
       .size = MockExecRegionFactory::kExecRegionSize,
       .prot = PROT_NONE,
       .flags = MAP_PRIVATE | MAP_ANONYMOUS,
@@ -88,8 +89,7 @@ TEST(CodePool, Smoke) {
     machine_code.AddSequence(kCode.data(), kCode.size());
     auto host_code = code_pool.Add(&machine_code);
     ASSERT_EQ(host_code, AsHostCodeAddr(first_exec_region_memory_exec));
-    EXPECT_EQ(std::string_view{reinterpret_cast<const char*>(first_exec_region_memory_write)},
-              kCode);
+    EXPECT_EQ(std::string_view{bit_cast<const char*>(first_exec_region_memory_write)}, kCode);
   }
 
   code_pool.ResetExecRegion();
@@ -100,8 +100,7 @@ TEST(CodePool, Smoke) {
     machine_code.AddSequence(kCode.data(), kCode.size());
     auto host_code = code_pool.Add(&machine_code);
     ASSERT_EQ(host_code, AsHostCodeAddr(second_exec_region_memory_exec));
-    EXPECT_EQ(std::string_view{reinterpret_cast<const char*>(second_exec_region_memory_write)},
-              kCode);
+    EXPECT_EQ(std::string_view{bit_cast<const char*>(second_exec_region_memory_write)}, kCode);
   }
 }
 

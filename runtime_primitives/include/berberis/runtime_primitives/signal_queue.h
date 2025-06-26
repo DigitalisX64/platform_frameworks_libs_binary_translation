@@ -63,7 +63,7 @@ class SignalQueue {
   void FreeSignal(siginfo_t* info);
 
  private:
-  // Can reinterpret_cast siginfo_t* -> Node*!
+  // Node and siginfo_t are pointer-interconvertible
   struct Node {
     siginfo_t info;
     Node* next;

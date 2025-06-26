@@ -23,6 +23,7 @@
 
 #include <atomic>
 
+#include "berberis/base/bit_util.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_arch.h"
 
@@ -68,7 +69,7 @@ class MemoryRegionReservation {
     auto new_value = cpu->reservation_value;
 
     // Embed value into new region value.
-    memcpy(reinterpret_cast<char*>(&new_value) + (addr - aligned_addr), &value, sizeof(Type));
+    memcpy(bit_cast<char*>(&new_value) + (addr - aligned_addr), &value, sizeof(Type));
 
     return ReservationExchange(cpu, aligned_addr, cur_value, new_value, mem_order) ? 0 : 1;
   }

@@ -22,6 +22,7 @@
 #include <type_traits>  // std::is_same
 
 #include "berberis/assembler/x86_32_or_x86_64.h"
+#include "berberis/base/bit_util.h"
 
 namespace berberis {
 
@@ -165,8 +166,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
     Emit8(0xe8);
     Emit32(0xcccccccc);
     // Set last 4 bytes to displacement from current pc to 'target'.
-    AddRelocation(
-        pc() - 4, RelocationType::RelocAbsToDisp32, pc(), reinterpret_cast<intptr_t>(target));
+    AddRelocation(pc() - 4, RelocationType::RelocAbsToDisp32, pc(), bit_cast<intptr_t>(target));
   }
 
   // Unside Jcc(Label), hidden by special version below.

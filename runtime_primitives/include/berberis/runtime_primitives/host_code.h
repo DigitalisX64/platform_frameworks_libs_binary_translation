@@ -55,12 +55,12 @@ constexpr HostCodeAddr kNullHostCodeAddr = 0;
 
 template <typename T>
 inline HostCode AsHostCode(T ptr) {
-  return reinterpret_cast<HostCode>(ptr);
+  return bit_cast<HostCode>(ptr);
 }
 
 template <typename T>
 inline T AsFuncPtr(HostCode ptr) {
-  return reinterpret_cast<T>(const_cast<void*>(ptr));
+  return bit_cast<T>(const_cast<void*>(ptr));
 }
 
 // Note: ideally we would like the class to be a local class in the AsFuncPtr function below, but
@@ -76,7 +76,7 @@ class [[nodiscard]] AsFuncPtrAdaptor {
  public:
   template <typename Result, typename... Args>
   operator MakeFunctionType<Result, Args...>() {
-    return reinterpret_cast<MakeFunctionType<Result, Args...>>(ptr_);
+    return bit_cast<MakeFunctionType<Result, Args...>>(ptr_);
   }
 
  private:

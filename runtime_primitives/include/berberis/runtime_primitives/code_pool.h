@@ -22,6 +22,7 @@
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/base/arena_alloc.h"
+#include "berberis/base/bit_util.h"
 #include "berberis/base/config_globals.h"
 #include "berberis/base/exec_region.h"
 #include "berberis/base/tracing.h"
@@ -117,7 +118,7 @@ class DataPool {
 
   template <typename T>
   T* Add(const T& v) {
-    return reinterpret_cast<T*>(AddRaw(&v, sizeof(T)));
+    return bit_cast<T*>(AddRaw(&v, sizeof(T)));
   }
 
   void* AddRaw(const void* ptr, uint32_t size);

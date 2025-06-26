@@ -18,6 +18,7 @@
 
 #include <atomic>
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/forever_pool.h"
 
 namespace berberis {
@@ -28,7 +29,7 @@ siginfo_t* SignalQueue::AllocSignal() {
 }
 
 void SignalQueue::EnqueueSignal(siginfo_t* info) {
-  Node* node = reinterpret_cast<Node*>(info);
+  Node* node = bit_cast<Node*>(info);
   Node* produced = produced_.load(std::memory_order_relaxed);
   do {
     node->next = produced;
@@ -69,7 +70,7 @@ siginfo_t* SignalQueue::DequeueSignalUnsafe() {
 }
 
 void SignalQueue::FreeSignal(siginfo_t* info) {
-  ForeverPool<Node>::Free(reinterpret_cast<Node*>(info));
+  ForeverPool<Node>::Free(bit_cast<Node*>(info));
 }
 
 }  // namespace berberis

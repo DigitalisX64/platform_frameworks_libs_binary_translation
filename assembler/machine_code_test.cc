@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include "berberis/assembler/machine_code.h"
+#include "berberis/base/bit_util.h"
 
 namespace berberis {
 
@@ -66,8 +67,8 @@ TEST(MachineCodeTest, RelocRecoveryPoint) {
   EXPECT_EQ(0xad, out[1]);
   EXPECT_EQ(0xef, out[3]);
 
-  auto fault_addr = reinterpret_cast<uintptr_t>(&out[1]);
-  auto recovery_addr = reinterpret_cast<uintptr_t>(&out[3]);
+  auto fault_addr = bit_cast<uintptr_t>(&out[1]);
+  auto recovery_addr = bit_cast<uintptr_t>(&out[3]);
 
   EXPECT_EQ(recovery_addr, rec[fault_addr]);
 }
@@ -85,9 +86,8 @@ TEST(MachineCodeTest, RelocAbsToDisp32) {
   uint8_t out[128]{};
 
   mc.AddRelocation(
-      1, RelocationType::RelocAbsToDisp32, 0, reinterpret_cast<intptr_t>(out) + 128);  // 128 (0x80)
-  mc.AddRelocation(
-      6, RelocationType::RelocAbsToDisp32, 6, reinterpret_cast<intptr_t>(out));  //  -6 (0xfa)
+      1, RelocationType::RelocAbsToDisp32, 0, bit_cast<intptr_t>(&out) + 128);         // 128 (0x80)
+  mc.AddRelocation(6, RelocationType::RelocAbsToDisp32, 6, bit_cast<intptr_t>(&out));  //  -6 (0xfa)
 
   ASSERT_GT(sizeof(out), mc.install_size());
   mc.InstallUnsafe(out, nullptr);

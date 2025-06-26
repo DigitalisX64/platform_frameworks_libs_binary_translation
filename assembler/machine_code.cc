@@ -72,7 +72,7 @@ void MachineCode::PerformRelocations(const uint8_t* code, RecoveryMap* recovery_
   for (const auto& rel : relocations_) {
     switch (rel.type) {
       case RelocationType::RelocAbsToDisp32: {
-        intptr_t start = std::bit_cast<intptr_t>(code);
+        intptr_t start = bit_cast<intptr_t>(code);
         intptr_t pc = start + rel.pc;
         intptr_t disp = rel.data - pc;
         CHECK(IsInRange<int32_t>(disp));
@@ -80,7 +80,7 @@ void MachineCode::PerformRelocations(const uint8_t* code, RecoveryMap* recovery_
         break;
       }
       case RelocationType::RelocRecoveryPoint: {
-        uintptr_t start = reinterpret_cast<uintptr_t>(code);
+        uintptr_t start = bit_cast<uintptr_t>(code);
         uintptr_t fault_addr = start + rel.pc;
         uintptr_t recovery_addr = start + rel.data;
         (*recovery_map)[fault_addr] = recovery_addr;
