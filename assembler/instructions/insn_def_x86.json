@@ -398,6 +398,7 @@
         "Pminub": { "opcodes": [ "66", "0F", "DA" ] },
         "Pminud": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "3B" ] },
         "Pminuw": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "3A" ] },
+        "Pmuldq": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "28" ] },
         "Pmulhrsw": { "feature": "SSSE3", "opcodes": [ "66", "0F", "38", "0B" ] },
         "Pmulhw": { "opcodes": [ "66", "0F", "E5" ] },
         "Pmulld": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "40" ] },
@@ -575,6 +576,7 @@
     },
     {
       "encodings": {
+        "Movddup": { "feature": "SSE3", "opcodes": [ "F2", "0F", "12" ] },
         "Movq": { "opcodes": [ "F3", "0F", "7E" ] },
         "Pmovsxbw": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "20" ] },
         "Pmovsxdq": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "25" ] },
