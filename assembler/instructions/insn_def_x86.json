@@ -386,6 +386,7 @@
         "Pcmpgtw": { "dependency_breaking": "true", "opcodes": [ "66", "0F", "65" ] },
         "Phaddd": { "feature": "SSSE3", "opcodes": [ "66", "0F", "38", "02" ] },
         "Phaddw": { "feature": "SSSE3", "opcodes": [ "66", "0F", "38", "01" ] },
+        "Pmaddwd": { "opcodes": [ "66", "0F", "F5" ] },
         "Pmaxsb": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "3C" ] },
         "Pmaxsd": { "feature": "SSE4_1", "opcodes": [ "66", "0F", "38", "3D" ] },
         "Pmaxsw": { "opcodes": [ "66", "0F", "EE" ] },
