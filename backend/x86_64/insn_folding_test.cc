@@ -247,14 +247,14 @@ TEST(InsnFoldingTest, DefMapGetsLatestDef) {
     def_map.ProcessInsn(insn_it);
   }
 
-  auto [vreg1_def_it, index1] = def_map.Get(vreg1);
+  auto [vreg1_def_it, index1, _1] = def_map.Get(vreg1);
   ASSERT_TRUE(vreg1_def_it.has_value());
   const berberis::MachineInsn* vreg1_def = *vreg1_def_it.value();
   EXPECT_EQ(kMachineOpMovqRegImm, vreg1_def->opcode());
   EXPECT_EQ(vreg1, vreg1_def->RegAt(0));
   EXPECT_EQ(index1, 0);
 
-  auto [vreg2_def_it, index2] = def_map.Get(vreg2);
+  auto [vreg2_def_it, index2, _2] = def_map.Get(vreg2);
   ASSERT_TRUE(vreg2_def_it.has_value());
   const berberis::MachineInsn* vreg2_def = *vreg2_def_it.value();
   EXPECT_EQ(kMachineOpAddqRegReg, vreg2_def->opcode());
@@ -285,13 +285,37 @@ TEST(InsnFoldingTest, DefMapReturnsNoDefIfVRegIsOverwrittenByInsn) {
     def_map.ProcessInsn(insn_it);
   }
 
-  auto [vreg1_def_insn_it, vreg_def_insn_pos] = def_map.Get(vreg1);
+  auto [vreg1_def_insn_it, vreg_def_insn_pos, _] = def_map.Get(vreg1);
   ASSERT_TRUE(vreg1_def_insn_it.has_value());
   EXPECT_EQ(kMachineOpAddqRegReg, (*vreg1_def_insn_it.value())->opcode());
 
   // Checking def_map for vreg1 at the position of an instruction that overwrites it.
-  auto [vreg1_overwritten_def_it, _] = def_map.Get(vreg1, vreg_def_insn_pos);
+  auto vreg1_overwritten_def_it = std::get<0>(def_map.Get(vreg1, vreg_def_insn_pos));
   EXPECT_FALSE(vreg1_overwritten_def_it.has_value());
+}
+
+TEST(InsnFoldingTest, DefMapReturnsCorrectRegisterPosition) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  auto* bb = machine_ir.NewBasicBlock();
+
+  MachineIRBuilder builder(&machine_ir);
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+  MachineReg vreg2 = machine_ir.AllocVReg();
+  MachineReg flags = machine_ir.AllocVReg();
+
+  builder.StartBasicBlock(bb);
+  builder.Gen<AddqRegReg>(vreg1, vreg2, flags);
+
+  DefMap def_map(machine_ir.NumVReg(), machine_ir.arena());
+  for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); ++insn_it) {
+    def_map.ProcessInsn(insn_it);
+  }
+
+  EXPECT_EQ(std::get<2>(def_map.Get(vreg1)), 0);
+  EXPECT_EQ(std::get<2>(def_map.Get(flags)), 2);
 }
 
 TEST(InsnFoldingTest, MovFolding) {
@@ -403,6 +427,29 @@ TEST(InsnFoldingTest, RedundantMovlFoldingExtraPseudoCopy) {
 
   berberis::MachineInsn* folded_insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
   EXPECT_EQ(kMachineOpPseudoCopy, folded_insn->opcode());
+  EXPECT_EQ(vreg1, folded_insn->RegAt(0));
+  EXPECT_EQ(vreg2, folded_insn->RegAt(1));
+}
+
+TEST(InsnFoldingTest, RedundantMovlFoldingCancelledIfNonZeroExtendingInsn) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  MachineIRBuilder builder(&machine_ir);
+
+  auto* bb = machine_ir.NewBasicBlock();
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+  MachineReg vreg2 = machine_ir.AllocVReg();
+  MachineReg vreg3 = machine_ir.AllocVReg();
+  MachineReg flags = machine_ir.AllocVReg();
+
+  builder.StartBasicBlock(bb);
+  builder.Gen<PseudoCopy>(vreg2, vreg3, 4);
+  builder.Gen<MovlRegReg>(vreg1, vreg2);
+
+  berberis::MachineInsn* folded_insn = *FoldInsnsAndGetLastInsnIt(&machine_ir, bb);
+  EXPECT_EQ(kMachineOpMovlRegReg, folded_insn->opcode());
   EXPECT_EQ(vreg1, folded_insn->RegAt(0));
   EXPECT_EQ(vreg2, folded_insn->RegAt(1));
 }

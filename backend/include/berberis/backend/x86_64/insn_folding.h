@@ -30,39 +30,46 @@ enum class FoldingType { kImpossible, kReplaceInsn, kInsertInsn, kRemoveInsn };
 class DefMap {
  public:
   DefMap(size_t size, Arena* arena)
-      : def_map_(size, {std::nullopt, 0}, arena), flags_reg_(kInvalidMachineReg), index_(0) {}
-  [[nodiscard]] std::pair<std::optional<MachineInsnList::iterator>, int> Get(MachineReg reg) const {
+      : def_map_(size, {std::nullopt, 0, 0}, arena), flags_reg_(kInvalidMachineReg), index_(0) {}
+  [[nodiscard]] std::tuple<std::optional<MachineInsnList::iterator>, int, int> Get(
+      MachineReg reg) const {
     if (!reg.IsVReg()) {
-      return {std::nullopt, 0};
+      return {std::nullopt, 0, 0};
     }
-    auto [def_insn, def_insn_index] = def_map_.at(reg.GetVRegIndex());
+    auto [def_insn, def_insn_index, reg_pos] = def_map_.at(reg.GetVRegIndex());
     if (!def_insn) {
-      return {std::nullopt, 0};
+      return {std::nullopt, 0, 0};
     }
-    return {def_insn, def_insn_index};
+    return {def_insn, def_insn_index, reg_pos};
   }
-  [[nodiscard]] std::pair<std::optional<MachineInsnList::iterator>, int> Get(MachineReg reg,
-                                                                             int use_index) const {
+  [[nodiscard]] std::tuple<std::optional<MachineInsnList::iterator>, int, int> Get(
+      MachineReg reg,
+      int use_index) const {
     if (!reg.IsVReg()) {
-      return {std::nullopt, 0};
+      return {std::nullopt, 0, 0};
     }
-    auto [def_insn, def_insn_index] = def_map_.at(reg.GetVRegIndex());
+    auto [def_insn, def_insn_index, reg_pos] = def_map_.at(reg.GetVRegIndex());
     if (!def_insn || def_insn_index >= use_index) {
-      return {std::nullopt, 0};
+      return {std::nullopt, 0, 0};
     }
-    return {def_insn, def_insn_index};
+    return {def_insn, def_insn_index, reg_pos};
   }
   void ProcessInsn(MachineInsnList::iterator insn_it);
   void Initialize();
 
  private:
-  void Set(MachineReg reg, MachineInsnList::iterator insn_it) {
+  void Set(MachineReg reg, MachineInsnList::iterator insn_it, int reg_pos) {
     if (reg.IsVReg()) {
-      def_map_.at(reg.GetVRegIndex()) = std::pair(insn_it, index_);
+      def_map_.at(reg.GetVRegIndex()) = std::tuple(insn_it, index_, reg_pos);
     }
   }
   void MapDefRegs(MachineInsnList::iterator insn_it);
-  ArenaVector<std::pair<std::optional<MachineInsnList::iterator>, int>> def_map_;
+
+  // Each tuple in the def_map_ vector contains:
+  // - The iterator to the instruction that defines the register
+  // - The index of the instruction that defines the register
+  // - The position of the register in the instruction that defines it
+  ArenaVector<std::tuple<std::optional<MachineInsnList::iterator>, int, int>> def_map_;
   MachineReg flags_reg_;
   int index_;
 };
@@ -80,7 +87,7 @@ class InsnFolding {
   MachineIR* machine_ir_;
   std::optional<uint64_t> GetImmValueIfPossible(MachineReg reg) const;
   bool IsWritingSameFlagsValue(MachineInsnList::iterator insn_it) const;
-  std::tuple<std::optional<MachineInsnList::iterator>, int> FindNonPseudoCopyDef(
+  std::tuple<std::optional<MachineInsnList::iterator>, int, int> FindNonPseudoCopyDef(
       MachineReg src_reg) const;
   template <bool kIsInput64Bit>
   std::tuple<FoldingType, berberis::MachineInsn*> TryFoldImmediateInput(
