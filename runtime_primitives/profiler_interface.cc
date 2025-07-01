@@ -77,7 +77,7 @@ int ProfilerOpenLogFile() {
   if (fd == -1) {
     TRACE("Profiling Error: Failed to open map file %s", buf);
   } else {
-    TRACE("Probfiling to %s", buf);
+    TRACE("Profiling to %s", buf);
   }
   return fd;
 }
