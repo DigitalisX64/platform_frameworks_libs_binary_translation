@@ -40,14 +40,14 @@ TEST(MapsSnapshot, Basic) {
   maps_snapshot->ClearForTesting();
 
   // No mappings can be found before snapshot is taken by Update().
-  auto no_mappings_result = maps_snapshot->FindMappedObjectName(bit_cast<uintptr_t>(&Foo));
+  auto no_mappings_result = maps_snapshot->GetMappedObjectRecord(bit_cast<uintptr_t>(&Foo));
   ASSERT_FALSE(no_mappings_result.has_value());
 
   maps_snapshot->Update();
 
-  auto result = maps_snapshot->FindMappedObjectName(bit_cast<uintptr_t>(&Foo));
+  auto result = maps_snapshot->GetMappedObjectRecord(bit_cast<uintptr_t>(&Foo));
   ASSERT_TRUE(result.has_value());
-  ASSERT_FALSE(result.value().empty());
+  ASSERT_FALSE(result.value().pathname.empty());
 }
 
 TEST(MapsSnapshot, AnonymousMapping) {
@@ -56,11 +56,13 @@ TEST(MapsSnapshot, AnonymousMapping) {
   void* addr = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
   ASSERT_NE(addr, MAP_FAILED);
   maps_snapshot->Update();
-  auto result = maps_snapshot->FindMappedObjectName(bit_cast<uintptr_t>(addr));
+  auto result = maps_snapshot->GetMappedObjectRecord(bit_cast<uintptr_t>(addr));
   munmap(addr, 4096);
 
   ASSERT_TRUE(result.has_value());
-  ASSERT_TRUE(result.value().empty());
+  ASSERT_TRUE(result.value().pathname.empty());
+  ASSERT_GT(result.value().start, 0u);
+  ASSERT_GE(result.value().end, result.value().start + 4096);
 }
 
 std::tuple<uintptr_t, std::string> GetAddressOfFirstMappingWithSubstring(std::string substr) {
@@ -99,11 +101,11 @@ TEST(MapsSnapshot, ExactFilenameMatch) {
   ASSERT_GT(addr, 0u);
 
   maps_snapshot->Update();
-  auto result = maps_snapshot->FindMappedObjectName(bit_cast<uintptr_t>(addr));
+  auto result = maps_snapshot->GetMappedObjectRecord(bit_cast<uintptr_t>(addr));
 
   ASSERT_TRUE(result.has_value());
   // MapsSnapshot only stores first 255 symbols plus terminating null.
-  ASSERT_TRUE(strncmp(result.value().c_str(), pathname.c_str(), 255) == 0);
+  ASSERT_TRUE(strncmp(result.value().pathname.c_str(), pathname.c_str(), 255) == 0);
 }
 
 }  // namespace

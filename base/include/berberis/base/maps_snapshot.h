@@ -37,21 +37,24 @@ class MapsSnapshot {
  public:
   static MapsSnapshot* GetInstance();
   void Update();
-  // It's important that we return const ArenaString, since arena isn't thread-safe, and we should
-  // NOT be triggering re-allocations from outside of this class.
-  std::optional<const ArenaString> FindMappedObjectName(uintptr_t addr);
+
   void ClearForTesting() {
     std::scoped_lock lock(mutex_);
     maps_.clear();
   };
 
- private:
-  MapsSnapshot() : arena_(), mutex_(), maps_(&arena_) {};
   struct Record {
     uintptr_t start;
     uintptr_t end;
     ArenaString pathname;
   };
+
+  // It's important that we return const, since ArenaString isn't thread-safe, and we should
+  // NOT be triggering re-allocations from outside of this class.
+  std::optional<const MapsSnapshot::Record> GetMappedObjectRecord(uintptr_t addr);
+
+ private:
+  MapsSnapshot() : arena_(), mutex_(), maps_(&arena_) {};
   Arena arena_;
   std::mutex mutex_;
   ArenaMap<uintptr_t, Record> maps_;

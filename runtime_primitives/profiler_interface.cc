@@ -91,32 +91,34 @@ MappedNameBuffer ConstructMappedNameBuffer(GuestAddr guest_addr) {
   MappedNameBuffer buf;
   auto* maps_snapshot = MapsSnapshot::GetInstance();
 
-  auto mapped_name = maps_snapshot->FindMappedObjectName(guest_addr);
-  if (!mapped_name.has_value()) {
+  auto mapped_object_record = maps_snapshot->GetMappedObjectRecord(guest_addr);
+  if (!mapped_object_record.has_value()) {
     // If no mapping is found renew the snapshot and try again.
     maps_snapshot->Update();
-    auto updated_mapped_name = maps_snapshot->FindMappedObjectName(guest_addr);
-    if (!updated_mapped_name.has_value()) {
+    auto updated_mapped_object_record = maps_snapshot->GetMappedObjectRecord(guest_addr);
+    if (!updated_mapped_object_record.has_value()) {
       TRACE("Guest addr %p not found in /proc/self/maps", ToHostAddr<void>(guest_addr));
       buf[0] = '\0';
       return buf;
     }
-    mapped_name.emplace(std::move(updated_mapped_name.value()));
+    mapped_object_record.emplace(std::move(updated_mapped_object_record.value()));
   }
 
   // We can use more clever logic here and try to extract the basename, but the parent directory
   // name may also be interesting (e.g. <guest_arch>/libc.so) so we just take the last
   // kMaxMappedNameLen symbols for simplicity until it's proven we need something more advanced.
   // An added benefit of this approach is that symbols look well aligned in the profile.
-  auto& result = mapped_name.value();
+  auto& mapped_pathname = mapped_object_record.value().pathname;
   size_t terminator_pos;
-  if (result.length() > kMaxMappedNameLen) {
+  if (mapped_pathname.length() > kMaxMappedNameLen) {
     // In this case it should be safe to call strcpy, but we still use strncpy to be extra careful.
-    strncpy(buf.data(), result.c_str() + result.length() - kMaxMappedNameLen, kMaxMappedNameLen);
+    strncpy(buf.data(),
+            mapped_pathname.c_str() + mapped_pathname.length() - kMaxMappedNameLen,
+            kMaxMappedNameLen);
     terminator_pos = kMaxMappedNameLen;
   } else {
-    strncpy(buf.data(), result.c_str(), kMaxMappedNameLen);
-    terminator_pos = result.length();
+    strncpy(buf.data(), mapped_pathname.c_str(), kMaxMappedNameLen);
+    terminator_pos = mapped_pathname.length();
   }
   buf[terminator_pos] = '_';
   buf[terminator_pos + 1] = '\0';
