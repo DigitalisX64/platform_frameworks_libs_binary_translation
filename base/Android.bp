@@ -50,7 +50,6 @@ cc_library_static {
     host_supported: true,
     srcs: [
         "config_globals.cc",
-        "config_globals_custom.cc",
         "exec_region.cc",
         "format_buffer.cc",
         "large_mmap.cc",
