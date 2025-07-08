@@ -315,6 +315,7 @@ TEST(InsnFoldingTest, DefMapReturnsCorrectRegisterPosition) {
   }
 
   EXPECT_EQ(std::get<2>(def_map.Get(vreg1)), 0);
+  EXPECT_EQ(std::get<0>(def_map.Get(vreg2)), std::nullopt);
   EXPECT_EQ(std::get<2>(def_map.Get(flags)), 2);
 }
 
