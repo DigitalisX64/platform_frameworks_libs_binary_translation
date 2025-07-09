@@ -429,7 +429,8 @@ class MachineIR {
 
   [[nodiscard]] std::string GetDebugString() const;
 
-  [[nodiscard]] std::string GetDebugStringForDot() const;
+  // DOT is a graph description language, which tools like Graphviz can visualize for you.
+  [[nodiscard]] std::string GetDebugStringAsDot() const;
 
   void Emit(CodeEmitter* as) const;
 

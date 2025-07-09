@@ -73,6 +73,12 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
     TRACE("}\n\n");
   }
 
+  if (IsConfigFlagSet(kPrintIRsAsDot)) {
+    TRACE("MachineIR before emit as Dot {\n");
+    TRACE("%s", machine_ir->GetDebugStringAsDot().c_str());
+    TRACE("}\n\n");
+  }
+
   if (!params.skip_emit) {
     CodeEmitter emitter(
         machine_code, machine_ir->FrameSize(), machine_ir->NumBasicBlocks(), machine_ir->arena());

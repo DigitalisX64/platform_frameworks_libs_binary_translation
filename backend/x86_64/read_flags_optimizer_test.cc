@@ -367,11 +367,11 @@ void TestCopiedInstruction(MachineIR* machine_ir, berberis::MachineInsn* insn) {
   auto* copy = gen.value()(machine_ir, insn);
 
   ASSERT_EQ(copy->opcode(), insn->opcode());
-  ASSERT_EQ(copy->NumRegOperands(), insn->NumRegOperands());
-  for (auto i = 0; i < insn->NumRegOperands(); i++) {
-    ASSERT_EQ(copy->RegAt(i), insn->RegAt(i));
-  }
-
+  // Note we use debug string to compare because it contains the actual
+  // instruction - using opcode isn't sufficient as the copy always has
+  // its opcode  set to that of the original instruction even if incorrect.
+  // See b/428950485 for more context.
+  ASSERT_EQ(copy->GetDebugString(), insn->GetDebugString());
   // Check that it's a deep copy.
   copy->SetRegAt(0, reg);
   ASSERT_NE(copy->RegAt(0), insn->RegAt(0));
@@ -386,8 +386,29 @@ TEST(MachineIRReadFlagsOptimizer, GetInsnGen) {
   TestCopiedInstruction(&machine_ir,
                         machine_ir.NewInsn<AddqRegReg>(
                             machine_ir.AllocVReg(), machine_ir.AllocVReg(), kMachineRegFLAGS));
-  // PseudoReadFlags is a special case as it has its own member variables and
-  // doesn't inherit from MachineInsnX86_64 so we test it too.
+  TestCopiedInstruction(
+      &machine_ir, machine_ir.NewInsn<CmplRegImm>(machine_ir.AllocVReg(), 123, kMachineRegFLAGS));
+  TestCopiedInstruction(&machine_ir,
+                        machine_ir.NewInsn<CmplRegReg>(
+                            machine_ir.AllocVReg(), machine_ir.AllocVReg(), kMachineRegFLAGS));
+  TestCopiedInstruction(
+      &machine_ir, machine_ir.NewInsn<CmpqRegImm>(machine_ir.AllocVReg(), 123, kMachineRegFLAGS));
+  TestCopiedInstruction(&machine_ir,
+                        machine_ir.NewInsn<CmpqRegReg>(
+                            machine_ir.AllocVReg(), machine_ir.AllocVReg(), kMachineRegFLAGS));
+  TestCopiedInstruction(
+      &machine_ir, machine_ir.NewInsn<SublRegImm>(machine_ir.AllocVReg(), 123, kMachineRegFLAGS));
+  TestCopiedInstruction(&machine_ir,
+                        machine_ir.NewInsn<SublRegReg>(
+                            machine_ir.AllocVReg(), machine_ir.AllocVReg(), kMachineRegFLAGS));
+  TestCopiedInstruction(
+      &machine_ir, machine_ir.NewInsn<SubqRegImm>(machine_ir.AllocVReg(), 123, kMachineRegFLAGS));
+  TestCopiedInstruction(&machine_ir,
+                        machine_ir.NewInsn<SubqRegReg>(
+                            machine_ir.AllocVReg(), machine_ir.AllocVReg(), kMachineRegFLAGS));
+
+  // Note PseudoReadFlags is a special case as it has its own member variables and
+  // doesn't inherit from MachineInsnX86_64
   TestCopiedInstruction(
       &machine_ir,
       machine_ir.NewInsn<PseudoReadFlags>(

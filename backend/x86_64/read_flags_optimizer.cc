@@ -165,7 +165,7 @@ std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode) {
     case kMachineOpCmplRegImm:
       return CopyInstruction<CmplRegImm>;
     case kMachineOpCmplRegReg:
-      return CopyInstruction<CmpqRegReg>;
+      return CopyInstruction<CmplRegReg>;
     case kMachineOpCmpqRegImm:
       return CopyInstruction<CmpqRegImm>;
     case kMachineOpCmpqRegReg:
