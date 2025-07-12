@@ -2913,6 +2913,28 @@
     },
     {
       "encodings": {
+        "Vpblendw": { "feature": "AVX", "opcodes": [ "C4", "03", "01", "0E" ], "type": "vex_rm_imm_to_reg" }
+      },
+      "args": [
+        { "class": "XmmReg", "usage": "def" },
+        { "class": "XmmReg", "usage": "use" },
+        { "class": "XmmReg/VecMem128", "usage": "use" },
+        { "class": "Imm8" }
+      ]
+    },
+    {
+      "encodings": {
+        "Vpblendw": { "feature": "AVX", "opcodes": [ "C4", "03", "05", "0E" ] , "type": "vex_rm_imm_to_reg" }
+      },
+      "args": [
+        { "class": "YmmReg", "usage": "def" },
+        { "class": "YmmReg", "usage": "use" },
+        { "class": "YmmReg/VecMem256", "usage": "use" },
+        { "class": "Imm8" }
+      ]
+    },
+    {
+      "encodings": {
         "Vbroadcastf128": { "feature": "AVX", "opcodes": [ "C4", "02", "05", "1a" ] },
         "Vbroadcasti128": { "feature": "AVX2", "opcodes": [ "C4", "02", "05", "5a" ] }
       },
