@@ -510,5 +510,5 @@ def load_all_lir_defs(allowlist_files, machine_ir_intrinsic_binding_files, lir_d
   insns.extend(insn for insn in macro_insns if _check_insn_defs(insn, True))
   assert allowlist_referenced == allowlist_defined, \
       "Intrinsics referenced in bindings and not defined: " + \
-      string(allowlist_referenced - allowlist_defined)
+      str(allowlist_referenced - allowlist_defined)
   return arch, insns
