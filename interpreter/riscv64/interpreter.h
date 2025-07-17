@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cfenv>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "berberis/base/bit_util.h"

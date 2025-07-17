@@ -30,6 +30,7 @@
 #include "berberis/backend/x86_64/code_emit.h"
 #include "berberis/backend/x86_64/memory_operand.h"
 #include "berberis/base/arena_alloc.h"
+#include "berberis/base/config_globals.h"
 #include "berberis/base/stringprintf.h"
 #include "berberis/device_arch_info/x86_64/device_arch_info.h"
 #include "berberis/guest_state/guest_state_arch.h"
@@ -515,7 +516,7 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
         }.template operator()<Operands>(),
         ...);
 
-    if (MachineInsnX86_64::recovery_pc()) {
+    if (MachineInsnX86_64::recovery_pc() && !IsConfigFlagSet(kDeterministicTracing)) {
       s += StringPrintf(" <0x%" PRIxPTR ">", MachineInsnX86_64::recovery_pc());
     }
     return s;

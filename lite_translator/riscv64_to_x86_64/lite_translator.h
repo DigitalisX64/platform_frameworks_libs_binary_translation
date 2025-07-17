@@ -43,8 +43,6 @@
 
 namespace berberis {
 
-class MachindeCode;
-
 class LiteTranslator {
  public:
   using Assembler = MacroAssembler<x86_64::Assembler>;

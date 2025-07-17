@@ -17,6 +17,8 @@
 #ifndef RISCV64_TO_ARM64_BERBERIS_INTRINSICS_VECTOR_INTRINSICS_H_
 #define RISCV64_TO_ARM64_BERBERIS_INTRINSICS_VECTOR_INTRINSICS_H_
 
+#include <cstdlib>
+
 #include "berberis/intrinsics/simd_register.h"
 
 namespace berberis::intrinsics {

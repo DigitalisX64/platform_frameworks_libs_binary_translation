@@ -149,6 +149,8 @@ std::string ToString(ConfigFlag flag) {
       return "merge-profiles-for-same-mode-regions";
     case kPrintTranslatedAddrs:
       return "print-translated-addrs";
+    case kDeterministicTracing:
+      return "deterministic-tracing";
     case kPrintIRs:
       return "print-irs";
     case kPrintIRsAsDot:

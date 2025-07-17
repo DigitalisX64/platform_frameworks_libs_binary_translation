@@ -58,6 +58,7 @@ enum ConfigFlag {
   kDisableIntrinsicInlining,
   kMergeProfilesForSameModeRegions,
   kPrintTranslatedAddrs,
+  kDeterministicTracing,
   kPrintIRs,
   kPrintIRsAsDot,
   kPrintCodePoolSize,

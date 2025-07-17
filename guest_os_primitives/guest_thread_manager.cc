@@ -212,8 +212,11 @@ void InsertCurrentThread(GuestThread* thread, bool register_dtor) {
   if (kInstrumentGuestThread) {
     OnInsertGuestThread(tid, thread);
   }
-
-  TRACE("guest thread attached %d", tid);
+  if (IsConfigFlagSet(kDeterministicTracing)) {
+    TRACE("guest thread attached");
+  } else {
+    TRACE("guest thread attached %d", tid);
+  }
 }
 
 // ATTENTION: Can be interrupted!

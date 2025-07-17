@@ -26,8 +26,6 @@
 
 namespace berberis {
 
-class MachindeCode;
-
 namespace x86_64 {
 
 class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {

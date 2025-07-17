@@ -21,6 +21,7 @@
 
 #include <cstdarg>
 
+#include "berberis/base/config_globals.h"
 #include "berberis/base/format_buffer.h"
 #include "berberis/base/gettid.h"
 #include "berberis/base/scoped_errno.h"
@@ -56,8 +57,9 @@ class Tracing {
   template <typename Args>
   static void TraceA(const char* format, Args* args) {
     DynamicCStrBuffer buf;
-
-    FormatBufferImplF(&buf, "%5u %5u ", GetpidSyscall(), GettidSyscall());
+    if (!IsConfigFlagSet(kDeterministicTracing)) {
+      FormatBufferImplF(&buf, "%5u %5u ", GetpidSyscall(), GettidSyscall());
+    }
     FormatBufferImpl(&buf, format, args);
     buf.Put('\n');
 

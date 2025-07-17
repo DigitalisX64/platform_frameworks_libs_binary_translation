@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <type_traits>
 
 #include "berberis/base/bit_util.h"

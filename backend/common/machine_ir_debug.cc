@@ -18,6 +18,7 @@
 
 #include <string>
 
+#include "berberis/base/config_globals.h"
 #include "berberis/base/stringprintf.h"
 #include "berberis/guest_state/guest_addr.h"
 
@@ -82,7 +83,11 @@ std::string MachineBasicBlock::GetDebugString() const {
 
   if (guest_addr() != kNullGuestAddr) {
     // Profile counter may exist only if guest-addr is set, so we print them together.
-    out += StringPrintf("    [GuestAddr=%p ProfCounter=", ToHostAddr<void>(guest_addr()));
+    if (IsConfigFlagSet(kDeterministicTracing)) {
+      out += StringPrintf("    [ProfCounter=");
+    } else {
+      out += StringPrintf("    [GuestAddr=%p ProfCounter=", ToHostAddr<void>(guest_addr()));
+    }
     out += profile_counter().has_value() ? StringPrintf("%" PRIu32 "]", profile_counter().value())
                                          : "unknown]";
     out += "\n";
@@ -162,6 +167,9 @@ std::string PseudoJump::GetDebugString() const {
     case Kind::kExitGeneratedCode:
       suffix = "_EXIT_GEN_CODE";
       break;
+  }
+  if (IsConfigFlagSet(kDeterministicTracing)) {
+    return StringPrintf("PSEUDO_JUMP%s <ADDR STRIPPED>", suffix);
   }
   return StringPrintf("PSEUDO_JUMP%s 0x%" PRIxPTR, suffix, target_);
 }

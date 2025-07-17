@@ -38,6 +38,7 @@
 
 #include <stdint.h>
 
+#include <cmath>
 #include <limits>
 
 #include "berberis/base/bit_util.h"

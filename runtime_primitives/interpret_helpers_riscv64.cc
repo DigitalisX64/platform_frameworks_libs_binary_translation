@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstring>
 
 #include "berberis/base/checks.h"
 #include "berberis/base/logging.h"
