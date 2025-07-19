@@ -19,7 +19,6 @@
 #include <csetjmp>
 
 #include "berberis/base/checks.h"
-#include "berberis/base/logging.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_thread.h"
 #include "berberis/guest_state/guest_state_opaque.h"
@@ -60,10 +59,10 @@ void ExecuteGuestCall(ThreadState* state) {
 
   // We have seen apps that actually didn't properly restore sp (b/427834604), so this cannot be a
   // fatal failure for bug-to-bug compatibility.
-  TRACE("Warning: guest call didn't restore sp: expected %p, actual %p",
-        ToHostAddr<void>(guest_call_execution.sp),
-        ToHostAddr<void>(GetStackRegister(GetCPUState(*state))));
-  TRACE("Trying to restore sp and continue...");
+  TRACE_AND_ALOGE("Warning: guest call didn't restore sp: expected %p, actual %p",
+                  ToHostAddr<void>(guest_call_execution.sp),
+                  ToHostAddr<void>(GetStackRegister(GetCPUState(*state))));
+  TRACE_AND_ALOGE("Trying to restore sp and continue...");
   // This is typically called from RunGuestCall which requires stack to be properly restored, so
   // that we can reload data which had been saved on stack before the call.
   SetStackRegister(GetCPUState(*state), guest_call_execution.sp);

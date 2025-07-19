@@ -27,7 +27,6 @@
 
 #include "berberis/base/checks.h"
 #include "berberis/base/gettid.h"
-#include "berberis/base/logging.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_abi/function_wrappers.h"
 #include "berberis/guest_abi/guest_arguments.h"
@@ -43,7 +42,7 @@
 
 #include "guest_jni_trampolines.h"
 
-// #define LOG_JNI(...) ALOGE(__VA_ARGS__)
+// #define LOG_JNI(...) TRACE_AND_ALOGE(__VA_ARGS__)
 #define LOG_JNI(...)
 
 namespace berberis {
@@ -398,10 +397,9 @@ JNIEnv* ToHostJNIEnv(GuestType<JNIEnv*> guest_jni_env) {
   auto it = mapping.guest_to_host_jni_env.find(guest_jni_env);
 
   if (it == mapping.guest_to_host_jni_env.end()) {
-    ALOGE("Unexpected guest JNIEnv: %p (it was never passed to guest), passing to host 'as is'",
-          ToHostAddr(guest_jni_env));
-    TRACE("Unexpected guest JNIEnv: %p (it was never passed to guest), passing to host 'as is'",
-          ToHostAddr(guest_jni_env));
+    TRACE_AND_ALOGE(
+        "Unexpected guest JNIEnv: %p (it was never passed to guest), passing to host 'as is'",
+        ToHostAddr(guest_jni_env));
     return ToHostAddr(guest_jni_env);
   }
 

@@ -73,9 +73,9 @@
 #include "berberis/base/arena_list.h"
 #include "berberis/base/arena_vector.h"
 #include "berberis/base/config.h"
-#include "berberis/base/logging.h"
+#include "berberis/base/tracing.h"
 
-// #define LOG_REG_ALLOC(...) ALOGE(__VA_ARGS__)
+// #define LOG_REG_ALLOC(...) TRACE(__VA_ARGS__)
 #define LOG_REG_ALLOC(...) ((void)0)
 
 namespace berberis {

@@ -17,7 +17,7 @@
 #include "berberis/guest_state/get_cpu_state_opaque.h"
 #include "native_bridge_support/guest_state_accessor/accessor.h"
 
-#include "berberis/base/logging.h"
+#include "berberis/base/tracing.h"
 #include "berberis/guest_state/guest_state_arch.h"
 
 #include <cstddef>
@@ -27,7 +27,7 @@ namespace berberis {
 
 int GetCpuState(NativeBridgeGuestRegs* guest_regs, const CPUState* state) {
   if (guest_regs->guest_arch != NATIVE_BRIDGE_ARCH_RISCV64) {
-    ALOGE("The guest architecture is unmatched: %lu", guest_regs->guest_arch);
+    TRACE_AND_ALOGE("The guest architecture is unmatched: %lu", guest_regs->guest_arch);
     return NATIVE_BRIDGE_GUEST_STATE_ACCESSOR_ERROR_UNSUPPORTED_ARCH;
   }
   memcpy(&guest_regs->regs_riscv64.x, &state->x, sizeof(guest_regs->regs_riscv64.x));
@@ -42,7 +42,7 @@ extern "C" __attribute__((visibility("default"))) int LoadGuestStateRegisters(
     size_t guest_state_data_size,
     NativeBridgeGuestRegs* guest_regs) {
   if (guest_state_data_size < sizeof(ThreadState)) {
-    ALOGE("The guest state data size is invalid: %zu", guest_state_data_size);
+    TRACE_AND_ALOGE("The guest state data size is invalid: %zu", guest_state_data_size);
     return NATIVE_BRIDGE_GUEST_STATE_ACCESSOR_ERROR_INVALID_STATE;
   }
   guest_regs->guest_arch = NATIVE_BRIDGE_ARCH_RISCV64;

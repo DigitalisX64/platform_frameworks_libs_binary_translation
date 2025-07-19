@@ -29,7 +29,7 @@
 #include "berberis/assembler/x86_32.h"
 #include "berberis/assembler/x86_64.h"
 #include "berberis/base/bit_util.h"
-#include "berberis/base/logging.h"
+#include "berberis/base/tracing.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 
 #if defined(__i386__)
@@ -71,14 +71,15 @@ inline bool CompareCode(const ParcelInt* code_template_begin,
                         const MachineCode& code,
                         CPUArch arch) {
   if ((code_template_end - code_template_begin) * sizeof(ParcelInt) != code.install_size()) {
-    ALOGE("Code size mismatch: %zd != %u",
-          (code_template_end - code_template_begin) * static_cast<unsigned>(sizeof(ParcelInt)),
-          code.install_size());
+    TRACE_AND_ALOGE(
+        "Code size mismatch: %zd != %u",
+        (code_template_end - code_template_begin) * static_cast<unsigned>(sizeof(ParcelInt)),
+        code.install_size());
     return false;
   }
 
   if (memcmp(code_template_begin, code.AddrAs<uint8_t>(0), code.install_size()) != 0) {
-    ALOGE("Code mismatch");
+    TRACE_AND_ALOGE("Code mismatch");
     MachineCode code2;
     code2.AddSequence(code_template_begin, code_template_end - code_template_begin);
     std::string code_str1, code_str2;
@@ -105,9 +106,9 @@ inline bool CompareCode(const ParcelInt* code_template_begin,
       insn++;
     }
     for (uint32_t i = insn; i < insn + 20 && i < number_of_instructions; i++) {
-      ALOGE("Assembler generated: %s, should be %s\n",
-            code_str1.substr(i * (insn_size + 1), insn_size).c_str(),
-            code_str2.substr(i * (insn_size + 1), insn_size).c_str());
+      TRACE_AND_ALOGE("Assembler generated: %s, should be %s\n",
+                      code_str1.substr(i * (insn_size + 1), insn_size).c_str(),
+                      code_str2.substr(i * (insn_size + 1), insn_size).c_str());
     }
 
     return false;
@@ -632,12 +633,12 @@ bool CondTest1() {
   auto target_func = exec.get<TestFunc>();
   uint32_t result = target_func(1, 2);
   if (result != 0xcccccc00) {
-    ALOGE("Bug in seteq(not equal): %x", result);
+    TRACE_AND_ALOGE("Bug in seteq(not equal): %x", result);
     return false;
   }
   result = target_func(-1, -1);
   if (result != 0xcccccc01) {
-    ALOGE("Bug in seteq(equal): %x", result);
+    TRACE_AND_ALOGE("Bug in seteq(equal): %x", result);
     return false;
   }
   return true;
@@ -662,12 +663,12 @@ bool CondTest2() {
   auto target_func = exec.get<TestFunc>();
   uint32_t result = target_func(0x11, 1);
   if (result != 0x1) {
-    ALOGE("Bug in testb(not zero): %x", result);
+    TRACE_AND_ALOGE("Bug in testb(not zero): %x", result);
     return false;
   }
   result = target_func(0x11, 0x8);
   if (result != 0x0) {
-    ALOGE("Bug in testb(zero): %x", result);
+    TRACE_AND_ALOGE("Bug in testb(zero): %x", result);
     return false;
   }
   return true;
@@ -709,17 +710,17 @@ bool JccTest() {
   auto target_func = exec.get<TestFunc>();
   int result = target_func(1, 1);
   if (result != 0) {
-    ALOGE("Bug in jcc(equal): %x", result);
+    TRACE_AND_ALOGE("Bug in jcc(equal): %x", result);
     return false;
   }
   result = target_func(1, 0);
   if (result != 1) {
-    ALOGE("Bug in jcc(above): %x", result);
+    TRACE_AND_ALOGE("Bug in jcc(above): %x", result);
     return false;
   }
   result = target_func(0, 1);
   if (result != -1) {
-    ALOGE("Bug in jcc(below): %x", result);
+    TRACE_AND_ALOGE("Bug in jcc(below): %x", result);
     return false;
   }
   return true;
@@ -892,12 +893,12 @@ bool CondTest1() {
   uint32_t result;
   result = target_func(1, 2);
   if (result != 0xcccccc00) {
-    ALOGE("Bug in seteq(not equal): %x", result);
+    TRACE_AND_ALOGE("Bug in seteq(not equal): %x", result);
     return false;
   }
   result = target_func(-1, -1);
   if (result != 0xcccccc01) {
-    ALOGE("Bug in seteq(equal): %x", result);
+    TRACE_AND_ALOGE("Bug in seteq(equal): %x", result);
     return false;
   }
   return true;
@@ -970,17 +971,17 @@ bool JccTest() {
   int result;
   result = target_func(1, 1);
   if (result != 0) {
-    ALOGE("Bug in jcc(equal): %x", result);
+    TRACE_AND_ALOGE("Bug in jcc(equal): %x", result);
     return false;
   }
   result = target_func(1, 0);
   if (result != 1) {
-    ALOGE("Bug in jcc(above): %x", result);
+    TRACE_AND_ALOGE("Bug in jcc(above): %x", result);
     return false;
   }
   result = target_func(0, 1);
   if (result != -1) {
-    ALOGE("Bug in jcc(below): %x", result);
+    TRACE_AND_ALOGE("Bug in jcc(below): %x", result);
     return false;
   }
   return true;

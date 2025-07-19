@@ -20,7 +20,7 @@
 #include <string>
 
 #include "berberis/base/bit_util.h"
-#include "berberis/base/logging.h"
+#include "berberis/base/tracing.h"
 
 namespace berberis {
 
@@ -93,7 +93,7 @@ void MachineCode::PerformRelocations(const uint8_t* code, RecoveryMap* recovery_
 void MachineCode::DumpCode(InstructionSize insn_size) const {
   std::string code_str;
   AsString(&code_str, insn_size);
-  ALOGE("%s\n", code_str.c_str());
+  TRACE("%s\n", code_str.c_str());
 }
 
 }  // namespace berberis

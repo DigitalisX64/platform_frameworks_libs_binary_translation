@@ -27,8 +27,8 @@
 #include "berberis/base/config.h"  // kGuestPageSize
 #include "berberis/base/forever_alloc.h"
 #include "berberis/base/large_mmap.h"
-#include "berberis/base/logging.h"
 #include "berberis/base/mmap.h"
+#include "berberis/base/tracing.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/runtime_primitives/runtime_library.h"  // InvalidateGuestRange
 
@@ -156,7 +156,7 @@ bool GuestMapShadow::IsExecutable(GuestAddr start, size_t size) const {
 }
 
 void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
-  ALOGV("SetExecutable: %zx..%zx", start, start + size);
+  TRACE("SetExecutable: %zx..%zx", start, start + size);
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
   while (pc < end) {
@@ -166,7 +166,7 @@ void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
 }
 
 void GuestMapShadow::ClearExecutable(GuestAddr start, size_t size) {
-  ALOGV("ClearExecutable: %zx..%zx", start, start + size);
+  TRACE("ClearExecutable: %zx..%zx", start, start + size);
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
   bool changed = false;
@@ -183,7 +183,7 @@ void GuestMapShadow::RemapExecutable(GuestAddr old_start,
                                      size_t old_size,
                                      GuestAddr new_start,
                                      size_t new_size) {
-  ALOGV("RemapExecutable: from %zx..%zx to %zx..%zx",
+  TRACE("RemapExecutable: from %zx..%zx to %zx..%zx",
         old_start,
         old_start + old_size,
         new_start,

@@ -24,6 +24,7 @@
 #include "berberis/base/config_globals.h"
 #include "berberis/base/format_buffer.h"
 #include "berberis/base/gettid.h"
+#include "berberis/base/logging.h"
 #include "berberis/base/scoped_errno.h"
 
 namespace berberis {
@@ -96,5 +97,13 @@ class Tracing {
       ::berberis::Tracing::TraceF(__VA_ARGS__); \
     }                                           \
   } while (0)
+
+#define TRACE_AND_ALOGE(...) \
+  TRACE(__VA_ARGS__);        \
+  ALOGE(__VA_ARGS__)
+
+#define TRACE_AND_ALOGI(...) \
+  TRACE(__VA_ARGS__);        \
+  ALOGI(__VA_ARGS__)
 
 #endif  // BERBERIS_BASE_TRACING_H_

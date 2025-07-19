@@ -30,8 +30,8 @@
 
 #include "berberis/base/checks.h"
 #include "berberis/base/forever_alloc.h"
-#include "berberis/base/logging.h"
 #include "berberis/base/strings.h"  // Split
+#include "berberis/base/tracing.h"
 
 namespace berberis {
 
@@ -184,7 +184,7 @@ std::bitset<kNumConfigFlags> MakeConfigFlagsSet() {
       }
     }
     if (!found) {
-      ALOGW("Unrecognized config flag '%s' - ignoring", token.c_str());
+      TRACE_AND_ALOGE("Unrecognized config flag '%s' - ignoring", token.c_str());
     }
   }
   return flags_set;
@@ -200,9 +200,9 @@ uintptr_t ParseAddr(const char* addr_cstr) {
 
   // Warning: setting errno on failure is implementation defined. So we also use extra heuristics.
   if (errno != 0 || (*end_ptr != '\n' && *end_ptr != '\0')) {
-    ALOGE("Cannot convert \"%s\" to integer: %s\n",
-          addr_cstr,
-          errno != 0 ? strerror(errno) : "unexpected end of string");
+    TRACE_AND_ALOGE("Cannot convert \"%s\" to integer: %s\n",
+                    addr_cstr,
+                    errno != 0 ? strerror(errno) : "unexpected end of string");
     return 0;
   }
   return addr;

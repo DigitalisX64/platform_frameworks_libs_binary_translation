@@ -34,7 +34,6 @@
 #include "berberis/base/bit_util.h"
 #include "berberis/base/config_globals.h"
 #include "berberis/base/file.h"
-#include "berberis/base/logging.h"
 #include "berberis/base/strings.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_abi/guest_call.h"
@@ -184,7 +183,7 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
 
   handle = android_dlopen_ext(libpath, flags, extinfo);
   if (handle != nullptr) {
-    ALOGI("'%s' library was loaded for the host platform.", libpath);
+    TRACE_AND_ALOGI("'%s' library was loaded for the host platform.", libpath);
     AddHostLibrary(handle);
   }
 
@@ -362,7 +361,7 @@ NdktNativeBridge g_ndkt_native_bridge;
 // Note, that 'supported_abis' and 'abi_count' are deprecated (b/18061712).
 const struct android::NativeBridgeRuntimeValues* GetAppEnvByIsa(const char* app_isa) {
   if (app_isa == nullptr) {
-    ALOGE("instruction set is null");
+    TRACE_AND_ALOGE("instruction set is null");
     return nullptr;
   }
 
@@ -370,7 +369,7 @@ const struct android::NativeBridgeRuntimeValues* GetAppEnvByIsa(const char* app_
     return &berberis::kNativeBridgeRuntimeValues;
   }
 
-  ALOGE("unknown instruction set '%s'", app_isa);
+  TRACE_AND_ALOGE("unknown instruction set '%s'", app_isa);
   return nullptr;
 }
 
@@ -411,9 +410,9 @@ bool native_bridge_initialize(const android::NativeBridgeRuntimeCallbacks* runti
 
   char version[PROP_VALUE_MAX];
   if (__system_property_get("ro.berberis.version", version)) {
-    ALOGI("Initialized Berberis (%s), version %s", env->os_arch, version);
+    TRACE_AND_ALOGI("Initialized Berberis (%s), version %s", env->os_arch, version);
   } else {
-    ALOGI("Initialized Berberis (%s)", env->os_arch);
+    TRACE_AND_ALOGI("Initialized Berberis (%s)", env->os_arch);
   }
 
   std::string error_msg;
