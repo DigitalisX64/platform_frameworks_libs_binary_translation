@@ -144,42 +144,21 @@ bool RegsLiveInBasicBlock(MachineBasicBlock* bb, const MachineRegVector& regs) {
   return false;
 }
 
-template <typename T>
-berberis::MachineInsn* CopyInstruction(MachineIR* machine_ir, berberis::MachineInsn* insn) {
-  return machine_ir->NewInsn<T>(*static_cast<T*>(insn));
-}
-
-template <template <typename> typename T>
-berberis::MachineInsn* CopyInstruction(MachineIR* machine_ir, berberis::MachineInsn* insn) {
-  return machine_ir->NewInsn<T>(
-      *static_cast<MachineInsn<typename T<typename CodeEmitter::Assemblers>::DeviceInsnInfo>*>(
-          insn));
-}
-
-std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode) {
+bool SupportedInsn(MachineOpcode opcode) {
   switch (opcode) {
     case kMachineOpAddqRegReg:
-      return CopyInstruction<AddqRegReg>;
     case kMachineOpPseudoReadFlags:
-      return CopyInstruction<PseudoReadFlags>;
     case kMachineOpCmplRegImm:
-      return CopyInstruction<CmplRegImm>;
     case kMachineOpCmplRegReg:
-      return CopyInstruction<CmplRegReg>;
     case kMachineOpCmpqRegImm:
-      return CopyInstruction<CmpqRegImm>;
     case kMachineOpCmpqRegReg:
-      return CopyInstruction<CmpqRegReg>;
     case kMachineOpSublRegImm:
-      return CopyInstruction<SublRegImm>;
     case kMachineOpSublRegReg:
-      return CopyInstruction<SublRegReg>;
     case kMachineOpSubqRegImm:
-      return CopyInstruction<SubqRegImm>;
     case kMachineOpSubqRegReg:
-      return CopyInstruction<SubqRegReg>;
+      return true;
     default:
-      return std::nullopt;
+      return false;
   }
 }
 
@@ -249,9 +228,7 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
   }
   MachineReg flag_reg;
   // First add instruction that sets flags register.
-  auto insn_opt = GetInsnGen((*context.flag_set_insn.insn)->opcode());
-  CHECK(insn_opt.has_value());
-  auto insn = insn_opt.value()(machine_ir, *context.flag_set_insn.insn);
+  auto insn = machine_ir->CloneInstruction(*context.flag_set_insn.insn);
   for (int i = 0; i < insn->NumRegOperands(); i++) {
     if (insn->RegKindAt(i).IsInput()) {
       CHECK(reg_map.contains(insn->RegAt(i)));
@@ -283,8 +260,7 @@ void InsertFlagGenInstructions(MachineIR* machine_ir,
   }
 
   // Now add readflags instruction.
-  insn =
-      GetInsnGen((*context.readflags_insn)->opcode()).value()(machine_ir, *context.readflags_insn);
+  insn = machine_ir->CloneInstruction(*context.readflags_insn);
   insn->SetRegAt(0, reg);
   insn->SetRegAt(1, flag_reg);
   context.bb->insn_list().insert(insn_it, insn);
@@ -356,7 +332,7 @@ std::optional<FlagSettingInsn> IsEligibleReadFlag(MachineIR* machine_ir,
 
   // Make sure we know how to copy this instruction.
   auto flag_setter = FindFlagSettingInsn(insn_it, bb->insn_list().begin(), flag_register);
-  if (flag_setter.has_value() && GetInsnGen((*flag_setter.value().insn)->opcode()).has_value()) {
+  if (flag_setter.has_value() && SupportedInsn((*flag_setter.value().insn)->opcode())) {
     return flag_setter.value();
   }
   return std::nullopt;

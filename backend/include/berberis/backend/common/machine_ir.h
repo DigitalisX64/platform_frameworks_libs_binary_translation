@@ -202,6 +202,8 @@ enum MachineInsnKind {
 
 enum MachineOpcode : int;
 
+class MachineIR;
+
 class MachineInsn {
  public:
   virtual ~MachineInsn() {
@@ -245,6 +247,9 @@ class MachineInsn {
   void set_recovery_pc(GuestAddr pc) { recovery_info_.pc = pc; }
 
  protected:
+  MachineInsn(const MachineInsn&) = default;
+  MachineInsn(const MachineInsn& insn, MachineReg* regs) : MachineInsn(insn) { regs_ = regs; }
+  MachineInsn* operator=(const MachineInsn&) = delete;
   MachineInsn(MachineOpcode opcode,
               int num_reg_operands,
               const MachineRegKind* reg_kinds,
@@ -257,9 +262,9 @@ class MachineInsn {
         kind_(kind),
         recovery_info_{nullptr, kNullGuestAddr} {}
 
-  void SetRegs(MachineReg* regs) { regs_ = regs; }
-
  private:
+  friend class MachineIR;
+  virtual MachineInsn* Clone(Arena* arena) const = 0;
   // We either recover by building explicit recovery blocks or by storing recovery pc.
   // TODO(b/200327919): Convert this to union? We'll need to know which one is used during
   // initialization and in has_side_effects.
@@ -441,6 +446,8 @@ class MachineIR {
     return NewInArena<T>(arena(), args...);
   }
 
+  MachineInsn* CloneInstruction(const MachineInsn* insn) { return insn->Clone(arena()); }
+
  private:
   // Basic block number is useful when allocating analytical data
   // structures indexed by IDs. Note that the return value of this function is
@@ -459,7 +466,7 @@ class MachineIR {
   MachineBasicBlockList bb_list_;
 };
 
-class PseudoBranch : public MachineInsn {
+class PseudoBranch final : public MachineInsn {
  public:
   static const MachineOpcode kOpcode;
 
@@ -472,10 +479,13 @@ class PseudoBranch : public MachineInsn {
   void set_then_bb(const MachineBasicBlock* then_bb) { then_bb_ = then_bb; }
 
  private:
+  friend PseudoBranch* NewInArena<PseudoBranch, const PseudoBranch&>(Arena*, const PseudoBranch&);
+  PseudoBranch(const PseudoBranch&) = default;
+  MachineInsn* Clone(Arena* arena) const override;
   const MachineBasicBlock* then_bb_;
 };
 
-class PseudoCondBranch : public MachineInsn {
+class PseudoCondBranch final : public MachineInsn {
  public:
   static const MachineOpcode kOpcode;
 
@@ -496,13 +506,18 @@ class PseudoCondBranch : public MachineInsn {
   MachineReg eflags() const { return eflags_; }
 
  private:
+  friend PseudoCondBranch* NewInArena<PseudoCondBranch, const PseudoCondBranch&>(
+      Arena*,
+      const PseudoCondBranch&);
+  PseudoCondBranch(const PseudoCondBranch&) = default;
+  MachineInsn* Clone(Arena* arena) const override;
   CodeEmitter::Condition cond_;
   const MachineBasicBlock* then_bb_;
   const MachineBasicBlock* else_bb_;
   MachineReg eflags_;
 };
 
-class PseudoJump : public MachineInsn {
+class PseudoJump final : public MachineInsn {
  public:
   enum class Kind {
     kJumpWithPendingSignalsCheck,
@@ -520,11 +535,14 @@ class PseudoJump : public MachineInsn {
   Kind kind() const { return kind_; }
 
  private:
+  friend PseudoJump* NewInArena<PseudoJump, const PseudoJump&>(Arena*, const PseudoJump&);
+  PseudoJump(const PseudoJump&) = default;
+  MachineInsn* Clone(Arena* arena) const override;
   GuestAddr target_;
   Kind kind_;
 };
 
-class PseudoIndirectJump : public MachineInsn {
+class PseudoIndirectJump final : public MachineInsn {
  public:
   explicit PseudoIndirectJump(MachineReg src);
 
@@ -532,6 +550,11 @@ class PseudoIndirectJump : public MachineInsn {
   void Emit(CodeEmitter* as) const override;
 
  private:
+  friend PseudoIndirectJump* NewInArena<PseudoIndirectJump, const PseudoIndirectJump&>(
+      Arena*,
+      const PseudoIndirectJump&);
+  PseudoIndirectJump(const PseudoIndirectJump&);
+  MachineInsn* Clone(Arena* arena) const override;
   MachineReg src_;
 };
 
@@ -539,7 +562,7 @@ class PseudoIndirectJump : public MachineInsn {
 // Register class of operands is anything capable of keeping values of this
 // size.
 // ATTENTION: this insn has operands with variable register class!
-class PseudoCopy : public MachineInsn {
+class PseudoCopy final : public MachineInsn {
  public:
   static const MachineOpcode kOpcode;
 
@@ -549,6 +572,9 @@ class PseudoCopy : public MachineInsn {
   void Emit(CodeEmitter* as) const override;
 
  private:
+  friend PseudoCopy* NewInArena<PseudoCopy, const PseudoCopy&>(Arena*, const PseudoCopy&);
+  PseudoCopy(const PseudoCopy&);
+  MachineInsn* Clone(Arena* arena) const override;
   MachineReg regs_[2];
 };
 
@@ -558,7 +584,7 @@ class PseudoCopy : public MachineInsn {
 //
 // Example: PmovsxwdXRegXReg followed by MovlhpsXRegXReg
 // Example: xor rax, rax
-class PseudoDefXReg : public MachineInsn {
+class PseudoDefXReg final : public MachineInsn {
  public:
   explicit PseudoDefXReg(MachineReg reg);
 
@@ -568,10 +594,14 @@ class PseudoDefXReg : public MachineInsn {
   }
 
  private:
+  friend PseudoDefXReg* NewInArena<PseudoDefXReg, const PseudoDefXReg&>(Arena*,
+                                                                        const PseudoDefXReg&);
+  PseudoDefXReg(const PseudoDefXReg&);
+  MachineInsn* Clone(Arena* arena) const override;
   MachineReg reg_;
 };
 
-class PseudoDefReg : public MachineInsn {
+class PseudoDefReg final : public MachineInsn {
  public:
   explicit PseudoDefReg(MachineReg reg);
 
@@ -581,10 +611,13 @@ class PseudoDefReg : public MachineInsn {
   }
 
  private:
+  friend PseudoDefReg* NewInArena<PseudoDefReg, const PseudoDefReg&>(Arena*, const PseudoDefReg&);
+  PseudoDefReg(const PseudoDefReg&);
+  MachineInsn* Clone(Arena* arena) const override;
   MachineReg reg_;
 };
 
-class PseudoReadFlags : public MachineInsn {
+class PseudoReadFlags final : public MachineInsn {
  public:
   static const MachineOpcode kOpcode;
 
@@ -600,7 +633,6 @@ class PseudoReadFlags : public MachineInsn {
   };
 
   PseudoReadFlags(WithOverflowEnum with_overflow, MachineReg dst, MachineReg flags);
-  PseudoReadFlags(const PseudoReadFlags& other);
 
   std::string GetDebugString() const override;
   void Emit(CodeEmitter* as) const override;
@@ -608,11 +640,16 @@ class PseudoReadFlags : public MachineInsn {
   bool with_overflow() const { return with_overflow_; };
 
  private:
+  friend PseudoReadFlags* NewInArena<PseudoReadFlags, const PseudoReadFlags&>(
+      Arena*,
+      const PseudoReadFlags&);
+  PseudoReadFlags(const PseudoReadFlags&);
+  MachineInsn* Clone(Arena* arena) const override;
   MachineReg regs_[2];
   bool with_overflow_;
 };
 
-class PseudoWriteFlags : public MachineInsn {
+class PseudoWriteFlags final : public MachineInsn {
  public:
   static const MachineOpcode kOpcode;
 
@@ -624,6 +661,11 @@ class PseudoWriteFlags : public MachineInsn {
   void Emit(CodeEmitter* as) const override;
 
  private:
+  friend PseudoWriteFlags* NewInArena<PseudoWriteFlags, const PseudoWriteFlags&>(
+      Arena*,
+      const PseudoWriteFlags&);
+  PseudoWriteFlags(const PseudoWriteFlags&);
+  MachineInsn* Clone(Arena* arena) const override;
   MachineReg regs_[2];
 };
 

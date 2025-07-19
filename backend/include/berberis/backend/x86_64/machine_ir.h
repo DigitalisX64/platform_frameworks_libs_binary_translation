@@ -168,61 +168,55 @@ inline constexpr auto& kFLAGS = kRegisterClass<device_arch_info::FLAGS>;
 
 class MachineInsnX86_64 : public MachineInsn {
  public:
-  MachineInsnX86_64(const MachineInsnX86_64& other) : MachineInsn(other) {
-    for (int i = 0; i < kMaxMachineRegOperands; i++) {
-      regs_[i] = other.regs_[i];
-    }
-    scale_ = other.scale_;
-    scale2_ = other.scale2_;
-    disp_ = other.disp_;
-    disp2_ = other.disp2_;
-    imm_ = other.imm_;
-    cond_ = other.cond_;
-
-    SetRegs(regs_);
-  }
-
   ~MachineInsnX86_64() override {
     // No code here - will never be called!
   }
 
-  Assembler::ScaleFactor scale() const { return scale_; }
+  Assembler::ScaleFactor scale() const { return x86_64_insn_info_.scale_; }
 
-  Assembler::ScaleFactor scale2() const { return scale2_; }
+  Assembler::ScaleFactor scale2() const { return x86_64_insn_info_.scale2_; }
 
-  uint32_t disp() const { return disp_; }
+  uint32_t disp() const { return x86_64_insn_info_.disp_; }
 
-  uint32_t disp2() const { return disp2_; }
+  uint32_t disp2() const { return x86_64_insn_info_.disp2_; }
 
-  Assembler::Condition cond() const { return cond_; }
+  Assembler::Condition cond() const { return x86_64_insn_info_.cond_; }
 
-  uint64_t imm() const { return imm_; }
+  uint64_t imm() const { return x86_64_insn_info_.imm_; }
 
  protected:
+  explicit MachineInsnX86_64(const MachineInsnX86_64& other)
+      : MachineInsn(other, x86_64_insn_info_.regs_), x86_64_insn_info_(other.x86_64_insn_info_) {}
+
   explicit MachineInsnX86_64(const MachineInsnInfo* info)
-      : MachineInsn(info->opcode, info->num_reg_operands, info->reg_kinds, regs_, info->kind),
-        scale_(Assembler::kTimesOne) {}
+      : MachineInsn(info->opcode,
+                    info->num_reg_operands,
+                    info->reg_kinds,
+                    x86_64_insn_info_.regs_,
+                    info->kind) {}
 
-  void set_scale(Assembler::ScaleFactor scale) { scale_ = scale; }
+  void set_scale(Assembler::ScaleFactor scale) { x86_64_insn_info_.scale_ = scale; }
 
-  void set_scale2(Assembler::ScaleFactor scale2) { scale2_ = scale2; }
+  void set_scale2(Assembler::ScaleFactor scale2) { x86_64_insn_info_.scale2_ = scale2; }
 
-  void set_disp(uint32_t disp) { disp_ = disp; }
+  void set_disp(uint32_t disp) { x86_64_insn_info_.disp_ = disp; }
 
-  void set_disp2(uint32_t disp2) { disp2_ = disp2; }
+  void set_disp2(uint32_t disp2) { x86_64_insn_info_.disp2_ = disp2; }
 
-  void set_cond(Assembler::Condition cond) { cond_ = cond; }
+  void set_cond(Assembler::Condition cond) { x86_64_insn_info_.cond_ = cond; }
 
-  void set_imm(uint64_t imm) { imm_ = imm; }
+  void set_imm(uint64_t imm) { x86_64_insn_info_.imm_ = imm; }
 
  private:
-  MachineReg regs_[kMaxMachineRegOperands];
-  uint32_t disp_;
-  Assembler::ScaleFactor scale_;
-  Assembler::ScaleFactor scale2_;
-  Assembler::Condition cond_;
-  uint32_t disp2_;
-  uint64_t imm_;
+  struct {
+    MachineReg regs_[kMaxMachineRegOperands];
+    uint32_t disp_;
+    Assembler::ScaleFactor scale_ = Assembler::kTimesOne;
+    Assembler::ScaleFactor scale2_ = Assembler::kTimesOne;
+    Assembler::Condition cond_;
+    uint32_t disp2_;
+    uint64_t imm_;
+  } x86_64_insn_info_;
 };
 
 // Syntax sugar.
@@ -236,7 +230,7 @@ inline MachineInsnX86_64* AsMachineInsnX86_64(MachineInsn* insn) {
 
 // Clobbered registers are described as DEF'ed.
 // TODO(b/232598137): implement simpler support for clobbered registers?
-class CallImm : public MachineInsnX86_64 {
+class CallImm final : public MachineInsnX86_64 {
  public:
   enum class RegType {
     kIntType,
@@ -265,6 +259,9 @@ class CallImm : public MachineInsnX86_64 {
   void EnableCustomAVX256ABI() { custom_avx256_abi_ = true; };
 
  private:
+  friend CallImm* NewInArena<CallImm, const CallImm&>(Arena*, const CallImm&);
+  CallImm(const CallImm&) = default;
+  MachineInsn* Clone(Arena* arena) const override;
   bool custom_avx256_abi_;
 };
 
@@ -272,7 +269,7 @@ class CallImm : public MachineInsnX86_64 {
 // the corresponding operand in CallImm. The specific hard register assigned is defined by the
 // register class of CallImm operand. MachineIRBuilder adds an extra PseudoCopy before this insn in
 // case the same vreg holds values for several arguments (with non-intersecting register classes).
-class CallImmArg : public MachineInsnX86_64 {
+class CallImmArg final : public MachineInsnX86_64 {
  public:
   explicit CallImmArg(MachineReg arg, CallImm::RegType reg_type);
 
@@ -280,6 +277,11 @@ class CallImmArg : public MachineInsnX86_64 {
   void Emit(CodeEmitter*) const override{
       // It's an auxiliary instruction. Do not emit.
   };
+
+ private:
+  friend CallImmArg* NewInArena<CallImmArg, const CallImmArg&>(Arena*, const CallImmArg&);
+  CallImmArg(const CallImmArg&) = default;
+  MachineInsn* Clone(Arena* arena) const override;
 };
 
 template <typename IntrinsicBindingInfo>
@@ -391,6 +393,8 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
                                      ((device_arch_info::kIsRegister<Operands> &&
                                        Operands::kUsage != device_arch_info::kUse) +
                                       ... + 0)>;
+
+  MachineInsn& operator=(const MachineInsn&) = delete;
 
   explicit MachineInsn(ConstructorArgs... args)
       : MachineInsnX86_64(&GenMachineInsnInfo<ConstructorArgs...>(args...)) {
@@ -572,6 +576,12 @@ class MachineInsn<device_arch_info::DeviceInsnInfo<kEmitInsnFunc,
   }
 
  private:
+  friend MachineInsn* NewInArena<MachineInsn, const MachineInsn&>(Arena*, const MachineInsn&);
+  MachineInsn(const MachineInsn& insn) = default;
+  berberis::MachineInsn* Clone(Arena* arena) const override {
+    return NewInArena<MachineInsn, const MachineInsn&>(arena, *this);
+  }
+
   template <typename ConstructorArg>
   void ProcessConstructorArg(size_t& reg_idx, size_t& mem_idx, ConstructorArg arg) {
     if constexpr (std::is_same_v<ConstructorArg, Assembler::Condition>) {

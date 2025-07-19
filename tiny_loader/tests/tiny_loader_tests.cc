@@ -146,6 +146,25 @@ TEST(tiny_loader, CalculateLoadSize) {
   EXPECT_EQ(size, kTestLibGnuLoadSize);
 }
 
+TEST(tiny_loader, CalculateLoadBias) {
+  LoadedElfFile loaded_elf_file;
+  std::string error_msg;
+  std::string elf_filepath;
+  ASSERT_TRUE(GetTestElfFilepath(kTestLibGnuName, &elf_filepath, &error_msg)) << error_msg;
+  ASSERT_TRUE(TinyLoader::LoadFromFile(elf_filepath.c_str(), &loaded_elf_file, &error_msg))
+      << error_msg;
+
+  const void* load_ptr = loaded_elf_file.base_addr();
+  size_t size = TinyLoader::CalculateLoadSize(elf_filepath.c_str(), &error_msg);
+  ASSERT_NE(size, 0U) << error_msg;
+
+  std::optional<uintptr_t> load_bias =
+      TinyLoader::CalculateLoadBias(elf_filepath.c_str(), load_ptr, size, &error_msg);
+  ASSERT_TRUE(load_bias.has_value()) << error_msg;
+  EXPECT_EQ(load_bias.value(), bit_cast<uintptr_t>(load_ptr));
+  EXPECT_EQ(error_msg, "") << error_msg;
+}
+
 TEST(tiny_loader, library_invalid_elf_class) {
   LoadedElfFile loaded_elf_file;
   std::string error_msg;
@@ -179,6 +198,8 @@ TEST(tiny_loader, binary) {
 
   ASSERT_EQ(nullptr, loaded_elf_file.dynamic());
 
+  auto load_ptr = loaded_elf_file.base_addr();
+
   // The second part of the test - to Load this file from already mapped memory.
   // Check that resulted loaded_elf_file is effectively the same
   LoadedElfFile memory_elf_file;
@@ -189,4 +210,10 @@ TEST(tiny_loader, binary) {
                                          &error_msg))
       << error_msg;
   AssertLoadedElfFilesEqual(memory_elf_file, loaded_elf_file);
+
+  std::optional<uintptr_t> load_bias = TinyLoader::CalculateLoadBias(
+      elf_filepath.c_str(), load_ptr, berberis::kPageSize, &error_msg);
+  ASSERT_TRUE(load_bias.has_value()) << error_msg;
+  EXPECT_EQ(load_bias.value(), 0U);
+  EXPECT_EQ(error_msg, "") << error_msg;
 }

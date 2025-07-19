@@ -19,12 +19,14 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <sys/cdefs.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/user.h>
 #include <unistd.h>
 
 #include <cstddef>
+#include <optional>
 #include <tuple>
 
 #include "berberis/base/bit_util.h"
@@ -44,7 +46,11 @@ using berberis::bit_cast;
 
 namespace {
 
-void set_error_msg(std::string* error_msg, const char* format, ...) {
+#if !defined(__printflike)
+#define __printflike(x, y) __attribute__((__format__(printf, x, y)))
+#endif
+
+__printflike(2, 3) void set_error_msg(std::string* error_msg, const char* format, ...) {
   if (error_msg == nullptr) {
     return;
   }
@@ -132,6 +138,7 @@ class TinyElfLoader {
   explicit TinyElfLoader(const char* name);
 
   std::tuple<bool, size_t> CalculateLoadSize(const char* path);
+  std::optional<uintptr_t> CalculateLoadBias(const void* load_addr, size_t load_size);
 
   bool LoadFromFile(const char* path,
                     size_t align,
@@ -271,7 +278,7 @@ bool TinyElfLoader::CheckElfHeader(const ElfEhdr* header) {
   // Like the kernel, we only accept program header tables that
   // are smaller than 64KiB.
   if (header->e_phnum < 1 || header->e_phnum > 65536 / sizeof(ElfPhdr)) {
-    set_error_msg(&error_msg_, "\"%s\" has invalid e_phnum: %zd", name_, header->e_phnum);
+    set_error_msg(&error_msg_, "\"%s\" has invalid e_phnum: %hu", name_, header->e_phnum);
     return false;
   }
 
@@ -452,14 +459,14 @@ bool TinyElfLoader::LoadSegments(int fd, size_t file_size, ElfHalf e_type,
     ElfAddr file_length = file_end - file_page_start;
 
     if (file_size <= 0) {
-      set_error_msg(&error_msg_, "\"%s\" invalid file size: %" PRId64, name_, file_size);
+      set_error_msg(&error_msg_, "\"%s\" invalid file size: %zd", name_, file_size);
       return false;
     }
 
     if (file_end > static_cast<size_t>(file_size)) {
       set_error_msg(&error_msg_,
                     "invalid ELF file \"%s\" load segment[%zd]:"
-                    " p_offset (%p) + p_filesz (%p) ( = %p) past end of file (0x%" PRIx64 ")",
+                    " p_offset (%p) + p_filesz (%p) ( = %p) past end of file (0x%zx)",
                     name_,
                     i,
                     bit_cast<void*>(phdr->p_offset),
@@ -681,6 +688,35 @@ std::tuple<bool, size_t> TinyElfLoader::CalculateLoadSize(const char* path) {
   return {true, size};
 }
 
+std::optional<uintptr_t> TinyElfLoader::CalculateLoadBias(const void* load_ptr, size_t load_size) {
+  const ElfEhdr* header = static_cast<const ElfEhdr*>(load_ptr);
+  const ElfPhdr* phdr_table = nullptr;
+  size_t phdr_num = 0;
+
+  uintptr_t load_addr = bit_cast<uintptr_t>(load_ptr);
+  if (!ReadProgramHeadersFromMemory(header, load_addr, load_size, &phdr_table, &phdr_num)) {
+    return std::nullopt;
+  }
+
+  ElfAddr min_vaddr;
+  size_t size = phdr_table_get_load_size(phdr_table, phdr_num, &min_vaddr);
+  if (size == 0) {
+    set_error_msg(&error_msg_, "\"%s\" has no loadable segments", name_);
+    return std::nullopt;
+  }
+
+  if (min_vaddr > load_addr) {
+    set_error_msg(&error_msg_,
+                  "\"%s\" min_vaddr(0x%zx) > load_addr(%p)",
+                  name_,
+                  bit_cast<size_t>(min_vaddr),
+                  load_ptr);
+    return std::nullopt;
+  }
+
+  return load_addr - min_vaddr;
+}
+
 bool TinyElfLoader::LoadFromFile(const char* path,
                                  size_t align,
                                  TinyLoader::mmap64_fn_t mmap64_fn,
@@ -763,4 +799,22 @@ size_t TinyLoader::CalculateLoadSize(const char* path, std::string* error_msg) {
   }
 
   return 0;
+}
+
+std::optional<uintptr_t> TinyLoader::CalculateLoadBias(const char* path,
+                                                       const void* load_ptr,
+                                                       size_t size,
+                                                       std::string* error_msg) {
+  TinyElfLoader loader(path);
+
+  auto load_bias = loader.CalculateLoadBias(load_ptr, size);
+  if (load_bias.has_value()) {
+    return load_bias;
+  }
+
+  if (error_msg != nullptr) {
+    *error_msg = loader.error_msg();
+  }
+
+  return std::nullopt;
 }

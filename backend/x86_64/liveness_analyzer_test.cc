@@ -99,6 +99,16 @@ class FakeInsnWithDefEarlyClobber : public MachineInsn {
   void Emit(CodeEmitter* /*as*/) const override {}
 
  private:
+  friend FakeInsnWithDefEarlyClobber*
+  NewInArena<FakeInsnWithDefEarlyClobber, const FakeInsnWithDefEarlyClobber&>(
+      Arena*,
+      const FakeInsnWithDefEarlyClobber&);
+  FakeInsnWithDefEarlyClobber(const FakeInsnWithDefEarlyClobber& insn)
+      : MachineInsn(insn), reg_{insn.reg_} {}
+  MachineInsn* Clone(Arena* arena) const {
+    return NewInArena<FakeInsnWithDefEarlyClobber, const FakeInsnWithDefEarlyClobber&>(arena,
+                                                                                       *this);
+  }
   static MachineRegKind reg_kind_;
   MachineReg reg_;
 };

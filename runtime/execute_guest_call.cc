@@ -58,9 +58,15 @@ void ExecuteGuestCall(ThreadState* state) {
     }
   }
 
-  LOG_ALWAYS_FATAL("Guest call didn't restore sp: expected %p, actual %p",
-                   ToHostAddr<void>(guest_call_execution.sp),
-                   ToHostAddr<void>(GetStackRegister(GetCPUState(*state))));
+  // We have seen apps that actually didn't properly restore sp (b/427834604), so this cannot be a
+  // fatal failure for bug-to-bug compatibility.
+  TRACE("Warning: guest call didn't restore sp: expected %p, actual %p",
+        ToHostAddr<void>(guest_call_execution.sp),
+        ToHostAddr<void>(GetStackRegister(GetCPUState(*state))));
+  TRACE("Trying to restore sp and continue...");
+  // This is typically called from RunGuestCall which requires stack to be properly restored, so
+  // that we can reload data which had been saved on stack before the call.
+  SetStackRegister(GetCPUState(*state), guest_call_execution.sp);
 }
 
 }  // namespace berberis

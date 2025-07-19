@@ -44,7 +44,6 @@ bool CheckRegsUnusedWithinInsnRange(MachineInsnList::iterator insn_it,
                                     MachineRegVector& regs);
 bool CheckPostLoopNode(MachineBasicBlock* block, const MachineRegVector& regs);
 bool CheckSuccessorNode(Loop* loop, MachineBasicBlock* block, MachineRegVector& regs);
-std::optional<InsnGenerator> GetInsnGen(MachineOpcode opcode);
 std::optional<FlagSettingInsn> FindFlagSettingInsn(MachineInsnList::iterator insn_it,
                                                    MachineInsnList::iterator begin,
                                                    MachineReg reg);

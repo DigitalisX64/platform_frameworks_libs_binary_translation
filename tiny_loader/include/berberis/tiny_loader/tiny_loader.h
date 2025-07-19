@@ -21,6 +21,9 @@
 
 #include <sys/mman.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #include "berberis/tiny_loader/loaded_elf_file.h"
@@ -45,6 +48,12 @@ class TinyLoader {
 
   // Returns 0 in the case of error.
   static size_t CalculateLoadSize(const char* path, std::string* error_msg);
+
+  // Returns std::nullopt in case of an error.
+  static std::optional<uintptr_t> CalculateLoadBias(const char* path,
+                                                    const void* load_ptr,
+                                                    size_t size,
+                                                    std::string* error_msg);
 
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(TinyLoader);

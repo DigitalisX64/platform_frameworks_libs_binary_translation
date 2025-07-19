@@ -362,9 +362,7 @@ TEST(MachineIRReadFlagsOptimizer, CheckSuccessorNodeLiveIn) {
 void TestCopiedInstruction(MachineIR* machine_ir, berberis::MachineInsn* insn) {
   MachineReg reg = machine_ir->AllocVReg();
 
-  auto gen = GetInsnGen(insn->opcode());
-  ASSERT_TRUE(gen.has_value());
-  auto* copy = gen.value()(machine_ir, insn);
+  auto* copy = machine_ir->CloneInstruction(insn);
 
   ASSERT_EQ(copy->opcode(), insn->opcode());
   // Note we use debug string to compare because it contains the actual

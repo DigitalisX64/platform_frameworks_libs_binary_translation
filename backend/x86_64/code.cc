@@ -100,6 +100,10 @@ CallImm::CallImm(uint64_t imm) : MachineInsnX86_64(&kCallImmInfo), custom_avx256
   set_imm(imm);
 }
 
+berberis::MachineInsn* CallImm::Clone(Arena* arena) const {
+  return NewInArena<CallImm, const CallImm&>(arena, *this);
+}
+
 int CallImm::GetIntArgIndex(int i) {
   constexpr int kIntArgIndex[] = {
       1,  // RDI
@@ -160,6 +164,10 @@ CallImmArg::CallImmArg(MachineReg arg, CallImm::RegType reg_type)
   SetRegAt(0, arg);
 }
 
+berberis::MachineInsn* CallImmArg::Clone(Arena* arena) const {
+  return NewInArena<CallImmArg, const CallImmArg&>(arena, *this);
+}
+
 }  // namespace x86_64
 
 const MachineOpcode PseudoBranch::kOpcode = kMachineOpPseudoBranch;
@@ -168,6 +176,10 @@ using Assembler = x86_64::Assembler;
 PseudoBranch::PseudoBranch(const MachineBasicBlock* then_bb)
     : MachineInsn(kMachineOpPseudoBranch, 0, nullptr, nullptr, kMachineInsnSideEffects),
       then_bb_(then_bb) {}
+
+MachineInsn* PseudoBranch::Clone(Arena* arena) const {
+  return NewInArena<PseudoBranch, const PseudoBranch&>(arena, *this);
+}
 
 const MachineOpcode PseudoCondBranch::kOpcode = kMachineOpPseudoCondBranch;
 
@@ -185,10 +197,18 @@ PseudoCondBranch::PseudoCondBranch(Assembler::Condition cond,
       else_bb_(else_bb),
       eflags_(eflags) {}
 
+MachineInsn* PseudoCondBranch::Clone(Arena* arena) const {
+  return NewInArena<PseudoCondBranch, const PseudoCondBranch&>(arena, *this);
+}
+
 PseudoJump::PseudoJump(GuestAddr target, Kind kind)
     : MachineInsn(kMachineOpPseudoJump, 0, nullptr, nullptr, kMachineInsnSideEffects),
       target_(target),
       kind_(kind) {}
+
+MachineInsn* PseudoJump::Clone(Arena* arena) const {
+  return NewInArena<PseudoJump, const PseudoJump&>(arena, *this);
+}
 
 PseudoIndirectJump::PseudoIndirectJump(MachineReg src)
     : MachineInsn(kMachineOpPseudoIndirectJump,
@@ -197,6 +217,13 @@ PseudoIndirectJump::PseudoIndirectJump(MachineReg src)
                   &src_,
                   kMachineInsnSideEffects),
       src_(src) {}
+
+PseudoIndirectJump::PseudoIndirectJump(const PseudoIndirectJump& insn)
+    : MachineInsn(insn, &src_), src_{insn.src_} {}
+
+MachineInsn* PseudoIndirectJump::Clone(Arena* arena) const {
+  return NewInArena<PseudoIndirectJump, const PseudoIndirectJump&>(arena, *this);
+}
 
 const MachineOpcode PseudoCopy::kOpcode = kMachineOpPseudoCopy;
 
@@ -211,6 +238,13 @@ PseudoCopy::PseudoCopy(MachineReg dst, MachineReg src, int size)
                   kMachineInsnCopy),
       regs_{dst, src} {}
 
+PseudoCopy::PseudoCopy(const PseudoCopy& insn)
+    : MachineInsn(insn, regs_), regs_{insn.regs_[0], insn.regs_[1]} {}
+
+MachineInsn* PseudoCopy::Clone(Arena* arena) const {
+  return NewInArena<PseudoCopy, const PseudoCopy&>(arena, *this);
+}
+
 PseudoDefXReg::PseudoDefXReg(MachineReg reg)
     : MachineInsn(kMachineOpPseudoDefXReg,
                   1,
@@ -219,6 +253,13 @@ PseudoDefXReg::PseudoDefXReg(MachineReg reg)
                   kMachineInsnDefault),
       reg_{reg} {}
 
+PseudoDefXReg::PseudoDefXReg(const PseudoDefXReg& insn)
+    : MachineInsn(insn, &reg_), reg_{insn.reg_} {}
+
+MachineInsn* PseudoDefXReg::Clone(Arena* arena) const {
+  return NewInArena<PseudoDefXReg, const PseudoDefXReg&>(arena, *this);
+}
+
 PseudoDefReg::PseudoDefReg(MachineReg reg)
     : MachineInsn(kMachineOpPseudoDefReg,
                   1,
@@ -226,6 +267,12 @@ PseudoDefReg::PseudoDefReg(MachineReg reg)
                   &reg_,
                   kMachineInsnDefault),
       reg_{reg} {}
+
+PseudoDefReg::PseudoDefReg(const PseudoDefReg& insn) : MachineInsn(insn, &reg_), reg_{insn.reg_} {}
+
+MachineInsn* PseudoDefReg::Clone(Arena* arena) const {
+  return NewInArena<PseudoDefReg, const PseudoDefReg&>(arena, *this);
+}
 
 const MachineOpcode PseudoReadFlags::kOpcode = kMachineOpPseudoReadFlags;
 
@@ -238,13 +285,13 @@ PseudoReadFlags::PseudoReadFlags(WithOverflowEnum with_overflow, MachineReg dst,
       regs_{dst, flags},
       with_overflow_(with_overflow == kWithOverflow) {}
 
-PseudoReadFlags::PseudoReadFlags(const PseudoReadFlags& other) : MachineInsn(other) {
-  with_overflow_ = other.with_overflow_;
-  for (size_t i = 0; i < std::size(regs_); i++) {
-    regs_[i] = other.regs_[i];
-  }
+PseudoReadFlags::PseudoReadFlags(const PseudoReadFlags& other)
+    : MachineInsn(other, regs_),
+      regs_{other.regs_[0], other.regs_[1]},
+      with_overflow_{other.with_overflow_} {}
 
-  SetRegs(regs_);
+MachineInsn* PseudoReadFlags::Clone(Arena* arena) const {
+  return NewInArena<PseudoReadFlags, const PseudoReadFlags&>(arena, *this);
 }
 
 const MachineOpcode PseudoWriteFlags::kOpcode = kMachineOpPseudoWriteFlags;
@@ -256,5 +303,12 @@ PseudoWriteFlags::PseudoWriteFlags(MachineReg src, MachineReg flags)
                   regs_,
                   kMachineInsnDefault),
       regs_{src, flags} {}
+
+PseudoWriteFlags::PseudoWriteFlags(const PseudoWriteFlags& insn)
+    : MachineInsn(insn), regs_{insn.regs_[0], insn.regs_[1]} {}
+
+MachineInsn* PseudoWriteFlags::Clone(Arena* arena) const {
+  return NewInArena<PseudoWriteFlags, const PseudoWriteFlags&>(arena, *this);
+}
 
 }  // namespace berberis
