@@ -50,6 +50,17 @@ TEST(MapsSnapshot, Basic) {
   ASSERT_FALSE(result.value().pathname.empty());
 }
 
+TEST(MapsSnapshot, UpdateAndRetry) {
+  auto* maps_snapshot = MapsSnapshot::GetInstance();
+
+  maps_snapshot->ClearForTesting();
+
+  // With UpdateAndRetry we should find the mapping right away.
+  auto result = maps_snapshot->GetMappedObjectRecordOrUpdateAndRetry(bit_cast<uintptr_t>(&Foo));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_FALSE(result.value().pathname.empty());
+}
+
 TEST(MapsSnapshot, AnonymousMapping) {
   auto* maps_snapshot = MapsSnapshot::GetInstance();
 

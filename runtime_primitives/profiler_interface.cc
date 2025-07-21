@@ -91,17 +91,11 @@ MappedNameBuffer ConstructMappedNameBuffer(GuestAddr guest_addr) {
   MappedNameBuffer buf;
   auto* maps_snapshot = MapsSnapshot::GetInstance();
 
-  auto mapped_object_record = maps_snapshot->GetMappedObjectRecord(guest_addr);
+  auto mapped_object_record = maps_snapshot->GetMappedObjectRecordOrUpdateAndRetry(guest_addr);
   if (!mapped_object_record.has_value()) {
-    // If no mapping is found renew the snapshot and try again.
-    maps_snapshot->Update();
-    auto updated_mapped_object_record = maps_snapshot->GetMappedObjectRecord(guest_addr);
-    if (!updated_mapped_object_record.has_value()) {
-      TRACE("Guest addr %p not found in /proc/self/maps", ToHostAddr<void>(guest_addr));
-      buf[0] = '\0';
-      return buf;
-    }
-    mapped_object_record.emplace(std::move(updated_mapped_object_record.value()));
+    TRACE("Guest addr %p not found in /proc/self/maps", ToHostAddr<void>(guest_addr));
+    buf[0] = '\0';
+    return buf;
   }
 
   // We can use more clever logic here and try to extract the basename, but the parent directory

@@ -52,6 +52,8 @@ class MapsSnapshot {
   // It's important that we return const, since ArenaString isn't thread-safe, and we should
   // NOT be triggering re-allocations from outside of this class.
   std::optional<const MapsSnapshot::Record> GetMappedObjectRecord(uintptr_t addr);
+  // Syntax sugar for update and retry logic.
+  std::optional<const MapsSnapshot::Record> GetMappedObjectRecordOrUpdateAndRetry(uintptr_t addr);
 
  private:
   MapsSnapshot() : arena_(), mutex_(), maps_(&arena_) {};

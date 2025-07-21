@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2025 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 #include "gtest/gtest.h"
 
+#include "cstddef"
+
 #include "berberis/base/bit_util.h"
 #include "berberis/guest_abi/function_wrappers.h"
 #include "berberis/guest_state/guest_state.h"
@@ -25,9 +27,14 @@ namespace berberis {
 
 namespace {
 
-TEST(TrampolineFuncGenerator, IntRes) {
+constexpr size_t kLargeNumber{0x0007'ffff'fff0};
+constexpr size_t kMask32Bit{0xffff'ffff};
+
+static_assert((kLargeNumber & kMask32Bit) != kLargeNumber);
+
+TEST(TrampolineFuncGenerator64, OutputIsTruncated) {
   struct Callee {
-    static int foo() { return 1; }
+    static size_t foo() { return kLargeNumber; }
   };
 
   TrampolineFunc func = GetTrampolineFunc<int(void)>();
@@ -36,25 +43,19 @@ TEST(TrampolineFuncGenerator, IntRes) {
 
   func(bit_cast<void*>(&Callee::foo), &state);
 
-  EXPECT_EQ(1u, state.cpu.r[0]);
+  EXPECT_EQ(kLargeNumber & kMask32Bit, state.cpu.x[0]);
 }
 
-TEST(TrampolineFuncGenerator, FloatArgs) {
+TEST(TrampolineFuncGenerator64, InputIsTruncated) {
   struct Callee {
-    static void foo(void* p, float x, float y) {
-      EXPECT_EQ(nullptr, p);
-      EXPECT_EQ(0.5f, x);
-      EXPECT_EQ(0.75f, y);
-    }
+    static void foo(size_t x) { EXPECT_EQ(kLargeNumber & kMask32Bit, x); }
   };
 
-  TrampolineFunc func = GetTrampolineFunc<void(void*, float, float)>();
+  TrampolineFunc func = GetTrampolineFunc<void(int)>();
 
   ProcessState state{};
 
-  state.cpu.r[0] = 0u;
-  state.cpu.r[1] = bit_cast<uint32_t>(0.5f);
-  state.cpu.r[2] = bit_cast<uint32_t>(0.75f);
+  state.cpu.x[0] = kLargeNumber;
 
   EXPECT_NO_FATAL_FAILURE(func(bit_cast<void*>(&Callee::foo), &state));
 }

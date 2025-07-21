@@ -78,4 +78,15 @@ std::optional<const MapsSnapshot::Record> MapsSnapshot::GetMappedObjectRecord(ui
   return std::nullopt;
 }
 
+std::optional<const MapsSnapshot::Record> MapsSnapshot::GetMappedObjectRecordOrUpdateAndRetry(
+    uintptr_t addr) {
+  auto rec = GetMappedObjectRecord(addr);
+  if (rec.has_value()) {
+    return rec;
+  }
+
+  Update();
+  return GetMappedObjectRecord(addr);
+}
+
 }  // namespace berberis

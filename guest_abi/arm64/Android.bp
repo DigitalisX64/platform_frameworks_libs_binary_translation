@@ -54,6 +54,7 @@ cc_test_library {
         "guest_params_test.cc",
         "guest_function_wrapper_test.cc",
         "host_function_wrapper_test.cc",
+        "trampoline_func_generator_test_arm64.cc",
     ],
     shared: {
         enabled: false,
