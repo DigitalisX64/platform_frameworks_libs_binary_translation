@@ -6732,6 +6732,13 @@ TEST(Arm64InsnTest, UnsignedRoundingShiftLeftInt16x8) {
   ASSERT_EQ(AsmUrshl(arg1, 0), MakeUInt128(0x9999999999999999ULL, 0x9999999999999999ULL));
 }
 
+TEST(Arm64InsnTest, SignedRoundingShiftLeftInt32x4) {
+  constexpr auto AsmSrshl = ASM_INSN_WRAP_FUNC_W_RES_WW_ARG("srshl %0.4s, %1.4s, %2.4s");
+  __uint128_t arg1 = MakeUInt128(0x12345678'12345678ULL, 0x87654321'87654321ULL);
+  __uint128_t arg2 = MakeUInt128(0x00000004'fffffffcULL, 0xfffffffc'ffffffe9ULL);
+  ASSERT_EQ(AsmSrshl(arg1, arg2), MakeUInt128(0x23456780'01234568ULL, 0xf8765432'ffffff0fULL));
+}
+
 TEST(Arm64InsnTest, UnsignedReciprocalSquareRootEstimateInt32x4) {
   __uint128_t arg = MakeUInt128(0x9641122821407533ULL, 0x0265510042410489ULL);
   __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("ursqrte %0.4s, %1.4s")(arg);
