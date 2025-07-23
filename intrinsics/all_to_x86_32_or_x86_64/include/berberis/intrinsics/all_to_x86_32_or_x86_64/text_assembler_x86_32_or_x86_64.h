@@ -316,6 +316,8 @@ class TextAssembler {
       return "host_platform::kHasAES && host_platform::kHasAVX";
     } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX>) {
       return "host_platform::kHasAVX";
+    } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX2>) {
+      return "host_platform::kHasAVX2";
     } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasBMI>) {
       return "host_platform::kHasBMI";
     } else if constexpr (std::is_same_v<CPUIDRestriction, device_arch_info::HasF16C>) {

@@ -17,13 +17,14 @@
 #include "berberis/kernel_api/sys_prctl_emulation.h"
 
 #include <linux/filter.h>
+#include <linux/prctl.h>
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 #include "berberis/base/bit_util.h"
-#include "berberis/base/checks.h"
+#include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/syscall_numbers.h"
 
 namespace berberis {
@@ -33,7 +34,7 @@ int PrctlForGuest(int option,
                   unsigned long arg3,
                   unsigned long arg4,
                   unsigned long arg5) {
-  if (option == PR_SET_SECCOMP) {
+  if (option == PR_SET_SECCOMP && arg2 == SECCOMP_MODE_FILTER) {
     auto prog = bit_cast<struct sock_fprog*>(arg3);
     for (int i = 0; i < prog->len; i++) {
       struct sock_filter& filter = prog->filter[i];
@@ -42,9 +43,13 @@ int PrctlForGuest(int option,
       }
       // TODO(b/110423578): Even if we block host syscall this may not block
       // emulated guest syscall.
-      filter.k = ToHostSyscallNumber(filter.k);
-      LOG_ALWAYS_FATAL_IF(filter.k == unsigned(-1),
-                          "Unsupported guest syscall number in PR_SET_SECCOMP");
+      int guest_nr = filter.k;
+      int host_nr = ToHostSyscallNumber(guest_nr);
+      if (host_nr == int{-1}) {
+        TRACE_AND_ALOGE("Unsupported guest syscall number in PR_SET_SECCOMP: %d", guest_nr);
+        TRACE_AND_ALOGE("Running prctl with invalid (-1) host syscall number...");
+      }
+      filter.k = host_nr;
     }
   }
 

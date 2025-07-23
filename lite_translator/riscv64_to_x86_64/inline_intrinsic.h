@@ -246,6 +246,11 @@ class TryBindingBasedInlineIntrinsic {
         return {};
       }
     } else if constexpr (std::is_same_v<CPUIDRestriction,
+                                        x86_32_or_x86_64::device_arch_info::HasAVX2>) {
+      if (!host_platform::kHasAVX2) {
+        return {};
+      }
+    } else if constexpr (std::is_same_v<CPUIDRestriction,
                                         x86_32_or_x86_64::device_arch_info::HasBMI>) {
       if (!host_platform::kHasBMI) {
         return {};

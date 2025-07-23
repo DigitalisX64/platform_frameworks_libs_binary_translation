@@ -731,9 +731,10 @@ class VerifierAssembler {
         std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMULAVX> || expect_vpclmulqd;
     constexpr bool expect_clmul = std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMUL>;
     constexpr bool expect_popcnt = std::is_same_v<CPUIDRestriction, device_arch_info::HasPOPCNT>;
+    constexpr bool expect_avx2 = std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX2>;
     constexpr bool expect_avx = std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX> ||
-                                expect_aesavx || expect_clmulavx || expect_f16c || expect_fma ||
-                                expect_fma4;
+                                expect_avx2 || expect_aesavx || expect_clmulavx || expect_f16c ||
+                                expect_fma || expect_fma4;
     constexpr bool expect_sse4_2 =
         std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE4_2> || expect_aes || expect_clmul;
     constexpr bool expect_sse4_1 =
@@ -750,6 +751,9 @@ class VerifierAssembler {
     }
     if (expect_aes != need_aes) {
       FATAL("error: expect_aes != need_aes");
+    }
+    if (expect_avx2 != need_avx2) {
+      FATAL("error: expect_avx2 != need_avx2");
     }
     if (expect_avx != need_avx) {
       FATAL("error: expect_avx != need_avx");

@@ -414,6 +414,9 @@ DEFINE_XMM_INT_INSTRUCTIONS_GROUP(sl, sl, kIntTypeWLQ, l, l)
 DEFINE_XMM_INT_INSTRUCTIONS_GROUP(sr, sr, kIntTypePsr, a, l)
 DEFINE_XMM_INT_INSTRUCTIONS_GROUP(subs, sub, kIntTypeBW, s, us)
 DEFINE_XMM_INT_INSTRUCTIONS_GROUP(sub, sub, kIntType, , )
+// Variable shifts .
+DEFINE_XMM_INT_INSTRUCTIONS_GROUP(slv, sl, kIntTypeLQ, lv, lv)
+DEFINE_XMM_INT_INSTRUCTIONS_GROUP(srv, sr, kIntTypeLQ, av, lv)
 #undef DEFINE_XMM_INT_INSTRUCTIONS_GROUP
 // Shifts have immediate form in addition to register-to-register form.
 #define DEFINE_XMM_INT_INSTRUCTIONS_GROUP(insn_name, asm_name, type_check, signed, unsigned) \
