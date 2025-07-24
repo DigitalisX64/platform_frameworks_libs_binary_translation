@@ -223,7 +223,7 @@ class VerifierAssembler {
   // they are written to, unless they are used in a dependency breaking instruction. However, many
   // intrinsics first use and define an XMM register in a non dependency breaking instruction. This
   // check is default disabled, but can be enabled to view and manually check these intrinsics.
-  static constexpr bool kCheckDefOrDefEarlyClobberXMMRegistersAreWrittenBeforeRead = false;
+  bool kCheckDefOrDefEarlyClobberXMMRegistersAreWrittenBeforeRead = false;
 
   class RegisterUsageFlags {
    public:
@@ -268,7 +268,8 @@ class VerifierAssembler {
     }
 
     constexpr void CheckValidDefOrDefEarlyClobberRegisterUse(int reg_arg_no) {
-      if (!intrinsic_defined_def_or_def_early_clobber_register.at(reg_arg_no)) {
+      if (!intrinsic_defined_def_or_def_early_clobber_register.at(reg_arg_no) &&
+          !intrinsic_pseudo_defined_xmm_register.at(reg_arg_no)) {
         FATAL("error: intrinsic read a def/def_early_clobber register before writing to it");
       }
     }
@@ -308,6 +309,10 @@ class VerifierAssembler {
 
     constexpr void UpdateIntrinsicXMMRegisterDefEarlyClobber(int reg_arg_no) {
       intrinsic_defined_def_early_clobber_xmm_register.at(reg_arg_no) = true;
+    }
+
+    constexpr void UpdateIntrinsicPseudoXMMRegisterDef(int reg_arg_no) {
+      intrinsic_pseudo_defined_xmm_register.at(reg_arg_no) = true;
     }
 
     constexpr void UpdateIntrinsicXMMRegisterUse() {
@@ -388,6 +393,8 @@ class VerifierAssembler {
     std::array<bool, kMaxRegisters> intrinsic_defined_def_early_clobber_fixed_register{};
     std::array<bool, kMaxRegisters> intrinsic_defined_def_early_clobber_general_register{};
     std::array<bool, kMaxRegisters> intrinsic_defined_def_early_clobber_xmm_register{};
+
+    std::array<bool, kMaxRegisters> intrinsic_pseudo_defined_xmm_register{};
 
     std::array<bool, kMaxRegisters> valid_def_early_clobber_register{};
 
@@ -811,6 +818,11 @@ class VerifierAssembler {
 // Instructions.
 #include "gen_verifier_assembler_common_x86-inl.h"  // NOLINT generated file
 
+  constexpr void PseudoDefXMMReg(XMMRegister arg) {
+    PseudoXMMRegisterDef(arg);
+    EndInstruction();
+  }
+
  protected:
   bool need_gpr_macroassembler_constants_ = false;
   bool need_gpr_macroassembler_scratch_ = false;
@@ -1040,6 +1052,10 @@ class VerifierAssembler {
         reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
       register_usage_flags.CheckValidDefOrDefEarlyClobberRegisterUse(reg.arg_no());
     }
+  }
+
+  constexpr void PseudoXMMRegisterDef(XMMRegister reg) {
+    register_usage_flags.UpdateIntrinsicPseudoXMMRegisterDef(reg.arg_no());
   }
 
   template <typename RegisterType>

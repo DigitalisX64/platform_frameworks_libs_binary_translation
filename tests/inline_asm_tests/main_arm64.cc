@@ -3966,12 +3966,32 @@ TEST(Arm64InsnTest, OrNotInt8x8) {
   ASSERT_EQ(rd, MakeUInt128(0xb7ff97efd8dfeebeULL, 0x0000000000000000ULL));
 }
 
+__uint128_t BitwiseSelect(__uint128_t mask, __uint128_t src1, __uint128_t src2) {
+  return (src1 & mask) | (src2 & ~mask);
+}
+
+TEST(Arm64InsnTest, BitwiseSelectInt8x16) {
+  __uint128_t op1 = MakeUInt128(0x123456789abcdef0ULL, 0xfedcba9876543210ULL);
+  __uint128_t op2 = MakeUInt128(0x0101010101010101ULL, 0x0202020202020202ULL);
+  __uint128_t op3 = MakeUInt128(0x8080808080808080ULL, 0x0000000000000000ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_WW0_ARG("bsl %0.16b, %1.16b, %2.16b")(op1, op2, op3);
+  ASSERT_EQ(res, BitwiseSelect(op3, op1, op2));
+}
+
 TEST(Arm64InsnTest, BitwiseSelectInt8x8) {
   __uint128_t op1 = MakeUInt128(0x2000568127145263ULL, 0x5608277857713427ULL);
   __uint128_t op2 = MakeUInt128(0x0792279689258923ULL, 0x5420199561121290ULL);
   __uint128_t op3 = MakeUInt128(0x8372978049951059ULL, 0x7317328160963185ULL);
   __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_WW0_ARG("bsl %0.8b, %1.8b, %2.8b")(op1, op2, op3);
-  ASSERT_EQ(res, MakeUInt128(0x0480369681349963ULL, 0x0000000000000000ULL));
+  ASSERT_EQ(res, static_cast<uint64_t>(BitwiseSelect(op3, op1, op2)));
+}
+
+TEST(Arm64InsnTest, BitwiseInsertIfTrueInt8x16) {
+  __uint128_t op1 = MakeUInt128(0x123456789abcdef0ULL, 0xfedcba9876543210ULL);
+  __uint128_t op2 = MakeUInt128(0x0101010101010101ULL, 0x0202020202020202ULL);
+  __uint128_t op3 = MakeUInt128(0x8080808080808080ULL, 0x0000000000000000ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_WW0_ARG("bit %0.16b, %1.16b, %2.16b")(op1, op2, op3);
+  ASSERT_EQ(res, BitwiseSelect(op2, op1, op3));
 }
 
 TEST(Arm64InsnTest, BitwiseInsertIfTrueInt8x8) {
@@ -3979,7 +3999,15 @@ TEST(Arm64InsnTest, BitwiseInsertIfTrueInt8x8) {
   __uint128_t op2 = MakeUInt128(0x9326117931051185ULL, 0x4807446237996274ULL);
   __uint128_t op3 = MakeUInt128(0x6430860213949463ULL, 0x9522473719070217ULL);
   __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_WW0_ARG("bit %0.8b, %1.8b, %2.8b")(op1, op2, op3);
-  ASSERT_EQ(res, MakeUInt128(0x7630965b03908563ULL, 0x0000000000000000ULL));
+  ASSERT_EQ(res, static_cast<uint64_t>(BitwiseSelect(op2, op1, op3)));
+}
+
+TEST(Arm64InsnTest, BitwiseInsertIfFalseInt8x16) {
+  __uint128_t op1 = MakeUInt128(0x123456789abcdef0ULL, 0xfedcba9876543210ULL);
+  __uint128_t op2 = MakeUInt128(0x0101010101010101ULL, 0x0202020202020202ULL);
+  __uint128_t op3 = MakeUInt128(0x8080808080808080ULL, 0x0000000000000000ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_WW0_ARG("bif %0.16b, %1.16b, %2.16b")(op1, op2, op3);
+  ASSERT_EQ(res, BitwiseSelect(op2, op3, op1));
 }
 
 TEST(Arm64InsnTest, BitwiseInsertIfFalseInt8x8) {
@@ -3987,7 +4015,7 @@ TEST(Arm64InsnTest, BitwiseInsertIfFalseInt8x8) {
   __uint128_t op2 = MakeUInt128(0x5964462294895493ULL, 0x0381964428810975ULL);
   __uint128_t op3 = MakeUInt128(0x0348610454326648ULL, 0x2133936072602491ULL);
   __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_WW0_ARG("bif %0.8b, %1.8b, %2.8b")(op1, op2, op3);
-  ASSERT_EQ(res, MakeUInt128(0x2143d8015c006500ULL, 0x0000000000000000ULL));
+  ASSERT_EQ(res, static_cast<uint64_t>(BitwiseSelect(op2, op3, op1)));
 }
 
 TEST(Arm64InsnTest, ArithmeticShiftRightInt64x1) {
@@ -5773,6 +5801,33 @@ TEST(Arm64InsnTest, AddAcrossInt8x8) {
   __uint128_t arg = MakeUInt128(0x0681216028764962ULL, 0x8674460477464915ULL);
   __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("addv %b0, %1.8b")(arg);
   ASSERT_EQ(res, MakeUInt128(0x51ULL, 0x0ULL));
+}
+
+TEST(Arm64InsnTest, AddAcrossInt8x16) {
+  __uint128_t arg = MakeUInt128(0x0102030405060708ULL, 0x090a0b0c0d0e0f10ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("addv %b0, %1.16b")(arg);
+  // Sum of 1 to 16 is (16 * 17) / 2 = 136 (0x88)
+  ASSERT_EQ(res, MakeUInt128(0x88ULL, 0x0ULL));
+}
+
+TEST(Arm64InsnTest, AddAcrossInt16x4) {
+  __uint128_t arg = MakeUInt128(0x0001000200030004ULL, 0x0ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("addv %h0, %1.4h")(arg);
+  // Sum of 1 to 4 is 10 (0xa)
+  ASSERT_EQ(res, MakeUInt128(0x000aULL, 0x0ULL));
+}
+
+TEST(Arm64InsnTest, AddAcrossInt16x8) {
+  __uint128_t arg = MakeUInt128(0x0001000200030004ULL, 0x0005000600070008ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("addv %h0, %1.8h")(arg);
+  // Sum of 1 to 8 is 36 (0x24)
+  ASSERT_EQ(res, MakeUInt128(0x0024ULL, 0x0ULL));
+}
+
+TEST(Arm64InsnTest, AddAcrossInt32x4) {
+  __uint128_t arg = MakeUInt128(0x0000000100000002ULL, 0x0000000300000004ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("addv %s0, %1.4s")(arg);
+  ASSERT_EQ(res, MakeUInt128(0x0000000aULL, 0x0ULL));
 }
 
 TEST(Arm64InsnTest, SignedAddLongAcrossInt16x8) {
