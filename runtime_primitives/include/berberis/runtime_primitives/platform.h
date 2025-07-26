@@ -38,7 +38,6 @@ extern const struct PlatformCapabilities {
   bool kIsAuthenticAMD;
   bool kHasAES;
   bool kHasAVX;
-  bool kHasAVX2;
   bool kHasBMI;
   bool kHasBMI2;
   bool kHasCLMUL;
@@ -62,7 +61,6 @@ extern const struct PlatformCapabilities {
 inline const bool& kIsAuthenticAMD = kPlatformCapabilities.kIsAuthenticAMD;
 inline const bool& kHasAES = kPlatformCapabilities.kHasAES;
 inline const bool& kHasAVX = kPlatformCapabilities.kHasAVX;
-inline const bool& kHasAVX2 = kPlatformCapabilities.kHasAVX2;
 inline const bool& kHasBMI = kPlatformCapabilities.kHasBMI;
 inline const bool& kHasBMI2 = kPlatformCapabilities.kHasBMI2;
 inline const bool& kHasCLMUL = kPlatformCapabilities.kHasCLMUL;

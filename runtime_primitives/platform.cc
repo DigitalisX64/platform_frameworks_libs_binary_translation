@@ -52,7 +52,6 @@ auto Init() {
   }
   platform_capabilities.kHasAES = ecx & bit_AES;
   platform_capabilities.kHasAVX = ecx & bit_AVX;
-  platform_capabilities.kHasAVX2 = ebx & bit_AVX2;
   platform_capabilities.kHasCLMUL = ecx & bit_PCLMUL;
   platform_capabilities.kHasF16C = ecx & bit_F16C;
   platform_capabilities.kHasFMA = ecx & bit_FMA;

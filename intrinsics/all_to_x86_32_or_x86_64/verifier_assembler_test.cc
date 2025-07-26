@@ -36,10 +36,9 @@ using x86_64::device_arch_info::FLAGS;
 using x86_64::device_arch_info::GeneralReg32;
 using x86_64::device_arch_info::XmmReg;
 
-using device_arch_info::NoCPUIDRestriction;
-using x86_32_or_x86_64::device_arch_info::HasAVX;
-using x86_32_or_x86_64::device_arch_info::HasAVX2;
 using x86_32_or_x86_64::device_arch_info::HasSSE3;
+
+using device_arch_info::NoCPUIDRestriction;
 
 template <typename RegisterClassTemplateName, device_arch_info::RegBindingKind kUsageTemplateName>
 using Operand = device_arch_info::OperandInfo<RegisterClassTemplateName, kUsageTemplateName>;
@@ -71,11 +70,6 @@ class MacroAssembler : public Assembler {
 
   // dst: USE_DEF, src1: USE
   constexpr void SSE3Intrinsic(XMMRegister dst, XMMRegister src1) { Haddpd(dst, src1); }
-
-  // dst: DEF, src1: USE, src2: USE
-  constexpr void AVX2Intrinsic(XMMRegister dst, XMMRegister src1, XMMRegister src2) {
-    Vpsllvd(dst, src1, src2);
-  }
 
   // dst: DEF_EARLY_CLOBBER, src1: USE_DEF, src2: USE, flags: DEF
   constexpr void LinearRegisterIntrinsic(Register dst, Register src1, Register src2) {
@@ -294,7 +288,7 @@ static constexpr const char kBindingMnemo[] = "TEST_0";
 
 using Assemblers = MacroAssembler<VerifierAssembler>::Assemblers;
 
-TEST(VerifierAssembler, TestCorrectCPUIDSSE3) {
+TEST(VerifierAssembler, TestCorrectCPUID) {
   using IntrinsicBindingInfo = IntrinsicBindingInfo<
       kBindingName,
       NoNansOperation,
@@ -326,42 +320,6 @@ TEST(VerifierAssembler, TestIncorrectCPUID) {
                      std::tuple<Operand<XmmReg, kUseDef>, Operand<XmmReg, kUse>>>>;
 
   ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(), "error: expect_sse3 != need_sse3");
-}
-
-TEST(VerifierAssembler, TestCorrectCPUIDAVX2) {
-  using IntrinsicBindingInfo = IntrinsicBindingInfo<
-      kBindingName,
-      NoNansOperation,
-      std::tuple<SIMD128Register, SIMD128Register>,
-      std::tuple<SIMD128Register>,
-      std::tuple<OutArg<0>, InArg<0>, InArg<1>>,
-      DeviceInsnInfo<
-          &std::tuple_element_t<0, Assemblers>::AVX2Intrinsic,
-          kBindingMnemo,
-          false,
-          nullptr,
-          HasAVX2,
-          std::tuple<Operand<XmmReg, kDef>, Operand<XmmReg, kUse>, Operand<XmmReg, kUse>>>>;
-
-  VerifyIntrinsic<IntrinsicBindingInfo>();
-}
-
-TEST(VerifierAssembler, TestIncorrectCPUIDAVX2) {
-  using IntrinsicBindingInfo = IntrinsicBindingInfo<
-      kBindingName,
-      NoNansOperation,
-      std::tuple<SIMD128Register, SIMD128Register>,
-      std::tuple<SIMD128Register>,
-      std::tuple<OutArg<0>, InArg<0>, InArg<1>>,
-      DeviceInsnInfo<
-          &std::tuple_element_t<0, Assemblers>::AVX2Intrinsic,
-          kBindingMnemo,
-          false,
-          nullptr,
-          HasAVX,
-          std::tuple<Operand<XmmReg, kDef>, Operand<XmmReg, kUse>, Operand<XmmReg, kUse>>>>;
-
-  ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(), "error: expect_avx2 != need_avx2");
 }
 
 TEST(VerifierAssembler, TestFlagsIntrinsicWithNoFlagsBinding) {
