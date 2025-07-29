@@ -6762,6 +6762,13 @@ TEST(Arm64InsnTest, UnsignedRoundingShiftLeftInt64x2) {
   ASSERT_EQ(AsmSrshl(arg1, arg2), MakeUInt128(0x23456781'23456780ULL, 0x08765432'18765433ULL));
 }
 
+TEST(Arm64InsnTest, UnsignedShiftLeftInt64x2) {
+  constexpr auto AsmUshl = ASM_INSN_WRAP_FUNC_W_RES_WW_ARG("ushl %0.2d, %1.2d, %2.2d");
+  __uint128_t arg1 = MakeUInt128(0x12345678'12345678ULL, 0x87654321'8765432fULL);
+  __uint128_t arg2 = MakeUInt128(0x00000000'00000004ULL, 0xffffffff'fffffffcULL);
+  ASSERT_EQ(AsmUshl(arg1, arg2), MakeUInt128(0x23456781'23456780ULL, 0x08765432'18765432ULL));
+}
+
 TEST(Arm64InsnTest, SignedShiftLeftInt16x8) {
   constexpr auto AsmSshl = ASM_INSN_WRAP_FUNC_W_RES_WW_ARG("sshl %0.8h, %1.8h, %2.8h");
   __uint128_t arg1 = MakeUInt128(0x9999999999999999ULL, 0x9999999999999999ULL);
@@ -6801,11 +6808,25 @@ TEST(Arm64InsnTest, SignedRoundingShiftLeftInt32x4) {
   ASSERT_EQ(AsmSrshl(arg1, arg2), MakeUInt128(0x23456780'01234568ULL, 0xf8765432'ffffff0fULL));
 }
 
+TEST(Arm64InsnTest, SignedShiftLeftInt32x4) {
+  constexpr auto AsmSshl = ASM_INSN_WRAP_FUNC_W_RES_WW_ARG("sshl %0.4s, %1.4s, %2.4s");
+  __uint128_t arg1 = MakeUInt128(0x12345678'12345678ULL, 0x87654321'87654321ULL);
+  __uint128_t arg2 = MakeUInt128(0x00000004'fffffffcULL, 0xfffffffc'ffffffe9ULL);
+  ASSERT_EQ(AsmSshl(arg1, arg2), MakeUInt128(0x23456780'01234567ULL, 0xf8765432'ffffff0eULL));
+}
+
 TEST(Arm64InsnTest, UnsignedRoundingShiftLeftInt32x4) {
   constexpr auto AsmSrshl = ASM_INSN_WRAP_FUNC_W_RES_WW_ARG("urshl %0.4s, %1.4s, %2.4s");
   __uint128_t arg1 = MakeUInt128(0x12345678'12345678ULL, 0x87654321'87654321ULL);
   __uint128_t arg2 = MakeUInt128(0x00000004'fffffffcULL, 0xfffffffc'ffffffe9ULL);
   ASSERT_EQ(AsmSrshl(arg1, arg2), MakeUInt128(0x23456780'01234568ULL, 0x08765432'0000010fULL));
+}
+
+TEST(Arm64InsnTest, UnsignedShiftLeftInt32x4) {
+  constexpr auto AsmUshl = ASM_INSN_WRAP_FUNC_W_RES_WW_ARG("ushl %0.4s, %1.4s, %2.4s");
+  __uint128_t arg1 = MakeUInt128(0x12345678'12345678ULL, 0x87654321'87654321ULL);
+  __uint128_t arg2 = MakeUInt128(0x00000004'fffffffcULL, 0xfffffffc'ffffffe9ULL);
+  ASSERT_EQ(AsmUshl(arg1, arg2), MakeUInt128(0x23456780'01234567ULL, 0x08765432'0000010eULL));
 }
 
 TEST(Arm64InsnTest, UnsignedReciprocalSquareRootEstimateInt32x4) {

@@ -219,12 +219,6 @@ class VerifierAssembler {
   // will see a compiler error, since we detect out-of-bounds access to the array in constexpr.
   static constexpr int kMaxRegisters = 16;
 
-  // Verifier Assmebler checks that 'def' or 'def_early_clober' XMM registers aren't read before
-  // they are written to, unless they are used in a dependency breaking instruction. However, many
-  // intrinsics first use and define an XMM register in a non dependency breaking instruction. This
-  // check is default disabled, but can be enabled to view and manually check these intrinsics.
-  bool kCheckDefOrDefEarlyClobberXMMRegistersAreWrittenBeforeRead = false;
-
   class RegisterUsageFlags {
    public:
     constexpr void CheckValidRegisterUse(bool is_fixed) {
@@ -738,9 +732,10 @@ class VerifierAssembler {
         std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMULAVX> || expect_vpclmulqd;
     constexpr bool expect_clmul = std::is_same_v<CPUIDRestriction, device_arch_info::HasCLMUL>;
     constexpr bool expect_popcnt = std::is_same_v<CPUIDRestriction, device_arch_info::HasPOPCNT>;
+    constexpr bool expect_avx2 = std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX2>;
     constexpr bool expect_avx = std::is_same_v<CPUIDRestriction, device_arch_info::HasAVX> ||
-                                expect_aesavx || expect_clmulavx || expect_f16c || expect_fma ||
-                                expect_fma4;
+                                expect_avx2 || expect_aesavx || expect_clmulavx || expect_f16c ||
+                                expect_fma || expect_fma4;
     constexpr bool expect_sse4_2 =
         std::is_same_v<CPUIDRestriction, device_arch_info::HasSSE4_2> || expect_aes || expect_clmul;
     constexpr bool expect_sse4_1 =
@@ -757,6 +752,9 @@ class VerifierAssembler {
     }
     if (expect_aes != need_aes) {
       FATAL("error: expect_aes != need_aes");
+    }
+    if (expect_avx2 != need_avx2) {
+      FATAL("error: expect_avx2 != need_avx2");
     }
     if (expect_avx != need_avx) {
       FATAL("error: expect_avx != need_avx");
@@ -814,6 +812,11 @@ class VerifierAssembler {
 // Instructions.
 #include "gen_verifier_assembler_common_x86-inl.h"  // NOLINT generated file
 
+  // Verifier Assembler checks that 'def' or 'def_early_clober' XMM registers aren't read before
+  // they are written to, unless they are used in a dependency breaking instruction. However, many
+  // intrinsics first use and define an XMM register in a non dependency breaking instruction.
+  // MacroInstructions can use PseudoDefXMMReg before such an instruction to prevent the
+  // VerifierAssembler from flagging this behaviour as erroneous.
   constexpr void PseudoDefXMMReg(XMMRegister arg) {
     PseudoXMMRegisterDef(arg);
     EndInstruction();
@@ -1040,9 +1043,6 @@ class VerifierAssembler {
     if (reg.get_binding_kind() == device_arch_info::kUse) {
       register_usage_flags.CheckValidXMMRegisterUse();
       register_usage_flags.UpdateIntrinsicXMMRegisterUse();
-    }
-    if (!kCheckDefOrDefEarlyClobberXMMRegistersAreWrittenBeforeRead) {
-      return;
     }
     if (reg.get_binding_kind() == device_arch_info::kDef ||
         reg.get_binding_kind() == device_arch_info::kDefEarlyClobber) {
