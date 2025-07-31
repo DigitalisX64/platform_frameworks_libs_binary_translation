@@ -47,7 +47,7 @@ MachineInsnList::iterator FoldInsnsAndGetLastInsnIt(MachineIR* machine_ir, Machi
 template <template <typename> typename InsnTypeRegReg,
           template <typename> typename InsnTypeRegImm,
           bool kExpectSuccess = true>
-void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
+void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777'ffffULL) {
   Arena arena;
   MachineIR machine_ir(&arena);
   auto* bb = machine_ir.NewBasicBlock();
@@ -79,7 +79,7 @@ void TryRegRegInsnFolding(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
 }
 
 template <template <typename> typename InsnTypeRegReg, template <typename> typename InsnTypeRegImm>
-void TryRegRegInsnFoldingExtraPseudoCopy(bool is_64bit_mov_imm, uint64_t imm = 0x7777ffffULL) {
+void TryRegRegInsnFoldingExtraPseudoCopy(bool is_64bit_mov_imm, uint64_t imm = 0x7777'ffffULL) {
   Arena arena;
   MachineIR machine_ir(&arena);
   auto* bb = machine_ir.NewBasicBlock();

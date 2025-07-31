@@ -32,18 +32,18 @@ TEST(NdkTest, GuestArgumentsAndResultTest) {
                          sizeof(uint64_t) +
                      4];
   } arguments = {{.argv = {1, 2, 3, 4, 5, 6, 7, 8},
-                  .simd_argv = {0x3ff0000000000000,
-                                0x3fe0000000000000,
-                                0x3fd5555555555555,
-                                0x3fd0000000000000,
-                                0x3fc999999999999a,
-                                0x3fc5555555555555,
-                                0x3fc2492492492492,
-                                0x3fc0000000000000},
-                  .stack_argv = {0x3fbc71c71c71c71c}}};
-  arguments.buffer.stack_argv[1] = 0x3fb999999999999a;
-  arguments.buffer.stack_argv[2] = 0x3fb745d1745d1746;
-  arguments.buffer.stack_argv[3] = 0x3fb5555555555555;
+                  .simd_argv = {0x3ff0'0000'0000'0000,
+                                0x3fe0'0000'0000'0000,
+                                0x3fd5'5555'5555'5555,
+                                0x3fd0'0000'0000'0000,
+                                0x3fc9'9999'9999'999a,
+                                0x3fc5'5555'5555'5555,
+                                0x3fc2'4924'9249'2492,
+                                0x3fc0'0000'0000'0000},
+                  .stack_argv = {0x3fbc'71c7'1c71'c71c}}};
+  arguments.buffer.stack_argv[1] = 0x3fb9'9999'9999'999a;
+  arguments.buffer.stack_argv[2] = 0x3fb7'45d1'745d'1746;
+  arguments.buffer.stack_argv[3] = 0x3fb5'5555'5555'5555;
 
   GuestArgumentsAndResult<double(int,
                                  double,
@@ -82,9 +82,9 @@ TEST(NdkTest, GuestArgumentsAndResultTest) {
   EXPECT_EQ(1.0 / 7.0, f1_args.GuestArgument<13>());
   EXPECT_EQ(8, f1_args.GuestArgument<14>());
   EXPECT_EQ(1.0 / 8.0, f1_args.GuestArgument<15>());
-  EXPECT_EQ(0x1c71c71c, f1_args.GuestArgument<16>());
+  EXPECT_EQ(0x1c71'c71c, f1_args.GuestArgument<16>());
   EXPECT_EQ(1.0 / 10.0, f1_args.GuestArgument<17>());
-  EXPECT_EQ(0x745d1746, f1_args.GuestArgument<18>());
+  EXPECT_EQ(0x745d'1746, f1_args.GuestArgument<18>());
   EXPECT_EQ(1.0 / 12.0, f1_args.GuestArgument<19>());
   EXPECT_EQ(1.0, f1_args.GuestResult());
 
@@ -126,9 +126,9 @@ TEST(NdkTest, GuestArgumentsAndResultTest) {
   EXPECT_EQ(1.0 / 8.0, f2_args.GuestArgument<14>());
   EXPECT_EQ(8, f2_args.GuestArgument<15>());
   EXPECT_EQ(1.0 / 9.0, f2_args.GuestArgument<16>());
-  EXPECT_EQ(-0x66666666, f2_args.GuestArgument<17>());
+  EXPECT_EQ(-0x6666'6666, f2_args.GuestArgument<17>());
   EXPECT_EQ(1.0 / 11.0, f2_args.GuestArgument<18>());
-  EXPECT_EQ(0x55555555, f2_args.GuestArgument<19>());
+  EXPECT_EQ(0x5555'5555, f2_args.GuestArgument<19>());
   EXPECT_EQ(1, f2_args.GuestResult());
 }
 

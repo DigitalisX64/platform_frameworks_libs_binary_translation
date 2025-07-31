@@ -33,7 +33,7 @@ namespace {
 
 using std::chrono_literals::operator""ms;
 // A test guest pc that is valid in both 32bit and 64bit modes.
-constexpr GuestAddr kGuestPC = 0x12345678;
+constexpr GuestAddr kGuestPC = 0x1234'5678;
 
 TEST(TranslationCacheTest, DefaultNotTranslated) {
   TranslationCache tc;
@@ -118,7 +118,7 @@ TEST(TranslationCacheTest, AddAndLockForWrapping) {
   ASSERT_FALSE(tc.AddAndLockForWrapping(kGuestPC + 64));
 }
 
-HostCodeAddr kHostCodeStub = AsHostCodeAddr(AsHostCode(0xdeadbeef));
+HostCodeAddr kHostCodeStub = AsHostCodeAddr(AsHostCode(0xdead'beef));
 
 void TestWrappingWorker(TranslationCache* tc, GuestAddr pc) {
   while (true) {

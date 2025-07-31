@@ -41,10 +41,10 @@ const constexpr char* kTestExecutableName = "tiny_static_executable";
 constexpr size_t kTestLibGnuLoadSize = 0x3000;
 
 #if defined(__LP64__)
-constexpr uintptr_t kStaticExecutableEntryPoint = 0x1ce00;
+constexpr uintptr_t kStaticExecutableEntryPoint = 0x1'ce00;
 constexpr const char* kTestFilesDir = "/tiny_loader/tests/files/64/";
 #else
-constexpr uintptr_t kStaticExecutableEntryPoint = 0x410f30;
+constexpr uintptr_t kStaticExecutableEntryPoint = 0x41'0f30;
 constexpr const char* kTestFilesDir = "/tiny_loader/tests/files/32/";
 #endif
 

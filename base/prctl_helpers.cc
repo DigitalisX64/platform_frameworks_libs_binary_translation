@@ -23,7 +23,7 @@
 // depending on CONFIG_ANON_VMA_NAME boot config flag. So the caller needs to check the result to
 // see if it actually worked.
 #if !defined(PR_SET_VMA)
-#define PR_SET_VMA 0x53564d41
+#define PR_SET_VMA 0x5356'4d41
 #endif
 #if !defined(PR_SET_VMA_ANON_NAME)
 #define PR_SET_VMA_ANON_NAME 0

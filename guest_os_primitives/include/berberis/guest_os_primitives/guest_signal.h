@@ -53,7 +53,7 @@ CHECK_STRUCT_LAYOUT(Guest_sigset_t, 64, 32);
 #endif
 
 // TODO(b/280551353): check other SA_* flags!
-static_assert(SA_NODEFER == 0x40000000, "Host and guest SA_NODEFER don't match");
+static_assert(SA_NODEFER == 0x4000'0000, "Host and guest SA_NODEFER don't match");
 
 template <typename SmallSigset, typename BigSigset>
 inline void ConvertToSmallSigset(const BigSigset& big_sigset, SmallSigset* small_sigset) {

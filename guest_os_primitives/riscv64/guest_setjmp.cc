@@ -58,7 +58,7 @@ const int kJmpBufHostBufWord = 31;
 
 // jmp_buf cookie can be anything but 0 (see bionic/tests/setjmp_test.cpp: setjmp_cookie)
 // ATTENTION: Keep low bit 0 for signal mask flag.
-const uint64_t kJmpBufCookie = 0x123210ULL;
+const uint64_t kJmpBufCookie = 0x12'3210ULL;
 
 uint64_t CalcJumpBufChecksum(const uint64_t* buf) {
   uint64_t res = 0;

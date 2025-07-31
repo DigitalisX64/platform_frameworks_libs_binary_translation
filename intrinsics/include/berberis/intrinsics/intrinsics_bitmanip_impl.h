@@ -36,11 +36,11 @@ inline std::tuple<int64_t> Cpop<int64_t, kUseCppImplementation>(int64_t src) {
 template <typename ElementType>
 std::tuple<ElementType> Brev8(ElementType arg) {
   constexpr unsigned long ls1 = 0x5555'5555'5555'5555;
-  constexpr unsigned long rs1 = 0xAAAA'AAAA'AAAA'AAAA;
+  constexpr unsigned long rs1 = 0xaaaa'aaaa'aaaa'aaaa;
   constexpr unsigned long ls2 = 0x3333'3333'3333'3333;
-  constexpr unsigned long rs2 = 0xCCCC'CCCC'CCCC'CCCC;
-  constexpr unsigned long ls4 = 0x0F0F'0F0F'0F0F'0F0F;
-  constexpr unsigned long rs4 = 0xF0F0'F0F0'F0F0'F0F0;
+  constexpr unsigned long rs2 = 0xcccc'cccc'cccc'cccc;
+  constexpr unsigned long ls4 = 0x0f0f'0f0f'0f0f'0f0f;
+  constexpr unsigned long rs4 = 0xf0f0'f0f0'f0f0'f0f0;
   auto tmp_arg = static_cast<typename ElementType::BaseType>(arg);
 
   tmp_arg = ((tmp_arg & ls1) << 1) | ((tmp_arg & rs1) >> 1);

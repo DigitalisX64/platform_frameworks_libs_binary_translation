@@ -106,8 +106,8 @@ TEST(CodePool, Smoke) {
 
 TEST(DataPool, Smoke) {
   DataPool data_pool;
-  static uint32_t kConst1 = 0x12345678;
-  static uint32_t kConst2 = 0x87654321;
+  static uint32_t kConst1 = 0x1234'5678;
+  static uint32_t kConst2 = 0x8765'4321;
   uint32_t kVar = kConst2;
   uint32_t* ptr = data_pool.Add(kVar);
   EXPECT_EQ(kConst2, *ptr);

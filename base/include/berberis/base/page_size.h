@@ -44,7 +44,7 @@ struct PageSize {
 
 namespace {
 
-inline constexpr size_t kMaxPageSize = 0x10000;  // 64KB
+inline constexpr size_t kMaxPageSize = 0x1'0000;  // 64KB
 inline const PageSize kPageSize;
 
 }  // namespace

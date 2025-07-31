@@ -38,23 +38,23 @@ TEST(RuntimeCodePatching, PatchCodeInCurrentThread) {
   // To avoid messing with immediates, code to write is taken from L3, and helper
   // to flush insn cache from L5.
   const uint32_t code_image[] = {
-      0xe92d41f0,  //   push {r4, r5, r6, r7, r8, lr}
-                   // <L1>:
-      0xe59f3014,  //   ldr r3, L3
-      0xe58f300c,  //   str r3, L2
-      0xe28f0008,  //   adr r0, L2
-      0xe28f1008,  //   adr r1, L3
-      0xe59f4010,  //   ldr r4, L5
-      0xe12fff34,  //   blx r4
-                   // <L2>:
-      0xeafffff8,  //   b L1
-                   // <L3>:
-      0xeaffffff,  //   b L4
-                   // <L4>:
-      0xe3a0000b,  //   mov r0, #11
-      0xe8bd81f0,  //   pop {r4, r5, r6, r7, r8, pc}
-                   // <L5>:
-      0xe320f000,  //   nop {0}
+      0xe92d'41f0,  //   push {r4, r5, r6, r7, r8, lr}
+                    // <L1>:
+      0xe59f'3014,  //   ldr r3, L3
+      0xe58f'300c,  //   str r3, L2
+      0xe28f'0008,  //   adr r0, L2
+      0xe28f'1008,  //   adr r1, L3
+      0xe59f'4010,  //   ldr r4, L5
+      0xe12f'ff34,  //   blx r4
+                    // <L2>:
+      0xeaff'fff8,  //   b L1
+                    // <L3>:
+      0xeaff'ffff,  //   b L4
+                    // <L4>:
+      0xe3a0'000b,  //   mov r0, #11
+      0xe8bd'81f0,  //   pop {r4, r5, r6, r7, r8, pc}
+                    // <L5>:
+      0xe320'f000,  //   nop {0}
   };
 
   uint32_t* code = reinterpret_cast<uint32_t*>(
@@ -76,15 +76,15 @@ TEST(RuntimeCodePatching, PatchCodeInOtherThread) {
   // needed to notify other threads that we entered the loop. We are going to
   // patch the back branch to exit the loop.
   const uint32_t code_image[] = {
-      0xe92d41f0,  //   push {r4, r5, r6, r7, r8, lr}
-                   // <L1>:
-      0xe3a01001,  //   mov r1, #1
-      0xe5801000,  //   str r1, [r0]
-                   // <L2>:
-      0xeafffffc,  //   b 4          // <L1>
-                   // <L4>:
-      0xe3a0000b,  //   mov r0, #11  // arbitrary return value
-      0xe8bd81f0,  //   pop {r4, r5, r6, r7, r8, pc}
+      0xe92d'41f0,  //   push {r4, r5, r6, r7, r8, lr}
+                    // <L1>:
+      0xe3a0'1001,  //   mov r1, #1
+      0xe580'1000,  //   str r1, [r0]
+                    // <L2>:
+      0xeaff'fffc,  //   b 4          // <L1>
+                    // <L4>:
+      0xe3a0'000b,  //   mov r0, #11  // arbitrary return value
+      0xe8bd'81f0,  //   pop {r4, r5, r6, r7, r8, pc}
   };
 
   uint32_t* code = reinterpret_cast<uint32_t*>(
@@ -107,7 +107,7 @@ TEST(RuntimeCodePatching, PatchCodeInOtherThread) {
     sched_yield();
   }
 
-  code[3] = 0xeaffffff;  // overwrite loop branch with branch to next insn
+  code[3] = 0xeaff'ffff;  // overwrite loop branch with branch to next insn
   ClearInsnCache(code + 3, code + 4);
 
   void* result;

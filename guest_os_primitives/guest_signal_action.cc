@@ -29,7 +29,7 @@
 
 // glibc doesn't define SA_RESTORER globally.
 #ifndef SA_RESTORER
-#define SA_RESTORER 0x04000000
+#define SA_RESTORER 0x0400'0000
 #endif
 
 namespace berberis {

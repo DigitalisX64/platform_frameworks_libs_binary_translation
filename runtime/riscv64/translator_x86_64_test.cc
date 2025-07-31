@@ -32,8 +32,8 @@ class TranslatorRiscv64ToX86_64 : public TranslationTest {};
 
 TEST_F(TranslatorRiscv64ToX86_64, LiteTranslateSupportedRegion) {
   static const uint32_t code[] = {
-      0x002081b3,  // add x3, x1, x2
-      0x008000ef,  // jal x1, 8
+      0x0020'81b3,  // add x3, x1, x2
+      0x0080'00ef,  // jal x1, 8
   };
   ScopedGuestExecRegion exec_region(ToGuestAddr(code), sizeof(code));
 
@@ -49,7 +49,7 @@ TEST_F(TranslatorRiscv64ToX86_64, LiteTranslateSupportedRegion) {
 
 TEST_F(TranslatorRiscv64ToX86_64, LiteTranslateUnsupportedRegion) {
   static const uint32_t code[] = {
-      0x00000073,  // ecall #0x0
+      0x0000'0073,  // ecall #0x0
   };
   ScopedGuestExecRegion exec_region(ToGuestAddr(code), sizeof(code));
 
@@ -61,8 +61,8 @@ TEST_F(TranslatorRiscv64ToX86_64, LiteTranslateUnsupportedRegion) {
 
 TEST_F(TranslatorRiscv64ToX86_64, LiteTranslatePartiallySupportedRegion) {
   static const uint32_t code[] = {
-      0x002081b3,  // add x3, x1, x2
-      0x00000073,  // ecall #0x0
+      0x0020'81b3,  // add x3, x1, x2
+      0x0000'0073,  // ecall #0x0
   };
   ScopedGuestExecRegion exec_region(ToGuestAddr(code), sizeof(code));
 
@@ -78,7 +78,7 @@ TEST_F(TranslatorRiscv64ToX86_64, LiteTranslatePartiallySupportedRegion) {
 
 TEST_F(TranslatorRiscv64ToX86_64, HeavyOptimizeSupportedRegion) {
   static const uint32_t code[] = {
-      0x008000ef,  // jal x1, 8
+      0x0080'00ef,  // jal x1, 8
   };
   ScopedGuestExecRegion exec_region(ToGuestAddr(code), sizeof(code));
 
@@ -93,7 +93,7 @@ TEST_F(TranslatorRiscv64ToX86_64, HeavyOptimizeSupportedRegion) {
 
 TEST_F(TranslatorRiscv64ToX86_64, HeavyOptimizeUnsupportedRegion) {
   static const uint32_t code[] = {
-      0x0000100f,  // fence.i
+      0x0000'100f,  // fence.i
   };
   ScopedGuestExecRegion exec_region(ToGuestAddr(code), sizeof(code));
 

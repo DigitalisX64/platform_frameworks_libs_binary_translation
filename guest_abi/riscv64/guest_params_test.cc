@@ -127,7 +127,7 @@ TEST(GuestParams_riscv64_lp64d, PtrRes) {
 TEST(GuestParams_riscv64_lp64d, SignedCharArg) {
   ThreadState state{};
 
-  SetXReg<A0>(state.cpu, 0xf0f0f0f0f0f0f0f0ULL);
+  SetXReg<A0>(state.cpu, 0xf0f0'f0f0'f0f0'f0f0ULL);
 
   auto [arg] = GuestParamsValues<void(signed char), GuestAbi::kLp64d>(&state);
   auto [argf] = GuestParamsValues<void (*)(signed char), GuestAbi::kLp64d>(&state);
@@ -489,11 +489,11 @@ TEST(GuestParams_riscv64_lp64d, LongArgLargeStructRes) {
   } result{};
 
   SetXReg<A0>(state.cpu, ToGuestAddr(&result));
-  SetXReg<A1>(state.cpu, 0xdead0000beef);
+  SetXReg<A1>(state.cpu, 0xdead'0000'beef);
 
   auto [arg] = GuestParamsValues<Result(uint64_t), GuestAbi::kLp64d>(&state);
 
-  EXPECT_EQ(arg, 0xdead0000beefU);
+  EXPECT_EQ(arg, 0xdead'0000'beefU);
 
   auto&& [ret] = GuestReturnReference<Result(uint64_t), GuestAbi::kLp64d>(&state);
 

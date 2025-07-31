@@ -50,7 +50,7 @@ void* TryMmap32Bit(MmapImplArgs args) {
   // exists "the kernel picks a new address that may or may not
   // depend on the hint." which makes it more difficult.
 
-  constexpr uintptr_t kMinAddress = 0x10000;
+  constexpr uintptr_t kMinAddress = 0x1'0000;
 
   // This is always positive hence no sign-extend.
   constexpr uintptr_t kMaxAddress = std::numeric_limits<int32_t>::max();

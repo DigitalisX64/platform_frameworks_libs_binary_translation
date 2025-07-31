@@ -83,10 +83,10 @@ TEST_F(HostFunctionWrapperTest, WrapTwoInt) {
   //   return ptr(5, 7);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x00050313,  // mv t1, a0
-      0x00500513,  // li a0, #5
-      0x00700593,  // li a1, #7
-      0x00030067   // jr tl
+      0x0005'0313,  // mv t1, a0
+      0x0050'0513,  // li a0, #5
+      0x0070'0593,  // li a1, #7
+      0x0003'0067   // jr tl
   });
 
   EXPECT_EQ(CallWrappedHostFunctionFromWrappedGuestFunction<int>(pc, sub), -2);
@@ -101,11 +101,11 @@ TEST_F(HostFunctionWrapperTest, WrapTwoFloat) {
   //    return ptr(5.0f, 7.0f);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x00500593,  // li a1, #5
-      0xd025f553,  // fcvt.s.l fa0, a1
-      0x00700593,  // li a1, #7
-      0xd025f5d3,  // fcvt.s.l fa1, a1
-      0x00050067,  // jr a0
+      0x0050'0593,  // li a1, #5
+      0xd025'f553,  // fcvt.s.l fa0, a1
+      0x0070'0593,  // li a1, #7
+      0xd025'f5d3,  // fcvt.s.l fa1, a1
+      0x0005'0067,  // jr a0
   });
 
   EXPECT_FLOAT_EQ(
@@ -121,11 +121,11 @@ TEST_F(HostFunctionWrapperTest, WrapTwoDouble) {
   //    return ptr(5.0, 7.0);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x00500593,  // li a1, #5
-      0xd225f553,  // fcvt.d.l fa0, a1
-      0x00700593,  // li a1, #7
-      0xd225f5d3,  // fcvt.d.l fa1, a1
-      0x00050067,  // jr a0
+      0x0050'0593,  // li a1, #5
+      0xd225'f553,  // fcvt.d.l fa0, a1
+      0x0070'0593,  // li a1, #7
+      0xd225'f5d3,  // fcvt.d.l fa1, a1
+      0x0005'0067,  // jr a0
   });
 
   EXPECT_DOUBLE_EQ(
@@ -147,17 +147,17 @@ TEST_F(HostFunctionWrapperTest, WrapReturnedFunction) {
   //   return ptr(n)(5, 7);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xff010113,  // addi sp, sp, #-16
-      0x00113423,  // sd ra, 8(sp)
-      0x00050613,  // mv a2, a0
-      0x00058513,  // mv a0, a1
-      0x000600e7,  // jalr a2
-      0x00050313,  // mv t1, a0
-      0x00500513,  // li a0, #5
-      0x00700593,  // li a1, #7
-      0x00813083,  // ld ra, 8(sp)
-      0x01010113,  // addi sp, sp, #16
-      0x00030067,  // jr tl
+      0xff01'0113,  // addi sp, sp, #-16
+      0x0011'3423,  // sd ra, 8(sp)
+      0x0005'0613,  // mv a2, a0
+      0x0005'8513,  // mv a0, a1
+      0x0006'00e7,  // jalr a2
+      0x0005'0313,  // mv t1, a0
+      0x0050'0513,  // li a0, #5
+      0x0070'0593,  // li a1, #7
+      0x0081'3083,  // ld ra, 8(sp)
+      0x0101'0113,  // addi sp, sp, #16
+      0x0003'0067,  // jr tl
   });
 
   EXPECT_EQ(CallWrappedHostFunctionFromWrappedGuestFunction<int>(pc, add_sub_chooser, 1), 12);

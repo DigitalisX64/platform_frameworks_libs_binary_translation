@@ -56,11 +56,11 @@ TEST(HandleNotExecutable, PcLessThan4096) {
 constexpr uint32_t kPageCrossingCode[] = {
     // First page
     // nop
-    0x00000013,
+    0x0000'0013,
     // Second page
     // If SIGSEGV doesn't happen, make sure we return cleanly.
     // ret
-    0x00008067,
+    0x0000'8067,
 };
 
 constexpr size_t kFirstPageCodeSize = 4;

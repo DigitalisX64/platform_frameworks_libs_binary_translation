@@ -51,33 +51,33 @@ class NonInlineWrapper<ResultType(ArgsTypes...)> {
 namespace {
 
 // We couldn't use float consts here because of bit_cast.
-constexpr uint32_t kBadNegativeNan32 = 0xff811dea;
-constexpr uint32_t kBadPositiveNan32 = 0x7f811dea;
-constexpr uint64_t kBadNegativeNan64 = 0xfff0deadbeaf0000;
-constexpr uint64_t kBadPositiveNan64 = 0x7ff0deadbeaf0000;
+constexpr uint32_t kBadNegativeNan32 = 0xff81'1dea;
+constexpr uint32_t kBadPositiveNan32 = 0x7f81'1dea;
+constexpr uint64_t kBadNegativeNan64 = 0xfff0'dead'beaf'0000;
+constexpr uint64_t kBadPositiveNan64 = 0x7ff0'dead'beaf'0000;
 // We don't use std::limits because we want to be sure definitions match RISC-V.
-constexpr uint32_t kPlusZero32 = 0x00000000;
-constexpr uint32_t kPlusOne32 = 0x3f800000;
-constexpr uint32_t kMinusZero32 = 0x80000000;
-constexpr uint32_t kMinusOne32 = 0xbf800000;
-constexpr uint32_t kPlusInfinity32 = 0x7f800000;
-constexpr uint32_t kMinusInfinity32 = 0xff800000;
+constexpr uint32_t kPlusZero32 = 0x0000'0000;
+constexpr uint32_t kPlusOne32 = 0x3f80'0000;
+constexpr uint32_t kMinusZero32 = 0x8000'0000;
+constexpr uint32_t kMinusOne32 = 0xbf80'0000;
+constexpr uint32_t kPlusInfinity32 = 0x7f80'0000;
+constexpr uint32_t kMinusInfinity32 = 0xff80'0000;
 // Default NaN created as result of math operations (when NaN wasn't an input).
 #if defined(__i386__) || defined(__x86_64__)
-constexpr uint32_t kDefaultNaN32AsInteger = 0xffc00000;
+constexpr uint32_t kDefaultNaN32AsInteger = 0xffc0'0000;
 #else
-constexpr uint32_t kDefaultNaN32AsInteger = 0x7fc00000;
+constexpr uint32_t kDefaultNaN32AsInteger = 0x7fc0'0000;
 #endif
-constexpr uint64_t kPlusZero64 = 0x0000000000000000;
-constexpr uint64_t kPlusOne64 = 0x3ff0000000000000;
-constexpr uint64_t kMinusZero64 = 0x8000000000000000;
-constexpr uint64_t kMinusOne64 = 0xbff0000000000000;
-constexpr uint64_t kPlusInfinity64 = 0x7ff0000000000000;
-constexpr uint64_t kMinusInfinity64 = 0xfff0000000000000;
+constexpr uint64_t kPlusZero64 = 0x0000'0000'0000'0000;
+constexpr uint64_t kPlusOne64 = 0x3ff0'0000'0000'0000;
+constexpr uint64_t kMinusZero64 = 0x8000'0000'0000'0000;
+constexpr uint64_t kMinusOne64 = 0xbff0'0000'0000'0000;
+constexpr uint64_t kPlusInfinity64 = 0x7ff0'0000'0000'0000;
+constexpr uint64_t kMinusInfinity64 = 0xfff0'0000'0000'0000;
 #if defined(__i386__) || defined(__x86_64__)
-constexpr uint64_t kDefaultNaN64AsInteger = 0xfff8000000000000;
+constexpr uint64_t kDefaultNaN64AsInteger = 0xfff8'0000'0000'0000;
 #else
-constexpr uint64_t kDefaultNaN64AsInteger = 0x7ff8000000000000;
+constexpr uint64_t kDefaultNaN64AsInteger = 0x7ff8'0000'0000'0000;
 #endif
 
 #ifdef __i386__

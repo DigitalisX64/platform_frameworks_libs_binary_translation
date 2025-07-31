@@ -95,7 +95,7 @@ uint32_t TinySymbolTable::SysvHash(const char* symbol_name) const {
   uint32_t h = 0;
   while (*name != 0) {
     h = (h << 4) + *name++;
-    uint32_t g = h & 0xf0000000;
+    uint32_t g = h & 0xf000'0000;
     h ^= g;
     h ^= g >> 24;
   }

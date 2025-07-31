@@ -58,17 +58,17 @@ constexpr uint32_t kPageCrossingCode[] = {
     // push {lr}
     //
     // We may need lr for graceful return if SIGSEGV doesn't happen.
-    0xe52de004,
+    0xe52d'e004,
     // blx r0
     //
     // The only way to check that this was executed (i.e. SIGSEGV didn't happen too early) is to
     // print something to stderr. Call FirstPageExecutionHelper for this.
-    0xe12fff30,
+    0xe12f'ff30,
     // nop
     //
     // Make sure we cross pages without jumps (i.e. we don't
     // return from blx directly to the second page).
-    0xe320f000,
+    0xe320'f000,
 
     //
     // Second page
@@ -77,7 +77,7 @@ constexpr uint32_t kPageCrossingCode[] = {
     // pop {pc}
     //
     // If SIGSEGV doesn't happen, make sure we return cleanly.
-    0xe49df004,
+    0xe49d'f004,
 };
 
 constexpr size_t kFirstPageInsnNum = 3;

@@ -28,7 +28,7 @@ namespace berberis {
 namespace {
 
 TEST(VirtualGuestFrame, InitReturnAddress) {
-  constexpr GuestAddr kVirtualGuestFrameReturnAddress = 0xbeefface;
+  constexpr GuestAddr kVirtualGuestFrameReturnAddress = 0xbeef'face;
   ScopedVirtualGuestCallFrame::SetReturnAddress(kVirtualGuestFrameReturnAddress);
 
   CPUState cpu{};
@@ -36,7 +36,7 @@ TEST(VirtualGuestFrame, InitReturnAddress) {
   alignas(uint64_t) std::array<char, 128> stack;
   SetXReg<SP>(cpu, ToGuestAddr(stack.data() + stack.size()));
 
-  ScopedVirtualGuestCallFrame virtual_guest_call_frame(&cpu, 0xdeadbeef);
+  ScopedVirtualGuestCallFrame virtual_guest_call_frame(&cpu, 0xdead'beef);
 
   EXPECT_EQ(kVirtualGuestFrameReturnAddress, GetXReg<RA>(cpu));
 
@@ -45,7 +45,7 @@ TEST(VirtualGuestFrame, InitReturnAddress) {
 }
 
 void RunGuestCall(CPUState* cpu) {
-  ScopedVirtualGuestCallFrame virtual_guest_call_frame(cpu, 0xbaaaaaad);
+  ScopedVirtualGuestCallFrame virtual_guest_call_frame(cpu, 0xbaaa'aaad);
 
   // Pretend guest code executed up to return address.
   cpu->insn_addr = GetXReg<RA>(*cpu);
@@ -54,8 +54,8 @@ void RunGuestCall(CPUState* cpu) {
   // that is calling guest code. That pseudo-function can make arbitrary
   // adjustments to sp and ra because those are callee-saved registers that are
   // restored when the function returns.
-  SetXReg<SP>(*cpu, 0x000ff1ce);
-  SetXReg<RA>(*cpu, 0xbaadf00d);
+  SetXReg<SP>(*cpu, 0x000f'f1ce);
+  SetXReg<RA>(*cpu, 0xbaad'f00d);
 }
 
 TEST(VirtualGuestFrame, Restore) {
@@ -63,8 +63,8 @@ TEST(VirtualGuestFrame, Restore) {
 
   alignas(uint64_t) std::array<char, 128> stack;
   const GuestAddr sp = ToGuestAddr(stack.data() + stack.size());
-  const GuestAddr ra = 0xdeadbeef;
-  const GuestAddr fp = 0xdeadc0de;
+  const GuestAddr ra = 0xdead'beef;
+  const GuestAddr fp = 0xdead'c0de;
 
   SetXReg<RA>(cpu, ra);
   SetXReg<SP>(cpu, sp);

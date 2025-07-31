@@ -32,34 +32,34 @@ TEST(GuestArguments_riscv64_lp64, Smoke) {
   union {
     GuestArgumentBuffer buffer;
     uint64_t padding[padding_size];
-  } arguments = {{.argv = {0x8000000000000000,
-                           0x3ff0000000000000,
-                           0x3fe0000000000000,
-                           0x3fd5555555555555,
-                           0x3fd0000000000000,
-                           0x3fc999999999999a,
-                           0x3fc5555555555555,
-                           0x3fb5555555555555},
-                  .stack_argv = {0x3fc0000000000000}}};
-  arguments.buffer.stack_argv[1] = 0x3fbc71c71c71c71c;
-  arguments.buffer.stack_argv[2] = 0x3fb999999999999a;
-  arguments.buffer.stack_argv[3] = 0x3fb745d1745d1746;
+  } arguments = {{.argv = {0x8000'0000'0000'0000,
+                           0x3ff0'0000'0000'0000,
+                           0x3fe0'0000'0000'0000,
+                           0x3fd5'5555'5555'5555,
+                           0x3fd0'0000'0000'0000,
+                           0x3fc9'9999'9999'999a,
+                           0x3fc5'5555'5555'5555,
+                           0x3fb5'5555'5555'5555},
+                  .stack_argv = {0x3fc0'0000'0000'0000}}};
+  arguments.buffer.stack_argv[1] = 0x3fbc'71c7'1c71'c71c;
+  arguments.buffer.stack_argv[2] = 0x3fb9'9999'9999'999a;
+  arguments.buffer.stack_argv[3] = 0x3fb7'45d1'745d'1746;
 
   GuestArgumentsAndResult<
       double(int, double, int, double, int, double, int, double, int, double, int, double),
       GuestAbi::kLp64>
       f1_args(&arguments.buffer);
-  EXPECT_EQ(0x00000000, f1_args.GuestArgument<0>());
+  EXPECT_EQ(0x0000'0000, f1_args.GuestArgument<0>());
   EXPECT_EQ(1.0, f1_args.GuestArgument<1>());
-  EXPECT_EQ(0x00000000, f1_args.GuestArgument<2>());
+  EXPECT_EQ(0x0000'0000, f1_args.GuestArgument<2>());
   EXPECT_EQ(1.0 / 3.0, f1_args.GuestArgument<3>());
-  EXPECT_EQ(0x00000000, f1_args.GuestArgument<4>());
+  EXPECT_EQ(0x0000'0000, f1_args.GuestArgument<4>());
   EXPECT_EQ(1.0 / 5.0, f1_args.GuestArgument<5>());
-  EXPECT_EQ(0x55555555, f1_args.GuestArgument<6>());
+  EXPECT_EQ(0x5555'5555, f1_args.GuestArgument<6>());
   EXPECT_EQ(1.0 / 12.0, f1_args.GuestArgument<7>());
-  EXPECT_EQ(0x00000000, f1_args.GuestArgument<8>());
+  EXPECT_EQ(0x0000'0000, f1_args.GuestArgument<8>());
   EXPECT_EQ(1.0 / 9.0, f1_args.GuestArgument<9>());
-  EXPECT_EQ(static_cast<int>(0x9999999a), f1_args.GuestArgument<10>());
+  EXPECT_EQ(static_cast<int>(0x9999'999a), f1_args.GuestArgument<10>());
   EXPECT_EQ(1.0 / 11.0, f1_args.GuestArgument<11>());
   EXPECT_EQ(-0.0, f1_args.GuestResult());
 
@@ -68,17 +68,17 @@ TEST(GuestArguments_riscv64_lp64, Smoke) {
       GuestAbi::kLp64>
       f2_args(&arguments.buffer);
   EXPECT_EQ(-0.0, f2_args.GuestArgument<0>());
-  EXPECT_EQ(0x00000000, f2_args.GuestArgument<1>());
+  EXPECT_EQ(0x0000'0000, f2_args.GuestArgument<1>());
   EXPECT_EQ(1.0 / 2.0, f2_args.GuestArgument<2>());
-  EXPECT_EQ(0x55555555, f2_args.GuestArgument<3>());
+  EXPECT_EQ(0x5555'5555, f2_args.GuestArgument<3>());
   EXPECT_EQ(1.0 / 4.0, f2_args.GuestArgument<4>());
-  EXPECT_EQ(static_cast<int>(0x9999999a), f2_args.GuestArgument<5>());
+  EXPECT_EQ(static_cast<int>(0x9999'999a), f2_args.GuestArgument<5>());
   EXPECT_EQ(1.0 / 6.0, f2_args.GuestArgument<6>());
-  EXPECT_EQ(0x55555555, f2_args.GuestArgument<7>());
+  EXPECT_EQ(0x5555'5555, f2_args.GuestArgument<7>());
   EXPECT_EQ(1.0 / 8.0, f2_args.GuestArgument<8>());
-  EXPECT_EQ(0x1c71c71c, f2_args.GuestArgument<9>());
+  EXPECT_EQ(0x1c71'c71c, f2_args.GuestArgument<9>());
   EXPECT_EQ(1.0 / 10.0, f2_args.GuestArgument<10>());
-  EXPECT_EQ(0x745d1746, f2_args.GuestArgument<11>());
+  EXPECT_EQ(0x745d'1746, f2_args.GuestArgument<11>());
   EXPECT_EQ(0, f2_args.GuestResult());
 }
 
@@ -89,18 +89,18 @@ TEST(GuestArguments_riscv64_lp64d, Smoke) {
     GuestArgumentBuffer buffer;
     uint64_t padding[padding_size];
   } arguments = {{.argv = {1, 2, 3, 4, 5, 6, 7, 8},
-                  .fp_argv = {0x3ff0000000000000,
-                              0x3fe0000000000000,
-                              0x3fd5555555555555,
-                              0x3fd0000000000000,
-                              0x3fc999999999999a,
-                              0x3fc5555555555555,
-                              0x3fc2492492492492,
-                              0x3fc0000000000000},
-                  .stack_argv = {0x3fbc71c71c71c71c}}};
-  arguments.buffer.stack_argv[1] = 0x3fb999999999999a;
-  arguments.buffer.stack_argv[2] = 0x3fb745d1745d1746;
-  arguments.buffer.stack_argv[3] = 0x3fb5555555555555;
+                  .fp_argv = {0x3ff0'0000'0000'0000,
+                              0x3fe0'0000'0000'0000,
+                              0x3fd5'5555'5555'5555,
+                              0x3fd0'0000'0000'0000,
+                              0x3fc9'9999'9999'999a,
+                              0x3fc5'5555'5555'5555,
+                              0x3fc2'4924'9249'2492,
+                              0x3fc0'0000'0000'0000},
+                  .stack_argv = {0x3fbc'71c7'1c71'c71c}}};
+  arguments.buffer.stack_argv[1] = 0x3fb9'9999'9999'999a;
+  arguments.buffer.stack_argv[2] = 0x3fb7'45d1'745d'1746;
+  arguments.buffer.stack_argv[3] = 0x3fb5'5555'5555'5555;
 
   GuestArgumentsAndResult<double(int,
                                  double,
@@ -140,9 +140,9 @@ TEST(GuestArguments_riscv64_lp64d, Smoke) {
   EXPECT_EQ(1.0 / 7.0, f1_args.GuestArgument<13>());
   EXPECT_EQ(8, f1_args.GuestArgument<14>());
   EXPECT_EQ(1.0 / 8.0, f1_args.GuestArgument<15>());
-  EXPECT_EQ(0x1c71c71c, f1_args.GuestArgument<16>());
+  EXPECT_EQ(0x1c71'c71c, f1_args.GuestArgument<16>());
   EXPECT_EQ(1.0 / 10.0, f1_args.GuestArgument<17>());
-  EXPECT_EQ(0x745d1746, f1_args.GuestArgument<18>());
+  EXPECT_EQ(0x745d'1746, f1_args.GuestArgument<18>());
   EXPECT_EQ(1.0 / 12.0, f1_args.GuestArgument<19>());
   EXPECT_EQ(1.0, f1_args.GuestResult());
 
@@ -185,9 +185,9 @@ TEST(GuestArguments_riscv64_lp64d, Smoke) {
   EXPECT_EQ(1.0 / 8.0, f2_args.GuestArgument<14>());
   EXPECT_EQ(8, f2_args.GuestArgument<15>());
   EXPECT_EQ(1.0 / 9.0, f2_args.GuestArgument<16>());
-  EXPECT_EQ(-0x66666666, f2_args.GuestArgument<17>());
+  EXPECT_EQ(-0x6666'6666, f2_args.GuestArgument<17>());
   EXPECT_EQ(1.0 / 11.0, f2_args.GuestArgument<18>());
-  EXPECT_EQ(0x55555555, f2_args.GuestArgument<19>());
+  EXPECT_EQ(0x5555'5555, f2_args.GuestArgument<19>());
   EXPECT_EQ(1, f2_args.GuestResult());
 }
 
@@ -195,11 +195,11 @@ TEST(GuestArguments_riscv64_lp64d, LongParamLargeStructRes) {
   struct Result {
     uint64_t values[10];
   } result{};
-  GuestArgumentBuffer buffer{.argv = {ToGuestAddr(&result), 0xdead0000beef}};
+  GuestArgumentBuffer buffer{.argv = {ToGuestAddr(&result), 0xdead'0000'beef}};
 
   GuestArgumentsAndResult<Result(uint64_t)> args(&buffer);
 
-  EXPECT_EQ(0xdead0000beefUL, args.GuestArgument<0>());
+  EXPECT_EQ(0xdead'0000'beefUL, args.GuestArgument<0>());
 
   args.GuestResult() = Result{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 
@@ -216,7 +216,7 @@ TEST(GuestArguments_riscv64_lp64d, LongParamLargeStructRes) {
 }
 
 TEST(GuestArguments_riscv64_lp64d, GuestArgumentsReferences) {
-  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0000000000000}};
+  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0'0000'0000'0000}};
 
   auto&& [length1, angle1] =
       GuestArgumentsReferences<double(int, double), GuestAbi::kLp64d>(&buffer);
@@ -234,7 +234,7 @@ TEST(GuestArguments_riscv64_lp64d, GuestArgumentsReferences) {
 }
 
 TEST(GuestArguments_riscv64_lp64d, HostArgumentsValues) {
-  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0000000000000}};
+  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0'0000'0000'0000}};
 
   auto [length, angle] = HostArgumentsValues<double(int, double), GuestAbi::kLp64d>(&buffer);
   EXPECT_EQ(length, 100);
@@ -242,14 +242,14 @@ TEST(GuestArguments_riscv64_lp64d, HostArgumentsValues) {
 }
 
 TEST(GuestArguments_riscv64_lp64d, GuestResultValue) {
-  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0000000000000}};
+  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0'0000'0000'0000}};
 
   auto [result] = GuestResultValue<double(int, double), GuestAbi::kLp64d>(&buffer);
   EXPECT_EQ(result, 1.0 / 2.0);
 }
 
 TEST(GuestArguments_riscv64_lp64d, HostResultReference) {
-  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0000000000000}};
+  GuestArgumentBuffer buffer{.argv = {100}, .fp_argv = {0x3fe0'0000'0000'0000}};
 
   auto&& [result1] = HostResultReference<double(int, double), GuestAbi::kLp64d>(&buffer);
   EXPECT_EQ(result1, 1.0 / 2.0);

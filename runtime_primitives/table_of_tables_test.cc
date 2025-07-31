@@ -91,7 +91,7 @@ TEST(TableOfTables_DeathTest, InvalidAddress) {
   berberis::TableOfTables<berberis::GuestAddr, uintptr_t> tot(42);
 
   // Try an address with its top 16 bits nonzero.
-  EXPECT_DEATH((void)tot.Get(0xdeadbeef12345678ULL), "");
+  EXPECT_DEATH((void)tot.Get(0xdead'beef'1234'5678ULL), "");
 #endif
 }
 

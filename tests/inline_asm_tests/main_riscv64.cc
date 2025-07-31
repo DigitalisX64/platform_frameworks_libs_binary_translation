@@ -1929,14 +1929,14 @@ TEST(InlineAsmTestRiscv64, TestVredminu) {
       // expected_result_vd0_int16
       {0x8100, 0x8100, 0x8100, 0x0291, /* unused */ 0, 0x8100, 0x8100, 0x8100},
       // expected_result_vd0_int32
-      {0x83028100,
-       0x83028100,
-       0x83028100,
-       0x06940291,
+      {0x8302'8100,
+       0x8302'8100,
+       0x8302'8100,
+       0x0694'0291,
        /* unused */ 0,
        /* unused */ 0,
-       0x83028100,
-       0x83028100},
+       0x8302'8100,
+       0x8302'8100},
       // expected_result_vd0_int64
       {0x8706'8504'8302'8100,
        0x8706'8504'8302'8100,

@@ -520,10 +520,10 @@ bool AssemblerTest() {
   assembler.Subl(Assembler::esp, 16);
   assembler.Movl({.base = Assembler::esp}, Assembler::eax);
   assembler.Push(Assembler::esp);
-  assembler.Push(0xcccccccc);
+  assembler.Push(0xcccc'cccc);
   assembler.Pushl({.base = Assembler::esp, .disp = 0x428});
   assembler.Popl({.base = Assembler::esp, .disp = 0x428});
-  assembler.Movl(Assembler::ecx, 0xcccccccc);
+  assembler.Movl(Assembler::ecx, 0xcccc'cccc);
   assembler.Call(Assembler::ecx);
   assembler.Movl(Assembler::eax, {.base = Assembler::esp, .disp = 8});
   assembler.Addl(Assembler::esp, 24);
@@ -619,7 +619,7 @@ bool LabelTest() {
 bool CondTest1() {
   MachineCode code;
   CodeEmitter as(&code);
-  as.Movl(Assembler::eax, 0xcccccccc);
+  as.Movl(Assembler::eax, 0xcccc'cccc);
   as.Movl(Assembler::edx, {.base = Assembler::esp, .disp = 4});  // arg1.
   as.Movl(Assembler::ecx, {.base = Assembler::esp, .disp = 8});  // arg2.
   as.Cmpl(Assembler::edx, Assembler::ecx);
@@ -632,12 +632,12 @@ bool CondTest1() {
   using TestFunc = uint32_t(int, int);
   auto target_func = exec.get<TestFunc>();
   uint32_t result = target_func(1, 2);
-  if (result != 0xcccccc00) {
+  if (result != 0xcccc'cc00) {
     TRACE_AND_ALOGE("Bug in seteq(not equal): %x", result);
     return false;
   }
   result = target_func(-1, -1);
-  if (result != 0xcccccc01) {
+  if (result != 0xcccc'cc01) {
     TRACE_AND_ALOGE("Bug in seteq(equal): %x", result);
     return false;
   }
@@ -783,8 +783,8 @@ bool BsrTest() {
 bool CallFPTest() {
   MachineCode code;
   CodeEmitter as(&code);
-  as.Push(0x3f800000);
-  as.Push(0x40000000);
+  as.Push(0x3f80'0000);
+  as.Push(0x4000'0000);
   as.Call(bit_cast<const void*>(&FloatFunc));
   as.Fstps({.base = Assembler::esp});
   as.Pop(Assembler::eax);
@@ -796,15 +796,15 @@ bool CallFPTest() {
 
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
-  return result == 0x3f800000;
+  return result == 0x3f80'0000;
 }
 
 bool XmmTest() {
   MachineCode code;
   CodeEmitter as(&code);
-  as.Movl(Assembler::eax, 0x3f800000);
+  as.Movl(Assembler::eax, 0x3f80'0000);
   as.Movd(Assembler::xmm0, Assembler::eax);
-  as.Movl(Assembler::eax, 0x40000000);
+  as.Movl(Assembler::eax, 0x4000'0000);
   as.Movd(Assembler::xmm5, Assembler::eax);
   as.Addss(Assembler::xmm0, Assembler::xmm5);
   as.Movd(Assembler::eax, Assembler::xmm0);
@@ -815,14 +815,14 @@ bool XmmTest() {
 
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
-  return result == 0x40400000;
+  return result == 0x4040'0000;
 }
 
 bool ReadGlobalTest() {
   MachineCode code;
   CodeEmitter as(&code);
   static const uint32_t kData[] __attribute__((aligned(16))) =  // NOLINT
-      {0x00112233, 0x44556677, 0x8899aabb, 0xccddeeff};
+      {0x0011'2233, 0x4455'6677, 0x8899'aabb, 0xccdd'eeff};
   as.Movsd(Assembler::xmm0, {.disp = bit_cast<int32_t>(&kData)});
   as.Movdqa(Assembler::xmm1, {.disp = bit_cast<int32_t>(&kData)});
   as.Movl(Assembler::eax, {.base = Assembler::esp, .disp = 4});
@@ -878,7 +878,7 @@ bool LabelTest() {
 bool CondTest1() {
   MachineCode code;
   CodeEmitter as(&code);
-  as.Movl(Assembler::rax, 0xcccccccc);
+  as.Movl(Assembler::rax, 0xcccc'cccc);
   as.Cmpl(Assembler::rdi, Assembler::rsi);
   as.Setcc(Assembler::Condition::kEqual, Assembler::rax);
   as.Ret();
@@ -892,12 +892,12 @@ bool CondTest1() {
   auto target_func = exec.get<TestFunc>();
   uint32_t result;
   result = target_func(1, 2);
-  if (result != 0xcccccc00) {
+  if (result != 0xcccc'cc00) {
     TRACE_AND_ALOGE("Bug in seteq(not equal): %x", result);
     return false;
   }
   result = target_func(-1, -1);
-  if (result != 0xcccccc01) {
+  if (result != 0xcccc'cc01) {
     TRACE_AND_ALOGE("Bug in seteq(equal): %x", result);
     return false;
   }
@@ -1011,9 +1011,9 @@ bool ReadWriteTest() {
 bool CallFPTest() {
   MachineCode code;
   CodeEmitter as(&code);
-  as.Movl(Assembler::rax, 0x40000000);
+  as.Movl(Assembler::rax, 0x4000'0000);
   as.Movd(Assembler::xmm0, Assembler::rax);
-  as.Movl(Assembler::rax, 0x3f800000);
+  as.Movl(Assembler::rax, 0x3f80'0000);
   as.Movd(Assembler::xmm1, Assembler::rax);
   as.Call(bit_cast<const void*>(&FloatFunc));
   as.Movd(Assembler::rax, Assembler::xmm0);
@@ -1024,15 +1024,15 @@ bool CallFPTest() {
 
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
-  return result == 0x3f800000;
+  return result == 0x3f80'0000;
 }
 
 bool XmmTest() {
   MachineCode code;
   CodeEmitter as(&code);
-  as.Movl(Assembler::rax, 0x40000000);
+  as.Movl(Assembler::rax, 0x4000'0000);
   as.Movd(Assembler::xmm0, Assembler::rax);
-  as.Movl(Assembler::rax, 0x3f800000);
+  as.Movl(Assembler::rax, 0x3f80'0000);
   as.Movd(Assembler::xmm11, Assembler::rax);
   as.Addss(Assembler::xmm0, Assembler::xmm11);
   as.Movaps(Assembler::xmm12, Assembler::xmm0);
@@ -1046,7 +1046,7 @@ bool XmmTest() {
 
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
-  return result == 0x40c00000;
+  return result == 0x40c0'0000;
 }
 
 bool XmmMemTest() {
@@ -1070,7 +1070,7 @@ bool XmmMemTest() {
   using TestFunc = uint64_t(char* p);
   uint64_t result = exec.get<TestFunc>()(p);
   uint64_t doubled = *bit_cast<uint64_t*>(p);
-  return result == 0x406de00000000000ULL && doubled == 0x407de00000000000ULL;
+  return result == 0x406d'e000'0000'0000ULL && doubled == 0x407d'e000'0000'0000ULL;
 }
 
 bool MovsxblRexTest() {
@@ -1078,7 +1078,7 @@ bool MovsxblRexTest() {
   CodeEmitter as(&code);
 
   as.Xorl(Assembler::rdx, Assembler::rdx);
-  as.Movl(Assembler::rsi, 0xdeadff);
+  as.Movl(Assembler::rsi, 0xde'adff);
   // CodeEmitter should use REX prefix to encode SIL.
   // Without REX DH is used.
   as.Movsxbl(Assembler::rax, Assembler::rsi);
@@ -1090,7 +1090,7 @@ bool MovsxblRexTest() {
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
 
-  return result == 0xffffffff;
+  return result == 0xffff'ffff;
 }
 
 bool MovzxblRexTest() {
@@ -1098,7 +1098,7 @@ bool MovzxblRexTest() {
   CodeEmitter as(&code);
 
   as.Xorl(Assembler::rdx, Assembler::rdx);
-  as.Movl(Assembler::rsi, 0xdeadff);
+  as.Movl(Assembler::rsi, 0xde'adff);
   // CodeEmitter should use REX prefix to encode SIL.
   // Without REX DH is used.
   as.Movzxbl(Assembler::rax, Assembler::rsi);
@@ -1110,20 +1110,20 @@ bool MovzxblRexTest() {
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
 
-  return result == 0x000000ff;
+  return result == 0x0000'00ff;
 }
 
 bool ShldlRexTest() {
   MachineCode code;
   CodeEmitter as(&code);
 
-  as.Movl(Assembler::rdx, 0x12345678);
+  as.Movl(Assembler::rdx, 0x1234'5678);
   // If most-significant bit is not encoded correctly with REX
   // RAX can be used instead R8 and R10 can be used instead RDX.
   // Init them all:
   as.Xorl(Assembler::r8, Assembler::r8);
-  as.Movl(Assembler::rax, 0xdeadbeef);
-  as.Movl(Assembler::r10, 0xdeadbeef);
+  as.Movl(Assembler::rax, 0xdead'beef);
+  as.Movl(Assembler::r10, 0xdead'beef);
 
   as.Shldl(Assembler::r8, Assembler::rdx, int8_t{8});
   as.Movl(Assembler::rcx, 8);
@@ -1146,13 +1146,13 @@ bool ShrdlRexTest() {
   MachineCode code;
   CodeEmitter as(&code);
 
-  as.Movl(Assembler::rdx, 0x12345678);
+  as.Movl(Assembler::rdx, 0x1234'5678);
   // If most-significant bit is not encoded correctly with REX
   // RAX can be used instead R8 and R10 can be used instead RDX.
   // Init them all:
   as.Xorl(Assembler::r8, Assembler::r8);
-  as.Movl(Assembler::rax, 0xdeadbeef);
-  as.Movl(Assembler::r10, 0xdeadbeef);
+  as.Movl(Assembler::rax, 0xdead'beef);
+  as.Movl(Assembler::r10, 0xdead'beef);
 
   as.Shrdl(Assembler::r8, Assembler::rdx, int8_t{8});
   as.Movl(Assembler::rcx, 8);
@@ -1168,14 +1168,14 @@ bool ShrdlRexTest() {
   using TestFunc = uint32_t();
   uint32_t result = exec.get<TestFunc>()();
 
-  return result == 0x78780000;
+  return result == 0x7878'0000;
 }
 
 bool ReadGlobalTest() {
   MachineCode code;
   CodeEmitter as(&code);
   static const uint32_t kData[] __attribute__((aligned(16))) =  // NOLINT
-      {0x00112233, 0x44556677, 0x8899aabb, 0xccddeeff};
+      {0x0011'2233, 0x4455'6677, 0x8899'aabb, 0xccdd'eeff};
   // We couldn't read data from arbitrary address on x86_64, need address in first 2GiB.
   void* data =
       mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);

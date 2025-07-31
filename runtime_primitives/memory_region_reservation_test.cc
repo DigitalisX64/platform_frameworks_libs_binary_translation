@@ -29,7 +29,7 @@ static_assert(sizeof(Reservation) >= 8, "Reservation size is too small");
 TEST(MemoryRegionReservation, Smoke) {
   CPUState cpu{};
 
-  constexpr uint32_t kTestVal = 0xf1234567;
+  constexpr uint32_t kTestVal = 0xf123'4567;
 
   Reservation reservation = kTestVal;
 
@@ -53,8 +53,8 @@ TEST(MemoryRegionReservation, Smoke) {
 TEST(MemoryRegionReservation, DoubleLoad) {
   CPUState cpu{};
 
-  constexpr uint32_t kTestVal1 = 0xf1234567;
-  constexpr uint32_t kTestVal2 = 0xdeadbeef;
+  constexpr uint32_t kTestVal1 = 0xf123'4567;
+  constexpr uint32_t kTestVal2 = 0xdead'beef;
 
   Reservation reservation_1 = kTestVal1;
   Reservation reservation_2 = kTestVal2;
@@ -79,9 +79,9 @@ TEST(MemoryRegionReservation, Steal) {
   CPUState cpu_1{};
   CPUState cpu_2{};
 
-  constexpr uint32_t kTestVal1 = 0xf1234567;
-  constexpr uint32_t kTestVal2 = 0xdeadbeef;
-  constexpr uint32_t kTestVal3 = 0xabcdefab;
+  constexpr uint32_t kTestVal1 = 0xf123'4567;
+  constexpr uint32_t kTestVal2 = 0xdead'beef;
+  constexpr uint32_t kTestVal3 = 0xabcd'efab;
 
   Reservation reservation = kTestVal1;
 
@@ -108,8 +108,8 @@ TEST(MemoryRegionReservation, StealEqual) {
   CPUState cpu_1{};
   CPUState cpu_2{};
 
-  constexpr uint32_t kTestVal1 = 0xf1234567;
-  constexpr uint32_t kTestVal2 = 0xdeadbeef;
+  constexpr uint32_t kTestVal1 = 0xf123'4567;
+  constexpr uint32_t kTestVal2 = 0xdead'beef;
 
   Reservation reservation = kTestVal1;
 

@@ -35,10 +35,10 @@ struct MacroAssemblerConstants {
   alignas(16) const uint64_t kNanBoxFloat32[2] = {0xffff'ffff'0000'0000, 0xffff'ffff'0000'0000};
   alignas(16) const uint64_t kNanBoxedNansFloat32[2] = {0xffff'ffff'7fc0'0000,
                                                         0xffff'ffff'7fc0'0000};
-  alignas(16) const uint32_t kCanonicalNansFloat32[4] = {0x7fc'00000,
-                                                         0x7fc'00000,
-                                                         0x7fc'00000,
-                                                         0x7fc'00000};
+  alignas(16) const uint32_t kCanonicalNansFloat32[4] = {0x7fc0'0000,
+                                                         0x7fc0'0000,
+                                                         0x7fc0'0000,
+                                                         0x7fc0'0000};
   alignas(16) const uint64_t kCanonicalNansFloat64[2] = {0x7ff8'0000'0000'0000,
                                                          0x7ff8'0000'0000'0000};
   alignas(16) const uint32_t kFloat32One[4] = {0x3f80'0000, 0x3f80'0000, 0x3f80'0000, 0x3f80'0000};

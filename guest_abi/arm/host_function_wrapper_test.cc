@@ -89,10 +89,10 @@ TEST_F(HostFunctionWrapperTest, WrapTwoInt) {
   //   return ptr(5, 7);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xe1a03000,  // mov r3, r0
-      0xe3a01007,  // mov r1, #7
-      0xe3a00005,  // mov r0, #5
-      0xe12fff13,  // bx  r3
+      0xe1a0'3000,  // mov r3, r0
+      0xe3a0'1007,  // mov r1, #7
+      0xe3a0'0005,  // mov r0, #5
+      0xe12f'ff13,  // bx  r3
   });
 
   EXPECT_EQ(-2, CallWrappedHostFunctionFromWrappedGuestFunction<int>(pc, sub));
@@ -107,12 +107,12 @@ TEST_F(HostFunctionWrapperTest, WrapTwoFloat) {
   //    return ptr(5.0, 7.0);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xe3001000,  // movw r1, #0
-      0xe1a02000,  // mov  r2, r0
-      0xe3000000,  // movw r0, #0
-      0xe34410e0,  // movt r1, #16608 ; 0x40e0
-      0xe34400a0,  // movt r0, #16544 ; 0x40a0
-      0xe12fff12,  // bx   r2
+      0xe300'1000,  // movw r1, #0
+      0xe1a0'2000,  // mov  r2, r0
+      0xe300'0000,  // movw r0, #0
+      0xe344'10e0,  // movt r1, #16608 ; 0x40e0
+      0xe344'00a0,  // movt r0, #16544 ; 0x40a0
+      0xe12f'ff12,  // bx   r2
   });
 
   EXPECT_EQ(-2.0, CallWrappedHostFunctionFromWrappedGuestFunction<float>(pc, fsub));
@@ -127,13 +127,13 @@ TEST_F(HostFunctionWrapperTest, WrapTwoFloatVFP) {
   //    return ptr(5.0, 7.0);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xe92d4800,  // push     {fp, lr}
-      0xe1a0b00d,  // mov      fp, sp
-      0xeeb10a04,  // vmov.f32 s0, #20 ; 5.0
-      0xeef10a0c,  // vmov.f32 s1, #28 ; 7.0
-      0xe12fff30,  // blx      r0
-      0xee100a10,  // vmov     r0, s0
-      0xe8bd8800,  // pop      {fp, pc}
+      0xe92d'4800,  // push     {fp, lr}
+      0xe1a0'b00d,  // mov      fp, sp
+      0xeeb1'0a04,  // vmov.f32 s0, #20 ; 5.0
+      0xeef1'0a0c,  // vmov.f32 s1, #28 ; 7.0
+      0xe12f'ff30,  // blx      r0
+      0xee10'0a10,  // vmov     r0, s0
+      0xe8bd'8800,  // pop      {fp, pc}
   });
 
   EXPECT_EQ(
@@ -156,16 +156,16 @@ TEST_F(HostFunctionWrapperTest, WrapReturnedFunction) {
   //   return ptr(n)(5, 7);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xe1a03000,  // mov  r3, r0
-      0xe92d4010,  // push {r4, lr}
-      0xe1a00001,  // mov  r0, r1
-      0xe1a0e00f,  // mov  lr, pc
-      0xe12fff13,  // bx   r3
-      0xe3a01007,  // mov  r1, #7
-      0xe1a03000,  // mov  r3, r0
-      0xe8bd4010,  // pop  {r4, lr}
-      0xe3a00005,  // mov  r0, #5
-      0xe12fff13,  // bx   r3
+      0xe1a0'3000,  // mov  r3, r0
+      0xe92d'4010,  // push {r4, lr}
+      0xe1a0'0001,  // mov  r0, r1
+      0xe1a0'e00f,  // mov  lr, pc
+      0xe12f'ff13,  // bx   r3
+      0xe3a0'1007,  // mov  r1, #7
+      0xe1a0'3000,  // mov  r3, r0
+      0xe8bd'4010,  // pop  {r4, lr}
+      0xe3a0'0005,  // mov  r0, #5
+      0xe12f'ff13,  // bx   r3
   });
 
   EXPECT_EQ(12, CallWrappedHostFunctionFromWrappedGuestFunction<int>(pc, add_sub_chooser, 1));

@@ -92,7 +92,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
   // Movb in 32-bit mode has certain optimizations not available in x86-64 mode
   constexpr void Movb(Register dest, const Operand& src) {
     if (IsAccumulator(dest) && src.base == no_register && src.index == no_register) {
-      EmitInstruction<0xA0>(src.disp);
+      EmitInstruction<0xa0>(src.disp);
     } else {
       BaseAssembler::Movb(dest, src);
     }
@@ -100,7 +100,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   constexpr void Movb(const Operand& dest, Register src) {
     if (dest.base == no_register && dest.index == no_register && IsAccumulator(src)) {
-      EmitInstruction<0xA2>(dest.disp);
+      EmitInstruction<0xa2>(dest.disp);
     } else {
       BaseAssembler::Movb(dest, src);
     }
@@ -112,7 +112,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
   // Movw in 32-bit mode has certain optimizations not available in x86-64 mode
   constexpr void Movw(Register dest, const Operand& src) {
     if (IsAccumulator(dest) && src.base == no_register && src.index == no_register) {
-      EmitInstruction<0x66, 0xA1>(src.disp);
+      EmitInstruction<0x66, 0xa1>(src.disp);
     } else {
       BaseAssembler::Movw(dest, src);
     }
@@ -120,7 +120,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   constexpr void Movw(const Operand& dest, Register src) {
     if (dest.base == no_register && dest.index == no_register && IsAccumulator(src)) {
-      EmitInstruction<0x66, 0xA3>(dest.disp);
+      EmitInstruction<0x66, 0xa3>(dest.disp);
     } else {
       BaseAssembler::Movw(dest, src);
     }
@@ -132,7 +132,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
   // Movl in 32-bit mode has certain optimizations not available in x86-64 mode
   constexpr void Movl(Register dest, const Operand& src) {
     if (IsAccumulator(dest) && src.base == no_register && src.index == no_register) {
-      EmitInstruction<0xA1>(src.disp);
+      EmitInstruction<0xa1>(src.disp);
     } else {
       BaseAssembler::Movl(dest, src);
     }
@@ -140,7 +140,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   constexpr void Movl(const Operand& dest, Register src) {
     if (dest.base == no_register && dest.index == no_register && IsAccumulator(src)) {
-      EmitInstruction<0xA3>(dest.disp);
+      EmitInstruction<0xa3>(dest.disp);
     } else {
       BaseAssembler::Movl(dest, src);
     }
@@ -164,7 +164,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   void Call(const void* target) {
     Emit8(0xe8);
-    Emit32(0xcccccccc);
+    Emit32(0xcccc'cccc);
     // Set last 4 bytes to displacement from current pc to 'target'.
     AddRelocation(pc() - 4, RelocationType::RelocAbsToDisp32, pc(), bit_cast<intptr_t>(target));
   }
@@ -187,10 +187,10 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
     } else if (cc == Condition::kNever) {
       return;
     }
-    CHECK_EQ(0, static_cast<uint8_t>(cc) & 0xF0);
-    Emit8(0x0F);
+    CHECK_EQ(0, static_cast<uint8_t>(cc) & 0xf0);
+    Emit8(0x0f);
     Emit8(0x80 | static_cast<uint8_t>(cc));
-    Emit32(0xcccccccc);
+    Emit32(0xcccc'cccc);
     // Set last 4 bytes to displacement from current pc to 'target'.
     AddRelocation(pc() - 4, RelocationType::RelocAbsToDisp32, pc(), bit_cast<intptr_t>(target));
   }
@@ -210,7 +210,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   void Jmp(uintptr_t target) {
     Emit8(0xe9);
-    Emit32(0xcccccccc);
+    Emit32(0xcccc'cccc);
     // Set last 4 bytes to displacement from current pc to 'target'.
     AddRelocation(pc() - 4, RelocationType::RelocAbsToDisp32, pc(), bit_cast<intptr_t>(target));
   }
@@ -277,7 +277,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
     // Note that ¬R is always 1 in x86-32 mode but it's not set in JSON.
     // This means that 2nd byte of 3-byte vex is always the same in 32bit mode (but 3rd byte of
     // unfolded version and 2nd byte of folded one may still need to handle vvvv argument).
-    if (byte1 == 0xC4 && byte2 == 0b0'0'0'00001 && (byte3 & 0b1'0000'0'00) == 0) {
+    if (byte1 == 0xc4 && byte2 == 0b0'0'0'00001 && (byte3 & 0b1'0000'0'00) == 0) {
       Emit16((0x80c5 | (byte3 << 8) | 0b0'1111'0'00'00000000) ^ (vvvv << 11));
     } else {
       Emit8(byte1);
@@ -293,13 +293,13 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   template <typename ArgumentType1, typename ArgumentType2>
   void EmitModRM(ArgumentType1 argument1, ArgumentType2 argument2) {
-    Emit8(0xC0 | (argument1.num_ << 3) | argument2.num_);
+    Emit8(0xc0 | (argument1.num_ << 3) | argument2.num_);
   }
 
   template <typename ArgumentType>
   void EmitModRM(uint8_t opcode_extension, ArgumentType argument) {
     CHECK_LE(opcode_extension, 7);
-    Emit8(0xC0 | (opcode_extension << 3) | argument.num_);
+    Emit8(0xc0 | (opcode_extension << 3) | argument.num_);
   }
 
   template <typename ArgumentType>

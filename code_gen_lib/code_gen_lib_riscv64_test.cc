@@ -177,7 +177,7 @@ TEST(CodeGenLib, GenWrapGuestFunction_Run10UInt8) {
   using Func = uint8_t(
       uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t);
   uint8_t res = exec.get<Func>()(0, 0xff, 2, 3, 4, 5, 6, 0xf9, 0xf8, 9);
-  ASSERT_EQ(res, 0xF6u);
+  ASSERT_EQ(res, 0xf6U);
 }
 
 void Run10Int8(GuestAddr pc, GuestArgumentBuffer* buf) {

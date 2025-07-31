@@ -69,7 +69,7 @@ void EmitIndirectDispatch(rv64i::Assembler* as, rv64i::Assembler::Register targe
 
   auto main_table_ptr = TranslationCache::GetInstance()->main_table_ptr();
 
-  as->Lui(as->t1, 0x1000000);
+  as->Lui(as->t1, 0x100'0000);
   as->Addi(as->t1, as->t1, -1);
   as->Srli(as->t2, as->s11, 24);
   as->And(as->t2, as->t2, as->t1);

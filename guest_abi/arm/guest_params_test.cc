@@ -64,16 +64,16 @@ TEST(Params, SignedCharRes) {
   auto&& [retfv] = GuestReturnReference<signed char (*)(...)>(&state);
 
   ret = -1;
-  EXPECT_EQ(0xFFFFFFFFu, state.cpu.r[0]);
+  EXPECT_EQ(0xffff'ffffU, state.cpu.r[0]);
 
   retf = -2;
-  EXPECT_EQ(0xFFFFFFFEu, state.cpu.r[0]);
+  EXPECT_EQ(0xffff'fffeU, state.cpu.r[0]);
 
   retv = -3;
-  EXPECT_EQ(0xFFFFFFFDu, state.cpu.r[0]);
+  EXPECT_EQ(0xffff'fffdU, state.cpu.r[0]);
 
   retfv = -4;
-  EXPECT_EQ(0xFFFFFFFCu, state.cpu.r[0]);
+  EXPECT_EQ(0xffff'fffcU, state.cpu.r[0]);
 }
 
 TEST(Params, PtrFloatFloatArgs) {
@@ -114,8 +114,8 @@ TEST(Params, PtrFloatFloatArgsVfp) {
 
   state.cpu.r[0] = bit_cast<uint32_t>(&x);
   state.cpu.r[1] = bit_cast<uint32_t>(42.0f);
-  state.cpu.r[2] = 0xa3d70a3d;     // -0.57 - bottom half
-  state.cpu.r[3] = 0xbfe23d70;     // -0.57 - top half
+  state.cpu.r[2] = 0xa3d7'0a3d;    // -0.57 - bottom half
+  state.cpu.r[3] = 0xbfe2'3d70;    // -0.57 - top half
   SetVfpFloat(&state, 0, 1.0f);    // s0
   SetVfpDouble(&state, 1, -.75f);  // d1
 
@@ -153,7 +153,7 @@ TEST(Params, PtrIntPtrLongLongArgs) {
   state.cpu.r[13] = bit_cast<uint32_t>(&stack[0]);
 
   static int x;
-  constexpr uint64_t kTestValue64 = 0xffff0000ffff0000ULL;
+  constexpr uint64_t kTestValue64 = 0xffff'0000'ffff'0000ULL;
 
   state.cpu.r[0] = bit_cast<uint32_t>(&x);
   state.cpu.r[1] = bit_cast<uint32_t>(123);
@@ -202,7 +202,7 @@ TEST(Params, LongLongArgHugeStructResult) {
 
   auto [arg] = GuestParamsValues<Result(uint64_t)>(&state);
 
-  EXPECT_EQ(0xdead0000beefULL, arg);
+  EXPECT_EQ(0xdead'0000'beefULL, arg);
 
   auto&& [ret] = GuestReturnReference<Result(uint64_t)>(&state);
 
@@ -243,7 +243,7 @@ TEST(GuestVAListParams, PtrIntPtrLongLongArgs) {
   state.cpu.r[13] = bit_cast<uint32_t>(&stack[0]);
 
   static int x;
-  constexpr uint64_t kTestValue64 = 0xffff0000ffff0000ULL;
+  constexpr uint64_t kTestValue64 = 0xffff'0000'ffff'0000ULL;
 
   state.cpu.r[0] = bit_cast<uint32_t>(&x);
   state.cpu.r[1] = bit_cast<uint32_t>(123);

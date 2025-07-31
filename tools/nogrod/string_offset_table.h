@@ -66,7 +66,7 @@ class StringOffsetTable {
   static DwarfFormat DetectDwarfFormat(const uint8_t* table, size_t size) {
     CHECK_GE(size, sizeof(uint32_t));
     uint32_t size32 = *bit_cast<const uint32_t*>(table);
-    if (size32 == uint32_t{0xFFFF'FFFFu}) {
+    if (size32 == uint32_t{0xffff'ffffU}) {
       return DwarfFormat::k64Bit;
     } else {
       return DwarfFormat::k32Bit;

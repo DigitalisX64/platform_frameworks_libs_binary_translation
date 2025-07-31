@@ -33,9 +33,9 @@ namespace {
 
 TEST(ExecuteGuestRiscv64, Basic) {
   const uint32_t code[] = {
-      0x003100b3,  // add x1, x2, x3
-      0x004090b3,  // sll x1, x1, x4
-      0x008002ef,  // jal x5, 8
+      0x0031'00b3,  // add x1, x2, x3
+      0x0040'90b3,  // sll x1, x1, x4
+      0x0080'02ef,  // jal x5, 8
   };
 
   InitBerberis();

@@ -30,7 +30,7 @@ TEST(MachineCodeTest, Add) {
 
   mc.AddU8(0x00);
   mc.Add<uint16_t>(0x0201);
-  mc.Add<uint32_t>(0x06050403);
+  mc.Add<uint32_t>(0x0605'0403);
   mc.AddU8(0x07);
 
   uint8_t out[128]{};
@@ -77,9 +77,9 @@ TEST(MachineCodeTest, RelocAbsToDisp32) {
   MachineCode mc;
 
   mc.AddU8(0xf1);
-  mc.Add<uint32_t>(0xcccccccc);
+  mc.Add<uint32_t>(0xcccc'cccc);
   mc.AddU8(0xf6);
-  mc.Add<uint32_t>(0xcccccccc);
+  mc.Add<uint32_t>(0xcccc'cccc);
   mc.AddU8(0xfb);
 
   // Relocate absolute addresses from 'out' to ensure displacement limit.

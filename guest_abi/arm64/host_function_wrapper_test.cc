@@ -88,10 +88,10 @@ TEST_F(HostFunctionWrapperTest, WrapTwoInt) {
   //   return ptr(5, 7);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xaa0003e2,  // mov x2, x0
-      0x528000e1,  // mov w1, #0x7
-      0x528000a0,  // mov w0, #0x5
-      0xd61f0040   // br x2
+      0xaa00'03e2,  // mov x2, x0
+      0x5280'00e1,  // mov w1, #0x7
+      0x5280'00a0,  // mov w0, #0x5
+      0xd61f'0040   // br x2
   });
 
   EXPECT_EQ(-2, CallWrappedHostFunctionFromWrappedGuestFunction<int>(pc, sub));
@@ -106,9 +106,9 @@ TEST_F(HostFunctionWrapperTest, WrapTwoFloat) {
   //    return ptr(5.0, 7.0);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x1e239001,  // fmov s1, #7.000000000000000000e+00
-      0x1e229000,  // fmov s0, #5.000000000000000000e+00
-      0xd61f0000,  // br   x0
+      0x1e23'9001,  // fmov s1, #7.000000000000000000e+00
+      0x1e22'9000,  // fmov s0, #5.000000000000000000e+00
+      0xd61f'0000,  // br   x0
   });
 
   EXPECT_EQ(-2.0, CallWrappedHostFunctionFromWrappedGuestFunction<float>(pc, fsub));
@@ -129,16 +129,16 @@ TEST_F(HostFunctionWrapperTest, WrapReturnedFunction) {
   //   return ptr(n)(5, 7);
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xa9bf7bfd,  // stp x29, x30, [sp, #-16]!
-      0xaa0003e2,  // mov x2, x0
-      0x2a0103e0,  // mov w0, w1
-      0x910003fd,  // mov x29, sp
-      0xd63f0040,  // blr x2
-      0xaa0003e2,  // mov x2, x0
-      0xa8c17bfd,  // ldp x29, x30, [sp], #16
-      0x528000e1,  // mov w1, #0x7
-      0x528000a0,  // mov w0, #0x5
-      0xd61f0040   // br  x2
+      0xa9bf'7bfd,  // stp x29, x30, [sp, #-16]!
+      0xaa00'03e2,  // mov x2, x0
+      0x2a01'03e0,  // mov w0, w1
+      0x9100'03fd,  // mov x29, sp
+      0xd63f'0040,  // blr x2
+      0xaa00'03e2,  // mov x2, x0
+      0xa8c1'7bfd,  // ldp x29, x30, [sp], #16
+      0x5280'00e1,  // mov w1, #0x7
+      0x5280'00a0,  // mov w0, #0x5
+      0xd61f'0040   // br  x2
   });
 
   EXPECT_EQ(12, CallWrappedHostFunctionFromWrappedGuestFunction<int>(pc, add_sub_chooser, 1));

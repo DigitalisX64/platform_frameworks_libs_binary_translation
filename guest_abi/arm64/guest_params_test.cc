@@ -91,16 +91,16 @@ TEST(Params, SignedCharRes) {
   auto&& [retfv] = GuestReturnReference<signed char (*)(...)>(&state);
 
   ret = -1;
-  EXPECT_EQ(0xFFu, state.cpu.x[0]);
+  EXPECT_EQ(0xffU, state.cpu.x[0]);
 
   retf = -2;
-  EXPECT_EQ(0xFEu, state.cpu.x[0]);
+  EXPECT_EQ(0xfeU, state.cpu.x[0]);
 
   retv = -3;
-  EXPECT_EQ(0xFDu, state.cpu.x[0]);
+  EXPECT_EQ(0xfdU, state.cpu.x[0]);
 
   retfv = -4;
-  EXPECT_EQ(0xFCu, state.cpu.x[0]);
+  EXPECT_EQ(0xfcU, state.cpu.x[0]);
 }
 
 TEST(Params, PtrRes) {
@@ -118,7 +118,7 @@ TEST(Params, PtrRes) {
 TEST(Params, SignedCharArg) {
   ThreadState state{};
 
-  state.cpu.x[0] = 0xF0F0F0F0F0F0F0F0ULL;
+  state.cpu.x[0] = 0xf0f0'f0f0'f0f0'f0f0ULL;
 
   auto [arg] = GuestParamsValues<void(signed char)>(&state);
   auto [argf] = GuestParamsValues<void (*)(signed char)>(&state);
@@ -495,12 +495,12 @@ TEST(Params, LongArgHugeStructResult) {
     uint64_t values[10];
   } result{};
 
-  state.cpu.x[0] = 0xdead0000beef;
+  state.cpu.x[0] = 0xdead'0000'beef;
   state.cpu.x[8] = bit_cast<uint64_t>(&result);
 
   auto [arg] = GuestParamsValues<Result(uint64_t)>(&state);
 
-  EXPECT_EQ(0xdead0000beefUL, arg);
+  EXPECT_EQ(0xdead'0000'beefUL, arg);
 
   auto&& [ret] = GuestReturnReference<Result(uint64_t)>(&state);
 

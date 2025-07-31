@@ -584,17 +584,17 @@ class Assembler : public AssemblerBase {
       Emit8(kOpcodesArray[legacy_prefixes_index]);
     }
     // We don't yet support any XOP-encoded instructions, but they are 100% identical to vex ones,
-    // except they are using 0x8F prefix, not 0xC4 prefix.
+    // except they are using 0x8f prefix, not 0xc4 prefix.
     constexpr auto kVexOrXop = []() {
       if constexpr (std::size(kOpcodesArray) < kLegacyPrefixesCount + 3) {
         return false;
         // Note that JSON files use AMD approach: bytes are specified as in AMD manual (only we are
         // replacing ¬R/¬X/¬B and vvvv bits with zeros).
         //
-        // In particular it means that vex-encoded instructions should be specified with 0xC4 even
-        // if they are always emitted with 0xC4-to-0xC5 folding.
-      } else if constexpr (kOpcodesArray[kLegacyPrefixesCount] == 0xC4 ||
-                           kOpcodesArray[kLegacyPrefixesCount] == 0x8F) {
+        // In particular it means that vex-encoded instructions should be specified with 0xc4 even
+        // if they are always emitted with 0xc4-to-0xc5 folding.
+      } else if constexpr (kOpcodesArray[kLegacyPrefixesCount] == 0xc4 ||
+                           kOpcodesArray[kLegacyPrefixesCount] == 0x8f) {
         return true;
       }
       return false;
@@ -627,9 +627,9 @@ class Assembler : public AssemblerBase {
         static_assert(conditions_count <= 1, "Only one condition is allowed in instruction.");
         static_assert((registers_count + operands_count + labels_count) <= 2,
                       "Only two-arguments legacy instructions are supported.");
-        if constexpr (kOpcodesArray[kLegacyPrefixesCount] == 0x0F) {
+        if constexpr (kOpcodesArray[kLegacyPrefixesCount] == 0x0f) {
           if constexpr (kOpcodesArray[kLegacyPrefixesCount + 1] == 0x38 ||
-                        kOpcodesArray[kLegacyPrefixesCount + 1] == 0x3A) {
+                        kOpcodesArray[kLegacyPrefixesCount + 1] == 0x3a) {
             return kLegacyPrefixesCount + 2;
           }
           return kLegacyPrefixesCount + 1;
@@ -662,7 +662,7 @@ class Assembler : public AssemblerBase {
       // Emit "main" single-byte opcode.
       if constexpr (conditions_count == 1) {
         auto condition_code = static_cast<uint8_t>(ArgumentByType<0, IsCondition>(arguments...));
-        CHECK_EQ(0, condition_code & 0xF0);
+        CHECK_EQ(0, condition_code & 0xf0);
         Emit8(kOpcodesArray[kPrefixesAndOpcodeExtensionsCount] | condition_code);
       } else {
         Emit8(kOpcodesArray[kPrefixesAndOpcodeExtensionsCount]);
@@ -874,7 +874,7 @@ constexpr inline void Assembler<DerivedAssemblerType>::Call(const Label& label) 
     Call(offset);
   } else {
     Emit8(0xe8);
-    Emit32(0xfffffffc);
+    Emit32(0xffff'fffc);
     jumps_.push_back(Jump{&label, pc() - 4, false});
   }
 }
@@ -887,7 +887,7 @@ constexpr inline void Assembler<DerivedAssemblerType>::Jcc(Condition cc, const L
   } else if (cc == Condition::kNever) {
     return;
   }
-  CHECK_EQ(0, static_cast<uint8_t>(cc) & 0xF0);
+  CHECK_EQ(0, static_cast<uint8_t>(cc) & 0xf0);
   // TODO(eaeltsin): may be remove IsBound case?
   // Then jcc by label will be of fixed size (5 bytes)
   if (label.IsBound()) {
@@ -895,7 +895,7 @@ constexpr inline void Assembler<DerivedAssemblerType>::Jcc(Condition cc, const L
     JccRel(cc, offset);
   } else {
     Emit16(0x800f | (static_cast<uint8_t>(cc) << 8));
-    Emit32(0xfffffffc);
+    Emit32(0xffff'fffc);
     jumps_.push_back(Jump{&label, pc() - 4, false});
   }
 }
@@ -909,7 +909,7 @@ constexpr inline void Assembler<DerivedAssemblerType>::Jmp(const Label& label) {
     JmpRel(offset);
   } else {
     Emit8(0xe9);
-    Emit32(0xfffffffc);
+    Emit32(0xffff'fffc);
     jumps_.push_back(Jump{&label, pc() - 4, false});
   }
 }

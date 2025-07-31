@@ -52,7 +52,7 @@ class AssemblerBase {
     bool IsBound() const { return position_ != kInvalid; }
 
    protected:
-    static const uint32_t kInvalid = 0xffffffff;
+    static const uint32_t kInvalid = 0xffff'ffff;
     uint32_t position_;
 
    private:

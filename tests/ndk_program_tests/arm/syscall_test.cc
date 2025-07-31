@@ -33,10 +33,10 @@ TEST(Syscall, CacheFlush) {
   // - modify code
   // - flush cache
   // - run code
-  static const int kCacheFlushSyscall = 0xf0002;
+  static const int kCacheFlushSyscall = 0xf'0002;
   static const uint32_t code_template[] = {
-      0xe3000001,  // movw r0, #0x1
-      0xe12fff1e,  // bx lr
+      0xe300'0001,  // movw r0, #0x1
+      0xe12f'ff1e,  // bx lr
   };
   uint8_t* start = reinterpret_cast<uint8_t*>(mmap(0,
                                                    sizeof(code_template),
@@ -51,7 +51,7 @@ TEST(Syscall, CacheFlush) {
   using TestFunc = int (*)(void);
   TestFunc func = reinterpret_cast<TestFunc>(start);
   ASSERT_EQ(func(), 0x1);
-  *reinterpret_cast<uint32_t*>(start) = 0xe3000011;  // movw r0, #0x11
+  *reinterpret_cast<uint32_t*>(start) = 0xe300'0011;  // movw r0, #0x11
   ASSERT_EQ(syscall(kCacheFlushSyscall, start, end, 0), 0);
   ASSERT_EQ(func(), 0x11);
   munmap(start, sizeof(code_template));

@@ -136,7 +136,7 @@ inline bool operator!=(const Float64& v1, const Float64& v2) {
 inline Float32 Negative(const Float32& v) {
   // TODO(b/120563432): Simple -v.value_ doesn't work after a clang update.
   Float32 result;
-  uint64_t sign_bit = 0x80000000U;
+  uint64_t sign_bit = 0x8000'0000U;
   asm("pxor %2, %0" : "=x"(result.value_) : "0"(v.value_), "x"(sign_bit));
   return result;
 }
@@ -144,7 +144,7 @@ inline Float32 Negative(const Float32& v) {
 inline Float64 Negative(const Float64& v) {
   // TODO(b/120563432): Simple -v.value_ doesn't work after a clang update.
   Float64 result;
-  uint64_t sign_bit = 0x8000000000000000ULL;
+  uint64_t sign_bit = 0x8000'0000'0000'0000ULL;
   asm("pxor %2, %0" : "=x"(result.value_) : "0"(v.value_), "x"(sign_bit));
   return result;
 }

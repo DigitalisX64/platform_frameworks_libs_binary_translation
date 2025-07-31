@@ -29,11 +29,11 @@ TEST(EPoll, Pipe) {
   epoll_event event;
   event.events = EPOLLIN | EPOLLOUT;
 
-  const uint64_t kData0 = 0x0123456701234567ULL;
+  const uint64_t kData0 = 0x0123'4567'0123'4567ULL;
   event.data.u64 = kData0;
   ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &event), 0);
 
-  const uint64_t kData1 = 0x7654321076543210ULL;
+  const uint64_t kData1 = 0x7654'3210'7654'3210ULL;
   event.data.u64 = kData1;
   ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &event), 0);
 

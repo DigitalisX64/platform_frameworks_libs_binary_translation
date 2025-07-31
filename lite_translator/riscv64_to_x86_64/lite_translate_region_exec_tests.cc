@@ -70,8 +70,8 @@ class Riscv64LiteTranslateRegionTest : public ::testing::Test {
 
 TEST_F(Riscv64LiteTranslateRegionTest, AddTwice) {
   static const uint32_t code[] = {
-      0x003100b3,  // add x1, x2, x3
-      0x002081b3,  // add x3, x1, x2
+      0x0031'00b3,  // add x1, x2, x3
+      0x0020'81b3,  // add x3, x1, x2
   };
   SetXReg<1>(state_.cpu, 0);
   SetXReg<2>(state_.cpu, 1);
@@ -99,11 +99,11 @@ TEST_F(Riscv64LiteTranslateRegionTest, XorLoop) {
 
 TEST_F(Riscv64LiteTranslateRegionTest, RegionEnd) {
   static const uint32_t code[] = {
-      0x003100b3,  // add x1, x2, x3
-      0x002081b3,  // add x3, x1, x2
-      0x008000ef,  // jal x1, 8
-      0x003100b3,  // add x1, x2, x3
-      0x002081b3,  // add x3, x1, x2
+      0x0031'00b3,  // add x1, x2, x3
+      0x0020'81b3,  // add x3, x1, x2
+      0x0080'00ef,  // jal x1, 8
+      0x0031'00b3,  // add x1, x2, x3
+      0x0020'81b3,  // add x3, x1, x2
   };
   SetXReg<1>(state_.cpu, 0);
   SetXReg<2>(state_.cpu, 1);
@@ -114,8 +114,8 @@ TEST_F(Riscv64LiteTranslateRegionTest, RegionEnd) {
 
 TEST_F(Riscv64LiteTranslateRegionTest, GracefulFailure) {
   static const uint32_t code[] = {
-      0x003100b3,  // add x1, x2, x3
-      0x00000073,  // ecall #0x0
+      0x0031'00b3,  // add x1, x2, x3
+      0x0000'0073,  // ecall #0x0
   };
   MachineCode machine_code;
   auto [success, stop_pc] = TryLiteTranslateRegion(ToGuestAddr(code),

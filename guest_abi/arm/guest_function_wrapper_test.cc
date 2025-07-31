@@ -42,8 +42,8 @@ TEST_F(GuestFunctionWrapperTest, Wrap2Sub) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xe0400001,  // sub r0, r0, r1
-      0xe12fff1e,  // bx lr
+      0xe040'0001,  // sub r0, r0, r1
+      0xe12f'ff1e,  // bx lr
   });
 
   using TwoArgFunction = int (*)(int, int);
@@ -58,16 +58,16 @@ TEST_F(GuestFunctionWrapperTest, Wrap2SubLong) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xe0500002,  // subs r0, r0, r2
-      0xe0c11003,  // sbc r1, r1, r3
-      0xe12fff1e,  // bx lr
+      0xe050'0002,  // subs r0, r0, r2
+      0xe0c1'1003,  // sbc r1, r1, r3
+      0xe12f'ff1e,  // bx lr
   });
 
   using TwoArgFunction = int64_t (*)(int64_t, int64_t);
   TwoArgFunction sub = WrapGuestFunction(bit_cast<GuestType<TwoArgFunction>>(pc), "sub_long");
 
-  uint64_t x = sub(0xffff0000ffff0001ULL, 0x7fff0000ffff0000ULL);
-  EXPECT_EQ(0x8000000000000001ULL, x);
+  uint64_t x = sub(0xffff'0000'ffff'0001ULL, 0x7fff'0000'ffff'0000ULL);
+  EXPECT_EQ(0x8000'0000'0000'0001ULL, x);
 }
 
 TEST_F(GuestFunctionWrapperTest, Wrap2SubFloat) {
@@ -75,11 +75,11 @@ TEST_F(GuestFunctionWrapperTest, Wrap2SubFloat) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xee070a90,  // vmov s15, r0
-      0xee071a10,  // vmov s14, r1
-      0xee777ac7,  // vsub.f32 s15, s15, s14
-      0xee170a90,  // vmov r0, s15
-      0xe12fff1e,  // bx lr
+      0xee07'0a90,  // vmov s15, r0
+      0xee07'1a10,  // vmov s14, r1
+      0xee77'7ac7,  // vsub.f32 s15, s15, s14
+      0xee17'0a90,  // vmov r0, s15
+      0xe12f'ff1e,  // bx lr
   });
 
   using TwoArgFunction = float (*)(float, float);
@@ -94,11 +94,11 @@ TEST_F(GuestFunctionWrapperTest, Wrap2SubDouble) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xec410b30,  // vmov d16, r0, r1
-      0xec432b31,  // vmov d17, r2, r3
-      0xee700be1,  // vsub.f64 d16, d16, d17
-      0xec510b30,  // vmov r0, r1, d16
-      0xe12fff1e,  // bx lr
+      0xec41'0b30,  // vmov d16, r0, r1
+      0xec43'2b31,  // vmov d17, r2, r3
+      0xee70'0be1,  // vsub.f64 d16, d16, d17
+      0xec51'0b30,  // vmov r0, r1, d16
+      0xe12f'ff1e,  // bx lr
   });
 
   using TwoArgFunction = double (*)(double, double);

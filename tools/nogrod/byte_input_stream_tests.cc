@@ -28,7 +28,7 @@ namespace nogrod {
 TEST(byte_input_stream, smoke) {
   uint8_t bytes[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
                      0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0xc1, 0x00, 0xc1, 0x7f, 'b',
-                     'a',  'r',  '\0', 0x2a, 0x2b, 0x2c, 0x1,  0x2,  0x3,  0xFF};
+                     'a',  'r',  '\0', 0x2a, 0x2b, 0x2c, 0x1,  0x2,  0x3,  0xff};
 
   ByteInputStream in(bytes, sizeof(bytes));
 
@@ -37,12 +37,12 @@ TEST(byte_input_stream, smoke) {
   ASSERT_TRUE(in.available());
   ASSERT_EQ(0x0302, in.ReadUint16());
   ASSERT_TRUE(in.available());
-  ASSERT_EQ(0x07060504U, in.ReadUint32());
+  ASSERT_EQ(0x0706'0504U, in.ReadUint32());
   // Reading 0 bytes should be a noop that returns empty vector
   auto empty_vector = in.ReadBytes(0);
   EXPECT_TRUE(empty_vector.empty());
   ASSERT_TRUE(in.available());
-  ASSERT_EQ(0x0f0e0d0c0b0a0908U, in.ReadUint64());
+  ASSERT_EQ(0x0f0e'0d0c'0b0a'0908U, in.ReadUint64());
   ASSERT_TRUE(in.available());
   ASSERT_EQ(65U, in.ReadLeb128());
   ASSERT_TRUE(in.available());
@@ -55,8 +55,8 @@ TEST(byte_input_stream, smoke) {
   ASSERT_EQ(0x2a, byte_vector[0]);
   ASSERT_EQ(0x2b, byte_vector[1]);
   ASSERT_EQ(0x2c, byte_vector[2]);
-  ASSERT_EQ(0x030201U, in.ReadUint24());
-  ASSERT_EQ(0xFF, in.ReadUint8());
+  ASSERT_EQ(0x03'0201U, in.ReadUint24());
+  ASSERT_EQ(0xff, in.ReadUint8());
   ASSERT_TRUE(!in.available());
 }
 

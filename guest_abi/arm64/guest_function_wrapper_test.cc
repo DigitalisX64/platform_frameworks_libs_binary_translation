@@ -41,8 +41,8 @@ TEST_F(GuestFunctionWrapperTest, Wrap2Sub) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x4b010000,  // sub w0, w0, w1
-      0xd65f03c0,  // ret
+      0x4b01'0000,  // sub w0, w0, w1
+      0xd65f'03c0,  // ret
   });
 
   using TwoArgFunction = int (*)(int, int);
@@ -57,15 +57,15 @@ TEST_F(GuestFunctionWrapperTest, Wrap2SubLong) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0xcb010000,  // sub x0, x0, x1
-      0xd65f03c0,  // ret
+      0xcb01'0000,  // sub x0, x0, x1
+      0xd65f'03c0,  // ret
   });
 
   using TwoArgFunction = int64_t (*)(int64_t, int64_t);
   TwoArgFunction sub = WrapGuestFunction(bit_cast<GuestType<TwoArgFunction>>(pc), "sub_long");
 
-  uint64_t x = sub(0xffff0000ffff0001ULL, 0x7fff0000ffff0000ULL);
-  EXPECT_EQ(0x8000000000000001ULL, x);
+  uint64_t x = sub(0xffff'0000'ffff'0001ULL, 0x7fff'0000'ffff'0000ULL);
+  EXPECT_EQ(0x8000'0000'0000'0001ULL, x);
 }
 
 TEST_F(GuestFunctionWrapperTest, Wrap2SubFloat) {
@@ -73,8 +73,8 @@ TEST_F(GuestFunctionWrapperTest, Wrap2SubFloat) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x1e213800,  // fsub s0, s0, s1
-      0xd65f03c0,  // ret
+      0x1e21'3800,  // fsub s0, s0, s1
+      0xd65f'03c0,  // ret
   });
 
   using TwoArgFunction = float (*)(float, float);
@@ -89,8 +89,8 @@ TEST_F(GuestFunctionWrapperTest, Wrap2SubDouble) {
   //   return x - y;
   // }
   GuestAddr pc = MakeGuestExecRegion<uint32_t>({
-      0x1e613800,  // fsub d0, d0, d1
-      0xd65f03c0,  // ret
+      0x1e61'3800,  // fsub d0, d0, d1
+      0xd65f'03c0,  // ret
   });
 
   using TwoArgFunction = double (*)(double, double);

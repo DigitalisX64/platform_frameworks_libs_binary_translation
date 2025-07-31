@@ -29,8 +29,8 @@ int arm_tests() {
 uintptr_t read_exidx_func(int32_t* entry) {
   int32_t offset = *entry;
   // sign-extend from int31 to int32.
-  if ((offset & 0x40000000) != 0) {
-    offset += -0x7fffffff - 1;
+  if ((offset & 0x4000'0000) != 0) {
+    offset += -0x7fff'ffff - 1;
   }
   return reinterpret_cast<uintptr_t>(entry) + offset;
 }

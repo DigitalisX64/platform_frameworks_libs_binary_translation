@@ -160,7 +160,7 @@ class DwarfParser {
 
     uint64_t unit_length = bs->ReadUint32();
     bool is_dwarf64 = false;
-    if (unit_length == 0xFFFFFFFF) {
+    if (unit_length == 0xffff'ffff) {
       unit_length = bs->ReadUint64();
       is_dwarf64 = true;
     }

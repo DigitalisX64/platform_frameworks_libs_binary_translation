@@ -148,8 +148,8 @@ TEST(Intrinsics, Rsqrt) {
   ASSERT_EQ(RSqrtEstimate<Float64>(Float64{255}), Float64{0.0625});
   ASSERT_EQ(RSqrtEstimate<Float32>(Float32{255}), Float32{0.0625});
   ASSERT_EQ(RSqrtEstimate<Float64>(Float64{2000.123}),
-            bit_cast<Float64>(uint64_t(0x3F96E00000000000)));
-  ASSERT_EQ(RSqrtEstimate<Float32>(Float32{2000.123}), bit_cast<Float32>(uint32_t(0x3CB70000)));
+            bit_cast<Float64>(uint64_t(0x3f96'e000'0000'0000)));
+  ASSERT_EQ(RSqrtEstimate<Float32>(Float32{2000.123}), bit_cast<Float32>(uint32_t(0x3cb7'0000)));
 
   ASSERT_EQ(RSqrtEstimate<Float64>(Float64{0.1123}), Float64{2.984375});
   ASSERT_EQ(RSqrtEstimate<Float32>(Float32{0.1123}), Float32{2.984375});

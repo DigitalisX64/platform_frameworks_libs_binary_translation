@@ -31,7 +31,7 @@ void RunSmokeTest() {
   std::array<T, 10> data = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 
   if constexpr (sizeof(T) == 8) {
-    data[0] = uint32_t{0xFFFF'FFFFu};
+    data[0] = uint32_t{0xffff'ffffU};
   }
 
   StringOffsetTable table(Buffer{bit_cast<const uint8_t*>(data.data()), data.size() * sizeof(T)});

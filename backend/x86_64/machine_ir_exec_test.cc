@@ -155,7 +155,7 @@ TEST(ExecMachineIR, CallImm) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  uint64_t data = 0xfeedf00d'feedf00dULL;
+  uint64_t data = 0xfeed'f00d'feed'f00dULL;
   builder.Gen<x86_64::MovqRegImm>(kMachineRegRDI, data);
   auto* invert_func_ptr = +[](uint64_t arg) { return ~arg; };
 
@@ -179,7 +179,7 @@ TEST(ExecMachineIR, CallImmAllocIntOperands) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  uint64_t data = 0xfeedf00d'feedf00dULL;
+  uint64_t data = 0xfeed'f00d'feed'f00dULL;
   struct Result {
     uint64_t x;
     uint64_t y;
@@ -226,7 +226,7 @@ TEST(ExecMachineIR, CallImmAllocIntOperandsTupleResult) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  uint64_t data = 0xfeedf00d'feedf00dULL;
+  uint64_t data = 0xfeed'f00d'feed'f00dULL;
   using Result = std::tuple<uint64_t, uint64_t, uint64_t>;
   Result result = std::make_tuple(0, 0, 0);
   MachineReg data_reg = machine_ir.AllocVReg();
@@ -318,7 +318,7 @@ TEST(ExecMachineIR, CallImmAllocXmmOperands) {
 }
 
 void ClobberAllCallerSaved() {
-  constexpr uint64_t kClobberValue = 0xdeadbeef'deadbeefULL;
+  constexpr uint64_t kClobberValue = 0xdead'beef'dead'beefULL;
   asm volatile(
       "Movq %0, %%rax\n"
       "Movq %0, %%rcx\n"
@@ -477,9 +477,9 @@ TEST(ExecMachineIR, MemoryOperand) {
   x86_64::MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(machine_ir.NewBasicBlock());
 
-  data.in_base_disp = 0xaaaabbbbccccddddULL;
-  data.in_index_disp = 0xdeadbeefdeadbeefULL;
-  data.in_base_index_disp[2] = 0xcafefeedf00dfeedULL;
+  data.in_base_disp = 0xaaaa'bbbb'cccc'ddddULL;
+  data.in_index_disp = 0xdead'beef'dead'beefULL;
+  data.in_base_index_disp[2] = 0xcafe'feed'f00d'feedULL;
 
   // Base address.
   MachineReg base_reg = machine_ir.AllocVReg();

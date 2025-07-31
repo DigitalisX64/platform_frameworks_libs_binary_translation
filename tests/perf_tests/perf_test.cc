@@ -39,7 +39,7 @@ int f3() {
 }  // namespace
 
 TEST(BerberisPerf, XorLoop) {
-  unsigned c = 0xdeadbeef;
+  unsigned c = 0xdead'beef;
 
   // c "wraps" every 32 iterations.  Since 1,000,000,000 is divisible
   // by 32, we expect to get the original value back.
@@ -47,11 +47,11 @@ TEST(BerberisPerf, XorLoop) {
     c ^= (c << 1);
   }
 
-  EXPECT_EQ(c, 0xdeadbeef);
+  EXPECT_EQ(c, 0xdead'beef);
 }
 
 TEST(BerberisPerf, LoopWithCondition) {
-  unsigned res = 0xf00dfeed;
+  unsigned res = 0xf00d'feed;
 
   // We want to make sure the loop body is efficiently executed even when loop
   // body is split by an unconditional branch. E.g. this shouldn't result in two
@@ -72,7 +72,7 @@ TEST(BerberisPerf, LoopWithCondition) {
     }
   }
 
-  EXPECT_EQ(res, 0xf00dfeed);
+  EXPECT_EQ(res, 0xf00d'feed);
 }
 
 TEST(BerberisPerf, Pi) {
@@ -194,12 +194,12 @@ TEST(BerberisPerf, ConvertF32I32) {
 #if defined __arm__
 
 TEST(BerberisPerf, ReadWriteFPSCR) {
-  for (int i = 0; i < 0x1ffffff; i++) {
+  for (int i = 0; i < 0x1ff'ffff; i++) {
     // Filter-out bits which implementation does not support and exception bits.
     // If we set exception bits then we get FP-exception (correct behavior), but
     // it's handling dwarfs the execution time by huge margin thus we couldn't do
     // that in perf test.
-    uint32_t fpscr_in = i & 0xc01f00;
+    uint32_t fpscr_in = i & 0xc0'1f00;
     uint32_t fpscr_out;
     asm("vmsr fpscr, %1\n"
         "vmrs %0, fpscr\n"

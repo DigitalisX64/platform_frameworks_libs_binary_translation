@@ -335,7 +335,7 @@ TEST(Arm64InsnTest, DivFp32FlushToZero) {
 
   // Verify that 0.0 / denormal yields a NaN.
   __uint128_t arg1 = bit_cast<uint32_t>(0.0f);
-  __uint128_t arg2 = 0x80008000ULL;  // denormal
+  __uint128_t arg2 = 0x8000'8000ULL;  // denormal
   __uint128_t res = AsmFdiv(arg1, arg2, kFpcrFzBit);
   ASSERT_TRUE(isnan(bit_cast<float>(static_cast<uint32_t>(res))));
   ASSERT_EQ(res >> 32, 0ULL);
@@ -346,14 +346,14 @@ TEST(Arm64InsnTest, DivFp64FlushToZero) {
 
   // Verify that 0.0 / denormal yields a NaN.
   __uint128_t arg1 = bit_cast<uint64_t>(0.0);
-  __uint128_t arg2 = 0x8000000080000000ULL;  // denormal
+  __uint128_t arg2 = 0x8000'0000'8000'0000ULL;  // denormal
   __uint128_t res = AsmFdiv(arg1, arg2, kFpcrFzBit);
   ASSERT_TRUE(isnan(bit_cast<double>(static_cast<uint64_t>(res))));
   ASSERT_EQ(res >> 64, 0ULL);
 }
 
 TEST(Arm64InsnTest, AddFp64FpStatusIdcWhenFzOn) {
-  __uint128_t arg1 = 0x8000000080000000ULL;  // Denormal
+  __uint128_t arg1 = 0x8000'0000'8000'0000ULL;  // Denormal
   __uint128_t arg2 = bit_cast<uint64_t>(0.0);
 
   uint64_t fpcr = kFpcrFzBit;
@@ -371,22 +371,22 @@ TEST(Arm64InsnTest, AddFp64FpStatusIdcWhenFzOn) {
 TEST(Arm64InsnTest, AddFp64FpStatusIoc) {
   constexpr auto AsmFadd = ASM_INSN_WRAP_FUNC_WQ_RES_WW_ARG("fadd %d0, %d2, %d3");
 
-  uint64_t fp_arg1 = 0x7ff4000000000000ULL;  // Nan
+  uint64_t fp_arg1 = 0x7ff4'0000'0000'0000ULL;  // Nan
   uint64_t fp_arg2 = kOneF64AsInteger;
   auto [res, fpsr] = AsmFadd(fp_arg1, fp_arg2);
-  ASSERT_EQ(res, MakeUInt128(0x7ffc000000000000ULL, 0x0000000000000000ULL));
+  ASSERT_EQ(res, MakeUInt128(0x7ffc'0000'0000'0000ULL, 0x0000'0000'0000'0000ULL));
   ASSERT_EQ(fpsr, kFpsrIocBit);
 }
 
 TEST(Arm64InsnTest, AddFp64FpStatusIxc) {
   constexpr auto AsmFadd = ASM_INSN_WRAP_FUNC_WQ_RES_WW_ARG("fadd %s0, %s2, %s3");
 
-  uint32_t fp_arg1 = 0x97876b0f;  // 8.7511959e-25
-  uint32_t fp_arg2 = 0x904e5f47;  // -4.0699736e-29
+  uint32_t fp_arg1 = 0x9787'6b0f;  // 8.7511959e-25
+  uint32_t fp_arg2 = 0x904e'5f47;  // -4.0699736e-29
 
   auto [res, fpsr] = AsmFadd(fp_arg1, fp_arg2);
   ASSERT_EQ(fpsr, kFpsrIxcBit);
-  ASSERT_EQ(res, MakeUInt128(0x0000000097876cacULL, 0x0000000000000000ULL));
+  ASSERT_EQ(res, MakeUInt128(0x0000'0000'9787'6cacULL, 0x0000'0000'0000'0000ULL));
 }
 
 TEST(Arm64InsnTest, AddFp64FpStatusDzc) {

@@ -43,8 +43,8 @@ class GuestMapShadowTest : public ::testing::Test {
   GuestMapShadow shadow_;
 };
 
-constexpr GuestAddr kGuestAddr{0x7f018000};
-constexpr size_t kGuestRegionSize{0x00020000};
+constexpr GuestAddr kGuestAddr{0x7f01'8000};
+constexpr size_t kGuestRegionSize{0x0002'0000};
 
 TEST_F(GuestMapShadowTest, Basic) {
   ASSERT_EQ(kBitUnset, shadow_.GetExecutable(kGuestAddr, kGuestRegionSize));
@@ -73,7 +73,7 @@ TEST_F(GuestMapShadowTest, Basic) {
 }
 
 TEST_F(GuestMapShadowTest, Remap) {
-  constexpr GuestAddr kRemapAddr = 0x00107000;
+  constexpr GuestAddr kRemapAddr = 0x0010'7000;
   constexpr size_t kRemapRegionSize1 = kGuestRegionSize / 2;
   constexpr size_t kRemapRegionSize2 = kGuestRegionSize * 2;
 
@@ -105,7 +105,7 @@ TEST_F(GuestMapShadowTest, Remap) {
 }
 
 TEST_F(GuestMapShadowTest, ProtectedMappings) {
-  const char* kStart = ToHostAddr<char>(0x00107000);
+  const char* kStart = ToHostAddr<char>(0x0010'7000);
   const char* kEnd = kStart + kGuestRegionSize;
   const size_t kHalf = kGuestRegionSize / 2;
 

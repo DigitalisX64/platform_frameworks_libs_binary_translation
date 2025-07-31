@@ -42,7 +42,8 @@
 
 #if !(defined(TESTING_INTERPRETER) || defined(TESTING_LITE_TRANSLATOR) || \
       defined(TESTING_HEAVY_OPTIMIZER))
-#error "One of TESTING_INTERPRETER, TESTING_LITE_TRANSLATOR, TESTING_HEAVY_OPTIMIZER must be defined
+#error \
+    "One of TESTING_INTERPRETER, TESTING_LITE_TRANSLATOR, TESTING_HEAVY_OPTIMIZER must be defined"
 #endif
 
 namespace {
@@ -233,7 +234,7 @@ class TESTSUITE : public ::testing::Test {
 
   void TestFFlagsOnGuestAndHost(uint8_t expected_guest_fflags) {
     // Read fflags register.
-    RunInstruction(0x00102173);  // frflags x2
+    RunInstruction(0x0010'2173);  // frflags x2
     EXPECT_EQ(GetXReg<2>(state_.cpu), expected_guest_fflags);
 
     // Check corresponding fenv exception flags on host.
@@ -384,7 +385,7 @@ class TESTSUITE : public ::testing::Test {
     state_.cpu.insn_addr = ToGuestAddr(&insn_bytes);
     SetXReg<1>(state_.cpu, ToGuestAddr(&store_area_));
     SetXReg<2>(state_.cpu, kDataToStore);
-    SetXReg<3>(state_.cpu, 0xdeadbeef);
+    SetXReg<3>(state_.cpu, 0xdead'beef);
     state_.cpu.reservation_address = ToGuestAddr(&store_area_);
     state_.cpu.reservation_value = store_area_;
     MemoryRegionReservation::SetOwner(ToGuestAddr(&store_area_), &state_.cpu);
@@ -397,7 +398,7 @@ class TESTSUITE : public ::testing::Test {
     state_.cpu.insn_addr = ToGuestAddr(&insn_bytes);
     SetXReg<1>(state_.cpu, ToGuestAddr(&store_area_));
     SetXReg<2>(state_.cpu, kDataToStore);
-    SetXReg<3>(state_.cpu, 0xdeadbeef);
+    SetXReg<3>(state_.cpu, 0xdead'beef);
     store_area_ = 0;
     EXPECT_TRUE(RunOneInstruction(&state_, state_.cpu.insn_addr + 4));
     EXPECT_EQ(store_area_, 0u);
@@ -408,7 +409,7 @@ class TESTSUITE : public ::testing::Test {
     state_.cpu.insn_addr = ToGuestAddr(&insn_bytes);
     SetXReg<1>(state_.cpu, ToGuestAddr(&store_area_));
     SetXReg<2>(state_.cpu, kDataToStore);
-    SetXReg<3>(state_.cpu, 0xdeadbeef);
+    SetXReg<3>(state_.cpu, 0xdead'beef);
     state_.cpu.reservation_address = ToGuestAddr(&kDataToStore);
     state_.cpu.reservation_value = 0;
     MemoryRegionReservation::SetOwner(ToGuestAddr(&kDataToStore), &state_.cpu);
@@ -545,7 +546,7 @@ class TESTSUITE : public ::testing::Test {
   }
 
  protected:
-  static constexpr uint64_t kDataToLoad{0xffffeeeeddddccccULL};
+  static constexpr uint64_t kDataToLoad{0xffff'eeee'dddd'ccccULL};
   static constexpr uint64_t kDataToStore = kDataToLoad;
   uint64_t store_area_;
   ThreadState state_;
@@ -1195,11 +1196,11 @@ TEST_F(TESTSUITE, CJalr) {
 TEST_F(TESTSUITE, CsrInstructions) {
   ScopedRoundingMode scoped_rounding_mode;
   // Csrrw x2, frm, 2
-  TestFrm(0x00215173, 0, 2);
+  TestFrm(0x0021'5173, 0, 2);
   // Csrrsi x2, frm, 2
-  TestFrm(0x00216173, 0, 3);
+  TestFrm(0x0021'6173, 0, 3);
   // Csrrci x2, frm, 1
-  TestFrm(0x0020f173, 0, 0);
+  TestFrm(0x0020'f173, 0, 0);
 }
 
 constexpr uint8_t kFPFlagsAll = FPFlags::NX | FPFlags::UF | FPFlags::OF | FPFlags::DZ | FPFlags::NV;
@@ -1220,7 +1221,7 @@ TEST_F(TESTSUITE, FFlagsRead) {
   ScopedFenv fenv;
   for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
     RaiseFeExceptForGuestFlags(fflags);
-    RunInstruction(0x00102173);  // frflags x2
+    RunInstruction(0x0010'2173);  // frflags x2
     EXPECT_EQ(GetXReg<2>(state_.cpu), fflags);
   }
 }
@@ -1231,7 +1232,7 @@ TEST_F(TESTSUITE, FFlagsSwap) {
     RaiseFeExceptForGuestFlags(fflags);
     // After swapping in 0 for flags, read fflags to verify.
     SetXReg<3>(state_.cpu, 0);
-    RunInstruction(0x00119173);  // fsflags x2, x3
+    RunInstruction(0x0011'9173);  // fsflags x2, x3
     EXPECT_EQ(GetXReg<2>(state_.cpu), fflags);
     TestFFlagsOnGuestAndHost(0u);
   }
@@ -1242,7 +1243,7 @@ TEST_F(TESTSUITE, FFlagsSwapImmediate) {
   for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
     RaiseFeExceptForGuestFlags(fflags);
     // After swapping in 0 for flags, read fflags to verify.
-    RunInstruction(0x00105173);  // fsflags x2, 0
+    RunInstruction(0x0010'5173);  // fsflags x2, 0
     EXPECT_EQ(GetXReg<2>(state_.cpu), fflags);
     TestFFlagsOnGuestAndHost(0u);
   }
@@ -1252,7 +1253,7 @@ TEST_F(TESTSUITE, FFlagsWrite) {
   ScopedFenv fenv;
   for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
     SetXReg<3>(state_.cpu, fflags);
-    RunInstruction(0x00119073);  // fsflags x3
+    RunInstruction(0x0011'9073);  // fsflags x3
     TestFFlagsOnGuestAndHost(fflags);
   }
 }
@@ -1260,7 +1261,7 @@ TEST_F(TESTSUITE, FFlagsWrite) {
 TEST_F(TESTSUITE, FFlagsWriteImmediate) {
   ScopedFenv fenv;
   for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
-    RunInstruction(0x00105073 | fflags << 15);  // fsflagsi 0 (+ fflags)
+    RunInstruction(0x0010'5073 | fflags << 15);  // fsflagsi 0 (+ fflags)
     TestFFlagsOnGuestAndHost(fflags);
   }
 }
@@ -1270,7 +1271,7 @@ TEST_F(TESTSUITE, FFlagsClearBits) {
   for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
     RaiseFeExceptForGuestFlags(kFPFlagsAll);
     SetXReg<3>(state_.cpu, fflags);
-    RunInstruction(0x0011b073);  // csrc fflags, x3
+    RunInstruction(0x0011'b073);  // csrc fflags, x3
     // Read fflags to verify previous bitwise clear operation.
     TestFFlagsOnGuestAndHost(static_cast<uint8_t>(~fflags & kFPFlagsAll));
   }
@@ -1280,7 +1281,7 @@ TEST_F(TESTSUITE, FFlagsClearBitsImmediate) {
   ScopedFenv fenv;
   for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
     RaiseFeExceptForGuestFlags(kFPFlagsAll);
-    RunInstruction(0x00107073 | fflags << 15);  // csrci fflags, 0 (+ fflags)
+    RunInstruction(0x0010'7073 | fflags << 15);  // csrci fflags, 0 (+ fflags)
     // Read fflags to verify previous bitwise clear operation.
     TestFFlagsOnGuestAndHost(static_cast<uint8_t>(~fflags & kFPFlagsAll));
   }
@@ -1292,19 +1293,19 @@ TEST_F(TESTSUITE, FCsrRegister) {
     RaiseFeExceptForGuestFlags(fflags);
 
     // Read and verify fflags, then replace with all flags.
-    TestFCsr(0x00319173 /* fscsr x2,x3 */, fflags, fflags, 0);
+    TestFCsr(0x0031'9173 /* fscsr x2,x3 */, fflags, fflags, 0);
 
     // Only read fcsr and verify fflags.
-    TestFCsr(0x00302173 /* frcsr x2 */, /* ignored */ 0, fflags, /* expected_frm= */ 0b100u);
+    TestFCsr(0x0030'2173 /* frcsr x2 */, /* ignored */ 0, fflags, /* expected_frm= */ 0b100u);
   }
 
   for (bool immediate_source : {true, false}) {
     for (uint8_t fflags = 0; fflags <= kFPFlagsAll; fflags++) {
       EXPECT_EQ(feclearexcept(FE_ALL_EXCEPT), 0);
       if (immediate_source) {
-        TestFCsr(0x00305173 /* csrrwi x2,fcsr,0 */ | (fflags << 15), 0, 0, 0);
+        TestFCsr(0x0030'5173 /* csrrwi x2,fcsr,0 */ | (fflags << 15), 0, 0, 0);
       } else {
-        TestFCsr(0x00319173 /* fscsr x2,x3 */, 0b100'0000 | fflags, 0, /* expected_frm= */ 0b010u);
+        TestFCsr(0x0031'9173 /* fscsr x2,x3 */, 0b100'0000 | fflags, 0, /* expected_frm= */ 0b010u);
       }
       TestFFlagsOnGuestAndHost(fflags);
     }
@@ -1327,9 +1328,9 @@ TEST_F(TESTSUITE, FsrRegister) {
   for (bool immediate_source : {true, false}) {
     for (auto [guest_rounding, host_rounding] : rounding) {
       if (immediate_source) {
-        TestFrm(0x00205173 | (guest_rounding << 15), 0, guest_rounding & 0b111);
+        TestFrm(0x0020'5173 | (guest_rounding << 15), 0, guest_rounding & 0b111);
       } else {
-        TestFrm(0x00219173, guest_rounding, guest_rounding & 0b111);
+        TestFrm(0x0021'9173, guest_rounding, guest_rounding & 0b111);
       }
       EXPECT_EQ(std::fegetround(), host_rounding);
     }
@@ -1338,279 +1339,282 @@ TEST_F(TESTSUITE, FsrRegister) {
 
 TEST_F(TESTSUITE, OpInstructions) {
   // Add
-  TestOp(0x003100b3, {{19, 23, 42}});
+  TestOp(0x0031'00b3, {{19, 23, 42}});
   // Sub
-  TestOp(0x403100b3, {{42, 23, 19}});
+  TestOp(0x4031'00b3, {{42, 23, 19}});
   // And
-  TestOp(0x003170b3, {{0b0101, 0b0011, 0b0001}});
+  TestOp(0x0031'70b3, {{0b0101, 0b0011, 0b0001}});
   // Or
-  TestOp(0x003160b3, {{0b0101, 0b0011, 0b0111}});
+  TestOp(0x0031'60b3, {{0b0101, 0b0011, 0b0111}});
   // Xor
-  TestOp(0x003140b3, {{0b0101, 0b0011, 0b0110}});
+  TestOp(0x0031'40b3, {{0b0101, 0b0011, 0b0110}});
   // Sll
-  TestOp(0x003110b3, {{0b1010, 3, 0b0101'0000}});
+  TestOp(0x0031'10b3, {{0b1010, 3, 0b0101'0000}});
   // Srl
-  TestOp(0x003150b3, {{0xf000'0000'0000'0000ULL, 12, 0x000f'0000'0000'0000ULL}});
+  TestOp(0x0031'50b3, {{0xf000'0000'0000'0000ULL, 12, 0x000f'0000'0000'0000ULL}});
   // Sra
-  TestOp(0x403150b3, {{0xf000'0000'0000'0000ULL, 12, 0xffff'0000'0000'0000ULL}});
+  TestOp(0x4031'50b3, {{0xf000'0000'0000'0000ULL, 12, 0xffff'0000'0000'0000ULL}});
   // Slt
-  TestOp(0x003120b3,
+  TestOp(0x0031'20b3,
          {
              {19, 23, 1},
              {23, 19, 0},
              {~0ULL, 0, 1},
          });
   // Sltu
-  TestOp(0x003130b3,
+  TestOp(0x0031'30b3,
          {
              {19, 23, 1},
              {23, 19, 0},
              {~0ULL, 0, 0},
          });
   // Mul
-  TestOp(0x023100b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0x0a3d'70a3'd70a'3d71}});
+  TestOp(0x0231'00b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0x0a3d'70a3'd70a'3d71}});
   // Mulh
-  TestOp(0x23110b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0x28f5'c28f'5c28'f5c3}});
+  TestOp(0x231'10b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0x28f5'c28f'5c28'f5c3}});
   // Mulhsu
-  TestOp(0x23120b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0xc28f'5c28'f5c2'8f5c}});
+  TestOp(0x231'20b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0xc28f'5c28'f5c2'8f5c}});
   // Mulhu
-  TestOp(0x23130b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0x5c28'f5c2'8f5c'28f5}});
+  TestOp(0x231'30b3, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0x5c28'f5c2'8f5c'28f5}});
   // Div
-  TestOp(0x23140b3, {{0x9999'9999'9999'9999, 0x3333, 0xfffd'fffd'fffd'fffe}});
-  TestOp(0x23140b3, {{42, 2, 21}});
-  TestOp(0x23140b3, {{42, 0, -1}});
-  TestOp(0x23140b3, {{-2147483648, -1, 2147483648}});
-  TestOp(0x23140b3, {{0x8000'0000'0000'0000, -1, 0x8000'0000'0000'0000}});
+  TestOp(0x231'40b3, {{0x9999'9999'9999'9999, 0x3333, 0xfffd'fffd'fffd'fffe}});
+  TestOp(0x231'40b3, {{42, 2, 21}});
+  TestOp(0x231'40b3, {{42, 0, -1}});
+  TestOp(0x231'40b3, {{-2147483648, -1, 2147483648}});
+  TestOp(0x231'40b3, {{0x8000'0000'0000'0000, -1, 0x8000'0000'0000'0000}});
 
   // Divu
-  TestOp(0x23150b3, {{0x9999'9999'9999'9999, 0x3333, 0x0003'0003'0003'0003}});
-  TestOp(0x23150b3, {{42, 2, 21}});
-  TestOp(0x23150b3, {{42, 0, 0xffff'ffff'ffff'ffffULL}});
+  TestOp(0x231'50b3, {{0x9999'9999'9999'9999, 0x3333, 0x0003'0003'0003'0003}});
+  TestOp(0x231'50b3, {{42, 2, 21}});
+  TestOp(0x231'50b3, {{42, 0, 0xffff'ffff'ffff'ffffULL}});
   // Rem
-  TestOp(0x23160b3, {{0x9999'9999'9999'9999, 0x3333, 0xffff'ffff'ffff'ffff}});
-  TestOp(0x23160b3, {{0x9999'9999'9999'9999, 0, 0x9999'9999'9999'9999}});
+  TestOp(0x231'60b3, {{0x9999'9999'9999'9999, 0x3333, 0xffff'ffff'ffff'ffff}});
+  TestOp(0x231'60b3, {{0x9999'9999'9999'9999, 0, 0x9999'9999'9999'9999}});
   // Remu
-  TestOp(0x23170b3, {{0x9999'9999'9999'9999, 0x3333, 0}});
-  TestOp(0x23170b3, {{0x9999'9999'9999'9999, 0, 0x9999'9999'9999'9999}});
+  TestOp(0x231'70b3, {{0x9999'9999'9999'9999, 0x3333, 0}});
+  TestOp(0x231'70b3, {{0x9999'9999'9999'9999, 0, 0x9999'9999'9999'9999}});
   // Andn
-  TestOp(0x403170b3, {{0b0101, 0b0011, 0b0100}});
+  TestOp(0x4031'70b3, {{0b0101, 0b0011, 0b0100}});
   // Orn
-  TestOp(0x403160b3, {{0b0101, 0b0011, 0xffff'ffff'ffff'fffd}});
+  TestOp(0x4031'60b3, {{0b0101, 0b0011, 0xffff'ffff'ffff'fffd}});
   // Xnor
-  TestOp(0x403140b3, {{0b0101, 0b0011, 0xffff'ffff'ffff'fff9}});
+  TestOp(0x4031'40b3, {{0b0101, 0b0011, 0xffff'ffff'ffff'fff9}});
   // Max
-  TestOp(0x0a3160b3, {{bit_cast<uint64_t>(int64_t{-5}), 4, 4}});
-  TestOp(0x0a3160b3,
+  TestOp(0x0a31'60b3, {{bit_cast<uint64_t>(int64_t{-5}), 4, 4}});
+  TestOp(0x0a31'60b3,
          {{bit_cast<uint64_t>(int64_t{-5}),
            bit_cast<uint64_t>(int64_t{-10}),
            bit_cast<uint64_t>(int64_t{-5})}});
   // Maxu
-  TestOp(0x0a3170b3, {{50, 1, 50}});
+  TestOp(0x0a31'70b3, {{50, 1, 50}});
   // Min
-  TestOp(0x0a3140b3, {{bit_cast<uint64_t>(int64_t{-5}), 4, bit_cast<uint64_t>(int64_t{-5})}});
-  TestOp(0x0a3140b3,
+  TestOp(0x0a31'40b3, {{bit_cast<uint64_t>(int64_t{-5}), 4, bit_cast<uint64_t>(int64_t{-5})}});
+  TestOp(0x0a31'40b3,
          {{bit_cast<uint64_t>(int64_t{-5}),
            bit_cast<uint64_t>(int64_t{-10}),
            bit_cast<uint64_t>(int64_t{-10})}});
   // Minu
-  TestOp(0x0a3150b3, {{50, 1, 1}});
+  TestOp(0x0a31'50b3, {{50, 1, 1}});
 
   // Ror
-  TestOp(0x603150b3, {{0xf000'0000'0000'000fULL, 4, 0xff00'0000'0000'0000ULL}});
-  TestOp(0x603150b3, {{0xf000'0000'0000'000fULL, 8, 0x0ff0'0000'0000'0000ULL}});
+  TestOp(0x6031'50b3, {{0xf000'0000'0000'000fULL, 4, 0xff00'0000'0000'0000ULL}});
+  TestOp(0x6031'50b3, {{0xf000'0000'0000'000fULL, 8, 0x0ff0'0000'0000'0000ULL}});
   // Rol
-  TestOp(0x603110b3, {{0xff00'0000'0000'0000ULL, 4, 0xf000'0000'0000'000fULL}});
-  TestOp(0x603110b3, {{0x000f'ff00'0000'000fULL, 8, 0x0fff'0000'0000'0f00ULL}});
+  TestOp(0x6031'10b3, {{0xff00'0000'0000'0000ULL, 4, 0xf000'0000'0000'000fULL}});
+  TestOp(0x6031'10b3, {{0x000f'ff00'0000'000fULL, 8, 0x0fff'0000'0000'0f00ULL}});
   // Sh1add
-  TestOp(0x203120b3, {{0x0008'0000'0000'0001, 0x1001'0001'0000'0000ULL, 0x1011'0001'0000'0002ULL}});
+  TestOp(0x2031'20b3,
+         {{0x0008'0000'0000'0001, 0x1001'0001'0000'0000ULL, 0x1011'0001'0000'0002ULL}});
   // Sh2add
-  TestOp(0x203140b3, {{0x0008'0000'0000'0001, 0x0001'0001'0000'0000ULL, 0x0021'0001'0000'0004ULL}});
+  TestOp(0x2031'40b3,
+         {{0x0008'0000'0000'0001, 0x0001'0001'0000'0000ULL, 0x0021'0001'0000'0004ULL}});
   // Sh3add
-  TestOp(0x203160b3, {{0x0008'0000'0000'0001, 0x1001'0011'0000'0000ULL, 0x1041'0011'0000'0008ULL}});
+  TestOp(0x2031'60b3,
+         {{0x0008'0000'0000'0001, 0x1001'0011'0000'0000ULL, 0x1041'0011'0000'0008ULL}});
   // Bclr
-  TestOp(0x483110b3, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
-  TestOp(0x483110b3, {{0b1000'0001'0000'0001ULL, 8, 0b1000'0000'0000'0001ULL}});
+  TestOp(0x4831'10b3, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
+  TestOp(0x4831'10b3, {{0b1000'0001'0000'0001ULL, 8, 0b1000'0000'0000'0001ULL}});
   // Bext
-  TestOp(0x483150b3, {{0b1000'0001'0000'0001ULL, 0, 0b0000'0000'0000'0001ULL}});
-  TestOp(0x483150b3, {{0b1000'0001'0000'0001ULL, 8, 0b0000'0000'0000'0001ULL}});
-  TestOp(0x483150b3, {{0b1000'0001'0000'0001ULL, 7, 0b0000'0000'0000'0000ULL}});
+  TestOp(0x4831'50b3, {{0b1000'0001'0000'0001ULL, 0, 0b0000'0000'0000'0001ULL}});
+  TestOp(0x4831'50b3, {{0b1000'0001'0000'0001ULL, 8, 0b0000'0000'0000'0001ULL}});
+  TestOp(0x4831'50b3, {{0b1000'0001'0000'0001ULL, 7, 0b0000'0000'0000'0000ULL}});
   // Binv
-  TestOp(0x683110b3, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
-  TestOp(0x683110b3, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
+  TestOp(0x6831'10b3, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
+  TestOp(0x6831'10b3, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
   // Bset
-  TestOp(0x283110b3, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0001ULL}});
-  TestOp(0x283110b3, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
+  TestOp(0x2831'10b3, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0001ULL}});
+  TestOp(0x2831'10b3, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
 }
 
 TEST_F(TESTSUITE, Op32Instructions) {
   // Addw
-  TestOp(0x003100bb, {{19, 23, 42}, {0x8000'0000, 0, 0xffff'ffff'8000'0000}});
+  TestOp(0x0031'00bb, {{19, 23, 42}, {0x8000'0000, 0, 0xffff'ffff'8000'0000}});
   // Add.uw
-  TestOp(0x083100bb, {{19, 23, 42}, {0x8000'0000'8000'0000, 1, 0x0000'0000'8000'0001}});
+  TestOp(0x0831'00bb, {{19, 23, 42}, {0x8000'0000'8000'0000, 1, 0x0000'0000'8000'0001}});
   // Subw
-  TestOp(0x403100bb, {{42, 23, 19}, {0x8000'0000, 0, 0xffff'ffff'8000'0000}});
+  TestOp(0x4031'00bb, {{42, 23, 19}, {0x8000'0000, 0, 0xffff'ffff'8000'0000}});
   // Sllw
-  TestOp(0x003110bb, {{0b1010, 3, 0b1010'000}});
+  TestOp(0x0031'10bb, {{0b1010, 3, 0b1010'000}});
   // Srlw
-  TestOp(0x003150bb, {{0x0000'0000'f000'0000ULL, 12, 0x0000'0000'000f'0000ULL}});
+  TestOp(0x0031'50bb, {{0x0000'0000'f000'0000ULL, 12, 0x0000'0000'000f'0000ULL}});
   // Sraw
-  TestOp(0x403150bb, {{0x0000'0000'f000'0000ULL, 12, 0xffff'ffff'ffff'0000ULL}});
+  TestOp(0x4031'50bb, {{0x0000'0000'f000'0000ULL, 12, 0xffff'ffff'ffff'0000ULL}});
   // Mulw
-  TestOp(0x023100bb, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0xffff'ffff'd70a'3d71}});
+  TestOp(0x0231'00bb, {{0x9999'9999'9999'9999, 0x9999'9999'9999'9999, 0xffff'ffff'd70a'3d71}});
   // Divw
-  TestOp(0x23140bb, {{0x9999'9999'9999'9999, 0x3333, 0xffff'ffff'fffd'fffe}});
-  TestOp(0x23140bb, {{0x9999'9999'9999'9999, 0, -1}});
-  TestOp(0x23140bb, {{-2147483648, -1, -2147483648}});
+  TestOp(0x231'40bb, {{0x9999'9999'9999'9999, 0x3333, 0xffff'ffff'fffd'fffe}});
+  TestOp(0x231'40bb, {{0x9999'9999'9999'9999, 0, -1}});
+  TestOp(0x231'40bb, {{-2147483648, -1, -2147483648}});
 
   // Divuw
-  TestOp(0x23150bb,
+  TestOp(0x231'50bb,
          {{0x9999'9999'9999'9999, 0x3333, 0x0000'0000'0003'0003},
           {0xffff'ffff'8000'0000, 1, 0xffff'ffff'8000'0000}});
   // Remw
-  TestOp(0x23160bb, {{0x9999'9999'9999'9999, 0x3333, 0xffff'ffff'ffff'ffff}});
+  TestOp(0x231'60bb, {{0x9999'9999'9999'9999, 0x3333, 0xffff'ffff'ffff'ffff}});
   // Remuw
-  TestOp(0x23170bb,
+  TestOp(0x231'70bb,
          {{0x9999'9999'9999'9999, 0x3333, 0},
           {0xffff'ffff'8000'0000, 0xffff'ffff'8000'0001, 0xffff'ffff'8000'0000}});
   // Zext.h
-  TestOp(0x080140bb, {{0xffff'ffff'ffff'fffeULL, 0, 0xfffe}});
+  TestOp(0x0801'40bb, {{0xffff'ffff'ffff'fffeULL, 0, 0xfffe}});
   // Zext.b
-  TestOp(0x0ff17093, {{0xffff'ffff'ffff'fffeULL, 0, 0xfe}});
+  TestOp(0x0ff1'7093, {{0xffff'ffff'ffff'fffeULL, 0, 0xfe}});
   // Zext.w
-  TestOp(0x080100bb, {{0xffff'ffff'ffff'fffeULL, 0, 0xffff'fffe}});
+  TestOp(0x0801'00bb, {{0xffff'ffff'ffff'fffeULL, 0, 0xffff'fffe}});
   // Rorw
-  TestOp(0x603150bb, {{0x0000'0000'f000'000fULL, 4, 0xffff'ffff'ff00'0000}});
-  TestOp(0x603150bb, {{0x0000'0000'f000'0000ULL, 4, 0x0000'0000'0f00'0000}});
-  TestOp(0x603150bb, {{0x0000'0000'0f00'000fULL, 4, 0xffff'ffff'f0f0'0000}});
+  TestOp(0x6031'50bb, {{0x0000'0000'f000'000fULL, 4, 0xffff'ffff'ff00'0000}});
+  TestOp(0x6031'50bb, {{0x0000'0000'f000'0000ULL, 4, 0x0000'0000'0f00'0000}});
+  TestOp(0x6031'50bb, {{0x0000'0000'0f00'000fULL, 4, 0xffff'ffff'f0f0'0000}});
   // Rolw
-  TestOp(0x603110bb, {{0x0000'0000'f000'000fULL, 4, 0x0000'0000'0000'00ff}});
-  TestOp(0x603110bb, {{0x0000'0000'0ff0'0000ULL, 4, 0xffff'ffff'ff00'0000}});
+  TestOp(0x6031'10bb, {{0x0000'0000'f000'000fULL, 4, 0x0000'0000'0000'00ff}});
+  TestOp(0x6031'10bb, {{0x0000'0000'0ff0'0000ULL, 4, 0xffff'ffff'ff00'0000}});
   // Sh1add.uw
-  TestOp(0x203120bb, {{0xf0ff'0000'8000'0001, 0x8000'0000, 0x0000'0001'8000'0002}});
+  TestOp(0x2031'20bb, {{0xf0ff'0000'8000'0001, 0x8000'0000, 0x0000'0001'8000'0002}});
   // Sh2add.uw
-  TestOp(0x203140bb, {{0xf0ff'00ff'8000'0001, 0x8000'0000, 0x0000'0002'8000'0004}});
+  TestOp(0x2031'40bb, {{0xf0ff'00ff'8000'0001, 0x8000'0000, 0x0000'0002'8000'0004}});
   // Sh3add.uw
-  TestOp(0x203160bb, {{0xf0ff'0f00'8000'0001, 0x8000'0000, 0x0000'0004'8000'0008}});
+  TestOp(0x2031'60bb, {{0xf0ff'0f00'8000'0001, 0x8000'0000, 0x0000'0004'8000'0008}});
 }
 
 TEST_F(TESTSUITE, OpImmInstructions) {
   // Addi
-  TestOpImm(0x00010093, {{19, 23, 42}});
+  TestOpImm(0x0001'0093, {{19, 23, 42}});
   // Slti
-  TestOpImm(0x00012093,
+  TestOpImm(0x0001'2093,
             {
                 {19, 23, 1},
                 {23, 19, 0},
                 {~0ULL, 0, 1},
             });
   // Sltiu
-  TestOpImm(0x00013093,
+  TestOpImm(0x0001'3093,
             {
                 {19, 23, 1},
                 {23, 19, 0},
                 {~0ULL, 0, 0},
             });
   // Xori
-  TestOpImm(0x00014093, {{0b0101, 0b0011, 0b0110}});
+  TestOpImm(0x0001'4093, {{0b0101, 0b0011, 0b0110}});
   // Ori
-  TestOpImm(0x00016093, {{0b0101, 0b0011, 0b0111}});
+  TestOpImm(0x0001'6093, {{0b0101, 0b0011, 0b0111}});
   // Andi
-  TestOpImm(0x00017093, {{0b0101, 0b0011, 0b0001}});
+  TestOpImm(0x0001'7093, {{0b0101, 0b0011, 0b0001}});
   // Slli
-  TestOpImm(0x00011093, {{0b1010, 3, 0b1010'000}});
+  TestOpImm(0x0001'1093, {{0b1010, 3, 0b1010'000}});
   // Srli
-  TestOpImm(0x00015093, {{0xf000'0000'0000'0000ULL, 12, 0x000f'0000'0000'0000ULL}});
+  TestOpImm(0x0001'5093, {{0xf000'0000'0000'0000ULL, 12, 0x000f'0000'0000'0000ULL}});
   // Srai
-  TestOpImm(0x40015093, {{0xf000'0000'0000'0000ULL, 12, 0xffff'0000'0000'0000ULL}});
+  TestOpImm(0x4001'5093, {{0xf000'0000'0000'0000ULL, 12, 0xffff'0000'0000'0000ULL}});
   // Rori
-  TestOpImm(0x60015093, {{0xf000'0000'0000'000fULL, 4, 0xff00'0000'0000'0000ULL}});
+  TestOpImm(0x6001'5093, {{0xf000'0000'0000'000fULL, 4, 0xff00'0000'0000'0000ULL}});
   // Clz
-  TestOpImm(0x60011093, {{0, 0, 64}});
-  TestOpImm(0x60011093, {{123, 0, 57}});
+  TestOpImm(0x6001'1093, {{0, 0, 64}});
+  TestOpImm(0x6001'1093, {{123, 0, 57}});
   // Ctz
-  TestOpImm(0x60111093, {{0, 0, 64}});
-  TestOpImm(0x60111093, {{0x01000000'0000, 0, 40}});
+  TestOpImm(0x6011'1093, {{0, 0, 64}});
+  TestOpImm(0x6011'1093, {{0x0100'0000'0000, 0, 40}});
   // Cpop
-  TestOpImm(0x60211093, {{0xf000'0000'0000'000fULL, 0, 8}});
+  TestOpImm(0x6021'1093, {{0xf000'0000'0000'000fULL, 0, 8}});
   // Rev8
-  TestOpImm(0x6b815093, {{0x0000'0000'0000'000fULL, 0, 0x0f00'0000'0000'0000ULL}});
-  TestOpImm(0x6b815093, {{0xf000'0000'0000'0000ULL, 0, 0x0000'0000'0000'00f0ULL}});
-  TestOpImm(0x6b815093, {{0x00f0'0000'0000'0000ULL, 0, 0x0000'0000'0000'f000ULL}});
-  TestOpImm(0x6b815093, {{0x0000'000f'0000'0000ULL, 0, 0x0000'0000'0f00'0000ULL}});
+  TestOpImm(0x6b81'5093, {{0x0000'0000'0000'000fULL, 0, 0x0f00'0000'0000'0000ULL}});
+  TestOpImm(0x6b81'5093, {{0xf000'0000'0000'0000ULL, 0, 0x0000'0000'0000'00f0ULL}});
+  TestOpImm(0x6b81'5093, {{0x00f0'0000'0000'0000ULL, 0, 0x0000'0000'0000'f000ULL}});
+  TestOpImm(0x6b81'5093, {{0x0000'000f'0000'0000ULL, 0, 0x0000'0000'0f00'0000ULL}});
 
   // Sext.b
-  TestOpImm(0x60411093, {{0b1111'1110, 0, 0xffff'ffff'ffff'fffe}});  // -2
+  TestOpImm(0x6041'1093, {{0b1111'1110, 0, 0xffff'ffff'ffff'fffe}});  // -2
   // Sext.h
-  TestOpImm(0x60511093, {{0b1111'1110, 0, 0xfe}});
-  TestOpImm(0x60511093, {{0b1111'1111'1111'1110, 0, 0xffff'ffff'ffff'fffe}});
+  TestOpImm(0x6051'1093, {{0b1111'1110, 0, 0xfe}});
+  TestOpImm(0x6051'1093, {{0b1111'1111'1111'1110, 0, 0xffff'ffff'ffff'fffe}});
   // Orc.b
-  TestOpImm(0x28715093, {{0xfe00'f0ff'fa00'fffb, 0, 0xff00'ffff'ff00'ffff}});
-  TestOpImm(0x28715093, {{0xfa00, 0, 0xff00}});
+  TestOpImm(0x2871'5093, {{0xfe00'f0ff'fa00'fffb, 0, 0xff00'ffff'ff00'ffff}});
+  TestOpImm(0x2871'5093, {{0xfa00, 0, 0xff00}});
   // Bclri
-  TestOpImm(0x48011093, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
-  TestOpImm(0x48011093, {{0b1000'0001'0000'0001ULL, 8, 0b1000'0000'0000'0001ULL}});
+  TestOpImm(0x4801'1093, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
+  TestOpImm(0x4801'1093, {{0b1000'0001'0000'0001ULL, 8, 0b1000'0000'0000'0001ULL}});
   // Bexti
-  TestOpImm(0x48015093, {{0b1000'0001'0000'0001ULL, 0, 0b0000'0000'0000'0001ULL}});
-  TestOpImm(0x48015093, {{0b1000'0001'0000'0001ULL, 8, 0b0000'0000'0000'0001ULL}});
-  TestOpImm(0x48015093, {{0b1000'0001'0000'0001ULL, 7, 0b0000'0000'0000'0000ULL}});
+  TestOpImm(0x4801'5093, {{0b1000'0001'0000'0001ULL, 0, 0b0000'0000'0000'0001ULL}});
+  TestOpImm(0x4801'5093, {{0b1000'0001'0000'0001ULL, 8, 0b0000'0000'0000'0001ULL}});
+  TestOpImm(0x4801'5093, {{0b1000'0001'0000'0001ULL, 7, 0b0000'0000'0000'0000ULL}});
   // Binvi
-  TestOpImm(0x68011093, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
-  TestOpImm(0x68011093, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
+  TestOpImm(0x6801'1093, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0000ULL}});
+  TestOpImm(0x6801'1093, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
   // Bseti
-  TestOpImm(0x28011093, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0001ULL}});
-  TestOpImm(0x28011093, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
+  TestOpImm(0x2801'1093, {{0b1000'0001'0000'0001ULL, 0, 0b1000'0001'0000'0001ULL}});
+  TestOpImm(0x2801'1093, {{0b1000'0001'0000'0001ULL, 1, 0b1000'0001'0000'0011ULL}});
 }
 
 TEST_F(TESTSUITE, OpImm32Instructions) {
   // Addiw
-  TestOpImm(0x0001009b, {{19, 23, 42}, {0x8000'0000, 0, 0xffff'ffff'8000'0000}});
+  TestOpImm(0x0001'009b, {{19, 23, 42}, {0x8000'0000, 0, 0xffff'ffff'8000'0000}});
   // Slliw
-  TestOpImm(0x0001109b, {{0b1010, 3, 0b1010'000}});
+  TestOpImm(0x0001'109b, {{0b1010, 3, 0b1010'000}});
   // Srliw
-  TestOpImm(0x0001509b, {{0x0000'0000'f000'0000ULL, 12, 0x0000'0000'000f'0000ULL}});
+  TestOpImm(0x0001'509b, {{0x0000'0000'f000'0000ULL, 12, 0x0000'0000'000f'0000ULL}});
   // Sraiw
-  TestOpImm(0x4001509b, {{0x0000'0000'f000'0000ULL, 12, 0xffff'ffff'ffff'0000ULL}});
+  TestOpImm(0x4001'509b, {{0x0000'0000'f000'0000ULL, 12, 0xffff'ffff'ffff'0000ULL}});
   // Roriw
-  TestOpImm(0x6001509b, {{0x0000'0000'f000'000fULL, 4, 0xffff'ffff'ff00'0000}});
-  TestOpImm(0x6001509b, {{0x0000'0000'f000'0000ULL, 4, 0x0000'0000'0f00'0000}});
-  TestOpImm(0x6001509b, {{0x0000'0000'0f00'000fULL, 4, 0xffff'ffff'f0f0'0000}});
+  TestOpImm(0x6001'509b, {{0x0000'0000'f000'000fULL, 4, 0xffff'ffff'ff00'0000}});
+  TestOpImm(0x6001'509b, {{0x0000'0000'f000'0000ULL, 4, 0x0000'0000'0f00'0000}});
+  TestOpImm(0x6001'509b, {{0x0000'0000'0f00'000fULL, 4, 0xffff'ffff'f0f0'0000}});
   // Clzw
-  TestOpImm(0x6001109b, {{0, 0, 32}});
-  TestOpImm(0x6001109b, {{123, 0, 25}});
+  TestOpImm(0x6001'109b, {{0, 0, 32}});
+  TestOpImm(0x6001'109b, {{123, 0, 25}});
   // Ctzw
-  TestOpImm(0x6011109b, {{0, 0, 32}});
-  TestOpImm(0x6011109b, {{0x0000'0000'0000'0010, 0, 4}});
+  TestOpImm(0x6011'109b, {{0, 0, 32}});
+  TestOpImm(0x6011'109b, {{0x0000'0000'0000'0010, 0, 4}});
   // Cpopw
-  TestOpImm(0x6021109b, {{0xf000'0000'0000'000f, 0, 4}});
+  TestOpImm(0x6021'109b, {{0xf000'0000'0000'000f, 0, 4}});
   // Slli.uw
-  TestOpImm(0x0801109b, {{0x0000'0000'f000'000fULL, 4, 0x0000'000f'0000'00f0}});
+  TestOpImm(0x0801'109b, {{0x0000'0000'f000'000fULL, 4, 0x0000'000f'0000'00f0}});
 }
 
 TEST_F(TESTSUITE, OpFpInstructions) {
   // FAdd.S
-  TestOpFp(0x003100d3, {std::tuple{1.0f, 2.0f, 3.0f}});
+  TestOpFp(0x0031'00d3, {std::tuple{1.0f, 2.0f, 3.0f}});
   // FAdd.D
-  TestOpFp(0x023100d3, {std::tuple{1.0, 2.0, 3.0}});
+  TestOpFp(0x0231'00d3, {std::tuple{1.0, 2.0, 3.0}});
   // FSub.S
-  TestOpFp(0x083100d3, {std::tuple{3.0f, 2.0f, 1.0f}});
+  TestOpFp(0x0831'00d3, {std::tuple{3.0f, 2.0f, 1.0f}});
   // FSub.D
-  TestOpFp(0x0a3100d3, {std::tuple{3.0, 2.0, 1.0}});
+  TestOpFp(0x0a31'00d3, {std::tuple{3.0, 2.0, 1.0}});
   // FMul.S
-  TestOpFp(0x103100d3, {std::tuple{3.0f, 2.0f, 6.0f}});
+  TestOpFp(0x1031'00d3, {std::tuple{3.0f, 2.0f, 6.0f}});
   // FMul.D
-  TestOpFp(0x123100d3, {std::tuple{3.0, 2.0, 6.0}});
+  TestOpFp(0x1231'00d3, {std::tuple{3.0, 2.0, 6.0}});
   // FDiv.S
-  TestOpFp(0x183100d3, {std::tuple{6.0f, 2.0f, 3.0f}});
+  TestOpFp(0x1831'00d3, {std::tuple{6.0f, 2.0f, 3.0f}});
   // FDiv.D
-  TestOpFp(0x1a3100d3, {std::tuple{6.0, 2.0, 3.0}});
+  TestOpFp(0x1a31'00d3, {std::tuple{6.0, 2.0, 3.0}});
   // FSgnj.S
-  TestOpFp(0x203100d3,
+  TestOpFp(0x2031'00d3,
            {std::tuple{1.0f, 2.0f, 1.0f},
             {-1.0f, 2.0f, 1.0f},
             {1.0f, -2.0f, -1.0f},
             {-1.0f, -2.0f, -1.0f}});
   // FSgnj.D
-  TestOpFp(0x223100d3,
+  TestOpFp(0x2231'00d3,
            {
                std::tuple{1.0, 2.0, 1.0},
                {-1.0, 2.0, 1.0},
@@ -1618,7 +1622,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
                {-1.0, -2.0, -1.0},
            });
   // FSgnjn.S
-  TestOpFp(0x203110d3,
+  TestOpFp(0x2031'10d3,
            {
                std::tuple{1.0f, 2.0f, -1.0f},
                {1.0f, 2.0f, -1.0f},
@@ -1626,7 +1630,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
                {-1.0f, -2.0f, 1.0f},
            });
   // FSgnjn.D
-  TestOpFp(0x223110d3,
+  TestOpFp(0x2231'10d3,
            {
                std::tuple{1.0, 2.0, -1.0},
                {1.0, 2.0, -1.0},
@@ -1634,7 +1638,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
                {-1.0, -2.0, 1.0},
            });
   // FSgnjx.S
-  TestOpFp(0x203120d3,
+  TestOpFp(0x2031'20d3,
            {
                std::tuple{1.0f, 2.0f, 1.0f},
                {-1.0f, 2.0f, -1.0f},
@@ -1642,7 +1646,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
                {-1.0f, -2.0f, 1.0f},
            });
   // FSgnjx.D
-  TestOpFp(0x223120d3,
+  TestOpFp(0x2231'20d3,
            {
                std::tuple{1.0, 2.0, 1.0},
                {-1.0, 2.0, -1.0},
@@ -1650,7 +1654,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
                {-1.0, -2.0, 1.0},
            });
   // FMin.S
-  TestOpFp(0x283100d3,
+  TestOpFp(0x2831'00d3,
            {std::tuple{+0.f, +0.f, +0.f},
             {+0.f, -0.f, -0.f},
             {-0.f, +0.f, -0.f},
@@ -1658,7 +1662,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
             {+0.f, 1.f, +0.f},
             {-0.f, 1.f, -0.f}});
   // FMin.D
-  TestOpFp(0x2a3100d3,
+  TestOpFp(0x2a31'00d3,
            {std::tuple{+0.0, +0.0, +0.0},
             {+0.0, -0.0, -0.0},
             {-0.0, +0.0, -0.0},
@@ -1666,7 +1670,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
             {+0.0, 1.0, +0.0},
             {-0.0, 1.0, -0.0}});
   // FMax.S
-  TestOpFp(0x283110d3,
+  TestOpFp(0x2831'10d3,
            {std::tuple{+0.f, +0.f, +0.f},
             {+0.f, -0.f, +0.f},
             {-0.f, +0.f, +0.f},
@@ -1674,7 +1678,7 @@ TEST_F(TESTSUITE, OpFpInstructions) {
             {+0.f, 1.f, 1.f},
             {-0.f, 1.f, 1.f}});
   // FMax.D
-  TestOpFp(0x2a3110d3,
+  TestOpFp(0x2a31'10d3,
            {std::tuple{+0.0, +0.0, +0.0},
             {+0.0, -0.0, +0.0},
             {-0.0, +0.0, +0.0},
@@ -1685,28 +1689,28 @@ TEST_F(TESTSUITE, OpFpInstructions) {
 
 TEST_F(TESTSUITE, UpperImmInstructions) {
   // Auipc
-  TestAuipc(0xfedcb097, 0xffff'ffff'fedc'b000);
+  TestAuipc(0xfedc'b097, 0xffff'ffff'fedc'b000);
   // Lui
-  TestLui(0xfedcb0b7, 0xffff'ffff'fedc'b000);
+  TestLui(0xfedc'b0b7, 0xffff'ffff'fedc'b000);
 }
 
 TEST_F(TESTSUITE, TestBranchInstructions) {
   // Beq
-  TestBranch(0x00208463,
+  TestBranch(0x0020'8463,
              {
                  {42, 42, 8},
                  {41, 42, 4},
                  {42, 41, 4},
              });
   // Bne
-  TestBranch(0x00209463,
+  TestBranch(0x0020'9463,
              {
                  {42, 42, 4},
                  {41, 42, 8},
                  {42, 41, 8},
              });
   // Bltu
-  TestBranch(0x0020e463,
+  TestBranch(0x0020'e463,
              {
                  {41, 42, 8},
                  {42, 42, 4},
@@ -1715,7 +1719,7 @@ TEST_F(TESTSUITE, TestBranchInstructions) {
                  {42, 0xf000'0000'0000'0000ULL, 8},
              });
   // Bgeu
-  TestBranch(0x0020f463,
+  TestBranch(0x0020'f463,
              {
                  {42, 41, 8},
                  {42, 42, 8},
@@ -1724,7 +1728,7 @@ TEST_F(TESTSUITE, TestBranchInstructions) {
                  {42, 0xf000'0000'0000'0000ULL, 4},
              });
   // Blt
-  TestBranch(0x0020c463,
+  TestBranch(0x0020'c463,
              {
                  {41, 42, 8},
                  {42, 42, 4},
@@ -1733,7 +1737,7 @@ TEST_F(TESTSUITE, TestBranchInstructions) {
                  {42, 0xf000'0000'0000'0000ULL, 4},
              });
   // Bge
-  TestBranch(0x0020d463,
+  TestBranch(0x0020'd463,
              {
                  {42, 41, 8},
                  {42, 42, 8},
@@ -1742,7 +1746,7 @@ TEST_F(TESTSUITE, TestBranchInstructions) {
                  {42, 0xf000'0000'0000'0000ULL, 8},
              });
   // Beq with negative offset.
-  TestBranch(0xfe208ee3,
+  TestBranch(0xfe20'8ee3,
              {
                  {42, 42, -4},
              });
@@ -1750,14 +1754,14 @@ TEST_F(TESTSUITE, TestBranchInstructions) {
 
 TEST_F(TESTSUITE, JumpAndLinkInstructions) {
   // Jal
-  TestJumpAndLink(0x008000ef, 8);
+  TestJumpAndLink(0x0080'00ef, 8);
   // Jal with negative offset.
-  TestJumpAndLink(0xffdff0ef, -4);
+  TestJumpAndLink(0xffdf'f0ef, -4);
 }
 
 TEST_F(TESTSUITE, JumpAndLinkWithReturnAddressRegisterAsTarget) {
   uint32_t insn_bytes{// jalr   ra
-                      0x000080e7};
+                      0x0000'80e7};
   auto code_start = ToGuestAddr(&insn_bytes);
   state_.cpu.insn_addr = code_start;
   // Translation cache requires upper bits to be zero.
@@ -1771,66 +1775,66 @@ TEST_F(TESTSUITE, JumpAndLinkWithReturnAddressRegisterAsTarget) {
 
 TEST_F(TESTSUITE, JumpAndLinkRegisterInstructions) {
   // Jalr offset=4.
-  TestJumpAndLinkRegister<4>(0x004100e7, 38, 42);
+  TestJumpAndLinkRegister<4>(0x0041'00e7, 38, 42);
   // Jalr offset=-4.
-  TestJumpAndLinkRegister<4>(0xffc100e7, 42, 38);
+  TestJumpAndLinkRegister<4>(0xffc1'00e7, 42, 38);
   // Jalr offset=5 - must properly align the target to even.
-  TestJumpAndLinkRegister<4>(0x005100e7, 38, 42);
+  TestJumpAndLinkRegister<4>(0x0051'00e7, 38, 42);
   // Jr offset=4.
-  TestJumpAndLinkRegister<0>(0x00410067, 38, 42);
+  TestJumpAndLinkRegister<0>(0x0041'0067, 38, 42);
   // Jr offset=-4.
-  TestJumpAndLinkRegister<0>(0xffc10067, 42, 38);
+  TestJumpAndLinkRegister<0>(0xffc1'0067, 42, 38);
   // Jr offset=5 - must properly align the target to even.
-  TestJumpAndLinkRegister<0>(0x00510067, 38, 42);
+  TestJumpAndLinkRegister<0>(0x0051'0067, 38, 42);
 }
 
 TEST_F(TESTSUITE, LoadInstructions) {
   // Offset is always 8.
   // Lbu
-  TestLoad(0x00814083, kDataToLoad & 0xffULL);
+  TestLoad(0x0081'4083, kDataToLoad & 0xffULL);
   // Lhu
-  TestLoad(0x00815083, kDataToLoad & 0xffffULL);
+  TestLoad(0x0081'5083, kDataToLoad & 0xffffULL);
   // Lwu
-  TestLoad(0x00816083, kDataToLoad & 0xffff'ffffULL);
+  TestLoad(0x0081'6083, kDataToLoad & 0xffff'ffffULL);
   // Ldu
-  TestLoad(0x00813083, kDataToLoad);
+  TestLoad(0x0081'3083, kDataToLoad);
   // Lb
-  TestLoad(0x00810083, int64_t{int8_t(kDataToLoad)});
+  TestLoad(0x0081'0083, int64_t{int8_t(kDataToLoad)});
   // Lh
-  TestLoad(0x00811083, int64_t{int16_t(kDataToLoad)});
+  TestLoad(0x0081'1083, int64_t{int16_t(kDataToLoad)});
   // Lw
-  TestLoad(0x00812083, int64_t{int32_t(kDataToLoad)});
+  TestLoad(0x0081'2083, int64_t{int32_t(kDataToLoad)});
 }
 
 TEST_F(TESTSUITE, StoreInstructions) {
   // Offset is always 8.
   // Sb
-  TestStore(0x00208423, kDataToStore & 0xffULL);
+  TestStore(0x0020'8423, kDataToStore & 0xffULL);
   // Sh
-  TestStore(0x00209423, kDataToStore & 0xffffULL);
+  TestStore(0x0020'9423, kDataToStore & 0xffffULL);
   // Sw
-  TestStore(0x0020a423, kDataToStore & 0xffff'ffffULL);
+  TestStore(0x0020'a423, kDataToStore & 0xffff'ffffULL);
   // Sd
-  TestStore(0x0020b423, kDataToStore);
+  TestStore(0x0020'b423, kDataToStore);
 }
 
 TEST_F(TESTSUITE, FmaInstructions) {
   // Fmadd.S
-  TestFma(0x203170c3, {std::tuple{1.0f, 2.0f, 3.0f, 5.0f}});
+  TestFma(0x2031'70c3, {std::tuple{1.0f, 2.0f, 3.0f, 5.0f}});
   // Fmadd.D
-  TestFma(0x223170c3, {std::tuple{1.0, 2.0, 3.0, 5.0}});
+  TestFma(0x2231'70c3, {std::tuple{1.0, 2.0, 3.0, 5.0}});
   // Fmsub.S
-  TestFma(0x203170c7, {std::tuple{1.0f, 2.0f, 3.0f, -1.0f}});
+  TestFma(0x2031'70c7, {std::tuple{1.0f, 2.0f, 3.0f, -1.0f}});
   // Fmsub.D
-  TestFma(0x223170c7, {std::tuple{1.0, 2.0, 3.0, -1.0}});
+  TestFma(0x2231'70c7, {std::tuple{1.0, 2.0, 3.0, -1.0}});
   // Fnmsub.S
-  TestFma(0x203170cb, {std::tuple{1.0f, 2.0f, 3.0f, 1.0f}});
+  TestFma(0x2031'70cb, {std::tuple{1.0f, 2.0f, 3.0f, 1.0f}});
   // Fnmsub.D
-  TestFma(0x223170cb, {std::tuple{1.0, 2.0, 3.0, 1.0}});
+  TestFma(0x2231'70cb, {std::tuple{1.0, 2.0, 3.0, 1.0}});
   // Fnmadd.S
-  TestFma(0x203170cf, {std::tuple{1.0f, 2.0f, 3.0f, -5.0f}});
+  TestFma(0x2031'70cf, {std::tuple{1.0f, 2.0f, 3.0f, -5.0f}});
   // Fnmadd.D
-  TestFma(0x223170cf, {std::tuple{1.0, 2.0, 3.0, -5.0}});
+  TestFma(0x2231'70cf, {std::tuple{1.0, 2.0, 3.0, -5.0}});
 }
 
 #if (defined(TESTING_INTERPRETER) || defined(TESTING_HEAVY_OPTIMIZER))
@@ -1845,35 +1849,35 @@ TEST_F(TESTSUITE, AtomicLoadInstructions) {
   static_assert(static_cast<int32_t>(kSignExtendedNegative) < 0);
 
   // Lrw - sign extends from 32 to 64.
-  TestAtomicLoad(0x1000a12f, &kPositive32BitValue, kSignExtendedPositive);
-  TestAtomicLoad(0x1000a12f, &kNegative32BitValue, kSignExtendedNegative);
+  TestAtomicLoad(0x1000'a12f, &kPositive32BitValue, kSignExtendedPositive);
+  TestAtomicLoad(0x1000'a12f, &kNegative32BitValue, kSignExtendedNegative);
 
   // Lrd
-  TestAtomicLoad(0x1000b12f, &kDataToLoad, kDataToLoad);
+  TestAtomicLoad(0x1000'b12f, &kDataToLoad, kDataToLoad);
 }
 
 TEST_F(TESTSUITE, AtomicStoreInstructions) {
   // Scw
-  TestAtomicStore(0x1820a1af, static_cast<uint32_t>(kDataToStore));
+  TestAtomicStore(0x1820'a1af, static_cast<uint32_t>(kDataToStore));
 
   // Scd
-  TestAtomicStore(0x1820b1af, kDataToStore);
+  TestAtomicStore(0x1820'b1af, kDataToStore);
 }
 
 TEST_F(TESTSUITE, AtomicStoreInstructionNoLoadFailure) {
   // Scw
-  TestAtomicStoreNoLoadFailure(0x1820a1af);
+  TestAtomicStoreNoLoadFailure(0x1820'a1af);
 
   // Scd
-  TestAtomicStoreNoLoadFailure(0x1820b1af);
+  TestAtomicStoreNoLoadFailure(0x1820'b1af);
 }
 
 TEST_F(TESTSUITE, AtomicStoreInstructionDifferentLoadFailure) {
   // Scw
-  TestAtomicStoreDifferentLoadFailure(0x1820a1af);
+  TestAtomicStoreDifferentLoadFailure(0x1820'a1af);
 
   // Scd
-  TestAtomicStoreDifferentLoadFailure(0x1820b1af);
+  TestAtomicStoreDifferentLoadFailure(0x1820'b1af);
 }
 
 #endif  // (defined(TESTING_INTERPRETER) || defined(TESTING_HEAVY_OPTIMIZER))
@@ -1883,67 +1887,68 @@ TEST_F(TESTSUITE, AmoInstructions) {
   // other instructions for brevity.
 
   // AmoswaoW/AmoswaoD
-  TestAmo(0x083120af, 0x083130af, 0xaaaa'bbbb'cccc'ddddULL);
+  TestAmo(0x0831'20af, 0x0831'30af, 0xaaaa'bbbb'cccc'ddddULL);
 
   // AmoswapWAq/AmoswapDAq
-  TestAmo(0x0c3120af, 0x0c3130af, 0xaaaa'bbbb'cccc'ddddULL);
+  TestAmo(0x0c31'20af, 0x0c31'30af, 0xaaaa'bbbb'cccc'ddddULL);
 
   // AmoswapWRl/AmoswapDRl
-  TestAmo(0x0a3120af, 0x0a3130af, 0xaaaa'bbbb'cccc'ddddULL);
+  TestAmo(0x0a31'20af, 0x0a31'30af, 0xaaaa'bbbb'cccc'ddddULL);
 
   // AmoswapWAqrl/AmoswapDAqrl
-  TestAmo(0x0e3120af, 0x0e3130af, 0xaaaa'bbbb'cccc'ddddULL);
+  TestAmo(0x0e31'20af, 0x0e31'30af, 0xaaaa'bbbb'cccc'ddddULL);
 
   // AmoaddW/AmoaddD
-  TestAmo(0x003120af, 0x003130af, 0xaaaa'aaaa'aaaa'aaa9);
+  TestAmo(0x0031'20af, 0x0031'30af, 0xaaaa'aaaa'aaaa'aaa9);
 
   // AmoxorW/AmoxorD
-  TestAmo(0x203120af, 0x203130af, 0x5555'5555'1111'1111);
+  TestAmo(0x2031'20af, 0x2031'30af, 0x5555'5555'1111'1111);
 
   // AmoandW/AmoandD
-  TestAmo(0x603120af, 0x603130af, 0xaaaa'aaaa'cccc'cccc);
+  TestAmo(0x6031'20af, 0x6031'30af, 0xaaaa'aaaa'cccc'cccc);
 
   // AmoorW/AmoorD
-  TestAmo(0x403120af, 0x403130af, 0xffff'ffff'dddd'dddd);
+  TestAmo(0x4031'20af, 0x4031'30af, 0xffff'ffff'dddd'dddd);
 
   // AmominW/AmominD
-  TestAmo(0x803120af, 0x803130af, 0xaaaa'bbbb'cccc'ddddULL);
+  TestAmo(0x8031'20af, 0x8031'30af, 0xaaaa'bbbb'cccc'ddddULL);
 
   // AmomaxW/AmomaxD
-  TestAmo(0xa03120af, 0xa03130af, 0xffff'eeee'dddd'ccccULL);
+  TestAmo(0xa031'20af, 0xa031'30af, 0xffff'eeee'dddd'ccccULL);
 
   // AmominuW/AmominuD
-  TestAmo(0xc03120af, 0xc03130af, 0xaaaa'bbbb'cccc'ddddULL);
+  TestAmo(0xc031'20af, 0xc031'30af, 0xaaaa'bbbb'cccc'ddddULL);
 
   // AmomaxuW/AmomaxuD
-  TestAmo(0xe03120af, 0xe03130af, 0xffff'eeee'dddd'ccccULL);
+  TestAmo(0xe031'20af, 0xe031'30af, 0xffff'eeee'dddd'ccccULL);
 }
 
 TEST_F(TESTSUITE, OpFpSingleInputInstructions) {
   // FSqrt.S
-  TestOpFpSingleInput(0x580170d3, {std::tuple{4.0f, 2.0f}});
+  TestOpFpSingleInput(0x5801'70d3, {std::tuple{4.0f, 2.0f}});
   // FSqrt.D
-  TestOpFpSingleInput(0x5a0170d3, {std::tuple{16.0, 4.0}});
+  TestOpFpSingleInput(0x5a01'70d3, {std::tuple{16.0, 4.0}});
 }
 
 TEST_F(TESTSUITE, Fmv) {
   // Fmv.X.W
-  TestFmvFloatToInteger(0xe00080d3,
+  TestFmvFloatToInteger(0xe000'80d3,
                         {std::tuple{1.0f, static_cast<uint64_t>(bit_cast<uint32_t>(1.0f))},
                          {-1.0f, static_cast<int64_t>(bit_cast<int32_t>(-1.0f))}});
   // Fmv.W.X
   TestFmvIntegerToFloat(
-      0xf00080d3, {std::tuple{bit_cast<uint32_t>(1.0f), 1.0f}, {bit_cast<uint32_t>(-1.0f), -1.0f}});
+      0xf000'80d3,
+      {std::tuple{bit_cast<uint32_t>(1.0f), 1.0f}, {bit_cast<uint32_t>(-1.0f), -1.0f}});
   // Fmv.X.D
   TestFmvFloatToInteger(
-      0xe20080d3, {std::tuple{1.0, bit_cast<uint64_t>(1.0)}, {-1.0, bit_cast<uint64_t>(-1.0)}});
+      0xe200'80d3, {std::tuple{1.0, bit_cast<uint64_t>(1.0)}, {-1.0, bit_cast<uint64_t>(-1.0)}});
   // Fmv.D.X
   TestFmvIntegerToFloat(
-      0xf20080d3, {std::tuple{bit_cast<uint64_t>(1.0), 1.0}, {bit_cast<uint64_t>(-1.0), -1.0}});
+      0xf200'80d3, {std::tuple{bit_cast<uint64_t>(1.0), 1.0}, {bit_cast<uint64_t>(-1.0), -1.0}});
   // Fmv.S
-  TestOpFpSingleInput(0x202100d3, {std::tuple{1.0f, 1.0f}, {-1.0f, -1.0f}});
+  TestOpFpSingleInput(0x2021'00d3, {std::tuple{1.0f, 1.0f}, {-1.0f, -1.0f}});
   // Fmv.D
-  TestOpFpSingleInput(0x222100d3,
+  TestOpFpSingleInput(0x2221'00d3,
                       {std::tuple{bit_cast<uint64_t>(1.0), 1.0}, {bit_cast<uint64_t>(-1.0), -1.0}});
 }
 
@@ -1955,116 +1960,116 @@ constexpr uint64_t kMaskFloatBits = (uint64_t{1} << 32) - 1;
 
 TEST_F(TESTSUITE, FabsSinglePrecisionNanPosToPos) {
   SetFReg<2>(state_.cpu, kPosNanFloat);
-  RunInstruction(0x202120d3);  // fabs.s f1, f2
+  RunInstruction(0x2021'20d3);  // fabs.s f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu) & kMaskFloatBits, kPosNanFloat);
 }
 
 TEST_F(TESTSUITE, FabsSinglePrecisionNanNegToPos) {
   SetFReg<2>(state_.cpu, kNegNanFloat);
-  RunInstruction(0x202120d3);  // fabs.s f1, f2
+  RunInstruction(0x2021'20d3);  // fabs.s f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu) & kMaskFloatBits, kPosNanFloat);
 }
 
 TEST_F(TESTSUITE, FabsDoublePrecisionNanPosToPos) {
   SetFReg<2>(state_.cpu, kPosNanDouble);
-  RunInstruction(0x222120d3);  // fabs.d f1, f2
+  RunInstruction(0x2221'20d3);  // fabs.d f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu), kPosNanDouble);
 }
 
 TEST_F(TESTSUITE, FabsDoublePrecisionNanNegToPos) {
   SetFReg<2>(state_.cpu, kNegNanDouble);
-  RunInstruction(0x222120d3);  // fabs.d f1, f2
+  RunInstruction(0x2221'20d3);  // fabs.d f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu), kPosNanDouble);
 }
 
 TEST_F(TESTSUITE, FnegSinglePrecisionNanPosToNeg) {
   SetFReg<2>(state_.cpu, kPosNanFloat);
-  RunInstruction(0x202110d3);  // fneg.s f1, f2
+  RunInstruction(0x2021'10d3);  // fneg.s f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu) & kMaskFloatBits, kNegNanFloat);
 }
 
 TEST_F(TESTSUITE, FnegSinglePrecisionNanNegToPos) {
   SetFReg<2>(state_.cpu, kNegNanFloat);
-  RunInstruction(0x202110d3);  // fneg.s f1, f2
+  RunInstruction(0x2021'10d3);  // fneg.s f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu) & kMaskFloatBits, kPosNanFloat);
 }
 
 TEST_F(TESTSUITE, FnegDoublePrecisionNanPosToNeg) {
   SetFReg<2>(state_.cpu, kPosNanDouble);
-  RunInstruction(0x222110d3);  // fneg.s f1, f2
+  RunInstruction(0x2221'10d3);  // fneg.s f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu), kNegNanDouble);
 }
 
 TEST_F(TESTSUITE, FnegDoublePrecisionNanNegToPos) {
   SetFReg<2>(state_.cpu, kNegNanDouble);
-  RunInstruction(0x222110d3);  // fneg.s f1, f2
+  RunInstruction(0x2221'10d3);  // fneg.s f1, f2
   EXPECT_EQ(GetFReg<1>(state_.cpu), kPosNanDouble);
 }
 
 TEST_F(TESTSUITE, OpFpFcvt) {
   // Fcvt.S.D
-  TestOpFpSingleInput(0x401170d3, {std::tuple{1.0, 1.0f}});
+  TestOpFpSingleInput(0x4011'70d3, {std::tuple{1.0, 1.0f}});
   // Fcvt.D.S
-  TestOpFpSingleInput(0x420100d3, {std::tuple{2.0f, 2.0}});
+  TestOpFpSingleInput(0x4201'00d3, {std::tuple{2.0f, 2.0}});
   // Fcvt.W.S
-  TestOpFpGpRegisterTargetSingleInput(0xc00170d3, {std::tuple{3.0f, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc001'70d3, {std::tuple{3.0f, 3UL}});
   // Fcvt.WU.S
-  TestOpFpGpRegisterTargetSingleInput(0xc01170d3, {std::tuple{3.0f, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc011'70d3, {std::tuple{3.0f, 3UL}});
   // Fcvt.L.S
-  TestOpFpGpRegisterTargetSingleInput(0xc02170d3, {std::tuple{3.0f, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc021'70d3, {std::tuple{3.0f, 3UL}});
   // Fcvt.LU.S
-  TestOpFpGpRegisterTargetSingleInput(0xc03170d3, {std::tuple{3.0f, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc031'70d3, {std::tuple{3.0f, 3UL}});
   // Fcvt.W.D
-  TestOpFpGpRegisterTargetSingleInput(0xc20170d3, {std::tuple{3.0, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc201'70d3, {std::tuple{3.0, 3UL}});
   // Fcvt.WU.D
-  TestOpFpGpRegisterTargetSingleInput(0xc21170d3, {std::tuple{3.0, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc211'70d3, {std::tuple{3.0, 3UL}});
   // Fcvt.L.D
-  TestOpFpGpRegisterTargetSingleInput(0xc22170d3, {std::tuple{3.0, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc221'70d3, {std::tuple{3.0, 3UL}});
   // Fcvt.LU.D
-  TestOpFpGpRegisterTargetSingleInput(0xc23170d3, {std::tuple{3.0, 3UL}});
+  TestOpFpGpRegisterTargetSingleInput(0xc231'70d3, {std::tuple{3.0, 3UL}});
   // Fcvt.S.W
-  TestOpFpGpRegisterSourceSingleInput(0xd00170d3, {std::tuple{3UL, 3.0f}});
+  TestOpFpGpRegisterSourceSingleInput(0xd001'70d3, {std::tuple{3UL, 3.0f}});
   // Fcvt.S.WU
-  TestOpFpGpRegisterSourceSingleInput(0xd01170d3, {std::tuple{3UL, 3.0f}});
+  TestOpFpGpRegisterSourceSingleInput(0xd011'70d3, {std::tuple{3UL, 3.0f}});
   // Fcvt.S.L
-  TestOpFpGpRegisterSourceSingleInput(0xd02170d3, {std::tuple{3UL, 3.0f}});
+  TestOpFpGpRegisterSourceSingleInput(0xd021'70d3, {std::tuple{3UL, 3.0f}});
   // Fcvt.S.LU
-  TestOpFpGpRegisterSourceSingleInput(0xd03170d3, {std::tuple{3UL, 3.0f}});
+  TestOpFpGpRegisterSourceSingleInput(0xd031'70d3, {std::tuple{3UL, 3.0f}});
   // Fcvt.D.W
-  TestOpFpGpRegisterSourceSingleInput(0xd20170d3, {std::tuple{3UL, 3.0}});
+  TestOpFpGpRegisterSourceSingleInput(0xd201'70d3, {std::tuple{3UL, 3.0}});
   // Fcvt.D.Wu
-  TestOpFpGpRegisterSourceSingleInput(0xd21170d3, {std::tuple{3UL, 3.0}});
+  TestOpFpGpRegisterSourceSingleInput(0xd211'70d3, {std::tuple{3UL, 3.0}});
   // Fcvt.D.L
-  TestOpFpGpRegisterSourceSingleInput(0xd22170d3, {std::tuple{3UL, 3.0}});
+  TestOpFpGpRegisterSourceSingleInput(0xd221'70d3, {std::tuple{3UL, 3.0}});
   // Fcvt.D.LU
-  TestOpFpGpRegisterSourceSingleInput(0xd23170d3, {std::tuple{3UL, 3.0}});
+  TestOpFpGpRegisterSourceSingleInput(0xd231'70d3, {std::tuple{3UL, 3.0}});
 }
 
 TEST_F(TESTSUITE, OpFpGpRegisterTargetInstructions) {
   // Fle.S
-  TestOpFpGpRegisterTarget(0xa03100d3,
+  TestOpFpGpRegisterTarget(0xa031'00d3,
                            {std::tuple{1.0f, 2.0f, 1UL}, {2.0f, 1.0f, 0UL}, {0.0f, 0.0f, 1UL}});
   // Fle.D
-  TestOpFpGpRegisterTarget(0xa23100d3,
+  TestOpFpGpRegisterTarget(0xa231'00d3,
                            {std::tuple{1.0, 2.0, 1UL}, {2.0, 1.0, 0UL}, {0.0, 0.0, 1UL}});
   // Flt.S
-  TestOpFpGpRegisterTarget(0xa03110d3,
+  TestOpFpGpRegisterTarget(0xa031'10d3,
                            {std::tuple{1.0f, 2.0f, 1UL}, {2.0f, 1.0f, 0UL}, {0.0f, 0.0f, 0UL}});
   // Flt.D
-  TestOpFpGpRegisterTarget(0xa23110d3,
+  TestOpFpGpRegisterTarget(0xa231'10d3,
                            {std::tuple{1.0, 2.0, 1UL}, {2.0, 1.0, 0UL}, {0.0, 0.0, 0UL}});
   // Feq.S
-  TestOpFpGpRegisterTarget(0xa03120d3,
+  TestOpFpGpRegisterTarget(0xa031'20d3,
                            {std::tuple{1.0f, 2.0f, 0UL}, {2.0f, 1.0f, 0UL}, {0.0f, 0.0f, 1UL}});
   // Feq.D
-  TestOpFpGpRegisterTarget(0xa23120d3,
+  TestOpFpGpRegisterTarget(0xa231'20d3,
                            {std::tuple{1.0, 2.0, 0UL}, {2.0, 1.0, 0UL}, {0.0, 0.0, 1UL}});
 }
 
 TEST_F(TESTSUITE, TestOpFpGpRegisterTargetSingleInput) {
   // Fclass.S
   TestOpFpGpRegisterTargetSingleInput(
-      0xe00110d3,
+      0xe001'10d3,
       {std::tuple{-std::numeric_limits<float>::infinity(), 0b00'0000'0001UL},
        {-1.0f, 0b00'0000'0010UL},
        {-std::numeric_limits<float>::denorm_min(), 0b00'0000'0100UL},
@@ -2077,7 +2082,7 @@ TEST_F(TESTSUITE, TestOpFpGpRegisterTargetSingleInput) {
        {std::numeric_limits<float>::quiet_NaN(), 0b10'0000'0000UL}});
   // Fclass.D
   TestOpFpGpRegisterTargetSingleInput(
-      0xe20110d3,
+      0xe201'10d3,
       {std::tuple{-std::numeric_limits<double>::infinity(), 0b00'0000'0001UL},
        {-1.0, 0b00'0000'0010UL},
        {-std::numeric_limits<double>::denorm_min(), 0b00'0000'0100UL},
@@ -2092,7 +2097,7 @@ TEST_F(TESTSUITE, TestOpFpGpRegisterTargetSingleInput) {
 
 TEST_F(TESTSUITE, RoundingModeTest) {
   // FAdd.S
-  TestOpFp(0x003100d3,
+  TestOpFp(0x0031'00d3,
            // Test RNE
            {std::tuple{1.0000001f, 0.000000059604645f, 1.0000002f},
             {1.0000002f, 0.000000059604645f, 1.0000002f},
@@ -2101,7 +2106,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000002f, -0.000000059604645f, -1.0000002f},
             {-1.0000004f, -0.000000059604645f, -1.0000005f}});
   // FAdd.S
-  TestOpFp(0x003110d3,
+  TestOpFp(0x0031'10d3,
            // Test RTZ
            {std::tuple{1.0000001f, 0.000000059604645f, 1.0000001f},
             {1.0000002f, 0.000000059604645f, 1.0000002f},
@@ -2110,7 +2115,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000002f, -0.000000059604645f, -1.0000002f},
             {-1.0000004f, -0.000000059604645f, -1.0000004f}});
   // FAdd.S
-  TestOpFp(0x003120d3,
+  TestOpFp(0x0031'20d3,
            // Test RDN
            {std::tuple{1.0000001f, 0.000000059604645f, 1.0000001f},
             {1.0000002f, 0.000000059604645f, 1.0000002f},
@@ -2119,7 +2124,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000002f, -0.000000059604645f, -1.0000004f},
             {-1.0000004f, -0.000000059604645f, -1.0000005f}});
   // FAdd.S
-  TestOpFp(0x003130d3,
+  TestOpFp(0x0031'30d3,
            // Test RUP
            {std::tuple{1.0000001f, 0.000000059604645f, 1.0000002f},
             {1.0000002f, 0.000000059604645f, 1.0000004f},
@@ -2128,7 +2133,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000002f, -0.000000059604645f, -1.0000002f},
             {-1.0000004f, -0.000000059604645f, -1.0000004f}});
   // FAdd.S
-  TestOpFp(0x003140d3,
+  TestOpFp(0x0031'40d3,
            // Test RMM
            {std::tuple{1.0000001f, 0.000000059604645f, 1.0000002f},
             {1.0000002f, 0.000000059604645f, 1.0000004f},
@@ -2138,7 +2143,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000004f, -0.000000059604645f, -1.0000005f}});
 
   // FAdd.D
-  TestOpFp(0x023100d3,
+  TestOpFp(0x0231'00d3,
            // Test RNE
            {std::tuple{1.0000000000000002, 0.00000000000000011102230246251565, 1.0000000000000004},
             {1.0000000000000004, 0.00000000000000011102230246251565, 1.0000000000000004},
@@ -2147,7 +2152,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000000000000004, -0.00000000000000011102230246251565, -1.0000000000000004},
             {-1.0000000000000007, -0.00000000000000011102230246251565, -1.0000000000000009}});
   // FAdd.D
-  TestOpFp(0x023110d3,
+  TestOpFp(0x0231'10d3,
            // Test RTZ
            {std::tuple{1.0000000000000002, 0.00000000000000011102230246251565, 1.0000000000000002},
             {1.0000000000000004, 0.00000000000000011102230246251565, 1.0000000000000004},
@@ -2156,7 +2161,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000000000000004, -0.00000000000000011102230246251565, -1.0000000000000004},
             {-1.0000000000000007, -0.00000000000000011102230246251565, -1.0000000000000007}});
   // FAdd.D
-  TestOpFp(0x023120d3,
+  TestOpFp(0x0231'20d3,
            // Test RDN
            {std::tuple{1.0000000000000002, 0.00000000000000011102230246251565, 1.0000000000000002},
             {1.0000000000000004, 0.00000000000000011102230246251565, 1.0000000000000004},
@@ -2165,7 +2170,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000000000000004, -0.00000000000000011102230246251565, -1.0000000000000007},
             {-1.0000000000000007, -0.00000000000000011102230246251565, -1.0000000000000009}});
   // FAdd.D
-  TestOpFp(0x023130d3,
+  TestOpFp(0x0231'30d3,
            // Test RUP
            {std::tuple{1.0000000000000002, 0.00000000000000011102230246251565, 1.0000000000000004},
             {1.0000000000000004, 0.00000000000000011102230246251565, 1.0000000000000007},
@@ -2174,7 +2179,7 @@ TEST_F(TESTSUITE, RoundingModeTest) {
             {-1.0000000000000004, -0.00000000000000011102230246251565, -1.0000000000000004},
             {-1.0000000000000007, -0.00000000000000011102230246251565, -1.0000000000000007}});
   // FAdd.D
-  TestOpFp(0x023140d3,
+  TestOpFp(0x0231'40d3,
            // Test RMM
            {std::tuple{1.0000000000000002, 0.00000000000000011102230246251565, 1.0000000000000004},
             {1.0000000000000004, 0.00000000000000011102230246251565, 1.0000000000000007},
@@ -2186,16 +2191,16 @@ TEST_F(TESTSUITE, RoundingModeTest) {
 
 TEST_F(TESTSUITE, LoadFpInstructions) {
   // Offset is always 8.
-  TestLoadFp(0x00812087, kDataToLoad | 0xffffffff00000000ULL);
-  TestLoadFp(0x00813087, kDataToLoad);
+  TestLoadFp(0x0081'2087, kDataToLoad | 0xffff'ffff'0000'0000ULL);
+  TestLoadFp(0x0081'3087, kDataToLoad);
 }
 
 TEST_F(TESTSUITE, StoreFpInstructions) {
   // Offset is always 8.
   // Fsw
-  TestStoreFp(0x0020a427, kDataToStore & 0xffff'ffffULL);
+  TestStoreFp(0x0020'a427, kDataToStore & 0xffff'ffffULL);
   // Fsd
-  TestStoreFp(0x0020b427, kDataToStore);
+  TestStoreFp(0x0020'b427, kDataToStore);
 }
 
 #if defined(TESTING_INTERPRETER) || defined(TESTING_LITE_TRANSLATOR)
@@ -2204,7 +2209,7 @@ TEST_F(TESTSUITE, TestVsetvl) {
   constexpr uint64_t kVill =
       0b1'0000000'00000000'00000000'00000000'00000000'00000000'00000000'00000000;
   // Vsetvl, rs1 != x0
-  TestVsetvl(0x803170d7,
+  TestVsetvl(0x8031'70d7,
              {
                  // Valid combinations.
                  {~0ULL, ~0ULL, ~0ULL, 005, 2, 005},
@@ -2289,29 +2294,29 @@ TEST_F(TESTSUITE, TestVsetvl) {
                  {~0ULL, ~0ULL, 257, 003, 128, 003},
              });
   // vsetvl rs1 == x0, rd != x0
-  TestVsetvl(0x803070d7, {{~0ULL, ~0ULL, 42, 000, 16, 000}});
+  TestVsetvl(0x8030'70d7, {{~0ULL, ~0ULL, 42, 000, 16, 000}});
   // vsetvl rs1 == x0, rd == x0
-  TestVsetvl(0x80307057,
+  TestVsetvl(0x8030'7057,
              {// Valid change of vtype.
               {9, 000, 128, 022, 9, 022},
               // Invalid change of vtype.
               {8, 001, 128, 022, 0, kVill}});
   // vsetvli rs1 != x0
-  TestVsetvl(0x12170d7, {{~0ULL, ~0ULL, 128, 0, 16, 022}});
+  TestVsetvl(0x121'70d7, {{~0ULL, ~0ULL, 128, 0, 16, 022}});
   // vsetvli rs1 == x0, rd != x0
-  TestVsetvl(0x12070d7, {{~0ULL, ~0ULL, 42, 000, 16, 022}});
+  TestVsetvl(0x120'70d7, {{~0ULL, ~0ULL, 42, 000, 16, 022}});
   // vsetvli, rs1 == x0, rd == x0
-  TestVsetvl(0x1207057,
+  TestVsetvl(0x120'7057,
              {// Valid change of vtype.
               {9, 000, 128, ~0ULL, 9, 022},
               // Invalid change of vtype.
               {8, 001, 128, ~0ULL, 0, kVill}});
   // vsetivli rs1 != x0
-  TestVsetvl(0xc12870d7, {{~0ULL, ~0ULL, 128, 0, 16, 022}});
+  TestVsetvl(0xc128'70d7, {{~0ULL, ~0ULL, 128, 0, 16, 022}});
   // vsetivli rs1 == x0, rd != x0
-  TestVsetvl(0xc12070d7, {{~0ULL, ~0ULL, 42, 000, 16, 022}});
+  TestVsetvl(0xc120'70d7, {{~0ULL, ~0ULL, 42, 000, 16, 022}});
   // vsetivli, rs1 == x0, rd == x0
-  TestVsetvl(0xc1207057,
+  TestVsetvl(0xc120'7057,
              {// Valid change of vtype.
               {9, 000, 128, ~0ULL, 9, 022},
               // Invalid change of vtype.

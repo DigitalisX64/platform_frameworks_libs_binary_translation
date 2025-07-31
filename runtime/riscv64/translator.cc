@@ -42,9 +42,9 @@ GuestCodeEntry::Kind kSpecialHandler = GuestCodeEntry::Kind::kSpecialHandler;
 // Unwinder might examine nearby insns.
 alignas(4) uint32_t g_native_bridge_call_guest[] = {
     // <native_bridge_call_guest>:
-    0xd503201f,  // nop
-    0xd503201f,  // nop  <--
-    0xd503201f,  // nop
+    0xd503'201f,  // nop
+    0xd503'201f,  // nop  <--
+    0xd503'201f,  // nop
 };
 
 uint8_t GetRiscv64InsnSize(GuestAddr pc) {

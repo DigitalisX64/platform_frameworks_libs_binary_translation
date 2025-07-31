@@ -21,17 +21,17 @@
 #include <arm_neon.h>
 
 TEST(Neon, VSRI) {
-  uint32x2_t d = {0x11223344, 0x55667788};
-  uint32x2_t m = {0x99AABBCC, 0xDDEEFF00};
+  uint32x2_t d = {0x1122'3344, 0x5566'7788};
+  uint32x2_t m = {0x99aa'bbcc, 0xddee'ff00};
   uint32x2_t r = vsri_n_u32(d, m, 8);
-  EXPECT_EQ(reinterpret_cast<uint32_t*>(&r)[0], 0x1199AABBu);
-  EXPECT_EQ(reinterpret_cast<uint32_t*>(&r)[1], 0x55DDEEFFu);
+  EXPECT_EQ(reinterpret_cast<uint32_t*>(&r)[0], 0x1199'aabbU);
+  EXPECT_EQ(reinterpret_cast<uint32_t*>(&r)[1], 0x55dd'eeffU);
 
-  uint64x2_t a = {0x1122334455667788, 0x8877665544332211};
-  uint64x2_t b = {0x99AABBCCDDEEFF00, 0x00FFEEDDCCBBAA99};
+  uint64x2_t a = {0x1122'3344'5566'7788, 0x8877'6655'4433'2211};
+  uint64x2_t b = {0x99aa'bbcc'ddee'ff00, 0x00ff'eedd'ccbb'aa99};
   uint64x2_t c = vsriq_n_u64(a, b, 40);
-  EXPECT_EQ(reinterpret_cast<uint64_t*>(&c)[0], 0x112233445599AABBu);
-  EXPECT_EQ(reinterpret_cast<uint64_t*>(&c)[1], 0x887766554400FFEEu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&c)[0], 0x1122'3344'5599'aabbU);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&c)[1], 0x8877'6655'4400'ffeeU);
 }
 
 TEST(Neon, VTBL) {

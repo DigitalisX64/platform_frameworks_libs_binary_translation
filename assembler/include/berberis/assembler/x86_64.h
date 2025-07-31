@@ -155,13 +155,13 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
   void Call(const void* target) {
     // There are no call instruction with properties we need thus we emulate it.
     // This is what the following code looks like when decoded with objdump (if
-    // target address is 0x123456789abcdef0):
+    // target address is 0x1234'5678'9abc'def0):
     //   0: ff 15 02 00 00 00        callq  *0x2(%rip) # 0x8
     //   6: eb 08                    jmp    0x10
-    //   8: f0 de bc 9a 78 56 34 12  lock fidivrs 0x12345678(%rdx,%rbx,4)
+    //   8: f0 de bc 9a 78 56 34 12  lock fidivrs 0x1234'5678(%rdx,%rbx,4)
     // First we do call - with address taken from last 8 bytes, then we jump over
     // these 8 bytes.
-    Emit64(0x08eb0000000215ff);
+    Emit64(0x08eb'0000'0002'15ff);
     Emit64(bit_cast<int64_t>(target));
   }
 
@@ -183,17 +183,17 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
     } else if (cc == Condition::kNever) {
       return;
     }
-    CHECK_EQ(0, static_cast<uint8_t>(cc) & 0xF0);
+    CHECK_EQ(0, static_cast<uint8_t>(cc) & 0xf0);
     // There are no Jcc instruction with properties we need thus we emulate it.
     // This is what the following code looks like when decoded with objdump (if
-    // target address is 0x123456789abcdef0):
+    // target address is 0x1234'5678'9abc'def0):
     //   0: 75 0e                   jne    0x10
     //   2: ff 25 00 00 00 00       jmpq   *0x0(%rip) # 0x8
-    //   8: f0 de bc 9a 78 56 34 12 lock fidivrs 0x12345678(%rdx,%rbx,4)
+    //   8: f0 de bc 9a 78 56 34 12 lock fidivrs 0x1234'5678(%rdx,%rbx,4)
     // We are doing relative jump for the inverted condition (because Jcc could
     // only jump ±2GiB and in 64 bit mode which is not enough to reach arbitrary
     // address), then jmpq with address stored right after jmpq.
-    Emit64(0x0000000025ff'0e70 | static_cast<int8_t>(ToReverseCond(cc)));
+    Emit64(0x0000'0000'25ff'0e70 | static_cast<int8_t>(ToReverseCond(cc)));
     Emit64(bit_cast<int64_t>(target));
   }
 
@@ -232,13 +232,13 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
   void Jmp(uintptr_t target) {
     // There are no jump instruction with properties we need thus we emulate it.
     // This is what the following code looks like when decoded with objdump (if
-    // target address is 0x123456789abcdef0):
+    // target address is 0x1234'5678'9abc'def0):
     //   0: ff 25 00 00 00 00       jmpq   *0x0(%rip) # 0x6
-    //   6: f0 de bc 9a 78 56 34 12 lock fidivrs 0x12345678(%rdx,%rbx,4)
+    //   6: f0 de bc 9a 78 56 34 12 lock fidivrs 0x1234'5678(%rdx,%rbx,4)
     // We are doing jump to the address stored right after jmpq using %rip-relative
     // addressing (with offset 0).
     Emit16(0x25ff);
-    Emit32(0x00000000);
+    Emit32(0x0000'0000);
     Emit64(bit_cast<int64_t>(target));
   }
 
@@ -408,7 +408,7 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
         vex2 ^= (ArgumentByType<1, IsRegister>(arguments...).num_ & 0b1000) << 2;
       }
     }
-    if (byte1 == 0xC4 && (vex2 & 0b0'1'1'11111) == 0b0'1'1'00001 && (byte3 & 0b1'0000'0'00) == 0) {
+    if (byte1 == 0xc4 && (vex2 & 0b0'1'1'11111) == 0b0'1'1'00001 && (byte3 & 0b1'0000'0'00) == 0) {
       Emit16((0xc5 | ((vex2 & 0b1'0'0'00000) << 8) | (byte3 << 8) |
               0b0'1111'000'00000000) ^ (vvvv << 11));
     } else {
@@ -424,13 +424,13 @@ class Assembler : public x86_32_or_x86_64::Assembler<Assembler> {
 
   template <typename ArgumentType1, typename ArgumentType2>
   void EmitModRM(ArgumentType1 argument1, ArgumentType2 argument2) {
-    Emit8(0xC0 | ((argument1.num_ & 0b111) << 3) | (argument2.num_ & 0b111));
+    Emit8(0xc0 | ((argument1.num_ & 0b111) << 3) | (argument2.num_ & 0b111));
   }
 
   template <typename ArgumentType>
   void EmitModRM(uint8_t opcode_extension, ArgumentType argument) {
     CHECK_LE(opcode_extension, 0b111);
-    Emit8(0xC0 | (opcode_extension << 3) | (argument.num_ & 0b111));
+    Emit8(0xc0 | (opcode_extension << 3) | (argument.num_ & 0b111));
   }
 
   template <typename ArgumentType>
@@ -509,7 +509,7 @@ template <size_t kImmediatesSize>
 constexpr inline void Assembler::EmitRipOp(int num_, const Label& label) {
   Emit8(0x05 | (num_ << 3));
   jumps_.push_back(Jump{&label, pc(), false});
-  Emit32(0xfffffffc - kImmediatesSize);
+  Emit32(0xffff'fffc - kImmediatesSize);
 }
 
 template <typename ArgType, void (AssemblerBase::* EmitBase)(ArgType)>
@@ -576,34 +576,34 @@ constexpr inline void Assembler::Vmovaps(YMMRegister arg0, YMMRegister arg1) {
 
 constexpr inline void Assembler::Vmovdqa(XMMRegister arg0, XMMRegister arg1) {
   if (IsSwapProfitable(arg1, arg0)) {
-    return EmitInstruction<0xc4, 0x01, 0x01, 0x7F>(VectorRegister128Bit(arg1),
+    return EmitInstruction<0xc4, 0x01, 0x01, 0x7f>(VectorRegister128Bit(arg1),
                                                    VectorRegister128Bit(arg0));
   }
-  EmitInstruction<0xc4, 0x01, 0x01, 0x6F>(VectorRegister128Bit(arg0), VectorRegister128Bit(arg1));
+  EmitInstruction<0xc4, 0x01, 0x01, 0x6f>(VectorRegister128Bit(arg0), VectorRegister128Bit(arg1));
 }
 
 constexpr inline void Assembler::Vmovdqa(YMMRegister arg0, YMMRegister arg1) {
   if (IsSwapProfitable(arg1, arg0)) {
-    return EmitInstruction<0xc4, 0x01, 0x05, 0x7F>(VectorRegister256Bit(arg1),
+    return EmitInstruction<0xc4, 0x01, 0x05, 0x7f>(VectorRegister256Bit(arg1),
                                                    VectorRegister256Bit(arg0));
   }
-  EmitInstruction<0xc4, 0x01, 0x05, 0x6F>(VectorRegister256Bit(arg0), VectorRegister256Bit(arg1));
+  EmitInstruction<0xc4, 0x01, 0x05, 0x6f>(VectorRegister256Bit(arg0), VectorRegister256Bit(arg1));
 }
 
 constexpr inline void Assembler::Vmovdqu(XMMRegister arg0, XMMRegister arg1) {
   if (IsSwapProfitable(arg1, arg0)) {
-    return EmitInstruction<0xc4, 0x01, 0x02, 0x7F>(VectorRegister128Bit(arg1),
+    return EmitInstruction<0xc4, 0x01, 0x02, 0x7f>(VectorRegister128Bit(arg1),
                                                    VectorRegister128Bit(arg0));
   }
-  EmitInstruction<0xc4, 0x01, 0x02, 0x6F>(VectorRegister128Bit(arg0), VectorRegister128Bit(arg1));
+  EmitInstruction<0xc4, 0x01, 0x02, 0x6f>(VectorRegister128Bit(arg0), VectorRegister128Bit(arg1));
 }
 
 constexpr inline void Assembler::Vmovdqu(YMMRegister arg0, YMMRegister arg1) {
   if (IsSwapProfitable(arg1, arg0)) {
-    return EmitInstruction<0xc4, 0x01, 0x06, 0x7F>(VectorRegister256Bit(arg1),
+    return EmitInstruction<0xc4, 0x01, 0x06, 0x7f>(VectorRegister256Bit(arg1),
                                                    VectorRegister256Bit(arg0));
   }
-  EmitInstruction<0xc4, 0x01, 0x06, 0x6F>(VectorRegister256Bit(arg0), VectorRegister256Bit(arg1));
+  EmitInstruction<0xc4, 0x01, 0x06, 0x6f>(VectorRegister256Bit(arg0), VectorRegister256Bit(arg1));
 }
 
 constexpr inline void Assembler::Vmovsd(XMMRegister arg0, XMMRegister arg1, XMMRegister arg2) {

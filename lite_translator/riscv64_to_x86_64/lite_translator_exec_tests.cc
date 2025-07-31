@@ -57,7 +57,7 @@ class Riscv64LiteTranslatorExecTest : public ::testing::Test {
 
  protected:
   // Upper 16-bits must be zero in a valid address.
-  constexpr static GuestAddr kStartGuestAddr = 0x0000aaaabbbbccccULL;
+  constexpr static GuestAddr kStartGuestAddr = 0x0000'aaaa'bbbb'ccccULL;
   ThreadState state_;
   LiteTranslator translator_;
 };
