@@ -232,6 +232,13 @@ class MacroAssembler : public Assembler {
     Bind(out);
   }
 
+  // src: USE, tmp: DEF, dst: DEF
+  constexpr void NonLinearIntrinsicWithTmpAndZeroExtendedOutput(Register src,
+                                                                [[maybe_unused]] Register tmp,
+                                                                Register dst) {
+    Movl(dst, src);
+  }
+
   // dst: USE_DEF, src1: USE
   constexpr void IntrinsicUsesDefXMMRegisterBeforeDefining(XMMRegister dst, XMMRegister src1) {
     Haddpd(dst, src1);
@@ -746,6 +753,26 @@ TEST(VerifierAssembler, TestECXOutputWithNoZeroExtensionBindedToOutputNonLinearI
 
   ASSERT_DEATH(VerifyIntrinsic<IntrinsicBindingInfo>(),
                "error: intrinsic didn't zero extend 32 bit ECX output");
+}
+
+TEST(VerifierAssembler, VerifierAssemblerChecksCorrectRegistersAreZeroExtended) {
+  using IntrinsicBindingInfo = IntrinsicBindingInfo<
+      kBindingName,
+      NoNansOperation,
+      std::tuple<uint32_t>,
+      std::tuple<uint32_t>,
+      std::tuple<InArg<0>, TmpArg, OutArg<0>>,
+      DeviceInsnInfo<
+          &std::tuple_element_t<0, Assemblers>::NonLinearIntrinsicWithTmpAndZeroExtendedOutput,
+          kBindingMnemo,
+          false,
+          nullptr,
+          NoCPUIDRestriction,
+          std::tuple<Operand<GeneralReg32, kUse>,
+                     Operand<GeneralReg32, kDef>,
+                     Operand<GeneralReg32, kDef>>>>;
+
+  VerifyIntrinsic<IntrinsicBindingInfo>();
 }
 
 TEST(VerifierAssembler, TestDefXMMRegisterUsedBeforeDefinedIntrinsic) {
