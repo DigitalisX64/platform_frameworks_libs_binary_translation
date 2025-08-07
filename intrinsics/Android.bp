@@ -256,7 +256,10 @@ cc_binary_host {
                 "libberberis_verifier_assembler_gen_headers_x86_64",
             ],
             header_libs: ["libberberis_macro_assembler_headers_riscv64_to_x86_64"],
-            static_libs: ["libberberis_macro_assembler_riscv64_to_x86_64"],
+            static_libs: [
+                "libberberis_base",
+                "libberberis_macro_assembler_riscv64_to_x86_64",
+            ],
         },
     },
 }

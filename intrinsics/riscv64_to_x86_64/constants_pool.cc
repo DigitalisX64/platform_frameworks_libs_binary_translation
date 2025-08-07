@@ -363,13 +363,14 @@ const MacroAssemblerConstants kBerberisMacroAssemblerConstants;
 namespace {
 
 int32_t GetConstants() {
+  static void* addr = MmapImplOrDie({
+      .size = AlignUpPageSize(sizeof(MacroAssemblerConstants)),
+      .prot = PROT_READ | PROT_WRITE,
+      .flags = MAP_PRIVATE | MAP_ANONYMOUS,
+      .berberis_flags = kMmapBerberis32Bit,
+  });
   static const MacroAssemblerConstants* Constants =
-      new (mmap(nullptr,
-                AlignUpPageSize(sizeof(MacroAssemblerConstants)),
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT,
-                -1,
-                0)) MacroAssemblerConstants(kBerberisMacroAssemblerConstants);
+      new (addr) MacroAssemblerConstants(kBerberisMacroAssemblerConstants);
   // Note that we are returning only 32-bit address here, but it's guaranteed to
   // be enough since struct is in low memory because of MAP_32BIT flag.
   return bit_cast<intptr_t>(Constants);

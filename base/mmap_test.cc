@@ -35,7 +35,7 @@ TEST(MmapTest, kMmapImpl_MmapBerberis32Bit) {
                              .prot = PROT_READ | PROT_WRITE,
                              .flags = MAP_PRIVATE | MAP_ANONYMOUS,
                              .berberis_flags = kMmapBerberis32Bit});
-    ASSERT_NE(result, MAP_FAILED);
+    ASSERT_NE(result, MAP_FAILED) << "iteration " << i;
     *bit_cast<uint64_t*>(result) = 42;
     ASSERT_EQ(*bit_cast<uint64_t*>(result), 42UL);
   }
