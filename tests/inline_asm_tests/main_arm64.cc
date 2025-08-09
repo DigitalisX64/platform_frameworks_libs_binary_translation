@@ -7863,6 +7863,11 @@ TEST(Arm64InsnTest, SignedSaturatingRoundingShiftRightNarrowInt16x8) {
   auto [res2, fpsr2] = AsmSqrshrn(arg2);
   ASSERT_EQ(res2, MakeUInt128(0x7f80'7f45'7f7f'7f7fULL, 0x0000'0000'0000'0000ULL));
   ASSERT_TRUE(IsQcBitSet(fpsr2));
+
+  __uint128_t arg3 = MakeUInt128(0x0000'0000'0000'8000ULL, 0x0000'0000'0000'0000ULL);
+  auto [res3, fpsr3] = AsmSqrshrn(arg3);
+  ASSERT_EQ(res3, MakeUInt128(0x0000'0000'0000'0080ULL, 0x0000'0000'0000'0000ULL));
+  ASSERT_TRUE(IsQcBitSet(fpsr3));
 }
 
 TEST(Arm64InsnTest, SignedSaturatingRoundingShiftRightNarrowInt16x8Upper) {
