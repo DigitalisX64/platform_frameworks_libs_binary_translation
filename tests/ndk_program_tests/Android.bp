@@ -133,6 +133,7 @@ cc_defaults {
                 "arm64/handle_not_executable_test.cc",
                 "arm64/runtime_code_patching_test.cc",
                 "arm64/sigill_test.cc",
+                "arm64/setjmp_test.cc",
             ],
         },
     },

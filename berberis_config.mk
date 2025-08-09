@@ -38,6 +38,7 @@ BERBERIS_PRODUCT_PACKAGES_RISCV64_TO_X86_64 := \
     libberberis_proxy_libc \
     libberberis_proxy_libcamera2ndk \
     libberberis_proxy_libjnigraphics \
+    libberberis_proxy_libm \
     libberberis_proxy_libmediandk \
     libberberis_proxy_libnativehelper \
     libberberis_proxy_libnativewindow \
@@ -77,6 +78,7 @@ BERBERIS_DISTRIBUTION_ARTIFACTS_RISCV64 := \
     system/lib64/libberberis_proxy_libc.so \
     system/lib64/libberberis_proxy_libcamera2ndk.so \
     system/lib64/libberberis_proxy_libjnigraphics.so \
+    system/lib64/libberberis_proxy_libm.so \
     system/lib64/libberberis_proxy_libmediandk.so \
     system/lib64/libberberis_proxy_libnativehelper.so \
     system/lib64/libberberis_proxy_libnativewindow.so \

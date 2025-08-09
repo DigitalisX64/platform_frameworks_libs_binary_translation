@@ -491,6 +491,11 @@ std::unique_ptr<TypeInfo> ParseBaseType(const nogrod::DwarfDie* die) {
       prefix = "bool";
       is_signed = false;
       break;
+    case DW_ATE_complex_float:
+      kind = "complex";
+      prefix = "complex";
+      is_signed = true;
+      break;
     case DW_ATE_float:
       kind = "float";
       prefix = "float";
