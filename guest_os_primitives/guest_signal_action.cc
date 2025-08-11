@@ -53,7 +53,7 @@ void ConvertHostSigactionToGuest(const HostStructSigaction* host_sa, Guest_sigac
     // Recognize canonical (kernel-provided) x86 handlers.
     // ATTENTION: kernel tolerates the case when SA_RESTORER is set but sa_restorer is null!
     if (host_sa->sa_restorer) {
-      const char* handler = bit_cast<const char*>(host_sa->sa_restorer);
+      [[maybe_unused]] const char* handler = bit_cast<const char*>(host_sa->sa_restorer);
 #if defined(__i386__)
       if ((memcmp(handler, "\x58\xb8\x77\x00\x00\x00\xcd\x80", 8) != 0) &&  // x86 sigreturn
           (memcmp(handler, "\xb8\xad\x00\x00\x00\xcd\x80", 7) != 0)) {      // x86 rt_sigreturn

@@ -34,9 +34,6 @@ namespace berberis {
 
 namespace {
 
-// Syntax sugar.
-GuestCodeEntry::Kind kSpecialHandler = GuestCodeEntry::Kind::kSpecialHandler;
-
 // Use aligned address of this variable as the default stop address for guest execution.
 // It should never coincide with any guest address or address of a wrapped host symbol.
 // Unwinder might examine nearby insns.

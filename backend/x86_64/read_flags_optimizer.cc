@@ -389,7 +389,6 @@ bool RemoveRegs(MachineRegVector& remove_from_regs, const MachineRegVector& regs
 void RemoveReadFlags(MachineIR* machine_ir, ReadFlagsOptContext context) {
   auto insn_it = context.readflags_insn;
   auto flags_reg = (*insn_it)->RegAt(0);
-  MachineReg flags_register = (*insn_it)->RegAt(1);
   // Delete READFLAGS instruction
   context.bb->insn_list().erase(insn_it);
 

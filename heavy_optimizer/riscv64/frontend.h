@@ -638,7 +638,7 @@ HeavyOptimizerFrontend::GetCsr<CsrName::kFCsr>() {
   auto [csr_reg] = Gen<x86_64::MovzxbqRegOp>(
       {.base = x86_64::kMachineRegRBP, .disp = kCsrFieldOffset<CsrName::kFrm>});
   auto [shifted_reg, shl_flags] = Gen<x86_64::ShlbRegImm, kNoSSA>(csr_reg, 5);
-  auto [ored_reg, or_flags] = Gen<x86_64::OrbRegReg>(csr_reg, tmp);
+  auto [ored_reg, or_flags] = Gen<x86_64::OrbRegReg>(shifted_reg, tmp);
   return ored_reg;
 }
 
