@@ -4322,6 +4322,12 @@ TEST(Arm64InsnTest, RoundingShiftRightNarrowI16x8Upper) {
   ASSERT_EQ(res, MakeUInt128(0x2103'0986'0409'2717ULL, 0x569d'dd59'c51e'c619ULL));
 }
 
+TEST(Arm64InsnTest, RoundingShiftRightNarrowI32x4) {
+  __uint128_t arg = MakeUInt128(0x9303'7746'8809'9929ULL, 0x6877'5824'4104'7878ULL);
+  __uint128_t res = ASM_INSN_WRAP_FUNC_W_RES_W_ARG("rshrn %0.4h, %1.4s, #2")(arg);
+  ASSERT_EQ(res, MakeUInt128(0xd609'1e1e'ddd2'664aULL, 0x0000'0000'0000'0000ULL));
+}
+
 TEST(Arm64InsnTest, AddInt64x1) {
   __uint128_t arg1 = MakeUInt128(0x0080'0000'0000'0003ULL, 0xdead'beef'0123'4567ULL);
   __uint128_t arg2 = MakeUInt128(0x0080'0000'0000'0005ULL, 0x0123'dead'beef'4567ULL);
