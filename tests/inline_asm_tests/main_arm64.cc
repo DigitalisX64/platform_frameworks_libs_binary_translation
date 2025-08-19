@@ -3473,6 +3473,19 @@ TEST(Arm64InsnTest, MulAddFp64Precision) {
   ASSERT_EQ(res, bit_cast<uint64_t>(0x1.7ffffffffffff8p1023));
 }
 
+TEST(Arm64InsnTest, MulAddI64) {
+  uint64_t arg1 = 12345;
+  uint64_t arg2 = 67890;
+  uint64_t arg3 = 100;
+  int64_t res;
+  asm("madd %0, %1, %2, %3" : "=r"(res) : "r"(arg1), "r"(arg2), "r"(arg3));
+  ASSERT_EQ(res, 838102150);
+
+  // mul is an alias for madd with the zero register.
+  asm("mul %0, %1, %2" : "=r"(res) : "r"(arg1), "r"(arg2));
+  ASSERT_EQ(res, 838102050);
+}
+
 TEST(Arm64InsnTest, NegMulAddFp32) {
   constexpr auto AsmFnmadd = ASM_INSN_WRAP_FUNC_W_RES_WWW_ARG("fnmadd %s0, %s1, %s2, %s3");
 
@@ -3664,6 +3677,18 @@ TEST(Arm64InsnTest, MulSubF64IndexedElem) {
   __uint128_t arg3 = MakeF64x2(6.0, 7.0f);
   // 6 - (2 * 1)
   ASSERT_EQ(AsmFmls(arg1, arg2, arg3), bit_cast<uint64_t>(4.0));
+}
+
+TEST(Arm64InsnTest, MulSubI64) {
+  uint64_t arg1 = 12345;
+  uint64_t arg2 = 67890;
+  uint64_t arg3 = 100;
+  int64_t res;
+  asm("msub %0, %1, %2, %3" : "=r"(res) : "r"(arg1), "r"(arg2), "r"(arg3));
+  ASSERT_EQ(res, -838101950);
+
+  asm("msub %0, %1, %2, xzr" : "=r"(res) : "r"(arg1), "r"(arg2));
+  ASSERT_EQ(res, -838102050);
 }
 
 TEST(Arm64InsnTest, CompareEqualF32) {
