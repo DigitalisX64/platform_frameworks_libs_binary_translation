@@ -56,6 +56,8 @@ class DefMap {
   }
   void ProcessInsn(MachineInsnList::iterator insn_it);
   void Initialize();
+  std::tuple<std::optional<MachineInsnList::iterator>, int, int> FindNonPseudoCopyDef(
+      MachineReg src_reg) const;
 
  private:
   void Set(MachineReg reg, MachineInsnList::iterator insn_it, int reg_pos) {
@@ -87,8 +89,6 @@ class InsnFolding {
   MachineIR* machine_ir_;
   std::optional<uint64_t> GetImmValueIfPossible(MachineReg reg) const;
   bool IsWritingSameFlagsValue(MachineInsnList::iterator insn_it) const;
-  std::tuple<std::optional<MachineInsnList::iterator>, int, int> FindNonPseudoCopyDef(
-      MachineReg src_reg) const;
   template <bool kIsInput64Bit>
   std::tuple<FoldingType, berberis::MachineInsn*> TryFoldImmediateInput(
       MachineInsnList::iterator insn_it);
@@ -105,6 +105,11 @@ class InsnFolding {
                                                            uint64_t imm1,
                                                            uint64_t imm2);
 };
+
+MachineInsnList::iterator ExecuteInsnFold(MachineInsnList& insn_list,
+                                          MachineInsnList::iterator folded_insn_it,
+                                          berberis::MachineInsn* new_insn,
+                                          FoldingType folding_type);
 
 void FoldInsns(MachineIR* machine_ir);
 

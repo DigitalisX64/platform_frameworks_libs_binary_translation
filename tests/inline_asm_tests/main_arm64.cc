@@ -51,6 +51,15 @@ TEST(Arm64InsnTest, BitfieldRightInsertion) {
   ASSERT_EQ(res, 0x1668'0391'8093'7734ULL);
 }
 
+TEST(Arm64InsnTest, Lsr) {
+  uint64_t arg = 0x3276'5618'0937'7344ULL;
+  uint64_t res = 0x1668'0396'2657'9787ULL;
+
+  asm("lsr %0, %1, #4" : "=r"(res) : "r"(arg));
+
+  ASSERT_EQ(res, 0x0327'6561'8093'7734ULL);
+}
+
 TEST(Arm64InsnTest, MoveImmToFp32) {
   // The tests below verify that fmov works with various immediates.
   // Specifically, the instruction has an 8-bit immediate field consisting of

@@ -56,8 +56,21 @@ void DefMap::Initialize() {
   index_ = 0;
 }
 
+std::tuple<std::optional<MachineInsnList::iterator>, int, int> DefMap::FindNonPseudoCopyDef(
+    MachineReg src_reg) const {
+  auto [def_insn_it, def_insn_pos, reg_pos] = Get(src_reg);
+  while (def_insn_it.has_value()) {
+    const berberis::MachineInsn* def_insn = *def_insn_it.value();
+    if (def_insn->opcode() != kMachineOpPseudoCopy) {
+      return {def_insn_it, def_insn_pos, reg_pos};
+    }
+    std::tie(def_insn_it, def_insn_pos, reg_pos) = Get(def_insn->RegAt(1), def_insn_pos);
+  }
+  return {std::nullopt, 0, 0};
+}
+
 std::optional<uint64_t> InsnFolding::GetImmValueIfPossible(MachineReg reg) const {
-  auto general_insn_it = std::get<0>(FindNonPseudoCopyDef(reg));
+  auto general_insn_it = std::get<0>(def_map_.FindNonPseudoCopyDef(reg));
   if (!general_insn_it.has_value()) {
     return std::nullopt;
   }
@@ -152,24 +165,11 @@ berberis::MachineInsn* InsnFolding::NewImmInsnFromRegInsn(const berberis::Machin
   return folded_insn;
 }
 
-std::tuple<std::optional<MachineInsnList::iterator>, int, int> InsnFolding::FindNonPseudoCopyDef(
-    MachineReg src_reg) const {
-  auto [def_insn_it, def_insn_pos, reg_pos] = def_map_.Get(src_reg);
-  while (def_insn_it.has_value()) {
-    const berberis::MachineInsn* def_insn = *def_insn_it.value();
-    if (def_insn->opcode() != kMachineOpPseudoCopy) {
-      return {def_insn_it, def_insn_pos, reg_pos};
-    }
-    std::tie(def_insn_it, def_insn_pos, reg_pos) = def_map_.Get(def_insn->RegAt(1), def_insn_pos);
-  }
-  return {std::nullopt, 0, 0};
-}
-
 bool InsnFolding::IsWritingSameFlagsValue(MachineInsnList::iterator write_flags_insn_it) const {
   const berberis::MachineInsn* write_flags_insn = *write_flags_insn_it;
   CHECK(write_flags_insn && write_flags_insn->opcode() == kMachineOpPseudoWriteFlags);
   MachineReg src_reg = write_flags_insn->RegAt(0);
-  auto [def_insn_it, def_insn_pos, _] = FindNonPseudoCopyDef(src_reg);
+  auto [def_insn_it, def_insn_pos, _] = def_map_.FindNonPseudoCopyDef(src_reg);
   if (!def_insn_it.has_value()) {
     return false;
   }
@@ -316,7 +316,7 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldRedundantMov
   const berberis::MachineInsn* insn = *insn_it;
   CHECK_EQ(insn->opcode(), kMachineOpMovlRegReg);
   auto src = insn->RegAt(1);
-  auto [def_insn_it, def_insn_pos, def_reg_pos] = FindNonPseudoCopyDef(src);
+  auto [def_insn_it, def_insn_pos, def_reg_pos] = def_map_.FindNonPseudoCopyDef(src);
   if (!def_insn_it.has_value()) {
     return {FoldingType::kImpossible, nullptr};
   }
@@ -350,7 +350,7 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldCountLeading
                       : kMachineOpCountLeadingZerosU32;
   CHECK_EQ(insn->opcode(), clz_insn_opcode);
   MachineReg clz_src_reg = insn->RegAt(1);
-  auto [def_insn_it, def_insn_pos, _] = FindNonPseudoCopyDef(clz_src_reg);
+  auto [def_insn_it, def_insn_pos, _] = def_map_.FindNonPseudoCopyDef(clz_src_reg);
   if (!def_insn_it.has_value()) {
     return {FoldingType::kImpossible, nullptr};
   }
@@ -470,6 +470,25 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldInsn(
   return {FoldingType::kImpossible, nullptr};
 }
 
+MachineInsnList::iterator ExecuteInsnFold(MachineInsnList& insn_list,
+                                          MachineInsnList::iterator folded_insn_it,
+                                          berberis::MachineInsn* new_insn,
+                                          FoldingType folding_type) {
+  if (folding_type == FoldingType::kRemoveInsn) {
+    folded_insn_it = insn_list.erase(folded_insn_it);
+    return folded_insn_it;
+  } else if (folding_type == FoldingType::kReplaceInsn) {
+    CHECK(new_insn);
+    *folded_insn_it = new_insn;
+    return folded_insn_it;
+  } else if (folding_type == FoldingType::kInsertInsn) {
+    CHECK(new_insn);
+    insn_list.insert(std::next(folded_insn_it), new_insn);
+    return folded_insn_it;
+  }
+  FATAL("Unsupported folding type %d", folding_type);
+}
+
 void FoldInsns(MachineIR* machine_ir) {
   DefMap def_map(machine_ir->NumVReg(), machine_ir->arena());
   for (auto* bb : machine_ir->bb_list()) {
@@ -478,22 +497,13 @@ void FoldInsns(MachineIR* machine_ir) {
     MachineInsnList& insn_list = bb->insn_list();
     for (auto insn_it = insn_list.begin(); insn_it != insn_list.end();) {
       auto [folding_type, new_insn] = insn_folding.TryFoldInsn(insn_it, bb);
-      if (folding_type == FoldingType::kRemoveInsn) {
-        insn_it = insn_list.erase(insn_it);
-        continue;
+      if (folding_type != FoldingType::kImpossible) {
+        insn_it = ExecuteInsnFold(insn_list, insn_it, new_insn, folding_type);
       }
-
-      if (folding_type == FoldingType::kReplaceInsn) {
-        CHECK(new_insn);
-        *insn_it = new_insn;
-      } else if (folding_type == FoldingType::kInsertInsn) {
-        CHECK(new_insn);
-        insn_list.insert(std::next(insn_it), new_insn);
-      } else {
-        CHECK(folding_type == FoldingType::kImpossible);
+      if (folding_type != FoldingType::kRemoveInsn) {
+        def_map.ProcessInsn(insn_it);
+        ++insn_it;
       }
-      def_map.ProcessInsn(insn_it);
-      ++insn_it;
     }
   }
 }
