@@ -443,7 +443,6 @@ TEST(InsnFoldingTest, RedundantMovlFoldingCancelledIfNonZeroExtendingInsn) {
   MachineReg vreg1 = machine_ir.AllocVReg();
   MachineReg vreg2 = machine_ir.AllocVReg();
   MachineReg vreg3 = machine_ir.AllocVReg();
-  MachineReg flags = machine_ir.AllocVReg();
 
   builder.StartBasicBlock(bb);
   builder.Gen<PseudoCopy>(vreg2, vreg3, 4);
