@@ -217,7 +217,7 @@ void RemoveRedundantPut(MachineIR* ir) {
 
     seen_get.reset();
     for (auto insn_it = bb->insn_list().rbegin(); insn_it != bb->insn_list().rend();) {
-      if (ir->IsCPUStatePut(*insn_it)) {
+      if (ir->IsCPUStateRegPut(*insn_it)) {
         insn_it = RemovePutIfDead(&analyzer, bb, insn_it, seen_get);
       } else {
         if (ir->IsCPUStateGet(*insn_it)) {

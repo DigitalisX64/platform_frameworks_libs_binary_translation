@@ -66,7 +66,7 @@ inline void CheckPutInsn(berberis::MachineInsn* insn,
                          MachineReg reg,
                          size_t disp) {
   auto put_insn = AsMachineInsnX86_64(insn);
-  EXPECT_TRUE(MachineIR::IsCPUStatePut(put_insn));
+  EXPECT_TRUE(MachineIR::IsCPUStateRegPut(put_insn));
   EXPECT_EQ(put_insn->opcode(), opcode);
   EXPECT_EQ(put_insn->RegAt(1), reg);
   EXPECT_EQ(put_insn->disp(), disp);

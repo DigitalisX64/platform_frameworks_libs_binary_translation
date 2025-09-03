@@ -835,7 +835,7 @@ class MachineIR : public berberis::MachineIR {
     bb_order_ = BasicBlockOrder::kUnordered;
   }
 
-  [[nodiscard]] static bool IsCPUStateGet(berberis::MachineInsn* insn) {
+  [[nodiscard]] static bool IsCPUStateGet(const berberis::MachineInsn* insn) {
     if (insn->opcode() != kMachineOpMovqRegMemBaseDisp &&
         insn->opcode() != kMachineOpMovdqaXRegMemBaseDisp &&
         insn->opcode() != kMachineOpMovwRegMemBaseDisp &&
@@ -862,11 +862,42 @@ class MachineIR : public berberis::MachineIR {
     return x86_insn->RegAt(1) == kCPUStatePointer;
   }
 
-  [[nodiscard]] static bool IsCPUStatePut(berberis::MachineInsn* insn) {
+  [[nodiscard]] static bool IsCPUStateRegPut(const berberis::MachineInsn* insn) {
+    // TODO(b/441767237): Guest Context Optimizers currently don't handle context writes using
+    // an immediate source instead of a register.
     if (insn->opcode() != kMachineOpMovqMemBaseDispReg &&
         insn->opcode() != kMachineOpMovdqaMemBaseDispXReg &&
         insn->opcode() != kMachineOpMovwMemBaseDispReg &&
         insn->opcode() != kMachineOpMovsdMemBaseDispXReg) {
+      return false;
+    }
+
+    auto x86_insn = AsMachineInsnX86_64(insn);
+
+    // Check that it is not for ThreadState fields outside of CPUState.
+    if (x86_insn->disp() >= sizeof(CPUState)) {
+      return false;
+    }
+
+    // reservation_value is loaded in HeavyOptimizerFrontend::AtomicLoad and written
+    // in HeavyOptimizerFrontend::AtomicStore partially (for performance
+    // reasons), which is not supported by our context optimizer.
+    auto reservation_value_offset = offsetof(ThreadState, cpu.reservation_value);
+    if (x86_insn->disp() >= reservation_value_offset &&
+        x86_insn->disp() < reservation_value_offset + sizeof(Reservation)) {
+      return false;
+    }
+
+    return x86_insn->RegAt(0) == kCPUStatePointer;
+  }
+
+  [[nodiscard]] static bool IsCPUStatePut(const berberis::MachineInsn* insn) {
+    if (insn->opcode() != kMachineOpMovqMemBaseDispReg &&
+        insn->opcode() != kMachineOpMovdqaMemBaseDispXReg &&
+        insn->opcode() != kMachineOpMovwMemBaseDispReg &&
+        insn->opcode() != kMachineOpMovsdMemBaseDispXReg &&
+        insn->opcode() != kMachineOpMovqMemBaseDispImm &&
+        insn->opcode() != kMachineOpMovlMemBaseDispImm) {
       return false;
     }
 

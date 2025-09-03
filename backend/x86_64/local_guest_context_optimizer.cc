@@ -17,6 +17,7 @@
 #include "berberis/backend/x86_64/local_guest_context_optimizer.h"
 
 #include <optional>
+#include <variant>
 
 #include "berberis/base/arena_vector.h"
 
@@ -35,8 +36,9 @@ class LocalGuestContextOptimizer {
   void RemoveLocalGuestContextAccesses(const OptimizeLocalParams& params);
 
  private:
+  using MappedValue = std::variant<MachineReg, uint64_t>;
   struct MappedRegUsage {
-    MachineReg reg;
+    MappedValue value;
     std::optional<MachineInsnList::iterator> last_store;
   };
 
@@ -132,13 +134,20 @@ void LocalGuestContextOptimizer::ReplaceGetAndUpdateMap(const MachineInsnList::i
   }
 
   auto copy_size = insn->opcode() == kMachineOpMovdqaXRegMemBaseDisp ? 16 : 8;
-  *insn_it = machine_ir_->NewInsn<PseudoCopy>(dst, mem_reg_map_[disp].value().reg, copy_size);
+  if (std::holds_alternative<MachineReg>(mem_reg_map_[disp].value().value)) {
+    *insn_it = machine_ir_->NewInsn<PseudoCopy>(
+        dst, std::get<MachineReg>(mem_reg_map_[disp].value().value), copy_size);
+  } else {
+    CHECK(insn->opcode() != kMachineOpMovdqaXRegMemBaseDisp &&
+          insn->opcode() != kMachineOpMovsdXRegMemBaseDisp);
+    *insn_it =
+        machine_ir_->NewInsn<MovqRegImm>(dst, std::get<uint64_t>(mem_reg_map_[disp].value().value));
+  }
 }
 
 void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineInsnList& insn_list,
                                                         const MachineInsnList::iterator insn_it) {
   auto* insn = AsMachineInsnX86_64(*insn_it);
-  auto src = insn->RegAt(1);
   auto disp = insn->disp();
 
   if (mem_reg_map_[disp].has_value() && mem_reg_map_[disp].value().last_store.has_value()) {
@@ -147,7 +156,14 @@ void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineInsnList& insn_li
     insn_list.erase(last_store_it);
   }
 
-  mem_reg_map_[disp] = {src, {insn_it}};
+  MappedValue new_value;
+  if (insn->opcode() == kMachineOpMovqMemBaseDispImm ||
+      insn->opcode() == kMachineOpMovlMemBaseDispImm) {
+    new_value = insn->imm();
+  } else {
+    new_value = insn->RegAt(1);
+  }
+  mem_reg_map_[disp] = {new_value, {insn_it}};
 }
 
 }  // namespace

@@ -61,6 +61,37 @@ TEST(MachineIRLocalGuestContextOptimizer, RemoveReadAfterWrite) {
   ASSERT_EQ(load_copy_insn->RegAt(1), replaced_reg);
 }
 
+TEST(MachineIRLocalGuestContextOptimizer, RemoveReadAfterWriteImmediate) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  auto bb = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb);
+  auto reg1 = machine_ir.AllocVReg();
+  builder.GenPutImm(GetThreadStateRegOffset(0), 6);
+  builder.GenGet(reg1, GetThreadStateRegOffset(0));
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  ASSERT_EQ(bb->insn_list().size(), 3UL);
+
+  auto* store_insn = *bb->insn_list().begin();
+  ASSERT_EQ(store_insn->opcode(), kMachineOpMovqMemBaseDispImm);
+  auto disp = x86_64::AsMachineInsnX86_64(store_insn)->disp();
+  ASSERT_EQ(disp, berberis::GetThreadStateRegOffset(0));
+  ASSERT_EQ(store_insn->RegAt(0), x86_64::kMachineRegRBP);
+
+  auto* load_copy_insn = *std::next(bb->insn_list().begin());
+  ASSERT_EQ(load_copy_insn->opcode(), kMachineOpMovqRegImm);
+  ASSERT_EQ(load_copy_insn->RegAt(0), reg1);
+  uint64_t imm = x86_64::AsMachineInsnX86_64(store_insn)->imm();
+  ASSERT_EQ(x86_64::AsMachineInsnX86_64(load_copy_insn)->imm(), imm);
+}
+
 TEST(MachineIRLocalGuestContextOptimizer, RemoveReadAfterRead) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
@@ -91,7 +122,7 @@ TEST(MachineIRLocalGuestContextOptimizer, RemoveReadAfterRead) {
   ASSERT_EQ(copy_insn->RegAt(1), reg1);
 }
 
-TEST(MachineIRLocalGuestContextOptimizer, RemoveWriteAfterWrite) {
+TEST(MachineIRLocalGuestContextOptimizer, RemoveWriteBeforeWrite) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
 
@@ -113,6 +144,70 @@ TEST(MachineIRLocalGuestContextOptimizer, RemoveWriteAfterWrite) {
   ASSERT_EQ(store_insn->opcode(), kMachineOpMovqMemBaseDispReg);
   ASSERT_EQ(x86_64::AsMachineInsnX86_64(store_insn)->disp(), berberis::GetThreadStateRegOffset(0));
   ASSERT_EQ(store_insn->RegAt(1), reg2);
+  ASSERT_EQ(store_insn->RegAt(0), x86_64::kMachineRegRBP);
+}
+
+TEST(MachineIRLocalGuestContextOptimizer, RemoveWriteImmediateBeforeWrite) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  auto bb = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb);
+  auto reg1 = machine_ir.AllocVReg();
+  auto reg2 = machine_ir.AllocVReg();
+  builder.GenPutImm(GetThreadStateRegOffset(0), 5);
+  builder.GenGet(reg2, GetThreadStateRegOffset(0));
+  builder.GenPut(GetThreadStateRegOffset(0), reg1);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  ASSERT_EQ(bb->insn_list().size(), 3UL);
+
+  auto* load_insn = *bb->insn_list().begin();
+  ASSERT_EQ(load_insn->opcode(), kMachineOpMovqRegImm);
+  ASSERT_EQ(load_insn->RegAt(0), reg2);
+  ASSERT_EQ(x86_64::AsMachineInsnX86_64(load_insn)->imm(), 5UL);
+
+  auto* store_insn = *std::next(bb->insn_list().begin());
+  ASSERT_EQ(store_insn->opcode(), kMachineOpMovqMemBaseDispReg);
+  ASSERT_EQ(x86_64::AsMachineInsnX86_64(store_insn)->disp(), berberis::GetThreadStateRegOffset(0));
+  ASSERT_EQ(store_insn->RegAt(1), reg1);
+  ASSERT_EQ(store_insn->RegAt(0), x86_64::kMachineRegRBP);
+}
+
+TEST(MachineIRLocalGuestContextOptimizer, RemoveWriteBeforeWriteImmediate) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  auto bb = machine_ir.NewBasicBlock();
+  builder.StartBasicBlock(bb);
+  auto reg1 = machine_ir.AllocVReg();
+  auto reg2 = machine_ir.AllocVReg();
+  builder.GenPut(GetThreadStateRegOffset(0), reg1);
+  builder.GenGet(reg2, GetThreadStateRegOffset(0));
+  builder.GenPutImm(GetThreadStateRegOffset(0), 5);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
+  ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  ASSERT_EQ(bb->insn_list().size(), 3UL);
+
+  auto* load_insn = *bb->insn_list().begin();
+  ASSERT_EQ(load_insn->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(load_insn->RegAt(0), reg2);
+  ASSERT_EQ(load_insn->RegAt(1), reg1);
+
+  auto* store_insn = *std::next(bb->insn_list().begin());
+  ASSERT_EQ(store_insn->opcode(), kMachineOpMovqMemBaseDispImm);
+  ASSERT_EQ(x86_64::AsMachineInsnX86_64(store_insn)->disp(), berberis::GetThreadStateRegOffset(0));
+  ASSERT_EQ(x86_64::AsMachineInsnX86_64(store_insn)->imm(), 5UL);
   ASSERT_EQ(store_insn->RegAt(0), x86_64::kMachineRegRBP);
 }
 

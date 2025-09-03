@@ -204,7 +204,7 @@ ArenaVector<int> CountGuestRegAccesses(const MachineIR* ir, const Loop* loop) {
   ArenaVector<int> guest_access_count(sizeof(CPUState), 0, ir->arena());
   for (auto* bb : *loop) {
     for (auto* base_insn : bb->insn_list()) {
-      if (ir->IsCPUStateGet(base_insn) || ir->IsCPUStatePut(base_insn)) {
+      if (ir->IsCPUStateGet(base_insn) || ir->IsCPUStateRegPut(base_insn)) {
         auto insn = AsMachineInsnX86_64(base_insn);
         guest_access_count.at(insn->disp())++;
       }
@@ -257,7 +257,7 @@ void OptimizeLoop(MachineIR* machine_ir, Loop* loop, const OptimizeLoopParams& p
   for (auto* bb : *loop) {
     for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); insn_it++) {
       // Skip insn if it accesses regs with low priority
-      if (machine_ir->IsCPUStateGet(*insn_it) || machine_ir->IsCPUStatePut(*insn_it)) {
+      if (machine_ir->IsCPUStateGet(*insn_it) || machine_ir->IsCPUStateRegPut(*insn_it)) {
         auto insn = AsMachineInsnX86_64(*insn_it);
         if (!optimized_offsets.at(insn->disp())) {
           continue;
@@ -265,7 +265,7 @@ void OptimizeLoop(MachineIR* machine_ir, Loop* loop, const OptimizeLoopParams& p
 
         if (machine_ir->IsCPUStateGet(insn)) {
           ReplaceGetAndUpdateMap(machine_ir, insn_it, mem_reg_map);
-        } else if (machine_ir->IsCPUStatePut(insn)) {
+        } else if (machine_ir->IsCPUStateRegPut(insn)) {
           ReplacePutAndUpdateMap(machine_ir, insn_it, mem_reg_map);
         }
       }
