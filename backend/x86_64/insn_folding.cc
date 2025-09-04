@@ -464,139 +464,60 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldCountLeading
 berberis::MachineInsn* InsnFolding::NewArithmeticInsnWithFoldedContextRead(
     const berberis::MachineInsn* insn,
     const berberis::MachineInsn* read_context_insn) {
+  const MemoryOperand mem_op = {
+      .base = kCPUStatePointer,
+      .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())};
   switch (insn->opcode()) {
     case kMachineOpAddqRegReg:
-      return machine_ir_->NewInsn<AddqRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<AddqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpAddlRegReg:
-      return machine_ir_->NewInsn<AddlRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<AddlRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpXorqRegReg:
-      return machine_ir_->NewInsn<XorqRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<XorqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpXorlRegReg:
-      return machine_ir_->NewInsn<XorlRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<XorlRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpOrqRegReg:
-      return machine_ir_->NewInsn<OrqRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<OrqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpOrlRegReg:
-      return machine_ir_->NewInsn<OrlRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<OrlRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpSubqRegReg:
-      return machine_ir_->NewInsn<SubqRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<SubqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpSublRegReg:
-      return machine_ir_->NewInsn<SublRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<SublRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpCmpqRegReg:
-      return machine_ir_->NewInsn<CmpqRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<CmpqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpCmplRegReg:
-      return machine_ir_->NewInsn<CmplRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<CmplRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpAndqRegReg:
-      return machine_ir_->NewInsn<AndqRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<AndqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpAndlRegReg:
-      return machine_ir_->NewInsn<AndlRegOp>(
-          insn->RegAt(0),
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<AndlRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpBtqRegReg:
-      return machine_ir_->NewInsn<BtqOpReg>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(1),
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<BtqOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
     case kMachineOpBtlRegReg:
-      return machine_ir_->NewInsn<BtlOpReg>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(1),
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<BtlOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
     case kMachineOpTestqRegReg:
-      return machine_ir_->NewInsn<TestqOpReg>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(1),
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<TestqOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
     case kMachineOpTestlRegReg:
-      return machine_ir_->NewInsn<TestlOpReg>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          insn->RegAt(1),
-          insn->RegAt(2));
+      return machine_ir_->NewInsn<TestlOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
     case kMachineOpCmpqRegImm:
       return machine_ir_->NewInsn<CmpqOpImm>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          AsMachineInsnX86_64(insn)->imm(),
-          insn->RegAt(1));
+          mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
     case kMachineOpCmplRegImm:
       return machine_ir_->NewInsn<CmplOpImm>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          AsMachineInsnX86_64(insn)->imm(),
-          insn->RegAt(1));
+          mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
     case kMachineOpBtqRegImm:
       return machine_ir_->NewInsn<BtqOpImm>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          AsMachineInsnX86_64(insn)->imm(),
-          insn->RegAt(1));
+          mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
     case kMachineOpBtlRegImm:
       return machine_ir_->NewInsn<BtlOpImm>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          AsMachineInsnX86_64(insn)->imm(),
-          insn->RegAt(1));
+          mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
     case kMachineOpTestqRegImm:
       return machine_ir_->NewInsn<TestqOpImm>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          AsMachineInsnX86_64(insn)->imm(),
-          insn->RegAt(1));
+          mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
     case kMachineOpTestlRegImm:
       return machine_ir_->NewInsn<TestlOpImm>(
-          {.base = kCPUStatePointer,
-           .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())},
-          AsMachineInsnX86_64(insn)->imm(),
-          insn->RegAt(1));
+          mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
     default:
       FATAL("unexpected opcode");
       return nullptr;

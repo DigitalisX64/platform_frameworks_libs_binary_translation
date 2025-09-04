@@ -156,7 +156,6 @@ filegroup {
         "x86_64/read_flags_optimizer.cc",
         "x86_64/rename_copy_uses.cc",
         "x86_64/rename_vregs.cc",
-        "x86_64/rename_vregs_local.cc",
     ],
 }
 
@@ -210,7 +209,6 @@ filegroup {
         "x86_64/read_flags_optimizer_test.cc",
         "x86_64/rename_copy_uses_test.cc",
         "x86_64/rename_vregs_test.cc",
-        "x86_64/rename_vregs_local_test.cc",
     ],
 }
 
