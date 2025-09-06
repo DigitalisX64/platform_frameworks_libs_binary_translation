@@ -426,6 +426,39 @@ TEST(MachineIR, PutsInSuccessorsKillPut) {
   ASSERT_EQ(2u, bb3->insn_list().size());
 }
 
+TEST(MachineIR, PutsInSuccessorsKillPutImm) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  auto* bb1 = machine_ir.NewBasicBlock();
+  auto* bb2 = machine_ir.NewBasicBlock();
+  auto* bb3 = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(bb1, bb2);
+  machine_ir.AddEdge(bb1, bb3);
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  auto vreg = machine_ir.AllocVReg();
+  builder.StartBasicBlock(bb1);
+  builder.GenPutImm(GetThreadStateRegOffset(0), 5);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, bb2, bb3, x86_64::kMachineRegFLAGS);
+
+  builder.StartBasicBlock(bb2);
+  builder.GenPut(GetThreadStateRegOffset(0), vreg);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  builder.StartBasicBlock(bb3);
+  builder.GenPutImm(GetThreadStateRegOffset(0), 6);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+  x86_64::RemoveRedundantPut(&machine_ir);
+  EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  ASSERT_EQ(1u, bb1->insn_list().size());
+  ASSERT_EQ(2u, bb2->insn_list().size());
+  ASSERT_EQ(2u, bb3->insn_list().size());
+}
+
 TEST(MachineIR, PutInOneOfTwoSuccessorsDoesNotKillPut) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);

@@ -157,8 +157,7 @@ void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineInsnList& insn_li
   }
 
   MappedValue new_value;
-  if (insn->opcode() == kMachineOpMovqMemBaseDispImm ||
-      insn->opcode() == kMachineOpMovlMemBaseDispImm) {
+  if (insn->opcode() == kMachineOpMovqMemBaseDispImm) {
     new_value = insn->imm();
   } else {
     new_value = insn->RegAt(1);

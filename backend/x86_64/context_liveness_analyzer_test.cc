@@ -68,6 +68,24 @@ TEST(MachineIRContextLivenessAnalyzerTest, PutKillsLiveIn) {
   CheckBBLiveIn(&analyzer, bb, {0});
 }
 
+TEST(MachineIRContextLivenessAnalyzerTest, PutImmKillsLiveIn) {
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+
+  auto* bb = machine_ir.NewBasicBlock();
+  x86_64::MachineIRBuilder builder(&machine_ir);
+
+  builder.StartBasicBlock(bb);
+  builder.GenPutImm(GetThreadStateRegOffset(0), 5);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  EXPECT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+  x86_64::ContextLivenessAnalyzer analyzer(&machine_ir);
+  analyzer.Init();
+
+  CheckBBLiveIn(&analyzer, bb, {0});
+}
+
 TEST(MachineIRContextLivenessAnalyzerTest, GetRevivesLiveInKilledByPut) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);

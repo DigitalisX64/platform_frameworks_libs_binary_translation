@@ -728,6 +728,53 @@ TEST(MachineIRLoopGuestContextOptimizer, RemovePutInSelfLoop) {
   CheckPutInsn(put_insn, kMachineOpMovqMemBaseDispReg, mapped_reg, GetThreadStateRegOffset(0));
 }
 
+TEST(MachineIRLoopGuestContextOptimizer, RemovePutRegAndPutImmediateInSelfLoop) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  auto* preloop = machine_ir.NewBasicBlock();
+  auto* body = machine_ir.NewBasicBlock();
+  auto* afterloop = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(preloop, body);
+  machine_ir.AddEdge(body, body);
+  machine_ir.AddEdge(body, afterloop);
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+
+  MachineIRBuilder builder(&machine_ir);
+
+  builder.StartBasicBlock(preloop);
+  builder.Gen<PseudoBranch>(body);
+
+  builder.StartBasicBlock(body);
+  builder.GenPut(GetThreadStateRegOffset(0), vreg1);
+  builder.GenPutImm(GetThreadStateRegOffset(0), 10);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, body, afterloop, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(afterloop);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  RemoveLoopGuestContextAccesses(&machine_ir);
+  ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  EXPECT_EQ(preloop->insn_list().size(), 2UL);
+  auto* get_insn = preloop->insn_list().front();
+  EXPECT_EQ(get_insn->opcode(), kMachineOpMovqRegMemBaseDisp);
+  auto mapped_reg = get_insn->RegAt(0);
+  auto disp = AsMachineInsnX86_64(get_insn)->disp();
+  EXPECT_EQ(disp, GetThreadStateRegOffset(0));
+
+  EXPECT_EQ(body->insn_list().size(), 3UL);
+  auto* copy_reg_insn = body->insn_list().front();
+  EXPECT_EQ(CheckCopyPutInsnAndObtainMappedReg(copy_reg_insn, vreg1), mapped_reg);
+  auto* copy_imm_insn = *std::next(body->insn_list().begin());
+  EXPECT_EQ(CheckCopyPutImmInsnAndObtainMappedReg(copy_imm_insn, 10), mapped_reg);
+
+  EXPECT_EQ(afterloop->insn_list().size(), 2UL);
+  auto* put_insn = afterloop->insn_list().front();
+  CheckPutInsn(put_insn, kMachineOpMovqMemBaseDispReg, mapped_reg, GetThreadStateRegOffset(0));
+}
+
 TEST(MachineIRLoopGuestContextOptimizer, RemoveGetInSelfLoop) {
   Arena arena;
   MachineIR machine_ir(&arena);
@@ -907,7 +954,7 @@ TEST(MachineIRLoopGuestContextOptimizer, CountGuestRegAccesses) {
 
   builder.StartBasicBlock(body2);
   builder.GenGet(vreg1, GetThreadStateRegOffset(1));
-  builder.GenPut(GetThreadStateRegOffset(1), vreg1);
+  builder.GenPutImm(GetThreadStateRegOffset(1), 5);
   if (DoesCpuStateHaveDedicatedSimdRegs()) {
     builder.GenSetSimd<16>(GetThreadStateSimdRegOffset(0), vreg2);
   } else if (DoesCpuStateHaveDedicatedVecRegs()) {
@@ -953,7 +1000,7 @@ TEST(MachineIRLoopGuestContextOptimizer, GetOffsetCounters) {
   builder.StartBasicBlock(body2);
   builder.GenGet(vreg1, GetThreadStateRegOffset(2));
   builder.GenPut(GetThreadStateRegOffset(2), vreg1);
-  builder.GenPut(GetThreadStateRegOffset(0), vreg1);
+  builder.GenPutImm(GetThreadStateRegOffset(0), 5);
   builder.Gen<PseudoBranch>(body1);
 
   Loop loop({body1, body2}, machine_ir.arena());

@@ -22,6 +22,7 @@
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
+#include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_arch.h"
 #include "berberis/guest_state/guest_state_opaque.h"
 #include "berberis/runtime_primitives/memory_region_reservation.h"
@@ -745,7 +746,7 @@ Register HeavyOptimizerFrontend::MemoryRegionReservationExchange(Register aligne
   int32_t address_offset = GetThreadStateReservationAddressOffset();
   auto [stored_aligned_addr] =
       Gen<x86_64::MovqRegOp>({.base = x86_64::kMachineRegRBP, .disp = address_offset});
-  Gen<x86_64::MovqOpImm>({.base = x86_64::kMachineRegRBP, .disp = address_offset}, kNullGuestAddr);
+  builder_.GenPutImm(address_offset, kNullGuestAddr);
   // Compare aligned_addr to the one in CPUState.
   builder_.Gen<PseudoCondBranch>(
       x86_64::Assembler::Condition::kNotEqual,

@@ -25,6 +25,7 @@
 
 #include "berberis/base/bit_util.h"
 #include "berberis/base/config.h"  // kGuestPageSize
+#include "berberis/base/config_globals.h"
 #include "berberis/base/forever_alloc.h"
 #include "berberis/base/large_mmap.h"
 #include "berberis/base/mmap.h"
@@ -156,7 +157,9 @@ bool GuestMapShadow::IsExecutable(GuestAddr start, size_t size) const {
 }
 
 void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
-  TRACE("SetExecutable: %zx..%zx", start, start + size);
+  if (!IsConfigFlagSet(kDeterministicTracing)) {
+    TRACE("SetExecutable: %zx..%zx", start, start + size);
+  }
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
   while (pc < end) {
@@ -166,7 +169,9 @@ void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
 }
 
 void GuestMapShadow::ClearExecutable(GuestAddr start, size_t size) {
-  TRACE("ClearExecutable: %zx..%zx", start, start + size);
+  if (!IsConfigFlagSet(kDeterministicTracing)) {
+    TRACE("ClearExecutable: %zx..%zx", start, start + size);
+  }
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
   bool changed = false;
