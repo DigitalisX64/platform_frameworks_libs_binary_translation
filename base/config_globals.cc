@@ -139,6 +139,8 @@ std::string ToString(ConfigFlag flag) {
       return "accurate-sigsegv";
     case kTopByteIgnore:
       return "top-byte-ignore";
+    case kDisableHeavyOptimizations:
+      return "disable-heavy-opts";
     case kDisableRegMap:
       return "disable-reg-map";
     case kDisableAdjacentRegionsTranslation:
