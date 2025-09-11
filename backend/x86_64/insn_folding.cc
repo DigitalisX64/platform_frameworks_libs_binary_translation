@@ -31,7 +31,7 @@ namespace berberis::x86_64 {
 
 void DefMap::MapDefRegs(MachineInsnList::iterator insn_it) {
   const berberis::MachineInsn* insn = *insn_it;
-  if (MachineIR::IsCPUStatePut(insn)) {
+  if (machine_ir_->IsCPUStatePut(insn)) {
     last_context_write_insn_ = index_;
   }
   for (int op = 0; op < insn->NumRegOperands(); ++op) {
@@ -85,7 +85,7 @@ void ContextAccessInfo::HandleRegisterUse(const berberis::MachineInsn* insn, Mac
 }
 
 void ContextAccessInfo::HandleRegisterDef(const berberis::MachineInsn* insn, MachineReg reg) {
-  if (MachineIR::IsCPUStateGet(insn)) {
+  if (machine_ir_->IsCPUStateGet(insn)) {
     MapRegToOffset(reg, AsMachineInsnX86_64(insn)->disp());
     return;
   }
@@ -463,10 +463,31 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldCountLeading
 
 berberis::MachineInsn* InsnFolding::NewArithmeticInsnWithFoldedContextRead(
     const berberis::MachineInsn* insn,
-    const berberis::MachineInsn* read_context_insn) {
-  const MemoryOperand mem_op = {
-      .base = kCPUStatePointer,
-      .disp = static_cast<int32_t>(AsMachineInsnX86_64(read_context_insn)->disp())};
+    int32_t context_read_disp,
+    int32_t mem_reg_pos) {
+  switch (insn->opcode()) {
+    case kMachineOpCmpqRegReg:
+    case kMachineOpCmplRegReg:
+    case kMachineOpTestqRegReg:
+    case kMachineOpTestlRegReg: {
+      CHECK(mem_reg_pos == 0 || mem_reg_pos == 1);
+      break;
+    }
+    case kMachineOpBtqRegImm:
+    case kMachineOpBtlRegImm:
+    case kMachineOpBtqRegReg:
+    case kMachineOpBtlRegReg:
+    case kMachineOpCmpqRegImm:
+    case kMachineOpCmplRegImm:
+    case kMachineOpTestqRegImm:
+    case kMachineOpTestlRegImm: {
+      CHECK(mem_reg_pos == 0);
+      break;
+    }
+    default:
+      CHECK(mem_reg_pos == 1);
+  }
+  const MemoryOperand mem_op = {.base = kCPUStatePointer, .disp = context_read_disp};
   switch (insn->opcode()) {
     case kMachineOpAddqRegReg:
       return machine_ir_->NewInsn<AddqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
@@ -484,10 +505,18 @@ berberis::MachineInsn* InsnFolding::NewArithmeticInsnWithFoldedContextRead(
       return machine_ir_->NewInsn<SubqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpSublRegReg:
       return machine_ir_->NewInsn<SublRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
-    case kMachineOpCmpqRegReg:
+    case kMachineOpCmpqRegReg: {
+      if (mem_reg_pos == 0) {
+        return machine_ir_->NewInsn<CmpqOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
+      }
       return machine_ir_->NewInsn<CmpqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
-    case kMachineOpCmplRegReg:
+    }
+    case kMachineOpCmplRegReg: {
+      if (mem_reg_pos == 0) {
+        return machine_ir_->NewInsn<CmplOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
+      }
       return machine_ir_->NewInsn<CmplRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
+    }
     case kMachineOpAndqRegReg:
       return machine_ir_->NewInsn<AndqRegOp>(insn->RegAt(0), mem_op, insn->RegAt(2));
     case kMachineOpAndlRegReg:
@@ -497,9 +526,15 @@ berberis::MachineInsn* InsnFolding::NewArithmeticInsnWithFoldedContextRead(
     case kMachineOpBtlRegReg:
       return machine_ir_->NewInsn<BtlOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
     case kMachineOpTestqRegReg:
-      return machine_ir_->NewInsn<TestqOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
+      // Test insn has TestMemReg version but no TestRegMem version. However, Test is commutative
+      // and both operands are 'use'. Therefore we can safely swap the operands.
+      return machine_ir_->NewInsn<TestqOpReg>(
+          mem_op, insn->RegAt(mem_reg_pos == 0 ? 1 : 0), insn->RegAt(2));
     case kMachineOpTestlRegReg:
-      return machine_ir_->NewInsn<TestlOpReg>(mem_op, insn->RegAt(1), insn->RegAt(2));
+      // Test insn has TestMemReg version but no TestRegMem version. However, Test is commutative
+      // and both operands are 'use'. Therefore we can safely swap the operands.
+      return machine_ir_->NewInsn<TestlOpReg>(
+          mem_op, insn->RegAt(mem_reg_pos == 0 ? 1 : 0), insn->RegAt(2));
     case kMachineOpCmpqRegImm:
       return machine_ir_->NewInsn<CmpqOpImm>(
           mem_op, AsMachineInsnX86_64(insn)->imm(), insn->RegAt(1));
@@ -525,36 +560,48 @@ berberis::MachineInsn* InsnFolding::NewArithmeticInsnWithFoldedContextRead(
 }
 
 std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldContextRead(
-    MachineInsnList::iterator insn_it) {
-  const berberis::MachineInsn* insn = *insn_it;
-  CHECK(insn->NumRegOperands() == 2 || insn->NumRegOperands() == 3);
-  int arith_src_reg_pos =
-      (insn->opcode() == kMachineOpTestqRegReg || insn->opcode() == kMachineOpTestlRegReg ||
-       insn->opcode() == kMachineOpBtqRegReg || insn->opcode() == kMachineOpBtlRegReg ||
-       insn->NumRegOperands() == 2)
-          ? 0
-          : 1;
-  const MachineReg arith_src_reg = insn->RegAt(arith_src_reg_pos);
+    const berberis::MachineInsn* insn,
+    int32_t mem_reg_pos) {
+  const MachineReg arith_src_reg = insn->RegAt(mem_reg_pos);
   auto [def_insn_it, def_insn_pos, _] = def_map_.FindNonPseudoCopyDef(arith_src_reg);
   if (!def_insn_it.has_value()) {
     return {FoldingType::kImpossible, nullptr};
   }
   const berberis::MachineInsn* def_insn = *def_insn_it.value();
-  if (!MachineIR::IsCPUStateGet(def_insn)) {
+  if (!machine_ir_->IsCPUStateGet(def_insn)) {
     return {FoldingType::kImpossible, nullptr};
   }
   if (!def_map_.IsContextReadActive(def_insn_pos)) {
     return {FoldingType::kImpossible, nullptr};
   }
-  uint32_t def_insn_disp = AsMachineInsnX86_64(def_insn)->disp();
+  int32_t def_insn_disp = AsMachineInsnX86_64(def_insn)->disp();
   if (context_access_info_.GetContextReadUsageCount(def_insn_disp) > 1) {
     // Do not fold this load if the value has multiple users in the basic block.
     // The cost of multiple memory accesses outweighs the benefit of reducing the instruction
     // count. It's better to load once and reuse the register.
     return {FoldingType::kImpossible, nullptr};
   }
-  auto folded_insn = NewArithmeticInsnWithFoldedContextRead(insn, def_insn);
+  auto folded_insn = NewArithmeticInsnWithFoldedContextRead(insn, def_insn_disp, mem_reg_pos);
   return {FoldingType::kReplaceInsn, folded_insn};
+}
+
+template <bool kIsInput64Bit>
+std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldImmediateAndContextReadInputs(
+    MachineInsnList::iterator insn_it) {
+  auto [immediate_folding_type, immediate_folded_insn] =
+      TryFoldImmediateInput<kIsInput64Bit>(insn_it);
+  berberis::MachineInsn* insn_to_context_read_fold =
+      immediate_folding_type == FoldingType::kImpossible ? *insn_it : immediate_folded_insn;
+
+  auto [context_read_folding_type, context_read_folding_insn] =
+      TryFoldContextRead(insn_to_context_read_fold, 0);
+  if (context_read_folding_type != FoldingType::kImpossible) {
+    return {context_read_folding_type, context_read_folding_insn};
+  }
+  if (immediate_folding_type != FoldingType::kImpossible) {
+    return {immediate_folding_type, immediate_folded_insn};
+  }
+  return TryFoldContextRead(insn_to_context_read_fold, 1);
 }
 
 std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldInsn(
@@ -571,15 +618,16 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldInsn(
     case kMachineOpXorqRegReg:
     case kMachineOpOrqRegReg:
     case kMachineOpSubqRegReg:
-    case kMachineOpCmpqRegReg:
-    case kMachineOpTestqRegReg:
     case kMachineOpAndqRegReg: {
       auto [folding_type, folded_insn] = TryFoldImmediateInput<true>(insn_it);
       if (folding_type != FoldingType::kImpossible) {
         return {folding_type, folded_insn};
       }
-      return TryFoldContextRead(insn_it);
+      return TryFoldContextRead(*insn_it, 1);
     }
+    case kMachineOpCmpqRegReg:
+    case kMachineOpTestqRegReg:
+      return TryFoldImmediateAndContextReadInputs<true>(insn_it);
     case kMachineOpBtqRegImm:
     case kMachineOpBtlRegImm:
     case kMachineOpBtqRegReg:
@@ -588,7 +636,7 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldInsn(
     case kMachineOpTestlRegImm:
     case kMachineOpCmpqRegImm:
     case kMachineOpCmplRegImm:
-      return TryFoldContextRead(insn_it);
+      return TryFoldContextRead(*insn_it, 0);
     case kMachineOpMovlRegReg: {
       auto [folding_type, folded_insn] = TryFoldImmediateInput<false>(insn_it);
       if (folding_type != FoldingType::kImpossible) {
@@ -604,15 +652,16 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldInsn(
     case kMachineOpXorlRegReg:
     case kMachineOpOrlRegReg:
     case kMachineOpSublRegReg:
-    case kMachineOpCmplRegReg:
-    case kMachineOpTestlRegReg:
     case kMachineOpAndlRegReg: {
       auto [folding_type, folded_insn] = TryFoldImmediateInput<false>(insn_it);
       if (folding_type != FoldingType::kImpossible) {
         return {folding_type, folded_insn};
       }
-      return TryFoldContextRead(insn_it);
+      return TryFoldContextRead(*insn_it, 1);
     }
+    case kMachineOpCmplRegReg:
+    case kMachineOpTestlRegReg:
+      return TryFoldImmediateAndContextReadInputs<false>(insn_it);
     case kMachineOpPseudoWriteFlags: {
       if (IsWritingSameFlagsValue(insn_it)) {
         return {FoldingType::kRemoveInsn, nullptr};
@@ -668,8 +717,8 @@ MachineInsnList::iterator ExecuteInsnFold(MachineInsnList& insn_list,
 }
 
 void FoldInsns(MachineIR* machine_ir) {
-  ContextAccessInfo context_access_info(machine_ir->NumVReg(), machine_ir->arena());
-  DefMap def_map(machine_ir->NumVReg(), machine_ir->arena());
+  ContextAccessInfo context_access_info(machine_ir);
+  DefMap def_map(machine_ir);
   for (auto* bb : machine_ir->bb_list()) {
     MachineInsnList& insn_list = bb->insn_list();
     context_access_info.Initialize(insn_list);
@@ -686,6 +735,7 @@ void FoldInsns(MachineIR* machine_ir) {
       }
     }
   }
+  machine_ir->SetInsnFoldingExecuted();
 }
 
 // TODO(b/179708579): Maybe combine with FoldInsns.

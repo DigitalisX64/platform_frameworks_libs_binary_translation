@@ -826,7 +826,9 @@ class MachineIR : public berberis::MachineIR {
   };
 
   explicit MachineIR(Arena* arena, int num_vreg = 0)
-      : berberis::MachineIR(arena, num_vreg, 0), bb_order_(BasicBlockOrder::kUnordered) {}
+      : berberis::MachineIR(arena, num_vreg, 0),
+        bb_order_(BasicBlockOrder::kUnordered),
+        insn_folding_executed_(false) {}
 
   void AddEdge(MachineBasicBlock* src, MachineBasicBlock* dst) {
     MachineEdge* edge = NewInArena<MachineEdge>(arena(), arena(), src, dst);
@@ -835,7 +837,12 @@ class MachineIR : public berberis::MachineIR {
     bb_order_ = BasicBlockOrder::kUnordered;
   }
 
-  [[nodiscard]] static bool IsCPUStateGet(const berberis::MachineInsn* insn) {
+  [[nodiscard]] bool IsCPUStateGet(const berberis::MachineInsn* insn) const {
+    // Insn folding can introduce new insns to the IR which read from CPU state. Thus, once insn
+    // folding has been executed IsCPUStateGet calls are no longer valid.
+    if (insn_folding_executed_) {
+      FATAL("IsCPUStateGet called after insn folding.");
+    }
     if (insn->opcode() != kMachineOpMovqRegMemBaseDisp &&
         insn->opcode() != kMachineOpMovdqaXRegMemBaseDisp &&
         insn->opcode() != kMachineOpMovwRegMemBaseDisp &&
@@ -862,7 +869,12 @@ class MachineIR : public berberis::MachineIR {
     return x86_insn->RegAt(1) == kCPUStatePointer;
   }
 
-  [[nodiscard]] static bool IsCPUStatePut(const berberis::MachineInsn* insn) {
+  [[nodiscard]] bool IsCPUStatePut(const berberis::MachineInsn* insn) const {
+    // Insn folding can introduce new insns to the IR which write to CPU state. Thus, once insn
+    // folding has been executed IsCPUStatePut calls are no longer valid.
+    if (insn_folding_executed_) {
+      FATAL("IsCPUStatePut called after insn folding.");
+    }
     if (insn->opcode() != kMachineOpMovqMemBaseDispReg &&
         insn->opcode() != kMachineOpMovdqaMemBaseDispXReg &&
         insn->opcode() != kMachineOpMovwMemBaseDispReg &&
@@ -925,6 +937,8 @@ class MachineIR : public berberis::MachineIR {
 
   void set_bb_order(BasicBlockOrder order) { bb_order_ = order; }
 
+  void SetInsnFoldingExecuted() { insn_folding_executed_ = true; }
+
   using berberis::MachineIR::NewInsn;
 
   template <typename T, typename... Args>
@@ -943,6 +957,7 @@ class MachineIR : public berberis::MachineIR {
 
  private:
   BasicBlockOrder bb_order_;
+  bool insn_folding_executed_;
 };
 
 }  // namespace x86_64

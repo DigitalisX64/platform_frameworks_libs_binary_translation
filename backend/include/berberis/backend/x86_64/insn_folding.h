@@ -31,8 +31,9 @@ enum class FoldingType { kImpossible, kReplaceInsn, kInsertInsn, kRemoveInsn };
 // It also contains the index of the last insn which accessed memory.
 class DefMap {
  public:
-  DefMap(size_t size, Arena* arena)
-      : def_map_(size, {std::nullopt, 0, 0}, arena),
+  DefMap(MachineIR* machine_ir)
+      : def_map_(machine_ir->NumVReg(), {std::nullopt, 0, 0}, machine_ir->arena()),
+        machine_ir_(machine_ir),
         flags_reg_(kInvalidMachineReg),
         index_(0),
         last_context_write_insn_(0) {}
@@ -84,6 +85,7 @@ class DefMap {
   // - The index of the instruction that defines the register
   // - The position of the register in the instruction that defines it
   ArenaVector<std::tuple<std::optional<MachineInsnList::iterator>, int, int>> def_map_;
+  MachineIR* machine_ir_;
   MachineReg flags_reg_;
   int index_;
   int last_context_write_insn_;
@@ -94,9 +96,10 @@ class DefMap {
 // used by subsequent instructions.
 class ContextAccessInfo {
  public:
-  ContextAccessInfo(size_t size, Arena* arena)
-      : reg_to_offset_map_(size, std::nullopt, arena),
-        context_read_usage_map_(sizeof(CPUState), {0}, arena) {}
+  ContextAccessInfo(MachineIR* machine_ir)
+      : machine_ir_(machine_ir),
+        reg_to_offset_map_(machine_ir->NumVReg(), std::nullopt, machine_ir->arena()),
+        context_read_usage_map_(sizeof(CPUState), {0}, machine_ir->arena()) {}
 
   [[nodiscard]] uint32_t GetContextReadUsageCount(uint32_t disp) const {
     return context_read_usage_map_.at(disp);
@@ -133,6 +136,7 @@ class ContextAccessInfo {
 
   void HandleRegisterDef(const berberis::MachineInsn* insn, MachineReg reg);
 
+  MachineIR* machine_ir_;
   // reg_to_offset_map_[i] contains the offset of the context read stored in register i, or
   // nullopt if the register is unwritten or contains a value that isn't the result of a context
   // read.
@@ -154,8 +158,9 @@ class InsnFolding {
                                                               const MachineBasicBlock* bb);
 
   std::tuple<FoldingType, berberis::MachineInsn*> TryFoldContextReadForTesting(
-      const MachineInsnList::iterator insn) {
-    return TryFoldContextRead(insn);
+      const berberis::MachineInsn* insn,
+      int32_t mem_reg_pos) {
+    return TryFoldContextRead(insn, mem_reg_pos);
   }
 
  private:
@@ -176,14 +181,18 @@ class InsnFolding {
       MachineInsnList::iterator insn_it,
       const MachineBasicBlock* bb);
   std::tuple<FoldingType, berberis::MachineInsn*> TryFoldContextRead(
-      const MachineInsnList::iterator insn);
+      const berberis::MachineInsn* insn,
+      int32_t mem_reg_pos);
+  template <bool kIsInput64Bit>
+  std::tuple<FoldingType, berberis::MachineInsn*> TryFoldImmediateAndContextReadInputs(
+      MachineInsnList::iterator insn_it);
   berberis::MachineInsn* NewImmInsnFromRegInsn(const berberis::MachineInsn* insn, int32_t imm);
   berberis::MachineInsn* NewInsnFromTwoImmediatesOperation(const berberis::MachineInsn* insn,
                                                            uint64_t imm1,
                                                            uint64_t imm2);
-  berberis::MachineInsn* NewArithmeticInsnWithFoldedContextRead(
-      const berberis::MachineInsn* insn,
-      const berberis::MachineInsn* read_context_insn);
+  berberis::MachineInsn* NewArithmeticInsnWithFoldedContextRead(const berberis::MachineInsn* insn,
+                                                                int32_t context_read_disp,
+                                                                int32_t mem_reg_pos);
 };
 
 MachineInsnList::iterator ExecuteInsnFold(MachineInsnList& insn_list,
