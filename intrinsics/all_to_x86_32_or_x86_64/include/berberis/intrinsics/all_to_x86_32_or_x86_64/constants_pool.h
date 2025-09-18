@@ -52,15 +52,15 @@ BERBERIS_CONST_EXTERN(uint32_t{63});
 
 // Helper constant for BsrToClz conversion. 63 for int32_t, 127 for int64_t.
 template <typename IntType>
-inline constexpr int32_t kBsrToClz = kImpossibleTypeConst<IntType>;
+inline constexpr int32_t& kBsrToClz = kImpossibleTypeConst<IntType>;
 template <>
-inline const int32_t kBsrToClz<int32_t> = kConst<uint32_t{63}>;
+inline const int32_t& kBsrToClz<int32_t> = kConst<uint32_t{63}>;
 
 // Helper constant for width of the type. 32 for int32_t, 64 for int64_t.
 template <typename IntType>
-inline constexpr int32_t kWidthInBits = kImpossibleTypeConst<IntType>;
+inline constexpr int32_t& kWidthInBits = kImpossibleTypeConst<IntType>;
 template <>
-inline const int32_t kWidthInBits<int32_t> = kConst<uint32_t{32}>;
+inline const int32_t& kWidthInBits<int32_t> = kConst<uint32_t{32}>;
 
 }  // namespace berberis::constants_pool
 

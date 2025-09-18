@@ -510,6 +510,7 @@ cc_test_library {
         x86_64: {
             cflags: ["-mssse3"],
             srcs: [
+                "all_to_x86_32_or_x86_64/constants_pool_test.cc",
                 "all_to_x86_32_or_x86_64/intrinsics_float_test.cc",
                 "all_to_x86_32_or_x86_64/verifier_assembler_test.cc",
                 "all_to_x86_64/tuple_test.cc",
