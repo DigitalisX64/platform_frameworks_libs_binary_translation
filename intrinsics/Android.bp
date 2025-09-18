@@ -513,6 +513,27 @@ cc_test_library {
                 "all_to_x86_32_or_x86_64/intrinsics_float_test.cc",
                 "all_to_x86_32_or_x86_64/verifier_assembler_test.cc",
                 "all_to_x86_64/tuple_test.cc",
+            ],
+        },
+    },
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_device_arch_info_headers",
+        "libberberis_intrinsics_headers",
+    ],
+    shared: {
+        enabled: false,
+    },
+}
+
+cc_test_library {
+    name: "libberberis_intrinsics_unit_tests_riscv64",
+    defaults: ["berberis_defaults"],
+    host_supported: true,
+    arch: {
+        x86_64: {
+            cflags: ["-mssse3"],
+            srcs: [
                 // Note that these two tests technically should work on any platform that supports
                 // riscv64 to something translation, but currently that's only x86-64.
                 "riscv64_to_all/intrinsics_test.cc",
