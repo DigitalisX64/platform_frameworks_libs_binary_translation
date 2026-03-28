@@ -18,6 +18,11 @@
 #define BERBERIS_GUEST_ABI_FUNCTION_WRAPPERS_H_
 
 #include <utility>
+// region digitalis
+#include <dlfcn.h>
+#include <type_traits>
+#include "berberis/base/tracing.h"
+// endregion
 
 #include <jni.h>
 
@@ -105,9 +110,67 @@ class TrampolineFuncGenerator<Res(Args...), kCallingConventionsVariant> {
   }
 
  private:
+  // region digitalis - debug: check first arg if it's a pointer
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  static void CheckFirstArgImpl(ThreadState*, void*) {}  // 0-arg overload
+  template <typename First, typename... Rest>
+  static void CheckFirstArgImpl(ThreadState* state, void* host_func, First first, Rest...) {
+    if constexpr (std::is_pointer_v<First>) {
+      auto addr = reinterpret_cast<uintptr_t>(first);
+      if (addr != 0 && addr < 0x10000) {
+        Dl_info dli{};
+        dladdr(host_func, &dli);
+        TRACE_AND_ALOGE("BAD proxy: extracted=%p raw_x0=0x%lx func=%s(%p) pc=0x%lx lr=0x%lx",
+            (void*)addr, (unsigned long)state->cpu.x[0],
+            dli.dli_sname ? dli.dli_sname : "??", host_func,
+            (unsigned long)state->cpu.insn_addr, (unsigned long)state->cpu.x[30]);
+      }
+    }
+  }
+#endif
+  // endregion
+
   template <typename Func, typename std::size_t... I>
   static void FuncImpl(Func func, ThreadState* state, std::index_sequence<I...>) {
+    // region digitalis - pre-extraction raw register check
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    if constexpr (sizeof...(Args) > 0) {
+      if constexpr (std::is_pointer_v<std::tuple_element_t<0, std::tuple<Args...>>>) {
+        auto raw_x0 = state->cpu.x[0];
+        if (raw_x0 != 0 && raw_x0 < 0x10000) {
+          TRACE_AND_ALOGE("BAD proxy PRE-EXTRACT: raw_x0=0x%lx func=%p pc=0x%lx lr=0x%lx",
+              (unsigned long)raw_x0, reinterpret_cast<void*>(func),
+              (unsigned long)state->cpu.insn_addr, (unsigned long)state->cpu.x[30]);
+          TRACE_AND_ALOGE("  x0=0x%lx x1=0x%lx x2=0x%lx x3=0x%lx x8=0x%lx x29=0x%lx",
+              (unsigned long)state->cpu.x[0], (unsigned long)state->cpu.x[1],
+              (unsigned long)state->cpu.x[2], (unsigned long)state->cpu.x[3],
+              (unsigned long)state->cpu.x[8], (unsigned long)state->cpu.x[29]);
+        }
+      }
+    }
+#endif
+    // endregion
     GuestParamsValues<Func, kCallingConventionsVariant> params(state);
+    // region digitalis - extraction mismatch check
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    if constexpr (sizeof...(Args) > 0) {
+      if constexpr (std::is_pointer_v<std::tuple_element_t<0, std::tuple<Args...>>>) {
+        auto* params_ptr = params.template debug_params_addr<0>();
+        auto gt0 = params.template get<0>();
+        auto extracted_guest = ToGuestAddr(gt0);
+        if (extracted_guest != state->cpu.x[0]) {
+          auto byte_diff = (const char*)params_ptr - (const char*)state->cpu.x;
+          TRACE_AND_ALOGE("MISMATCH: x0=0x%lx extracted=0x%lx val_at_ptr=0x%lx byte_diff=%ld nargs=%zu",
+              (unsigned long)state->cpu.x[0],
+              (unsigned long)extracted_guest,
+              (unsigned long)*reinterpret_cast<const uint64_t*>(params_ptr),
+              (long)byte_diff,
+              sizeof...(Args));
+        }
+      }
+    }
+#endif
+    // endregion
     if constexpr (std::is_same_v<Res, void>) {
       func(GetGuestArgument<std::tuple_element_t<I, std::tuple<Args...>>,
                             kCallingConventionsVariant>(params.template get<I>())...);

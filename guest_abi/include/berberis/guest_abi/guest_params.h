@@ -63,6 +63,13 @@ class GuestParamsValues : public GuestParamsAndReturn<FunctionType, kCallingConv
   auto get() const {
     return *this->template Params<index>();
   }
+
+  // region digitalis - debug: expose params address
+  template <std::size_t index>
+  auto* debug_params_addr() const {
+    return this->template Params<index>();
+  }
+  // endregion
 };
 
 // GuestReturnReference is a syntax sugar for use with structured binding declaration.

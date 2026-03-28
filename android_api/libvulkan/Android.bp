@@ -25,9 +25,52 @@ genrule {
     cmd: "$(location gen_vulkan) --xml $(out) --input $(in) --guest_arch riscv64 --host_arch x86_64",
 }
 
+// region digitalis - arm64 vulkan gen headers and arch-conditional selection
+genrule {
+    name: "libberberis_android_api_libvulkan_vulkan_xml_headers_arm64_to_x86_64",
+    out: ["vulkan_xml-inl.h"],
+    srcs: [":vulkan_headers_registry"],
+    tools: ["gen_vulkan"],
+    cmd: "$(location gen_vulkan) --xml $(out) --input $(in) --guest_arch arm64 --host_arch x86_64",
+}
+
+soong_config_module_type_import {
+    from: "frameworks/libs/binary_translation/Android.bp",
+    module_types: ["berberis_cc_defaults"],
+}
+
+berberis_cc_defaults {
+    name: "berberis_proxy_libvulkan_gen_headers_defaults",
+    soong_config_variables: {
+        translation_arch: {
+            riscv64_to_x86_64: {
+                generated_headers: ["libberberis_android_api_libvulkan_vulkan_xml_headers_riscv64_to_x86_64"],
+            },
+            arm64_to_x86_64: {
+                generated_headers: ["libberberis_android_api_libvulkan_vulkan_xml_headers_arm64_to_x86_64"],
+            },
+        },
+    },
+}
+
+// Original:
+// cc_library_shared {
+//     name: "libberberis_proxy_libvulkan",
+//     defaults: ["berberis_proxy_library_defaults"],
+//     ...
+//     arch: {
+//         x86_64: {
+//             generated_headers: ["libberberis_android_api_libvulkan_vulkan_xml_headers_riscv64_to_x86_64"],
+//         },
+//     },
+//     shared_libs: ["libvulkan"],
+// }
 cc_library_shared {
     name: "libberberis_proxy_libvulkan",
-    defaults: ["berberis_proxy_library_defaults"],
+    defaults: [
+        "berberis_proxy_library_defaults",
+        "berberis_proxy_libvulkan_gen_headers_defaults",
+    ],
     cflags: [
         "-DVK_USE_PLATFORM_ANDROID_KHR",
     ],
@@ -36,13 +79,9 @@ cc_library_shared {
         "hwvulkan_headers",
         "libberberis_base_headers",
     ],
-    arch: {
-        x86_64: {
-            generated_headers: ["libberberis_android_api_libvulkan_vulkan_xml_headers_riscv64_to_x86_64"],
-        },
-    },
     shared_libs: ["libvulkan"],
 }
+// endregion
 
 cc_library_static {
     name: "libberberis_emulated_libvulkan_api_checker",

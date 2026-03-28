@@ -98,6 +98,23 @@ cc_library_static {
     ],
 }
 
+// region digitalis
+cc_library_static {
+    name: "libberberis_guest_loader_arm64",
+    defaults: [
+        "berberis_arm64_defaults",
+        "libberberis_guest_loader_defaults",
+    ],
+    srcs: [
+        "arm64/guest_loader_arch.cc",
+        "arm64/linker_callbacks_arch.cc",
+    ],
+    header_libs: [
+        "libberberis_guest_abi_arm64_headers",
+    ],
+}
+// endregion
+
 cc_defaults {
     name: "libberberis_guest_loader_tests_defaults",
     host_supported: false,

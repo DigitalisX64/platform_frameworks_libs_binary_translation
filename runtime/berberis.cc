@@ -18,6 +18,9 @@
 #include "berberis/base/macros.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
+// region digitalis
+#include "berberis/guest_os_primitives/guest_signal.h"
+// endregion
 #include "berberis/guest_os_primitives/guest_thread_manager.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/runtime/init_guest_arch.h"
@@ -41,6 +44,11 @@ bool InitBerberisUnsafe() {
   InitGuestThreadManager();
   InitGuestFunctionWrapper(&IsAddressGuestExecutable);
   InitTranslator();
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  ClaimHostFaultSignals();
+#endif
+  // endregion
   InitCrashReporter();
   InitGuestArch();
   return true;

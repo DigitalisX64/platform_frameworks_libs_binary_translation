@@ -378,6 +378,49 @@ ndk_translation_package {
     generate_build_files: false,
 }
 
+// region digitalis
+// Separate test binary for ARM64 lite translator to avoid symbol conflicts
+// with the RISC-V TryLiteTranslateRegion.
+cc_test_host {
+    name: "berberis_arm64_host_tests",
+    defaults: ["berberis_defaults"],
+    static_libs: [
+        "libberberis_assembler",
+        "libberberis_base",
+        "libberberis_elf_backed_exec_region",
+        "libberberis_instrument",
+        "libberberis_runtime_primitives",
+        "libgmock",
+    ],
+    shared_libs: [
+        "libbase",
+        "liblog",
+    ],
+    arch: {
+        x86_64: {
+            static_libs: [
+                "libberberis_code_gen_lib_arm64",
+                "libberberis_runtime",
+                // Must use ARM64 runtime — it compiles runtime_library_x86_64.cc
+                // with ARM64 ThreadState layout for correct offsetof() in entry/exit code.
+                "libberberis_runtime_arm64",
+                "libberberis_runtime_primitives_arm64",
+                "libberberis_guest_os_primitives_arm64",
+                "libberberis_guest_state_arm64",
+                "libberberis_kernel_api_arm64",
+                "libberberis_interpreter_arm64",
+                "libberberis_guest_abi_arm64",
+            ],
+            whole_static_libs: [
+                "libberberis_tests_main",
+                "libberberis_lite_translator_arm64_to_x86_64",
+                "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
+            ],
+        },
+    },
+}
+// endregion
+
 phony_rule_defaults {
     name: "berberis_all_deps_defaults",
     phony_deps: [
@@ -481,6 +524,21 @@ phony_rule_defaults {
     ],
 }
 
+// region digitalis - soong config module type for arch-conditional defaults
+soong_config_module_type {
+    name: "berberis_cc_defaults",
+    module_type: "cc_defaults",
+    config_namespace: "berberis",
+    variables: ["translation_arch"],
+    properties: [
+        "defaults",
+        "generated_headers",
+        "header_libs",
+        "shared_libs",
+    ],
+}
+// endregion
+
 soong_config_module_type {
     name: "berberis_phony_rule",
     module_type: "phony_rule",
@@ -497,6 +555,9 @@ soong_config_string_variable {
     name: "translation_arch",
     values: [
         "riscv64_to_x86_64", // BUILD_BERBERIS_RISCV64_TO_X86_64
+        // region digitalis
+        "arm64_to_x86_64", // BUILD_BERBERIS_ARM64_TO_X86_64 (Digitalis)
+        // endregion
     ],
 }
 
@@ -511,12 +572,115 @@ berberis_phony_rule {
                 ],
                 enabled: true,
             },
+            // region digitalis
+            arm64_to_x86_64: {
+                defaults: [
+                    "berberis_all_deps_defaults",
+                    "berberis_all_arm64_to_x86_64_defaults",
+                ],
+                enabled: true,
+            },
+            // endregion
             conditions_default: {
                 enabled: false,
             },
         },
     },
 }
+
+// region digitalis - ARM64 to x86_64 translation defaults and library.
+phony_rule_defaults {
+    name: "berberis_all_arm64_to_x86_64_defaults",
+    phony_deps: [
+        "libberberis_exec_region",
+        "libberberis_proxy_libEGL",
+        "libberberis_proxy_libGLESv1_CM",
+        "libberberis_proxy_libGLESv2",
+        "libberberis_proxy_libGLESv3",
+        "libberberis_proxy_libOpenMAXAL",
+        "libberberis_proxy_libOpenSLES",
+        "libberberis_proxy_libaaudio",
+        "libberberis_proxy_libamidi",
+        "libberberis_proxy_libandroid",
+        "libberberis_proxy_libandroid_runtime",
+        "libberberis_proxy_libbinder_ndk",
+        "libberberis_proxy_libc",
+        "libberberis_proxy_libcamera2ndk",
+        "libberberis_proxy_libjnigraphics",
+        "libberberis_proxy_libm",
+        "libberberis_proxy_libmediandk",
+        "libberberis_proxy_libnativehelper",
+        "libberberis_proxy_libnativewindow",
+        "libberberis_proxy_libneuralnetworks",
+        "libberberis_proxy_libvulkan",
+        "libberberis_proxy_libwebviewchromium_plat_support",
+        "libberberis_arm64",
+    ],
+}
+
+cc_library_shared {
+    name: "libberberis_arm64",
+    defaults: ["berberis_defaults_64"],
+    host_supported: true,
+    static_libs: [
+        "libbase",
+        "libberberis_assembler",
+        "libberberis_base",
+        "libberberis_elf_backed_exec_region",
+        "libberberis_instrument",
+        "libberberis_intrinsics",
+        "libberberis_kernel_api_arm64",
+        "libberberis_runtime_primitives",
+        "libberberis_tinyloader",
+    ],
+    whole_static_libs: [
+        "libberberis_proxy_loader",
+    ],
+    export_static_lib_headers: [
+        "libberberis_proxy_loader",
+    ],
+    shared_libs: [
+        "liblog",
+    ],
+    arch: {
+        x86_64: {
+            static_libs: [
+                "libberberis_code_gen_lib_arm64",
+                "libberberis_guest_abi_arm64",
+                "libberberis_interpreter_arm64",
+                "libberberis_intrinsics_arm64",
+                "libberberis_lite_translator_arm64_to_x86_64",
+                "libberberis_runtime_primitives_arm64",
+            ],
+            whole_static_libs: [
+                "libberberis_guest_loader_arm64",
+                // Proxy libraries reference symbols from guest_os_primitives,
+                // so we need to keep them all.
+                "libberberis_guest_os_primitives_arm64",
+                // Android debuggerd reference symbols from get_cpu_state.
+                "libberberis_guest_state_arm64",
+                "libberberis_runtime_arm64",
+            ],
+            export_static_lib_headers: [
+                "libberberis_guest_loader_arm64",
+            ],
+        },
+    },
+    target: {
+        android: {
+            whole_static_libs: [
+                "libberberis_jni_arm64",
+                "libberberis_native_activity_arm64",
+                "libberberis_native_bridge_arm64",
+            ],
+            shared_libs: [
+                "libandroid",
+                "libdl_android",
+            ],
+        },
+    },
+}
+// endregion
 
 python_binary_host {
     name: "berberis_gen_gtest_failure_template",

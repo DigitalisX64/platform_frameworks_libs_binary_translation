@@ -199,6 +199,54 @@ cc_library_static {
     ],
 }
 
+// region digitalis
+cc_library_headers {
+    name: "libberberis_guest_os_primitives_arm64_headers",
+    defaults: ["berberis_all_hosts_defaults"],
+    host_supported: true,
+    export_include_dirs: ["arm64/include"],
+    header_libs: [
+        "libberberis_guest_os_primitives_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_guest_os_primitives_headers",
+    ],
+}
+
+cc_library_static {
+    name: "libberberis_guest_os_primitives_arm64",
+    defaults: [
+        "berberis_arm64_defaults",
+        "libberberis_guest_os_primitives_common_defaults",
+        "libberberis_guest_os_primitives_common_arch_defaults",
+    ],
+    host_supported: true,
+    arch: {
+        x86_64: {
+            srcs: [
+                "arm64/gen_syscall_numbers_x86_64.cc",
+            ],
+        },
+    },
+    srcs: [
+        "arm64/guest_setjmp.cc",
+        "arm64/guest_signal.cc",
+    ],
+    local_include_dirs: ["arm64"],
+    header_libs: [
+        "libberberis_guest_abi_arm64_headers",
+        "libberberis_guest_os_primitives_headers",
+        "libberberis_guest_os_primitives_arm64_headers",
+        "libberberis_guest_state_headers",
+        "libberberis_guest_state_arm64_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_guest_os_primitives_headers",
+        "libberberis_guest_os_primitives_arm64_headers",
+    ],
+}
+// endregion
+
 filegroup {
     name: "libberberis_guest_os_primitives_unit_tests_srcs",
     srcs: [

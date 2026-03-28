@@ -84,6 +84,14 @@ GuestAddr WrapHostSigactionForGuest(const HostStructSigaction& host_sa);
 
 void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_siginfo_t* info);
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// Register HandleHostSignal for fault signals (SIGSEGV, SIGBUS) so that
+// FaultyLoad/FaultyStore recovery works before guest code sets up handlers.
+void ClaimHostFaultSignals();
+#endif
+// endregion
+
 }  // namespace berberis
 
 #endif  // BERBERIS_GUEST_OS_PRIMITIVES_GUEST_SIGNAL_H_

@@ -53,6 +53,44 @@ cc_library_static {
     ],
 }
 
+// region digitalis
+cc_library_static {
+    name: "libberberis_lite_translator_arm64_to_x86_64",
+    defaults: ["berberis_all_hosts_defaults_64"],
+    host_supported: true,
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_code_gen_lib_headers",
+        "libberberis_decoder_arm64_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_kernel_api_headers",
+        "libberberis_lite_translator_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+    srcs: [
+        "arm64_to_x86_64/lite_translate_region.cc",
+        "arm64_to_x86_64/lite_translator.cc",
+    ],
+}
+// endregion
+
+// region digitalis
+cc_test_library {
+    name: "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
+    defaults: ["berberis_test_library_defaults_64"],
+    srcs: [
+        "arm64_to_x86_64/lite_translate_region_exec_tests.cc",
+    ],
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_decoder_arm64_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_lite_translator_headers",
+        "berberis_test_utils_headers",
+    ],
+}
+// endregion
+
 cc_test_library {
     name: "libberberis_lite_translator_riscv64_to_x86_64_unit_tests",
     defaults: ["berberis_test_library_defaults_64"],

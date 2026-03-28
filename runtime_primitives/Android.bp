@@ -122,6 +122,35 @@ cc_library_static {
     ],
 }
 
+// region digitalis
+cc_library_static {
+    name: "libberberis_runtime_primitives_arm64",
+    defaults: [
+        "berberis_arm64_defaults",
+        "berberis_memory_region_reservation_defaults",
+    ],
+    host_supported: true,
+    srcs: [
+        "checks_arm64.cc",
+        "interpret_helpers_arm64.cc",
+        "virtual_guest_call_frame_arm64.cc",
+    ],
+    whole_static_libs: [
+        "libberberis_runtime_primitives",
+    ],
+    header_libs: [
+        "libberberis_assembler_headers",
+        "libberberis_base_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_runtime_primitives_headers",
+        "libberberis_guest_state_arm64_headers",
+    ],
+}
+// endregion
+
 cc_test_library {
     name: "libberberis_runtime_primitives_unit_tests",
     defaults: ["berberis_test_library_defaults"],

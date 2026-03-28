@@ -42,6 +42,13 @@ prebuilt_etc {
     src: "system/etc/init/berberis.rc",
 }
 
+// region digitalis
+prebuilt_etc {
+    name: "ld.config.arm64.txt",
+    src: "system/etc/ld.config.arm64.txt",
+}
+// endregion
+
 phony {
     name: "berberis_prebuilt_riscv64",
     required: [
@@ -51,3 +58,13 @@ phony {
         "riscv64_exe",
     ],
 }
+
+// region digitalis
+phony {
+    name: "berberis_prebuilt_arm64",
+    required: [
+        "berberis.rc",
+        "ld.config.arm64.txt",
+    ],
+}
+// endregion

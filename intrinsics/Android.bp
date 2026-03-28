@@ -492,6 +492,44 @@ cc_library_static {
     ],
 }
 
+// region digitalis
+// Digitalis: ARM64 intrinsics headers.
+cc_library_headers {
+    name: "libberberis_intrinsics_arm64_headers",
+    defaults: ["berberis_all_hosts_defaults"],
+    host_supported: true,
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_intrinsics_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_base_headers",
+        "libberberis_intrinsics_headers",
+    ],
+    export_include_dirs: [
+        "arm64_to_all/include",
+    ],
+}
+
+// Digitalis: ARM64 intrinsics.
+cc_library_static {
+    name: "libberberis_intrinsics_arm64",
+    defaults: ["berberis_all_hosts_defaults_64"],
+    host_supported: true,
+    srcs: [
+        "arm64_to_all/intrinsics.cc",
+    ],
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_intrinsics_arm64_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_base_headers",
+        "libberberis_intrinsics_arm64_headers",
+    ],
+}
+// endregion
+
 cc_test_library {
     name: "libberberis_intrinsics_unit_tests",
     defaults: ["berberis_defaults"],

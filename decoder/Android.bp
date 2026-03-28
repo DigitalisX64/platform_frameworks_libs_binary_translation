@@ -24,3 +24,13 @@ cc_library_headers {
     host_supported: true,
     export_include_dirs: ["include"],
 }
+
+// region digitalis
+cc_library_headers {
+    name: "libberberis_decoder_arm64_headers",
+    defaults: ["berberis_all_hosts_defaults_64"],
+    header_libs: ["libberberis_base_headers"],
+    host_supported: true,
+    export_include_dirs: ["include"],
+}
+// endregion

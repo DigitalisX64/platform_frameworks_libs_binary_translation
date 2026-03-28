@@ -88,3 +88,19 @@ cc_library_static {
         "libberberis_guest_abi_riscv64_headers",
     ],
 }
+
+// region digitalis
+cc_library_static {
+    name: "libberberis_jni_arm64",
+    defaults: [
+        "berberis_arm64_defaults",
+        "libberberis_jni_defaults",
+    ],
+    header_libs: [
+        "libberberis_guest_abi_arm64_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_guest_abi_arm64_headers",
+    ],
+}
+// endregion

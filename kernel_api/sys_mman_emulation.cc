@@ -19,6 +19,15 @@
 #include <sys/mman.h>
 
 #include <cerrno>
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include <cstdint>
+#include <elf.h>
+#include <unistd.h>
+
+#include <android/log.h>
+#endif
+// endregion
 
 #include "berberis/base/mmap.h"
 #include "berberis/base/prctl_helpers.h"
@@ -58,11 +67,102 @@ void UpdateGuestProt(int guest_prot, void* addr, size_t length) {
 // If other thread starts translation after actual mmap/mprotect/munmap but before xbit update,
 // it might pick up an already obsolete code.
 
+// region digitalis - mmap diagnostic counters
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+static uint64_t g_mmap_count = 0;
+static uint64_t g_mmap_fail_count = 0;
+#endif
+// endregion
+
 void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) {
+  // region digitalis - log mmap calls
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  uint64_t n = ++g_mmap_count;
+#endif
+  // endregion
   void* result = mmap64(addr, length, ToHostProt(prot), flags, fd, offset);
   if (result != MAP_FAILED) {
     UpdateGuestProt(prot, result, length);
   }
+  // region digitalis - zero .bss partial pages for ELF segment mappings
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // When the guest linker mmaps a file-backed page for a LOAD segment that has
+  // .bss (p_memsz > p_filesz), the kernel maps the full page from the file,
+  // including bytes beyond p_filesz (e.g., section headers). The linker should
+  // memset these to zero, but the ARM64 memset under translation may not execute
+  // correctly. As a safety net, we detect ELF segments with .bss and zero the
+  // partial page ourselves after the mmap.
+  if (result != MAP_FAILED && fd >= 0 &&
+      (flags & MAP_FIXED) && (flags & MAP_PRIVATE) && (prot & PROT_WRITE)) {
+    Elf64_Ehdr ehdr;
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) == sizeof(ehdr) &&
+        ehdr.e_ident[EI_MAG0] == ELFMAG0 && ehdr.e_ident[EI_MAG1] == ELFMAG1 &&
+        ehdr.e_ident[EI_MAG2] == ELFMAG2 && ehdr.e_ident[EI_MAG3] == ELFMAG3 &&
+        ehdr.e_phnum > 0 && ehdr.e_phnum <= 64) {
+      Elf64_Phdr phdrs[64];
+      ssize_t phdr_bytes = ehdr.e_phnum * sizeof(Elf64_Phdr);
+      if (pread(fd, phdrs, phdr_bytes, ehdr.e_phoff) == phdr_bytes) {
+        // The kernel rounds the mapping up to page size, so bytes beyond the
+        // guest's requested length but within the page are still mapped from
+        // the file. Use page-aligned length to cover the full mapped region.
+        size_t page_size = static_cast<size_t>(getpagesize());
+        size_t mapped_length = (length + page_size - 1) & ~(page_size - 1);
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+          if (phdrs[i].p_type != PT_LOAD) continue;
+          if (phdrs[i].p_memsz <= phdrs[i].p_filesz) continue;
+          // This segment has .bss (memsz > filesz).
+          // Only process this segment if this mmap belongs to it.
+          // The linker maps each segment with offset = floor(p_offset, page_size).
+          // Two segments may share overlapping file ranges but have different
+          // page-aligned offsets, so only match the one this mmap is actually for.
+          off64_t page_aligned_seg_offset = phdrs[i].p_offset & ~(off64_t)(page_size - 1);
+          if (offset != page_aligned_seg_offset) continue;
+          // Check if our mapping covers the boundary between file data and .bss.
+          off64_t seg_file_end = phdrs[i].p_offset + phdrs[i].p_filesz;
+          if (seg_file_end >= offset && seg_file_end < offset + (off64_t)mapped_length) {
+            size_t bss_start = (size_t)(seg_file_end - offset);
+            size_t bytes_to_zero = mapped_length - bss_start;
+            if (bytes_to_zero > 0 && bss_start < mapped_length) {
+              memset(static_cast<char*>(result) + bss_start, 0, bytes_to_zero);
+              static uint64_t bss_zero_count = 0;
+              if (++bss_zero_count <= 10) {
+                __android_log_print(ANDROID_LOG_INFO, "berberis",
+                    "bss-zero#%lu: %p+0x%lx len=0x%lx (seg off=0x%lx filesz=0x%lx memsz=0x%lx)",
+                    (unsigned long)bss_zero_count,
+                    result, (unsigned long)bss_start, (unsigned long)bytes_to_zero,
+                    (unsigned long)phdrs[i].p_offset,
+                    (unsigned long)phdrs[i].p_filesz, (unsigned long)phdrs[i].p_memsz);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+  // endregion
+  // region digitalis - log all executable mmaps and first 30
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (n <= 30 || n % 500 == 0 || (prot & 4)) {
+    __android_log_print(ANDROID_LOG_ERROR, "berberis",
+        "mmap#%lu addr=%p→%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx",
+        (unsigned long)n, addr, result, (unsigned long)length, prot, flags, fd, (unsigned long)offset);
+  }
+#endif
+  // endregion
+  // region digitalis - log failures
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (result == MAP_FAILED) {
+    int saved_errno = errno;
+    ++g_mmap_fail_count;
+    __android_log_print(ANDROID_LOG_ERROR, "berberis",
+        "mmap FAILED #%lu errno=%d addr=%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx (total_fail=%lu)",
+        (unsigned long)n, saved_errno, addr, (unsigned long)length, prot, flags, fd,
+        (unsigned long)offset, (unsigned long)g_mmap_fail_count);
+    errno = saved_errno;
+  }
+#endif
+  // endregion
   return result;
 }
 

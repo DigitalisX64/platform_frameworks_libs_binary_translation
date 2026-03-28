@@ -19,6 +19,9 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+// region digitalis
+#include <android/log.h>
+// endregion
 
 #if defined(__BIONIC__)
 #include <platform/bionic/reserved_signals.h>
@@ -35,6 +38,9 @@
 #include "berberis/guest_os_primitives/syscall_numbers.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_opaque.h"
+// region digitalis
+#include "berberis/guest_state/guest_state.h"
+// endregion
 #include "berberis/runtime_primitives/crash_reporter.h"
 #include "berberis/runtime_primitives/recovery_code.h"
 
@@ -77,6 +83,19 @@ std::mutex* GetSignalActionsGuardMutex() {
   return g_mutex;
 }
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// For ARM64, return a nullable pointer so unclaimed signals get the kernel
+// default action (terminate) instead of CHECK-failing.
+const Guest_sigaction* FindSignalHandler(const GuestSignalActionsTable& signal_actions,
+                                         int signal) {
+  CHECK_GT(signal, 0);
+  CHECK_LE(signal, Guest__KERNEL__NSIG);
+  std::lock_guard<std::mutex> lock(*GetSignalActionsGuardMutex());
+  return signal_actions.at(signal - 1).TryGetGuestAction();
+}
+#else
+// endregion
 const Guest_sigaction* FindSignalHandler(const GuestSignalActionsTable& signal_actions,
                                          int signal) {
   CHECK_GT(signal, 0);
@@ -84,6 +103,9 @@ const Guest_sigaction* FindSignalHandler(const GuestSignalActionsTable& signal_a
   std::lock_guard<std::mutex> lock(*GetSignalActionsGuardMutex());
   return &signal_actions.at(signal - 1).GetClaimedGuestAction();
 }
+// region digitalis
+#endif
+// endregion
 
 uintptr_t GetHostRegIP(const ucontext_t* ucontext) {
 #if defined(__i386__)
@@ -338,8 +360,44 @@ void GuestThread::ProcessPendingSignalsImpl() {
   siginfo_t* signal_info;
   while ((signal_info = pending_signals_.DequeueSignalUnsafe())) {
     const Guest_sigaction* sa = FindSignalHandler(*signal_actions_.get(), signal_info->si_signo);
+    // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    if (sa) {
+      ProcessGuestSignal(this, sa, signal_info);
+      pending_signals_.FreeSignal(signal_info);
+    } else {
+      int signo = signal_info->si_signo;
+      void* fault_addr = signal_info->si_addr;
+      pending_signals_.FreeSignal(signal_info);
+
+      {
+        auto& cpu = GetCPUState(*state_);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "Guest signal %d (fault_addr=%p, pc=%p) has no handler — "
+            "applying default action (terminate)",
+            signo, fault_addr, ToHostAddr<void>(GetInsnAddr(cpu)));
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x0=%p x1=%p x2=%p x3=%p",
+            (void*)cpu.x[0], (void*)cpu.x[1], (void*)cpu.x[2], (void*)cpu.x[3]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x8=%p x9=%p x10=%p x17=%p x28=%p x29=%p x30=%p",
+            (void*)cpu.x[8], (void*)cpu.x[9], (void*)cpu.x[10],
+            (void*)cpu.x[17], (void*)cpu.x[28], (void*)cpu.x[29], (void*)cpu.x[30]);
+        uint64_t sp_val = cpu.sp;
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  SP=%p", (void*)sp_val);
+      }
+
+      ::signal(signo, SIG_DFL);
+      raise(signo);
+    }
+#else
+    // endregion
     ProcessGuestSignal(this, sa, signal_info);
     pending_signals_.FreeSignal(signal_info);
+    // region digitalis
+#endif
+    // endregion
   }
 }
 
@@ -365,5 +423,73 @@ bool SetGuestSignalHandler(int signal,
   GuestSignalAction& action = GetCurrentGuestThread()->GetSignalActionsTable()->at(signal - 1);
   return action.Change(signal, act, HandleHostSignal, old_act, error);
 }
+
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+namespace {
+
+// Fault handler for FaultyLoad/FaultyStore recovery.
+// After redirecting to recovery code, queues the signal for guest delivery.
+// If the guest has a handler, it runs. If not, ProcessPendingSignalsImpl
+// applies the kernel default action (terminate for SIGSEGV/SIGBUS).
+void HandleFaultForRecovery(int sig, siginfo_t* info, void* context) {
+  ucontext_t* ucontext = bit_cast<ucontext_t*>(context);
+  uintptr_t fault_pc = GetHostRegIP(ucontext);
+
+  GuestThread* thread = GetCurrentGuestThread();
+  if (thread) {
+    uintptr_t recovery = FindRecoveryCode(fault_pc, thread->state());
+    if (recovery) {
+      SetHostRegIP(ucontext, recovery);
+
+      // Queue the signal for guest delivery. On real hardware, a SIGSEGV
+      // during guest execution would be delivered to the guest's signal handler.
+      // If no handler is registered, the default action (terminate) applies.
+      // This ensures matching behavior under translation.
+      if (info->si_addr == nullptr) {
+        auto& cpu = thread->state()->cpu;
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "Guest NULL dereference: sig=%d guest_pc=0x%llx x30(lr)=0x%llx",
+            sig,
+            (unsigned long long)cpu.insn_addr,
+            (unsigned long long)cpu.x[30]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx",
+            (unsigned long long)cpu.x[0], (unsigned long long)cpu.x[1],
+            (unsigned long long)cpu.x[2], (unsigned long long)cpu.x[3]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x4=0x%llx x5=0x%llx x6=0x%llx x7=0x%llx",
+            (unsigned long long)cpu.x[4], (unsigned long long)cpu.x[5],
+            (unsigned long long)cpu.x[6], (unsigned long long)cpu.x[7]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  sp=0x%llx x29(fp)=0x%llx",
+            (unsigned long long)cpu.sp, (unsigned long long)cpu.x[29]);
+      }
+      thread->TestAndEnablePendingSignals();
+      thread->SetSignalFromHost(*info);
+      return;
+    }
+  }
+
+  // No recovery found. Re-raise with default handler to terminate.
+  ::signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+}  // namespace
+
+void ClaimHostFaultSignals() {
+  // Register a minimal fault handler for SIGSEGV/SIGBUS so that
+  // FaultyLoad/FaultyStore recovery works before guest code sets up handlers.
+  for (int sig : {SIGSEGV, SIGBUS}) {
+    struct sigaction sa = {};
+    sa.sa_sigaction = HandleFaultForRecovery;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_NODEFER;
+    sigfillset(&sa.sa_mask);
+    sigaction(sig, &sa, nullptr);
+  }
+}
+#endif
+// endregion
 
 }  // namespace berberis

@@ -76,6 +76,42 @@ cc_library_static {
     ],
 }
 
+// region digitalis
+cc_library_headers {
+    name: "libberberis_interpreter_arm64_headers",
+    defaults: ["berberis_all_hosts_defaults"],
+    host_supported: true,
+    export_include_dirs: ["include"],
+}
+
+cc_library_static {
+    name: "libberberis_interpreter_arm64",
+    defaults: [
+        "berberis_all_hosts_defaults_64",
+    ],
+    host_supported: true,
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_decoder_arm64_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_interpreter_arm64_headers",
+        "libberberis_kernel_api_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+    export_header_lib_headers: ["libberberis_interpreter_arm64_headers"],
+    srcs: [
+        "arm64/interpreter-main.cc",
+    ],
+    arch: {
+        x86_64: {
+            srcs: [
+                "arm64/faulty_memory_accesses_x86_64.cc",
+            ],
+        },
+    },
+}
+// endregion
+
 cc_test_library {
     name: "libberberis_interpreter_riscv64_unit_tests",
     defaults: ["berberis_test_library_defaults_64"],

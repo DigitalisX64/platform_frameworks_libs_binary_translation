@@ -49,6 +49,16 @@ class GuestSignalAction {
     return claimed_guest_sa_;
   }
 
+  // region digitalis
+  // Returns guest action if a handler is registered, nullptr otherwise.
+  // Unlike GetClaimedGuestAction(), this does not CHECK-fail for unclaimed signals,
+  // allowing callers to apply the kernel default action instead.
+  const Guest_sigaction* TryGetGuestAction() const {
+    if (!IsClaimed()) return nullptr;
+    return &claimed_guest_sa_;
+  }
+  // endregion
+
  private:
   bool IsClaimed() const { return claimed_guest_sa_.guest_sa_sigaction != Guest_SIG_DFL; }
 

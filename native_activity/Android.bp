@@ -69,3 +69,17 @@ cc_library_static {
         "libberberis_guest_abi_riscv64_headers",
     ],
 }
+
+// region digitalis
+// Digitalis: ARM64 native activity wrapper.
+cc_library_static {
+    name: "libberberis_native_activity_arm64",
+    defaults: [
+        "berberis_arm64_defaults",
+        "libberberis_native_activity_defaults",
+    ],
+    header_libs: [
+        "libberberis_guest_abi_arm64_headers",
+    ],
+}
+// endregion

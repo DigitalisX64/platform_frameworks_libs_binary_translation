@@ -1,0 +1,3900 @@
+// region digitalis
+/*
+ * Copyright (C) 2026 utzcoz
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "berberis/interpreter/arm64/interpreter.h"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+#include "../faulty_memory_accesses.h"
+// endregion
+
+#include "berberis/base/bit_util.h"
+#include "berberis/base/checks.h"
+#include "berberis/decoder/arm64/decoder.h"
+#include "berberis/decoder/arm64/semantics_player.h"
+#include "berberis/guest_state/guest_addr.h"
+#include "berberis/guest_state/guest_state.h"
+#include "berberis/kernel_api/run_guest_syscall.h"
+#include "berberis/runtime_primitives/interpret_helpers.h"
+
+namespace berberis {
+
+class Interpreter {
+ public:
+  using Decoder = Decoder<SemanticsPlayer<Interpreter>>;
+  using Register = uint64_t;
+  static constexpr Register no_register = 0;
+
+  explicit Interpreter(ThreadState* state)
+      : state_(state), branch_taken_(false), exception_raised_(false) {}
+
+  // region digitalis
+  // Reset per-instruction state for batch reuse — avoids reconstructing
+  // the Interpreter object for every instruction in the batch.
+  void Reset() {
+    branch_taken_ = false;
+    exception_raised_ = false;
+  }
+  // endregion
+
+  // region digitalis
+  // Memory fault handler — called when FaultyLoad/FaultyStore detects a fault.
+  // Sets exception_raised_ to stop the interpreter batch. HandleFaultForRecovery
+  // has already queued a SIGSEGV for guest delivery — the runtime will process it
+  // in ExecuteGuest, either invoking the guest's handler or applying the default
+  // action (terminate for unclaimed SIGSEGV).
+  void HandleMemoryFault(uint64_t fault_addr) {
+    (void)fault_addr;
+    exception_raised_ = true;
+  }
+
+  bool HasException() const { return exception_raised_; }
+  // endregion
+
+  //
+  // Instruction implementations.
+  //
+
+  Register AddSubImm(bool is_sub, bool set_flags, bool is_64bit,
+                     Register src, uint32_t imm) {
+    CHECK(!exception_raised_);
+    uint64_t operand1 = is_64bit ? src : (src & 0xFFFFFFFFULL);
+    uint64_t operand2 = static_cast<uint64_t>(imm);
+    uint64_t result;
+
+    if (is_sub) {
+      result = operand1 - operand2;
+    } else {
+      result = operand1 + operand2;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    if (set_flags) {
+      UpdateFlags(operand1, operand2, result, is_sub, is_64bit);
+    }
+
+    return result;
+  }
+
+  Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
+                      Register src, uint64_t imm) {
+    CHECK(!exception_raised_);
+    uint64_t operand = is_64bit ? src : (src & 0xFFFFFFFFULL);
+    uint64_t result;
+
+    switch (opcode) {
+      case Decoder::LogicalImmOpcode::kAnd:
+      case Decoder::LogicalImmOpcode::kAnds:
+        result = operand & imm;
+        break;
+      case Decoder::LogicalImmOpcode::kOrr:
+        result = operand | imm;
+        break;
+      case Decoder::LogicalImmOpcode::kEor:
+        result = operand ^ imm;
+        break;
+      default:
+        Undefined();
+        return 0;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    if (opcode == Decoder::LogicalImmOpcode::kAnds) {
+      UpdateLogicalFlags(result, is_64bit);
+    }
+
+    return result;
+  }
+
+  Register MoveWide(Decoder::MoveWideOpcode opcode, bool is_64bit,
+                    uint16_t imm16, uint8_t shift) {
+    CHECK(!exception_raised_);
+    uint64_t value = static_cast<uint64_t>(imm16) << shift;
+
+    switch (opcode) {
+      case Decoder::MoveWideOpcode::kMovz:
+        break;
+      case Decoder::MoveWideOpcode::kMovn:
+        value = ~value;
+        break;
+      case Decoder::MoveWideOpcode::kMovk:
+        // MOVK keeps other bits -- but we don't have the destination register value here.
+        // The SemanticsPlayer should handle MOVK differently, but for the simple case
+        // where dst is being initialized, we handle it as-is. For proper MOVK we need
+        // the current register value. We return just the shifted value; the caller must
+        // merge. Note: we handle this specially below in a dedicated method.
+        break;
+      default:
+        Undefined();
+        return 0;
+    }
+
+    if (!is_64bit) {
+      value &= 0xFFFFFFFFULL;
+    }
+
+    return value;
+  }
+
+  // Special MOVK handler that merges with current register value.
+  Register MoveWideKeep(Register current, uint16_t imm16, uint8_t shift, bool is_64bit) {
+    CHECK(!exception_raised_);
+    uint64_t mask = static_cast<uint64_t>(0xFFFF) << shift;
+    uint64_t value = static_cast<uint64_t>(imm16) << shift;
+    uint64_t result = (current & ~mask) | value;
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+    return result;
+  }
+
+  Register PcRelAddr(bool is_adrp, int64_t offset) {
+    CHECK(!exception_raised_);
+    uint64_t pc = state_->cpu.insn_addr;
+    if (is_adrp) {
+      // ADRP: page of PC + offset.
+      pc &= ~0xFFFULL;  // Align PC to 4K page.
+    }
+    return pc + offset;
+  }
+
+  Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
+                    Register dst_val, Register src, uint8_t immr, uint8_t imms) {
+    CHECK(!exception_raised_);
+    // region digitalis
+    // Simplified implementation based on ARM ARM pseudocode for BFM/SBFM/UBFM.
+    // When imms >= immr: extract bits[imms:immr] (bitfield extract / shift right)
+    // When imms < immr:  insert bits[imms:0] at position (regsize-immr) (bitfield insert / shift left)
+    unsigned reg_size = is_64bit ? 64 : 32;
+    uint64_t src_val = is_64bit ? src : (src & 0xFFFFFFFFULL);
+    uint64_t result;
+
+    if (imms >= immr) {
+      // Extraction case: extract bits[imms:immr] from source.
+      // Width = imms - immr + 1
+      unsigned width = imms - immr + 1;
+      uint64_t extracted = (src_val >> immr);
+      if (width < reg_size) {
+        extracted &= ((1ULL << width) - 1);
+      }
+
+      switch (opcode) {
+        case Decoder::BitfieldOpcode::kUbfm:
+          // Zero-extend extracted bits. Aliases: LSR, UBFX, UXTB, UXTH.
+          result = extracted;
+          break;
+        case Decoder::BitfieldOpcode::kSbfm: {
+          // Sign-extend from bit (width-1). Aliases: ASR, SBFX, SXTB, SXTH, SXTW.
+          result = extracted;
+          if (width < reg_size && (extracted & (1ULL << (width - 1)))) {
+            result |= ~((1ULL << width) - 1);
+          }
+          break;
+        }
+        case Decoder::BitfieldOpcode::kBfm:
+          // Merge: insert extracted bits at position 0, keep other dest bits.
+          if (width < reg_size) {
+            uint64_t mask = (1ULL << width) - 1;
+            result = (dst_val & ~mask) | (extracted & mask);
+          } else {
+            result = extracted;
+          }
+          break;
+        default:
+          Undefined();
+          return 0;
+      }
+    } else {
+      // Insertion case: take bits[imms:0] from source and place at position (regsize-immr).
+      // Width = imms + 1
+      unsigned width = imms + 1;
+      unsigned pos = reg_size - immr;
+      uint64_t field = src_val & ((1ULL << width) - 1);
+      uint64_t placed = field << pos;
+      uint64_t mask = ((1ULL << width) - 1) << pos;
+
+      switch (opcode) {
+        case Decoder::BitfieldOpcode::kUbfm:
+          // Zero other bits. Aliases: LSL, UBFIZ.
+          result = placed;
+          break;
+        case Decoder::BitfieldOpcode::kSbfm: {
+          // Sign-extend from bit (pos + width - 1). Aliases: SBFIZ.
+          result = placed;
+          unsigned top_bit = pos + width - 1;
+          if (top_bit < reg_size - 1 && (result & (1ULL << top_bit))) {
+            result |= ~((1ULL << (top_bit + 1)) - 1);
+          }
+          break;
+        }
+        case Decoder::BitfieldOpcode::kBfm:
+          // Merge: insert field bits, keep other dest bits. Aliases: BFI.
+          result = (dst_val & ~mask) | (placed & mask);
+          break;
+        default:
+          Undefined();
+          return 0;
+      }
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    return result;
+    // endregion
+  }
+
+  void Branch(int32_t offset) {
+    CHECK(!exception_raised_);
+    state_->cpu.insn_addr += offset;
+    branch_taken_ = true;
+  }
+
+  void BranchCond(Decoder::Condition cond, int32_t offset) {
+    CHECK(!exception_raised_);
+    if (EvaluateCondition(cond)) {
+      Branch(offset);
+    }
+  }
+
+  void BranchRegister(Register target) {
+    CHECK(!exception_raised_);
+    state_->cpu.insn_addr = target;
+    branch_taken_ = true;
+  }
+
+  void CompareAndBranch(bool is_nonzero, bool is_64bit, Register src, int32_t offset) {
+    CHECK(!exception_raised_);
+    uint64_t val = is_64bit ? src : (src & 0xFFFFFFFFULL);
+    bool take_branch = is_nonzero ? (val != 0) : (val == 0);
+    if (take_branch) {
+      Branch(offset);
+    }
+  }
+
+  void TestAndBranch(bool is_nonzero, Register src, uint8_t bit, int32_t offset) {
+    CHECK(!exception_raised_);
+    bool bit_set = (src >> bit) & 1;
+    bool take_branch = is_nonzero ? bit_set : !bit_set;
+    if (take_branch) {
+      Branch(offset);
+    }
+  }
+
+  Register Load(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
+                Register base, int32_t offset) {
+    CHECK(!exception_raised_);
+    void* ptr = ToHostAddr<void>(base + offset);
+    // region digitalis
+    uint8_t data_bytes;
+    switch (size) {
+      case Decoder::LoadStoreSize::k8bit: data_bytes = 1; break;
+      case Decoder::LoadStoreSize::k16bit: data_bytes = 2; break;
+      case Decoder::LoadStoreSize::k32bit: data_bytes = 4; break;
+      case Decoder::LoadStoreSize::k64bit: data_bytes = 8; break;
+      default: Undefined(); return 0;
+    }
+    FaultyLoadResult fl = FaultyLoad(ptr, data_bytes);
+    if (fl.is_fault) {
+      HandleMemoryFault(base + offset);
+      return 0;
+    }
+    // endregion
+    uint64_t result;
+
+    switch (size) {
+      case Decoder::LoadStoreSize::k8bit: {
+        uint8_t val = static_cast<uint8_t>(fl.value);
+        if (is_signed) {
+          if (is_64bit_target) {
+            result = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(val)));
+          } else {
+            result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(
+                static_cast<int8_t>(val))));
+          }
+        } else {
+          result = val;
+        }
+        break;
+      }
+      case Decoder::LoadStoreSize::k16bit: {
+        uint16_t val = static_cast<uint16_t>(fl.value);
+        if (is_signed) {
+          if (is_64bit_target) {
+            result = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(val)));
+          } else {
+            result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(
+                static_cast<int16_t>(val))));
+          }
+        } else {
+          result = val;
+        }
+        break;
+      }
+      case Decoder::LoadStoreSize::k32bit: {
+        uint32_t val = static_cast<uint32_t>(fl.value);
+        if (is_signed) {
+          if (is_64bit_target) {
+            result = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(val)));
+          } else {
+            result = val;
+          }
+        } else {
+          result = val;
+        }
+        break;
+      }
+      case Decoder::LoadStoreSize::k64bit: {
+        result = fl.value;
+        break;
+      }
+      default:
+        Undefined();
+        return 0;
+    }
+
+    return result;
+  }
+
+  void Store(Decoder::LoadStoreSize size, Register base, int32_t offset, Register data) {
+    CHECK(!exception_raised_);
+    void* ptr = ToHostAddr<void>(base + offset);
+    // region digitalis
+    uint8_t data_bytes;
+    switch (size) {
+      case Decoder::LoadStoreSize::k8bit: data_bytes = 1; break;
+      case Decoder::LoadStoreSize::k16bit: data_bytes = 2; break;
+      case Decoder::LoadStoreSize::k32bit: data_bytes = 4; break;
+      case Decoder::LoadStoreSize::k64bit: data_bytes = 8; break;
+      default: Undefined(); return;
+    }
+    if (FaultyStore(ptr, data_bytes, data)) {
+      HandleMemoryFault(base + offset);
+      return;
+    }
+    // endregion
+  }
+
+  Register AddImm(Register base, int32_t offset) {
+    return base + offset;
+  }
+
+  void LoadPair(Decoder::LoadStoreSize size, Register base, int32_t offset,
+                uint8_t rt1, uint8_t rt2, uint8_t scale) {
+    CHECK(!exception_raised_);
+    void* ptr1 = ToHostAddr<void>(base + offset);
+    void* ptr2 = ToHostAddr<void>(base + offset + scale);
+    // region digitalis
+    uint8_t data_bytes = (size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
+    FaultyLoadResult fl1 = FaultyLoad(ptr1, data_bytes);
+    if (fl1.is_fault) { HandleMemoryFault(base + offset); return; }
+    FaultyLoadResult fl2 = FaultyLoad(ptr2, data_bytes);
+    if (fl2.is_fault) { HandleMemoryFault(base + offset + scale); return; }
+
+    if (rt1 != 31) state_->cpu.x[rt1] = fl1.value;
+    if (rt2 != 31) state_->cpu.x[rt2] = fl2.value;
+    // endregion
+  }
+
+  void StorePair(Decoder::LoadStoreSize size, Register base, int32_t offset,
+                 Register data1, Register data2, uint8_t scale) {
+    CHECK(!exception_raised_);
+    void* ptr1 = ToHostAddr<void>(base + offset);
+    void* ptr2 = ToHostAddr<void>(base + offset + scale);
+    // region digitalis
+    uint8_t data_bytes = (size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
+    if (FaultyStore(ptr1, data_bytes, data1)) { HandleMemoryFault(base + offset); return; }
+    if (FaultyStore(ptr2, data_bytes, data2)) { HandleMemoryFault(base + offset + scale); return; }
+    // endregion
+  }
+
+  Register LoadReg(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
+                   Register base, Register offset_reg, uint8_t shift_amount) {
+    // region digitalis
+    // Compute full 64-bit address directly to avoid int32_t truncation.
+    uint64_t addr = base + (offset_reg << shift_amount);
+    return Load(size, is_signed, is_64bit_target, addr, 0);
+    // endregion
+  }
+
+  void StoreReg(Decoder::LoadStoreSize size, Register base, Register offset_reg,
+                uint8_t shift_amount, Register data) {
+    // region digitalis
+    uint64_t addr = base + (offset_reg << shift_amount);
+    Store(size, addr, 0, data);
+    // endregion
+  }
+
+  void Svc(uint16_t /*imm*/) {
+    CHECK(!exception_raised_);
+    // ARM64 syscall convention: syscall number in x8, args in x0-x5, return in x0.
+    RunGuestSyscall(state_);
+  }
+
+  Register Mrs(Decoder::SystemReg sysreg) {
+    CHECK(!exception_raised_);
+    switch (sysreg) {
+      case Decoder::SystemReg::kTpidrEl0:
+        return state_->tls;
+      case Decoder::SystemReg::kNzcv: {
+        // Convert internal flags to NZCV format: N[31] Z[30] C[29] V[28].
+        uint32_t nzcv = 0;
+        if (state_->cpu.flags & CPUState::kFlagNegative) nzcv |= (1u << 31);
+        if (state_->cpu.flags & CPUState::kFlagZero) nzcv |= (1u << 30);
+        if (state_->cpu.flags & CPUState::kFlagCarry) nzcv |= (1u << 29);
+        if (state_->cpu.flags & CPUState::kFlagOverflow) nzcv |= (1u << 28);
+        return nzcv;
+      }
+      case Decoder::SystemReg::kFpcr:
+        return state_->cpu.cached_fpcr;
+      case Decoder::SystemReg::kFpsr:
+        return state_->cpu.emulated_fpsr;
+      // region digitalis
+      case Decoder::SystemReg::kCtrEl0:
+        // CTR_EL0: Cache Type Register.
+        // IminLine=4 (log2 of 16-byte icache line), DminLine=4 (log2 of 16-byte dcache line)
+        // L1Ip=3 (PIPT), CWG=4, ERG=4
+        return 0x8444c004ULL;
+      case Decoder::SystemReg::kDczidEl0:
+        // DCZID_EL0: Data Cache Zero ID Register.
+        // DZP=1 (DC ZVA prohibited), BS=4 (log2 of 64-byte block)
+        return 0x10ULL;  // DZP=1: DC ZVA not available
+      // endregion
+      default:
+        Undefined();
+        return 0;
+    }
+  }
+
+  void Msr(Decoder::SystemReg sysreg, Register value) {
+    CHECK(!exception_raised_);
+    switch (sysreg) {
+      case Decoder::SystemReg::kTpidrEl0:
+        state_->tls = value;
+        break;
+      case Decoder::SystemReg::kNzcv: {
+        uint16_t flags = 0;
+        if (value & (1u << 31)) flags |= CPUState::kFlagNegative;
+        if (value & (1u << 30)) flags |= CPUState::kFlagZero;
+        if (value & (1u << 29)) flags |= CPUState::kFlagCarry;
+        if (value & (1u << 28)) flags |= CPUState::kFlagOverflow;
+        state_->cpu.flags = flags;
+        break;
+      }
+      case Decoder::SystemReg::kFpcr:
+        state_->cpu.cached_fpcr = static_cast<uint32_t>(value);
+        break;
+      case Decoder::SystemReg::kFpsr:
+        state_->cpu.emulated_fpsr = static_cast<uint32_t>(value);
+        break;
+      default:
+        Undefined();
+        break;
+    }
+  }
+
+  Register LogicalShiftedReg(Decoder::LogicalShiftedRegOpcode opcode, bool is_64bit,
+                             bool invert, Register src1, Register src2,
+                             Decoder::ShiftType shift_type, uint8_t shift_amount) {
+    CHECK(!exception_raised_);
+    uint64_t operand2 = ApplyShift(src2, shift_type, shift_amount, is_64bit);
+    if (invert) {
+      operand2 = ~operand2;
+      if (!is_64bit) operand2 &= 0xFFFFFFFFULL;
+    }
+
+    uint64_t operand1 = is_64bit ? src1 : (src1 & 0xFFFFFFFFULL);
+    uint64_t result;
+
+    switch (opcode) {
+      case Decoder::LogicalShiftedRegOpcode::kAnd:
+      case Decoder::LogicalShiftedRegOpcode::kAnds:
+        result = operand1 & operand2;
+        break;
+      case Decoder::LogicalShiftedRegOpcode::kOrr:
+        result = operand1 | operand2;
+        break;
+      case Decoder::LogicalShiftedRegOpcode::kEor:
+        result = operand1 ^ operand2;
+        break;
+      default:
+        Undefined();
+        return 0;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    if (opcode == Decoder::LogicalShiftedRegOpcode::kAnds) {
+      UpdateLogicalFlags(result, is_64bit);
+    }
+
+    return result;
+  }
+
+  Register AddSubShiftedReg(bool is_sub, bool set_flags, bool is_64bit,
+                            Register src1, Register src2,
+                            Decoder::ShiftType shift_type, uint8_t shift_amount) {
+    CHECK(!exception_raised_);
+    uint64_t operand1 = is_64bit ? src1 : (src1 & 0xFFFFFFFFULL);
+    uint64_t operand2 = ApplyShift(src2, shift_type, shift_amount, is_64bit);
+
+    uint64_t result;
+    if (is_sub) {
+      result = operand1 - operand2;
+    } else {
+      result = operand1 + operand2;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    if (set_flags) {
+      UpdateFlags(operand1, operand2, result, is_sub, is_64bit);
+    }
+
+    return result;
+  }
+
+  Register AddSubExtendedReg(bool is_sub, bool set_flags, bool is_64bit,
+                             Register src1, Register src2,
+                             uint8_t extend_type, uint8_t shift_amount) {
+    CHECK(!exception_raised_);
+    uint64_t operand1 = is_64bit ? src1 : (src1 & 0xFFFFFFFFULL);
+    uint64_t operand2 = ExtendReg(src2, extend_type, shift_amount);
+    if (!is_64bit) operand2 &= 0xFFFFFFFFULL;
+
+    uint64_t result;
+    if (is_sub) {
+      result = operand1 - operand2;
+    } else {
+      result = operand1 + operand2;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    if (set_flags) {
+      UpdateFlags(operand1, operand2, result, is_sub, is_64bit);
+    }
+
+    return result;
+  }
+
+  Register ConditionalSelect(Decoder::ConditionalSelectOpcode opcode, bool is_64bit,
+                             Register src1, Register src2, Decoder::Condition cond) {
+    CHECK(!exception_raised_);
+    bool cond_true = EvaluateCondition(cond);
+    uint64_t result;
+
+    if (cond_true) {
+      result = src1;
+    } else {
+      switch (opcode) {
+        case Decoder::ConditionalSelectOpcode::kCsel:
+          result = src2;
+          break;
+        case Decoder::ConditionalSelectOpcode::kCsinc:
+          result = src2 + 1;
+          break;
+        case Decoder::ConditionalSelectOpcode::kCsinv:
+          result = ~src2;
+          break;
+        case Decoder::ConditionalSelectOpcode::kCsneg:
+          result = static_cast<uint64_t>(-static_cast<int64_t>(src2));
+          break;
+        default:
+          Undefined();
+          return 0;
+      }
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    return result;
+  }
+
+  Register DataProc2Src(Decoder::DataProc2SrcOpcode opcode, bool is_64bit,
+                        Register src1, Register src2) {
+    CHECK(!exception_raised_);
+    uint64_t result;
+
+    switch (opcode) {
+      case Decoder::DataProc2SrcOpcode::kUdiv: {
+        if (is_64bit) {
+          result = (src2 != 0) ? (src1 / src2) : 0;
+        } else {
+          uint32_t a = static_cast<uint32_t>(src1);
+          uint32_t b = static_cast<uint32_t>(src2);
+          result = (b != 0) ? (a / b) : 0;
+        }
+        break;
+      }
+      case Decoder::DataProc2SrcOpcode::kSdiv: {
+        if (is_64bit) {
+          int64_t a = static_cast<int64_t>(src1);
+          int64_t b = static_cast<int64_t>(src2);
+          if (b == 0) {
+            result = 0;
+          } else if (a == INT64_MIN && b == -1) {
+            result = static_cast<uint64_t>(INT64_MIN);
+          } else {
+            result = static_cast<uint64_t>(a / b);
+          }
+        } else {
+          int32_t a = static_cast<int32_t>(src1);
+          int32_t b = static_cast<int32_t>(src2);
+          if (b == 0) {
+            result = 0;
+          } else if (a == INT32_MIN && b == -1) {
+            result = static_cast<uint64_t>(static_cast<uint32_t>(INT32_MIN));
+          } else {
+            result = static_cast<uint64_t>(static_cast<uint32_t>(a / b));
+          }
+        }
+        break;
+      }
+      case Decoder::DataProc2SrcOpcode::kLslv:
+        if (is_64bit) {
+          uint8_t shift = src2 & 63;
+          result = src1 << shift;
+        } else {
+          uint8_t shift = static_cast<uint32_t>(src2) & 31;
+          result = static_cast<uint32_t>(src1) << shift;
+        }
+        break;
+      case Decoder::DataProc2SrcOpcode::kLsrv:
+        if (is_64bit) {
+          uint8_t shift = src2 & 63;
+          result = src1 >> shift;
+        } else {
+          uint8_t shift = static_cast<uint32_t>(src2) & 31;
+          result = static_cast<uint32_t>(src1) >> shift;
+        }
+        break;
+      case Decoder::DataProc2SrcOpcode::kAsrv:
+        if (is_64bit) {
+          uint8_t shift = src2 & 63;
+          result = static_cast<uint64_t>(static_cast<int64_t>(src1) >> shift);
+        } else {
+          uint8_t shift = static_cast<uint32_t>(src2) & 31;
+          result = static_cast<uint64_t>(static_cast<uint32_t>(
+              static_cast<int32_t>(static_cast<uint32_t>(src1)) >> shift));
+        }
+        break;
+      case Decoder::DataProc2SrcOpcode::kRorv:
+        if (is_64bit) {
+          uint8_t shift = src2 & 63;
+          result = (src1 >> shift) | (src1 << (64 - shift));
+        } else {
+          uint8_t shift = static_cast<uint32_t>(src2) & 31;
+          uint32_t val = static_cast<uint32_t>(src1);
+          result = ((val >> shift) | (val << (32 - shift))) & 0xFFFFFFFFULL;
+        }
+        break;
+      // region digitalis - CRC32 instructions
+      case Decoder::DataProc2SrcOpcode::kCrc32b:
+      case Decoder::DataProc2SrcOpcode::kCrc32h:
+      case Decoder::DataProc2SrcOpcode::kCrc32w:
+      case Decoder::DataProc2SrcOpcode::kCrc32x: {
+        uint32_t crc = static_cast<uint32_t>(src1);
+        // CRC32 uses ISO 3309 polynomial 0x04C11DB7 (bit-reversed: 0xEDB88320)
+        auto crc32_byte = [](uint32_t c, uint8_t byte) -> uint32_t {
+          c ^= byte;
+          for (int i = 0; i < 8; i++) {
+            c = (c >> 1) ^ ((c & 1) ? 0xEDB88320u : 0u);
+          }
+          return c;
+        };
+        uint8_t nbytes;
+        switch (opcode) {
+          case Decoder::DataProc2SrcOpcode::kCrc32b: nbytes = 1; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32h: nbytes = 2; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32w: nbytes = 4; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32x: nbytes = 8; break;
+          default: __builtin_unreachable();
+        }
+        for (uint8_t i = 0; i < nbytes; i++) {
+          crc = crc32_byte(crc, static_cast<uint8_t>(src2 >> (i * 8)));
+        }
+        result = crc;
+        break;
+      }
+      case Decoder::DataProc2SrcOpcode::kCrc32cb:
+      case Decoder::DataProc2SrcOpcode::kCrc32ch:
+      case Decoder::DataProc2SrcOpcode::kCrc32cw:
+      case Decoder::DataProc2SrcOpcode::kCrc32cx: {
+        uint32_t crc = static_cast<uint32_t>(src1);
+        // CRC32C uses Castagnoli polynomial (bit-reversed: 0x82F63B78)
+        auto crc32c_byte = [](uint32_t c, uint8_t byte) -> uint32_t {
+          c ^= byte;
+          for (int i = 0; i < 8; i++) {
+            c = (c >> 1) ^ ((c & 1) ? 0x82F63B78u : 0u);
+          }
+          return c;
+        };
+        uint8_t nbytes;
+        switch (opcode) {
+          case Decoder::DataProc2SrcOpcode::kCrc32cb: nbytes = 1; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32ch: nbytes = 2; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32cw: nbytes = 4; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32cx: nbytes = 8; break;
+          default: __builtin_unreachable();
+        }
+        for (uint8_t i = 0; i < nbytes; i++) {
+          crc = crc32c_byte(crc, static_cast<uint8_t>(src2 >> (i * 8)));
+        }
+        result = crc;
+        break;
+      }
+      // endregion
+      default:
+        Undefined();
+        return 0;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    return result;
+  }
+
+  Register DataProc3Src(Decoder::DataProc3SrcOpcode opcode, bool is_64bit,
+                        Register src1, Register src2, Register src3) {
+    CHECK(!exception_raised_);
+    uint64_t result;
+
+    switch (opcode) {
+      case Decoder::DataProc3SrcOpcode::kMadd:
+        // MADD: Rd = Ra + Rn * Rm  (MUL is MADD with Ra=XZR)
+        if (is_64bit) {
+          result = src3 + (src1 * src2);
+        } else {
+          result = static_cast<uint32_t>(
+              static_cast<uint32_t>(src3) +
+              (static_cast<uint32_t>(src1) * static_cast<uint32_t>(src2)));
+        }
+        break;
+      case Decoder::DataProc3SrcOpcode::kMsub:
+        // MSUB: Rd = Ra - Rn * Rm  (MNEG is MSUB with Ra=XZR)
+        if (is_64bit) {
+          result = src3 - (src1 * src2);
+        } else {
+          result = static_cast<uint32_t>(
+              static_cast<uint32_t>(src3) -
+              (static_cast<uint32_t>(src1) * static_cast<uint32_t>(src2)));
+        }
+        break;
+      case Decoder::DataProc3SrcOpcode::kSmaddl: {
+        // SMADDL: Xd = Wa (sign-extended) * Wn (sign-extended) + Xa
+        int64_t a = static_cast<int32_t>(static_cast<uint32_t>(src1));
+        int64_t b = static_cast<int32_t>(static_cast<uint32_t>(src2));
+        result = static_cast<uint64_t>(static_cast<int64_t>(src3) + a * b);
+        break;
+      }
+      case Decoder::DataProc3SrcOpcode::kSmsubl: {
+        int64_t a = static_cast<int32_t>(static_cast<uint32_t>(src1));
+        int64_t b = static_cast<int32_t>(static_cast<uint32_t>(src2));
+        result = static_cast<uint64_t>(static_cast<int64_t>(src3) - a * b);
+        break;
+      }
+      case Decoder::DataProc3SrcOpcode::kSmulh: {
+        // SMULH: Xd = (Xn * Xm) >> 64  (signed 128-bit multiply, return high 64 bits)
+        __int128 a = static_cast<int64_t>(src1);
+        __int128 b = static_cast<int64_t>(src2);
+        result = static_cast<uint64_t>((a * b) >> 64);
+        break;
+      }
+      case Decoder::DataProc3SrcOpcode::kUmaddl: {
+        uint64_t a = static_cast<uint32_t>(src1);
+        uint64_t b = static_cast<uint32_t>(src2);
+        result = src3 + a * b;
+        break;
+      }
+      case Decoder::DataProc3SrcOpcode::kUmsubl: {
+        uint64_t a = static_cast<uint32_t>(src1);
+        uint64_t b = static_cast<uint32_t>(src2);
+        result = src3 - a * b;
+        break;
+      }
+      case Decoder::DataProc3SrcOpcode::kUmulh: {
+        // UMULH: Xd = (Xn * Xm) >> 64  (unsigned 128-bit multiply, return high 64 bits)
+        unsigned __int128 a = src1;
+        unsigned __int128 b = src2;
+        result = static_cast<uint64_t>((a * b) >> 64);
+        break;
+      }
+      default:
+        Undefined();
+        return 0;
+    }
+
+    if (!is_64bit && opcode != Decoder::DataProc3SrcOpcode::kSmaddl &&
+        opcode != Decoder::DataProc3SrcOpcode::kSmsubl &&
+        opcode != Decoder::DataProc3SrcOpcode::kSmulh &&
+        opcode != Decoder::DataProc3SrcOpcode::kUmaddl &&
+        opcode != Decoder::DataProc3SrcOpcode::kUmsubl &&
+        opcode != Decoder::DataProc3SrcOpcode::kUmulh) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    return result;
+  }
+
+  // region digitalis
+  // region digitalis
+  Register AddSubWithCarry(Register src1, Register src2, bool is_64bit, bool is_sub, bool set_flags) {
+    CHECK(!exception_raised_);
+    uint64_t op1 = is_64bit ? src1 : (src1 & 0xFFFFFFFFULL);
+    uint64_t op2 = is_64bit ? src2 : (src2 & 0xFFFFFFFFULL);
+    uint64_t carry = (state_->cpu.flags & CPUState::kFlagCarry) ? 1 : 0;
+    uint64_t result;
+    if (is_sub) {
+      op2 = ~op2;
+      if (!is_64bit) op2 &= 0xFFFFFFFFULL;
+    }
+    result = op1 + op2 + carry;
+    if (!is_64bit) result &= 0xFFFFFFFFULL;
+    if (set_flags) {
+      UpdateFlags(op1, op2 + carry, result, is_sub, is_64bit);
+    }
+    return result;
+  }
+
+  Register DataProc1Src(Register src, uint8_t opcode2, bool is_64bit) {
+    CHECK(!exception_raised_);
+    uint64_t val = is_64bit ? src : (src & 0xFFFFFFFFULL);
+    uint64_t result;
+    unsigned bits = is_64bit ? 64 : 32;
+
+    switch (opcode2) {
+      case 0b000000: {
+        // RBIT: reverse bits
+        result = 0;
+        for (unsigned i = 0; i < bits; i++) {
+          if (val & (1ULL << i)) result |= (1ULL << (bits - 1 - i));
+        }
+        break;
+      }
+      case 0b000001: {
+        // REV16: reverse bytes in 16-bit halfwords
+        result = 0;
+        for (unsigned i = 0; i < bits; i += 16) {
+          uint64_t hw = (val >> i) & 0xFFFF;
+          hw = ((hw & 0xFF) << 8) | ((hw >> 8) & 0xFF);
+          result |= hw << i;
+        }
+        break;
+      }
+      case 0b000010:
+        if (is_64bit) {
+          // REV32: reverse bytes in 32-bit words (64-bit only)
+          result = __builtin_bswap64(val);
+          result = (result << 32) | (result >> 32);  // swap the two 32-bit halves back
+          // Actually: REV32 reverses bytes within each 32-bit word
+          uint32_t lo = __builtin_bswap32(static_cast<uint32_t>(val));
+          uint32_t hi = __builtin_bswap32(static_cast<uint32_t>(val >> 32));
+          result = (static_cast<uint64_t>(hi) << 32) | lo;
+        } else {
+          // REV: reverse bytes in 32-bit word
+          result = __builtin_bswap32(static_cast<uint32_t>(val));
+        }
+        break;
+      case 0b000011:
+        // REV: reverse bytes in 64-bit (64-bit only)
+        result = __builtin_bswap64(val);
+        break;
+      case 0b000100: {
+        // CLZ: count leading zeros
+        if (is_64bit) {
+          result = val ? __builtin_clzll(val) : 64;
+        } else {
+          result = static_cast<uint32_t>(val) ? __builtin_clz(static_cast<uint32_t>(val)) : 32;
+        }
+        break;
+      }
+      case 0b000101: {
+        // CLS: count leading sign bits (= CLZ of XOR with arithmetic shift)
+        if (is_64bit) {
+          int64_t sval = static_cast<int64_t>(val);
+          uint64_t xored = sval ^ (sval >> 1);
+          result = xored ? (__builtin_clzll(xored) - 1) : 63;
+        } else {
+          int32_t sval = static_cast<int32_t>(static_cast<uint32_t>(val));
+          uint32_t xored = sval ^ (sval >> 1);
+          result = xored ? (__builtin_clz(xored) - 1) : 31;
+        }
+        break;
+      }
+      default:
+        Undefined();
+        return 0;
+    }
+
+    if (!is_64bit) result &= 0xFFFFFFFFULL;
+    return result;
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD three different (widening): operations on narrow elements producing wide results.
+  //   Q=0 uses lower half of source registers, Q=1 uses upper half.
+  //   Result is always full 128-bit vector with wider elements.
+  //
+  void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];  // Needed for accumulate ops (MLAL, MLSL, ABAL)
+    __uint128_t result = 0;
+
+    // Input element sizes.
+    uint8_t in_esize;  // input element size in bytes
+    switch (args.size) {
+      case 0b00: in_esize = 1; break;  // 8-bit -> 16-bit
+      case 0b01: in_esize = 2; break;  // 16-bit -> 32-bit
+      case 0b10: in_esize = 4; break;  // 32-bit -> 64-bit
+      default: Undefined(); return;
+    }
+    uint8_t out_esize = in_esize * 2;  // output element size
+    uint8_t num_elements = 8 / out_esize;  // elements in output (always 128-bit result but /16 * out_esize)
+
+    // 128-bit output, so num_elements = 16 / out_esize
+    num_elements = 16 / out_esize;
+
+    // Q=0: use lower half of source (bytes 0-7), Q=1: use upper half (bytes 8-15).
+    uint8_t src_offset = args.q ? 8 : 0;
+
+    // Helper to extract an unsigned element from source at given byte offset.
+    auto get_unsigned = [&](const __uint128_t& src, uint8_t elem_idx) -> uint64_t {
+      uint64_t val = 0;
+      memcpy(&val, reinterpret_cast<const uint8_t*>(&src) + src_offset + elem_idx * in_esize, in_esize);
+      return val;
+    };
+
+    // Helper to extract a signed element from source at given byte offset.
+    auto get_signed = [&](const __uint128_t& src, uint8_t elem_idx) -> int64_t {
+      uint64_t val = 0;
+      memcpy(&val, reinterpret_cast<const uint8_t*>(&src) + src_offset + elem_idx * in_esize, in_esize);
+      // Sign-extend
+      uint8_t shift = (8 - in_esize) * 8;
+      return static_cast<int64_t>(val << shift) >> shift;
+    };
+
+    // Helper to write a wide element to result.
+    auto set_result = [&](uint8_t elem_idx, uint64_t val) {
+      memcpy(reinterpret_cast<uint8_t*>(&result) + elem_idx * out_esize, &val, out_esize);
+    };
+
+    // Helper to get existing accumulator value.
+    auto get_accum = [&](uint8_t elem_idx) -> uint64_t {
+      uint64_t val = 0;
+      memcpy(&val, reinterpret_cast<const uint8_t*>(&dst) + elem_idx * out_esize, out_esize);
+      return val;
+    };
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdThreeDiffOpcode::kUaddl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, get_unsigned(src_n, i) + get_unsigned(src_m, i));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSaddl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, static_cast<uint64_t>(get_signed(src_n, i) + get_signed(src_m, i)));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kUsubl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, get_unsigned(src_n, i) - get_unsigned(src_m, i));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSsubl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, static_cast<uint64_t>(get_signed(src_n, i) - get_signed(src_m, i)));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kUmlal:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, get_accum(i) + get_unsigned(src_n, i) * get_unsigned(src_m, i));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSmlal:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t prod = get_signed(src_n, i) * get_signed(src_m, i);
+          set_result(i, static_cast<uint64_t>(static_cast<int64_t>(get_accum(i)) + prod));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kUmlsl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, get_accum(i) - get_unsigned(src_n, i) * get_unsigned(src_m, i));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSmlsl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t prod = get_signed(src_n, i) * get_signed(src_m, i);
+          set_result(i, static_cast<uint64_t>(static_cast<int64_t>(get_accum(i)) - prod));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kUmull:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, get_unsigned(src_n, i) * get_unsigned(src_m, i));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSmull:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          set_result(i, static_cast<uint64_t>(get_signed(src_n, i) * get_signed(src_m, i)));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kUabdl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = get_unsigned(src_n, i);
+          uint64_t b = get_unsigned(src_m, i);
+          set_result(i, a > b ? a - b : b - a);
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSabdl:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t a = get_signed(src_n, i);
+          int64_t b = get_signed(src_m, i);
+          int64_t diff = a - b;
+          set_result(i, static_cast<uint64_t>(diff < 0 ? -diff : diff));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kUabal:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = get_unsigned(src_n, i);
+          uint64_t b = get_unsigned(src_m, i);
+          set_result(i, get_accum(i) + (a > b ? a - b : b - a));
+        }
+        break;
+      case Decoder::AdvSimdThreeDiffOpcode::kSabal:
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t a = get_signed(src_n, i);
+          int64_t b = get_signed(src_m, i);
+          int64_t diff = a - b;
+          set_result(i, get_accum(i) + static_cast<uint64_t>(diff < 0 ? -diff : diff));
+        }
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
+    CHECK(!exception_raised_);
+    // EXT: extract bytes from concatenation of Vn:Vm at byte position index.
+    uint8_t bytes[32];
+    memcpy(bytes, &state_->cpu.v[rn], 16);
+    memcpy(bytes + 16, &state_->cpu.v[rm], 16);
+    __uint128_t result = 0;
+    unsigned num_bytes = q ? 16 : 8;
+    memcpy(&result, bytes + index, num_bytes);
+    state_->cpu.v[rd] = result;
+  }
+
+  // region digitalis
+  void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
+                      uint8_t opcode, bool q) {
+    CHECK(!exception_raised_);
+    uint8_t esize;
+    switch (size) {
+      case 0b00: esize = 1; break;
+      case 0b01: esize = 2; break;
+      case 0b10: esize = 4; break;
+      case 0b11: esize = 8; break;
+      default: Undefined(); return;
+    }
+    uint8_t vec_len = q ? 16 : 8;
+    uint8_t num_elements = vec_len / esize;  // elements per source
+    __uint128_t src_n = state_->cpu.v[rn];
+    __uint128_t src_m = state_->cpu.v[rm];
+    __uint128_t result = 0;
+    switch (opcode) {
+      case 0b001: // UZP1: even elements (0, 2, 4, ...) from Vn then Vm
+      case 0b101: { // UZP2: odd elements (1, 3, 5, ...) from Vn then Vm
+        uint8_t start = (opcode == 0b101) ? 1 : 0;
+        uint8_t pairs = num_elements / 2;
+        for (uint8_t i = 0; i < pairs; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src_n) + (i * 2 + start) * esize, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &elem, esize);
+        }
+        for (uint8_t i = 0; i < pairs; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src_m) + (i * 2 + start) * esize, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + (pairs + i) * esize, &elem, esize);
+        }
+        break;
+      }
+      case 0b010: // TRN1: even-indexed transpose
+      case 0b110: { // TRN2: odd-indexed transpose
+        uint8_t start = (opcode == 0b110) ? 1 : 0;
+        for (uint8_t i = 0; i < num_elements; i += 2) {
+          uint64_t elem_n = 0, elem_m = 0;
+          memcpy(&elem_n, reinterpret_cast<const uint8_t*>(&src_n) + (i + start) * esize, esize);
+          memcpy(&elem_m, reinterpret_cast<const uint8_t*>(&src_m) + (i + start) * esize, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &elem_n, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + (i + 1) * esize, &elem_m, esize);
+        }
+        break;
+      }
+      case 0b011: // ZIP1: interleave lower halves
+      case 0b111: { // ZIP2: interleave upper halves
+        uint8_t half = num_elements / 2;
+        uint8_t start = (opcode == 0b111) ? half : 0;
+        for (uint8_t i = 0; i < half; i++) {
+          uint64_t elem_n = 0, elem_m = 0;
+          memcpy(&elem_n, reinterpret_cast<const uint8_t*>(&src_n) + (start + i) * esize, esize);
+          memcpy(&elem_m, reinterpret_cast<const uint8_t*>(&src_m) + (start + i) * esize, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2 * esize, &elem_n, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + (i * 2 + 1) * esize, &elem_m, esize);
+        }
+        break;
+      }
+      default:
+        Undefined();
+        return;
+    }
+    state_->cpu.v[rd] = result;
+  }
+  // endregion
+
+  // region digitalis
+  void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t /*size*/,
+                          bool q, bool is_store, bool postindex, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint8_t vec_bytes = q ? 16 : 8;
+    uint64_t base_addr = (rn == 31) ? GetSp() : state_->cpu.x[rn];
+
+    for (uint8_t r = 0; r < num_regs; r++) {
+      uint8_t vreg = (rt + r) & 31;
+      uint64_t addr = base_addr + r * vec_bytes;
+      if (is_store) {
+        __uint128_t val = state_->cpu.v[vreg];
+        void* ptr = ToHostAddr<void>(addr);
+        if (FaultyStore(ptr, 8, static_cast<uint64_t>(val))) {
+          HandleMemoryFault(addr); return;
+        }
+        if (vec_bytes > 8) {
+          uint64_t hi = static_cast<uint64_t>(val >> 64);
+          if (FaultyStore(static_cast<uint8_t*>(ptr) + 8, 8, hi)) {
+            HandleMemoryFault(addr + 8); return;
+          }
+        }
+      } else {
+        void* ptr = ToHostAddr<void>(addr);
+        FaultyLoadResult lo = FaultyLoad(ptr, 8);
+        if (lo.is_fault) { HandleMemoryFault(addr); return; }
+        if (vec_bytes > 8) {
+          FaultyLoadResult hi = FaultyLoad(static_cast<uint8_t*>(ptr) + 8, 8);
+          if (hi.is_fault) { HandleMemoryFault(addr + 8); return; }
+          state_->cpu.v[vreg] = static_cast<__uint128_t>(lo.value) |
+                                (static_cast<__uint128_t>(hi.value) << 64);
+        } else {
+          state_->cpu.v[vreg] = static_cast<__uint128_t>(lo.value);
+        }
+      }
+    }
+
+    if (postindex) {
+      int64_t post_offset;
+      if (rm == 31) {
+        post_offset = num_regs * vec_bytes;  // immediate post-index
+      } else {
+        post_offset = static_cast<int64_t>(state_->cpu.x[rm]);  // register post-index
+      }
+      if (rn == 31) {
+        SetSp(base_addr + post_offset);
+      } else {
+        state_->cpu.x[rn] = base_addr + post_offset;
+      }
+    }
+  }
+
+  //
+  // AdvSIMD load/store single structure: LD1R-LD4R (replicate) and LD/ST to one lane.
+  //
+  void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
+    CHECK(!exception_raised_);
+
+    uint64_t base_addr = (args.rn == 31) ? GetSp() : state_->cpu.x[args.rn];
+
+    // Element size in bytes.
+    uint8_t esize = 1u << args.size;
+    uint8_t vec_bytes = args.q ? 16 : 8;
+
+    if (args.is_replicate) {
+      // LD1R-LD4R: Load one element per register, replicate to all lanes.
+      for (uint8_t r = 0; r < args.num_regs; r++) {
+        uint8_t vreg = (args.rt + r) & 31;
+        uint64_t addr = base_addr + r * esize;
+
+        FaultyLoadResult res = FaultyLoad(ToHostAddr<void>(addr), esize);
+        if (res.is_fault) { HandleMemoryFault(addr); return; }
+
+        // Replicate the loaded element across all lanes.
+        __uint128_t val = 0;
+        uint8_t num_lanes = vec_bytes / esize;
+        for (uint8_t lane = 0; lane < num_lanes; lane++) {
+          uint64_t elem = res.value;
+          // Mask to element size.
+          if (esize < 8) elem &= (1ULL << (esize * 8)) - 1;
+          memcpy(reinterpret_cast<uint8_t*>(&val) + lane * esize, &elem, esize);
+        }
+        // Clear upper 64 bits if Q=0.
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &val, 8);
+          val = 0;
+          memcpy(&val, &lo, 8);
+        }
+        state_->cpu.v[vreg] = val;
+      }
+
+      // Post-index.
+      if (args.postindex) {
+        int64_t offset;
+        if (args.rm == 31) {
+          offset = args.num_regs * esize;  // Immediate: total bytes loaded.
+        } else {
+          offset = static_cast<int64_t>(state_->cpu.x[args.rm]);
+        }
+        if (args.rn == 31) {
+          SetSp(base_addr + offset);
+        } else {
+          state_->cpu.x[args.rn] = base_addr + offset;
+        }
+      }
+    } else {
+      // LD/ST single element to/from one lane.
+      for (uint8_t r = 0; r < args.num_regs; r++) {
+        uint8_t vreg = (args.rt + r) & 31;
+        uint64_t addr = base_addr + r * esize;
+
+        bool is_store = (args.op == Decoder::AdvSimdSingleStructOp::kSt1 ||
+                         args.op == Decoder::AdvSimdSingleStructOp::kSt2 ||
+                         args.op == Decoder::AdvSimdSingleStructOp::kSt3 ||
+                         args.op == Decoder::AdvSimdSingleStructOp::kSt4);
+
+        if (is_store) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&state_->cpu.v[vreg]) + args.index * esize, esize);
+          if (FaultyStore(ToHostAddr<void>(addr), esize, elem)) {
+            HandleMemoryFault(addr); return;
+          }
+        } else {
+          FaultyLoadResult res = FaultyLoad(ToHostAddr<void>(addr), esize);
+          if (res.is_fault) { HandleMemoryFault(addr); return; }
+          // Write to specific lane, preserving other lanes.
+          __uint128_t vec = state_->cpu.v[vreg];
+          uint64_t elem = res.value;
+          if (esize < 8) elem &= (1ULL << (esize * 8)) - 1;
+          memcpy(reinterpret_cast<uint8_t*>(&vec) + args.index * esize, &elem, esize);
+          state_->cpu.v[vreg] = vec;
+        }
+      }
+
+      // Post-index.
+      if (args.postindex) {
+        int64_t offset;
+        if (args.rm == 31) {
+          offset = args.num_regs * esize;
+        } else {
+          offset = static_cast<int64_t>(state_->cpu.x[args.rm]);
+        }
+        if (args.rn == 31) {
+          SetSp(base_addr + offset);
+        } else {
+          state_->cpu.x[args.rn] = base_addr + offset;
+        }
+      }
+    }
+  }
+  // endregion
+
+  Register Extr(Register src_n, Register src_m, uint8_t lsb, bool is_64bit) {
+    CHECK(!exception_raised_);
+    unsigned reg_size = is_64bit ? 64 : 32;
+    uint64_t n = is_64bit ? src_n : (src_n & 0xFFFFFFFFULL);
+    uint64_t m = is_64bit ? src_m : (src_m & 0xFFFFFFFFULL);
+    uint64_t result;
+    if (lsb == 0) {
+      result = m;
+    } else {
+      result = (m >> lsb) | (n << (reg_size - lsb));
+    }
+    if (!is_64bit) result &= 0xFFFFFFFFULL;
+    return result;
+  }
+  // endregion
+
+  void ConditionalCompare(bool is_neg, bool is_64bit, Register rn, Register rm,
+                          Decoder::Condition cond, uint8_t nzcv_imm) {
+    CHECK(!exception_raised_);
+    if (EvaluateCondition(cond)) {
+      // Condition is true: perform the comparison and set flags.
+      uint64_t operand1 = is_64bit ? rn : (rn & 0xFFFFFFFFULL);
+      uint64_t operand2 = is_64bit ? rm : (rm & 0xFFFFFFFFULL);
+      uint64_t result;
+      if (is_neg) {
+        // CCMN: add
+        result = operand1 + operand2;
+        if (!is_64bit) result &= 0xFFFFFFFFULL;
+        UpdateFlags(operand1, operand2, result, false, is_64bit);
+      } else {
+        // CCMP: subtract
+        result = operand1 - operand2;
+        if (!is_64bit) result &= 0xFFFFFFFFULL;
+        UpdateFlags(operand1, operand2, result, true, is_64bit);
+      }
+    } else {
+      // Condition is false: set flags to the immediate value.
+      uint16_t flags = 0;
+      if (nzcv_imm & 0b1000) flags |= CPUState::kFlagNegative;
+      if (nzcv_imm & 0b0100) flags |= CPUState::kFlagZero;
+      if (nzcv_imm & 0b0010) flags |= CPUState::kFlagCarry;
+      if (nzcv_imm & 0b0001) flags |= CPUState::kFlagOverflow;
+      state_->cpu.flags = flags;
+    }
+  }
+
+  void Nop() {}
+
+  void Undefined() {
+    UndefinedInsn(GetInsnAddr());
+    exception_raised_ = true;
+  }
+
+  // region digitalis
+  //
+  // SIMD/FP instruction implementations.
+  //
+
+  void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
+    CHECK(!exception_raised_);
+    __uint128_t value = ExpandSimdModifiedImm(args.op, args.cmode, args.abc, args.defgh, args.q);
+    state_->cpu.v[args.rd] = value;
+  }
+
+  void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
+    CHECK(!exception_raised_);
+    uint64_t addr = base + args.offset;
+    void* host_addr = ToHostAddr<void>(addr);
+
+    if (args.is_store) {
+      SimdStoreToMemory(host_addr, args.rt, args.size);
+    } else {
+      SimdLoadFromMemory(host_addr, args.rt, args.size);
+    }
+  }
+
+  void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register base) {
+    CHECK(!exception_raised_);
+    uint8_t element_size;
+    switch (args.size) {
+      case Decoder::SimdLoadStoreSize::k32bit: element_size = 4; break;
+      case Decoder::SimdLoadStoreSize::k64bit: element_size = 8; break;
+      case Decoder::SimdLoadStoreSize::k128bit: element_size = 16; break;
+      default: Undefined(); return;
+    }
+
+    void* addr1 = ToHostAddr<void>(base);
+    void* addr2 = ToHostAddr<void>(base + element_size);
+
+    if (args.is_store) {
+      SimdStoreToMemory(addr1, args.rt1, args.size);
+      SimdStoreToMemory(addr2, args.rt2, args.size);
+    } else {
+      SimdLoadFromMemory(addr1, args.rt1, args.size);
+      SimdLoadFromMemory(addr2, args.rt2, args.size);
+    }
+  }
+
+  void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
+                         Register base, Register offset_reg) {
+    CHECK(!exception_raised_);
+    uint64_t addr = base + (offset_reg << args.shift_amount);
+    void* host_addr = ToHostAddr<void>(addr);
+
+    if (args.is_store) {
+      SimdStoreToMemory(host_addr, args.rt, args.size);
+    } else {
+      SimdLoadFromMemory(host_addr, args.rt, args.size);
+    }
+  }
+
+  void FpIntConversion(const Decoder::FpIntConvArgs& args) {
+    CHECK(!exception_raised_);
+    uint8_t rmode = args.rmode;
+    uint8_t opcode = args.op;
+
+    // endregion (digitalis FMOV trace removed)
+
+    // FMOV between GP and FP registers (rmode=00, opcode=110 or 111)
+    // ARM64 encoding: opcode=111 → GP to FP (FMOV Dd, Xn)
+    //                 opcode=110 → FP to GP (FMOV Xd, Dn)
+    if (rmode == 0b00 && opcode == 0b111) {
+      // FMOV Sd, Wn (or FMOV Dd, Xn depending on ftype/sf)
+      uint64_t gp_val = (args.rn < 31) ? state_->cpu.x[args.rn] : 0;
+      state_->cpu.v[args.rd] = 0;  // zero upper bits
+      if (args.ftype == 0b00) {
+        // FMOV Sd, Wn (32-bit)
+        memcpy(&state_->cpu.v[args.rd], &gp_val, 4);
+      } else if (args.ftype == 0b01) {
+        // FMOV Dd, Xn (64-bit)
+        memcpy(&state_->cpu.v[args.rd], &gp_val, 8);
+      } else {
+        Undefined();
+      }
+      return;
+    }
+
+    if (rmode == 0b00 && opcode == 0b110) {
+      // FMOV Wn, Sd (or FMOV Xn, Dd)
+      uint64_t result = 0;
+      if (args.ftype == 0b00) {
+        // FMOV Wn, Sd (32-bit)
+        memcpy(&result, &state_->cpu.v[args.rn], 4);
+        result &= 0xFFFFFFFFULL;
+      } else if (args.ftype == 0b01) {
+        // FMOV Xn, Dd (64-bit)
+        memcpy(&result, &state_->cpu.v[args.rn], 8);
+      } else {
+        Undefined();
+        return;
+      }
+      if (args.rd < 31) {
+        state_->cpu.x[args.rd] = result;
+      }
+      return;
+    }
+
+    // FMOV to/from top half of Q register: rmode=01, opcode=110 or 111
+    // ARM64 encoding: opcode=111 → GP to FP (FMOV Vd.D[1], Xn)
+    //                 opcode=110 → FP to GP (FMOV Xd, Vn.D[1])
+    if (rmode == 0b01 && opcode == 0b110) {
+      // FMOV Xd, Vn.D[1] — read top 64 bits
+      uint64_t result = 0;
+      __uint128_t v = state_->cpu.v[args.rn];
+      result = static_cast<uint64_t>(v >> 64);
+      if (args.rd < 31) {
+        state_->cpu.x[args.rd] = result;
+      }
+      return;
+    }
+
+    if (rmode == 0b01 && opcode == 0b111) {
+      // FMOV Vd.D[1], Xn — write top 64 bits
+      uint64_t gp_val = (args.rn < 31) ? state_->cpu.x[args.rn] : 0;
+      __uint128_t v = state_->cpu.v[args.rd];
+      // Keep lower 64 bits, replace upper 64 bits
+      v = (v & static_cast<__uint128_t>(0xFFFFFFFFFFFFFFFFULL)) |
+          (static_cast<__uint128_t>(gp_val) << 64);
+      state_->cpu.v[args.rd] = v;
+      return;
+    }
+
+    // SCVTF, UCVTF, FCVTZS, FCVTZU: integer <-> FP conversion
+    if (rmode == 0b00 && opcode == 0b010) {
+      // SCVTF: signed integer to FP
+      int64_t ival = args.sf ? static_cast<int64_t>(args.rn < 31 ? state_->cpu.x[args.rn] : 0)
+                             : static_cast<int64_t>(static_cast<int32_t>(
+                                   static_cast<uint32_t>(args.rn < 31 ? state_->cpu.x[args.rn] : 0)));
+      state_->cpu.v[args.rd] = 0;
+      if (args.ftype == 0b00) {
+        float f = static_cast<float>(ival);
+        memcpy(&state_->cpu.v[args.rd], &f, 4);
+      } else if (args.ftype == 0b01) {
+        double d = static_cast<double>(ival);
+        memcpy(&state_->cpu.v[args.rd], &d, 8);
+      } else { Undefined(); }
+      return;
+    }
+
+    if (rmode == 0b00 && opcode == 0b011) {
+      // UCVTF: unsigned integer to FP
+      uint64_t uval = args.sf ? (args.rn < 31 ? state_->cpu.x[args.rn] : 0)
+                              : static_cast<uint64_t>(static_cast<uint32_t>(
+                                    args.rn < 31 ? state_->cpu.x[args.rn] : 0));
+      state_->cpu.v[args.rd] = 0;
+      if (args.ftype == 0b00) {
+        float f = static_cast<float>(uval);
+        memcpy(&state_->cpu.v[args.rd], &f, 4);
+      } else if (args.ftype == 0b01) {
+        double d = static_cast<double>(uval);
+        memcpy(&state_->cpu.v[args.rd], &d, 8);
+      } else { Undefined(); }
+      return;
+    }
+
+    // region digitalis
+    // FCVTNS/FCVTNU/FCVTPS/FCVTPU/FCVTMS/FCVTMU: various rounding modes
+    // rmode=00: round to nearest (ties to even)
+    // rmode=01: round toward +inf
+    // rmode=10: round toward -inf
+    // rmode=11: round toward zero
+    // opcode=000: signed, opcode=001: unsigned
+    if ((rmode == 0b00 || rmode == 0b01 || rmode == 0b10) &&
+        (opcode == 0b000 || opcode == 0b001)) {
+      bool is_signed = (opcode == 0b000);
+      uint64_t result = 0;
+      double dval = 0;
+      if (args.ftype == 0b00) {
+        float f; memcpy(&f, &state_->cpu.v[args.rn], 4);
+        dval = f;
+      } else if (args.ftype == 0b01) {
+        memcpy(&dval, &state_->cpu.v[args.rn], 8);
+      } else { Undefined(); return; }
+      // Apply rounding
+      double rounded;
+      if (rmode == 0b00) rounded = rint(dval);        // nearest, ties to even
+      else if (rmode == 0b01) rounded = ceil(dval);    // toward +inf
+      else rounded = floor(dval);                       // toward -inf
+      if (is_signed) {
+        if (args.sf) result = static_cast<uint64_t>(static_cast<int64_t>(rounded));
+        else result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(rounded)));
+      } else {
+        if (args.sf) result = static_cast<uint64_t>(rounded);
+        else result = static_cast<uint64_t>(static_cast<uint32_t>(rounded));
+      }
+      if (args.rd < 31) {
+        state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
+      }
+      return;
+    }
+    // endregion
+
+    if (rmode == 0b11 && opcode == 0b000) {
+      // FCVTZS: FP to signed integer, round toward zero
+      uint64_t result = 0;
+      if (args.ftype == 0b00) {
+        float f;
+        memcpy(&f, &state_->cpu.v[args.rn], 4);
+        if (args.sf) { result = static_cast<uint64_t>(static_cast<int64_t>(f)); }
+        else { result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(f))); }
+      } else if (args.ftype == 0b01) {
+        double d;
+        memcpy(&d, &state_->cpu.v[args.rn], 8);
+        if (args.sf) { result = static_cast<uint64_t>(static_cast<int64_t>(d)); }
+        else { result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(d))); }
+      } else { Undefined(); return; }
+      if (args.rd < 31) {
+        state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
+      }
+      return;
+    }
+
+    if (rmode == 0b11 && opcode == 0b001) {
+      // FCVTZU: FP to unsigned integer, round toward zero
+      uint64_t result = 0;
+      if (args.ftype == 0b00) {
+        float f;
+        memcpy(&f, &state_->cpu.v[args.rn], 4);
+        if (args.sf) { result = static_cast<uint64_t>(f); }
+        else { result = static_cast<uint64_t>(static_cast<uint32_t>(f)); }
+      } else if (args.ftype == 0b01) {
+        double d;
+        memcpy(&d, &state_->cpu.v[args.rn], 8);
+        if (args.sf) { result = static_cast<uint64_t>(d); }
+        else { result = static_cast<uint64_t>(static_cast<uint32_t>(d)); }
+      } else { Undefined(); return; }
+      if (args.rd < 31) {
+        state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
+      }
+      return;
+    }
+
+    Undefined();
+  }
+
+  void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
+    CHECK(!exception_raised_);
+    void* host_addr = ToHostAddr<void>(base);
+    bool need_write = (args.op != Decoder::AtomicOp::kLdxr &&
+                       args.op != Decoder::AtomicOp::kLdar);
+    // Atomic ops use __atomic builtins which handle their own faults via
+    // the registered FaultyLoad/FaultyStore recovery code addresses.
+
+    switch (args.op) {
+      case Decoder::AtomicOp::kLdxr:
+      case Decoder::AtomicOp::kLdar: {
+        uint64_t val = 0;
+        switch (args.size) {
+          case 0: val = AtomicLoad<uint8_t>(host_addr); break;
+          case 1: val = AtomicLoad<uint16_t>(host_addr); break;
+          case 2: val = AtomicLoad<uint32_t>(host_addr); break;
+          case 3: val = AtomicLoad<uint64_t>(host_addr); break;
+        }
+        if (args.op == Decoder::AtomicOp::kLdxr) {
+          state_->cpu.reservation_address = base;
+          memcpy(&state_->cpu.reservation_value, &val, sizeof(val));
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kStxr: {
+        uint64_t new_val = (args.rt < 31) ? state_->cpu.x[args.rt] : 0;
+        uint64_t expected;
+        memcpy(&expected, &state_->cpu.reservation_value, sizeof(expected));
+        bool success = false;
+        if (state_->cpu.reservation_address == base) {
+          switch (args.size) {
+            case 0: success = AtomicCAS<uint8_t>(host_addr, expected, new_val); break;
+            case 1: success = AtomicCAS<uint16_t>(host_addr, expected, new_val); break;
+            case 2: success = AtomicCAS<uint32_t>(host_addr, expected, new_val); break;
+            case 3: success = AtomicCAS<uint64_t>(host_addr, expected, new_val); break;
+          }
+        }
+        state_->cpu.reservation_address = 0;
+        // Rs gets 0 on success, 1 on failure.
+        if (args.rs < 31) state_->cpu.x[args.rs] = success ? 0 : 1;
+        break;
+      }
+
+      case Decoder::AtomicOp::kStlr: {
+        uint64_t val = (args.rt < 31) ? state_->cpu.x[args.rt] : 0;
+        switch (args.size) {
+          case 0: AtomicStore<uint8_t>(host_addr, val); break;
+          case 1: AtomicStore<uint16_t>(host_addr, val); break;
+          case 2: AtomicStore<uint32_t>(host_addr, val); break;
+          case 3: AtomicStore<uint64_t>(host_addr, val); break;
+        }
+        break;
+      }
+
+      case Decoder::AtomicOp::kCas: {
+        uint64_t expected = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t desired = (args.rt < 31) ? state_->cpu.x[args.rt] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicCASVal<uint8_t>(host_addr, expected, desired); break;
+          case 1: old_val = AtomicCASVal<uint16_t>(host_addr, expected, desired); break;
+          case 2: old_val = AtomicCASVal<uint32_t>(host_addr, expected, desired); break;
+          case 3: old_val = AtomicCASVal<uint64_t>(host_addr, expected, desired); break;
+        }
+        // CAS writes original value back to Rs.
+        if (args.rs < 31) state_->cpu.x[args.rs] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kSwp: {
+        uint64_t new_val = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicExchange<uint8_t>(host_addr, new_val); break;
+          case 1: old_val = AtomicExchange<uint16_t>(host_addr, new_val); break;
+          case 2: old_val = AtomicExchange<uint32_t>(host_addr, new_val); break;
+          case 3: old_val = AtomicExchange<uint64_t>(host_addr, new_val); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdadd: {
+        uint64_t addend = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchAdd<uint8_t>(host_addr, addend); break;
+          case 1: old_val = AtomicFetchAdd<uint16_t>(host_addr, addend); break;
+          case 2: old_val = AtomicFetchAdd<uint32_t>(host_addr, addend); break;
+          case 3: old_val = AtomicFetchAdd<uint64_t>(host_addr, addend); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdclr: {
+        uint64_t mask = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchAndNot<uint8_t>(host_addr, mask); break;
+          case 1: old_val = AtomicFetchAndNot<uint16_t>(host_addr, mask); break;
+          case 2: old_val = AtomicFetchAndNot<uint32_t>(host_addr, mask); break;
+          case 3: old_val = AtomicFetchAndNot<uint64_t>(host_addr, mask); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdset: {
+        uint64_t bits = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchOr<uint8_t>(host_addr, bits); break;
+          case 1: old_val = AtomicFetchOr<uint16_t>(host_addr, bits); break;
+          case 2: old_val = AtomicFetchOr<uint32_t>(host_addr, bits); break;
+          case 3: old_val = AtomicFetchOr<uint64_t>(host_addr, bits); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdeor: {
+        uint64_t bits = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchXor<uint8_t>(host_addr, bits); break;
+          case 1: old_val = AtomicFetchXor<uint16_t>(host_addr, bits); break;
+          case 2: old_val = AtomicFetchXor<uint32_t>(host_addr, bits); break;
+          case 3: old_val = AtomicFetchXor<uint64_t>(host_addr, bits); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+    }
+  }
+
+  // region digitalis
+  //
+  // AdvSIMD copy: DUP (element), DUP (general), INS (general), SMOV, UMOV.
+  //
+  void AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
+    CHECK(!exception_raised_);
+    uint8_t imm5 = args.imm5;
+
+    // Determine element size and index from imm5.
+    // imm5[0]=1: byte (8-bit), index = imm5[4:1]
+    // imm5[1:0]=10: halfword (16-bit), index = imm5[4:2]
+    // imm5[2:0]=100: word (32-bit), index = imm5[4:3]
+    // imm5[3:0]=1000: doubleword (64-bit), index = imm5[4]
+    uint8_t esize;    // element size in bytes
+    uint8_t index;    // element index
+
+    if (imm5 & 0b00001) {
+      esize = 1;
+      index = (imm5 >> 1) & 0xF;
+    } else if (imm5 & 0b00010) {
+      esize = 2;
+      index = (imm5 >> 2) & 0x7;
+    } else if (imm5 & 0b00100) {
+      esize = 4;
+      index = (imm5 >> 3) & 0x3;
+    } else if (imm5 & 0b01000) {
+      esize = 8;
+      index = (imm5 >> 4) & 0x1;
+    } else {
+      Undefined();
+      return;
+    }
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdCopyOpcode::kDupElement: {
+        // DUP (element): duplicate Vn[index] to all elements of Vd.
+        // Q=0: 64-bit result (lower half), Q=1: 128-bit result.
+        __uint128_t src = state_->cpu.v[args.rn];
+        uint64_t element = 0;
+        memcpy(&element, reinterpret_cast<const uint8_t*>(&src) + index * esize, esize);
+
+        __uint128_t result = 0;
+        uint8_t num_elements = (args.q ? 16 : 8) / esize;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &element, esize);
+        }
+        state_->cpu.v[args.rd] = result;
+        break;
+      }
+
+      case Decoder::AdvSimdCopyOpcode::kDupGeneral: {
+        // DUP (general): duplicate GP register Rn to all elements of Vd.
+        // Element size determined by imm5 (same encoding as above).
+        // Q=0: 64-bit result, Q=1: 128-bit result.
+        uint64_t gp_val = (args.rn < 31) ? state_->cpu.x[args.rn] : 0;
+
+        __uint128_t result = 0;
+        uint8_t num_elements = (args.q ? 16 : 8) / esize;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &gp_val, esize);
+        }
+        state_->cpu.v[args.rd] = result;
+        break;
+      }
+
+      case Decoder::AdvSimdCopyOpcode::kInsGeneral: {
+        // INS (general): insert GP register Rn into Vd[index].
+        // The rest of Vd is unchanged.
+        uint64_t gp_val = (args.rn < 31) ? state_->cpu.x[args.rn] : 0;
+        __uint128_t v = state_->cpu.v[args.rd];
+        memcpy(reinterpret_cast<uint8_t*>(&v) + index * esize, &gp_val, esize);
+        state_->cpu.v[args.rd] = v;
+        break;
+      }
+
+      case Decoder::AdvSimdCopyOpcode::kSmov: {
+        // SMOV: signed move from Vn[index] to GP register Rd.
+        // Q=0: destination is Wd (32-bit), Q=1: destination is Xd (64-bit).
+        // Element size must be smaller than destination.
+        __uint128_t src = state_->cpu.v[args.rn];
+        uint64_t element = 0;
+        memcpy(&element, reinterpret_cast<const uint8_t*>(&src) + index * esize, esize);
+
+        // Sign-extend the element to 64 bits.
+        int64_t signed_val;
+        switch (esize) {
+          case 1:
+            signed_val = static_cast<int64_t>(static_cast<int8_t>(element));
+            break;
+          case 2:
+            signed_val = static_cast<int64_t>(static_cast<int16_t>(element));
+            break;
+          case 4:
+            signed_val = static_cast<int64_t>(static_cast<int32_t>(element));
+            break;
+          default:
+            Undefined();
+            return;
+        }
+
+        uint64_t result = static_cast<uint64_t>(signed_val);
+        if (!args.q) {
+          // SMOV to Wd: truncate to 32 bits.
+          result &= 0xFFFFFFFFULL;
+        }
+        if (args.rd < 31) {
+          state_->cpu.x[args.rd] = result;
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdCopyOpcode::kUmov: {
+        // UMOV: unsigned move from Vn[index] to GP register Rd.
+        // Q=0: destination is Wd (32-bit), Q=1: destination is Xd (64-bit).
+        __uint128_t src = state_->cpu.v[args.rn];
+        uint64_t element = 0;
+        memcpy(&element, reinterpret_cast<const uint8_t*>(&src) + index * esize, esize);
+
+        if (!args.q) {
+          element &= 0xFFFFFFFFULL;
+        }
+        if (args.rd < 31) {
+          state_->cpu.x[args.rd] = element;
+        }
+        break;
+      }
+
+      default:
+        Undefined();
+        break;
+    }
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD three same: element-wise vector arithmetic/logic operations.
+  //
+  void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];  // Needed for BSL/BIT/BIF
+    __uint128_t result = 0;
+
+    uint8_t esize;  // element size in bytes
+    switch (args.size) {
+      case 0b00: esize = 1; break;
+      case 0b01: esize = 2; break;
+      case 0b10: esize = 4; break;
+      case 0b11: esize = 8; break;
+      default: Undefined(); return;
+    }
+
+    uint8_t vec_len = args.q ? 16 : 8;  // total bytes in result vector
+    uint8_t num_elements = vec_len / esize;
+
+    switch (args.opcode) {
+      // --- Logic operations (ignore size for element iteration, operate on whole vector) ---
+      case Decoder::AdvSimdThreeSameOpcode::kAnd:
+        result = src_n & src_m;
+        if (!args.q) {
+          // Zero upper 64 bits for 64-bit vector.
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kBic:
+        result = src_n & ~src_m;
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kOrr:
+        result = src_n | src_m;
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kOrn:
+        result = src_n | ~src_m;
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kEor:
+        result = src_n ^ src_m;
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kBsl:
+        // BSL: Vd = (Vd & Vn) | (~Vd & Vm) — bitwise select using Vd as mask.
+        result = (dst & src_n) | (~dst & src_m);
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kBit:
+        // BIT: Vd = (Vm & Vn) | (~Vm & Vd) — insert bits where Vm is 1.
+        result = (src_m & src_n) | (~src_m & dst);
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kBif:
+        // BIF: Vd = (Vm & Vd) | (~Vm & Vn) — insert bits where Vm is 0.
+        result = (src_m & dst) | (~src_m & src_n);
+        if (!args.q) {
+          uint64_t lo;
+          memcpy(&lo, &result, 8);
+          result = 0;
+          memcpy(&result, &lo, 8);
+        }
+        break;
+
+      // --- Arithmetic: element-wise ADD/SUB ---
+      case Decoder::AdvSimdThreeSameOpcode::kAdd:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t { return a + b; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kSub:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t { return a - b; });
+        break;
+
+      // --- Compare: CMEQ, CMTST ---
+      case Decoder::AdvSimdThreeSameOpcode::kCmeq:
+        // CMEQ: if (Vn[i] == Vm[i]) result[i] = all-ones, else all-zeros.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              return (a == b) ? mask : 0;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmtst:
+        // CMTST: if (Vn[i] & Vm[i] != 0) result[i] = all-ones, else all-zeros.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              return ((a & b) != 0) ? mask : 0;
+            });
+        break;
+
+      // region digitalis
+      // --- Compare: CMGT, CMHI, CMGE, CMHS ---
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt:
+        // CMGT (signed >): if (Vn[i] > Vm[i]) signed, result = all-ones.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              uint8_t bits = es * 8;
+              int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+              int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+              return (sa > sb) ? mask : 0;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmhi:
+        // CMHI (unsigned >): if (Vn[i] > Vm[i]) unsigned, result = all-ones.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              return (a > b) ? mask : 0;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmge:
+        // CMGE (signed >=): if (Vn[i] >= Vm[i]) signed, result = all-ones.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              uint8_t bits = es * 8;
+              int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+              int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+              return (sa >= sb) ? mask : 0;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmhs:
+        // CMHS (unsigned >=): if (Vn[i] >= Vm[i]) unsigned, result = all-ones.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              return (a >= b) ? mask : 0;
+            });
+        break;
+      // endregion
+
+      // --- Max/Min ---
+      case Decoder::AdvSimdThreeSameOpcode::kSmax:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t { return a > b ? a : b; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kSmin:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t { return a < b ? a : b; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUmax:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return a > b ? a : b;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUmin:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return a < b ? a : b;
+            });
+        break;
+
+      // --- Halving add/sub ---
+      case Decoder::AdvSimdThreeSameOpcode::kShadd:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t { return (a + b) >> 1; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUhadd:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return (a + b) >> 1;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kSrhadd:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t { return (a + b + 1) >> 1; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUrhadd:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return (a + b + 1) >> 1;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kShsub:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t { return (a - b) >> 1; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUhsub:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return (a - b) >> 1;
+            });
+        break;
+
+      // --- Saturating add/sub ---
+      case Decoder::AdvSimdThreeSameOpcode::kSqadd:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t {
+              int64_t sum = a + b;
+              // Overflow: positive + positive = negative, or negative + negative = positive.
+              if (b > 0 && sum < a) return INT64_MAX;  // Saturated by caller's mask.
+              if (b < 0 && sum > a) return INT64_MIN;
+              return sum;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUqadd:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              uint64_t sum = a + b;
+              uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
+              return (sum > mask) ? mask : sum;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kSqsub:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t {
+              int64_t diff = a - b;
+              if (b > 0 && diff > a) return INT64_MIN;
+              if (b < 0 && diff < a) return INT64_MAX;
+              return diff;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUqsub:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return (a > b) ? (a - b) : 0;
+            });
+        break;
+
+      // --- Shift ---
+      case Decoder::AdvSimdThreeSameOpcode::kSshl:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              int8_t shift = static_cast<int8_t>(b & 0xFF);
+              uint8_t bits = es * 8;
+              if (shift >= 0) {
+                return (shift >= bits) ? 0 : (a << shift);
+              } else {
+                // Signed shift right: sign-extend a, then shift.
+                int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+                int8_t rshift = -shift;
+                return static_cast<uint64_t>(
+                    (rshift >= bits) ? (sa >> (bits - 1)) : (sa >> rshift));
+              }
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUshl:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              int8_t shift = static_cast<int8_t>(b & 0xFF);
+              uint8_t bits = es * 8;
+              if (shift >= 0) {
+                return (shift >= bits) ? 0 : (a << shift);
+              } else {
+                int8_t rshift = -shift;
+                return (rshift >= bits) ? 0 : (a >> rshift);
+              }
+            });
+        break;
+
+      // --- Saturating shift (simplified — treat as regular shift for now) ---
+      case Decoder::AdvSimdThreeSameOpcode::kSqshl:
+      case Decoder::AdvSimdThreeSameOpcode::kUqshl:
+      case Decoder::AdvSimdThreeSameOpcode::kSrshl:
+      case Decoder::AdvSimdThreeSameOpcode::kUrshl:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrshl:
+      case Decoder::AdvSimdThreeSameOpcode::kUqrshl:
+        // Fallback: treat as SSHL/USHL for basic functionality.
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              int8_t shift = static_cast<int8_t>(b & 0xFF);
+              uint8_t bits = es * 8;
+              if (shift >= 0) {
+                return (shift >= bits) ? 0 : (a << shift);
+              } else {
+                int8_t rshift = -shift;
+                return (rshift >= bits) ? 0 : (a >> rshift);
+              }
+            });
+        break;
+
+      // --- ADDP (pairwise add) ---
+      case Decoder::AdvSimdThreeSameOpcode::kAddp: {
+        // ADDP concatenates Vn:Vm, then adds adjacent pairs.
+        // First half of result from Vn pairs, second half from Vm pairs.
+        uint64_t emask = ElementMask(esize);
+        uint8_t half_elements = num_elements;  // total output elements
+        result = 0;
+        for (uint8_t i = 0; i < half_elements / 2; i++) {
+          uint64_t a = 0, b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + (2 * i) * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_n) + (2 * i + 1) * esize, esize);
+          uint64_t sum = (a + b) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &sum, esize);
+        }
+        for (uint8_t i = 0; i < half_elements / 2; i++) {
+          uint64_t a = 0, b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_m) + (2 * i) * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + (2 * i + 1) * esize, esize);
+          uint64_t sum = (a + b) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + (half_elements / 2 + i) * esize, &sum, esize);
+        }
+        break;
+      }
+
+      // region digitalis
+      // --- Pairwise max/min (SMAXP, UMAXP, SMINP, UMINP) ---
+      case Decoder::AdvSimdThreeSameOpcode::kSmaxp:
+      case Decoder::AdvSimdThreeSameOpcode::kUmaxp:
+      case Decoder::AdvSimdThreeSameOpcode::kSminp:
+      case Decoder::AdvSimdThreeSameOpcode::kUminp: {
+        bool is_unsigned = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmaxp ||
+                            args.opcode == Decoder::AdvSimdThreeSameOpcode::kUminp);
+        bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmaxp ||
+                       args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmaxp);
+        uint64_t emask = ElementMask(esize);
+        uint8_t half_elements = num_elements;
+        result = 0;
+        for (uint8_t i = 0; i < half_elements / 2; i++) {
+          uint64_t a = 0, b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + (2 * i) * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_n) + (2 * i + 1) * esize, esize);
+          a &= emask;
+          b &= emask;
+          bool pick_a;
+          if (is_unsigned) {
+            pick_a = is_max ? (a >= b) : (a <= b);
+          } else {
+            uint8_t bits = esize * 8;
+            int64_t sa = (a ^ (1ULL << (bits - 1))) - (1ULL << (bits - 1));
+            int64_t sb = (b ^ (1ULL << (bits - 1))) - (1ULL << (bits - 1));
+            pick_a = is_max ? (sa >= sb) : (sa <= sb);
+          }
+          uint64_t val = (pick_a ? a : b) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &val, esize);
+        }
+        for (uint8_t i = 0; i < half_elements / 2; i++) {
+          uint64_t a = 0, b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_m) + (2 * i) * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + (2 * i + 1) * esize, esize);
+          a &= emask;
+          b &= emask;
+          bool pick_a;
+          if (is_unsigned) {
+            pick_a = is_max ? (a >= b) : (a <= b);
+          } else {
+            uint8_t bits = esize * 8;
+            int64_t sa = (a ^ (1ULL << (bits - 1))) - (1ULL << (bits - 1));
+            int64_t sb = (b ^ (1ULL << (bits - 1))) - (1ULL << (bits - 1));
+            pick_a = is_max ? (sa >= sb) : (sa <= sb);
+          }
+          uint64_t val = (pick_a ? a : b) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + (half_elements / 2 + i) * esize, &val, esize);
+        }
+        break;
+      }
+      // endregion
+
+      // --- MUL / MLA / MLS ---
+      case Decoder::AdvSimdThreeSameOpcode::kMul:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t { return a * b; });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kMla: {
+        // MLA: Vd[i] = Vd[i] + Vn[i] * Vm[i]
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0, b = 0, d = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t r = (d + a * b) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kMls: {
+        // MLS: Vd[i] = Vd[i] - Vn[i] * Vm[i]
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0, b = 0, d = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t r = (d - a * b) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      // --- Opcodes in the enum but not mapped by decoder (CMGT etc.) ---
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // FP data-processing (1 source): FMOV, FABS, FNEG, FSQRT, FCVT, FRINTx.
+  //
+  void FpDataProc1(const Decoder::FpDataProc1Args& args) {
+    CHECK(!exception_raised_);
+    uint8_t ftype = args.ftype;
+    uint8_t opcode = args.opcode;
+
+    if (ftype == 0b00) {
+      // Single-precision.
+      float src;
+      memcpy(&src, &state_->cpu.v[args.rn], 4);
+      float result;
+      bool write_single = true;
+
+      switch (opcode) {
+        case 0b000000:  // FMOV Sd, Sn
+          result = src;
+          break;
+        case 0b000001:  // FABS
+          result = std::fabs(src);
+          break;
+        case 0b000010:  // FNEG
+          result = -src;
+          break;
+        case 0b000011:  // FSQRT
+          result = std::sqrt(src);
+          break;
+        case 0b000101: {  // FCVT Dd, Sn (single -> double)
+          double d = static_cast<double>(src);
+          state_->cpu.v[args.rd] = 0;
+          memcpy(&state_->cpu.v[args.rd], &d, 8);
+          return;
+        }
+        case 0b000111: {  // FCVT Hd, Sn (single -> half) - approximate
+          // Store as half-precision using truncation to 16-bit float.
+          // For simplicity, store the lower 16 bits of the float representation.
+          uint16_t half = FpSingleToHalf(src);
+          state_->cpu.v[args.rd] = 0;
+          memcpy(&state_->cpu.v[args.rd], &half, 2);
+          return;
+        }
+        case 0b001000:  // FRINTN (round to nearest, ties to even)
+          result = std::nearbyint(src);
+          break;
+        case 0b001001:  // FRINTP (round toward +inf)
+          result = std::ceil(src);
+          break;
+        case 0b001010:  // FRINTM (round toward -inf)
+          result = std::floor(src);
+          break;
+        case 0b001011:  // FRINTZ (round toward zero)
+          result = std::trunc(src);
+          break;
+        case 0b001100:  // FRINTA (round to nearest, ties away from zero)
+          result = std::round(src);
+          break;
+        case 0b001110:  // FRINTX (round to nearest, exact, signal inexact)
+          result = std::rint(src);
+          break;
+        case 0b001111:  // FRINTI (round using FPCR rounding mode)
+          result = std::rint(src);
+          break;
+        default:
+          Undefined();
+          return;
+      }
+
+      if (write_single) {
+        state_->cpu.v[args.rd] = 0;
+        memcpy(&state_->cpu.v[args.rd], &result, 4);
+      }
+    } else if (ftype == 0b01) {
+      // Double-precision.
+      double src;
+      memcpy(&src, &state_->cpu.v[args.rn], 8);
+      double result;
+      bool write_double = true;
+
+      switch (opcode) {
+        case 0b000000:  // FMOV Dd, Dn
+          result = src;
+          break;
+        case 0b000001:  // FABS
+          result = std::fabs(src);
+          break;
+        case 0b000010:  // FNEG
+          result = -src;
+          break;
+        case 0b000011:  // FSQRT
+          result = std::sqrt(src);
+          break;
+        case 0b000100: {  // FCVT Sd, Dn (double -> single)
+          float f = static_cast<float>(src);
+          state_->cpu.v[args.rd] = 0;
+          memcpy(&state_->cpu.v[args.rd], &f, 4);
+          return;
+        }
+        case 0b000111: {  // FCVT Hd, Dn (double -> half) - approximate
+          float f = static_cast<float>(src);
+          uint16_t half = FpSingleToHalf(f);
+          state_->cpu.v[args.rd] = 0;
+          memcpy(&state_->cpu.v[args.rd], &half, 2);
+          return;
+        }
+        case 0b001000:  // FRINTN
+          result = std::nearbyint(src);
+          break;
+        case 0b001001:  // FRINTP
+          result = std::ceil(src);
+          break;
+        case 0b001010:  // FRINTM
+          result = std::floor(src);
+          break;
+        case 0b001011:  // FRINTZ
+          result = std::trunc(src);
+          break;
+        case 0b001100:  // FRINTA
+          result = std::round(src);
+          break;
+        case 0b001110:  // FRINTX
+          result = std::rint(src);
+          break;
+        case 0b001111:  // FRINTI
+          result = std::rint(src);
+          break;
+        default:
+          Undefined();
+          return;
+      }
+
+      if (write_double) {
+        state_->cpu.v[args.rd] = 0;
+        memcpy(&state_->cpu.v[args.rd], &result, 8);
+      }
+    } else if (ftype == 0b11) {
+      // Half-precision source — only FCVT to single/double is common.
+      if (opcode == 0b000100) {
+        // FCVT Sd, Hn (half -> single)
+        uint16_t half;
+        memcpy(&half, &state_->cpu.v[args.rn], 2);
+        float f = FpHalfToSingle(half);
+        state_->cpu.v[args.rd] = 0;
+        memcpy(&state_->cpu.v[args.rd], &f, 4);
+        return;
+      }
+      if (opcode == 0b000101) {
+        // FCVT Dd, Hn (half -> double)
+        uint16_t half;
+        memcpy(&half, &state_->cpu.v[args.rn], 2);
+        float f = FpHalfToSingle(half);
+        double d = static_cast<double>(f);
+        state_->cpu.v[args.rd] = 0;
+        memcpy(&state_->cpu.v[args.rd], &d, 8);
+        return;
+      }
+      Undefined();
+    } else {
+      Undefined();
+    }
+  }
+
+  //
+  // FP data-processing (2 source): FMUL, FDIV, FADD, FSUB, FMAX, FMIN, FNMUL.
+  //
+  void FpDataProc2(const Decoder::FpDataProc2Args& args) {
+    CHECK(!exception_raised_);
+    uint8_t ftype = args.ftype;
+    uint8_t opcode = args.opcode;
+
+    if (ftype == 0b00) {
+      // Single-precision.
+      float src_n, src_m;
+      memcpy(&src_n, &state_->cpu.v[args.rn], 4);
+      memcpy(&src_m, &state_->cpu.v[args.rm], 4);
+      float result;
+
+      switch (opcode) {
+        case 0b0000: result = src_n * src_m; break;       // FMUL
+        case 0b0001: result = src_n / src_m; break;       // FDIV
+        case 0b0010: result = src_n + src_m; break;       // FADD
+        case 0b0011: result = src_n - src_m; break;       // FSUB
+        case 0b0100: result = std::fmax(src_n, src_m); break;  // FMAX
+        case 0b0101: result = std::fmin(src_n, src_m); break;  // FMIN
+        case 0b0110: result = std::fmax(src_n, src_m); break;  // FMAXNM (same as FMAX for non-NaN)
+        case 0b0111: result = std::fmin(src_n, src_m); break;  // FMINNM (same as FMIN for non-NaN)
+        case 0b1000: result = -(src_n * src_m); break;    // FNMUL
+        default: Undefined(); return;
+      }
+
+      state_->cpu.v[args.rd] = 0;
+      memcpy(&state_->cpu.v[args.rd], &result, 4);
+    } else if (ftype == 0b01) {
+      // Double-precision.
+      double src_n, src_m;
+      memcpy(&src_n, &state_->cpu.v[args.rn], 8);
+      memcpy(&src_m, &state_->cpu.v[args.rm], 8);
+      double result;
+
+      switch (opcode) {
+        case 0b0000: result = src_n * src_m; break;       // FMUL
+        case 0b0001: result = src_n / src_m; break;       // FDIV
+        case 0b0010: result = src_n + src_m; break;       // FADD
+        case 0b0011: result = src_n - src_m; break;       // FSUB
+        case 0b0100: result = std::fmax(src_n, src_m); break;  // FMAX
+        case 0b0101: result = std::fmin(src_n, src_m); break;  // FMIN
+        case 0b0110: result = std::fmax(src_n, src_m); break;  // FMAXNM
+        case 0b0111: result = std::fmin(src_n, src_m); break;  // FMINNM
+        case 0b1000: result = -(src_n * src_m); break;    // FNMUL
+        default: Undefined(); return;
+      }
+
+      state_->cpu.v[args.rd] = 0;
+      memcpy(&state_->cpu.v[args.rd], &result, 8);
+    } else {
+      Undefined();
+    }
+  }
+
+  //
+  // FP compare: FCMP, FCMPE — set NZCV flags.
+  //
+  void FpCompare(const Decoder::FpCompareArgs& args) {
+    CHECK(!exception_raised_);
+    uint16_t flags = 0;
+
+    if (args.ftype == 0b00) {
+      // Single-precision.
+      float src_n;
+      memcpy(&src_n, &state_->cpu.v[args.rn], 4);
+      float src_m;
+      if (args.with_zero) {
+        src_m = 0.0f;
+      } else {
+        memcpy(&src_m, &state_->cpu.v[args.rm], 4);
+      }
+
+      if (std::isnan(src_n) || std::isnan(src_m)) {
+        // Unordered: N=0, Z=0, C=1, V=1
+        flags = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+      } else if (src_n == src_m) {
+        // Equal: N=0, Z=1, C=1, V=0
+        flags = CPUState::kFlagZero | CPUState::kFlagCarry;
+      } else if (src_n < src_m) {
+        // Less than: N=1, Z=0, C=0, V=0
+        flags = CPUState::kFlagNegative;
+      } else {
+        // Greater than: N=0, Z=0, C=1, V=0
+        flags = CPUState::kFlagCarry;
+      }
+    } else if (args.ftype == 0b01) {
+      // Double-precision.
+      double src_n;
+      memcpy(&src_n, &state_->cpu.v[args.rn], 8);
+      double src_m;
+      if (args.with_zero) {
+        src_m = 0.0;
+      } else {
+        memcpy(&src_m, &state_->cpu.v[args.rm], 8);
+      }
+
+      if (std::isnan(src_n) || std::isnan(src_m)) {
+        flags = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+      } else if (src_n == src_m) {
+        flags = CPUState::kFlagZero | CPUState::kFlagCarry;
+      } else if (src_n < src_m) {
+        flags = CPUState::kFlagNegative;
+      } else {
+        flags = CPUState::kFlagCarry;
+      }
+    } else {
+      Undefined();
+      return;
+    }
+
+    state_->cpu.flags = flags;
+  }
+
+  // region digitalis
+  //
+  // AdvSIMD scalar two-reg misc: scalar UCVTF, SCVTF, FCVTZS, FCVTZU.
+  //
+  void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src = state_->cpu.v[args.rn];
+    __uint128_t result = 0;
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kUcvtf: {
+        if (args.size == 0) {
+          // UCVTF Sd, Sn: uint32 → float32
+          uint32_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          float fval = static_cast<float>(ival);
+          memcpy(&result, &fval, sizeof(fval));
+        } else {
+          // UCVTF Dd, Dn: uint64 → float64
+          uint64_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          double fval = static_cast<double>(ival);
+          memcpy(&result, &fval, sizeof(fval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kScvtf: {
+        if (args.size == 0) {
+          // SCVTF Sd, Sn: int32 → float32
+          int32_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          float fval = static_cast<float>(ival);
+          memcpy(&result, &fval, sizeof(fval));
+        } else {
+          // SCVTF Dd, Dn: int64 → float64
+          int64_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          double fval = static_cast<double>(ival);
+          memcpy(&result, &fval, sizeof(fval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu: {
+        if (args.size == 0) {
+          // FCVTZU Sd, Sn: float32 → uint32, round toward zero
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          uint32_t ival;
+          if (std::isnan(fval) || fval < 0.0f) {
+            ival = 0;
+          } else if (fval >= static_cast<float>(UINT32_MAX)) {
+            ival = UINT32_MAX;
+          } else {
+            ival = static_cast<uint32_t>(fval);
+          }
+          memcpy(&result, &ival, sizeof(ival));
+        } else {
+          // FCVTZU Dd, Dn: float64 → uint64, round toward zero
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          uint64_t ival;
+          if (std::isnan(fval) || fval < 0.0) {
+            ival = 0;
+          } else if (fval >= static_cast<double>(UINT64_MAX)) {
+            ival = UINT64_MAX;
+          } else {
+            ival = static_cast<uint64_t>(fval);
+          }
+          memcpy(&result, &ival, sizeof(ival));
+        }
+        break;
+      }
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs: {
+        if (args.size == 0) {
+          // FCVTZS Sd, Sn: float32 → int32, round toward zero
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          int32_t ival;
+          if (std::isnan(fval)) {
+            ival = 0;
+          } else if (fval >= static_cast<float>(INT32_MAX)) {
+            ival = INT32_MAX;
+          } else if (fval <= static_cast<float>(INT32_MIN)) {
+            ival = INT32_MIN;
+          } else {
+            ival = static_cast<int32_t>(fval);
+          }
+          uint32_t uval;
+          memcpy(&uval, &ival, sizeof(uval));
+          memcpy(&result, &uval, sizeof(uval));
+        } else {
+          // FCVTZS Dd, Dn: float64 → int64, round toward zero
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          int64_t ival;
+          if (std::isnan(fval)) {
+            ival = 0;
+          } else if (fval >= static_cast<double>(INT64_MAX)) {
+            ival = INT64_MAX;
+          } else if (fval <= static_cast<double>(INT64_MIN)) {
+            ival = INT64_MIN;
+          } else {
+            ival = static_cast<int64_t>(fval);
+          }
+          uint64_t uval;
+          memcpy(&uval, &ival, sizeof(uval));
+          memcpy(&result, &uval, sizeof(uval));
+        }
+        break;
+      }
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  //
+  // AdvSIMD two-reg misc: unary element-wise vector operations.
+  //
+  void AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src = state_->cpu.v[args.rn];
+    __uint128_t result = 0;
+
+    uint8_t esize;  // element size in bytes
+    switch (args.size) {
+      case 0b00: esize = 1; break;
+      case 0b01: esize = 2; break;
+      case 0b10: esize = 4; break;
+      case 0b11: esize = 8; break;
+      default: Undefined(); return;
+    }
+
+    uint8_t vec_len = args.q ? 16 : 8;
+    uint8_t num_elements = vec_len / esize;
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev64: {
+        // REV64: reverse bytes within each 64-bit element.
+        // Element size determines the unit of reversal.
+        for (uint8_t i = 0; i < vec_len; i += 8) {
+          uint8_t group[8];
+          memcpy(group, reinterpret_cast<const uint8_t*>(&src) + i, 8);
+          // Reverse units of esize bytes within the 8-byte group.
+          uint8_t reversed[8];
+          uint8_t units = 8 / esize;
+          for (uint8_t j = 0; j < units; j++) {
+            memcpy(reversed + j * esize, group + (units - 1 - j) * esize, esize);
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i, reversed, 8);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev32: {
+        // REV32: reverse bytes within each 32-bit element.
+        for (uint8_t i = 0; i < vec_len; i += 4) {
+          uint8_t group[4];
+          memcpy(group, reinterpret_cast<const uint8_t*>(&src) + i, 4);
+          uint8_t reversed[4];
+          uint8_t units = 4 / esize;
+          for (uint8_t j = 0; j < units; j++) {
+            memcpy(reversed + j * esize, group + (units - 1 - j) * esize, esize);
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i, reversed, 4);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev16: {
+        // REV16: reverse bytes within each 16-bit element.
+        for (uint8_t i = 0; i < vec_len; i += 2) {
+          uint8_t a, b;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src) + i, 1);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src) + i + 1, 1);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i, &b, 1);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i + 1, &a, 1);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNot: {
+        if (args.size == 0b00) {
+          // NOT (bitwise NOT): U=1, size=00.
+          result = ~src;
+          if (!args.q) {
+            uint64_t lo;
+            memcpy(&lo, &result, 8);
+            result = 0;
+            memcpy(&result, &lo, 8);
+          }
+        } else if (args.size == 0b01) {
+          // RBIT (reverse bits per byte): U=1, size=01.
+          for (uint8_t i = 0; i < vec_len; i++) {
+            uint8_t byte_val;
+            memcpy(&byte_val, reinterpret_cast<const uint8_t*>(&src) + i, 1);
+            uint8_t reversed = 0;
+            for (int b = 0; b < 8; b++) {
+              reversed |= ((byte_val >> b) & 1) << (7 - b);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i, &reversed, 1);
+          }
+        } else {
+          Undefined();
+          return;
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCnt: {
+        // CNT: count set bits per byte.
+        for (uint8_t i = 0; i < vec_len; i++) {
+          uint8_t byte_val;
+          memcpy(&byte_val, reinterpret_cast<const uint8_t*>(&src) + i, 1);
+          uint8_t count = __builtin_popcount(byte_val);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i, &count, 1);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kClz: {
+        // CLZ: count leading zeros per element.
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          uint64_t clz;
+          if (elem == 0) {
+            clz = esize * 8;
+          } else {
+            clz = __builtin_clzll(elem) - (64 - esize * 8);
+          }
+          clz &= emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &clz, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
+        // ABS: absolute value per signed element.
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          uint64_t abs_val = static_cast<uint64_t>(signed_val < 0 ? -signed_val : signed_val) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &abs_val, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNeg: {
+        // NEG: negate per element.
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          uint64_t neg_val = (0 - elem) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &neg_val, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero: {
+        // CMGT #0: compare signed > 0, result = all-ones or all-zeros.
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          uint64_t r = (signed_val > 0) ? emask : 0;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero: {
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          uint64_t r = (signed_val >= 0) ? emask : 0;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: {
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          uint64_t r = (elem == 0) ? emask : 0;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero: {
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          uint64_t r = (signed_val <= 0) ? emask : 0;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          uint64_t r = (signed_val < 0) ? emask : 0;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kXtn: {
+        // XTN: extract narrow — take lower half of each wider element.
+        // Source element size is 2*esize, destination element size is esize.
+        // Q=0: lower half of result, Q=1: upper half (XTN2).
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_count = 16 / src_esize;  // always operate on full 128-bit source
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &elem, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFabs: {
+        // FABS (vector): floating-point absolute value per element.
+        if (args.size == 0b10) {
+          // Single-precision elements (size=10 means float for this FP opcode group).
+          uint8_t fp_count = args.q ? 4 : 2;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            f = std::fabs(f);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &f, 4);
+          }
+        } else if (args.size == 0b11 && args.q) {
+          // Double-precision elements (size=11, Q=1 only).
+          for (uint8_t i = 0; i < 2; i++) {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            d = std::fabs(d);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &d, 8);
+          }
+        } else {
+          Undefined();
+          return;
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
+        // FNEG (vector): floating-point negate per element.
+        if (args.size == 0b10) {
+          uint8_t fp_count = args.q ? 4 : 2;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            f = -f;
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &f, 4);
+          }
+        } else if (args.size == 0b11 && args.q) {
+          for (uint8_t i = 0; i < 2; i++) {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            d = -d;
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &d, 8);
+          }
+        } else {
+          Undefined();
+          return;
+        }
+        break;
+      }
+
+      // region digitalis
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAddv: {
+        // ADDV: add across vector — sum all elements, produce scalar result.
+        uint64_t emask = ElementMask(esize);
+        uint64_t sum = 0;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          sum += elem & emask;
+        }
+        result = sum & emask;  // scalar result in bottom esize bytes, upper zeroed
+        break;
+      }
+      // endregion
+
+      // region digitalis - pairwise add long instructions
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSadalp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUadalp: {
+        // {S,U}ADDLP: Add Long Pairwise - add pairs of adjacent elements
+        // producing wider results. {S,U}ADALP: same but accumulate into dst.
+        if (esize > 4) { Undefined(); return; }  // max input is 32-bit
+        uint8_t out_esize = esize * 2;  // output elements are twice as wide
+        uint8_t num_pairs = vec_len / (esize * 2);
+        bool is_signed = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp ||
+                          args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp);
+        bool is_accum = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp ||
+                         args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUadalp);
+        if (is_accum) {
+          result = state_->cpu.v[args.rd];
+        }
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_pairs; i++) {
+          uint64_t a = 0, b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src) + i * 2 * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src) + i * 2 * esize + esize, esize);
+          uint64_t sum;
+          if (is_signed) {
+            int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+            int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+            sum = static_cast<uint64_t>(sa + sb) & ElementMask(out_esize);
+          } else {
+            sum = (a + b) & ElementMask(out_esize);
+          }
+          if (is_accum) {
+            uint64_t existing = 0;
+            memcpy(&existing, reinterpret_cast<const uint8_t*>(&result) + i * out_esize, out_esize);
+            sum = (existing + sum) & ElementMask(out_esize);
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * out_esize, &sum, out_esize);
+        }
+        break;
+      }
+      // endregion
+
+      // Less critical ops: leave as undefined for now.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCls:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl:
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+
+  //
+  // AdvSIMD shift by immediate: SSHR, USHR, SHL, SSRA, USRA, SLI, SRI, SHRN, SSHLL, USHLL.
+  //
+  void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src = state_->cpu.v[args.rn];
+    __uint128_t result = 0;
+
+    // Determine element size from immh:
+    //   immh=0001 -> 8-bit  (esize=1)
+    //   immh=001x -> 16-bit (esize=2)
+    //   immh=01xx -> 32-bit (esize=4)
+    //   immh=1xxx -> 64-bit (esize=8)
+    uint8_t esize;
+    uint8_t immh = args.immh;
+    if (immh & 0b1000) {
+      esize = 8;
+    } else if (immh & 0b0100) {
+      esize = 4;
+    } else if (immh & 0b0010) {
+      esize = 2;
+    } else {
+      esize = 1;
+    }
+
+    uint8_t bits = esize * 8;
+    uint8_t shift = ((immh << 3) | args.immb) - bits;  // for left shifts: shift = (immh:immb) - esize*8
+    uint8_t rshift = (2 * bits) - ((immh << 3) | args.immb);  // for right shifts: shift = 2*esize*8 - (immh:immb)
+
+    uint8_t vec_len = args.q ? 16 : 8;
+    uint8_t num_elements = vec_len / esize;
+    uint64_t emask = ElementMask(esize);
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdShiftImmOpcode::kSshr: {
+        // SSHR: signed shift right by immediate.
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t shifted = (rshift >= bits) ? (signed_val >> (bits - 1)) : (signed_val >> rshift);
+          uint64_t r = static_cast<uint64_t>(shifted) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kUshr: {
+        // USHR: unsigned shift right by immediate.
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          uint64_t r = (rshift >= bits) ? 0 : ((elem >> rshift) & emask);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kShl: {
+        // SHL: shift left by immediate.
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          uint64_t r = (shift >= bits) ? 0 : ((elem << shift) & emask);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSsra: {
+        // SSRA: signed shift right and accumulate.
+        __uint128_t dst = state_->cpu.v[args.rd];
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0, dst_elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t shifted = (rshift >= bits) ? (signed_val >> (bits - 1)) : (signed_val >> rshift);
+          uint64_t r = (dst_elem + static_cast<uint64_t>(shifted)) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kUsra: {
+        // USRA: unsigned shift right and accumulate.
+        __uint128_t dst = state_->cpu.v[args.rd];
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0, dst_elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t shifted = (rshift >= bits) ? 0 : (elem >> rshift);
+          uint64_t r = (dst_elem + shifted) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSli: {
+        // SLI: shift left and insert — keep destination bits not written by shift.
+        __uint128_t dst = state_->cpu.v[args.rd];
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0, dst_elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t shifted = (shift >= bits) ? 0 : (elem << shift);
+          // Bits [shift-1:0] come from dst, bits [bits-1:shift] come from shifted source.
+          uint64_t mask = (shift >= bits) ? emask : (emask << shift) & emask;
+          uint64_t r = (dst_elem & ~mask) | (shifted & mask);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSri: {
+        // SRI: shift right and insert — keep destination bits not written by shift.
+        __uint128_t dst = state_->cpu.v[args.rd];
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0, dst_elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t shifted = (rshift >= bits) ? 0 : (elem >> rshift);
+          // Bits [bits-1:bits-shift] come from dst, lower bits come from shifted source.
+          uint64_t mask = (rshift >= bits) ? 0 : (emask >> rshift);
+          uint64_t r = (dst_elem & ~mask) | (shifted & mask);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kShrn: {
+        // SHRN: shift right narrow — narrows each element by half width.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;  // always from full 128-bit source
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        // Q=0: write lower half, Q=1: write upper half (SHRN2).
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t narrow_mask = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          uint64_t shifted = (narrow_rshift >= src_bits) ? 0 : (elem >> narrow_rshift);
+          uint64_t r = shifted & narrow_mask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSshll: {
+        // SSHLL: signed shift left long — widen each element, then shift left.
+        // Source: Q=0 lower half, Q=1 upper half. Result: full 128-bit.
+        uint8_t src_esize = esize;  // source element size
+        uint8_t dst_esize = esize * 2;  // destination element size
+        if (dst_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 8 / src_esize;  // elements in 64-bit half
+        uint8_t src_offset = args.q ? 8 : 0;
+        uint64_t dst_mask = ElementMask(dst_esize);
+        // For SSHLL, shift = (immh:immb) - source_element_bits
+        uint8_t shl_amount = ((immh << 3) | args.immb) - src_bits;
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + src_offset + i * src_esize, src_esize);
+          // Sign-extend.
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          uint64_t r = (static_cast<uint64_t>(signed_val) << shl_amount) & dst_mask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * dst_esize, &r, dst_esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kUshll: {
+        // USHLL: unsigned shift left long.
+        uint8_t src_esize = esize;
+        uint8_t dst_esize = esize * 2;
+        if (dst_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 8 / src_esize;
+        uint8_t src_offset = args.q ? 8 : 0;
+        uint64_t dst_mask = ElementMask(dst_esize);
+        uint8_t shl_amount = ((immh << 3) | args.immb) - src_bits;
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + src_offset + i * src_esize, src_esize);
+          uint64_t r = (elem << shl_amount) & dst_mask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * dst_esize, &r, dst_esize);
+        }
+        break;
+      }
+
+      // Less critical ops: leave as undefined for now.
+      case Decoder::AdvSimdShiftImmOpcode::kSrshr:
+      case Decoder::AdvSimdShiftImmOpcode::kUrshr:
+      case Decoder::AdvSimdShiftImmOpcode::kSrsra:
+      case Decoder::AdvSimdShiftImmOpcode::kUrsra:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshl:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshl:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshlu:
+      case Decoder::AdvSimdShiftImmOpcode::kRshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  //
+  // Guest state getters/setters.
+  //
+
+  Register GetReg(uint8_t reg) const {
+    CHECK(reg < 31);
+    return state_->cpu.x[reg];
+  }
+
+  void SetReg(uint8_t reg, Register value) {
+    if (exception_raised_) {
+      return;
+    }
+    CHECK(reg < 31);
+    state_->cpu.x[reg] = value;
+  }
+
+  Register GetSp() const {
+    return state_->cpu.sp;
+  }
+
+  void SetSp(Register value) {
+    if (exception_raised_) {
+      return;
+    }
+    state_->cpu.sp = value;
+  }
+
+  [[nodiscard]] uint64_t GetImm(uint64_t imm) const { return imm; }
+
+  [[nodiscard]] Register Copy(Register value) const { return value; }
+
+  [[nodiscard]] GuestAddr GetInsnAddr() const { return state_->cpu.insn_addr; }
+
+  void FinalizeInsn(uint8_t insn_len) {
+    if (!branch_taken_ && !exception_raised_) {
+      state_->cpu.insn_addr += insn_len;
+    }
+  }
+
+ private:
+  // region digitalis
+  // Compute element mask: all-ones for element of esize bytes.
+  // Avoids UB from (1ULL << 64) when esize == 8.
+  static uint64_t ElementMask(uint8_t esize) {
+    return (esize >= 8) ? ~0ULL : ((1ULL << (esize * 8)) - 1);
+  }
+
+  // Helper: apply an unsigned element-wise operation across the vector.
+  template <typename Op>
+  void AdvSimdThreeSameElementWise(__uint128_t src_n, __uint128_t src_m,
+                                   uint8_t esize, uint8_t num_elements,
+                                   __uint128_t* result, Op op) {
+    *result = 0;
+    uint64_t mask = ElementMask(esize);
+    for (uint8_t i = 0; i < num_elements; i++) {
+      uint64_t a = 0, b = 0;
+      memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+      memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+      uint64_t r = op(a, b, esize) & mask;
+      memcpy(reinterpret_cast<uint8_t*>(result) + i * esize, &r, esize);
+    }
+  }
+
+  // Helper: apply a signed element-wise operation across the vector.
+  template <typename Op>
+  void AdvSimdThreeSameElementWiseSigned(__uint128_t src_n, __uint128_t src_m,
+                                         uint8_t esize, uint8_t num_elements,
+                                         __uint128_t* result, Op op) {
+    *result = 0;
+    uint8_t bits = esize * 8;
+    uint64_t mask = ElementMask(esize);
+    for (uint8_t i = 0; i < num_elements; i++) {
+      uint64_t a = 0, b = 0;
+      memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+      memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+      // Sign-extend to int64_t.
+      int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+      int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+      int64_t sr = op(sa, sb);
+      uint64_t r = static_cast<uint64_t>(sr) & mask;
+      memcpy(reinterpret_cast<uint8_t*>(result) + i * esize, &r, esize);
+    }
+  }
+  // endregion
+
+  //
+  // Flag update helpers.
+  //
+
+  void UpdateFlags(uint64_t operand1, uint64_t operand2, uint64_t result,
+                   bool is_sub, bool is_64bit) {
+    uint16_t flags = 0;
+    unsigned top_bit = is_64bit ? 63 : 31;
+
+    // N flag: result is negative.
+    if ((result >> top_bit) & 1) {
+      flags |= CPUState::kFlagNegative;
+    }
+
+    // Z flag: result is zero.
+    uint64_t mask = is_64bit ? ~0ULL : 0xFFFFFFFFULL;
+    if ((result & mask) == 0) {
+      flags |= CPUState::kFlagZero;
+    }
+
+    // C and V flags.
+    if (is_sub) {
+      // SUB/CMP: C is set if there is NO borrow (i.e., operand1 >= operand2 unsigned).
+      if (is_64bit) {
+        if (operand1 >= operand2) flags |= CPUState::kFlagCarry;
+      } else {
+        if (static_cast<uint32_t>(operand1) >= static_cast<uint32_t>(operand2))
+          flags |= CPUState::kFlagCarry;
+      }
+      // V: signed overflow.
+      if (is_64bit) {
+        int64_t a = static_cast<int64_t>(operand1);
+        int64_t b = static_cast<int64_t>(operand2);
+        int64_t r = static_cast<int64_t>(result);
+        if ((a >= 0 && b < 0 && r < 0) || (a < 0 && b >= 0 && r >= 0)) {
+          flags |= CPUState::kFlagOverflow;
+        }
+      } else {
+        int32_t a = static_cast<int32_t>(static_cast<uint32_t>(operand1));
+        int32_t b = static_cast<int32_t>(static_cast<uint32_t>(operand2));
+        int32_t r = static_cast<int32_t>(static_cast<uint32_t>(result));
+        if ((a >= 0 && b < 0 && r < 0) || (a < 0 && b >= 0 && r >= 0)) {
+          flags |= CPUState::kFlagOverflow;
+        }
+      }
+    } else {
+      // ADD/CMN: C is set if unsigned overflow occurred.
+      if (is_64bit) {
+        if (result < operand1) flags |= CPUState::kFlagCarry;
+      } else {
+        if (static_cast<uint32_t>(result) < static_cast<uint32_t>(operand1))
+          flags |= CPUState::kFlagCarry;
+      }
+      // V: signed overflow.
+      if (is_64bit) {
+        int64_t a = static_cast<int64_t>(operand1);
+        int64_t b = static_cast<int64_t>(operand2);
+        int64_t r = static_cast<int64_t>(result);
+        if ((a >= 0 && b >= 0 && r < 0) || (a < 0 && b < 0 && r >= 0)) {
+          flags |= CPUState::kFlagOverflow;
+        }
+      } else {
+        int32_t a = static_cast<int32_t>(static_cast<uint32_t>(operand1));
+        int32_t b = static_cast<int32_t>(static_cast<uint32_t>(operand2));
+        int32_t r = static_cast<int32_t>(static_cast<uint32_t>(result));
+        if ((a >= 0 && b >= 0 && r < 0) || (a < 0 && b < 0 && r >= 0)) {
+          flags |= CPUState::kFlagOverflow;
+        }
+      }
+    }
+
+    state_->cpu.flags = flags;
+  }
+
+  void UpdateLogicalFlags(uint64_t result, bool is_64bit) {
+    uint16_t flags = 0;
+    unsigned top_bit = is_64bit ? 63 : 31;
+
+    // N flag.
+    if ((result >> top_bit) & 1) {
+      flags |= CPUState::kFlagNegative;
+    }
+
+    // Z flag.
+    uint64_t mask = is_64bit ? ~0ULL : 0xFFFFFFFFULL;
+    if ((result & mask) == 0) {
+      flags |= CPUState::kFlagZero;
+    }
+
+    // C and V are always cleared for logical operations.
+    state_->cpu.flags = flags;
+  }
+
+  bool EvaluateCondition(Decoder::Condition cond) const {
+    uint16_t flags = state_->cpu.flags;
+    bool n = flags & CPUState::kFlagNegative;
+    bool z = flags & CPUState::kFlagZero;
+    bool c = flags & CPUState::kFlagCarry;
+    bool v = flags & CPUState::kFlagOverflow;
+
+    switch (cond) {
+      case Decoder::Condition::kEq:  return z;
+      case Decoder::Condition::kNe:  return !z;
+      case Decoder::Condition::kCs:  return c;
+      case Decoder::Condition::kCc:  return !c;
+      case Decoder::Condition::kMi:  return n;
+      case Decoder::Condition::kPl:  return !n;
+      case Decoder::Condition::kVs:  return v;
+      case Decoder::Condition::kVc:  return !v;
+      case Decoder::Condition::kHi:  return c && !z;
+      case Decoder::Condition::kLs:  return !c || z;
+      case Decoder::Condition::kGe:  return n == v;
+      case Decoder::Condition::kLt:  return n != v;
+      case Decoder::Condition::kGt:  return !z && (n == v);
+      case Decoder::Condition::kLe:  return z || (n != v);
+      case Decoder::Condition::kAl:  return true;
+      case Decoder::Condition::kNv:  return true;
+      default: return false;
+    }
+  }
+
+  uint64_t ApplyShift(uint64_t value, Decoder::ShiftType shift_type,
+                      uint8_t shift_amount, bool is_64bit) const {
+    if (!is_64bit) {
+      value &= 0xFFFFFFFFULL;
+    }
+
+    if (shift_amount == 0) {
+      return value;
+    }
+
+    uint64_t result;
+    switch (shift_type) {
+      case Decoder::ShiftType::kLsl:
+        result = value << shift_amount;
+        break;
+      case Decoder::ShiftType::kLsr:
+        result = value >> shift_amount;
+        break;
+      case Decoder::ShiftType::kAsr:
+        if (is_64bit) {
+          result = static_cast<uint64_t>(static_cast<int64_t>(value) >> shift_amount);
+        } else {
+          result = static_cast<uint64_t>(static_cast<uint32_t>(
+              static_cast<int32_t>(static_cast<uint32_t>(value)) >> shift_amount));
+        }
+        break;
+      case Decoder::ShiftType::kRor:
+        if (is_64bit) {
+          result = (value >> shift_amount) | (value << (64 - shift_amount));
+        } else {
+          uint32_t v32 = static_cast<uint32_t>(value);
+          result = ((v32 >> shift_amount) | (v32 << (32 - shift_amount))) & 0xFFFFFFFFULL;
+        }
+        break;
+      default:
+        result = value;
+        break;
+    }
+
+    if (!is_64bit) {
+      result &= 0xFFFFFFFFULL;
+    }
+
+    return result;
+  }
+
+  uint64_t ExtendReg(uint64_t value, uint8_t extend_type, uint8_t shift_amount) const {
+    uint64_t extended;
+    switch (extend_type) {
+      case 0b000:  // UXTB
+        extended = value & 0xFF;
+        break;
+      case 0b001:  // UXTH
+        extended = value & 0xFFFF;
+        break;
+      case 0b010:  // UXTW
+        extended = value & 0xFFFFFFFFULL;
+        break;
+      case 0b011:  // UXTX
+        extended = value;
+        break;
+      case 0b100:  // SXTB
+        extended = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(
+            static_cast<uint8_t>(value))));
+        break;
+      case 0b101:  // SXTH
+        extended = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(
+            static_cast<uint16_t>(value))));
+        break;
+      case 0b110:  // SXTW
+        extended = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(value))));
+        break;
+      case 0b111:  // SXTX
+        extended = value;
+        break;
+      default:
+        extended = value;
+        break;
+    }
+    return extended << shift_amount;
+  }
+
+  // region digitalis
+  //
+  // Memory access safety helpers.
+  // (CheckPageAccess and RaiseGuestSegv removed — replaced by FaultyLoad/FaultyStore
+  // with HandleMemoryFault)
+
+  //
+  // Atomic helpers.
+  //
+  template <typename T>
+  uint64_t AtomicLoad(void* addr) {
+    return static_cast<uint64_t>(__atomic_load_n(static_cast<T*>(addr), __ATOMIC_ACQUIRE));
+  }
+
+  template <typename T>
+  void AtomicStore(void* addr, uint64_t val) {
+    __atomic_store_n(static_cast<T*>(addr), static_cast<T>(val), __ATOMIC_RELEASE);
+  }
+
+  template <typename T>
+  bool AtomicCAS(void* addr, uint64_t expected, uint64_t desired) {
+    T exp = static_cast<T>(expected);
+    T des = static_cast<T>(desired);
+    return __atomic_compare_exchange_n(static_cast<T*>(addr), &exp, des,
+                                       false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  }
+
+  template <typename T>
+  uint64_t AtomicCASVal(void* addr, uint64_t expected, uint64_t desired) {
+    T exp = static_cast<T>(expected);
+    T des = static_cast<T>(desired);
+    __atomic_compare_exchange_n(static_cast<T*>(addr), &exp, des,
+                                false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return static_cast<uint64_t>(exp);  // Returns original value
+  }
+
+  template <typename T>
+  uint64_t AtomicExchange(void* addr, uint64_t val) {
+    return static_cast<uint64_t>(
+        __atomic_exchange_n(static_cast<T*>(addr), static_cast<T>(val), __ATOMIC_SEQ_CST));
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchAdd(void* addr, uint64_t operand) {
+    return static_cast<uint64_t>(
+        __atomic_fetch_add(static_cast<T*>(addr), static_cast<T>(operand), __ATOMIC_SEQ_CST));
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchAndNot(void* addr, uint64_t mask) {
+    return static_cast<uint64_t>(
+        __atomic_fetch_and(static_cast<T*>(addr), static_cast<T>(~mask), __ATOMIC_SEQ_CST));
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchOr(void* addr, uint64_t bits) {
+    return static_cast<uint64_t>(
+        __atomic_fetch_or(static_cast<T*>(addr), static_cast<T>(bits), __ATOMIC_SEQ_CST));
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchXor(void* addr, uint64_t bits) {
+    return static_cast<uint64_t>(
+        __atomic_fetch_xor(static_cast<T*>(addr), static_cast<T>(bits), __ATOMIC_SEQ_CST));
+  }
+
+  //
+  // SIMD helpers.
+  //
+
+  // region digitalis
+  // Half-precision float conversion helpers (IEEE 754 binary16).
+  static uint16_t FpSingleToHalf(float f) {
+    uint32_t fbits;
+    memcpy(&fbits, &f, 4);
+    uint16_t sign = (fbits >> 16) & 0x8000;
+    int32_t exp = ((fbits >> 23) & 0xFF) - 127;
+    uint32_t frac = fbits & 0x7FFFFF;
+
+    if (exp == 128) {
+      // Inf or NaN.
+      return sign | 0x7C00 | (frac ? (frac >> 13) | 1 : 0);
+    }
+    if (exp > 15) {
+      // Overflow -> infinity.
+      return sign | 0x7C00;
+    }
+    if (exp < -24) {
+      // Underflow -> zero.
+      return sign;
+    }
+    if (exp < -14) {
+      // Denormalized half-precision.
+      frac = (frac | 0x800000) >> (-exp - 14 + 13);
+      return sign | static_cast<uint16_t>(frac);
+    }
+    return sign | static_cast<uint16_t>((exp + 15) << 10) | static_cast<uint16_t>(frac >> 13);
+  }
+
+  static float FpHalfToSingle(uint16_t h) {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t frac = h & 0x3FF;
+
+    uint32_t fbits;
+    if (exp == 0) {
+      if (frac == 0) {
+        fbits = sign;  // Zero.
+      } else {
+        // Denormalized: normalize.
+        exp = 1;
+        while (!(frac & 0x400)) {
+          frac <<= 1;
+          exp--;
+        }
+        frac &= 0x3FF;
+        fbits = sign | (static_cast<uint32_t>(exp + 127 - 15) << 23) | (frac << 13);
+      }
+    } else if (exp == 0x1F) {
+      // Inf or NaN.
+      fbits = sign | 0x7F800000 | (frac << 13);
+    } else {
+      fbits = sign | (static_cast<uint32_t>(exp + 127 - 15) << 23) | (frac << 13);
+    }
+
+    float result;
+    memcpy(&result, &fbits, 4);
+    return result;
+  }
+  // endregion
+
+  __uint128_t ExpandSimdModifiedImm(uint8_t op, uint8_t cmode, uint8_t abc, uint8_t defgh, bool q) {
+    uint8_t imm8 = (abc << 5) | defgh;
+    uint64_t imm64 = 0;
+
+    if (op == 0) {
+      uint8_t cmode_hi = cmode >> 1;
+      switch (cmode_hi) {
+        case 0b000:  // 32-bit, no shift
+          imm64 = static_cast<uint64_t>(imm8) | (static_cast<uint64_t>(imm8) << 32);
+          break;
+        case 0b001:  // 32-bit, LSL #8
+          imm64 = (static_cast<uint64_t>(imm8) << 8) | (static_cast<uint64_t>(imm8) << 40);
+          break;
+        case 0b010:  // 32-bit, LSL #16
+          imm64 = (static_cast<uint64_t>(imm8) << 16) | (static_cast<uint64_t>(imm8) << 48);
+          break;
+        case 0b011:  // 32-bit, LSL #24
+          imm64 = (static_cast<uint64_t>(imm8) << 24) | (static_cast<uint64_t>(imm8) << 56);
+          break;
+        case 0b100:  // 16-bit, no shift
+          for (int i = 0; i < 4; i++) imm64 |= static_cast<uint64_t>(imm8) << (i * 16);
+          break;
+        case 0b101:  // 16-bit, LSL #8
+          for (int i = 0; i < 4; i++) imm64 |= static_cast<uint64_t>(imm8) << (i * 16 + 8);
+          break;
+        case 0b110:
+          if (!(cmode & 1)) {
+            // 32-bit, ones then imm8
+            uint32_t val = (imm8 << 8) | 0xFF;
+            imm64 = static_cast<uint64_t>(val) | (static_cast<uint64_t>(val) << 32);
+          } else {
+            // 32-bit, ones then imm8 then ones
+            uint32_t val = (imm8 << 16) | 0xFFFF;
+            imm64 = static_cast<uint64_t>(val) | (static_cast<uint64_t>(val) << 32);
+          }
+          break;
+        case 0b111:
+          if (!(cmode & 1)) {
+            // 8-bit, replicated
+            for (int i = 0; i < 8; i++) imm64 |= static_cast<uint64_t>(imm8) << (i * 8);
+          } else {
+            // FMOV (immediate) - skip for now
+            for (int i = 0; i < 8; i++) imm64 |= static_cast<uint64_t>(imm8) << (i * 8);
+          }
+          break;
+      }
+    } else {
+      // op=1
+      if (cmode == 0b1110) {
+        // MOVI 64-bit: each bit of imm8 expands to a byte
+        for (int i = 0; i < 8; i++) {
+          if (imm8 & (1 << i)) {
+            imm64 |= 0xFFULL << (i * 8);
+          }
+        }
+      } else {
+        // MVNI variants (op=1, cmode != 1110): NOT of the MOVI value
+        // Reuse op=0 decode then invert
+        __uint128_t base = ExpandSimdModifiedImm(0, cmode, abc, defgh, q);
+        __uint128_t result = ~base;
+        return result;
+      }
+    }
+
+    __uint128_t result = static_cast<__uint128_t>(imm64);
+    if (q) {
+      result |= static_cast<__uint128_t>(imm64) << 64;
+    }
+    return result;
+  }
+
+  void SimdLoadFromMemory(void* host_addr, uint8_t rt, Decoder::SimdLoadStoreSize size) {
+    // region digitalis - use FaultyLoad for sizes <= 8 bytes, two loads for 128-bit
+    if (size == Decoder::SimdLoadStoreSize::k128bit) {
+      FaultyLoadResult lo = FaultyLoad(host_addr, 8);
+      if (lo.is_fault) { HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return; }
+      FaultyLoadResult hi = FaultyLoad(static_cast<uint8_t*>(host_addr) + 8, 8);
+      if (hi.is_fault) { HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr) + 8); return; }
+      state_->cpu.v[rt] = static_cast<__uint128_t>(lo.value) | (static_cast<__uint128_t>(hi.value) << 64);
+      return;
+    }
+    uint8_t bytes = 0;
+    switch (size) {
+      case Decoder::SimdLoadStoreSize::k8bit: bytes = 1; break;
+      case Decoder::SimdLoadStoreSize::k16bit: bytes = 2; break;
+      case Decoder::SimdLoadStoreSize::k32bit: bytes = 4; break;
+      case Decoder::SimdLoadStoreSize::k64bit: bytes = 8; break;
+      default: break;
+    }
+    if (bytes > 0) {
+      FaultyLoadResult fl = FaultyLoad(host_addr, bytes);
+      if (fl.is_fault) { HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return; }
+      state_->cpu.v[rt] = static_cast<__uint128_t>(fl.value);
+      return;
+    }
+    // endregion
+    state_->cpu.v[rt] = 0;  // zero-extend upper bits
+    switch (size) {
+      case Decoder::SimdLoadStoreSize::k8bit: {
+        uint8_t val;
+        memcpy(&val, host_addr, 1);
+        state_->cpu.v[rt] = val;
+        break;
+      }
+      case Decoder::SimdLoadStoreSize::k16bit: {
+        uint16_t val;
+        memcpy(&val, host_addr, 2);
+        state_->cpu.v[rt] = val;
+        break;
+      }
+      case Decoder::SimdLoadStoreSize::k32bit: {
+        uint32_t val;
+        memcpy(&val, host_addr, 4);
+        state_->cpu.v[rt] = val;
+        break;
+      }
+      case Decoder::SimdLoadStoreSize::k64bit: {
+        uint64_t val;
+        memcpy(&val, host_addr, 8);
+        state_->cpu.v[rt] = val;
+        break;
+      }
+      case Decoder::SimdLoadStoreSize::k128bit: {
+        memcpy(&state_->cpu.v[rt], host_addr, 16);
+        break;
+      }
+    }
+  }
+
+  void SimdStoreToMemory(void* host_addr, uint8_t rt, Decoder::SimdLoadStoreSize size) {
+    // region digitalis - use FaultyStore for fault recovery
+    uint64_t lo_val = static_cast<uint64_t>(state_->cpu.v[rt]);
+    uint64_t hi_val = static_cast<uint64_t>(state_->cpu.v[rt] >> 64);
+    uint8_t bytes = 0;
+    switch (size) {
+      case Decoder::SimdLoadStoreSize::k8bit: bytes = 1; break;
+      case Decoder::SimdLoadStoreSize::k16bit: bytes = 2; break;
+      case Decoder::SimdLoadStoreSize::k32bit: bytes = 4; break;
+      case Decoder::SimdLoadStoreSize::k64bit: bytes = 8; break;
+      case Decoder::SimdLoadStoreSize::k128bit: {
+        if (FaultyStore(host_addr, 8, lo_val)) {
+          HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return;
+        }
+        if (FaultyStore(static_cast<uint8_t*>(host_addr) + 8, 8, hi_val)) {
+          HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr) + 8); return;
+        }
+        return;
+      }
+    }
+    if (bytes > 0) {
+      if (FaultyStore(host_addr, bytes, lo_val)) {
+        HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return;
+      }
+    }
+    // endregion
+  }
+  // endregion
+
+  ThreadState* state_;
+  bool branch_taken_;
+  bool exception_raised_;
+  // region digitalis
+  // (removed: page cache variables no longer needed with FaultyLoad/FaultyStore)
+  // endregion
+};
+
+}  // namespace berberis
+// endregion
