@@ -1,5 +1,6 @@
+// region digitalis
 /*
- * Copyright (C) 2023 The Android Open Source Project
+ * Copyright (C) 2026 utzcoz
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,12 +23,13 @@
 
 namespace berberis {
 
+// Default stub implementation without any custom linker callbacks.
 bool InitializeLinkerCallbacksArch(LinkerCallbacks* linker_callbacks,
                                    const LoadedElfFile& linker_elf_file,
                                    std::string* error_msg) {
   UNUSED(linker_callbacks, linker_elf_file, error_msg);
-  // ARM64 doesn't require any special linker callbacks.
   return true;
 }
 
 }  // namespace berberis
+// endregion

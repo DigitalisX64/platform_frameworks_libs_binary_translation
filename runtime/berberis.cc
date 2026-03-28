@@ -42,6 +42,12 @@ bool InitBerberisUnsafe() {
   InitGuestFunctionWrapper(&IsAddressGuestExecutable);
   InitTranslator();
   InitGuestSignalHandling();
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  ClaimHostFaultSignals();
+#endif
+  // endregion
+  InitCrashReporter();
   InitGuestArch();
   return true;
 }

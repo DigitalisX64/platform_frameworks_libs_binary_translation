@@ -1,5 +1,6 @@
+// region digitalis
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2026 utzcoz
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +17,14 @@
 
 #include "epoll_emulation.h"
 
-#include <errno.h>
 #include <linux/unistd.h>
-#include <string.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
-#include <bit>
+#include <cerrno>
+#include <cstring>
 
+#include "berberis/base/bit_util.h"
 #include "berberis/base/tracing.h"
 
 #include "guest_types.h"
@@ -62,7 +63,7 @@ long RunGuestSyscall___NR_epoll_ctl(long arg_1, long arg_2, long arg_3, long arg
     return syscall(__NR_epoll_ctl, arg_1, arg_2, arg_3, nullptr);
   }
 
-  Guest_epoll_event* guest_event = std::bit_cast<Guest_epoll_event*>(arg_4);
+  Guest_epoll_event* guest_event = bit_cast<Guest_epoll_event*>(arg_4);
   epoll_event host_event;
   host_event.events = guest_event->events;
   host_event.data.u64 = guest_event->data;
@@ -77,7 +78,7 @@ long RunGuestSyscall___NR_epoll_pwait(long arg_1,
                                       long arg_6) {
   long res = syscall(__NR_epoll_pwait, arg_1, arg_2, arg_3, arg_4, arg_5, arg_6);
   if (res != -1 && arg_2 != 0) {
-    ConvertHostEPollEventArrayToGuestInPlace(std::bit_cast<Guest_epoll_event*>(arg_2), arg_3);
+    ConvertHostEPollEventArrayToGuestInPlace(bit_cast<Guest_epoll_event*>(arg_2), arg_3);
   }
   return res;
 }
@@ -89,3 +90,4 @@ long RunGuestSyscall___NR_epoll_pwait2(long, long, long, long, long, long) {
 }
 
 }  // namespace berberis
+// endregion

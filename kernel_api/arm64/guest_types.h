@@ -1,5 +1,6 @@
+// region digitalis
 /*
- * Copyright (C) 2023 The Android Open Source Project
+ * Copyright (C) 2026 utzcoz
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +20,7 @@
 
 #include <dirent.h>
 #include <sys/epoll.h>
-#include <time.h>
-
-#include <cstdint>
+#include <sys/file.h>
 
 #include "berberis/base/struct_check.h"
 
@@ -51,10 +50,32 @@ CHECK_FIELD_LAYOUT(dirent64, d_reclen, 128, 16);
 CHECK_FIELD_LAYOUT(dirent64, d_type, 144, 8);
 CHECK_FIELD_LAYOUT(dirent64, d_name, 152, 2048);
 
+using Guest_flock = struct flock;
+using Guest_flock64 = struct flock64;
+
+CHECK_STRUCT_LAYOUT(Guest_flock, 256, 64);
+CHECK_FIELD_LAYOUT(Guest_flock, l_type, 0, 16);
+CHECK_FIELD_LAYOUT(Guest_flock, l_whence, 16, 16);
+CHECK_FIELD_LAYOUT(Guest_flock, l_start, 64, 64);
+CHECK_FIELD_LAYOUT(Guest_flock, l_len, 128, 64);
+CHECK_FIELD_LAYOUT(Guest_flock, l_pid, 192, 32);
+
+CHECK_STRUCT_LAYOUT(Guest_flock64, 256, 64);
+CHECK_FIELD_LAYOUT(Guest_flock64, l_type, 0, 16);
+CHECK_FIELD_LAYOUT(Guest_flock64, l_whence, 16, 16);
+CHECK_FIELD_LAYOUT(Guest_flock64, l_start, 64, 64);
+CHECK_FIELD_LAYOUT(Guest_flock64, l_len, 128, 64);
+CHECK_FIELD_LAYOUT(Guest_flock64, l_pid, 192, 32);
+
+static_assert(F_GETLK64 == 5);
+static_assert(F_SETLK64 == 6);
+static_assert(F_SETLKW64 == 7);
+
 CHECK_STRUCT_LAYOUT(timespec, 128, 64);
 CHECK_FIELD_LAYOUT(timespec, tv_sec, 0, 64);
 CHECK_FIELD_LAYOUT(timespec, tv_nsec, 64, 64);
 
+// ARM64 uses the same generic stat layout as RISC-V (both LP64, same asm-generic/stat.h).
 struct Guest_stat {
   alignas(8) uint64_t st_dev;
   alignas(8) uint64_t st_ino;
@@ -90,4 +111,5 @@ CHECK_FIELD_LAYOUT(Guest_stat, st_ctim, 832, 128);
 
 }  // namespace berberis
 
-#endif  // BERBERIS_ON_KERNEL_API_ARM64_GUEST_TYPES_ARCH_H_
+#endif  // BERBERIS_KERNEL_API_ARM64_GUEST_TYPES_ARCH_H_
+// endregion

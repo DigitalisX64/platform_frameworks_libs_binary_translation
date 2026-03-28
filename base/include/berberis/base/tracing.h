@@ -106,4 +106,10 @@ class Tracing {
   TRACE(__VA_ARGS__);        \
   ALOGI(__VA_ARGS__)
 
+// region digitalis
+#define TRACE_AND_ALOGD(...) \
+  TRACE(__VA_ARGS__);        \
+  ALOGD(__VA_ARGS__)
+// endregion
+
 #endif  // BERBERIS_BASE_TRACING_H_

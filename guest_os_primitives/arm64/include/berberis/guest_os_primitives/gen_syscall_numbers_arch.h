@@ -1,5 +1,6 @@
+// region digitalis
 /*
- * Copyright (C) 2023 The Android Open Source Project
+ * Copyright (C) 2026 utzcoz
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,11 +15,13 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_GUEST_OS_PRIMITIVES_GEN_SYSCALL_NUMBERS_ARCH_H_
-#define BERBERIS_GUEST_OS_PRIMITIVES_GEN_SYSCALL_NUMBERS_ARCH_H_
+#ifndef BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GEN_SYSCALL_NUMBERS_ARCH_H_
+#define BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GEN_SYSCALL_NUMBERS_ARCH_H_
 
 namespace berberis {
 
+// ARM64 uses the same generic Linux syscall table as RISC-V.
+// These numbers are identical to the riscv64 ones (asm-generic/unistd.h).
 enum {
   GUEST_NR_accept = 202,
   GUEST_NR_accept4 = 242,
@@ -330,4 +333,5 @@ enum {
 
 }  // namespace berberis
 
-#endif  // BERBERIS_GUEST_OS_PRIMITIVES_GEN_SYSCALL_NUMBERS_ARCH_H_
+#endif  // BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GEN_SYSCALL_NUMBERS_ARCH_H_
+// endregion

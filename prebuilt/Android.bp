@@ -42,6 +42,13 @@ prebuilt_etc {
     src: "system/etc/init/berberis.rc",
 }
 
+// region digitalis
+prebuilt_etc {
+    name: "ld.config.arm64.txt",
+    src: "system/etc/ld.config.arm64.txt",
+}
+// endregion
+
 phony {
     name: "berberis_prebuilt_riscv64",
     required: [
@@ -52,114 +59,12 @@ phony {
     ],
 }
 
-prebuilt_etc {
-    name: "ld.config.arm.txt",
-    src: "system/etc/ld.config.arm.txt",
-}
-
-prebuilt_etc {
-    name: "ld.config.arm64.txt",
-    src: "system/etc/ld.config.arm64.txt",
-}
-
-prebuilt_etc {
-    name: "berberis_cpuinfo_arm",
-    sub_dir: "berberis",
-    filename: "cpuinfo.arm.txt",
-    target: {
-        android_arm: {
-            src: "cpuinfo.arm",
-        },
-        android_arm64: {
-            src: "cpuinfo.arm64.arm",
-        },
-        android_x86: {
-            src: "cpuinfo.arm",
-        },
-        android_x86_64: {
-            src: "cpuinfo.arm64.arm",
-        },
-        android_riscv64: {
-            enabled: false,
-        },
-    },
-}
-
-prebuilt_etc {
-    name: "berberis_cpuinfo_arm64",
-    sub_dir: "berberis",
-    filename: "cpuinfo.arm64.txt",
-    src: "cpuinfo.arm64",
-}
-
-prebuilt_etc {
-    name: "arm_dyn",
-    sub_dir: "binfmt_misc",
-    src: "system/etc/binfmt_misc/arm_dyn",
-}
-
-prebuilt_etc {
-    name: "arm_exe",
-    sub_dir: "binfmt_misc",
-    src: "system/etc/binfmt_misc/arm_exe",
-}
-
-prebuilt_etc {
-    name: "arm64_dyn",
-    sub_dir: "binfmt_misc",
-    src: "system/etc/binfmt_misc/arm64_dyn",
-}
-
-prebuilt_etc {
-    name: "arm64_exe",
-    sub_dir: "binfmt_misc",
-    src: "system/etc/binfmt_misc/arm64_exe",
-}
-
-prebuilt_etc {
-    name: "berberis_arm_or_arm64.rc",
-    sub_dir: "init",
-    src: "system/etc/init/berberis_arm_or_arm64.rc",
-}
-
-phony {
-    name: "berberis_prebuilt_arm",
-    required: [
-        "arm_dyn",
-        "arm_exe",
-        "berberis_arm_or_arm64.rc",
-        "berberis_cpuinfo_arm",
-        "ld.config.arm.txt",
-    ],
-}
-
+// region digitalis
 phony {
     name: "berberis_prebuilt_arm64",
     required: [
-        "arm_dyn",
-        "arm_exe",
-        "arm64_dyn",
-        "arm64_exe",
-        "berberis_arm_or_arm64.rc",
-        "berberis_cpuinfo_arm",
-        "berberis_cpuinfo_arm64",
-        "ld.config.arm.txt",
+        "berberis.rc",
         "ld.config.arm64.txt",
     ],
 }
-
-// Prebuilts don't support native_bridge targets, so if the importing module supports native bridge
-// this one should be referenced using host_first_srcs (which excludes native bridge).
-cc_prebuilt_test_binary {
-    name: "berberis_ndk_program_tests_static_riscv64_prebuilt",
-    host_supported: true,
-    relative_install_path: "berberis_ndk_program_tests_static_riscv64_prebuilt",
-    srcs: ["testcases/berberis_ndk_program_tests_static_riscv64"],
-}
-
-cc_prebuilt_test_binary {
-    name: "inline_asm_tests_riscv64_prebuilt",
-    host_supported: true,
-    relative_install_path: "inline_asm_tests_riscv64_prebuilt",
-    srcs: ["testcases/inline_asm_tests_riscv64"],
-}
+// endregion

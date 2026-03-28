@@ -17,6 +17,10 @@
 # This file defines:
 #   BERBERIS_PRODUCT_PACKAGES_RISCV64_TO_X86_64 - list of main product packages for riscv64 to
 #                                                 x86_64 translation.
+# region digitalis
+#   BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 - list of main product packages for arm64 to
+#                                               x86_64 translation (Digitalis).
+# endregion
 #
 
 include frameworks/libs/native_bridge_support/native_bridge_support.mk
@@ -53,6 +57,41 @@ BERBERIS_PRODUCT_PACKAGES_RISCV64_TO_X86_64 := \
 # TODO(b/277625560): Include $(NATIVE_BRIDGE_PRODUCT_PACKAGES) instead
 # when all its bits are ready for riscv64.
 BERBERIS_PRODUCT_PACKAGES_RISCV64_TO_X86_64 += $(NATIVE_BRIDGE_PRODUCT_PACKAGES_RISCV64_READY)
+
+# region digitalis
+# Digitalis: ARM64 to x86_64 translation packages.
+BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 := \
+    libberberis_exec_region \
+    libberberis_proxy_libEGL \
+    libberberis_proxy_libGLESv1_CM \
+    libberberis_proxy_libGLESv2 \
+    libberberis_proxy_libGLESv3 \
+    libberberis_proxy_libOpenMAXAL \
+    libberberis_proxy_libOpenSLES \
+    libberberis_proxy_libaaudio \
+    libberberis_proxy_libamidi \
+    libberberis_proxy_libandroid \
+    libberberis_proxy_libandroid_runtime \
+    libberberis_proxy_libbinder_ndk \
+    libberberis_proxy_libc \
+    libberberis_proxy_libcamera2ndk \
+    libberberis_proxy_libjnigraphics \
+    libberberis_proxy_libm \
+    libberberis_proxy_libmediandk \
+    libberberis_proxy_libnativehelper \
+    libberberis_proxy_libnativewindow \
+    libberberis_proxy_libneuralnetworks \
+    libberberis_proxy_libvulkan \
+    libberberis_proxy_libwebviewchromium_plat_support \
+    berberis_prebuilt_arm64 \
+    libberberis_arm64
+
+BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 += $(NATIVE_BRIDGE_PRODUCT_PACKAGES)
+
+BERBERIS_DISTRIBUTION_ARTIFACTS_ARM64 := \
+    system/etc/ld.config.arm64.txt \
+    system/lib64/libberberis_arm64.so
+# endregion
 
 BERBERIS_DISTRIBUTION_ARTIFACTS_RISCV64 := \
     system/bin/berberis_program_runner_binfmt_misc_riscv64 \

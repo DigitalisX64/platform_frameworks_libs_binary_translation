@@ -1,5 +1,6 @@
+// region digitalis
 /*
- * Copyright (C) 2023 The Android Open Source Project
+ * Copyright (C) 2026 utzcoz
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,11 +24,12 @@ const char* kGuestIsa = "arm64";
 const char* kSupportedLibraryPathSubstring = "/lib/arm64";
 
 const android::NativeBridgeRuntimeValues kNativeBridgeRuntimeValues = {
-    .os_arch = nullptr,
-    .cpu_abi = nullptr,
+    .os_arch = "aarch64",
+    .cpu_abi = "arm64-v8a",
     .cpu_abi2 = nullptr,
     .supported_abis = nullptr,
     .abi_count = 0,
 };
 
 }  // namespace berberis
+// endregion

@@ -1,5 +1,6 @@
+// region digitalis
 /*
- * Copyright (C) 2023 The Android Open Source Project
+ * Copyright (C) 2026 utzcoz
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,32 +15,32 @@
  * limitations under the License.
  */
 
-#ifndef ARM_BERBERIS_GUEST_OS_PRIMITIVES_GUEST_SIGNAL_ARCH_H_
-#define ARM_BERBERIS_GUEST_OS_PRIMITIVES_GUEST_SIGNAL_ARCH_H_
-
-#include "berberis/base/struct_check.h"
-#include "berberis/guest_os_primitives/guest_signal.h"
+#ifndef BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GUEST_SIGNAL_ARCH_H_
+#define BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GUEST_SIGNAL_ARCH_H_
 
 namespace berberis {
 
-// TODO(eaeltsin): check other SA_* flags!
-static_assert(SA_NODEFER == 0x4000'0000, "Host and guest SA_NODEFER don't match");
-
 // Guest struct (__kernel_)sigaction, as expected by rt_sigaction syscall.
+// ARM64 sigaction includes sa_restorer (same as x86_64, unlike RISC-V).
 struct Guest_sigaction {
-  // Prefix for avoiding conflict with original 'sa_sigaction' defined as macro.
+  // Prefix avoids conflict with original 'sa_sigaction' defined as macro.
   GuestAddr guest_sa_sigaction;
   unsigned long sa_flags;
   GuestAddr sa_restorer;
   Guest_sigset_t sa_mask;
 };
 
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 CHECK_STRUCT_LAYOUT(Guest_sigaction, 256, 64);
 CHECK_FIELD_LAYOUT(Guest_sigaction, guest_sa_sigaction, 0, 64);
 CHECK_FIELD_LAYOUT(Guest_sigaction, sa_flags, 64, 64);
 CHECK_FIELD_LAYOUT(Guest_sigaction, sa_restorer, 128, 64);
 CHECK_FIELD_LAYOUT(Guest_sigaction, sa_mask, 192, 64);
+#else
+#error "Unexpected guest arch."
+#endif
 
 }  // namespace berberis
 
-#endif  // ARM_BERBERIS_GUEST_OS_PRIMITIVES_GUEST_SIGNAL_ARCH_H_
+#endif  // BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GUEST_SIGNAL_ARCH_H_
+// endregion

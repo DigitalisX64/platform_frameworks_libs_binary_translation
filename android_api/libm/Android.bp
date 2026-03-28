@@ -17,18 +17,29 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
+// region digitalis - use berberis_proxy_library_defaults for arch-conditional selection
+// Original:
+// cc_library_shared {
+//     name: "libberberis_proxy_libm",
+//     defaults: [
+//         "berberis_defaults_64",
+//         "native_bridge_proxy_libm_defaults",
+//     ],
+//     header_libs: [
+//         "libberberis_guest_abi_riscv64_headers",
+//     ],
+//     shared_libs: [
+//         "libberberis_riscv64",
+//         "liblog",
+//     ],
+// }
 cc_library_shared {
     // TODO(b/232598137): Libm-proxy isn't enabled yet.
     name: "libberberis_proxy_libm",
     defaults: [
         "berberis_riscv64_defaults",
+        "berberis_proxy_library_defaults",
         "native_bridge_proxy_libm_defaults",
     ],
-    header_libs: [
-        "libberberis_guest_abi_riscv64_headers",
-    ],
-    shared_libs: [
-        "libberberis_riscv64",
-        "liblog",
-    ],
 }
+// endregion

@@ -89,3 +89,19 @@ cc_library_static {
     host_supported: true,
     header_libs: ["libberberis_guest_state_riscv64_headers"],
 }
+
+// region digitalis
+// The ARM64 guest's runtime library. Mirrors the riscv64 variant, but binds
+// berberis_arm64_defaults and the ARM64 guest state so that
+// runtime_library_x86_64.cc's entry/exit trampolines compute their offsetof()
+// against the ARM64 ThreadState layout.
+cc_library_static {
+    name: "libberberis_runtime_library_arm64",
+    defaults: [
+        "berberis_runtime_library_defaults",
+        "berberis_arm64_defaults",
+    ],
+    host_supported: true,
+    header_libs: ["libberberis_guest_state_arm64_headers"],
+}
+// endregion
