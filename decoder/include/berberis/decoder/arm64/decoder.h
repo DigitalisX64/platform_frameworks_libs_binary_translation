@@ -2864,10 +2864,11 @@ class Decoder {
     uint8_t rt = GetBits<0, 5>();
 
     // region digitalis
-    // o2 is NOT just for exclusive pairs — it's used in various instructions:
-    // o2=0: STXR/LDXR/STLXR/LDAXR/CAS/LDAR/STLR
-    // o2=1: LDAXR/STLXR variants with additional ordering, or exclusive pair
-    // For now, treat o2 as part of the acquire/release encoding.
+    // o2 distinguishes exclusive (o2=0) from ordered/CAS (o2=1):
+    //   o2=0, o1=0: STXR/LDXR/STLXR/LDAXR (exclusive)
+    //   o2=0, o1=1: CASP (exclusive pair CAS)
+    //   o2=1, o1=0: STLR/LDAR (ordered, non-exclusive)
+    //   o2=1, o1=1: CAS/CASA/CASL/CASAL
     // endregion
 
     LoadStoreExclusiveArgs args;
@@ -2879,18 +2880,9 @@ class Decoder {
     args.release = false;
 
     if (o1 == 0) {
-      // LDXR/STXR family
-      if (L) {
-        args.op = AtomicOp::kLdxr;
-        args.acquire = (o0 != 0);  // LDAXR
-      } else {
-        args.op = AtomicOp::kStxr;
-        args.release = (o0 != 0);  // STLXR
-      }
-    } else {
-      // o1=1: CAS or LDAR/STLR
-      if (rs == 0b11111 && o0 == 1) {
-        // LDAR/STLR (ordered access, no exclusive)
+      // region digitalis - check o2 to distinguish STLR/LDAR from STXR/LDXR
+      if (o2) {
+        // o2=1, o1=0: LDAR/STLR (ordered, non-exclusive)
         if (L) {
           args.op = AtomicOp::kLdar;
           args.acquire = true;
@@ -2899,11 +2891,21 @@ class Decoder {
           args.release = true;
         }
       } else {
-        // CAS family
-        args.op = AtomicOp::kCas;
-        args.acquire = (L != 0);   // CASA/CASAL
-        args.release = (o0 != 0);  // CASL/CASAL
+        // o2=0, o1=0: LDXR/STXR family (exclusive)
+        if (L) {
+          args.op = AtomicOp::kLdxr;
+          args.acquire = (o0 != 0);  // LDAXR
+        } else {
+          args.op = AtomicOp::kStxr;
+          args.release = (o0 != 0);  // STLXR
+        }
       }
+      // endregion
+    } else {
+      // o1=1: CAS family
+      args.op = AtomicOp::kCas;
+      args.acquire = (L != 0);   // CASA/CASAL
+      args.release = (o0 != 0);  // CASL/CASAL
     }
     insn_consumer_->LoadStoreExclusive(args);
   }

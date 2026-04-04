@@ -298,12 +298,13 @@ TEST_F(Arm64LiteTranslateRegionTest, CbnzTaken) {
   EXPECT_TRUE(Run(code, branch_target));
 }
 
-TEST_F(Arm64LiteTranslateRegionTest, GracefulFailure) {
-  // region digitalis - SVC now ends region cleanly instead of failing.
-  // SVC exits to interpreter, preserving JIT work before the SVC.
+TEST_F(Arm64LiteTranslateRegionTest, SvcEndsRegion) {
+  // region digitalis - SVC sets success_=false so the interpreter handles it.
+  // The region translates MOVZ successfully, then fails at SVC.
+  // The dispatch loop installs kInterpreted for the SVC address.
   static const uint32_t code[] = {
       MovzX(0, 1),    // MOVZ X0, #1 (translatable)
-      0xD4000001,     // SVC #0 (ends region, interpreter handles syscall)
+      0xD4000001,     // SVC #0 (interpreter handles syscall)
   };
   MachineCode machine_code;
   auto [success, stop_pc] = TryLiteTranslateRegion(ToGuestAddr(code),
@@ -312,10 +313,9 @@ TEST_F(Arm64LiteTranslateRegionTest, GracefulFailure) {
                                                        .end_pc = ToGuestAddr(code) + 8,
                                                        .allow_dispatch = false,
                                                    });
-  EXPECT_TRUE(success);
-  // Region includes the SVC instruction (which exits to interpreter).
-  // stop_pc is past the SVC since the instruction was processed.
-  EXPECT_EQ(stop_pc, ToGuestAddr(code) + 8);
+  // SVC causes translation failure at its PC — interpreter will handle it.
+  EXPECT_FALSE(success);
+  EXPECT_EQ(stop_pc, ToGuestAddr(code) + 4);  // PC of the SVC instruction
   // endregion
 }
 
@@ -538,6 +538,108 @@ TEST_F(Arm64LiteTranslateRegionTest, CselAlways) {
   };
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[3], 100ULL);
+}
+
+// STLR Wt, [Xn]: size=10, o2=1, L=0, o1=0, Rs=11111, o0=1, Rt2=11111
+// Encoding: 10 001000 1 0 0 11111 1 11111 Rn Rt
+constexpr uint32_t StlrW(uint8_t rt, uint8_t rn) {
+  return 0x889FFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// LDR Wt, [Xn] (unsigned offset 0): size=10, V=0, opc=01
+// Encoding: 1011 1001 01 imm12=0 Rn Rt
+constexpr uint32_t LdrWUnsigned(uint8_t rt, uint8_t rn) {
+  return 0xB9400000 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StlrWritesToMemory) {
+  // STLR W1, [X0] should write the value in W1 to the address in X0.
+  // Then LDR W2, [X0] should read it back.
+  static uint32_t target_mem = 0;
+  static const uint32_t code[] = {
+      MovzX(1, 42),                // MOVZ X1, #42 (value to store)
+      StlrW(1, 0),                 // STLR W1, [X0] (store-release)
+      LdrWUnsigned(2, 0),          // LDR W2, [X0] (load it back)
+  };
+  target_mem = 0;
+  state_.cpu.x[0] = ToGuestAddr(&target_mem);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target_mem, 42u);
+  EXPECT_EQ(state_.cpu.x[2], 42ULL);
+}
+
+// DUP V0.16B, Wn: broadcast byte from GP register to all 16 lanes of V0.
+// Encoding: 0 Q=1 0 01110 000 imm5=00001 0 imm4=0001 1 Rn Rd
+// = 0100 1110 0000 0001 0000 0111 00 Rn Rd
+constexpr uint32_t DupV16B(uint8_t rd, uint8_t rn) {
+  return 0x4E010C00 | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// STP Q<rt1>, Q<rt2>, [Xn], #32 (post-index, 128-bit pair store)
+// opc=10, V=1, type=001(post-index), L=0(store), imm7=2(32/16), Rt2, Rn, Rt
+// Encoding: 10 101 1 001 0 0000010 Rt2 Rn Rt
+constexpr uint32_t StpQPostIndex(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div16) {
+  uint32_t imm7 = static_cast<uint32_t>(imm_div16) & 0x7F;
+  return 0xAC800000 | (imm7 << 15) | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MemsetPattern) {
+  // Test the ARM64 memset pattern: DUP V0.16B, W0 + STP Q0, Q0, [X1], #32
+  // This writes 32 bytes of the byte value in W0 to the address in X1.
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),                 // DUP V0.16B, W0 (broadcast byte)
+      StpQPostIndex(0, 0, 1, 2),     // STP Q0, Q0, [X1], #32
+  };
+  state_.cpu.x[0] = 0xAB;            // byte value to fill
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // First 32 bytes should be 0xAB
+  for (int i = 0; i < 32; i++) {
+    EXPECT_EQ(buffer[i], 0xAB) << "byte " << i;
+  }
+  // Remaining bytes should be untouched
+  for (int i = 32; i < 64; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+  // X1 should be advanced by 32
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(buffer) + 32);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ForwardBranchExtension) {
+  // Forward B.EQ should NOT end the region — code after it should also translate.
+  // X0=10, CMP X0,#5 → Z=0 → B.EQ not taken → fall through to ADD.
+  static const uint32_t code[] = {
+      MovzX(0, 10),         // MOVZ X0, #10
+      CmpImmX(0, 5),        // CMP X0, #5 → Z=0
+      Bcond(kCondEQ, 8),    // B.EQ +8 (forward, not taken)
+      AddImmX(0, 0, 1),     // ADD X0, X0, #1 → X0=11 (should be in same region)
+      AddImmX(0, 0, 2),     // ADD X0, X0, #2 → X0=13 (branch target, also translated)
+  };
+  // With forward branch extension, the entire block should be one region.
+  // Without it, the region would end at B.EQ and X0 would be 10 (ADD not reached).
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 13ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ForwardBranchTaken) {
+  // Forward B.EQ taken: X0=5, CMP X0,#5 → Z=1 → B.EQ taken → skips ADD X0,#1.
+  static const uint32_t code[] = {
+      MovzX(0, 5),          // MOVZ X0, #5
+      CmpImmX(0, 5),        // CMP X0, #5 → Z=1
+      Bcond(kCondEQ, 8),    // B.EQ +8 (forward, taken → skips next insn)
+      AddImmX(0, 0, 1),     // ADD X0, X0, #1 (skipped)
+      AddImmX(0, 0, 2),     // ADD X0, X0, #2 → X0=7 (branch target)
+  };
+  // B.EQ is taken, so it exits the region to code+16 (the second ADD).
+  // The dispatch will handle code+16 as a new region.
+  GuestAddr branch_target = ToGuestAddr(code) + 16;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);  // Branch exits before any ADD executes
 }
 // endregion
 

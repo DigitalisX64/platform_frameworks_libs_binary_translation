@@ -191,10 +191,15 @@ void LiteTranslator::BranchCond(Decoder::Condition cond, int32_t offset) {
       break;
   }
 
-  // region digitalis - reverted region extension (was causing linker hang)
-  is_region_end_reached_ = true;
+  // region digitalis - forward branch extension with back-edge detection
   GuestAddr target = GetInsnAddr() + offset;
+  if (offset <= 0) {
+    // Backward branch (or self-loop): end region to prevent infinite loops.
+    is_region_end_reached_ = true;
+  }
+  // Taken path: always exit to branch target.
   ExitRegion(target);
+  // Fall-through: continue translating if forward branch (is_region_end_reached_ not set).
   // endregion
   as_.Bind(cont);
 }

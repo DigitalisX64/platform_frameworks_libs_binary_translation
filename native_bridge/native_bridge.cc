@@ -30,6 +30,11 @@
 
 #include "procinfo/process_map.h"
 
+// region digitalis
+#include <android/log.h>
+#define DIGITALIS_LOG(...) __android_log_print(ANDROID_LOG_ERROR, "berberis", __VA_ARGS__)
+// endregion
+
 #include "berberis/base/algorithm.h"
 #include "berberis/base/bit_util.h"
 #include "berberis/base/config_globals.h"
@@ -166,6 +171,13 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
     return handle;
   }
 
+  // region digitalis
+  {
+    const char* guest_err = guest_loader_->DlError();
+    DIGITALIS_LOG("LoadGuestLibrary FAILED for %s: %s", libpath, guest_err ? guest_err : "(no error)");
+  }
+  // endregion
+
   // http://b/206676167: Do not fallback to host for libRS.so
   if (berberis::Basename(libpath) == "libRS.so") {
     return handle;
@@ -257,11 +269,35 @@ native_bridge_namespace_t* NdktNativeBridge::CreateNamespace(
                                                   permitted_when_isolated_path,
                                                   parent_ns->host_namespace);
 
+  // region digitalis
+  // Append ARM64 system library paths to the guest namespace so the guest linker
+  // can find proxy libraries (libandroid.so, libvulkan.so, etc.) that live in
+  // /system/lib64/arm64/. The guest namespace linking mechanism doesn't work
+  // reliably because the guest linker config only has a single "default" namespace
+  // while the framework expects multiple exported namespaces (system, com_android_art, etc.).
+  std::string guest_default_path;
+  if (default_library_path != nullptr) {
+    guest_default_path = default_library_path;
+    guest_default_path += ":/system/lib64/arm64/bootstrap:/system/lib64/arm64";
+  } else {
+    guest_default_path = "/system/lib64/arm64/bootstrap:/system/lib64/arm64";
+  }
+  std::string guest_permitted;
+  if (permitted_when_isolated_path != nullptr) {
+    guest_permitted = permitted_when_isolated_path;
+    guest_permitted += ":/system/lib64/arm64/bootstrap:/system/lib64/arm64";
+  } else {
+    guest_permitted = "/system/lib64/arm64/bootstrap:/system/lib64/arm64";
+  }
+  DIGITALIS_LOG("createNamespace guest: name=%s default_path=%s permitted=%s",
+                name, guest_default_path.c_str(), guest_permitted.c_str());
+  // endregion
+
   auto* guest_namespace = guest_loader_->CreateNamespace(name,
                                                          ld_library_path,
-                                                         default_library_path,
+                                                         guest_default_path.c_str(),
                                                          type,
-                                                         permitted_when_isolated_path,
+                                                         guest_permitted.c_str(),
                                                          parent_ns->guest_namespace);
 
   return CreateNativeBridgeNamespace(host_namespace, guest_namespace);
@@ -276,6 +312,17 @@ native_bridge_namespace_t* NdktNativeBridge::GetExportedNamespace(const char* na
 
   auto host_namespace = android_get_exported_namespace(name);
   auto guest_namespace = guest_loader_->GetExportedNamespace(name);
+
+  // region digitalis
+  // The guest linker config may not export all namespaces that the host config
+  // does (e.g. "system", "com_android_art"). When the guest doesn't have the
+  // requested namespace, fall back to the guest's "default" namespace which
+  // contains the ARM64 system library search paths.
+  if (guest_namespace == nullptr) {
+    guest_namespace = guest_loader_->GetExportedNamespace("default");
+    DIGITALIS_LOG("getExportedNamespace: guest fallback for '%s' -> default=%p", name, guest_namespace);
+  }
+  // endregion
 
   auto [insert_it, inserted] =
       exported_namespaces_.try_emplace(std::string(name),
@@ -295,8 +342,22 @@ bool NdktNativeBridge::InitAnonymousNamespace(const char* public_ns_sonames,
 bool NdktNativeBridge::LinkNamespaces(native_bridge_namespace_t* from,
                                       native_bridge_namespace_t* to,
                                       const char* shared_libs_sonames) {
+  // region digitalis
+  // Add linux-vdso.so.1 to the guest shared libs whitelist so the guest linker
+  // can find the TinyLoader-loaded vDSO across namespace boundaries. Without this,
+  // the guest linker loads a second copy from the filesystem which has no
+  // trampolines registered, causing a null function pointer crash (SIGSEGV at
+  // vDSO offset 0x800c — blr x3 with x3=0).
+  std::string guest_shared_libs;
+  if (shared_libs_sonames != nullptr) {
+    guest_shared_libs = shared_libs_sonames;
+    guest_shared_libs += ":linux-vdso.so.1";
+  } else {
+    guest_shared_libs = "linux-vdso.so.1";
+  }
+  // endregion
   return guest_loader_->LinkNamespaces(
-             from->guest_namespace, to->guest_namespace, shared_libs_sonames) &&
+             from->guest_namespace, to->guest_namespace, guest_shared_libs.c_str()) &&
          android_link_namespaces(from->host_namespace, to->host_namespace, shared_libs_sonames);
 }
 
@@ -556,10 +617,19 @@ bool native_bridge_isPathSupported(const char* library_path) {
 
 bool native_bridge_initAnonymousNamespace(const char* public_ns_sonames,
                                           const char* anon_ns_library_path) {
+  // region digitalis
+  DIGITALIS_LOG("initAnonymousNamespace: sonames=%.200s path=%s",
+                public_ns_sonames ? public_ns_sonames : "(null)",
+                anon_ns_library_path ? anon_ns_library_path : "(null)");
+  // endregion
   LOG_NB("native_bridge_initAnonymousNamespace(public_ns_sonames=%s, anon_ns_library_path=%s)",
          public_ns_sonames,
          anon_ns_library_path);
-  return g_ndkt_native_bridge.InitAnonymousNamespace(public_ns_sonames, anon_ns_library_path);
+  bool result = g_ndkt_native_bridge.InitAnonymousNamespace(public_ns_sonames, anon_ns_library_path);
+  // region digitalis
+  DIGITALIS_LOG("initAnonymousNamespace: result=%d", result);
+  // endregion
+  return result;
 }
 
 native_bridge_namespace_t* native_bridge_createNamespace(const char* name,
@@ -568,26 +638,60 @@ native_bridge_namespace_t* native_bridge_createNamespace(const char* name,
                                                          uint64_t type,
                                                          const char* permitted_when_isolated_path,
                                                          native_bridge_namespace_t* parent_ns) {
+  // region digitalis
+  DIGITALIS_LOG("createNamespace: name=%s ld_path=%s default_path=%s type=%llu permitted=%s parent=%p",
+                name ? name : "(null)",
+                ld_library_path ? ld_library_path : "(null)",
+                default_library_path ? default_library_path : "(null)",
+                (unsigned long long)type,
+                permitted_when_isolated_path ? permitted_when_isolated_path : "(null)",
+                parent_ns);
+  // endregion
   LOG_NB("native_bridge_createNamespace(name=%s, path=%s)", name, ld_library_path);
-  return g_ndkt_native_bridge.CreateNamespace(
+  auto* result = g_ndkt_native_bridge.CreateNamespace(
       name, ld_library_path, default_library_path, type, permitted_when_isolated_path, parent_ns);
+  // region digitalis
+  DIGITALIS_LOG("createNamespace: result=%p guest=%p", result,
+                result ? result->guest_namespace : nullptr);
+  // endregion
+  return result;
 }
 
 bool native_bridge_linkNamespaces(native_bridge_namespace_t* from,
                                   native_bridge_namespace_t* to,
                                   const char* shared_libs_sonames) {
+  // region digitalis
+  DIGITALIS_LOG("linkNamespaces: from=%p(guest=%p) to=%p(guest=%p) shared_libs=%.300s",
+                from, from ? from->guest_namespace : nullptr,
+                to, to ? to->guest_namespace : nullptr,
+                shared_libs_sonames ? shared_libs_sonames : "(null)");
+  // endregion
   LOG_NB("native_bridge_linkNamespaces(from=%p, to=%p, shared_libs=%s)",
          from,
          to,
          shared_libs_sonames);
 
-  return g_ndkt_native_bridge.LinkNamespaces(from, to, shared_libs_sonames);
+  bool result = g_ndkt_native_bridge.LinkNamespaces(from, to, shared_libs_sonames);
+  // region digitalis
+  DIGITALIS_LOG("linkNamespaces: result=%d", result);
+  // endregion
+  return result;
 }
 
 void* native_bridge_loadLibraryExt(const char* libpath, int flag, native_bridge_namespace_t* ns) {
+  // region digitalis
+  DIGITALIS_LOG("loadLibraryExt: path=%s ns=%p(guest=%p)",
+                libpath ? libpath : "(null)",
+                ns, ns ? ns->guest_namespace : nullptr);
+  // endregion
   LOG_NB("native_bridge_loadLibraryExt(path=%s)", libpath);
 
-  return g_ndkt_native_bridge.LoadLibrary(libpath, flag, ns);
+  void* result = g_ndkt_native_bridge.LoadLibrary(libpath, flag, ns);
+  // region digitalis
+  DIGITALIS_LOG("loadLibraryExt: result=%p dlerror=%s", result,
+                result ? "ok" : (g_ndkt_native_bridge.DlError() ? g_ndkt_native_bridge.DlError() : "(null)"));
+  // endregion
+  return result;
 }
 
 native_bridge_namespace_t* native_bridge_getVendorNamespace() {
@@ -598,7 +702,13 @@ native_bridge_namespace_t* native_bridge_getVendorNamespace() {
 
 native_bridge_namespace_t* native_bridge_getExportedNamespace(const char* name) {
   LOG_NB("native_bridge_getExportedNamespace(name=%s)", name);
-  return g_ndkt_native_bridge.GetExportedNamespace(name);
+  auto* result = g_ndkt_native_bridge.GetExportedNamespace(name);
+  // region digitalis
+  DIGITALIS_LOG("getExportedNamespace: name=%s result=%p guest=%p",
+                name ? name : "(null)",
+                result, result ? result->guest_namespace : nullptr);
+  // endregion
+  return result;
 }
 
 void native_bridge_preZygoteFork() {

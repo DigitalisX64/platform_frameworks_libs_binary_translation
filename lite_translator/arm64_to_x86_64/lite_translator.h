@@ -405,9 +405,12 @@ class LiteTranslator {
       // CBZ: branch if zero, so skip branch (fall through) if nonzero.
       as_.Jcc(Condition::kNotEqual, *cont);
     }
-    // region digitalis - reverted region extension (was causing linker hang)
-    is_region_end_reached_ = true;
+    // region digitalis - forward branch extension with back-edge detection
     GuestAddr target = GetInsnAddr() + offset;
+    if (offset <= 0) {
+      // Backward branch: end region to prevent infinite loops.
+      is_region_end_reached_ = true;
+    }
     ExitRegion(target);
     // endregion
     as_.Bind(cont);
@@ -429,9 +432,12 @@ class LiteTranslator {
       // TBZ: branch if bit clear (CF=0), so skip if CF=1.
       as_.Jcc(Condition::kCarry, *cont);
     }
-    // region digitalis - reverted region extension
-    is_region_end_reached_ = true;
+    // region digitalis - forward branch extension with back-edge detection
     GuestAddr target = GetInsnAddr() + offset;
+    if (offset <= 0) {
+      // Backward branch: end region to prevent infinite loops.
+      is_region_end_reached_ = true;
+    }
     ExitRegion(target);
     // endregion
     as_.Bind(cont);
