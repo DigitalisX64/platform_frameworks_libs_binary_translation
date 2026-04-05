@@ -88,7 +88,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
       if (break_count <= 20 || break_count % 50000 == 0) {
         GuestAddr fail_pc = translator.GetInsnAddr();
         uint32_t insn = *ToHostAddr<const uint32_t>(fail_pc);
-        TRACE_AND_ALOGE("berberis: JIT break #%lu pc=0x%lx insn=0x%08x",
+        TRACE_AND_ALOGD("berberis: JIT break #%lu pc=0x%lx insn=0x%08x",
                         (unsigned long)break_count,
                         (unsigned long)fail_pc,
                         insn);

@@ -625,6 +625,14 @@ class LiteTranslator {
       as_.Movq(res, 0x8444c004ULL);
       return res;
     }
+    if (sysreg == Decoder::SystemReg::kDczidEl0) {
+      // DCZID_EL0: Data Cache Zero ID Register.
+      // DZP=1 (DC ZVA prohibited), BS=0. Matches interpreter value.
+      Register res = AllocTempReg();
+      if (!success()) return no_register;
+      as_.Movq(res, 0x10ULL);
+      return res;
+    }
     // endregion
     Undefined();
     return no_register;

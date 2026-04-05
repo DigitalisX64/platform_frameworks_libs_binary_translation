@@ -32,7 +32,7 @@
 
 // region digitalis
 #include <android/log.h>
-#define DIGITALIS_LOG(...) __android_log_print(ANDROID_LOG_ERROR, "berberis", __VA_ARGS__)
+#define DIGITALIS_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "berberis", __VA_ARGS__)
 // endregion
 
 #include "berberis/base/algorithm.h"

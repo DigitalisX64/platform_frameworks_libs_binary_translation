@@ -641,6 +641,333 @@ TEST_F(Arm64LiteTranslateRegionTest, ForwardBranchTaken) {
   EXPECT_TRUE(Run(code, branch_target));
   EXPECT_EQ(state_.cpu.x[0], 5ULL);  // Branch exits before any ADD executes
 }
+// --- Memset instruction variant tests ---
+
+// STUR Q<rt>, [Xn, #imm9]: Store 128-bit SIMD with unscaled immediate.
+// Encoding: 00 111 1 00 10 imm9 00 Rn Rt
+constexpr uint32_t SturQ(uint8_t rt, uint8_t rn, int16_t imm9) {
+  uint32_t uimm9 = static_cast<uint32_t>(imm9) & 0x1FF;
+  return 0x3C800000 | (uimm9 << 12) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// STR Q<rt>, [Xn, Xm]: Store 128-bit SIMD with register offset (no shift).
+// Encoding: 00 111 1 00 10 1 Rm 011 0 00 Rn Rt
+constexpr uint32_t StrQReg(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0x3CA06800 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// STR Q<rt>, [Xn, #uimm12]: Store 128-bit SIMD with unsigned immediate (scaled by 16).
+constexpr uint32_t StrQUnsigned(uint8_t rt, uint8_t rn, uint16_t imm12_div16) {
+  return 0x3D800000 | (static_cast<uint32_t>(imm12_div16) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// STUR S<rt>, [Xn, #imm9]: Store 32-bit SIMD with unscaled immediate.
+// Encoding: 10 111 1 00 00 imm9 00 Rn Rt
+constexpr uint32_t SturS(uint8_t rt, uint8_t rn, int16_t imm9) {
+  uint32_t uimm9 = static_cast<uint32_t>(imm9) & 0x1FF;
+  return 0xBC000000 | (uimm9 << 12) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// STR S<rt>, [Xn, Xm, LSL #2]: Store 32-bit SIMD with register offset and shift.
+// Encoding: 10 111 1 00 00 1 Rm 011 S 10 Rn Rt
+// S=1 means shift by 2 (log2 of 4 bytes).
+constexpr uint32_t StrSRegLsl2(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xBC207800 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// STR S<rt>, [Xn, #uimm]: Store 32-bit SIMD unsigned offset.
+constexpr uint32_t StrSUnsigned(uint8_t rt, uint8_t rn, uint16_t imm12_div4) {
+  return 0xBD000000 | (static_cast<uint32_t>(imm12_div4) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// STP Q<rt1>, Q<rt2>, [Xn, #imm]: Store pair 128-bit, signed offset.
+// opc=10, V=1, type=10(signed-offset), L=0, imm7, Rt2, Rn, Rt1
+constexpr uint32_t StpQSigned(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div16) {
+  uint32_t imm7 = static_cast<uint32_t>(imm_div16) & 0x7F;
+  return 0xAD000000 | (imm7 << 15) | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+
+// AND Xd, Xn, Xm, LSR #amount (logical shifted register)
+constexpr uint32_t AndRegLsr(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t shift) {
+  return 0x8A400000 | (static_cast<uint32_t>(shift) << 10) |
+         (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// SUB Xd, Xn, Xm, LSL #amount (shifted register)
+constexpr uint32_t SubRegLsl(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t shift) {
+  return 0xCB000000 | (static_cast<uint32_t>(shift) << 10) |
+         (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SturQ_NegativeOffset) {
+  // STUR Q0, [X1, #-16]: store 16 bytes of V0 at address X1-16.
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),           // DUP V0.16B, W0 (fill with 0xAB)
+      SturQ(0, 1, -16),        // STUR Q0, [X1, #-16]
+  };
+  state_.cpu.x[0] = 0xAB;
+  state_.cpu.x[1] = ToGuestAddr(buffer + 32);  // X1 points to buffer+32
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // Bytes 0-15: untouched
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+  // Bytes 16-31: should be 0xAB (stored at X1-16 = buffer+16)
+  for (int i = 16; i < 32; i++) {
+    EXPECT_EQ(buffer[i], 0xAB) << "byte " << i;
+  }
+  // Bytes 32-63: untouched
+  for (int i = 32; i < 64; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StrQ_RegisterOffset) {
+  // STR Q0, [X0, X3]: store 16 bytes of V0 at address X0+X3.
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),           // DUP V0.16B, W0 (fill with 0xBB)
+      StrQReg(0, 1, 2),        // STR Q0, [X1, X2]
+  };
+  state_.cpu.x[0] = 0xBB;
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  state_.cpu.x[2] = 16;  // offset
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // Bytes 0-15: untouched
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+  // Bytes 16-31: should be 0xBB
+  for (int i = 16; i < 32; i++) {
+    EXPECT_EQ(buffer[i], 0xBB) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SturS_NegativeOffset) {
+  // STUR S0, [X1, #-4]: store low 4 bytes of V0 at address X1-4.
+  alignas(16) static uint8_t buffer[32];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),           // DUP V0.16B, W0 (fill with 0xDD)
+      SturS(0, 1, -4),         // STUR S0, [X1, #-4]
+  };
+  state_.cpu.x[0] = 0xDD;
+  state_.cpu.x[1] = ToGuestAddr(buffer + 16);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // Bytes 12-15: should be 0xDD (stored at X1-4 = buffer+12)
+  for (int i = 12; i < 16; i++) {
+    EXPECT_EQ(buffer[i], 0xDD) << "byte " << i;
+  }
+  // Others untouched
+  for (int i = 0; i < 12; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StrS_RegisterOffsetShift) {
+  // STR S0, [X1, X2, LSL #2]: store low 4 bytes of V0 at X1 + (X2 << 2).
+  alignas(16) static uint8_t buffer[32];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),             // DUP V0.16B, W0 (fill with 0xEE)
+      StrSRegLsl2(0, 1, 2),      // STR S0, [X1, X2, LSL #2]
+  };
+  state_.cpu.x[0] = 0xEE;
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  state_.cpu.x[2] = 3;  // offset = 3 << 2 = 12
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // Bytes 12-15: should be 0xEE
+  for (int i = 12; i < 16; i++) {
+    EXPECT_EQ(buffer[i], 0xEE) << "byte " << i;
+  }
+  // Others untouched
+  for (int i = 0; i < 12; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StpQ_SignedOffset_Negative) {
+  // STP Q0, Q0, [X1, #-32]: store 32 bytes at X1-32.
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),              // DUP V0.16B, W0 (fill with 0x55)
+      StpQSigned(0, 0, 1, -2),    // STP Q0, Q0, [X1, #-32] (imm/16 = -2)
+  };
+  state_.cpu.x[0] = 0x55;
+  state_.cpu.x[1] = ToGuestAddr(buffer + 48);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // Bytes 16-47: should be 0x55 (stored at X1-32 = buffer+16)
+  for (int i = 16; i < 48; i++) {
+    EXPECT_EQ(buffer[i], 0x55) << "byte " << i;
+  }
+  // Others untouched
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+  for (int i = 48; i < 64; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AndShiftedReg_Lsr) {
+  // AND X3, X3, X2, LSR #1: x3 = x3 & (x2 >> 1)
+  static const uint32_t code[] = {
+      MovzX(2, 32),              // X2 = 32
+      MovzX(3, 16),              // X3 = 16
+      AndRegLsr(3, 3, 2, 1),     // AND X3, X3, X2, LSR #1
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // X2 >> 1 = 16, X3 & 16 = 16 & 16 = 16
+  EXPECT_EQ(state_.cpu.x[3], 16ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SubShiftedReg_Lsl) {
+  // SUB X5, X4, X3, LSL #2: x5 = x4 - (x3 << 2)
+  static const uint32_t code[] = {
+      MovzX(4, 100),             // X4 = 100
+      MovzX(3, 5),               // X3 = 5
+      SubRegLsl(5, 4, 3, 2),     // SUB X5, X4, X3, LSL #2
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // X3 << 2 = 20, X4 - 20 = 80
+  EXPECT_EQ(state_.cpu.x[5], 80ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Memset_16_63_Path) {
+  // Test the full 16-63 byte memset path from __memset_aarch64.
+  // For count=32, val=0:
+  //   dup v0.16b, w1      (v0 = all zeros)
+  //   mov x3, #16         (x3 = 16)
+  //   and x3, x3, x2, lsr #1  (x3 = 16 & (32>>1) = 16 & 16 = 16)
+  //   sub x5, x4, x3      (x5 = end - 16)
+  //   str q0, [x0]         (store 16 bytes at start)
+  //   str q0, [x0, x3]     (store 16 bytes at start+16)
+  //   stur q0, [x5, #-16]  (store 16 bytes at (end-16)-16 = start)
+  //   stur q0, [x4, #-16]  (store 16 bytes at end-16 = start+16)
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xFF, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 1),                 // DUP V0.16B, W1 (w1=0 → v0 all zeros)
+      MovzX(3, 16),                  // MOV X3, #16
+      AndRegLsr(3, 3, 2, 1),         // AND X3, X3, X2, LSR #1
+      // SUB X5, X4, X3 (no shift)
+      0xCB030085,                    // SUB X5, X4, X3
+      StrQUnsigned(0, 0, 0),         // STR Q0, [X0, #0]
+      StrQReg(0, 0, 3),             // STR Q0, [X0, X3]
+      SturQ(0, 5, -16),             // STUR Q0, [X5, #-16]
+      SturQ(0, 4, -16),             // STUR Q0, [X4, #-16]
+  };
+
+  // Setup: x0=buffer, x1=0 (val), x2=32 (count), x4=buffer+32 (dstend)
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 32;
+  state_.cpu.x[4] = ToGuestAddr(buffer + 32);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // First 32 bytes should be zeroed
+  for (int i = 0; i < 32; i++) {
+    EXPECT_EQ(buffer[i], 0x00) << "byte " << i;
+  }
+  // Rest untouched
+  for (int i = 32; i < 64; i++) {
+    EXPECT_EQ(buffer[i], 0xFF) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Memset_4_15_Path) {
+  // Test the 4-15 byte memset path from __memset_aarch64.
+  // For count=8, val=0:
+  //   dup v0.16b, w1      (v0 = all zeros)
+  //   lsr x3, x2, #3      (x3 = 8 >> 3 = 1)
+  //   sub x5, x4, x3, lsl #2  (x5 = end - (1<<2) = end - 4)
+  //   str s0, [x0]         (store 4 bytes at start)
+  //   str s0, [x0, x3, lsl #2]  (store 4 bytes at start + 4)
+  //   stur s0, [x5, #-4]   (store 4 bytes at (end-4) - 4 = start)
+  //   stur s0, [x4, #-4]   (store 4 bytes at end - 4 = start + 4)
+  alignas(16) static uint8_t buffer[32];
+  memset(buffer, 0xFF, sizeof(buffer));
+
+  // LSR X3, X2, #3 is UBFM X3, X2, #3, #63 = 0xd343fc43
+  // But with rd=3, rn=2: matches the encoding.
+  // UBFM: sf=1, opc=10, N=1, immr=3, imms=63
+  // 1 10 100110 1 000011 111111 00010 00011
+  // = 1101 0011 0100 0011 1111 1100 0100 0011 = 0xd343fc43
+  constexpr uint32_t LsrImm3_X3_X2 = 0xd343fc43;
+
+  static const uint32_t code[] = {
+      DupV16B(0, 1),               // DUP V0.16B, W1 (w1=0 → v0 all zeros)
+      LsrImm3_X3_X2,               // LSR X3, X2, #3
+      SubRegLsl(5, 4, 3, 2),        // SUB X5, X4, X3, LSL #2
+      StrSUnsigned(0, 0, 0),        // STR S0, [X0, #0]
+      StrSRegLsl2(0, 0, 3),         // STR S0, [X0, X3, LSL #2]
+      SturS(0, 5, -4),             // STUR S0, [X5, #-4]
+      SturS(0, 4, -4),             // STUR S0, [X4, #-4]
+  };
+
+  // Setup: x0=buffer, x1=0 (val), x2=8 (count), x4=buffer+8 (dstend)
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 8;
+  state_.cpu.x[4] = ToGuestAddr(buffer + 8);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // First 8 bytes should be zeroed
+  for (int i = 0; i < 8; i++) {
+    EXPECT_EQ(buffer[i], 0x00) << "byte " << i;
+  }
+  // Rest untouched
+  for (int i = 8; i < 32; i++) {
+    EXPECT_EQ(buffer[i], 0xFF) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StpQ_SignedOffset_Positive) {
+  // STP Q0, Q0, [X0, #32]: store 32 bytes at X0+32.
+  alignas(16) static uint8_t buffer[96];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      DupV16B(0, 0),              // DUP V0.16B, W0 (fill with 0x77)
+      StpQSigned(0, 0, 1, 2),    // STP Q0, Q0, [X1, #32] (imm/16 = 2)
+  };
+  state_.cpu.x[0] = 0x77;
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // Bytes 0-31: untouched
+  for (int i = 0; i < 32; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+  // Bytes 32-63: should be 0x77
+  for (int i = 32; i < 64; i++) {
+    EXPECT_EQ(buffer[i], 0x77) << "byte " << i;
+  }
+  // Bytes 64-95: untouched
+  for (int i = 64; i < 96; i++) {
+    EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
+  }
+}
 // endregion
 
 }  // namespace

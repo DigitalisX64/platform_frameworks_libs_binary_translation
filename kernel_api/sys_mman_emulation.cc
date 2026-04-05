@@ -144,7 +144,7 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
   // region digitalis - log all executable mmaps and first 30
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   if (n <= 30 || n % 500 == 0 || (prot & 4)) {
-    __android_log_print(ANDROID_LOG_ERROR, "berberis",
+    __android_log_print(ANDROID_LOG_DEBUG, "berberis",
         "mmap#%lu addr=%p→%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx",
         (unsigned long)n, addr, result, (unsigned long)length, prot, flags, fd, (unsigned long)offset);
   }

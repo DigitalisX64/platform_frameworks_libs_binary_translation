@@ -137,7 +137,7 @@ void TranslateRegion(GuestAddr pc) {
   g_translation_stats.total_translations++;
   // Log first 20, then every 100th translation
   if (g_translation_stats.total_translations <= 20 || g_translation_stats.total_translations % 100 == 0) {
-    TRACE_AND_ALOGE("berberis: trans#%lu pc=0x%lx size=%lu %s jit=%lu interp=%lu avg=%lu",
+    TRACE_AND_ALOGD("berberis: trans#%lu pc=0x%lx size=%lu %s jit=%lu interp=%lu avg=%lu",
                     (unsigned long)g_translation_stats.total_translations,
                     (unsigned long)pc,
                     (unsigned long)(success ? size / 4 : 0),
@@ -166,26 +166,19 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleI
                     g_translation_stats.interpret_invocations % 5000000 == 0;
   uint64_t pre_x0 = state->cpu.x[0];
   if (should_log) {
-    TRACE_AND_ALOGE("berberis: interp #%lu pc=0x%lx x8=%lu x0=0x%lx x1=0x%lx x2=0x%lx",
+    TRACE_AND_ALOGD("berberis: interp #%lu pc=0x%lx x8=%lu x0=0x%lx x1=0x%lx x2=0x%lx",
                     (unsigned long)g_translation_stats.interpret_invocations,
                     (unsigned long)state->cpu.insn_addr,
                     (unsigned long)state->cpu.x[8],
                     (unsigned long)state->cpu.x[0],
                     (unsigned long)state->cpu.x[1],
                     (unsigned long)state->cpu.x[2]);
-    // Log actual memory at futex address for futex syscalls
-    if (state->cpu.x[8] == 98 && state->cpu.x[0] != 0) {
-      uint32_t* futex_addr = reinterpret_cast<uint32_t*>(state->cpu.x[0]);
-      TRACE_AND_ALOGE("berberis: futex *addr=0x%x expected=0x%lx",
-                      *futex_addr,
-                      (unsigned long)state->cpu.x[2]);
-    }
   }
   // endregion
   InterpretBatch(state, 500, TranslationCache::GetInstance());
   // region digitalis - post-SVC diagnostics
   if (should_log && state->cpu.x[0] != pre_x0) {
-    TRACE_AND_ALOGE("berberis: post-interp x0=0x%lx (was 0x%lx) pc=0x%lx",
+    TRACE_AND_ALOGD("berberis: post-interp x0=0x%lx (was 0x%lx) pc=0x%lx",
                     (unsigned long)state->cpu.x[0],
                     (unsigned long)pre_x0,
                     (unsigned long)state->cpu.insn_addr);
