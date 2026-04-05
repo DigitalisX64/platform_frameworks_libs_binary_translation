@@ -433,6 +433,24 @@ class Decoder {
     uint8_t op;
   };
 
+  // region digitalis
+  enum class FpFixedPointOp : uint8_t {
+    kScvtf,   // Signed fixed-point to FP
+    kUcvtf,   // Unsigned fixed-point to FP
+    kFcvtzs,  // FP to signed fixed-point
+    kFcvtzu,  // FP to unsigned fixed-point
+  };
+
+  struct FpFixedPointArgs {
+    uint8_t rd;
+    uint8_t rn;
+    FpFixedPointOp op;
+    bool sf;          // true = 64-bit integer
+    uint8_t ftype;    // 00=S, 01=D
+    uint8_t fbits;    // Number of fractional bits (1..32 for sf=0, 1..64 for sf=1)
+  };
+  // endregion
+
   struct ConditionalCompareArgs {
     uint8_t rn;        // First operand register
     uint8_t rm_or_imm; // Second operand (register or 5-bit immediate)
@@ -1728,6 +1746,16 @@ class Decoder {
       return;
     }
 
+    // region digitalis
+    // FP <-> fixed-point conversion: bits[28:24]=11110, bit21=0
+    // Must be checked BEFORE all bit21=1 FP checks.
+    // Encoding: sf 0 S 11110 ftype 0 rmode opcode scale Rn Rd
+    if (GetBits<24, 5>() == 0b11110 && !GetBits<21, 1>()) {
+      DecodeFpFixedPointConversion();
+      return;
+    }
+    // endregion
+
     // Floating-point data-processing (1 source): bits[28:24]=11110, bit21=1, bits[14:10]=10000
     // Must be checked BEFORE FpIntConversion because both share bits[28:24]=11110 and bit21=1,
     // but FpDataProc1 has bits[14:10]=10000 while FpIntConversion has bits[15:10]=000000.
@@ -1744,6 +1772,16 @@ class Decoder {
       return;
     }
 
+    // region digitalis
+    // FMOV (scalar, immediate): bit31=0, bits[28:24]=11110, bit21=1, bits[12:10]=100, bits[9:5]=00000
+    // Encoding: 0 0 0 11110 ftype 1 imm8 100 00000 Rd
+    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() &&
+        GetBits<10, 3>() == 0b100 && GetBits<5, 5>() == 0b00000) {
+      DecodeFpMovImmediate();
+      return;
+    }
+    // endregion
+
     // Floating-point data-processing (2 source): bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=10
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b10) {
       DecodeFpDataProc2();
@@ -1756,6 +1794,21 @@ class Decoder {
       DecodeFpCompare();
       return;
     }
+
+    // region digitalis
+    // FCSEL: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=11
+    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b11) {
+      DecodeFpCondSelect();
+      return;
+    }
+
+    // Floating-point data-processing (3 source): bit31=0, bits[28:24]=11111
+    // FMADD, FMSUB, FNMADD, FNMSUB
+    if (!bit31 && GetBits<24, 5>() == 0b11111) {
+      DecodeFpDataProc3();
+      return;
+    }
+    // endregion
 
     // region digitalis
     // AdvSIMD three different: bit31=0, bits[28:24]=01110, bit21=1, bits[11:10]=00
@@ -2220,6 +2273,78 @@ class Decoder {
     };
     insn_consumer_->FpIntConversion(args);
   }
+
+  // region digitalis
+  // FMOV (scalar, immediate): Dd/Sd = VFPExpandImm(imm8)
+  void DecodeFpMovImmediate() {
+    uint8_t ftype = GetBits<22, 2>();
+    uint8_t imm8 = GetBits<13, 8>();
+    uint8_t rd = GetBits<0, 5>();
+    insn_consumer_->FpMovImmediate(rd, imm8, ftype);
+  }
+
+  // FCSEL: Floating-point conditional select
+  // Encoding: 0 0 0 11110 ftype 1 Rm cond 11 Rn Rd
+  void DecodeFpCondSelect() {
+    uint8_t ftype = GetBits<22, 2>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t cond = GetBits<12, 4>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+    insn_consumer_->FpCondSelect(rd, rn, rm, ftype, static_cast<Condition>(cond));
+  }
+
+  // FP <-> fixed-point conversion: SCVTF, UCVTF, FCVTZS, FCVTZU (scalar, fixed-point)
+  // Encoding: sf 0 S 11110 ftype 0 rmode opcode scale Rn Rd
+  void DecodeFpFixedPointConversion() {
+    bool sf = GetBits<31, 1>();
+    uint8_t ftype = GetBits<22, 2>();
+    uint8_t rmode = GetBits<19, 2>();
+    uint8_t opcode = GetBits<16, 3>();
+    uint8_t scale = GetBits<10, 6>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    uint8_t fbits = 64 - scale;
+
+    FpFixedPointOp op;
+    if (rmode == 0b00 && opcode == 0b010) {
+      op = FpFixedPointOp::kScvtf;
+    } else if (rmode == 0b00 && opcode == 0b011) {
+      op = FpFixedPointOp::kUcvtf;
+    } else if (rmode == 0b11 && opcode == 0b000) {
+      op = FpFixedPointOp::kFcvtzs;
+    } else if (rmode == 0b11 && opcode == 0b001) {
+      op = FpFixedPointOp::kFcvtzu;
+    } else {
+      Undefined();
+      return;
+    }
+
+    const FpFixedPointArgs args = {
+        .rd = rd,
+        .rn = rn,
+        .op = op,
+        .sf = sf,
+        .ftype = ftype,
+        .fbits = fbits,
+    };
+    insn_consumer_->FpFixedPointConversion(args);
+  }
+
+  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB
+  // Encoding: 0 0 0 11111 ftype o1 Rm o0 Ra Rn Rd
+  void DecodeFpDataProc3() {
+    uint8_t ftype = GetBits<22, 2>();
+    bool o1 = GetBits<21, 1>();    // 0=FMADD/FMSUB, 1=FNMADD/FNMSUB
+    uint8_t rm = GetBits<16, 5>();
+    bool o0 = GetBits<15, 1>();    // 0=FMADD/FNMADD, 1=FMSUB/FNMSUB
+    uint8_t ra = GetBits<10, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+    insn_consumer_->FpDataProc3(rd, rn, rm, ra, ftype, o1, o0);
+  }
+  // endregion
 
   //
   // Stub decoders for SIMD/FP instruction groups (dispatch to Undefined for now,

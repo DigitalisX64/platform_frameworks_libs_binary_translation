@@ -1523,6 +1523,69 @@ class LiteTranslator {
     // endregion
   }
 
+  // region digitalis
+  // FCSEL: fall back to interpreter (condition flag checking complex in JIT)
+  void FpCondSelect(uint8_t /*rd*/, uint8_t /*rn*/, uint8_t /*rm*/,
+                    uint8_t /*ftype*/, Decoder::Condition /*cond*/) {
+    success_ = false;  // interpreter fallback
+  }
+
+  // FP <-> fixed-point conversion: fall back to interpreter
+  void FpFixedPointConversion(const Decoder::FpFixedPointArgs& /*args*/) {
+    success_ = false;  // interpreter fallback
+  }
+
+  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB
+  // Fall back to interpreter for now (3-source FP operations are complex for JIT).
+  void FpDataProc3(uint8_t /*rd*/, uint8_t /*rn*/, uint8_t /*rm*/, uint8_t /*ra*/,
+                   uint8_t /*ftype*/, bool /*o1*/, bool /*o0*/) {
+    success_ = false;  // interpreter fallback
+  }
+
+  // FMOV (scalar, immediate): JIT - load a FP constant into SIMD register
+  void FpMovImmediate(uint8_t rd, uint8_t imm8, uint8_t ftype) {
+    int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+    SimdRegister xmm = AllocTempSimdReg();
+    if (xmm == no_simd_register) {
+      success_ = false;  // fallback to interpreter
+      return;
+    }
+    // Zero the full 128-bit register
+    as_.Pxor(xmm, xmm);
+    as_.Movdqu({.base = Assembler::rbp, .disp = vreg_offset}, xmm);
+
+    if (ftype == 0b00) {
+      // Single-precision: expand imm8 to 32-bit float
+      uint32_t sign = (imm8 >> 7) & 1;
+      uint32_t exp6 = (imm8 >> 6) & 1;
+      uint32_t exp_top = exp6 ? 0 : 1;
+      uint32_t exp_rep = exp6 ? 0b11111 : 0b00000;
+      uint32_t exp_low = (imm8 >> 4) & 0b11;
+      uint32_t exp = (exp_top << 7) | (exp_rep << 2) | exp_low;
+      uint32_t frac = (imm8 & 0xF) << 19;
+      uint32_t imm32 = (sign << 31) | (exp << 23) | frac;
+      Register tmp = AllocTempReg();
+      as_.Movl(tmp, imm32);
+      as_.Movl({.base = Assembler::rbp, .disp = vreg_offset}, tmp);
+    } else if (ftype == 0b01) {
+      // Double-precision: expand imm8 to 64-bit double
+      uint64_t sign = (imm8 >> 7) & 1;
+      uint64_t exp6 = (imm8 >> 6) & 1;
+      uint64_t exp_top = exp6 ? 0 : 1;
+      uint64_t exp_rep = exp6 ? 0xFF : 0x00;
+      uint64_t exp_low = (imm8 >> 4) & 0b11;
+      uint64_t exp = (exp_top << 10) | (exp_rep << 2) | exp_low;
+      uint64_t frac = static_cast<uint64_t>(imm8 & 0xF) << 48;
+      uint64_t imm64 = (sign << 63) | (exp << 52) | frac;
+      Register tmp = AllocTempReg();
+      as_.Movq(tmp, imm64);
+      as_.Movq({.base = Assembler::rbp, .disp = vreg_offset}, tmp);
+    } else {
+      success_ = false;  // fallback for half-precision
+    }
+  }
+  // endregion
+
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
     // region digitalis - JIT support for FMOV GP↔FP conversions
     uint8_t rmode = args.rmode;

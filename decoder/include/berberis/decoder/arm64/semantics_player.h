@@ -348,6 +348,26 @@ class SemanticsPlayer {
     listener_->FpIntConversion(args);
   }
 
+  // region digitalis
+  void FpMovImmediate(uint8_t rd, uint8_t imm8, uint8_t ftype) {
+    listener_->FpMovImmediate(rd, imm8, ftype);
+  }
+
+  void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
+                   uint8_t ftype, bool o1, bool o0) {
+    listener_->FpDataProc3(rd, rn, rm, ra, ftype, o1, o0);
+  }
+
+  void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ftype,
+                    typename Decoder::Condition cond) {
+    listener_->FpCondSelect(rd, rn, rm, ftype, cond);
+  }
+
+  void FpFixedPointConversion(const typename Decoder::FpFixedPointArgs& args) {
+    listener_->FpFixedPointConversion(args);
+  }
+  // endregion
+
   void AdvSimdCopy(const typename Decoder::AdvSimdCopyArgs& args) {
     listener_->AdvSimdCopy(args);
   }

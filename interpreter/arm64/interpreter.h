@@ -1460,6 +1460,200 @@ class Interpreter {
     }
   }
 
+  // region digitalis
+  // FCSEL: Floating-point conditional select
+  // If condition is true, Rd = Rn; else Rd = Rm.
+  void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ftype, Decoder::Condition cond) {
+    CHECK(!exception_raised_);
+    bool condition_holds = EvaluateCondition(cond);
+    uint8_t src = condition_holds ? rn : rm;
+    state_->cpu.v[rd] = 0;
+    if (ftype == 0b00) {
+      // Single-precision: copy 32 bits
+      uint32_t val;
+      memcpy(&val, &state_->cpu.v[src], 4);
+      memcpy(&state_->cpu.v[rd], &val, 4);
+    } else if (ftype == 0b01) {
+      // Double-precision: copy 64 bits
+      uint64_t val;
+      memcpy(&val, &state_->cpu.v[src], 8);
+      memcpy(&state_->cpu.v[rd], &val, 8);
+    } else {
+      Undefined();
+    }
+  }
+
+  // FP <-> fixed-point conversion: SCVTF, UCVTF, FCVTZS, FCVTZU (scalar, fixed-point)
+  void FpFixedPointConversion(const Decoder::FpFixedPointArgs& args) {
+    CHECK(!exception_raised_);
+    using Op = Decoder::FpFixedPointOp;
+    double scale = static_cast<double>(1ULL << args.fbits);
+
+    switch (args.op) {
+      case Op::kScvtf: {
+        // Signed integer -> FP, divided by 2^fbits
+        int64_t int_val;
+        if (args.sf) {
+          int_val = static_cast<int64_t>(state_->cpu.x[args.rn]);
+        } else {
+          int_val = static_cast<int64_t>(static_cast<int32_t>(
+              static_cast<uint32_t>(state_->cpu.x[args.rn])));
+        }
+        state_->cpu.v[args.rd] = 0;
+        if (args.ftype == 0b00) {
+          float result = static_cast<float>(static_cast<double>(int_val) / scale);
+          memcpy(&state_->cpu.v[args.rd], &result, 4);
+        } else {
+          double result = static_cast<double>(int_val) / scale;
+          memcpy(&state_->cpu.v[args.rd], &result, 8);
+        }
+        break;
+      }
+      case Op::kUcvtf: {
+        // Unsigned integer -> FP, divided by 2^fbits
+        uint64_t uint_val;
+        if (args.sf) {
+          uint_val = state_->cpu.x[args.rn];
+        } else {
+          uint_val = static_cast<uint32_t>(state_->cpu.x[args.rn]);
+        }
+        state_->cpu.v[args.rd] = 0;
+        if (args.ftype == 0b00) {
+          float result = static_cast<float>(static_cast<double>(uint_val) / scale);
+          memcpy(&state_->cpu.v[args.rd], &result, 4);
+        } else {
+          double result = static_cast<double>(uint_val) / scale;
+          memcpy(&state_->cpu.v[args.rd], &result, 8);
+        }
+        break;
+      }
+      case Op::kFcvtzs: {
+        // FP -> signed fixed-point, multiplied by 2^fbits, round toward zero
+        double fp_val;
+        if (args.ftype == 0b00) {
+          float f;
+          memcpy(&f, &state_->cpu.v[args.rn], 4);
+          fp_val = static_cast<double>(f);
+        } else {
+          memcpy(&fp_val, &state_->cpu.v[args.rn], 8);
+        }
+        double scaled = fp_val * scale;
+        int64_t result = static_cast<int64_t>(trunc(scaled));
+        if (args.sf) {
+          state_->cpu.x[args.rd] = static_cast<uint64_t>(result);
+        } else {
+          state_->cpu.x[args.rd] = static_cast<uint64_t>(static_cast<uint32_t>(
+              static_cast<int32_t>(result)));
+        }
+        break;
+      }
+      case Op::kFcvtzu: {
+        // FP -> unsigned fixed-point, multiplied by 2^fbits, round toward zero
+        double fp_val;
+        if (args.ftype == 0b00) {
+          float f;
+          memcpy(&f, &state_->cpu.v[args.rn], 4);
+          fp_val = static_cast<double>(f);
+        } else {
+          memcpy(&fp_val, &state_->cpu.v[args.rn], 8);
+        }
+        double scaled = fp_val * scale;
+        uint64_t result = static_cast<uint64_t>(trunc(scaled));
+        if (args.sf) {
+          state_->cpu.x[args.rd] = result;
+        } else {
+          state_->cpu.x[args.rd] = static_cast<uint32_t>(result);
+        }
+        break;
+      }
+    }
+  }
+
+  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB
+  void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
+                   uint8_t ftype, bool o1, bool o0) {
+    CHECK(!exception_raised_);
+    if (ftype == 0b00) {
+      // Single-precision
+      float fn, fm, fa;
+      memcpy(&fn, &state_->cpu.v[rn], 4);
+      memcpy(&fm, &state_->cpu.v[rm], 4);
+      memcpy(&fa, &state_->cpu.v[ra], 4);
+      float result;
+      if (!o1 && !o0) {
+        // FMADD: Rd = Ra + (Rn * Rm)
+        result = fmaf(fn, fm, fa);
+      } else if (!o1 && o0) {
+        // FMSUB: Rd = Ra - (Rn * Rm) = -(Rn*Rm) + Ra = fma(-Rn, Rm, Ra)
+        result = fmaf(-fn, fm, fa);
+      } else if (o1 && !o0) {
+        // FNMADD: Rd = -(Ra + Rn * Rm) = fma(-Rn, Rm, -Ra) = -fma(Rn, Rm, Ra)
+        result = -fmaf(fn, fm, fa);
+      } else {
+        // FNMSUB: Rd = Rn * Rm - Ra = fma(Rn, Rm, -Ra)
+        result = fmaf(fn, fm, -fa);
+      }
+      state_->cpu.v[rd] = 0;
+      memcpy(&state_->cpu.v[rd], &result, 4);
+    } else if (ftype == 0b01) {
+      // Double-precision
+      double fn, fm, fa;
+      memcpy(&fn, &state_->cpu.v[rn], 8);
+      memcpy(&fm, &state_->cpu.v[rm], 8);
+      memcpy(&fa, &state_->cpu.v[ra], 8);
+      double result;
+      if (!o1 && !o0) {
+        result = fma(fn, fm, fa);
+      } else if (!o1 && o0) {
+        result = fma(-fn, fm, fa);
+      } else if (o1 && !o0) {
+        result = -fma(fn, fm, fa);
+      } else {
+        result = fma(fn, fm, -fa);
+      }
+      state_->cpu.v[rd] = 0;
+      memcpy(&state_->cpu.v[rd], &result, 8);
+    } else {
+      Undefined();
+    }
+  }
+
+  // FMOV (scalar, immediate): load a floating-point constant into SIMD register.
+  // The imm8 is expanded via VFPExpandImm to the target precision.
+  void FpMovImmediate(uint8_t rd, uint8_t imm8, uint8_t ftype) {
+    CHECK(!exception_raised_);
+    state_->cpu.v[rd] = 0;  // zero entire 128-bit register
+    if (ftype == 0b00) {
+      // Single-precision: VFPExpandImm to 32-bit float
+      // sign = imm8[7], exp = NOT(imm8[6]):Repeat(imm8[6],5):imm8[5:4], frac = imm8[3:0]:Zeros(19)
+      uint32_t sign = (imm8 >> 7) & 1;
+      uint32_t exp6 = (imm8 >> 6) & 1;
+      uint32_t exp_top = exp6 ? 0b0 : 0b1;  // NOT(imm8[6])
+      uint32_t exp_rep = exp6 ? 0b11111 : 0b00000;  // Repeat(imm8[6], 5)
+      uint32_t exp_low = (imm8 >> 4) & 0b11;  // imm8[5:4]
+      uint32_t exp = (exp_top << 7) | (exp_rep << 2) | exp_low;
+      uint32_t frac = (imm8 & 0xF) << 19;
+      uint32_t result = (sign << 31) | (exp << 23) | frac;
+      memcpy(&state_->cpu.v[rd], &result, 4);
+    } else if (ftype == 0b01) {
+      // Double-precision: VFPExpandImm to 64-bit double
+      // sign = imm8[7], exp = NOT(imm8[6]):Repeat(imm8[6],8):imm8[5:4], frac = imm8[3:0]:Zeros(48)
+      uint64_t sign = (imm8 >> 7) & 1;
+      uint64_t exp6 = (imm8 >> 6) & 1;
+      uint64_t exp_top = exp6 ? 0 : 1;  // NOT(imm8[6])
+      uint64_t exp_rep = exp6 ? 0xFF : 0x00;  // Repeat(imm8[6], 8)
+      uint64_t exp_low = (imm8 >> 4) & 0b11;  // imm8[5:4]
+      uint64_t exp = (exp_top << 10) | (exp_rep << 2) | exp_low;
+      uint64_t frac = static_cast<uint64_t>(imm8 & 0xF) << 48;
+      uint64_t result = (sign << 63) | (exp << 52) | frac;
+      memcpy(&state_->cpu.v[rd], &result, 8);
+    } else {
+      // Half-precision (ftype=11) or reserved (ftype=10)
+      Undefined();
+    }
+  }
+  // endregion
+
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
     CHECK(!exception_raised_);
     uint8_t rmode = args.rmode;
@@ -1587,6 +1781,33 @@ class Interpreter {
       if (rmode == 0b00) rounded = rint(dval);        // nearest, ties to even
       else if (rmode == 0b01) rounded = ceil(dval);    // toward +inf
       else rounded = floor(dval);                       // toward -inf
+      if (is_signed) {
+        if (args.sf) result = static_cast<uint64_t>(static_cast<int64_t>(rounded));
+        else result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(rounded)));
+      } else {
+        if (args.sf) result = static_cast<uint64_t>(rounded);
+        else result = static_cast<uint64_t>(static_cast<uint32_t>(rounded));
+      }
+      if (args.rd < 31) {
+        state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
+      }
+      return;
+    }
+
+    // FCVTAS/FCVTAU: rmode=00, opcode=100 (signed) or 101 (unsigned)
+    // Round to nearest, ties away from zero
+    if (rmode == 0b00 && (opcode == 0b100 || opcode == 0b101)) {
+      bool is_signed = (opcode == 0b100);
+      uint64_t result = 0;
+      double dval = 0;
+      if (args.ftype == 0b00) {
+        float f; memcpy(&f, &state_->cpu.v[args.rn], 4);
+        dval = f;
+      } else if (args.ftype == 0b01) {
+        memcpy(&dval, &state_->cpu.v[args.rn], 8);
+      } else { Undefined(); return; }
+      // Round to nearest, ties away from zero
+      double rounded = round(dval);
       if (is_signed) {
         if (args.sf) result = static_cast<uint64_t>(static_cast<int64_t>(rounded));
         else result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(rounded)));
