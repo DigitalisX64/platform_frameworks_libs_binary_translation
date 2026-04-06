@@ -189,6 +189,19 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleI
 extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_GetDispatchAddress(
     ThreadState* state) {
   CHECK(state);
+  // region digitalis - dispatch watchdog for hang diagnosis
+  static thread_local uint64_t dispatch_count = 0;
+  dispatch_count++;
+  if (dispatch_count % 10000 == 0) {
+    TRACE_AND_ALOGD("berberis: dispatch#%lu pc=0x%lx x0=0x%lx x29=0x%lx x30=0x%lx sp=0x%lx",
+                    (unsigned long)dispatch_count,
+                    (unsigned long)state->cpu.insn_addr,
+                    (unsigned long)state->cpu.x[0],
+                    (unsigned long)state->cpu.x[29],
+                    (unsigned long)state->cpu.x[30],
+                    (unsigned long)state->cpu.x[1]);  // x1 for context
+  }
+  // endregion
   if (ArePendingSignalsPresent(*state)) {
     return AsHostCode(kEntryExitGeneratedCode);
   }

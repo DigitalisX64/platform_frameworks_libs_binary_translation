@@ -2212,6 +2212,13 @@ class LiteTranslator {
     Undefined();
   }
 
+  // region digitalis
+  void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
+    UNUSED(args);
+    Undefined();
+  }
+  // endregion
+
   //
   // Accessor helpers.
   //

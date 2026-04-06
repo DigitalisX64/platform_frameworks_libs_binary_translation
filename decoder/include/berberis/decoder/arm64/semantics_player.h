@@ -464,6 +464,12 @@ class SemanticsPlayer {
   }
   // endregion
 
+  // region digitalis
+  void AdvSimdVecXIndexedElement(const typename Decoder::AdvSimdVecXIdxArgs& args) {
+    listener_->AdvSimdVecXIndexedElement(args);
+  }
+  // endregion
+
  private:
   // ARM64: register 31 as zero register.
   Register GetRegOrZero(uint8_t reg) {

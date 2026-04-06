@@ -92,46 +92,69 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
   // memset these to zero, but the ARM64 memset under translation may not execute
   // correctly. As a safety net, we detect ELF segments with .bss and zero the
   // partial page ourselves after the mmap.
+  //
+  // For APK-contained libraries, the fd points to the APK file and the offset
+  // is non-zero. The ELF header is NOT at offset 0 of the fd. We find it by
+  // searching backward from the current mapping offset.
   if (result != MAP_FAILED && fd >= 0 &&
       (flags & MAP_FIXED) && (flags & MAP_PRIVATE) && (prot & PROT_WRITE)) {
     Elf64_Ehdr ehdr;
+    off64_t elf_base = -1;
+    // Try offset 0 first (standalone ELF files).
     if (pread(fd, &ehdr, sizeof(ehdr), 0) == sizeof(ehdr) &&
         ehdr.e_ident[EI_MAG0] == ELFMAG0 && ehdr.e_ident[EI_MAG1] == ELFMAG1 &&
-        ehdr.e_ident[EI_MAG2] == ELFMAG2 && ehdr.e_ident[EI_MAG3] == ELFMAG3 &&
-        ehdr.e_phnum > 0 && ehdr.e_phnum <= 64) {
+        ehdr.e_ident[EI_MAG2] == ELFMAG2 && ehdr.e_ident[EI_MAG3] == ELFMAG3) {
+      elf_base = 0;
+    }
+    // If not found at 0, search backward from the mapping offset for the ELF
+    // magic. This handles libraries stored inside APKs where the ELF starts at
+    // a non-zero offset within the container file.
+    if (elf_base < 0 && offset > 0) {
+      size_t page_size = static_cast<size_t>(getpagesize());
+      // The data segment is typically within 1MB of the ELF header. Search back
+      // in page increments up to 2MB.
+      off64_t search_limit = (offset > 0x200000) ? offset - 0x200000 : 0;
+      for (off64_t candidate = (offset & ~(off64_t)(page_size - 1)) - page_size;
+           candidate >= search_limit;
+           candidate -= page_size) {
+        if (pread(fd, &ehdr, sizeof(ehdr), candidate) == sizeof(ehdr) &&
+            ehdr.e_ident[EI_MAG0] == ELFMAG0 && ehdr.e_ident[EI_MAG1] == ELFMAG1 &&
+            ehdr.e_ident[EI_MAG2] == ELFMAG2 && ehdr.e_ident[EI_MAG3] == ELFMAG3 &&
+            ehdr.e_type == ET_DYN && ehdr.e_machine == EM_AARCH64) {
+          elf_base = candidate;
+          break;
+        }
+      }
+    }
+    if (elf_base >= 0 && ehdr.e_phnum > 0 && ehdr.e_phnum <= 64) {
       Elf64_Phdr phdrs[64];
       ssize_t phdr_bytes = ehdr.e_phnum * sizeof(Elf64_Phdr);
-      if (pread(fd, phdrs, phdr_bytes, ehdr.e_phoff) == phdr_bytes) {
-        // The kernel rounds the mapping up to page size, so bytes beyond the
-        // guest's requested length but within the page are still mapped from
-        // the file. Use page-aligned length to cover the full mapped region.
+      if (pread(fd, phdrs, phdr_bytes, elf_base + ehdr.e_phoff) == phdr_bytes) {
         size_t page_size = static_cast<size_t>(getpagesize());
         size_t mapped_length = (length + page_size - 1) & ~(page_size - 1);
         for (int i = 0; i < ehdr.e_phnum; i++) {
           if (phdrs[i].p_type != PT_LOAD) continue;
           if (phdrs[i].p_memsz <= phdrs[i].p_filesz) continue;
           // This segment has .bss (memsz > filesz).
-          // Only process this segment if this mmap belongs to it.
-          // The linker maps each segment with offset = floor(p_offset, page_size).
-          // Two segments may share overlapping file ranges but have different
-          // page-aligned offsets, so only match the one this mmap is actually for.
-          off64_t page_aligned_seg_offset = phdrs[i].p_offset & ~(off64_t)(page_size - 1);
+          // Adjust p_offset to be relative to the container file (APK).
+          off64_t seg_file_offset = elf_base + (off64_t)phdrs[i].p_offset;
+          off64_t page_aligned_seg_offset = seg_file_offset & ~(off64_t)(page_size - 1);
           if (offset != page_aligned_seg_offset) continue;
-          // Check if our mapping covers the boundary between file data and .bss.
-          off64_t seg_file_end = phdrs[i].p_offset + phdrs[i].p_filesz;
+          off64_t seg_file_end = seg_file_offset + phdrs[i].p_filesz;
           if (seg_file_end >= offset && seg_file_end < offset + (off64_t)mapped_length) {
             size_t bss_start = (size_t)(seg_file_end - offset);
             size_t bytes_to_zero = mapped_length - bss_start;
             if (bytes_to_zero > 0 && bss_start < mapped_length) {
               memset(static_cast<char*>(result) + bss_start, 0, bytes_to_zero);
               static uint64_t bss_zero_count = 0;
-              if (++bss_zero_count <= 10) {
+              if (++bss_zero_count <= 20) {
                 __android_log_print(ANDROID_LOG_INFO, "berberis",
-                    "bss-zero#%lu: %p+0x%lx len=0x%lx (seg off=0x%lx filesz=0x%lx memsz=0x%lx)",
+                    "bss-zero#%lu: %p+0x%lx len=0x%lx (seg off=0x%lx filesz=0x%lx memsz=0x%lx elf_base=0x%lx)",
                     (unsigned long)bss_zero_count,
                     result, (unsigned long)bss_start, (unsigned long)bytes_to_zero,
                     (unsigned long)phdrs[i].p_offset,
-                    (unsigned long)phdrs[i].p_filesz, (unsigned long)phdrs[i].p_memsz);
+                    (unsigned long)phdrs[i].p_filesz, (unsigned long)phdrs[i].p_memsz,
+                    (unsigned long)elf_base);
               }
             }
           }
