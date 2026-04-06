@@ -99,6 +99,20 @@ constexpr uint32_t CbnzX(uint8_t rt, int32_t offset) {
 
 constexpr uint32_t kNop = 0xD503201F;
 
+// FMUL Sd, Sn, Sm (single-precision float multiply)
+// ARM64 encoding: 0001_1110_001_Rm_0000_10_Rn_Rd
+constexpr uint32_t FmulS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x1E200800 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// LDR St, [Xn, #imm12*4] (load single-precision float, unsigned offset)
+// ARM64 encoding: 1011_1101_01_imm12_Rn_Rt
+constexpr uint32_t LdrSUoff(uint8_t rt, uint8_t rn, uint16_t imm12) {
+  return 0xBD400000 | (static_cast<uint32_t>(imm12) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
 class Arm64LiteTranslateRegionTest : public ::testing::Test {
  public:
   template <typename T>
@@ -967,6 +981,176 @@ TEST_F(Arm64LiteTranslateRegionTest, StpQ_SignedOffset_Positive) {
   for (int i = 64; i < 96; i++) {
     EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
   }
+}
+// Test: single FMUL s0, s0, s1 (in-place multiply)
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_InPlace) {
+  static const uint32_t code[] = {
+      FmulS(0, 0, 1),   // FMUL S0, S0, S1
+  };
+  // Set up float values via ThreadState directly.
+  // v[0] low 32 bits = 0.5f, v[1] low 32 bits = 3.0f
+  float val0 = 0.5f, val1 = 3.0f;
+  memcpy(&state_.cpu.v[0], &val0, sizeof(float));
+  memcpy(&state_.cpu.v[1], &val1, sizeof(float));
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  float result;
+  memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.5f);  // 0.5 * 3.0 = 1.5
+}
+
+// Test: chained FMUL s0, s0, s1 then FMUL s0, s0, s2 (a*b*c pattern)
+// This is the pattern that caused black screen in gles3jni.
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_ChainedMultiply) {
+  static const uint32_t code[] = {
+      FmulS(0, 0, 1),   // FMUL S0, S0, S1  -> s0 = a * b
+      FmulS(0, 0, 2),   // FMUL S0, S0, S2  -> s0 = (a*b) * c
+  };
+  // a=0.5, b=0.125, c=1.0 — should produce 0.0625
+  float a = 0.5f, b = 0.125f, c = 1.0f;
+  memcpy(&state_.cpu.v[0], &a, sizeof(float));
+  memcpy(&state_.cpu.v[1], &b, sizeof(float));
+  memcpy(&state_.cpu.v[2], &c, sizeof(float));
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  float result;
+  memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.0625f);  // 0.5 * 0.125 * 1.0 = 0.0625
+}
+
+// Test: chained FMUL with different values to ensure non-zero result
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_ChainedMultiply_NonTrivial) {
+  static const uint32_t code[] = {
+      FmulS(0, 0, 1),   // FMUL S0, S0, S1
+      FmulS(0, 0, 2),   // FMUL S0, S0, S2
+  };
+  // 2.0 * 3.0 * 4.0 = 24.0
+  float a = 2.0f, b = 3.0f, c = 4.0f;
+  memcpy(&state_.cpu.v[0], &a, sizeof(float));
+  memcpy(&state_.cpu.v[1], &b, sizeof(float));
+  memcpy(&state_.cpu.v[2], &c, sizeof(float));
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  float result;
+  memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 24.0f);
+}
+// Test: chained FMUL with LDR in between (the exact real-world pattern)
+// Sequence: LDR s1, [x1]; FMUL s0, s0, s1; LDR s1, [x2]; FMUL s0, s0, s1
+// This is the ARM64 codegen for: result = a * b * c
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_ChainedWithLdr) {
+  // Set up a memory buffer with float values that LDR can read from.
+  // We'll point X1 at b_val and X2 at c_val.
+  float b_val = 0.125f;
+  float c_val = 1.0f;
+
+  static const uint32_t code[] = {
+      LdrSUoff(1, 1, 0),   // LDR S1, [X1, #0]  -> load b
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1   -> s0 = a * b
+      LdrSUoff(1, 2, 0),   // LDR S1, [X2, #0]  -> load c
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1   -> s0 = (a*b) * c
+  };
+
+  // Set s0 = 0.5 (a)
+  float a_val = 0.5f;
+  memcpy(&state_.cpu.v[0], &a_val, sizeof(float));
+  // X1 points to b_val, X2 points to c_val
+  state_.cpu.x[1] = reinterpret_cast<uint64_t>(&b_val);
+  state_.cpu.x[2] = reinterpret_cast<uint64_t>(&c_val);
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  float result;
+  memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.0625f) << "0.5 * 0.125 * 1.0 should be 0.0625";
+}
+
+// Same pattern but with larger values to make failures more obvious
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_ChainedWithLdr_LargerValues) {
+  float b_val = 3.0f;
+  float c_val = 4.0f;
+
+  static const uint32_t code[] = {
+      LdrSUoff(1, 1, 0),   // LDR S1, [X1, #0]
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1
+      LdrSUoff(1, 2, 0),   // LDR S1, [X2, #0]
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1
+  };
+
+  float a_val = 2.0f;
+  memcpy(&state_.cpu.v[0], &a_val, sizeof(float));
+  state_.cpu.x[1] = reinterpret_cast<uint64_t>(&b_val);
+  state_.cpu.x[2] = reinterpret_cast<uint64_t>(&c_val);
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  float result;
+  memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 24.0f) << "2.0 * 3.0 * 4.0 should be 24.0";
+}
+// LDUR St, [Xn, #simm9] (load single, unscaled offset)
+constexpr uint32_t LdurS(uint8_t rt, uint8_t rn, int16_t simm9) {
+  uint32_t imm = static_cast<uint32_t>(simm9 & 0x1FF);
+  return 0xBC400000 | (imm << 12) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// Test: the exact real-world code pattern from gles3jni calcSceneParams:
+// Load float from memory, FMUL, store result to memory.
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_FullCalcScenePattern) {
+  // scene2clip[0] = 1.0f
+  float scene2clip0 = 1.0f;
+  float result = -1.0f;  // sentinel
+
+  // Encode: LDR S0, [X0, #0]; LDR S1, [X1, #0]; FMUL S0, S0, S1; STUR S0, [X2, #0]
+  static const uint32_t code[] = {
+      LdrSUoff(0, 0, 0),   // LDR S0, [X0, #0]  -> load 0.0625
+      LdurS(1, 1, 0),       // LDUR S1, [X1, #0] -> load scene2clip[0]=1.0
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1   -> 0.0625 * 1.0
+      SturS(0, 2, 0),       // STUR S0, [X2, #0] -> store result
+  };
+
+  float val0 = 0.0625f;
+  state_.cpu.x[0] = reinterpret_cast<uint64_t>(&val0);
+  state_.cpu.x[1] = reinterpret_cast<uint64_t>(&scene2clip0);
+  state_.cpu.x[2] = reinterpret_cast<uint64_t>(&result);
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_FLOAT_EQ(result, 0.0625f) << "0.0625 * 1.0 should be 0.0625";
+}
+
+// Test: two consecutive LDR-FMUL-STR chains (simulating both mScale assignments)
+TEST_F(Arm64LiteTranslateRegionTest, FmulS_TwoChainedLoadMulStore) {
+  float const_val = 0.0625f;
+  float s2c0 = 1.0f;
+  float s2c1 = 1.644f;
+  float results[2] = {-1.0f, -1.0f};
+
+  static const uint32_t code[] = {
+      // First multiply: results[0] = 0.0625 * 1.0
+      LdrSUoff(0, 0, 0),   // LDR S0, [X0, #0]  -> 0.0625
+      LdurS(1, 1, 0),       // LDUR S1, [X1, #0] -> 1.0
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1
+      SturS(0, 3, 0),       // STUR S0, [X3, #0] -> results[0]
+      // Second multiply: results[1] = 0.0625 * 1.644
+      LdrSUoff(0, 0, 0),   // LDR S0, [X0, #0]  -> 0.0625
+      LdurS(1, 2, 0),       // LDUR S1, [X2, #0] -> 1.644
+      FmulS(0, 0, 1),       // FMUL S0, S0, S1
+      SturS(0, 3, 4),       // STUR S0, [X3, #4] -> results[1]
+  };
+
+  state_.cpu.x[0] = reinterpret_cast<uint64_t>(&const_val);
+  state_.cpu.x[1] = reinterpret_cast<uint64_t>(&s2c0);
+  state_.cpu.x[2] = reinterpret_cast<uint64_t>(&s2c1);
+  state_.cpu.x[3] = reinterpret_cast<uint64_t>(&results[0]);
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_FLOAT_EQ(results[0], 0.0625f) << "0.0625 * 1.0";
+  EXPECT_NEAR(results[1], 0.10275f, 0.0001f) << "0.0625 * 1.644";
 }
 // endregion
 
