@@ -490,6 +490,7 @@ class Decoder {
     kInsGeneral,   // INS (general): insert Xn/Wn into Vd element
     kSmov,         // SMOV: signed move from Vn element to Xd/Wd
     kUmov,         // UMOV: unsigned move from Vn element to Xd/Wd
+    kInsElement,   // INS (element): copy Vn element to Vd element
   };
 
   struct AdvSimdCopyArgs {
@@ -791,6 +792,30 @@ class Decoder {
     uint8_t immb;     // immb field (bits[18:16])
     bool q;           // Q bit
     bool u;           // U bit
+  };
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD vector x indexed element opcodes.
+  //
+  enum class AdvSimdVecXIdxOpcode : uint8_t {
+    kFmla,    // FMLA (by element)
+    kFmls,    // FMLS (by element)
+    kFmul,    // FMUL (by element)
+    kMul,     // MUL (by element)
+    kMla,     // MLA (by element)
+    kMls,     // MLS (by element)
+  };
+
+  struct AdvSimdVecXIdxArgs {
+    AdvSimdVecXIdxOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;       // indexed source register
+    uint8_t index;    // element index within rm
+    uint8_t size;     // 01=16b, 10=32b, 11=64b
+    bool q;
   };
   // endregion
 
@@ -1855,8 +1880,16 @@ class Decoder {
       return;
     }
 
-    // AdvSIMD shift by immediate: bit31=0, bits[28:24]=01111, bits[23:19]!=00000
-    if (!bit31 && GetBits<24, 5>() == 0b01111 && GetBits<19, 5>() != 0) {
+    // region digitalis
+    // AdvSIMD vector x indexed element: bit31=0, bits[28:24]=01111, bit10=0
+    if (!bit31 && GetBits<24, 5>() == 0b01111 && !GetBits<10, 1>()) {
+      DecodeAdvSimdVecXIndexedElement();
+      return;
+    }
+    // endregion
+
+    // AdvSIMD shift by immediate: bit31=0, bits[28:24]=01111, bit10=1, immh!=0000
+    if (!bit31 && GetBits<24, 5>() == 0b01111 && GetBits<10, 1>() && GetBits<19, 4>() != 0) {
       DecodeAdvSimdShiftByImm();
       return;
     }
@@ -2858,10 +2891,9 @@ class Decoder {
           return;
       }
     } else {
-      // op=1: INS (element) -- imm4 encodes source element index.
-      // Left as Undefined for now.
-      Undefined();
-      return;
+      // op=1: INS (element) -- imm4 encodes source element index. Q must be 1.
+      if (!q) { Undefined(); return; }
+      opcode = AdvSimdCopyOpcode::kInsElement;
     }
 
     // Validate imm5: must have at least one bit set in [3:0] to encode a valid element size.
@@ -2881,6 +2913,92 @@ class Decoder {
     insn_consumer_->AdvSimdCopy(args);
   }
   // endregion
+  // region digitalis
+  //
+  // AdvSIMD vector x indexed element.
+  // Encoding: 0 Q U 01111 size L M Rm opcode H 0 Rn Rd
+  //
+  void DecodeAdvSimdVecXIndexedElement() {
+    bool q = GetBits<30, 1>();
+    bool u = GetBits<29, 1>();
+    uint8_t size = GetBits<22, 2>();
+    uint8_t L = GetBits<21, 1>();
+    uint8_t M = GetBits<20, 1>();
+    uint8_t Rm4 = GetBits<16, 4>();
+    uint8_t opcode = GetBits<12, 4>();
+    uint8_t H = GetBits<11, 1>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    uint8_t rm;
+    uint8_t index;
+
+    if (size == 0b10) {
+      // 32-bit: Vm = M:Rm, index = H:L
+      rm = (M << 4) | Rm4;
+      index = (H << 1) | L;
+    } else if (size == 0b11) {
+      // 64-bit: Vm = M:Rm, index = H
+      rm = (M << 4) | Rm4;
+      index = H;
+    } else {
+      // 16-bit or reserved.
+      Undefined();
+      return;
+    }
+
+    AdvSimdVecXIdxOpcode op;
+    switch (opcode) {
+      case 0b0001:
+        if (u) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kFmla;
+        break;
+      case 0b0101:
+        if (u) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kFmls;
+        break;
+      case 0b1001:
+        op = u ? AdvSimdVecXIdxOpcode::kFmul : AdvSimdVecXIdxOpcode::kFmul;
+        break;
+      case 0b1000:
+        if (u) {
+          op = AdvSimdVecXIdxOpcode::kMla;
+        } else {
+          op = AdvSimdVecXIdxOpcode::kMul;
+        }
+        break;
+      case 0b0100:
+        if (u) {
+          op = AdvSimdVecXIdxOpcode::kMls;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b0000:
+        if (u) {
+          op = AdvSimdVecXIdxOpcode::kMla;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
+    const AdvSimdVecXIdxArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .index = index,
+        .size = size,
+        .q = q,
+    };
+    insn_consumer_->AdvSimdVecXIndexedElement(args);
+  }
+  // endregion
+
   // region digitalis
   //
   // AdvSIMD shift by immediate.
