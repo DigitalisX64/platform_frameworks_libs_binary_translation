@@ -1600,16 +1600,14 @@ class LiteTranslator {
       as_.Pxor(xmm, xmm);
       as_.Movdqu({.base = Assembler::rbp, .disp = vreg_offset}, xmm);
       if (args.rn < 31) {
-        // Load GP value and store to lower 64 bits of V register
-        Register tmp = AllocTempReg();
-        int32_t gp_offset = offsetof(ThreadState, cpu.x[0]) + args.rn * 8;
-        as_.Movq(tmp, {.base = Assembler::rbp, .disp = gp_offset});
+        // Use GetReg to read the latest GP value (may be in a mapped register)
+        Register gp_val = GetReg(args.rn);
         if (args.ftype == 0b00) {
           // FMOV Sd, Wn: 32-bit
-          as_.Movl({.base = Assembler::rbp, .disp = vreg_offset}, tmp);
+          as_.Movl({.base = Assembler::rbp, .disp = vreg_offset}, gp_val);
         } else {
           // FMOV Dd, Xn: 64-bit
-          as_.Movq({.base = Assembler::rbp, .disp = vreg_offset}, tmp);
+          as_.Movq({.base = Assembler::rbp, .disp = vreg_offset}, gp_val);
         }
       }
       // else: rn=31 (XZR), register is already zeroed
@@ -1620,7 +1618,6 @@ class LiteTranslator {
     if (rmode == 0b00 && opcode == 0b110 && args.rd < 31) {
       Register tmp = AllocTempReg();
       int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
-      int32_t gp_offset = offsetof(ThreadState, cpu.x[0]) + args.rd * 8;
       if (args.ftype == 0b00) {
         // FMOV Wd, Sn: 32-bit (zero-extend to 64)
         as_.Movl(tmp, {.base = Assembler::rbp, .disp = vreg_offset});
@@ -1628,24 +1625,25 @@ class LiteTranslator {
         // FMOV Xd, Dn: 64-bit
         as_.Movq(tmp, {.base = Assembler::rbp, .disp = vreg_offset});
       }
-      as_.Movq({.base = Assembler::rbp, .disp = gp_offset}, tmp);
+      // Use SetReg to update the mapped register (not just ThreadState)
+      SetReg(args.rd, tmp);
       return;
     }
 
     // FMOV Vd.D[1], Xn: opcode=0b111, rmode=0b01
     if (rmode == 0b01 && opcode == 0b111) {
-      Register tmp = AllocTempReg();
       int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
-      int32_t gp_val = (args.rn < 31)
-          ? offsetof(ThreadState, cpu.x[0]) + args.rn * 8
-          : -1;
-      if (gp_val >= 0) {
-        as_.Movq(tmp, {.base = Assembler::rbp, .disp = gp_val});
+      if (args.rn < 31) {
+        // Use GetReg to read the latest GP value (may be in a mapped register)
+        Register gp_val = GetReg(args.rn);
+        // Write to upper 64 bits (offset + 8)
+        as_.Movq({.base = Assembler::rbp, .disp = vreg_offset + 8}, gp_val);
       } else {
+        // XZR: write zero to upper 64 bits
+        Register tmp = AllocTempReg();
         as_.Xorq(tmp, tmp);
+        as_.Movq({.base = Assembler::rbp, .disp = vreg_offset + 8}, tmp);
       }
-      // Write to upper 64 bits (offset + 8)
-      as_.Movq({.base = Assembler::rbp, .disp = vreg_offset + 8}, tmp);
       return;
     }
 
@@ -1653,10 +1651,10 @@ class LiteTranslator {
     if (rmode == 0b01 && opcode == 0b110 && args.rd < 31) {
       Register tmp = AllocTempReg();
       int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
-      int32_t gp_offset = offsetof(ThreadState, cpu.x[0]) + args.rd * 8;
       // Read upper 64 bits (offset + 8)
       as_.Movq(tmp, {.base = Assembler::rbp, .disp = vreg_offset + 8});
-      as_.Movq({.base = Assembler::rbp, .disp = gp_offset}, tmp);
+      // Use SetReg to update the mapped register (not just ThreadState)
+      SetReg(args.rd, tmp);
       return;
     }
     // endregion
