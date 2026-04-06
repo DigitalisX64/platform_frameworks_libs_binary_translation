@@ -1152,6 +1152,180 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulS_TwoChainedLoadMulStore) {
   EXPECT_FLOAT_EQ(results[0], 0.0625f) << "0.0625 * 1.0";
   EXPECT_NEAR(results[1], 0.10275f, 0.0001f) << "0.0625 * 1.644";
 }
+// MOVN Xd, #imm16 (move wide with NOT)
+constexpr uint32_t MovnX(uint8_t rd, uint16_t imm16) {
+  return 0x92800000 | (static_cast<uint32_t>(imm16) << 5) | rd;
+}
+
+// CMP Xn, Xm (SUBS XZR, Xn, Xm, shifted register no shift)
+constexpr uint32_t CmpRegX(uint8_t rn, uint8_t rm) {
+  return 0xEB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | 31;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CselCcTrue_SmallVsMax) {
+  // Reproduces the orderfile crash scenario:
+  // X0 = 5, X1 = UINT64_MAX (via MOVN #0)
+  // CMP X0, X1 → 5 < UINT64_MAX → C=0 (borrow) → CC (C==0) is true
+  // CSEL X3, X4, X5, CC → should select X4 (true case)
+  static const uint32_t code[] = {
+      MovzX(0, 5),                    // MOVZ X0, #5
+      MovnX(1, 0),                    // MOVN X1, #0 → X1 = 0xFFFFFFFFFFFFFFFF
+      MovzX(4, 100),                  // MOVZ X4, #100 (true case)
+      MovzX(5, 200),                  // MOVZ X5, #200 (false case)
+      CmpRegX(0, 1),                  // CMP X0, X1 (5 vs UINT64_MAX)
+      CselX(3, 4, 5, kCondCC),        // CSEL X3, X4, X5, CC
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFFFFFFFFFFFULL);  // verify MOVN
+  EXPECT_EQ(state_.cpu.x[3], 100ULL);  // CC should be true → X3 = X4 = 100
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CselCcFalse_LargeVsSmall) {
+  // X0 = 100, X1 = 5
+  // CMP X0, X1 → 100 > 5 → C=1 (no borrow) → CC (C==0) is false
+  // CSEL X3, X4, X5, CC → should select X5 (false case)
+  static const uint32_t code[] = {
+      MovzX(0, 100),                  // MOVZ X0, #100
+      MovzX(1, 5),                    // MOVZ X1, #5
+      MovzX(4, 100),                  // MOVZ X4, #100 (true case)
+      MovzX(5, 200),                  // MOVZ X5, #200 (false case)
+      CmpRegX(0, 1),                  // CMP X0, X1 (100 vs 5)
+      CselX(3, 4, 5, kCondCC),        // CSEL X3, X4, X5, CC
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 200ULL);  // CC should be false → X3 = X5 = 200
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CselCcWithInterveningAdd) {
+  // Exact pattern from orderfile crash: CMP + non-flag ADD + CSEL CC.
+  // X0 = 5, X1 = UINT64_MAX
+  // CMP X0, X1 → C=0 → CC true
+  // ADD W6, W6, #1 (non-flag-setting, should NOT clobber stored ARM flags)
+  // CSEL X3, X4, X5, CC → should still see C=0 from CMP
+  static const uint32_t code[] = {
+      MovzX(0, 5),                    // MOVZ X0, #5
+      MovnX(1, 0),                    // MOVN X1, #0 → UINT64_MAX
+      MovzX(4, 100),                  // MOVZ X4, #100
+      MovzX(5, 200),                  // MOVZ X5, #200
+      MovzX(6, 0),                    // MOVZ X6, #0 (counter)
+      CmpRegX(0, 1),                  // CMP X0, X1
+      // ADD W6, W6, #1 (32-bit, no flags): 0x11000400 + rd + rn<<5
+      0x110004C6,                     // ADD W6, W6, #1
+      CselX(3, 4, 5, kCondCC),        // CSEL X3, X4, X5, CC
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[6], 1ULL);    // ADD happened
+  EXPECT_EQ(state_.cpu.x[3], 100ULL);  // CC should be true → X3 = X4 = 100
+}
+
+// MOVZ Wd, #imm16 (32-bit move, zero-extends to X)
+constexpr uint32_t MovzW(uint8_t rd, uint16_t imm16) {
+  return 0x52800000 | (static_cast<uint32_t>(imm16) << 5) | rd;
+}
+
+// CMP Wn, Wm (32-bit SUBS WZR, Wn, Wm, shifted register)
+constexpr uint32_t CmpRegW(uint8_t rn, uint8_t rm) {
+  return 0x6B000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | 31;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmpW_BranchLs_NotTaken) {
+  // Test 32-bit CMP W0, WZR with W0=24 → B.LS should NOT be taken.
+  // This mirrors the orderfile Path B: threshold=24, cmp w10, wzr, b.ls.
+  static const uint32_t code[] = {
+      MovzW(0, 24),                    // MOVZ W0, #24
+      CmpRegW(0, 31),                  // CMP W0, WZR (24 vs 0)
+      Bcond(kCondLS, 8),               // B.LS +8 (should NOT be taken)
+      MovzX(1, 42),                    // MOVZ X1, #42 (reached if not taken)
+      MovzX(1, 0),                     // padding (branch target)
+  };
+  // B.LS NOT taken → falls through to MOVZ X1, #42, then exits region.
+  // The forward branch doesn't end the region, so both MOVZs are translated.
+  // But B.LS not taken means we execute MOVZ X1, #42 then MOVZ X1, #0 (overwritten).
+  // Actually, B.LS at code+8 targets code+16 (MOVZ X1,#0). If taken, exits to code+16.
+  // If not taken, continues to code+12 (MOVZ X1,#42), then code+16 (MOVZ X1,#0).
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0ULL);  // Both MOVZs execute; X1 = 0 from last one
+  // But the key test: B.LS was NOT taken. X1 passes through #42 then #0.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmpW_BranchLs_Taken) {
+  // CMP W0, WZR with W0=0 → B.LS SHOULD be taken (0 <= 0 unsigned).
+  static const uint32_t code[] = {
+      MovzW(0, 0),                     // MOVZ W0, #0
+      CmpRegW(0, 31),                  // CMP W0, WZR (0 vs 0)
+      Bcond(kCondLS, 8),               // B.LS +8 (should be taken)
+      MovzX(1, 42),                    // skipped
+      MovzX(1, 0),                     // branch target
+  };
+  GuestAddr branch_target = ToGuestAddr(code) + 16;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[1], 0ULL);  // X1 unchanged (starts at 0)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, OrderfileCrashPattern_9Registers) {
+  // Reproduce EXACT register pressure from the orderfile crash:
+  // 9 permanent registers in one region, with CMP + CSEL CC pattern.
+  // Guest regs: x8, x9, x10, x11, x12, x19, x20, x22, x2
+  //
+  // This mimics region 2 of the orderfile function:
+  // MOV X8, XZR → x8 = 0
+  // MOV X10, #-1 → x10 = UINT64_MAX
+  // MOV X22, X11 (X11 = some_ptr)
+  // LDR X12, [X22, #8] (load count)
+  // CMP X12, X10 (count vs UINT64_MAX)
+  // ADD W9, W9, #1 (counter++)
+  // CSEL X8, X22, X8, CC (best_entry = current if count < min_count)
+  // CSEL X10, X12, X10, CC (min_count = count if count < min_count)
+  static uint64_t fake_node[3];  // [0]=key, [1]=count, [2]=next
+  fake_node[0] = 0xDEAD;  // key
+  fake_node[1] = 42;      // count
+  fake_node[2] = 0;       // next = NULL
+
+  // Set up initial state for registers used in the "loop":
+  state_.cpu.x[11] = ToGuestAddr(&fake_node[0]);  // x11 = pointer to node
+  state_.cpu.x[19] = 0xBEEF;  // x19 = target key (different from 0xDEAD → b.eq not taken)
+  state_.cpu.x[20] = ToGuestAddr(&fake_node[0]);  // x20 (just to map it)
+  state_.cpu.x[2] = 7;  // x2 (just to map it)
+
+  // Encode the loop body instructions exactly:
+  static const uint32_t code[] = {
+      // LDR X20, [X20] (map x20 early by reading it)
+      0xF9400294,                      // LDR X20, [X20]
+      // LDR X2, [X20] (map x2 by reading x20 into it — just to fill pool)
+      // Actually: MOV X2, X2 is simpler: ORR X2, XZR, X2
+      // Better: use existing x2 value. Just do ADD X2, X2, #0
+      0x91000042,                      // ADD X2, X2, #0 (maps x2)
+      // MOV W9, WZR
+      MovzW(9, 0),                     // W9 = 0 (counter)
+      // MOV X8, XZR
+      MovzX(8, 0),                     // X8 = 0 (best_entry)
+      // MOVN X10, #0
+      MovnX(10, 0),                    // X10 = UINT64_MAX (min_count)
+      // MOV X22, X11 (ORR X22, XZR, X11)
+      0xAA0B03F6,                      // ORR X22, XZR, X11
+      // LDR X11, [X11] (key = node.key)
+      0xF940016B,                      // LDR X11, [X11]
+      // LDR X12, [X22, #8] (count = node.count)
+      0xF94006CC,                      // LDR X12, [X22, #8]
+      // CMP X11, X19 (compare key with target)
+      0xEB13017F,                      // CMP X11, X19
+      // B.EQ +20 (5 instructions forward — to end of code)
+      Bcond(kCondEQ, 20),              // B.EQ +20 (forward, region continues)
+      // CMP X12, X10 (compare count vs min_count)
+      CmpRegX(12, 10),                 // CMP X12, X10
+      // ADD W9, W9, #1
+      0x11000529,                      // ADD W9, W9, #1
+      // CSEL X8, X22, X8, CC
+      CselX(8, 22, 8, kCondCC),        // CSEL X8, X22, X8, CC
+      // CSEL X10, X12, X10, CC
+      CselX(10, 12, 10, kCondCC),      // CSEL X10, X12, X10, CC
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // x8 should be the node address (CSEL CC fired since 42 < UINT64_MAX)
+  EXPECT_EQ(state_.cpu.x[8], ToGuestAddr(&fake_node[0]));
+  EXPECT_EQ(state_.cpu.x[10], 42ULL);  // min_count updated to 42
+  EXPECT_EQ(state_.cpu.x[9], 1ULL);    // counter incremented
+}
 // endregion
 
 }  // namespace

@@ -21,6 +21,7 @@
 #include <cerrno>
 // region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include <algorithm>
 #include <cstdint>
 #include <elf.h>
 #include <unistd.h>
@@ -143,7 +144,12 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
           off64_t seg_file_end = seg_file_offset + phdrs[i].p_filesz;
           if (seg_file_end >= offset && seg_file_end < offset + (off64_t)mapped_length) {
             size_t bss_start = (size_t)(seg_file_end - offset);
-            size_t bytes_to_zero = mapped_length - bss_start;
+            // Cap at the segment's actual BSS size (memsz - filesz). Without
+            // this, when two LOAD segments page-align to the same file offset
+            // a smaller segment can match a larger mapping and zero far beyond
+            // its own BSS, wiping out file-backed .data of the other segment.
+            size_t seg_bss_size = phdrs[i].p_memsz - phdrs[i].p_filesz;
+            size_t bytes_to_zero = std::min(mapped_length - bss_start, seg_bss_size);
             if (bytes_to_zero > 0 && bss_start < mapped_length) {
               memset(static_cast<char*>(result) + bss_start, 0, bytes_to_zero);
               static uint64_t bss_zero_count = 0;
