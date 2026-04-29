@@ -56,7 +56,7 @@ cc_library_static {
 // region digitalis
 cc_library_static {
     name: "libberberis_lite_translator_arm64_to_x86_64",
-    defaults: ["berberis_all_hosts_defaults_64"],
+    defaults: ["berberis_defaults_64"],
     host_supported: true,
     header_libs: [
         "libberberis_base_headers",
