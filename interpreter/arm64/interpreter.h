@@ -3435,6 +3435,44 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis - across-lanes max/min reductions
+      // SMAXV/UMAXV/SMINV/UMINV: reduce a vector to a single scalar lane holding
+      // the signed/unsigned max or min across all input lanes. The scalar result
+      // is placed in the bottom esize bytes of Vd; upper bits are zeroed.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUminv: {
+        if (esize > 4) { Undefined(); return; }  // no 64-bit element form
+        bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSminv);
+        bool is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv);
+        uint8_t bits = esize * 8;
+        uint64_t emask = ElementMask(esize);
+        // Seed accumulator from element 0.
+        uint64_t acc = 0;
+        memcpy(&acc, reinterpret_cast<const uint8_t*>(&src), esize);
+        for (uint8_t i = 1; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          bool elem_wins;
+          if (is_signed) {
+            int64_t s_elem = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+            int64_t s_acc = static_cast<int64_t>(acc << (64 - bits)) >> (64 - bits);
+            elem_wins = is_max ? (s_elem > s_acc) : (s_elem < s_acc);
+          } else {
+            elem_wins = is_max ? (elem > acc) : (elem < acc);
+          }
+          if (elem_wins) acc = elem;
+        }
+        result = acc & emask;
+        break;
+      }
+      // endregion
+
       // region digitalis - pairwise add long instructions
       case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlp:

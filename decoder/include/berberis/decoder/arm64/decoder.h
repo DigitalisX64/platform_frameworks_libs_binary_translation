@@ -763,7 +763,13 @@ class Decoder {
     kFabs,
     kFneg,
     // region digitalis
-    kAddv,      // ADDV (across lanes): U=0, opcode=11011 (across-lanes group, bit20=1)
+    // Across-lanes reductions share the two-reg-misc dispatch path but are
+    // distinguished by bit20=1 (across-lanes group) vs bit20=0 (two-reg-misc).
+    kAddv,      // ADDV: U=0, opcode=11011
+    kSmaxv,     // SMAXV: U=0, opcode=01010
+    kUmaxv,     // UMAXV: U=1, opcode=01010
+    kSminv,     // SMINV: U=0, opcode=11010
+    kUminv,     // UMINV: U=1, opcode=11010
     // endregion
   };
 
@@ -2857,9 +2863,27 @@ class Decoder {
         op = u ? AdvSimdTwoRegMiscOpcode::kCmleZero : AdvSimdTwoRegMiscOpcode::kCmeqZero;
         break;
       case 0b01010:
-        if (u) { Undefined(); return; }
-        op = AdvSimdTwoRegMiscOpcode::kCmltZero;
+        // region digitalis - bit20 distinguishes across-lanes (1) from two-reg-misc (0).
+        // Across-lanes opcode=01010 is SMAXV (U=0) / UMAXV (U=1).
+        // Two-reg-misc opcode=01010 is CMLT zero (U=0 only; U=1 unallocated).
+        if (GetBits<20, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUmaxv : AdvSimdTwoRegMiscOpcode::kSmaxv;
+          // SMAXV/UMAXV are only defined for size 00/01/10 with Q matching, but the
+          // interpreter validates size; reject 64-bit element which has no encoding.
+          if (size == 0b11) { Undefined(); return; }
+        } else {
+          if (u) { Undefined(); return; }
+          op = AdvSimdTwoRegMiscOpcode::kCmltZero;
+        }
         break;
+      case 0b11010:
+        // Across-lanes opcode=11010 is SMINV (U=0) / UMINV (U=1).
+        // bit20 must be 1; bit20=0 with this opcode is unallocated in two-reg-misc.
+        if (!GetBits<20, 1>()) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kUminv : AdvSimdTwoRegMiscOpcode::kSminv;
+        if (size == 0b11) { Undefined(); return; }
+        break;
+        // endregion
       case 0b01011:
         op = u ? AdvSimdTwoRegMiscOpcode::kNeg : AdvSimdTwoRegMiscOpcode::kAbs;
         break;
