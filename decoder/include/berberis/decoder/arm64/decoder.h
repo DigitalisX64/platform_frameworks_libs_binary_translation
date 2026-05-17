@@ -297,7 +297,19 @@ class Decoder {
     uint8_t rt;
     uint8_t rn;
     uint8_t rm;
-    ShiftType extend_type;
+    // region digitalis - raw 3-bit ARMv8 option field:
+    // 000=UXTB, 001=UXTH, 010=UXTW, 011=LSL (UXTX), 100=SXTB,
+    // 101=SXTH, 110=SXTW, 111=SXTX. Only 010/011/110/111 are valid for
+    // a load/store address; the encoded option is preserved so the JIT
+    // and interpreter can apply the correct 32->64 extension before
+    // shifting/adding to the base. Throwing this away (treating SXTW or
+    // UXTW as LSL) silently uses bits[63:32] of the X register that
+    // backs the W offset, corrupting addresses for sign-extended or
+    // unclean upper-half offsets. See libsuperpack-jni.so hot loops at
+    // 0x34488 / 0x344a4 where ldrb [..., w, uxtw] is the entire decode
+    // inner kernel.
+    uint8_t extend_type;
+    // endregion
     uint8_t shift_amount;
     LoadStoreSize size;
     bool is_store;
@@ -426,6 +438,11 @@ class Decoder {
     uint8_t rt;
     uint8_t rn;
     uint8_t rm;
+    // region digitalis - raw 3-bit ARMv8 option field for the offset
+    // register, same encoding as LoadStoreRegArgs::extend_type. See the
+    // comment there.
+    uint8_t extend_type;
+    // endregion
     uint8_t shift_amount;
     SimdLoadStoreSize size;
     bool is_store;
@@ -1709,17 +1726,14 @@ class Decoder {
 
     uint8_t shift_amount = s_bit ? size : 0;
 
-    // Map option to extend type / shift type.
-    // option=011 => LSL (default), option=010 => UXTW, option=110 => SXTW, option=111 => SXTX
-    ShiftType shift_type;
+    // region digitalis - Validate option field. Only word-or-larger
+    // offsets are encodable: 010=UXTW, 011=LSL/UXTX, 110=SXTW, 111=SXTX.
+    // Other options are UNDEFINED per ARMv8.
     switch (option) {
-      case 0b011:
-        shift_type = ShiftType::kLsl;
-        break;
       case 0b010:
+      case 0b011:
       case 0b110:
       case 0b111:
-        shift_type = ShiftType::kLsl;  // We simplify; extend handling is in the interpreter.
         break;
       default:
         return Undefined();
@@ -1729,13 +1743,14 @@ class Decoder {
         .rt = rt,
         .rn = rn,
         .rm = rm,
-        .extend_type = shift_type,
+        .extend_type = option,
         .shift_amount = shift_amount,
         .size = LoadStoreSize{size},
         .is_store = is_store,
         .is_signed = is_signed,
         .is_64bit_target = is_64bit_target,
     };
+    // endregion
     insn_consumer_->LoadStoreReg(args);
   }
 
@@ -2098,14 +2113,31 @@ class Decoder {
     else if (size == 0b00 && opc == 0b11) { ls_size = SimdLoadStoreSize::k128bit; is_store = false; if (s_bit) shift_amount = 4; }
     else { Undefined(); return; }
 
+    // region digitalis - Reject UNDEFINED option encodings for the
+    // offset register (only 010/011/110/111 are valid SIMD load/store
+    // forms). Preserve the option so the handler can apply the right
+    // extension.
+    switch (option) {
+      case 0b010:
+      case 0b011:
+      case 0b110:
+      case 0b111:
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
     const SimdLoadStoreRegArgs args = {
         .rt = rt,
         .rn = rn,
         .rm = rm,
+        .extend_type = option,
         .shift_amount = shift_amount,
         .size = ls_size,
         .is_store = is_store,
     };
+    // endregion
     insn_consumer_->SimdLoadStoreReg(args);
   }
 

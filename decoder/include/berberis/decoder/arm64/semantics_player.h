@@ -205,14 +205,22 @@ class SemanticsPlayer {
     Register base = GetRegOrSp(args.rn);
     Register offset_reg = GetRegOrZero(args.rm);
 
+    // region digitalis - Forward extend_type so the handler can apply
+    // the correct 32->64 extension (UXTW vs SXTW vs LSL/SXTX) before
+    // shift+add. Previously this collapsed to LSL and corrupted the
+    // address whenever the offset W register had nonzero upper half or
+    // SXTW was actually requested.
     if (args.is_store) {
       Register data = GetRegOrZero(args.rt);
-      listener_->StoreReg(args.size, base, offset_reg, args.shift_amount, data);
+      listener_->StoreReg(args.size, base, offset_reg, args.extend_type,
+                          args.shift_amount, data);
     } else {
       Register result = listener_->LoadReg(args.size, args.is_signed, args.is_64bit_target,
-                                           base, offset_reg, args.shift_amount);
+                                           base, offset_reg, args.extend_type,
+                                           args.shift_amount);
       SetRegOrIgnore(args.rt, result);
     }
+    // endregion
   }
 
   void Svc(const typename Decoder::SvcArgs& args) {

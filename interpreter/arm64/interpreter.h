@@ -432,22 +432,41 @@ class Interpreter {
     // endregion
   }
 
+  // region digitalis - Apply the correct 32->64 extension to the offset
+  // register before shift+add. extend_type is the raw 3-bit ARMv8
+  // option field; only 010=UXTW, 011=LSL/UXTX, 110=SXTW, 111=SXTX are
+  // valid for memory ops. Bug history: collapsing all four to LSL
+  // silently used bits[63:32] of the X register backing a W offset,
+  // corrupting addresses for SXTW or unclean upper-half UXTW. Discovered
+  // chasing Brotli "Bad context map" in libsuperpack-jni.so.
+  static uint64_t ApplyOffsetExtend(uint64_t reg_val, uint8_t extend_type) {
+    switch (extend_type) {
+      case 0b010:  // UXTW
+        return reg_val & 0xFFFFFFFFULL;
+      case 0b110:  // SXTW
+        return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(reg_val)));
+      case 0b011:  // LSL / UXTX
+      case 0b111:  // SXTX
+      default:
+        return reg_val;
+    }
+  }
+
   Register LoadReg(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
-                   Register base, Register offset_reg, uint8_t shift_amount) {
-    // region digitalis
-    // Compute full 64-bit address directly to avoid int32_t truncation.
-    uint64_t addr = base + (offset_reg << shift_amount);
+                   Register base, Register offset_reg, uint8_t extend_type,
+                   uint8_t shift_amount) {
+    uint64_t off = ApplyOffsetExtend(offset_reg, extend_type) << shift_amount;
+    uint64_t addr = base + off;
     return Load(size, is_signed, is_64bit_target, addr, 0);
-    // endregion
   }
 
   void StoreReg(Decoder::LoadStoreSize size, Register base, Register offset_reg,
-                uint8_t shift_amount, Register data) {
-    // region digitalis
-    uint64_t addr = base + (offset_reg << shift_amount);
+                uint8_t extend_type, uint8_t shift_amount, Register data) {
+    uint64_t off = ApplyOffsetExtend(offset_reg, extend_type) << shift_amount;
+    uint64_t addr = base + off;
     Store(size, addr, 0, data);
-    // endregion
   }
+  // endregion
 
   void Svc(uint16_t /*imm*/) {
     CHECK(!exception_raised_);
@@ -1528,7 +1547,11 @@ class Interpreter {
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                          Register base, Register offset_reg) {
     CHECK(!exception_raised_);
-    uint64_t addr = base + (offset_reg << args.shift_amount);
+    // region digitalis - Apply the offset register extension before
+    // shift+add (see ApplyOffsetExtend comment above).
+    uint64_t off = ApplyOffsetExtend(offset_reg, args.extend_type) << args.shift_amount;
+    uint64_t addr = base + off;
+    // endregion
     void* host_addr = ToHostAddr<void>(addr);
 
     if (args.is_store) {

@@ -627,11 +627,37 @@ class LiteTranslator {
     Store(size, base, static_cast<int32_t>(scale), data2);
   }
 
+  // region digitalis - Apply the correct 32->64 extension to the offset
+  // register before shift+add. Without this, ldrb/ldr [Xn, Wm, UXTW]
+  // and SXTW forms can produce wrong addresses (silent data corruption,
+  // not faults — observed as Brotli "Bad context map" in
+  // libsuperpack-jni.so's decompressor on Facebook startup).
+  void ApplyOffsetExtend(Register dst, Register src, uint8_t extend_type) {
+    // extend_type encoding (3-bit option from the encoded instruction):
+    //   010=UXTW, 011=LSL (UXTX), 110=SXTW, 111=SXTX
+    // Smaller-byte forms (UXTB etc.) are not encodable for load/store.
+    switch (extend_type) {
+      case 0b010:  // UXTW: zero-extend low 32 bits (32-bit mov zero-extends)
+        as_.Movl(dst, src);
+        break;
+      case 0b110:  // SXTW: sign-extend low 32 bits to 64
+        as_.Movsxlq(dst, src);
+        break;
+      case 0b011:  // LSL / UXTX: full 64-bit value, no extension
+      case 0b111:  // SXTX: full 64-bit value, sign-extend is a no-op
+      default:
+        as_.Movq(dst, src);
+        break;
+    }
+  }
+
   Register LoadReg(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
-                   Register base, Register offset_reg, uint8_t shift_amount) {
-    // Compute address: base + (offset_reg << shift_amount)
+                   Register base, Register offset_reg, uint8_t extend_type,
+                   uint8_t shift_amount) {
+    // Compute address: base + extend(offset_reg) << shift_amount
     Register addr = AllocTempReg();
-    as_.Movq(addr, offset_reg);
+    if (!success()) return no_register;
+    ApplyOffsetExtend(addr, offset_reg, extend_type);
     if (shift_amount != 0) {
       as_.Shlq(addr, static_cast<int8_t>(shift_amount));
     }
@@ -640,16 +666,18 @@ class LiteTranslator {
   }
 
   void StoreReg(Decoder::LoadStoreSize size, Register base, Register offset_reg,
-                uint8_t shift_amount, Register data) {
-    // Compute address: base + (offset_reg << shift_amount)
+                uint8_t extend_type, uint8_t shift_amount, Register data) {
+    // Compute address: base + extend(offset_reg) << shift_amount
     Register addr = AllocTempReg();
-    as_.Movq(addr, offset_reg);
+    if (!success()) return;
+    ApplyOffsetExtend(addr, offset_reg, extend_type);
     if (shift_amount != 0) {
       as_.Shlq(addr, static_cast<int8_t>(shift_amount));
     }
     as_.Addq(addr, base);
     Store(size, addr, 0, data);
   }
+  // endregion
 
   void Svc(uint16_t imm) {
     // region digitalis - SVC must be handled by interpreter, not JIT.
@@ -1542,12 +1570,14 @@ class LiteTranslator {
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                         Register base, Register offset_reg) {
     // region digitalis
-    // Handle SIMD load/store with register offset: LDR/STR Vt, [Xn, Xm{, LSL #shift}]
+    // Handle SIMD load/store with register offset:
+    //   LDR/STR Vt, [Xn, (X|W)m{, extend{ #shift}}]
+    // The offset register may need UXTW / SXTW / UXTX / SXTX extension
+    // before shift+add, exactly like the GP load/store path.
     Register addr = AllocTempReg();
     if (addr == no_register) { Undefined(); return; }
 
-    // Compute effective address: base + (offset_reg << shift_amount)
-    as_.Movq(addr, offset_reg);
+    ApplyOffsetExtend(addr, offset_reg, args.extend_type);
     if (args.shift_amount > 0) {
       as_.Shlq(addr, static_cast<int8_t>(args.shift_amount));
     }
