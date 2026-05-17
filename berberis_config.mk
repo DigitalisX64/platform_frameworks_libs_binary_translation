@@ -89,8 +89,75 @@ BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 := \
 BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 += $(NATIVE_BRIDGE_PRODUCT_PACKAGES)
 
 BERBERIS_DISTRIBUTION_ARTIFACTS_ARM64 := \
+    system/bin/arm64/app_process64 \
+    system/bin/arm64/linker64 \
+    system/etc/init/berberis.rc \
     system/etc/ld.config.arm64.txt \
-    system/lib64/libberberis_arm64.so
+    system/lib64/libberberis_arm64.so \
+    system/lib64/libberberis_exec_region.so \
+    system/lib64/libberberis_proxy_libEGL.so \
+    system/lib64/libberberis_proxy_libGLESv1_CM.so \
+    system/lib64/libberberis_proxy_libGLESv2.so \
+    system/lib64/libberberis_proxy_libGLESv3.so \
+    system/lib64/libberberis_proxy_libOpenMAXAL.so \
+    system/lib64/libberberis_proxy_libOpenSLES.so \
+    system/lib64/libberberis_proxy_libaaudio.so \
+    system/lib64/libberberis_proxy_libamidi.so \
+    system/lib64/libberberis_proxy_libandroid.so \
+    system/lib64/libberberis_proxy_libandroid_runtime.so \
+    system/lib64/libberberis_proxy_libbinder_ndk.so \
+    system/lib64/libberberis_proxy_libc.so \
+    system/lib64/libberberis_proxy_libcamera2ndk.so \
+    system/lib64/libberberis_proxy_libjnigraphics.so \
+    system/lib64/libberberis_proxy_libm.so \
+    system/lib64/libberberis_proxy_libmediandk.so \
+    system/lib64/libberberis_proxy_libnativehelper.so \
+    system/lib64/libberberis_proxy_libnativewindow.so \
+    system/lib64/libberberis_proxy_libneuralnetworks.so \
+    system/lib64/libberberis_proxy_libvulkan.so \
+    system/lib64/libberberis_proxy_libwebviewchromium_plat_support.so \
+    system/lib64/arm64/ld-android.so \
+    system/lib64/arm64/libEGL.so \
+    system/lib64/arm64/libGLESv1_CM.so \
+    system/lib64/arm64/libGLESv2.so \
+    system/lib64/arm64/libGLESv3.so \
+    system/lib64/arm64/libOpenMAXAL.so \
+    system/lib64/arm64/libOpenSLES.so \
+    system/lib64/arm64/libaaudio.so \
+    system/lib64/arm64/libamidi.so \
+    system/lib64/arm64/libandroid.so \
+    system/lib64/arm64/libandroid_runtime.so \
+    system/lib64/arm64/libandroidicu.so \
+    system/lib64/arm64/libbase.so \
+    system/lib64/arm64/libbinder_ndk.so \
+    system/lib64/arm64/libc++.so \
+    system/lib64/arm64/libc.so \
+    system/lib64/arm64/libcamera2ndk.so \
+    system/lib64/arm64/libcompiler_rt.so \
+    system/lib64/arm64/libcrypto.so \
+    system/lib64/arm64/libcutils.so \
+    system/lib64/arm64/libdl.so \
+    system/lib64/arm64/libdl_android.so \
+    system/lib64/arm64/libicu.so \
+    system/lib64/arm64/libicui18n.so \
+    system/lib64/arm64/libicuuc.so \
+    system/lib64/arm64/libjnigraphics.so \
+    system/lib64/arm64/liblog.so \
+    system/lib64/arm64/libm.so \
+    system/lib64/arm64/libmediandk.so \
+    system/lib64/arm64/libnative_bridge_vdso.so \
+    system/lib64/arm64/libnativehelper.so \
+    system/lib64/arm64/libnativewindow.so \
+    system/lib64/arm64/libneuralnetworks.so \
+    system/lib64/arm64/libsqlite.so \
+    system/lib64/arm64/libssl.so \
+    system/lib64/arm64/libstdc++.so \
+    system/lib64/arm64/libsync.so \
+    system/lib64/arm64/libutils.so \
+    system/lib64/arm64/libvndksupport.so \
+    system/lib64/arm64/libvulkan.so \
+    system/lib64/arm64/libwebviewchromium_plat_support.so \
+    system/lib64/arm64/libz.so
 # endregion
 
 BERBERIS_DISTRIBUTION_ARTIFACTS_RISCV64 := \
