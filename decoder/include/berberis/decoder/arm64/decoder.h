@@ -2125,15 +2125,24 @@ class Decoder {
     uint8_t rt = GetBits<0, 5>();
 
     uint8_t num_regs;
+    bool is_interleaved;
     switch (opcode) {
-      case 0b0111: num_regs = 1; break;
-      case 0b1010: num_regs = 2; break;
-      case 0b0110: num_regs = 3; break;
-      case 0b0010: num_regs = 4; break;
+      // LD1 / ST1 with N contiguous registers (no de-interleave).
+      case 0b0111: num_regs = 1; is_interleaved = false; break;
+      case 0b1010: num_regs = 2; is_interleaved = false; break;
+      case 0b0110: num_regs = 3; is_interleaved = false; break;
+      case 0b0010: num_regs = 4; is_interleaved = false; break;
+      // region digitalis - LD2 / LD3 / LD4 (de-interleaving on load,
+      // interleaving on store). Distinct from LDn-with-1-reg-N-times.
+      case 0b1000: num_regs = 2; is_interleaved = true; break;
+      case 0b0100: num_regs = 3; is_interleaved = true; break;
+      case 0b0000: num_regs = 4; is_interleaved = true; break;
+      // endregion
       default: Undefined(); return;
     }
 
-    insn_consumer_->AdvSimdMultiStruct(rt, rn, num_regs, size, q, !is_load, postindex, rm);
+    insn_consumer_->AdvSimdMultiStruct(rt, rn, num_regs, size, q, !is_load, postindex, rm,
+                                       is_interleaved);
   }
 
   //

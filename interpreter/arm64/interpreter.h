@@ -1197,38 +1197,110 @@ class Interpreter {
   // endregion
 
   // region digitalis
-  void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t /*size*/,
-                          bool q, bool is_store, bool postindex, uint8_t rm) {
+  //
+  // Multi-structure load/store. Two distinct families share this entry:
+  //
+  //   is_interleaved == false  ->  LD1 / ST1 with N contiguous registers.
+  //                                Each Vreg gets vec_bytes of memory in
+  //                                sequence. No element reordering -- what
+  //                                NEON-optimised memcpy / strcmp in Bionic
+  //                                libc emits.
+  //
+  //   is_interleaved == true   ->  LD2 / LD3 / LD4 (and their store dual).
+  //                                Memory is element-interleaved across N
+  //                                vectors; the load de-interleaves into
+  //                                V[rt..rt+N-1], the store interleaves
+  //                                from them. Used by audio/image codecs
+  //                                and compression libraries (e.g.
+  //                                Facebook's superpack).
+  //
+  // Treating the interleaved family as contiguous (the prior behaviour) was
+  // silently wrong; treating the contiguous family as interleaved is also
+  // silently wrong. The decoder splits the two via the is_interleaved flag.
+  //
+  void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t size,
+                          bool q, bool is_store, bool postindex, uint8_t rm,
+                          bool is_interleaved) {
     CHECK(!exception_raised_);
     uint8_t vec_bytes = q ? 16 : 8;
     uint64_t base_addr = (rn == 31) ? GetSp() : state_->cpu.x[rn];
 
-    for (uint8_t r = 0; r < num_regs; r++) {
-      uint8_t vreg = (rt + r) & 31;
-      uint64_t addr = base_addr + r * vec_bytes;
-      if (is_store) {
-        __uint128_t val = state_->cpu.v[vreg];
-        void* ptr = ToHostAddr<void>(addr);
-        if (FaultyStore(ptr, 8, static_cast<uint64_t>(val))) {
-          HandleMemoryFault(addr); return;
+    if (!is_interleaved) {
+      // LD1 / ST1 multi-reg — contiguous. Bulk 8-byte transfers per vec.
+      for (uint8_t r = 0; r < num_regs; r++) {
+        uint8_t vreg = (rt + r) & 31;
+        uint64_t addr = base_addr + r * vec_bytes;
+        if (is_store) {
+          __uint128_t val = state_->cpu.v[vreg];
+          void* ptr = ToHostAddr<void>(addr);
+          if (FaultyStore(ptr, 8, static_cast<uint64_t>(val))) {
+            HandleMemoryFault(addr); return;
+          }
+          if (vec_bytes > 8) {
+            uint64_t hi = static_cast<uint64_t>(val >> 64);
+            if (FaultyStore(static_cast<uint8_t*>(ptr) + 8, 8, hi)) {
+              HandleMemoryFault(addr + 8); return;
+            }
+          }
+        } else {
+          void* ptr = ToHostAddr<void>(addr);
+          FaultyLoadResult lo = FaultyLoad(ptr, 8);
+          if (lo.is_fault) { HandleMemoryFault(addr); return; }
+          if (vec_bytes > 8) {
+            FaultyLoadResult hi = FaultyLoad(static_cast<uint8_t*>(ptr) + 8, 8);
+            if (hi.is_fault) { HandleMemoryFault(addr + 8); return; }
+            state_->cpu.v[vreg] = static_cast<__uint128_t>(lo.value) |
+                                  (static_cast<__uint128_t>(hi.value) << 64);
+          } else {
+            state_->cpu.v[vreg] = static_cast<__uint128_t>(lo.value);
+          }
         }
-        if (vec_bytes > 8) {
-          uint64_t hi = static_cast<uint64_t>(val >> 64);
-          if (FaultyStore(static_cast<uint8_t*>(ptr) + 8, 8, hi)) {
-            HandleMemoryFault(addr + 8); return;
+      }
+    } else {
+      // LD2 / LD3 / LD4 / ST2 / ST3 / ST4 — element-interleaved memory.
+      // Stage everything through a packed buffer (max 64 B = 4 regs * 16 B),
+      // then de-interleave on load or interleave on store. Bulk 8-byte
+      // FaultyLoad/Store calls keep syscall overhead low.
+      uint8_t esize = 1u << size;  // 1, 2, 4, or 8 bytes per element
+      if (esize > vec_bytes) { Undefined(); return; }
+      uint8_t elems_per_vec = vec_bytes / esize;
+      uint64_t total_bytes = static_cast<uint64_t>(num_regs) * vec_bytes;
+      alignas(16) uint8_t buf[64];
+
+      if (is_store) {
+        // Pack: buf[e*n + r] = V[rt+r][e]
+        for (uint8_t e = 0; e < elems_per_vec; e++) {
+          for (uint8_t r = 0; r < num_regs; r++) {
+            uint8_t vreg = (rt + r) & 31;
+            __uint128_t val = state_->cpu.v[vreg];
+            memcpy(buf + (e * num_regs + r) * esize,
+                   reinterpret_cast<const uint8_t*>(&val) + e * esize, esize);
+          }
+        }
+        void* base_ptr = ToHostAddr<void>(base_addr);
+        for (uint64_t off = 0; off + 8 <= total_bytes; off += 8) {
+          uint64_t chunk;
+          memcpy(&chunk, buf + off, 8);
+          if (FaultyStore(static_cast<uint8_t*>(base_ptr) + off, 8, chunk)) {
+            HandleMemoryFault(base_addr + off); return;
           }
         }
       } else {
-        void* ptr = ToHostAddr<void>(addr);
-        FaultyLoadResult lo = FaultyLoad(ptr, 8);
-        if (lo.is_fault) { HandleMemoryFault(addr); return; }
-        if (vec_bytes > 8) {
-          FaultyLoadResult hi = FaultyLoad(static_cast<uint8_t*>(ptr) + 8, 8);
-          if (hi.is_fault) { HandleMemoryFault(addr + 8); return; }
-          state_->cpu.v[vreg] = static_cast<__uint128_t>(lo.value) |
-                                (static_cast<__uint128_t>(hi.value) << 64);
-        } else {
-          state_->cpu.v[vreg] = static_cast<__uint128_t>(lo.value);
+        void* base_ptr = ToHostAddr<void>(base_addr);
+        for (uint64_t off = 0; off + 8 <= total_bytes; off += 8) {
+          FaultyLoadResult res = FaultyLoad(static_cast<uint8_t*>(base_ptr) + off, 8);
+          if (res.is_fault) { HandleMemoryFault(base_addr + off); return; }
+          memcpy(buf + off, &res.value, 8);
+        }
+        // De-interleave: V[rt+r][e] = buf[e*n + r]
+        for (uint8_t r = 0; r < num_regs; r++) {
+          __uint128_t val = 0;  // upper lanes zero when Q=0
+          for (uint8_t e = 0; e < elems_per_vec; e++) {
+            memcpy(reinterpret_cast<uint8_t*>(&val) + e * esize,
+                   buf + (e * num_regs + r) * esize, esize);
+          }
+          uint8_t vreg = (rt + r) & 31;
+          state_->cpu.v[vreg] = val;
         }
       }
     }
