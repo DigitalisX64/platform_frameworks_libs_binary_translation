@@ -97,9 +97,21 @@ class TableOfTables {
 
  private:
   struct SplitKey {
-    explicit SplitKey(Key key) : low(key & (kTableSize - 1)), high(key >> kTableBits) {
-      CHECK_EQ(high & ~(kTableSize - 1), 0);
+    // region digitalis - mask top bits before splitting so PAC (ARMv8.3
+    // pointer authentication) and TBI (top byte ignore) pointer tags
+    // carried in bits 48-63 of a guest PC don't trip the table-range
+    // check. With kTableBits = 24 on LP64, only the lower 48 bits index
+    // the two-level table; the masked bits are guaranteed to fit. On
+    // 32-bit Key types and on RISC-V (which doesn't use pointer tagging)
+    // the mask is a no-op.
+    explicit SplitKey(Key key)
+        : low(key & (kTableSize - 1)),
+          high((key >> kTableBits) & (kTableSize - 1)) {
+      // (No CHECK needed — the mask on 'high' makes the range invariant
+      // hold trivially. Without the mask, ARM64 PAC-signed PCs would
+      // fail the previous CHECK_EQ(high & ~(kTableSize-1), 0).)
     }
+    // endregion
 
     const uint32_t low;
     const uint32_t high;
