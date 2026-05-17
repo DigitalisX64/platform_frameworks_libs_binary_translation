@@ -84,6 +84,8 @@ BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 := \
     libberberis_proxy_libvulkan \
     libberberis_proxy_libwebviewchromium_plat_support \
     berberis_prebuilt_arm64 \
+    berberis_program_runner_binfmt_misc_arm64 \
+    berberis_program_runner_arm64 \
     libberberis_arm64
 
 BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 += $(NATIVE_BRIDGE_PRODUCT_PACKAGES)
@@ -91,6 +93,10 @@ BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 += $(NATIVE_BRIDGE_PRODUCT_PACKAGES)
 BERBERIS_DISTRIBUTION_ARTIFACTS_ARM64 := \
     system/bin/arm64/app_process64 \
     system/bin/arm64/linker64 \
+    system/bin/berberis_program_runner_binfmt_misc_arm64 \
+    system/bin/berberis_program_runner_arm64 \
+    system/etc/binfmt_misc/arm64_dyn \
+    system/etc/binfmt_misc/arm64_exe \
     system/etc/init/berberis.rc \
     system/etc/ld.config.arm64.txt \
     system/lib64/libberberis_arm64.so \

@@ -100,3 +100,35 @@ cc_binary {
     defaults: ["berberis_program_runner_arm64_defaults"],
     srcs: [":berberis_program_runner_main_srcs"],
 }
+
+// region digitalis
+// Digitalis: ARM64 guest, x86_64 host program runners. The defaults mirror
+// berberis_program_runner_defaults but link libberberis_arm64 instead of
+// libberberis_riscv64.
+cc_defaults {
+    name: "berberis_program_runner_defaults_arm64_to_x86_64",
+    defaults: ["berberis_defaults_64"],
+    host_supported: true,
+    static_libs: [
+        "libberberis_base",
+        "libberberis_program_runner",
+    ],
+    shared_libs: [
+        "libbase",
+        "libberberis_arm64",
+        "liblog",
+    ],
+}
+
+cc_binary {
+    name: "berberis_program_runner_binfmt_misc_arm64",
+    defaults: ["berberis_program_runner_defaults_arm64_to_x86_64"],
+    srcs: [":berberis_binfmt_misc_srcs"],
+}
+
+cc_binary {
+    name: "berberis_program_runner_arm64",
+    defaults: ["berberis_program_runner_defaults_arm64_to_x86_64"],
+    srcs: [":berberis_program_runner_main_srcs"],
+}
+// endregion
