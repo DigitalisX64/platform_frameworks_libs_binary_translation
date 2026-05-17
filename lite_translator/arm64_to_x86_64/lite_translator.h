@@ -2012,6 +2012,14 @@ class LiteTranslator {
           Register old_val = AllocTempReg();
           if (!success()) return;
           as_.Movq(old_val, Assembler::rax);
+          // region digitalis - byte/halfword forms only update low bits of RAX;
+          // upper bits remain stale. ARM CAS Wt zero-extends to 64. Mask.
+          if (args.size == 0) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFF));
+          } else if (args.size == 1) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFFFF));
+          }
+          // endregion
           SetReg(args.rs, old_val);
         }
         break;
@@ -2044,6 +2052,15 @@ class LiteTranslator {
         ExitGeneratedCode(GetInsnAddr());
         as_.Bind(cont);
 
+        // region digitalis - byte/halfword Xchg leaves upper bits of new_val
+        // as the original guest Xs (copied via Movq above), not zero. ARM SWP
+        // Wt zero-extends the old memory value to 64. Mask.
+        if (args.size == 0) {
+          as_.Andq(new_val, static_cast<int32_t>(0xFF));
+        } else if (args.size == 1) {
+          as_.Andq(new_val, static_cast<int32_t>(0xFFFF));
+        }
+        // endregion
         if (args.rt < 31) SetReg(args.rt, new_val);
         break;
       }
@@ -2075,6 +2092,15 @@ class LiteTranslator {
         ExitGeneratedCode(GetInsnAddr());
         as_.Bind(cont);
 
+        // region digitalis - byte/halfword LockXadd only updates low bits of
+        // addend; upper bits stay as guest Xs. ARM LDADD Wt zero-extends the
+        // old memory value to 64. Mask.
+        if (args.size == 0) {
+          as_.Andq(addend, static_cast<int32_t>(0xFF));
+        } else if (args.size == 1) {
+          as_.Andq(addend, static_cast<int32_t>(0xFFFF));
+        }
+        // endregion
         // addend now contains old value.
         if (args.rt < 31) SetReg(args.rt, addend);
         break;
