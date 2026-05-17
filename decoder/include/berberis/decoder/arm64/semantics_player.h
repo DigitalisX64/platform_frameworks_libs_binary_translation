@@ -104,6 +104,15 @@ class SemanticsPlayer {
     Register target = GetRegOrZero(args.src);
     if (args.is_link) {
       // BLR: save return address in X30.
+      // region digitalis - snapshot target before overwriting X30.
+      // For BLR X30 (or any BLR Xn where Xn maps to the same host register as
+      // X30), SetReg(30, ret_addr) would clobber the host register that still
+      // holds the original branch target. Copy target to a fresh temp first so
+      // ExitRegionIndirect jumps to the correct address.
+      if (args.src == 30) {
+        target = listener_->Copy(target);
+      }
+      // endregion
       Register ret_addr = listener_->GetImm(listener_->GetInsnAddr() + 4);
       listener_->SetReg(30, ret_addr);
     }
