@@ -2584,6 +2584,54 @@ class Interpreter {
         break;
       }
 
+      // --- FP three-same vector ops (Digitalis addition) ---
+      // For FP cases args.size is sz alone (0 = single 32-bit, 1 = double 64-bit),
+      // not the {op_high, sz} pair the raw encoding carries; the decoder
+      // already split that.
+      case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+      case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmlaV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmlsV: {
+        bool is_double = (args.size == 0b01);
+        uint8_t fp_esize = is_double ? 8 : 4;
+        uint8_t fp_num = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_num; i++) {
+          if (is_double) {
+            double a, b, d, r;
+            memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * 8, 8);
+            memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * 8, 8);
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * 8, 8);
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV: r = a + b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV: r = a - b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
+              default: Undefined(); return;
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
+          } else {
+            float a, b, d, r;
+            memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * 4, 4);
+            memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * 4, 4);
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * 4, 4);
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV: r = a + b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV: r = a - b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
+              default: Undefined(); return;
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+          }
+        }
+        // Zero upper 64 bits if Q=0 (already covered by 'result' starting at 0
+        // and the loop only writing the lower lanes when fp_num < 16 / esize).
+        break;
+      }
+
       // --- Opcodes in the enum but not mapped by decoder (CMGT etc.) ---
       default:
         Undefined();

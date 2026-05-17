@@ -557,6 +557,18 @@ class Decoder {
     kUmaxp,     // UMAXP (vector): U=1, opcode=10100
     kSminp,     // SMINP (vector): U=0, opcode=10101
     kUminp,     // UMINP (vector): U=1, opcode=10101
+    // FP three-same (vector). The encoding actually uses bit 23 as
+    // op_high (0 = FADD/FMUL/FMLA half; 1 = FSUB/FMLS half) plus bit
+    // 22 as sz (0 = single 32-bit; 1 = double 64-bit). The args.size
+    // field is repurposed to carry sz alone (so 0b00 = single,
+    // 0b01 = double); the decoder distinguishes FSUB / FMLS from
+    // FADD / FMLA by selecting a different enum value rather than
+    // leaking op_high through args.
+    kFaddV,     // FADD  (vector): op_high=0, opcode=11010, U=0
+    kFsubV,     // FSUB  (vector): op_high=1, opcode=11010, U=0
+    kFmulV,     // FMUL  (vector): op_high=0, opcode=11011, U=1
+    kFmlaV,     // FMLA  (vector): op_high=0, opcode=11001, U=0
+    kFmlsV,     // FMLS  (vector): op_high=1, opcode=11001, U=0
     // endregion
   };
 
@@ -2613,6 +2625,55 @@ class Decoder {
       op = u ? AdvSimdThreeSameOpcode::kUmaxp : AdvSimdThreeSameOpcode::kSmaxp;
     } else if (opcode == 0b10101) {
       op = u ? AdvSimdThreeSameOpcode::kUminp : AdvSimdThreeSameOpcode::kSminp;
+    } else if ((opcode & 0b11000) == 0b11000) {
+      // FP three-same (vector). bits[23] = op_high, bits[22] = sz.
+      // The 'size' field as read above is {op_high, sz} for this encoding;
+      // split it out and pass only sz through args.size so the interpreter
+      // can dispatch element width purely from args.size.
+      bool op_high = (size >> 1) & 1;
+      uint8_t sz = size & 1;
+      bool ok = true;
+      if (!op_high) {
+        switch (opcode) {
+          case 0b11010:
+            if (u) { ok = false; break; }   // FADDP not implemented
+            op = AdvSimdThreeSameOpcode::kFaddV;
+            break;
+          case 0b11011:
+            if (!u) { ok = false; break; }  // FMULX not implemented
+            op = AdvSimdThreeSameOpcode::kFmulV;
+            break;
+          case 0b11001:
+            if (u) { ok = false; break; }   // U=1 reserved here
+            op = AdvSimdThreeSameOpcode::kFmlaV;
+            break;
+          default: ok = false; break;
+        }
+      } else {
+        switch (opcode) {
+          case 0b11010:
+            if (u) { ok = false; break; }   // FABD not implemented
+            op = AdvSimdThreeSameOpcode::kFsubV;
+            break;
+          case 0b11001:
+            if (u) { ok = false; break; }   // U=1 reserved here
+            op = AdvSimdThreeSameOpcode::kFmlsV;
+            break;
+          default: ok = false; break;
+        }
+      }
+      if (!ok) {
+        Undefined();
+        return;
+      }
+      // sz=1 (double) requires Q=1.
+      if (sz && !q) {
+        Undefined();
+        return;
+      }
+      // Pass sz as args.size (0 = single -> 4-byte elements,
+      // 1 = double -> 8-byte elements). Interpreter dispatches on this.
+      size = sz;
     // endregion
     } else {
       Undefined();
