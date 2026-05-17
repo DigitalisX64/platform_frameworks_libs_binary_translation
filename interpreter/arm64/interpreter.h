@@ -2505,14 +2505,15 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kSshl:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int8_t shift = static_cast<int8_t>(b & 0xFF);
-              uint8_t bits = es * 8;
+              // Promote to int32_t so -shift never overflows (int8_t INT8_MIN case).
+              int32_t shift = static_cast<int8_t>(b & 0xFF);
+              uint32_t bits = es * 8;
               if (shift >= 0) {
-                return (shift >= bits) ? 0 : (a << shift);
+                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
                 // Signed shift right: sign-extend a, then shift.
                 int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-                int8_t rshift = -shift;
+                uint32_t rshift = static_cast<uint32_t>(-shift);
                 return static_cast<uint64_t>(
                     (rshift >= bits) ? (sa >> (bits - 1)) : (sa >> rshift));
               }
@@ -2521,12 +2522,12 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kUshl:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int8_t shift = static_cast<int8_t>(b & 0xFF);
-              uint8_t bits = es * 8;
+              int32_t shift = static_cast<int8_t>(b & 0xFF);
+              uint32_t bits = es * 8;
               if (shift >= 0) {
-                return (shift >= bits) ? 0 : (a << shift);
+                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
-                int8_t rshift = -shift;
+                uint32_t rshift = static_cast<uint32_t>(-shift);
                 return (rshift >= bits) ? 0 : (a >> rshift);
               }
             });
@@ -2542,12 +2543,12 @@ class Interpreter {
         // Fallback: treat as SSHL/USHL for basic functionality.
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int8_t shift = static_cast<int8_t>(b & 0xFF);
-              uint8_t bits = es * 8;
+              int32_t shift = static_cast<int8_t>(b & 0xFF);
+              uint32_t bits = es * 8;
               if (shift >= 0) {
-                return (shift >= bits) ? 0 : (a << shift);
+                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
-                int8_t rshift = -shift;
+                uint32_t rshift = static_cast<uint32_t>(-shift);
                 return (rshift >= bits) ? 0 : (a >> rshift);
               }
             });
