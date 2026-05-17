@@ -1561,6 +1561,16 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
+    // region digitalis - PRFM (immediate) is size=0b11, opc=0b10. The
+    // previous check (opc=0b11) never fired and let PRFM execute as
+    // LDRSW Xt, [Xn, #imm12] with Rt=0 (the prefetch type), silently
+    // clobbering X0 with eight bytes from [Xn + imm12]. NOP it.
+    if (size == 0b11 && opc == 0b10) {
+      insn_consumer_->Nop();
+      return;
+    }
+    // endregion
+
     bool is_store = ((opc & 0b01) == 0) && ((opc & 0b10) == 0);
     bool is_signed = (opc & 0b10) != 0;
     bool is_64bit_target = (opc & 0b01) != 0;
@@ -1568,8 +1578,8 @@ class Decoder {
     // opc encoding:
     // 00 = STR
     // 01 = LDR
-    // 10 = LDRS (sign-extend to 64-bit)
-    // 11 = LDRS (sign-extend to 32-bit)  [or PRFM for size=11]
+    // 10 = LDRS (sign-extend to 64-bit)  [size=11 -> PRFM, handled above]
+    // 11 = LDRS (sign-extend to 32-bit)
     if (opc == 0b00) {
       is_store = true;
     } else if (opc == 0b01) {
@@ -1580,12 +1590,6 @@ class Decoder {
       is_signed = true;
       is_64bit_target = true;
     } else {
-      // opc == 0b11
-      if (size == 0b11) {
-        // PRFM - prefetch, treat as NOP.
-        insn_consumer_->Nop();
-        return;
-      }
       is_store = false;
       is_signed = true;
       is_64bit_target = false;
@@ -1663,6 +1667,15 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
+    // region digitalis - PRFUM (prefetch unscaled) shares this encoding with
+    // size=0b11, opc=0b10. NOP it; otherwise it would be decoded as LDURSW
+    // into Rt (prefetch type code), clobbering the destination register.
+    if (size == 0b11 && opc == 0b10) {
+      insn_consumer_->Nop();
+      return;
+    }
+    // endregion
+
     int32_t offset = SignExtend<9>(imm9);
 
     bool is_store;
@@ -1707,6 +1720,19 @@ class Decoder {
     bool s_bit = GetBits<12, 1>();
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
+
+    // region digitalis - PRFM (register) shares this encoding with
+    // size=0b11, opc=0b10. Without this guard, the decoder treats the
+    // prefetch as an LDRSW into Rt (where Rt is the prefetch type code,
+    // typically 0 = pldl1keep), silently clobbering X0 with eight bytes
+    // from [Xn, Xm]. Observed as bad x0 (e.g. 0x000000XX_00070001) in
+    // libsuperpack-jni.so's Brotli/SP2 decompressor on Facebook startup.
+    // PRFM has no architectural side effects we need to emulate; NOP it.
+    if (size == 0b11 && opc == 0b10) {
+      insn_consumer_->Nop();
+      return;
+    }
+    // endregion
 
     bool is_store;
     bool is_signed;
