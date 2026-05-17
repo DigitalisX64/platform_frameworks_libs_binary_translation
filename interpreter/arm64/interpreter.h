@@ -432,22 +432,41 @@ class Interpreter {
     // endregion
   }
 
+  // region digitalis - Apply the correct 32->64 extension to the offset
+  // register before shift+add. extend_type is the raw 3-bit ARMv8
+  // option field; only 010=UXTW, 011=LSL/UXTX, 110=SXTW, 111=SXTX are
+  // valid for memory ops. Bug history: collapsing all four to LSL
+  // silently used bits[63:32] of the X register backing a W offset,
+  // corrupting addresses for SXTW or unclean upper-half UXTW. Discovered
+  // chasing Brotli "Bad context map" in libsuperpack-jni.so.
+  static uint64_t ApplyOffsetExtend(uint64_t reg_val, uint8_t extend_type) {
+    switch (extend_type) {
+      case 0b010:  // UXTW
+        return reg_val & 0xFFFFFFFFULL;
+      case 0b110:  // SXTW
+        return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(reg_val)));
+      case 0b011:  // LSL / UXTX
+      case 0b111:  // SXTX
+      default:
+        return reg_val;
+    }
+  }
+
   Register LoadReg(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
-                   Register base, Register offset_reg, uint8_t shift_amount) {
-    // region digitalis
-    // Compute full 64-bit address directly to avoid int32_t truncation.
-    uint64_t addr = base + (offset_reg << shift_amount);
+                   Register base, Register offset_reg, uint8_t extend_type,
+                   uint8_t shift_amount) {
+    uint64_t off = ApplyOffsetExtend(offset_reg, extend_type) << shift_amount;
+    uint64_t addr = base + off;
     return Load(size, is_signed, is_64bit_target, addr, 0);
-    // endregion
   }
 
   void StoreReg(Decoder::LoadStoreSize size, Register base, Register offset_reg,
-                uint8_t shift_amount, Register data) {
-    // region digitalis
-    uint64_t addr = base + (offset_reg << shift_amount);
+                uint8_t extend_type, uint8_t shift_amount, Register data) {
+    uint64_t off = ApplyOffsetExtend(offset_reg, extend_type) << shift_amount;
+    uint64_t addr = base + off;
     Store(size, addr, 0, data);
-    // endregion
   }
+  // endregion
 
   void Svc(uint16_t /*imm*/) {
     CHECK(!exception_raised_);
@@ -1528,7 +1547,11 @@ class Interpreter {
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                          Register base, Register offset_reg) {
     CHECK(!exception_raised_);
-    uint64_t addr = base + (offset_reg << args.shift_amount);
+    // region digitalis - Apply the offset register extension before
+    // shift+add (see ApplyOffsetExtend comment above).
+    uint64_t off = ApplyOffsetExtend(offset_reg, args.extend_type) << args.shift_amount;
+    uint64_t addr = base + off;
+    // endregion
     void* host_addr = ToHostAddr<void>(addr);
 
     if (args.is_store) {
@@ -2505,14 +2528,15 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kSshl:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int8_t shift = static_cast<int8_t>(b & 0xFF);
-              uint8_t bits = es * 8;
+              // Promote to int32_t so -shift never overflows (int8_t INT8_MIN case).
+              int32_t shift = static_cast<int8_t>(b & 0xFF);
+              uint32_t bits = es * 8;
               if (shift >= 0) {
-                return (shift >= bits) ? 0 : (a << shift);
+                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
                 // Signed shift right: sign-extend a, then shift.
                 int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-                int8_t rshift = -shift;
+                uint32_t rshift = static_cast<uint32_t>(-shift);
                 return static_cast<uint64_t>(
                     (rshift >= bits) ? (sa >> (bits - 1)) : (sa >> rshift));
               }
@@ -2521,12 +2545,12 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kUshl:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int8_t shift = static_cast<int8_t>(b & 0xFF);
-              uint8_t bits = es * 8;
+              int32_t shift = static_cast<int8_t>(b & 0xFF);
+              uint32_t bits = es * 8;
               if (shift >= 0) {
-                return (shift >= bits) ? 0 : (a << shift);
+                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
-                int8_t rshift = -shift;
+                uint32_t rshift = static_cast<uint32_t>(-shift);
                 return (rshift >= bits) ? 0 : (a >> rshift);
               }
             });
@@ -2542,12 +2566,12 @@ class Interpreter {
         // Fallback: treat as SSHL/USHL for basic functionality.
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int8_t shift = static_cast<int8_t>(b & 0xFF);
-              uint8_t bits = es * 8;
+              int32_t shift = static_cast<int8_t>(b & 0xFF);
+              uint32_t bits = es * 8;
               if (shift >= 0) {
-                return (shift >= bits) ? 0 : (a << shift);
+                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
-                int8_t rshift = -shift;
+                uint32_t rshift = static_cast<uint32_t>(-shift);
                 return (rshift >= bits) ? 0 : (a >> rshift);
               }
             });
@@ -3407,6 +3431,44 @@ class Interpreter {
           sum += elem & emask;
         }
         result = sum & emask;  // scalar result in bottom esize bytes, upper zeroed
+        break;
+      }
+      // endregion
+
+      // region digitalis - across-lanes max/min reductions
+      // SMAXV/UMAXV/SMINV/UMINV: reduce a vector to a single scalar lane holding
+      // the signed/unsigned max or min across all input lanes. The scalar result
+      // is placed in the bottom esize bytes of Vd; upper bits are zeroed.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUminv: {
+        if (esize > 4) { Undefined(); return; }  // no 64-bit element form
+        bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSminv);
+        bool is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv);
+        uint8_t bits = esize * 8;
+        uint64_t emask = ElementMask(esize);
+        // Seed accumulator from element 0.
+        uint64_t acc = 0;
+        memcpy(&acc, reinterpret_cast<const uint8_t*>(&src), esize);
+        for (uint8_t i = 1; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          bool elem_wins;
+          if (is_signed) {
+            int64_t s_elem = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+            int64_t s_acc = static_cast<int64_t>(acc << (64 - bits)) >> (64 - bits);
+            elem_wins = is_max ? (s_elem > s_acc) : (s_elem < s_acc);
+          } else {
+            elem_wins = is_max ? (elem > acc) : (elem < acc);
+          }
+          if (elem_wins) acc = elem;
+        }
+        result = acc & emask;
         break;
       }
       // endregion

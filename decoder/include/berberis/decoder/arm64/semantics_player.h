@@ -104,6 +104,15 @@ class SemanticsPlayer {
     Register target = GetRegOrZero(args.src);
     if (args.is_link) {
       // BLR: save return address in X30.
+      // region digitalis - snapshot target before overwriting X30.
+      // For BLR X30 (or any BLR Xn where Xn maps to the same host register as
+      // X30), SetReg(30, ret_addr) would clobber the host register that still
+      // holds the original branch target. Copy target to a fresh temp first so
+      // ExitRegionIndirect jumps to the correct address.
+      if (args.src == 30) {
+        target = listener_->Copy(target);
+      }
+      // endregion
       Register ret_addr = listener_->GetImm(listener_->GetInsnAddr() + 4);
       listener_->SetReg(30, ret_addr);
     }
@@ -205,14 +214,22 @@ class SemanticsPlayer {
     Register base = GetRegOrSp(args.rn);
     Register offset_reg = GetRegOrZero(args.rm);
 
+    // region digitalis - Forward extend_type so the handler can apply
+    // the correct 32->64 extension (UXTW vs SXTW vs LSL/SXTX) before
+    // shift+add. Previously this collapsed to LSL and corrupted the
+    // address whenever the offset W register had nonzero upper half or
+    // SXTW was actually requested.
     if (args.is_store) {
       Register data = GetRegOrZero(args.rt);
-      listener_->StoreReg(args.size, base, offset_reg, args.shift_amount, data);
+      listener_->StoreReg(args.size, base, offset_reg, args.extend_type,
+                          args.shift_amount, data);
     } else {
       Register result = listener_->LoadReg(args.size, args.is_signed, args.is_64bit_target,
-                                           base, offset_reg, args.shift_amount);
+                                           base, offset_reg, args.extend_type,
+                                           args.shift_amount);
       SetRegOrIgnore(args.rt, result);
     }
+    // endregion
   }
 
   void Svc(const typename Decoder::SvcArgs& args) {

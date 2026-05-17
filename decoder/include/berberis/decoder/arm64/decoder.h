@@ -297,7 +297,19 @@ class Decoder {
     uint8_t rt;
     uint8_t rn;
     uint8_t rm;
-    ShiftType extend_type;
+    // region digitalis - raw 3-bit ARMv8 option field:
+    // 000=UXTB, 001=UXTH, 010=UXTW, 011=LSL (UXTX), 100=SXTB,
+    // 101=SXTH, 110=SXTW, 111=SXTX. Only 010/011/110/111 are valid for
+    // a load/store address; the encoded option is preserved so the JIT
+    // and interpreter can apply the correct 32->64 extension before
+    // shifting/adding to the base. Throwing this away (treating SXTW or
+    // UXTW as LSL) silently uses bits[63:32] of the X register that
+    // backs the W offset, corrupting addresses for sign-extended or
+    // unclean upper-half offsets. See libsuperpack-jni.so hot loops at
+    // 0x34488 / 0x344a4 where ldrb [..., w, uxtw] is the entire decode
+    // inner kernel.
+    uint8_t extend_type;
+    // endregion
     uint8_t shift_amount;
     LoadStoreSize size;
     bool is_store;
@@ -426,6 +438,11 @@ class Decoder {
     uint8_t rt;
     uint8_t rn;
     uint8_t rm;
+    // region digitalis - raw 3-bit ARMv8 option field for the offset
+    // register, same encoding as LoadStoreRegArgs::extend_type. See the
+    // comment there.
+    uint8_t extend_type;
+    // endregion
     uint8_t shift_amount;
     SimdLoadStoreSize size;
     bool is_store;
@@ -746,7 +763,13 @@ class Decoder {
     kFabs,
     kFneg,
     // region digitalis
-    kAddv,      // ADDV (across lanes): U=0, opcode=11011 (across-lanes group, bit20=1)
+    // Across-lanes reductions share the two-reg-misc dispatch path but are
+    // distinguished by bit20=1 (across-lanes group) vs bit20=0 (two-reg-misc).
+    kAddv,      // ADDV: U=0, opcode=11011
+    kSmaxv,     // SMAXV: U=0, opcode=01010
+    kUmaxv,     // UMAXV: U=1, opcode=01010
+    kSminv,     // SMINV: U=0, opcode=11010
+    kUminv,     // UMINV: U=1, opcode=11010
     // endregion
   };
 
@@ -1709,17 +1732,14 @@ class Decoder {
 
     uint8_t shift_amount = s_bit ? size : 0;
 
-    // Map option to extend type / shift type.
-    // option=011 => LSL (default), option=010 => UXTW, option=110 => SXTW, option=111 => SXTX
-    ShiftType shift_type;
+    // region digitalis - Validate option field. Only word-or-larger
+    // offsets are encodable: 010=UXTW, 011=LSL/UXTX, 110=SXTW, 111=SXTX.
+    // Other options are UNDEFINED per ARMv8.
     switch (option) {
-      case 0b011:
-        shift_type = ShiftType::kLsl;
-        break;
       case 0b010:
+      case 0b011:
       case 0b110:
       case 0b111:
-        shift_type = ShiftType::kLsl;  // We simplify; extend handling is in the interpreter.
         break;
       default:
         return Undefined();
@@ -1729,13 +1749,14 @@ class Decoder {
         .rt = rt,
         .rn = rn,
         .rm = rm,
-        .extend_type = shift_type,
+        .extend_type = option,
         .shift_amount = shift_amount,
         .size = LoadStoreSize{size},
         .is_store = is_store,
         .is_signed = is_signed,
         .is_64bit_target = is_64bit_target,
     };
+    // endregion
     insn_consumer_->LoadStoreReg(args);
   }
 
@@ -2098,14 +2119,31 @@ class Decoder {
     else if (size == 0b00 && opc == 0b11) { ls_size = SimdLoadStoreSize::k128bit; is_store = false; if (s_bit) shift_amount = 4; }
     else { Undefined(); return; }
 
+    // region digitalis - Reject UNDEFINED option encodings for the
+    // offset register (only 010/011/110/111 are valid SIMD load/store
+    // forms). Preserve the option so the handler can apply the right
+    // extension.
+    switch (option) {
+      case 0b010:
+      case 0b011:
+      case 0b110:
+      case 0b111:
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
     const SimdLoadStoreRegArgs args = {
         .rt = rt,
         .rn = rn,
         .rm = rm,
+        .extend_type = option,
         .shift_amount = shift_amount,
         .size = ls_size,
         .is_store = is_store,
     };
+    // endregion
     insn_consumer_->SimdLoadStoreReg(args);
   }
 
@@ -2825,9 +2863,27 @@ class Decoder {
         op = u ? AdvSimdTwoRegMiscOpcode::kCmleZero : AdvSimdTwoRegMiscOpcode::kCmeqZero;
         break;
       case 0b01010:
-        if (u) { Undefined(); return; }
-        op = AdvSimdTwoRegMiscOpcode::kCmltZero;
+        // region digitalis - bit20 distinguishes across-lanes (1) from two-reg-misc (0).
+        // Across-lanes opcode=01010 is SMAXV (U=0) / UMAXV (U=1).
+        // Two-reg-misc opcode=01010 is CMLT zero (U=0 only; U=1 unallocated).
+        if (GetBits<20, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUmaxv : AdvSimdTwoRegMiscOpcode::kSmaxv;
+          // SMAXV/UMAXV are only defined for size 00/01/10 with Q matching, but the
+          // interpreter validates size; reject 64-bit element which has no encoding.
+          if (size == 0b11) { Undefined(); return; }
+        } else {
+          if (u) { Undefined(); return; }
+          op = AdvSimdTwoRegMiscOpcode::kCmltZero;
+        }
         break;
+      case 0b11010:
+        // Across-lanes opcode=11010 is SMINV (U=0) / UMINV (U=1).
+        // bit20 must be 1; bit20=0 with this opcode is unallocated in two-reg-misc.
+        if (!GetBits<20, 1>()) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kUminv : AdvSimdTwoRegMiscOpcode::kSminv;
+        if (size == 0b11) { Undefined(); return; }
+        break;
+        // endregion
       case 0b01011:
         op = u ? AdvSimdTwoRegMiscOpcode::kNeg : AdvSimdTwoRegMiscOpcode::kAbs;
         break;

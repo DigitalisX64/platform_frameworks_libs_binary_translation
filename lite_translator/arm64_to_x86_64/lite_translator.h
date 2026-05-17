@@ -327,6 +327,53 @@ class LiteTranslator {
         as_.Movzxwl(res, src);
         return res;
       }
+      // region digitalis - general UBFM (UBFX extract; UBFIZ insert).
+      // imms >= immr  → UBFX: extract bits[imms:immr] of src to low bits of dst.
+      // imms <  immr  → UBFIZ: insert low (imms+1) bits of src at position
+      //                  (reg_size - immr); other dst bits zeroed.
+      Register res = AllocTempReg();
+      if (imms >= immr) {
+        // UBFX-like: extract bits.
+        unsigned width = imms - immr + 1;
+        uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        if (is_64bit) {
+          as_.Movq(res, src);
+          if (immr != 0) as_.Shrq(res, static_cast<int8_t>(immr));
+          if (width < 64) {
+            Register mask_reg = AllocTempReg();
+            as_.Movq(mask_reg, static_cast<int64_t>(mask));
+            as_.Andq(res, mask_reg);
+          }
+        } else {
+          as_.Movl(res, src);
+          if (immr != 0) as_.Shrl(res, static_cast<int8_t>(immr));
+          if (width < 32) {
+            as_.Andl(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL));
+          }
+        }
+      } else {
+        // UBFIZ-like: extract low (imms+1) bits of src, shift left by (reg_size - immr).
+        unsigned width = imms + 1;
+        unsigned pos = reg_size - immr;
+        uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        if (is_64bit) {
+          as_.Movq(res, src);
+          if (width < 64) {
+            Register mask_reg = AllocTempReg();
+            as_.Movq(mask_reg, static_cast<int64_t>(mask));
+            as_.Andq(res, mask_reg);
+          }
+          if (pos != 0) as_.Shlq(res, static_cast<int8_t>(pos));
+        } else {
+          as_.Movl(res, src);
+          if (width < 32) {
+            as_.Andl(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL));
+          }
+          if (pos != 0) as_.Shll(res, static_cast<int8_t>(pos));
+        }
+      }
+      return res;
+      // endregion
     }
 
     // Handle common SBFM aliases with direct x86_64 instructions.
@@ -338,9 +385,14 @@ class LiteTranslator {
           as_.Movq(res, src);
           if (immr != 0) as_.Sarq(res, static_cast<int8_t>(immr));
         } else {
+          // ASR Wd, Wn, #imm: 32-bit arithmetic shift. Sarl writes the result
+          // to the low 32 bits and (per x86 semantics) zero-extends to 64.
+          // ARM64 W-register writes also zero the upper 32 bits of Xd, so the
+          // zero-extension we get from Sarl is exactly correct — do NOT
+          // sign-extend further, that would corrupt the upper 32 with the sign
+          // of bit 31 of the shifted W-value.
           as_.Movl(res, src);
           if (immr != 0) as_.Sarl(res, static_cast<int8_t>(immr));
-          as_.Movsxlq(res, res);  // sign-extend to 64-bit for consistency
         }
         return res;
       }
@@ -443,8 +495,24 @@ class LiteTranslator {
     as_.Bind(cont);
   }
 
+  // region digitalis - ARM64 TBI (Top Byte Ignore): mask the top 8 bits of an
+  // address register before using it in a host x86 load/store. ARM64 ignores
+  // the top byte of pointers in load/store; x86 doesn't, so we must clear it
+  // ourselves. Returns a temp register holding (base & 0x00FFFFFFFFFFFFFF).
+  Register ApplyTbi(Register base) {
+    Register tbi = AllocTempReg();
+    as_.Movq(tbi, base);
+    as_.Shlq(tbi, static_cast<int8_t>(8));
+    as_.Shrq(tbi, static_cast<int8_t>(8));
+    return tbi;
+  }
+  // endregion
+
   Register Load(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
                 Register base, int32_t offset) {
+    // region digitalis - apply TBI mask before using base as memory operand.
+    base = ApplyTbi(base);
+    // endregion
     AssemblerBase::Label* recovery_label = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery_label);
 
@@ -496,6 +564,9 @@ class LiteTranslator {
   }
 
   void Store(Decoder::LoadStoreSize size, Register base, int32_t offset, Register data) {
+    // region digitalis - apply TBI mask before using base as memory operand.
+    base = ApplyTbi(base);
+    // endregion
     AssemblerBase::Label* recovery_label = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery_label);
 
@@ -556,11 +627,37 @@ class LiteTranslator {
     Store(size, base, static_cast<int32_t>(scale), data2);
   }
 
+  // region digitalis - Apply the correct 32->64 extension to the offset
+  // register before shift+add. Without this, ldrb/ldr [Xn, Wm, UXTW]
+  // and SXTW forms can produce wrong addresses (silent data corruption,
+  // not faults — observed as Brotli "Bad context map" in
+  // libsuperpack-jni.so's decompressor on Facebook startup).
+  void ApplyOffsetExtend(Register dst, Register src, uint8_t extend_type) {
+    // extend_type encoding (3-bit option from the encoded instruction):
+    //   010=UXTW, 011=LSL (UXTX), 110=SXTW, 111=SXTX
+    // Smaller-byte forms (UXTB etc.) are not encodable for load/store.
+    switch (extend_type) {
+      case 0b010:  // UXTW: zero-extend low 32 bits (32-bit mov zero-extends)
+        as_.Movl(dst, src);
+        break;
+      case 0b110:  // SXTW: sign-extend low 32 bits to 64
+        as_.Movsxlq(dst, src);
+        break;
+      case 0b011:  // LSL / UXTX: full 64-bit value, no extension
+      case 0b111:  // SXTX: full 64-bit value, sign-extend is a no-op
+      default:
+        as_.Movq(dst, src);
+        break;
+    }
+  }
+
   Register LoadReg(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
-                   Register base, Register offset_reg, uint8_t shift_amount) {
-    // Compute address: base + (offset_reg << shift_amount)
+                   Register base, Register offset_reg, uint8_t extend_type,
+                   uint8_t shift_amount) {
+    // Compute address: base + extend(offset_reg) << shift_amount
     Register addr = AllocTempReg();
-    as_.Movq(addr, offset_reg);
+    if (!success()) return no_register;
+    ApplyOffsetExtend(addr, offset_reg, extend_type);
     if (shift_amount != 0) {
       as_.Shlq(addr, static_cast<int8_t>(shift_amount));
     }
@@ -569,16 +666,18 @@ class LiteTranslator {
   }
 
   void StoreReg(Decoder::LoadStoreSize size, Register base, Register offset_reg,
-                uint8_t shift_amount, Register data) {
-    // Compute address: base + (offset_reg << shift_amount)
+                uint8_t extend_type, uint8_t shift_amount, Register data) {
+    // Compute address: base + extend(offset_reg) << shift_amount
     Register addr = AllocTempReg();
-    as_.Movq(addr, offset_reg);
+    if (!success()) return;
+    ApplyOffsetExtend(addr, offset_reg, extend_type);
     if (shift_amount != 0) {
       as_.Shlq(addr, static_cast<int8_t>(shift_amount));
     }
     as_.Addq(addr, base);
     Store(size, addr, 0, data);
   }
+  // endregion
 
   void Svc(uint16_t imm) {
     // region digitalis - SVC must be handled by interpreter, not JIT.
@@ -1328,6 +1427,9 @@ class LiteTranslator {
   }
 
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
+    // region digitalis - apply TBI mask before using base as memory operand.
+    base = ApplyTbi(base);
+    // endregion
     // region digitalis
     // Handle 128-bit SIMD load/store with immediate offset (STR/LDR Q-register).
     if (args.size == Decoder::SimdLoadStoreSize::k128bit) {
@@ -1432,6 +1534,9 @@ class LiteTranslator {
   }
 
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register addr) {
+    // region digitalis - apply TBI mask before using addr as memory operand.
+    addr = ApplyTbi(addr);
+    // endregion
     // region digitalis
     // Handle 128-bit pair store/load (STP/LDP q-register).
     if (args.size == Decoder::SimdLoadStoreSize::k128bit) {
@@ -1465,16 +1570,22 @@ class LiteTranslator {
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                         Register base, Register offset_reg) {
     // region digitalis
-    // Handle SIMD load/store with register offset: LDR/STR Vt, [Xn, Xm{, LSL #shift}]
+    // Handle SIMD load/store with register offset:
+    //   LDR/STR Vt, [Xn, (X|W)m{, extend{ #shift}}]
+    // The offset register may need UXTW / SXTW / UXTX / SXTX extension
+    // before shift+add, exactly like the GP load/store path.
     Register addr = AllocTempReg();
     if (addr == no_register) { Undefined(); return; }
 
-    // Compute effective address: base + (offset_reg << shift_amount)
-    as_.Movq(addr, offset_reg);
+    ApplyOffsetExtend(addr, offset_reg, args.extend_type);
     if (args.shift_amount > 0) {
       as_.Shlq(addr, static_cast<int8_t>(args.shift_amount));
     }
     as_.Addq(addr, base);
+    // region digitalis - apply TBI mask (top byte ignored on ARM64).
+    as_.Shlq(addr, static_cast<int8_t>(8));
+    as_.Shrq(addr, static_cast<int8_t>(8));
+    // endregion
 
     int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + args.rt * 16;
 
@@ -1836,6 +1947,9 @@ class LiteTranslator {
 
   // region digitalis - Atomics JIT
   void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
+    // region digitalis - apply TBI mask before using base as memory operand.
+    base = ApplyTbi(base);
+    // endregion
     auto lss = static_cast<Decoder::LoadStoreSize>(args.size);
     Assembler::Operand mem{.base = base, .disp = 0};
 
@@ -1898,6 +2012,14 @@ class LiteTranslator {
           Register old_val = AllocTempReg();
           if (!success()) return;
           as_.Movq(old_val, Assembler::rax);
+          // region digitalis - byte/halfword forms only update low bits of RAX;
+          // upper bits remain stale. ARM CAS Wt zero-extends to 64. Mask.
+          if (args.size == 0) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFF));
+          } else if (args.size == 1) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFFFF));
+          }
+          // endregion
           SetReg(args.rs, old_val);
         }
         break;
@@ -1930,6 +2052,15 @@ class LiteTranslator {
         ExitGeneratedCode(GetInsnAddr());
         as_.Bind(cont);
 
+        // region digitalis - byte/halfword Xchg leaves upper bits of new_val
+        // as the original guest Xs (copied via Movq above), not zero. ARM SWP
+        // Wt zero-extends the old memory value to 64. Mask.
+        if (args.size == 0) {
+          as_.Andq(new_val, static_cast<int32_t>(0xFF));
+        } else if (args.size == 1) {
+          as_.Andq(new_val, static_cast<int32_t>(0xFFFF));
+        }
+        // endregion
         if (args.rt < 31) SetReg(args.rt, new_val);
         break;
       }
@@ -1961,6 +2092,15 @@ class LiteTranslator {
         ExitGeneratedCode(GetInsnAddr());
         as_.Bind(cont);
 
+        // region digitalis - byte/halfword LockXadd only updates low bits of
+        // addend; upper bits stay as guest Xs. ARM LDADD Wt zero-extends the
+        // old memory value to 64. Mask.
+        if (args.size == 0) {
+          as_.Andq(addend, static_cast<int32_t>(0xFF));
+        } else if (args.size == 1) {
+          as_.Andq(addend, static_cast<int32_t>(0xFFFF));
+        }
+        // endregion
         // addend now contains old value.
         if (args.rt < 31) SetReg(args.rt, addend);
         break;
