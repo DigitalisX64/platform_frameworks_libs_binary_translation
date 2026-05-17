@@ -1326,6 +1326,59 @@ TEST_F(Arm64LiteTranslateRegionTest, OrderfileCrashPattern_9Registers) {
   EXPECT_EQ(state_.cpu.x[10], 42ULL);  // min_count updated to 42
   EXPECT_EQ(state_.cpu.x[9], 1ULL);    // counter incremented
 }
+
+// region digitalis - regression test for WhatsApp libsuperpack vtable dispatcher.
+// LDP Xt1, Xt2, [Xn] where Xt1 (or Xt2) aliases Xn must load BOTH values from
+// the *original* base address, not from "base updated with val1". Previously
+// LoadPair did SetReg(rt1, val1) between the two underlying Loads — and since
+// the second Load used the same host register as `base`, it read from (val1 +
+// scale) instead of (base + scale). The bug manifested as a hard SIGSEGV at
+// jump to non-canonical address `0x624c000010cc0000` in WhatsApp's
+// `Java_com_facebook_superpack_AssetDecompressor_testDecompressorLibraryUsable`
+// when the dispatcher `ldp x0, x8, [x0]; ldr x3, [x8, #0x28]; br x3` ran with
+// x0 = wrapper object: x8 ended up as `*(obj[0] + 8)` instead of obj[1].
+//
+// LDP Xt1, Xt2, [Xn]: 1010_1001_01_imm7_Rt2_Rn_Rt1 (32-bit), use unsigned
+// signed-offset variant for offset=0 (imm7=0).
+constexpr uint32_t LdpX(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm7) {
+  uint32_t imm = static_cast<uint32_t>(imm7) & 0x7F;
+  return 0xA9400000 | (imm << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+TEST_F(Arm64LiteTranslateRegionTest, LdpBaseAliasesFirstDest) {
+  // LDP X0, X8, [X0] — base register aliases first destination.
+  // Slot 0 = obj[0] = pointer that, if used as base for slot 1's load, would
+  // produce garbage. Slot 1 = obj[1] = the real value we expect in X8.
+  alignas(16) static uint64_t obj[4] = {
+      0xAAAA'BBBB'CCCC'DDDDULL,  // [0] becomes X0 after LDP
+      0x1122'3344'5566'7788ULL,  // [8] must become X8 — NOT *(obj[0]+8)
+      0xDEAD'BEEF'DEAD'BEEFULL,  // never read
+      0xDEAD'BEEF'DEAD'BEEFULL,
+  };
+  state_.cpu.x[0] = ToGuestAddr(&obj[0]);
+  state_.cpu.x[8] = 0;
+  static const uint32_t code[] = {
+      LdpX(0, 8, 0, 0),  // LDP X0, X8, [X0]
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0xAAAA'BBBB'CCCC'DDDDULL);
+  EXPECT_EQ(state_.cpu.x[8], 0x1122'3344'5566'7788ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, LdpBaseAliasesSecondDest) {
+  // LDP X1, X2, [X2] — base aliases the second destination only. Without the
+  // fix the second Load still reads from the original base (because SetReg
+  // happens after both loads in the corrected code), but verify nothing else
+  // regresses.
+  alignas(16) static uint64_t obj2[2] = {0xCAFEBABE'12345678ULL,
+                                          0xF00DFACE'87654321ULL};
+  state_.cpu.x[2] = ToGuestAddr(&obj2[0]);
+  state_.cpu.x[1] = 0;
+  static const uint32_t code[] = {
+      LdpX(1, 2, 2, 0),  // LDP X1, X2, [X2]
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xCAFEBABE'12345678ULL);
+  EXPECT_EQ(state_.cpu.x[2], 0xF00DFACE'87654321ULL);
+}
 // endregion
 
 }  // namespace

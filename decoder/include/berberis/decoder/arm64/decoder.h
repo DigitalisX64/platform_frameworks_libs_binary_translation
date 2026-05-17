@@ -516,6 +516,9 @@ class Decoder {
     kSmov,         // SMOV: signed move from Vn element to Xd/Wd
     kUmov,         // UMOV: unsigned move from Vn element to Xd/Wd
     kInsElement,   // INS (element): copy Vn element to Vd element
+    // region digitalis - scalar SIMD copy (DUP scalar / MOV Vd, Vn[index])
+    kDupScalar,    // DUP (scalar) / MOV scalar: copy one Vn[index] element into bottom of Vd, zero upper
+    // endregion
   };
 
   struct AdvSimdCopyArgs {
@@ -594,6 +597,16 @@ class Decoder {
     kFmulV,     // FMUL  (vector): op_high=0, opcode=11011, U=1
     kFmlaV,     // FMLA  (vector): op_high=0, opcode=11001, U=0
     kFmlsV,     // FMLS  (vector): op_high=1, opcode=11001, U=0
+    kFmaxnmV,   // FMAXNM (vector): op_high=0, opcode=11000, U=0
+    kFminnmV,   // FMINNM (vector): op_high=1, opcode=11000, U=0
+    kFmaxV,     // FMAX   (vector): op_high=0, opcode=11110, U=0
+    kFminV,     // FMIN   (vector): op_high=1, opcode=11110, U=0
+    kFdivV,     // FDIV   (vector): op_high=0, opcode=11111, U=1
+    kFcmeqV,    // FCMEQ  (vector): op_high=0, opcode=11100, U=0
+    kFcmgeV,    // FCMGE  (vector): op_high=0, opcode=11100, U=1
+    kFcmgtV,    // FCMGT  (vector): op_high=1, opcode=11100, U=1
+    kFacgeV,    // FACGE  (vector): op_high=0, opcode=11101, U=1
+    kFacgtV,    // FACGT  (vector): op_high=1, opcode=11101, U=1
     // endregion
   };
 
@@ -628,6 +641,12 @@ class Decoder {
     kUabdl,    // UABDL/UABDL2: U=1, opcode=0111
     kSabal,    // SABAL/SABAL2: U=0, opcode=0101
     kUabal,    // UABAL/UABAL2: U=1, opcode=0101
+    // region digitalis - wide add/sub: Vd(wide) = Vn(wide) op extend(Vm(narrow))
+    kSaddw,    // SADDW/SADDW2: U=0, opcode=0001
+    kUaddw,    // UADDW/UADDW2: U=1, opcode=0001
+    kSsubw,    // SSUBW/SSUBW2: U=0, opcode=0011
+    kUsubw,    // USUBW/USUBW2: U=1, opcode=0011
+    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -770,6 +789,12 @@ class Decoder {
     kUmaxv,     // UMAXV: U=1, opcode=01010
     kSminv,     // SMINV: U=0, opcode=11010
     kUminv,     // UMINV: U=1, opcode=11010
+    kSuqadd,    // SUQADD: U=0, opcode=00011, bit20=0 (signed sat acc of unsigned)
+    kUsqadd,    // USQADD: U=1, opcode=00011, bit20=0 (unsigned sat acc of signed)
+    kSaddlv,    // SADDLV: U=0, opcode=00011, bit20=1 (signed add long across)
+    kUaddlv,    // UADDLV: U=1, opcode=00011, bit20=1 (unsigned add long across)
+    kScvtfV,    // SCVTF (vector, integer): U=0, opcode=11101, bit23=0
+    kUcvtfV,    // UCVTF (vector, integer): U=1, opcode=11101, bit23=0
     // endregion
   };
 
@@ -798,6 +823,62 @@ class Decoder {
     uint8_t rd;
     uint8_t rn;
     uint8_t size;   // 0=single, 1=double
+  };
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD scalar three same opcodes.
+  // Encoding: 01 U 11110 size 1 Rm opcode 1 Rn Rd
+  // Scalar variants — operate on the bottom element of each register; only
+  // size=11 (D-form, 64-bit) is typically defined for the integer arithmetic
+  // family (ADD/SUB/CMxx/SHL).
+  //
+  enum class AdvSimdScalarThreeSameOpcode : uint8_t {
+    kAdd,     // ADD  (scalar, D): U=0, opcode=10000
+    kSub,     // SUB  (scalar, D): U=1, opcode=10000
+    kCmgt,    // CMGT (scalar, D): U=0, opcode=00110 (signed >)
+    kCmhi,    // CMHI (scalar, D): U=1, opcode=00110 (unsigned >)
+    kCmge,    // CMGE (scalar, D): U=0, opcode=00111 (signed >=)
+    kCmhs,    // CMHS (scalar, D): U=1, opcode=00111 (unsigned >=)
+    kCmtst,   // CMTST(scalar, D): U=0, opcode=10001 (bitwise AND != 0)
+    kCmeq,    // CMEQ (scalar, D): U=1, opcode=10001
+    kSshl,    // SSHL (scalar, D): U=0, opcode=01000 (signed shift left)
+    kUshl,    // USHL (scalar, D): U=1, opcode=01000 (unsigned shift left)
+    // region digitalis - FP scalar three same.
+    // For FP variants, size bits [23:22] = 1x where bit22 (sz) selects S (0) or D (1).
+    kFabd,    // FABD (scalar, FP): U=1, bit23=1, opcode=11010
+    kFcmgt,   // FCMGT (scalar, FP): U=1, bit23=1, opcode=11100
+    kFcmge,   // FCMGE (scalar, FP): U=1, bit23=0, opcode=11100
+    kFcmeq,   // FCMEQ (scalar, FP): U=0, bit23=0, opcode=11100
+    kFacgt,   // FACGT (scalar, FP): U=1, bit23=1, opcode=11101
+    kFacge,   // FACGE (scalar, FP): U=1, bit23=0, opcode=11101
+    // endregion
+  };
+
+  struct AdvSimdScalarThreeSameArgs {
+    AdvSimdScalarThreeSameOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t size;   // integer: full size field; FP: 0 -> S (32-bit), 1 -> D (64-bit)
+  };
+
+  // AdvSIMD scalar pairwise opcodes.
+  // Encoding: 01 U 11110 size 11000 opcode 10 Rn Rd
+  // Reads a pair of esize elements from Vn (low pair) and combines them into
+  // a single scalar in Vd.
+  enum class AdvSimdScalarPairwiseOpcode : uint8_t {
+    kAddp,    // ADDP (scalar): U=0, size=11, opcode=11011 -> d-form
+    // (FMAXNMP/FMAXP/FMINNMP/FMINP scalar variants live here too, but only
+    //  ADDP scalar is needed at present.)
+  };
+
+  struct AdvSimdScalarPairwiseArgs {
+    AdvSimdScalarPairwiseOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t size;
   };
   // endregion
 
@@ -1561,6 +1642,16 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
+    // region digitalis - PRFM (immediate) is size=0b11, opc=0b10. The
+    // previous check (opc=0b11) never fired and let PRFM execute as
+    // LDRSW Xt, [Xn, #imm12] with Rt=0 (the prefetch type), silently
+    // clobbering X0 with eight bytes from [Xn + imm12]. NOP it.
+    if (size == 0b11 && opc == 0b10) {
+      insn_consumer_->Nop();
+      return;
+    }
+    // endregion
+
     bool is_store = ((opc & 0b01) == 0) && ((opc & 0b10) == 0);
     bool is_signed = (opc & 0b10) != 0;
     bool is_64bit_target = (opc & 0b01) != 0;
@@ -1568,8 +1659,8 @@ class Decoder {
     // opc encoding:
     // 00 = STR
     // 01 = LDR
-    // 10 = LDRS (sign-extend to 64-bit)
-    // 11 = LDRS (sign-extend to 32-bit)  [or PRFM for size=11]
+    // 10 = LDRS (sign-extend to 64-bit)  [size=11 -> PRFM, handled above]
+    // 11 = LDRS (sign-extend to 32-bit)
     if (opc == 0b00) {
       is_store = true;
     } else if (opc == 0b01) {
@@ -1580,12 +1671,6 @@ class Decoder {
       is_signed = true;
       is_64bit_target = true;
     } else {
-      // opc == 0b11
-      if (size == 0b11) {
-        // PRFM - prefetch, treat as NOP.
-        insn_consumer_->Nop();
-        return;
-      }
       is_store = false;
       is_signed = true;
       is_64bit_target = false;
@@ -1663,6 +1748,15 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
+    // region digitalis - PRFUM (prefetch unscaled) shares this encoding with
+    // size=0b11, opc=0b10. NOP it; otherwise it would be decoded as LDURSW
+    // into Rt (prefetch type code), clobbering the destination register.
+    if (size == 0b11 && opc == 0b10) {
+      insn_consumer_->Nop();
+      return;
+    }
+    // endregion
+
     int32_t offset = SignExtend<9>(imm9);
 
     bool is_store;
@@ -1707,6 +1801,19 @@ class Decoder {
     bool s_bit = GetBits<12, 1>();
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
+
+    // region digitalis - PRFM (register) shares this encoding with
+    // size=0b11, opc=0b10. Without this guard, the decoder treats the
+    // prefetch as an LDRSW into Rt (where Rt is the prefetch type code,
+    // typically 0 = pldl1keep), silently clobbering X0 with eight bytes
+    // from [Xn, Xm]. Observed as bad x0 (e.g. 0x000000XX_00070001) in
+    // libsuperpack-jni.so's Brotli/SP2 decompressor on Facebook startup.
+    // PRFM has no architectural side effects we need to emulate; NOP it.
+    if (size == 0b11 && opc == 0b10) {
+      insn_consumer_->Nop();
+      return;
+    }
+    // endregion
 
     bool is_store;
     bool is_signed;
@@ -1809,6 +1916,40 @@ class Decoder {
     if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
         GetBits<17, 5>() == 0b10000 && GetBits<10, 2>() == 0b10) {
       DecodeAdvSimdScalarTwoRegMisc();
+      return;
+    }
+
+    // AdvSIMD scalar copy (DUP scalar / MOV Vd, Vn[index]):
+    //   bit31=0, bit30=1, op=bit29=0, bits[28:24]=11110, bits[23:21]=000,
+    //   bit15=0, imm4=bits[14:11]=0000, bit10=1
+    // Distinct from scalar two-reg misc (bits[21:17]=10000, bits[11:10]=10).
+    // Distinct from FP scalar ops (those have bit30=0).
+    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
+        GetBits<24, 5>() == 0b11110 && GetBits<21, 3>() == 0b000 &&
+        !GetBits<15, 1>() && GetBits<11, 4>() == 0b0000 && GetBits<10, 1>()) {
+      DecodeAdvSimdScalarCopy();
+      return;
+    }
+
+    // AdvSIMD scalar pairwise:
+    //   bit31=0, bit30=1, bits[28:24]=11110, bits[21:17]=11000, bits[11:10]=10
+    // Must be checked BEFORE scalar three same (which only requires bit21=1).
+    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
+        GetBits<17, 5>() == 0b11000 && GetBits<10, 2>() == 0b10) {
+      DecodeAdvSimdScalarPairwise();
+      return;
+    }
+
+    // AdvSIMD scalar three same:
+    //   bit31=0, bit30=1, bits[28:24]=11110, bit21=1, bit10=1
+    // Must be checked AFTER scalar two-reg misc (which requires
+    // bits[20:17]=0000) to avoid mis-routing — for scalar three same we
+    // require Rm != 0 conceptually, but the safer way is just ordering
+    // and demanding bits[14:11] (opcode field) is non-zero in a way
+    // that doesn't match two-reg-misc opcode shape.
+    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
+        GetBits<21, 1>() && GetBits<10, 1>()) {
+      DecodeAdvSimdScalarThreeSame();
       return;
     }
 
@@ -2702,6 +2843,28 @@ class Decoder {
             if (u) { ok = false; break; }   // U=1 reserved here
             op = AdvSimdThreeSameOpcode::kFmlaV;
             break;
+          // region digitalis - FMAXNM/FMAX (op_high=0, U=0); FDIV (U=1);
+          // FCMEQ (U=0)/FCMGE (U=1)/FACGE (U=1) at opcode 11100/11101.
+          case 0b11000:
+            if (u) { ok = false; break; }   // FMAXNMP — not implemented
+            op = AdvSimdThreeSameOpcode::kFmaxnmV;
+            break;
+          case 0b11100:
+            op = u ? AdvSimdThreeSameOpcode::kFcmgeV : AdvSimdThreeSameOpcode::kFcmeqV;
+            break;
+          case 0b11101:
+            if (!u) { ok = false; break; }  // FRECPS — not implemented
+            op = AdvSimdThreeSameOpcode::kFacgeV;
+            break;
+          case 0b11110:
+            if (u) { ok = false; break; }   // FMAXP — not implemented
+            op = AdvSimdThreeSameOpcode::kFmaxV;
+            break;
+          case 0b11111:
+            if (!u) { ok = false; break; }  // FRECPS-low — not implemented
+            op = AdvSimdThreeSameOpcode::kFdivV;
+            break;
+          // endregion
           default: ok = false; break;
         }
       } else {
@@ -2714,6 +2877,24 @@ class Decoder {
             if (u) { ok = false; break; }   // U=1 reserved here
             op = AdvSimdThreeSameOpcode::kFmlsV;
             break;
+          // region digitalis - FMINNM/FMIN (op_high=1, U=0); FCMGT (U=1)/FACGT (U=1).
+          case 0b11000:
+            if (u) { ok = false; break; }   // FMINNMP — not implemented
+            op = AdvSimdThreeSameOpcode::kFminnmV;
+            break;
+          case 0b11100:
+            if (!u) { ok = false; break; }  // op_high=1,U=0 undef at opcode 11100
+            op = AdvSimdThreeSameOpcode::kFcmgtV;
+            break;
+          case 0b11101:
+            if (!u) { ok = false; break; }  // FRSQRTS — not implemented
+            op = AdvSimdThreeSameOpcode::kFacgtV;
+            break;
+          case 0b11110:
+            if (u) { ok = false; break; }   // FMINP — not implemented
+            op = AdvSimdThreeSameOpcode::kFminV;
+            break;
+          // endregion
           default: ok = false; break;
         }
       }
@@ -2782,6 +2963,14 @@ class Decoder {
       case 0b0000:
         op = u ? AdvSimdThreeDiffOpcode::kUaddl : AdvSimdThreeDiffOpcode::kSaddl;
         break;
+      // region digitalis - wide add/sub variants (opcode 0001/0011)
+      case 0b0001:
+        op = u ? AdvSimdThreeDiffOpcode::kUaddw : AdvSimdThreeDiffOpcode::kSaddw;
+        break;
+      case 0b0011:
+        op = u ? AdvSimdThreeDiffOpcode::kUsubw : AdvSimdThreeDiffOpcode::kSsubw;
+        break;
+      // endregion
       case 0b0010:
         op = u ? AdvSimdThreeDiffOpcode::kUsubl : AdvSimdThreeDiffOpcode::kSsubl;
         break;
@@ -2843,6 +3032,20 @@ class Decoder {
       case 0b00010:
         op = u ? AdvSimdTwoRegMiscOpcode::kUaddlp : AdvSimdTwoRegMiscOpcode::kSaddlp;
         break;
+      // region digitalis - opcode 00011 covers two distinct families:
+      //  bit20=0 (bits[21:17]=10000) -> two-reg-misc SUQADD (U=0) / USQADD (U=1)
+      //  bit20=1 (bits[21:17]=11000) -> across-lanes  SADDLV (U=0) / UADDLV (U=1)
+      // Observed `uaddlv h0, v0.8b` (insn 0x2e303800) in WhatsApp's
+      // libar-bundle3.so JNI_OnLoad path.
+      case 0b00011:
+        if (GetBits<20, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUaddlv : AdvSimdTwoRegMiscOpcode::kSaddlv;
+          if (size == 0b11) { Undefined(); return; }  // no 64-bit element
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUsqadd : AdvSimdTwoRegMiscOpcode::kSuqadd;
+        }
+        break;
+      // endregion
       case 0b00100:
         op = u ? AdvSimdTwoRegMiscOpcode::kClz : AdvSimdTwoRegMiscOpcode::kCls;
         break;
@@ -2909,6 +3112,15 @@ class Decoder {
       case 0b01111:
         op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
         break;
+      // region digitalis - SCVTF/UCVTF (vector, integer): opcode=11101, bit23=0.
+      // (bit23=1 with this opcode is FRECPE/FRSQRTE — not implemented here.)
+      // Observed `ucvtf v0.4s, v0.4s` (insn 0x6e21d800) in WhatsApp's
+      // libar-bundle3.so init path.
+      case 0b11101:
+        if (GetBits<23, 1>()) { Undefined(); return; }  // FRECPE/FRSQRTE - TODO
+        op = u ? AdvSimdTwoRegMiscOpcode::kUcvtfV : AdvSimdTwoRegMiscOpcode::kScvtfV;
+        break;
+      // endregion
       // region digitalis
       case 0b11011:
         // ADDV is in the across-lanes group (bit20=1), not two-reg-misc (bit20=0).
@@ -2974,6 +3186,154 @@ class Decoder {
         .size = static_cast<uint8_t>(size & 1),  // 0=single, 1=double
     };
     insn_consumer_->AdvSimdScalarTwoRegMisc(args);
+  }
+  // endregion
+  // region digitalis
+  //
+  // AdvSIMD scalar three same: ADD/SUB/CMxx/SSHL/USHL on scalar D-form.
+  // Encoding: 01 U 11110 size 1 Rm opcode 1 Rn Rd
+  //
+  void DecodeAdvSimdScalarThreeSame() {
+    bool u = GetBits<29, 1>();
+    uint8_t size = GetBits<22, 2>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t opcode = GetBits<11, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    AdvSimdScalarThreeSameOpcode op;
+    uint8_t out_size = size;
+    bool is_fp = false;
+
+    // FP scalar three-same opcodes live in the same encoding class but the
+    // size field is interpreted as bit23=Fp-discriminator (1), bit22=sz.
+    // Distinguish FP by opcode: 11010 (FABD), 11100 (FCMxx), 11101 (FAC..).
+    if (opcode == 0b11010 || opcode == 0b11100 || opcode == 0b11101) {
+      is_fp = true;
+      bool bit23 = (size >> 1) & 1;
+      uint8_t sz = size & 1;  // 0 -> S, 1 -> D
+      switch (opcode) {
+        case 0b11010:
+          if (!u || !bit23) { Undefined(); return; }
+          op = AdvSimdScalarThreeSameOpcode::kFabd;
+          break;
+        case 0b11100:
+          if (u && bit23) op = AdvSimdScalarThreeSameOpcode::kFcmgt;
+          else if (u && !bit23) op = AdvSimdScalarThreeSameOpcode::kFcmge;
+          else if (!u && !bit23) op = AdvSimdScalarThreeSameOpcode::kFcmeq;
+          else { Undefined(); return; }
+          break;
+        case 0b11101:
+          if (u && bit23) op = AdvSimdScalarThreeSameOpcode::kFacgt;
+          else if (u && !bit23) op = AdvSimdScalarThreeSameOpcode::kFacge;
+          else { Undefined(); return; }
+          break;
+        default:
+          Undefined();
+          return;
+      }
+      out_size = sz;
+    } else {
+      // Integer scalar three same — D-form only.
+      if (size != 0b11) { Undefined(); return; }
+
+      switch (opcode) {
+        case 0b00110:
+          op = u ? AdvSimdScalarThreeSameOpcode::kCmhi
+                 : AdvSimdScalarThreeSameOpcode::kCmgt;
+          break;
+        case 0b00111:
+          op = u ? AdvSimdScalarThreeSameOpcode::kCmhs
+                 : AdvSimdScalarThreeSameOpcode::kCmge;
+          break;
+        case 0b01000:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUshl
+                 : AdvSimdScalarThreeSameOpcode::kSshl;
+          break;
+        case 0b10000:
+          op = u ? AdvSimdScalarThreeSameOpcode::kSub
+                 : AdvSimdScalarThreeSameOpcode::kAdd;
+          break;
+        case 0b10001:
+          op = u ? AdvSimdScalarThreeSameOpcode::kCmeq
+                 : AdvSimdScalarThreeSameOpcode::kCmtst;
+          break;
+        default:
+          Undefined();
+          return;
+      }
+    }
+    (void)is_fp;
+
+    const AdvSimdScalarThreeSameArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .size = out_size,
+    };
+    insn_consumer_->AdvSimdScalarThreeSame(args);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD scalar pairwise.
+  // Encoding: 01 U 11110 size 11000 opcode 10 Rn Rd
+  // For now only ADDP scalar (U=0, size=11, opcode=11011) is supported.
+  //
+  void DecodeAdvSimdScalarPairwise() {
+    bool u = GetBits<29, 1>();
+    uint8_t size = GetBits<22, 2>();
+    uint8_t opcode = GetBits<12, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    if (u || opcode != 0b11011 || size != 0b11) {
+      Undefined();
+      return;
+    }
+
+    const AdvSimdScalarPairwiseArgs args = {
+        .opcode = AdvSimdScalarPairwiseOpcode::kAddp,
+        .rd = rd,
+        .rn = rn,
+        .size = size,
+    };
+    insn_consumer_->AdvSimdScalarPairwise(args);
+  }
+  // endregion
+  // region digitalis
+  //
+  // AdvSIMD scalar copy: DUP (scalar), aka MOV Vd, Vn[index].
+  // Encoding: 0 1 0 11110 000 imm5 0 0000 1 Rn Rd
+  // Element size derived from imm5 like the vector copy form:
+  //   imm5[0]=1 -> B, imm5[1:0]=10 -> H, imm5[2:0]=100 -> S, imm5[3:0]=1000 -> D.
+  // Result: copy Vn[index] (one esize-byte element) into bottom of Vd; upper bits zero.
+  //
+  void DecodeAdvSimdScalarCopy() {
+    uint8_t imm5 = GetBits<16, 5>();
+    uint8_t imm4 = GetBits<11, 4>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    // Validate imm5: must encode a valid element size.
+    if ((imm5 & 0xF) == 0) {
+      Undefined();
+      return;
+    }
+
+    // Reuse the vector-copy args plumbing with kDupScalar opcode.
+    // q=false signals "scalar" semantics (zero-extend element to 128-bit).
+    const AdvSimdCopyArgs args = {
+        .opcode = AdvSimdCopyOpcode::kDupScalar,
+        .rd = rd,
+        .rn = rn,
+        .imm5 = imm5,
+        .imm4 = imm4,
+        .q = false,
+    };
+    insn_consumer_->AdvSimdCopy(args);
   }
   // endregion
   // region digitalis
