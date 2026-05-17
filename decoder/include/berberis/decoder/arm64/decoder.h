@@ -186,6 +186,14 @@ class Decoder {
     // region digitalis
     kCtrEl0 = 0xD807,     // CTR_EL0: op0=3, op1=3, CRn=0, CRm=0, op2=7
     kDczidEl0 = 0xD80F,   // DCZID_EL0: op0=3, op1=3, CRn=0, CRm=0, op2=7 (alt)
+    // MIDR_EL1: op0=3, op1=0, CRn=0, CRm=0, op2=0
+    //   sysreg = (3<<14)|(0<<11)|(0<<7)|(0<<3)|0 = 0xC000
+    // Read by code that decides whether to use vectorised fast paths;
+    // returning a real ARM CPU id (Cortex-A53 here) keeps Bionic and
+    // third-party compression libs (Facebook superpack, etc.) on the
+    // expected fast paths instead of the SIGILL-handler-driven probe
+    // fallbacks that can spin in detection loops.
+    kMidrEl1 = 0xC000,
     // endregion
   };
 

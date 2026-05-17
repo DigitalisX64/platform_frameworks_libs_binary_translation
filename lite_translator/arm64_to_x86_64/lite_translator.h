@@ -633,6 +633,16 @@ class LiteTranslator {
       as_.Movq(res, 0x10ULL);
       return res;
     }
+    if (sysreg == Decoder::SystemReg::kMidrEl1) {
+      // MIDR_EL1: synthesised Cortex-A53 r0p4 layout. Same value the
+      // interpreter returns; keeping it JIT-resolved avoids a region
+      // exit on every CPU-detect MRS in hot code (Bionic ifunc
+      // resolvers, compression-lib feature probes).
+      Register res = AllocTempReg();
+      if (!success()) return no_register;
+      as_.Movq(res, 0x410FD034ULL);
+      return res;
+    }
     // endregion
     Undefined();
     return no_register;

@@ -483,6 +483,12 @@ class Interpreter {
         // DCZID_EL0: Data Cache Zero ID Register.
         // DZP=1 (DC ZVA prohibited), BS=4 (log2 of 64-byte block)
         return 0x10ULL;  // DZP=1: DC ZVA not available
+      case Decoder::SystemReg::kMidrEl1:
+        // MIDR_EL1: Main ID Register. Cortex-A53 r0p4 layout.
+        //   Implementer 0x41 ('A' = ARM Ltd)
+        //   Variant 0x0, Architecture 0xF (defined by ID_AA64*_EL1)
+        //   PartNum 0xD03 (Cortex-A53), Revision 0x4
+        return 0x410FD034ULL;
       // endregion
       default:
         Undefined();
