@@ -1381,6 +1381,108 @@ TEST_F(Arm64LiteTranslateRegionTest, LdpBaseAliasesSecondDest) {
 }
 // endregion
 
+// region digitalis - STP pre-index probe tests.
+// STP Xt1, Xt2, [Xn, #imm]!  (pre-index, with writeback)
+// Encoding: sf=1 -> 1010_1001_10_imm7_Rt2_Rn_Rt1 (64-bit), type=11.
+//   bits[31:30]=10, bits[29:23]=1010_011, bit22=0(store), imm7=signed7, then rt2/rn/rt1.
+constexpr uint32_t StpXPreIndex(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div8) {
+  uint32_t imm = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0xA9800000 | (imm << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+// STP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback). type=10.
+constexpr uint32_t StpXSigned(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div8) {
+  uint32_t imm = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0xA9000000 | (imm << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+// Reproduces the prologue of __dl__ZL19__android_log_levelPKcm in linker64:
+//   stp x29, x30, [sp, #-0x60]!
+//   stp x28, x27, [sp, #0x10]
+//   stp x26, x25, [sp, #0x20]
+//   stp x24, x23, [sp, #0x30]
+// VulkanCapsViewer SIGSEGVs in this region at trans#4800 with rip in JIT cache.
+TEST_F(Arm64LiteTranslateRegionTest, StpX_PreIndexNegative_SpProlog) {
+  alignas(16) static uint64_t stack_buf[32] = {};
+  // Place guest SP near the END of the buffer so [sp, #-0x60] still lands
+  // inside it.
+  state_.cpu.sp = ToGuestAddr(&stack_buf[20]);  // 20*8 = 160 bytes into buf
+  state_.cpu.x[29] = 0x29292929'29292929ULL;
+  state_.cpu.x[30] = 0x30303030'30303030ULL;
+  state_.cpu.x[27] = 0x27272727'27272727ULL;
+  state_.cpu.x[28] = 0x28282828'28282828ULL;
+  state_.cpu.x[25] = 0x25252525'25252525ULL;
+  state_.cpu.x[26] = 0x26262626'26262626ULL;
+  state_.cpu.x[23] = 0x23232323'23232323ULL;
+  state_.cpu.x[24] = 0x24242424'24242424ULL;
+  const uint64_t orig_sp = state_.cpu.sp;
+  static const uint32_t code[] = {
+      StpXPreIndex(29, 30, 31, -12),  // stp x29, x30, [sp, #-0x60]!  (imm/8 = -12)
+      StpXSigned(28, 27, 31, 2),      // stp x28, x27, [sp, #0x10]
+      StpXSigned(26, 25, 31, 4),      // stp x26, x25, [sp, #0x20]
+      StpXSigned(24, 23, 31, 6),      // stp x24, x23, [sp, #0x30]
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // SP must have been decremented by 0x60 exactly once (only the first STP
+  // is pre-index; the others are signed-offset).
+  EXPECT_EQ(state_.cpu.sp, orig_sp - 0x60);
+  // All eight values must have been written to the right slots in stack_buf.
+  uint64_t* new_sp = bit_cast<uint64_t*>(static_cast<uintptr_t>(state_.cpu.sp));
+  EXPECT_EQ(new_sp[0], 0x29292929'29292929ULL);          // [sp, #0]   = x29
+  EXPECT_EQ(new_sp[1], 0x30303030'30303030ULL);          // [sp, #8]   = x30
+  EXPECT_EQ(new_sp[2], 0x28282828'28282828ULL);          // [sp, #16]  = x28
+  EXPECT_EQ(new_sp[3], 0x27272727'27272727ULL);          // [sp, #24]  = x27
+  EXPECT_EQ(new_sp[4], 0x26262626'26262626ULL);          // [sp, #32]  = x26
+  EXPECT_EQ(new_sp[5], 0x25252525'25252525ULL);          // [sp, #40]  = x25
+  EXPECT_EQ(new_sp[6], 0x24242424'24242424ULL);          // [sp, #48]  = x24
+  EXPECT_EQ(new_sp[7], 0x23232323'23232323ULL);          // [sp, #56]  = x23
+}
+
+// MRS X<rt>, TPIDR_EL0  =  1101_0101_0011_1101_0000_0010_0_Rt
+constexpr uint32_t MrsTpidrEl0(uint8_t rt) {
+  return 0xD53BD040 | rt;
+}
+// LDR X<rt>, [X<rn>, #imm]  (64-bit unsigned offset, imm/8)
+constexpr uint32_t LdrXUoff(uint8_t rt, uint8_t rn, uint16_t imm_div8) {
+  return 0xF9400000 | (static_cast<uint32_t>(imm_div8 & 0xFFF) << 10) | (rn << 5) | rt;
+}
+
+// VulkanCapsViewer prologue: __dl__ZL19__android_log_levelPKcm sequence
+//   9ff40: mrs   x26, TPIDR_EL0
+//   9ff44: ldr   x8,  [x26, #0x28]
+// If MRS-TPIDR_EL0 returns NULL (because ThreadState.tls is not set), the LDR
+// faults at addr 0. Reproduce by leaving state_.tls = 0.
+TEST_F(Arm64LiteTranslateRegionTest, MrsTpidrEl0_LoadFromTls) {
+  alignas(16) static uint64_t tls_buf[16] = {};
+  tls_buf[5] = 0xC0DE'C0DE'C0DE'C0DEULL;  // offset 0x28 = 5*8
+  state_.tls = ToGuestAddr(&tls_buf[0]);
+  static const uint32_t code[] = {
+      MrsTpidrEl0(26),         // mrs x26, TPIDR_EL0
+      LdrXUoff(8, 26, 5),      // ldr x8, [x26, #0x28]
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[26], static_cast<uint64_t>(state_.tls));
+  EXPECT_EQ(state_.cpu.x[8], 0xC0DE'C0DE'C0DE'C0DEULL);
+}
+
+// Minimal probe: only the pre-index instruction, on a non-SP base register.
+// If this passes and the SP variant fails, the bug is in SP-as-base handling.
+TEST_F(Arm64LiteTranslateRegionTest, StpX_PreIndexNegative_X1Base) {
+  alignas(16) static uint64_t buf[32] = {};
+  state_.cpu.x[1] = ToGuestAddr(&buf[20]);
+  state_.cpu.x[29] = 0xAAAA'AAAA'AAAA'AAAAULL;
+  state_.cpu.x[30] = 0xBBBB'BBBB'BBBB'BBBBULL;
+  const uint64_t orig_x1 = state_.cpu.x[1];
+  static const uint32_t code[] = {
+      StpXPreIndex(29, 30, 1, -12),  // stp x29, x30, [x1, #-0x60]!
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], orig_x1 - 0x60);
+  uint64_t* new_x1 = bit_cast<uint64_t*>(static_cast<uintptr_t>(state_.cpu.x[1]));
+  EXPECT_EQ(new_x1[0], 0xAAAA'AAAA'AAAA'AAAAULL);
+  EXPECT_EQ(new_x1[1], 0xBBBB'BBBB'BBBB'BBBBULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
