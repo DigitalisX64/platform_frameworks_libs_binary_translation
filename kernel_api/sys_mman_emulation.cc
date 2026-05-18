@@ -141,13 +141,22 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
           off64_t seg_file_offset = elf_base + (off64_t)phdrs[i].p_offset;
           off64_t page_aligned_seg_offset = seg_file_offset & ~(off64_t)(page_size - 1);
           if (offset != page_aligned_seg_offset) continue;
+          // Two PT_LOAD segments can share a page-aligned file offset (when
+          // both p_offset values fall in the same file page, e.g. one segment
+          // ends in the page and the next starts in the same page). In that
+          // case the page_aligned_seg_offset check above matches BOTH segments
+          // for whichever mmap the linker is doing. Disambiguate by length:
+          // this mapping belongs to segment i only if it is small enough to be
+          // explained by segment i's own memsz from its start in this page.
+          size_t seg_in_mapping_offset = (size_t)(seg_file_offset - offset);
+          size_t seg_max_mapping =
+              (seg_in_mapping_offset + phdrs[i].p_memsz + page_size - 1) &
+              ~(page_size - 1);
+          if (mapped_length > seg_max_mapping) continue;
           off64_t seg_file_end = seg_file_offset + phdrs[i].p_filesz;
           if (seg_file_end >= offset && seg_file_end < offset + (off64_t)mapped_length) {
             size_t bss_start = (size_t)(seg_file_end - offset);
-            // Cap at the segment's actual BSS size (memsz - filesz). Without
-            // this, when two LOAD segments page-align to the same file offset
-            // a smaller segment can match a larger mapping and zero far beyond
-            // its own BSS, wiping out file-backed .data of the other segment.
+            // Cap at the segment's actual BSS size (memsz - filesz).
             size_t seg_bss_size = phdrs[i].p_memsz - phdrs[i].p_filesz;
             size_t bytes_to_zero = std::min(mapped_length - bss_start, seg_bss_size);
             if (bytes_to_zero > 0 && bss_start < mapped_length) {
