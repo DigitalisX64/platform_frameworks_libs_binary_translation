@@ -606,17 +606,25 @@ class LiteTranslator {
   void LoadPair(Decoder::LoadStoreSize size, Register base, int32_t offset,
                 uint8_t rt1, uint8_t rt2, uint8_t scale) {
     UNUSED(offset);  // Already applied by caller in semantics_player.
-    // Load first register.
+    // region digitalis - LDP Xt1, Xt2, [Xn]: when Xt1 (or Xt2) aliases Xn, the
+    // ARM64 architecture loads BOTH pair elements using the *original* base
+    // (post-index/writeback are decoded separately into base updates). The
+    // previous implementation issued SetReg(rt1, val1) between the two Loads,
+    // and since `base` references the same host register that the mapping for
+    // Xt1 may write to, the second Load then read from the wrong address —
+    // observed as WhatsApp's libsuperpack.so dispatcher (`ldp x0, x8, [x0];
+    // ldr x3, [x8, #0x28]; br x3`) jumping into random xz-compressed bytes.
+    // Fix: load both halves into temps first, then commit both via SetReg.
     Register val1 = Load(size, /*is_signed=*/false, /*is_64bit_target=*/
                          (size == Decoder::LoadStoreSize::k64bit), base, 0);
     if (!success()) return;
-    if (rt1 != 31) SetReg(rt1, val1);
-    // Load second register at base + scale.
     Register val2 = Load(size, /*is_signed=*/false, /*is_64bit_target=*/
                          (size == Decoder::LoadStoreSize::k64bit), base,
                          static_cast<int32_t>(scale));
     if (!success()) return;
+    if (rt1 != 31) SetReg(rt1, val1);
     if (rt2 != 31) SetReg(rt2, val2);
+    // endregion
   }
 
   void StorePair(Decoder::LoadStoreSize size, Register base, int32_t offset,
