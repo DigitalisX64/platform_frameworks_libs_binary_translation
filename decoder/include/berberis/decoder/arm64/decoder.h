@@ -594,6 +594,16 @@ class Decoder {
     kFmulV,     // FMUL  (vector): op_high=0, opcode=11011, U=1
     kFmlaV,     // FMLA  (vector): op_high=0, opcode=11001, U=0
     kFmlsV,     // FMLS  (vector): op_high=1, opcode=11001, U=0
+    kFmaxnmV,   // FMAXNM (vector): op_high=0, opcode=11000, U=0
+    kFminnmV,   // FMINNM (vector): op_high=1, opcode=11000, U=0
+    kFmaxV,     // FMAX   (vector): op_high=0, opcode=11110, U=0
+    kFminV,     // FMIN   (vector): op_high=1, opcode=11110, U=0
+    kFdivV,     // FDIV   (vector): op_high=0, opcode=11111, U=1
+    kFcmeqV,    // FCMEQ  (vector): op_high=0, opcode=11100, U=0
+    kFcmgeV,    // FCMGE  (vector): op_high=0, opcode=11100, U=1
+    kFcmgtV,    // FCMGT  (vector): op_high=1, opcode=11100, U=1
+    kFacgeV,    // FACGE  (vector): op_high=0, opcode=11101, U=1
+    kFacgtV,    // FACGT  (vector): op_high=1, opcode=11101, U=1
     // endregion
   };
 
@@ -770,6 +780,12 @@ class Decoder {
     kUmaxv,     // UMAXV: U=1, opcode=01010
     kSminv,     // SMINV: U=0, opcode=11010
     kUminv,     // UMINV: U=1, opcode=11010
+    kSuqadd,    // SUQADD: U=0, opcode=00011, bit20=0 (signed sat acc of unsigned)
+    kUsqadd,    // USQADD: U=1, opcode=00011, bit20=0 (unsigned sat acc of signed)
+    kSaddlv,    // SADDLV: U=0, opcode=00011, bit20=1 (signed add long across)
+    kUaddlv,    // UADDLV: U=1, opcode=00011, bit20=1 (unsigned add long across)
+    kScvtfV,    // SCVTF (vector, integer): U=0, opcode=11101, bit23=0
+    kUcvtfV,    // UCVTF (vector, integer): U=1, opcode=11101, bit23=0
     // endregion
   };
 
@@ -2728,6 +2744,28 @@ class Decoder {
             if (u) { ok = false; break; }   // U=1 reserved here
             op = AdvSimdThreeSameOpcode::kFmlaV;
             break;
+          // region digitalis - FMAXNM/FMAX (op_high=0, U=0); FDIV (U=1);
+          // FCMEQ (U=0)/FCMGE (U=1)/FACGE (U=1) at opcode 11100/11101.
+          case 0b11000:
+            if (u) { ok = false; break; }   // FMAXNMP — not implemented
+            op = AdvSimdThreeSameOpcode::kFmaxnmV;
+            break;
+          case 0b11100:
+            op = u ? AdvSimdThreeSameOpcode::kFcmgeV : AdvSimdThreeSameOpcode::kFcmeqV;
+            break;
+          case 0b11101:
+            if (!u) { ok = false; break; }  // FRECPS — not implemented
+            op = AdvSimdThreeSameOpcode::kFacgeV;
+            break;
+          case 0b11110:
+            if (u) { ok = false; break; }   // FMAXP — not implemented
+            op = AdvSimdThreeSameOpcode::kFmaxV;
+            break;
+          case 0b11111:
+            if (!u) { ok = false; break; }  // FRECPS-low — not implemented
+            op = AdvSimdThreeSameOpcode::kFdivV;
+            break;
+          // endregion
           default: ok = false; break;
         }
       } else {
@@ -2740,6 +2778,24 @@ class Decoder {
             if (u) { ok = false; break; }   // U=1 reserved here
             op = AdvSimdThreeSameOpcode::kFmlsV;
             break;
+          // region digitalis - FMINNM/FMIN (op_high=1, U=0); FCMGT (U=1)/FACGT (U=1).
+          case 0b11000:
+            if (u) { ok = false; break; }   // FMINNMP — not implemented
+            op = AdvSimdThreeSameOpcode::kFminnmV;
+            break;
+          case 0b11100:
+            if (!u) { ok = false; break; }  // op_high=1,U=0 undef at opcode 11100
+            op = AdvSimdThreeSameOpcode::kFcmgtV;
+            break;
+          case 0b11101:
+            if (!u) { ok = false; break; }  // FRSQRTS — not implemented
+            op = AdvSimdThreeSameOpcode::kFacgtV;
+            break;
+          case 0b11110:
+            if (u) { ok = false; break; }   // FMINP — not implemented
+            op = AdvSimdThreeSameOpcode::kFminV;
+            break;
+          // endregion
           default: ok = false; break;
         }
       }
@@ -2869,6 +2925,20 @@ class Decoder {
       case 0b00010:
         op = u ? AdvSimdTwoRegMiscOpcode::kUaddlp : AdvSimdTwoRegMiscOpcode::kSaddlp;
         break;
+      // region digitalis - opcode 00011 covers two distinct families:
+      //  bit20=0 (bits[21:17]=10000) -> two-reg-misc SUQADD (U=0) / USQADD (U=1)
+      //  bit20=1 (bits[21:17]=11000) -> across-lanes  SADDLV (U=0) / UADDLV (U=1)
+      // Observed `uaddlv h0, v0.8b` (insn 0x2e303800) in WhatsApp's
+      // libar-bundle3.so JNI_OnLoad path.
+      case 0b00011:
+        if (GetBits<20, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUaddlv : AdvSimdTwoRegMiscOpcode::kSaddlv;
+          if (size == 0b11) { Undefined(); return; }  // no 64-bit element
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUsqadd : AdvSimdTwoRegMiscOpcode::kSuqadd;
+        }
+        break;
+      // endregion
       case 0b00100:
         op = u ? AdvSimdTwoRegMiscOpcode::kClz : AdvSimdTwoRegMiscOpcode::kCls;
         break;
@@ -2935,6 +3005,15 @@ class Decoder {
       case 0b01111:
         op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
         break;
+      // region digitalis - SCVTF/UCVTF (vector, integer): opcode=11101, bit23=0.
+      // (bit23=1 with this opcode is FRECPE/FRSQRTE — not implemented here.)
+      // Observed `ucvtf v0.4s, v0.4s` (insn 0x6e21d800) in WhatsApp's
+      // libar-bundle3.so init path.
+      case 0b11101:
+        if (GetBits<23, 1>()) { Undefined(); return; }  // FRECPE/FRSQRTE - TODO
+        op = u ? AdvSimdTwoRegMiscOpcode::kUcvtfV : AdvSimdTwoRegMiscOpcode::kScvtfV;
+        break;
+      // endregion
       // region digitalis
       case 0b11011:
         // ADDV is in the across-lanes group (bit20=1), not two-reg-misc (bit20=0).

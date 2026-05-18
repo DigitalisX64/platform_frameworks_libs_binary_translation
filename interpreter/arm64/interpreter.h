@@ -2694,7 +2694,17 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
       case Decoder::AdvSimdThreeSameOpcode::kFmlaV:
-      case Decoder::AdvSimdThreeSameOpcode::kFmlsV: {
+      case Decoder::AdvSimdThreeSameOpcode::kFmlsV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
+      case Decoder::AdvSimdThreeSameOpcode::kFminV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
+      case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
+      case Decoder::AdvSimdThreeSameOpcode::kFdivV:
+      case Decoder::AdvSimdThreeSameOpcode::kFcmeqV:
+      case Decoder::AdvSimdThreeSameOpcode::kFcmgeV:
+      case Decoder::AdvSimdThreeSameOpcode::kFcmgtV:
+      case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
+      case Decoder::AdvSimdThreeSameOpcode::kFacgtV: {
         bool is_double = (args.size == 0b01);
         uint8_t fp_esize = is_double ? 8 : 4;
         uint8_t fp_num = vec_len / fp_esize;
@@ -2710,6 +2720,42 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
+              // FMAX/FMIN: IEEE 754-2008 max/min — if either is NaN, result is NaN.
+              case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
+                r = (std::isnan(a) || std::isnan(b)) ? std::nan("") : (a > b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFminV:
+                r = (std::isnan(a) || std::isnan(b)) ? std::nan("") : (a < b ? a : b);
+                break;
+              // FMAXNM/FMINNM: max/min number — if exactly one is NaN, return the other.
+              case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
+                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a > b ? a : b));
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
+                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a < b ? a : b));
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV: r = a / b; break;
+              // FP compare: result is all-ones (bit pattern) on TRUE, zero on FALSE.
+              case Decoder::AdvSimdThreeSameOpcode::kFcmeqV: {
+                uint64_t bits = (a == b) ? ~uint64_t{0} : 0;
+                memcpy(&r, &bits, 8); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFcmgeV: {
+                uint64_t bits = (a >= b) ? ~uint64_t{0} : 0;
+                memcpy(&r, &bits, 8); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFcmgtV: {
+                uint64_t bits = (a > b) ? ~uint64_t{0} : 0;
+                memcpy(&r, &bits, 8); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFacgeV: {
+                uint64_t bits = (std::fabs(a) >= std::fabs(b)) ? ~uint64_t{0} : 0;
+                memcpy(&r, &bits, 8); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFacgtV: {
+                uint64_t bits = (std::fabs(a) > std::fabs(b)) ? ~uint64_t{0} : 0;
+                memcpy(&r, &bits, 8); break;
+              }
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
@@ -2724,6 +2770,39 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
+                r = (std::isnan(a) || std::isnan(b)) ? std::nanf("") : (a > b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFminV:
+                r = (std::isnan(a) || std::isnan(b)) ? std::nanf("") : (a < b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
+                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a > b ? a : b));
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
+                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a < b ? a : b));
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV: r = a / b; break;
+              case Decoder::AdvSimdThreeSameOpcode::kFcmeqV: {
+                uint32_t bits = (a == b) ? 0xFFFFFFFFu : 0;
+                memcpy(&r, &bits, 4); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFcmgeV: {
+                uint32_t bits = (a >= b) ? 0xFFFFFFFFu : 0;
+                memcpy(&r, &bits, 4); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFcmgtV: {
+                uint32_t bits = (a > b) ? 0xFFFFFFFFu : 0;
+                memcpy(&r, &bits, 4); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFacgeV: {
+                uint32_t bits = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFu : 0;
+                memcpy(&r, &bits, 4); break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFacgtV: {
+                uint32_t bits = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFu : 0;
+                memcpy(&r, &bits, 4); break;
+              }
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
@@ -3469,6 +3548,116 @@ class Interpreter {
           if (elem_wins) acc = elem;
         }
         result = acc & emask;
+        break;
+      }
+      // endregion
+
+      // region digitalis - SCVTF/UCVTF (vector, integer): per-lane signed or
+      // unsigned int-to-FP. Element size from `size` field: sz=0 -> single
+      // (.4S / .2S), sz=1 -> double (.2D). Observed `ucvtf v0.4s, v0.4s`
+      // (insn 0x6e21d800) in WhatsApp's libar-bundle3.so init path.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
+        // The decoder uses bit22 (sz) as the LOW bit of `size`; for FP
+        // two-reg-misc the high bit of `size` is reserved. So sz = size&1.
+        // Element width: sz=0 -> 32-bit (float), sz=1 -> 64-bit (double).
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        if (args.size & 0b10) { Undefined(); return; }
+        uint8_t fp_count = vec_len / fp_esize;
+        bool is_unsigned = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV);
+        for (uint8_t i = 0; i < fp_count; i++) {
+          uint64_t int_bits = 0;
+          memcpy(&int_bits, reinterpret_cast<const uint8_t*>(&src) + i * fp_esize, fp_esize);
+          if (fp_esize == 4) {
+            float f;
+            if (is_unsigned) {
+              f = static_cast<float>(static_cast<uint32_t>(int_bits));
+            } else {
+              f = static_cast<float>(static_cast<int32_t>(int_bits));
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * fp_esize, &f, 4);
+          } else {
+            double d;
+            if (is_unsigned) {
+              d = static_cast<double>(int_bits);
+            } else {
+              d = static_cast<double>(static_cast<int64_t>(int_bits));
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * fp_esize, &d, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis - SADDLV/UADDLV: add-long across vector. Sum all
+      // lanes of Vn into a single 2x-width scalar result written to bottom
+      // of Vd; upper bits cleared. Observed as `uaddlv h0, v0.8b` (insn
+      // 0x2e303800) in WhatsApp's libar-bundle3.so JNI_OnLoad path.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlv: {
+        if (esize >= 8) { Undefined(); return; }  // max input element 32-bit
+        bool is_signed = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv);
+        uint8_t bits = esize * 8;
+        uint8_t out_esize = esize * 2;
+        __int128_t acc = 0;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          if (is_signed) {
+            int64_t s = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+            acc += s;
+          } else {
+            acc += elem;
+          }
+        }
+        uint64_t r = static_cast<uint64_t>(acc) & ElementMask(out_esize);
+        result = 0;
+        memcpy(reinterpret_cast<uint8_t*>(&result), &r, out_esize);
+        break;
+      }
+      // endregion
+
+      // region digitalis - SUQADD / USQADD: per-lane saturating accumulate.
+      //  SUQADD Vd, Vn: Vd[i] = sat_signed( (int)Vd[i] + (uint)Vn[i] )
+      //  USQADD Vd, Vn: Vd[i] = sat_unsigned( (uint)Vd[i] + (int)Vn[i] )
+      // Per-lane element widths: 1/2/4/8 bytes. Observed as `usqadd v0.8b,
+      // v0.8b` (insn 0x2e303800) in WhatsApp's libar-bundle3.so JNI_OnLoad.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSuqadd:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd: {
+        bool is_unsigned_sat =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd);
+        uint8_t bits = esize * 8;
+        // Per-element signed/unsigned ranges. For esize=8 the unsigned max is
+        // 2^64-1 which overflows int64, so compute carefully via __int128.
+        __uint128_t dst_vec = state_->cpu.v[args.rd];
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t src_elem = 0, dst_elem = 0;
+          memcpy(&src_elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst_vec) + i * esize, esize);
+          __int128_t sum;
+          if (is_unsigned_sat) {
+            // Vd unsigned, Vn signed.
+            __int128_t s_src =
+                static_cast<__int128_t>(static_cast<int64_t>(src_elem << (64 - bits)) >> (64 - bits));
+            sum = static_cast<__int128_t>(dst_elem) + s_src;
+            __int128_t max_u = (bits >= 64) ? ((static_cast<__int128_t>(1) << 64) - 1)
+                                            : ((static_cast<__int128_t>(1) << bits) - 1);
+            if (sum < 0) sum = 0;
+            else if (sum > max_u) sum = max_u;
+          } else {
+            // Vd signed, Vn unsigned.
+            __int128_t s_dst =
+                static_cast<__int128_t>(static_cast<int64_t>(dst_elem << (64 - bits)) >> (64 - bits));
+            sum = s_dst + static_cast<__int128_t>(src_elem);
+            __int128_t max_s = (static_cast<__int128_t>(1) << (bits - 1)) - 1;
+            __int128_t min_s = -(static_cast<__int128_t>(1) << (bits - 1));
+            if (sum > max_s) sum = max_s;
+            else if (sum < min_s) sum = min_s;
+          }
+          uint64_t r = static_cast<uint64_t>(sum) & ElementMask(esize);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
         break;
       }
       // endregion
