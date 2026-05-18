@@ -2362,6 +2362,16 @@ class LiteTranslator {
     UNUSED(args);
     Undefined();
   }
+
+  void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
+    UNUSED(args);
+    Undefined();
+  }
+
+  void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
+    UNUSED(args);
+    Undefined();
+  }
   // endregion
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {

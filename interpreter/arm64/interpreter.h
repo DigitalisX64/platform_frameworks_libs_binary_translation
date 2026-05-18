@@ -1133,6 +1133,34 @@ class Interpreter {
           set_result(i, get_accum(i) + static_cast<uint64_t>(diff < 0 ? -diff : diff));
         }
         break;
+      // region digitalis - wide add/sub: Vn is already wide (out_esize per elem);
+      // Vm is narrow (in_esize per elem, selected by Q=0 low half / Q=1 high half).
+      case Decoder::AdvSimdThreeDiffOpcode::kUaddw:
+      case Decoder::AdvSimdThreeDiffOpcode::kSaddw:
+      case Decoder::AdvSimdThreeDiffOpcode::kUsubw:
+      case Decoder::AdvSimdThreeDiffOpcode::kSsubw: {
+        bool is_signed = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSaddw ||
+                          args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSsubw);
+        bool is_sub    = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSsubw ||
+                          args.opcode == Decoder::AdvSimdThreeDiffOpcode::kUsubw);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t wide_n = 0;
+          memcpy(&wide_n, reinterpret_cast<const uint8_t*>(&src_n) + i * out_esize, out_esize);
+          uint64_t r;
+          if (is_signed) {
+            int64_t sn = static_cast<int64_t>(wide_n << ((8 - out_esize) * 8)) >> ((8 - out_esize) * 8);
+            int64_t sm = get_signed(src_m, i);
+            r = static_cast<uint64_t>(is_sub ? sn - sm : sn + sm);
+          } else {
+            uint64_t un = wide_n;
+            uint64_t um = get_unsigned(src_m, i);
+            r = is_sub ? un - um : un + um;
+          }
+          set_result(i, r);
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;
@@ -2231,6 +2259,20 @@ class Interpreter {
         break;
       }
 
+      // region digitalis - scalar SIMD copy (DUP scalar / MOV Vd, Vn[index])
+      case Decoder::AdvSimdCopyOpcode::kDupScalar: {
+        // DUP (scalar): copy one esize-byte element from Vn[index] into the
+        // bottom of Vd; upper bits are zeroed.
+        __uint128_t src = state_->cpu.v[args.rn];
+        __uint128_t result = 0;
+        memcpy(reinterpret_cast<uint8_t*>(&result),
+               reinterpret_cast<const uint8_t*>(&src) + index * esize,
+               esize);
+        state_->cpu.v[args.rd] = result;
+        break;
+      }
+      // endregion
+
       case Decoder::AdvSimdCopyOpcode::kInsElement: {
         // INS (element): copy Vn[src_index] to Vd[dst_index].
         // dst_index is encoded in imm5, src_index in imm4.
@@ -3219,6 +3261,166 @@ class Interpreter {
   }
   // endregion
 
+  // region digitalis
+  //
+  // AdvSIMD scalar three same: scalar (D-form, 64-bit) integer 3-operand ops.
+  // Operates on the bottom 64-bit element of each register; upper bits zero.
+  //
+  void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
+    CHECK(!exception_raised_);
+
+    // FP scalar ops: dispatch separately because size encodes S (0) vs D (1).
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFabd:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFcmge:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFacgt:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFacge: {
+        __uint128_t src_n = state_->cpu.v[args.rn];
+        __uint128_t src_m = state_->cpu.v[args.rm];
+        __uint128_t result = 0;
+        if (args.size == 1) {
+          double a, b;
+          memcpy(&a, &src_n, sizeof(a));
+          memcpy(&b, &src_m, sizeof(b));
+          uint64_t r64;
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFabd: {
+              double d = std::fabs(a - b);
+              memcpy(&r64, &d, sizeof(r64));
+              break;
+            }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt:
+              r64 = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmge:
+              r64 = (a >= b) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
+              r64 = (a == b) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFacgt:
+              r64 = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
+              r64 = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
+            default: r64 = 0; break;
+          }
+          result = static_cast<__uint128_t>(r64);
+        } else {
+          float a, b;
+          memcpy(&a, &src_n, sizeof(a));
+          memcpy(&b, &src_m, sizeof(b));
+          uint32_t r32;
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFabd: {
+              float f = std::fabs(a - b);
+              memcpy(&r32, &f, sizeof(r32));
+              break;
+            }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt:
+              r32 = (a > b) ? 0xFFFFFFFFu : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmge:
+              r32 = (a >= b) ? 0xFFFFFFFFu : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
+              r32 = (a == b) ? 0xFFFFFFFFu : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFacgt:
+              r32 = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFu : 0; break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
+              r32 = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFu : 0; break;
+            default: r32 = 0; break;
+          }
+          result = static_cast<__uint128_t>(r32);
+        }
+        state_->cpu.v[args.rd] = result;
+        return;
+      }
+      default:
+        break;
+    }
+
+    // D-form integer ops below.
+    uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]);
+    uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]);
+    uint64_t r;
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kAdd:
+        r = a + b;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSub:
+        r = a - b;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kCmgt:
+        r = (static_cast<int64_t>(a) > static_cast<int64_t>(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kCmhi:
+        r = (a > b) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kCmge:
+        r = (static_cast<int64_t>(a) >= static_cast<int64_t>(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kCmhs:
+        r = (a >= b) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kCmtst:
+        r = ((a & b) != 0) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kCmeq:
+        r = (a == b) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        break;
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSshl: {
+        // SSHL: shift left by signed amount from Rm[7:0].
+        int8_t sh = static_cast<int8_t>(b & 0xFF);
+        int64_t sa = static_cast<int64_t>(a);
+        if (sh >= 64) { r = 0; }
+        else if (sh >= 0) { r = static_cast<uint64_t>(sa << sh); }
+        else if (sh <= -64) { r = static_cast<uint64_t>(sa >> 63); }  // arithmetic
+        else { r = static_cast<uint64_t>(sa >> (-sh)); }
+        break;
+      }
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUshl: {
+        // USHL: shift left by signed amount from Rm[7:0] (logical for negatives).
+        int8_t sh = static_cast<int8_t>(b & 0xFF);
+        if (sh >= 64) { r = 0; }
+        else if (sh >= 0) { r = a << sh; }
+        else if (sh <= -64) { r = 0; }
+        else { r = a >> (-sh); }
+        break;
+      }
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD scalar pairwise.
+  // ADDP scalar (D-form): Vd[0] = Vn.D[0] + Vn.D[1].
+  //
+  void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src = state_->cpu.v[args.rn];
+    uint64_t lo = static_cast<uint64_t>(src);
+    uint64_t hi = static_cast<uint64_t>(src >> 64);
+
+    uint64_t r;
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarPairwiseOpcode::kAddp:
+        // D-form only.
+        r = lo + hi;
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+  }
+  // endregion
+
   //
   // AdvSIMD two-reg misc: unary element-wise vector operations.
   //
@@ -3703,12 +3905,86 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis - saturating extract narrow: UQXTN / SQXTN.
+      // Source element size is 2*esize, destination is esize.
+      // SQXTN: signed saturate source to [INT_min(esize), INT_max(esize)],
+      //        write low esize bytes per element.
+      // UQXTN: unsigned saturate source to [0, UINT_max(esize)] (or signed
+      //        source clamped to [0, UINT_max] if negative -> 0).
+      // Per ARM ARM, UQXTN reads UNSIGNED src and saturates to unsigned dest.
+      // Q=0: low half of dest vector (upper zeroed),
+      // Q=1: upper half (lower half preserved) — XTN2 form.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn: {
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_count = 16 / src_esize;
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        bool is_signed = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn);
+        uint64_t dst_emask = ElementMask(esize);
+        uint64_t dst_smax = dst_emask >> 1;                // e.g. 0x7F  for esize=1
+        uint64_t dst_smin_bits = (dst_emask ^ dst_smax);   // e.g. 0x80  for esize=1
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t raw = 0;
+          memcpy(&raw, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          uint64_t out;
+          if (is_signed) {
+            // Sign-extend src to int64
+            int64_t s = static_cast<int64_t>(raw << (64 - src_esize * 8)) >> (64 - src_esize * 8);
+            int64_t smax = static_cast<int64_t>(dst_smax);
+            int64_t smin = -smax - 1;
+            if (s > smax) s = smax;
+            if (s < smin) s = smin;
+            out = static_cast<uint64_t>(s) & dst_emask;
+          } else {
+            // Unsigned saturate to dst_emask.
+            out = (raw > dst_emask) ? dst_emask : raw;
+          }
+          (void)dst_smin_bits;  // silence unused warning when only used in is_signed branch above
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &out, esize);
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis - floating-point convert long / narrow.
+      // FCVTL: widen narrow FP source to wide FP destination.
+      //   size=01 (sz=0): f32 -> f64, narrow lane count=2, wide count=2.
+      //   Q=0 reads narrow elems from low half of Vn; Q=1 reads from high half.
+      //   Result occupies full destination vector.
+      // FCVTN: narrow wide FP source to narrow FP destination.
+      //   size=01 (sz=0): f64 -> f32.
+      //   Q=0 writes narrow elems into low half of Vd (upper zeroed);
+      //   Q=1 writes into high half (lower preserved).
+      // size=00 (half-precision) is not implemented yet.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl: {
+        if (args.size != 0b01) { Undefined(); return; }
+        uint8_t src_off = args.q ? 8 : 0;
+        for (uint8_t i = 0; i < 2; i++) {
+          float f;
+          memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + src_off + i * 4, 4);
+          double d = static_cast<double>(f);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &d, 8);
+        }
+        break;
+      }
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn: {
+        if (args.size != 0b01) { Undefined(); return; }
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_off = args.q ? 8 : 0;
+        for (uint8_t i = 0; i < 2; i++) {
+          double d;
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+          float f = static_cast<float>(d);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 4, &f, 4);
+        }
+        break;
+      }
+      // endregion
+
       // Less critical ops: leave as undefined for now.
       case Decoder::AdvSimdTwoRegMiscOpcode::kCls:
-      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
-      case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
-      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn:
-      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl:
       default:
         Undefined();
         return;

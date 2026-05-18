@@ -476,6 +476,14 @@ class SemanticsPlayer {
   void AdvSimdScalarTwoRegMisc(const typename Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
     listener_->AdvSimdScalarTwoRegMisc(args);
   }
+
+  void AdvSimdScalarThreeSame(const typename Decoder::AdvSimdScalarThreeSameArgs& args) {
+    listener_->AdvSimdScalarThreeSame(args);
+  }
+
+  void AdvSimdScalarPairwise(const typename Decoder::AdvSimdScalarPairwiseArgs& args) {
+    listener_->AdvSimdScalarPairwise(args);
+  }
   // endregion
 
   void AdvSimdShiftByImm(const typename Decoder::AdvSimdShiftImmArgs& args) {
