@@ -411,6 +411,12 @@ class SemanticsPlayer {
   // endregion
 
   // region digitalis
+  void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
+    listener_->CryptoAes(rd, rn, opcode);
+  }
+  // endregion
+
+  // region digitalis
   void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t size,
                           bool q, bool is_store, bool postindex, uint8_t rm,
                           bool is_interleaved) {
