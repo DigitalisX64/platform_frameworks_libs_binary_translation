@@ -58,6 +58,13 @@ cc_defaults {
             ],
             static_libs: [
                 "libprocinfo",
+                // region digitalis: APK extract fallback for in-APK dlopen.
+                // libbase is already pulled in by libberberis_arm64, so we
+                // only need libziparchive (which header-uses libbase) and libz
+                // here.
+                "libziparchive",
+                "libz",
+                // endregion
             ],
         },
     },
