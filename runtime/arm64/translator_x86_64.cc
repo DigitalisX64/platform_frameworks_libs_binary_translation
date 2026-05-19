@@ -27,6 +27,7 @@
 #include "berberis/base/config.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
+#include "berberis/guest_os_primitives/guest_signal.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_opaque.h"
 #include "berberis/interpreter/arm64/interpreter.h"
@@ -56,7 +57,15 @@ size_t GetExecutableRegionSize(GuestAddr pc) {
 
 }  // namespace
 
-void InitTranslatorArch() {}
+void InitTranslatorArch() {
+  // Install Berberis's host SIGSEGV/SIGBUS handler. This used to live in
+  // runtime/berberis.cc inside `#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)`,
+  // but that file is compiled into the host-agnostic libberberis_runtime which
+  // does not get the ARM64 cflag — the call was silently elided. Hooking it
+  // here (the arm64-specific translator) ensures the host fault signals are
+  // claimed for arm64 guest processes.
+  ClaimHostFaultSignals();
+}
 
 // Exported for testing only.
 std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> TryLiteTranslateAndInstallRegion(
