@@ -54,6 +54,10 @@ GuestAddr InitKernelArgs(GuestAddr guest_sp,
       (1UL << 7) |   // HWCAP_CRC32
       (1UL << 8);    // HWCAP_ATOMICS (LSE)
 
+  // Bionic linker_main passes AT_EXECFN's string to __libc_shared_globals's
+  // init_progname; the riscv64 path also doesn't set it, but providing the
+  // executable path here matches what the kernel would set on a real exec().
+  const char* execfn = (argc > 0 && argv[0] != nullptr) ? argv[0] : "<guest>";
   const uint64_t auxv[] = {
       AT_HWCAP,      kArm64ValueHwcap,
       AT_RANDOM,     ToGuestAddr(random_bytes),
@@ -69,6 +73,7 @@ GuestAddr InitKernelArgs(GuestAddr guest_sp,
       AT_EUID,       geteuid(),
       AT_GID,        getgid(),
       AT_EGID,       getegid(),
+      AT_EXECFN,     reinterpret_cast<uint64_t>(execfn),
       AT_NULL,
   };
 
