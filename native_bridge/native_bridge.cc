@@ -33,6 +33,14 @@
 // region digitalis
 #include <android/log.h>
 #define DIGITALIS_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "berberis", __VA_ARGS__)
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+
+#include "ziparchive/zip_archive.h"
 // endregion
 
 #include "berberis/base/algorithm.h"
@@ -158,6 +166,88 @@ bool NdktNativeBridge::Initialize(std::string* error_msg) {
   return guest_loader_ != nullptr;
 }
 
+// region digitalis
+// Extract <apk_path>!/<entry> to /data/data/<pkg>/cache/berberis_extract/<basename>
+// and return the extracted path on success. Used as a fallback when the guest
+// dynamic linker fails to dlopen an in-APK library path — happens with Qt 6
+// apps (e.g. VulkanCapsViewer) whose deployment APKs ship Qt libs in the
+// `base.apk!/lib/arm64-v8a/` form and whose JVM-side QtLoader hits a
+// `dlopen failed: library not found` from inside an instrumented `!/` path
+// after libziparchive logs a META-INF/...properties duplicate-entry warning.
+//
+// The extracted file is dropped in the app's own cache (per-uid, persists
+// across launches, cleaned up by the OS), so the next launch reuses it.
+// Returns "" if anything fails — caller falls through to its existing
+// host-loader path.
+static std::string ExtractInApkLibToCache(const char* libpath) {
+  const char* bang = strstr(libpath, "!/");
+  if (bang == nullptr) {
+    return {};
+  }
+  std::string apk_path(libpath, static_cast<size_t>(bang - libpath));
+  std::string entry_name(bang + 2);  // skip "!/"
+  const char* basename = strrchr(entry_name.c_str(), '/');
+  basename = basename ? basename + 1 : entry_name.c_str();
+
+  const char* private_dir = berberis::GetAppPrivateDir();
+  if (private_dir == nullptr || private_dir[0] == '\0') {
+    DIGITALIS_LOG("ExtractInApkLibToCache: no app private dir; can't cache %s", libpath);
+    return {};
+  }
+  std::string cache_dir = std::string(private_dir) + "/cache/berberis_extract";
+  // Best-effort mkdir; ignore EEXIST.
+  mkdir((std::string(private_dir) + "/cache").c_str(), 0700);
+  mkdir(cache_dir.c_str(), 0700);
+
+  std::string out_path = cache_dir + "/" + basename;
+
+  // If a previous launch already extracted this lib, reuse it.
+  struct stat st_out;
+  if (stat(out_path.c_str(), &st_out) == 0 && st_out.st_size > 0) {
+    return out_path;
+  }
+
+  ZipArchiveHandle zip = nullptr;
+  if (OpenArchive(apk_path.c_str(), &zip) != 0) {
+    DIGITALIS_LOG("ExtractInApkLibToCache: OpenArchive(%s) failed", apk_path.c_str());
+    if (zip) CloseArchive(zip);
+    return {};
+  }
+  ZipEntry entry;
+  if (FindEntry(zip, entry_name, &entry) != 0) {
+    DIGITALIS_LOG("ExtractInApkLibToCache: entry %s not found in %s",
+                  entry_name.c_str(), apk_path.c_str());
+    CloseArchive(zip);
+    return {};
+  }
+  // Extract to a temp file and rename so partial reads from concurrent
+  // launches don't see a half-written .so.
+  std::string tmp_path = out_path + ".tmp";
+  int out_fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (out_fd < 0) {
+    DIGITALIS_LOG("ExtractInApkLibToCache: open(%s) failed: %s", tmp_path.c_str(), strerror(errno));
+    CloseArchive(zip);
+    return {};
+  }
+  int32_t rc = ExtractEntryToFile(zip, &entry, out_fd);
+  close(out_fd);
+  CloseArchive(zip);
+  if (rc != 0) {
+    unlink(tmp_path.c_str());
+    DIGITALIS_LOG("ExtractInApkLibToCache: ExtractEntryToFile rc=%d for %s", rc, entry_name.c_str());
+    return {};
+  }
+  if (rename(tmp_path.c_str(), out_path.c_str()) != 0) {
+    unlink(tmp_path.c_str());
+    DIGITALIS_LOG("ExtractInApkLibToCache: rename(%s,%s) failed: %s",
+                  tmp_path.c_str(), out_path.c_str(), strerror(errno));
+    return {};
+  }
+  DIGITALIS_LOG("ExtractInApkLibToCache: %s -> %s", libpath, out_path.c_str());
+  return out_path;
+}
+// endregion
+
 void* NdktNativeBridge::LoadLibrary(const char* libpath,
                                     int flags,
                                     const native_bridge_namespace_t* ns) {
@@ -175,6 +265,23 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
   {
     const char* guest_err = guest_loader_->DlError();
     DIGITALIS_LOG("LoadGuestLibrary FAILED for %s: %s", libpath, guest_err ? guest_err : "(no error)");
+  }
+
+  // In-APK path fallback: when the guest linker rejects "<apk>!/<entry>"
+  // (e.g. Qt 6 apps that ship libs inside base.apk), extract the entry to a
+  // disk path under the app's cache dir and retry guest dlopen with that.
+  if (libpath != nullptr && strstr(libpath, "!/") != nullptr) {
+    std::string extracted = ExtractInApkLibToCache(libpath);
+    if (!extracted.empty()) {
+      void* retry = LoadGuestLibrary(extracted.c_str(), flags, ns);
+      if (retry != nullptr) {
+        DIGITALIS_LOG("LoadGuestLibrary succeeded after APK extract: %s", libpath);
+        return retry;
+      }
+      const char* retry_err = guest_loader_->DlError();
+      DIGITALIS_LOG("LoadGuestLibrary still FAILED for extracted %s: %s",
+                    extracted.c_str(), retry_err ? retry_err : "(no error)");
+    }
   }
   // endregion
 

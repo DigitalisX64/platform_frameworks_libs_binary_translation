@@ -35,6 +35,18 @@ namespace berberis {
 namespace {
 
 int TraceToFile(std::string trace_filename) {
+  // region digitalis
+  // Property setters can leave `berberis.tracing` with a non-empty filter
+  // prefix and an empty trailing value (e.g. "com.foo.bar=") — possibly from
+  // an aborted `setprop` retry or a debugger that emptied it after capture.
+  // After GetTracingConfig() strips the filter, trace_filename is "" and
+  // `at(0)` below throws out_of_range, which under -fno-exceptions aborts
+  // the whole zygote-forked app. Treat empty-as-no-tracing instead.
+  if (trace_filename.empty()) {
+    ALOGD("not tracing - trace filename is empty");
+    return -1;
+  }
+  // endregion
   if (trace_filename == "1") {
     ALOGD("tracing to stdout");
     return STDOUT_FILENO;

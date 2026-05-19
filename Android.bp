@@ -673,6 +673,12 @@ cc_library_shared {
                 "libberberis_native_activity_arm64",
                 "libberberis_native_bridge_arm64",
             ],
+            static_libs: [
+                // region digitalis: APK extract fallback uses libziparchive in native_bridge_arm64.
+                "libziparchive",
+                "libz",
+                // endregion
+            ],
             shared_libs: [
                 "libandroid",
                 "libdl_android",
