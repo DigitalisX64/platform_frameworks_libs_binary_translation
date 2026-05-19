@@ -24,6 +24,12 @@
 
 #include <cerrno>
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+#include <android/fdsan.h>
+#endif
+// endregion
+
 #include "berberis/base/bit_util.h"
 #include "berberis/base/macros.h"
 #include "berberis/base/tracing.h"
@@ -55,7 +61,22 @@ inline long RunGuestSyscall___NR_close(long arg_1) {
   return -1;
 #else
   CloseEmulatedProcSelfMapsFileDescriptor(arg_1);
+  // region digitalis
+  // Route guest close() through host libc's android_fdsan_close_with_tag using
+  // the fd's current owner tag instead of a raw close syscall. A raw syscall
+  // closes the kernel fd but leaves the host libc fdsan owner tag table entry
+  // intact. When the kernel later reuses that fd value for a host open() (e.g.
+  // TinyLoader::OpenFile during ResetAllExecRegions in CloneGuestThread), the
+  // first host-side close on the new fd hits a stale tag and fdsan aborts
+  // ("expected to be unowned, actually owned by unique_fd 0x..."). Only needed
+  // for arm64 guest on Android (riscv64 guest doesn't hit this path yet).
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+  uint64_t tag = android_fdsan_get_owner_tag(arg_1);
+  return android_fdsan_close_with_tag(arg_1, tag);
+#else
   return syscall(__NR_close, arg_1);
+#endif
+  // endregion
 #endif
 }
 
