@@ -26,6 +26,17 @@
 #include <random>
 #include <thread>
 
+// region digitalis
+#include <fcntl.h>     // open, O_RDONLY, O_CLOEXEC
+#include <sys/mman.h>  // mmap, munmap, PROT_READ, MAP_PRIVATE, MAP_FAILED
+#include <sys/stat.h>  // fstat
+#include <unistd.h>    // close
+#include <cerrno>      // errno
+#include <cstring>     // memcmp, strcmp, strerror
+
+#include "berberis/tiny_loader/elf_types.h"
+// endregion
+
 #include "berberis/base/checks.h"
 #include "berberis/base/config_globals.h"  // SetMainExecutableRealPath
 #include "berberis/base/stringprintf.h"
@@ -254,6 +265,141 @@ bool InitializeLinker(LinkerCallbacks* linker_callbacks,
 
 std::atomic<GuestLoader*> g_guest_loader_instance;
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// Initializes the guest linker's private static __progname pointer so that
+// GetDefaultTag() (called whenever the linker emits a log line) doesn't
+// strlen(NULL) and crash. The linker's own static __progname.cpp copy is
+// otherwise never written: __libc_init_common only sets __progname inside
+// the executable's libc.so after the linker has already handed off, and the
+// static linkage keeps the two copies separate.
+//
+// The linker's static symbol table is the only place where this LOCAL
+// symbol lives; .dynsym does not export it, so LoadedElfFile::FindSymbol
+// can't see it. We mmap the on-disk linker, walk .symtab/.strtab to find
+// __dl___progname, then write the pointer to (load_bias + st_value) in the
+// already-loaded linker image. The variable lives in writable .data, which
+// TinyLoader maps PROT_READ|PROT_WRITE for any PT_LOAD with PF_W set.
+void PatchLinkerProgname(const char* loader_path,
+                         const LoadedElfFile& linker_elf,
+                         const char* progname) {
+  if (!linker_elf.is_loaded() || progname == nullptr || loader_path == nullptr) {
+    return;
+  }
+
+  int fd = open(loader_path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    TRACE("PatchLinkerProgname: open(\"%s\") failed: %s", loader_path, strerror(errno));
+    return;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    close(fd);
+    TRACE("PatchLinkerProgname: fstat(\"%s\") failed", loader_path);
+    return;
+  }
+  size_t file_size = static_cast<size_t>(st.st_size);
+  void* map = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (map == MAP_FAILED) {
+    TRACE("PatchLinkerProgname: mmap(\"%s\") failed", loader_path);
+    return;
+  }
+
+  const uint8_t* file = static_cast<const uint8_t*>(map);
+  if (file_size < sizeof(ElfEhdr)) {
+    munmap(map, file_size);
+    return;
+  }
+  const ElfEhdr* ehdr = reinterpret_cast<const ElfEhdr*>(file);
+  if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+      ehdr->e_ident[EI_CLASS] != kSupportedElfClass ||
+      ehdr->e_shoff == 0 ||
+      ehdr->e_shentsize != sizeof(ElfShdr)) {
+    munmap(map, file_size);
+    TRACE("PatchLinkerProgname: \"%s\" not a supported ELF", loader_path);
+    return;
+  }
+
+  size_t shnum = ehdr->e_shnum;
+  if (ehdr->e_shoff + shnum * sizeof(ElfShdr) > file_size) {
+    munmap(map, file_size);
+    return;
+  }
+  const ElfShdr* shdrs = reinterpret_cast<const ElfShdr*>(file + ehdr->e_shoff);
+
+  // Locate the static symbol table (SHT_SYMTAB).
+  const ElfShdr* symtab_shdr = nullptr;
+  for (size_t i = 0; i < shnum; ++i) {
+    if (shdrs[i].sh_type == SHT_SYMTAB) {
+      symtab_shdr = &shdrs[i];
+      break;
+    }
+  }
+  if (symtab_shdr == nullptr ||
+      symtab_shdr->sh_link >= shnum ||
+      symtab_shdr->sh_entsize != sizeof(ElfSym) ||
+      symtab_shdr->sh_offset + symtab_shdr->sh_size > file_size) {
+    munmap(map, file_size);
+    TRACE("PatchLinkerProgname: no usable .symtab in \"%s\"", loader_path);
+    return;
+  }
+  const ElfShdr& strtab_shdr = shdrs[symtab_shdr->sh_link];
+  if (strtab_shdr.sh_offset + strtab_shdr.sh_size > file_size) {
+    munmap(map, file_size);
+    return;
+  }
+  const ElfSym* syms = reinterpret_cast<const ElfSym*>(file + symtab_shdr->sh_offset);
+  const char* strs = reinterpret_cast<const char*>(file + strtab_shdr.sh_offset);
+  size_t nsyms = symtab_shdr->sh_size / sizeof(ElfSym);
+
+  auto find_symbol = [&](const char* wanted) -> const ElfSym* {
+    for (size_t i = 0; i < nsyms; ++i) {
+      if (syms[i].st_name == 0 || syms[i].st_name >= strtab_shdr.sh_size) {
+        continue;
+      }
+      if (syms[i].st_shndx == SHN_UNDEF) {
+        continue;
+      }
+      const char* name = strs + syms[i].st_name;
+      if (strcmp(name, wanted) == 0) {
+        return &syms[i];
+      }
+    }
+    return nullptr;
+  };
+
+  const ElfSym* sym = find_symbol("__dl___progname");
+  if (sym == nullptr) {
+    sym = find_symbol("__progname");
+  }
+  ElfAddr st_value = 0;
+  size_t st_size = 0;
+  if (sym != nullptr) {
+    st_value = sym->st_value;
+    st_size = sym->st_size;
+  }
+
+  munmap(map, file_size);
+
+  if (sym == nullptr || st_size < sizeof(const char*)) {
+    TRACE("PatchLinkerProgname: __dl___progname not found in \"%s\"", loader_path);
+    return;
+  }
+
+  // The linker is ET_DYN: load_bias is the offset added to file VAs to obtain
+  // the runtime VA in the loaded image. Berberis runs guest code 1:1 in the
+  // host address space, so this is also the host-writable address.
+  uintptr_t target_addr =
+      static_cast<uintptr_t>(linker_elf.load_bias()) + static_cast<uintptr_t>(st_value);
+  const char** target = reinterpret_cast<const char**>(target_addr);
+  *target = progname;
+  TRACE("PatchLinkerProgname: linker __dl___progname=%p (\"%s\") at host %p",
+        progname, progname, target);
+}
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+// endregion
+
 }  // namespace
 
 GuestLoader::GuestLoader() = default;
@@ -330,6 +476,16 @@ GuestLoader* GuestLoader::CreateInstance(const char* main_executable_path,
                                   error_msg)) {
       return nullptr;
     }
+    // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    // Prevent __dl___strlen_aarch64(NULL) inside the linker's GetDefaultTag
+    // by seeding the linker's private __progname with the executable path.
+    // SetMainExecutableRealPath above forever-allocates the string, so the
+    // pointer we install here is safe for the full process lifetime.
+    PatchLinkerProgname(loader_path, instance->linker_elf_file_,
+                        GetMainExecutableRealPath());
+#endif
+    // endregion
     if (!InitializeLinker(&instance->linker_callbacks_, instance->linker_elf_file_, error_msg)) {
       return nullptr;
     }
