@@ -417,6 +417,15 @@ class SemanticsPlayer {
   // endregion
 
   // region digitalis
+  void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
+    listener_->CryptoSha3Reg(rd, rn, rm, opcode);
+  }
+  void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
+    listener_->CryptoSha2Reg(rd, rn, opcode);
+  }
+  // endregion
+
+  // region digitalis
   void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t size,
                           bool q, bool is_store, bool postindex, uint8_t rm,
                           bool is_interleaved) {
