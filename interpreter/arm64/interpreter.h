@@ -1223,6 +1223,120 @@ class Interpreter {
     state_->cpu.v[rd] = result;
   }
 
+  // region digitalis - TBL / TBX (vector table lookup). Reads `len+1`
+  // consecutive Q registers starting at Rn to form a 16/32/48/64-byte
+  // table, then for each lane i of Vm uses Vm[i] as an index into the
+  // table.
+  //   TBL: out-of-range indices produce 0.
+  //   TBX: out-of-range indices preserve the existing Vd byte.
+  // Per the ARM ARM, when len+1 source registers are used, they form a
+  // single linear byte table -- Vn, V(n+1)%32, V(n+2)%32, V(n+3)%32.
+  void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
+                          uint8_t op, bool q) {
+    CHECK(!exception_raised_);
+    uint8_t table_regs = len + 1;
+    uint8_t table[64] = {};
+    uint8_t table_bytes = table_regs * 16;
+    for (uint8_t r = 0; r < table_regs; r++) {
+      __uint128_t v = state_->cpu.v[(rn + r) % 32];
+      memcpy(table + r * 16, &v, 16);
+    }
+    __uint128_t vm_val = state_->cpu.v[rm];
+    uint8_t idx_bytes[16];
+    memcpy(idx_bytes, &vm_val, 16);
+
+    uint8_t out[16];
+    if (op /*TBX*/) {
+      __uint128_t vd_val = state_->cpu.v[rd];
+      memcpy(out, &vd_val, 16);
+    } else {
+      memset(out, 0, sizeof(out));
+    }
+
+    uint8_t num_bytes = q ? 16 : 8;
+    for (uint8_t i = 0; i < num_bytes; i++) {
+      uint8_t idx = idx_bytes[i];
+      if (idx < table_bytes) {
+        out[i] = table[idx];
+      }
+      // else: TBL leaves 0 (already zeroed), TBX leaves the existing Vd byte.
+    }
+
+    // Upper bytes of result for Q=0 (8-byte) form should be zeroed.
+    __uint128_t result = 0;
+    memcpy(&result, out, num_bytes);
+    state_->cpu.v[rd] = result;
+  }
+  // endregion
+
+  // region digitalis - SHA-512 (FEAT_SHA512). Each op operates on .2D vectors.
+  // The references below match ARM ARM C7.2.85/86/87/88 pseudocode exactly,
+  // double-checked against FIPS-180-4 section 4.1.3 (SHA-512 round functions).
+  void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    auto ror64 = [](uint64_t x, unsigned n) -> uint64_t {
+      return (x >> n) | (x << (64u - n));
+    };
+    auto big_sigma0 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 28) ^ ror64(x, 34) ^ ror64(x, 39);
+    };
+    auto big_sigma1 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 14) ^ ror64(x, 18) ^ ror64(x, 41);
+    };
+    auto little_sigma0 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 1) ^ ror64(x, 8) ^ (x >> 7);
+    };
+    auto little_sigma1 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 19) ^ ror64(x, 61) ^ (x >> 6);
+    };
+
+    uint64_t d[2], n[2], m[2];
+    {
+      __uint128_t vd_v = state_->cpu.v[rd];
+      __uint128_t vn_v = state_->cpu.v[rn];
+      __uint128_t vm_v = state_->cpu.v[rm];
+      memcpy(d, &vd_v, 16);
+      memcpy(n, &vn_v, 16);
+      memcpy(m, &vm_v, 16);
+    }
+
+    uint64_t out[2] = {d[0], d[1]};
+    switch (op) {
+      case Decoder::Sha512Op::kSha512h: {
+        uint64_t e = m[0], f = n[0], g = n[1];
+        uint64_t tmp = ((e & f) ^ (~e & g)) + big_sigma1(e) + d[1];
+        out[1] = d[0] + tmp;
+        out[0] = tmp;
+        break;
+      }
+      case Decoder::Sha512Op::kSha512h2: {
+        auto maj = [](uint64_t a, uint64_t b, uint64_t c) -> uint64_t {
+          return (a & b) ^ (a & c) ^ (b & c);
+        };
+        uint64_t new_d1 =
+            d[1] + big_sigma0(n[0]) + maj(n[0], m[0], m[1]);
+        uint64_t new_d0 =
+            d[0] + big_sigma0(new_d1) + maj(new_d1, n[0], m[0]);
+        out[0] = new_d0;
+        out[1] = new_d1;
+        break;
+      }
+      case Decoder::Sha512Op::kSha512su0:
+        out[0] = d[0] + little_sigma0(d[1]);
+        out[1] = d[1] + little_sigma0(n[0]);
+        break;
+      case Decoder::Sha512Op::kSha512su1:
+        out[0] = d[0] + little_sigma1(n[0]) + m[0];
+        out[1] = d[1] + little_sigma1(n[1]) + m[1];
+        break;
+    }
+
+    __uint128_t result = 0;
+    memcpy(&result, out, 16);
+    state_->cpu.v[rd] = result;
+  }
+  // endregion
+
   // region digitalis
   // Cryptographic AES — ARMv8 crypto extension (used by libcrypto / TLS in
   // apps like WhatsApp). Spec: ARM ARM C7.2.1 (AESE/AESD/AESMC/AESIMC).
@@ -1353,10 +1467,12 @@ class Interpreter {
   // Cryptographic three-register SHA — ARMv8 crypto extension. This cycle
   // implements the SHA-1 round-mix variants (SHA1C/SHA1P/SHA1M), which differ
   // only by which choice function f(B,C,D) is used, plus SHA1SU0 (message
-  // schedule helper). The SHA-256 group (100/101/110) and undefined (111)
-  // still fall through to Undefined() for a future cycle.
+  // schedule helper) and the SHA-256 round-mix (SHA256H/H2) + schedule
+  // helper SHA256SU1. The undefined opcode 111 still falls through to
+  // Undefined().
   //
-  // Spec: ARM ARM C7.2.71/72/73 (SHA1C/SHA1P/SHA1M), C7.2.75 (SHA1SU0).
+  // Spec: ARM ARM C7.2.71/72/73 (SHA1C/SHA1P/SHA1M), C7.2.75 (SHA1SU0),
+  //       C7.2.77/78 (SHA256H/H2), C7.2.80 (SHA256SU1).
   //
   // SHA1C/SHA1P/SHA1M:
   //   Qd holds {A,B,C,D} in lanes 0..3; Sn = e (32-bit input);
@@ -1379,17 +1495,54 @@ class Interpreter {
   //     result[2] = Vn[0] XOR Vd[2] XOR Vm[2]
   //     result[3] = Vn[1] XOR Vd[3] XOR Vm[3]
   //   Together with SHA1SU1 this computes W[t..t+3] from W[t-16..t-1].
+  //
+  // SHA256H (X = Vd = {A,B,C,D}, Y = Vn = {E,F,G,H}, W = Vm = K+wt):
+  //   For e = 0..3:
+  //     chs = (Y0&Y1)^(~Y0&Y2)               // Ch(E,F,G)
+  //     maj = (X0&X1)^(X0&X2)^(X1&X2)        // Maj(A,B,C)
+  //     t   = Y3 + Sigma1(Y0) + chs + W[e]   // T1 of FIPS-180-4
+  //     X3  = t + X3                         // D_new = T1 + D
+  //     Y3  = t + Sigma0(X0) + maj           // H_new = T1 + T2
+  //     ROL({Y,X}, 32): new X = {Y3, X0, X1, X2}, new Y = {X3, Y0, Y1, Y2}
+  //   Vd <- X.
+  //   SHA256H2 is the same loop but with X = Vn and Y = Vd, returning Y to Vd.
+  //   Sigma0(x) = ROR(x,2) ^ ROR(x,13) ^ ROR(x,22)
+  //   Sigma1(x) = ROR(x,6) ^ ROR(x,11) ^ ROR(x,25)
+  //
+  // SHA256SU1 (message schedule helper, part 2 of 2):
+  //   d holds W[t..t+3] + σ0(W[t+1..t+4]) (from a prior SHA256SU0).
+  //   n holds W[t+8..t+11], m holds W[t+12..t+15].
+  //   d[0] += σ1(m[2]) + n[1];                    // → W[t+16]
+  //   d[1] += σ1(m[3]) + n[2];                    // → W[t+17]
+  //   d[2] += σ1(d[0]_new) + n[3];                // → W[t+18]
+  //   d[3] += σ1(d[1]_new) + m[0];                // → W[t+19]
+  //   where σ1(x) = ROR(x,17) ^ ROR(x,19) ^ (x >> 10). Note that lane 0 of
+  //   the n operand is unused (a quirk of the ARM ARM definition; in
+  //   practice OpenSSL builds n by `ext` so that lanes 1..3 align).
   void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
     CHECK(!exception_raised_);
-    if (opcode > 0b011) {
-      // SHA256H/H2/SU1 (100/101/110), Undefined (111) — not implemented.
+    if (opcode > 0b110) {
+      // Undefined (111).
       Undefined();
       return;
     }
     __uint128_t qd = state_->cpu.v[rd];
     __uint128_t vn = state_->cpu.v[rn];
     __uint128_t vm = state_->cpu.v[rm];
+    auto unpack4 = [](__uint128_t v, uint32_t out[4]) {
+      out[0] = static_cast<uint32_t>(v);
+      out[1] = static_cast<uint32_t>(v >> 32);
+      out[2] = static_cast<uint32_t>(v >> 64);
+      out[3] = static_cast<uint32_t>(v >> 96);
+    };
+    auto pack4 = [](const uint32_t in[4]) -> __uint128_t {
+      return static_cast<__uint128_t>(in[0]) |
+             (static_cast<__uint128_t>(in[1]) << 32) |
+             (static_cast<__uint128_t>(in[2]) << 64) |
+             (static_cast<__uint128_t>(in[3]) << 96);
+    };
     if (opcode == 0b011) {
+      // SHA1SU0.
       uint32_t d0 = static_cast<uint32_t>(qd);
       uint32_t d1 = static_cast<uint32_t>(qd >> 32);
       uint32_t d2 = static_cast<uint32_t>(qd >> 64);
@@ -1408,6 +1561,58 @@ class Interpreter {
                           (static_cast<__uint128_t>(t1) << 32) |
                           (static_cast<__uint128_t>(t2) << 64) |
                           (static_cast<__uint128_t>(t3) << 96);
+      return;
+    }
+    if (opcode == 0b100 || opcode == 0b101) {
+      // SHA256H (100) / SHA256H2 (101).
+      // ARM ARM: for SHA256H, X = Vd, Y = Vn, write result back to Vd as X.
+      // For SHA256H2, X = Vn, Y = Vd, write result back to Vd as Y.
+      auto BigSigma0 = [](uint32_t x) -> uint32_t {
+        return ((x >> 2) | (x << 30)) ^ ((x >> 13) | (x << 19)) ^
+               ((x >> 22) | (x << 10));
+      };
+      auto BigSigma1 = [](uint32_t x) -> uint32_t {
+        return ((x >> 6) | (x << 26)) ^ ((x >> 11) | (x << 21)) ^
+               ((x >> 25) | (x << 7));
+      };
+      uint32_t x[4], y[4], w[4];
+      if (opcode == 0b100) {
+        unpack4(qd, x);
+        unpack4(vn, y);
+      } else {
+        unpack4(vn, x);
+        unpack4(qd, y);
+      }
+      unpack4(vm, w);
+      for (int e = 0; e < 4; e++) {
+        uint32_t chs = (y[0] & y[1]) ^ (~y[0] & y[2]);
+        uint32_t maj = (x[0] & x[1]) ^ (x[0] & x[2]) ^ (x[1] & x[2]);
+        uint32_t t = y[3] + BigSigma1(y[0]) + chs + w[e];
+        uint32_t new_x3 = t + x[3];
+        uint32_t new_y3 = t + BigSigma0(x[0]) + maj;
+        uint32_t x0 = x[0], x1 = x[1], x2 = x[2];
+        uint32_t y0 = y[0], y1 = y[1], y2 = y[2];
+        x[0] = new_y3; x[1] = x0; x[2] = x1; x[3] = x2;
+        y[0] = new_x3; y[1] = y0; y[2] = y1; y[3] = y2;
+      }
+      state_->cpu.v[rd] = pack4(opcode == 0b100 ? x : y);
+      return;
+    }
+    if (opcode == 0b110) {
+      // SHA256SU1.
+      auto LittleSigma1 = [](uint32_t x) -> uint32_t {
+        return ((x >> 17) | (x << 15)) ^ ((x >> 19) | (x << 13)) ^ (x >> 10);
+      };
+      uint32_t d[4], n[4], m[4];
+      unpack4(qd, d);
+      unpack4(vn, n);
+      unpack4(vm, m);
+      uint32_t nd0 = d[0] + LittleSigma1(m[2]) + n[1];
+      uint32_t nd1 = d[1] + LittleSigma1(m[3]) + n[2];
+      uint32_t nd2 = d[2] + LittleSigma1(nd0) + n[3];
+      uint32_t nd3 = d[3] + LittleSigma1(nd1) + m[0];
+      uint32_t out[4] = {nd0, nd1, nd2, nd3};
+      state_->cpu.v[rd] = pack4(out);
       return;
     }
     // SHA1C/SHA1P/SHA1M.
@@ -1444,10 +1649,10 @@ class Interpreter {
                         (static_cast<__uint128_t>(d) << 96);
   }
 
-  // Cryptographic two-register SHA. This cycle implements SHA1H and SHA1SU1;
-  // SHA256SU0 (10) and Undefined (11) still fall through to Undefined().
+  // Cryptographic two-register SHA. Implements SHA1H, SHA1SU1, and SHA256SU0.
+  // Only opcode 11 (Undefined) falls through to Undefined() now.
   //
-  // Spec: ARM ARM C7.2.74 (SHA1H), C7.2.76 (SHA1SU1).
+  // Spec: ARM ARM C7.2.74 (SHA1H), C7.2.76 (SHA1SU1), C7.2.79 (SHA256SU0).
   //
   // SHA1H <Sd>, <Sn>:
   //   Sd[31:0] = ROL(Sn[31:0], 30); Sd[127:32] = 0.
@@ -1457,6 +1662,12 @@ class Interpreter {
   //   Step 2: d[i] = ROL(d[i], 1) for i = 0..2
   //   Step 3: d[3] = ROL(d[3] ^ d[0], 1)     (d[0] here is post-step-2 = W[t+16])
   //   This completes the schedule: d now holds the next four ROL1'd words.
+  //
+  // SHA256SU0 <Vd>.4S, <Vn>.4S (message schedule update, part 1 of 2):
+  //   d[i] = Vd[i] + σ0(Vd[i+1]) for i = 0..2
+  //   d[3] = Vd[3] + σ0(Vn[0])
+  //   where σ0(x) = ROR(x,7) ^ ROR(x,18) ^ (x >> 3) (FIPS-180-4 lowercase σ0).
+  //   Together with SHA256SU1 this computes W[t+16..t+19] from W[t..t+15].
   void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
     CHECK(!exception_raised_);
     if (opcode == 0b00) {
@@ -1496,7 +1707,31 @@ class Interpreter {
                           (static_cast<__uint128_t>(d[3]) << 96);
       return;
     }
-    // SHA256SU0 (10), Undefined (11).
+    if (opcode == 0b10) {
+      // SHA256SU0.
+      auto LittleSigma0 = [](uint32_t x) -> uint32_t {
+        return ((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3);
+      };
+      __uint128_t vd = state_->cpu.v[rd];
+      __uint128_t vn = state_->cpu.v[rn];
+      uint32_t d[4] = {
+          static_cast<uint32_t>(vd),
+          static_cast<uint32_t>(vd >> 32),
+          static_cast<uint32_t>(vd >> 64),
+          static_cast<uint32_t>(vd >> 96),
+      };
+      uint32_t n0 = static_cast<uint32_t>(vn);
+      uint32_t out0 = d[0] + LittleSigma0(d[1]);
+      uint32_t out1 = d[1] + LittleSigma0(d[2]);
+      uint32_t out2 = d[2] + LittleSigma0(d[3]);
+      uint32_t out3 = d[3] + LittleSigma0(n0);
+      state_->cpu.v[rd] = static_cast<__uint128_t>(out0) |
+                          (static_cast<__uint128_t>(out1) << 32) |
+                          (static_cast<__uint128_t>(out2) << 64) |
+                          (static_cast<__uint128_t>(out3) << 96);
+      return;
+    }
+    // Undefined (11).
     Undefined();
   }
   // endregion
@@ -2851,16 +3086,27 @@ class Interpreter {
         break;
 
       // --- Saturating add/sub ---
-      case Decoder::AdvSimdThreeSameOpcode::kSqadd:
+      // SQADD / SQSUB clamp to the per-element signed range, not the lambda's
+      // int64 range. Pre-fix these returned INT64_MIN/MAX which the caller's
+      // mask truncated to garbage; now we capture `esize` so the lambda can
+      // pick the right bounds.
+      case Decoder::AdvSimdThreeSameOpcode::kSqadd: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (bits_local == 64) ? INT64_MAX
+                                          : ((1LL << (bits_local - 1)) - 1);
+        int64_t smin = (bits_local == 64) ? INT64_MIN
+                                          : -(1LL << (bits_local - 1));
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
-            [](int64_t a, int64_t b) -> int64_t {
+            [smax, smin](int64_t a, int64_t b) -> int64_t {
               int64_t sum = a + b;
-              // Overflow: positive + positive = negative, or negative + negative = positive.
-              if (b > 0 && sum < a) return INT64_MAX;  // Saturated by caller's mask.
-              if (b < 0 && sum > a) return INT64_MIN;
+              if (b > 0 && sum < a) return smax;
+              if (b < 0 && sum > a) return smin;
+              if (sum > smax) return smax;
+              if (sum < smin) return smin;
               return sum;
             });
         break;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kUqadd:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
@@ -2869,15 +3115,23 @@ class Interpreter {
               return (sum > mask) ? mask : sum;
             });
         break;
-      case Decoder::AdvSimdThreeSameOpcode::kSqsub:
+      case Decoder::AdvSimdThreeSameOpcode::kSqsub: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (bits_local == 64) ? INT64_MAX
+                                          : ((1LL << (bits_local - 1)) - 1);
+        int64_t smin = (bits_local == 64) ? INT64_MIN
+                                          : -(1LL << (bits_local - 1));
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
-            [](int64_t a, int64_t b) -> int64_t {
+            [smax, smin](int64_t a, int64_t b) -> int64_t {
               int64_t diff = a - b;
-              if (b > 0 && diff > a) return INT64_MIN;
-              if (b < 0 && diff < a) return INT64_MAX;
+              if (b > 0 && diff > a) return smin;
+              if (b < 0 && diff < a) return smax;
+              if (diff > smax) return smax;
+              if (diff < smin) return smin;
               return diff;
             });
         break;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kUqsub:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
@@ -3065,7 +3319,8 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFcmgeV:
       case Decoder::AdvSimdThreeSameOpcode::kFcmgtV:
       case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
-      case Decoder::AdvSimdThreeSameOpcode::kFacgtV: {
+      case Decoder::AdvSimdThreeSameOpcode::kFacgtV:
+      case Decoder::AdvSimdThreeSameOpcode::kFabdV: {
         bool is_double = (args.size == 0b01);
         uint8_t fp_esize = is_double ? 8 : 4;
         uint8_t fp_num = vec_len / fp_esize;
@@ -3117,6 +3372,8 @@ class Interpreter {
                 uint64_t bits = (std::fabs(a) > std::fabs(b)) ? ~uint64_t{0} : 0;
                 memcpy(&r, &bits, 8); break;
               }
+              case Decoder::AdvSimdThreeSameOpcode::kFabdV:
+                r = std::fabs(a - b); break;
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
@@ -3164,6 +3421,8 @@ class Interpreter {
                 uint32_t bits = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFu : 0;
                 memcpy(&r, &bits, 4); break;
               }
+              case Decoder::AdvSimdThreeSameOpcode::kFabdV:
+                r = std::fabs(a - b); break;
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
@@ -4105,6 +4364,125 @@ class Interpreter {
               d = static_cast<double>(static_cast<int64_t>(int_bits));
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * fp_esize, &d, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis - FCVTZS/FCVTZU (vector, FP→int): per-lane FP-to-int
+      // truncating conversion. sz=0 -> 32-bit float→int32, sz=1 -> 64-bit
+      // double→int64. Out-of-range values saturate per the ARM ARM spec.
+      // The decoder routes opcode=11011 with bit23=1 here, so args.size's
+      // high bit is always 1 -- only the low bit (sz) selects single vs
+      // double, unlike SCVTF/UCVTF whose bit23=0 path keeps size's high
+      // bit clear. We don't reject "size & 0b10" the way SCVTF does.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
+        bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV);
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            uint32_t out;
+            if (is_unsigned) {
+              uint32_t v;
+              if (f != f /* NaN */ || f < 0.0f) v = 0u;
+              else if (f >= 4294967296.0f) v = 0xffffffffu;
+              else v = static_cast<uint32_t>(f);  // truncates toward zero
+              out = v;
+            } else {
+              int32_t v;
+              if (f != f) v = 0;
+              else if (f >= 2147483648.0f) v = 0x7fffffff;
+              else if (f < -2147483648.0f) v = static_cast<int32_t>(0x80000000);
+              else v = static_cast<int32_t>(f);
+              memcpy(&out, &v, 4);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &out, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            uint64_t out;
+            if (is_unsigned) {
+              uint64_t v;
+              if (d != d || d < 0.0) v = 0u;
+              else if (d >= 18446744073709551616.0) v = 0xffffffffffffffffULL;
+              else v = static_cast<uint64_t>(d);
+              out = v;
+            } else {
+              int64_t v;
+              if (d != d) v = 0;
+              else if (d >= 9223372036854775808.0) v = 0x7fffffffffffffffLL;
+              else if (d < -9223372036854775808.0)
+                v = static_cast<int64_t>(0x8000000000000000ULL);
+              else v = static_cast<int64_t>(d);
+              memcpy(&out, &v, 8);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &out, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis - FRECPE / FRSQRTE (vector): per-lane reciprocal /
+      // reciprocal-square-root estimate. The ARM spec only requires ~8 bits
+      // of mantissa precision; computing 1/x and 1/sqrt(x) in full precision
+      // is well within that bound, so callers that need the estimate as a
+      // Newton-Raphson seed will converge identically.
+      // region digitalis - FSQRT (vector): per-lane square root.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            float r = __builtin_sqrtf(f);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            double r = __builtin_sqrt(d);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        // Same bit23=1 rationale as the FCVTZS case above.
+        uint8_t fp_count = vec_len / fp_esize;
+        bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV);
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            float r;
+            if (is_rsqrt) {
+              r = (f <= 0.0f || f != f) ? __builtin_nanf("") : 1.0f / __builtin_sqrtf(f);
+            } else {
+              r = (f == 0.0f) ? __builtin_inff() * (1.0f / f) : 1.0f / f;
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            double r;
+            if (is_rsqrt) {
+              r = (d <= 0.0 || d != d) ? __builtin_nan("") : 1.0 / __builtin_sqrt(d);
+            } else {
+              r = (d == 0.0) ? __builtin_inf() * (1.0 / d) : 1.0 / d;
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
           }
         }
         break;

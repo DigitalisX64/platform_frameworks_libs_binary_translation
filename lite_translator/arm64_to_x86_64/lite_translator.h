@@ -1848,6 +1848,17 @@ class LiteTranslator {
     UNUSED(rd, rn, rm, size, opcode, q);
     Undefined();
   }
+
+  void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
+                          uint8_t op, bool q) {
+    UNUSED(rd, rn, rm, len, op, q);
+    Undefined();
+  }
+
+  void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(op, rd, rn, rm);
+    Undefined();
+  }
   // endregion
 
   // region digitalis
