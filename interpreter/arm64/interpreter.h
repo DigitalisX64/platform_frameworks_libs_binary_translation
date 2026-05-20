@@ -1352,10 +1352,13 @@ class Interpreter {
   // region digitalis
   // Cryptographic three-register SHA — ARMv8 crypto extension. This cycle
   // implements the SHA-1 round-mix variants (SHA1C/SHA1P/SHA1M), which differ
-  // only by which choice function f(B,C,D) is used. SHA1SU0 and the SHA-256
-  // group are routed here too but left as Undefined() for a future cycle.
+  // only by which choice function f(B,C,D) is used, plus SHA1SU0 (message
+  // schedule helper). The SHA-256 group (100/101/110) and undefined (111)
+  // still fall through to Undefined() for a future cycle.
   //
-  // Spec: ARM ARM C7.2.71/72/73 (SHA1C/SHA1P/SHA1M).
+  // Spec: ARM ARM C7.2.71/72/73 (SHA1C/SHA1P/SHA1M), C7.2.75 (SHA1SU0).
+  //
+  // SHA1C/SHA1P/SHA1M:
   //   Qd holds {A,B,C,D} in lanes 0..3; Sn = e (32-bit input);
   //   Vm.4S holds the 4 schedule words W[0..3].
   //   For j = 0..3:
@@ -1365,21 +1368,54 @@ class Interpreter {
   //   f for SHA1C: (B & C) | (~B & D)
   //   f for SHA1P: B ^ C ^ D
   //   f for SHA1M: (B & C) | (B & D) | (C & D)
+  //
+  // SHA1SU0 (message schedule update, part 1 of 2):
+  //   T<127:64> = Vn<63:0>;    // lanes 2,3 of result = lanes 0,1 of Vn
+  //   T<63:0>   = Vd<127:64>;  // lanes 0,1 of result = lanes 2,3 of Vd
+  //   Vd = T EOR Vd EOR Vm.
+  //   Equivalently per-lane:
+  //     result[0] = Vd[2] XOR Vd[0] XOR Vm[0]
+  //     result[1] = Vd[3] XOR Vd[1] XOR Vm[1]
+  //     result[2] = Vn[0] XOR Vd[2] XOR Vm[2]
+  //     result[3] = Vn[1] XOR Vd[3] XOR Vm[3]
+  //   Together with SHA1SU1 this computes W[t..t+3] from W[t-16..t-1].
   void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
     CHECK(!exception_raised_);
-    if (opcode > 0b010) {
-      // SHA1SU0 (011), SHA256H/H2/SU1 (100/101/110), Undefined (111) —
-      // not implemented this cycle.
+    if (opcode > 0b011) {
+      // SHA256H/H2/SU1 (100/101/110), Undefined (111) — not implemented.
       Undefined();
       return;
     }
     __uint128_t qd = state_->cpu.v[rd];
+    __uint128_t vn = state_->cpu.v[rn];
     __uint128_t vm = state_->cpu.v[rm];
+    if (opcode == 0b011) {
+      uint32_t d0 = static_cast<uint32_t>(qd);
+      uint32_t d1 = static_cast<uint32_t>(qd >> 32);
+      uint32_t d2 = static_cast<uint32_t>(qd >> 64);
+      uint32_t d3 = static_cast<uint32_t>(qd >> 96);
+      uint32_t n0 = static_cast<uint32_t>(vn);
+      uint32_t n1 = static_cast<uint32_t>(vn >> 32);
+      uint32_t m0 = static_cast<uint32_t>(vm);
+      uint32_t m1 = static_cast<uint32_t>(vm >> 32);
+      uint32_t m2 = static_cast<uint32_t>(vm >> 64);
+      uint32_t m3 = static_cast<uint32_t>(vm >> 96);
+      uint32_t t0 = d2 ^ d0 ^ m0;
+      uint32_t t1 = d3 ^ d1 ^ m1;
+      uint32_t t2 = n0 ^ d2 ^ m2;
+      uint32_t t3 = n1 ^ d3 ^ m3;
+      state_->cpu.v[rd] = static_cast<__uint128_t>(t0) |
+                          (static_cast<__uint128_t>(t1) << 32) |
+                          (static_cast<__uint128_t>(t2) << 64) |
+                          (static_cast<__uint128_t>(t3) << 96);
+      return;
+    }
+    // SHA1C/SHA1P/SHA1M.
     uint32_t a = static_cast<uint32_t>(qd);
     uint32_t b = static_cast<uint32_t>(qd >> 32);
     uint32_t c = static_cast<uint32_t>(qd >> 64);
     uint32_t d = static_cast<uint32_t>(qd >> 96);
-    uint32_t e = static_cast<uint32_t>(state_->cpu.v[rn]);  // Sn (32-bit)
+    uint32_t e = static_cast<uint32_t>(vn);  // Sn (32-bit)
     uint32_t w[4] = {
         static_cast<uint32_t>(vm),
         static_cast<uint32_t>(vm >> 32),
@@ -1408,21 +1444,60 @@ class Interpreter {
                         (static_cast<__uint128_t>(d) << 96);
   }
 
-  // Cryptographic two-register SHA. This cycle implements SHA1H only;
-  // SHA1SU1 and SHA256SU0 fall through to Undefined() for a future cycle.
+  // Cryptographic two-register SHA. This cycle implements SHA1H and SHA1SU1;
+  // SHA256SU0 (10) and Undefined (11) still fall through to Undefined().
   //
-  // Spec: ARM ARM C7.2.74 (SHA1H).
-  //   SHA1H <Sd>, <Sn>: Sd[31:0] = ROL(Sn[31:0], 30); Sd[127:32] = 0.
+  // Spec: ARM ARM C7.2.74 (SHA1H), C7.2.76 (SHA1SU1).
+  //
+  // SHA1H <Sd>, <Sn>:
+  //   Sd[31:0] = ROL(Sn[31:0], 30); Sd[127:32] = 0.
+  //
+  // SHA1SU1 <Vd>.4S, <Vn>.4S (message schedule update, part 2 of 2):
+  //   Step 1: d[i] ^= Vn[i+1] for i = 0..2   (lane-shifted XOR, lane 3 untouched)
+  //   Step 2: d[i] = ROL(d[i], 1) for i = 0..2
+  //   Step 3: d[3] = ROL(d[3] ^ d[0], 1)     (d[0] here is post-step-2 = W[t+16])
+  //   This completes the schedule: d now holds the next four ROL1'd words.
   void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
     CHECK(!exception_raised_);
-    if (opcode != 0b00) {
-      // SHA1SU1 (01), SHA256SU0 (10), Undefined (11) — not implemented.
-      Undefined();
+    if (opcode == 0b00) {
+      // SHA1H.
+      uint32_t n = static_cast<uint32_t>(state_->cpu.v[rn]);
+      uint32_t result = (n << 30) | (n >> 2);  // ROL by 30 == ROR by 2.
+      state_->cpu.v[rd] = static_cast<__uint128_t>(result);
       return;
     }
-    uint32_t n = static_cast<uint32_t>(state_->cpu.v[rn]);
-    uint32_t result = (n << 30) | (n >> 2);  // ROL by 30 == ROR by 2.
-    state_->cpu.v[rd] = static_cast<__uint128_t>(result);
+    if (opcode == 0b01) {
+      // SHA1SU1.
+      __uint128_t vd = state_->cpu.v[rd];
+      __uint128_t vn = state_->cpu.v[rn];
+      uint32_t d[4] = {
+          static_cast<uint32_t>(vd),
+          static_cast<uint32_t>(vd >> 32),
+          static_cast<uint32_t>(vd >> 64),
+          static_cast<uint32_t>(vd >> 96),
+      };
+      uint32_t n[4] = {
+          static_cast<uint32_t>(vn),
+          static_cast<uint32_t>(vn >> 32),
+          static_cast<uint32_t>(vn >> 64),
+          static_cast<uint32_t>(vn >> 96),
+      };
+      for (int i = 0; i < 3; i++) {
+        d[i] ^= n[i + 1];
+      }
+      for (int i = 0; i < 3; i++) {
+        d[i] = (d[i] << 1) | (d[i] >> 31);  // ROL by 1
+      }
+      uint32_t t3 = d[3] ^ d[0];
+      d[3] = (t3 << 1) | (t3 >> 31);
+      state_->cpu.v[rd] = static_cast<__uint128_t>(d[0]) |
+                          (static_cast<__uint128_t>(d[1]) << 32) |
+                          (static_cast<__uint128_t>(d[2]) << 64) |
+                          (static_cast<__uint128_t>(d[3]) << 96);
+      return;
+    }
+    // SHA256SU0 (10), Undefined (11).
+    Undefined();
   }
   // endregion
 

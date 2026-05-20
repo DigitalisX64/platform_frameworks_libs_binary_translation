@@ -1967,7 +1967,7 @@ class Decoder {
     //   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:12]=opcode, bits[11:10]=00
     // Must be checked BEFORE FpFixedPointConversion (which catches !bit21
     // for the bits[28:24]=11110 group and would silently mis-route SHA).
-    // opcode: 000=SHA1C, 001=SHA1P, 010=SHA1M, 011=SHA1SU0 (interp-only),
+    // opcode: 000=SHA1C, 001=SHA1P, 010=SHA1M, 011=SHA1SU0,
     //         100=SHA256H, 101=SHA256H2, 110=SHA256SU1, 111=Undefined.
     if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
         GetBits<24, 5>() == 0b11110 && GetBits<22, 2>() == 0 &&
@@ -1988,8 +1988,7 @@ class Decoder {
     //   bits[11:10]=10
     // Must be checked BEFORE FpDataProc2 (which also matches bits[28:24]=11110,
     // bit21=1, bits[11:10]=10 — but with bit30=0).
-    // opcode: 00=SHA1H, 01=SHA1SU1 (interp-only), 10=SHA256SU0 (interp-only),
-    //         11=Undefined.
+    // opcode: 00=SHA1H, 01=SHA1SU1, 10=SHA256SU0 (interp-only), 11=Undefined.
     if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
         GetBits<24, 5>() == 0b11110 && GetBits<22, 2>() == 0 &&
         GetBits<17, 5>() == 0b10100 && !GetBits<16, 1>() &&
