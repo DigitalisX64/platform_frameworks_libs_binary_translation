@@ -1961,6 +1961,48 @@ class Decoder {
     }
 
     // region digitalis
+    // Cryptographic three-register SHA (SHA1C/SHA1P/SHA1M/SHA1SU0,
+    // SHA256H/SHA256H2/SHA256SU1):
+    //   bit31=0, bit30=1, bit29=0, bits[28:24]=11110, bits[23:22]=00,
+    //   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:12]=opcode, bits[11:10]=00
+    // Must be checked BEFORE FpFixedPointConversion (which catches !bit21
+    // for the bits[28:24]=11110 group and would silently mis-route SHA).
+    // opcode: 000=SHA1C, 001=SHA1P, 010=SHA1M, 011=SHA1SU0 (interp-only),
+    //         100=SHA256H, 101=SHA256H2, 110=SHA256SU1, 111=Undefined.
+    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
+        GetBits<24, 5>() == 0b11110 && GetBits<22, 2>() == 0 &&
+        !GetBits<21, 1>() && !GetBits<15, 1>() && GetBits<10, 2>() == 0b00) {
+      insn_consumer_->CryptoSha3Reg(
+          GetBits<0, 5>(),    // rd
+          GetBits<5, 5>(),    // rn
+          GetBits<16, 5>(),   // rm
+          GetBits<12, 3>());  // opcode
+      return;
+    }
+    // endregion
+
+    // region digitalis
+    // Cryptographic two-register SHA (SHA1H, SHA1SU1, SHA256SU0):
+    //   bit31=0, bit30=1, bit29=0, bits[28:24]=11110, bits[23:22]=00,
+    //   bits[21:17]=10100, bit16=0, bits[15:14]=00, bits[13:12]=opcode,
+    //   bits[11:10]=10
+    // Must be checked BEFORE FpDataProc2 (which also matches bits[28:24]=11110,
+    // bit21=1, bits[11:10]=10 — but with bit30=0).
+    // opcode: 00=SHA1H, 01=SHA1SU1 (interp-only), 10=SHA256SU0 (interp-only),
+    //         11=Undefined.
+    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
+        GetBits<24, 5>() == 0b11110 && GetBits<22, 2>() == 0 &&
+        GetBits<17, 5>() == 0b10100 && !GetBits<16, 1>() &&
+        GetBits<14, 2>() == 0 && GetBits<10, 2>() == 0b10) {
+      insn_consumer_->CryptoSha2Reg(
+          GetBits<0, 5>(),    // rd
+          GetBits<5, 5>(),    // rn
+          GetBits<12, 2>());  // opcode
+      return;
+    }
+    // endregion
+
+    // region digitalis
     // FP <-> fixed-point conversion: bits[28:24]=11110, bit21=0
     // Must be checked BEFORE all bit21=1 FP checks.
     // Encoding: sf 0 S 11110 ftype 0 rmode opcode scale Rn Rd

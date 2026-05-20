@@ -1350,6 +1350,83 @@ class Interpreter {
   // endregion
 
   // region digitalis
+  // Cryptographic three-register SHA — ARMv8 crypto extension. This cycle
+  // implements the SHA-1 round-mix variants (SHA1C/SHA1P/SHA1M), which differ
+  // only by which choice function f(B,C,D) is used. SHA1SU0 and the SHA-256
+  // group are routed here too but left as Undefined() for a future cycle.
+  //
+  // Spec: ARM ARM C7.2.71/72/73 (SHA1C/SHA1P/SHA1M).
+  //   Qd holds {A,B,C,D} in lanes 0..3; Sn = e (32-bit input);
+  //   Vm.4S holds the 4 schedule words W[0..3].
+  //   For j = 0..3:
+  //     t = ROL(A, 5) + f(B,C,D) + e + W[j]
+  //     e, D, C, B, A <- D, C, ROL(B,30), A, t
+  //   Qd <- {A,B,C,D}.
+  //   f for SHA1C: (B & C) | (~B & D)
+  //   f for SHA1P: B ^ C ^ D
+  //   f for SHA1M: (B & C) | (B & D) | (C & D)
+  void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
+    CHECK(!exception_raised_);
+    if (opcode > 0b010) {
+      // SHA1SU0 (011), SHA256H/H2/SU1 (100/101/110), Undefined (111) —
+      // not implemented this cycle.
+      Undefined();
+      return;
+    }
+    __uint128_t qd = state_->cpu.v[rd];
+    __uint128_t vm = state_->cpu.v[rm];
+    uint32_t a = static_cast<uint32_t>(qd);
+    uint32_t b = static_cast<uint32_t>(qd >> 32);
+    uint32_t c = static_cast<uint32_t>(qd >> 64);
+    uint32_t d = static_cast<uint32_t>(qd >> 96);
+    uint32_t e = static_cast<uint32_t>(state_->cpu.v[rn]);  // Sn (32-bit)
+    uint32_t w[4] = {
+        static_cast<uint32_t>(vm),
+        static_cast<uint32_t>(vm >> 32),
+        static_cast<uint32_t>(vm >> 64),
+        static_cast<uint32_t>(vm >> 96),
+    };
+    for (int j = 0; j < 4; j++) {
+      uint32_t f;
+      switch (opcode) {
+        case 0b000: f = (b & c) | (~b & d); break;            // SHA1C
+        case 0b001: f = b ^ c ^ d; break;                     // SHA1P
+        case 0b010: f = (b & c) | (b & d) | (c & d); break;   // SHA1M
+        default: Undefined(); return;
+      }
+      uint32_t rol5_a = (a << 5) | (a >> 27);
+      uint32_t t = rol5_a + f + e + w[j];
+      e = d;
+      d = c;
+      c = (b << 30) | (b >> 2);  // ROL(B, 30)
+      b = a;
+      a = t;
+    }
+    state_->cpu.v[rd] = static_cast<__uint128_t>(a) |
+                        (static_cast<__uint128_t>(b) << 32) |
+                        (static_cast<__uint128_t>(c) << 64) |
+                        (static_cast<__uint128_t>(d) << 96);
+  }
+
+  // Cryptographic two-register SHA. This cycle implements SHA1H only;
+  // SHA1SU1 and SHA256SU0 fall through to Undefined() for a future cycle.
+  //
+  // Spec: ARM ARM C7.2.74 (SHA1H).
+  //   SHA1H <Sd>, <Sn>: Sd[31:0] = ROL(Sn[31:0], 30); Sd[127:32] = 0.
+  void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
+    CHECK(!exception_raised_);
+    if (opcode != 0b00) {
+      // SHA1SU1 (01), SHA256SU0 (10), Undefined (11) — not implemented.
+      Undefined();
+      return;
+    }
+    uint32_t n = static_cast<uint32_t>(state_->cpu.v[rn]);
+    uint32_t result = (n << 30) | (n >> 2);  // ROL by 30 == ROR by 2.
+    state_->cpu.v[rd] = static_cast<__uint128_t>(result);
+  }
+  // endregion
+
+  // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
     CHECK(!exception_raised_);

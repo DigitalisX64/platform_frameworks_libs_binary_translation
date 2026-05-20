@@ -1855,6 +1855,16 @@ class LiteTranslator {
     UNUSED(rd, rn, opcode);
     Undefined();  // interpreter fallback
   }
+
+  void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
+    UNUSED(rd, rn, rm, opcode);
+    Undefined();  // interpreter fallback
+  }
+
+  void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
+    UNUSED(rd, rn, opcode);
+    Undefined();  // interpreter fallback
+  }
   // endregion
 
   // region digitalis
