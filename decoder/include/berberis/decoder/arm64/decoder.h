@@ -802,6 +802,10 @@ class Decoder {
     kUaddlv,    // UADDLV: U=1, opcode=00011, bit20=1 (unsigned add long across)
     kScvtfV,    // SCVTF (vector, integer): U=0, opcode=11101, bit23=0
     kUcvtfV,    // UCVTF (vector, integer): U=1, opcode=11101, bit23=0
+    kFcvtzsV,   // FCVTZS (vector, FP→int trunc): U=0, opcode=11011, bit23=1
+    kFcvtzuV,   // FCVTZU (vector, FP→int trunc): U=1, opcode=11011, bit23=1
+    kFrecpeV,   // FRECPE (vector): U=0, opcode=11101, bit23=1
+    kFrsqrteV,  // FRSQRTE (vector): U=1, opcode=11101, bit23=1
     // endregion
   };
 
@@ -3189,22 +3193,34 @@ class Decoder {
       case 0b01111:
         op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
         break;
-      // region digitalis - SCVTF/UCVTF (vector, integer): opcode=11101, bit23=0.
-      // (bit23=1 with this opcode is FRECPE/FRSQRTE — not implemented here.)
-      // Observed `ucvtf v0.4s, v0.4s` (insn 0x6e21d800) in WhatsApp's
-      // libar-bundle3.so init path.
+      // region digitalis - opcode=11101 splits on bit23:
+      //   bit23=0: SCVTF (U=0) / UCVTF (U=1) — vector int→FP.
+      //   bit23=1: FRECPE (U=0) / FRSQRTE (U=1) — vector FP reciprocal estimate.
       case 0b11101:
-        if (GetBits<23, 1>()) { Undefined(); return; }  // FRECPE/FRSQRTE - TODO
-        op = u ? AdvSimdTwoRegMiscOpcode::kUcvtfV : AdvSimdTwoRegMiscOpcode::kScvtfV;
+        if (GetBits<23, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFrsqrteV
+                 : AdvSimdTwoRegMiscOpcode::kFrecpeV;
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUcvtfV
+                 : AdvSimdTwoRegMiscOpcode::kScvtfV;
+        }
         break;
       // endregion
-      // region digitalis
+      // region digitalis - opcode=11011 splits on whether this is the
+      // across-lanes group (bit20=1, ADDV) or two-reg-misc (bit20=0).
+      // For bit20=0 with bit23=1, this is FCVTZS / FCVTZU (vector FP→int
+      // truncating). bit23=0 / bit20=0 / opcode=11011 is FCVTMS/FCVTMU
+      // (round toward -inf) which are not implemented yet.
       case 0b11011:
-        // ADDV is in the across-lanes group (bit20=1), not two-reg-misc (bit20=0).
-        if (!GetBits<20, 1>()) { Undefined(); return; }
-        if (u) { Undefined(); return; }  // ADDV is U=0 only
-        if (size == 0b11) { Undefined(); return; }  // No 64-bit element ADDV
-        op = AdvSimdTwoRegMiscOpcode::kAddv;
+        if (GetBits<20, 1>()) {
+          if (u) { Undefined(); return; }  // ADDV is U=0 only
+          if (size == 0b11) { Undefined(); return; }  // No 64-bit element ADDV
+          op = AdvSimdTwoRegMiscOpcode::kAddv;
+        } else {
+          if (!GetBits<23, 1>()) { Undefined(); return; }  // FCVTMS/MU — TODO
+          op = u ? AdvSimdTwoRegMiscOpcode::kFcvtzuV
+                 : AdvSimdTwoRegMiscOpcode::kFcvtzsV;
+        }
         break;
       // endregion
       default:
