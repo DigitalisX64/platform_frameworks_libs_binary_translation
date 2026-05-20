@@ -408,6 +408,11 @@ class SemanticsPlayer {
                       uint8_t opcode, bool q) {
     listener_->AdvSimdPermute(rd, rn, rm, size, opcode, q);
   }
+
+  void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
+                          uint8_t op, bool q) {
+    listener_->AdvSimdTableLookup(rd, rn, rm, len, op, q);
+  }
   // endregion
 
   // region digitalis

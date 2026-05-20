@@ -1223,6 +1223,52 @@ class Interpreter {
     state_->cpu.v[rd] = result;
   }
 
+  // region digitalis - TBL / TBX (vector table lookup). Reads `len+1`
+  // consecutive Q registers starting at Rn to form a 16/32/48/64-byte
+  // table, then for each lane i of Vm uses Vm[i] as an index into the
+  // table.
+  //   TBL: out-of-range indices produce 0.
+  //   TBX: out-of-range indices preserve the existing Vd byte.
+  // Per the ARM ARM, when len+1 source registers are used, they form a
+  // single linear byte table -- Vn, V(n+1)%32, V(n+2)%32, V(n+3)%32.
+  void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
+                          uint8_t op, bool q) {
+    CHECK(!exception_raised_);
+    uint8_t table_regs = len + 1;
+    uint8_t table[64] = {};
+    uint8_t table_bytes = table_regs * 16;
+    for (uint8_t r = 0; r < table_regs; r++) {
+      __uint128_t v = state_->cpu.v[(rn + r) % 32];
+      memcpy(table + r * 16, &v, 16);
+    }
+    __uint128_t vm_val = state_->cpu.v[rm];
+    uint8_t idx_bytes[16];
+    memcpy(idx_bytes, &vm_val, 16);
+
+    uint8_t out[16];
+    if (op /*TBX*/) {
+      __uint128_t vd_val = state_->cpu.v[rd];
+      memcpy(out, &vd_val, 16);
+    } else {
+      memset(out, 0, sizeof(out));
+    }
+
+    uint8_t num_bytes = q ? 16 : 8;
+    for (uint8_t i = 0; i < num_bytes; i++) {
+      uint8_t idx = idx_bytes[i];
+      if (idx < table_bytes) {
+        out[i] = table[idx];
+      }
+      // else: TBL leaves 0 (already zeroed), TBX leaves the existing Vd byte.
+    }
+
+    // Upper bytes of result for Q=0 (8-byte) form should be zeroed.
+    __uint128_t result = 0;
+    memcpy(&result, out, num_bytes);
+    state_->cpu.v[rd] = result;
+  }
+  // endregion
+
   // region digitalis
   // Cryptographic AES — ARMv8 crypto extension (used by libcrypto / TLS in
   // apps like WhatsApp). Spec: ARM ARM C7.2.1 (AESE/AESD/AESMC/AESIMC).
@@ -2972,16 +3018,27 @@ class Interpreter {
         break;
 
       // --- Saturating add/sub ---
-      case Decoder::AdvSimdThreeSameOpcode::kSqadd:
+      // SQADD / SQSUB clamp to the per-element signed range, not the lambda's
+      // int64 range. Pre-fix these returned INT64_MIN/MAX which the caller's
+      // mask truncated to garbage; now we capture `esize` so the lambda can
+      // pick the right bounds.
+      case Decoder::AdvSimdThreeSameOpcode::kSqadd: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (bits_local == 64) ? INT64_MAX
+                                          : ((1LL << (bits_local - 1)) - 1);
+        int64_t smin = (bits_local == 64) ? INT64_MIN
+                                          : -(1LL << (bits_local - 1));
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
-            [](int64_t a, int64_t b) -> int64_t {
+            [smax, smin](int64_t a, int64_t b) -> int64_t {
               int64_t sum = a + b;
-              // Overflow: positive + positive = negative, or negative + negative = positive.
-              if (b > 0 && sum < a) return INT64_MAX;  // Saturated by caller's mask.
-              if (b < 0 && sum > a) return INT64_MIN;
+              if (b > 0 && sum < a) return smax;
+              if (b < 0 && sum > a) return smin;
+              if (sum > smax) return smax;
+              if (sum < smin) return smin;
               return sum;
             });
         break;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kUqadd:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
@@ -2990,15 +3047,23 @@ class Interpreter {
               return (sum > mask) ? mask : sum;
             });
         break;
-      case Decoder::AdvSimdThreeSameOpcode::kSqsub:
+      case Decoder::AdvSimdThreeSameOpcode::kSqsub: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (bits_local == 64) ? INT64_MAX
+                                          : ((1LL << (bits_local - 1)) - 1);
+        int64_t smin = (bits_local == 64) ? INT64_MIN
+                                          : -(1LL << (bits_local - 1));
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
-            [](int64_t a, int64_t b) -> int64_t {
+            [smax, smin](int64_t a, int64_t b) -> int64_t {
               int64_t diff = a - b;
-              if (b > 0 && diff > a) return INT64_MIN;
-              if (b < 0 && diff < a) return INT64_MAX;
+              if (b > 0 && diff > a) return smin;
+              if (b < 0 && diff < a) return smax;
+              if (diff > smax) return smax;
+              if (diff < smin) return smin;
               return diff;
             });
         break;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kUqsub:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
@@ -3186,7 +3251,8 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFcmgeV:
       case Decoder::AdvSimdThreeSameOpcode::kFcmgtV:
       case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
-      case Decoder::AdvSimdThreeSameOpcode::kFacgtV: {
+      case Decoder::AdvSimdThreeSameOpcode::kFacgtV:
+      case Decoder::AdvSimdThreeSameOpcode::kFabdV: {
         bool is_double = (args.size == 0b01);
         uint8_t fp_esize = is_double ? 8 : 4;
         uint8_t fp_num = vec_len / fp_esize;
@@ -3238,6 +3304,8 @@ class Interpreter {
                 uint64_t bits = (std::fabs(a) > std::fabs(b)) ? ~uint64_t{0} : 0;
                 memcpy(&r, &bits, 8); break;
               }
+              case Decoder::AdvSimdThreeSameOpcode::kFabdV:
+                r = std::fabs(a - b); break;
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
@@ -3285,6 +3353,8 @@ class Interpreter {
                 uint32_t bits = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFu : 0;
                 memcpy(&r, &bits, 4); break;
               }
+              case Decoder::AdvSimdThreeSameOpcode::kFabdV:
+                r = std::fabs(a - b); break;
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
@@ -4296,6 +4366,27 @@ class Interpreter {
       // of mantissa precision; computing 1/x and 1/sqrt(x) in full precision
       // is well within that bound, so callers that need the estimate as a
       // Newton-Raphson seed will converge identically.
+      // region digitalis - FSQRT (vector): per-lane square root.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            float r = __builtin_sqrtf(f);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            double r = __builtin_sqrt(d);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;

@@ -607,6 +607,7 @@ class Decoder {
     kFcmgtV,    // FCMGT  (vector): op_high=1, opcode=11100, U=1
     kFacgeV,    // FACGE  (vector): op_high=0, opcode=11101, U=1
     kFacgtV,    // FACGT  (vector): op_high=1, opcode=11101, U=1
+    kFabdV,     // FABD   (vector): op_high=1, opcode=11010, U=1
     // endregion
   };
 
@@ -806,6 +807,7 @@ class Decoder {
     kFcvtzuV,   // FCVTZU (vector, FP→int trunc): U=1, opcode=11011, bit23=1
     kFrecpeV,   // FRECPE (vector): U=0, opcode=11101, bit23=1
     kFrsqrteV,  // FRSQRTE (vector): U=1, opcode=11101, bit23=1
+    kFsqrtV,    // FSQRT  (vector): U=1, opcode=11111, bit23=1
     // endregion
   };
 
@@ -2148,16 +2150,34 @@ class Decoder {
     }
 
     // region digitalis
-    // AdvSIMD extract (EXT): bit31=0, bits[28:24]=01110, bits[23:22]=00, bit21=0, bit15=0, bit10=0
+    // AdvSIMD extract (EXT) and AdvSIMD table lookup (TBL/TBX) share most of
+    // their encoding prefix. They differ on bit29 (op2 in the encoding tree):
+    //   EXT: bit29=1   (i.e. bits[29:24]=101110)
+    //   TBL: bit29=0   (i.e. bits[29:24]=001110)
+    // plus the imm4/len/op subfields differ. We dispatch on bit29.
     if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0 &&
         !GetBits<21, 1>() && !GetBits<15, 1>() && !GetBits<10, 1>()) {
-      // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index
-      insn_consumer_->AdvSimdExtract(
-          GetBits<0, 5>(),   // rd
-          GetBits<5, 5>(),   // rn
-          GetBits<16, 5>(),  // rm
-          GetBits<11, 4>(),  // imm4 (byte index)
-          GetBits<30, 1>()); // q
+      if (GetBits<29, 1>()) {
+        // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index
+        insn_consumer_->AdvSimdExtract(
+            GetBits<0, 5>(),   // rd
+            GetBits<5, 5>(),   // rn
+            GetBits<16, 5>(),  // rm
+            GetBits<11, 4>(),  // imm4 (byte index)
+            GetBits<30, 1>()); // q
+      } else {
+        // TBL/TBX Vd.<T>, {Vn.16B [, V(n+1).16B [, V(n+2).16B [, V(n+3).16B]]]}, Vm.<T>
+        // len = bits[14:13]+1 table registers; op = bit12 (0=TBL, 1=TBX).
+        // bit11 must be 0 for TBL/TBX; any other value is reserved.
+        if (GetBits<11, 1>()) { Undefined(); return; }
+        insn_consumer_->AdvSimdTableLookup(
+            GetBits<0, 5>(),   // rd
+            GetBits<5, 5>(),   // rn (first table register; spans len consecutive)
+            GetBits<16, 5>(),  // rm (index vector)
+            GetBits<13, 2>(),  // len (0..3 → 1..4 table registers)
+            GetBits<12, 1>(),  // op (0=TBL, 1=TBX)
+            GetBits<30, 1>()); // q
+      }
       return;
     }
     // endregion
@@ -2941,8 +2961,8 @@ class Decoder {
       } else {
         switch (opcode) {
           case 0b11010:
-            if (u) { ok = false; break; }   // FABD not implemented
-            op = AdvSimdThreeSameOpcode::kFsubV;
+            op = u ? AdvSimdThreeSameOpcode::kFabdV
+                   : AdvSimdThreeSameOpcode::kFsubV;
             break;
           case 0b11001:
             if (u) { ok = false; break; }   // U=1 reserved here
@@ -3204,6 +3224,14 @@ class Decoder {
           op = u ? AdvSimdTwoRegMiscOpcode::kUcvtfV
                  : AdvSimdTwoRegMiscOpcode::kScvtfV;
         }
+        break;
+      // endregion
+      // region digitalis - opcode=11111 with bit23=1, U=1 is FSQRT (vector).
+      // No defined encoding for U=0 / opcode=11111 in two-reg-misc.
+      case 0b11111:
+        if (!u) { Undefined(); return; }
+        if (!GetBits<23, 1>()) { Undefined(); return; }
+        op = AdvSimdTwoRegMiscOpcode::kFsqrtV;
         break;
       // endregion
       // region digitalis - opcode=11011 splits on whether this is the
