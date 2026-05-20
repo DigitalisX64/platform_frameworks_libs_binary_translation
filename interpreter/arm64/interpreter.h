@@ -1005,6 +1005,47 @@ class Interpreter {
     __uint128_t dst = state_->cpu.v[args.rd];  // Needed for accumulate ops (MLAL, MLSL, ABAL)
     __uint128_t result = 0;
 
+    // region digitalis - PMULL handles size=00 (8-bit) and size=11 (64-bit, PMULL64).
+    // Dispatch it before the generic widening size table (which rejects size=11).
+    if (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kPmull) {
+      auto poly_mul = [](uint64_t a, uint64_t b, unsigned in_bits) -> __uint128_t {
+        __uint128_t res = 0;
+        __uint128_t aa = a;
+        for (unsigned i = 0; i < in_bits; ++i) {
+          if ((b >> i) & 1u) {
+            res ^= (aa << i);
+          }
+        }
+        return res;
+      };
+      if (args.size == 0b00) {
+        uint8_t src_n_bytes[16];
+        uint8_t src_m_bytes[16];
+        memcpy(src_n_bytes, &src_n, 16);
+        memcpy(src_m_bytes, &src_m, 16);
+        uint8_t off = args.q ? 8 : 0;
+        uint16_t out_lanes[8];
+        for (unsigned i = 0; i < 8; ++i) {
+          out_lanes[i] =
+              static_cast<uint16_t>(poly_mul(src_n_bytes[off + i], src_m_bytes[off + i], 8));
+        }
+        memcpy(&result, out_lanes, 16);
+      } else if (args.size == 0b11) {
+        uint64_t a;
+        uint64_t b;
+        uint8_t off = args.q ? 8 : 0;
+        memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + off, 8);
+        memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + off, 8);
+        result = poly_mul(a, b, 64);
+      } else {
+        Undefined();
+        return;
+      }
+      state_->cpu.v[args.rd] = result;
+      return;
+    }
+    // endregion
+
     // Input element sizes.
     uint8_t in_esize;  // input element size in bytes
     switch (args.size) {
