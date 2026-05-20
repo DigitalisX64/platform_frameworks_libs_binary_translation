@@ -647,6 +647,13 @@ class Decoder {
     kSsubw,    // SSUBW/SSUBW2: U=0, opcode=0011
     kUsubw,    // USUBW/USUBW2: U=1, opcode=0011
     // endregion
+    // region digitalis - polynomial multiply (ARMv8 base PMULL + crypto PMULL64)
+    // PMULL/PMULL2: U=0, opcode=1110
+    //   size=00: 8-bit element poly-mul, 8 lanes -> 8x 16-bit results
+    //   size=11: 64-bit element poly-mul, 1 lane -> 128-bit result (PMULL64)
+    //   size=01,10 are RESERVED. Used by libz CRC32 acceleration.
+    kPmull,
+    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -2970,11 +2977,13 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // size=11 is reserved for three-different.
-    if (size == 0b11) {
+    // region digitalis - PMULL (opcode=1110) accepts size=00 (8-bit) and size=11 (64-bit, PMULL64).
+    // Decoder rule: size=11 is reserved for all OTHER three-different opcodes; only PMULL allows it.
+    if (size == 0b11 && !(u == 0 && opcode == 0b1110)) {
       Undefined();
       return;
     }
+    // endregion
 
     AdvSimdThreeDiffOpcode op;
 
@@ -2982,6 +2991,14 @@ class Decoder {
       case 0b0000:
         op = u ? AdvSimdThreeDiffOpcode::kUaddl : AdvSimdThreeDiffOpcode::kSaddl;
         break;
+      // region digitalis - polynomial multiply (used by libz CRC32-acc).
+      case 0b1110:
+        if (u != 0) { Undefined(); return; }  // U=1 with opcode=1110 is unallocated
+        // size=01 and size=10 are unallocated for PMULL.
+        if (size == 0b01 || size == 0b10) { Undefined(); return; }
+        op = AdvSimdThreeDiffOpcode::kPmull;
+        break;
+      // endregion
       // region digitalis - wide add/sub variants (opcode 0001/0011)
       case 0b0001:
         op = u ? AdvSimdThreeDiffOpcode::kUaddw : AdvSimdThreeDiffOpcode::kSaddw;
