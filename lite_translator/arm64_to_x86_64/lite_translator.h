@@ -1854,6 +1854,11 @@ class LiteTranslator {
     UNUSED(rd, rn, rm, len, op, q);
     Undefined();
   }
+
+  void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(op, rd, rn, rm);
+    Undefined();
+  }
   // endregion
 
   // region digitalis

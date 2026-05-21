@@ -1269,6 +1269,74 @@ class Interpreter {
   }
   // endregion
 
+  // region digitalis - SHA-512 (FEAT_SHA512). Each op operates on .2D vectors.
+  // The references below match ARM ARM C7.2.85/86/87/88 pseudocode exactly,
+  // double-checked against FIPS-180-4 section 4.1.3 (SHA-512 round functions).
+  void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    auto ror64 = [](uint64_t x, unsigned n) -> uint64_t {
+      return (x >> n) | (x << (64u - n));
+    };
+    auto big_sigma0 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 28) ^ ror64(x, 34) ^ ror64(x, 39);
+    };
+    auto big_sigma1 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 14) ^ ror64(x, 18) ^ ror64(x, 41);
+    };
+    auto little_sigma0 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 1) ^ ror64(x, 8) ^ (x >> 7);
+    };
+    auto little_sigma1 = [&](uint64_t x) -> uint64_t {
+      return ror64(x, 19) ^ ror64(x, 61) ^ (x >> 6);
+    };
+
+    uint64_t d[2], n[2], m[2];
+    {
+      __uint128_t vd_v = state_->cpu.v[rd];
+      __uint128_t vn_v = state_->cpu.v[rn];
+      __uint128_t vm_v = state_->cpu.v[rm];
+      memcpy(d, &vd_v, 16);
+      memcpy(n, &vn_v, 16);
+      memcpy(m, &vm_v, 16);
+    }
+
+    uint64_t out[2] = {d[0], d[1]};
+    switch (op) {
+      case Decoder::Sha512Op::kSha512h: {
+        uint64_t e = m[0], f = n[0], g = n[1];
+        uint64_t tmp = ((e & f) ^ (~e & g)) + big_sigma1(e) + d[1];
+        out[1] = d[0] + tmp;
+        out[0] = tmp;
+        break;
+      }
+      case Decoder::Sha512Op::kSha512h2: {
+        auto maj = [](uint64_t a, uint64_t b, uint64_t c) -> uint64_t {
+          return (a & b) ^ (a & c) ^ (b & c);
+        };
+        uint64_t new_d1 =
+            d[1] + big_sigma0(n[0]) + maj(n[0], m[0], m[1]);
+        uint64_t new_d0 =
+            d[0] + big_sigma0(new_d1) + maj(new_d1, n[0], m[0]);
+        out[0] = new_d0;
+        out[1] = new_d1;
+        break;
+      }
+      case Decoder::Sha512Op::kSha512su0:
+        out[0] = d[0] + little_sigma0(d[1]);
+        out[1] = d[1] + little_sigma0(n[0]);
+        break;
+      case Decoder::Sha512Op::kSha512su1:
+        out[0] = d[0] + little_sigma1(n[0]) + m[0];
+        out[1] = d[1] + little_sigma1(n[1]) + m[1];
+        break;
+    }
+
+    __uint128_t result = 0;
+    memcpy(&result, out, 16);
+    state_->cpu.v[rd] = result;
+  }
+  // endregion
+
   // region digitalis
   // Cryptographic AES — ARMv8 crypto extension (used by libcrypto / TLS in
   // apps like WhatsApp). Spec: ARM ARM C7.2.1 (AESE/AESD/AESMC/AESIMC).

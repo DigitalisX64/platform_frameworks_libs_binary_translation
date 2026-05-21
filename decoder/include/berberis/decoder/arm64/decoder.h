@@ -811,6 +811,19 @@ class Decoder {
     // endregion
   };
 
+  // region digitalis - SHA-512 (FEAT_SHA512) ops live outside the AdvSIMD
+  // encoding family. The three-register SHA-512 group encodes:
+  //   11001110 011 Rm 1000 o2 Rn Rd
+  // with o2 = bits[11:10] picking the op. The two-register variant
+  // (SHA512SU0) encodes: 11001110 110 00000 1000 00 Rn Rd.
+  enum class Sha512Op : uint8_t {
+    kSha512h,    // 3-reg, o2=00
+    kSha512h2,   // 3-reg, o2=01
+    kSha512su1,  // 3-reg, o2=10
+    kSha512su0,  // 2-reg
+  };
+  // endregion
+
   struct AdvSimdTwoRegMiscArgs {
     AdvSimdTwoRegMiscOpcode opcode;
     uint8_t rd;
@@ -2179,6 +2192,41 @@ class Decoder {
             GetBits<30, 1>()); // q
       }
       return;
+    }
+    // endregion
+
+    // region digitalis
+    // SHA-512 (FEAT_SHA512) — bit31=1 group, outside the AdvSIMD family.
+    // Common prefix: bits[30:24]=1001110, bits[15:12]=1000.
+    //   Three-register encoding: 11001110 011 Rm 1000 o2 Rn Rd, where
+    //     o2 = bits[11:10] = 00 (SHA512H), 01 (SHA512H2), 10 (SHA512SU1).
+    //   Two-register encoding (SHA512SU0):
+    //     11001110 110 00000 1000 00 Rn Rd.
+    if (bit31 && GetBits<24, 7>() == 0b1001110 &&
+        GetBits<12, 4>() == 0b1000) {
+      uint8_t bits23_21 = GetBits<21, 3>();
+      uint8_t opcode2 = GetBits<10, 2>();   // bits[11:10]
+      if (bits23_21 == 0b011) {
+        Sha512Op op;
+        switch (opcode2) {
+          case 0b00: op = Sha512Op::kSha512h; break;
+          case 0b01: op = Sha512Op::kSha512h2; break;
+          case 0b10: op = Sha512Op::kSha512su1; break;
+          default: Undefined(); return;
+        }
+        insn_consumer_->Sha512(op,
+                               GetBits<0, 5>(),   // rd
+                               GetBits<5, 5>(),   // rn
+                               GetBits<16, 5>()); // rm
+        return;
+      }
+      if (bits23_21 == 0b110 && GetBits<16, 5>() == 0 && opcode2 == 0b00) {
+        insn_consumer_->Sha512(Sha512Op::kSha512su0,
+                               GetBits<0, 5>(),   // rd
+                               GetBits<5, 5>(),   // rn
+                               0);                // rm unused
+        return;
+      }
     }
     // endregion
 
