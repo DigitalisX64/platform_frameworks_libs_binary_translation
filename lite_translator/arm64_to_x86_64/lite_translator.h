@@ -4692,6 +4692,33 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // Vector FSQRT (FP32 .2S/.4S, FP64 .2D) -- per-lane square root.
+      //   size=10 -> FP32, size=11 -> FP64.  FP64 requires Q=1.
+      // SSE SQRTPS / SQRTPD handle the lanewise sqrt natively; default
+      // MXCSR rounding (RNE) matches ARM's default FPCR rounding.  NaN,
+      // signed zeros and negative finites all behave identically to the
+      // ARM ARM semantics (SQRTPS/PD propagate NaN, produce -0 for -0
+      // input and qNaN for negative finite input).
+      // The FP16 .4H/.8H form (args.is_fp16) bails to the interpreter
+      // (which uses __builtin_sqrtf with FpHalfToSingle/FpSingleToHalf
+      // round-trip -- see interpreter.h:5717).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_double) {
+          as_.Sqrtpd(xn, xn);
+        } else {
+          as_.Sqrtps(xn, xn);
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
       default:
         Undefined();
         return;
