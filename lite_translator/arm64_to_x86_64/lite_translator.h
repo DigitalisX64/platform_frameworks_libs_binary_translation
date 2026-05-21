@@ -2719,6 +2719,120 @@ class LiteTranslator {
         }
         return;
       }
+      case Decoder::AdvSimdThreeSameOpcode::kFcmeqV:
+      case Decoder::AdvSimdThreeSameOpcode::kFcmgeV:
+      case Decoder::AdvSimdThreeSameOpcode::kFcmgtV:
+      case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
+      case Decoder::AdvSimdThreeSameOpcode::kFacgtV: {
+        // FP16 vector FP compares via F16C round-trip.
+        //   FCMEQ: a == b
+        //   FCMGE: a >= b
+        //   FCMGT: a >  b
+        //   FACGE: |a| >= |b|
+        //   FACGT: |a| >  |b|
+        // ARM result lane is all-ones (0xFFFF) on TRUE, zero on FALSE, and is
+        // false for any unordered (NaN-involving) compare.
+        //
+        // Lowering: widen each operand half to FP32, do a 4-lane FP32 compare
+        // producing 0xFFFFFFFF / 0x00000000 dwords, then narrow via PACKSSDW.
+        // PACKSSDW signed-saturates each 32-bit lane to int16: 0xFFFFFFFF
+        // (signed -1) saturates to 0xFFFF; 0x00000000 stays 0x0000. That
+        // matches ARM's bit-mask result directly.
+        //
+        //   FCMEQ: Cmpeqps xn, xm                  (imm=0, EQ_OQ)
+        //   FCMGE: Cmpleps xm, xn ; Movdqa xn, xm  ((xm<=xn) == (xn>=xm))
+        //   FCMGT: Cmpltps xm, xn ; Movdqa xn, xm  ((xm<xn)  == (xn>xm))
+        //   FACGE: pre-mask both operands with 0x7FFFFFFF (FP32 sign-clear),
+        //          then FCMGE shape
+        //   FACGT: pre-mask, then FCMGT shape
+        //
+        // The legacy SSE compare predicates Cmpeqps/Cmpltps/Cmpleps are all
+        // ordered: they return 0 (false) for any NaN operand, matching ARM.
+        // The sign-clear mask is built once with the `Pcmpeqd self ; Psrld 1`
+        // idiom — same as the FABD lowering above — and shared across both
+        // halves of a .8H lowering.
+        //
+        // For .8H, `Packssdw(low_mask, hi_mask)` is a one-instruction
+        // recombine: low 64 bits of the destination hold the packed low_mask
+        // (4 16-bit lanes for FP16 lanes 0..3), upper 64 bits hold the packed
+        // hi_mask (lanes 4..7). No Pslldq+Por dance needed.
+        //
+        // FP32 / FP64 forms (size = 00 / 01) still bail to the interpreter.
+        if (!args.is_fp16) { Undefined(); return; }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
+        using Op = Decoder::AdvSimdThreeSameOpcode;
+        const bool is_eq  = (args.opcode == Op::kFcmeqV);
+        const bool is_ge  = (args.opcode == Op::kFcmgeV ||
+                             args.opcode == Op::kFacgeV);
+        const bool is_abs = (args.opcode == Op::kFacgeV ||
+                             args.opcode == Op::kFacgtV);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          Undefined(); return;
+        }
+        SimdRegister mask = no_simd_register;
+        if (is_abs) {
+          mask = AllocTempSimdReg();
+          if (mask == no_simd_register) { Undefined(); return; }
+          as_.Pcmpeqd(mask, mask);
+          as_.Psrld(mask, int8_t{1});   // 0x7FFFFFFF per dword
+        }
+        auto cmp = [&](SimdRegister a, SimdRegister b) {
+          // Emits a = (Va_original op Vb_original). Currently a holds Vn-half
+          // FP32, b holds Vm-half FP32. For GE/GT we need a swapped compare
+          // to land the mask in `a`.
+          if (is_abs) {
+            as_.Pand(a, mask);
+            as_.Pand(b, mask);
+          }
+          if (is_eq) {
+            as_.Cmpeqps(a, b);
+          } else if (is_ge) {
+            as_.Cmpleps(b, a);
+            as_.Movdqa(a, b);
+          } else {
+            as_.Cmpltps(b, a);
+            as_.Movdqa(a, b);
+          }
+        };
+        if (!args.q) {
+          // .4H: 4 FP16 lanes in low 64 bits of each operand.
+          as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn, xn);
+          as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Vcvtph2ps(xm, xm);
+          cmp(xn, xm);
+          // Packssdw with a duplicate src fills both halves with the packed
+          // low_mask; we want the upper 64 bits zero. Movq xn,xn zero-extends.
+          as_.Packssdw(xn, xn);
+          as_.Movq(xn, xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          // .8H: process low 4 lanes, then high 4 lanes, then one PACKSSDW
+          // to interleave (low_mask -> low 64 bits, hi_mask -> upper 64).
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqu(xn_hi, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqa(xn, xn_hi);
+          as_.Vcvtph2ps(xn, xn);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Vcvtph2ps(xn_hi, xn_hi);
+          as_.Movdqu(xm_hi, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Movdqa(xm, xm_hi);
+          as_.Vcvtph2ps(xm, xm);
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Vcvtph2ps(xm_hi, xm_hi);
+          cmp(xn, xm);
+          cmp(xn_hi, xm_hi);
+          as_.Packssdw(xn, xn_hi);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
       case Decoder::AdvSimdThreeSameOpcode::kFminV:
       case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
