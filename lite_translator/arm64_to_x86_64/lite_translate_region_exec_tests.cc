@@ -1483,6 +1483,516 @@ TEST_F(Arm64LiteTranslateRegionTest, StpX_PreIndexNegative_X1Base) {
 }
 // endregion
 
+// region digitalis LDP/STP pre/post-index JIT exec-tests.
+// Confirms the decoder routes op2=01 (post-index) and op2=11 (pre-index) to
+// the LoadStorePair callback with is_postindex / is_preindex set, and that
+// the semantics_player + JIT pair correctly writes back the indexed base.
+// Encoding (bits[31:30]=10 → 64-bit, bits[29:25]=10100, bits[24:23]=op2,
+// bit[22]=L, bits[21:15]=imm7, bits[14:10]=Rt2, bits[9:5]=Rn, bits[4:0]=Rt):
+//   LDP signed-offset: 0xA9400000 (op2=10, L=1) — see LdpX above.
+//   LDP pre-index:     0xA9C00000 (op2=11, L=1).
+//   LDP post-index:    0xA8C00000 (op2=01, L=1).
+//   STP post-index:    0xA8800000 (op2=01, L=0) — pre-index covered by StpXPreIndex.
+constexpr uint32_t LdpXPreIndex(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div8) {
+  uint32_t imm = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0xA9C00000 | (imm << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t LdpXPostIndex(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div8) {
+  uint32_t imm = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0xA8C00000 | (imm << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t StpXPostIndex(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm_div8) {
+  uint32_t imm = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0xA8800000 | (imm << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+// LDP X3, X4, [X5, #0x10]!  (pre-index)
+// Verifies (a) the load reads from base+offset, not base, and (b) the base
+// register is updated to base+offset.  Pre-handoff-39 the decoder mis-routed
+// this as signed-offset, so the load was correct but the base writeback was
+// missing — LLVM-emitted prologues that use [sp,#-N]! to allocate frame would
+// then leave sp unmodified and corrupt the stack on the matching epilogue.
+TEST_F(Arm64LiteTranslateRegionTest, LdpPreIndexUpdatesBase) {
+  alignas(16) static uint64_t buf[8] = {
+      0xBAAD'BAAD'BAAD'BAADULL,   // [0]: must NOT be read
+      0xBAAD'BAAD'BAAD'BAADULL,   // [1]: must NOT be read
+      0x1111'2222'3333'4444ULL,   // [2]: loaded into x3 (offset = +0x10)
+      0x5555'6666'7777'8888ULL,   // [3]: loaded into x4 (offset = +0x18)
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+  };
+  state_.cpu.x[5] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[3] = 0xDEAD'BEEFULL;
+  state_.cpu.x[4] = 0xDEAD'BEEFULL;
+  const uint64_t orig_x5 = state_.cpu.x[5];
+  static const uint32_t code[] = {
+      LdpXPreIndex(3, 4, 5, 2),  // ldp x3, x4, [x5, #0x10]!
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 0x1111'2222'3333'4444ULL);
+  EXPECT_EQ(state_.cpu.x[4], 0x5555'6666'7777'8888ULL);
+  EXPECT_EQ(state_.cpu.x[5], orig_x5 + 0x10);
+}
+
+// LDP X3, X4, [X5], #0x10  (post-index)
+// Verifies (a) the load reads from the ORIGINAL base (no offset applied),
+// and (b) the base register is updated to base+offset AFTER the load.
+TEST_F(Arm64LiteTranslateRegionTest, LdpPostIndexUpdatesBase) {
+  alignas(16) static uint64_t buf2[8] = {
+      0xAAAA'BBBB'CCCC'DDDDULL,   // [0]: loaded into x3 (post-index = pre-load addr)
+      0x1122'3344'5566'7788ULL,   // [1]: loaded into x4
+      0xBAAD'BAAD'BAAD'BAADULL,   // [2]: must NOT be read
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+      0xBAAD'BAAD'BAAD'BAADULL,
+  };
+  state_.cpu.x[5] = ToGuestAddr(&buf2[0]);
+  state_.cpu.x[3] = 0xDEAD'BEEFULL;
+  state_.cpu.x[4] = 0xDEAD'BEEFULL;
+  const uint64_t orig_x5 = state_.cpu.x[5];
+  static const uint32_t code[] = {
+      LdpXPostIndex(3, 4, 5, 2),  // ldp x3, x4, [x5], #0x10
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 0xAAAA'BBBB'CCCC'DDDDULL);
+  EXPECT_EQ(state_.cpu.x[4], 0x1122'3344'5566'7788ULL);
+  EXPECT_EQ(state_.cpu.x[5], orig_x5 + 0x10);
+}
+
+// STP X3, X4, [X5], #-0x10  (post-index with negative offset; common in epilogues).
+// Verifies (a) the store writes at the ORIGINAL base, and (b) base is then
+// updated to base+offset.  Wrong-order writeback (computing addr=base+offset
+// first) would store at the wrong location.
+TEST_F(Arm64LiteTranslateRegionTest, StpPostIndexUpdatesBase) {
+  alignas(16) static uint64_t buf3[8] = {};
+  state_.cpu.x[5] = ToGuestAddr(&buf3[4]);  // start 32 bytes in
+  state_.cpu.x[3] = 0xC0DE'C0DE'C0DE'C0DEULL;
+  state_.cpu.x[4] = 0xDEAD'D00D'DEAD'D00DULL;
+  const uint64_t orig_x5 = state_.cpu.x[5];
+  static const uint32_t code[] = {
+      StpXPostIndex(3, 4, 5, -2),  // stp x3, x4, [x5], #-0x10
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Store must hit [orig_x5] and [orig_x5+8] (buf3[4] and buf3[5]) — NOT
+  // [orig_x5 - 0x10].
+  EXPECT_EQ(buf3[4], 0xC0DE'C0DE'C0DE'C0DEULL);
+  EXPECT_EQ(buf3[5], 0xDEAD'D00D'DEAD'D00DULL);
+  EXPECT_EQ(buf3[2], 0ULL);  // [orig_x5 - 0x10] must be untouched.
+  EXPECT_EQ(buf3[3], 0ULL);
+  EXPECT_EQ(state_.cpu.x[5], orig_x5 - 0x10);
+}
+
+// STP X5, X4, [X5], #0x10  (post-index where Rt1 aliases Rn).
+// ARM ARM marks this CONSTRAINED UNPREDICTABLE; on real hardware the
+// architectural choice is to write *the original* value of Rt1 (which equals
+// the original Rn).  Verify the JIT writes the ORIGINAL base value (not the
+// updated one) and then writes back the new base.
+TEST_F(Arm64LiteTranslateRegionTest, StpPostIndexAliasRn) {
+  alignas(16) static uint64_t buf4[8] = {};
+  const uint64_t base = ToGuestAddr(&buf4[2]);
+  state_.cpu.x[5] = base;
+  state_.cpu.x[4] = 0xABAB'ABAB'ABAB'ABABULL;
+  static const uint32_t code[] = {
+      StpXPostIndex(5, 4, 5, 2),  // stp x5, x4, [x5], #0x10
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // First slot must hold the ORIGINAL value of x5 (the pre-update base).
+  EXPECT_EQ(buf4[2], base);
+  EXPECT_EQ(buf4[3], 0xABAB'ABAB'ABAB'ABABULL);
+  // Base register must now be base + 0x10.
+  EXPECT_EQ(state_.cpu.x[5], base + 0x10);
+}
+// endregion
+
+// region digitalis atomic-op JIT exec-tests.
+// The interpreter path was verified by hello-lse (handoff-37) and hello-barriers
+// (handoff-38) at the integration level, but until now the JIT path for LSE
+// atomics had zero unit-test coverage.  A hot-loop regression would slip past
+// the integration probe because hello-lse runs each op a small fixed number of
+// times — a CMPXCHG-loop drop-out (e.g. wrong size of cmpxchg, wrong reg into
+// RAX, missing zero-extend of B/H result) would not be visible without these.
+//
+// Encoding references (DDI 0487, confirmed via llvm-mc):
+//   CAS family (LoadStoreExclusive path):
+//     size:2 | 001000 | o2:1 | L:1 | o1:1 | Rs:5 | o0:1 | 11111 | Rn:5 | Rt:5
+//     non-A/L: o2=1, L=0, o1=1, o0=0
+//     32-bit base = 0x88A07C00 | (Rs<<16) | (Rn<<5) | Rt
+//     64-bit base = 0xC8A07C00 | (Rs<<16) | (Rn<<5) | Rt
+//   LD<op>/SWP (AtomicMemoryOp path):
+//     size:2 | 111000 | A:1 | R:1 | 1 | Rs:5 | o3:1 | opc:3 | 00 | Rn:5 | Rt:5
+//     non-A/R: A=0, R=0
+//     32-bit base = 0xB8200000; 64-bit base = 0xF8200000
+//     opc = 0:LDADD, 1:LDCLR, 2:LDEOR, 3:LDSET, 4:LDSMAX, 5:LDSMIN,
+//           6:LDUMAX, 7:LDUMIN  (with o3=0)
+//     SWP = o3=1, opc=0 → +0x8000 over the base
+constexpr uint32_t CasW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x88A07C00 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t CasX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xC8A07C00 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdaddX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8200000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdclrX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8201000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdeorX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8202000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdsetX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8203000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdsmaxX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8204000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdsminX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8205000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdumaxX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8206000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LduminX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8207000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t SwpX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8208000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// CASP / CASPX (compare-and-swap pair, Armv8.1 LSE — ):
+//   bit[31]=0, bit[30]=sz (0 W-pair, 1 X-pair), bits[29:23]=0010000, bit[22]=L,
+//   bit[21]=1, bits[20:16]=Rs (must be even), bit[15]=o0, bits[14:10]=11111,
+//   bits[9:5]=Rn, bits[4:0]=Rt (must be even).  Non-A/L → L=0, o0=0.
+// Encoding cross-checked via llvm-mc (clang-r563880c) in decoder.h comment:
+//   casp w0,w1,w2,w3,[x10] = 0x08207d42 → matches CaspW(0, 2, 10) below.
+constexpr uint32_t CaspW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x08207C00 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t CaspX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x48207C00 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+constexpr uint32_t kDmbIsh = 0xD5033BBF;  // dmb ish
+constexpr uint32_t kDsbIsh = 0xD5033B9F;  // dsb ish
+constexpr uint32_t kIsb    = 0xD5033FDF;  // isb
+constexpr uint32_t kWfe    = 0xD503205F;  // wfe (HINT #2)
+constexpr uint32_t kYield  = 0xD503203F;  // yield (HINT #1)
+
+// CAS 32-bit: equal expected → swap performed, Rs receives the (matching) old.
+TEST_F(Arm64LiteTranslateRegionTest, CasEqualSwapsW) {
+  alignas(16) static uint32_t target = 0x11111111u;
+  target = 0x11111111u;
+  state_.cpu.x[0] = 0x11111111ULL;                // Rs = expected (matches)
+  state_.cpu.x[1] = 0x22222222ULL;                // Rt = new
+  state_.cpu.x[2] = ToGuestAddr(&target);         // Rn = base
+  static const uint32_t code[] = {
+      CasW(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0x22222222u);
+  EXPECT_EQ(state_.cpu.x[0], 0x11111111ULL);
+}
+
+// CAS 32-bit: unequal expected → swap NOT performed, Rs receives current value.
+TEST_F(Arm64LiteTranslateRegionTest, CasUnequalLeavesMemoryW) {
+  alignas(16) static uint32_t target = 0xDEADBEEFu;
+  target = 0xDEADBEEFu;
+  state_.cpu.x[0] = 0x11111111ULL;                // Rs = expected (does NOT match)
+  state_.cpu.x[1] = 0x22222222ULL;                // Rt = new
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      CasW(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0xDEADBEEFu);                 // memory unchanged
+  EXPECT_EQ(state_.cpu.x[0] & 0xFFFFFFFFULL, 0xDEADBEEFULL);  // old returned
+}
+
+// CAS 64-bit: equal expected → swap.
+TEST_F(Arm64LiteTranslateRegionTest, CasEqualSwapsX) {
+  alignas(16) static uint64_t target = 0xCAFEBABE'F00DFEEDULL;
+  target = 0xCAFEBABE'F00DFEEDULL;
+  state_.cpu.x[0] = 0xCAFEBABE'F00DFEEDULL;
+  state_.cpu.x[1] = 0x12345678'9ABCDEF0ULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      CasX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0x12345678'9ABCDEF0ULL);
+  EXPECT_EQ(state_.cpu.x[0], 0xCAFEBABE'F00DFEEDULL);
+}
+
+// SWP 64-bit: unconditional exchange of memory with Rs, old → Rt.
+TEST_F(Arm64LiteTranslateRegionTest, SwpReplacesAndReturnsOldX) {
+  alignas(16) static uint64_t target = 0x0123456789ABCDEFULL;
+  target = 0x0123456789ABCDEFULL;
+  state_.cpu.x[0] = 0xFEDCBA9876543210ULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      SwpX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0xFEDCBA9876543210ULL);
+  EXPECT_EQ(state_.cpu.x[1], 0x0123456789ABCDEFULL);
+}
+
+// LDADD 64-bit: memory += Rs, old → Rt.
+TEST_F(Arm64LiteTranslateRegionTest, LdaddIncrementsAndReturnsOldX) {
+  alignas(16) static uint64_t target = 100;
+  target = 100;
+  state_.cpu.x[0] = 25;                            // increment
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdaddX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 125u);
+  EXPECT_EQ(state_.cpu.x[1], 100ULL);
+}
+
+// LDSET 64-bit: memory |= Rs, old → Rt.
+TEST_F(Arm64LiteTranslateRegionTest, LdsetSetsBitsX) {
+  alignas(16) static uint64_t target = 0x0000FF00'0000FF00ULL;
+  target = 0x0000FF00'0000FF00ULL;
+  state_.cpu.x[0] = 0xFF000000'FF000000ULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdsetX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0xFF00FF00'FF00FF00ULL);
+  EXPECT_EQ(state_.cpu.x[1], 0x0000FF00'0000FF00ULL);
+}
+
+// LDCLR 64-bit: memory &= ~Rs, old → Rt.
+TEST_F(Arm64LiteTranslateRegionTest, LdclrClearsBitsX) {
+  alignas(16) static uint64_t target = 0xFFFFFFFF'FFFFFFFFULL;
+  target = 0xFFFFFFFF'FFFFFFFFULL;
+  state_.cpu.x[0] = 0x0F0F0F0F'0F0F0F0FULL;       // bits to clear
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdclrX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0xF0F0F0F0'F0F0F0F0ULL);
+  EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFFF'FFFFFFFFULL);
+}
+
+// LDEOR 64-bit: memory ^= Rs, old → Rt.
+TEST_F(Arm64LiteTranslateRegionTest, LdeorTogglesBitsX) {
+  alignas(16) static uint64_t target = 0xAAAAAAAA'AAAAAAAAULL;
+  target = 0xAAAAAAAA'AAAAAAAAULL;
+  state_.cpu.x[0] = 0xFFFFFFFF'FFFFFFFFULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdeorX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0x55555555'55555555ULL);
+  EXPECT_EQ(state_.cpu.x[1], 0xAAAAAAAA'AAAAAAAAULL);
+}
+
+// LDUMAX 64-bit: memory = unsigned_max(memory, Rs), old → Rt.
+TEST_F(Arm64LiteTranslateRegionTest, LdumaxKeepsLargerX) {
+  alignas(16) static uint64_t target = 100;
+  target = 100;
+  state_.cpu.x[0] = 500;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdumaxX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 500u);
+  EXPECT_EQ(state_.cpu.x[1], 100ULL);
+}
+
+// LDUMAX 64-bit: Rs is smaller — memory stays.
+TEST_F(Arm64LiteTranslateRegionTest, LdumaxKeepsExistingWhenLargerX) {
+  alignas(16) static uint64_t target = 500;
+  target = 500;
+  state_.cpu.x[0] = 100;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdumaxX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 500u);
+  EXPECT_EQ(state_.cpu.x[1], 500ULL);
+}
+
+// LDSMIN 64-bit: memory = signed_min(memory, Rs), old → Rt.
+// Specifically tests that the signed comparison treats high-bit-set values as
+// negative (so unsigned ordering would give the wrong answer).
+TEST_F(Arm64LiteTranslateRegionTest, LdsminKeepsSmallerSignedX) {
+  alignas(16) static uint64_t target = 5;
+  target = 5;
+  state_.cpu.x[0] = static_cast<uint64_t>(-100LL);  // signed-min candidate
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdsminX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(target), -100LL);
+  EXPECT_EQ(state_.cpu.x[1], 5ULL);
+}
+
+// LDSMAX 64-bit: positive vs negative — signed max picks positive.
+TEST_F(Arm64LiteTranslateRegionTest, LdsmaxPicksPositiveOverNegativeX) {
+  alignas(16) static uint64_t target = static_cast<uint64_t>(-7LL);
+  target = static_cast<uint64_t>(-7LL);
+  state_.cpu.x[0] = 12;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdsmaxX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 12u);
+  EXPECT_EQ(state_.cpu.x[1], static_cast<uint64_t>(-7LL));
+}
+
+// LDUMIN 64-bit: unsigned-min over a high-bit value vs a small positive.
+// In unsigned terms, the small positive wins.
+TEST_F(Arm64LiteTranslateRegionTest, LduminPicksSmallerUnsignedX) {
+  alignas(16) static uint64_t target = 0xFFFFFFFFFFFFFF00ULL;
+  target = 0xFFFFFFFFFFFFFF00ULL;
+  state_.cpu.x[0] = 7;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LduminX(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 7u);
+  EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFFFFFFFFF00ULL);
+}
+
+// CASP 32-bit pair: equal expected → swap performed; Rs:Rs+1 receive the
+// (matching) old pair zero-extended (verify checkbox).
+// Memory layout: lo32 lives at the lower address, hi32 at +4 (little-endian).
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairEqualSwapsW) {
+  alignas(16) static uint64_t target;
+  target = (uint64_t{0x22222222ULL} << 32) | uint64_t{0x11111111ULL};
+  state_.cpu.x[4] = 0x11111111ULL;   // Rs   = expected.lo (matches)
+  state_.cpu.x[5] = 0x22222222ULL;   // Rs+1 = expected.hi (matches)
+  state_.cpu.x[6] = 0xAAAAAAAAULL;   // Rt   = new.lo
+  state_.cpu.x[7] = 0xBBBBBBBBULL;   // Rt+1 = new.hi
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      CaspW(/*rs=*/4, /*rt=*/6, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target,
+            (uint64_t{0xBBBBBBBBULL} << 32) | uint64_t{0xAAAAAAAAULL});
+  // Each half of the prior pair written back zero-extended into Rs/Rs+1.
+  EXPECT_EQ(state_.cpu.x[4], 0x11111111ULL);
+  EXPECT_EQ(state_.cpu.x[5], 0x22222222ULL);
+}
+
+// CASP 32-bit pair: unequal expected → swap NOT performed; Rs:Rs+1 receive the
+// actual prior pair (each half zero-extended).
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairUnequalLeavesMemoryW) {
+  alignas(16) static uint64_t target;
+  target = (uint64_t{0xCAFEBABEULL} << 32) | uint64_t{0xDEADBEEFULL};
+  state_.cpu.x[4] = 0x12345678ULL;   // expected.lo — does NOT match memory.lo
+  state_.cpu.x[5] = 0x9ABCDEF0ULL;   // expected.hi — does NOT match memory.hi
+  state_.cpu.x[6] = 0xAAAAAAAAULL;
+  state_.cpu.x[7] = 0xBBBBBBBBULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      CaspW(/*rs=*/4, /*rt=*/6, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target,
+            (uint64_t{0xCAFEBABEULL} << 32) | uint64_t{0xDEADBEEFULL});
+  EXPECT_EQ(state_.cpu.x[4], 0xDEADBEEFULL);   // memory.lo zero-extended
+  EXPECT_EQ(state_.cpu.x[5], 0xCAFEBABEULL);   // memory.hi zero-extended
+}
+
+// CASP 64-bit pair: equal expected → swap performed (LOCK CMPXCHG16B path).
+// The pair address MUST be 16-byte aligned — Intel #GP's misaligned
+// CMPXCHG16B.  alignas(16) on the static buffer guarantees that.
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairEqualSwapsX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0xCAFEBABEF00DFEEDULL;
+  pair_mem.hi = 0x0123456789ABCDEFULL;
+  state_.cpu.x[4] = 0xCAFEBABEF00DFEEDULL;   // expected.lo (matches)
+  state_.cpu.x[5] = 0x0123456789ABCDEFULL;   // expected.hi (matches)
+  state_.cpu.x[6] = 0xFEEDFACECAFEBABEULL;   // new.lo
+  state_.cpu.x[7] = 0xDEADBEEF12345678ULL;   // new.hi
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  static const uint32_t code[] = {
+      CaspX(/*rs=*/4, /*rt=*/6, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(pair_mem.lo, 0xFEEDFACECAFEBABEULL);
+  EXPECT_EQ(pair_mem.hi, 0xDEADBEEF12345678ULL);
+  EXPECT_EQ(state_.cpu.x[4], 0xCAFEBABEF00DFEEDULL);
+  EXPECT_EQ(state_.cpu.x[5], 0x0123456789ABCDEFULL);
+}
+
+// CASP 64-bit pair: unequal expected → memory unchanged; Rs:Rs+1 receive the
+// actual prior 128-bit pair (low → Rs, high → Rs+1).
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairUnequalLeavesMemoryX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0xCAFEBABEF00DFEEDULL;
+  pair_mem.hi = 0x0123456789ABCDEFULL;
+  state_.cpu.x[4] = 0x1111111111111111ULL;   // does NOT match
+  state_.cpu.x[5] = 0x2222222222222222ULL;
+  state_.cpu.x[6] = 0xFEEDFACECAFEBABEULL;
+  state_.cpu.x[7] = 0xDEADBEEF12345678ULL;
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  static const uint32_t code[] = {
+      CaspX(/*rs=*/4, /*rt=*/6, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(pair_mem.lo, 0xCAFEBABEF00DFEEDULL);
+  EXPECT_EQ(pair_mem.hi, 0x0123456789ABCDEFULL);
+  EXPECT_EQ(state_.cpu.x[4], 0xCAFEBABEF00DFEEDULL);
+  EXPECT_EQ(state_.cpu.x[5], 0x0123456789ABCDEFULL);
+}
+
+// Barrier instructions in the middle of a JIT region must compile through
+// without breaking up the region or corrupting register values.  Catches a
+// future Nop-handler regression that drops to interpreter (success_ = false)
+// for any of DMB/DSB/ISB/WFE/YIELD.
+TEST_F(Arm64LiteTranslateRegionTest, BarriersDoNotBreakRegion) {
+  static const uint32_t code[] = {
+      MovzX(0, 7),         // X0 = 7
+      kDmbIsh,             // dmb ish — Nop in JIT
+      kDsbIsh,             // dsb ish — Nop
+      kIsb,                // isb     — Nop
+      kWfe,                // wfe     — Nop (HINT)
+      kYield,              // yield   — Nop (HINT)
+      AddImmX(0, 0, 5),    // X0 += 5 → 12
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 12ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

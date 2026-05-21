@@ -309,6 +309,67 @@ class SemanticsPlayer {
   void Undefined() { listener_->Undefined(); }
 
   // region digitalis
+  // MTE DP-2src: IRG / GMI / SUBP / SUBPS. The listener owns the full
+  // SP/XZR semantics + (for SUBPS) NZCV update, because those rules
+  // differ between the four opcodes (e.g., IRG dst can be SP, the others
+  // cannot). The pass-through here avoids having to expose all four
+  // GetReg* / SetReg* variants from this template.
+  void MteDataProc(const typename Decoder::MteDataProcArgs& args) {
+    listener_->MteDataProc(args);
+  }
+
+  // MTE load/store memory tags. The listener owns SP/XZR rules + address
+  // arithmetic + writeback because each opcode has slightly different
+  // semantics and the SemanticsPlayer would otherwise need to expose four
+  // variants (offset / pre / post / no-writeback) for one rare family.
+  void MteLoadStore(const typename Decoder::MteLoadStoreArgs& args) {
+    listener_->MteLoadStore(args);
+  }
+  // endregion
+
+  // region digitalis
+  // AdvSIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
+  // The listener owns the per-rot lane shuffling (FCADD's "rotate operand2
+  // by ±90°" and FCMLA's four-rot table) since exposing every variant via
+  // GetSimd*/SetSimd* would mean four method shapes on this template.
+  void AdvSimdFcma(const typename Decoder::FcmaArgs& args) {
+    listener_->AdvSimdFcma(args);
+  }
+  // endregion
+
+  // region digitalis indexed FCMLA
+  // AdvSIMD complex floating-point by element (Armv8.3-FCMA): FCMLA-idx.
+  // The listener owns broadcasting a single complex pair from Vm[index]
+  // across every output pair; expressing the per-index broadcast through
+  // GetSimd*/SetSimd* would require a separate by-element lane shape that
+  // no other player path needs.
+  void AdvSimdFcmaIdx(const typename Decoder::FcmaIdxArgs& args) {
+    listener_->AdvSimdFcmaIdx(args);
+  }
+  // endregion
+
+  // region digitalis
+  // AdvSIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT / BFMMLA.
+  // The listener owns BF16-to-FP32 widening and the 2x4 * 4x2 matrix
+  // iteration pattern because doing that through GetSimd*/SetSimd* would
+  // force two distinct lane-layout templates onto this player.
+  void AdvSimdBf16ThreeSame(const typename Decoder::Bf16ThreeSameArgs& args) {
+    listener_->AdvSimdBf16ThreeSame(args);
+  }
+  // endregion
+
+  // region digitalis hello-dotprod
+  // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT, vector
+  // and by-element forms.  Lane layout (4 bytes packed per 32-bit lane)
+  // and the per-form indexed broadcast belong in the listener since
+  // expressing them through GetSimd*/SetSimd* would mean per-byte lane
+  // accessors that no other player path needs.
+  void AdvSimdDotProduct(const typename Decoder::DotProductArgs& args) {
+    listener_->AdvSimdDotProduct(args);
+  }
+  // endregion
+
+  // region digitalis
   void SimdModifiedImm(const typename Decoder::SimdModifiedImmArgs& args) {
     listener_->SimdModifiedImm(args);
   }
@@ -492,6 +553,12 @@ class SemanticsPlayer {
   void FpCompare(const typename Decoder::FpCompareArgs& args) {
     listener_->FpCompare(args);
   }
+
+  // region digitalis
+  void FpConditionalCompare(const typename Decoder::FpConditionalCompareArgs& args) {
+    listener_->FpConditionalCompare(args);
+  }
+  // endregion
 
   void AdvSimdTwoRegMisc(const typename Decoder::AdvSimdTwoRegMiscArgs& args) {
     listener_->AdvSimdTwoRegMisc(args);
