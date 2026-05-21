@@ -2460,8 +2460,10 @@ class LiteTranslator {
     //
     // Implements MUL/MLA/MLS/ADD/SUB/AND/ORR/EOR/CMEQ at the lane sizes
     // the dynamic linker's calculate_gnu_hash_neon needs (4S MUL/MLA in
-    // particular). Falls back to interpreter for opcodes/sizes outside
-    // this set.
+    // particular), plus the Armv8.2-FP16 FADD/FSUB/FMUL/FDIV vector forms
+    // via F16C round-trip (bit-exact for FP16 binary FADD/FSUB/FMUL/FDIV
+    // because FP32's 24-bit mantissa strictly contains FP16's 11). Falls
+    // back to interpreter for opcodes/sizes outside this set.
     int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
@@ -2590,6 +2592,66 @@ class LiteTranslator {
         }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+      case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+      case Decoder::AdvSimdThreeSameOpcode::kFdivV: {
+        // FP16 vector FADD/FSUB/FMUL/FDIV via F16C round-trip: widen each
+        // operand half to FP32, run the binary op at FP32, narrow back to
+        // FP16. The round-trip is bit-exact for any single FP16-input
+        // FADD/FSUB/FMUL/FDIV because FP32's 24-bit mantissa strictly
+        // contains FP16's 11. FP32/FP64 forms still bail to the interpreter.
+        if (!args.is_fp16) { Undefined(); return; }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        auto fp_op = [&](SimdRegister dst, SimdRegister src) {
+          switch (args.opcode) {
+            case Decoder::AdvSimdThreeSameOpcode::kFaddV: as_.Addps(dst, src); break;
+            case Decoder::AdvSimdThreeSameOpcode::kFsubV: as_.Subps(dst, src); break;
+            case Decoder::AdvSimdThreeSameOpcode::kFmulV: as_.Mulps(dst, src); break;
+            case Decoder::AdvSimdThreeSameOpcode::kFdivV: as_.Divps(dst, src); break;
+            default: break;  // unreachable
+          }
+        };
+        if (!args.q) {
+          // .4H: 4 FP16 lanes in low 64 bits of each operand.
+          as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn, xn);
+          as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Vcvtph2ps(xm, xm);
+          fp_op(xn, xm);
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+          // Vcvtps2ph auto-zeroes upper 64 bits.
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          // .8H: process low 4 lanes, then high 4 lanes, then recombine.
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqu(xn_hi, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqa(xn, xn_hi);
+          as_.Vcvtph2ps(xn, xn);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Vcvtph2ps(xn_hi, xn_hi);
+          as_.Movdqu(xm_hi, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Movdqa(xm, xm_hi);
+          as_.Vcvtph2ps(xm, xm);
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Vcvtph2ps(xm_hi, xm_hi);
+          fp_op(xn, xm);
+          fp_op(xn_hi, xm_hi);
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+          as_.Vcvtps2ph(xn_hi, xn_hi, int8_t{0});
+          as_.Pslldq(xn_hi, int8_t{8});
+          as_.Por(xn, xn_hi);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
         return;
       }
       default:
