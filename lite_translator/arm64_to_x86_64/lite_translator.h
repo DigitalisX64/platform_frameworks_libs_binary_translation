@@ -1438,11 +1438,12 @@ class LiteTranslator {
 
   // region digitalis FCADD/FCMLA JIT (handoff-69)
   //
-  // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32.
-  // The interpreter (interpreter.h::AdvSimdFcma) is the spec — see the
-  // per-pair scalar math there for the six rotations (FCADD ±90/±270,
-  // FCMLA 0/90/180/270).  The JIT path here lowers FP32 (size=0b10,
-  // .2S Q=0 and .4S Q=1) to a 4-to-7 SSE-instruction sequence:
+  // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32
+  // and FP64.  The interpreter (interpreter.h::AdvSimdFcma) is the
+  // spec — see the per-pair scalar math there for the six rotations
+  // (FCADD ±90/±270, FCMLA 0/90/180/270).  The JIT path here lowers
+  // FP32 (size=0b10, .2S Q=0 and .4S Q=1) and FP64 (size=0b11, .2D
+  // Q=1) to a 4-to-7 SSE-instruction sequence:
   //
   //   * FCADD .4S, rot=#rot:
   //       Vm' = shufps(Vm, Vm, 0xB1)           // pair-swap (re,im)->(im,re)
@@ -1472,8 +1473,8 @@ class LiteTranslator {
   // available on the emulator host CPU, the FP16 path becomes a 2-step
   // VCVTPH2PS round-trip; that's a follow-up perf row.
   void AdvSimdFcma(const Decoder::FcmaArgs& args) {
-    if (args.size != 0b10) {
-      // FP16 / FP64 — fall back to the interpreter.
+    if (args.size == 0b01) {
+      // FP16 vector — fall back to interpreter (F16C round-trip path TBD).
       success_ = false;
       return;
     }
@@ -1494,82 +1495,162 @@ class LiteTranslator {
     as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
     as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
 
-    // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
-    as_.Pcmpeqd(xmm_sign, xmm_sign);
-    as_.Pslld(xmm_sign, static_cast<int8_t>(31));
-
     SimdRegister xmm_result = no_simd_register;  // tracks the register holding the final value
 
-    if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
-      // m_xformed = pair-swap(Vm), negate the lanes implied by rot.
-      as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+    if (args.size == 0b10) {
+      // FP32 path: 1 pair (.2S, Q=0) or 2 pairs (.4S, Q=1).
+      // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
+      as_.Pcmpeqd(xmm_sign, xmm_sign);
+      as_.Pslld(xmm_sign, static_cast<int8_t>(31));
 
-      as_.Pcmpeqd(xmm_lane, xmm_lane);
-      if (args.rot == 0) {
-        // rot=#90: negate real lanes (0, 2) — mask = [0xff..ff, 0, 0xff..ff, 0].
-        as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
-      } else {
-        // rot=#270: negate imag lanes (1, 3) — mask = [0, 0xff..ff, 0, 0xff..ff].
-        as_.Psllq(xmm_lane, static_cast<int8_t>(32));
-      }
-      as_.Pand(xmm_sign, xmm_lane);
-      as_.Xorps(xmm_m, xmm_sign);
+      if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+        // m_xformed = pair-swap(Vm), negate the lanes implied by rot.
+        as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
 
-      // Vn + m_xformed -> xmm_n.
-      as_.Addps(xmm_n, xmm_m);
-      xmm_result = xmm_n;
-    } else {
-      // FCMLA: result = Vd + n_broadcast * m_xformed.
-      SimdRegister xmm_d = AllocTempSimdReg();
-      if (xmm_d == no_simd_register) { success_ = false; return; }
-      as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
-
-      // m_xformed depends on rotation.
-      switch (args.rot) {
-        case 0:
-          // No transform.
-          break;
-        case 1:
-          // Swap + negate real lanes.
-          as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
-          as_.Pcmpeqd(xmm_lane, xmm_lane);
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        if (args.rot == 0) {
+          // rot=#90: negate real lanes (0, 2) — mask = [0xff..ff, 0, 0xff..ff, 0].
           as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
-          as_.Pand(xmm_sign, xmm_lane);
-          as_.Xorps(xmm_m, xmm_sign);
-          break;
-        case 2:
-          // Negate all lanes.
-          as_.Xorps(xmm_m, xmm_sign);
-          break;
-        case 3:
-          // Swap + negate imag lanes.
-          as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
-          as_.Pcmpeqd(xmm_lane, xmm_lane);
+        } else {
+          // rot=#270: negate imag lanes (1, 3) — mask = [0, 0xff..ff, 0, 0xff..ff].
           as_.Psllq(xmm_lane, static_cast<int8_t>(32));
-          as_.Pand(xmm_sign, xmm_lane);
-          as_.Xorps(xmm_m, xmm_sign);
-          break;
-        default:
-          // Cannot happen: decoder only emits rot in 0..3 for FCMLA.
-          success_ = false;
-          return;
-      }
+        }
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorps(xmm_m, xmm_sign);
 
-      // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
-      // PSHUFD imm=0xA0 = (10,10,00,00): [lane0, lane0, lane2, lane2] = n_re bcast.
-      // PSHUFD imm=0xF5 = (11,11,01,01): [lane1, lane1, lane3, lane3] = n_im bcast.
-      if (args.rot == 0 || args.rot == 2) {
-        as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+        // Vn + m_xformed -> xmm_n.
+        as_.Addps(xmm_n, xmm_m);
+        xmm_result = xmm_n;
       } else {
-        as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
-      }
+        // FCMLA: result = Vd + n_broadcast * m_xformed.
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_d == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
 
-      as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
-      as_.Addps(xmm_d, xmm_n);   // Vd += ...
-      xmm_result = xmm_d;
+        // m_xformed depends on rotation.
+        switch (args.rot) {
+          case 0:
+            // No transform.
+            break;
+          case 1:
+            // Swap + negate real lanes.
+            as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorps(xmm_m, xmm_sign);
+            break;
+          case 2:
+            // Negate all lanes.
+            as_.Xorps(xmm_m, xmm_sign);
+            break;
+          case 3:
+            // Swap + negate imag lanes.
+            as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Psllq(xmm_lane, static_cast<int8_t>(32));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorps(xmm_m, xmm_sign);
+            break;
+          default:
+            // Cannot happen: decoder only emits rot in 0..3 for FCMLA.
+            success_ = false;
+            return;
+        }
+
+        // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
+        // PSHUFD imm=0xA0 = (10,10,00,00): [lane0, lane0, lane2, lane2] = n_re bcast.
+        // PSHUFD imm=0xF5 = (11,11,01,01): [lane1, lane1, lane3, lane3] = n_im bcast.
+        if (args.rot == 0 || args.rot == 2) {
+          as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+        } else {
+          as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
+        }
+
+        as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
+        as_.Addps(xmm_d, xmm_n);   // Vd += ...
+        xmm_result = xmm_d;
+      }
+    } else {
+      // FP64 path: size==0b11, .2D only (decoder rejects Q=0 for FP64).
+      // 1 complex pair (lane 0 = re, lane 1 = im); 8 bytes per lane.
+      // Same shape as FP32 but with FP64-width lowerings:
+      //   Shufpd 0x01 swaps the two doubles; Shufpd 0x00/0x03 broadcasts
+      //   lane 0/1 across both. PSRLDQ/PSLLDQ 8 builds the lane-mask
+      //   (single pair, 8-byte lane width).
+      // Sign-bit mask for 64-bit FP lanes: [0x8000000000000000]*2.
+      as_.Pcmpeqd(xmm_sign, xmm_sign);
+      as_.Psllq(xmm_sign, static_cast<int8_t>(63));
+
+      if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+        // Pair-swap: SHUFPD imm=0x01 -> [m_im, m_re].
+        as_.Shufpd(xmm_m, xmm_m, static_cast<int8_t>(0x01));
+
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        if (args.rot == 0) {
+          // rot=#90: negate real lane (lane 0).
+          // mask = [0xff..ff (low 64), 0 (high 64)] = PSRLDQ 8 over [-1; 16].
+          as_.Psrldq(xmm_lane, static_cast<int8_t>(8));
+        } else {
+          // rot=#270: negate imag lane (lane 1).
+          // mask = [0 (low 64), 0xff..ff (high 64)] = PSLLDQ 8 over [-1; 16].
+          as_.Pslldq(xmm_lane, static_cast<int8_t>(8));
+        }
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorpd(xmm_m, xmm_sign);
+
+        as_.Addpd(xmm_n, xmm_m);
+        xmm_result = xmm_n;
+      } else {
+        // FCMLA: result = Vd + n_broadcast * m_xformed.
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_d == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
+
+        switch (args.rot) {
+          case 0:
+            // No transform.
+            break;
+          case 1:
+            // Swap + negate real lane.
+            as_.Shufpd(xmm_m, xmm_m, static_cast<int8_t>(0x01));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Psrldq(xmm_lane, static_cast<int8_t>(8));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorpd(xmm_m, xmm_sign);
+            break;
+          case 2:
+            // Negate both lanes.
+            as_.Xorpd(xmm_m, xmm_sign);
+            break;
+          case 3:
+            // Swap + negate imag lane.
+            as_.Shufpd(xmm_m, xmm_m, static_cast<int8_t>(0x01));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Pslldq(xmm_lane, static_cast<int8_t>(8));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorpd(xmm_m, xmm_sign);
+            break;
+          default:
+            success_ = false;
+            return;
+        }
+
+        // Broadcast n_re (rot 0/2) -> [n[0], n[0]] via SHUFPD imm=0x00.
+        // Broadcast n_im (rot 1/3) -> [n[1], n[1]] via SHUFPD imm=0x03.
+        if (args.rot == 0 || args.rot == 2) {
+          as_.Shufpd(xmm_n, xmm_n, static_cast<int8_t>(0x00));
+        } else {
+          as_.Shufpd(xmm_n, xmm_n, static_cast<int8_t>(0x03));
+        }
+
+        as_.Mulpd(xmm_n, xmm_m);
+        as_.Addpd(xmm_d, xmm_n);
+        xmm_result = xmm_d;
+      }
     }
 
-    // Q=0 (.2S): zero the upper 64 bits, preserving lanes 0..1.
+    // Q=0 (.2S only — FP64 always has Q=1): zero the upper 64 bits.
     if (!args.q) {
       // Reuse xmm_lane to build a [0xff..ff (low 64), 0 (high 64)] mask.
       as_.Pcmpeqd(xmm_lane, xmm_lane);
