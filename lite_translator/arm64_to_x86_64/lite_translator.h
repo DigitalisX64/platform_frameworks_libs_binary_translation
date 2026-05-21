@@ -4552,6 +4552,146 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D).
+      //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
+      //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
+      //   FNEG: XOR with broadcast mask 0x80000000 (FP32) or 0x80000000_00000000 (FP64).
+      // The FP16 vector form (args.is_fp16) bails to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFabs:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister mask = AllocTempSimdReg();
+        if (xn == no_simd_register || mask == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pcmpeqd(mask, mask);
+        const bool is_fabs =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFabs);
+        if (is_double) {
+          // FABS mask 0x7FFFFFFFFFFFFFFF (allones >> 1); FNEG mask 0x8000000000000000.
+          if (is_fabs) {
+            as_.Psrlq(mask, int8_t{1});
+            as_.Pand(xn, mask);
+          } else {
+            as_.Psllq(mask, int8_t{63});
+            as_.Pxor(xn, mask);
+          }
+        } else {
+          if (is_fabs) {
+            as_.Psrld(mask, int8_t{1});
+            as_.Pand(xn, mask);
+          } else {
+            as_.Pslld(mask, int8_t{31});
+            as_.Pxor(xn, mask);
+          }
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // Vector FRINTN / FRINTM / FRINTP / FRINTZ / FRINTX / FRINTI
+      // (FP32 .2S/.4S, FP64 .2D).
+      //   FRINTN  -> ROUNDPS/PD imm=0 (round to nearest even).
+      //   FRINTM  -> ROUNDPS/PD imm=1 (toward -inf, floor).
+      //   FRINTP  -> ROUNDPS/PD imm=2 (toward +inf, ceil).
+      //   FRINTZ  -> ROUNDPS/PD imm=3 (toward zero, trunc).
+      //   FRINTX/FRINTI -> ROUNDPS/PD imm=4 (use MXCSR; default RNE matches ARM).
+      // SSE4.1 ROUNDPS/PD natively accepts the imm; one instruction per vector.
+      // The FP16 form (args.is_fp16) bails to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        int8_t round_imm;
+        switch (args.opcode) {
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV: round_imm = 0x00; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV: round_imm = 0x01; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV: round_imm = 0x02; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV: round_imm = 0x03; break;
+          // FRINTX / FRINTI follow the current FPCR rounding mode; we treat
+          // MXCSR (default RNE) as the canonical mode.  imm=0x04 sets the
+          // ROUND* "use MXCSR" bit.
+          default: round_imm = 0x04; break;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_double) {
+          as_.Roundpd(xn, xn, round_imm);
+        } else {
+          as_.Roundps(xn, xn, round_imm);
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // Vector FRINTA (FP32 .2S/.4S, FP64 .2D) -- "round to nearest, ties away".
+      // x86 ROUNDPS/PD has no ties-away mode, so use the identity
+      //     FRINTA(x) = trunc(x + copysign(0.5, x))
+      // already used by the scalar FRINTA JIT path (handoff-81).  Per-lane:
+      // build (x AND sign_mask) OR half_pattern  ->  +/-0.5, add to x, ROUND
+      // imm=3.  Bit-exact against ARM for all finite/NaN/Inf inputs (the
+      // +0.5 nudge is a no-op when |x| >= 2^p; signed zeros preserved by
+      // ROUNDPS imm=3; NaN/Inf propagate through ADDPS/ADDPD).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister copysign = AllocTempSimdReg();
+        SimdRegister half = AllocTempSimdReg();
+        if (xn == no_simd_register || copysign == no_simd_register ||
+            half == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // Build the sign-bit mask in copysign, then AND with xn to extract
+        // per-lane sign bits.
+        as_.Pcmpeqd(copysign, copysign);
+        if (is_double) {
+          as_.Psllq(copysign, int8_t{63});
+        } else {
+          as_.Pslld(copysign, int8_t{31});
+        }
+        as_.Pand(copysign, xn);
+        // Build per-lane 0.5 broadcast in half (FP32: 0x3F000000, FP64:
+        // 0x3FE0000000000000).  Move via a GP scratch -> Movd/Movq -> Pshufd.
+        Register gp_half = AllocTempReg();
+        if (gp_half == no_register) { Undefined(); return; }
+        if (is_double) {
+          as_.Movq(gp_half, int64_t{0x3FE0000000000000LL});
+          as_.Movq(half, gp_half);
+          // imm=0x44 = 01_00_01_00 -> broadcast low 64 bits across both
+          // 64-bit lanes of the XMM.
+          as_.Pshufd(half, half, static_cast<int8_t>(0x44));
+        } else {
+          as_.Movl(gp_half, int32_t{0x3F000000});
+          as_.Movd(half, gp_half);
+          // imm=0x00 broadcasts the low dword across all 4 dwords.
+          as_.Pshufd(half, half, static_cast<int8_t>(0x00));
+        }
+        // copysign |= half  -> per-lane sign(xn) * 0.5.
+        as_.Por(copysign, half);
+        // xn += copysign(0.5, xn); truncate toward zero.
+        if (is_double) {
+          as_.Addpd(xn, copysign);
+          as_.Roundpd(xn, xn, int8_t{0x03});
+        } else {
+          as_.Addps(xn, copysign);
+          as_.Roundps(xn, xn, int8_t{0x03});
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
       default:
         Undefined();
         return;
