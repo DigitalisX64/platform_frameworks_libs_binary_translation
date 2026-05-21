@@ -31,6 +31,7 @@
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/lite_translator/lite_translate_region.h"
+#include "berberis/runtime_primitives/platform.h"
 
 #include "allocator.h"
 #include "register_maintainer.h"
@@ -3736,10 +3737,24 @@ class LiteTranslator {
   }
 
   // region digitalis - FP arithmetic JIT
+  //
+  // FP16 (ftype=0b11) lowering: F16C round-trip.
+  //   PINSRW [src] -> XMM lane0       (load the 16-bit half, upper lanes zero)
+  //   VCVTPH2PS XMM, XMM              (widen 4 halves->4 singles; lanes 1-3 are zero)
+  //   <op>SS    XMM, XMM              (perform the binary op in single precision)
+  //   VCVTPS2PH XMM, XMM, imm=0       (narrow back, RNE, ignore MXCSR)
+  //   MOVDQU [dst], XMM               (store 128 bits: result in low 16, rest zero)
+  //
+  // The round-trip is exact for FADD/FSUB/FMUL/FDIV because binary32's 24-bit
+  // mantissa fully covers a single-rounding narrowing from any FP16 op result.
+  // RNE matches the ARM default rounding mode (FPCR.RMode=0, ties-to-even).
+  // F16C is part of the IvyBridge+ baseline; bail to interpreter if absent.
   void FpDataProc2(const Decoder::FpDataProc2Args& args) {
-    // Only handle single (ftype=00) and double (ftype=01) precision.
-    if (args.ftype != 0b00 && args.ftype != 0b01) { Undefined(); return; }
+    // Only handle single (ftype=00), double (ftype=01), and half (ftype=11).
+    if (args.ftype == 0b10) { Undefined(); return; }
+    if (args.ftype == 0b11 && !host_platform::kHasF16C) { success_ = false; return; }
     bool is_double = (args.ftype == 0b01);
+    bool is_half = (args.ftype == 0b11);
 
     int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
@@ -3754,12 +3769,20 @@ class LiteTranslator {
     if (is_double) {
       as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+    } else if (is_half) {
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
     }
 
-    // Perform operation: result in xmm_n.
+    // Perform operation: result in xmm_n. FP16 reuses the SS form because the
+    // value already lives as binary32 in lane 0.
     switch (args.opcode) {
       case 0b0000:  // FMUL
         if (is_double) as_.Mulsd(xmm_n, xmm_m);
@@ -3783,6 +3806,16 @@ class LiteTranslator {
         return;
     }
 
+    if (is_half) {
+      // Narrow FP32 result -> FP16 with RNE (imm=0). VCVTPS2PH zeroes the upper
+      // 64 bits of the XMM dest; lanes 1-3 of the FP32 are zero so the FP16
+      // lanes 1-3 are also zero. Storing all 128 bits gives the correct guest
+      // register layout: result in low 16, rest zero.
+      as_.Vcvtps2ph(xmm_n, xmm_n, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_n);
+      return;
+    }
+
     // Zero dest register, then store result.
     SimdRegister zero = AllocTempSimdReg();
     if (zero == no_simd_register) {
@@ -3801,9 +3834,11 @@ class LiteTranslator {
   }
 
   void FpCompare(const Decoder::FpCompareArgs& args) {
-    // FCMP Sn, Sm or FCMP Dn, Dm: compare and set NZCV flags.
-    if (args.ftype != 0b00 && args.ftype != 0b01) { Undefined(); return; }
+    // FCMP Sn, Sm / FCMP Dn, Dm / FCMP Hn, Hm: compare and set NZCV flags.
+    if (args.ftype == 0b10) { Undefined(); return; }
+    if (args.ftype == 0b11 && !host_platform::kHasF16C) { success_ = false; return; }
     bool is_double = (args.ftype == 0b01);
+    bool is_half = (args.ftype == 0b11);
 
     int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
@@ -3821,6 +3856,21 @@ class LiteTranslator {
         as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       }
       as_.Ucomisd(xmm_n, xmm_m);
+    } else if (is_half) {
+      // Widen both operands FP16->FP32 via F16C, then UCOMISS. FP16 zero
+      // (0x0000) round-trips through Vcvtph2ps to FP32 +0.0, so the with_zero
+      // path simply leaves xmm_m as Pxor'd (FP32 zero in lane 0).
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      if (args.with_zero) {
+        as_.Pxor(xmm_m, xmm_m);
+      } else {
+        as_.Pxor(xmm_m, xmm_m);
+        as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_m, xmm_m);
+      }
+      as_.Ucomiss(xmm_n, xmm_m);
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       if (args.with_zero) {
