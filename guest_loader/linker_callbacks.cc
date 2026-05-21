@@ -19,6 +19,12 @@
 #include <cinttypes>
 #include <string>
 
+// region digitalis - per-DlOpen wall-clock latency + Set/ClearExecutable counters
+#include <chrono>
+
+#include "berberis/guest_os_primitives/guest_map_shadow.h"
+// endregion
+
 #include "berberis/base/tracing.h"
 
 #include "guest_loader_impl.h"  // FindSymbol
@@ -107,7 +113,30 @@ void* GuestLoader::DlOpen(const char* libpath, int flags) {
 
 void* GuestLoader::DlOpenExt(const char* libpath, int flags, const android_dlextinfo* extinfo) {
   TRACE("GuestLoader::DlOpen(libpath=\"%s\", flags=0x%x, extinfo=%p)", libpath, flags, extinfo);
+  // region digitalis - per-DlOpen wall-clock + Set/ClearExecutable counters.
+  // Log entry and exit so we see start markers even when the call blocks for
+  // long stretches (the trace pull may happen before the call returns).
+  // The Set/Clear counts isolate "linker mprotect churn" as a fraction of the
+  // total wall-clock — Qt6Widgets vs Qt6Network etc.
+  TRACE_AND_ALOGD(
+      "berberis: DlOpen ENTER libpath=\"%s\" flags=0x%x",
+      libpath ? libpath : "(null)",
+      flags);
+  GuestMapShadowResetExecutableCounts();
+  auto t0 = std::chrono::steady_clock::now();
   auto handle = linker_callbacks_.dlopen_ext_fn_(libpath, flags, extinfo, caller_addr_);
+  auto t1 = std::chrono::steady_clock::now();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+  auto set_count = GuestMapShadowGetSetExecutableCount();
+  auto clear_count = GuestMapShadowGetClearExecutableCount();
+  TRACE_AND_ALOGD(
+      "berberis: DlOpen EXIT  %lldms set=%llu clear=%llu libpath=\"%s\" handle=%p",
+      (long long)ms,
+      (unsigned long long)set_count,
+      (unsigned long long)clear_count,
+      libpath ? libpath : "(null)",
+      handle);
+  // endregion
   TRACE("GuestLoader::DlOpen(...) = %p", handle);
   SetDlErrorIfNeeded();
   return handle;
