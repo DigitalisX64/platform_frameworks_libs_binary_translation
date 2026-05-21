@@ -2460,10 +2460,14 @@ class LiteTranslator {
     //
     // Implements MUL/MLA/MLS/ADD/SUB/AND/ORR/EOR/CMEQ at the lane sizes
     // the dynamic linker's calculate_gnu_hash_neon needs (4S MUL/MLA in
-    // particular), plus the Armv8.2-FP16 FADD/FSUB/FMUL/FDIV vector forms
-    // via F16C round-trip (bit-exact for FP16 binary FADD/FSUB/FMUL/FDIV
-    // because FP32's 24-bit mantissa strictly contains FP16's 11). Falls
-    // back to interpreter for opcodes/sizes outside this set.
+    // particular), plus the Armv8.2-FP16 FADD/FSUB/FMUL/FDIV and
+    // FMAX/FMIN/FMAXNM/FMINNM vector forms via F16C round-trip. The
+    // round-trip is bit-exact for the binary arithmetic ops because
+    // FP32's 24-bit mantissa strictly contains FP16's 11; the max/min
+    // family wraps the round-trip in a NaN-handling shim that adapts
+    // x86's asymmetric MAXPS/MINPS NaN semantics to ARM's (FMAX/FMIN
+    // propagate NaN, FMAXNM/FMINNM suppress single NaNs). Falls back
+    // to the interpreter for opcodes/sizes outside this set.
     int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
@@ -2652,6 +2656,181 @@ class LiteTranslator {
           as_.Por(xn, xn_hi);
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         }
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
+      case Decoder::AdvSimdThreeSameOpcode::kFminV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
+      case Decoder::AdvSimdThreeSameOpcode::kFminnmV: {
+        // FP16 vector FMAX / FMIN / FMAXNM / FMINNM via F16C round-trip.
+        //
+        // ARM and x86 disagree on NaN handling for MAX/MIN:
+        //   - ARM FMAX/FMIN  (IEEE 754-2008): if either input is NaN, result is NaN.
+        //   - ARM FMAXNM/FMINNM (max/min Number): if exactly one input is NaN,
+        //     return the other; if both NaN, result is NaN.
+        //   - x86 MAXPS/MINPS: if either input is NaN, result = SRC2 (asymmetric).
+        //
+        // Lowering for FMAX (NaN-propagating):
+        //   tmp = b ; MAXPS tmp, a   -> tmp = a if any NaN, else max
+        //   MAXPS a, b               -> a   = b if any NaN, else max
+        //   POR a, tmp               -> bitwise OR keeps all-1 exponent (NaN) if
+        //                               either operand was NaN; equals max otherwise.
+        // FMIN is the same shape with MINPS.
+        //
+        // Lowering for FMAXNM (NaN-suppressing):
+        //   substitute NaN-lanes in each operand with the other operand's value,
+        //   then MAXPS. After substitution:
+        //     - a NaN, b non-NaN -> a' = b, b' = b -> MAXPS = b. ✓
+        //     - b NaN, a non-NaN -> a' = a, b' = a -> MAXPS = a. ✓
+        //     - both NaN         -> a' = b (NaN), b' = a (NaN) -> MAXPS = SRC2 = a (a NaN). ✓
+        //     - neither          -> a' = a, b' = b -> MAXPS = max(a, b). ✓
+        // FMINNM analogous with MINPS.
+        //
+        // Round-trip is bit-exact for the non-NaN path because FP32's mantissa
+        // strictly contains FP16's. NaN-result bit patterns may differ from a
+        // canonical FP16 qNaN (0x7E00), but are still valid NaNs per ARM ARM
+        // default-NaN propagation rules.
+        //
+        // FP32 / FP64 forms (size = 00 / 01) still bail to the interpreter.
+        if (!args.is_fp16) { Undefined(); return; }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
+        const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
+                             args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV);
+        const bool is_nm  = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
+                             args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV);
+        auto minmax_op = [&](SimdRegister dst, SimdRegister src) {
+          if (is_max) {
+            as_.Maxps(dst, src);
+          } else {
+            as_.Minps(dst, src);
+          }
+        };
+        if (!args.q) {
+          // .4H: 4 FP16 lanes in low 64 bits of each operand.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn, xn);
+          as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Vcvtph2ps(xm, xm);
+          if (!is_nm) {
+            SimdRegister tmp = AllocTempSimdReg();
+            if (tmp == no_simd_register) { Undefined(); return; }
+            as_.Movdqa(tmp, xm);
+            minmax_op(tmp, xn);
+            minmax_op(xn, xm);
+            as_.Por(xn, tmp);
+          } else {
+            SimdRegister t_mask_a = AllocTempSimdReg();
+            SimdRegister t_mask_b = AllocTempSimdReg();
+            SimdRegister t_an_sub = AllocTempSimdReg();
+            SimdRegister t_bn_sub = AllocTempSimdReg();
+            if (t_mask_a == no_simd_register || t_mask_b == no_simd_register ||
+                t_an_sub == no_simd_register || t_bn_sub == no_simd_register) {
+              Undefined(); return;
+            }
+            as_.Movdqa(t_mask_a, xn);
+            as_.Cmpunordps(t_mask_a, t_mask_a);   // 1s where a is NaN
+            as_.Movdqa(t_mask_b, xm);
+            as_.Cmpunordps(t_mask_b, t_mask_b);   // 1s where b is NaN
+            as_.Movdqa(t_an_sub, t_mask_a);
+            as_.Pand(t_an_sub, xm);                // mask_a & b
+            as_.Movdqa(t_bn_sub, t_mask_b);
+            as_.Pand(t_bn_sub, xn);                // mask_b & a
+            as_.Pandn(t_mask_a, xn);               // ~mask_a & a
+            as_.Pandn(t_mask_b, xm);               // ~mask_b & b
+            as_.Por(t_mask_a, t_an_sub);           // a' in t_mask_a
+            as_.Por(t_mask_b, t_bn_sub);           // b' in t_mask_b
+            minmax_op(t_mask_a, t_mask_b);         // result in t_mask_a
+            as_.Movdqa(xn, t_mask_a);
+          }
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+          // Vcvtps2ph auto-zeroes upper 64 bits.
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        // .8H: process low 4 lanes, then high 4 lanes, then recombine.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xn_hi = AllocTempSimdReg();
+        SimdRegister xm_hi = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xn_hi == no_simd_register || xm_hi == no_simd_register) {
+          Undefined(); return;
+        }
+        as_.Movdqu(xn_hi, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqa(xn, xn_hi);
+        as_.Vcvtph2ps(xn, xn);
+        as_.Psrldq(xn_hi, int8_t{8});
+        as_.Vcvtph2ps(xn_hi, xn_hi);
+        as_.Movdqu(xm_hi, {.base = Assembler::rbp, .disp = vm_off});
+        as_.Movdqa(xm, xm_hi);
+        as_.Vcvtph2ps(xm, xm);
+        as_.Psrldq(xm_hi, int8_t{8});
+        as_.Vcvtph2ps(xm_hi, xm_hi);
+        if (!is_nm) {
+          // FMAX / FMIN — NaN-propagating via maxab|maxba|OR; one scratch.
+          SimdRegister tmp = AllocTempSimdReg();
+          if (tmp == no_simd_register) { Undefined(); return; }
+          // Low half.
+          as_.Movdqa(tmp, xm);
+          minmax_op(tmp, xn);
+          minmax_op(xn, xm);
+          as_.Por(xn, tmp);
+          // High half — reuse `tmp`.
+          as_.Movdqa(tmp, xm_hi);
+          minmax_op(tmp, xn_hi);
+          minmax_op(xn_hi, xm_hi);
+          as_.Por(xn_hi, tmp);
+        } else {
+          // FMAXNM / FMINNM — NaN-suppressing; four scratch temps per half.
+          SimdRegister t_mask_a = AllocTempSimdReg();
+          SimdRegister t_mask_b = AllocTempSimdReg();
+          SimdRegister t_an_sub = AllocTempSimdReg();
+          SimdRegister t_bn_sub = AllocTempSimdReg();
+          if (t_mask_a == no_simd_register || t_mask_b == no_simd_register ||
+              t_an_sub == no_simd_register || t_bn_sub == no_simd_register) {
+            Undefined(); return;
+          }
+          // Low half: process xn (a) and xm (b), result back into xn.
+          as_.Movdqa(t_mask_a, xn);
+          as_.Cmpunordps(t_mask_a, t_mask_a);
+          as_.Movdqa(t_mask_b, xm);
+          as_.Cmpunordps(t_mask_b, t_mask_b);
+          as_.Movdqa(t_an_sub, t_mask_a);
+          as_.Pand(t_an_sub, xm);
+          as_.Movdqa(t_bn_sub, t_mask_b);
+          as_.Pand(t_bn_sub, xn);
+          as_.Pandn(t_mask_a, xn);
+          as_.Pandn(t_mask_b, xm);
+          as_.Por(t_mask_a, t_an_sub);
+          as_.Por(t_mask_b, t_bn_sub);
+          minmax_op(t_mask_a, t_mask_b);
+          as_.Movdqa(xn, t_mask_a);
+          // High half: reuse the four temps for xn_hi (a) and xm_hi (b).
+          as_.Movdqa(t_mask_a, xn_hi);
+          as_.Cmpunordps(t_mask_a, t_mask_a);
+          as_.Movdqa(t_mask_b, xm_hi);
+          as_.Cmpunordps(t_mask_b, t_mask_b);
+          as_.Movdqa(t_an_sub, t_mask_a);
+          as_.Pand(t_an_sub, xm_hi);
+          as_.Movdqa(t_bn_sub, t_mask_b);
+          as_.Pand(t_bn_sub, xn_hi);
+          as_.Pandn(t_mask_a, xn_hi);
+          as_.Pandn(t_mask_b, xm_hi);
+          as_.Por(t_mask_a, t_an_sub);
+          as_.Por(t_mask_b, t_bn_sub);
+          minmax_op(t_mask_a, t_mask_b);
+          as_.Movdqa(xn_hi, t_mask_a);
+        }
+        as_.Vcvtps2ph(xn, xn, int8_t{0});
+        as_.Vcvtps2ph(xn_hi, xn_hi, int8_t{0});
+        as_.Pslldq(xn_hi, int8_t{8});
+        as_.Por(xn, xn_hi);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
       default:
