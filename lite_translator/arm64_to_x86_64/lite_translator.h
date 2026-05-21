@@ -1663,11 +1663,108 @@ class LiteTranslator {
   // endregion
 
   // region digitalis indexed FCMLA
-  // AdvSIMD complex floating-point by element (FCMLA-idx): bail to the
-  // interpreter.  Same rationale as the FCMA-vector JIT row above; the
-  // index broadcast would add yet another per-rot shuffle pattern, and
-  // the interpreter is correct and rare enough to not yet warrant JIT.
-  void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs&) { success_ = false; }
+  //
+  // AdvSIMD complex floating-point by element (FCMLA-idx) JIT path for
+  // FP32 (.4s).  Same shape as AdvSimdFcma's FP32 FCMLA branch, except
+  // Vm contributes a single broadcast complex pair (Vm.s[2*idx],
+  // Vm.s[2*idx+1]) rather than per-pair distinct pairs.  The broadcast
+  // is one PSHUFD over Vm before the existing per-rot transform:
+  //   idx=0: imm=0x44 -> [Vm.s[0], Vm.s[1], Vm.s[0], Vm.s[1]]
+  //   idx=1: imm=0xEE -> [Vm.s[2], Vm.s[3], Vm.s[2], Vm.s[3]]
+  // After the broadcast, the per-rot Vm transform (Shufps/Pand/Xorps)
+  // and the Vn-half broadcast (PSHUFD 0xA0 for n_re, 0xF5 for n_im)
+  // match the non-indexed FCMLA path verbatim.  Vd is read-modify-write
+  // (FCMLA always accumulates).
+  //
+  // FP32-indexed mandates Q=1: the decoder rejects L=1 or Q=0 for
+  // size=0b10, so there is no .2s indexed form and the post-loop Q=0
+  // zero-clear tail used by the vector path is unreachable here.
+  //
+  // FP16-indexed (size=0b01) bails to the interpreter — same F16C
+  // round-trip follow-up as the FP16 FCMA-vector row.
+  void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
+    if (args.size != 0b10) {
+      // FP16-indexed (size=0b01) — fall back to interpreter (F16C
+      // round-trip path TBD).
+      success_ = false;
+      return;
+    }
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    if (xmm_n == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_m == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_d = AllocTempSimdReg();
+    if (xmm_d == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_sign = AllocTempSimdReg();
+    if (xmm_sign == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_lane = AllocTempSimdReg();
+    if (xmm_lane == no_simd_register) { success_ = false; return; }
+
+    int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t dst_off   = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+    as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+    as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
+
+    // Broadcast the indexed complex pair across all of xmm_m.  PSHUFD
+    // imm bits (3:2:1:0) each pick a source dword for that dst dword.
+    //   idx=0: imm=0b01_00_01_00 = 0x44 -> [src[0], src[1], src[0], src[1]]
+    //   idx=1: imm=0b11_10_11_10 = 0xEE -> [src[2], src[3], src[2], src[3]]
+    as_.Pshufd(xmm_m, xmm_m,
+               static_cast<int8_t>(args.index == 0 ? 0x44 : 0xEE));
+
+    // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
+    as_.Pcmpeqd(xmm_sign, xmm_sign);
+    as_.Pslld(xmm_sign, static_cast<int8_t>(31));
+
+    // Apply the per-rotation Vm transform — identical to the vector
+    // FCMLA path (lite_translator::AdvSimdFcma FP32 FCMLA branch).
+    switch (args.rot) {
+      case 0:
+        // No transform.
+        break;
+      case 1:
+        // Swap pair + negate real lanes.
+        as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorps(xmm_m, xmm_sign);
+        break;
+      case 2:
+        // Negate all lanes.
+        as_.Xorps(xmm_m, xmm_sign);
+        break;
+      case 3:
+        // Swap pair + negate imag lanes.
+        as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        as_.Psllq(xmm_lane, static_cast<int8_t>(32));
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorps(xmm_m, xmm_sign);
+        break;
+      default:
+        // Decoder only emits rot in 0..3 for FCMLA-idx.
+        success_ = false;
+        return;
+    }
+
+    // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
+    if (args.rot == 0 || args.rot == 2) {
+      as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+    } else {
+      as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
+    }
+
+    as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
+    as_.Addps(xmm_d, xmm_n);   // Vd += ...
+
+    // FP32-indexed FCMLA mandates Q=1, so no Q=0 zero-clear is needed.
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_d);
+  }
   // endregion
 
   // region digitalis
