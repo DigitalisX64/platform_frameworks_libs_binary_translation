@@ -2434,11 +2434,90 @@ class LiteTranslator {
     success_ = false;  // interpreter fallback
   }
 
-  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB
-  // Fall back to interpreter for now (3-source FP operations are complex for JIT).
-  void FpDataProc3(uint8_t /*rd*/, uint8_t /*rn*/, uint8_t /*rm*/, uint8_t /*ra*/,
-                   uint8_t /*ftype*/, bool /*o1*/, bool /*o0*/) {
-    success_ = false;  // interpreter fallback
+  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB at S/D.
+  //
+  //   FMADD  (o1=0, o0=0) : Rd = Ra + Rn*Rm
+  //   FMSUB  (o1=0, o0=1) : Rd = Ra - Rn*Rm
+  //   FNMADD (o1=1, o0=0) : Rd = -(Ra + Rn*Rm)
+  //   FNMSUB (o1=1, o0=1) : Rd = Rn*Rm - Ra
+  //
+  // The ARM ARM specifies the single multiply-add is computed without
+  // intermediate rounding (one rounding for the whole fused operation).
+  // x86 FMA3 (VFMADD231SS/SD and friends) has the same semantic, so this is
+  // the only sound JIT lowering.  Hosts without FMA3 fall back to the
+  // interpreter (which uses libc fma() / fmaf() — also single-rounded),
+  // not to a MUL+ADD pair (which would double-round).
+  //
+  // Mapping to x86 FMA231 form (dest = src1*src2 ± dest, ± from mnemonic;
+  // load Ra into the dest slot, Rn into src1, Rm into src2):
+  //   FMADD  -> Vfmadd231(ss|sd)  : Ra +  Rn*Rm
+  //   FMSUB  -> Vfnmadd231(ss|sd) : Ra + -(Rn*Rm)  = Ra - Rn*Rm
+  //   FNMADD -> Vfnmsub231(ss|sd) : -(Rn*Rm) - Ra  = -(Ra + Rn*Rm)
+  //   FNMSUB -> Vfmsub231(ss|sd)  :  Rn*Rm - Ra
+  //
+  // FP16 (ftype=11) stays on the interpreter: F16C round-trip is not exact
+  // for FMA (-91 parking note); the interpreter does fma() in binary64
+  // before narrowing, which is exact.
+  void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
+                   uint8_t ftype, bool o1, bool o0) {
+    // region digitalis
+    if (ftype != 0b00 && ftype != 0b01) {
+      success_ = false;
+      return;
+    }
+    if (!host_platform::kHasFMA) {
+      success_ = false;
+      return;
+    }
+    const bool is_double = (ftype == 0b01);
+
+    const int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+    const int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    const int32_t src_a_off = offsetof(ThreadState, cpu.v[0]) + ra * 16;
+    const int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    if (xmm_n == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_m == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_a = AllocTempSimdReg();
+    if (xmm_a == no_simd_register) { success_ = false; return; }
+
+    if (is_double) {
+      as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
+    } else {
+      as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
+    }
+
+    if (!o1 && !o0) {
+      if (is_double) as_.Vfmadd231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfmadd231ss(xmm_a, xmm_n, xmm_m);
+    } else if (!o1 && o0) {
+      if (is_double) as_.Vfnmadd231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfnmadd231ss(xmm_a, xmm_n, xmm_m);
+    } else if (o1 && !o0) {
+      if (is_double) as_.Vfnmsub231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfnmsub231ss(xmm_a, xmm_n, xmm_m);
+    } else {
+      if (is_double) as_.Vfmsub231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfmsub231ss(xmm_a, xmm_n, xmm_m);
+    }
+
+    // ARM zero-extends Vd above the result lane.  Zero the full 128 bits
+    // (reusing xmm_n as a scratch — n is no longer needed), then write the
+    // scalar lane on top.
+    as_.Pxor(xmm_n, xmm_n);
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_n);
+    if (is_double) {
+      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    } else {
+      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    }
+    // endregion
   }
 
   // FMOV (scalar, immediate): JIT - load a FP constant into SIMD register
@@ -2554,6 +2633,171 @@ class LiteTranslator {
       as_.Movq(tmp, {.base = Assembler::rbp, .disp = vreg_offset + 8});
       // Use SetReg to update the mapped register (not just ThreadState)
       SetReg(args.rd, tmp);
+      return;
+    }
+
+    // SCVTF / UCVTF (scalar, integer→FP, rmode=00): Vd = (FP)(s|u)Wn/Xn.
+    //
+    //   rmode=00, opcode=010 -> SCVTF: signed Wn/Xn -> Sd/Dd
+    //   rmode=00, opcode=011 -> UCVTF: unsigned Wn/Xn -> Sd/Dd
+    //
+    // x86 CVTSI2SS/SD always reads a signed source.  For SCVTF this matches
+    // ARM directly: the L-variant takes a 32-bit source and sign-extends it
+    // into the FP unit's signed conversion, the Q-variant takes a 64-bit
+    // source.  For UCVTF with sf=0 (32-bit unsigned source) we zero-extend
+    // the source into a 64-bit GPR via MOVL and then use CVTSI2SS/SD Q-form
+    // — the value always fits in int64 so the signed convert is exact.
+    // UCVTF with sf=1 (64-bit unsigned) splits at bit 63: if the source is
+    // < 2^63 the direct Q-form is exact; otherwise we apply the textbook
+    // "halve, round-to-odd, convert, double" fix-up.  The round-to-odd
+    // halve (`v >> 1) | (v & 1)`) preserves enough information that the
+    // subsequent round-to-nearest-even after doubling lands on the same
+    // bit pattern clang emits for `static_cast<float|double>(uint64_t)`.
+    if (rmode == 0b00 && (opcode == 0b010 || opcode == 0b011) &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      const bool is_unsigned = (opcode == 0b011);
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      as_.Pxor(xmm, xmm);
+      if (args.rn < 31) {
+        Register gp_val = GetReg(args.rn);
+        if (is_unsigned && args.sf) {
+          // sf=1, opcode=011: 64-bit unsigned.  Branch on the sign bit:
+          // direct convert for values < 2^63, halve/convert/double for the
+          // upper half.  Forward jumps keep the positive (fast) path
+          // straight-line; only the >= 2^63 case takes the fix-up.
+          Register tmp = AllocTempReg();
+          if (tmp == no_register) { success_ = false; return; }
+          as_.Movq(tmp, gp_val);
+          Assembler::Label* neg_path = as_.MakeLabel();
+          Assembler::Label* done = as_.MakeLabel();
+          as_.Testq(tmp, tmp);
+          as_.Jcc(Assembler::Condition::kNegative, *neg_path);
+          if (args.ftype == 0b00) as_.Cvtsi2ssq(xmm, tmp);
+          else as_.Cvtsi2sdq(xmm, tmp);
+          as_.Jmp(*done);
+          as_.Bind(neg_path);
+          Register low_bit = AllocTempReg();
+          if (low_bit == no_register) { success_ = false; return; }
+          as_.Movq(low_bit, tmp);
+          as_.Andq(low_bit, static_cast<int32_t>(1));  // round-to-odd LSB
+          as_.Shrq(tmp, static_cast<int8_t>(1));       // logical halve
+          as_.Orq(tmp, low_bit);                       // tmp = halve|LSB
+          if (args.ftype == 0b00) {
+            as_.Cvtsi2ssq(xmm, tmp);
+            as_.Addss(xmm, xmm);                       // double back
+          } else {
+            as_.Cvtsi2sdq(xmm, tmp);
+            as_.Addsd(xmm, xmm);                       // double back
+          }
+          as_.Bind(done);
+        } else if (is_unsigned) {
+          // sf=0, opcode=011: 32-bit unsigned.  Zero-extend via MOVL then
+          // convert as signed 64-bit (value <= UINT32_MAX < INT64_MAX).
+          Register tmp = AllocTempReg();
+          as_.Movl(tmp, gp_val);  // 32-bit MOV zero-extends to 64
+          if (args.ftype == 0b00) as_.Cvtsi2ssq(xmm, tmp);
+          else as_.Cvtsi2sdq(xmm, tmp);
+        } else if (args.sf) {
+          // sf=1, opcode=010: 64-bit signed, direct Q-form.
+          if (args.ftype == 0b00) as_.Cvtsi2ssq(xmm, gp_val);
+          else as_.Cvtsi2sdq(xmm, gp_val);
+        } else {
+          // sf=0, opcode=010: 32-bit signed, L-form.  CVTSI2{SS,SD}L reads
+          // the 32-bit subreg as int32 (sign-extends to the FP convert).
+          if (args.ftype == 0b00) as_.Cvtsi2ssl(xmm, gp_val);
+          else as_.Cvtsi2sdl(xmm, gp_val);
+        }
+      }
+      // Legacy CVTSI2{SS,SD} leaves xmm[127:32]/xmm[127:64] unchanged; the
+      // pre-PXOR guarantees those bits are zero, so the single MOVDQU below
+      // writes the lane plus ARM's required zero-extension above it in one
+      // shot.  rn=31 (XZR/WZR) falls through here too — xmm is still zero,
+      // matching the (FP)(0) result.
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm);
+      return;
+    }
+
+    // FCVTZS (scalar, FP -> signed int, truncate toward zero):
+    //   rmode=11, opcode=000, ftype in {00, 01}.
+    //
+    //   sf  ftype  insn               x86 lowering
+    //    0   00    FCVTZS Wd, Sn      Cvttss2sil + ARM saturation fix-up
+    //    0   01    FCVTZS Wd, Dn      Cvttsd2sil + ARM saturation fix-up
+    //    1   00    FCVTZS Xd, Sn      Cvttss2siq + ARM saturation fix-up
+    //    1   01    FCVTZS Xd, Dn      Cvttsd2siq + ARM saturation fix-up
+    //
+    // x86 cvtt{ss,sd}2si returns the destination type's INT_MIN ("indefinite")
+    // for any out-of-range input (NaN, +/-Inf, overflow), so we must rebuild
+    // ARM's by-sign saturation:
+    //   NaN              -> 0
+    //   positive overflow -> INT_MAX
+    //   negative overflow -> INT_MIN (matches the indefinite already)
+    // After truncate-convert we classify by (a) parity flag (PF=1 iff NaN)
+    // and (b) the FP source's sign bit (extracted via Movd/Movq):
+    //   NaN              -> branch to nan_path, write 0.
+    //   non-NaN, FP < 0  -> keep tmp (correct in-range neg or INT_MIN).
+    //   non-NaN, FP >= 0 -> if tmp >= 0 keep it (in-range pos); else
+    //                       tmp == INT_MIN i.e. positive overflow, write INT_MAX.
+    // -0.0 takes the non-NaN/FP<0 branch but tmp is 0 (cvtt returns 0 for
+    // -0.0), so keeping tmp gives the ARM-correct 0.
+    if (rmode == 0b11 && opcode == 0b000 &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      Register sign_tmp = AllocTempReg();
+      if (sign_tmp == no_register) { success_ = false; return; }
+      int32_t src_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      if (args.ftype == 0b00) {
+        as_.Movss(xmm, {.base = Assembler::rbp, .disp = src_off});
+      } else {
+        as_.Movsd(xmm, {.base = Assembler::rbp, .disp = src_off});
+      }
+      if (args.sf) {
+        if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+        else as_.Cvttsd2siq(tmp, xmm);
+      } else {
+        if (args.ftype == 0b00) as_.Cvttss2sil(tmp, xmm);
+        else as_.Cvttsd2sil(tmp, xmm);
+      }
+      Assembler::Label* nan_path = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+      // NaN check.
+      if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+      else as_.Ucomisd(xmm, xmm);
+      as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+      // Sign-of-FP check via raw bits.
+      if (args.ftype == 0b00) {
+        as_.Movd(sign_tmp, xmm);
+        as_.Testl(sign_tmp, sign_tmp);
+      } else {
+        as_.Movq(sign_tmp, xmm);
+        as_.Testq(sign_tmp, sign_tmp);
+      }
+      as_.Jcc(Assembler::Condition::kNegative, *done);
+      // Non-negative FP: keep tmp if tmp >= 0 (in-range); else overwrite
+      // with INT_MAX (positive overflow).
+      if (args.sf) as_.Testq(tmp, tmp);
+      else as_.Testl(tmp, tmp);
+      as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+      if (args.sf) {
+        as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+      } else {
+        as_.Movl(tmp, int32_t{INT32_MAX});
+      }
+      as_.Jmp(*done);
+      as_.Bind(nan_path);
+      if (args.sf) as_.Xorq(tmp, tmp);
+      else as_.Xorl(tmp, tmp);
+      as_.Bind(done);
+      if (args.rd < 31) {
+        // sf=0: tmp's upper 32 bits are already zero (x86-64 writes to
+        // 32-bit subregs auto-zero-extend), matching Wd-write semantics.
+        SetReg(args.rd, tmp);
+      }
       return;
     }
     // endregion
@@ -5000,8 +5244,105 @@ class LiteTranslator {
         if (is_double) as_.Subsd(xmm_n, xmm_m);
         else as_.Subss(xmm_n, xmm_m);
         break;
+      // region digitalis: scalar FMAX / FMIN / FMAXNM / FMINNM / FNMUL JIT.
+      //
+      // FMAX/FMIN (NaN-propagating per ARM ARM): symmetric MAX with POR.
+      //   tmp = m; MAXP{S,D} tmp, n   ; tmp lane0 = NaN if any NaN else max
+      //   MAXP{S,D} n, m              ; n lane0   = NaN if any NaN else max
+      //   POR n, tmp                  ; bitwise OR keeps NaN exponent if any NaN
+      //
+      // FMAXNM/FMINNM (NaN-suppressing per ARM ARM): substitute NaN lanes
+      // with the other operand, then MAXP{S,D}.
+      //
+      // Operates on the vector forms because the SS/SD scalar MAX/MIN
+      // mnemonics are not exposed in the Berberis x86 assembler. For S/D
+      // only lane 0 matters (Movss/Movsd writes lane 0 only); for H the
+      // upper lanes are pre-zeroed by Pxor+Pinsrw, so MAXP{S,D} lanes 1..3
+      // = max(0, 0) = 0 and the F16C narrow produces zero in FP16 lanes
+      // 1..3 — matching the AArch64 Hd zero-extend semantic.
+      case 0b0100:    // FMAX
+      case 0b0101: {  // FMIN
+        SimdRegister tmp = AllocTempSimdReg();
+        if (tmp == no_simd_register) { Undefined(); return; }
+        as_.Movdqa(tmp, xmm_m);
+        const bool is_max = (args.opcode == 0b0100);
+        if (is_max) {
+          if (is_double) {
+            as_.Maxpd(tmp, xmm_n);
+            as_.Maxpd(xmm_n, xmm_m);
+          } else {
+            as_.Maxps(tmp, xmm_n);
+            as_.Maxps(xmm_n, xmm_m);
+          }
+        } else {
+          if (is_double) {
+            as_.Minpd(tmp, xmm_n);
+            as_.Minpd(xmm_n, xmm_m);
+          } else {
+            as_.Minps(tmp, xmm_n);
+            as_.Minps(xmm_n, xmm_m);
+          }
+        }
+        as_.Por(xmm_n, tmp);
+        break;
+      }
+      case 0b0110:    // FMAXNM
+      case 0b0111: {  // FMINNM
+        SimdRegister mask_a = AllocTempSimdReg();
+        SimdRegister mask_b = AllocTempSimdReg();
+        SimdRegister an_sub = AllocTempSimdReg();
+        SimdRegister bn_sub = AllocTempSimdReg();
+        if (mask_a == no_simd_register || mask_b == no_simd_register ||
+            an_sub == no_simd_register || bn_sub == no_simd_register) {
+          Undefined();
+          return;
+        }
+        as_.Movdqa(mask_a, xmm_n);
+        if (is_double) as_.Cmpunordpd(mask_a, mask_a);
+        else as_.Cmpunordps(mask_a, mask_a);
+        as_.Movdqa(mask_b, xmm_m);
+        if (is_double) as_.Cmpunordpd(mask_b, mask_b);
+        else as_.Cmpunordps(mask_b, mask_b);
+        as_.Movdqa(an_sub, mask_a);
+        as_.Pand(an_sub, xmm_m);
+        as_.Movdqa(bn_sub, mask_b);
+        as_.Pand(bn_sub, xmm_n);
+        as_.Pandn(mask_a, xmm_n);
+        as_.Pandn(mask_b, xmm_m);
+        as_.Por(mask_a, an_sub);
+        as_.Por(mask_b, bn_sub);
+        const bool is_max = (args.opcode == 0b0110);
+        if (is_max) {
+          if (is_double) as_.Maxpd(mask_a, mask_b);
+          else as_.Maxps(mask_a, mask_b);
+        } else {
+          if (is_double) as_.Minpd(mask_a, mask_b);
+          else as_.Minps(mask_a, mask_b);
+        }
+        as_.Movdqa(xmm_n, mask_a);
+        break;
+      }
+      case 0b1000: {  // FNMUL: -(n * m)
+        SimdRegister sign_xmm = AllocTempSimdReg();
+        if (sign_xmm == no_simd_register) { Undefined(); return; }
+        if (is_double) {
+          as_.Mulsd(xmm_n, xmm_m);
+          Register sign_gpr = AllocTempReg();
+          as_.Movq(sign_gpr, int64_t{static_cast<int64_t>(0x8000000000000000ULL)});
+          as_.Movq(sign_xmm, sign_gpr);
+          as_.Xorpd(xmm_n, sign_xmm);
+        } else {
+          as_.Mulss(xmm_n, xmm_m);
+          Register sign_gpr = AllocTempReg();
+          as_.Movl(sign_gpr, int32_t{static_cast<int32_t>(0x80000000U)});
+          as_.Movd(sign_xmm, sign_gpr);
+          as_.Xorps(xmm_n, sign_xmm);
+        }
+        break;
+      }
+      // endregion
       default:
-        // FMAX, FMIN, FNMUL, etc. - less common, fall back.
+        // Any other opcode (reserved / future) — fall back to interpreter.
         Undefined();
         return;
     }
