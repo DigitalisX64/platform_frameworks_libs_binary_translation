@@ -4627,10 +4627,6 @@ class LiteTranslator {
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV: {
-        if (args.is_fp16) { success_ = false; return; }
-        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
-        const bool is_double = (args.size & 1);
-        if (is_double && !args.q) { Undefined(); return; }
         int8_t round_imm;
         switch (args.opcode) {
           case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV: round_imm = 0x00; break;
@@ -4642,6 +4638,42 @@ class LiteTranslator {
           // ROUND* "use MXCSR" bit.
           default: round_imm = 0x04; break;
         }
+        if (args.is_fp16) {
+          // .4H (Q=0) and .8H (Q=1) — F16C round-trip with ROUNDPS imm.
+          // Per standing rule (handoff-82): F16C round-trip is exact for
+          // FP16 unary FRINT*. Pattern identical to FSQRT FP16 but with
+          // ROUNDPS instead of SQRTPS.
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          SimdRegister xlo = AllocTempSimdReg();
+          if (xlo == no_simd_register) { Undefined(); return; }
+          if (!args.q) {
+            as_.Movq(xlo, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xlo, xlo);
+            as_.Roundps(xlo, xlo, round_imm);
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            // Vcvtps2ph already zeroes the upper 64 bits of xlo.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          } else {
+            SimdRegister xhi = AllocTempSimdReg();
+            if (xhi == no_simd_register) { Undefined(); return; }
+            as_.Movdqu(xhi, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Movdqa(xlo, xhi);
+            as_.Vcvtph2ps(xlo, xlo);
+            as_.Psrldq(xhi, int8_t{8});
+            as_.Vcvtph2ps(xhi, xhi);
+            as_.Roundps(xlo, xlo, round_imm);
+            as_.Roundps(xhi, xhi, round_imm);
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            as_.Vcvtps2ph(xhi, xhi, int8_t{0});
+            as_.Pslldq(xhi, int8_t{8});
+            as_.Por(xlo, xhi);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          }
+          return;
+        }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { Undefined(); return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
