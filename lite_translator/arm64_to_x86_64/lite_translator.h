@@ -1438,11 +1438,12 @@ class LiteTranslator {
 
   // region digitalis FCADD/FCMLA JIT (handoff-69)
   //
-  // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32.
-  // The interpreter (interpreter.h::AdvSimdFcma) is the spec — see the
-  // per-pair scalar math there for the six rotations (FCADD ±90/±270,
-  // FCMLA 0/90/180/270).  The JIT path here lowers FP32 (size=0b10,
-  // .2S Q=0 and .4S Q=1) to a 4-to-7 SSE-instruction sequence:
+  // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32
+  // and FP64.  The interpreter (interpreter.h::AdvSimdFcma) is the
+  // spec — see the per-pair scalar math there for the six rotations
+  // (FCADD ±90/±270, FCMLA 0/90/180/270).  The JIT path here lowers
+  // FP32 (size=0b10, .2S Q=0 and .4S Q=1) and FP64 (size=0b11, .2D
+  // Q=1) to a 4-to-7 SSE-instruction sequence:
   //
   //   * FCADD .4S, rot=#rot:
   //       Vm' = shufps(Vm, Vm, 0xB1)           // pair-swap (re,im)->(im,re)
@@ -1472,8 +1473,8 @@ class LiteTranslator {
   // available on the emulator host CPU, the FP16 path becomes a 2-step
   // VCVTPH2PS round-trip; that's a follow-up perf row.
   void AdvSimdFcma(const Decoder::FcmaArgs& args) {
-    if (args.size != 0b10) {
-      // FP16 / FP64 — fall back to the interpreter.
+    if (args.size == 0b01) {
+      // FP16 vector — fall back to interpreter (F16C round-trip path TBD).
       success_ = false;
       return;
     }
@@ -1494,82 +1495,162 @@ class LiteTranslator {
     as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
     as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
 
-    // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
-    as_.Pcmpeqd(xmm_sign, xmm_sign);
-    as_.Pslld(xmm_sign, static_cast<int8_t>(31));
-
     SimdRegister xmm_result = no_simd_register;  // tracks the register holding the final value
 
-    if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
-      // m_xformed = pair-swap(Vm), negate the lanes implied by rot.
-      as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+    if (args.size == 0b10) {
+      // FP32 path: 1 pair (.2S, Q=0) or 2 pairs (.4S, Q=1).
+      // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
+      as_.Pcmpeqd(xmm_sign, xmm_sign);
+      as_.Pslld(xmm_sign, static_cast<int8_t>(31));
 
-      as_.Pcmpeqd(xmm_lane, xmm_lane);
-      if (args.rot == 0) {
-        // rot=#90: negate real lanes (0, 2) — mask = [0xff..ff, 0, 0xff..ff, 0].
-        as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
-      } else {
-        // rot=#270: negate imag lanes (1, 3) — mask = [0, 0xff..ff, 0, 0xff..ff].
-        as_.Psllq(xmm_lane, static_cast<int8_t>(32));
-      }
-      as_.Pand(xmm_sign, xmm_lane);
-      as_.Xorps(xmm_m, xmm_sign);
+      if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+        // m_xformed = pair-swap(Vm), negate the lanes implied by rot.
+        as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
 
-      // Vn + m_xformed -> xmm_n.
-      as_.Addps(xmm_n, xmm_m);
-      xmm_result = xmm_n;
-    } else {
-      // FCMLA: result = Vd + n_broadcast * m_xformed.
-      SimdRegister xmm_d = AllocTempSimdReg();
-      if (xmm_d == no_simd_register) { success_ = false; return; }
-      as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
-
-      // m_xformed depends on rotation.
-      switch (args.rot) {
-        case 0:
-          // No transform.
-          break;
-        case 1:
-          // Swap + negate real lanes.
-          as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
-          as_.Pcmpeqd(xmm_lane, xmm_lane);
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        if (args.rot == 0) {
+          // rot=#90: negate real lanes (0, 2) — mask = [0xff..ff, 0, 0xff..ff, 0].
           as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
-          as_.Pand(xmm_sign, xmm_lane);
-          as_.Xorps(xmm_m, xmm_sign);
-          break;
-        case 2:
-          // Negate all lanes.
-          as_.Xorps(xmm_m, xmm_sign);
-          break;
-        case 3:
-          // Swap + negate imag lanes.
-          as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
-          as_.Pcmpeqd(xmm_lane, xmm_lane);
+        } else {
+          // rot=#270: negate imag lanes (1, 3) — mask = [0, 0xff..ff, 0, 0xff..ff].
           as_.Psllq(xmm_lane, static_cast<int8_t>(32));
-          as_.Pand(xmm_sign, xmm_lane);
-          as_.Xorps(xmm_m, xmm_sign);
-          break;
-        default:
-          // Cannot happen: decoder only emits rot in 0..3 for FCMLA.
-          success_ = false;
-          return;
-      }
+        }
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorps(xmm_m, xmm_sign);
 
-      // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
-      // PSHUFD imm=0xA0 = (10,10,00,00): [lane0, lane0, lane2, lane2] = n_re bcast.
-      // PSHUFD imm=0xF5 = (11,11,01,01): [lane1, lane1, lane3, lane3] = n_im bcast.
-      if (args.rot == 0 || args.rot == 2) {
-        as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+        // Vn + m_xformed -> xmm_n.
+        as_.Addps(xmm_n, xmm_m);
+        xmm_result = xmm_n;
       } else {
-        as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
-      }
+        // FCMLA: result = Vd + n_broadcast * m_xformed.
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_d == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
 
-      as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
-      as_.Addps(xmm_d, xmm_n);   // Vd += ...
-      xmm_result = xmm_d;
+        // m_xformed depends on rotation.
+        switch (args.rot) {
+          case 0:
+            // No transform.
+            break;
+          case 1:
+            // Swap + negate real lanes.
+            as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorps(xmm_m, xmm_sign);
+            break;
+          case 2:
+            // Negate all lanes.
+            as_.Xorps(xmm_m, xmm_sign);
+            break;
+          case 3:
+            // Swap + negate imag lanes.
+            as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Psllq(xmm_lane, static_cast<int8_t>(32));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorps(xmm_m, xmm_sign);
+            break;
+          default:
+            // Cannot happen: decoder only emits rot in 0..3 for FCMLA.
+            success_ = false;
+            return;
+        }
+
+        // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
+        // PSHUFD imm=0xA0 = (10,10,00,00): [lane0, lane0, lane2, lane2] = n_re bcast.
+        // PSHUFD imm=0xF5 = (11,11,01,01): [lane1, lane1, lane3, lane3] = n_im bcast.
+        if (args.rot == 0 || args.rot == 2) {
+          as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+        } else {
+          as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
+        }
+
+        as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
+        as_.Addps(xmm_d, xmm_n);   // Vd += ...
+        xmm_result = xmm_d;
+      }
+    } else {
+      // FP64 path: size==0b11, .2D only (decoder rejects Q=0 for FP64).
+      // 1 complex pair (lane 0 = re, lane 1 = im); 8 bytes per lane.
+      // Same shape as FP32 but with FP64-width lowerings:
+      //   Shufpd 0x01 swaps the two doubles; Shufpd 0x00/0x03 broadcasts
+      //   lane 0/1 across both. PSRLDQ/PSLLDQ 8 builds the lane-mask
+      //   (single pair, 8-byte lane width).
+      // Sign-bit mask for 64-bit FP lanes: [0x8000000000000000]*2.
+      as_.Pcmpeqd(xmm_sign, xmm_sign);
+      as_.Psllq(xmm_sign, static_cast<int8_t>(63));
+
+      if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+        // Pair-swap: SHUFPD imm=0x01 -> [m_im, m_re].
+        as_.Shufpd(xmm_m, xmm_m, static_cast<int8_t>(0x01));
+
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        if (args.rot == 0) {
+          // rot=#90: negate real lane (lane 0).
+          // mask = [0xff..ff (low 64), 0 (high 64)] = PSRLDQ 8 over [-1; 16].
+          as_.Psrldq(xmm_lane, static_cast<int8_t>(8));
+        } else {
+          // rot=#270: negate imag lane (lane 1).
+          // mask = [0 (low 64), 0xff..ff (high 64)] = PSLLDQ 8 over [-1; 16].
+          as_.Pslldq(xmm_lane, static_cast<int8_t>(8));
+        }
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorpd(xmm_m, xmm_sign);
+
+        as_.Addpd(xmm_n, xmm_m);
+        xmm_result = xmm_n;
+      } else {
+        // FCMLA: result = Vd + n_broadcast * m_xformed.
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_d == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
+
+        switch (args.rot) {
+          case 0:
+            // No transform.
+            break;
+          case 1:
+            // Swap + negate real lane.
+            as_.Shufpd(xmm_m, xmm_m, static_cast<int8_t>(0x01));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Psrldq(xmm_lane, static_cast<int8_t>(8));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorpd(xmm_m, xmm_sign);
+            break;
+          case 2:
+            // Negate both lanes.
+            as_.Xorpd(xmm_m, xmm_sign);
+            break;
+          case 3:
+            // Swap + negate imag lane.
+            as_.Shufpd(xmm_m, xmm_m, static_cast<int8_t>(0x01));
+            as_.Pcmpeqd(xmm_lane, xmm_lane);
+            as_.Pslldq(xmm_lane, static_cast<int8_t>(8));
+            as_.Pand(xmm_sign, xmm_lane);
+            as_.Xorpd(xmm_m, xmm_sign);
+            break;
+          default:
+            success_ = false;
+            return;
+        }
+
+        // Broadcast n_re (rot 0/2) -> [n[0], n[0]] via SHUFPD imm=0x00.
+        // Broadcast n_im (rot 1/3) -> [n[1], n[1]] via SHUFPD imm=0x03.
+        if (args.rot == 0 || args.rot == 2) {
+          as_.Shufpd(xmm_n, xmm_n, static_cast<int8_t>(0x00));
+        } else {
+          as_.Shufpd(xmm_n, xmm_n, static_cast<int8_t>(0x03));
+        }
+
+        as_.Mulpd(xmm_n, xmm_m);
+        as_.Addpd(xmm_d, xmm_n);
+        xmm_result = xmm_d;
+      }
     }
 
-    // Q=0 (.2S): zero the upper 64 bits, preserving lanes 0..1.
+    // Q=0 (.2S only — FP64 always has Q=1): zero the upper 64 bits.
     if (!args.q) {
       // Reuse xmm_lane to build a [0xff..ff (low 64), 0 (high 64)] mask.
       as_.Pcmpeqd(xmm_lane, xmm_lane);
@@ -1582,11 +1663,108 @@ class LiteTranslator {
   // endregion
 
   // region digitalis indexed FCMLA
-  // AdvSIMD complex floating-point by element (FCMLA-idx): bail to the
-  // interpreter.  Same rationale as the FCMA-vector JIT row above; the
-  // index broadcast would add yet another per-rot shuffle pattern, and
-  // the interpreter is correct and rare enough to not yet warrant JIT.
-  void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs&) { success_ = false; }
+  //
+  // AdvSIMD complex floating-point by element (FCMLA-idx) JIT path for
+  // FP32 (.4s).  Same shape as AdvSimdFcma's FP32 FCMLA branch, except
+  // Vm contributes a single broadcast complex pair (Vm.s[2*idx],
+  // Vm.s[2*idx+1]) rather than per-pair distinct pairs.  The broadcast
+  // is one PSHUFD over Vm before the existing per-rot transform:
+  //   idx=0: imm=0x44 -> [Vm.s[0], Vm.s[1], Vm.s[0], Vm.s[1]]
+  //   idx=1: imm=0xEE -> [Vm.s[2], Vm.s[3], Vm.s[2], Vm.s[3]]
+  // After the broadcast, the per-rot Vm transform (Shufps/Pand/Xorps)
+  // and the Vn-half broadcast (PSHUFD 0xA0 for n_re, 0xF5 for n_im)
+  // match the non-indexed FCMLA path verbatim.  Vd is read-modify-write
+  // (FCMLA always accumulates).
+  //
+  // FP32-indexed mandates Q=1: the decoder rejects L=1 or Q=0 for
+  // size=0b10, so there is no .2s indexed form and the post-loop Q=0
+  // zero-clear tail used by the vector path is unreachable here.
+  //
+  // FP16-indexed (size=0b01) bails to the interpreter — same F16C
+  // round-trip follow-up as the FP16 FCMA-vector row.
+  void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
+    if (args.size != 0b10) {
+      // FP16-indexed (size=0b01) — fall back to interpreter (F16C
+      // round-trip path TBD).
+      success_ = false;
+      return;
+    }
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    if (xmm_n == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_m == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_d = AllocTempSimdReg();
+    if (xmm_d == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_sign = AllocTempSimdReg();
+    if (xmm_sign == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_lane = AllocTempSimdReg();
+    if (xmm_lane == no_simd_register) { success_ = false; return; }
+
+    int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t dst_off   = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+    as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+    as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
+
+    // Broadcast the indexed complex pair across all of xmm_m.  PSHUFD
+    // imm bits (3:2:1:0) each pick a source dword for that dst dword.
+    //   idx=0: imm=0b01_00_01_00 = 0x44 -> [src[0], src[1], src[0], src[1]]
+    //   idx=1: imm=0b11_10_11_10 = 0xEE -> [src[2], src[3], src[2], src[3]]
+    as_.Pshufd(xmm_m, xmm_m,
+               static_cast<int8_t>(args.index == 0 ? 0x44 : 0xEE));
+
+    // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
+    as_.Pcmpeqd(xmm_sign, xmm_sign);
+    as_.Pslld(xmm_sign, static_cast<int8_t>(31));
+
+    // Apply the per-rotation Vm transform — identical to the vector
+    // FCMLA path (lite_translator::AdvSimdFcma FP32 FCMLA branch).
+    switch (args.rot) {
+      case 0:
+        // No transform.
+        break;
+      case 1:
+        // Swap pair + negate real lanes.
+        as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorps(xmm_m, xmm_sign);
+        break;
+      case 2:
+        // Negate all lanes.
+        as_.Xorps(xmm_m, xmm_sign);
+        break;
+      case 3:
+        // Swap pair + negate imag lanes.
+        as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+        as_.Pcmpeqd(xmm_lane, xmm_lane);
+        as_.Psllq(xmm_lane, static_cast<int8_t>(32));
+        as_.Pand(xmm_sign, xmm_lane);
+        as_.Xorps(xmm_m, xmm_sign);
+        break;
+      default:
+        // Decoder only emits rot in 0..3 for FCMLA-idx.
+        success_ = false;
+        return;
+    }
+
+    // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
+    if (args.rot == 0 || args.rot == 2) {
+      as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+    } else {
+      as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
+    }
+
+    as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
+    as_.Addps(xmm_d, xmm_n);   // Vd += ...
+
+    // FP32-indexed FCMLA mandates Q=1, so no Q=0 zero-clear is needed.
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_d);
+  }
   // endregion
 
   // region digitalis
@@ -3719,7 +3897,10 @@ class LiteTranslator {
     //                   round-trip with SQRTSS at FP16.
     //   FRINTN/M/P/Z/X/I :  ROUNDSS / ROUNDSD natively at FP32/FP64;
     //                   F16C round-trip with ROUNDSS at FP16.
-    //   FRINTA        : no native x86 ties-to-away mode -- interpreter.
+    //   FRINTA        : ARM ties-to-away has no native x86 ROUND* imm.
+    //                   Lowered as: dst = trunc(src + copysign(0.5, src)).
+    //                   Half goes through F16C round-trip; FP32/FP64 use
+    //                   ADDSS+ROUNDSS / ADDSD+ROUNDSD on a GP-built half.
     //   FCVT between precisions : interpreter (different dst layouts).
     //
     // ROUNDSS / ROUNDSD imm[3:0]:
@@ -3778,8 +3959,70 @@ class LiteTranslator {
         return;
       }
 
-      // FSQRT and FRINT* need F16C; bail to interpreter if absent.
+      // FSQRT, FRINT*, and FCVT-from-half need F16C; bail to interpreter
+      // if absent.
       if (!host_platform::kHasF16C) { success_ = false; return; }
+
+      // FCVT Sd, Hn (opcode=0b000100) and FCVT Dd, Hn (opcode=0b000101):
+      // widen half->single via VCVTPH2PS, then optionally widen to double
+      // via CVTSS2SD.  Result lives in lane 0 of a freshly-zeroed dst XMM,
+      // so MOVDQU writes the AArch64 scalar layout [val_in_low_N, 0×rest]
+      // verbatim.
+      if (args.opcode == 0b000100 || args.opcode == 0b000101) {
+        bool to_double = (args.opcode == 0b000101);
+        SimdRegister xmm_src = AllocTempSimdReg();
+        SimdRegister xmm_dst = AllocTempSimdReg();
+        if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+          Undefined();
+          return;
+        }
+        as_.Pxor(xmm_src, xmm_src);
+        as_.Pinsrw(xmm_src, {.base = Assembler::rbp, .disp = src_offset},
+                   int8_t{0});
+        as_.Vcvtph2ps(xmm_src, xmm_src);   // half->single in lane 0
+        if (to_double) {
+          as_.Pxor(xmm_dst, xmm_dst);
+          as_.Cvtss2sd(xmm_dst, xmm_src);  // single->double in lane 0; dst
+                                           // upper 96 preserved (zero).
+          as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+        } else {
+          // VCVTPH2PS already produced [single, 0, 0, 0] in xmm_src
+          // because lanes 1..3 of the source halves were zero.
+          as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_src);
+        }
+        return;
+      }
+
+      // FRINTA Hd, Hn: ties-to-away in FP32 space via the canonical
+      // add-copysign(0.5)-then-truncate trick.  Build the copysign value
+      // in a GP register from the FP16 sign bit, widen src via F16C, do
+      // the ADDSS + ROUNDSS imm=3 (truncate), and narrow back.
+      if (args.opcode == 0b001100) {
+        SimdRegister xmm_val = AllocTempSimdReg();
+        SimdRegister xmm_half = AllocTempSimdReg();
+        if (xmm_val == no_simd_register || xmm_half == no_simd_register) {
+          Undefined();
+          return;
+        }
+        Register tmp = AllocTempReg();
+        // bits-of-copysign(0.5_fp32, src_fp16): sign of FP16 src shifted to
+        // FP32 sign-bit position, OR'd with the FP32 mantissa/exponent bits
+        // of +0.5 (0x3F000000).
+        as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Andl(tmp, int32_t{0x00008000});
+        as_.Shll(tmp, int8_t{16});
+        as_.Orl(tmp, int32_t{0x3F000000});
+        as_.Movd(xmm_half, tmp);
+        as_.Pxor(xmm_val, xmm_val);
+        as_.Pinsrw(xmm_val, {.base = Assembler::rbp, .disp = src_offset},
+                   int8_t{0});
+        as_.Vcvtph2ps(xmm_val, xmm_val);
+        as_.Addss(xmm_val, xmm_half);
+        as_.Roundss(xmm_val, xmm_val, int8_t{0x03});  // truncate toward 0
+        as_.Vcvtps2ph(xmm_val, xmm_val, int8_t{0});
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+        return;
+      }
 
       int8_t round_imm = 0;
       bool is_sqrt = false;
@@ -3792,7 +4035,7 @@ class LiteTranslator {
         case 0b001110: round_imm = 0x00; break;     // FRINTX
         case 0b001111: round_imm = 0x08; break;     // FRINTI
         default:
-          // FCVT half->{single,double}, FRINTA -> interpreter.
+          // Unknown FP16 unary opcode -> interpreter.
           success_ = false;
           return;
       }
@@ -3863,6 +4106,104 @@ class LiteTranslator {
       return;
     }
 
+    // FCVT between FP32 and FP64: zero a fresh dst XMM, then CVTSS2SD or
+    // CVTSD2SS into lane 0.  Both ops preserve the upper 96 bits of the
+    // destination, so the zero-then-convert sequence leaves
+    // [val_in_low_N, 0×rest] which is the AArch64 scalar layout.
+    if (!is_double && args.opcode == 0b000101) {
+      // FCVT Dd, Sn — single -> double.  No F16C needed.
+      SimdRegister xmm_src = AllocTempSimdReg();
+      SimdRegister xmm_dst = AllocTempSimdReg();
+      if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+        Undefined();
+        return;
+      }
+      as_.Movss(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+      as_.Pxor(xmm_dst, xmm_dst);
+      as_.Cvtss2sd(xmm_dst, xmm_src);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+      return;
+    }
+    if (is_double && args.opcode == 0b000100) {
+      // FCVT Sd, Dn — double -> single.  No F16C needed.
+      SimdRegister xmm_src = AllocTempSimdReg();
+      SimdRegister xmm_dst = AllocTempSimdReg();
+      if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+        Undefined();
+        return;
+      }
+      as_.Movsd(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+      as_.Pxor(xmm_dst, xmm_dst);
+      as_.Cvtsd2ss(xmm_dst, xmm_src);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+      return;
+    }
+    // FCVT Hd, Sn / FCVT Hd, Dn — narrow to half.  Needs F16C for VCVTPS2PH.
+    // For FP64 source, first narrow double->single via CVTSD2SS into a
+    // zeroed XMM, then VCVTPS2PH narrows single->half and zeroes upper 64.
+    if (args.opcode == 0b000111) {
+      if (!host_platform::kHasF16C) { success_ = false; return; }
+      SimdRegister xmm_src = AllocTempSimdReg();
+      SimdRegister xmm_dst = AllocTempSimdReg();
+      if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+        Undefined();
+        return;
+      }
+      if (is_double) {
+        as_.Movsd(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Pxor(xmm_dst, xmm_dst);
+        as_.Cvtsd2ss(xmm_dst, xmm_src);            // single in xmm_dst lane 0
+        as_.Vcvtps2ph(xmm_dst, xmm_dst, int8_t{0}); // half in xmm_dst lane 0
+      } else {
+        as_.Movss(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Vcvtps2ph(xmm_dst, xmm_src, int8_t{0}); // half in xmm_dst lane 0
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+      return;
+    }
+
+    // FRINTA Sd/Dd, Sn/Dn: ties-to-away has no native ROUND* imm.
+    // Lowered as: dst = trunc(src + copysign(0.5, src)).  Build the
+    // copysign value in a GP register, then ADDSS/ADDSD + ROUNDSS/ROUNDSD
+    // imm=0x03 (truncate toward zero).
+    if (args.opcode == 0b001100) {
+      SimdRegister xmm_val = AllocTempSimdReg();
+      SimdRegister xmm_half = AllocTempSimdReg();
+      SimdRegister xmm_zero = AllocTempSimdReg();
+      if (xmm_val == no_simd_register || xmm_half == no_simd_register ||
+          xmm_zero == no_simd_register) { Undefined(); return; }
+      Register tmp = AllocTempReg();
+      if (is_double) {
+        // FP64: high 32 bits hold sign+exp; low 32 bits of 0.5_fp64 are
+        // zero.  Build only the high half in a GP register, then PINSRD
+        // it into the upper-32 of an otherwise-zero XMM.
+        as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset + 4});
+        as_.Andl(tmp, static_cast<int32_t>(0x80000000));  // sign bit only
+        as_.Orl(tmp, int32_t{0x3FE00000});                 // |= high32(0.5d)
+        as_.Pxor(xmm_half, xmm_half);
+        as_.Pinsrd(xmm_half, tmp, int8_t{1});              // xmm_half = copysign(0.5d,src)
+        as_.Movsd(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Addsd(xmm_val, xmm_half);
+        as_.Roundsd(xmm_val, xmm_val, int8_t{0x03});       // truncate toward 0
+        as_.Pxor(xmm_zero, xmm_zero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+      } else {
+        // FP32: one word holds sign+exp+mantissa.
+        as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Andl(tmp, static_cast<int32_t>(0x80000000));  // sign bit only
+        as_.Orl(tmp, int32_t{0x3F000000});                 // |= bits of +0.5
+        as_.Movd(xmm_half, tmp);                           // xmm_half = copysign(0.5,src)
+        as_.Movss(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Addss(xmm_val, xmm_half);
+        as_.Roundss(xmm_val, xmm_val, int8_t{0x03});       // truncate toward 0
+        as_.Pxor(xmm_zero, xmm_zero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+        as_.Movss({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+      }
+      return;
+    }
+
     // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
     int8_t round_imm = 0;
     bool is_sqrt = false;
@@ -3875,7 +4216,7 @@ class LiteTranslator {
       case 0b001110: round_imm = 0x00; break;     // FRINTX
       case 0b001111: round_imm = 0x08; break;     // FRINTI
       default:
-        // FRINTA, FCVT S<->D, FCVT to half -> interpreter.
+        // Unknown FP unary opcode -> interpreter.
         success_ = false;
         return;
     }
@@ -4207,6 +4548,146 @@ class LiteTranslator {
         as_.Psllw(xn, int8_t{8});
         as_.Psrlw(xt, int8_t{8});
         as_.Por(xn, xt);
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D).
+      //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
+      //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
+      //   FNEG: XOR with broadcast mask 0x80000000 (FP32) or 0x80000000_00000000 (FP64).
+      // The FP16 vector form (args.is_fp16) bails to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFabs:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister mask = AllocTempSimdReg();
+        if (xn == no_simd_register || mask == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pcmpeqd(mask, mask);
+        const bool is_fabs =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFabs);
+        if (is_double) {
+          // FABS mask 0x7FFFFFFFFFFFFFFF (allones >> 1); FNEG mask 0x8000000000000000.
+          if (is_fabs) {
+            as_.Psrlq(mask, int8_t{1});
+            as_.Pand(xn, mask);
+          } else {
+            as_.Psllq(mask, int8_t{63});
+            as_.Pxor(xn, mask);
+          }
+        } else {
+          if (is_fabs) {
+            as_.Psrld(mask, int8_t{1});
+            as_.Pand(xn, mask);
+          } else {
+            as_.Pslld(mask, int8_t{31});
+            as_.Pxor(xn, mask);
+          }
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // Vector FRINTN / FRINTM / FRINTP / FRINTZ / FRINTX / FRINTI
+      // (FP32 .2S/.4S, FP64 .2D).
+      //   FRINTN  -> ROUNDPS/PD imm=0 (round to nearest even).
+      //   FRINTM  -> ROUNDPS/PD imm=1 (toward -inf, floor).
+      //   FRINTP  -> ROUNDPS/PD imm=2 (toward +inf, ceil).
+      //   FRINTZ  -> ROUNDPS/PD imm=3 (toward zero, trunc).
+      //   FRINTX/FRINTI -> ROUNDPS/PD imm=4 (use MXCSR; default RNE matches ARM).
+      // SSE4.1 ROUNDPS/PD natively accepts the imm; one instruction per vector.
+      // The FP16 form (args.is_fp16) bails to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        int8_t round_imm;
+        switch (args.opcode) {
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV: round_imm = 0x00; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV: round_imm = 0x01; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV: round_imm = 0x02; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV: round_imm = 0x03; break;
+          // FRINTX / FRINTI follow the current FPCR rounding mode; we treat
+          // MXCSR (default RNE) as the canonical mode.  imm=0x04 sets the
+          // ROUND* "use MXCSR" bit.
+          default: round_imm = 0x04; break;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_double) {
+          as_.Roundpd(xn, xn, round_imm);
+        } else {
+          as_.Roundps(xn, xn, round_imm);
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // Vector FRINTA (FP32 .2S/.4S, FP64 .2D) -- "round to nearest, ties away".
+      // x86 ROUNDPS/PD has no ties-away mode, so use the identity
+      //     FRINTA(x) = trunc(x + copysign(0.5, x))
+      // already used by the scalar FRINTA JIT path (handoff-81).  Per-lane:
+      // build (x AND sign_mask) OR half_pattern  ->  +/-0.5, add to x, ROUND
+      // imm=3.  Bit-exact against ARM for all finite/NaN/Inf inputs (the
+      // +0.5 nudge is a no-op when |x| >= 2^p; signed zeros preserved by
+      // ROUNDPS imm=3; NaN/Inf propagate through ADDPS/ADDPD).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister copysign = AllocTempSimdReg();
+        SimdRegister half = AllocTempSimdReg();
+        if (xn == no_simd_register || copysign == no_simd_register ||
+            half == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // Build the sign-bit mask in copysign, then AND with xn to extract
+        // per-lane sign bits.
+        as_.Pcmpeqd(copysign, copysign);
+        if (is_double) {
+          as_.Psllq(copysign, int8_t{63});
+        } else {
+          as_.Pslld(copysign, int8_t{31});
+        }
+        as_.Pand(copysign, xn);
+        // Build per-lane 0.5 broadcast in half (FP32: 0x3F000000, FP64:
+        // 0x3FE0000000000000).  Move via a GP scratch -> Movd/Movq -> Pshufd.
+        Register gp_half = AllocTempReg();
+        if (gp_half == no_register) { Undefined(); return; }
+        if (is_double) {
+          as_.Movq(gp_half, int64_t{0x3FE0000000000000LL});
+          as_.Movq(half, gp_half);
+          // imm=0x44 = 01_00_01_00 -> broadcast low 64 bits across both
+          // 64-bit lanes of the XMM.
+          as_.Pshufd(half, half, static_cast<int8_t>(0x44));
+        } else {
+          as_.Movl(gp_half, int32_t{0x3F000000});
+          as_.Movd(half, gp_half);
+          // imm=0x00 broadcasts the low dword across all 4 dwords.
+          as_.Pshufd(half, half, static_cast<int8_t>(0x00));
+        }
+        // copysign |= half  -> per-lane sign(xn) * 0.5.
+        as_.Por(copysign, half);
+        // xn += copysign(0.5, xn); truncate toward zero.
+        if (is_double) {
+          as_.Addpd(xn, copysign);
+          as_.Roundpd(xn, xn, int8_t{0x03});
+        } else {
+          as_.Addps(xn, copysign);
+          as_.Roundps(xn, xn, int8_t{0x03});
+        }
         if (!args.q) mask_low64(xn);
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
