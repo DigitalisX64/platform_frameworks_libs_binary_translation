@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include "../faulty_memory_accesses.h"
 // endregion
@@ -814,6 +815,634 @@ class Interpreter {
     return result;
   }
 
+  // region digitalis
+  //
+  // MTE (Memory Tagging Extension, Armv8.5-A) data-processing 2-source:
+  // IRG / GMI / SUBP / SUBPS. The translator has no MTE backing, so the
+  // correct behavior is to NOT SIGILL — produce the result as if the
+  // tag-related fields were absent (we already TBI-strip on every guest
+  // memory access, so tag bits in addresses are inert).
+  //
+  // SP semantics per ARM ARM:
+  //   SUBP / SUBPS:  Rd∈{Xd,XZR}, Rn∈{Xn,SP},   Rm∈{Xm,SP}
+  //   IRG:           Rd∈{Xd,SP},  Rn∈{Xn,SP},   Rm∈{Xm,XZR}
+  //   GMI:           Rd∈{Xd,XZR}, Rn∈{Xn,SP},   Rm∈{Xm,XZR}
+  void MteDataProc(const Decoder::MteDataProcArgs& args) {
+    CHECK(!exception_raised_);
+
+    auto read_x_or_sp = [&](uint8_t r) -> uint64_t {
+      return (r == 31) ? state_->cpu.sp : state_->cpu.x[r];
+    };
+    auto read_x_or_zr = [&](uint8_t r) -> uint64_t {
+      return (r == 31) ? 0 : state_->cpu.x[r];
+    };
+
+    switch (args.opcode) {
+      case Decoder::MteDataProcOpcode::kSubp:
+      case Decoder::MteDataProcOpcode::kSubps: {
+        // SUBP[S]: 56-bit signed difference of tag-stripped pointers,
+        // sign-extended to 64 bits. Tag bits are bits[59:56] (logical
+        // tag) — strip with mask 0x00FFFFFFFFFFFFFFULL, then
+        // sign-extend bit[55] up to bit[63].
+        uint64_t a = read_x_or_sp(args.src1) & 0x00FFFFFFFFFFFFFFULL;
+        uint64_t b = read_x_or_sp(args.src2) & 0x00FFFFFFFFFFFFFFULL;
+        if (a & (1ULL << 55)) a |= 0xFF00000000000000ULL;
+        if (b & (1ULL << 55)) b |= 0xFF00000000000000ULL;
+        uint64_t result = a - b;
+        if (args.opcode == Decoder::MteDataProcOpcode::kSubps) {
+          UpdateFlags(a, b, result, /*is_sub=*/true, /*is_64bit=*/true);
+        }
+        // Rd=31 means XZR for SUBP/SUBPS — write is discarded.
+        if (args.dst != 31) state_->cpu.x[args.dst] = result;
+        break;
+      }
+      case Decoder::MteDataProcOpcode::kIrg: {
+        // IRG Xd|SP, Xn|SP{, Xm}. With no MTE backing, the
+        // "random tag" is the existing tag bits of Rn — i.e., act as a
+        // move. The exclusion-mask in Rm is ignored.
+        uint64_t result = read_x_or_sp(args.src1);
+        if (args.dst == 31) {
+          state_->cpu.sp = result;
+        } else {
+          state_->cpu.x[args.dst] = result;
+        }
+        break;
+      }
+      case Decoder::MteDataProcOpcode::kGmi: {
+        // GMI Xd, Xn|SP, Xm. The architectural semantics OR a single
+        // tag bit (1<<((Rn>>56)&0xF)) into the 16-bit mask in Rm.
+        // Implement it for free since the math is cheap and any future
+        // MTE-aware code in the guest will observe the right bit
+        // pattern.
+        uint64_t mask = read_x_or_zr(args.src2);
+        uint8_t tag = static_cast<uint8_t>((read_x_or_sp(args.src1) >> 56) & 0xF);
+        uint64_t result = mask | (1ULL << tag);
+        // GMI Rd=31 means XZR.
+        if (args.dst != 31) state_->cpu.x[args.dst] = result;
+        break;
+      }
+    }
+  }
+
+  // MTE (Armv8.5-A) load/store memory tags: LDG / STG / ST2G / STZG / STZ2G.
+  //
+  // Without MTE backing the tags don't exist, but the data side-effects of
+  // STZG (zero 16 bytes) and STZ2G (zero 32 bytes) still execute — guest
+  // code relies on the zeroing for stack-frame init even when it doesn't
+  // care about tags. STG / ST2G are pure tag stores and become NOPs. LDG
+  // clears the tag field of Rt (loaded tag is 0 because no MTE backing).
+  //
+  // Addressing rules per ARM ARM C6.2.x:
+  //   op2=00 (LDG only):  addr = Xn + imm, no writeback.
+  //   op2=01 (post-index): addr = Xn,       writeback Xn = Xn + imm.
+  //   op2=10 (offset):     addr = Xn + imm, no writeback.
+  //   op2=11 (pre-index):  addr = Xn + imm, writeback Xn = Xn + imm.
+  // The effective address must be granule-aligned (16 for the 'g' forms,
+  // 32 for the '2g' forms); we mask defensively before zeroing so a
+  // misaligned guest address can't tear a host page.
+  void MteLoadStore(const Decoder::MteLoadStoreArgs& args) {
+    CHECK(!exception_raised_);
+
+    uint64_t base = (args.rn == 31) ? state_->cpu.sp : state_->cpu.x[args.rn];
+    int64_t imm = static_cast<int64_t>(args.imm);
+    uint64_t access_addr = (args.op2 == 0b01) ? base : (base + imm);
+    bool writeback = (args.op2 == 0b01) || (args.op2 == 0b11);
+    uint64_t new_base = base + imm;
+
+    switch (args.opcode) {
+      case Decoder::MteLoadStoreOpcode::kStg:
+      case Decoder::MteLoadStoreOpcode::kSt2g:
+        // Pure tag store — NOP without MTE backing.
+        break;
+      case Decoder::MteLoadStoreOpcode::kLdg: {
+        // LDG: load 4-bit tag from memory into Rt[59:56]. With no MTE
+        // backing, the loaded tag is 0 — i.e., clear Rt[59:56].
+        if (args.rt != 31) {
+          state_->cpu.x[args.rt] = state_->cpu.x[args.rt] & ~0x0F00000000000000ULL;
+        }
+        break;
+      }
+      case Decoder::MteLoadStoreOpcode::kStzg: {
+        // Zero the 16-byte granule containing access_addr.
+        uint64_t aligned = access_addr & ~uint64_t{0x0F};
+        if (FaultyStore(ToHostAddr<void>(aligned), 8, 0)) {
+          HandleMemoryFault(aligned);
+          return;
+        }
+        if (FaultyStore(ToHostAddr<void>(aligned + 8), 8, 0)) {
+          HandleMemoryFault(aligned + 8);
+          return;
+        }
+        break;
+      }
+      case Decoder::MteLoadStoreOpcode::kStz2g: {
+        // Zero the 32-byte granule containing access_addr.
+        uint64_t aligned = access_addr & ~uint64_t{0x1F};
+        for (int i = 0; i < 32; i += 8) {
+          if (FaultyStore(ToHostAddr<void>(aligned + i), 8, 0)) {
+            HandleMemoryFault(aligned + i);
+            return;
+          }
+        }
+        break;
+      }
+    }
+
+    if (writeback) {
+      if (args.rn == 31) {
+        state_->cpu.sp = new_base;
+      } else {
+        state_->cpu.x[args.rn] = new_base;
+      }
+    }
+  }
+  // endregion
+
+  // region digitalis
+  // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
+  //
+  // FCADD <Vd>.<T>, <Vn>.<T>, <Vm>.<T>, #<rotation>:
+  //   for each complex element pair (re=lane 2i, im=lane 2i+1):
+  //     rot=#90:   (Vd_re, Vd_im) = (Vn_re - Vm_im, Vn_im + Vm_re)
+  //     rot=#270:  (Vd_re, Vd_im) = (Vn_re + Vm_im, Vn_im - Vm_re)
+  //
+  // FCMLA <Vd>.<T>, <Vn>.<T>, <Vm>.<T>, #<rotation>:
+  //   accumulate-multiply with a per-rot lane-and-sign pattern (ARM ARM
+  //   C7.2.84).  Each call computes ONE half of a complex multiply:
+  //     rot=#0:    (Vd_re, Vd_im) += (Vn_re * Vm_re, Vn_re * Vm_im)
+  //     rot=#90:   (Vd_re, Vd_im) += (Vn_im * -Vm_im, Vn_im * Vm_re)
+  //     rot=#180:  (Vd_re, Vd_im) += (Vn_re * -Vm_re, Vn_re * -Vm_im)
+  //     rot=#270:  (Vd_re, Vd_im) += (Vn_im * Vm_im, Vn_im * -Vm_re)
+  //   A full complex multiply C += A*B is FCMLA #0 followed by FCMLA #90.
+  //
+  // Element size: size == 0b10 is float (4 lanes / 4S, 2 lanes / 2S); size
+  // == 0b11 is double (only valid with Q=1, i.e. 2D — 2 lanes).  The
+  // decoder has already rejected size 0b00 / 0b01, plus size 0b11 with Q=0.
+  void AdvSimdFcma(const Decoder::FcmaArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];
+    __uint128_t result = 0;
+
+    uint8_t vec_len = args.q ? 16 : 8;  // bytes in result vector
+
+    // region digitalis FP16 SIMD FCMA (handoff-61)
+    if (args.size == 0b01) {
+      // Half-precision: 2 bytes per lane; pairs are 4 bytes each.
+      // .4H (Q=0) has 2 pairs (lanes 0..3); .8H (Q=1) has 4 pairs (0..7).
+      // Promote each half to binary32 via FpHalfToSingle, apply the FCMA
+      // rotation table, narrow back via FpSingleToHalf — same round-trip
+      // pattern as FP16 vector three-same / two-reg-misc.
+      uint8_t pairs = (vec_len / 2) / 2;
+      for (uint8_t p = 0; p < pairs; p++) {
+        uint8_t lane_re = 2 * p;
+        uint8_t lane_im = 2 * p + 1;
+        uint16_t hn_re, hn_im, hm_re, hm_im, hd_re, hd_im;
+        memcpy(&hn_re, reinterpret_cast<const uint8_t*>(&src_n) + lane_re * 2, 2);
+        memcpy(&hn_im, reinterpret_cast<const uint8_t*>(&src_n) + lane_im * 2, 2);
+        memcpy(&hm_re, reinterpret_cast<const uint8_t*>(&src_m) + lane_re * 2, 2);
+        memcpy(&hm_im, reinterpret_cast<const uint8_t*>(&src_m) + lane_im * 2, 2);
+        memcpy(&hd_re, reinterpret_cast<const uint8_t*>(&dst) + lane_re * 2, 2);
+        memcpy(&hd_im, reinterpret_cast<const uint8_t*>(&dst) + lane_im * 2, 2);
+        float n_re = FpHalfToSingle(hn_re);
+        float n_im = FpHalfToSingle(hn_im);
+        float m_re = FpHalfToSingle(hm_re);
+        float m_im = FpHalfToSingle(hm_im);
+        float d_re = FpHalfToSingle(hd_re);
+        float d_im = FpHalfToSingle(hd_im);
+        float r_re, r_im;
+        if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+          if (args.rot == 0) {           // rot=#90
+            r_re = n_re - m_im;
+            r_im = n_im + m_re;
+          } else {                       // rot=#270
+            r_re = n_re + m_im;
+            r_im = n_im - m_re;
+          }
+        } else {                         // FCMLA
+          switch (args.rot) {
+            case 0:  r_re = d_re + n_re * m_re;  r_im = d_im + n_re * m_im;  break;
+            case 1:  r_re = d_re + n_im * -m_im; r_im = d_im + n_im * m_re;  break;
+            case 2:  r_re = d_re + n_re * -m_re; r_im = d_im + n_re * -m_im; break;
+            default: r_re = d_re + n_im * m_im;  r_im = d_im + n_im * -m_re; break;
+          }
+        }
+        uint16_t hr_re = FpSingleToHalf(r_re);
+        uint16_t hr_im = FpSingleToHalf(r_im);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_re * 2, &hr_re, 2);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_im * 2, &hr_im, 2);
+      }
+    } else if (args.size == 0b10) {
+    // endregion
+      // Single-precision: 4 bytes per lane; pairs are 8 bytes each.
+      // 2S has 1 pair (lanes 0,1); 4S has 2 pairs (lanes 0..3).
+      uint8_t pairs = (vec_len / 4) / 2;
+      for (uint8_t p = 0; p < pairs; p++) {
+        uint8_t lane_re = 2 * p;
+        uint8_t lane_im = 2 * p + 1;
+        float n_re, n_im, m_re, m_im, d_re, d_im;
+        memcpy(&n_re, reinterpret_cast<const uint8_t*>(&src_n) + lane_re * 4, 4);
+        memcpy(&n_im, reinterpret_cast<const uint8_t*>(&src_n) + lane_im * 4, 4);
+        memcpy(&m_re, reinterpret_cast<const uint8_t*>(&src_m) + lane_re * 4, 4);
+        memcpy(&m_im, reinterpret_cast<const uint8_t*>(&src_m) + lane_im * 4, 4);
+        memcpy(&d_re, reinterpret_cast<const uint8_t*>(&dst) + lane_re * 4, 4);
+        memcpy(&d_im, reinterpret_cast<const uint8_t*>(&dst) + lane_im * 4, 4);
+        float r_re, r_im;
+        if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+          if (args.rot == 0) {           // rot=#90
+            r_re = n_re - m_im;
+            r_im = n_im + m_re;
+          } else {                       // rot=#270
+            r_re = n_re + m_im;
+            r_im = n_im - m_re;
+          }
+        } else {                         // FCMLA
+          switch (args.rot) {
+            case 0:  r_re = d_re + n_re * m_re;  r_im = d_im + n_re * m_im;  break;
+            case 1:  r_re = d_re + n_im * -m_im; r_im = d_im + n_im * m_re;  break;
+            case 2:  r_re = d_re + n_re * -m_re; r_im = d_im + n_re * -m_im; break;
+            default: r_re = d_re + n_im * m_im;  r_im = d_im + n_im * -m_re; break;
+          }
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_re * 4, &r_re, 4);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_im * 4, &r_im, 4);
+      }
+    } else {
+      // size == 0b11: double-precision; 8 bytes per lane.
+      // 2D is the only valid form (Q=1, 1 pair: lanes 0,1).
+      double n_re, n_im, m_re, m_im, d_re, d_im;
+      memcpy(&n_re, reinterpret_cast<const uint8_t*>(&src_n) + 0,  8);
+      memcpy(&n_im, reinterpret_cast<const uint8_t*>(&src_n) + 8,  8);
+      memcpy(&m_re, reinterpret_cast<const uint8_t*>(&src_m) + 0,  8);
+      memcpy(&m_im, reinterpret_cast<const uint8_t*>(&src_m) + 8,  8);
+      memcpy(&d_re, reinterpret_cast<const uint8_t*>(&dst) + 0,    8);
+      memcpy(&d_im, reinterpret_cast<const uint8_t*>(&dst) + 8,    8);
+      double r_re, r_im;
+      if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+        if (args.rot == 0) {
+          r_re = n_re - m_im;
+          r_im = n_im + m_re;
+        } else {
+          r_re = n_re + m_im;
+          r_im = n_im - m_re;
+        }
+      } else {
+        switch (args.rot) {
+          case 0:  r_re = d_re + n_re * m_re;  r_im = d_im + n_re * m_im;  break;
+          case 1:  r_re = d_re + n_im * -m_im; r_im = d_im + n_im * m_re;  break;
+          case 2:  r_re = d_re + n_re * -m_re; r_im = d_im + n_re * -m_im; break;
+          default: r_re = d_re + n_im * m_im;  r_im = d_im + n_im * -m_re; break;
+        }
+      }
+      memcpy(reinterpret_cast<uint8_t*>(&result) + 0, &r_re, 8);
+      memcpy(reinterpret_cast<uint8_t*>(&result) + 8, &r_im, 8);
+    }
+
+    // Q=0 zeros the upper 64 bits of the destination vector.
+    if (!args.q) {
+      uint64_t lo;
+      memcpy(&lo, &result, 8);
+      result = 0;
+      memcpy(&result, &lo, 8);
+    }
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  // region digitalis indexed FCMLA
+  //
+  // FCMLA (by element) — Armv8.3-FCMA.  Same per-rot rotation table as
+  // FCMLA (vector), but Vm is replaced by a broadcast vector where every
+  // complex pair is Vm[index].
+  //
+  // Per ARM ARM C7.2.86:
+  //   for e = 0 to output_pairs - 1:
+  //     n_pair = Vn[2*e : 2*e+1]
+  //     m_pair = Vm[2*index : 2*index+1]   (single broadcast pair)
+  //     apply FCMLA rotation table using n_pair and m_pair,
+  //     accumulate into Vd[2*e : 2*e+1].
+  //
+  // FP32 only (size == 0b10) for now — FP16-indexed parked alongside
+  // non-indexed FP16.
+  void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];
+    __uint128_t result = 0;
+
+    uint8_t vec_len = args.q ? 16 : 8;  // bytes in result vector.
+
+    // region digitalis FP16 SIMD FCMA indexed (handoff-61)
+    if (args.size == 0b01) {
+      // Half-precision: 2 bytes per lane; pairs are 4 bytes each.
+      // Read the single broadcast complex pair from Vm[index].
+      uint16_t hm_re, hm_im;
+      memcpy(&hm_re,
+             reinterpret_cast<const uint8_t*>(&src_m) + (2 * args.index) * 2,
+             2);
+      memcpy(&hm_im,
+             reinterpret_cast<const uint8_t*>(&src_m) +
+                 (2 * args.index + 1) * 2,
+             2);
+      float m_re = FpHalfToSingle(hm_re);
+      float m_im = FpHalfToSingle(hm_im);
+
+      uint8_t pairs = (vec_len / 2) / 2;
+      for (uint8_t p = 0; p < pairs; p++) {
+        uint8_t lane_re = 2 * p;
+        uint8_t lane_im = 2 * p + 1;
+        uint16_t hn_re, hn_im, hd_re, hd_im;
+        memcpy(&hn_re, reinterpret_cast<const uint8_t*>(&src_n) + lane_re * 2, 2);
+        memcpy(&hn_im, reinterpret_cast<const uint8_t*>(&src_n) + lane_im * 2, 2);
+        memcpy(&hd_re, reinterpret_cast<const uint8_t*>(&dst)   + lane_re * 2, 2);
+        memcpy(&hd_im, reinterpret_cast<const uint8_t*>(&dst)   + lane_im * 2, 2);
+        float n_re = FpHalfToSingle(hn_re);
+        float n_im = FpHalfToSingle(hn_im);
+        float d_re = FpHalfToSingle(hd_re);
+        float d_im = FpHalfToSingle(hd_im);
+        float r_re, r_im;
+        switch (args.rot) {
+          case 0:  r_re = d_re + n_re *  m_re; r_im = d_im + n_re *  m_im; break;
+          case 1:  r_re = d_re + n_im * -m_im; r_im = d_im + n_im *  m_re; break;
+          case 2:  r_re = d_re + n_re * -m_re; r_im = d_im + n_re * -m_im; break;
+          default: r_re = d_re + n_im *  m_im; r_im = d_im + n_im * -m_re; break;
+        }
+        uint16_t hr_re = FpSingleToHalf(r_re);
+        uint16_t hr_im = FpSingleToHalf(r_im);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_re * 2, &hr_re, 2);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_im * 2, &hr_im, 2);
+      }
+    } else if (args.size == 0b10) {
+    // endregion
+      // Single-precision: 4 bytes per lane; pairs are 8 bytes each.
+      // Read the single broadcast complex pair from Vm[index].
+      float m_re, m_im;
+      memcpy(&m_re,
+             reinterpret_cast<const uint8_t*>(&src_m) + (2 * args.index) * 4,
+             4);
+      memcpy(&m_im,
+             reinterpret_cast<const uint8_t*>(&src_m) +
+                 (2 * args.index + 1) * 4,
+             4);
+
+      uint8_t pairs = (vec_len / 4) / 2;
+      for (uint8_t p = 0; p < pairs; p++) {
+        uint8_t lane_re = 2 * p;
+        uint8_t lane_im = 2 * p + 1;
+        float n_re, n_im, d_re, d_im;
+        memcpy(&n_re, reinterpret_cast<const uint8_t*>(&src_n) + lane_re * 4, 4);
+        memcpy(&n_im, reinterpret_cast<const uint8_t*>(&src_n) + lane_im * 4, 4);
+        memcpy(&d_re, reinterpret_cast<const uint8_t*>(&dst)   + lane_re * 4, 4);
+        memcpy(&d_im, reinterpret_cast<const uint8_t*>(&dst)   + lane_im * 4, 4);
+        float r_re, r_im;
+        switch (args.rot) {
+          case 0:  r_re = d_re + n_re *  m_re; r_im = d_im + n_re *  m_im; break;
+          case 1:  r_re = d_re + n_im * -m_im; r_im = d_im + n_im *  m_re; break;
+          case 2:  r_re = d_re + n_re * -m_re; r_im = d_im + n_re * -m_im; break;
+          default: r_re = d_re + n_im *  m_im; r_im = d_im + n_im * -m_re; break;
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_re * 4, &r_re, 4);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + lane_im * 4, &r_im, 4);
+      }
+    }
+
+    // Q=0 zeros the upper 64 bits of the destination vector.
+    if (!args.q) {
+      uint64_t lo;
+      memcpy(&lo, &result, 8);
+      result = 0;
+      memcpy(&result, &lo, 8);
+    }
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  // region digitalis hello-dotprod
+  // SDOT / UDOT (Armv8.4-DotProd), vector and by-element forms.
+  //
+  // Both forms accumulate a 4-byte dot product into each 32-bit destination
+  // lane.  Bytes are interpreted as signed for SDOT and unsigned for UDOT.
+  // The 32-bit accumulators wrap on overflow (no saturation).
+  //
+  // Vector form: lane i pulls bytes Vn.b[4*i .. 4*i+3] and Vm.b[4*i .. 4*i+3].
+  // Indexed form: lane i pulls bytes Vn.b[4*i .. 4*i+3] but Vm broadcasts one
+  // 4-byte group Vm.b[4*index .. 4*index+3] across all output lanes — index
+  // selects which 4-byte slice of Vm.16B to use (index ∈ [0,3] always).
+  //
+  // lanes = q ? 4 : 2.  Q=0 zeros the upper 64 bits of Vd.
+  void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];
+
+    uint8_t n_b[16], m_b[16];
+    memcpy(n_b, &src_n, 16);
+    memcpy(m_b, &src_m, 16);
+
+    const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
+                            args.opcode == Decoder::DotProductOpcode::kSdotIdx);
+    const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
+                             args.opcode == Decoder::DotProductOpcode::kUdotIdx);
+
+    __uint128_t result = 0;
+    uint8_t lanes = args.q ? 4 : 2;
+    for (uint8_t i = 0; i < lanes; i++) {
+      int32_t acc;
+      memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + i * 4, 4);
+      for (uint8_t k = 0; k < 4; k++) {
+        uint8_t n_byte = n_b[4 * i + k];
+        uint8_t m_byte = is_indexed ? m_b[4 * args.index + k]
+                                    : m_b[4 * i + k];
+        int32_t n_ext = is_signed ? static_cast<int32_t>(static_cast<int8_t>(n_byte))
+                                  : static_cast<int32_t>(n_byte);
+        int32_t m_ext = is_signed ? static_cast<int32_t>(static_cast<int8_t>(m_byte))
+                                  : static_cast<int32_t>(m_byte);
+        // Cast through uint32_t to make wraparound well-defined; bit-pattern
+        // of the result matches the signed-arithmetic case for both SDOT
+        // and UDOT per ARM ARM C7.2.397 / C7.2.398.
+        acc = static_cast<int32_t>(static_cast<uint32_t>(acc) +
+                                   static_cast<uint32_t>(n_ext * m_ext));
+      }
+      memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &acc, 4);
+    }
+
+    // Q=0 zeros the upper 64 bits of the destination vector.
+    if (!args.q) {
+      uint64_t lo;
+      memcpy(&lo, &result, 8);
+      result = 0;
+      memcpy(&result, &lo, 8);
+    }
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  // region digitalis
+  // BFloat16 helpers.  BF16 is the upper 16 bits of an IEEE-754 single-
+  // precision float; widening is a pure shift, narrowing rounds to nearest
+  // even with NaN quieting.
+
+  // Widen one BF16 (low 16 bits of u16) to FP32.
+  static float Bf16ToFloat(uint16_t bf) {
+    uint32_t bits = static_cast<uint32_t>(bf) << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+  }
+
+  // Narrow one FP32 to BF16 with round-to-nearest-even.  NaN becomes a
+  // quiet BF16 NaN; ±Inf and zeros pass through structurally identical.
+  static uint16_t FloatToBf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    // NaN: force MSB of the BF16 mantissa to 1 so it stays quiet, and
+    // make sure the BF16 keeps at least one mantissa bit set.
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0) {
+      return static_cast<uint16_t>((bits >> 16) | 0x0040u);
+    }
+    // Round to nearest, ties to even: add half-ulp plus low-bit-of-result
+    // (so a tie rounds toward even).
+    uint32_t lsb = (bits >> 16) & 1u;
+    uint32_t rounded = bits + 0x7FFFu + lsb;
+    return static_cast<uint16_t>(rounded >> 16);
+  }
+  // endregion
+
+  // region digitalis
+  // Advanced SIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT (vec),
+  // BFMMLA, BFMLALB/T (vec), BFDOT (idx), BFMLALB/T (idx).
+  //
+  // BFDOT (vector):
+  //   for each FP32 output lane i in [0..lanes):
+  //     n0 = Bf16ToFloat(Vn.h[2i + 0])
+  //     n1 = Bf16ToFloat(Vn.h[2i + 1])
+  //     m0 = Bf16ToFloat(Vm.h[2i + 0])
+  //     m1 = Bf16ToFloat(Vm.h[2i + 1])
+  //     Vd.s[i] = Vd.s[i] + n0 * m0 + n1 * m1
+  //   lanes = q ? 4 : 2 (Q selects 4S vs 2S).
+  //   For Q=0, the upper 64 bits of Vd are zeroed.
+  //
+  // BFMMLA: Vd.4S viewed as a 2×2 FP32 matrix; Vn.8H / Vm.8H viewed as
+  //   2×4 BF16 matrices.  Vd += Vn * Vm^T per ARM ARM C7.2.55:
+  //     for i in [0..2):
+  //       for j in [0..2):
+  //         sum = Vd.s[i*2 + j]
+  //         for k in [0..4):
+  //           sum += Bf16ToFloat(Vn.h[i*4 + k]) * Bf16ToFloat(Vm.h[j*4 + k])
+  //         Vd.s[i*2 + j] = sum
+  //   Q is always 1 (decoder rejected Q=0); no upper-half zeroing needed.
+  //
+  // BFMLALB / BFMLALT (vector): per-FP32-lane single-pair widening MAC.
+  //   off = (T ? 1 : 0)
+  //   for i in [0..4):
+  //     Vd.s[i] = Vd.s[i] + Bf16ToFloat(Vn.h[2i + off]) * Bf16ToFloat(Vm.h[2i + off])
+  //   Always 4S (Q implicit 1).
+  //
+  // BFDOT (by element): same pair-MAC as BFDOT vector but Vm reads a
+  //   single indexed BF16 pair (Vm.h[2*idx], Vm.h[2*idx + 1]) and
+  //   broadcasts it across all output lanes.  lanes = q ? 4 : 2.
+  //
+  // BFMLAL{B,T} (by element): per-FP32-lane single-element widening MAC.
+  //   off = (T ? 1 : 0)
+  //   m = Bf16ToFloat(Vm.h[idx])
+  //   for i in [0..4):
+  //     Vd.s[i] = Vd.s[i] + Bf16ToFloat(Vn.h[2i + off]) * m
+  //   Always 4S (Q implicit 1).
+  void AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];
+
+    uint16_t n_h[8], m_h[8];
+    for (uint8_t i = 0; i < 8; i++) {
+      memcpy(&n_h[i], reinterpret_cast<const uint8_t*>(&src_n) + i * 2, 2);
+      memcpy(&m_h[i], reinterpret_cast<const uint8_t*>(&src_m) + i * 2, 2);
+    }
+
+    __uint128_t result = 0;
+    switch (args.opcode) {
+      case Decoder::Bf16ThreeSameOpcode::kBfdot: {
+        uint8_t lanes = args.q ? 4 : 2;
+        for (uint8_t i = 0; i < lanes; i++) {
+          float acc;
+          memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + i * 4, 4);
+          float n0 = Bf16ToFloat(n_h[2 * i + 0]);
+          float n1 = Bf16ToFloat(n_h[2 * i + 1]);
+          float m0 = Bf16ToFloat(m_h[2 * i + 0]);
+          float m1 = Bf16ToFloat(m_h[2 * i + 1]);
+          acc = acc + n0 * m0 + n1 * m1;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &acc, 4);
+        }
+        break;
+      }
+      case Decoder::Bf16ThreeSameOpcode::kBfmmla: {
+        // BFMMLA: 2x2 output matrix.
+        for (uint8_t i = 0; i < 2; i++) {
+          for (uint8_t j = 0; j < 2; j++) {
+            float sum;
+            memcpy(&sum, reinterpret_cast<const uint8_t*>(&dst) + (i * 2 + j) * 4, 4);
+            for (uint8_t k = 0; k < 4; k++) {
+              sum += Bf16ToFloat(n_h[i * 4 + k]) * Bf16ToFloat(m_h[j * 4 + k]);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + (i * 2 + j) * 4, &sum, 4);
+          }
+        }
+        break;
+      }
+      case Decoder::Bf16ThreeSameOpcode::kBfmlalbVec:
+      case Decoder::Bf16ThreeSameOpcode::kBfmlaltVec: {
+        uint8_t off = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltVec) ? 1 : 0;
+        for (uint8_t i = 0; i < 4; i++) {
+          float acc;
+          memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + i * 4, 4);
+          float n = Bf16ToFloat(n_h[2 * i + off]);
+          float m = Bf16ToFloat(m_h[2 * i + off]);
+          acc = acc + n * m;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &acc, 4);
+        }
+        break;
+      }
+      case Decoder::Bf16ThreeSameOpcode::kBfdotIdx: {
+        uint8_t lanes = args.q ? 4 : 2;
+        float m0 = Bf16ToFloat(m_h[2 * args.index + 0]);
+        float m1 = Bf16ToFloat(m_h[2 * args.index + 1]);
+        for (uint8_t i = 0; i < lanes; i++) {
+          float acc;
+          memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + i * 4, 4);
+          float n0 = Bf16ToFloat(n_h[2 * i + 0]);
+          float n1 = Bf16ToFloat(n_h[2 * i + 1]);
+          acc = acc + n0 * m0 + n1 * m1;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &acc, 4);
+        }
+        break;
+      }
+      case Decoder::Bf16ThreeSameOpcode::kBfmlalbIdx:
+      case Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx: {
+        uint8_t off = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx) ? 1 : 0;
+        float m = Bf16ToFloat(m_h[args.index]);
+        for (uint8_t i = 0; i < 4; i++) {
+          float acc;
+          memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + i * 4, 4);
+          float n = Bf16ToFloat(n_h[2 * i + off]);
+          acc = acc + n * m;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &acc, 4);
+        }
+        break;
+      }
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
   Register DataProc3Src(Decoder::DataProc3SrcOpcode opcode, bool is_64bit,
                         Register src1, Register src2, Register src3) {
     CHECK(!exception_raised_);
@@ -921,6 +1550,15 @@ class Interpreter {
     uint64_t val = is_64bit ? src : (src & 0xFFFFFFFFULL);
     uint64_t result;
     unsigned bits = is_64bit ? 64 : 32;
+
+    // region digitalis PAuth DP-1Src as identity
+    // The decoder sets bit 0x40 to mark a PAuth variant (PACIA/PACIB/PACDA/
+    // PACDB/AUTI*/AUTD*/PACIZ*/PACDZ*/AUTIZ*/AUTDZ*/XPACI/XPACD).  Digitalis
+    // never injects PAC bits, so authenticate/strip is the identity.
+    if (opcode2 & 0x40) {
+      return val;
+    }
+    // endregion
 
     switch (opcode2) {
       case 0b000000: {
@@ -1736,6 +2374,7 @@ class Interpreter {
   }
   // endregion
 
+
   // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
@@ -2161,6 +2800,12 @@ class Interpreter {
       uint64_t val;
       memcpy(&val, &state_->cpu.v[src], 8);
       memcpy(&state_->cpu.v[rd], &val, 8);
+    } else if (ftype == 0b11) {
+      // region digitalis: half-precision FCSEL.
+      uint16_t val;
+      memcpy(&val, &state_->cpu.v[src], 2);
+      memcpy(&state_->cpu.v[rd], &val, 2);
+      // endregion
     } else {
       Undefined();
     }
@@ -2296,6 +2941,33 @@ class Interpreter {
       }
       state_->cpu.v[rd] = 0;
       memcpy(&state_->cpu.v[rd], &result, 8);
+    } else if (ftype == 0b11) {
+      // region digitalis: Half-precision FMADD/FMSUB/FNMADD/FNMSUB.
+      // Use double-precision fma() so the multiply-add is computed exactly
+      // before single-rounding back to FP16.  binary64 mantissa (53 bits)
+      // covers any (binary16 * binary16) + binary16 product exactly, so the
+      // only rounding is the final float->half conversion.
+      uint16_t bn, bm, ba;
+      memcpy(&bn, &state_->cpu.v[rn], 2);
+      memcpy(&bm, &state_->cpu.v[rm], 2);
+      memcpy(&ba, &state_->cpu.v[ra], 2);
+      double fn = static_cast<double>(FpHalfToSingle(bn));
+      double fm = static_cast<double>(FpHalfToSingle(bm));
+      double fa = static_cast<double>(FpHalfToSingle(ba));
+      double result;
+      if (!o1 && !o0) {
+        result = fma(fn, fm, fa);
+      } else if (!o1 && o0) {
+        result = fma(-fn, fm, fa);
+      } else if (o1 && !o0) {
+        result = -fma(fn, fm, fa);
+      } else {
+        result = fma(fn, fm, -fa);
+      }
+      uint16_t result_bits = FpSingleToHalf(static_cast<float>(result));
+      state_->cpu.v[rd] = 0;
+      memcpy(&state_->cpu.v[rd], &result_bits, 2);
+      // endregion
     } else {
       Undefined();
     }
@@ -2330,8 +3002,23 @@ class Interpreter {
       uint64_t frac = static_cast<uint64_t>(imm8 & 0xF) << 48;
       uint64_t result = (sign << 63) | (exp << 52) | frac;
       memcpy(&state_->cpu.v[rd], &result, 8);
+    } else if (ftype == 0b11) {
+      // region digitalis: half-precision FMOV immediate.
+      // VFPExpandImm to FP16:
+      //   sign = imm8[7]
+      //   exp  = NOT(imm8[6]):Repeat(imm8[6], 2):imm8[5:4]   (5 bits)
+      //   frac = imm8[3:0]:Zeros(6)                          (10 bits)
+      uint16_t sign = (imm8 >> 7) & 1;
+      uint16_t exp6 = (imm8 >> 6) & 1;
+      uint16_t exp_top = exp6 ? 0 : 1;
+      uint16_t exp_rep = exp6 ? 0b11 : 0b00;
+      uint16_t exp_low = (imm8 >> 4) & 0b11;
+      uint16_t exp = (exp_top << 4) | (exp_rep << 2) | exp_low;
+      uint16_t frac = static_cast<uint16_t>(imm8 & 0xF) << 6;
+      uint16_t result = (sign << 15) | (exp << 10) | frac;
+      memcpy(&state_->cpu.v[rd], &result, 2);
+      // endregion
     } else {
-      // Half-precision (ftype=11) or reserved (ftype=10)
       Undefined();
     }
   }
@@ -2505,6 +3192,55 @@ class Interpreter {
     }
     // endregion
 
+    // region digitalis (FJCVTZS — Armv8.3-JSCVT)
+    // FJCVTZS Wd, Dn: convert double-precision FP to 32-bit signed integer
+    // using ECMAScript ToInt32 semantics (round-toward-zero + modular reduction).
+    // Encoding: ftype=01 (double), rmode=11, opcode=110, sf=0.
+    // Semantics (ARM ARM C7.2.110): NaN/±Inf → 0; truncate toward zero, then
+    // map result modulo 2^32 to signed range [-2^31, 2^31).  Sets PSTATE.Z=1
+    // iff the conversion was exact (input was an integer-valued finite double
+    // in [INT32_MIN, INT32_MAX]); N=C=V=0 always.
+    if (rmode == 0b11 && opcode == 0b110 && args.ftype == 0b01 && !args.sf) {
+      double d;
+      memcpy(&d, &state_->cpu.v[args.rn], 8);
+
+      uint32_t result;
+      bool exact;
+      if (std::isnan(d) || std::isinf(d)) {
+        result = 0;
+        exact = false;
+      } else {
+        double t = std::trunc(d);
+        if (t >= static_cast<double>(INT32_MIN) && t <= static_cast<double>(INT32_MAX)) {
+          result = static_cast<uint32_t>(static_cast<int32_t>(t));
+          exact = (t == d);
+        } else {
+          // ECMAScript ToInt32 modular reduction.  fmod gives |t| mod 2^32 as
+          // a non-negative double; cast to uint32_t to get the low 32 bits,
+          // then negate for the sign-preserving signed mapping.
+          double abs_t = std::fabs(t);
+          double mod_v = std::fmod(abs_t, 4294967296.0);
+          uint32_t u = static_cast<uint32_t>(mod_v);
+          if (std::signbit(t)) {
+            u = static_cast<uint32_t>(-static_cast<int64_t>(u));
+          }
+          result = u;
+          exact = false;
+        }
+      }
+
+      uint32_t flags = 0;
+      if (exact) flags |= CPUState::kFlagZero;
+      state_->cpu.flags = flags;
+
+      if (args.rd < 31) {
+        // Zero-extend the 32-bit result into Xd (Wd write, upper 32 bits zero).
+        state_->cpu.x[args.rd] = static_cast<uint64_t>(result);
+      }
+      return;
+    }
+    // endregion
+
     if (rmode == 0b11 && opcode == 0b000) {
       // FCVTZS: FP to signed integer, round toward zero
       uint64_t result = 0;
@@ -2632,6 +3368,53 @@ class Interpreter {
         break;
       }
 
+      // region digitalis CASP (compare-and-swap pair, Armv8.1 LSE).
+      // CASP <Ws>,<Ws+1>,<Wt>,<Wt+1>,[<Xn>]: compare the pair at [Xn] against
+      // {Rs+1, Rs}; if equal store {Rt+1, Rt}. The actual prior pair is
+      // written back into {Rs+1, Rs}. ARM ARM C7.2.40.
+      // args.size: 2 = 32-bit pair (8 bytes), 3 = 64-bit pair (16 bytes).
+      // Rs and Rt must be even per the ARM encoding (UNPREDICTABLE otherwise);
+      // the decoder doesn't reject odd registers — we just follow the same
+      // permissive policy as bare ARM cores and read whatever Rs/Rs+1 are.
+      case Decoder::AtomicOp::kCasp: {
+        uint8_t rs_lo = args.rs;
+        uint8_t rs_hi = args.rs + 1;
+        uint8_t rt_lo = args.rt;
+        uint8_t rt_hi = args.rt + 1;
+        if (args.size == 2) {
+          // 32-bit pair: pack lo/hi halves into one 64-bit CAS.
+          uint64_t exp_lo = (rs_lo < 31) ? (state_->cpu.x[rs_lo] & 0xFFFFFFFF) : 0;
+          uint64_t exp_hi = (rs_hi < 31) ? (state_->cpu.x[rs_hi] & 0xFFFFFFFF) : 0;
+          uint64_t new_lo = (rt_lo < 31) ? (state_->cpu.x[rt_lo] & 0xFFFFFFFF) : 0;
+          uint64_t new_hi = (rt_hi < 31) ? (state_->cpu.x[rt_hi] & 0xFFFFFFFF) : 0;
+          uint64_t expected = (exp_hi << 32) | exp_lo;
+          uint64_t desired  = (new_hi << 32) | new_lo;
+          uint64_t old_pair = AtomicCASVal<uint64_t>(host_addr, expected, desired);
+          // Each half written back zero-extended to the X register.
+          if (rs_lo < 31) state_->cpu.x[rs_lo] = old_pair & 0xFFFFFFFF;
+          if (rs_hi < 31) state_->cpu.x[rs_hi] = (old_pair >> 32) & 0xFFFFFFFF;
+        } else {  // args.size == 3
+          // 64-bit pair: 128-bit compare-and-swap via AtomicCASVal128
+          // (inline-asm LOCK CMPXCHG16B; avoids the libatomic libcall path
+          // that bare `__atomic_compare_exchange_n` on __uint128_t may take
+          // when -mcx16 isn't set on the translation unit).
+          uint64_t exp_lo = (rs_lo < 31) ? state_->cpu.x[rs_lo] : 0;
+          uint64_t exp_hi = (rs_hi < 31) ? state_->cpu.x[rs_hi] : 0;
+          uint64_t new_lo = (rt_lo < 31) ? state_->cpu.x[rt_lo] : 0;
+          uint64_t new_hi = (rt_hi < 31) ? state_->cpu.x[rt_hi] : 0;
+          __uint128_t expected =
+              (static_cast<__uint128_t>(exp_hi) << 64) | exp_lo;
+          __uint128_t desired =
+              (static_cast<__uint128_t>(new_hi) << 64) | new_lo;
+          __uint128_t old_pair =
+              AtomicCASVal128(host_addr, expected, desired);
+          if (rs_lo < 31) state_->cpu.x[rs_lo] = static_cast<uint64_t>(old_pair);
+          if (rs_hi < 31) state_->cpu.x[rs_hi] = static_cast<uint64_t>(old_pair >> 64);
+        }
+        break;
+      }
+      // endregion
+
       case Decoder::AtomicOp::kLdadd: {
         uint64_t addend = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
         uint64_t old_val = 0;
@@ -2683,6 +3466,62 @@ class Interpreter {
         if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
         break;
       }
+
+      // region digitalis atomic min/max (LSE Armv8.1).
+      // x86 has no single-instruction equivalent; AtomicFetchSMax/SMin/UMax/UMin
+      // implement these via __atomic_compare_exchange retry loops.
+      case Decoder::AtomicOp::kLdsmax: {
+        uint64_t operand = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchSMax<int8_t>(host_addr, operand); break;
+          case 1: old_val = AtomicFetchSMax<int16_t>(host_addr, operand); break;
+          case 2: old_val = AtomicFetchSMax<int32_t>(host_addr, operand); break;
+          case 3: old_val = AtomicFetchSMax<int64_t>(host_addr, operand); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdsmin: {
+        uint64_t operand = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchSMin<int8_t>(host_addr, operand); break;
+          case 1: old_val = AtomicFetchSMin<int16_t>(host_addr, operand); break;
+          case 2: old_val = AtomicFetchSMin<int32_t>(host_addr, operand); break;
+          case 3: old_val = AtomicFetchSMin<int64_t>(host_addr, operand); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdumax: {
+        uint64_t operand = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchUMax<uint8_t>(host_addr, operand); break;
+          case 1: old_val = AtomicFetchUMax<uint16_t>(host_addr, operand); break;
+          case 2: old_val = AtomicFetchUMax<uint32_t>(host_addr, operand); break;
+          case 3: old_val = AtomicFetchUMax<uint64_t>(host_addr, operand); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+
+      case Decoder::AtomicOp::kLdumin: {
+        uint64_t operand = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
+        uint64_t old_val = 0;
+        switch (args.size) {
+          case 0: old_val = AtomicFetchUMin<uint8_t>(host_addr, operand); break;
+          case 1: old_val = AtomicFetchUMin<uint16_t>(host_addr, operand); break;
+          case 2: old_val = AtomicFetchUMin<uint32_t>(host_addr, operand); break;
+          case 3: old_val = AtomicFetchUMin<uint64_t>(host_addr, operand); break;
+        }
+        if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
+        break;
+      }
+      // endregion
     }
   }
 
@@ -3304,7 +4143,9 @@ class Interpreter {
       // --- FP three-same vector ops (Digitalis addition) ---
       // For FP cases args.size is sz alone (0 = single 32-bit, 1 = double 64-bit),
       // not the {op_high, sz} pair the raw encoding carries; the decoder
-      // already split that.
+      // already split that. For the Armv8.2-FP16 NEON encoding the
+      // decoder sets args.is_fp16=true and lanes are 2-byte half (see the
+      // FP16 branch below).
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
@@ -3321,6 +4162,91 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
       case Decoder::AdvSimdThreeSameOpcode::kFacgtV:
       case Decoder::AdvSimdThreeSameOpcode::kFabdV: {
+        // region digitalis: FP16 vector lanes via float round-trip.
+        // Promote each 2-byte half to binary32, do the op in binary32 (which
+        // is exact for any single FP16 op because binary32's 24-bit mantissa
+        // strictly contains binary16's 11), then narrow back to half.  FMA
+        // uses binary64 to keep the multiply-add exact before the single
+        // narrow to half. Reuses FpHalfToSingle / FpSingleToHalf from.
+        if (args.is_fp16) {
+          uint8_t fp_num = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_num; i++) {
+            uint16_t hn, hm, hd;
+            memcpy(&hn, reinterpret_cast<const uint8_t*>(&src_n) + i * 2, 2);
+            memcpy(&hm, reinterpret_cast<const uint8_t*>(&src_m) + i * 2, 2);
+            memcpy(&hd, reinterpret_cast<const uint8_t*>(&dst) + i * 2, 2);
+            float a = FpHalfToSingle(hn);
+            float b = FpHalfToSingle(hm);
+            float d = FpHalfToSingle(hd);
+            uint16_t rh;
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+                rh = FpSingleToHalf(a + b); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+                rh = FpSingleToHalf(a - b); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+                rh = FpSingleToHalf(a * b); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV:
+                rh = FpSingleToHalf(a / b); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: {
+                // FMLA: Vd[i] = Vd[i] + Vn[i] * Vm[i].  Use binary64 fma() so
+                // the multiply-add has no intermediate rounding before the
+                // single narrow back to half.
+                double r64 = std::fma(static_cast<double>(a), static_cast<double>(b),
+                                      static_cast<double>(d));
+                rh = FpSingleToHalf(static_cast<float>(r64));
+                break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: {
+                double r64 = std::fma(static_cast<double>(-a), static_cast<double>(b),
+                                      static_cast<double>(d));
+                rh = FpSingleToHalf(static_cast<float>(r64));
+                break;
+              }
+              case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
+                rh = (std::isnan(a) || std::isnan(b))
+                         ? FpSingleToHalf(std::nanf(""))
+                         : FpSingleToHalf(a > b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFminV:
+                rh = (std::isnan(a) || std::isnan(b))
+                         ? FpSingleToHalf(std::nanf(""))
+                         : FpSingleToHalf(a < b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
+                rh = std::isnan(a) ? FpSingleToHalf(b)
+                                   : std::isnan(b) ? FpSingleToHalf(a)
+                                                   : FpSingleToHalf(a > b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
+                rh = std::isnan(a) ? FpSingleToHalf(b)
+                                   : std::isnan(b) ? FpSingleToHalf(a)
+                                                   : FpSingleToHalf(a < b ? a : b);
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFcmeqV:
+                rh = (a == b) ? uint16_t{0xFFFF} : uint16_t{0};
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFcmgeV:
+                rh = (a >= b) ? uint16_t{0xFFFF} : uint16_t{0};
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFcmgtV:
+                rh = (a > b) ? uint16_t{0xFFFF} : uint16_t{0};
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
+                rh = (std::fabs(a) >= std::fabs(b)) ? uint16_t{0xFFFF} : uint16_t{0};
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFacgtV:
+                rh = (std::fabs(a) > std::fabs(b)) ? uint16_t{0xFFFF} : uint16_t{0};
+                break;
+              case Decoder::AdvSimdThreeSameOpcode::kFabdV:
+                rh = FpSingleToHalf(std::fabs(a - b)); break;
+              default: Undefined(); return;
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
         bool is_double = (args.size == 0b01);
         uint8_t fp_esize = is_double ? 8 : 4;
         uint8_t fp_num = vec_len / fp_esize;
@@ -3549,6 +4475,19 @@ class Interpreter {
           memcpy(&state_->cpu.v[args.rd], &half, 2);
           return;
         }
+        // region digitalis
+        case 0b000110: {  // BFCVT Hd, Sn (single -> BF16)
+          // The encoding uses ftype=01 even though the *source* is single-
+          // precision (Sn), so explicitly reload the source as a 32-bit
+          // float rather than reusing `src` (a 64-bit double from above).
+          float src_single;
+          memcpy(&src_single, &state_->cpu.v[args.rn], 4);
+          uint16_t bf = FloatToBf16(src_single);
+          state_->cpu.v[args.rd] = 0;
+          memcpy(&state_->cpu.v[args.rd], &bf, 2);
+          return;
+        }
+        // endregion
         case 0b001000:  // FRINTN
           result = std::nearbyint(src);
           break;
@@ -3580,27 +4519,85 @@ class Interpreter {
         memcpy(&state_->cpu.v[args.rd], &result, 8);
       }
     } else if (ftype == 0b11) {
-      // Half-precision source — only FCVT to single/double is common.
+      // Half-precision source.
+      uint16_t bits;
+      memcpy(&bits, &state_->cpu.v[args.rn], 2);
+
       if (opcode == 0b000100) {
         // FCVT Sd, Hn (half -> single)
-        uint16_t half;
-        memcpy(&half, &state_->cpu.v[args.rn], 2);
-        float f = FpHalfToSingle(half);
+        float f = FpHalfToSingle(bits);
         state_->cpu.v[args.rd] = 0;
         memcpy(&state_->cpu.v[args.rd], &f, 4);
         return;
       }
       if (opcode == 0b000101) {
         // FCVT Dd, Hn (half -> double)
-        uint16_t half;
-        memcpy(&half, &state_->cpu.v[args.rn], 2);
-        float f = FpHalfToSingle(half);
+        float f = FpHalfToSingle(bits);
         double d = static_cast<double>(f);
         state_->cpu.v[args.rd] = 0;
         memcpy(&state_->cpu.v[args.rd], &d, 8);
         return;
       }
-      Undefined();
+
+      // region digitalis: half-precision 1-source arithmetic.
+      uint16_t result_bits;
+      switch (opcode) {
+        case 0b000000:  // FMOV Hd, Hn
+          result_bits = bits;
+          break;
+        case 0b000001:  // FABS Hd, Hn — clear sign bit.
+          result_bits = bits & 0x7FFF;
+          break;
+        case 0b000010:  // FNEG Hd, Hn — flip sign bit.
+          result_bits = bits ^ 0x8000;
+          break;
+        case 0b000011: {  // FSQRT Hd, Hn
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::sqrt(f));
+          break;
+        }
+        case 0b001000: {  // FRINTN
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::nearbyint(f));
+          break;
+        }
+        case 0b001001: {  // FRINTP
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::ceil(f));
+          break;
+        }
+        case 0b001010: {  // FRINTM
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::floor(f));
+          break;
+        }
+        case 0b001011: {  // FRINTZ
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::trunc(f));
+          break;
+        }
+        case 0b001100: {  // FRINTA
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::round(f));
+          break;
+        }
+        case 0b001110: {  // FRINTX
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::rint(f));
+          break;
+        }
+        case 0b001111: {  // FRINTI
+          float f = FpHalfToSingle(bits);
+          result_bits = FpSingleToHalf(std::rint(f));
+          break;
+        }
+        default:
+          Undefined();
+          return;
+      }
+      state_->cpu.v[args.rd] = 0;
+      memcpy(&state_->cpu.v[args.rd], &result_bits, 2);
+      // endregion
     } else {
       Undefined();
     }
@@ -3658,6 +4655,35 @@ class Interpreter {
 
       state_->cpu.v[args.rd] = 0;
       memcpy(&state_->cpu.v[args.rd], &result, 8);
+    } else if (ftype == 0b11) {
+      // region digitalis: Half-precision (Armv8.2-FP16).
+      // Round-trip through float: load uint16 -> FpHalfToSingle -> op in
+      // float -> FpSingleToHalf back.  binary32 has 24 mantissa bits vs
+      // binary16's 11, so single-rounding back to half is correct.
+      uint16_t bits_n, bits_m;
+      memcpy(&bits_n, &state_->cpu.v[args.rn], 2);
+      memcpy(&bits_m, &state_->cpu.v[args.rm], 2);
+      float src_n = FpHalfToSingle(bits_n);
+      float src_m = FpHalfToSingle(bits_m);
+      float result;
+
+      switch (opcode) {
+        case 0b0000: result = src_n * src_m; break;       // FMUL
+        case 0b0001: result = src_n / src_m; break;       // FDIV
+        case 0b0010: result = src_n + src_m; break;       // FADD
+        case 0b0011: result = src_n - src_m; break;       // FSUB
+        case 0b0100: result = std::fmax(src_n, src_m); break;  // FMAX
+        case 0b0101: result = std::fmin(src_n, src_m); break;  // FMIN
+        case 0b0110: result = std::fmax(src_n, src_m); break;  // FMAXNM
+        case 0b0111: result = std::fmin(src_n, src_m); break;  // FMINNM
+        case 0b1000: result = -(src_n * src_m); break;    // FNMUL
+        default: Undefined(); return;
+      }
+
+      uint16_t result_bits = FpSingleToHalf(result);
+      state_->cpu.v[args.rd] = 0;
+      memcpy(&state_->cpu.v[args.rd], &result_bits, 2);
+      // endregion
     } else {
       Undefined();
     }
@@ -3714,6 +4740,29 @@ class Interpreter {
       } else {
         flags = CPUState::kFlagCarry;
       }
+    } else if (args.ftype == 0b11) {
+      // region digitalis: Half-precision compare.
+      uint16_t bits_n;
+      memcpy(&bits_n, &state_->cpu.v[args.rn], 2);
+      float src_n = FpHalfToSingle(bits_n);
+      float src_m;
+      if (args.with_zero) {
+        src_m = 0.0f;
+      } else {
+        uint16_t bits_m;
+        memcpy(&bits_m, &state_->cpu.v[args.rm], 2);
+        src_m = FpHalfToSingle(bits_m);
+      }
+      if (std::isnan(src_n) || std::isnan(src_m)) {
+        flags = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+      } else if (src_n == src_m) {
+        flags = CPUState::kFlagZero | CPUState::kFlagCarry;
+      } else if (src_n < src_m) {
+        flags = CPUState::kFlagNegative;
+      } else {
+        flags = CPUState::kFlagCarry;
+      }
+      // endregion
     } else {
       Undefined();
       return;
@@ -3721,6 +4770,63 @@ class Interpreter {
 
     state_->cpu.flags = flags;
   }
+
+  // region digitalis
+  //
+  // FP conditional compare: FCCMP / FCCMPE.
+  // If cond is true, perform an FP compare and set NZCV;
+  // otherwise copy the 4-bit immediate directly into NZCV.
+  //
+  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args) {
+    CHECK(!exception_raised_);
+
+    if (!EvaluateCondition(args.cond)) {
+      uint16_t flags = 0;
+      if (args.nzcv & 0b1000) flags |= CPUState::kFlagNegative;
+      if (args.nzcv & 0b0100) flags |= CPUState::kFlagZero;
+      if (args.nzcv & 0b0010) flags |= CPUState::kFlagCarry;
+      if (args.nzcv & 0b0001) flags |= CPUState::kFlagOverflow;
+      state_->cpu.flags = flags;
+      return;
+    }
+
+    uint16_t flags = 0;
+    if (args.ftype == 0b00) {
+      float src_n;
+      float src_m;
+      memcpy(&src_n, &state_->cpu.v[args.rn], 4);
+      memcpy(&src_m, &state_->cpu.v[args.rm], 4);
+      if (std::isnan(src_n) || std::isnan(src_m)) {
+        flags = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+      } else if (src_n == src_m) {
+        flags = CPUState::kFlagZero | CPUState::kFlagCarry;
+      } else if (src_n < src_m) {
+        flags = CPUState::kFlagNegative;
+      } else {
+        flags = CPUState::kFlagCarry;
+      }
+    } else if (args.ftype == 0b01) {
+      double src_n;
+      double src_m;
+      memcpy(&src_n, &state_->cpu.v[args.rn], 8);
+      memcpy(&src_m, &state_->cpu.v[args.rm], 8);
+      if (std::isnan(src_n) || std::isnan(src_m)) {
+        flags = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+      } else if (src_n == src_m) {
+        flags = CPUState::kFlagZero | CPUState::kFlagCarry;
+      } else if (src_n < src_m) {
+        flags = CPUState::kFlagNegative;
+      } else {
+        flags = CPUState::kFlagCarry;
+      }
+    } else {
+      Undefined();
+      return;
+    }
+
+    state_->cpu.flags = flags;
+  }
+  // endregion
 
   // region digitalis
   //
@@ -4148,65 +5254,53 @@ class Interpreter {
         break;
       }
 
-      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero: {
-        // CMGT #0: compare signed > 0, result = all-ones or all-zeros.
-        uint64_t emask = ElementMask(esize);
-        uint8_t bits = esize * 8;
-        for (uint8_t i = 0; i < num_elements; i++) {
-          uint64_t elem = 0;
-          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
-          uint64_t r = (signed_val > 0) ? emask : 0;
-          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-        }
-        break;
-      }
-
-      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero: {
-        uint64_t emask = ElementMask(esize);
-        uint8_t bits = esize * 8;
-        for (uint8_t i = 0; i < num_elements; i++) {
-          uint64_t elem = 0;
-          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
-          uint64_t r = (signed_val >= 0) ? emask : 0;
-          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-        }
-        break;
-      }
-
-      case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: {
-        uint64_t emask = ElementMask(esize);
-        for (uint8_t i = 0; i < num_elements; i++) {
-          uint64_t elem = 0;
-          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          uint64_t r = (elem == 0) ? emask : 0;
-          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-        }
-        break;
-      }
-
-      case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero: {
-        uint64_t emask = ElementMask(esize);
-        uint8_t bits = esize * 8;
-        for (uint8_t i = 0; i < num_elements; i++) {
-          uint64_t elem = 0;
-          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
-          uint64_t r = (signed_val <= 0) ? emask : 0;
-          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-        }
-        break;
-      }
-
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
+        // region digitalis: Armv8.2-FP16 vector FCMxx zero.
+        // The FP16 encoding of FCMGT/FCMEQ/FCMLT/FCMGE/FCMLE #0 routes to
+        // the same enum values; is_fp16 flips the per-lane semantics from
+        // integer signed compare to FP compare with FpHalfToSingle.
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            float f = FpHalfToSingle(h);
+            bool cond;
+            switch (args.opcode) {
+              case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero: cond = (f >  0.0f); break;
+              case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero: cond = (f >= 0.0f); break;
+              case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: cond = (f == 0.0f); break;
+              case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero: cond = (f <= 0.0f); break;
+              case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: cond = (f <  0.0f); break;
+              default: cond = false; break;
+            }
+            uint16_t rh = cond ? uint16_t{0xFFFF} : uint16_t{0};
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
+        // Integer signed compare against zero.
         uint64_t emask = ElementMask(esize);
         uint8_t bits = esize * 8;
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
           int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
-          uint64_t r = (signed_val < 0) ? emask : 0;
+          bool cond;
+          switch (args.opcode) {
+            case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero: cond = (signed_val >  0); break;
+            case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero: cond = (signed_val >= 0); break;
+            case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: cond = (elem == 0); break;
+            case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero: cond = (signed_val <= 0); break;
+            case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: cond = (signed_val <  0); break;
+            default: cond = false; break;
+          }
+          uint64_t r = cond ? emask : 0;
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
         }
         break;
@@ -4231,6 +5325,18 @@ class Interpreter {
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kFabs: {
         // FABS (vector): floating-point absolute value per element.
+        // region digitalis: Armv8.2-FP16 vector FABS.
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            uint16_t rh = FpSingleToHalf(std::fabs(FpHalfToSingle(h)));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
         if (args.size == 0b10) {
           // Single-precision elements (size=10 means float for this FP opcode group).
           uint8_t fp_count = args.q ? 4 : 2;
@@ -4257,6 +5363,18 @@ class Interpreter {
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
         // FNEG (vector): floating-point negate per element.
+        // region digitalis: Armv8.2-FP16 vector FNEG.
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            uint16_t rh = FpSingleToHalf(-FpHalfToSingle(h));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
         if (args.size == 0b10) {
           uint8_t fp_count = args.q ? 4 : 2;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -4338,6 +5456,23 @@ class Interpreter {
       // (insn 0x6e21d800) in WhatsApp's libar-bundle3.so init path.
       case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
+        // region digitalis: FP16 form (SCVTF/UCVTF v.4h, v.4h).
+        // Per-lane sint16->half / uint16->half.
+        if (args.is_fp16) {
+          bool is_unsigned_fp16 = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV);
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t int_bits;
+            memcpy(&int_bits, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            float f = is_unsigned_fp16
+                          ? static_cast<float>(int_bits)
+                          : static_cast<float>(static_cast<int16_t>(int_bits));
+            uint16_t rh = FpSingleToHalf(f);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
         // The decoder uses bit22 (sz) as the LOW bit of `size`; for FP
         // two-reg-misc the high bit of `size` is reserved. So sz = size&1.
         // Element width: sz=0 -> 32-bit (float), sz=1 -> 64-bit (double).
@@ -4377,12 +5512,154 @@ class Interpreter {
       // high bit is always 1 -- only the low bit (sz) selects single vs
       // double, unlike SCVTF/UCVTF whose bit23=0 path keeps size's high
       // bit clear. We don't reject "size & 0b10" the way SCVTF does.
-      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV:
-      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
+      // region digitalis - FCVT* vector with explicit rounding mode.
+      // Mirrors the scalar FpIntConversion rounding cases. Implements
+      // FCVTN[S|U] (ties-to-even), FCVTM[S|U] (toward -inf),
+      // FCVTP[S|U] (toward +inf), FCVTA[S|U] (ties-away-from-zero).
+      // FCVTZ[S|U] (truncate) keeps its existing dedicated case below.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnuV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmuV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpuV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtasV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtauV: {
+        bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnuV ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmuV ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpuV ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtauV);
+        auto apply_round = [&](double x) -> double {
+          switch (args.opcode) {
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnsV:
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnuV:
+              return rint(x);   // ties-to-even (assumes default FE_TONEAREST)
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmsV:
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmuV:
+              return floor(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpsV:
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpuV:
+              return ceil(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtasV:
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtauV:
+              return round(x);  // ties-away-from-zero
+            default:
+              return 0.0;
+          }
+        };
+        // region digitalis: FP16 form. Promote each half lane to
+        // float, apply the same round-to-int, then narrow to int16/uint16.
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            float f = FpHalfToSingle(h);
+            double r = (f != f) ? static_cast<double>(f) : apply_round(static_cast<double>(f));
+            uint16_t out;
+            if (is_unsigned) {
+              uint16_t v;
+              if (f != f || r < 0.0) v = 0u;
+              else if (r >= 65536.0) v = 0xffffu;
+              else v = static_cast<uint16_t>(r);
+              out = v;
+            } else {
+              int16_t v;
+              if (f != f) v = 0;
+              else if (r >= 32768.0) v = 0x7fff;
+              else if (r < -32768.0) v = static_cast<int16_t>(0x8000);
+              else v = static_cast<int16_t>(r);
+              memcpy(&out, &v, 2);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &out, 2);
+          }
+          break;
+        }
+        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         uint8_t fp_count = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            double r = (f != f) ? f : apply_round(static_cast<double>(f));
+            uint32_t out;
+            if (is_unsigned) {
+              uint32_t v;
+              if (f != f || r < 0.0) v = 0u;
+              else if (r >= 4294967296.0) v = 0xffffffffu;
+              else v = static_cast<uint32_t>(r);
+              out = v;
+            } else {
+              int32_t v;
+              if (f != f) v = 0;
+              else if (r >= 2147483648.0) v = 0x7fffffff;
+              else if (r < -2147483648.0) v = static_cast<int32_t>(0x80000000);
+              else v = static_cast<int32_t>(r);
+              memcpy(&out, &v, 4);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &out, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            double r = (d != d) ? d : apply_round(d);
+            uint64_t out;
+            if (is_unsigned) {
+              uint64_t v;
+              if (d != d || r < 0.0) v = 0u;
+              else if (r >= 18446744073709551616.0) v = 0xffffffffffffffffULL;
+              else v = static_cast<uint64_t>(r);
+              out = v;
+            } else {
+              int64_t v;
+              if (d != d) v = 0;
+              else if (r >= 9223372036854775808.0) v = 0x7fffffffffffffffLL;
+              else if (r < -9223372036854775808.0)
+                v = static_cast<int64_t>(0x8000000000000000ULL);
+              else v = static_cast<int64_t>(r);
+              memcpy(&out, &v, 8);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &out, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
         bool is_unsigned =
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV);
+        // region digitalis: FP16 form (FCVTZS/ZU v.4h, v.4h).
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            float f = FpHalfToSingle(h);
+            uint16_t out;
+            if (is_unsigned) {
+              uint16_t v;
+              if (f != f || f < 0.0f) v = 0u;
+              else if (f >= 65536.0f) v = 0xffffu;
+              else v = static_cast<uint16_t>(f);  // truncates toward zero
+              out = v;
+            } else {
+              int16_t v;
+              if (f != f) v = 0;
+              else if (f >= 32768.0f) v = 0x7fff;
+              else if (f < -32768.0f) v = static_cast<int16_t>(0x8000);
+              else v = static_cast<int16_t>(f);
+              memcpy(&out, &v, 2);
+            }
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &out, 2);
+          }
+          break;
+        }
+        // endregion
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
         for (uint8_t i = 0; i < fp_count; i++) {
           if (fp_esize == 4) {
             float f;
@@ -4436,6 +5713,18 @@ class Interpreter {
       // Newton-Raphson seed will converge identically.
       // region digitalis - FSQRT (vector): per-lane square root.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
+        // region digitalis: Armv8.2-FP16 vector FSQRT.
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            uint16_t rh = FpSingleToHalf(__builtin_sqrtf(FpHalfToSingle(h)));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         uint8_t fp_count = vec_len / fp_esize;
         for (uint8_t i = 0; i < fp_count; i++) {
@@ -4455,13 +5744,120 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis a=0/a=1 columns: FP16 vector FRINT*.
+      // Per-lane round-to-integral-FP-value with mode selected by opcode.
+      // FRINTN ties-to-even, FRINTA ties-away, FRINTM toward -inf,
+      // FRINTP toward +inf, FRINTZ toward zero, FRINTX/FRINTI use the
+      // current FPCR rounding mode (we treat both as nearbyint, which on
+      // x86_64 with default FE_TONEAREST is round-half-to-even — matching
+      // the ARM default).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV: {
+        auto apply_round_f32 = [&](float x) -> float {
+          if (x != x) return x;  // NaN propagates
+          switch (args.opcode) {
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV:
+              return nearbyintf(x);    // ties-to-even (default FE_TONEAREST)
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV:
+              return roundf(x);        // ties-away-from-zero
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV:
+              return floorf(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV:
+              return ceilf(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
+              return truncf(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV:
+              return rintf(x);         // current FPCR rounding mode
+            default:
+              return 0.0f;
+          }
+        };
+        // region digitalis: FP16 form (FRINT* v.4h / v.8h).
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            uint16_t rh = FpSingleToHalf(apply_round_f32(FpHalfToSingle(h)));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
+        // region digitalis: std FP32/FP64 FRINT*. `args.size`
+        // here is (bit23=a, bit22=sz); only bit22 selects FP32 (0) vs FP64 (1).
+        auto apply_round_f64 = [&](double x) -> double {
+          if (x != x) return x;
+          switch (args.opcode) {
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV:
+              return nearbyint(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV:
+              return round(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV:
+              return floor(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV:
+              return ceil(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
+              return trunc(x);
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
+            case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV:
+              return rint(x);
+            default:
+              return 0.0;
+          }
+        };
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            f = apply_round_f32(f);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &f, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            d = apply_round_f64(d);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &d, 8);
+          }
+        }
+        break;
+        // endregion
+      }
+      // endregion
+
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
+        bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV);
+        // region digitalis: FP16 form (FRECPE/FRSQRTE v.4h, v.4h).
+        if (args.is_fp16) {
+          uint8_t fp_count = args.q ? 8 : 4;
+          for (uint8_t i = 0; i < fp_count; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            float f = FpHalfToSingle(h);
+            float r;
+            if (is_rsqrt) {
+              r = (f <= 0.0f || f != f) ? __builtin_nanf("") : 1.0f / __builtin_sqrtf(f);
+            } else {
+              r = (f == 0.0f) ? __builtin_inff() * (1.0f / f) : 1.0f / f;
+            }
+            uint16_t rh = FpSingleToHalf(r);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
+          }
+          break;
+        }
+        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         // Same bit23=1 rationale as the FCVTZS case above.
         uint8_t fp_count = vec_len / fp_esize;
-        bool is_rsqrt =
-            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV);
         for (uint8_t i = 0; i < fp_count; i++) {
           if (fp_esize == 4) {
             float f;
@@ -4679,6 +6075,23 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis BFCVTN/BFCVTN2 (vector narrow FP32->BF16).
+      // BFCVTN  (Q=0): writes 4 BF16 lanes into Vd.h[0..3]; upper 64 bits zeroed.
+      // BFCVTN2 (Q=1): writes 4 BF16 lanes into Vd.h[4..7]; lower 64 bits preserved.
+      // Decoder pins size=10 (only valid FP32 source).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kBfcvtn: {
+        if (args.size != 0b10) { Undefined(); return; }
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_off = args.q ? 8 : 0;
+        for (uint8_t i = 0; i < 4; i++) {
+          float f;
+          memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+          uint16_t bf = FloatToBf16(f);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 2, &bf, 2);
+        }
+        break;
+      }
+      // endregion
 
       // Less critical ops: leave as undefined for now.
       case Decoder::AdvSimdTwoRegMiscOpcode::kCls:
@@ -4701,7 +6114,56 @@ class Interpreter {
     __uint128_t src_m = state_->cpu.v[args.rm];
     __uint128_t result = state_->cpu.v[args.rd];
 
-    if (args.size == 0b10) {
+    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL (handoff-62)
+    if (args.size == 0b00) {
+      // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,
+      // Q=1 (.8h) → 8 output lanes.  Index selects one lane (0..7) from
+      // Vm.8H to broadcast as the multiplier.  Promote via FpHalfToSingle,
+      // op in binary32 (exact for any single FP16 multiply / FMA goes
+      // through binary64 std::fma per reasoning), narrow via
+      // FpSingleToHalf — same round-trip pattern as three-same.
+      uint8_t num_elements = args.q ? 8 : 4;
+      uint16_t hm_indexed;
+      memcpy(&hm_indexed, reinterpret_cast<const uint8_t*>(&src_m) + args.index * 2, 2);
+      float m_indexed = FpHalfToSingle(hm_indexed);
+      for (uint8_t i = 0; i < num_elements; i++) {
+        uint16_t hn, hd, hr;
+        memcpy(&hn, reinterpret_cast<const uint8_t*>(&src_n) + i * 2, 2);
+        memcpy(&hd, reinterpret_cast<const uint8_t*>(&result) + i * 2, 2);
+        float n = FpHalfToSingle(hn);
+        float d = FpHalfToSingle(hd);
+        float r;
+        switch (args.opcode) {
+          case Decoder::AdvSimdVecXIdxOpcode::kFmla: {
+            double r_d = std::fma(static_cast<double>(n),
+                                  static_cast<double>(m_indexed),
+                                  static_cast<double>(d));
+            r = static_cast<float>(r_d);
+            break;
+          }
+          case Decoder::AdvSimdVecXIdxOpcode::kFmls: {
+            double r_d = std::fma(static_cast<double>(-n),
+                                  static_cast<double>(m_indexed),
+                                  static_cast<double>(d));
+            r = static_cast<float>(r_d);
+            break;
+          }
+          case Decoder::AdvSimdVecXIdxOpcode::kFmul:
+            r = n * m_indexed;
+            break;
+          default:
+            Undefined();
+            return;
+        }
+        hr = FpSingleToHalf(r);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &hr, 2);
+      }
+      // For Q=0, clear the upper half of the destination register.
+      if (!args.q) {
+        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+      }
+    } else if (args.size == 0b10) {
+    // endregion
       // 32-bit float elements.
       uint8_t num_elements = args.q ? 4 : 2;
       float indexed;
@@ -5558,6 +7020,29 @@ class Interpreter {
     return static_cast<uint64_t>(exp);  // Returns original value
   }
 
+  // region digitalis: 128-bit compare-and-swap for CASP (64-bit pair).
+  // Emit LOCK CMPXCHG16B via inline asm so we don't take a libatomic dependency
+  // (the bare `__atomic_compare_exchange_n` on `__uint128_t` may lower to a
+  // libcall without -mcx16).  The Digitalis host is x86_64; the upstream ARM64
+  // build does not link this file (interpreter.h is host-only — see handoff-33).
+  __uint128_t AtomicCASVal128(void* addr, __uint128_t expected, __uint128_t desired) {
+    uint64_t exp_lo = static_cast<uint64_t>(expected);
+    uint64_t exp_hi = static_cast<uint64_t>(expected >> 64);
+    uint64_t new_lo = static_cast<uint64_t>(desired);
+    uint64_t new_hi = static_cast<uint64_t>(desired >> 64);
+    // GCC/clang inline asm: LOCK CMPXCHG16B [addr]
+    //   In : RAX=exp_lo, RDX=exp_hi, RBX=new_lo, RCX=new_hi, mem=*addr
+    //   Out: RAX=old_lo, RDX=old_hi (always — independent of success).
+    asm volatile(
+        "lock cmpxchg16b %[mem]\n"
+        : "+a"(exp_lo), "+d"(exp_hi),
+          [mem] "+m"(*static_cast<__uint128_t*>(addr))
+        : "b"(new_lo), "c"(new_hi)
+        : "cc", "memory");
+    return (static_cast<__uint128_t>(exp_hi) << 64) | exp_lo;
+  }
+  // endregion
+
   template <typename T>
   uint64_t AtomicExchange(void* addr, uint64_t val) {
     return static_cast<uint64_t>(
@@ -5587,6 +7072,63 @@ class Interpreter {
     return static_cast<uint64_t>(
         __atomic_fetch_xor(static_cast<T*>(addr), static_cast<T>(bits), __ATOMIC_SEQ_CST));
   }
+
+  // region digitalis atomic min/max (LSE Armv8.1).
+  // No __atomic_fetch_max/min builtin exists; emulate via a CAS retry loop.
+  // T is the signed/unsigned host type at the guest operation size; the
+  // returned uint64_t is the prior memory value, zero-extended.
+  template <typename T>
+  uint64_t AtomicFetchSMax(void* addr, uint64_t operand) {
+    T* p = static_cast<T*>(addr);
+    T op_v = static_cast<T>(operand);
+    T cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    T desired;
+    do {
+      desired = (cur > op_v) ? cur : op_v;
+    } while (!__atomic_compare_exchange_n(p, &cur, desired, false,
+                                          __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    return static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(cur));
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchSMin(void* addr, uint64_t operand) {
+    T* p = static_cast<T*>(addr);
+    T op_v = static_cast<T>(operand);
+    T cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    T desired;
+    do {
+      desired = (cur < op_v) ? cur : op_v;
+    } while (!__atomic_compare_exchange_n(p, &cur, desired, false,
+                                          __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    return static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(cur));
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchUMax(void* addr, uint64_t operand) {
+    T* p = static_cast<T*>(addr);
+    T op_v = static_cast<T>(operand);
+    T cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    T desired;
+    do {
+      desired = (cur > op_v) ? cur : op_v;
+    } while (!__atomic_compare_exchange_n(p, &cur, desired, false,
+                                          __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    return static_cast<uint64_t>(cur);
+  }
+
+  template <typename T>
+  uint64_t AtomicFetchUMin(void* addr, uint64_t operand) {
+    T* p = static_cast<T*>(addr);
+    T op_v = static_cast<T>(operand);
+    T cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    T desired;
+    do {
+      desired = (cur < op_v) ? cur : op_v;
+    } while (!__atomic_compare_exchange_n(p, &cur, desired, false,
+                                          __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    return static_cast<uint64_t>(cur);
+  }
+  // endregion
 
   //
   // SIMD helpers.

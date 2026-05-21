@@ -1418,6 +1418,333 @@ class LiteTranslator {
 
   void Undefined() { success_ = false; }
 
+  // region digitalis
+  // MTE DP-2src (IRG/GMI/SUBP/SUBPS): bail to the interpreter. These
+  // are rare in real workloads (MTE-built libraries only) and SUBPS
+  // sets NZCV based on a 56-bit subtraction, which is awkward to emit
+  // inline; the interpreter implementation is straightforward and the
+  // cost is paid once per region containing one of these.
+  void MteDataProc(const Decoder::MteDataProcArgs&) { success_ = false; }
+
+  // MTE load/store memory tags (LDG/STG/ST2G/STZG/STZ2G): bail to the
+  // interpreter. These are rare in shipping APKs (only emitted when a
+  // library is built with -mmemtag-stack and the runtime opts in). STZG
+  // and STZ2G also touch memory via FaultyStore which would need its own
+  // host fault-recovery slot if JIT'd; deferring keeps that complexity
+  // out of the JIT until profiling shows it matters.
+  void MteLoadStore(const Decoder::MteLoadStoreArgs&) { success_ = false; }
+  // endregion
+
+  // region digitalis FCADD/FCMLA JIT (handoff-69)
+  //
+  // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32.
+  // The interpreter (interpreter.h::AdvSimdFcma) is the spec — see the
+  // per-pair scalar math there for the six rotations (FCADD ±90/±270,
+  // FCMLA 0/90/180/270).  The JIT path here lowers FP32 (size=0b10,
+  // .2S Q=0 and .4S Q=1) to a 4-to-7 SSE-instruction sequence:
+  //
+  //   * FCADD .4S, rot=#rot:
+  //       Vm' = shufps(Vm, Vm, 0xB1)           // pair-swap (re,im)->(im,re)
+  //       sign = pslld(pcmpeqd self, 31)       // [0x80000000]*4
+  //       lane = psrlq(pcmpeqd self, 32)       // rot=0:  [-1,0,-1,0] (negate real)
+  //              psllq(pcmpeqd self, 32)       // rot=1:  [0,-1,0,-1] (negate imag)
+  //       sign &= lane
+  //       Vm' ^= sign                          // negate appropriate lanes
+  //       Vd  = Vn + Vm'                       // ADDPS
+  //
+  //   * FCMLA .4S, rot=#rot:  Vd += n_broadcast * m_xformed where
+  //       rot=#0   (rot=0): xform=identity,      broadcast=n_re
+  //       rot=#90  (rot=1): xform=swap+~re,      broadcast=n_im
+  //       rot=#180 (rot=2): xform=negate-all,    broadcast=n_re
+  //       rot=#270 (rot=3): xform=swap+~im,      broadcast=n_im
+  //     n_re_broadcast = pshufd(Vn, 0xA0) = [n_re0, n_re0, n_re1, n_re1]
+  //     n_im_broadcast = pshufd(Vn, 0xF5) = [n_im0, n_im0, n_im1, n_im1]
+  //
+  //   * Q=0 form (.2S): same emit; the upper 64 bits are masked away with
+  //     psrldq+pand at the end (matches AArch64 vector half-vector semantics
+  //     and the interpreter's Q=0 zero-clear at the end of AdvSimdFcma).
+  //
+  // FP16 (size=0b01) and FP64 (size=0b11) bail to the interpreter via
+  // `success_ = false` — the interpreter handles them through the same
+  // FpHalfToSingle round-trip / double-precision arithmetic paths used by
+  // the rest of. When AVX-512-FP16 (or F16C) is unconditionally
+  // available on the emulator host CPU, the FP16 path becomes a 2-step
+  // VCVTPH2PS round-trip; that's a follow-up perf row.
+  void AdvSimdFcma(const Decoder::FcmaArgs& args) {
+    if (args.size != 0b10) {
+      // FP16 / FP64 — fall back to the interpreter.
+      success_ = false;
+      return;
+    }
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    if (xmm_n == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_m == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_sign = AllocTempSimdReg();
+    if (xmm_sign == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_lane = AllocTempSimdReg();
+    if (xmm_lane == no_simd_register) { success_ = false; return; }
+
+    int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t dst_off   = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+    as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+
+    // Sign-bit mask for 32-bit FP lanes: [0x80000000]*4.
+    as_.Pcmpeqd(xmm_sign, xmm_sign);
+    as_.Pslld(xmm_sign, static_cast<int8_t>(31));
+
+    SimdRegister xmm_result = no_simd_register;  // tracks the register holding the final value
+
+    if (args.opcode == Decoder::FcmaOpcode::kFcadd) {
+      // m_xformed = pair-swap(Vm), negate the lanes implied by rot.
+      as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+
+      as_.Pcmpeqd(xmm_lane, xmm_lane);
+      if (args.rot == 0) {
+        // rot=#90: negate real lanes (0, 2) — mask = [0xff..ff, 0, 0xff..ff, 0].
+        as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
+      } else {
+        // rot=#270: negate imag lanes (1, 3) — mask = [0, 0xff..ff, 0, 0xff..ff].
+        as_.Psllq(xmm_lane, static_cast<int8_t>(32));
+      }
+      as_.Pand(xmm_sign, xmm_lane);
+      as_.Xorps(xmm_m, xmm_sign);
+
+      // Vn + m_xformed -> xmm_n.
+      as_.Addps(xmm_n, xmm_m);
+      xmm_result = xmm_n;
+    } else {
+      // FCMLA: result = Vd + n_broadcast * m_xformed.
+      SimdRegister xmm_d = AllocTempSimdReg();
+      if (xmm_d == no_simd_register) { success_ = false; return; }
+      as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = dst_off});
+
+      // m_xformed depends on rotation.
+      switch (args.rot) {
+        case 0:
+          // No transform.
+          break;
+        case 1:
+          // Swap + negate real lanes.
+          as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+          as_.Pcmpeqd(xmm_lane, xmm_lane);
+          as_.Psrlq(xmm_lane, static_cast<int8_t>(32));
+          as_.Pand(xmm_sign, xmm_lane);
+          as_.Xorps(xmm_m, xmm_sign);
+          break;
+        case 2:
+          // Negate all lanes.
+          as_.Xorps(xmm_m, xmm_sign);
+          break;
+        case 3:
+          // Swap + negate imag lanes.
+          as_.Shufps(xmm_m, xmm_m, static_cast<int8_t>(0xB1));
+          as_.Pcmpeqd(xmm_lane, xmm_lane);
+          as_.Psllq(xmm_lane, static_cast<int8_t>(32));
+          as_.Pand(xmm_sign, xmm_lane);
+          as_.Xorps(xmm_m, xmm_sign);
+          break;
+        default:
+          // Cannot happen: decoder only emits rot in 0..3 for FCMLA.
+          success_ = false;
+          return;
+      }
+
+      // Broadcast n_re (rot 0/2) or n_im (rot 1/3) across both pair slots.
+      // PSHUFD imm=0xA0 = (10,10,00,00): [lane0, lane0, lane2, lane2] = n_re bcast.
+      // PSHUFD imm=0xF5 = (11,11,01,01): [lane1, lane1, lane3, lane3] = n_im bcast.
+      if (args.rot == 0 || args.rot == 2) {
+        as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xA0));
+      } else {
+        as_.Pshufd(xmm_n, xmm_n, static_cast<int8_t>(0xF5));
+      }
+
+      as_.Mulps(xmm_n, xmm_m);   // n_broadcast * m_xformed
+      as_.Addps(xmm_d, xmm_n);   // Vd += ...
+      xmm_result = xmm_d;
+    }
+
+    // Q=0 (.2S): zero the upper 64 bits, preserving lanes 0..1.
+    if (!args.q) {
+      // Reuse xmm_lane to build a [0xff..ff (low 64), 0 (high 64)] mask.
+      as_.Pcmpeqd(xmm_lane, xmm_lane);
+      as_.Psrldq(xmm_lane, static_cast<int8_t>(8));
+      as_.Pand(xmm_result, xmm_lane);
+    }
+
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+  }
+  // endregion
+
+  // region digitalis indexed FCMLA
+  // AdvSIMD complex floating-point by element (FCMLA-idx): bail to the
+  // interpreter.  Same rationale as the FCMA-vector JIT row above; the
+  // index broadcast would add yet another per-rot shuffle pattern, and
+  // the interpreter is correct and rare enough to not yet warrant JIT.
+  void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs&) { success_ = false; }
+  // endregion
+
+  // region digitalis
+  // AdvSIMD BFloat16 three-same-extra (BFDOT / BFMMLA): bail to the
+  // interpreter for now.  The host x86_64 baseline doesn't include
+  // AVX-512-BF16, so without runtime feature detection the JIT lowering
+  // would need its own BF16 widening sequence (SLLI $16 over a PSHUFD
+  // mask) — feasible but the interpreter path is the right starting
+  // point for correctness, and these instructions are rare per JIT
+  // region in the current sample suite.  JIT path is parked under
+  // "Implement" row 2.
+  void AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameArgs&) { success_ = false; }
+  // endregion
+
+  // region digitalis SDOT/UDOT JIT (handoff-71)
+  //
+  // AdvSIMD integer dot product: SDOT/UDOT (vector and indexed-by-element).
+  // Reference: ARM ARM C7.2.397 (SDOT), C7.2.398 (UDOT).
+  //
+  // Each 32-bit lane of Vd accumulates the dot product of 4 byte products:
+  //   Vd[i] = (int32_t)(Vd[i] + sum_{k=0..3}(Vn_byte[4*i+k] * Vm_byte[base+k]))
+  // where base = 4*i for the vector form, 4*args.index for the indexed
+  // form (the indexed form broadcasts a single 4-byte group of Vm across
+  // every lane).  SDOT sign-extends both byte vectors; UDOT zero-extends.
+  // Q=0 reads only the low 8 bytes of Vn (and Vm in vector form), writes
+  // 2 lanes, and zeros the upper 64 bits of Vd.
+  //
+  // SSE4.1 / SSSE3 lowering (no AVX-VNNI dependency — the emulator host
+  // baseline doesn't include VPDPBUSD):
+  //
+  //   1.  Widen each 8-byte half of Vn (and Vm, vector form) from bytes to
+  //       16-bit signed (SDOT) or unsigned-zero-extended (UDOT) words via
+  //       PMOVSXBW / PMOVZXBW.
+  //   2.  PMADDWD pairs adjacent 16-bit words: 8 words -> 4 int32 lanes,
+  //       each lane = w[2k]*v[2k] + w[2k+1]*v[2k+1].
+  //   3.  Each ARM dot lane is the sum of 4 byte products, so two adjacent
+  //       PMADDWD outputs must be horizontally added — PHADDD pairs.
+  //   4.  PADDD accumulates the 4 lanes into Vd (read-modify-write).
+  //
+  // For Q=0 (2 lanes): apply (1)-(3) on the low 8 bytes only, PHADDD x,x
+  // gives [lane0,lane1,lane0,lane1]; MOVQ x,x masks the duplicate upper
+  // half; MOVQ-load Vd's low half (zero-upper), PADDD, MOVDQU 16-byte
+  // store — the upper 8 bytes land as zero, matching Q=0 semantics.
+  //
+  // Indexed form: load 4 bytes from [Vm + 4*idx] via MOVD, PSHUFD
+  // imm=0x00 broadcasts that dword across all four 32-bit lanes; the
+  // resulting xmm has identical low and high 8 bytes, so one
+  // PMOVSXBW/ZXBW serves both PMADDWD pairings.
+  //
+  // All eight DOT encodings — vec×{Q=0,Q=1} × idx×{Q=0,Q=1} ×
+  // {SDOT,UDOT} — are lowered.  The interpreter (interpreter.h:1237)
+  // remains the executable spec; this JIT path produces bit-exact
+  // output (32-bit integer arithmetic with defined wraparound).
+  void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
+    const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
+                            args.opcode == Decoder::DotProductOpcode::kSdotIdx);
+    const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
+                             args.opcode == Decoder::DotProductOpcode::kUdotIdx);
+
+    const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    SimdRegister xmm_n_lo = AllocTempSimdReg();
+    if (xmm_n_lo == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m_lo = AllocTempSimdReg();
+    if (xmm_m_lo == no_simd_register) { success_ = false; return; }
+
+    // For Q=1 we additionally need 2 temps to widen the high halves
+    // (vector form) or hold the second PMADDWD result (indexed form).
+    SimdRegister xmm_n_hi = no_simd_register;
+    SimdRegister xmm_m_hi = no_simd_register;
+    if (args.q) {
+      xmm_n_hi = AllocTempSimdReg();
+      if (xmm_n_hi == no_simd_register) { success_ = false; return; }
+      if (!is_indexed) {
+        xmm_m_hi = AllocTempSimdReg();
+        if (xmm_m_hi == no_simd_register) { success_ = false; return; }
+      }
+    }
+
+    // Stage 1: prepare widened Vm operand.
+    if (is_indexed) {
+      // Load Vm[4*idx..4*idx+3] as a dword, broadcast across all 4
+      // lanes; after PSHUFD the low and high 8 bytes are identical,
+      // so a single PMOVSXBW/ZXBW from the low half suffices for both
+      // PMADDWD pairings.
+      as_.Movd(xmm_m_lo, {.base = Assembler::rbp,
+                          .disp = vm_off + 4 * args.index});
+      as_.Pshufd(xmm_m_lo, xmm_m_lo, static_cast<int8_t>(0x00));
+      if (is_signed) {
+        as_.Pmovsxbw(xmm_m_lo, xmm_m_lo);
+      } else {
+        as_.Pmovzxbw(xmm_m_lo, xmm_m_lo);
+      }
+    } else {
+      // Vector form: widen low 8 bytes of Vm from memory.
+      if (is_signed) {
+        as_.Pmovsxbw(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
+      } else {
+        as_.Pmovzxbw(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
+      }
+      if (args.q) {
+        if (is_signed) {
+          as_.Pmovsxbw(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
+        } else {
+          as_.Pmovzxbw(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
+        }
+      }
+    }
+
+    // Stage 2: widen Vn.
+    if (is_signed) {
+      as_.Pmovsxbw(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
+    } else {
+      as_.Pmovzxbw(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
+    }
+    if (args.q) {
+      if (is_signed) {
+        as_.Pmovsxbw(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+      } else {
+        as_.Pmovzxbw(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+      }
+    }
+
+    // Stage 3: pair multiply-and-add into 4 int32 partial sums per half.
+    as_.Pmaddwd(xmm_n_lo, xmm_m_lo);
+    if (args.q) {
+      // Vector form pairs with xmm_m_hi; indexed form reuses xmm_m_lo.
+      as_.Pmaddwd(xmm_n_hi, is_indexed ? xmm_m_lo : xmm_m_hi);
+    }
+
+    // Stage 4: horizontal add adjacent pairs to get final lanes.
+    if (args.q) {
+      // Result lanes: [n_lo[0..1], n_lo[2..3], n_hi[0..1], n_hi[2..3]].
+      as_.Phaddd(xmm_n_lo, xmm_n_hi);
+    } else {
+      // Q=0: only 2 lanes are meaningful.  PHADDD xmm,xmm duplicates
+      // the low 64 bits into the upper 64; we mask via MOVQ below.
+      as_.Phaddd(xmm_n_lo, xmm_n_lo);
+    }
+
+    // Stage 5: accumulate into Vd and store.
+    if (args.q) {
+      as_.Paddd(xmm_n_lo, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n_lo);
+    } else {
+      // Q=0: low 8 bytes of Vd are accumulated; upper 8 bytes are zeroed.
+      // MOVQ x,x clears the duplicate upper half from PHADDD; MOVQ from
+      // Vd zero-extends Vd[0..7] into a clean operand; PADDD adds; the
+      // full-width MOVDQU lands the upper 8 bytes as zero.
+      as_.Movq(xmm_n_lo, xmm_n_lo);
+      as_.Movq(xmm_m_lo, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Paddd(xmm_n_lo, xmm_m_lo);
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n_lo);
+    }
+  }
+  // endregion
+
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
     // region digitalis
     if (args.op == 1 && args.cmode == 0b1110 && args.abc == 0 && args.defgh == 0 && args.q) {
@@ -1792,6 +2119,117 @@ class LiteTranslator {
   }
 
   void AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
+    // region digitalis
+    // Decode element size + lane index from imm5. The encoding is shared by
+    // every AdvSimdCopy opcode that selects a lane (UMOV / SMOV / INS-general
+    // / DUP-element). UMOV and INS-general are JIT-implemented below; the
+    // other opcodes still fall through to the interpreter / Undefined() path.
+    uint8_t imm5_low4 = args.imm5 & 0xf;
+    uint8_t esize = 0;
+    uint8_t index = 0;
+    if (imm5_low4 & 0x1) {
+      esize = 1; index = (args.imm5 >> 1) & 0xf;
+    } else if (imm5_low4 & 0x2) {
+      esize = 2; index = (args.imm5 >> 2) & 0x7;
+    } else if (imm5_low4 & 0x4) {
+      esize = 4; index = (args.imm5 >> 3) & 0x3;
+    } else if (imm5_low4 & 0x8) {
+      esize = 8; index = (args.imm5 >> 4) & 0x1;
+    }
+
+    // UMOV (unsigned move Vn.B/H/S/D[index] -> Rd). The destination width
+    // is encoded by Q: Q=0 -> Wd (32-bit, zero-extended), Q=1 -> Xd. The
+    // architecture only defines (esize=1,Q=0) (esize=2,Q=0) (esize=4,Q=0)
+    // (esize=8,Q=1); other combinations are unallocated. Fall back to the
+    // interpreter for non-canonical pairs rather than guess.
+    //
+    // Doubleword variant (UMOV Xd, Vn.D[i]) must use a 64-bit memory load
+    // (movq, REX.W) — handoff-19's DUP fix flagged 32-bit-MOVD-vs-64-bit-MOVQ
+    // as a load-bearing class of bug; the switch below is explicit about
+    // which mov-width belongs at each esize.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kUmov && esize != 0) {
+      bool canonical = (esize == 8 && args.q) || (esize != 8 && !args.q);
+      if (!canonical) { success_ = false; return; }
+      if (args.rd < 31) {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        int32_t off =
+            offsetof(ThreadState, cpu.v[0]) + args.rn * 16 + index * esize;
+        switch (esize) {
+          case 1: as_.Movzxbq(tmp, {.base = Assembler::rbp, .disp = off}); break;
+          case 2: as_.Movzxwq(tmp, {.base = Assembler::rbp, .disp = off}); break;
+          // Movl on a 64-bit Register dst zero-extends the 32-bit load to
+          // 64 bits, which matches the ARM64 W-register write semantics.
+          case 4: as_.Movl   (tmp, {.base = Assembler::rbp, .disp = off}); break;
+          case 8: as_.Movq   (tmp, {.base = Assembler::rbp, .disp = off}); break;
+        }
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
+
+    // SMOV (signed move Vn.B/H/S[index] -> Rd). Like UMOV but sign-extending.
+    // Canonical (esize, q) pairs per ARM ARM are:
+    //   (1, 0) SMOV Wd, Vn.B[i]   sign-ext 8  -> 32, Wd upper zero
+    //   (1, 1) SMOV Xd, Vn.B[i]   sign-ext 8  -> 64
+    //   (2, 0) SMOV Wd, Vn.H[i]   sign-ext 16 -> 32, Wd upper zero
+    //   (2, 1) SMOV Xd, Vn.H[i]   sign-ext 16 -> 64
+    //   (4, 1) SMOV Xd, Vn.S[i]   sign-ext 32 -> 64
+    // (4, 0) and the doubleword (8, *) variants are unallocated; fall back
+    // to the interpreter rather than guess. The 32-bit Movsx*l forms
+    // implicitly zero the upper 32 bits of the 64-bit Register (x86_64
+    // semantics), which matches AArch64 Wd-write semantics — no separate
+    // masking needed.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kSmov && esize != 0) {
+      bool canonical = (esize == 1) || (esize == 2) || (esize == 4 && args.q);
+      if (!canonical) { success_ = false; return; }
+      if (args.rd < 31) {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        int32_t off =
+            offsetof(ThreadState, cpu.v[0]) + args.rn * 16 + index * esize;
+        if (esize == 1 && !args.q) {
+          as_.Movsxbl(tmp, {.base = Assembler::rbp, .disp = off});
+        } else if (esize == 1 && args.q) {
+          as_.Movsxbq(tmp, {.base = Assembler::rbp, .disp = off});
+        } else if (esize == 2 && !args.q) {
+          as_.Movsxwl(tmp, {.base = Assembler::rbp, .disp = off});
+        } else if (esize == 2 && args.q) {
+          as_.Movsxwq(tmp, {.base = Assembler::rbp, .disp = off});
+        } else /* esize == 4 && args.q */ {
+          as_.Movsxlq(tmp, {.base = Assembler::rbp, .disp = off});
+        }
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
+
+    // INS (general): insert Rn into Vd.B/H/S/D[index]. The other lanes of
+    // v[rd] are unchanged. We write straight into ThreadState memory at the
+    // computed byte offset; the lane width determines mov-width. Same
+    // movq-vs-movd discipline as DUP-general below.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kInsGeneral && esize != 0) {
+      int32_t off =
+          offsetof(ThreadState, cpu.v[0]) + args.rd * 16 + index * esize;
+      Register src = no_register;
+      if (args.rn < 31) {
+        src = GetReg(args.rn);
+      } else {
+        // XZR: materialise a zero in a temp and use it as the source.
+        src = AllocTempReg();
+        if (src == no_register) { success_ = false; return; }
+        as_.Xorq(src, src);
+      }
+      switch (esize) {
+        case 1: as_.Movb({.base = Assembler::rbp, .disp = off}, src); break;
+        case 2: as_.Movw({.base = Assembler::rbp, .disp = off}, src); break;
+        case 4: as_.Movl({.base = Assembler::rbp, .disp = off}, src); break;
+        case 8: as_.Movq({.base = Assembler::rbp, .disp = off}, src); break;
+      }
+      return;
+    }
+    // endregion
+
     // region digitalis - implement DUP (general) for memset fast path
     if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupGeneral && args.q) {
       // DUP (general), Q=1: broadcast GP register to all lanes of 128-bit SIMD register.
@@ -1800,7 +2238,20 @@ class LiteTranslator {
       SimdRegister xmm = AllocTempSimdReg();
       if (xmm == no_simd_register) { Undefined(); return; }
       Register src = GetReg(args.rn);
-      as_.Movd(xmm, src);
+      // For 64-bit broadcast we must move the FULL 64 bits of the GP register
+      // into the XMM register; using 32-bit MOVD here silently truncates the
+      // upper half and the subsequent PSHUFD(0x44) then duplicates the low
+      // 32-bit value into both D-lanes. That was the FB libcoldstart Yoga
+      // layout x21 truncation bug (handoff-18): DUP V0.2D, X21 produced
+      // V0 = {lo32(x21), lo32(x21)} instead of {x21, x21}, so when the
+      // surrounding INS/UMOV spill cycle later reloaded X21 from V0.D[1]
+      // it got the 32-bit-truncated pointer and the next post-indexed STR
+      // faulted at the low-address.
+      if (esize_bits == 0x08) {
+        as_.Movq(xmm, src);
+      } else {
+        as_.Movd(xmm, src);
+      }
       if (esize_bits == 0x01) {
         // Byte broadcast: PSHUFB with zero mask → each byte picks byte 0
         SimdRegister zero_mask = AllocTempSimdReg();
@@ -1826,20 +2277,268 @@ class LiteTranslator {
   }
 
   void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
-    UNUSED(args);
-    Undefined();
+    // region digitalis - JIT for common SIMD three-same ops.
+    //
+    // Implements MUL/MLA/MLS/ADD/SUB/AND/ORR/EOR/CMEQ at the lane sizes
+    // the dynamic linker's calculate_gnu_hash_neon needs (4S MUL/MLA in
+    // particular). Falls back to interpreter for opcodes/sizes outside
+    // this set.
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    auto load_full = [&](SimdRegister xmm, int32_t off) {
+      as_.Movdqu(xmm, {.base = Assembler::rbp, .disp = off});
+    };
+    auto store_full = [&](int32_t off, SimdRegister xmm) {
+      as_.Movdqu({.base = Assembler::rbp, .disp = off}, xmm);
+    };
+    auto mask_low64 = [&](SimdRegister xmm) {
+      // Zero upper 64 bits when q=0 (D-register semantics).
+      as_.Pslldq(xmm, int8_t{8});
+      as_.Psrldq(xmm, int8_t{8});
+    };
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdThreeSameOpcode::kMul: {
+        if (args.size != 0b10) { Undefined(); return; }   // only 32-bit lanes here
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pmulld(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kMla: {
+        if (args.size != 0b10) { Undefined(); return; }   // only 32-bit lanes here
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pmulld(xn, xm);
+        as_.Paddd(xd, xn);
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kAdd: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        switch (args.size) {
+          case 0b00: as_.Paddb(xn, xm); break;
+          case 0b01: as_.Paddw(xn, xm); break;
+          case 0b10: as_.Paddd(xn, xm); break;
+          case 0b11: as_.Paddq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kSub: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        switch (args.size) {
+          case 0b00: as_.Psubb(xn, xm); break;
+          case 0b01: as_.Psubw(xn, xm); break;
+          case 0b10: as_.Psubd(xn, xm); break;
+          case 0b11: as_.Psubq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kAnd: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pand(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kOrr: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Por(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kEor: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pxor(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmeq: {
+        // CMEQ Vd, Vn, Vm — lane-wise equality (-1 if equal, 0 otherwise).
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        switch (args.size) {
+          case 0b00: as_.Pcmpeqb(xn, xm); break;
+          case 0b01: as_.Pcmpeqw(xn, xm); break;
+          case 0b10: as_.Pcmpeqd(xn, xm); break;
+          default: Undefined(); return;  // 64-bit Pcmpeqq is SSE4_1 — skip for now
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      default:
+        Undefined();
+        return;
+    }
+    // endregion
   }
 
   // region digitalis
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
-    UNUSED(args);
-    Undefined();
+    // Implements UMLAL / UMULL (q=0, low-half source) at narrow→wide
+    // widths used by the linker's NEON GNU hash and other common Qt
+    // paths. q=1 ("2" variants on upper half) falls through to the
+    // interpreter for now.
+    if (args.q) { Undefined(); return; }
+
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdThreeDiffOpcode::kUmlal: {
+        // UMLAL Vd.<wide>, Vn.<narrow>, Vm.<narrow> (low half of source).
+        // Vd += zext(Vn[lane]) * zext(Vm[lane])
+        // Only 4H→4S (size=01) is the hot case; 8B→8H (size=00) also
+        // appears occasionally.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        // Load D-half (low 64 bits) of Vn and Vm; widen to full 128.
+        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (args.size == 0b01) {
+          // 4H → 4S
+          as_.Pmovzxwd(xn, xn);
+          as_.Pmovzxwd(xm, xm);
+          as_.Pmulld(xn, xm);
+          as_.Paddd(xd, xn);
+        } else if (args.size == 0b00) {
+          // 8B → 8H (use Pmullw on 16-bit lanes after widening)
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmullw(xn, xm);
+          as_.Paddw(xd, xn);
+        } else {
+          Undefined(); return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
+      case Decoder::AdvSimdThreeDiffOpcode::kUmull: {
+        // UMULL Vd.<wide>, Vn.<narrow>, Vm.<narrow>.
+        // Vd = zext(Vn) * zext(Vm) (no accumulate).
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+        if (args.size == 0b01) {
+          as_.Pmovzxwd(xn, xn);
+          as_.Pmovzxwd(xm, xm);
+          as_.Pmulld(xn, xm);
+        } else if (args.size == 0b00) {
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmullw(xn, xm);
+        } else {
+          Undefined(); return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      default:
+        Undefined();
+        return;
+    }
   }
   // endregion
 
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
-    UNUSED(rd, rn, rm, index, q);
-    Undefined();
+    // region digitalis - JIT for EXT Vd.<T>, Vn.<T>, Vm.<T>, #imm.
+    // Concatenates Vn:Vm and extracts a vector starting at byte `index`
+    // from Vn. Equivalent to:
+    //   result = (Vn >> (index*8)) | (Vm << ((vlen-index)*8))
+    // For q=1 this is a 16-byte window; for q=0 it's an 8-byte window.
+    if (!q) {
+      // 64-bit form: handle index 0..7. The simplest correct route is
+      // to pack Vm:Vn into a 16-byte register, shift right by index
+      // bytes, then mask to low 8 bytes. For now fall back to interp
+      // for q=0 to keep the change small (calculate_gnu_hash_neon's ext
+      // uses q=1).
+      UNUSED(rd, rn, rm, index);
+      Undefined();
+      return;
+    }
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+
+    SimdRegister xn = AllocTempSimdReg();
+    SimdRegister xm = AllocTempSimdReg();
+    if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+
+    as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+
+    if (index == 0) {
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      return;
+    }
+    if (index == 16) {
+      // ARM ARM forbids index==16 for q=1 (encoding has 4-bit index when
+      // q=1, so max 15). Belt-and-braces.
+      Undefined(); return;
+    }
+
+    as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+    // xn = xn >> (index bytes) ; zero upper bytes
+    as_.Psrldq(xn, static_cast<int8_t>(index));
+    // xm = xm << ((16-index) bytes) ; zero lower bytes
+    as_.Pslldq(xm, static_cast<int8_t>(16 - index));
+    as_.Por(xn, xm);
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+    // endregion
   }
 
   // region digitalis
@@ -1887,8 +2586,163 @@ class LiteTranslator {
   }
 
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
-    UNUSED(args);
-    Undefined();
+    // region digitalis - JIT for LD1R / LD1 / ST1 single-element variants
+    // with num_regs == 1.  Critical for `calculate_gnu_hash_neon`'s tail
+    // (`ld1r v3.4s, [x10], #4`) in the dynamic linker — without this the
+    // post-loop tail bails to the interpreter on every symbol resolve.
+    using Op = Decoder::AdvSimdSingleStructOp;
+    const bool is_replicate = (args.op == Op::kLd1r);
+    const bool is_single_load = (args.op == Op::kLd1);
+    const bool is_single_store = (args.op == Op::kSt1);
+    if (!is_replicate && !is_single_load && !is_single_store) {
+      Undefined(); return;
+    }
+    if (args.num_regs != 1) { Undefined(); return; }
+
+    // size: 00=B(1), 01=H(2), 10=S(4), 11=D(8).
+    const uint8_t esize = static_cast<uint8_t>(1u << args.size);
+    if (esize != 1 && esize != 2 && esize != 4 && esize != 8) {
+      Undefined(); return;
+    }
+
+    int32_t vt_off = offsetof(ThreadState, cpu.v[0]) + args.rt * 16;
+
+    // Compute base address (with TBI mask).
+    Register base_orig = (args.rn == 31) ? GetSp() : GetReg(args.rn);
+    if (base_orig == no_register) { Undefined(); return; }
+    Register base = ApplyTbi(base_orig);
+    if (base == no_register) { Undefined(); return; }
+
+    Assembler::Operand mem{.base = base, .disp = 0};
+
+    if (is_single_store) {
+      // ST1 lane: load element from v[rt].lane[index] (ThreadState — no fault),
+      // then store to guest memory.
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { Undefined(); return; }
+      int32_t lane_off = vt_off + args.index * esize;
+      switch (esize) {
+        case 1: as_.Movzxbl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+        case 2: as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+        case 4: as_.Movl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+        case 8: as_.Movq(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+      }
+      AssemblerBase::Label* recovery_label = as_.MakeLabel();
+      as_.SetRecoveryPoint(recovery_label);
+      switch (esize) {
+        case 1: as_.Movb(mem, tmp); break;
+        case 2: as_.Movw(mem, tmp); break;
+        case 4: as_.Movl(mem, tmp); break;
+        case 8: as_.Movq(mem, tmp); break;
+      }
+      AssemblerBase::Label* cont = as_.MakeLabel();
+      as_.Jmp(*cont);
+      as_.Bind(recovery_label);
+      ExitGeneratedCode(GetInsnAddr());
+      as_.Bind(cont);
+    } else if (is_replicate) {
+      // LD1R: load esize bytes, broadcast to all lanes, zero upper 64 bits
+      // if Q=0.
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { Undefined(); return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { Undefined(); return; }
+      SimdRegister zero_mask = no_simd_register;
+      if (esize == 1) {
+        zero_mask = AllocTempSimdReg();
+        if (zero_mask == no_simd_register) { Undefined(); return; }
+      }
+      AssemblerBase::Label* recovery_label = as_.MakeLabel();
+      as_.SetRecoveryPoint(recovery_label);
+      switch (esize) {
+        case 1: as_.Movzxbl(tmp, mem); break;
+        case 2: as_.Movzxwl(tmp, mem); break;
+        case 4: as_.Movl(tmp, mem); break;
+        case 8: as_.Movq(tmp, mem); break;
+      }
+      AssemblerBase::Label* cont = as_.MakeLabel();
+      as_.Jmp(*cont);
+      as_.Bind(recovery_label);
+      ExitGeneratedCode(GetInsnAddr());
+      as_.Bind(cont);
+
+      // Broadcast `tmp` across XMM lanes.
+      switch (esize) {
+        case 1:
+          as_.Movd(xmm, tmp);
+          as_.Pxor(zero_mask, zero_mask);
+          as_.Pshufb(xmm, zero_mask);  // broadcast byte 0 to all 16 bytes
+          break;
+        case 2:
+          as_.Movd(xmm, tmp);
+          // Broadcast 16-bit element to all 4 low words, then to upper if Q=1.
+          as_.Pshuflw(xmm, xmm, static_cast<int8_t>(0));
+          if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
+          break;
+        case 4:
+          as_.Movd(xmm, tmp);
+          as_.Pshufd(xmm, xmm, static_cast<int8_t>(0));
+          break;
+        case 8:
+          as_.Movq(xmm, tmp);
+          if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
+          break;
+      }
+      if (!args.q) {
+        as_.Pslldq(xmm, int8_t{8});
+        as_.Psrldq(xmm, int8_t{8});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vt_off}, xmm);
+    } else {
+      // LD1 single-lane: load esize bytes into v[rt].lane[index], preserving
+      // other lanes by writing directly to ThreadState at the lane offset.
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { Undefined(); return; }
+      AssemblerBase::Label* recovery_label = as_.MakeLabel();
+      as_.SetRecoveryPoint(recovery_label);
+      switch (esize) {
+        case 1: as_.Movzxbl(tmp, mem); break;
+        case 2: as_.Movzxwl(tmp, mem); break;
+        case 4: as_.Movl(tmp, mem); break;
+        case 8: as_.Movq(tmp, mem); break;
+      }
+      AssemblerBase::Label* cont = as_.MakeLabel();
+      as_.Jmp(*cont);
+      as_.Bind(recovery_label);
+      ExitGeneratedCode(GetInsnAddr());
+      as_.Bind(cont);
+
+      int32_t lane_off = vt_off + args.index * esize;
+      switch (esize) {
+        case 1: as_.Movb({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+        case 2: as_.Movw({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+        case 4: as_.Movl({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+        case 8: as_.Movq({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+      }
+    }
+
+    // Post-index update of Xn (or SP).
+    if (args.postindex) {
+      Register new_base = AllocTempReg();
+      if (new_base == no_register) { Undefined(); return; }
+      Register reread_base = (args.rn == 31) ? GetSp() : GetReg(args.rn);
+      as_.Movq(new_base, reread_base);
+      if (args.rm == 31) {
+        // Immediate post-index: total bytes accessed == num_regs * esize.
+        int32_t imm = static_cast<int32_t>(args.num_regs) * esize;
+        as_.Addq(new_base, imm);
+      } else {
+        Register rm_val = GetReg(args.rm);
+        if (rm_val == no_register) { Undefined(); return; }
+        as_.Addq(new_base, rm_val);
+      }
+      if (args.rn == 31) {
+        SetSp(new_base);
+      } else {
+        SetReg(args.rn, new_base);
+      }
+    }
+    // endregion
   }
   // endregion
 
@@ -1902,6 +2756,20 @@ class LiteTranslator {
   Register DataProc1Src(Register src, uint8_t opcode2, bool is_64bit) {
     // region digitalis - JIT support for REV, CLZ, RBIT
     Register res = AllocTempReg();
+    // region digitalis PAuth DP-1Src as identity (emit a plain move)
+    // The decoder sets bit 0x40 to flag PAuth variants — Digitalis is PAC-blind,
+    // so the JIT just copies src→dst (the upper-half clear of Movl handles the
+    // sf=0 sign/zero-extend semantics; PAuth ops are X-form only but Movl is
+    // still safe because sf=1 always reaches the Movq branch).
+    if (opcode2 & 0x40) {
+      if (is_64bit) {
+        as_.Movq(res, src);
+      } else {
+        as_.Movl(res, src);
+      }
+      return res;
+    }
+    // endregion
     switch (opcode2) {
       case 0b000010:  // REV16 (not commonly needed, skip for now)
         Undefined();
@@ -2234,8 +3102,417 @@ class LiteTranslator {
         break;
       }
 
+      // region digitalis LSE bitwise atomics (LDCLR/LDSET/LDEOR).
+      // x86 has no single-instruction equivalent; emit a CMPXCHG retry loop.
+      // ARM: tmp = [Xn]; [Xn] = tmp <op> Xs; Xt = tmp (zero-extended for W form).
+      case Decoder::AtomicOp::kLdclr:
+      case Decoder::AtomicOp::kLdset:
+      case Decoder::AtomicOp::kLdeor: {
+        Register mask = (args.rs < 31) ? GetReg(args.rs) : AllocTempReg();
+        if (!success()) return;
+        if (args.rs >= 31) as_.Xorl(mask, mask);
+
+        // Precompute ~Xs once for LDCLR (mask doesn't change across iterations).
+        Register clr_mask = no_register;
+        if (args.op == Decoder::AtomicOp::kLdclr) {
+          clr_mask = AllocTempReg();
+          if (!success()) return;
+          as_.Movq(clr_mask, mask);
+          as_.Notq(clr_mask);
+        }
+
+        // Initial fetch of [mem] into RAX (Load() emits fault recovery).
+        Register init = Load(lss, /*is_signed=*/false, /*is_64bit_target=*/true,
+                             base, 0);
+        if (!success()) return;
+        as_.Movq(Assembler::rax, init);
+
+        Register tmp_new = AllocTempReg();
+        if (!success()) return;
+
+        AssemblerBase::Label* loop_top = as_.MakeLabel();
+        AssemblerBase::Label* recovery_label = as_.MakeLabel();
+        AssemblerBase::Label* cont = as_.MakeLabel();
+        as_.Bind(loop_top);
+        as_.Movq(tmp_new, Assembler::rax);
+        switch (args.op) {
+          case Decoder::AtomicOp::kLdclr:
+            as_.Andq(tmp_new, clr_mask);
+            break;
+          case Decoder::AtomicOp::kLdset:
+            as_.Orq(tmp_new, mask);
+            break;
+          case Decoder::AtomicOp::kLdeor:
+            as_.Xorq(tmp_new, mask);
+            break;
+          default:
+            break;
+        }
+
+        as_.SetRecoveryPoint(recovery_label);
+        switch (args.size) {
+          case 0: as_.LockCmpXchgb(mem, tmp_new); break;
+          case 1: as_.LockCmpXchgw(mem, tmp_new); break;
+          case 2: as_.LockCmpXchgl(mem, tmp_new); break;
+          case 3: as_.LockCmpXchgq(mem, tmp_new); break;
+        }
+        as_.Jmp(*cont);
+        as_.Bind(recovery_label);
+        ExitGeneratedCode(GetInsnAddr());
+        as_.Bind(cont);
+        // ZF=0 means CMPXCHG failed; retry with the updated RAX.
+        as_.Jcc(Condition::kNotEqual, *loop_top);
+
+        // Old value is in RAX. For byte/halfword sizes the failure path of
+        // CMPXCHG only refreshes AL/AX; upper bits are whatever the initial
+        // Movzxbl/Movzxwl in Load() set them to (zero), so they're already
+        // clean. Still mask explicitly to match the existing kLdadd/kSwp
+        // pattern for byte/halfword zero-extension to 64 bits.
+        if (args.rt < 31) {
+          Register old_val = AllocTempReg();
+          if (!success()) return;
+          as_.Movq(old_val, Assembler::rax);
+          if (args.size == 0) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFF));
+          } else if (args.size == 1) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFFFF));
+          }
+          SetReg(args.rt, old_val);
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis atomic min/max (LSE Armv8.1).
+      // x86 has no single-instruction equivalent; emit a CMPXCHG retry loop
+      // with a sign- or zero-extended Cmpq+Cmovq to pick max/min.  ARM
+      // semantics: tmp = [Xn]; [Xn] = is_max ? max(tmp, Xs) : min(tmp, Xs);
+      // Xt = tmp (zero-extended at the operation size to 64 bits for W form).
+      case Decoder::AtomicOp::kLdsmax:
+      case Decoder::AtomicOp::kLdsmin:
+      case Decoder::AtomicOp::kLdumax:
+      case Decoder::AtomicOp::kLdumin: {
+        const bool is_signed = (args.op == Decoder::AtomicOp::kLdsmax ||
+                                args.op == Decoder::AtomicOp::kLdsmin);
+        const bool is_max = (args.op == Decoder::AtomicOp::kLdsmax ||
+                             args.op == Decoder::AtomicOp::kLdumax);
+
+        Register operand = (args.rs < 31) ? GetReg(args.rs) : AllocTempReg();
+        if (!success()) return;
+        if (args.rs >= 31) as_.Xorl(operand, operand);
+
+        // Initial fetch of [mem] into RAX (Load emits fault recovery).
+        Register init = Load(lss, /*is_signed=*/false,
+                             /*is_64bit_target=*/true, base, 0);
+        if (!success()) return;
+        as_.Movq(Assembler::rax, init);
+
+        Register tmp_new = AllocTempReg();
+        if (!success()) return;
+        Register cmp_old = AllocTempReg();
+        if (!success()) return;
+        Register cmp_op = AllocTempReg();
+        if (!success()) return;
+
+        AssemblerBase::Label* loop_top = as_.MakeLabel();
+        AssemblerBase::Label* recovery_label = as_.MakeLabel();
+        AssemblerBase::Label* cont = as_.MakeLabel();
+        as_.Bind(loop_top);
+
+        // Sign- or zero-extend RAX (current) and operand to 64 bits at the
+        // guest operation size so the Cmpq below has the right ordering.
+        switch (args.size) {
+          case 0:
+            if (is_signed) {
+              as_.Movsxbq(cmp_old, Assembler::rax);
+              as_.Movsxbq(cmp_op, operand);
+            } else {
+              as_.Movzxbl(cmp_old, Assembler::rax);
+              as_.Movzxbl(cmp_op, operand);
+            }
+            break;
+          case 1:
+            if (is_signed) {
+              as_.Movsxwq(cmp_old, Assembler::rax);
+              as_.Movsxwq(cmp_op, operand);
+            } else {
+              as_.Movzxwl(cmp_old, Assembler::rax);
+              as_.Movzxwl(cmp_op, operand);
+            }
+            break;
+          case 2:
+            if (is_signed) {
+              as_.Movsxlq(cmp_old, Assembler::rax);
+              as_.Movsxlq(cmp_op, operand);
+            } else {
+              as_.Movl(cmp_old, Assembler::rax);   // implicit zero-extend to 64
+              as_.Movl(cmp_op, operand);
+            }
+            break;
+          case 3:
+            as_.Movq(cmp_old, Assembler::rax);
+            as_.Movq(cmp_op, operand);
+            break;
+        }
+
+        // tmp_new starts as cmp_old; Cmovq swaps in cmp_op when the
+        // comparison says cmp_op is the desired max/min.
+        as_.Movq(tmp_new, cmp_old);
+        as_.Cmpq(tmp_new, cmp_op);
+        Condition cc;
+        if (is_max) {
+          cc = is_signed ? Condition::kLess
+                         : Condition::kBelow;
+        } else {
+          cc = is_signed ? Condition::kGreater
+                         : Condition::kAbove;
+        }
+        as_.Cmovq(cc, tmp_new, cmp_op);
+
+        as_.SetRecoveryPoint(recovery_label);
+        switch (args.size) {
+          case 0: as_.LockCmpXchgb(mem, tmp_new); break;
+          case 1: as_.LockCmpXchgw(mem, tmp_new); break;
+          case 2: as_.LockCmpXchgl(mem, tmp_new); break;
+          case 3: as_.LockCmpXchgq(mem, tmp_new); break;
+        }
+        as_.Jmp(*cont);
+        as_.Bind(recovery_label);
+        ExitGeneratedCode(GetInsnAddr());
+        as_.Bind(cont);
+        // ZF=0 means CMPXCHG saw a stale RAX; retry with the refreshed one.
+        as_.Jcc(Condition::kNotEqual, *loop_top);
+
+        // Old value in RAX. ARM W-form atomics zero-extend the loaded value
+        // to 64 bits; byte/halfword CMPXCHG only refreshes AL/AX so the
+        // upper bits already match the initial zero-extending Load, but we
+        // mask explicitly to match the kLdadd/kSwp/kLdset pattern.
+        if (args.rt < 31) {
+          Register old_val = AllocTempReg();
+          if (!success()) return;
+          as_.Movq(old_val, Assembler::rax);
+          if (args.size == 0) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFF));
+          } else if (args.size == 1) {
+            as_.Andq(old_val, static_cast<int32_t>(0xFFFF));
+          }
+          SetReg(args.rt, old_val);
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis CASP JIT (compare-and-swap pair).
+      // size=2 (32-bit pair): pack Rs:Rs+1 into a single 64-bit value and use
+      //   LOCK CMPXCHGq.  Mirrors the interpreter's path (interpreter.h
+      //   delegates the 32-bit pair to AtomicCASVal<uint64_t>).
+      // size=3 (64-bit pair): LOCK CMPXCHG16B.  This clobbers RAX/RDX/RBX/RCX
+      //   in fixed roles (RDX:RAX = expected, RCX:RBX = desired, RDX:RAX = old
+      //   after).  RBX/RCX/RDX are in the allocator pool and may hold
+      //   permanent guest reg mappings, so we save them on the host stack
+      //   around the CMPXCHG16B and restore on both the success path and the
+      //   fault-recovery path.  RAX is reserved (no guest reg maps to it) so
+      //   it needs no save.
+      // Other sizes (0, 1) and `acquire`/`release` variants are not
+      // architecturally allowed for CASP; x86 TSO already provides the
+      // ordering CASPA/CASPL/CASPAL want, so the same emit covers all four.
+      case Decoder::AtomicOp::kCasp: {
+        if (args.size != 2 && args.size != 3) { Undefined(); return; }
+
+        const uint8_t rs_lo = args.rs;
+        const uint8_t rs_hi = static_cast<uint8_t>(args.rs + 1);
+        const uint8_t rt_lo = args.rt;
+        const uint8_t rt_hi = static_cast<uint8_t>(args.rt + 1);
+
+        if (args.size == 2) {
+          // 32-bit pair via packed 64-bit LOCK CMPXCHG.
+          Register expected = AllocTempReg();
+          if (!success()) return;
+          Register desired = AllocTempReg();
+          if (!success()) return;
+          Register hi_tmp = AllocTempReg();
+          if (!success()) return;
+
+          // expected = (Rs_hi & 0xFFFFFFFF) << 32 | (Rs_lo & 0xFFFFFFFF).
+          // Movl with a register destination zero-extends to 64 bits.
+          if (rs_lo < 31) {
+            as_.Movl(expected, GetReg(rs_lo));
+          } else {
+            as_.Xorl(expected, expected);
+          }
+          if (rs_hi < 31) {
+            as_.Movl(hi_tmp, GetReg(rs_hi));
+            as_.Shlq(hi_tmp, int8_t{32});
+            as_.Orq(expected, hi_tmp);
+          }
+
+          // desired = (Rt_hi & 0xFFFFFFFF) << 32 | (Rt_lo & 0xFFFFFFFF).
+          if (rt_lo < 31) {
+            as_.Movl(desired, GetReg(rt_lo));
+          } else {
+            as_.Xorl(desired, desired);
+          }
+          if (rt_hi < 31) {
+            as_.Movl(hi_tmp, GetReg(rt_hi));
+            as_.Shlq(hi_tmp, int8_t{32});
+            as_.Orq(desired, hi_tmp);
+          }
+
+          // CMPXCHG: RAX = expected. On equal, store `desired`; on unequal,
+          // RAX loaded from [mem].  RAX is reserved (no guest map), safe to
+          // clobber.
+          as_.Movq(Assembler::rax, expected);
+
+          AssemblerBase::Label* recovery_label = as_.MakeLabel();
+          as_.SetRecoveryPoint(recovery_label);
+          as_.LockCmpXchgq(mem, desired);
+
+          AssemblerBase::Label* cont = as_.MakeLabel();
+          as_.Jmp(*cont);
+          as_.Bind(recovery_label);
+          ExitGeneratedCode(GetInsnAddr());
+          as_.Bind(cont);
+
+          // Unpack old: low 32 → Rs (zero-extend), high 32 → Rs+1
+          // (zero-extend).  Each half is written back like ARM CAS Wt, i.e.,
+          // zero-extended to 64 bits.
+          if (rs_lo < 31) {
+            Register old_lo = AllocTempReg();
+            if (!success()) return;
+            as_.Movl(old_lo, Assembler::rax);  // zero-extends to 64
+            SetReg(rs_lo, old_lo);
+          }
+          if (rs_hi < 31) {
+            Register old_hi = AllocTempReg();
+            if (!success()) return;
+            as_.Movq(old_hi, Assembler::rax);
+            as_.Shrq(old_hi, int8_t{32});
+            SetReg(rs_hi, old_hi);
+          }
+        } else {
+          // size=3: 64-bit pair via LOCK CMPXCHG16B.
+          //
+          // Register roles for CMPXCHG16B [mem]:
+          //   in : RDX:RAX = expected (high:low)
+          //        RCX:RBX = desired  (high:low)
+          //   out: RDX:RAX = old [mem] (always — equal case leaves them
+          //        unchanged, which equals the old value already)
+          //        ZF = 1 on success, 0 on failure
+          //
+          // CMPXCHG16B clobbers RBX/RCX/RDX, which are in the allocator
+          // pool and may hold permanent guest mappings.  We save them on
+          // the host stack and restore on both the success and the
+          // fault-recovery paths.  RAX is reserved (no guest reg maps to
+          // it) so it needs no save.
+          //
+          // Critical detail: `base` came back from ApplyTbi() (the
+          // function entry), which allocates a temp.  AllocTempReg()
+          // starts handing out RDX as the first temp, so `base` is
+          // typically RDX itself.  We MUST move it to a stable temp
+          // before clobbering RDX — otherwise the CMPXCHG16B operand's
+          // memory base ends up holding exp_hi instead of the guest
+          // address, producing a #GP from a bogus memory access.
+
+          // Allocate 5 stable temps not in {RAX, RBX, RCX, RDX}: r15, r14,
+          // r13, r12, r11 (post-ApplyTbi the first temp slot is already
+          // taken, so AllocTempReg returns r15 first here).
+          Register base_save = AllocTempReg();
+          if (!success()) return;
+          Register exp_lo = AllocTempReg();
+          if (!success()) return;
+          Register exp_hi = AllocTempReg();
+          if (!success()) return;
+          Register des_lo = AllocTempReg();
+          if (!success()) return;
+          Register des_hi = AllocTempReg();
+          if (!success()) return;
+
+          // Pin the memory base in a stable register before any clobber.
+          as_.Movq(base_save, base);
+          Assembler::Operand mem_save{.base = base_save, .disp = 0};
+
+          // Stage all four source values into temps *before* clobbering
+          // RBX/RCX/RDX, so GetReg() can still read guest values held in
+          // RBX/RCX/RDX.
+          if (rs_lo < 31) {
+            as_.Movq(exp_lo, GetReg(rs_lo));
+          } else {
+            as_.Xorl(exp_lo, exp_lo);
+          }
+          if (rs_hi < 31) {
+            as_.Movq(exp_hi, GetReg(rs_hi));
+          } else {
+            as_.Xorl(exp_hi, exp_hi);
+          }
+          if (rt_lo < 31) {
+            as_.Movq(des_lo, GetReg(rt_lo));
+          } else {
+            as_.Xorl(des_lo, des_lo);
+          }
+          if (rt_hi < 31) {
+            as_.Movq(des_hi, GetReg(rt_hi));
+          } else {
+            as_.Xorl(des_hi, des_hi);
+          }
+
+          // Save RBX/RCX/RDX on the host stack.  Order matters: we pop in
+          // reverse on restore.  These pushes never fault (host stack is
+          // always mapped), so no recovery point is needed for them.
+          as_.Push(Assembler::rbx);
+          as_.Push(Assembler::rcx);
+          as_.Push(Assembler::rdx);
+
+          // Load the CMPXCHG16B operand registers.  Sources are in temps
+          // that are NOT in {RAX, RBX, RCX, RDX}, so no read-after-write
+          // hazards here.
+          as_.Movq(Assembler::rax, exp_lo);
+          as_.Movq(Assembler::rdx, exp_hi);
+          as_.Movq(Assembler::rbx, des_lo);
+          as_.Movq(Assembler::rcx, des_hi);
+
+          AssemblerBase::Label* recovery_label = as_.MakeLabel();
+          as_.SetRecoveryPoint(recovery_label);
+          as_.LockCmpXchg16b(mem_save);
+
+          AssemblerBase::Label* cont = as_.MakeLabel();
+          as_.Jmp(*cont);
+
+          // Recovery path: the CMPXCHG16B faulted (misaligned address or
+          // bad memory).  Restore RBX/RCX/RDX so StoreMappedRegs() in
+          // ExitGeneratedCode sees correct permanent-mapping values, then
+          // bail to the interpreter at the current guest PC.
+          as_.Bind(recovery_label);
+          as_.Pop(Assembler::rdx);
+          as_.Pop(Assembler::rcx);
+          as_.Pop(Assembler::rbx);
+          ExitGeneratedCode(GetInsnAddr());
+
+          as_.Bind(cont);
+
+          // Success path.  Save the old values (currently in RAX:RDX) to
+          // the staging temps before popping RDX restores the guest
+          // mapping value.  exp_lo/exp_hi are R15/R14, not in
+          // {RAX/RBX/RCX/RDX}, so these Movqs don't interfere with the
+          // pending pops.
+          as_.Movq(exp_lo, Assembler::rax);
+          as_.Movq(exp_hi, Assembler::rdx);
+          as_.Pop(Assembler::rdx);
+          as_.Pop(Assembler::rcx);
+          as_.Pop(Assembler::rbx);
+
+          // Write old values back to Rs:Rs+1.  If a guest reg mapping
+          // happens to live in RBX/RCX/RDX, SetReg targets that physical
+          // register and overwrites the just-restored guest value.  That's
+          // the correct semantics: Rs/Rs+1 ARE getting new values from the
+          // CASP, even if the guest register happened to map there.
+          if (rs_lo < 31) SetReg(rs_lo, exp_lo);
+          if (rs_hi < 31) SetReg(rs_hi, exp_hi);
+        }
+        break;
+      }
+      // endregion
+
       default:
-        // kLdclr, kLdset, kLdeor: less common, fall back to interpreter.
         Undefined();
         break;
     }
@@ -2366,23 +3643,162 @@ class LiteTranslator {
       as_.Ucomiss(xmm_n, xmm_m);
     }
 
-    // UCOMISD/UCOMISS set x86 ZF/PF/CF. Map to ARM64 NZCV:
-    // ARM64: N=less, Z=equal, C=greater-or-equal-or-unordered, V=unordered
-    // x86 UCOMISS result flags:
-    //   a > b:  ZF=0 PF=0 CF=0  → ARM64: N=0 Z=0 C=1 V=0
-    //   a < b:  ZF=0 PF=0 CF=1  → ARM64: N=1 Z=0 C=0 V=0
-    //   a == b: ZF=1 PF=0 CF=0  → ARM64: N=0 Z=1 C=1 V=0
-    //   NaN:    ZF=1 PF=1 CF=1  → ARM64: N=0 Z=0 C=1 V=1
-    // Use LAHF + SETO like EmitStoreArmNZCV but with custom mapping.
-    // For now, store approximate flags. The common usage is EQ/NE/LT/GE
-    // which map well from x86 flags to conditional jumps.
-    EmitStoreArmNZCV(/*is_sub=*/true);
+    // region digitalis fix: emit the correct FP-specific ARM NZCV
+    // mapping, not the integer-SUB EmitStoreArmNZCV.  UCOMISS/UCOMISD set
+    // only ZF/PF/CF; SF and OF retain stale values, so the integer-flag
+    // emission produced random N and V bits.  This silently broke any
+    // FCMP-then-CSET-{ge,gt,lt,le} sequence (only EQ/NE worked because
+    // they only depend on Z, which the integer mapping happened to set
+    // correctly).  See note in EmitStoreArmFpNZCV below.
+    EmitStoreArmFpNZCV();
+    // endregion
+  }
+  // endregion
+
+  // region digitalis
+  // FCCMP / FCCMPE: fall back to interpreter (condition-dependent flag write
+  // makes this awkward in JIT; cost is one interpreter dispatch per FCCMP).
+  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& /*args*/) {
+    success_ = false;
   }
   // endregion
 
   void AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscArgs& args) {
-    UNUSED(args);
-    Undefined();
+    // region digitalis - JIT for CMEQZ (cmeq Vd, Vn, #0) used by the
+    // dynamic linker's calculate_gnu_hash_neon. Other opcodes fall
+    // through to the interpreter.
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    auto mask_low64 = [&](SimdRegister xmm) {
+      as_.Pslldq(xmm, int8_t{8});
+      as_.Psrldq(xmm, int8_t{8});
+    };
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        switch (args.size) {
+          case 0b00: as_.Pcmpeqb(xn, xz); break;
+          case 0b01: as_.Pcmpeqw(xn, xz); break;
+          case 0b10: as_.Pcmpeqd(xn, xz); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
+      // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
+      // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
+      // size=10: word reverse (2S / 4S) — PSHUFD imm=0x01 (Q=0) or 0xB1 (Q=1).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev64: {
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {
+            Register r1 = AllocTempReg();
+            if (r1 == no_register) { Undefined(); return; }
+            as_.Movq(r1, xn);
+            as_.Bswapq(r1);
+            if (args.q) {
+              Register r2 = AllocTempReg();
+              if (r2 == no_register) { Undefined(); return; }
+              as_.Pextrq(r2, xn, int8_t{1});
+              as_.Bswapq(r2);
+              as_.Movq(xn, r1);
+              as_.Pinsrq(xn, r2, int8_t{1});
+            } else {
+              as_.Movq(xn, r1);  // zeros upper 64 bits
+            }
+            break;
+          }
+          case 0b01:
+            as_.Pshuflw(xn, xn, int8_t{0x1B});
+            if (args.q) {
+              as_.Pshufhw(xn, xn, int8_t{0x1B});
+            } else {
+              mask_low64(xn);
+            }
+            break;
+          case 0b10:
+            if (args.q) {
+              as_.Pshufd(xn, xn, static_cast<int8_t>(0xB1));
+            } else {
+              as_.Pshufd(xn, xn, static_cast<int8_t>(0x01));
+              mask_low64(xn);
+            }
+            break;
+          default: Undefined(); return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // REV32 Vd.<T>, Vn.<T> — reverse element order within each 32-bit lane.
+      // size=00: byte reverse (8B / 16B) — BSWAPL per 32-bit lane.
+      // size=01: halfword reverse (4H / 8H) — PSHUFLW/HW imm=0xB1 (swap pairs).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev32: {
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {
+            SimdRegister xd = AllocTempSimdReg();
+            Register r1 = AllocTempReg();
+            if (xd == no_simd_register || r1 == no_register) { Undefined(); return; }
+            as_.Pxor(xd, xd);
+            int lanes = args.q ? 4 : 2;
+            for (int i = 0; i < lanes; ++i) {
+              as_.Pextrd(r1, xn, static_cast<int8_t>(i));
+              as_.Bswapl(r1);
+              as_.Pinsrd(xd, r1, static_cast<int8_t>(i));
+            }
+            as_.Movdqa(xn, xd);
+            break;
+          }
+          case 0b01:
+            as_.Pshuflw(xn, xn, static_cast<int8_t>(0xB1));
+            if (args.q) {
+              as_.Pshufhw(xn, xn, static_cast<int8_t>(0xB1));
+            } else {
+              mask_low64(xn);
+            }
+            break;
+          default: Undefined(); return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // REV16 Vd.<T>, Vn.<T> — reverse byte order within each 16-bit lane.
+      // size=00 only (8B / 16B). Compute: (Vn << 8) | (Vn >> 8) per halfword.
+      // PSLLW shifts each 16-bit lane left by 8 (high byte was lost, low byte
+      // moves to high). PSRLW shifts right by 8 in the saved copy (low byte
+      // was lost, high byte moves to low). OR'ing combines the byte-swapped
+      // result without needing a PSHUFB mask table.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev16: {
+        if (args.size != 0b00) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xt = AllocTempSimdReg();
+        if (xn == no_simd_register || xt == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqa(xt, xn);
+        as_.Psllw(xn, int8_t{8});
+        as_.Psrlw(xt, int8_t{8});
+        as_.Por(xn, xt);
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      default:
+        Undefined();
+        return;
+    }
+    // endregion
   }
 
   // region digitalis
@@ -2403,8 +3819,55 @@ class LiteTranslator {
   // endregion
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
-    UNUSED(args);
-    Undefined();
+    // region digitalis - JIT for USHLL (unsigned shift-left long) at
+    // 8B→8H / 4H→4S widening, used by calculate_gnu_hash_neon and many
+    // SIMD widening expansions. Other shift-imm opcodes fall back.
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdShiftImmOpcode::kUshll: {
+        // USHLL Vd.<wide>, Vn.<narrow>, #shift.
+        // ARM encoding: esize = 8 << highest-set-bit(immh).
+        // immh=0001 → 8B→8H, shift = (immh:immb) - 8
+        // immh=001x → 4H→4S, shift = (immh:immb) - 16
+        // immh=01xx → 2S→2D, shift = (immh:immb) - 32
+        uint8_t immh = args.immh;
+        if (immh == 0) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        // Q bit is which half of Vn to read; for the !q (low-half)
+        // form used by the linker, we read the D portion. Q=1 reads
+        // the upper half ("ushll2"): not implemented yet.
+        if (args.q) { Undefined(); return; }
+        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+        uint8_t shift_imm;
+        if (immh & 0b1000) {
+          // 2S → 2D
+          shift_imm = ((immh << 3) | args.immb) - 32;
+          as_.Pmovzxdq(xn, xn);
+          if (shift_imm != 0) as_.Psllq(xn, shift_imm);
+        } else if (immh & 0b0110) {
+          // 4H → 4S
+          shift_imm = ((immh << 3) | args.immb) - 16;
+          as_.Pmovzxwd(xn, xn);
+          if (shift_imm != 0) as_.Pslld(xn, shift_imm);
+        } else if (immh & 0b0001) {
+          // 8B → 8H
+          shift_imm = ((immh << 3) | args.immb) - 8;
+          as_.Pmovzxbw(xn, xn);
+          if (shift_imm != 0) as_.Psllw(xn, shift_imm);
+        } else {
+          Undefined(); return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      default:
+        Undefined();
+        return;
+    }
+    // endregion
   }
 
   // region digitalis
@@ -2508,6 +3971,47 @@ class LiteTranslator {
     if (is_sub) {
       as_.Xorl(Assembler::rax, static_cast<int32_t>(0x0100));
     }
+    int32_t flags_offset = offsetof(ThreadState, cpu.flags);
+    as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, Assembler::rax);
+  }
+  // endregion
+
+  // region digitalis: emit ARM FP-compare NZCV from x86 UCOMIS flags.
+  //
+  // UCOMISS/UCOMISD set ZF/PF/CF and leave SF/OF untouched, so the integer
+  // EmitStoreArmNZCV path (which copies SF into ARM N and OF into ARM V)
+  // produced random N and V.  Map the four ordered outcomes by jump-table:
+  //   x86 ZF PF CF   ARM NZCV (bit15 N, bit14 Z, bit8 C, bit0 V)   value
+  //   gt:  0 0 0  -> 0 0 1 0                                       0x0100
+  //   lt:  0 0 1  -> 1 0 0 0                                       0x8000
+  //   eq:  1 0 0  -> 0 1 1 0                                       0x4100
+  //   uo:  1 1 1  -> 0 0 1 1                                       0x0101
+  // The Movl-imm sequence below preserves EFLAGS (MOV doesn't touch them),
+  // so the Jcc reads UCOMISS's flags directly.
+  void EmitStoreArmFpNZCV() {
+    Assembler::Label* uo_label = as_.MakeLabel();
+    Assembler::Label* eq_label = as_.MakeLabel();
+    Assembler::Label* lt_label = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    as_.Movl(Assembler::rax, static_cast<int32_t>(0x0100));  // gt (default)
+    as_.Jcc(Condition::kParityEven, *uo_label);  // PF=1 -> unordered (NaN)
+    as_.Jcc(Condition::kEqual, *eq_label);       // ZF=1 (PF=0) -> equal
+    as_.Jcc(Condition::kBelow, *lt_label);       // CF=1 -> less
+    as_.Jmp(*done);                              // else gt
+
+    as_.Bind(lt_label);
+    as_.Movl(Assembler::rax, static_cast<int32_t>(0x8000));
+    as_.Jmp(*done);
+
+    as_.Bind(eq_label);
+    as_.Movl(Assembler::rax, static_cast<int32_t>(0x4100));
+    as_.Jmp(*done);
+
+    as_.Bind(uo_label);
+    as_.Movl(Assembler::rax, static_cast<int32_t>(0x0101));
+
+    as_.Bind(done);
     int32_t flags_offset = offsetof(ThreadState, cpu.flags);
     as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, Assembler::rax);
   }

@@ -141,6 +141,281 @@ class Decoder {
     // endregion
   };
 
+  // region digitalis
+  //
+  // MTE (Memory Tagging Extension, Armv8.5-A) data-processing 2-source
+  // opcodes. Encoding:
+  //   sf 0 S 11010110 Rm opcode Rn Rd
+  // where opcode = bits[15:10]. Distinguished from the regular
+  // DataProc2Src opcodes (which start at 0b000010) because MTE uses
+  // 0b000000, 0b000100, 0b000101; SUBP (opcode=0,S=0) and SUBPS
+  // (opcode=0,S=1) collide on opcode but differ on S, so we fold the
+  // S-bit into the enum as a synthetic kSubps value.
+  //
+  // llvm-mc verified (aarch64-linux-gnu-as -march=armv8.5-a+memtag):
+  //   irg   x0, x1     = 0x9adf1020  (sf=1, S=0, Rm=11111(XZR), opc=000100, Rn=1, Rd=0)
+  //   gmi   x0, x1, x2 = 0x9ac21420  (sf=1, S=0, Rm=2,          opc=000101, Rn=1, Rd=0)
+  //   subp  x0, x1, x2 = 0x9ac20020  (sf=1, S=0, Rm=2,          opc=000000, Rn=1, Rd=0)
+  //   subps x0, x1, x2 = 0xbac20020  (sf=1, S=1, Rm=2,          opc=000000, Rn=1, Rd=0)
+  enum class MteDataProcOpcode : uint8_t {
+    kSubp = 0b000000,    // SUBP  Xd, Xn|SP, Xm|SP — 56-bit signed Rn - Rm
+    kIrg  = 0b000100,    // IRG   Xd|SP, Xn|SP{, Xm} — identity (no MTE)
+    kGmi  = 0b000101,    // GMI   Xd, Xn|SP, Xm — pass-through Rm (no MTE)
+    kSubps = 0b1000000,  // SUBPS Xd, Xn|SP, Xm|SP — SUBP + set NZCV
+                         // (synthetic high bit; not on the wire)
+  };
+
+  struct MteDataProcArgs {
+    MteDataProcOpcode opcode;
+    uint8_t dst;   // Rd; for SUBP[S]/GMI dst=31 means XZR, for IRG dst=31 means SP.
+    uint8_t src1;  // Rn; src1=31 always means SP for MTE DP-2src.
+    uint8_t src2;  // Rm; src2=31 means XZR (or "no Rm" for IRG without Xm).
+  };
+
+  // MTE (Armv8.5-A) load/store memory tags.
+  //
+  // Encoding (ARM ARM C4.1.84.4):
+  //   11011001 opc 1 imm9 op2 Rn Rt
+  //     opc = bits[23:22]    op2 = bits[11:10]    imm9 = bits[20:12] (signed, granule-scaled)
+  //
+  // llvm-mc verified (aarch64-linux-gnu-as -march=armv8.5-a+memtag):
+  //   stg   x0,[x1],#16   = 0xd9201420  (opc=00, op2=01, imm9=1, post-index)
+  //   stg   x0,[x1,#16]   = 0xd9201820  (opc=00, op2=10, imm9=1, signed offset)
+  //   stg   x0,[x1,#16]!  = 0xd9201c20  (opc=00, op2=11, imm9=1, pre-index)
+  //   ldg   x0,[x1,#16]   = 0xd9601020  (opc=01, op2=00, imm9=1, signed offset, no writeback)
+  //   stzg  x0,[x1,#16]   = 0xd9601820  (opc=01, op2=10, imm9=1, signed offset)
+  //   st2g  x0,[x1,#32]   = 0xd9a02820  (opc=10, op2=10, imm9=2, signed offset)
+  //   stz2g x0,[x1,#32]   = 0xd9e02820  (opc=11, op2=10, imm9=2, signed offset)
+  //
+  // op2 encodes the index mode (and, for opc=01, picks LDG vs STZG):
+  //   0b00 = signed offset, no writeback (only valid for opc=01 => LDG)
+  //   0b01 = post-index (writeback Xn += imm after access)
+  //   0b10 = signed offset, no writeback
+  //   0b11 = pre-index (writeback Xn += imm before access)
+  enum class MteLoadStoreOpcode : uint8_t {
+    kStg,    // store tag — NOP without MTE backing
+    kLdg,    // load tag into Rt[59:56] — without MTE, loaded tag is 0
+    kStzg,   // store tag + zero 16-byte granule
+    kSt2g,   // store double tag (32-byte granule) — NOP without MTE backing
+    kStz2g,  // store double tag + zero 32-byte granule
+  };
+
+  struct MteLoadStoreArgs {
+    MteLoadStoreOpcode opcode;
+    uint8_t rn;       // base; rn=31 means SP.
+    uint8_t rt;       // data/dest; rt=31 means XZR.
+    int32_t imm;      // sign-extended imm9 << 4 (already scaled by 16-byte granule).
+    uint8_t op2;      // 0b00=offset-no-wb (LDG), 0b01=post, 0b10=offset, 0b11=pre.
+  };
+  // endregion
+
+  // region digitalis
+  // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
+  //
+  // Encoding (observed bits, llvm-mc-verified with
+  //   aarch64-linux-gnu-as -march=armv8.3-a):
+  //   bit31=0, bit30=Q, bit29=1 (U), bits[28:24]=01110, bits[23:22]=size,
+  //   bit21=0, bits[20:16]=Rm, bit15=1, bit14=1, bit10=1, bits[9:5]=Rn,
+  //   bits[4:0]=Rd.
+  // FCADD: bit13=1, bit12=rot (0=#90, 1=#270), bit11=0.
+  // FCMLA: bit13=0, bits[12:11]=rot (00=#0, 01=#90, 10=#180, 11=#270).
+  //
+  // Verified encodings:
+  //   fcadd v0.4s,v1.4s,v2.4s,#90   = 0x6e82e420  (size=10, Q=1, bit12=0)
+  //   fcadd v0.4s,v1.4s,v2.4s,#270  = 0x6e82f420  (size=10, Q=1, bit12=1)
+  //   fcadd v0.2d,v1.2d,v2.2d,#90   = 0x6ec2e420  (size=11, Q=1, bit12=0)
+  //   fcadd v0.2s,v1.2s,v2.2s,#90   = 0x2e82e420  (size=10, Q=0)
+  //   fcmla v0.4s,v1.4s,v2.4s,#0    = 0x6e82c420  (size=10, Q=1, bits[12:11]=00)
+  //   fcmla v0.4s,v1.4s,v2.4s,#90   = 0x6e82cc20  (size=10, Q=1, bits[12:11]=01)
+  //   fcmla v0.4s,v1.4s,v2.4s,#180  = 0x6e82d420  (size=10, Q=1, bits[12:11]=10)
+  //   fcmla v0.4s,v1.4s,v2.4s,#270  = 0x6e82dc20  (size=10, Q=1, bits[12:11]=11)
+  //   fcmla v0.2d,v1.2d,v2.2d,#90   = 0x6ec2cc20  (size=11, Q=1)
+  //
+  // size: 00 reserved, 01 = half-precision (FP16 — Digitalis treats as
+  // Undefined for now; FP16 SIMD support is a separate plan item under),
+  // 10 = single, 11 = double.  For size=11 only Q=1 (2D) is valid; the
+  // half-vector "1D" form is reserved.
+  enum class FcmaOpcode : uint8_t {
+    kFcadd,
+    kFcmla,
+  };
+
+  struct FcmaArgs {
+    FcmaOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t size;     // raw bits[23:22] — 10 = single, 11 = double.
+    uint8_t rot;      // FCADD: 0=#90, 1=#270; FCMLA: 0=#0, 1=#90, 2=#180, 3=#270.
+    bool q;           // bit[30] — 0 = 64-bit vector, 1 = 128-bit vector.
+  };
+  // endregion
+
+  // region digitalis indexed FCMLA
+  // Advanced SIMD complex floating-point by element (Armv8.3-FCMA): FCMLA.
+  //
+  // FCADD has no by-element form; only FCMLA has an indexed encoding.
+  //
+  // Encoding (ARM ARM C7.2.86, verified via llvm-mc — handoff-58):
+  //   bit31=0, bit30=Q, bit29=1 (U), bits[28:24]=01111,
+  //   bits[23:22]=size, bit21=L, bit20=M, bits[19:16]=Rm[3:0],
+  //   bit15=0, bits[14:13]=rot, bit12=1, bit11=H, bit10=0,
+  //   bits[9:5]=Rn, bits[4:0]=Rd.
+  //
+  // The size field is 2-bit raw bits[23:22]:
+  //   size==0b01: FP16, Vd is .4h (Q=0) or .8h (Q=1).
+  //   size==0b10: FP32, Vd is .4s (Q=1 ONLY — .2s reserved).
+  //   size==0b00 / 0b11: reserved.
+  // FP32 size=0b10 SHARES the raw size value with FMLA-by-element FP32
+  // — the distinguisher is U: FMLA/FMLS use U=0, FCMLA-idx uses U=1.
+  //
+  // index width:
+  //   FP16: H:L (2 bits, 0..3 — Vm.8H has 4 complex pairs).
+  //   FP32: H (1 bit, 0..1 — Vm.4S has 2 complex pairs); L must be 0.
+  //
+  // Vm: M:Rm[3:0] (5 bits).
+  //
+  // Without this carve-out, FMLA-pattern opcodes 0001/0101 with U=1 hit
+  // the existing `case 0b0001/case 0b0101: if (u) Undefined()` branches,
+  // while rot=1 (0011) and rot=3 (0111) fall through to the default
+  // Undefined.  None of those four paths surface to the consumer.
+  //
+  // llvm-mc-verified encodings (handoff-58):
+  //   fcmla v0.4s, v1.4s, v2.s[0], #0   = 0x6F821020
+  //   fcmla v0.4s, v1.4s, v2.s[1], #0   = 0x6F821820  (H=1)
+  //   fcmla v0.4s, v1.4s, v2.s[0], #90  = 0x6F823020  (rot=01)
+  //   fcmla v0.4s, v1.4s, v2.s[1], #90  = 0x6F823820
+  //   fcmla v0.4s, v1.4s, v2.s[0], #180 = 0x6F825020  (rot=10)
+  //   fcmla v0.4s, v1.4s, v2.s[1], #180 = 0x6F825820
+  //   fcmla v0.4s, v1.4s, v2.s[0], #270 = 0x6F827020  (rot=11)
+  //   fcmla v0.4s, v1.4s, v2.s[1], #270 = 0x6F827820
+  //   fcmla v0.4s, v1.4s, v17.s[0], #0  = 0x6F911020  (Vm=10001)
+  //
+  // FP16-indexed FCMLA is parked alongside non-indexed FP16 (handoff-49
+  // rejects size==FP16 as "no Digitalis FP16-SIMD FCMA yet").  Even
+  // though handoff-57 added FP16 vector three-same support (), the
+  // family hasn't been extended yet; doing both at once would bundle two
+  // task blocks.  Future work: lift the FP16 reject in both indexed and
+  // non-indexed paths together.
+  enum class FcmaIdxOpcode : uint8_t {
+    kFcmlaIdx,
+  };
+
+  struct FcmaIdxArgs {
+    FcmaIdxOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t index;    // 0..1 for FP32 (1-bit H); 0..3 for FP16 (2-bit H:L).
+    uint8_t size;     // 0b10 = FP32 only (FP16 parked).
+    uint8_t rot;      // 0=#0, 1=#90, 2=#180, 3=#270.
+    bool q;           // bit[30] — false = .2s (1 pair), true = .4s (2 pairs).
+  };
+  // endregion
+
+  // region digitalis
+  // Advanced SIMD BFloat16 three-same-extra (Armv8.6-BF16):
+  //   BFDOT (vector), BFMMLA.
+  //
+  // Encoding (verified via aarch64-linux-gnu-as -march=armv8.6-a):
+  //   bit31=0, bit30=Q, bit29=1 (U), bits[28:24]=01110, bits[23:22]=01,
+  //   bit21=0, bits[20:16]=Rm, bit15=1, bit14=1, bit13=1, bit11=1, bit10=1,
+  //   bits[9:5]=Rn, bits[4:0]=Rd.
+  //   bit12 = 1  ->  BFDOT
+  //   bit12 = 0  ->  BFMMLA   (requires Q=1 — only 4S form exists)
+  //
+  // Verified encodings:
+  //   bfdot v0.4s, v1.8h, v2.8h   = 0x6e42fc20  (Q=1)
+  //   bfdot v0.2s, v1.4h, v2.4h   = 0x2e42fc20  (Q=0)
+  //   bfmmla v0.4s, v1.8h, v2.8h  = 0x6e42ec20  (Q=1)
+  //
+  // BFDOT semantics: 32-bit accumulation lanes; each lane is FP32 += dot
+  // product of two BF16 pairs from Vn,Vm.  2S form (Q=0) covers 2 lanes,
+  // 4S form (Q=1) covers 4 lanes.
+  //
+  // BFMMLA semantics: Vd.4S viewed as 2x2 FP32 matrix; Vn.8H / Vm.8H
+  // viewed as 2x4 BF16 matrices; computes Vd += Vn * Vm^T per the
+  // ARM ARM C7.2.55 pseudo-code.  Always 128-bit (Q=1).
+  //
+  // Handoff-51 follow-ups (Armv8.6-BF16 surface closeout):
+  //   - kBfmlalbVec / kBfmlaltVec — BFMLALB/BFMLALT (vector).
+  //     Per-FP32-lane widening MAC; B=even (h[2i]), T=odd (h[2i+1]).
+  //     Encoding: bits[28:24]=01110, bits[23:22]=11, bit21=0,
+  //     bits[15:10]=111111. bit30 is the T discriminator (Q implicit 1).
+  //     llvm-mc: bfmlalb v0.4s,v1.8h,v2.8h = 0x2ec2fc20,
+  //              bfmlalt v0.4s,v1.8h,v2.8h = 0x6ec2fc20.
+  //   - kBfdotIdx — BFDOT (by element).
+  //     Encoding: bits[28:24]=01111, bits[23:22]=01, bit10=0,
+  //     opcode bits[15:12]=1111. Vm = M:Rm[3:0] (V0..V31), index = H:L.
+  //     Q selects 2S vs 4S form (.2s or .4s).
+  //     llvm-mc: bfdot v0.4s,v1.8h,v2.2h[0] = 0x4f42f020.
+  //   - kBfmlalbIdx / kBfmlaltIdx — BFMLALB/BFMLALT (by element).
+  //     Encoding: bits[28:24]=01111, bits[23:22]=11, bit10=0,
+  //     opcode bits[15:12]=1111. Vm = Rm[3:0] (V0..V15), index = H:L:M.
+  //     bit30 is the T discriminator (Q implicit 1, dest always .4s).
+  //     llvm-mc: bfmlalb v0.4s,v1.8h,v2.h[0] = 0x0fc2f020,
+  //              bfmlalt v0.4s,v1.8h,v2.h[7] = 0x4ff2f820.
+  enum class Bf16ThreeSameOpcode : uint8_t {
+    kBfdot,
+    kBfmmla,
+    kBfmlalbVec,    // BFMLALB (vector)
+    kBfmlaltVec,    // BFMLALT (vector)
+    kBfdotIdx,      // BFDOT (by element)
+    kBfmlalbIdx,    // BFMLALB (by element)
+    kBfmlaltIdx,    // BFMLALT (by element)
+  };
+
+  struct Bf16ThreeSameArgs {
+    Bf16ThreeSameOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t index;  // 0..3 for kBfdotIdx; 0..7 for kBfmlal{b,t}Idx; 0 otherwise.
+    bool q;         // True selects 4S/.4s form; BFMMLA & BFMLAL ops always pass true.
+  };
+  // endregion
+
+  // region digitalis hello-dotprod
+  // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT, vector
+  // and by-element forms.
+  //
+  // Semantics: each 32-bit output lane accumulates the dot product of a
+  // 4-byte group from Vn against a 4-byte group from Vm.
+  //   for each output lane i:
+  //     for k in [0..4):
+  //       n_byte = Vn.b[4*i + k]              (signed for SDOT, unsigned for UDOT)
+  //       m_byte = vector form: Vm.b[4*i + k]
+  //                indexed form: Vm.b[4*index + k]  (one 4-byte group broadcast)
+  //       Vd.s[i] += ext(n_byte) * ext(m_byte)
+  //   lanes = q ? 4 : 2 (Q selects .4s vs .2s).  For Q=0 the upper 64 bits of
+  //   Vd are zeroed.
+  //
+  // Verified encodings (clang --target=aarch64 -march=armv8.4-a+dotprod):
+  //   sdot v0.4s, v1.16b, v2.16b      = 0x4e829420  (vector, Q=1, U=0)
+  //   udot v0.4s, v1.16b, v2.16b      = 0x6e829420  (vector, Q=1, U=1)
+  //   sdot v0.2s, v1.8b,  v2.8b       = 0x0e829420  (vector, Q=0, U=0)
+  //   udot v0.2s, v1.8b,  v2.8b       = 0x2e829420  (vector, Q=0, U=1)
+  //   sdot v0.4s, v1.16b, v2.4b[0]    = 0x4f82e020  (idx, Q=1, U=0, index=0)
+  //   udot v0.4s, v1.16b, v2.4b[3]    = 0x6fa2e820  (idx, Q=1, U=1, index=3)
+  //   sdot v0.2s, v1.8b,  v2.4b[0]    = 0x0f82e020  (idx, Q=0, U=0, index=0)
+  //   udot v0.2s, v1.8b,  v2.4b[3]    = 0x2fa2e820  (idx, Q=0, U=1, index=3)
+  enum class DotProductOpcode : uint8_t {
+    kSdot,      // SDOT vector
+    kUdot,      // UDOT vector
+    kSdotIdx,   // SDOT by element
+    kUdotIdx,   // UDOT by element
+  };
+
+  struct DotProductArgs {
+    DotProductOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t index;  // 0..3 for indexed forms; 0 for vector forms.
+    bool q;         // True selects .4s form (4 lanes); false selects .2s (2 lanes).
+  };
+  // endregion
+
   //
   // Data Processing (3-source) opcodes.
   //
@@ -492,11 +767,20 @@ class Decoder {
     kLdar,     // Load acquire
     kStlr,     // Store release
     kCas,      // Compare and swap
+    // region digitalis CASP (compare-and-swap pair, Armv8.1 LSE).
+    kCasp,     // Compare and swap pair (Rs:Rs+1 = expected, Rt:Rt+1 = new)
+    // endregion
     kSwp,      // Swap
     kLdadd,    // Atomic add
     kLdclr,    // Atomic bit clear
     kLdset,    // Atomic bit set
     kLdeor,    // Atomic exclusive or
+    // region digitalis atomic min/max (LSE Armv8.1).
+    kLdsmax,   // Atomic signed max
+    kLdsmin,   // Atomic signed min
+    kLdumax,   // Atomic unsigned max
+    kLdumin,   // Atomic unsigned min
+    // endregion
   };
 
   struct LoadStoreExclusiveArgs {
@@ -616,8 +900,17 @@ class Decoder {
     uint8_t rd;        // Destination SIMD register
     uint8_t rn;        // First source SIMD register
     uint8_t rm;        // Second source SIMD register
-    uint8_t size;      // Element size: 00=8b, 01=16b, 10=32b, 11=64b
+    uint8_t size;      // Element size: 00=8b, 01=16b, 10=32b, 11=64b.
+                       // For the FP three-same encoding the decoder already
+                       // collapses {op_high, sz} to sz here (0=single, 1=double);
+                       // when is_fp16 is set, the lanes are 2-byte half.
     bool q;            // Q bit: 0=64-bit vector (D regs), 1=128-bit vector (Q regs)
+    // region digitalis: Armv8.2-FP16 NEON vector three-same.
+    // FP16 vector three-same has a separate encoding (bit21=0, bits[15:14]=00,
+    // bit22=1) from the standard three-same (bit21=1).  The decoder maps both
+    // through this struct and the interpreter dispatches on this flag.
+    bool is_fp16;
+    // endregion
   };
   // endregion
 
@@ -710,6 +1003,13 @@ class Decoder {
     kFsqrt = 0b000011,
     kFcvtToOther1 = 0b000100,  // FCVT to the other single/double
     kFcvtToOther2 = 0b000101,  // FCVT to half or from half
+    // region digitalis
+    // BFCVT <Hd>, <Sn>: FP32 single -> BFloat16 with round-to-nearest-even.
+    // Encoded with ftype=01 (the 6-bit opcode + ftype together discriminate
+    // this from the FCVT-from-double cases above).  llvm-mc-verified:
+    //   bfcvt h0, s1  =  0x1e634020
+    kBfcvt = 0b000110,
+    // endregion
     kFrintn = 0b001000,
     kFrintp = 0b001001,
     kFrintm = 0b001010,
@@ -760,6 +1060,20 @@ class Decoder {
     bool signal_nans; // true = FCMPE (signal all NaNs)
   };
 
+  // region digitalis
+  // FP conditional compare args (FCCMP, FCCMPE).
+  // If cond evaluates true, perform an FP compare (FCMP-style for FCCMP, FCMPE-style for FCCMPE)
+  // and set NZCV; else copy nzcv immediate directly into NZCV.
+  struct FpConditionalCompareArgs {
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t nzcv;        // 4-bit NZCV immediate written when condition is false
+    Condition cond;      // Condition selecting compare-vs-imm path
+    uint8_t ftype;       // 00=S, 01=D
+    bool signal_nans;    // true = FCCMPE, false = FCCMP
+  };
+  // endregion
+
   //
   // AdvSIMD two-reg misc opcodes.
   //
@@ -808,6 +1122,39 @@ class Decoder {
     kFrecpeV,   // FRECPE (vector): U=0, opcode=11101, bit23=1
     kFrsqrteV,  // FRSQRTE (vector): U=1, opcode=11101, bit23=1
     kFsqrtV,    // FSQRT  (vector): U=1, opcode=11111, bit23=1
+    // region digitalis - FCVT* vector rounding-mode variants.
+    // Encoding follows the bit23 ("a") + opcode ("op") split in DDI 0487.
+    // Pair  (signed,unsigned) -> bit U.
+    kFcvtnsV,   // FCVTNS (vector, round-to-nearest ties-even): U=0, opcode=11010, bit23=0
+    kFcvtnuV,   // FCVTNU: U=1, opcode=11010, bit23=0
+    kFcvtmsV,   // FCVTMS (vector, round toward -inf): U=0, opcode=11011, bit23=0
+    kFcvtmuV,   // FCVTMU: U=1, opcode=11011, bit23=0
+    kFcvtpsV,   // FCVTPS (vector, round toward +inf): U=0, opcode=11010, bit23=1
+    kFcvtpuV,   // FCVTPU: U=1, opcode=11010, bit23=1
+    kFcvtasV,   // FCVTAS (vector, round-to-nearest ties-away): U=0, opcode=11100, bit23=0
+    kFcvtauV,   // FCVTAU: U=1, opcode=11100, bit23=0
+    // endregion
+    // region digitalis BFCVTN/BFCVTN2 (Armv8.6-BF16).
+    // Vector narrow FP32 -> BF16. Encoding shares opcode=10110 with FCVTN,
+    // but uses size=10 (vs FCVTN's size=00/01). bit30 = Q: Q=0 -> BFCVTN
+    // (writes low 4H of Vd, upper 64 bits zeroed); Q=1 -> BFCVTN2 (writes
+    // upper 4H of Vd, low 64 bits preserved).
+    //   llvm-mc: bfcvtn  v0.4h, v1.4s  = 0x0ea16820
+    //            bfcvtn2 v0.8h, v1.4s  = 0x4ea16820
+    kBfcvtn,    // BFCVTN/BFCVTN2 (vector narrow FP32->BF16).
+    // endregion
+    // region digitalis a=0 column: FP16 vector FRINT* (round to
+    // integral). Currently only the FP16 form of these is decoded (via
+    // DecodeAdvSimdFp16TwoRegMisc); the std FP32/FP64 two-reg-misc dispatch
+    // still routes opcodes 11000/11001 to Undefined() for now.
+    kFrintnV,   // FRINTN  (ties-to-even):          a=0, U=0, opcode=11000
+    kFrintaV,   // FRINTA  (ties-away):             a=0, U=1, opcode=11000
+    kFrintmV,   // FRINTM  (toward -inf):           a=0, U=0, opcode=11001
+    kFrintxV,   // FRINTX  (use current rounding):  a=0, U=1, opcode=11001
+    kFrintpV,   // FRINTP  (toward +inf):           a=1, U=0, opcode=11000
+    kFrintzV,   // FRINTZ  (toward zero):           a=1, U=0, opcode=11001
+    kFrintiV,   // FRINTI  (use current rounding):  a=1, U=1, opcode=11001
+    // endregion
     // endregion
   };
 
@@ -831,6 +1178,14 @@ class Decoder {
     uint8_t size;     // element size: 00=8b, 01=16b, 10=32b, 11=64b
     bool q;           // Q bit: 0=64-bit vector, 1=128-bit vector
     bool u;           // U bit from encoding
+    // region digitalis: Armv8.2-FP16 vector two-reg-misc.
+    // The FP16 encoding (DDI 0487 C7.2 "Advanced SIMD two-register
+    // miscellaneous (FP16)") shares this struct.  When set, lanes are
+    // 2-byte half and `size` carries no meaning (set to 0 by the FP16
+    // dispatcher).  The interpreter reads is_fp16 inside each opcode
+    // case and dispatches via FpHalfToSingle / FpSingleToHalf as.
+    bool is_fp16;
+    // endregion
   };
 
   // region digitalis
@@ -1435,16 +1790,63 @@ class Decoder {
     // NOP and other HINT instructions: SYS with CRn=0010, op0=00.
     if (op0 == 0b00 && l == 0) {
       if (crn == 0b0010) {
-        // HINT instructions: NOP is CRm=0000, op2=000, Rt=11111.
-        // DMB: CRn=0011, CRm=barrier_type, op2=001
-        // DSB: CRn=0011, CRm=barrier_type, op2=100
-        // ISB: CRn=0011, CRm=barrier_type, op2=110
+        // region digitalis hint audit (HINT #N = CRm:op2[2:0]).
+        // The HINT (CRn=0010) space encodes a 7-bit hint number formed
+        // by CRm:op2.  At EL0 every hint we see should be treated as a
+        // no-op — the kernel handles any real sleep / wake / barrier
+        // semantics, and we never run at EL1.  Encodings verified with
+        // llvm-mc (clang-r563880c, armv8.5-a):
+        //   NOP   = CRm=0000, op2=000  (HINT #0)
+        //   YIELD = CRm=0000, op2=001  (HINT #1)
+        //   WFE   = CRm=0000, op2=010  (HINT #2)
+        //   WFI   = CRm=0000, op2=011  (HINT #3)
+        //   SEV   = CRm=0000, op2=100  (HINT #4)
+        //   SEVL  = CRm=0000, op2=101  (HINT #5)
+        //   DGH   = CRm=0000, op2=110  (HINT #6, Armv8.6-DGH)
+        //   ESB   = CRm=0010, op2=000  (HINT #16, Armv8.2-RAS)
+        //   CSDB  = CRm=0010, op2=100  (HINT #20, Armv8.0-PRED)
+        //   PAC/AUT-1716, BTI, etc. also live here at higher hint
+        //   numbers.  All are correctly NOPed for binary translation.
+        // explicit BTI audit (handoff-45): BTI guards live in
+        // the HINT space with CRm=0100; the four variants are
+        //   BTI    = CRm=0100, op2=000  (HINT #32 = 0x20)
+        //   BTI c  = CRm=0100, op2=010  (HINT #34 = 0x22)
+        //   BTI j  = CRm=0100, op2=100  (HINT #36 = 0x24)
+        //   BTI jc = CRm=0100, op2=110  (HINT #38 = 0x26)
+        // The intervening odd-op2 encodings (HINT #33/35/37/39) are
+        // reserved BTI placeholders and decode as plain NOP on hardware
+        // that does not implement BTI — exactly what we want here.  All
+        // of HINT #32–#39 (the full 0x20–0x27 block called out in the
+        // plan) share CRn=0010 with the other hints above and reach
+        // this `Nop()` call, never `Undefined()`.  Verified by
+        // hello-bti sample (compiled with -mbranch-protection=bti):
+        // every indirect-branch entry point starts with a BTI guard
+        // and all four mnemonics also appear as explicit inline-asm
+        // probes — process must not SIGILL.
+        // endregion
         insn_consumer_->Nop();
         return;
       }
       if (crn == 0b0011) {
-        // Barrier instructions: DMB, DSB, ISB.
-        // For now, treat as NOP (barriers are handled by host memory model).
+        // region digitalis barrier audit (CRn=0011).
+        // Memory and synchronization barriers.  Op2 selects the variant:
+        //   CLREX = CRn=0011, CRm=imm,  op2=010
+        //   DSB   = CRn=0011, CRm=opt,  op2=100  (incl. "DFB" — full)
+        //   DMB   = CRn=0011, CRm=opt,  op2=101
+        //   ISB   = CRn=0011, CRm=imm,  op2=110
+        //   SB    = CRn=0011, CRm=0000, op2=111  (Armv8.5-SB)
+        //   TSB CSYNC = CRn=0011, CRm=0010, op2=010 (Armv8.4-TRBE)
+        // x86_64 already provides total store order with locked atomics
+        // (see kCas/kSwp/kLdadd handlers in interpreter.h and
+        // lite_translator.h: every LSE op uses `lock` or `xchg`).  ISB
+        // is unnecessary because we never patch code in-flight from the
+        // guest's perspective; the JIT cache is invalidated through
+        // the translator's own mechanism, not via guest ISB.  CLREX
+        // clears the LL/SC exclusive monitor, which we don't model
+        // (Digitalis emulates LDXR/STXR pairs as cmpxchg, see
+        //). Routing the whole CRn=0011 class to Nop is therefore
+        // correct.
+        // endregion
         insn_consumer_->Nop();
         return;
       }
@@ -1494,10 +1896,25 @@ class Decoder {
   void DecodeBranchReg() {
     uint8_t opc = GetBits<21, 4>();
     uint8_t rn = GetBits<5, 5>();
+    // region digitalis PAuth BR/BLR/RET variants (Armv8.3-PAuth).
+    // op3 = bits[15:10] distinguishes the PAC variants from the plain ones:
+    //   000000 = no PAC; 000010 = A-key PAC; 000011 = B-key PAC.
+    // BRAAZ/BRABZ (opc=0000) and BLRAAZ/BLRABZ (opc=0001) already route
+    // correctly through the existing BR/BLR cases since Rn carries the
+    // actual target and op4 is ignored.  RETAA/RETAB (opc=0010, op3!=0)
+    // need the implicit LR (X30) as the source — the encoding hardcodes
+    // Rn=11111 (XZR) which would otherwise be misrouted.  BRAA/BRAB
+    // (opc=1000) and BLRAA/BLRAB (opc=1001) currently bail to Undefined.
+    // PAC modifier in op4/Rm is ignored: Digitalis never inserts PAC bits
+    // into pointers (see handoff-30), so Rn already holds the clean
+    // target — no masking is needed.
+    uint8_t op3 = GetBits<10, 6>();
+    bool is_pac = (op3 == 0b000010 || op3 == 0b000011);
+    // endregion
 
     switch (opc) {
       case 0b0000: {
-        // BR Xn
+        // BR Xn, BRAAZ Xn, BRABZ Xn.
         const BranchRegArgs args = {
             .src = rn,
             .link_reg = 0,
@@ -1508,7 +1925,7 @@ class Decoder {
         break;
       }
       case 0b0001: {
-        // BLR Xn
+        // BLR Xn, BLRAAZ Xn, BLRABZ Xn.
         const BranchRegArgs args = {
             .src = rn,
             .link_reg = 30,
@@ -1519,9 +1936,13 @@ class Decoder {
         break;
       }
       case 0b0010: {
-        // RET {Xn} (default Xn = X30)
+        // RET {Xn} (default Xn = X30), RETAA, RETAB.
+        // region digitalis: RETAA/RETAB are encoded with Rn=11111
+        // but the architectural source register is implicitly X30 (LR).
+        uint8_t src = is_pac ? 30 : rn;
+        // endregion
         const BranchRegArgs args = {
-            .src = rn,
+            .src = src,
             .link_reg = 0,
             .is_link = false,
             .is_ret = true,
@@ -1529,6 +1950,32 @@ class Decoder {
         insn_consumer_->BranchReg(args);
         break;
       }
+      // region digitalis BRAA/BRAB/BLRAA/BLRAB (Armv8.3-PAuth).
+      case 0b1000: {
+        // BRAA Xn, Xm / BRAB Xn, Xm.
+        if (!is_pac) { Undefined(); return; }
+        const BranchRegArgs args = {
+            .src = rn,
+            .link_reg = 0,
+            .is_link = false,
+            .is_ret = false,
+        };
+        insn_consumer_->BranchReg(args);
+        break;
+      }
+      case 0b1001: {
+        // BLRAA Xn, Xm / BLRAB Xn, Xm.
+        if (!is_pac) { Undefined(); return; }
+        const BranchRegArgs args = {
+            .src = rn,
+            .link_reg = 30,
+            .is_link = true,
+            .is_ret = false,
+        };
+        insn_consumer_->BranchReg(args);
+        break;
+      }
+      // endregion
       default:
         Undefined();
         break;
@@ -1623,6 +2070,17 @@ class Decoder {
     //           size[31:30] 111 0 01xx ... (unsigned offset)
     if (op_28_27 == 0b11 && op_26 == 0) {
       if (op_24) {
+        // region digitalis
+        // MTE load/store memory tags (LDG/STG/ST2G/STZG/STZ2G):
+        //   bits[31:24]=11011001, bit[21]=1.
+        // op_29=0 distinguishes from ordinary LDR/STR (unsigned imm), which
+        // has op_29=1. size==11 is required by the MTE encoding; other
+        // bits[31:30] with op_29=0 here are unallocated per ARM ARM.
+        if (op_29 == 0 && GetBits<30, 2>() == 0b11 && GetBits<21, 1>()) {
+          DecodeLoadStoreMemTag();
+          return;
+        }
+        // endregion
         // bit[24]=1: Load/store register (unsigned immediate).
         DecodeLoadStoreUnsignedImm();
         return;
@@ -1660,6 +2118,45 @@ class Decoder {
     // Catch-all for other load/store variants not yet implemented (SIMD, exclusive, etc.).
     Undefined();
   }
+
+  // region digitalis
+  // MTE load/store memory tags: LDG / STG / ST2G / STZG / STZ2G.
+  // Common encoding: 11011001 opc 1 imm9 op2 Rn Rt
+  // See `MteLoadStoreOpcode` for the per-opcode encoding citations.
+  void DecodeLoadStoreMemTag() {
+    uint8_t opc = GetBits<22, 2>();
+    int32_t imm9 = static_cast<int32_t>(GetBits<12, 9>());
+    if (imm9 & (1 << 8)) imm9 |= ~0x1FF;  // Sign-extend bit[8].
+    int32_t imm = imm9 * 16;              // Scale by 16-byte tag granule.
+    uint8_t op2 = GetBits<10, 2>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rt = GetBits<0, 5>();
+
+    // Map (opc, op2) -> opcode. op2=00 is reserved except for opc=01 (LDG).
+    MteLoadStoreOpcode mte_op;
+    if (opc == 0b00 && op2 != 0b00) {
+      mte_op = MteLoadStoreOpcode::kStg;
+    } else if (opc == 0b01 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kLdg;
+    } else if (opc == 0b01 && op2 != 0b00) {
+      mte_op = MteLoadStoreOpcode::kStzg;
+    } else if (opc == 0b10 && op2 != 0b00) {
+      mte_op = MteLoadStoreOpcode::kSt2g;
+    } else if (opc == 0b11 && op2 != 0b00) {
+      mte_op = MteLoadStoreOpcode::kStz2g;
+    } else {
+      return Undefined();
+    }
+
+    insn_consumer_->MteLoadStore({
+        .opcode = mte_op,
+        .rn = rn,
+        .rt = rt,
+        .imm = imm,
+        .op2 = op2,
+    });
+  }
+  // endregion
 
   void DecodeLoadStoreUnsignedImm() {
     uint8_t size = GetBits<30, 2>();
@@ -2070,6 +2567,15 @@ class Decoder {
     }
 
     // region digitalis
+    // Floating-point conditional compare: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=01
+    // Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv  (op: 0=FCCMP, 1=FCCMPE)
+    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b01) {
+      DecodeFpConditionalCompare();
+      return;
+    }
+    // endregion
+
+    // region digitalis
     // FCSEL: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=11
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b11) {
       DecodeFpCondSelect();
@@ -2088,6 +2594,91 @@ class Decoder {
     // AdvSIMD three different: bit31=0, bits[28:24]=01110, bit21=1, bits[11:10]=00
     if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b00) {
       DecodeAdvSimdThreeDiff();
+      return;
+    }
+    // endregion
+
+    // region digitalis
+    // AdvSIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT, BFMMLA,
+    // BFMLALB, BFMLALT (vector forms).
+    //   bit31=0, bit29=1, bits[28:24]=01110, bits[23:22] ∈ {01, 11},
+    //   bit21=0, bit15=1, bit14=1, bit13=1, bit11=1, bit10=1.
+    // Inner dispatch (DecodeAdvSimdBf16ThreeSame) picks per-size:
+    //   size=01: bit12=1 -> BFDOT (vector); bit12=0 -> BFMMLA (Q=1 only).
+    //   size=11: bit12=1 -> BFMLALB (bit30=0) / BFMLALT (bit30=1).
+    // Must precede the FCMA dispatch below since they share bit15=1,
+    // bit14=1, bit10=1 with bit21=0; for size=01 the FCMA inner decode
+    // would reject the encoding (FCMA needs size>=10), and for size=11
+    // FCMA's FCADD path requires bit11=0 (BFMLAL has bit11=1) so it
+    // would reject as Undefined.  Either way, without this carve-out
+    // BF16 ops silently SIGILL.
+    if (!bit31 && GetBits<29, 1>() && GetBits<24, 5>() == 0b01110 &&
+        (GetBits<22, 2>() == 0b01 || GetBits<22, 2>() == 0b11) &&
+        !GetBits<21, 1>() &&
+        GetBits<15, 1>() && GetBits<14, 1>() && GetBits<13, 1>() &&
+        GetBits<11, 1>() && GetBits<10, 1>()) {
+      DecodeAdvSimdBf16ThreeSame();
+      return;
+    }
+    // endregion
+
+    // region digitalis
+    // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
+    //   bit31=0, bits[28:24]=01110, bit21=0, bit15=1, bit14=1, bit10=1.
+    // Must precede three-same / permute / copy / two-reg-misc to avoid
+    // mis-routing the FCMA encoding bits.  Three-same itself requires
+    // bit21=1, so there's no overlap there; but the other AdvSIMD shapes
+    // that have bit21=0 all require bit15=0 or bit14=0 or bit10=0, so
+    // pinning bit15=1, bit14=1, bit10=1 carves the FCMA subspace cleanly.
+    // Other three-same-extra opcodes (SDOT, UDOT, SQRDMLAH, SQRDMLSH,
+    // USDOT, BF*) all have bit14=0 in their opcode field, so the
+    // bit14=1 guard keeps this branch FCMA-only.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<21, 1>() &&
+        GetBits<15, 1>() && GetBits<14, 1>() && GetBits<10, 1>()) {
+      DecodeAdvSimdFcma();
+      return;
+    }
+    // endregion
+
+    // region digitalis hello-dotprod
+    // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT (vector).
+    //   bit31=0, bits[28:24]=01110, bits[23:21]=100 (so bits[23:22]=10
+    //   and bit21=0), bits[15:10]=100101 (bit15=1, bit14=0, bit13=0,
+    //   bit12=1, bit11=0, bit10=1).  bit30=Q, bit29=U (0=SDOT, 1=UDOT).
+    // Verified from clang --target=aarch64 -march=armv8.4-a+dotprod:
+    //   sdot v0.4s,v1.16b,v2.16b = 0x4e829420 — bit23=1, bit22=0.
+    // Must precede the generic three-same / permute / copy / two-reg-misc
+    // decoders that share the bits[28:24]=01110 prefix.  Three-same proper
+    // requires bit21=1, so there's no overlap; permute / copy require
+    // bit15=0; two-reg-misc requires bit21=1; FCMA (above) requires
+    // bit14=1; BF16 three-same-extra (above) requires bits[23:22] ∈ {01,
+    // 11} — DotProd uses bits[23:22]=10, so no conflict.  Without this
+    // carve-out SDOT/UDOT silently fall through and SIGILL the guest.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0b10 &&
+        !GetBits<21, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
+        !GetBits<13, 1>() && GetBits<12, 1>() && !GetBits<11, 1>() &&
+        GetBits<10, 1>()) {
+      DecodeAdvSimdDotProductVec();
+      return;
+    }
+    // endregion
+
+    // region digitalis: Armv8.2-FP16 NEON vector three-same.
+    // Encoding (per ARM ARM C7.2 "Advanced SIMD three same (FP16)"):
+    //   0 Q U 0 1 1 1 0 a 1 0 Rm 0 0 opcode 1 Rn Rd
+    // i.e. bit31=0, bits[28:24]=01110, bit23=a, bit22=1, bit21=0,
+    //      bits[15:14]=00, bit10=1, bits[13:11]=3-bit opcode.
+    // Verified against `clang --target=aarch64 -march=armv8.2-a+fp16`:
+    //   FADD v0.4h,v1.4h,v2.4h = 0x0e421420 -> bit23=0, bit22=1, bit21=0,
+    //                                          bits[15:14]=00, bit13:11=010, bit10=1.
+    //   FSUB v0.4h,v1.4h,v2.4h = 0x0ec21420 -> bit23=1 (a=1), bit22=1, ...
+    // Must precede AdvSimdCopy (bit21=0, bit15=0, bit10=1) which it overlaps
+    // on bit21/bit15/bit10; bit22 distinguishes (Copy has bit22=0, FP16
+    // three-same has bit22=1).  Standard three-same below requires bit21=1
+    // so there's no overlap with that.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 1>() && !GetBits<21, 1>() &&
+        GetBits<14, 2>() == 0b00 && GetBits<10, 1>()) {
+      DecodeAdvSimdFp16ThreeSame();
       return;
     }
     // endregion
@@ -2132,6 +2723,39 @@ class Decoder {
           GetBits<0, 5>(),    // rd
           GetBits<5, 5>(),    // rn
           GetBits<12, 2>());  // 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC
+      return;
+    }
+    // endregion
+
+    // region digitalis
+    // Cryptographic AES (AESE, AESD, AESMC, AESIMC):
+    //   bit31=0, bit30=1, bit29=0, bits[28:24]=01110, bits[23:22]=00,
+    //   bits[21:17]=10100, bits[16:14]=001, bits[11:10]=10
+    // opcode field bits[16:12] = 00100=AESE, 00101=AESD, 00110=AESMC, 00111=AESIMC.
+    // Must be checked BEFORE AdvSIMD two-reg-misc which also matches
+    // bits[24:5]=01110, bit17=0, bits[11:10]=10 but does not handle these.
+    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
+        GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0 &&
+        GetBits<17, 5>() == 0b10100 && GetBits<14, 3>() == 0b001 &&
+        GetBits<10, 2>() == 0b10) {
+      insn_consumer_->CryptoAes(
+          GetBits<0, 5>(),    // rd
+          GetBits<5, 5>(),    // rn
+          GetBits<12, 2>());  // 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC
+      return;
+    }
+    // endregion
+
+    // region digitalis: Armv8.2-FP16 NEON vector two-register miscellaneous.
+    // Encoding: 0 Q U 0 1 1 1 0 a 1 1 1 1 1 0 opcode 1 0 Rn Rd
+    //   bit31=0, bits[28:24]=01110, bit23=a (free), bit22=1, bits[21:17]=11100,
+    //   bits[11:10]=10.
+    // The std two-reg-misc form (below) sets bits[21:17]=10000; carve out the
+    // FP16 form first so it doesn't fall into the std handler where args.size
+    // would mis-route bit22=1 to FP64 element semantics.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 1>() &&
+        GetBits<17, 5>() == 0b11100 && GetBits<10, 2>() == 0b10) {
+      DecodeAdvSimdFp16TwoRegMisc();
       return;
     }
     // endregion
@@ -2773,12 +3397,54 @@ class Decoder {
   // Data Processing (1-source): CLZ, CLS, RBIT, REV, REV16, REV32
   void DecodeDataProc1Src() {
     bool sf = GetBits<31, 1>();
+    uint8_t op2 = GetBits<16, 5>();  // ARM ARM "opcode2" (bits 20:16)
     uint8_t opcode2 = GetBits<10, 6>();
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
     // Dispatch based on opcode2
     // 000000 = RBIT, 000001 = REV16, 000010 = REV32(32-bit)/REV(64-bit),
     // 000011 = REV(64-bit only), 000100 = CLZ, 000101 = CLS
+    // region digitalis PAuth DP-1Src as identity
+    // ARM ARM opcode2=00001 selects the PAuth family of DP-1Src ops
+    // (PACIA/PACIB/PACDA/PACDB and AUT* siblings, the Z-variants where
+    // Rn==RZR, plus XPACI/XPACD).  Digitalis does not implement pointer
+    // authentication: PAC bits are never inserted, so authenticating or
+    // stripping a pointer is the identity dst = src.  We route every
+    // documented opcode (000000..010001) to the existing DataProc1Src
+    // handler with a marker bit (0x40) that tells the interpreter/JIT
+    // "this is PAuth — return src unchanged".  Without this dispatch the
+    // PAuth ops alias RBIT/REV/CLZ etc. and silently miscompile, which
+    // breaks any binary built with -mbranch-protection=pac-ret on NDK r25+.
+    if (op2 == 0b00001) {
+      if (!sf) {
+        // PAuth DP-1Src is X-form only (sf must be 1).
+        Undefined();
+        return;
+      }
+      if (opcode2 > 0b010001) {
+        // Reserved encoding within the PAuth family.
+        Undefined();
+        return;
+      }
+      // ARM ARM semantics for the PAuth family use Xd as BOTH the input
+      // pointer and the destination (Xn is just the modifier salt).  For a
+      // PAC-blind translator the identity is Xd' = Xd — so the source we
+      // hand to the existing DataProc1Src callback must be Xd, not Xn.
+      // Passing rn here (as the pre-handoff-41 code did) caused PACIA/AUTIA
+      // and the rest of the on-register PAC family to overwrite Xd with the
+      // value of Xn, silently miscompiling any PAuth probe / verifier.
+      // Z-variants (PACIZA et al.) encode Rn=11111 (XZR) and XPACI/XPACD
+      // similarly use XZR as Rn — passing rd uniformly is still correct
+      // because the architectural input register is always Xd.
+      insn_consumer_->DataProc1Src(rd, rd, /*pauth marker=*/0x40 | opcode2, sf);
+      return;
+    }
+    if (op2 != 0) {
+      // Other opcode2 values are reserved; bail to interpreter.
+      Undefined();
+      return;
+    }
+    // endregion
     insn_consumer_->DataProc1Src(rd, rn, opcode2, sf);
   }
   // endregion
@@ -2817,8 +3483,10 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // Only ftype 00 (single) and 01 (double) supported.
-    if (ftype >= 2) { Undefined(); return; }
+    // region digitalis
+    // ftype: 00=S, 01=D, 11=H (Armv8.2-FP16).  10 is reserved.
+    if (ftype == 0b10) { Undefined(); return; }
+    // endregion
 
     // Validate opcode range.
     if (opcode > 0b1000) { Undefined(); return; }
@@ -2863,8 +3531,10 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t opcode2 = GetBits<0, 5>();
 
-    // Only ftype 00 (single) and 01 (double) supported.
-    if (ftype >= 2) { Undefined(); return; }
+    // region digitalis
+    // ftype: 00=S, 01=D, 11=H (Armv8.2-FP16).  10 is reserved.
+    if (ftype == 0b10) { Undefined(); return; }
+    // endregion
 
     bool with_zero = (opcode2 & 0b01000) != 0;
     bool signal_nans = (opcode2 & 0b10000) != 0;
@@ -2879,6 +3549,179 @@ class Decoder {
     insn_consumer_->FpCompare(args);
   }
   // endregion
+
+  // region digitalis
+  //
+  // FP conditional compare (FCCMP / FCCMPE).
+  // Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv
+  //   op == 0 -> FCCMP, op == 1 -> FCCMPE (signals on quiet NaN)
+  //
+  void DecodeFpConditionalCompare() {
+    uint8_t ftype = GetBits<22, 2>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t cond = GetBits<12, 4>();
+    uint8_t rn = GetBits<5, 5>();
+    bool signal_nans = GetBits<4, 1>();
+    uint8_t nzcv = GetBits<0, 4>();
+
+    // Only ftype 00 (single) and 01 (double) supported.
+    if (ftype >= 2) { Undefined(); return; }
+
+    const FpConditionalCompareArgs args = {
+        .rn = rn,
+        .rm = rm,
+        .nzcv = nzcv,
+        .cond = Condition{cond},
+        .ftype = ftype,
+        .signal_nans = signal_nans,
+    };
+    insn_consumer_->FpConditionalCompare(args);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
+  //
+  // Encoding (verified via llvm-mc):
+  //   bit31=0, bit30=Q, bit29=1 (U), bits[28:24]=01110, bits[23:22]=size,
+  //   bit21=0, bits[20:16]=Rm, bit15=1, bit14=1, bit10=1.
+  // FCADD: bit13=1, bit12=rot (0=#90, 1=#270), bit11=0.
+  // FCMLA: bit13=0, bits[12:11]=rot (00=#0, 01=#90, 10=#180, 11=#270).
+  //
+  // Reserved combinations rejected as Undefined:
+  //   - size == 00 (no 8-bit FP).
+  //   - size == 11 (double) with Q == 0 (no half-size double vector — the
+  //     2D form requires the 128-bit container).
+  //   - FCADD with bit11 != 0 (unallocated).
+  //
+  // size == 01 (FP16): both Q=0 (.4h, 2 pairs) and Q=1 (.8h, 4 pairs) are
+  // accepted (handoff-61, FP16 SIMD FCMA). Interpreter promotes
+  // each half-precision lane to binary32 via FpHalfToSingle, applies the
+  // FCMA rotation table, and narrows back via FpSingleToHalf — same
+  // round-trip pattern as FP16 vector three-same / two-reg-misc.
+  void DecodeAdvSimdFcma() {
+    bool q = GetBits<30, 1>();
+    uint8_t size = GetBits<22, 2>();
+    uint8_t rm = GetBits<16, 5>();
+    bool bit13 = GetBits<13, 1>();
+    uint8_t rot;
+    FcmaOpcode opcode;
+    if (bit13) {
+      // FCADD: rot is bit[12]; bit[11] must be 0.
+      if (GetBits<11, 1>()) { Undefined(); return; }
+      opcode = FcmaOpcode::kFcadd;
+      rot = GetBits<12, 1>();
+    } else {
+      // FCMLA: rot is bits[12:11].
+      opcode = FcmaOpcode::kFcmla;
+      rot = GetBits<11, 2>();
+    }
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    if (size == 0b00) { Undefined(); return; }
+    if (size == 0b11 && !q) { Undefined(); return; }
+
+    const FcmaArgs args = {
+        .opcode = opcode,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .size = size,
+        .rot = rot,
+        .q = q,
+    };
+    insn_consumer_->AdvSimdFcma(args);
+  }
+  // endregion
+
+  // region digitalis hello-dotprod
+  // SDOT / UDOT (vector).  Encoding already filtered by the DecodeArmV8
+  // guard: bits[28:24]=01110, bits[23:22]=00, bit21=0, bits[15:10]=100101.
+  // bit30 = Q (vector length), bit29 = U (SDOT=0 / UDOT=1).
+  void DecodeAdvSimdDotProductVec() {
+    bool q = GetBits<30, 1>();
+    bool u = GetBits<29, 1>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    const DotProductArgs args = {
+        .opcode = u ? DotProductOpcode::kUdot : DotProductOpcode::kSdot,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .index = 0,
+        .q = q,
+    };
+    insn_consumer_->AdvSimdDotProduct(args);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD BFloat16 three-same-extra: BFDOT (vec), BFMMLA, BFMLALB (vec),
+  // BFMLALT (vec).
+  //
+  // Encoding (verified via llvm-mc -march=armv8.6-a):
+  //   bit31=0, bit29=1, bits[28:24]=01110, bits[23:22]=size, bit21=0,
+  //   bits[20:16]=Rm, bits[15:13]=111, bit12=op, bit11=1, bit10=1,
+  //   bits[9:5]=Rn, bits[4:0]=Rd.
+  //
+  // size=01:
+  //   bit30 = Q.
+  //   bit12=1 -> BFDOT  (Q selects 2S vs 4S form).
+  //   bit12=0 -> BFMMLA (Q must be 1; Q=0 reserved per ARM ARM C7.2.55).
+  //
+  // size=11:
+  //   bit30 = T (B/T discriminator).  Q is implicit 1 (BFMLAL is always .4s).
+  //   bit12 must be 1 (bits[15:10]=111111).  bit30=0 -> BFMLALB; bit30=1 -> BFMLALT.
+  //
+  // llvm-mc-verified encodings (handoff-51):
+  //   bfmlalb v0.4s, v1.8h, v2.8h   = 0x2ec2fc20  (bit30=0, T=B)
+  //   bfmlalt v0.4s, v1.8h, v2.8h   = 0x6ec2fc20  (bit30=1, T=T)
+  void DecodeAdvSimdBf16ThreeSame() {
+    uint8_t size = GetBits<22, 2>();
+    bool bit30 = GetBits<30, 1>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+    bool bit12 = GetBits<12, 1>();
+
+    Bf16ThreeSameOpcode opcode;
+    bool eff_q;
+
+    if (size == 0b01) {
+      // BFDOT (vector) / BFMMLA.
+      if (bit12) {
+        opcode = Bf16ThreeSameOpcode::kBfdot;
+      } else {
+        if (!bit30) { Undefined(); return; }   // BFMMLA requires Q=1
+        opcode = Bf16ThreeSameOpcode::kBfmmla;
+      }
+      eff_q = bit30;
+    } else {
+      // size == 0b11: BFMLALB / BFMLALT (vector).
+      // bit12 must be 1; bit12=0 here is unallocated.
+      if (!bit12) { Undefined(); return; }
+      opcode = bit30 ? Bf16ThreeSameOpcode::kBfmlaltVec
+                     : Bf16ThreeSameOpcode::kBfmlalbVec;
+      eff_q = true;  // BFMLAL vector is always .4s
+    }
+
+    const Bf16ThreeSameArgs args = {
+        .opcode = opcode,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .index = 0,
+        .q = eff_q,
+    };
+    insn_consumer_->AdvSimdBf16ThreeSame(args);
+  }
+  // endregion
+
   // region digitalis
   //
   // AdvSIMD three same.
@@ -2887,6 +3730,201 @@ class Decoder {
   //   size = bits[23:22], Rm = bits[20:16]
   //   opcode = bits[15:11], Rn = bits[9:5], Rd = bits[4:0]
   //
+  // region digitalis: Armv8.2-FP16 vector three-same.
+  // Encoding: 0 Q U 0 1 1 1 0 a 1 0 Rm 0 0 opcode 1 Rn Rd
+  // where a = bit23, opcode = bits[13:11] (3 bits).  Maps (a, U, opcode) to
+  // the existing AdvSimdThreeSameOpcode set (which the interpreter then
+  // dispatches with args.is_fp16 = true to use 2-byte lanes).
+  // Opcode table (per ARM ARM C7.2 "Advanced SIMD three same (FP16)"):
+  //   a=0,U=0,op=000 FMAXNM    a=1,U=0,op=000 FMINNM
+  //   a=0,U=0,op=001 FMLA      a=1,U=0,op=001 FMLS
+  //   a=0,U=0,op=010 FADD      a=1,U=0,op=010 FSUB
+  //   a=0,U=0,op=011 FMULX*    a=1,U=0,op=011 reserved
+  //   a=0,U=0,op=100 FCMEQ     a=1,U=0,op=100 reserved
+  //   a=0,U=0,op=110 FMAX      a=1,U=0,op=110 FMIN
+  //   a=0,U=0,op=111 FRECPS*   a=1,U=0,op=111 FRSQRTS*
+  //   a=0,U=1,op=000 FMAXNMP*  a=1,U=1,op=000 FMINNMP*
+  //   a=0,U=1,op=010 FADDP*    a=1,U=1,op=010 FABD
+  //   a=0,U=1,op=011 FMUL      a=1,U=1,op=011 reserved
+  //   a=0,U=1,op=100 FCMGE     a=1,U=1,op=100 FCMGT
+  //   a=0,U=1,op=101 FACGE     a=1,U=1,op=101 FACGT
+  //   a=0,U=1,op=110 FMAXP*    a=1,U=1,op=110 FMINP*
+  //   a=0,U=1,op=111 FDIV      a=1,U=1,op=111 reserved
+  // * = not implemented in this cycle (pairwise / FRECPS / FMULX); routed
+  // to Undefined() until the interpreter grows handlers.
+  void DecodeAdvSimdFp16ThreeSame() {
+    bool q = GetBits<30, 1>();
+    bool u = GetBits<29, 1>();
+    bool a = GetBits<23, 1>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t opcode_3 = GetBits<11, 3>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    AdvSimdThreeSameOpcode op;
+    bool ok = false;
+    if (!u) {
+      if (!a) {
+        switch (opcode_3) {
+          case 0b000: op = AdvSimdThreeSameOpcode::kFmaxnmV; ok = true; break;
+          case 0b001: op = AdvSimdThreeSameOpcode::kFmlaV;   ok = true; break;
+          case 0b010: op = AdvSimdThreeSameOpcode::kFaddV;   ok = true; break;
+          case 0b100: op = AdvSimdThreeSameOpcode::kFcmeqV;  ok = true; break;
+          case 0b110: op = AdvSimdThreeSameOpcode::kFmaxV;   ok = true; break;
+          default: break;  // 011 FMULX, 101 reserved, 111 FRECPS — Undefined.
+        }
+      } else {
+        switch (opcode_3) {
+          case 0b000: op = AdvSimdThreeSameOpcode::kFminnmV; ok = true; break;
+          case 0b001: op = AdvSimdThreeSameOpcode::kFmlsV;   ok = true; break;
+          case 0b010: op = AdvSimdThreeSameOpcode::kFsubV;   ok = true; break;
+          case 0b110: op = AdvSimdThreeSameOpcode::kFminV;   ok = true; break;
+          default: break;  // 011 reserved, 100 reserved, 101 reserved, 111 FRSQRTS — Undefined.
+        }
+      }
+    } else {
+      if (!a) {
+        switch (opcode_3) {
+          case 0b011: op = AdvSimdThreeSameOpcode::kFmulV;   ok = true; break;
+          case 0b100: op = AdvSimdThreeSameOpcode::kFcmgeV;  ok = true; break;
+          case 0b101: op = AdvSimdThreeSameOpcode::kFacgeV;  ok = true; break;
+          case 0b111: op = AdvSimdThreeSameOpcode::kFdivV;   ok = true; break;
+          default: break;  // 000 FMAXNMP, 010 FADDP, 110 FMAXP — Undefined.
+        }
+      } else {
+        switch (opcode_3) {
+          case 0b010: op = AdvSimdThreeSameOpcode::kFabdV;   ok = true; break;
+          case 0b100: op = AdvSimdThreeSameOpcode::kFcmgtV;  ok = true; break;
+          case 0b101: op = AdvSimdThreeSameOpcode::kFacgtV;  ok = true; break;
+          default: break;  // 000 FMINNMP, 011 reserved, 110 FMINP, 111 reserved — Undefined.
+        }
+      }
+    }
+    if (!ok) {
+      Undefined();
+      return;
+    }
+
+    const AdvSimdThreeSameArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .size = 0,        // unused for the FP16 path (interpreter checks is_fp16)
+        .q = q,
+        .is_fp16 = true,
+    };
+    insn_consumer_->AdvSimdThreeSame(args);
+  }
+  // endregion
+
+  // region digitalis: Armv8.2-FP16 vector two-register miscellaneous.
+  // Encoding (per ARM ARM C7.2 "Advanced SIMD two-register miscellaneous (FP16)"):
+  //   0 Q U 0 1 1 1 0 a 1 1 1 1 1 0 opcode 1 0 Rn Rd
+  // i.e. bit31=0, bits[28:24]=01110, bit23=a, bits[22:17]=111110,
+  //      bits[16:12]=opcode, bits[11:10]=10.
+  // Verified against `clang --target=aarch64 -march=armv8.2-a+fp16`:
+  //   FABS  v0.4h,v1.4h = 0x0ef8f820 -> a=1,U=0,op=01111
+  //   FNEG  v0.4h,v1.4h = 0x2ef8f820 -> a=1,U=1,op=01111
+  //   FSQRT v0.4h,v1.4h = 0x2ef9f820 -> a=1,U=1,op=11111
+  //   FCMEQ v0.4h,v1.4h,#0 = 0x0ef8d820 -> a=1,U=0,op=01101
+  //   FCMGT v0.4h,v1.4h,#0 = 0x0ef8c820 -> a=1,U=0,op=01100
+  //   FCMLT v0.4h,v1.4h,#0 = 0x0ef8e820 -> a=1,U=0,op=01110
+  //   FCMGE v0.4h,v1.4h,#0 = 0x2ef8c820 -> a=1,U=1,op=01100
+  //   FCMLE v0.4h,v1.4h,#0 = 0x2ef8d820 -> a=1,U=1,op=01101
+  // Opcodes that aren't implemented yet (FRINT* / FCVT* round-mode /
+  // SCVTF/UCVTF/FRECPE/FRSQRTE in FP16 form) route to Undefined() until
+  // the interpreter grows the handlers; this matches the three-same
+  // pairwise-reject pattern (handoff-57).
+  void DecodeAdvSimdFp16TwoRegMisc() {
+    bool q = GetBits<30, 1>();
+    bool u = GetBits<29, 1>();
+    bool a = GetBits<23, 1>();
+    uint8_t opcode_5 = GetBits<12, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    AdvSimdTwoRegMiscOpcode op;
+    bool ok = false;
+
+    // (a, U, opcode_5) selects the op per ARM ARM C7.2 "Advanced SIMD
+    // two-register miscellaneous (FP16)".
+    if (a) {
+      if (!u) {
+        switch (opcode_5) {
+          case 0b01100: op = AdvSimdTwoRegMiscOpcode::kCmgtZero; ok = true; break;  // FCMGT #0
+          case 0b01101: op = AdvSimdTwoRegMiscOpcode::kCmeqZero; ok = true; break;  // FCMEQ #0
+          case 0b01110: op = AdvSimdTwoRegMiscOpcode::kCmltZero; ok = true; break;  // FCMLT #0
+          case 0b01111: op = AdvSimdTwoRegMiscOpcode::kFabs;     ok = true; break;  // FABS
+          // region digitalis a=0/a=1 columns: FRINT*/FCVT*-round.
+          case 0b11000: op = AdvSimdTwoRegMiscOpcode::kFrintpV;  ok = true; break;  // FRINTP
+          case 0b11001: op = AdvSimdTwoRegMiscOpcode::kFrintzV;  ok = true; break;  // FRINTZ
+          case 0b11010: op = AdvSimdTwoRegMiscOpcode::kFcvtpsV;  ok = true; break;  // FCVTPS
+          case 0b11011: op = AdvSimdTwoRegMiscOpcode::kFcvtzsV;  ok = true; break;  // FCVTZS
+          case 0b11101: op = AdvSimdTwoRegMiscOpcode::kFrecpeV;  ok = true; break;  // FRECPE
+          // endregion
+          default: break;
+        }
+      } else {
+        switch (opcode_5) {
+          case 0b01100: op = AdvSimdTwoRegMiscOpcode::kCmgeZero; ok = true; break;  // FCMGE #0
+          case 0b01101: op = AdvSimdTwoRegMiscOpcode::kCmleZero; ok = true; break;  // FCMLE #0
+          case 0b01111: op = AdvSimdTwoRegMiscOpcode::kFneg;     ok = true; break;  // FNEG
+          case 0b11111: op = AdvSimdTwoRegMiscOpcode::kFsqrtV;   ok = true; break;  // FSQRT
+          // region digitalis a=0/a=1 columns.
+          case 0b11001: op = AdvSimdTwoRegMiscOpcode::kFrintiV;  ok = true; break;  // FRINTI
+          case 0b11010: op = AdvSimdTwoRegMiscOpcode::kFcvtpuV;  ok = true; break;  // FCVTPU
+          case 0b11011: op = AdvSimdTwoRegMiscOpcode::kFcvtzuV;  ok = true; break;  // FCVTZU
+          case 0b11101: op = AdvSimdTwoRegMiscOpcode::kFrsqrteV; ok = true; break;  // FRSQRTE
+          // endregion
+          default: break;
+        }
+      }
+    } else {
+      // region digitalis a=0 column: FRINTN/A, FRINTM/X,
+      // FCVTNS/NU, FCVTMS/MU, FCVTAS/AU, SCVTF/UCVTF in FP16 form.
+      if (!u) {
+        switch (opcode_5) {
+          case 0b11000: op = AdvSimdTwoRegMiscOpcode::kFrintnV;  ok = true; break;  // FRINTN
+          case 0b11001: op = AdvSimdTwoRegMiscOpcode::kFrintmV;  ok = true; break;  // FRINTM
+          case 0b11010: op = AdvSimdTwoRegMiscOpcode::kFcvtnsV;  ok = true; break;  // FCVTNS
+          case 0b11011: op = AdvSimdTwoRegMiscOpcode::kFcvtmsV;  ok = true; break;  // FCVTMS
+          case 0b11100: op = AdvSimdTwoRegMiscOpcode::kFcvtasV;  ok = true; break;  // FCVTAS
+          case 0b11101: op = AdvSimdTwoRegMiscOpcode::kScvtfV;   ok = true; break;  // SCVTF
+          default: break;
+        }
+      } else {
+        switch (opcode_5) {
+          case 0b11000: op = AdvSimdTwoRegMiscOpcode::kFrintaV;  ok = true; break;  // FRINTA
+          case 0b11001: op = AdvSimdTwoRegMiscOpcode::kFrintxV;  ok = true; break;  // FRINTX
+          case 0b11010: op = AdvSimdTwoRegMiscOpcode::kFcvtnuV;  ok = true; break;  // FCVTNU
+          case 0b11011: op = AdvSimdTwoRegMiscOpcode::kFcvtmuV;  ok = true; break;  // FCVTMU
+          case 0b11100: op = AdvSimdTwoRegMiscOpcode::kFcvtauV;  ok = true; break;  // FCVTAU
+          case 0b11101: op = AdvSimdTwoRegMiscOpcode::kUcvtfV;   ok = true; break;  // UCVTF
+          default: break;
+        }
+      }
+      // endregion
+    }
+
+    if (!ok) {
+      Undefined();
+      return;
+    }
+
+    const AdvSimdTwoRegMiscArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .size = 0,        // unused for the FP16 path (interpreter checks is_fp16)
+        .q = q,
+        .u = u,
+        .is_fp16 = true,
+    };
+    insn_consumer_->AdvSimdTwoRegMisc(args);
+  }
+  // endregion
+
   void DecodeAdvSimdThreeSame() {
     bool q = GetBits<30, 1>();
     bool u = GetBits<29, 1>();
@@ -3229,11 +4267,22 @@ class Decoder {
         }
         break;
       case 0b11010:
-        // Across-lanes opcode=11010 is SMINV (U=0) / UMINV (U=1).
-        // bit20 must be 1; bit20=0 with this opcode is unallocated in two-reg-misc.
-        if (!GetBits<20, 1>()) { Undefined(); return; }
-        op = u ? AdvSimdTwoRegMiscOpcode::kUminv : AdvSimdTwoRegMiscOpcode::kSminv;
-        if (size == 0b11) { Undefined(); return; }
+        // bit20=1: across-lanes SMINV (U=0) / UMINV (U=1).
+        // bit20=0: vector FCVT* rounding-mode, with bit23 picking N (0) vs P (1).
+        if (GetBits<20, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kUminv : AdvSimdTwoRegMiscOpcode::kSminv;
+          if (size == 0b11) { Undefined(); return; }
+        } else {
+          // region digitalis - vector FCVTNS/NU (bit23=0) and FCVTPS/PU (bit23=1).
+          if (!GetBits<23, 1>()) {
+            op = u ? AdvSimdTwoRegMiscOpcode::kFcvtnuV
+                   : AdvSimdTwoRegMiscOpcode::kFcvtnsV;
+          } else {
+            op = u ? AdvSimdTwoRegMiscOpcode::kFcvtpuV
+                   : AdvSimdTwoRegMiscOpcode::kFcvtpsV;
+          }
+          // endregion
+        }
         break;
         // endregion
       case 0b01011:
@@ -3252,7 +4301,15 @@ class Decoder {
         break;
       case 0b10110:
         if (u) { Undefined(); return; }
-        op = AdvSimdTwoRegMiscOpcode::kFcvtn;
+        // region digitalis BFCVTN/BFCVTN2 share opcode=10110
+        // with FCVTN; distinguished by size=10 (vs FCVTN's size=00/01).
+        // bit30 (q) selects BFCVTN (low half write) vs BFCVTN2 (high half).
+        if (size == 0b10) {
+          op = AdvSimdTwoRegMiscOpcode::kBfcvtn;
+        } else {
+          op = AdvSimdTwoRegMiscOpcode::kFcvtn;
+        }
+        // endregion
         break;
       case 0b10111:
         if (u) { Undefined(); return; }
@@ -3293,9 +4350,66 @@ class Decoder {
           if (size == 0b11) { Undefined(); return; }  // No 64-bit element ADDV
           op = AdvSimdTwoRegMiscOpcode::kAddv;
         } else {
-          if (!GetBits<23, 1>()) { Undefined(); return; }  // FCVTMS/MU — TODO
-          op = u ? AdvSimdTwoRegMiscOpcode::kFcvtzuV
-                 : AdvSimdTwoRegMiscOpcode::kFcvtzsV;
+          if (GetBits<23, 1>()) {
+            op = u ? AdvSimdTwoRegMiscOpcode::kFcvtzuV
+                   : AdvSimdTwoRegMiscOpcode::kFcvtzsV;
+          } else {
+            // region digitalis - vector FCVTMS/MU (round toward -inf). .
+            op = u ? AdvSimdTwoRegMiscOpcode::kFcvtmuV
+                   : AdvSimdTwoRegMiscOpcode::kFcvtmsV;
+            // endregion
+          }
+        }
+        break;
+      // endregion
+      // region digitalis - vector FCVTAS/AU (round-to-nearest ties-away).
+      // Encoding: opcode=11100, bit23=0. bit23=1 is unallocated.
+      case 0b11100:
+        if (GetBits<23, 1>()) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kFcvtauV
+               : AdvSimdTwoRegMiscOpcode::kFcvtasV;
+        break;
+      // endregion
+      // region digitalis: std FP32/FP64 FRINT* round-to-int.
+      // Encoding (per ARM ARM C7.2 "Advanced SIMD two-register miscellaneous"):
+      //   0 Q U 0 1110 size 10000 opcode 10 Rn Rd
+      // with bit23 = 'a' (rounding-mode subset) and bit22 = 'sz' (0=FP32,
+      // 1=FP64).  The interpreter picks FP32 vs FP64 from `args.size & 1`,
+      // matching the existing FCVTNS / FCVTPS / FCVTZS fp dispatch.
+      //   opcode=11000:
+      //     a=0,U=0: FRINTN  ties-to-even
+      //     a=0,U=1: FRINTA  ties-away
+      //     a=1,U=0: FRINTP  toward +inf
+      //     a=1,U=1: FRINT32X (Armv8.5) -- left Undefined
+      //   opcode=11001:
+      //     a=0,U=0: FRINTM  toward -inf
+      //     a=0,U=1: FRINTX  use current FPCR (raises Inexact)
+      //     a=1,U=0: FRINTZ  toward zero
+      //     a=1,U=1: FRINTI  use current FPCR (no Inexact)
+      // Verified with llvm-mc:
+      //   frintn v0.4s = 0x4e218820  (a=0,U=0,opcode=11000)
+      //   frinta v0.4s = 0x6e218820  (a=0,U=1,opcode=11000)
+      //   frintp v0.4s = 0x4ea18820  (a=1,U=0,opcode=11000)
+      //   frintm v0.4s = 0x4e219820  (a=0,U=0,opcode=11001)
+      //   frintx v0.4s = 0x6e219820  (a=0,U=1,opcode=11001)
+      //   frintz v0.4s = 0x4ea19820  (a=1,U=0,opcode=11001)
+      //   frinti v0.4s = 0x6ea19820  (a=1,U=1,opcode=11001)
+      case 0b11000:
+        if (!GetBits<23, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFrintaV
+                 : AdvSimdTwoRegMiscOpcode::kFrintnV;
+        } else {
+          if (u) { Undefined(); return; }  // FRINT32X (Armv8.5) unimplemented
+          op = AdvSimdTwoRegMiscOpcode::kFrintpV;
+        }
+        break;
+      case 0b11001:
+        if (!GetBits<23, 1>()) {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFrintxV
+                 : AdvSimdTwoRegMiscOpcode::kFrintmV;
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFrintiV
+                 : AdvSimdTwoRegMiscOpcode::kFrintzV;
         }
         break;
       // endregion
@@ -3593,6 +4707,177 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
+    // region digitalis BF16 indexed
+    //
+    // Armv8.6-BF16 by-element forms route through the vector x indexed
+    // element subspace too: bit31=0, bit29=0 (U=0), bits[28:24]=01111,
+    // bit10=0.  Distinguishing field is the opcode (bits[15:12]=1111)
+    // combined with size:
+    //   size=01: BFDOT (by element).   Vm = M:Rm[3:0] (5-bit, V0..V31);
+    //                                  index = H:L (2-bit, 0..3).
+    //   size=11: BFMLALB/BFMLALT (idx). bit30 = T discriminator (Q
+    //                                  implicit 1, dest always .4s).
+    //                                  Vm = Rm[3:0] (V0..V15);
+    //                                  index = H:L:M (3-bit, 0..7).
+    // Otherwise size=01 falls into the existing "Undefined" check below
+    // and size=11 falls into the existing FP MLA/MLS/MUL switch (which
+    // would reject opcode=1111 as default Undefined).
+    //
+    // Encoding cross-checks (llvm-mc, handoff-51):
+    //   bfdot   v0.4s,v1.8h,v17.2h[0] = 0x4f51f020   (Vm=17 via M:Rm)
+    //   bfdot   v0.4s,v1.8h,v2.2h[3]  = 0x4f62f820   (index=3 via H:L)
+    //   bfmlalb v0.4s,v1.8h,v15.h[0]  = 0x0fcff020   (Vm=15 via Rm[3:0])
+    //   bfmlalb v0.4s,v1.8h,v2.h[4]   = 0x0fc2f820   (index=4 via H)
+    //   bfmlalb v0.4s,v1.8h,v2.h[2]   = 0x0fe2f020   (index=2 via L)
+    //   bfmlalb v0.4s,v1.8h,v2.h[1]   = 0x0fd2f020   (index=1 via M)
+    //   bfmlalt v0.4s,v1.8h,v2.h[7]   = 0x4ff2f820   (bit30=1 -> T)
+    if (!u && opcode == 0b1111) {
+      if (size == 0b01) {
+        // BFDOT (by element).  Vm is 5-bit M:Rm, index is 2-bit H:L.
+        uint8_t bf_rm = static_cast<uint8_t>((M << 4) | Rm4);
+        uint8_t bf_index = static_cast<uint8_t>((H << 1) | L);
+        const Bf16ThreeSameArgs args = {
+            .opcode = Bf16ThreeSameOpcode::kBfdotIdx,
+            .rd = rd,
+            .rn = rn,
+            .rm = bf_rm,
+            .index = bf_index,
+            .q = q,
+        };
+        insn_consumer_->AdvSimdBf16ThreeSame(args);
+        return;
+      }
+      if (size == 0b11) {
+        // BFMLALB / BFMLALT (by element).  Vm is 4-bit Rm[3:0], index
+        // is 3-bit H:L:M.  bit30 is the T discriminator (Q implicit 1).
+        uint8_t bf_index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
+        const Bf16ThreeSameArgs args = {
+            .opcode = q ? Bf16ThreeSameOpcode::kBfmlaltIdx
+                        : Bf16ThreeSameOpcode::kBfmlalbIdx,
+            .rd = rd,
+            .rn = rn,
+            .rm = Rm4,
+            .index = bf_index,
+            .q = true,
+        };
+        insn_consumer_->AdvSimdBf16ThreeSame(args);
+        return;
+      }
+    }
+    // endregion
+
+    // region digitalis hello-dotprod
+    // SDOT / UDOT (by element) — Armv8.4-DotProd.
+    //   bit31=0, bits[28:24]=01111, bits[23:22]=10, opcode=bits[15:12]=1110,
+    //   bit10=0.  bit30=Q (selects .4s vs .2s), bit29=U (SDOT/UDOT).
+    //   Vm = M:Rm[3:0] (5-bit, V0..V31); index = H:L (2-bit, 0..3).
+    //
+    // Verified encodings (clang --target=aarch64 -march=armv8.4-a+dotprod):
+    //   sdot v0.4s, v1.16b, v2.4b[0]  = 0x4f82e020  (U=0, L=0, H=0)
+    //   udot v0.4s, v1.16b, v2.4b[3]  = 0x6fa2e820  (U=1, L=1, H=1)
+    //   sdot v0.2s, v1.8b,  v2.4b[0]  = 0x0f82e020  (Q=0, U=0)
+    //   udot v0.2s, v1.8b,  v2.4b[3]  = 0x2fa2e820  (Q=0, U=1)
+    //
+    // The DotProd opcode 1110 differs from the FP {MLA=0001, MLS=0101,
+    // MUL=1001, MLA/MUL=1000, MLS=0100, MLA=0000} cases that the default
+    // path below handles for size=10, so this carve-out is required to
+    // route DOT idx away from the FP switch's default Undefined() branch.
+    if (size == 0b10 && opcode == 0b1110) {
+      uint8_t dp_rm = static_cast<uint8_t>((M << 4) | Rm4);
+      uint8_t dp_index = static_cast<uint8_t>((H << 1) | L);
+      const DotProductArgs args = {
+          .opcode = u ? DotProductOpcode::kUdotIdx : DotProductOpcode::kSdotIdx,
+          .rd = rd,
+          .rn = rn,
+          .rm = dp_rm,
+          .index = dp_index,
+          .q = q,
+      };
+      insn_consumer_->AdvSimdDotProduct(args);
+      return;
+    }
+    // endregion
+
+    // region digitalis indexed FCMLA
+    // FCMLA (by element) — Armv8.3-FCMA.
+    //
+    // Distinguished from FMLA/FMLS (by element) by U=1 (bit29).
+    // Opcode field bits[15:12] = (0, rot[1], rot[0], 1) — i.e., a 4-bit
+    // value whose bit15 is 0 and bit12 is 1, with rot in the middle two
+    // bits.  Mask `(opcode & 0b1001) == 0b0001` catches all four rotations:
+    //   rot=0 (opcode=0001), rot=1 (0011), rot=2 (0101), rot=3 (0111).
+    // Without this carve-out, rot=0 (0001) and rot=2 (0101) would be routed
+    // to Undefined by the existing `case 0b0001/case 0b0101: if (u)
+    // Undefined()` branches, while rot=1 (0011) and rot=3 (0111) would fall
+    // through to the default Undefined.
+    //
+    // size encoding: raw bits[23:22] with bit23=1 fixed and bit22=size:
+    //   bit22=0 (raw bits[23:22] = 0b10) -> FP32 (only Q=1 .4s form).
+    //   bit22=1 (raw bits[23:22] = 0b11) -> this is the FMLA-FP64 slot;
+    //     FCMLA does NOT use it.
+    //   bit23=0,bit22=1 (raw bits[23:22] = 0b01) -> FP16.  Parked
+    // alongside non-indexed FP16 (handoff-49 rejects FP16-SIMD
+    //     FCMA until the family is implemented end-to-end).
+    //
+    // llvm-mc-verified FP32 encodings (handoff-58 derivation):
+    //   fcmla v0.4s, v1.4s, v2.s[0], #0   = 0x6F821020
+    //   fcmla v0.4s, v1.4s, v2.s[1], #0   = 0x6F821820  (H=1)
+    //   fcmla v0.4s, v1.4s, v2.s[0], #90  = 0x6F823020  (rot=01)
+    //   fcmla v0.4s, v1.4s, v2.s[1], #90  = 0x6F823820
+    //   fcmla v0.4s, v1.4s, v2.s[0], #180 = 0x6F825020  (rot=10)
+    //   fcmla v0.4s, v1.4s, v2.s[1], #180 = 0x6F825820
+    //   fcmla v0.4s, v1.4s, v2.s[0], #270 = 0x6F827020  (rot=11)
+    //   fcmla v0.4s, v1.4s, v2.s[1], #270 = 0x6F827820
+    //   fcmla v0.4s, v1.4s, v17.s[0], #0  = 0x6F911020  (Vm=M:Rm=10001)
+    //
+    // FP32 .2s form is REJECTED by the architecture (the .2s container
+    // would have only 1 output complex pair while indexed FCMLA requires
+    // at least one accumulation per index value across .4s).  Q=0 with
+    // size=0b10 is reserved for FCMLA-indexed.
+    if (u && (opcode & 0b1001) == 0b0001) {
+      uint8_t fcmla_rot = static_cast<uint8_t>((opcode >> 1) & 0b11);
+      uint8_t fcmla_rm = static_cast<uint8_t>((M << 4) | Rm4);
+      if (size == 0b10) {
+        // FP32: index = H (1 bit); L must be 0; Q must be 1.
+        if (L || !q) { Undefined(); return; }
+        const FcmaIdxArgs args = {
+            .opcode = FcmaIdxOpcode::kFcmlaIdx,
+            .rd = rd,
+            .rn = rn,
+            .rm = fcmla_rm,
+            .index = H,
+            .size = 0b10, // non-indexed convention: 0b10 = FP32.
+            .rot = fcmla_rot,
+            .q = q,
+        };
+        insn_consumer_->AdvSimdFcmaIdx(args);
+        return;
+      }
+      if (size == 0b01) {
+        // FP16 (handoff-61, FP16 SIMD FCMA indexed):
+        //   Q=1 (.8h): index = H:L (2 bits, 0..3) — Vm.8H has 4 pairs.
+        //   Q=0 (.4h): index = L only (1 bit, 0..1); H must be 0.
+        if (!q && H) { Undefined(); return; }
+        uint8_t fcmla_idx_fp16 = static_cast<uint8_t>((H << 1) | L);
+        const FcmaIdxArgs args = {
+            .opcode = FcmaIdxOpcode::kFcmlaIdx,
+            .rd = rd,
+            .rn = rn,
+            .rm = fcmla_rm,
+            .index = fcmla_idx_fp16,
+            .size = 0b01,
+            .rot = fcmla_rot,
+            .q = q,
+        };
+        insn_consumer_->AdvSimdFcmaIdx(args);
+        return;
+      }
+      // Other size values (0b00, 0b11) are reserved — fall through to
+      // the existing paths below, which route opcode=0001/0101 with U=1
+      // to Undefined and opcode=0011/0111 to the default Undefined.
+    }
+    // endregion
+
     uint8_t rm;
     uint8_t index;
 
@@ -3604,8 +4889,72 @@ class Decoder {
       // 64-bit: Vm = M:Rm, index = H
       rm = (M << 4) | Rm4;
       index = H;
+    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL (handoff-62)
+    //
+    // FP16 by-element FMLA/FMLS/FMUL — Armv8.2-FP16.  Encoding pattern:
+    //   0 Q 0 01111 00 L M Rm[3:0] opcode H 0 Rn Rd
+    // i.e. U=0, size=0b00, opcode ∈ {0001 FMLA, 0101 FMLS, 1001 FMUL}.
+    //   - Vm is only 4 bits (M:Rm[3:0] where M is consumed by the index),
+    //     so the indexed source is restricted to V0..V15.
+    //   - index = (H << 2) | (L << 1) | M (3 bits, 0..7) — broadcasts one
+    //     lane from Vm.8H regardless of Q.
+    //   - Q selects the destination width only: Q=0 updates the low 4
+    //     lanes of Vd.8H (.4H), Q=1 updates all 8 (.8H).
+    //
+    // Note: size=0b00 with the integer MLA/MLS/MUL opcodes (1000/0100/0000)
+    // is reserved by the architecture (8-bit indexed MLA does not exist),
+    // so this carve-out only fires for FP opcodes (and only U=0).  Integer
+    // MLA-idx with size=01 (.4h/.8h elements) is a separate path still
+    // routed to Undefined below — out of scope for handoff-62.
+    } else if (size == 0b00) {
+      if (u || (opcode != 0b0001 && opcode != 0b0101 && opcode != 0b1001)) {
+        Undefined();
+        return;
+      }
+      rm = Rm4;
+      index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
+    // endregion
+    // region digitalis - Plan §H-followup: integer MLA/MLS/MUL-idx halfword (handoff-64)
+    //
+    // Integer MUL/MLA/MLS by-element with halfword elements (.4h/.8h) —
+    // Armv8-A baseline (not an extension; just a previously deferred
+    // decoder gap, see handoff-63 standing item "Integer MLA/MLS/MUL-idx
+    // with size=0b01").  Encoding pattern (per ARM ARM C7.2):
+    //   0 Q U 01111 01 L M Rm[3:0] opcode H 0 Rn Rd
+    // Vm restricted to V0..V15 — the bit-20 M slot is consumed by the
+    // index field rather than as Vm's high bit, identical to the
+    // FP16-indexed convention above.  index = H:L:M (3 bits, 0..7).
+    //
+    // Valid (size=01, U, opcode) tuples per ARM ARM:
+    //   U=0, opcode=1000 -> MUL  (MUL_byelement,  halfword)
+    //   U=1, opcode=0000 -> MLA  (MLA_byelement,  halfword)
+    //   U=1, opcode=0100 -> MLS  (MLS_byelement,  halfword)
+    // Other opcodes at size=01 belong to SMULL/UMULL/SQDMULL widening
+    // or saturating variants which use the post-switch Undefined path.
+    //
+    // The interpreter already handles size=0b01 via the generic integer
+    // else-branch in AdvSimdVecXIndexedElement (esize = 2), so no
+    // interpreter change is needed.
+    //
+    // llvm-mc-verified encodings (handoff-64):
+    //   mul  v0.4h, v1.4h, v2.h[0] = 0x0f428020
+    //   mul  v0.8h, v1.8h, v2.h[7] = 0x4f728820
+    //   mla  v0.4h, v1.4h, v2.h[0] = 0x2f420020
+    //   mla  v0.8h, v1.8h, v2.h[7] = 0x6f720820
+    //   mls  v0.4h, v1.4h, v2.h[0] = 0x2f424020
+    //   mls  v0.8h, v1.8h, v2.h[7] = 0x6f724820
+    } else if (size == 0b01) {
+      if (!((opcode == 0b1000 && !u) ||
+            (opcode == 0b0000 && u) ||
+            (opcode == 0b0100 && u))) {
+        Undefined();
+        return;
+      }
+      rm = Rm4;
+      index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
+    // endregion
     } else {
-      // 16-bit or reserved.
+      // Reserved.
       Undefined();
       return;
     }
@@ -3621,15 +4970,51 @@ class Decoder {
         op = AdvSimdVecXIdxOpcode::kFmls;
         break;
       case 0b1001:
-        op = u ? AdvSimdVecXIdxOpcode::kFmul : AdvSimdVecXIdxOpcode::kFmul;
-        break;
-      case 0b1000:
+        // region digitalis follow-up (handoff-68): reject FMULX-by-
+        // element until the interpreter implements it.  Per ARM ARM C7.2
+        // AdvSIMD-vector-x-indexed-element:
+        //   U=0, opcode=1001 -> FMUL  (by element) — kept as kFmul.
+        //   U=1, opcode=1001 -> FMULX (by element, Armv8.2-FP — multiply-extended
+        //     with NaN-preserving semantics: FMULX(±0, ±inf) = ±2.0 rather than
+        //     NaN, used by libm reciprocal-estimate refinements).
+        // The previous code (`u ? kFmul : kFmul`) was a tautology that silently
+        // routed FMULX to FMUL.  Same family as the handoff-67 fix at
+        // case 0b1000: silent wrong-result decoding is worse than a SIGILL —
+        // an FMULX whose input includes a ±0/±inf pair will produce a NaN
+        // under kFmul vs the ARM-required ±2.0, breaking libm reciprocal
+        // refinement loops.  No current sample emits FMULX (NDK clang doesn't
+        // generate it by default; libm uses VFMUL not VFMULX in the shipped
+        // bionic), so flipping to Undefined() is forward-compatible.
+        // Implementing FMULX in the interpreter is the next-cycle follow-up
+        // when a sample needs it.
         if (u) {
-          op = AdvSimdVecXIdxOpcode::kMla;
-        } else {
-          op = AdvSimdVecXIdxOpcode::kMul;
+          Undefined();
+          return;
         }
+        op = AdvSimdVecXIdxOpcode::kFmul;
         break;
+        // endregion
+      case 0b1000:
+        // region digitalis follow-up (handoff-67): reject reserved
+        // opcode=1000 with U=1.  Per ARM ARM C7.2 AdvSIMD-vector-x-indexed-element:
+        //   U=0, opcode=1000 -> MUL (by element) — kept as kMul.
+        //   U=1, opcode=1000 -> RESERVED — there is no instruction at this slot.
+        //     MLA-by-element is encoded at opcode=0000 with U=1 (handled by the
+        //     `case 0b0000` arm below); SQRDMLAH-by-element (Armv8.1-RDM) is at
+        //     opcode=1101 (not implemented anywhere here yet).
+        // The previous code silently mapped this reserved slot to kMla, which
+        // produced wrong results without any SIGILL — a textbook silent decoder
+        // mis-route.  We now route reserved encodings to Undefined so a guest
+        // emitting (size=10/11, U=1, opcode=1000) at least gets a diagnostic
+        // SIGILL instead of corrupted vector arithmetic.  size=01 with U=1
+        // opcode=1000 is already rejected by the size==0b01 guard above.
+        if (u) {
+          Undefined();
+          return;
+        }
+        op = AdvSimdVecXIdxOpcode::kMul;
+        break;
+        // endregion
       case 0b0100:
         if (u) {
           op = AdvSimdVecXIdxOpcode::kMls;
@@ -3808,10 +5193,33 @@ class Decoder {
       }
       // endregion
     } else {
-      // o1=1: CAS family
-      args.op = AtomicOp::kCas;
-      args.acquire = (L != 0);   // CASA/CASAL
-      args.release = (o0 != 0);  // CASL/CASAL
+      // region digitalis CASP fix: o1=1 covers both CAS and CASP.
+      // The o2 bit is the discriminator: o2=0 → CASP (pair); o2=1 → CAS (single).
+      // Encodings confirmed via llvm-mc (clang-r563880c):
+      //   casp   w0,w1,w2,w3,[x10] = 0x08207d42 → o2=0, o1=1
+      //   casa   w0,w1,[x10]       = 0x88e07d41 → o2=1, o1=1
+      // Prior code routed both to kCas, silently miscompiling CASP.
+      if (o2 == 0) {
+        // CASP: bit[31] must be 0 and bits[14:10] must be 11111.
+        // bit[30] = sz: 0 → 32-bit pair, 1 → 64-bit pair.
+        // Re-encode args.size to 2 (32-bit) or 3 (64-bit) so the
+        // interpreter/JIT can reuse their existing size dispatch.
+        uint8_t rt2 = GetBits<10, 5>();
+        if (GetBits<31, 1>() != 0 || rt2 != 0b11111) {
+          Undefined();
+          return;
+        }
+        args.op = AtomicOp::kCasp;
+        args.acquire = (L != 0);   // CASPA/CASPAL
+        args.release = (o0 != 0);  // CASPL/CASPAL
+        args.size = (GetBits<30, 1>() != 0) ? 3 : 2;
+      } else {
+        // CAS family
+        args.op = AtomicOp::kCas;
+        args.acquire = (L != 0);   // CASA/CASAL
+        args.release = (o0 != 0);  // CASL/CASAL
+      }
+      // endregion
     }
     insn_consumer_->LoadStoreExclusive(args);
   }
@@ -3845,9 +5253,57 @@ class Decoder {
     switch (full_op) {
       case 0b0000: args.op = AtomicOp::kLdadd; break;
       case 0b0001: args.op = AtomicOp::kLdclr; break;
-      case 0b0010: args.op = AtomicOp::kLdset; break;
-      case 0b0011: args.op = AtomicOp::kLdeor; break;
+      // region digitalis fix: LDEOR/LDSET routing was swapped.
+      // Per ARM ARM C7.2.149/162 and confirmed via llvm-mc:
+      //   ldeor w0,w1,[x2] = 0xB820_2041 → opc=010 → kLdeor (XOR)
+      //   ldset w0,w1,[x2] = 0xB820_3041 → opc=011 → kLdset (OR)
+      // The interpreter and JIT handlers for kLdeor (XOR) / kLdset (OR)
+      // already match those names; only the decoder's case 0b0010/0b0011
+      // were transposed.  Hit rarely in the wild because Bionic on the
+      // pre-LSE NDK falls back to LL/SC for fetch_or, but anyone built
+      // with -march=armv8.1-a+lse hits this silently.
+      case 0b0010: args.op = AtomicOp::kLdeor; break;
+      case 0b0011: args.op = AtomicOp::kLdset; break;
+      // atomic min/max (LSE Armv8.1).
+      // LDSMAX/SMIN/UMAX/UMIN are encoded at opc=100/101/110/111 with o3=0;
+      // full_op = (o3<<3)|opc.
+      case 0b0100: args.op = AtomicOp::kLdsmax; break;
+      case 0b0101: args.op = AtomicOp::kLdsmin; break;
+      case 0b0110: args.op = AtomicOp::kLdumax; break;
+      case 0b0111: args.op = AtomicOp::kLdumin; break;
+      // endregion
       case 0b1000: args.op = AtomicOp::kSwp; break;
+      // region digitalis LDAPR (Armv8.3-LRCPC) as plain LDAR.
+      // LDAPR/LDAPRB/LDAPRH/LDAPR (Load-Acquire RCpc Register) shares the
+      // atomic-memory-op encoding class with full_op=(o3<<3)|opc=0b1100
+      // (o3=1, opc=0b100).  Verified via NDK r28 clang assembly:
+      //   ldapr x0,[x1]  = 0xF8BFC020  -> o3=1, opc=100, Rs=11111, A=1, R=0
+      //   ldapr w0,[x1]  = 0xB8BFC020
+      //   ldaprb w0,[x1] = 0x38BFC020
+      //   ldaprh w0,[x1] = 0x78BFC020
+      // The architectural distinguishers are Rs=11111 and A=1, R=0; we
+      // gate on Rs=11111 here (A/R live in args.acquire/release set above).
+      // RCpc is *weaker* than ARM release-consistency; x86-TSO is *stronger*
+      // than both, so routing to kLdar (which the interpreter and JIT
+      // already implement as a plain x86 load) is correctness-preserving.
+      // Encoding ref: ARM ARM DDI 0487 C7.2.156 (LDAPR).
+      // Handoff-31 picked case 0b1111 here, which never fired -- the bug
+      // surfaced when hello-lrcpc (handoff-42) issued the explicit
+      // instruction via inline asm and SIGILL'd on the first probe.
+      case 0b1100: {
+        if (rs != 0b11111) {
+          Undefined();
+          return;
+        }
+        args.op = AtomicOp::kLdar;
+        // args.acquire/release are already (A,R)=(1,0) from above — match
+        // them to LDAR's canonical (acquire=true, release=false) so the
+        // interpreter/JIT see the same shape as a real LDAR.
+        args.acquire = true;
+        args.release = false;
+        break;
+      }
+      // endregion
       default: Undefined(); return;
     }
     insn_consumer_->LoadStoreExclusive(args);
@@ -4073,6 +5529,33 @@ class Decoder {
     uint8_t opcode = GetBits<10, 6>();
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
+
+    // region digitalis
+    // MTE DP-2src: SUBP(opc=0,S=0), SUBPS(opc=0,S=1), IRG(opc=4,S=0),
+    // GMI(opc=5,S=0). All require sf=1 (64-bit). Route them to the
+    // MteDataProc listener BEFORE the S-bit check below, since SUBPS
+    // has S=1 by definition.
+    if (sf && (opcode == 0b000000 || opcode == 0b000100 || opcode == 0b000101)) {
+      MteDataProcOpcode mte_op;
+      if (opcode == 0b000000) {
+        mte_op = s ? MteDataProcOpcode::kSubps : MteDataProcOpcode::kSubp;
+      } else if (opcode == 0b000100) {
+        if (s) return Undefined();   // IRG never sets flags.
+        mte_op = MteDataProcOpcode::kIrg;
+      } else {
+        if (s) return Undefined();   // GMI never sets flags.
+        mte_op = MteDataProcOpcode::kGmi;
+      }
+      const MteDataProcArgs args = {
+          .opcode = mte_op,
+          .dst = rd,
+          .src1 = rn,
+          .src2 = rm,
+      };
+      insn_consumer_->MteDataProc(args);
+      return;
+    }
+    // endregion
 
     // S must be 0 for these instructions.
     if (s) {
