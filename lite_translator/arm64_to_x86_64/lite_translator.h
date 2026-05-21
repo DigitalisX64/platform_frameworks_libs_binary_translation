@@ -4552,14 +4552,36 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D).
+      // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
       //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
       //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
       //   FNEG: XOR with broadcast mask 0x80000000 (FP32) or 0x80000000_00000000 (FP64).
-      // The FP16 vector form (args.is_fp16) bails to the interpreter.
+      //   FP16: broadcast 16-bit mask 0x7FFF (FABS) / 0x8000 (FNEG).  FP16
+      //   FABS/FNEG are pure bit operations — no F16C round-trip required.
+      // region digitalis
       case Decoder::AdvSimdTwoRegMiscOpcode::kFabs:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
-        if (args.is_fp16) { success_ = false; return; }
+        const bool is_fabs =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFabs);
+        if (args.is_fp16) {
+          // .4H (Q=0) and .8H (Q=1) — broadcast 16-bit mask then PAND/PXOR.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister mask = AllocTempSimdReg();
+          if (xn == no_simd_register || mask == no_simd_register) { Undefined(); return; }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Pcmpeqd(mask, mask);
+          if (is_fabs) {
+            as_.Psrlw(mask, int8_t{1});   // each 16-bit lane = 0x7FFF
+            as_.Pand(xn, mask);
+          } else {
+            as_.Psllw(mask, int8_t{15});  // each 16-bit lane = 0x8000
+            as_.Pxor(xn, mask);
+          }
+          if (!args.q) mask_low64(xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        // endregion
         if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { Undefined(); return; }
@@ -4568,8 +4590,6 @@ class LiteTranslator {
         if (xn == no_simd_register || mask == no_simd_register) { Undefined(); return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
         as_.Pcmpeqd(mask, mask);
-        const bool is_fabs =
-            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFabs);
         if (is_double) {
           // FABS mask 0x7FFFFFFFFFFFFFFF (allones >> 1); FNEG mask 0x8000000000000000.
           if (is_fabs) {
