@@ -2635,6 +2635,61 @@ class LiteTranslator {
       SetReg(args.rd, tmp);
       return;
     }
+
+    // SCVTF / UCVTF (scalar, integer→FP, rmode=00): Vd = (FP)(s|u)Wn/Xn.
+    //
+    //   rmode=00, opcode=010 -> SCVTF: signed Wn/Xn -> Sd/Dd
+    //   rmode=00, opcode=011 -> UCVTF: unsigned Wn/Xn -> Sd/Dd
+    //
+    // x86 CVTSI2SS/SD always reads a signed source.  For SCVTF this matches
+    // ARM directly: the L-variant takes a 32-bit source and sign-extends it
+    // into the FP unit's signed conversion, the Q-variant takes a 64-bit
+    // source.  For UCVTF with sf=0 (32-bit unsigned source) we zero-extend
+    // the source into a 64-bit GPR via MOVL and then use CVTSI2SS/SD Q-form
+    // — the value always fits in int64 so the signed convert is exact.
+    // UCVTF with sf=1 (64-bit unsigned) needs the textbook "halve, convert,
+    // double" trick for inputs >= 2^63; defer to the interpreter for now —
+    // it's not worth the extra control flow for the JIT until profiling
+    // flags it.
+    if (rmode == 0b00 && (opcode == 0b010 || opcode == 0b011) &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      const bool is_unsigned = (opcode == 0b011);
+      if (is_unsigned && args.sf) {
+        success_ = false;  // UCVTF X-source -> interpreter
+        return;
+      }
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      as_.Pxor(xmm, xmm);
+      if (args.rn < 31) {
+        Register gp_val = GetReg(args.rn);
+        if (is_unsigned) {
+          // sf=0, opcode=011: 32-bit unsigned.  Zero-extend via MOVL then
+          // convert as signed 64-bit (value <= UINT32_MAX < INT64_MAX).
+          Register tmp = AllocTempReg();
+          as_.Movl(tmp, gp_val);  // 32-bit MOV zero-extends to 64
+          if (args.ftype == 0b00) as_.Cvtsi2ssq(xmm, tmp);
+          else as_.Cvtsi2sdq(xmm, tmp);
+        } else if (args.sf) {
+          // sf=1, opcode=010: 64-bit signed, direct Q-form.
+          if (args.ftype == 0b00) as_.Cvtsi2ssq(xmm, gp_val);
+          else as_.Cvtsi2sdq(xmm, gp_val);
+        } else {
+          // sf=0, opcode=010: 32-bit signed, L-form.  CVTSI2{SS,SD}L reads
+          // the 32-bit subreg as int32 (sign-extends to the FP convert).
+          if (args.ftype == 0b00) as_.Cvtsi2ssl(xmm, gp_val);
+          else as_.Cvtsi2sdl(xmm, gp_val);
+        }
+      }
+      // Legacy CVTSI2{SS,SD} leaves xmm[127:32]/xmm[127:64] unchanged; the
+      // pre-PXOR guarantees those bits are zero, so the single MOVDQU below
+      // writes the lane plus ARM's required zero-extension above it in one
+      // shot.  rn=31 (XZR/WZR) falls through here too — xmm is still zero,
+      // matching the (FP)(0) result.
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm);
+      return;
+    }
     // endregion
 
     Undefined();
