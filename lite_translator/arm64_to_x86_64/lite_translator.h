@@ -2647,24 +2647,52 @@ class LiteTranslator {
     // source.  For UCVTF with sf=0 (32-bit unsigned source) we zero-extend
     // the source into a 64-bit GPR via MOVL and then use CVTSI2SS/SD Q-form
     // — the value always fits in int64 so the signed convert is exact.
-    // UCVTF with sf=1 (64-bit unsigned) needs the textbook "halve, convert,
-    // double" trick for inputs >= 2^63; defer to the interpreter for now —
-    // it's not worth the extra control flow for the JIT until profiling
-    // flags it.
+    // UCVTF with sf=1 (64-bit unsigned) splits at bit 63: if the source is
+    // < 2^63 the direct Q-form is exact; otherwise we apply the textbook
+    // "halve, round-to-odd, convert, double" fix-up.  The round-to-odd
+    // halve (`v >> 1) | (v & 1)`) preserves enough information that the
+    // subsequent round-to-nearest-even after doubling lands on the same
+    // bit pattern clang emits for `static_cast<float|double>(uint64_t)`.
     if (rmode == 0b00 && (opcode == 0b010 || opcode == 0b011) &&
         (args.ftype == 0b00 || args.ftype == 0b01)) {
       const bool is_unsigned = (opcode == 0b011);
-      if (is_unsigned && args.sf) {
-        success_ = false;  // UCVTF X-source -> interpreter
-        return;
-      }
       SimdRegister xmm = AllocTempSimdReg();
       if (xmm == no_simd_register) { success_ = false; return; }
       int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
       as_.Pxor(xmm, xmm);
       if (args.rn < 31) {
         Register gp_val = GetReg(args.rn);
-        if (is_unsigned) {
+        if (is_unsigned && args.sf) {
+          // sf=1, opcode=011: 64-bit unsigned.  Branch on the sign bit:
+          // direct convert for values < 2^63, halve/convert/double for the
+          // upper half.  Forward jumps keep the positive (fast) path
+          // straight-line; only the >= 2^63 case takes the fix-up.
+          Register tmp = AllocTempReg();
+          if (tmp == no_register) { success_ = false; return; }
+          as_.Movq(tmp, gp_val);
+          Assembler::Label* neg_path = as_.MakeLabel();
+          Assembler::Label* done = as_.MakeLabel();
+          as_.Testq(tmp, tmp);
+          as_.Jcc(Assembler::Condition::kNegative, *neg_path);
+          if (args.ftype == 0b00) as_.Cvtsi2ssq(xmm, tmp);
+          else as_.Cvtsi2sdq(xmm, tmp);
+          as_.Jmp(*done);
+          as_.Bind(neg_path);
+          Register low_bit = AllocTempReg();
+          if (low_bit == no_register) { success_ = false; return; }
+          as_.Movq(low_bit, tmp);
+          as_.Andq(low_bit, static_cast<int32_t>(1));  // round-to-odd LSB
+          as_.Shrq(tmp, static_cast<int8_t>(1));       // logical halve
+          as_.Orq(tmp, low_bit);                       // tmp = halve|LSB
+          if (args.ftype == 0b00) {
+            as_.Cvtsi2ssq(xmm, tmp);
+            as_.Addss(xmm, xmm);                       // double back
+          } else {
+            as_.Cvtsi2sdq(xmm, tmp);
+            as_.Addsd(xmm, xmm);                       // double back
+          }
+          as_.Bind(done);
+        } else if (is_unsigned) {
           // sf=0, opcode=011: 32-bit unsigned.  Zero-extend via MOVL then
           // convert as signed 64-bit (value <= UINT32_MAX < INT64_MAX).
           Register tmp = AllocTempReg();
