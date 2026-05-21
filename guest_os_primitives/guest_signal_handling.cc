@@ -135,14 +135,27 @@ void SetHostRegIP(ucontext* ucontext, uintptr_t addr) {
 #endif
 }
 
+// region digitalis - nested-signal recursion depth tracking
+// Thread-local count of how many HandleHostSignal frames are active on this
+// thread right now. depth > 1 means a nested signal arrived while we were
+// already handling one (e.g. breakpad's signal handler itself faulted).
+// Used purely for diagnostics — does not change recovery behaviour.
+static thread_local int g_handle_host_signal_depth = 0;
+// endregion
+
 // Can be interrupted by another HandleHostSignal!
 void HandleHostSignal(int sig, siginfo_t* info, void* context) {
   ucontext_t* ucontext = bit_cast<ucontext_t*>(context);
-  TRACE("Handle host signal %s (%d) at pc=%p si_addr=%p",
+  // region digitalis
+  ++g_handle_host_signal_depth;
+  int depth = g_handle_host_signal_depth;
+  // endregion
+  TRACE("Handle host signal %s (%d) at pc=%p si_addr=%p depth=%d",
         strsignal(sig),
         sig,
         bit_cast<void*>(GetHostRegIP(ucontext)),
-        info->si_addr);
+        info->si_addr,
+        depth);
 
   bool attached;
   GuestThread* thread = AttachCurrentThread(false, &attached);
@@ -174,6 +187,9 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
         if (!IsPendingSignalWithoutRecoveryCodeFatal(info)) {
           TRACE("Skipping imprecise context recovery for non-fatal signal");
           TRACE("Guest signal handler suspended, continue");
+          // region digitalis
+          --g_handle_host_signal_depth;
+          // endregion
           return;
         }
         TRACE(
@@ -184,19 +200,107 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
       TRACE("guest signal handler suspended, run recovery for host pc %p at host pc %p",
             bit_cast<void*>(addr),
             bit_cast<void*>(recovery_addr));
+      // region digitalis - NULL-page / low-address fault forensics.
+      // For any SIGSEGV/SIGBUS where si_addr lies below 4 GB, dump the
+      // guest CPU. On Android ARM64 real heap/stack/lib mappings are
+      // always >= 0x10000000000, so anything < 0x100000000 is a
+      // truncated or bogus pointer. Dump caller PC (x30), arg regs
+      // (x0..x7), and callee-saved + iterator regs (x16..x29) — the
+      // latter group commonly holds loop pointers (x21 was the buggy
+      // value in FB libcoldstart Yoga layout per handoff-18). The
+      // "Imprecise context" warning still applies for JIT execution —
+      // for interpreter execution state is precise.
+      if (thread &&
+          (sig == SIGSEGV || sig == SIGBUS) &&
+          reinterpret_cast<uintptr_t>(info->si_addr) < 0x100000000ULL) {
+        auto& cpu = thread->state()->cpu;
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "LowAddr fault: sig=%d si_addr=%p si_code=%d guest_pc=0x%lx "
+            "x30(lr)=0x%lx x0=0x%lx x1=0x%lx",
+            sig, info->si_addr, info->si_code,
+            (unsigned long)cpu.insn_addr,
+            (unsigned long)cpu.x[30],
+            (unsigned long)cpu.x[0],
+            (unsigned long)cpu.x[1]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x2=0x%lx x3=0x%lx x4=0x%lx x5=0x%lx x6=0x%lx x7=0x%lx "
+            "sp=0x%lx x29(fp)=0x%lx",
+            (unsigned long)cpu.x[2], (unsigned long)cpu.x[3],
+            (unsigned long)cpu.x[4], (unsigned long)cpu.x[5],
+            (unsigned long)cpu.x[6], (unsigned long)cpu.x[7],
+            (unsigned long)cpu.sp, (unsigned long)cpu.x[29]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x16=0x%lx x17=0x%lx x18=0x%lx x19=0x%lx x20=0x%lx x21=0x%lx "
+            "x22=0x%lx x23=0x%lx",
+            (unsigned long)cpu.x[16], (unsigned long)cpu.x[17],
+            (unsigned long)cpu.x[18], (unsigned long)cpu.x[19],
+            (unsigned long)cpu.x[20], (unsigned long)cpu.x[21],
+            (unsigned long)cpu.x[22], (unsigned long)cpu.x[23]);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  x24=0x%lx x25=0x%lx x26=0x%lx x27=0x%lx x28=0x%lx",
+            (unsigned long)cpu.x[24], (unsigned long)cpu.x[25],
+            (unsigned long)cpu.x[26], (unsigned long)cpu.x[27],
+            (unsigned long)cpu.x[28]);
+      }
+      // endregion
+      // region digitalis - if this is a NESTED host signal (depth > 1) the
+      // first frame is still mid-ProcessGuestSignal (guest handler in flight).
+      // Recording the guest CPU here gives forensic data the existing
+      // "delivering signal" trace doesn't capture for the inner fault.
+      if (depth > 1 && thread) {
+        auto& cpu = thread->state()->cpu;
+        TRACE(
+            "NESTED host signal: depth=%d sig=%d host_pc=0x%lx host_recovery=0x%lx "
+            "fault_addr=%p si_code=%d guest_insn_addr=0x%lx guest_sp=0x%lx "
+            "guest_x30=0x%lx guest_x29=0x%lx",
+            depth,
+            sig,
+            (unsigned long)addr,
+            (unsigned long)recovery_addr,
+            info->si_addr,
+            info->si_code,
+            (unsigned long)cpu.insn_addr,
+            (unsigned long)cpu.sp,
+            (unsigned long)cpu.x[30],
+            (unsigned long)cpu.x[29]);
+      }
+      // endregion
     } else {
       // Failed to find recovery code.
       // Translated code should be arranged to continue till
       // the next pending signals check unless it's fatal.
       if (IsPendingSignalWithoutRecoveryCodeFatal(info)) {
+        // region digitalis - log nested no-recovery fatals
+        if (depth > 1 && thread) {
+          auto& cpu = thread->state()->cpu;
+          TRACE(
+              "NESTED host signal NO-RECOVERY: depth=%d sig=%d host_pc=0x%lx "
+              "fault_addr=%p si_code=%d guest_insn_addr=0x%lx guest_sp=0x%lx "
+              "guest_x30=0x%lx",
+              depth,
+              sig,
+              (unsigned long)addr,
+              info->si_addr,
+              info->si_code,
+              (unsigned long)cpu.insn_addr,
+              (unsigned long)cpu.sp,
+              (unsigned long)cpu.x[30]);
+        }
+        // endregion
         HandleFatalSignal(sig, info, context);
         // If the raised signal is blocked we may need to return from the handler to unblock it.
         TRACE("Detected return from HandleFatalSignal, continue");
+        // region digitalis
+        --g_handle_host_signal_depth;
+        // endregion
         return;
       }
       TRACE("guest signal handler suspended, continue");
     }
   }
+  // region digitalis
+  --g_handle_host_signal_depth;
+  // endregion
 }
 
 bool IsReservedSignal(int signal) {
@@ -446,11 +550,15 @@ void HandleFaultForRecovery(int sig, siginfo_t* info, void* context) {
       // during guest execution would be delivered to the guest's signal handler.
       // If no handler is registered, the default action (terminate) applies.
       // This ensures matching behavior under translation.
-      if (info->si_addr == nullptr) {
+      // Log for any fault in the first page (NULL + small offset). FB's
+      // libcoldstart.so faults at NULL+8 (ldp w22, w23, [x0, #8]); capturing
+      // x30 here points at the caller that passed x0=NULL.
+      if (reinterpret_cast<uintptr_t>(info->si_addr) < 0x1000) {
         auto& cpu = thread->state()->cpu;
         __android_log_print(ANDROID_LOG_ERROR, "berberis",
-            "Guest NULL dereference: sig=%d guest_pc=0x%llx x30(lr)=0x%llx",
+            "Guest NULL-page deref: sig=%d si_addr=%p guest_pc=0x%llx x30(lr)=0x%llx",
             sig,
+            info->si_addr,
             (unsigned long long)cpu.insn_addr,
             (unsigned long long)cpu.x[30]);
         __android_log_print(ANDROID_LOG_ERROR, "berberis",

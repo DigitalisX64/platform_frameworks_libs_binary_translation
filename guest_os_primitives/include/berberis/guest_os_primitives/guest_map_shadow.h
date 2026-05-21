@@ -18,6 +18,9 @@
 #define BERBERIS_GUEST_OS_PRIMITIVES_GUEST_MAP_SHADOW_H_
 
 #include <cstddef>
+// region digitalis - per-thread Set/ClearExecutable counters for DlOpen diagnosis.
+#include <cstdint>
+// endregion
 #include <mutex>
 #include <utility>
 
@@ -32,6 +35,15 @@ enum BitValue {
   kBitSet,
   kBitMixed,
 };
+
+// region digitalis - per-thread Set/ClearExecutable counters.
+// Used to break down "what consumes the >30s libQt6Widgets DlOpen?"
+// by counting executable-page state changes between DlOpen ENTER/EXIT.
+// Per-thread so concurrent dlopens on other threads don't pollute the count.
+uint64_t GuestMapShadowGetSetExecutableCount();
+uint64_t GuestMapShadowGetClearExecutableCount();
+void GuestMapShadowResetExecutableCounts();
+// endregion
 
 class GuestMapShadow {
  public:
