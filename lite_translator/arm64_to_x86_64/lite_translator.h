@@ -4692,18 +4692,54 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // Vector FSQRT (FP32 .2S/.4S, FP64 .2D) -- per-lane square root.
-      //   size=10 -> FP32, size=11 -> FP64.  FP64 requires Q=1.
-      // SSE SQRTPS / SQRTPD handle the lanewise sqrt natively; default
-      // MXCSR rounding (RNE) matches ARM's default FPCR rounding.  NaN,
-      // signed zeros and negative finites all behave identically to the
-      // ARM ARM semantics (SQRTPS/PD propagate NaN, produce -0 for -0
-      // input and qNaN for negative finite input).
-      // The FP16 .4H/.8H form (args.is_fp16) bails to the interpreter
-      // (which uses __builtin_sqrtf with FpHalfToSingle/FpSingleToHalf
-      // round-trip -- see interpreter.h:5717).
+      // Vector FSQRT (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H) -- per-lane
+      // square root.
+      //   FP32/FP64: SSE SQRTPS / SQRTPD; default MXCSR rounding (RNE)
+      //   matches ARM's default FPCR rounding. NaN, signed zeros and
+      //   negative finites all behave identically to the ARM ARM
+      //   semantics (SQRTPS/PD propagate NaN, produce -0 for -0 input
+      //   and qNaN for negative finite input).
+      //   FP16: F16C round-trip (Vcvtph2ps widen -> SQRTPS -> Vcvtps2ph
+      //   narrow imm=0). Per the standing rule, F16C round-trip is
+      //   exact for FP16 unary FSQRT. The .8H form splits the upper 4
+      //   half-lanes into a second F16C round-trip (no AVX YMM path).
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
-        if (args.is_fp16) { success_ = false; return; }
+        if (args.is_fp16) {
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          SimdRegister xlo = AllocTempSimdReg();
+          if (xlo == no_simd_register) { Undefined(); return; }
+          if (!args.q) {
+            // .4H: 4 FP16 lanes in low 64 bits of Vn.
+            as_.Movq(xlo, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xlo, xlo);
+            as_.Sqrtps(xlo, xlo);
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            // Vcvtps2ph already zeroes the upper 64 bits of xlo.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          } else {
+            // .8H: 8 FP16 lanes; process low 4 then high 4.
+            SimdRegister xhi = AllocTempSimdReg();
+            if (xhi == no_simd_register) { Undefined(); return; }
+            as_.Movdqu(xhi, {.base = Assembler::rbp, .disp = vn_off});
+            // Low half: copy then widen lanes 0-3.
+            as_.Movdqa(xlo, xhi);
+            as_.Vcvtph2ps(xlo, xlo);
+            // High half: shift right 8 bytes so upper 4 FP16 -> low 64
+            // bits of xhi, then widen.
+            as_.Psrldq(xhi, int8_t{8});
+            as_.Vcvtph2ps(xhi, xhi);
+            as_.Sqrtps(xlo, xlo);
+            as_.Sqrtps(xhi, xhi);
+            // Narrow each back to 4 FP16 in the low 64 bits.
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            as_.Vcvtps2ph(xhi, xhi, int8_t{0});
+            // Shift high result into the upper 64 bits and OR with low.
+            as_.Pslldq(xhi, int8_t{8});
+            as_.Por(xlo, xhi);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          }
+          return;
+        }
         if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { Undefined(); return; }
