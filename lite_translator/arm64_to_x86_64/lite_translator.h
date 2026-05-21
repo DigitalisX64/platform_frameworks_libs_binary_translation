@@ -3778,8 +3778,39 @@ class LiteTranslator {
         return;
       }
 
-      // FSQRT and FRINT* need F16C; bail to interpreter if absent.
+      // FSQRT, FRINT*, and FCVT-from-half need F16C; bail to interpreter
+      // if absent.
       if (!host_platform::kHasF16C) { success_ = false; return; }
+
+      // FCVT Sd, Hn (opcode=0b000100) and FCVT Dd, Hn (opcode=0b000101):
+      // widen half->single via VCVTPH2PS, then optionally widen to double
+      // via CVTSS2SD.  Result lives in lane 0 of a freshly-zeroed dst XMM,
+      // so MOVDQU writes the AArch64 scalar layout [val_in_low_N, 0×rest]
+      // verbatim.
+      if (args.opcode == 0b000100 || args.opcode == 0b000101) {
+        bool to_double = (args.opcode == 0b000101);
+        SimdRegister xmm_src = AllocTempSimdReg();
+        SimdRegister xmm_dst = AllocTempSimdReg();
+        if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+          Undefined();
+          return;
+        }
+        as_.Pxor(xmm_src, xmm_src);
+        as_.Pinsrw(xmm_src, {.base = Assembler::rbp, .disp = src_offset},
+                   int8_t{0});
+        as_.Vcvtph2ps(xmm_src, xmm_src);   // half->single in lane 0
+        if (to_double) {
+          as_.Pxor(xmm_dst, xmm_dst);
+          as_.Cvtss2sd(xmm_dst, xmm_src);  // single->double in lane 0; dst
+                                           // upper 96 preserved (zero).
+          as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+        } else {
+          // VCVTPH2PS already produced [single, 0, 0, 0] in xmm_src
+          // because lanes 1..3 of the source halves were zero.
+          as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_src);
+        }
+        return;
+      }
 
       int8_t round_imm = 0;
       bool is_sqrt = false;
@@ -3792,7 +3823,7 @@ class LiteTranslator {
         case 0b001110: round_imm = 0x00; break;     // FRINTX
         case 0b001111: round_imm = 0x08; break;     // FRINTI
         default:
-          // FCVT half->{single,double}, FRINTA -> interpreter.
+          // FRINTA -> interpreter.
           success_ = false;
           return;
       }
@@ -3863,6 +3894,62 @@ class LiteTranslator {
       return;
     }
 
+    // FCVT between FP32 and FP64: zero a fresh dst XMM, then CVTSS2SD or
+    // CVTSD2SS into lane 0.  Both ops preserve the upper 96 bits of the
+    // destination, so the zero-then-convert sequence leaves
+    // [val_in_low_N, 0×rest] which is the AArch64 scalar layout.
+    if (!is_double && args.opcode == 0b000101) {
+      // FCVT Dd, Sn — single -> double.  No F16C needed.
+      SimdRegister xmm_src = AllocTempSimdReg();
+      SimdRegister xmm_dst = AllocTempSimdReg();
+      if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+        Undefined();
+        return;
+      }
+      as_.Movss(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+      as_.Pxor(xmm_dst, xmm_dst);
+      as_.Cvtss2sd(xmm_dst, xmm_src);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+      return;
+    }
+    if (is_double && args.opcode == 0b000100) {
+      // FCVT Sd, Dn — double -> single.  No F16C needed.
+      SimdRegister xmm_src = AllocTempSimdReg();
+      SimdRegister xmm_dst = AllocTempSimdReg();
+      if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+        Undefined();
+        return;
+      }
+      as_.Movsd(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+      as_.Pxor(xmm_dst, xmm_dst);
+      as_.Cvtsd2ss(xmm_dst, xmm_src);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+      return;
+    }
+    // FCVT Hd, Sn / FCVT Hd, Dn — narrow to half.  Needs F16C for VCVTPS2PH.
+    // For FP64 source, first narrow double->single via CVTSD2SS into a
+    // zeroed XMM, then VCVTPS2PH narrows single->half and zeroes upper 64.
+    if (args.opcode == 0b000111) {
+      if (!host_platform::kHasF16C) { success_ = false; return; }
+      SimdRegister xmm_src = AllocTempSimdReg();
+      SimdRegister xmm_dst = AllocTempSimdReg();
+      if (xmm_src == no_simd_register || xmm_dst == no_simd_register) {
+        Undefined();
+        return;
+      }
+      if (is_double) {
+        as_.Movsd(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Pxor(xmm_dst, xmm_dst);
+        as_.Cvtsd2ss(xmm_dst, xmm_src);            // single in xmm_dst lane 0
+        as_.Vcvtps2ph(xmm_dst, xmm_dst, int8_t{0}); // half in xmm_dst lane 0
+      } else {
+        as_.Movss(xmm_src, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Vcvtps2ph(xmm_dst, xmm_src, int8_t{0}); // half in xmm_dst lane 0
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_dst);
+      return;
+    }
+
     // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
     int8_t round_imm = 0;
     bool is_sqrt = false;
@@ -3875,7 +3962,7 @@ class LiteTranslator {
       case 0b001110: round_imm = 0x00; break;     // FRINTX
       case 0b001111: round_imm = 0x08; break;     // FRINTI
       default:
-        // FRINTA, FCVT S<->D, FCVT to half -> interpreter.
+        // FRINTA -> interpreter.
         success_ = false;
         return;
     }
