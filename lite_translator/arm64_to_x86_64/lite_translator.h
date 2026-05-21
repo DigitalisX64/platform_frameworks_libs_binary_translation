@@ -4686,7 +4686,8 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // Vector FRINTA (FP32 .2S/.4S, FP64 .2D) -- "round to nearest, ties away".
+      // Vector FRINTA (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H) -- "round to
+      // nearest, ties away".
       // x86 ROUNDPS/PD has no ties-away mode, so use the identity
       //     FRINTA(x) = trunc(x + copysign(0.5, x))
       // already used by the scalar FRINTA JIT path (handoff-81).  Per-lane:
@@ -4694,8 +4695,75 @@ class LiteTranslator {
       // imm=3.  Bit-exact against ARM for all finite/NaN/Inf inputs (the
       // +0.5 nudge is a no-op when |x| >= 2^p; signed zeros preserved by
       // ROUNDPS imm=3; NaN/Inf propagate through ADDPS/ADDPD).
+      // FP16 .4H/.8H runs the same trick in FP32 space via the F16C
+      // round-trip (Vcvtph2ps -> ADDPS + ROUNDPS imm=3 -> Vcvtps2ph
+      // imm=0).  Bit-exact for FP16 because: the widen-add-trunc-narrow
+      // sequence preserves ARM's RNA result at every FP16 input (the
+      // +0.5 nudge is exact in FP32; trunc gives an integer that, when
+      // |x| <= 2^11, is representable in FP16 directly; when |x| > 2^11,
+      // x itself is already integer in FP16 and trunc(x + sign*0.5) == x).
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV: {
-        if (args.is_fp16) { success_ = false; return; }
+        if (args.is_fp16) {
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          SimdRegister xlo = AllocTempSimdReg();
+          SimdRegister smask = AllocTempSimdReg();
+          SimdRegister half = AllocTempSimdReg();
+          SimdRegister tmp = AllocTempSimdReg();
+          if (xlo == no_simd_register || smask == no_simd_register ||
+              half == no_simd_register || tmp == no_simd_register) {
+            Undefined(); return;
+          }
+          Register gp_half = AllocTempReg();
+          if (gp_half == no_register) { Undefined(); return; }
+          // Build FP32 sign-bit broadcast mask.
+          as_.Pcmpeqd(smask, smask);
+          as_.Pslld(smask, int8_t{31});
+          // Build 0.5 (FP32) broadcast across all 4 dwords.
+          as_.Movl(gp_half, int32_t{0x3F000000});
+          as_.Movd(half, gp_half);
+          as_.Pshufd(half, half, static_cast<int8_t>(0x00));
+          if (!args.q) {
+            // .4H: 4 FP16 lanes in low 64 bits of Vn.
+            as_.Movq(xlo, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xlo, xlo);
+            as_.Movdqa(tmp, xlo);
+            as_.Pand(tmp, smask);   // tmp = sign(xlo) in FP32 sign-bit position
+            as_.Por(tmp, half);     // tmp = copysign(0.5, xlo)
+            as_.Addps(xlo, tmp);
+            as_.Roundps(xlo, xlo, int8_t{0x03});
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            // Vcvtps2ph zeroes the upper 64 bits of xlo.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          } else {
+            SimdRegister xhi = AllocTempSimdReg();
+            if (xhi == no_simd_register) { Undefined(); return; }
+            as_.Movdqu(xhi, {.base = Assembler::rbp, .disp = vn_off});
+            // Low half: widen lanes 0-3 into xlo.
+            as_.Vcvtph2ps(xlo, xhi);
+            // High half: shift xhi right 8 bytes, then widen.
+            as_.Psrldq(xhi, int8_t{8});
+            as_.Vcvtph2ps(xhi, xhi);
+            // FRINTA dance on low half; narrow immediately.
+            as_.Movdqa(tmp, xlo);
+            as_.Pand(tmp, smask);
+            as_.Por(tmp, half);
+            as_.Addps(xlo, tmp);
+            as_.Roundps(xlo, xlo, int8_t{0x03});
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            // FRINTA dance on high half; narrow.
+            as_.Movdqa(tmp, xhi);
+            as_.Pand(tmp, smask);
+            as_.Por(tmp, half);
+            as_.Addps(xhi, tmp);
+            as_.Roundps(xhi, xhi, int8_t{0x03});
+            as_.Vcvtps2ph(xhi, xhi, int8_t{0});
+            // Recombine: xhi << 8 bytes; xlo |= xhi.
+            as_.Pslldq(xhi, int8_t{8});
+            as_.Por(xlo, xhi);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          }
+          return;
+        }
         if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { Undefined(); return; }
