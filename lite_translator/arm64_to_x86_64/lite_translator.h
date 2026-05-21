@@ -2422,76 +2422,136 @@ class LiteTranslator {
 
   // region digitalis
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
-    // Implements UMLAL / UMULL (q=0, low-half source) at narrow→wide
-    // widths used by the linker's NEON GNU hash and other common Qt
-    // paths. q=1 ("2" variants on upper half) falls through to the
-    // interpreter for now.
-    if (args.q) { Undefined(); return; }
+    // JIT lowering for the widening multiply-and-(add|sub|just-store) family:
+    //   {S,U}MULL{,2}, {S,U}MLAL{,2}, {S,U}MLSL{,2}
+    // at all three input sizes (8/16/32) and both Q=0 (low half of Vn/Vm) and
+    // Q=1 ("2" variants — upper half of Vn/Vm). The result vector always fills
+    // 128 bits (8H/4S/2D). Other ThreeDiff ops (SADDL, USUBL, SABDL, SABAL,
+    // SADDW, etc., and the polynomial PMULL) still bail to the interpreter.
+    //
+    // Widening recipe (per size):
+    //   size=00 (8b→16b): PMOVSXBW / PMOVZXBW + PMULLW       (8 lanes, fills 128)
+    //   size=01 (16b→32b): PMOVSXWD / PMOVZXWD + PMULLD       (4 lanes, fills 128)
+    //   size=10 (32b→64b): PMOVSXDQ / PMOVZXDQ + PMULDQ / PMULUDQ (2 lanes)
+    //     The PMOVSXDQ/PMOVZXDQ widening places the two 32-bit source dwords
+    //     into the low dword of each qword, which is exactly the input shape
+    //     PMULDQ/PMULUDQ wants — they multiply the low dword of each qword
+    //     of src1 against the low dword of each qword of src2 and produce
+    //     two qword products at positions [0..7] and [8..15].
+    using Op = Decoder::AdvSimdThreeDiffOpcode;
 
-    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
-    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
-    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
-
-    switch (args.opcode) {
-      case Decoder::AdvSimdThreeDiffOpcode::kUmlal: {
-        // UMLAL Vd.<wide>, Vn.<narrow>, Vm.<narrow> (low half of source).
-        // Vd += zext(Vn[lane]) * zext(Vm[lane])
-        // Only 4H→4S (size=01) is the hot case; 8B→8H (size=00) also
-        // appears occasionally.
-        SimdRegister xn = AllocTempSimdReg();
-        SimdRegister xm = AllocTempSimdReg();
-        SimdRegister xd = AllocTempSimdReg();
-        if (xn == no_simd_register || xm == no_simd_register || xd == no_simd_register) {
-          Undefined(); return;
-        }
-        // Load D-half (low 64 bits) of Vn and Vm; widen to full 128.
-        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
-        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
-        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
-        if (args.size == 0b01) {
-          // 4H → 4S
-          as_.Pmovzxwd(xn, xn);
-          as_.Pmovzxwd(xm, xm);
-          as_.Pmulld(xn, xm);
-          as_.Paddd(xd, xn);
-        } else if (args.size == 0b00) {
-          // 8B → 8H (use Pmullw on 16-bit lanes after widening)
-          as_.Pmovzxbw(xn, xn);
-          as_.Pmovzxbw(xm, xm);
-          as_.Pmullw(xn, xm);
-          as_.Paddw(xd, xn);
-        } else {
-          Undefined(); return;
-        }
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
-        return;
-      }
-      case Decoder::AdvSimdThreeDiffOpcode::kUmull: {
-        // UMULL Vd.<wide>, Vn.<narrow>, Vm.<narrow>.
-        // Vd = zext(Vn) * zext(Vm) (no accumulate).
-        SimdRegister xn = AllocTempSimdReg();
-        SimdRegister xm = AllocTempSimdReg();
-        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
-        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
-        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
-        if (args.size == 0b01) {
-          as_.Pmovzxwd(xn, xn);
-          as_.Pmovzxwd(xm, xm);
-          as_.Pmulld(xn, xm);
-        } else if (args.size == 0b00) {
-          as_.Pmovzxbw(xn, xn);
-          as_.Pmovzxbw(xm, xm);
-          as_.Pmullw(xn, xm);
-        } else {
-          Undefined(); return;
-        }
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
-        return;
-      }
-      default:
+    // PMULL64 (size=11) lowers to a single PCLMULQDQ — the imm-named
+    // Pclmullqlqdq for Q=0 (poly_mul64(Vn.D[0], Vm.D[0])) and Pclmulhqhqdq
+    // for Q=1 (PMULL2; poly_mul64(Vn.D[1], Vm.D[1])). PMULL.8H (size=00)
+    // is 8 independent 8-bit polynomial products with no native shape —
+    // continues to bail to the interpreter.
+    if (args.opcode == Op::kPmull) {
+      if (args.size != 0b11) {
         Undefined();
         return;
+      }
+      const int32_t vn_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      const int32_t vm_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      const int32_t vd_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn_p = AllocTempSimdReg();
+      SimdRegister xm_p = AllocTempSimdReg();
+      if (xn_p == no_simd_register || xm_p == no_simd_register) {
+        success_ = false;
+        return;
+      }
+      as_.Movdqu(xn_p, {.base = Assembler::rbp, .disp = vn_off_pmull});
+      as_.Movdqu(xm_p, {.base = Assembler::rbp, .disp = vm_off_pmull});
+      if (args.q) {
+        as_.Pclmulhqhqdq(xn_p, xm_p);
+      } else {
+        as_.Pclmullqlqdq(xn_p, xm_p);
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, xn_p);
+      return;
     }
+
+    const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
+    const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
+    const bool is_mlsl = (args.opcode == Op::kSmlsl || args.opcode == Op::kUmlsl);
+    if (!is_mull && !is_mlal && !is_mlsl) {
+      Undefined();  // remaining ThreeDiff ops not JIT-lowered yet
+      return;
+    }
+    const bool is_signed = (args.opcode == Op::kSmull ||
+                            args.opcode == Op::kSmlal ||
+                            args.opcode == Op::kSmlsl);
+    if (args.size > 0b10) { Undefined(); return; }
+
+    const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    // Q=0 reads the low 64 bits of Vn/Vm; Q=1 reads bytes 8..15. The widening
+    // turns 8 input bytes into the full 128-bit output.
+    const int32_t src_disp_extra = args.q ? 8 : 0;
+
+    SimdRegister xn = AllocTempSimdReg();
+    SimdRegister xm = AllocTempSimdReg();
+    if (xn == no_simd_register || xm == no_simd_register) {
+      success_ = false;
+      return;
+    }
+
+    as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off + src_disp_extra});
+    as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off + src_disp_extra});
+
+    // Widen + multiply. After this block xn holds the 128-bit lane-wise
+    // product (eight 16-bit / four 32-bit / two 64-bit lanes).
+    switch (args.size) {
+      case 0b00:
+        if (is_signed) { as_.Pmovsxbw(xn, xn); as_.Pmovsxbw(xm, xm); }
+        else           { as_.Pmovzxbw(xn, xn); as_.Pmovzxbw(xm, xm); }
+        as_.Pmullw(xn, xm);
+        break;
+      case 0b01:
+        if (is_signed) { as_.Pmovsxwd(xn, xn); as_.Pmovsxwd(xm, xm); }
+        else           { as_.Pmovzxwd(xn, xn); as_.Pmovzxwd(xm, xm); }
+        as_.Pmulld(xn, xm);  // SSE4.1
+        break;
+      case 0b10:
+        if (is_signed) {
+          as_.Pmovsxdq(xn, xn);
+          as_.Pmovsxdq(xm, xm);
+          as_.Pmuldq(xn, xm);  // SSE4.1 — signed 32×32 → 64
+        } else {
+          as_.Pmovzxdq(xn, xn);
+          as_.Pmovzxdq(xm, xm);
+          as_.Pmuludq(xn, xm);  // unsigned 32×32 → 64
+        }
+        break;
+    }
+
+    if (is_mull) {
+      // No accumulate — store the lane-wise product directly.
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      return;
+    }
+
+    // MLAL (accumulate) / MLSL (subtract-accumulate): Vd = Vd ± products,
+    // at the *wide* lane width.
+    SimdRegister xd = AllocTempSimdReg();
+    if (xd == no_simd_register) { success_ = false; return; }
+    as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+    switch (args.size) {
+      case 0b00:
+        if (is_mlal) as_.Paddw(xd, xn);
+        else         as_.Psubw(xd, xn);
+        break;
+      case 0b01:
+        if (is_mlal) as_.Paddd(xd, xn);
+        else         as_.Psubd(xd, xn);
+        break;
+      case 0b10:
+        if (is_mlal) as_.Paddq(xd, xn);
+        else         as_.Psubq(xd, xn);
+        break;
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
   }
   // endregion
 
