@@ -2470,6 +2470,134 @@ class LiteTranslator {
       return;
     }
 
+    // Widening add/sub family — same widen-then-binop pattern as the
+    // multiply family below:
+    //   SADDL/UADDL/SSUBL/USUBL — widen both Vn and Vm, then add/sub
+    //                              at the wide lane.
+    //   SADDW/UADDW/SSUBW/USUBW — Vn is already wide (loaded as 128b),
+    //                              widen only Vm, then add/sub.
+    //   SABDL/UABDL              — widen both, compute max-min at wide
+    //                              lane width (= absolute difference,
+    //                              valid because zero/sign-extending
+    //                              keeps the subtraction within the
+    //                              signed range of the wider type).
+    //   SABAL/UABAL              — same abs diff, then accumulate into Vd.
+    // size=10 (32→64) for the ABDL/ABAL forms needs 64-bit lane-wise
+    // max/min, neither of which is in SSE — that case bails to the
+    // interpreter (success_ = false). All other size/Q/sign combinations
+    // are JIT-lowered.
+    {
+      const bool is_addl = (args.opcode == Op::kSaddl || args.opcode == Op::kUaddl);
+      const bool is_subl = (args.opcode == Op::kSsubl || args.opcode == Op::kUsubl);
+      const bool is_addw = (args.opcode == Op::kSaddw || args.opcode == Op::kUaddw);
+      const bool is_subw = (args.opcode == Op::kSsubw || args.opcode == Op::kUsubw);
+      const bool is_abdl = (args.opcode == Op::kSabdl || args.opcode == Op::kUabdl);
+      const bool is_abal = (args.opcode == Op::kSabal || args.opcode == Op::kUabal);
+
+      if (is_addl || is_subl || is_addw || is_subw || is_abdl || is_abal) {
+        if (args.size > 0b10) { Undefined(); return; }
+        if ((is_abdl || is_abal) && args.size == 0b10) {
+          // No 64-bit lane-wise signed/unsigned max/min in SSE.
+          success_ = false;
+          return;
+        }
+        const bool addsub_signed = (args.opcode == Op::kSaddl ||
+                                    args.opcode == Op::kSsubl ||
+                                    args.opcode == Op::kSaddw ||
+                                    args.opcode == Op::kSsubw ||
+                                    args.opcode == Op::kSabdl ||
+                                    args.opcode == Op::kSabal);
+
+        const int32_t vn_off_as = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+        const int32_t vm_off_as = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+        const int32_t vd_off_as = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+        const int32_t narrow_disp = args.q ? 8 : 0;
+        const bool n_is_wide = (is_addw || is_subw);
+
+        SimdRegister xn_as = AllocTempSimdReg();
+        SimdRegister xm_as = AllocTempSimdReg();
+        if (xn_as == no_simd_register || xm_as == no_simd_register) {
+          success_ = false;
+          return;
+        }
+
+        // Load + widen Vn.
+        if (n_is_wide) {
+          // Vn is already a 128-bit wide-lane vector (SADDW family).
+          as_.Movdqu(xn_as, {.base = Assembler::rbp, .disp = vn_off_as});
+        } else {
+          as_.Movq(xn_as, {.base = Assembler::rbp, .disp = vn_off_as + narrow_disp});
+          switch (args.size) {
+            case 0b00: if (addsub_signed) as_.Pmovsxbw(xn_as, xn_as); else as_.Pmovzxbw(xn_as, xn_as); break;
+            case 0b01: if (addsub_signed) as_.Pmovsxwd(xn_as, xn_as); else as_.Pmovzxwd(xn_as, xn_as); break;
+            case 0b10: if (addsub_signed) as_.Pmovsxdq(xn_as, xn_as); else as_.Pmovzxdq(xn_as, xn_as); break;
+          }
+        }
+        // Load + widen Vm (always narrow).
+        as_.Movq(xm_as, {.base = Assembler::rbp, .disp = vm_off_as + narrow_disp});
+        switch (args.size) {
+          case 0b00: if (addsub_signed) as_.Pmovsxbw(xm_as, xm_as); else as_.Pmovzxbw(xm_as, xm_as); break;
+          case 0b01: if (addsub_signed) as_.Pmovsxwd(xm_as, xm_as); else as_.Pmovzxwd(xm_as, xm_as); break;
+          case 0b10: if (addsub_signed) as_.Pmovsxdq(xm_as, xm_as); else as_.Pmovzxdq(xm_as, xm_as); break;
+        }
+
+        if (is_addl || is_addw) {
+          switch (args.size) {
+            case 0b00: as_.Paddw(xn_as, xm_as); break;
+            case 0b01: as_.Paddd(xn_as, xm_as); break;
+            case 0b10: as_.Paddq(xn_as, xm_as); break;
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_as}, xn_as);
+          return;
+        }
+        if (is_subl || is_subw) {
+          switch (args.size) {
+            case 0b00: as_.Psubw(xn_as, xm_as); break;
+            case 0b01: as_.Psubd(xn_as, xm_as); break;
+            case 0b10: as_.Psubq(xn_as, xm_as); break;
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_as}, xn_as);
+          return;
+        }
+
+        // ABDL / ABAL: abs(a - b) = max(a, b) - min(a, b) at the widened
+        // lane width. After widening both operands, signed and unsigned
+        // halves diverge in *which* max/min flavour to pick.
+        SimdRegister xmax = AllocTempSimdReg();
+        if (xmax == no_simd_register) { success_ = false; return; }
+        as_.Movdqa(xmax, xn_as);  // save original Vn
+        if (addsub_signed) {
+          switch (args.size) {
+            case 0b00: as_.Pmaxsw(xmax, xm_as); as_.Pminsw(xn_as, xm_as); break;
+            case 0b01: as_.Pmaxsd(xmax, xm_as); as_.Pminsd(xn_as, xm_as); break;  // SSE4.1
+          }
+        } else {
+          switch (args.size) {
+            case 0b00: as_.Pmaxuw(xmax, xm_as); as_.Pminuw(xn_as, xm_as); break;  // SSE4.1
+            case 0b01: as_.Pmaxud(xmax, xm_as); as_.Pminud(xn_as, xm_as); break;  // SSE4.1
+          }
+        }
+        switch (args.size) {
+          case 0b00: as_.Psubw(xmax, xn_as); break;
+          case 0b01: as_.Psubd(xmax, xn_as); break;
+        }
+
+        if (is_abal) {
+          SimdRegister xd_as = AllocTempSimdReg();
+          if (xd_as == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd_as, {.base = Assembler::rbp, .disp = vd_off_as});
+          switch (args.size) {
+            case 0b00: as_.Paddw(xd_as, xmax); break;
+            case 0b01: as_.Paddd(xd_as, xmax); break;
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_as}, xd_as);
+          return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_as}, xmax);
+        return;
+      }
+    }
+
     const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
     const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
     const bool is_mlsl = (args.opcode == Op::kSmlsl || args.opcode == Op::kUmlsl);
