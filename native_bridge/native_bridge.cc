@@ -256,6 +256,30 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
   static bool init_finalized = FinalizeInit();
   UNUSED(init_finalized);
 
+  // region digitalis
+  // In-APK path fast path: when libpath is "<apk>!/<entry>" (Qt 6 apps that
+  // ship native libs inside base.apk), the guest linker's own load of that
+  // path is known to either fail fast (sister Qt 6 libs) or hang for >30 s
+  // (observed with libQt6Widgets in VulkanCapsViewer 4.11 — first-launch
+  // extraction inside the guest linker). Either way, the eventual successful
+  // load is via our host-side ExtractInApkLibToCache + cache-path reload.
+  // Skip the broken guest-linker `!/` attempt entirely and extract first.
+  // This also turns the previously-hanging Widgets case into a one-time
+  // host-side ZIP extract + a normal cache-path dlopen.
+  if (libpath != nullptr && strstr(libpath, "!/") != nullptr) {
+    std::string extracted = ExtractInApkLibToCache(libpath);
+    if (!extracted.empty()) {
+      void* cached = LoadGuestLibrary(extracted.c_str(), flags, ns);
+      if (cached != nullptr) {
+        return cached;
+      }
+      const char* cache_err = guest_loader_->DlError();
+      DIGITALIS_LOG("LoadGuestLibrary for extracted %s failed: %s",
+                    extracted.c_str(), cache_err ? cache_err : "(no error)");
+    }
+  }
+  // endregion
+
   void* handle = LoadGuestLibrary(libpath, flags, ns);
   if (handle != nullptr) {
     return handle;
@@ -265,23 +289,6 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
   {
     const char* guest_err = guest_loader_->DlError();
     DIGITALIS_LOG("LoadGuestLibrary FAILED for %s: %s", libpath, guest_err ? guest_err : "(no error)");
-  }
-
-  // In-APK path fallback: when the guest linker rejects "<apk>!/<entry>"
-  // (e.g. Qt 6 apps that ship libs inside base.apk), extract the entry to a
-  // disk path under the app's cache dir and retry guest dlopen with that.
-  if (libpath != nullptr && strstr(libpath, "!/") != nullptr) {
-    std::string extracted = ExtractInApkLibToCache(libpath);
-    if (!extracted.empty()) {
-      void* retry = LoadGuestLibrary(extracted.c_str(), flags, ns);
-      if (retry != nullptr) {
-        DIGITALIS_LOG("LoadGuestLibrary succeeded after APK extract: %s", libpath);
-        return retry;
-      }
-      const char* retry_err = guest_loader_->DlError();
-      DIGITALIS_LOG("LoadGuestLibrary still FAILED for extracted %s: %s",
-                    extracted.c_str(), retry_err ? retry_err : "(no error)");
-    }
   }
   // endregion
 
