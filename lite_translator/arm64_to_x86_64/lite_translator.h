@@ -2434,11 +2434,90 @@ class LiteTranslator {
     success_ = false;  // interpreter fallback
   }
 
-  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB
-  // Fall back to interpreter for now (3-source FP operations are complex for JIT).
-  void FpDataProc3(uint8_t /*rd*/, uint8_t /*rn*/, uint8_t /*rm*/, uint8_t /*ra*/,
-                   uint8_t /*ftype*/, bool /*o1*/, bool /*o0*/) {
-    success_ = false;  // interpreter fallback
+  // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB at S/D.
+  //
+  //   FMADD  (o1=0, o0=0) : Rd = Ra + Rn*Rm
+  //   FMSUB  (o1=0, o0=1) : Rd = Ra - Rn*Rm
+  //   FNMADD (o1=1, o0=0) : Rd = -(Ra + Rn*Rm)
+  //   FNMSUB (o1=1, o0=1) : Rd = Rn*Rm - Ra
+  //
+  // The ARM ARM specifies the single multiply-add is computed without
+  // intermediate rounding (one rounding for the whole fused operation).
+  // x86 FMA3 (VFMADD231SS/SD and friends) has the same semantic, so this is
+  // the only sound JIT lowering.  Hosts without FMA3 fall back to the
+  // interpreter (which uses libc fma() / fmaf() — also single-rounded),
+  // not to a MUL+ADD pair (which would double-round).
+  //
+  // Mapping to x86 FMA231 form (dest = src1*src2 ± dest, ± from mnemonic;
+  // load Ra into the dest slot, Rn into src1, Rm into src2):
+  //   FMADD  -> Vfmadd231(ss|sd)  : Ra +  Rn*Rm
+  //   FMSUB  -> Vfnmadd231(ss|sd) : Ra + -(Rn*Rm)  = Ra - Rn*Rm
+  //   FNMADD -> Vfnmsub231(ss|sd) : -(Rn*Rm) - Ra  = -(Ra + Rn*Rm)
+  //   FNMSUB -> Vfmsub231(ss|sd)  :  Rn*Rm - Ra
+  //
+  // FP16 (ftype=11) stays on the interpreter: F16C round-trip is not exact
+  // for FMA (-91 parking note); the interpreter does fma() in binary64
+  // before narrowing, which is exact.
+  void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
+                   uint8_t ftype, bool o1, bool o0) {
+    // region digitalis
+    if (ftype != 0b00 && ftype != 0b01) {
+      success_ = false;
+      return;
+    }
+    if (!host_platform::kHasFMA) {
+      success_ = false;
+      return;
+    }
+    const bool is_double = (ftype == 0b01);
+
+    const int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+    const int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    const int32_t src_a_off = offsetof(ThreadState, cpu.v[0]) + ra * 16;
+    const int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    if (xmm_n == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_m == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_a = AllocTempSimdReg();
+    if (xmm_a == no_simd_register) { success_ = false; return; }
+
+    if (is_double) {
+      as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
+    } else {
+      as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
+    }
+
+    if (!o1 && !o0) {
+      if (is_double) as_.Vfmadd231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfmadd231ss(xmm_a, xmm_n, xmm_m);
+    } else if (!o1 && o0) {
+      if (is_double) as_.Vfnmadd231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfnmadd231ss(xmm_a, xmm_n, xmm_m);
+    } else if (o1 && !o0) {
+      if (is_double) as_.Vfnmsub231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfnmsub231ss(xmm_a, xmm_n, xmm_m);
+    } else {
+      if (is_double) as_.Vfmsub231sd(xmm_a, xmm_n, xmm_m);
+      else as_.Vfmsub231ss(xmm_a, xmm_n, xmm_m);
+    }
+
+    // ARM zero-extends Vd above the result lane.  Zero the full 128 bits
+    // (reusing xmm_n as a scratch — n is no longer needed), then write the
+    // scalar lane on top.
+    as_.Pxor(xmm_n, xmm_n);
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_n);
+    if (is_double) {
+      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    } else {
+      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    }
+    // endregion
   }
 
   // FMOV (scalar, immediate): JIT - load a FP constant into SIMD register
