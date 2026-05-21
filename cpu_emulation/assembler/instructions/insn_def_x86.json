@@ -450,7 +450,11 @@
     {
       "encodings": {
         "Rsqrtps": { "opcodes": [ "0F", "52" ] },
-        "Vrsqrtps": { "feature": "AVX", "opcodes": [ "C4", "01", "00", "52" ] }
+        "Sqrtpd": { "opcodes": [ "66", "0F", "51" ] },
+        "Sqrtps": { "opcodes": [ "0F", "51" ] },
+        "Vrsqrtps": { "feature": "AVX", "opcodes": [ "C4", "01", "00", "52" ] },
+        "Vsqrtpd": { "feature": "AVX", "opcodes": [ "C4", "01", "01", "51" ] },
+        "Vsqrtps": { "feature": "AVX", "opcodes": [ "C4", "01", "00", "51" ] }
       },
       "args": [
         { "class": "VecReg128", "usage": "def" },
