@@ -3709,45 +3709,71 @@ class LiteTranslator {
   // endregion
 
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
-    // region digitalis - JIT support for FMOV (FP32/FP64) plus scalar FP16
-    // FMOV / FSQRT / FRINT{N,P,M,Z,X,I} via F16C round-trip.
+    // region digitalis - JIT path for FP one-source ops across FP16/FP32/FP64.
     //
-    // FP16 lowering pattern for FSQRT / FRINT*:
-    //   PXOR      xmm, xmm                 (zero upper lanes)
-    //   PINSRW    xmm, [src], #0           (load the 16-bit half into lane 0)
-    //   VCVTPH2PS xmm, xmm                 (widen 4 halves -> 4 singles;
-    //                                       lanes 1-3 are zero from PXOR)
-    //   SQRTSS / ROUNDSS xmm, xmm[, imm]   (do the op on lane 0 in FP32)
-    //   VCVTPS2PH xmm, xmm, imm=0          (narrow back, RNE, ignore MXCSR;
-    //                                       VCVTPS2PH zeroes upper 64 bits)
-    //   MOVDQU    [dst], xmm               (store 128 bits: result in low 16,
-    //                                       rest zero -- correct AArch64 layout)
+    //   FMOV          : direct copy (no F16C).
+    //   FABS / FNEG   : sign-bit clear / flip via GP register mask
+    //                   (0x7FFF / 0x8000 for FP16, 0x7FFFFFFF / 0x80000000
+    //                   for FP32, sign byte at +7 for FP64).
+    //   FSQRT         : SQRTSS / SQRTSD natively at FP32/FP64; F16C
+    //                   round-trip with SQRTSS at FP16.
+    //   FRINTN/M/P/Z/X/I :  ROUNDSS / ROUNDSD natively at FP32/FP64;
+    //                   F16C round-trip with ROUNDSS at FP16.
+    //   FRINTA        : no native x86 ties-to-away mode -- interpreter.
+    //   FCVT between precisions : interpreter (different dst layouts).
     //
-    // The round-trip is exact for FSQRT/FRINT* because binary32's 24-bit
-    // mantissa fully covers a single-rounding narrowing from any FP16 unary
-    // result; the only rounding happens at the final VCVTPS2PH (RNE), which
-    // matches ARM default FPCR.RMode=0.
+    // ROUNDSS / ROUNDSD imm[3:0]:
+    //   bit 3   : SAE (suppress all FP exceptions)
+    //   bit 2   : 1 -> route rounding through MXCSR.RC (NEVER set here;
+    //             Berberis doesn't sync MXCSR.RC with guest FPCR.RMode)
+    //   bits[1:0] : rounding mode when bit 2 == 0:
+    //     00 = RNE (FRINTN)
+    //     01 = -inf (FRINTM)
+    //     10 = +inf (FRINTP)
+    //     11 = zero (FRINTZ)
+    //   FRINTX uses current FPCR (assume default RNE) and signals Inexact
+    //     -> imm 0x00.
+    //   FRINTI uses current FPCR without raising Inexact -> imm 0x08
+    //     (SAE + RNE).  Berberis doesn't track FPSR yet, so the SAE bit
+    //     is documentary; setting it keeps the lowering spec-faithful.
     //
-    // FMOV is a direct 2-byte move via a GP scratch.
-    // FRINTA (ties-away-from-zero) has no native x86 rounding mode -- bails
-    // to the interpreter (which uses std::round on the FP32 round-trip).
-    // FABS/FNEG also stay on the interpreter, matching the FP32/FP64 path
-    // which is interpreter-only today.  FCVT half->single (0b000100) and
-    // half->double (0b000101) stay on the interpreter -- their destination
-    // layout differs from the FP16 path.
-    if (args.ftype == 0b11) {
-      int32_t src_offset = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
-      int32_t dst_offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+    // The F16C round-trip is exact for FP16 FSQRT / FRINT* because
+    // binary32's 24-bit mantissa fully covers a single-rounding narrowing
+    // from any FP16 unary result; the only rounding is at VCVTPS2PH (RNE,
+    // matching ARM default FPCR.RMode=0).
 
+    int32_t src_offset = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t dst_offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (args.ftype == 0b11) {
+      // FP16 (half-precision) ops.
       if (args.opcode == 0b000000) {
-        // FMOV Hd, Hn: zero dest, then copy 2 bytes via GP scratch.  No F16C
-        // dependency.
+        // FMOV Hd, Hn: zero dest, then copy 2 bytes via GP scratch.
+        // No F16C dependency.
         SimdRegister xmm = AllocTempSimdReg();
         if (xmm == no_simd_register) { Undefined(); return; }
         Register tmp = AllocTempReg();
+        as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = src_offset});
         as_.Pxor(xmm, xmm);
         as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm);
+        as_.Movw({.base = Assembler::rbp, .disp = dst_offset}, tmp);
+        return;
+      }
+
+      if (args.opcode == 0b000001 || args.opcode == 0b000010) {
+        // FABS / FNEG Hd, Hn: load 16 bits, mask/xor sign bit, store 2
+        // bytes into a zero-filled dest.  No F16C dependency.
+        SimdRegister xmm = AllocTempSimdReg();
+        if (xmm == no_simd_register) { Undefined(); return; }
+        Register tmp = AllocTempReg();
         as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = src_offset});
+        if (args.opcode == 0b000001) {
+          as_.Andl(tmp, int32_t{0x00007FFF});  // FABS: clear sign bit
+        } else {
+          as_.Xorl(tmp, int32_t{0x00008000});  // FNEG: flip sign bit
+        }
+        as_.Pxor(xmm, xmm);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm);
         as_.Movw({.base = Assembler::rbp, .disp = dst_offset}, tmp);
         return;
       }
@@ -3755,21 +3781,6 @@ class LiteTranslator {
       // FSQRT and FRINT* need F16C; bail to interpreter if absent.
       if (!host_platform::kHasF16C) { success_ = false; return; }
 
-      // ROUNDSS imm encoding (bits[3:0]):
-      //   bit 3   = SAE (suppress all FP exceptions)
-      //   bit 2   = 1 -> route rounding through MXCSR.RC (NEVER set here:
-      //             Berberis does not sync MXCSR.RC with guest FPCR.RMode)
-      //   bits[1:0] = rounding mode when bit 2 == 0:
-      //     00 = round to nearest, ties to even   (FRINTN)
-      //     01 = round toward -inf                (FRINTM)
-      //     10 = round toward +inf                (FRINTP)
-      //     11 = round toward zero                (FRINTZ)
-      //   FRINTX uses current FPCR rounding (assume default RNE) and is
-      //         specified to raise Inexact -> imm 0x00 (RNE, no SAE).
-      //   FRINTI uses current FPCR rounding without raising Inexact -> imm
-      //         0x08 (RNE + SAE).  Berberis doesn't track FPSR so the SAE
-      //         distinction is mainly documentary, but using SAE for FRINTI
-      //         matches its spec.
       int8_t round_imm = 0;
       bool is_sqrt = false;
       switch (args.opcode) {
@@ -3781,7 +3792,7 @@ class LiteTranslator {
         case 0b001110: round_imm = 0x00; break;     // FRINTX
         case 0b001111: round_imm = 0x08; break;     // FRINTI
         default:
-          // FABS, FNEG, FCVT half->{single,double}, FRINTA -> interpreter.
+          // FCVT half->{single,double}, FRINTA -> interpreter.
           success_ = false;
           return;
       }
@@ -3801,29 +3812,105 @@ class LiteTranslator {
       return;
     }
 
-    // FP32 / FP64 path: only FMOV is JIT'd today; everything else bails.
-    if (args.opcode != 0b000000) { Undefined(); return; }
+    // FP32 (ftype=00) and FP64 (ftype=01) paths.
     if (args.ftype != 0b00 && args.ftype != 0b01) { Undefined(); return; }
+    bool is_double = (args.ftype == 0b01);
 
-    int32_t src_offset = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
-    int32_t dst_offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+    // FMOV, FABS, FNEG: GP-register mask/copy lowering.
+    if (args.opcode == 0b000000 || args.opcode == 0b000001 ||
+        args.opcode == 0b000010) {
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { Undefined(); return; }
+      Register tmp_lo = AllocTempReg();
 
-    // Zero the full 128-bit dest register, then copy the data via GP temp
-    SimdRegister xmm = AllocTempSimdReg();
-    if (xmm == no_simd_register) { Undefined(); return; }
-    Register tmp = AllocTempReg();
+      if (!is_double) {
+        // FP32: one 4-byte word.
+        as_.Movl(tmp_lo, {.base = Assembler::rbp, .disp = src_offset});
+        if (args.opcode == 0b000001) {
+          as_.Andl(tmp_lo, int32_t{0x7FFFFFFF});  // FABS
+        } else if (args.opcode == 0b000010) {
+          as_.Xorl(tmp_lo, static_cast<int32_t>(0x80000000));  // FNEG
+        }
+        as_.Pxor(xmm, xmm);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm);
+        as_.Movl({.base = Assembler::rbp, .disp = dst_offset}, tmp_lo);
+        return;
+      }
 
-    as_.Pxor(xmm, xmm);
-    as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm);
+      // FP64: load low 4 bytes verbatim, load high 4 bytes and patch sign
+      // bit there.  Splitting into two MOVL avoids needing a 64-bit
+      // immediate (MOVABSQ) for the FABS/FNEG masks.
+      if (args.opcode == 0b000000) {
+        // FMOV Dd, Dn: copy all 8 bytes.
+        as_.Movq(tmp_lo, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Pxor(xmm, xmm);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm);
+        as_.Movq({.base = Assembler::rbp, .disp = dst_offset}, tmp_lo);
+        return;
+      }
+      Register tmp_hi = AllocTempReg();
+      as_.Movl(tmp_lo, {.base = Assembler::rbp, .disp = src_offset});
+      as_.Movl(tmp_hi, {.base = Assembler::rbp, .disp = src_offset + 4});
+      if (args.opcode == 0b000001) {
+        as_.Andl(tmp_hi, int32_t{0x7FFFFFFF});  // FABS Dd
+      } else {
+        as_.Xorl(tmp_hi, static_cast<int32_t>(0x80000000));  // FNEG Dd
+      }
+      as_.Pxor(xmm, xmm);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm);
+      as_.Movl({.base = Assembler::rbp, .disp = dst_offset}, tmp_lo);
+      as_.Movl({.base = Assembler::rbp, .disp = dst_offset + 4}, tmp_hi);
+      return;
+    }
 
-    if (args.ftype == 0b00) {
-      // FMOV Sd, Sn: copy 4 bytes
-      as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset});
-      as_.Movl({.base = Assembler::rbp, .disp = dst_offset}, tmp);
+    // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
+    int8_t round_imm = 0;
+    bool is_sqrt = false;
+    switch (args.opcode) {
+      case 0b000011: is_sqrt = true; break;       // FSQRT
+      case 0b001000: round_imm = 0x00; break;     // FRINTN
+      case 0b001001: round_imm = 0x02; break;     // FRINTP
+      case 0b001010: round_imm = 0x01; break;     // FRINTM
+      case 0b001011: round_imm = 0x03; break;     // FRINTZ
+      case 0b001110: round_imm = 0x00; break;     // FRINTX
+      case 0b001111: round_imm = 0x08; break;     // FRINTI
+      default:
+        // FRINTA, FCVT S<->D, FCVT to half -> interpreter.
+        success_ = false;
+        return;
+    }
+
+    SimdRegister xmm_val = AllocTempSimdReg();
+    if (xmm_val == no_simd_register) { Undefined(); return; }
+    SimdRegister xmm_zero = AllocTempSimdReg();
+    if (xmm_zero == no_simd_register) { Undefined(); return; }
+
+    // Load src first (in case dst == src).
+    if (is_double) {
+      as_.Movsd(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
     } else {
-      // FMOV Dd, Dn: copy 8 bytes
-      as_.Movq(tmp, {.base = Assembler::rbp, .disp = src_offset});
-      as_.Movq({.base = Assembler::rbp, .disp = dst_offset}, tmp);
+      as_.Movss(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+    }
+    // Zero the full 128-bit dst register.
+    as_.Pxor(xmm_zero, xmm_zero);
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+    // Operate in place on lane 0 of xmm_val (upper lanes were zeroed by
+    // MOVSS/MOVSD from memory; SQRTSS/SQRTSD and ROUNDSS/ROUNDSD preserve
+    // the upper lanes of the dest).
+    if (is_double) {
+      if (is_sqrt) {
+        as_.Sqrtsd(xmm_val, xmm_val);
+      } else {
+        as_.Roundsd(xmm_val, xmm_val, round_imm);
+      }
+      as_.Movsd({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+    } else {
+      if (is_sqrt) {
+        as_.Sqrtss(xmm_val, xmm_val);
+      } else {
+        as_.Roundss(xmm_val, xmm_val, round_imm);
+      }
+      as_.Movss({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
     }
     // endregion
   }
