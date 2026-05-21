@@ -3897,7 +3897,10 @@ class LiteTranslator {
     //                   round-trip with SQRTSS at FP16.
     //   FRINTN/M/P/Z/X/I :  ROUNDSS / ROUNDSD natively at FP32/FP64;
     //                   F16C round-trip with ROUNDSS at FP16.
-    //   FRINTA        : no native x86 ties-to-away mode -- interpreter.
+    //   FRINTA        : ARM ties-to-away has no native x86 ROUND* imm.
+    //                   Lowered as: dst = trunc(src + copysign(0.5, src)).
+    //                   Half goes through F16C round-trip; FP32/FP64 use
+    //                   ADDSS+ROUNDSS / ADDSD+ROUNDSD on a GP-built half.
     //   FCVT between precisions : interpreter (different dst layouts).
     //
     // ROUNDSS / ROUNDSD imm[3:0]:
@@ -3990,6 +3993,37 @@ class LiteTranslator {
         return;
       }
 
+      // FRINTA Hd, Hn: ties-to-away in FP32 space via the canonical
+      // add-copysign(0.5)-then-truncate trick.  Build the copysign value
+      // in a GP register from the FP16 sign bit, widen src via F16C, do
+      // the ADDSS + ROUNDSS imm=3 (truncate), and narrow back.
+      if (args.opcode == 0b001100) {
+        SimdRegister xmm_val = AllocTempSimdReg();
+        SimdRegister xmm_half = AllocTempSimdReg();
+        if (xmm_val == no_simd_register || xmm_half == no_simd_register) {
+          Undefined();
+          return;
+        }
+        Register tmp = AllocTempReg();
+        // bits-of-copysign(0.5_fp32, src_fp16): sign of FP16 src shifted to
+        // FP32 sign-bit position, OR'd with the FP32 mantissa/exponent bits
+        // of +0.5 (0x3F000000).
+        as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Andl(tmp, int32_t{0x00008000});
+        as_.Shll(tmp, int8_t{16});
+        as_.Orl(tmp, int32_t{0x3F000000});
+        as_.Movd(xmm_half, tmp);
+        as_.Pxor(xmm_val, xmm_val);
+        as_.Pinsrw(xmm_val, {.base = Assembler::rbp, .disp = src_offset},
+                   int8_t{0});
+        as_.Vcvtph2ps(xmm_val, xmm_val);
+        as_.Addss(xmm_val, xmm_half);
+        as_.Roundss(xmm_val, xmm_val, int8_t{0x03});  // truncate toward 0
+        as_.Vcvtps2ph(xmm_val, xmm_val, int8_t{0});
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+        return;
+      }
+
       int8_t round_imm = 0;
       bool is_sqrt = false;
       switch (args.opcode) {
@@ -4001,7 +4035,7 @@ class LiteTranslator {
         case 0b001110: round_imm = 0x00; break;     // FRINTX
         case 0b001111: round_imm = 0x08; break;     // FRINTI
         default:
-          // FRINTA -> interpreter.
+          // Unknown FP16 unary opcode -> interpreter.
           success_ = false;
           return;
       }
@@ -4128,6 +4162,48 @@ class LiteTranslator {
       return;
     }
 
+    // FRINTA Sd/Dd, Sn/Dn: ties-to-away has no native ROUND* imm.
+    // Lowered as: dst = trunc(src + copysign(0.5, src)).  Build the
+    // copysign value in a GP register, then ADDSS/ADDSD + ROUNDSS/ROUNDSD
+    // imm=0x03 (truncate toward zero).
+    if (args.opcode == 0b001100) {
+      SimdRegister xmm_val = AllocTempSimdReg();
+      SimdRegister xmm_half = AllocTempSimdReg();
+      SimdRegister xmm_zero = AllocTempSimdReg();
+      if (xmm_val == no_simd_register || xmm_half == no_simd_register ||
+          xmm_zero == no_simd_register) { Undefined(); return; }
+      Register tmp = AllocTempReg();
+      if (is_double) {
+        // FP64: high 32 bits hold sign+exp; low 32 bits of 0.5_fp64 are
+        // zero.  Build only the high half in a GP register, then PINSRD
+        // it into the upper-32 of an otherwise-zero XMM.
+        as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset + 4});
+        as_.Andl(tmp, static_cast<int32_t>(0x80000000));  // sign bit only
+        as_.Orl(tmp, int32_t{0x3FE00000});                 // |= high32(0.5d)
+        as_.Pxor(xmm_half, xmm_half);
+        as_.Pinsrd(xmm_half, tmp, int8_t{1});              // xmm_half = copysign(0.5d,src)
+        as_.Movsd(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Addsd(xmm_val, xmm_half);
+        as_.Roundsd(xmm_val, xmm_val, int8_t{0x03});       // truncate toward 0
+        as_.Pxor(xmm_zero, xmm_zero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+      } else {
+        // FP32: one word holds sign+exp+mantissa.
+        as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Andl(tmp, static_cast<int32_t>(0x80000000));  // sign bit only
+        as_.Orl(tmp, int32_t{0x3F000000});                 // |= bits of +0.5
+        as_.Movd(xmm_half, tmp);                           // xmm_half = copysign(0.5,src)
+        as_.Movss(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Addss(xmm_val, xmm_half);
+        as_.Roundss(xmm_val, xmm_val, int8_t{0x03});       // truncate toward 0
+        as_.Pxor(xmm_zero, xmm_zero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+        as_.Movss({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+      }
+      return;
+    }
+
     // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
     int8_t round_imm = 0;
     bool is_sqrt = false;
@@ -4140,7 +4216,7 @@ class LiteTranslator {
       case 0b001110: round_imm = 0x00; break;     // FRINTX
       case 0b001111: round_imm = 0x08; break;     // FRINTI
       default:
-        // FRINTA -> interpreter.
+        // Unknown FP unary opcode -> interpreter.
         success_ = false;
         return;
     }
