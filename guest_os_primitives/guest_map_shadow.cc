@@ -67,7 +67,25 @@ bool DoIntervalsIntersect(const void* start,
   return !not_intersect;
 }
 
+// region digitalis - per-thread Set/ClearExecutable counters.
+thread_local uint64_t g_set_executable_count = 0;
+thread_local uint64_t g_clear_executable_count = 0;
+// endregion
+
 }  // namespace
+
+// region digitalis - exposed for DlOpen-scoped diagnosis (see linker_callbacks.cc).
+uint64_t GuestMapShadowGetSetExecutableCount() {
+  return g_set_executable_count;
+}
+uint64_t GuestMapShadowGetClearExecutableCount() {
+  return g_clear_executable_count;
+}
+void GuestMapShadowResetExecutableCounts() {
+  g_set_executable_count = 0;
+  g_clear_executable_count = 0;
+}
+// endregion
 
 GuestMapShadow* GuestMapShadow::GetInstance() {
   static auto* g_map_shadow = NewForever<GuestMapShadow>();
@@ -160,6 +178,9 @@ void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
   if (!IsConfigFlagSet(kDeterministicTracing)) {
     TRACE("SetExecutable: %zx..%zx", start, start + size);
   }
+  // region digitalis
+  ++g_set_executable_count;
+  // endregion
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
   while (pc < end) {
@@ -172,6 +193,9 @@ void GuestMapShadow::ClearExecutable(GuestAddr start, size_t size) {
   if (!IsConfigFlagSet(kDeterministicTracing)) {
     TRACE("ClearExecutable: %zx..%zx", start, start + size);
   }
+  // region digitalis
+  ++g_clear_executable_count;
+  // endregion
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
   bool changed = false;
