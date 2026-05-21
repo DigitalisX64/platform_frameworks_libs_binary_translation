@@ -2718,6 +2718,88 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm);
       return;
     }
+
+    // FCVTZS (scalar, FP -> signed int, truncate toward zero):
+    //   rmode=11, opcode=000, ftype in {00, 01}.
+    //
+    //   sf  ftype  insn               x86 lowering
+    //    0   00    FCVTZS Wd, Sn      Cvttss2sil + ARM saturation fix-up
+    //    0   01    FCVTZS Wd, Dn      Cvttsd2sil + ARM saturation fix-up
+    //    1   00    FCVTZS Xd, Sn      Cvttss2siq + ARM saturation fix-up
+    //    1   01    FCVTZS Xd, Dn      Cvttsd2siq + ARM saturation fix-up
+    //
+    // x86 cvtt{ss,sd}2si returns the destination type's INT_MIN ("indefinite")
+    // for any out-of-range input (NaN, +/-Inf, overflow), so we must rebuild
+    // ARM's by-sign saturation:
+    //   NaN              -> 0
+    //   positive overflow -> INT_MAX
+    //   negative overflow -> INT_MIN (matches the indefinite already)
+    // After truncate-convert we classify by (a) parity flag (PF=1 iff NaN)
+    // and (b) the FP source's sign bit (extracted via Movd/Movq):
+    //   NaN              -> branch to nan_path, write 0.
+    //   non-NaN, FP < 0  -> keep tmp (correct in-range neg or INT_MIN).
+    //   non-NaN, FP >= 0 -> if tmp >= 0 keep it (in-range pos); else
+    //                       tmp == INT_MIN i.e. positive overflow, write INT_MAX.
+    // -0.0 takes the non-NaN/FP<0 branch but tmp is 0 (cvtt returns 0 for
+    // -0.0), so keeping tmp gives the ARM-correct 0.
+    if (rmode == 0b11 && opcode == 0b000 &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      Register sign_tmp = AllocTempReg();
+      if (sign_tmp == no_register) { success_ = false; return; }
+      int32_t src_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      if (args.ftype == 0b00) {
+        as_.Movss(xmm, {.base = Assembler::rbp, .disp = src_off});
+      } else {
+        as_.Movsd(xmm, {.base = Assembler::rbp, .disp = src_off});
+      }
+      if (args.sf) {
+        if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+        else as_.Cvttsd2siq(tmp, xmm);
+      } else {
+        if (args.ftype == 0b00) as_.Cvttss2sil(tmp, xmm);
+        else as_.Cvttsd2sil(tmp, xmm);
+      }
+      Assembler::Label* nan_path = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+      // NaN check.
+      if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+      else as_.Ucomisd(xmm, xmm);
+      as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+      // Sign-of-FP check via raw bits.
+      if (args.ftype == 0b00) {
+        as_.Movd(sign_tmp, xmm);
+        as_.Testl(sign_tmp, sign_tmp);
+      } else {
+        as_.Movq(sign_tmp, xmm);
+        as_.Testq(sign_tmp, sign_tmp);
+      }
+      as_.Jcc(Assembler::Condition::kNegative, *done);
+      // Non-negative FP: keep tmp if tmp >= 0 (in-range); else overwrite
+      // with INT_MAX (positive overflow).
+      if (args.sf) as_.Testq(tmp, tmp);
+      else as_.Testl(tmp, tmp);
+      as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+      if (args.sf) {
+        as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+      } else {
+        as_.Movl(tmp, int32_t{INT32_MAX});
+      }
+      as_.Jmp(*done);
+      as_.Bind(nan_path);
+      if (args.sf) as_.Xorq(tmp, tmp);
+      else as_.Xorl(tmp, tmp);
+      as_.Bind(done);
+      if (args.rd < 31) {
+        // sf=0: tmp's upper 32 bits are already zero (x86-64 writes to
+        // 32-bit subregs auto-zero-extend), matching Wd-write semantics.
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
     // endregion
 
     Undefined();
