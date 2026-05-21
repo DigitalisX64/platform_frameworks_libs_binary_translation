@@ -2800,6 +2800,151 @@ class LiteTranslator {
       }
       return;
     }
+
+    // FCVTZU (scalar, FP -> unsigned int, truncate toward zero):
+    //   rmode=11, opcode=001, ftype in {00, 01}.
+    //
+    //   sf  ftype  insn               Strategy
+    //    0   00    FCVTZU Wd, Sn      Cvttss2siq + upper-32-saturation
+    //    0   01    FCVTZU Wd, Dn      Cvttsd2siq + upper-32-saturation
+    //    1   00    FCVTZU Xd, Sn      offset-trick for FP in [2^63, 2^64)
+    //    1   01    FCVTZU Xd, Dn      offset-trick for FP in [2^63, 2^64)
+    //
+    // ARM saturation rules:
+    //   NaN              -> 0
+    //   FP < 0 (incl -0) -> 0 (FCVTZU(-0.0) = 0 because the cvtt result is 0)
+    //   FP > UINT*_MAX   -> UINT*_MAX
+    //   in-range         -> trunc(FP) as unsigned
+    //
+    // sf=0: x86 cvtt-Q form yields an int64 result.  Valid unsigned outputs
+    // are in [0, UINT32_MAX]; the upper 32 bits are zero in that range and
+    // non-zero for both INT64_MIN indefinite and any finite FP > UINT32_MAX
+    // — so a single upper-32 zero test classifies in-range vs. overflow.
+    //
+    // sf=1: cvtt-Q covers FP in [0, 2^63) directly.  For FP >= 2^63, the
+    // standard offset trick (FP - 2^63 in FP, cvtt to int64, OR bit 63
+    // back in) recovers the unsigned result exactly.  The subtract is
+    // exact because both 2^63 and FP - 2^63 land on representable values
+    // at the same exponent step in FP32/FP64.  FP >= 2^64 saturates to
+    // UINT64_MAX; +Inf falls into this bucket via the FP comparison.
+    if (rmode == 0b11 && opcode == 0b001 &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      Register sign_tmp = AllocTempReg();
+      if (sign_tmp == no_register) { success_ = false; return; }
+      int32_t src_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      if (args.ftype == 0b00) {
+        as_.Movss(xmm, {.base = Assembler::rbp, .disp = src_off});
+      } else {
+        as_.Movsd(xmm, {.base = Assembler::rbp, .disp = src_off});
+      }
+
+      Assembler::Label* zero_path = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+
+      // NaN check via Ucomi self (PF=1 iff NaN).
+      if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+      else as_.Ucomisd(xmm, xmm);
+      as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+
+      // FP sign bit check via raw bits.  ARM FCVTZU(-0.0) = 0, which falls
+      // out of this branch naturally (cvtt(-0.0) = 0 in the zero_path).
+      if (args.ftype == 0b00) {
+        as_.Movd(sign_tmp, xmm);
+        as_.Testl(sign_tmp, sign_tmp);
+      } else {
+        as_.Movq(sign_tmp, xmm);
+        as_.Testq(sign_tmp, sign_tmp);
+      }
+      as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+
+      if (!args.sf) {
+        // sf=0 (uint32 destination): cvtt-Q always fits in int64.  Either
+        // the upper 32 bits of the result are zero (in-range, low 32 are
+        // the answer) or non-zero (saturate to UINT32_MAX).
+        if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+        else as_.Cvttsd2siq(tmp, xmm);
+        // sign_tmp is dead after the FP-sign jump above; reuse as upper-32 scratch.
+        as_.Movq(sign_tmp, tmp);
+        as_.Shrq(sign_tmp, int8_t{32});
+        as_.Testq(sign_tmp, sign_tmp);
+        as_.Jcc(Assembler::Condition::kZero, *done);
+        // Positive overflow: saturate to UINT32_MAX (low 32 ones, upper auto-zero).
+        as_.Movl(tmp, int32_t{-1});
+        as_.Jmp(*done);
+        as_.Bind(zero_path);
+        as_.Xorq(tmp, tmp);
+      } else {
+        // sf=1 (uint64 destination).
+        SimdRegister bound_xmm = AllocTempSimdReg();
+        if (bound_xmm == no_simd_register) { success_ = false; return; }
+        Assembler::Label* sat_max = as_.MakeLabel();
+        Assembler::Label* direct_path = as_.MakeLabel();
+
+        // Load 2^63 as FP constant into bound_xmm via the existing GP scratch.
+        // FP32(2^63) = 0x5F000000, FP64(2^63) = 0x43E0000000000000.
+        if (args.ftype == 0b00) {
+          as_.Movl(tmp, int32_t{0x5F000000});
+          as_.Movd(bound_xmm, tmp);
+        } else {
+          as_.Movq(tmp, static_cast<int64_t>(0x43E0000000000000LL));
+          as_.Movq(bound_xmm, tmp);
+        }
+
+        // FP < 2^63 -> direct cvtt-Q gives an exact non-negative int64.
+        if (args.ftype == 0b00) as_.Ucomiss(xmm, bound_xmm);
+        else as_.Ucomisd(xmm, bound_xmm);
+        as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+
+        // FP >= 2^63: now check upper bound.  Load 2^64 into sign_tmp's
+        // companion register, materialize as FP, and compare.  After the
+        // compare we discard the 2^64 constant and reuse bound_xmm (still
+        // holding 2^63) for the subtract.
+        SimdRegister bound2_xmm = AllocTempSimdReg();
+        if (bound2_xmm == no_simd_register) { success_ = false; return; }
+        if (args.ftype == 0b00) {
+          as_.Movl(tmp, int32_t{0x5F800000});  // FP32(2^64)
+          as_.Movd(bound2_xmm, tmp);
+        } else {
+          as_.Movq(tmp, static_cast<int64_t>(0x43F0000000000000LL));  // FP64(2^64)
+          as_.Movq(bound2_xmm, tmp);
+        }
+        if (args.ftype == 0b00) as_.Ucomiss(xmm, bound2_xmm);
+        else as_.Ucomisd(xmm, bound2_xmm);
+        as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+
+        // FP in [2^63, 2^64): subtract 2^63 (exact), cvtt, set bit 63.
+        if (args.ftype == 0b00) {
+          as_.Subss(xmm, bound_xmm);
+          as_.Cvttss2siq(tmp, xmm);
+        } else {
+          as_.Subsd(xmm, bound_xmm);
+          as_.Cvttsd2siq(tmp, xmm);
+        }
+        as_.Btsq(tmp, int8_t{63});
+        as_.Jmp(*done);
+
+        as_.Bind(sat_max);
+        as_.Movq(tmp, static_cast<int64_t>(-1));  // UINT64_MAX
+        as_.Jmp(*done);
+
+        as_.Bind(direct_path);
+        if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+        else as_.Cvttsd2siq(tmp, xmm);
+        as_.Jmp(*done);
+
+        as_.Bind(zero_path);
+        as_.Xorq(tmp, tmp);
+      }
+      as_.Bind(done);
+      if (args.rd < 31) {
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
     // endregion
 
     Undefined();
