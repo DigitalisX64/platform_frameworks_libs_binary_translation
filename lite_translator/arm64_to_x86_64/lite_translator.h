@@ -2658,6 +2658,67 @@ class LiteTranslator {
         }
         return;
       }
+      case Decoder::AdvSimdThreeSameOpcode::kFabdV: {
+        // FP16 vector FABD .4H / .8H via F16C round-trip:
+        //   widen each operand half to FP32, compute (a - b) at FP32, clear
+        //   the FP32 sign bit (0x7FFFFFFF per dword) before narrow.
+        // The sign-clear constant is built in an XMM temp with the
+        // `PCMPEQD self ; PSRLD 1` idiom — avoids a memory-side rodata load.
+        // F16C round-trip is bit-exact for FP16 FSUB (FP32 mantissa strictly
+        // contains FP16's), and a subsequent bitwise AND is bit-exact by
+        // construction, so the FP16 round-trip composes cleanly with the
+        // sign-clear step. FP32/FP64 forms still bail to the interpreter.
+        if (!args.is_fp16) { Undefined(); return; }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister mask = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            mask == no_simd_register) {
+          Undefined(); return;
+        }
+        as_.Pcmpeqd(mask, mask);
+        as_.Psrld(mask, int8_t{1});  // 0x7FFFFFFF per dword (FP32 sign-clear).
+        if (!args.q) {
+          // .4H: 4 FP16 lanes in the low 64 bits of each operand.
+          as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn, xn);
+          as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Vcvtph2ps(xm, xm);
+          as_.Subps(xn, xm);
+          as_.Pand(xn, mask);
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+          // Vcvtps2ph auto-zeroes the upper 64 bits.
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          // .8H: process low 4 lanes, then high 4 lanes, then recombine.
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqu(xn_hi, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqa(xn, xn_hi);
+          as_.Vcvtph2ps(xn, xn);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Vcvtph2ps(xn_hi, xn_hi);
+          as_.Movdqu(xm_hi, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Movdqa(xm, xm_hi);
+          as_.Vcvtph2ps(xm, xm);
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Vcvtph2ps(xm_hi, xm_hi);
+          as_.Subps(xn, xm);
+          as_.Subps(xn_hi, xm_hi);
+          as_.Pand(xn, mask);
+          as_.Pand(xn_hi, mask);
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+          as_.Vcvtps2ph(xn_hi, xn_hi, int8_t{0});
+          as_.Pslldq(xn_hi, int8_t{8});
+          as_.Por(xn, xn_hi);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
       case Decoder::AdvSimdThreeSameOpcode::kFminV:
       case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
