@@ -5000,8 +5000,105 @@ class LiteTranslator {
         if (is_double) as_.Subsd(xmm_n, xmm_m);
         else as_.Subss(xmm_n, xmm_m);
         break;
+      // region digitalis: scalar FMAX / FMIN / FMAXNM / FMINNM / FNMUL JIT.
+      //
+      // FMAX/FMIN (NaN-propagating per ARM ARM): symmetric MAX with POR.
+      //   tmp = m; MAXP{S,D} tmp, n   ; tmp lane0 = NaN if any NaN else max
+      //   MAXP{S,D} n, m              ; n lane0   = NaN if any NaN else max
+      //   POR n, tmp                  ; bitwise OR keeps NaN exponent if any NaN
+      //
+      // FMAXNM/FMINNM (NaN-suppressing per ARM ARM): substitute NaN lanes
+      // with the other operand, then MAXP{S,D}.
+      //
+      // Operates on the vector forms because the SS/SD scalar MAX/MIN
+      // mnemonics are not exposed in the Berberis x86 assembler. For S/D
+      // only lane 0 matters (Movss/Movsd writes lane 0 only); for H the
+      // upper lanes are pre-zeroed by Pxor+Pinsrw, so MAXP{S,D} lanes 1..3
+      // = max(0, 0) = 0 and the F16C narrow produces zero in FP16 lanes
+      // 1..3 — matching the AArch64 Hd zero-extend semantic.
+      case 0b0100:    // FMAX
+      case 0b0101: {  // FMIN
+        SimdRegister tmp = AllocTempSimdReg();
+        if (tmp == no_simd_register) { Undefined(); return; }
+        as_.Movdqa(tmp, xmm_m);
+        const bool is_max = (args.opcode == 0b0100);
+        if (is_max) {
+          if (is_double) {
+            as_.Maxpd(tmp, xmm_n);
+            as_.Maxpd(xmm_n, xmm_m);
+          } else {
+            as_.Maxps(tmp, xmm_n);
+            as_.Maxps(xmm_n, xmm_m);
+          }
+        } else {
+          if (is_double) {
+            as_.Minpd(tmp, xmm_n);
+            as_.Minpd(xmm_n, xmm_m);
+          } else {
+            as_.Minps(tmp, xmm_n);
+            as_.Minps(xmm_n, xmm_m);
+          }
+        }
+        as_.Por(xmm_n, tmp);
+        break;
+      }
+      case 0b0110:    // FMAXNM
+      case 0b0111: {  // FMINNM
+        SimdRegister mask_a = AllocTempSimdReg();
+        SimdRegister mask_b = AllocTempSimdReg();
+        SimdRegister an_sub = AllocTempSimdReg();
+        SimdRegister bn_sub = AllocTempSimdReg();
+        if (mask_a == no_simd_register || mask_b == no_simd_register ||
+            an_sub == no_simd_register || bn_sub == no_simd_register) {
+          Undefined();
+          return;
+        }
+        as_.Movdqa(mask_a, xmm_n);
+        if (is_double) as_.Cmpunordpd(mask_a, mask_a);
+        else as_.Cmpunordps(mask_a, mask_a);
+        as_.Movdqa(mask_b, xmm_m);
+        if (is_double) as_.Cmpunordpd(mask_b, mask_b);
+        else as_.Cmpunordps(mask_b, mask_b);
+        as_.Movdqa(an_sub, mask_a);
+        as_.Pand(an_sub, xmm_m);
+        as_.Movdqa(bn_sub, mask_b);
+        as_.Pand(bn_sub, xmm_n);
+        as_.Pandn(mask_a, xmm_n);
+        as_.Pandn(mask_b, xmm_m);
+        as_.Por(mask_a, an_sub);
+        as_.Por(mask_b, bn_sub);
+        const bool is_max = (args.opcode == 0b0110);
+        if (is_max) {
+          if (is_double) as_.Maxpd(mask_a, mask_b);
+          else as_.Maxps(mask_a, mask_b);
+        } else {
+          if (is_double) as_.Minpd(mask_a, mask_b);
+          else as_.Minps(mask_a, mask_b);
+        }
+        as_.Movdqa(xmm_n, mask_a);
+        break;
+      }
+      case 0b1000: {  // FNMUL: -(n * m)
+        SimdRegister sign_xmm = AllocTempSimdReg();
+        if (sign_xmm == no_simd_register) { Undefined(); return; }
+        if (is_double) {
+          as_.Mulsd(xmm_n, xmm_m);
+          Register sign_gpr = AllocTempReg();
+          as_.Movq(sign_gpr, int64_t{static_cast<int64_t>(0x8000000000000000ULL)});
+          as_.Movq(sign_xmm, sign_gpr);
+          as_.Xorpd(xmm_n, sign_xmm);
+        } else {
+          as_.Mulss(xmm_n, xmm_m);
+          Register sign_gpr = AllocTempReg();
+          as_.Movl(sign_gpr, int32_t{static_cast<int32_t>(0x80000000U)});
+          as_.Movd(sign_xmm, sign_gpr);
+          as_.Xorps(xmm_n, sign_xmm);
+        }
+        break;
+      }
+      // endregion
       default:
-        // FMAX, FMIN, FNMUL, etc. - less common, fall back.
+        // Any other opcode (reserved / future) — fall back to interpreter.
         Undefined();
         return;
     }
