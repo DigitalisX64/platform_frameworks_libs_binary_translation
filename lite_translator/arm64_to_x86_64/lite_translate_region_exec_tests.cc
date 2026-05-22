@@ -6976,6 +6976,228 @@ TEST_F(Arm64LiteTranslateRegionTest, FdivDInfOverInfIsNan) {
 }
 // endregion
 
+// region digitalis - FP scalar↔int conversion edges
+//
+// Scalar FCVTZS / FCVTZU (FP → integer, truncate-toward-zero) and SCVTF /
+// UCVTF (integer → FP) JIT lowerings live in `FpIntConversion` at
+// `lite_translator.h:2771`.  §D4's verify gate calls out three edge
+// categories that the JIT must get right regardless of what x86 cvtt /
+// cvtsi2 happen to produce: NaN → 0 (FCVTZS / FCVTZU), ±Inf saturation,
+// and the unsigned overflow boundary (FCVTZU returning UINT_MAX rather
+// than the x86 indefinite, FCVTZS returning INT_MAX for FP > INT_MAX).
+//
+//   Encoding (Floating-point ↔ Integer conversion, scalar):
+//     sf | 0011110 ftype 1 rmode opcode 000000 Rn Rd
+//     rmode=11 opcode=000 -> FCVTZS,    rmode=11 opcode=001 -> FCVTZU,
+//     rmode=00 opcode=010 -> SCVTF,     rmode=00 opcode=011 -> UCVTF.
+//     ftype: 00 = S (FP32), 01 = D (FP64).
+//     sf:    0  = W destination (or source), 1 = X destination (or source).
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e380041 fcvtzs w1,s2 / 9e380041 fcvtzs x1,s2
+//   1e780041 fcvtzs w1,d2 / 9e780041 fcvtzs x1,d2
+//   1e390041 fcvtzu w1,s2 / 9e390041 fcvtzu x1,s2
+//   1e790041 fcvtzu w1,d2 / 9e790041 fcvtzu x1,d2
+//   1e220020 scvtf  s0,w1 / 9e220020 scvtf  s0,x1
+//   1e620020 scvtf  d0,w1 / 9e620020 scvtf  d0,x1
+//   1e230020 ucvtf  s0,w1 / 9e230020 ucvtf  s0,x1
+//   1e630020 ucvtf  d0,w1 / 9e630020 ucvtf  d0,x1
+constexpr uint32_t FpIntConv(uint32_t base, uint8_t rd, uint8_t rn) {
+  return base | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcvtzsWS(uint8_t wd, uint8_t sn) {
+  return FpIntConv(0x1E380000, wd, sn);
+}
+constexpr uint32_t FcvtzsXD(uint8_t xd, uint8_t dn) {
+  return FpIntConv(0x9E780000, xd, dn);
+}
+constexpr uint32_t FcvtzuWS(uint8_t wd, uint8_t sn) {
+  return FpIntConv(0x1E390000, wd, sn);
+}
+constexpr uint32_t FcvtzuXD(uint8_t xd, uint8_t dn) {
+  return FpIntConv(0x9E790000, xd, dn);
+}
+constexpr uint32_t ScvtfSW(uint8_t sd, uint8_t wn) {
+  return FpIntConv(0x1E220000, sd, wn);
+}
+constexpr uint32_t UcvtfDX(uint8_t dd, uint8_t xn) {
+  return FpIntConv(0x9E630000, dd, xn);
+}
+
+// FCVTZS Wd, Sn — qNaN source must yield 0, not x86 cvtt's INT32_MIN
+// "indefinite".  Exercises the PF=1 nan_path branch in the JIT (see
+// `lite_translator.h:2970`'s `Ucomis` + `Jcc kParityEven` arm).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsWSNanToZero) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzsWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);  // W-form: zero-extended to 64.
+}
+
+// FCVTZS Wd, Sn — +Inf must saturate to INT32_MAX.  x86 cvtt returns
+// INT32_MIN here; the JIT's pos-overflow fix-up writes INT32_MAX after
+// observing FP-sign=0 and tmp==INT32_MIN.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsWSPosInfSaturatesMax) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FcvtzsWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int32_t>(state_.cpu.x[0]), INT32_MAX);
+}
+
+// FCVTZS Wd, Sn — −Inf saturates to INT32_MIN.  This matches x86 cvtt's
+// indefinite return for negative overflow, so the JIT's FP-sign=1 keep-
+// tmp branch is what must fire.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsWSNegInfSaturatesMin) {
+  StoreFp32(state_.cpu, 1, -std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FcvtzsWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int32_t>(state_.cpu.x[0]), INT32_MIN);
+}
+
+// FCVTZS Xd, Dn — qNaN source yields 0 (64-bit path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsXDNanToZero) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzsXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZS Xd, Dn — +Inf saturates to INT64_MAX (the pos-overflow fix-up).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsXDPosInfSaturatesMax) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FcvtzsXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[0]), INT64_MAX);
+}
+
+// FCVTZS Xd, Dn — −Inf saturates to INT64_MIN.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsXDNegInfSaturatesMin) {
+  StoreFp64(state_.cpu, 1, -std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FcvtzsXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[0]), INT64_MIN);
+}
+
+// FCVTZU Wd, Sn — qNaN yields 0 (unsigned NaN→0 mirrors signed).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSNanToZero) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Wd, Sn — +Inf saturates to UINT32_MAX.  Exercises the W-form
+// upper-32 saturation path that detects out-of-u32-range cvtt-q result.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSPosInfSaturatesMax) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.x[0]), UINT32_MAX);
+}
+
+// FCVTZU Wd, Sn — −Inf clamps to 0 (negative inputs all clamp to 0 in
+// ARM FCVTZU).  The FP-sign-bit-set branch jumps to the zero path.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSNegInfClampsZero) {
+  StoreFp32(state_.cpu, 1, -std::numeric_limits<float>::infinity());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Wd, Sn — exactly UINT32_MAX (2^32 - 1) is *not* exactly
+// representable in FP32; the nearest representable below 2^32 is
+// 0x4F7FFFFF (~4.2949666e9, exactly 4294967040).  This is the largest
+// in-range FP32 value, and it must truncate to 4294967040 (not saturate
+// — the JIT only saturates when the cvtt-q result exceeds UINT32_MAX).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSLargestInRange) {
+  // 0x4F7FFFFF = (float)4294967040.0
+  StoreFp32(state_.cpu, 1, 4294967040.0f);
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.x[0]), 4294967040u);
+}
+
+// FCVTZU Wd, Sn — overflow just above 2^32 saturates to UINT32_MAX.
+// 0x4F800000 = 2^32 = 4294967296.0f; the cvtt-q result equals UINT32_MAX+1,
+// which the JIT's upper-32 saturation detects and clamps.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWS2p32SaturatesMax) {
+  StoreFp32(state_.cpu, 1, 4294967296.0f);  // 2^32
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.x[0]), UINT32_MAX);
+}
+
+// FCVTZU Xd, Dn — qNaN yields 0 (64-bit path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXDNanToZero) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Xd, Dn — +Inf saturates to UINT64_MAX (the > 2^64 sat_max path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXDPosInfSaturatesMax) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+// FCVTZU Xd, Dn — −Inf clamps to 0 (negative-clamp path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXDNegInfClampsZero) {
+  StoreFp64(state_.cpu, 1, -std::numeric_limits<double>::infinity());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Xd, Dn — 2^64 saturates to UINT64_MAX (the >= 2^64 boundary).
+// 0x43F0000000000000 = (double)2^64.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXD2p64SaturatesMax) {
+  const uint64_t bits = 0x43F0000000000000ULL;
+  double val;
+  std::memcpy(&val, &bits, sizeof(val));
+  StoreFp64(state_.cpu, 1, val);  // 2^64
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+// SCVTF Sd, Wn — INT32_MIN converts to -2147483648.0f exactly (the
+// boundary the L-form CVTSI2SSL must sign-extend correctly).  Also
+// pins the architectural zero-extend of V[rd]'s upper 96 bits via the
+// pre-PXOR + Movdqu pattern in the JIT.
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfSWInt32MinExact) {
+  state_.cpu.x[1] = static_cast<uint64_t>(static_cast<uint32_t>(INT32_MIN));
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {ScvtfSW(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -2147483648.0f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// UCVTF Dd, Xn — 64-bit unsigned with the high bit set exercises the
+// halve / round-to-odd / convert / double JIT fix-up at
+// `lite_translator.h:2884`.  UINT64_MAX is the boundary; the result
+// rounds to 2^64 exactly under round-to-nearest-even.
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfDXUint64MaxRoundsTo2p64) {
+  state_.cpu.x[1] = UINT64_MAX;
+  static const uint32_t code[] = {UcvtfDX(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const double expected = static_cast<double>(UINT64_MAX);  // 2^64
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), expected);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
