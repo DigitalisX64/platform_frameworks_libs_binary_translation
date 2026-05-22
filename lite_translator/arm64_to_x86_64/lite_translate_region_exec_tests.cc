@@ -17,7 +17,10 @@
 
 #include "gtest/gtest.h"
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -3625,6 +3628,151 @@ TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsTwoToTheFiftyThree) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
   EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});  // not exact: d != 0
+}
+// endregion
+
+// region digitalis: FMULX scalar three-same JIT lowering (FP32 / FP64).
+// FMULX = FMUL except (±0 * ±inf) returns ±2.0 with sign(a) XOR sign(b).
+// Encoding (per ARM ARM C7.2.149 "FMULX (vector)" scalar subset and
+// llvm-mc verification):
+//   FMULX Sd, Sn, Sm = 0101_1110_0010_xxxx_x1101_1100_0xxx_xxx (sz=0)
+//   FMULX Dd, Dn, Dm = 0101_1110_0110_xxxx_x1101_1100_0xxx_xxx (sz=1)
+// Verified: fmulx s0,s1,s2 -> 0x5e22dc20; fmulx d0,d1,d2 -> 0x5e62dc20.
+constexpr uint32_t FmulxScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E60DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+template <typename T>
+static void StoreScalarToV(CPUState& cpu, unsigned idx, T value) {
+  std::memset(&cpu.v[idx], 0, 16);
+  std::memcpy(&cpu.v[idx], &value, sizeof(T));
+}
+
+// Regular finite multiply: 3.0 * 4.0 = 12.0 (S).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSRegular) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 4.0f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 12.0f);
+  // Lanes 1..3 must be zero (AArch64 scalar zero-extend).
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// Regular finite multiply: 0.5 * -3.0 = -1.5 (D).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarDRegular) {
+  StoreScalarToV<double>(state_.cpu, 1, 0.5);
+  StoreScalarToV<double>(state_.cpu, 2, -3.0);
+  StoreScalarToV<double>(state_.cpu, 0, std::nan(""));
+  static const uint32_t code[] = {FmulxScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, -1.5);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, 0u);
+}
+
+// Special case: +0 * +inf -> +2.0 (S).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSZeroTimesInf) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+}
+
+// Special case: -0 * +inf -> -2.0 (S).  Sign = sign(-0) XOR sign(+inf) = 1.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSNegZeroTimesInf) {
+  StoreScalarToV<float>(state_.cpu, 1, -0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, -2.0f);
+}
+
+// Special case: -inf * +0 -> -2.0 (S).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSNegInfTimesZero) {
+  StoreScalarToV<float>(state_.cpu, 1, -std::numeric_limits<float>::infinity());
+  StoreScalarToV<float>(state_.cpu, 2, 0.0f);
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, -2.0f);
+}
+
+// Special case: -inf * -0 -> +2.0 (S).  Sign = 1 XOR 1 = 0.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSNegInfTimesNegZero) {
+  StoreScalarToV<float>(state_.cpu, 1, -std::numeric_limits<float>::infinity());
+  StoreScalarToV<float>(state_.cpu, 2, -0.0f);
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+}
+
+// Special case for FP64: +0 * +inf -> +2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarDZeroTimesInf) {
+  StoreScalarToV<double>(state_.cpu, 1, 0.0);
+  StoreScalarToV<double>(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FmulxScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 2.0);
+}
+
+// NaN propagation: NaN input must produce NaN (not ±2.0).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSNaNInput) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// Sign on regular multiply (no special case): negative*negative = positive.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarDNegNeg) {
+  StoreScalarToV<double>(state_.cpu, 1, -2.5);
+  StoreScalarToV<double>(state_.cpu, 2, -4.0);
+  static const uint32_t code[] = {FmulxScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 10.0);
+}
+
+// Finite zero result: 0 * 5 -> +0 (NOT ±2.0; the special case is 0*inf only).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSZeroTimesFinite) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FmulxScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.0f);
+  EXPECT_FALSE(std::signbit(result));
 }
 // endregion
 

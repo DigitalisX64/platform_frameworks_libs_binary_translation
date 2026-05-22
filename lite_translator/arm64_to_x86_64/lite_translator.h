@@ -7496,10 +7496,132 @@ class LiteTranslator {
     Undefined();
   }
 
+  // region digitalis: FMULX (scalar three-same, FP32/FP64) JIT.
+  //
+  // FMULX is identical to FMUL except the (zero * infinity) saturation case
+  // returns ±2.0 (sign = sign(a) XOR sign(b)) instead of the FMUL-produced
+  // NaN.  See Interpreter::FmulxScalar<> for the reference semantics.
+  //
+  // Strategy (branchless): always compute mul = a * b first.  The result is
+  // NaN iff one of {a, b} is NaN OR {a, b} is the (0, ±inf) / (±inf, 0) pair.
+  // We construct a mask that is all-ones iff the special case (0*inf) fired
+  // — that is, "mul is NaN AND neither input is NaN" — then blend mul with
+  // ±2.0 under that mask:
+  //
+  //   special_mask = cmpunord(mul, mul) AND NOT cmpunord(a, b)
+  //                = "mul became NaN purely from 0*inf"
+  //   two_signed   = (a XOR b) AND sign_mask  OR  bits-of(2.0)
+  //   result       = (mul AND NOT special_mask) OR (two_signed AND special_mask)
+  //
+  // Bit-exact match to the interpreter's FmulxScalar<> for every finite,
+  // ±0, ±inf, and NaN input — FMUL handles NaN propagation, and the (0,
+  // ±inf) lanes get replaced with ±2.0.  Sign of ±2.0 is sign(a) XOR
+  // sign(b) (XOR of the source sign bits), matching std::signbit(a) ^
+  // std::signbit(b) in the interpreter.
+  //
+  // Other opcodes in this dispatch class (FABD, FCMxx, FACxx) and the FP16
+  // path (is_fp16=true) bail to the interpreter via success_=false — they
+  // are JIT follow-ups; the interpreter handles them correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
-    UNUSED(args);
-    Undefined();
+    if (args.is_fp16) { success_ = false; return; }
+    if (args.opcode != Decoder::AdvSimdScalarThreeSameOpcode::kFmulx) {
+      success_ = false; return;
+    }
+
+    const bool is_double = (args.size != 0);  // FP: 0 -> S, 1 -> D
+    int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    SimdRegister xmm_m = AllocTempSimdReg();
+    SimdRegister xmm_mul = AllocTempSimdReg();
+    SimdRegister xmm_mul_unord = AllocTempSimdReg();
+    SimdRegister xmm_input_unord = AllocTempSimdReg();
+    SimdRegister xmm_two = AllocTempSimdReg();
+    if (xmm_n == no_simd_register || xmm_m == no_simd_register ||
+        xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+        xmm_input_unord == no_simd_register || xmm_two == no_simd_register) {
+      success_ = false; return;
+    }
+
+    // Load a, b into lane 0.  Upper lanes are don't-care; the final store
+    // overwrites the full Vd slot.
+    if (is_double) {
+      as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+    } else {
+      as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+    }
+
+    // mul = a * b
+    as_.Movdqa(xmm_mul, xmm_n);
+    if (is_double) {
+      as_.Mulsd(xmm_mul, xmm_m);
+    } else {
+      as_.Mulss(xmm_mul, xmm_m);
+    }
+
+    // mul_unord = cmpunord(mul, mul): all-ones iff mul is NaN.
+    as_.Movdqa(xmm_mul_unord, xmm_mul);
+    if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
+    else as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+    // input_unord = cmpunord(a, b): all-ones iff either a or b is NaN.
+    // CMPUNORDPS/PD sets the lane to all-ones when either operand is NaN.
+    as_.Movdqa(xmm_input_unord, xmm_n);
+    if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
+    else as_.Cmpunordps(xmm_input_unord, xmm_m);
+
+    // special_mask = mul_unord AND NOT input_unord.
+    // Use PANDN: dst = (NOT dst) AND src.  So xmm_input_unord becomes
+    // (NOT input_unord) AND mul_unord.
+    as_.Pandn(xmm_input_unord, xmm_mul_unord);
+    // xmm_input_unord now holds special_mask.
+
+    // two_signed = (a XOR b) restricted to sign bit, OR'd with bits of 2.0.
+    // Reuse xmm_n as the scratch for (a XOR b); we still have xmm_m intact.
+    if (is_double) {
+      as_.Xorpd(xmm_n, xmm_m);
+    } else {
+      as_.Xorps(xmm_n, xmm_m);
+    }
+    // Build sign-bit mask in xmm_mul_unord (we no longer need mul_unord).
+    as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+    if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
+    else as_.Pslld(xmm_mul_unord, int8_t{31});
+    as_.Pand(xmm_n, xmm_mul_unord);
+    // Build ±2.0 by OR'ing in the bits of +2.0.
+    Register tmp_gpr = AllocTempReg();
+    if (is_double) {
+      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});  // bits of 2.0 (FP64)
+      as_.Movq(xmm_two, tmp_gpr);
+    } else {
+      as_.Movl(tmp_gpr, int32_t{0x40000000});  // bits of 2.0 (FP32)
+      as_.Movd(xmm_two, tmp_gpr);
+    }
+    as_.Por(xmm_n, xmm_two);
+    // xmm_n now holds ±2.0 (lane 0), with sign = sign(a) XOR sign(b).
+
+    // Blend: result = (mul AND NOT mask) OR (±2.0 AND mask).
+    // Reuse xmm_m as the masked-2.0; reuse xmm_mul_unord as the masked-mul.
+    as_.Movdqa(xmm_m, xmm_n);
+    as_.Pand(xmm_m, xmm_input_unord);          // m = ±2.0 AND mask
+    as_.Pandn(xmm_input_unord, xmm_mul);       // input_unord = NOT(mask) AND mul
+    as_.Por(xmm_input_unord, xmm_m);           // result in xmm_input_unord lane 0.
+
+    // Zero Vd, then write the scalar lane 0.  Matches AArch64 scalar
+    // semantics: bits above the operand size are zero.
+    as_.Pxor(xmm_two, xmm_two);
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_two);
+    if (is_double) {
+      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+    } else {
+      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+    }
   }
+  // endregion
 
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
     UNUSED(args);
