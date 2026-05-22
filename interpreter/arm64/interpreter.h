@@ -6465,6 +6465,48 @@ class Interpreter {
   }
   // endregion
 
+  // region digitalis
+  // AdvSIMD scalar x indexed element (sibling of vector form above).
+  // Reads one lane from Vn (lane 0), one lane from Vm (args.index), computes
+  // FmulxScalar, writes the result to Vd lane 0 and zeros the upper lanes.
+  void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
+    CHECK(!exception_raised_);
+
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t result = 0;
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarXIdxOpcode::kFmulx: {
+        if (args.size == 0b10) {
+          // FP32 scalar.
+          float n_lane, m_lane;
+          memcpy(&n_lane, reinterpret_cast<const uint8_t*>(&src_n), 4);
+          memcpy(&m_lane, reinterpret_cast<const uint8_t*>(&src_m) + args.index * 4, 4);
+          float r = FmulxScalar<float>(n_lane, m_lane);
+          memcpy(reinterpret_cast<uint8_t*>(&result), &r, 4);
+        } else if (args.size == 0b11) {
+          // FP64 scalar.
+          double n_lane, m_lane;
+          memcpy(&n_lane, reinterpret_cast<const uint8_t*>(&src_n), 8);
+          memcpy(&m_lane, reinterpret_cast<const uint8_t*>(&src_m) + args.index * 8, 8);
+          double r = FmulxScalar<double>(n_lane, m_lane);
+          memcpy(reinterpret_cast<uint8_t*>(&result), &r, 8);
+        } else {
+          Undefined();
+          return;
+        }
+        break;
+      }
+      default:
+        Undefined();
+        return;
+    }
+
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
     CHECK(!exception_raised_);
 

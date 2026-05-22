@@ -1362,6 +1362,33 @@ class Decoder {
   };
   // endregion
 
+  // region digitalis
+  //
+  // AdvSIMD scalar x indexed element (ARM ARM C4.1.71).
+  // Encoding: 0 1 U 11111 size L M Rm opcode H 0 Rn Rd
+  // The destination is a single FP lane in Vd; upper lanes of Vd are zeroed.
+  // This is the scalar sibling of AdvSimdVecXIndexedElement.  size encodes
+  // the precision (10=FP32, 11=FP64; 01=FP16 is Armv8.2-FP16 — not handled
+  // here yet).  Currently only FMULX (U=1, opcode=1001) is implemented; the
+  // other scalar-x-indexed encodings (FMUL/FMLA/FMLS/SQDMULL/SQDMULH) fall
+  // through the decoder to Undefined() until they are needed.
+  //
+  enum class AdvSimdScalarXIdxOpcode : uint8_t {
+    kFmulx,   // FMULX (scalar by element): U=1, opcode=1001.  Same lane
+              // semantics as FMUL except (±0 * ±inf) returns ±2.0 instead
+              // of NaN.  Used by libm reciprocal-estimate refinement loops.
+  };
+
+  struct AdvSimdScalarXIdxArgs {
+    AdvSimdScalarXIdxOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;       // indexed source register
+    uint8_t index;    // element index within rm
+    uint8_t size;     // 10 = FP32 (single), 11 = FP64 (double)
+  };
+  // endregion
+
   // Signextend bits from size to the corresponding signed type of sizeof(Type) size.
   template <unsigned size, typename Type>
   static auto SignExtend(const Type val) {
@@ -2653,6 +2680,19 @@ class Decoder {
     if (!bit31 && !GetBits<30, 1>() && !GetBits<29, 1>() &&
         GetBits<24, 5>() == 0b11111) {
       DecodeFpDataProc3();
+      return;
+    }
+    // endregion
+
+    // region digitalis
+    // AdvSIMD scalar x indexed element (ARM ARM C4.1.71):
+    //   bit31=0, bit30=1, bits[28:24]=11111, bit10=0.
+    // Sibling of vector-x-indexed (bits[28:24]=01111, dispatched below at
+    // the AdvSimd*VecXIndexedElement path).  Distinguished from
+    // FpDataProc3 (above) by bit30=1.
+    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11111 &&
+        !GetBits<10, 1>()) {
+      DecodeAdvSimdScalarXIndexedElement();
       return;
     }
     // endregion
@@ -5226,6 +5266,72 @@ class Decoder {
         .q = q,
     };
     insn_consumer_->AdvSimdVecXIndexedElement(args);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD scalar x indexed element.
+  // Encoding: 0 1 U 11111 size L M Rm opcode H 0 Rn Rd
+  //   size = bits[23:22]: 10 = FP32 (single lane), 11 = FP64 (double lane).
+  //   For FP32: Vm = M:Rm[3:0] (5-bit), index = H:L (2-bit, 0..3).
+  //   For FP64: Vm = M:Rm[3:0] (5-bit), index = H   (1-bit, 0..1); L must
+  //             be 0 (reserved).
+  // Only FMULX (U=1, opcode=1001) is implemented currently — the other
+  // opcodes (FMUL/FMLA/FMLS/SQDMULL/SQDMULH variants) route to Undefined
+  // until they are needed.
+  //
+  // Encoding cross-checks (aarch64-linux-gnu-as / objdump):
+  //   fmulx s0, s1, v2.s[0]   = 0x7F829020   (size=10, L=0, H=0)
+  //   fmulx s0, s1, v2.s[3]   = 0x7FA29820   (size=10, L=1, H=1)
+  //   fmulx d0, d1, v2.d[0]   = 0x7FC29020   (size=11, H=0)
+  //   fmulx d0, d1, v2.d[1]   = 0x7FC29820   (size=11, H=1)
+  //   fmulx s0, s1, v17.s[3]  = 0x7FB19820   (M=1, Rm[3:0]=1 -> Vm=17)
+  //
+  void DecodeAdvSimdScalarXIndexedElement() {
+    bool u = GetBits<29, 1>();
+    uint8_t size = GetBits<22, 2>();
+    uint8_t L = GetBits<21, 1>();
+    uint8_t M = GetBits<20, 1>();
+    uint8_t Rm4 = GetBits<16, 4>();
+    uint8_t opcode = GetBits<12, 4>();
+    uint8_t H = GetBits<11, 1>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    // FMULX (scalar, by element).
+    if (u && opcode == 0b1001) {
+      uint8_t rm = static_cast<uint8_t>((M << 4) | Rm4);
+      uint8_t index;
+      if (size == 0b10) {
+        // FP32: index = H:L (4 elements in Vm.4S).
+        index = static_cast<uint8_t>((H << 1) | L);
+      } else if (size == 0b11) {
+        // FP64: index = H (2 elements in Vm.2D); L must be 0.
+        if (L) { Undefined(); return; }
+        index = H;
+      } else {
+        // FP16 (size=01) is Armv8.2-FP16 scalar-x-indexed — not handled
+        // yet.  size=00 is reserved at this slot.
+        Undefined();
+        return;
+      }
+      const AdvSimdScalarXIdxArgs args = {
+          .opcode = AdvSimdScalarXIdxOpcode::kFmulx,
+          .rd = rd,
+          .rn = rn,
+          .rm = rm,
+          .index = index,
+          .size = size,
+      };
+      insn_consumer_->AdvSimdScalarXIndexedElement(args);
+      return;
+    }
+
+    // Remaining opcodes (FMUL=U=0/1001, FMLA=U=0/0001, FMLS=U=0/0101,
+    // SQDMULL=U=0/1011 / U=0/0111, SQDMULH=U=0/1100 / U=1/1101, SQRDMULH,
+    // SQRDMLAH/SQRDMLSH) are not implemented — raise SIGILL.
+    Undefined();
   }
   // endregion
 

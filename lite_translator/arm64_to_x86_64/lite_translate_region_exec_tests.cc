@@ -4772,6 +4772,122 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec2DRegular) {
   EXPECT_DOUBLE_EQ(r[1], -1.0);
 }
 
+// FMULX scalar-by-element encoders (AdvSIMD scalar x indexed element).
+// Verified with aarch64-linux-gnu-as / objdump:
+//   FMULX s0, s1, v2.s[0]   = 0x7F829020   (size=10, L=0, H=0)
+//   FMULX s0, s1, v2.s[1]   = 0x7FA29020   (size=10, L=1, H=0)
+//   FMULX s0, s1, v2.s[2]   = 0x7F829820   (size=10, L=0, H=1)
+//   FMULX s0, s1, v2.s[3]   = 0x7FA29820   (size=10, L=1, H=1)
+//   FMULX d0, d1, v2.d[0]   = 0x7FC29020   (size=11, H=0)
+//   FMULX d0, d1, v2.d[1]   = 0x7FC29820   (size=11, H=1)
+//   FMULX s7, s9, v11.s[2]  = 0x7F8B9927   (M=0, Rm[3:0]=1011, H=1, L=0)
+// L lives at bit21; H lives at bit11.  Rm[3:0] at bits[19:16]; M at bit20.
+constexpr uint32_t FmulxIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x7F809000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // size=11 (bit22 set in addition to bit23); L must be 0; index = H only.
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x7FC09000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMULX scalar FP32: (+0 * +inf) -> +2.  Confirms the (zero,inf) saturation
+// override fires on the scalar by-element path.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarSPosZeroPosInfReturnsPlusTwo) {
+  const float inf = std::numeric_limits<float>::infinity();
+  // Vn.s[0] = +0; Vm.s[1] = +inf — index 1 broadcasts the saturating lane.
+  StoreVec4S(state_.cpu, 1, 0.0f, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, inf, 9.9f, 9.9f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulxIdxScalarS(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  // Scalar destination must zero the upper three S-lanes of Vd.
+  uint32_t lane1_bits, lane2_bits, lane3_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1_bits, 0u);
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMULX scalar FP64: (-0 * +inf) -> -2.  Sign comes from XOR of operands.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarDNegZeroPosInfReturnsMinusTwo) {
+  const double inf = std::numeric_limits<double>::infinity();
+  StoreVec2D(state_.cpu, 1, -0.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 9.9, inf);  // Vm.d[1] = +inf
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulxIdxScalarD(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], -2.0);
+  // Scalar destination must zero the upper D-lane of Vd.
+  uint64_t lane1_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1_bits, 0ULL);
+}
+
+// FMULX scalar with NaN input must propagate NaN — not get replaced by ±2.0.
+// The saturation override fires only when (mul is NaN) AND (neither input is NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarSNaNPropagation) {
+  const float qnan = std::nanf("");
+  // Vn.s[0] = qnan; Vm.s[0] = 1.0 (finite).
+  StoreVec4S(state_.cpu, 1, qnan, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 1.0f, 9.9f, 9.9f, 9.9f);
+  static const uint32_t code[] = {FmulxIdxScalarS(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0])) << "expected NaN at scalar lane, got " << r[0];
+}
+
+// FMULX scalar finite multiply — sanity that ordinary multiplies are not
+// disturbed by the saturation path.  Use FP32, lane index 3 to also exercise
+// the bit21/bit11 packing.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarSRegular) {
+  StoreVec4S(state_.cpu, 1, 2.5f, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, -4.0f);  // Vm.s[3] = -4.0
+  static const uint32_t code[] = {FmulxIdxScalarS(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], -10.0f);   // 2.5 * -4
+  uint32_t lane1_bits, lane2_bits, lane3_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1_bits, 0u);
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMULX scalar FP64 lane[0] broadcast: confirms the H=0 encoding selects
+// Vm.d[0] and not Vm.d[1].
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 3.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 0.5, 9.9);  // Vm.d[0] = 0.5
+  static const uint32_t code[] = {FmulxIdxScalarD(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  uint64_t lane1_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1_bits, 0ULL);
+}
+
 // Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs
 // from (a*b)+d in float, proving the lowering uses VFMADD231PS.
 TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {

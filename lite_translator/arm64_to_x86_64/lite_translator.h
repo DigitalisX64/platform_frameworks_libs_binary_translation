@@ -8301,6 +8301,126 @@ class LiteTranslator {
   }
   // endregion
 
+  // region digitalis
+  // AdvSIMD scalar x indexed element — JIT lowering for FMULX scalar by
+  // element only.  Same saturation shape as the three-same FMULX JIT
+  // (handoff #120) and the vector by-element FMULX (handoff #124), but
+  // applied to a single lane; the upper lanes of Vd are always zeroed
+  // (scalar destination semantics).
+  void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
+    using Op = Decoder::AdvSimdScalarXIdxOpcode;
+    if (args.opcode != Op::kFmulx) {
+      success_ = false;
+      return;
+    }
+    if (args.size != 0b10 && args.size != 0b11) {
+      success_ = false;
+      return;
+    }
+    const bool is_double = (args.size == 0b11);
+
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+      success_ = false;
+      return;
+    }
+
+    as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+    as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+
+    // Broadcast lane args.index of xmm_m across all lanes — same layout as
+    // the vector by-element FMULX path.  The broadcast lets us reuse the
+    // FMULX saturation shape verbatim; we only need to zero the upper
+    // lanes of the result afterwards.
+    if (is_double) {
+      const int8_t imm = (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
+      as_.Pshufd(xmm_m, xmm_m, imm);
+    } else {
+      const uint8_t i = args.index & 0b11;
+      const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+      as_.Pshufd(xmm_m, xmm_m, imm);
+    }
+
+    // FMULX saturation: mul = a*b; if mul is NaN and neither input was NaN
+    // (the (±0,±inf) case), return ±2.0 with sign = sign(a)^sign(b).
+    SimdRegister xmm_mul = AllocTempSimdReg();
+    SimdRegister xmm_mul_unord = AllocTempSimdReg();
+    SimdRegister xmm_input_unord = AllocTempSimdReg();
+    SimdRegister xmm_two = AllocTempSimdReg();
+    if (xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+        xmm_input_unord == no_simd_register || xmm_two == no_simd_register) {
+      success_ = false;
+      return;
+    }
+
+    // mul = a * broadcast_b
+    as_.Movdqa(xmm_mul, xmm_n);
+    if (is_double) as_.Mulpd(xmm_mul, xmm_m);
+    else           as_.Mulps(xmm_mul, xmm_m);
+
+    // mul_unord = cmpunord(mul, mul)
+    as_.Movdqa(xmm_mul_unord, xmm_mul);
+    if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
+    else           as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+    // input_unord = cmpunord(a, broadcast_b)
+    as_.Movdqa(xmm_input_unord, xmm_n);
+    if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
+    else           as_.Cmpunordps(xmm_input_unord, xmm_m);
+
+    // special_mask = mul_unord AND NOT input_unord.
+    as_.Pandn(xmm_input_unord, xmm_mul_unord);
+
+    // two_signed: ((a XOR broadcast_b) AND sign_mask) OR bits(+2.0).
+    if (is_double) as_.Xorpd(xmm_n, xmm_m);
+    else           as_.Xorps(xmm_n, xmm_m);
+    as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+    if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
+    else           as_.Pslld(xmm_mul_unord, int8_t{31});
+    as_.Pand(xmm_n, xmm_mul_unord);
+
+    Register tmp_gpr = AllocTempReg();
+    if (tmp_gpr == Assembler::no_register) { return; }
+    if (is_double) {
+      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});
+      as_.Movq(xmm_two, tmp_gpr);
+      as_.Punpcklqdq(xmm_two, xmm_two);
+    } else {
+      as_.Movl(tmp_gpr, int32_t{0x40000000});
+      as_.Movd(xmm_two, tmp_gpr);
+      as_.Pshufd(xmm_two, xmm_two, int8_t{0});
+    }
+    as_.Por(xmm_n, xmm_two);
+
+    // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+    as_.Movdqa(xmm_m, xmm_n);
+    as_.Pand(xmm_m, xmm_input_unord);
+    as_.Pandn(xmm_input_unord, xmm_mul);
+    as_.Por(xmm_input_unord, xmm_m);
+
+    SimdRegister xmm_result = xmm_input_unord;
+
+    // Scalar destination: keep only the low lane and zero the rest.
+    // FP32: low 4 bytes -> low 32 bits of Vd; FP64: low 8 bytes -> low
+    // 64 bits of Vd.
+    if (is_double) {
+      // PSLLDQ 8 + PSRLDQ 8 zeroes the upper 64 bits.
+      as_.Pslldq(xmm_result, int8_t{8});
+      as_.Psrldq(xmm_result, int8_t{8});
+    } else {
+      // PSLLDQ 12 + PSRLDQ 12 zeroes the upper 96 bits.
+      as_.Pslldq(xmm_result, int8_t{12});
+      as_.Psrldq(xmm_result, int8_t{12});
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+  }
+  // endregion
+
   //
   // Accessor helpers.
   //
