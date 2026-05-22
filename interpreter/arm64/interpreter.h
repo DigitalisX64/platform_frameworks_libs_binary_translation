@@ -3135,6 +3135,41 @@ class Interpreter {
     // rmode=10: round toward -inf
     // rmode=11: round toward zero
     // opcode=000: signed, opcode=001: unsigned
+    //
+    // ARM saturation rules (applied AFTER rounding):
+    //   NaN              -> 0
+    //   FP < min_int     -> INT_MIN (signed); 0 (unsigned, since FP<0 -> 0)
+    //   FP > max_int     -> INT_MAX (signed); UINT_MAX (unsigned)
+    //   in-range         -> truncated value
+    // The host C++ static_cast on out-of-range FP is undefined / implementation
+    // defined and on x86 typically returns INT_MIN (the "indefinite" CVTTSD2SI
+    // result), which mis-saturates positive overflow.  Apply explicit ARM
+    // saturation instead.
+    auto sat_to_int32 = [](double r) -> int32_t {
+      if (std::isnan(r)) return 0;
+      if (r >= 0x1p31) return INT32_MAX;   // r >= 2^31  (= INT32_MAX + 1)
+      if (r < -0x1p31) return INT32_MIN;   // r < -2^31  (= INT32_MIN exact)
+      return static_cast<int32_t>(r);
+    };
+    auto sat_to_int64 = [](double r) -> int64_t {
+      if (std::isnan(r)) return 0;
+      if (r >= 0x1p63) return INT64_MAX;   // r >= 2^63
+      if (r < -0x1p63) return INT64_MIN;
+      return static_cast<int64_t>(r);
+    };
+    auto sat_to_uint32 = [](double r) -> uint32_t {
+      if (std::isnan(r)) return 0;
+      if (r <= 0.0) return 0;              // ARM unsigned: FP <= 0 -> 0
+      if (r >= 0x1p32) return UINT32_MAX;
+      return static_cast<uint32_t>(r);
+    };
+    auto sat_to_uint64 = [](double r) -> uint64_t {
+      if (std::isnan(r)) return 0;
+      if (r <= 0.0) return 0;
+      if (r >= 0x1p64) return UINT64_MAX;
+      return static_cast<uint64_t>(r);
+    };
+
     if ((rmode == 0b00 || rmode == 0b01 || rmode == 0b10) &&
         (opcode == 0b000 || opcode == 0b001)) {
       bool is_signed = (opcode == 0b000);
@@ -3152,11 +3187,11 @@ class Interpreter {
       else if (rmode == 0b01) rounded = ceil(dval);    // toward +inf
       else rounded = floor(dval);                       // toward -inf
       if (is_signed) {
-        if (args.sf) result = static_cast<uint64_t>(static_cast<int64_t>(rounded));
-        else result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(rounded)));
+        if (args.sf) result = static_cast<uint64_t>(sat_to_int64(rounded));
+        else result = static_cast<uint64_t>(static_cast<uint32_t>(sat_to_int32(rounded)));
       } else {
-        if (args.sf) result = static_cast<uint64_t>(rounded);
-        else result = static_cast<uint64_t>(static_cast<uint32_t>(rounded));
+        if (args.sf) result = sat_to_uint64(rounded);
+        else result = sat_to_uint32(rounded);
       }
       if (args.rd < 31) {
         state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
@@ -3179,11 +3214,11 @@ class Interpreter {
       // Round to nearest, ties away from zero
       double rounded = round(dval);
       if (is_signed) {
-        if (args.sf) result = static_cast<uint64_t>(static_cast<int64_t>(rounded));
-        else result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(rounded)));
+        if (args.sf) result = static_cast<uint64_t>(sat_to_int64(rounded));
+        else result = static_cast<uint64_t>(static_cast<uint32_t>(sat_to_int32(rounded)));
       } else {
-        if (args.sf) result = static_cast<uint64_t>(rounded);
-        else result = static_cast<uint64_t>(static_cast<uint32_t>(rounded));
+        if (args.sf) result = sat_to_uint64(rounded);
+        else result = sat_to_uint32(rounded);
       }
       if (args.rd < 31) {
         state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
@@ -3242,19 +3277,20 @@ class Interpreter {
     // endregion
 
     if (rmode == 0b11 && opcode == 0b000) {
-      // FCVTZS: FP to signed integer, round toward zero
+      // FCVTZS: FP to signed integer, round toward zero (truncate).  Use the
+      // ARM-saturation helpers defined above instead of raw static_cast to
+      // match real ARM hardware on NaN / out-of-range inputs.
       uint64_t result = 0;
+      double rounded;
       if (args.ftype == 0b00) {
-        float f;
-        memcpy(&f, &state_->cpu.v[args.rn], 4);
-        if (args.sf) { result = static_cast<uint64_t>(static_cast<int64_t>(f)); }
-        else { result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(f))); }
+        float f; memcpy(&f, &state_->cpu.v[args.rn], 4);
+        rounded = trunc(static_cast<double>(f));
       } else if (args.ftype == 0b01) {
-        double d;
-        memcpy(&d, &state_->cpu.v[args.rn], 8);
-        if (args.sf) { result = static_cast<uint64_t>(static_cast<int64_t>(d)); }
-        else { result = static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(d))); }
+        double d; memcpy(&d, &state_->cpu.v[args.rn], 8);
+        rounded = trunc(d);
       } else { Undefined(); return; }
+      if (args.sf) result = static_cast<uint64_t>(sat_to_int64(rounded));
+      else result = static_cast<uint64_t>(static_cast<uint32_t>(sat_to_int32(rounded)));
       if (args.rd < 31) {
         state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
       }
@@ -3262,19 +3298,18 @@ class Interpreter {
     }
 
     if (rmode == 0b11 && opcode == 0b001) {
-      // FCVTZU: FP to unsigned integer, round toward zero
+      // FCVTZU: FP to unsigned integer, round toward zero (truncate).
       uint64_t result = 0;
+      double rounded;
       if (args.ftype == 0b00) {
-        float f;
-        memcpy(&f, &state_->cpu.v[args.rn], 4);
-        if (args.sf) { result = static_cast<uint64_t>(f); }
-        else { result = static_cast<uint64_t>(static_cast<uint32_t>(f)); }
+        float f; memcpy(&f, &state_->cpu.v[args.rn], 4);
+        rounded = trunc(static_cast<double>(f));
       } else if (args.ftype == 0b01) {
-        double d;
-        memcpy(&d, &state_->cpu.v[args.rn], 8);
-        if (args.sf) { result = static_cast<uint64_t>(d); }
-        else { result = static_cast<uint64_t>(static_cast<uint32_t>(d)); }
+        double d; memcpy(&d, &state_->cpu.v[args.rn], 8);
+        rounded = trunc(d);
       } else { Undefined(); return; }
+      if (args.sf) result = sat_to_uint64(rounded);
+      else result = sat_to_uint32(rounded);
       if (args.rd < 31) {
         state_->cpu.x[args.rd] = args.sf ? result : (result & 0xFFFFFFFFULL);
       }
