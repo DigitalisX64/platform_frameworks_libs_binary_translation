@@ -6452,6 +6452,143 @@ TEST_F(Arm64LiteTranslateRegionTest, FccmpDCompoundLtTrue) {
 }
 // endregion
 
+// region digitalis - FCMP NaN
+//
+// FCMP Sn, Sm / FCMP Dn, Dm / FCMP Sn, #0.0 / FCMP Dn, #0.0
+// FCMPE variants share the same NZCV mapping (the quiet-vs-signalling NaN
+// bit only changes FP-exception behaviour, not the architectural output).
+//
+//   Encoding: M S 11110 ftype 1 Rm op 1000 Rn opcode2
+//     opcode2[3] = with_zero (Rm field then = 0)
+//     opcode2[4] = signal_nans (FCMPE)
+//   Base FCMP S Rn, Rm : 0x1E202020
+//   Base FCMP D Rn, Rm : 0x1E602020
+//   Base FCMP S Rn, #0 : 0x1E202028
+//   Base FCMP D Rn, #0 : 0x1E602028
+//   Base FCMPE S Rn, Rm: 0x1E202030
+//   Base FCMPE S Rn, #0: 0x1E202038
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e222020 fcmp s1, s2 / 1e622020 fcmp d1, d2
+//   1e202028 fcmp s1, #0.0 / 1e602028 fcmp d1, #0.0
+//   1e222030 fcmpe s1, s2 / 1e202038 fcmpe s1, #0.0
+//
+// ARM FPCompare(Vn, Vm) -> NZCV mapping:
+//   Vn or Vm NaN     : 0b0011 (unordered)
+//   Vn == Vm         : 0b0110 (equal)
+//   Vn  < Vm         : 0b1000 (less than)
+//   Vn  > Vm         : 0b0010 (greater than)
+constexpr uint32_t FcmpScalar(uint32_t base, uint8_t rn, uint8_t rm) {
+  return base | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpS(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E202020, rn, rm);
+}
+constexpr uint32_t FcmpD(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E602020, rn, rm);
+}
+constexpr uint32_t FcmpSZero(uint8_t rn) {
+  return 0x1E202028 | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpDZero(uint8_t rn) {
+  return 0x1E602028 | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpeS(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E202030, rn, rm);
+}
+
+// FCMP S — unordered (NaN operand): NZCV = 0b0011 (C=1, V=1).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSUnordered) {
+  StoreFp32(state_.cpu, 1, std::nanf(""));
+  StoreFp32(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {
+      FcmpS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCMP S — ordered equal: NZCV = 0b0110 (Z=1, C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSOrderedEqual) {
+  StoreFp32(state_.cpu, 1, 3.5f);
+  StoreFp32(state_.cpu, 2, 3.5f);
+  static const uint32_t code[] = {
+      FcmpS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMP S — ordered less: NZCV = 0b1000 (N=1).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSOrderedLess) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {
+      FcmpS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);
+}
+
+// FCMP D — ordered equal (with widened FP64): NZCV = 0b0110.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDOrderedEqual) {
+  StoreFp64(state_.cpu, 1, 1.0);
+  StoreFp64(state_.cpu, 2, 1.0);
+  static const uint32_t code[] = {
+      FcmpD(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMP D — unordered (Vm is a quiet NaN): NZCV = 0b0011.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDUnordered) {
+  StoreFp64(state_.cpu, 1, 1.0);
+  StoreFp64(state_.cpu, 2, std::nan(""));
+  static const uint32_t code[] = {
+      FcmpD(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCMP S, #0.0 — Vn > 0 produces NZCV = 0b0010 (C=1 only).
+// Exercises the with_zero path (opcode2[3]=1, Rm field unused).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSWithZeroGreater) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  static const uint32_t code[] = {
+      FcmpSZero(1),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0010u);
+}
+
+// FCMP D, #0.0 — Vn == 0 produces NZCV = 0b0110.  +0.0 == -0.0 by FP
+// equality, so this also implicitly proves the zero-form pulls a true
+// +0.0 (Pxor) for the Vm side rather than reading uninitialised lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDWithZeroEqual) {
+  StoreFp64(state_.cpu, 1, 0.0);
+  static const uint32_t code[] = {
+      FcmpDZero(1),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMPE S — signal_nans bit does not alter NZCV (mirrors the FCCMP/FCCMPE
+// invariant).  Unordered input still yields 0b0011.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpeSUnorderedMatchesFcmp) {
+  StoreFp32(state_.cpu, 1, std::nanf(""));
+  StoreFp32(state_.cpu, 2, 4.0f);
+  static const uint32_t code[] = {
+      FcmpeS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
