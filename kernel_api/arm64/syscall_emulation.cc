@@ -211,30 +211,6 @@ void RunGuestSyscall(ThreadState* state) {
   }
   // endregion
 
-  // region digitalis - futex diagnostic logging
-  if (guest_nr == 98) {  // __NR_futex
-    int futex_op = static_cast<int>(state->cpu.x[1]) & FUTEX_CMD_MASK;
-    static uint64_t futex_log_count = 0;
-    futex_log_count++;
-    if (futex_log_count <= 20 || futex_op == FUTEX_WAIT || futex_op == FUTEX_WAIT_BITSET) {
-      uint32_t actual_val = 0;
-      if (state->cpu.x[0] != 0) {
-        actual_val = *reinterpret_cast<volatile uint32_t*>(state->cpu.x[0]);
-      }
-      __android_log_print(ANDROID_LOG_DEBUG, "berberis",
-          "futex#%lu: op=%d uaddr=0x%llx val=0x%x actual=0x%x pc=0x%lx lr=0x%lx sp=0x%lx x29=0x%lx",
-          (unsigned long)futex_log_count, futex_op,
-          (unsigned long long)state->cpu.x[0],
-          (uint32_t)((guest_nr == 98) ? futex_arg3 : state->cpu.x[2]),
-          actual_val,
-          (unsigned long)state->cpu.insn_addr,
-          (unsigned long)state->cpu.x[30],
-          (unsigned long)state->cpu.x[1],  // sp is stored elsewhere but x1 has context
-          (unsigned long)state->cpu.x[29]);
-    }
-  }
-  // endregion
-
   long result = RunGuestSyscallImpl(guest_nr,
                                     state->cpu.x[0],
                                     state->cpu.x[1],
