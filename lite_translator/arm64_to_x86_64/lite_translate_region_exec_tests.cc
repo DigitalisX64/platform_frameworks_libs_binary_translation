@@ -2199,6 +2199,88 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtauWdPosInfSaturates) {
 }
 // endregion
 
+// region digitalis
+// FRINTA Sd, Sn / Dd, Dn (round to nearest, ties AWAY from zero).
+// FP data-processing 1-source, opcode=001100:
+//   FRINTA Sd, Sn: 0001_1110_0010_0110_0100_00nn_nnnd_dddd  (ftype=00)
+//   FRINTA Dd, Dn: 0001_1110_0110_0110_0100_00nn_nnnd_dddd  (ftype=01)
+constexpr uint32_t kFrintaSs0 = 0x1E264000;
+constexpr uint32_t kFrintaDd0 = 0x1E664000;
+
+// Halfway tie: FRINTA rounds 2.5 -> 3.0 (away from zero), NOT 2.0 (RNE).
+TEST_F(Arm64LiteTranslateRegionTest, FrintaSs2p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x40200000u;  // 2.5f
+  static const uint32_t code[] = {kFrintaSs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x40400000u);  // 3.0f
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintaSsNeg2p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0xC0200000u;  // -2.5f
+  static const uint32_t code[] = {kFrintaSs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0xC0400000u);  // -3.0f
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintaDd0p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) =
+      0x3FE0000000000000ULL;  // 0.5d
+  static const uint32_t code[] = {kFrintaDd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x3FF0000000000000ULL);  // 1.0d
+}
+
+// Magnitude-gate edge case: an already-integer FP value at or above
+// the mantissa-overflow boundary (FP32 step >= 1 at |x| >= 2^23,
+// FP64 step >= 1 at |x| >= 2^52).  Adding 0.5 lands a tie below the
+// LSB and RNE round-half-to-even bumps odd values to the next even.
+// Expected: FRINTA(2^23+1) == 2^23+1 (already integer, untouched).
+TEST_F(Arm64LiteTranslateRegionTest, FrintaSsOddIntegerAboveThreshold) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) =
+      0x4B000001u;  // 2^23 + 1 = 8388609.0f
+  static const uint32_t code[] = {kFrintaSs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x4B000001u);  // 8388609.0f (NOT 8388610.0f)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintaDdOddIntegerAboveDoubleThreshold) {
+  state_.cpu.v[0] = 0;
+  // 2^52 + 1 = 4503599627370497.0d
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x4330000000000001ULL;
+  static const uint32_t code[] = {kFrintaDd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x4330000000000001ULL);  // 4503599627370497 unchanged
+}
+
+// Non-tie inputs: FRINTA(0.4) -> 0.0, FRINTA(0.6) -> 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrintaSs0p4) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x3ECCCCCDu;  // 0.4f
+  static const uint32_t code[] = {kFrintaSs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x00000000u);  // 0.0f
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintaSs0p6) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x3F19999Au;  // 0.6f
+  static const uint32_t code[] = {kFrintaSs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x3F800000u);  // 1.0f
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

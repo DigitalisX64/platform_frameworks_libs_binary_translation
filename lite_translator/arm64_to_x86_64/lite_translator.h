@@ -5602,9 +5602,14 @@ class LiteTranslator {
     }
 
     // FRINTA Sd/Dd, Sn/Dn: ties-to-away has no native ROUND* imm.
-    // Lowered as: dst = trunc(src + copysign(0.5, src)).  Build the
-    // copysign value in a GP register, then ADDSS/ADDSD + ROUNDSS/ROUNDSD
-    // imm=0x03 (truncate toward zero).
+    // Lowered as: dst = trunc(src + copysign(0.5, src)), gated on
+    // magnitude.  For |x| >= 2^23 (FP32) / 2^52 (FP64) x is already an
+    // exact integer (FP step >= 1 at that magnitude), so adding 0.5
+    // lands a tie below the LSB and RNE round-half-to-even would bump
+    // odd values to the next even — skip the add in that range and
+    // trunc directly (trunc on an exact integer is a no-op).  NaN /
+    // +/-Inf bits also exceed the threshold and skip the add; ROUNDSS/SD
+    // preserves NaN and Inf per Intel SDM.
     if (args.opcode == 0b001100) {
       SimdRegister xmm_val = AllocTempSimdReg();
       SimdRegister xmm_half = AllocTempSimdReg();
@@ -5612,32 +5617,65 @@ class LiteTranslator {
       if (xmm_val == no_simd_register || xmm_half == no_simd_register ||
           xmm_zero == no_simd_register) { Undefined(); return; }
       Register tmp = AllocTempReg();
+      Register sign_tmp = AllocTempReg();
+      // Load src into xmm_val first so the magnitude gate can read its
+      // bits without a second memory round-trip.
       if (is_double) {
-        // FP64: high 32 bits hold sign+exp; low 32 bits of 0.5_fp64 are
-        // zero.  Build only the high half in a GP register, then PINSRD
-        // it into the upper-32 of an otherwise-zero XMM.
+        as_.Movsd(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+      } else {
+        as_.Movss(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+      }
+      // Magnitude gate via integer-domain compare on |bits(x)|.  IEEE-754
+      // bits compare as unsigned int for non-negative values; clearing
+      // the sign bit gives |bits(x)|.  Compare against the bit pattern
+      // of 2^23 (FP32) / 2^52 (FP64).
+      Assembler::Label* skip_add = as_.MakeLabel();
+      if (is_double) {
+        as_.Movq(sign_tmp, xmm_val);
+        as_.Movq(tmp, static_cast<int64_t>(0x7FFFFFFFFFFFFFFFLL));
+        as_.Andq(sign_tmp, tmp);
+        as_.Movq(tmp, static_cast<int64_t>(0x4330000000000000LL));  // 2^52
+        as_.Cmpq(sign_tmp, tmp);
+        as_.Jcc(Assembler::Condition::kAboveEqual, *skip_add);
+      } else {
+        as_.Movd(sign_tmp, xmm_val);
+        as_.Andl(sign_tmp, int32_t{0x7FFFFFFF});
+        as_.Cmpl(sign_tmp, int32_t{0x4B000000});  // 2^23
+        as_.Jcc(Assembler::Condition::kAboveEqual, *skip_add);
+      }
+      // |x| < threshold: build copysign(0.5, x) and add to xmm_val.
+      if (is_double) {
+        // FP64: high 32 bits hold sign+exp; low 32 of 0.5_fp64 are zero.
         as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset + 4});
         as_.Andl(tmp, static_cast<int32_t>(0x80000000));  // sign bit only
         as_.Orl(tmp, int32_t{0x3FE00000});                 // |= high32(0.5d)
         as_.Pxor(xmm_half, xmm_half);
-        as_.Pinsrd(xmm_half, tmp, int8_t{1});              // xmm_half = copysign(0.5d,src)
-        as_.Movsd(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Pinsrd(xmm_half, tmp, int8_t{1});              // copysign(0.5d, src)
         as_.Addsd(xmm_val, xmm_half);
-        as_.Roundsd(xmm_val, xmm_val, int8_t{0x03});       // truncate toward 0
-        as_.Pxor(xmm_zero, xmm_zero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
-        as_.Movsd({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
       } else {
         // FP32: one word holds sign+exp+mantissa.
         as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_offset});
         as_.Andl(tmp, static_cast<int32_t>(0x80000000));  // sign bit only
         as_.Orl(tmp, int32_t{0x3F000000});                 // |= bits of +0.5
-        as_.Movd(xmm_half, tmp);                           // xmm_half = copysign(0.5,src)
-        as_.Movss(xmm_val, {.base = Assembler::rbp, .disp = src_offset});
+        as_.Movd(xmm_half, tmp);                           // copysign(0.5, src)
         as_.Addss(xmm_val, xmm_half);
-        as_.Roundss(xmm_val, xmm_val, int8_t{0x03});       // truncate toward 0
-        as_.Pxor(xmm_zero, xmm_zero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+      }
+      as_.Bind(skip_add);
+      // Truncate toward zero (no-op for the skip-add path; rounds away
+      // from zero for the add-half path because adding sign(x)*0.5
+      // pushed |x| up by half).
+      if (is_double) {
+        as_.Roundsd(xmm_val, xmm_val, int8_t{0x03});
+      } else {
+        as_.Roundss(xmm_val, xmm_val, int8_t{0x03});
+      }
+      // Write back to v[d], zeroing the high 64 bits of the scalar
+      // AArch64 layout.
+      as_.Pxor(xmm_zero, xmm_zero);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
+      } else {
         as_.Movss({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
       }
       return;
