@@ -4620,9 +4620,14 @@ class Decoder {
           op = AdvSimdScalarThreeSameOpcode::kFabd;
           break;
         case 0b11011:
-          // FMULX (scalar): U=0, bit23=1, opcode=11011. Other combinations of
-          // (U, bit23) at opcode=11011 are unallocated in the scalar encoding.
-          if (!u && bit23) op = AdvSimdScalarThreeSameOpcode::kFmulx;
+          // FMULX (scalar, single & double): U=0, bit23=0, opcode=11011.
+          // Per ARM ARM C7.2.150 "FMULX (vector, scalar)": encoding
+          //   01 0 11110 0 sz 1 Rm 11011 1 Rn Rd
+          // i.e. bit29=U=0, bit23=0, bit22=sz (0=S, 1=D), bit21=1.
+          // Verified: fmulx s0,s1,s2 = 0x5E22DC20, fmulx d0,d1,d2 = 0x5E62DC20.
+          // Other combinations of (U, bit23) at opcode=11011 are unallocated
+          // in the scalar encoding.
+          if (!u && !bit23) op = AdvSimdScalarThreeSameOpcode::kFmulx;
           else { Undefined(); return; }
           break;
         case 0b11100:
