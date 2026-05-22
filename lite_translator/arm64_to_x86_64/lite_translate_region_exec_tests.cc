@@ -2070,6 +2070,133 @@ TEST_F(Arm64LiteTranslateRegionTest, DISABLED_FcvtnuXdPosInfWithRegPressure) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
 }
+
+// FCVTAS / FCVTAU (round-to-nearest ties-AWAY-from-zero) JIT lowering.
+// rmode=00, opcode=100 (signed) / 101 (unsigned), ftype in {00, 01}.
+// FCVTAS Wd, Sn -> sf=0, ftype=00: 0001_1110_0010_0100_0000_00nn_nnnd_dddd
+// FCVTAS Xd, Sn -> sf=1, ftype=00: 1001_1110_0010_0100 ...
+// FCVTAS Wd, Dn -> sf=0, ftype=01: 0001_1110_0110_0100 ...
+// FCVTAS Xd, Dn -> sf=1, ftype=01: 1001_1110_0110_0100 ...
+// FCVTAU Wd, Sn -> 0x1E25...; FCVTAU Xd, Sn -> 0x9E25...;
+// FCVTAU Wd, Dn -> 0x1E65...; FCVTAU Xd, Dn -> 0x9E65...
+constexpr uint32_t kFcvtasWs0 = 0x1E240000;
+constexpr uint32_t kFcvtasXs0 = 0x9E240000;
+constexpr uint32_t kFcvtasWd0 = 0x1E640000;
+constexpr uint32_t kFcvtasXd0 = 0x9E640000;
+constexpr uint32_t kFcvtauWs0 = 0x1E250000;
+constexpr uint32_t kFcvtauXs0 = 0x9E250000;
+constexpr uint32_t kFcvtauWd0 = 0x1E650000;
+constexpr uint32_t kFcvtauXd0 = 0x9E650000;
+
+// Halfway tie: FCVTAS rounds 2.5 -> 3 (away from zero), NOT 2 (RNE round-
+// to-even).  This is the load-bearing distinguishing case vs FCVTNS.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasWs2p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x40200000u;  // 2.5f
+  static const uint32_t code[] = {kFcvtasWs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 3ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasWsNeg2p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0xC0200000u;  // -2.5f
+  static const uint32_t code[] = {kFcvtasWs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // -3 sign-extended into Wd is 0xFFFFFFFD; the JIT writes Wd, upper 32 zero.
+  EXPECT_EQ(state_.cpu.x[0], 0x00000000FFFFFFFDULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasXd0p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x3FE0000000000000ULL;  // 0.5d
+  static const uint32_t code[] = {kFcvtasXd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 1ULL);
+}
+
+// Already-integer above the magnitude threshold (FP32 step >= 1 at |x| >=
+// 2^23): magnitude gate skips the add-half, so an odd integer at 2^23+1
+// must round-trip exactly.  Without the gate it would be bumped to
+// 2^23+2 by RNE of (2^23+1)+0.5.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasWsOddIntegerAboveThreshold) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x4B000001u;  // 2^23 + 1 = 8388609.0f
+  static const uint32_t code[] = {kFcvtasWs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 8388609ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasXdOddIntegerAboveDoubleThreshold) {
+  state_.cpu.v[0] = 0;
+  // 2^52 + 1 = 4503599627370497.0d, bits 0x4330000000000001
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x4330000000000001ULL;
+  static const uint32_t code[] = {kFcvtasXd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 4503599627370497ULL);
+}
+
+// NaN -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasWsNanReturnsZero) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7FC00000u;  // QNaN
+  static const uint32_t code[] = {kFcvtasWs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// Positive overflow saturates to INT_MAX (signed).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasWsPosInfSaturates) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7F800000u;  // +Inf
+  static const uint32_t code[] = {kFcvtasWs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(INT32_MAX));
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasXdNegInfSaturates) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0xFFF0000000000000ULL;  // -Inf
+  static const uint32_t code[] = {kFcvtasXd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(INT64_MIN));
+}
+
+// FCVTAU: negative inputs saturate to 0.  -0.5 ties away from zero would
+// give -1 if signed, but unsigned saturates to 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtauWsNegHalfSaturatesZero) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0xBF000000u;  // -0.5f
+  static const uint32_t code[] = {kFcvtauWs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtauXd0p5TiesAway) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x3FE0000000000000ULL;  // 0.5d
+  static const uint32_t code[] = {kFcvtauXd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 1ULL);
+}
+
+// FCVTAU sf=1 +Inf -> UINT64_MAX (offset-trick saturation path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtauXdPosInfSaturates) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {kFcvtauXd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+// FCVTAU sf=0 +Inf -> UINT32_MAX (upper-32 zero saturation path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtauWdPosInfSaturates) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {kFcvtauWd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(UINT32_MAX));
+}
 // endregion
 
 }  // namespace

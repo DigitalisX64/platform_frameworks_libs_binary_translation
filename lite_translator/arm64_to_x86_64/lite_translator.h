@@ -2963,8 +2963,8 @@ class LiteTranslator {
     // zero pass through ROUNDSS/ROUNDSD unchanged, so the NaN-check (PF=1
     // from Ucomi self) and the FP-sign-bit branch still classify them
     // correctly.  FCVTAS / FCVTAU (rmode=00, opcode in {100, 101}, ties-
-    // away-from-zero) has no native x86 ROUND mode and is left to the
-    // interpreter for now.
+    // away-from-zero) has no native x86 ROUND mode; see the dedicated
+    // magnitude-gated add-half-and-trunc path further down.
     if ((rmode == 0b00 || rmode == 0b01 || rmode == 0b10) &&
         (opcode == 0b000 || opcode == 0b001) &&
         (args.ftype == 0b00 || args.ftype == 0b01)) {
@@ -3059,6 +3059,210 @@ class LiteTranslator {
         } else {
           // sf=1 (uint64): offset-trick for FP in [2^63, 2^64); saturate
           // to UINT64_MAX for FP >= 2^64 (incl +Inf).
+          SimdRegister bound_xmm = AllocTempSimdReg();
+          if (bound_xmm == no_simd_register) { success_ = false; return; }
+          Assembler::Label* sat_max = as_.MakeLabel();
+          Assembler::Label* direct_path = as_.MakeLabel();
+          if (args.ftype == 0b00) {
+            as_.Movl(tmp, int32_t{0x5F000000});               // FP32(2^63)
+            as_.Movd(bound_xmm, tmp);
+          } else {
+            as_.Movq(tmp, static_cast<int64_t>(0x43E0000000000000LL));  // FP64(2^63)
+            as_.Movq(bound_xmm, tmp);
+          }
+          if (args.ftype == 0b00) as_.Ucomiss(xmm, bound_xmm);
+          else as_.Ucomisd(xmm, bound_xmm);
+          as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+          SimdRegister bound2_xmm = AllocTempSimdReg();
+          if (bound2_xmm == no_simd_register) { success_ = false; return; }
+          if (args.ftype == 0b00) {
+            as_.Movl(tmp, int32_t{0x5F800000});               // FP32(2^64)
+            as_.Movd(bound2_xmm, tmp);
+          } else {
+            as_.Movq(tmp, static_cast<int64_t>(0x43F0000000000000LL));  // FP64(2^64)
+            as_.Movq(bound2_xmm, tmp);
+          }
+          if (args.ftype == 0b00) as_.Ucomiss(xmm, bound2_xmm);
+          else as_.Ucomisd(xmm, bound2_xmm);
+          as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+          if (args.ftype == 0b00) {
+            as_.Subss(xmm, bound_xmm);
+            as_.Cvttss2siq(tmp, xmm);
+          } else {
+            as_.Subsd(xmm, bound_xmm);
+            as_.Cvttsd2siq(tmp, xmm);
+          }
+          as_.Btsq(tmp, int8_t{63});
+          as_.Jmp(*done);
+          as_.Bind(sat_max);
+          as_.Movq(tmp, static_cast<int64_t>(-1));  // UINT64_MAX
+          as_.Jmp(*done);
+          as_.Bind(direct_path);
+          if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+          else as_.Cvttsd2siq(tmp, xmm);
+          as_.Jmp(*done);
+          as_.Bind(zero_path);
+          as_.Xorq(tmp, tmp);
+        }
+        as_.Bind(done);
+      }
+      if (args.rd < 31) {
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
+
+    // FCVTAS (signed) / FCVTAU (unsigned) scalar FP -> int, round to nearest
+    // ties-AWAY-from-zero:
+    //   rmode=00, opcode=100 (signed) or 101 (unsigned), ftype in {00, 01}.
+    //
+    // x86 has no native ROUND* imm for ties-away.  Strategy: the canonical
+    // "trunc(x + copysign(0.5, x))" trick, gated on magnitude.  For
+    // |x| < 2^23 (FP32) / 2^52 (FP64) the add lands a tie x=k+/-0.5 exactly
+    // on k+/-1, and trunc rounds it away from zero.  For |x| >= threshold,
+    // x is already an exact integer (FP step >= 1 at that magnitude), so we
+    // skip the add and trunc directly — without the gate, odd integers x in
+    // [threshold, dst_max) would be wrongly bumped to x+1 by RNE of x+0.5
+    // (since 0.5 lies below the LSB and RNE rounds half-to-even).
+    //
+    // After the magnitude branch the saturation fix-up is identical to the
+    // FCVTZS/FCVTZU paths above: classify by NaN (Ucomi self -> PF=1) and
+    // by post-rounded FP sign, saturate to INT_MAX / INT_MIN / 0 /
+    // UINT*_MAX accordingly.
+    if (rmode == 0b00 && (opcode == 0b100 || opcode == 0b101) &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      const bool is_unsigned = (opcode == 0b101);
+
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      SimdRegister half_xmm = AllocTempSimdReg();
+      if (half_xmm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      Register sign_tmp = AllocTempReg();
+      if (sign_tmp == no_register) { success_ = false; return; }
+
+      int32_t src_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      if (args.ftype == 0b00) {
+        as_.Movss(xmm, {.base = Assembler::rbp, .disp = src_off});
+      } else {
+        as_.Movsd(xmm, {.base = Assembler::rbp, .disp = src_off});
+      }
+
+      // Magnitude gate via integer-domain compare on |bits(x)|.  IEEE-754
+      // bits compare as unsigned int for non-negative values: larger
+      // exponent -> larger bit value; mantissa breaks ties left-to-right.
+      // NaN bits (exponent all 1) and +/-Inf both exceed any finite
+      // threshold, so they skip the add (NaN+0.5=NaN passes through
+      // ROUNDSS and the saturation fix-up classifies them correctly).
+      Assembler::Label* skip_add = as_.MakeLabel();
+      if (args.ftype == 0b00) {
+        as_.Movd(sign_tmp, xmm);
+        as_.Andl(sign_tmp, int32_t{0x7FFFFFFF});
+        as_.Cmpl(sign_tmp, int32_t{0x4B000000});  // FP32 bits of 2^23
+        as_.Jcc(Assembler::Condition::kAboveEqual, *skip_add);
+      } else {
+        as_.Movq(sign_tmp, xmm);
+        as_.Movq(tmp, static_cast<int64_t>(0x7FFFFFFFFFFFFFFFLL));
+        as_.Andq(sign_tmp, tmp);
+        as_.Movq(tmp, static_cast<int64_t>(0x4330000000000000LL));  // FP64 bits of 2^52
+        as_.Cmpq(sign_tmp, tmp);
+        as_.Jcc(Assembler::Condition::kAboveEqual, *skip_add);
+      }
+
+      // |x| < threshold: build copysign(0.5, x) in half_xmm, add to xmm.
+      // FP32 bits of copysign(0.5, x) = (bits(x) & 0x80000000) | 0x3F000000.
+      // FP64 high 32 bits = (high32(bits(x)) & 0x80000000) | 0x3FE00000;
+      // low 32 bits are 0.  Mirrors the FRINTA pattern at line ~5400.
+      if (args.ftype == 0b00) {
+        as_.Movd(tmp, xmm);
+        as_.Andl(tmp, static_cast<int32_t>(0x80000000));
+        as_.Orl(tmp, int32_t{0x3F000000});
+        as_.Movd(half_xmm, tmp);
+        as_.Addss(xmm, half_xmm);
+      } else {
+        as_.Movl(tmp, {.base = Assembler::rbp, .disp = src_off + 4});
+        as_.Andl(tmp, static_cast<int32_t>(0x80000000));
+        as_.Orl(tmp, int32_t{0x3FE00000});
+        as_.Pxor(half_xmm, half_xmm);
+        as_.Pinsrd(half_xmm, tmp, int8_t{1});
+        as_.Addsd(xmm, half_xmm);
+      }
+      as_.Bind(skip_add);
+
+      // Truncate toward zero.  For exact-integer skipped-add inputs this
+      // is a no-op; for |x| < threshold inputs the add already produced a
+      // (possibly half-)integer whose trunc is the ARM result.
+      if (args.ftype == 0b00) {
+        as_.Roundss(xmm, xmm, int8_t{0x03});
+      } else {
+        as_.Roundsd(xmm, xmm, int8_t{0x03});
+      }
+
+      if (!is_unsigned) {
+        // Signed saturation fix-up (mirror of FCVTZS).
+        if (args.sf) {
+          if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+          else as_.Cvttsd2siq(tmp, xmm);
+        } else {
+          if (args.ftype == 0b00) as_.Cvttss2sil(tmp, xmm);
+          else as_.Cvttsd2sil(tmp, xmm);
+        }
+        Assembler::Label* nan_path = as_.MakeLabel();
+        Assembler::Label* done = as_.MakeLabel();
+        if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+        else as_.Ucomisd(xmm, xmm);
+        as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+        if (args.ftype == 0b00) {
+          as_.Movd(sign_tmp, xmm);
+          as_.Testl(sign_tmp, sign_tmp);
+        } else {
+          as_.Movq(sign_tmp, xmm);
+          as_.Testq(sign_tmp, sign_tmp);
+        }
+        as_.Jcc(Assembler::Condition::kNegative, *done);
+        if (args.sf) as_.Testq(tmp, tmp);
+        else as_.Testl(tmp, tmp);
+        as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+        if (args.sf) {
+          as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+        } else {
+          as_.Movl(tmp, int32_t{INT32_MAX});
+        }
+        as_.Jmp(*done);
+        as_.Bind(nan_path);
+        if (args.sf) as_.Xorq(tmp, tmp);
+        else as_.Xorl(tmp, tmp);
+        as_.Bind(done);
+      } else {
+        // Unsigned saturation fix-up (mirror of FCVTZU).
+        Assembler::Label* zero_path = as_.MakeLabel();
+        Assembler::Label* done = as_.MakeLabel();
+        if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+        else as_.Ucomisd(xmm, xmm);
+        as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+        if (args.ftype == 0b00) {
+          as_.Movd(sign_tmp, xmm);
+          as_.Testl(sign_tmp, sign_tmp);
+        } else {
+          as_.Movq(sign_tmp, xmm);
+          as_.Testq(sign_tmp, sign_tmp);
+        }
+        as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+        if (!args.sf) {
+          // sf=0 (uint32): cvtt-Q + upper-32 zero classifies in-range.
+          if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+          else as_.Cvttsd2siq(tmp, xmm);
+          as_.Movq(sign_tmp, tmp);
+          as_.Shrq(sign_tmp, int8_t{32});
+          as_.Testq(sign_tmp, sign_tmp);
+          as_.Jcc(Assembler::Condition::kZero, *done);
+          as_.Movl(tmp, int32_t{-1});  // UINT32_MAX
+          as_.Jmp(*done);
+          as_.Bind(zero_path);
+          as_.Xorq(tmp, tmp);
+        } else {
+          // sf=1 (uint64): offset-trick + 2^64 saturation.
           SimdRegister bound_xmm = AllocTempSimdReg();
           if (bound_xmm == no_simd_register) { success_ = false; return; }
           Assembler::Label* sat_max = as_.MakeLabel();
