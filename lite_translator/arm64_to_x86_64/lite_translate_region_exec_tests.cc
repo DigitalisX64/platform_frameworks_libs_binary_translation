@@ -80,6 +80,8 @@ constexpr uint8_t kCondEQ = 0;
 constexpr uint8_t kCondNE = 1;
 constexpr uint8_t kCondCS = 0x2;
 constexpr uint8_t kCondCC = 0x3;
+constexpr uint8_t kCondMI = 0x4;
+constexpr uint8_t kCondPL = 0x5;
 constexpr uint8_t kCondHI = 0x8;
 constexpr uint8_t kCondLS = 0x9;
 constexpr uint8_t kCondGE = 0xA;
@@ -985,6 +987,134 @@ TEST_F(Arm64LiteTranslateRegionTest, StpQ_SignedOffset_Positive) {
     EXPECT_EQ(buffer[i], 0xCC) << "byte " << i;
   }
 }
+
+// region digitalis - SIMD load JIT coverage (plan §C1 verify).
+//
+// The SIMD load JIT path (lite_translator.h:2207 SimdLoadStoreImm,
+// :2314 SimdLoadStorePair, :2348 SimdLoadStoreReg) was added piecemeal
+// with stores covered by the memset-pattern tests above.  The four
+// loads (LDR Q unsigned-imm, LDR D unsigned-imm zero-extend, LDP Q
+// signed-imm, LDR Q register-offset) below pin the corresponding load
+// emit sequences so a future change that, e.g., drops the Pxor
+// zero-fill before LDR D would fail loudly here instead of producing
+// stale garbage in the upper 64 bits of V[rt].
+//
+// Encodings verified against aarch64-linux-gnu-as (system binutils
+// per CLAUDE.md guidance).
+
+// LDR Q<rt>, [Xn, #imm12*16]: 128-bit SIMD load, unsigned imm12.
+// size=00 V=1 opc=11 imm12 Rn Rt
+constexpr uint32_t LdrQUnsigned(uint8_t rt, uint8_t rn, uint16_t imm12_div16) {
+  return 0x3DC00000 | (static_cast<uint32_t>(imm12_div16) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// LDR D<rt>, [Xn, #imm12*8]: 64-bit SIMD load, zero-extends V[rt] upper half.
+// size=11 V=1 opc=01 imm12 Rn Rt
+constexpr uint32_t LdrDUnsigned(uint8_t rt, uint8_t rn, uint16_t imm12_div8) {
+  return 0xFD400000 | (static_cast<uint32_t>(imm12_div8) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// LDP Q<rt1>, Q<rt2>, [Xn, #imm7*16]: 128-bit load-pair, signed imm7.
+// opc=10 V=1 L=1 imm7 Rt2 Rn Rt1
+constexpr uint32_t LdpQSigned(uint8_t rt1, uint8_t rt2, uint8_t rn,
+                              int8_t imm_div16) {
+  uint32_t imm7 = static_cast<uint32_t>(imm_div16) & 0x7F;
+  return 0xAD400000 | (imm7 << 15) | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+
+// LDR Q<rt>, [Xn, Xm]: 128-bit load with register offset, no shift/extend.
+// size=00 V=1 opc=11 reg-offset Rm option=011(UXTX) S=0 Rn Rt
+constexpr uint32_t LdrQReg(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0x3CE06800 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SimdLoad128Bit) {
+  // LDR Q0, [X1] should load 16 bytes at X1 into the full 128-bit V0.
+  alignas(16) static uint8_t buffer[16];
+  for (int i = 0; i < 16; ++i) buffer[i] = static_cast<uint8_t>(0xA0 + i);
+
+  static const uint32_t code[] = {
+      LdrQUnsigned(0, 1, 0),  // LDR Q0, [X1, #0]
+  };
+  // Pre-fill V0 with a sentinel so a stale-upper-half bug is detectable.
+  memset(&state_.cpu.v[0], 0x5A, 16);
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(reinterpret_cast<uint8_t*>(&state_.cpu.v[0])[i],
+              static_cast<uint8_t>(0xA0 + i))
+        << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SimdLoad64BitZeroExtends) {
+  // LDR D0, [X1] loads 8 bytes and zero-extends V0's upper 64 bits.
+  // Pre-poison the upper half so a missing Pxor would be visible.
+  alignas(16) static uint8_t buffer[8] =
+      {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+
+  static const uint32_t code[] = {
+      LdrDUnsigned(0, 1, 0),  // LDR D0, [X1, #0]
+  };
+  memset(&state_.cpu.v[0], 0xCC, 16);  // sentinel for upper-half zero-extend
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(v0[i], buffer[i]) << "low byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(v0[i], 0x00) << "upper byte " << i << " (must be zero-extended)";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SimdLoadPair128Bit) {
+  // LDP Q0, Q1, [X2, #0]: load 32 bytes into V0 (low half) and V1 (high half).
+  alignas(16) static uint8_t buffer[32];
+  for (int i = 0; i < 32; ++i) buffer[i] = static_cast<uint8_t>(0xD0 + i);
+
+  static const uint32_t code[] = {
+      LdpQSigned(0, 1, 2, 0),  // LDP Q0, Q1, [X2]
+  };
+  memset(&state_.cpu.v[0], 0x33, 16);
+  memset(&state_.cpu.v[1], 0x44, 16);
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  uint8_t* v1 = reinterpret_cast<uint8_t*>(&state_.cpu.v[1]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v0[i], buffer[i]) << "v0 byte " << i;
+    EXPECT_EQ(v1[i], buffer[16 + i]) << "v1 byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SimdLoadRegOffset128Bit) {
+  // LDR Q0, [X1, X2]: 128-bit load using a register offset.
+  alignas(16) static uint8_t buffer[32];
+  for (int i = 0; i < 32; ++i) buffer[i] = static_cast<uint8_t>(0x10 + i);
+
+  static const uint32_t code[] = {
+      LdrQReg(0, 1, 2),  // LDR Q0, [X1, X2]
+  };
+  memset(&state_.cpu.v[0], 0x77, 16);
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  state_.cpu.x[2] = 16;  // offset into buffer (loads buffer[16..31])
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v0[i], buffer[16 + i]) << "byte " << i;
+  }
+}
+// endregion
+
 // Test: single FMUL s0, s0, s1 (in-place multiply)
 TEST_F(Arm64LiteTranslateRegionTest, FmulS_InPlace) {
   static const uint32_t code[] = {
@@ -6323,6 +6453,133 @@ TEST_F(Arm64LiteTranslateRegionTest, FcselSLeTrueViaZ) {
   };
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(LoadFp32(state_.cpu, 0), 7.0f);
+}
+
+// FCSEL S — NE taken (Z=0): Vd = Vn.  Also asserts V[rd] high 96 bits
+// are zero (Movss into a pre-PXOR-cleared register, then 128-bit
+// Movdqu store).
+TEST_F(Arm64LiteTranslateRegionTest, FcselSNeTrueZeroExtendsVd) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  StoreFp32(state_.cpu, 2, 2.5f);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // Z=0 (result 5-10=-5) -> NE true
+      FcselS(0, 1, 2, kCondNE),      // NE -> Vd = Vn (1.5f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.5f);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 4; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselSNeFalse) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  StoreFp32(state_.cpu, 2, 2.5f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> NE false
+      FcselS(0, 1, 2, kCondNE),      // NE -> Vd = Vm (2.5f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.5f);
+}
+
+// FCSEL D — MI taken (N=1): Vd = Vn.  Pins FCSEL D's high-64-bit zero
+// extend on the V[rn] (TRUE) load path; Movsd into the XMM clears the
+// upper 64 bits, then the 128-bit Movdqu writes both lanes to V[rd].
+TEST_F(Arm64LiteTranslateRegionTest, FcselDMiTrueZeroExtendsVd) {
+  StoreFp64(state_.cpu, 1, 3.14159);
+  StoreFp64(state_.cpu, 2, 2.71828);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // N=1 (negative result) -> MI true
+      FcselD(0, 1, 2, kCondMI),      // MI -> Vd = Vn (3.14159)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.14159);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselDMiFalse) {
+  StoreFp64(state_.cpu, 1, 3.14159);
+  StoreFp64(state_.cpu, 2, 2.71828);
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),                 // N=0 (positive result) -> MI false
+      FcselD(0, 1, 2, kCondMI),      // MI -> Vd = Vm (2.71828)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.71828);
+}
+
+// FCSEL S — PL taken (N=0): Vd = Vn.
+TEST_F(Arm64LiteTranslateRegionTest, FcselSPlTrue) {
+  StoreFp32(state_.cpu, 1, 11.0f);
+  StoreFp32(state_.cpu, 2, 22.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),                 // N=0 (positive result) -> PL true
+      FcselS(0, 1, 2, kCondPL),      // PL -> Vd = Vn (11.0f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 11.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselSPlFalse) {
+  StoreFp32(state_.cpu, 1, 11.0f);
+  StoreFp32(state_.cpu, 2, 22.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // N=1 (negative result) -> PL false
+      FcselS(0, 1, 2, kCondPL),      // PL -> Vd = Vm (22.0f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 22.0f);
+}
+
+// FCSEL D — EQ taken: pins FCSEL D's high-64-bit zero extend on the
+// V[rn] (TRUE) load path under the EQ encoding (the existing
+// FcselSEqTrueZeroExtendsVd covers the S form; this completes the
+// symmetric pin at the D form).
+TEST_F(Arm64LiteTranslateRegionTest, FcselDEqTrueZeroExtendsVd) {
+  StoreFp64(state_.cpu, 1, 1.5);
+  StoreFp64(state_.cpu, 2, 2.5);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> EQ true
+      FcselD(0, 1, 2, kCondEQ),      // EQ -> Vd = Vn (1.5)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 1.5);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+// FCSEL D — NE false: pins FCSEL D's high-64-bit zero extend on the
+// V[rm] (FALSE default) load path -- the JIT emits the V[rm] Movsd
+// before the condition switch, so a FALSE outcome exercises a distinct
+// register-write arm from the TRUE-overwrite path pinned above.
+TEST_F(Arm64LiteTranslateRegionTest, FcselDNeFalseZeroExtendsVd) {
+  StoreFp64(state_.cpu, 1, 1.5);
+  StoreFp64(state_.cpu, 2, 2.5);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> NE false
+      FcselD(0, 1, 2, kCondNE),      // NE -> Vd = Vm (2.5)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.5);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
 }
 // endregion
 

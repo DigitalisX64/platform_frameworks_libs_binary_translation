@@ -37,9 +37,6 @@
 
 #include "berberis/guest_os_primitives/scoped_pending_signals.h"
 #include "berberis/runtime_primitives/runtime_library.h"
-// region digitalis
-#include <android/log.h>
-// endregion
 
 #include "epoll_emulation.h"
 #include "guest_types.h"
@@ -199,12 +196,6 @@ void RunGuestSyscall(ThreadState* state) {
       if (actual != expected &&
           (actual & 0xFFFF) == (expected & 0xFFFF) &&
           (expected >> 16) == 0 && (actual >> 16) != 0) {
-        static uint64_t fixup_count = 0;
-        if (++fixup_count <= 5) {
-          __android_log_print(ANDROID_LOG_DEBUG, "berberis",
-              "futex-fixup#%lu: uaddr=0x%llx actual=0x%x expected=0x%x -> using 0x%x",
-              (unsigned long)fixup_count, (unsigned long long)uaddr, actual, expected, actual);
-        }
         futex_arg3 = static_cast<long>(static_cast<int32_t>(actual));
       }
     }
