@@ -8309,7 +8309,8 @@ class LiteTranslator {
   // (scalar destination semantics).
   void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
     using Op = Decoder::AdvSimdScalarXIdxOpcode;
-    if (args.opcode != Op::kFmulx) {
+    if (args.opcode != Op::kFmulx && args.opcode != Op::kFmul &&
+        args.opcode != Op::kFmla && args.opcode != Op::kFmls) {
       success_ = false;
       return;
     }
@@ -8317,7 +8318,78 @@ class LiteTranslator {
       success_ = false;
       return;
     }
+    const bool needs_fma = (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
+    if (needs_fma && !host_platform::kHasFMA) {
+      success_ = false;
+      return;
+    }
     const bool is_double = (args.size == 0b11);
+
+    // FMUL / FMLA / FMLS — simpler scalar lowering without the FMULX
+    // saturation shape.  Load Vn/Vm into XMM regs, broadcast the indexed
+    // lane of Vm into lane 0 (Pshufd works regardless of the upper-lane
+    // garbage we'll later zero), then issue the scalar SS/SD instruction.
+    if (args.opcode != Op::kFmulx) {
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      SimdRegister xmm_m = AllocTempSimdReg();
+      if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+        success_ = false;
+        return;
+      }
+      as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Move the indexed lane of Vm into lane 0.  Use Pshufd to broadcast
+      // (the upper lanes are about to be zeroed anyway).
+      if (is_double) {
+        const int8_t imm = (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
+        as_.Pshufd(xmm_m, xmm_m, imm);
+      } else {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xmm_m, xmm_m, imm);
+      }
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kFmul) {
+        // Scalar multiply: lane 0 of xmm_n = Vn.lane0 * Vm.lane[index].
+        // Upper lanes of xmm_n still hold Vn — zero them below.
+        if (is_double) as_.Mulsd(xmm_n, xmm_m);
+        else           as_.Mulss(xmm_n, xmm_m);
+        xmm_result = xmm_n;
+      } else {
+        // FMLA / FMLS: Vd.lane0 = Vd.lane0 ± Vn.lane0 * Vm.lane[index].
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_d == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = vd_off});
+        if (args.opcode == Op::kFmla) {
+          if (is_double) as_.Vfmadd231sd(xmm_d, xmm_n, xmm_m);
+          else           as_.Vfmadd231ss(xmm_d, xmm_n, xmm_m);
+        } else {
+          // FMLS: Vd = Vd + (-Vn)*Vm  (single fused rounding).
+          if (is_double) as_.Vfnmadd231sd(xmm_d, xmm_n, xmm_m);
+          else           as_.Vfnmadd231ss(xmm_d, xmm_n, xmm_m);
+        }
+        xmm_result = xmm_d;
+      }
+
+      // Scalar destination: zero the upper lanes of Vd.
+      if (is_double) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      } else {
+        as_.Pslldq(xmm_result, int8_t{12});
+        as_.Psrldq(xmm_result, int8_t{12});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+
+    // FMULX path follows below — broadcast shape + saturation override.
 
     int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;

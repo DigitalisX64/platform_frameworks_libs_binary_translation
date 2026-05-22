@@ -6472,35 +6472,72 @@ class Interpreter {
   void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
     CHECK(!exception_raised_);
 
+    using Op = typename Decoder::AdvSimdScalarXIdxOpcode;
+    if (args.size != 0b10 && args.size != 0b11) {
+      Undefined();
+      return;
+    }
+    const bool is_double = (args.size == 0b11);
+    const uint8_t esize = is_double ? 8 : 4;
+    const bool needs_dst = (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
+
     __uint128_t src_n = state_->cpu.v[args.rn];
     __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t src_d = needs_dst ? state_->cpu.v[args.rd] : __uint128_t{0};
     __uint128_t result = 0;
 
-    switch (args.opcode) {
-      case Decoder::AdvSimdScalarXIdxOpcode::kFmulx: {
-        if (args.size == 0b10) {
-          // FP32 scalar.
-          float n_lane, m_lane;
-          memcpy(&n_lane, reinterpret_cast<const uint8_t*>(&src_n), 4);
-          memcpy(&m_lane, reinterpret_cast<const uint8_t*>(&src_m) + args.index * 4, 4);
-          float r = FmulxScalar<float>(n_lane, m_lane);
-          memcpy(reinterpret_cast<uint8_t*>(&result), &r, 4);
-        } else if (args.size == 0b11) {
-          // FP64 scalar.
-          double n_lane, m_lane;
-          memcpy(&n_lane, reinterpret_cast<const uint8_t*>(&src_n), 8);
-          memcpy(&m_lane, reinterpret_cast<const uint8_t*>(&src_m) + args.index * 8, 8);
-          double r = FmulxScalar<double>(n_lane, m_lane);
-          memcpy(reinterpret_cast<uint8_t*>(&result), &r, 8);
-        } else {
+    if (is_double) {
+      double n_lane, m_lane, d_lane = 0.0;
+      memcpy(&n_lane, reinterpret_cast<const uint8_t*>(&src_n), esize);
+      memcpy(&m_lane, reinterpret_cast<const uint8_t*>(&src_m) + args.index * esize, esize);
+      if (needs_dst) {
+        memcpy(&d_lane, reinterpret_cast<const uint8_t*>(&src_d), esize);
+      }
+      double r;
+      switch (args.opcode) {
+        case Op::kFmulx:
+          r = FmulxScalar<double>(n_lane, m_lane);
+          break;
+        case Op::kFmul:
+          r = n_lane * m_lane;
+          break;
+        case Op::kFmla:
+          r = d_lane + n_lane * m_lane;
+          break;
+        case Op::kFmls:
+          r = d_lane - n_lane * m_lane;
+          break;
+        default:
           Undefined();
           return;
-        }
-        break;
       }
-      default:
-        Undefined();
-        return;
+      memcpy(reinterpret_cast<uint8_t*>(&result), &r, esize);
+    } else {
+      float n_lane, m_lane, d_lane = 0.0f;
+      memcpy(&n_lane, reinterpret_cast<const uint8_t*>(&src_n), esize);
+      memcpy(&m_lane, reinterpret_cast<const uint8_t*>(&src_m) + args.index * esize, esize);
+      if (needs_dst) {
+        memcpy(&d_lane, reinterpret_cast<const uint8_t*>(&src_d), esize);
+      }
+      float r;
+      switch (args.opcode) {
+        case Op::kFmulx:
+          r = FmulxScalar<float>(n_lane, m_lane);
+          break;
+        case Op::kFmul:
+          r = n_lane * m_lane;
+          break;
+        case Op::kFmla:
+          r = d_lane + n_lane * m_lane;
+          break;
+        case Op::kFmls:
+          r = d_lane - n_lane * m_lane;
+          break;
+        default:
+          Undefined();
+          return;
+      }
+      memcpy(reinterpret_cast<uint8_t*>(&result), &r, esize);
     }
 
     state_->cpu.v[args.rd] = result;

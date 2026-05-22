@@ -4888,6 +4888,176 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarDRegular) {
   EXPECT_EQ(lane1_bits, 0ULL);
 }
 
+// FMUL / FMLA / FMLS scalar-by-element encoders.  Same encoding shape as
+// FMULX scalar except U=0 and (opcode=1001/0001/0101).  Verified with
+// aarch64-linux-gnu-as / objdump:
+//   fmul  s0, s1, v2.s[0]  = 0x5F829020
+//   fmul  d0, d1, v2.d[0]  = 0x5FC29020
+//   fmla  s0, s1, v2.s[0]  = 0x5F821020
+//   fmla  d0, d1, v2.d[1]  = 0x5FC21820
+//   fmls  s0, s1, v2.s[0]  = 0x5F825020
+//   fmls  d0, d1, v2.d[0]  = 0x5FC25020
+constexpr uint32_t FmulIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5F809000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5FC09000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5F801000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5FC01000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5F805000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5FC05000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMUL scalar FP32: regular finite multiply, lane index 3 exercises both
+// L (bit21) and H (bit11) of the index encoding.  Upper-lane zero check
+// confirms scalar destination semantics.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxScalarSRegular) {
+  StoreVec4S(state_.cpu, 1, 2.5f, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, -4.0f);  // Vm.s[3] = -4.0
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulIdxScalarS(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], -10.0f);  // 2.5 * -4
+  uint32_t lane1, lane2, lane3;
+  std::memcpy(&lane1, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1, 0u);
+  EXPECT_EQ(lane2, 0u);
+  EXPECT_EQ(lane3, 0u);
+}
+
+// FMUL scalar FP64: confirms H=1 selects Vm.d[1].
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 6.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 9.9, 0.25);  // Vm.d[1] = 0.25
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulIdxScalarD(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);  // 6.0 * 0.25
+  uint64_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1, 0ULL);
+}
+
+// FMLA scalar FP32: Vd = Vd + Vn * Vm[index], with fused-vs-unfused
+// divergence proving the lowering uses VFMADD231SS rather than
+// (Vn*Vm)+Vd through Mulss+Addss.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxScalarSFusedRounding) {
+  const float a = 1.0f + std::ldexp(1.0f, -12);
+  StoreVec4S(state_.cpu, 1, a, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, a, 9.9f, 9.9f, 9.9f);  // Vm.s[0] = a
+  StoreVec4S(state_.cpu, 0, -1.0f, 99.f, 99.f, 99.f);
+  static const uint32_t code[] = {FmlaIdxScalarS(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  const float expected = std::fmaf(a, a, -1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+  // Upper-lane zero check.
+  uint32_t lane1, lane2, lane3;
+  std::memcpy(&lane1, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1, 0u);
+  EXPECT_EQ(lane2, 0u);
+  EXPECT_EQ(lane3, 0u);
+}
+
+// FMLA scalar FP64: confirms FMA semantics and FP64 path through
+// VFMADD231SD on the H=1 (Vm.d[1]) lane.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 2.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 9.9, 3.0);  // Vm.d[1] = 3.0
+  StoreVec2D(state_.cpu, 0, 1.5, 99.0);
+  static const uint32_t code[] = {FmlaIdxScalarD(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.5);  // 1.5 + 2.0 * 3.0
+  uint64_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1, 0ULL);
+}
+
+// FMLS scalar FP32: Vd = Vd - Vn * Vm[index] (single fused rounding).
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarSFusedRounding) {
+  const float a = 1.0f + std::ldexp(1.0f, -12);
+  StoreVec4S(state_.cpu, 1, a, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, a, 9.9f);  // Vm.s[2] = a
+  StoreVec4S(state_.cpu, 0, 1.0f, 99.f, 99.f, 99.f);
+  static const uint32_t code[] = {FmlsIdxScalarS(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  // Vd = 1.0 - a*a  = std::fma(-a, a, 1.0)
+  const float expected = std::fmaf(-a, a, 1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+  uint32_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint32_t));
+  EXPECT_EQ(lane1, 0u);
+}
+
+// FMLS scalar FP64: regular finite path, sanity check.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 4.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 2.5, 9.9);  // Vm.d[0] = 2.5
+  StoreVec2D(state_.cpu, 0, 12.0, 99.0);
+  static const uint32_t code[] = {FmlsIdxScalarD(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 2.0);  // 12.0 - 4.0 * 2.5
+  uint64_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1, 0ULL);
+}
+
 // Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs
 // from (a*b)+d in float, proving the lowering uses VFMADD231PS.
 TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {
