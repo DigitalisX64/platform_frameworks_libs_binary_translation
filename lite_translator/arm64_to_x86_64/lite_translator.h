@@ -4241,19 +4241,138 @@ class LiteTranslator {
       //   FMLS  Vd <- Vd - Vn*Vm  ->  VFNMADD231PS / VFNMADD231PD
       // Same shape as the existing scalar FMADD/FMSUB JIT in FpDataProc3.
       //
-      // FP16 .4H/.8H continues to bail to the interpreter: it does the
-      // multiply-accumulate in binary64 then narrows once back to half via
-      // FpSingleToHalf, which is exact.  An F16C round-trip + packed
-      // VFMADD on the binary32 promotion would not match bit-for-bit
-      // because the intermediate sum can lose precision against the
-      // binary64 oracle for sub-normal results.
+      // FP16 .4H/.8H lifts via FP16 -> FP32 -> FP64 round-trip: widen 4
+      // FP16 lanes to 4 FP32 lanes (Vcvtph2ps), then promote each pair
+      // of FP32 lanes to FP64 (Vcvtps2pd) and run VFMADD231PD /
+      // VFNMADD231PD on 2 FP64 lanes at a time, narrow back to FP32
+      // (Vcvtpd2ps), recombine the two FP32 halves, and narrow once
+      // more to FP16 (Vcvtps2ph).  Matches the interpreter's
+      //   r64 = std::fma((double)a, (double)b, (double)d);
+      //   rh  = FpSingleToHalf((float)r64);
+      // because the multiply-add is in binary64 and there is a single
+      // narrow back through FP32 to half — no intermediate FP32 sum to
+      // double-round.  .4H needs two FP64 passes; .8H needs four.
       //
       // Reserved .1D shape (size=01 && q=0) bails too.  Hosts without
       // FMA3 fall back to the interpreter (no MUL+ADD pair — that would
-      // double-round, violating ARM's fused semantics).
+      // double-round, violating ARM's fused semantics).  Hosts without
+      // F16C bail on the FP16 path.
       case Decoder::AdvSimdThreeSameOpcode::kFmlaV:
       case Decoder::AdvSimdThreeSameOpcode::kFmlsV: {
-        if (args.is_fp16) { success_ = false; return; }
+        if (args.is_fp16) {
+          if (!host_platform::kHasFMA) { success_ = false; return; }
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          const bool is_fmls =
+              (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV);
+
+          // Pre-allocate all temps once and reuse across both FP64
+          // passes (lanes 0,1 and lanes 2,3 of each FP32 quad) so we
+          // don't burn through the 16-reg XMM pool.  For .8H we also
+          // need xlo to stash the low-4-lane FP16 result while the
+          // high-4-lane quad runs.
+          SimdRegister xn_f32 = AllocTempSimdReg();
+          SimdRegister xm_f32 = AllocTempSimdReg();
+          SimdRegister xd_f32 = AllocTempSimdReg();
+          SimdRegister xn_pd = AllocTempSimdReg();
+          SimdRegister xm_pd = AllocTempSimdReg();
+          SimdRegister xd_pd = AllocTempSimdReg();
+          SimdRegister xres = AllocTempSimdReg();
+          SimdRegister xlo = args.q ? AllocTempSimdReg() : no_simd_register;
+          if (xn_f32 == no_simd_register || xm_f32 == no_simd_register ||
+              xd_f32 == no_simd_register || xn_pd == no_simd_register ||
+              xm_pd == no_simd_register || xd_pd == no_simd_register ||
+              xres == no_simd_register ||
+              (args.q && xlo == no_simd_register)) {
+            success_ = false; return;
+          }
+
+          // With 4 FP32 lanes already widened into xn_f32/xm_f32/xd_f32,
+          // do two FP64 passes (low 2 lanes via Vcvtps2pd of the low
+          // 64 bits, then high 2 lanes after Psrldq 8 brings them
+          // down).  Recombines into xres as 4 FP32 lanes, ready for
+          // the final Vcvtps2ph narrow.  Destroys xn_f32/xm_f32/xd_f32
+          // (they're scratch within the lambda's scope of use).
+          auto emit_quad = [&]() {
+            // Pass 1: low 2 FP32 lanes -> 2 FP64 lanes.
+            as_.Vcvtps2pd(xn_pd, xn_f32);
+            as_.Vcvtps2pd(xm_pd, xm_f32);
+            as_.Vcvtps2pd(xd_pd, xd_f32);
+            if (is_fmls) {
+              as_.Vfnmadd231pd(xd_pd, xn_pd, xm_pd);
+            } else {
+              as_.Vfmadd231pd(xd_pd, xn_pd, xm_pd);
+            }
+            as_.Vcvtpd2ps(xres, xd_pd);  // 2 FP32 lanes in low 64 of xres.
+
+            // Pass 2: shift high 2 FP32 lanes down, promote to FP64,
+            // FMA, narrow back to FP32 (low 64 of xn_f32 used as a
+            // scratch since the originals are no longer needed).
+            as_.Psrldq(xn_f32, int8_t{8});
+            as_.Vcvtps2pd(xn_pd, xn_f32);
+            as_.Psrldq(xm_f32, int8_t{8});
+            as_.Vcvtps2pd(xm_pd, xm_f32);
+            as_.Psrldq(xd_f32, int8_t{8});
+            as_.Vcvtps2pd(xd_pd, xd_f32);
+            if (is_fmls) {
+              as_.Vfnmadd231pd(xd_pd, xn_pd, xm_pd);
+            } else {
+              as_.Vfmadd231pd(xd_pd, xn_pd, xm_pd);
+            }
+            as_.Vcvtpd2ps(xn_f32, xd_pd);  // 2 FP32 lanes in low 64.
+
+            // Recombine: lanes 0,1 in xres low 64, lanes 2,3 in
+            // xn_f32 low 64 -> xres lanes 0..3.
+            as_.Pslldq(xn_f32, int8_t{8});
+            as_.Por(xres, xn_f32);
+          };
+
+          if (!args.q) {
+            // .4H: 4 FP16 lanes (low 64 bits) -> 4 FP32 -> 2 FP64
+            // passes -> 4 FP32 -> 4 FP16.
+            as_.Movq(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xn_f32, xn_f32);
+            as_.Movq(xm_f32, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Vcvtph2ps(xm_f32, xm_f32);
+            as_.Movq(xd_f32, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Vcvtph2ps(xd_f32, xd_f32);
+            emit_quad();
+            as_.Vcvtps2ph(xres, xres, int8_t{0});
+            // Vcvtps2ph auto-zeroes upper 64 bits.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+          } else {
+            // .8H: 8 FP16 lanes split into two quads.  Pass low 4 ->
+            // narrow -> stash in xlo; then high 4 (Psrldq 8 on the
+            // 128-bit source loads) -> narrow -> recombine with xlo
+            // via Pslldq + Por.
+            as_.Movq(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xn_f32, xn_f32);
+            as_.Movq(xm_f32, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Vcvtph2ps(xm_f32, xm_f32);
+            as_.Movq(xd_f32, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Vcvtph2ps(xd_f32, xd_f32);
+            emit_quad();
+            as_.Vcvtps2ph(xlo, xres, int8_t{0});
+            // xlo: 4 FP16 lanes in low 64 (lanes 0..3 of result).
+
+            as_.Movdqu(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Psrldq(xn_f32, int8_t{8});
+            as_.Vcvtph2ps(xn_f32, xn_f32);
+            as_.Movdqu(xm_f32, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Psrldq(xm_f32, int8_t{8});
+            as_.Vcvtph2ps(xm_f32, xm_f32);
+            as_.Movdqu(xd_f32, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Psrldq(xd_f32, int8_t{8});
+            as_.Vcvtph2ps(xd_f32, xd_f32);
+            emit_quad();
+            as_.Vcvtps2ph(xres, xres, int8_t{0});
+            // xres: 4 FP16 lanes in low 64 (lanes 4..7 of result).
+
+            as_.Pslldq(xres, int8_t{8});
+            as_.Por(xlo, xres);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          }
+          return;
+        }
         if (!host_platform::kHasFMA) { success_ = false; return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { success_ = false; return; }
@@ -4302,14 +4421,142 @@ class LiteTranslator {
       // up from sign(a) XOR sign(b), unlike FMULX).  NaN inputs override
       // the lane with the default qNaN.
       //
-      // FP16 .4H/.8H bails to the interpreter (FP16 path is item 1 of
-      // -121's follow-ups — needs the FP16->FP64 round-trip).  Hosts
-      // without FMA3 bail too (no MUL+SUB fallback — that would
-      // double-round, violating ARM's fused semantics).  Reserved .1D
-      // shape (size=01 && q=0) bails.
+      // FP16 .4H/.8H lowers via F16C round-trip into the FP32 algorithm
+      // below; see the dedicated FP16 branch.  Hosts without FMA3 bail
+      // (no MUL+SUB fallback — that would double-round, violating ARM's
+      // fused semantics).  Reserved .1D shape (size=01 && q=0) bails.
       case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
       case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV: {
-        if (args.is_fp16) { success_ = false; return; }
+        // region digitalis: FP16 vector FRECPS / FRSQRTS .4H / .8H via
+        // F16C round-trip.  The interpreter computes FP16 lanes as
+        // FpSingleToHalf(FrecpsScalar<float>(a, b)) — i.e. the whole
+        // Newton step is done in FP32 then narrowed to half.  Lift:
+        //   widen FP16 -> FP32 via Vcvtph2ps;
+        //   run the FP32 FRECPS/FRSQRTS algorithm (same constants as the
+        //   FP32 path below);
+        //   narrow FP32 -> FP16 via Vcvtps2ph.
+        // For .8H process low 4 lanes and high 4 lanes in two passes,
+        // reusing the same temp set, then recombine via PSLLDQ + POR
+        // (matches the FP16 FADD/FSUB/FMUL/FDIV vector pattern earlier
+        // in this function).
+        if (args.is_fp16) {
+          if (!host_platform::kHasFMA) { success_ = false; return; }
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          const bool is_frecps_fp16 =
+              (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFrecpsV);
+
+          const int32_t k_fma_bits = is_frecps_fp16 ? int32_t{0x40000000}   // +2.0
+                                                    : int32_t{0x40400000};  // +3.0
+          const int32_t k_sat_bits = is_frecps_fp16 ? int32_t{0x40000000}   // +2.0
+                                                    : int32_t{0x3FC00000};  // +1.5
+          const int32_t qnan_bits  = int32_t{0x7FC00000};
+          const int32_t two_bits   = int32_t{0x40000000};
+
+          // Allocate temps once — reuse across both passes for .8H so we
+          // don't burn through the 16-reg XMM pool with redundant temps.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xmul = AllocTempSimdReg();
+          SimdRegister xiu = AllocTempSimdReg();
+          SimdRegister xsp = AllocTempSimdReg();
+          SimdRegister xlo = args.q ? AllocTempSimdReg() : no_simd_register;
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xmul == no_simd_register || xiu == no_simd_register ||
+              xsp == no_simd_register ||
+              (args.q && xlo == no_simd_register)) {
+            success_ = false; return;
+          }
+          Register tmp_gpr = AllocTempReg();
+          if (tmp_gpr == Assembler::no_register) {
+            success_ = false; return;
+          }
+
+          // Emit the FP32 FRECPS/FRSQRTS Newton-step lowering on xn/xm
+          // (which already hold 4 FP32 lanes).  Result ends up in xmul.
+          auto emit_pass = [&]() {
+            // mul = a * b (only its NaN bit is observed via cmpunord).
+            as_.Movdqa(xmul, xn);
+            as_.Mulps(xmul, xm);
+            // input_unord = cmpunord(a, b)
+            as_.Movdqa(xiu, xn);
+            as_.Cmpunordps(xiu, xm);
+            // mul_unord reused in xmul (product value no longer needed).
+            as_.Cmpunordps(xmul, xmul);
+            // special_mask = (NOT input_unord) AND mul_unord.
+            as_.Movdqa(xsp, xiu);
+            as_.Pandn(xsp, xmul);
+
+            // fma_result = K_fma - a*b via VFNMADD231PS into broadcast K_fma.
+            as_.Movl(tmp_gpr, k_fma_bits);
+            as_.Movd(xmul, tmp_gpr);
+            as_.Pshufd(xmul, xmul, int8_t{0});
+            as_.Vfnmadd231ps(xmul, xn, xm);
+
+            if (!is_frecps_fp16) {
+              // FRSQRTS: divide by 2 (exact one-exponent decrement).  Reuse
+              // xn as a broadcast-2.0 scratch; a is no longer needed.
+              as_.Movl(tmp_gpr, two_bits);
+              as_.Movd(xn, tmp_gpr);
+              as_.Pshufd(xn, xn, int8_t{0});
+              as_.Divps(xmul, xn);
+            }
+            // xmul holds fma_result.
+
+            // First select: result_first = special_mask ? K_sat : fma_result.
+            as_.Movl(tmp_gpr, k_sat_bits);
+            as_.Movd(xn, tmp_gpr);
+            as_.Pshufd(xn, xn, int8_t{0});
+            as_.Pand(xn, xsp);
+            as_.Pandn(xsp, xmul);
+            as_.Por(xn, xsp);  // xn = result_first
+
+            // Second select: result_final = input_unord ? qnan : result_first.
+            as_.Movl(tmp_gpr, qnan_bits);
+            as_.Movd(xmul, tmp_gpr);
+            as_.Pshufd(xmul, xmul, int8_t{0});
+            as_.Pand(xmul, xiu);
+            as_.Pandn(xiu, xn);
+            as_.Por(xmul, xiu);  // xmul = result_final (FP32 lanes)
+          };
+
+          if (!args.q) {
+            // .4H: 4 FP16 lanes in low 64 bits.
+            as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xn, xn);
+            as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Vcvtph2ps(xm, xm);
+            emit_pass();
+            as_.Vcvtps2ph(xmul, xmul, int8_t{0});
+            // Vcvtps2ph auto-zeroes upper 64 bits.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmul);
+          } else {
+            // .8H: pass 1 (low 4 lanes), narrow & save in xlo; pass 2 (high
+            // 4 lanes via Psrldq 8), narrow, recombine via Pslldq + Por.
+            as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xn, xn);
+            as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Vcvtph2ps(xm, xm);
+            emit_pass();
+            as_.Vcvtps2ph(xlo, xmul, int8_t{0});
+            // xlo has 4 FP16 lanes in low 64 bits.
+
+            as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Psrldq(xn, int8_t{8});
+            as_.Vcvtph2ps(xn, xn);
+            as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Psrldq(xm, int8_t{8});
+            as_.Vcvtph2ps(xm, xm);
+            emit_pass();
+            as_.Vcvtps2ph(xmul, xmul, int8_t{0});
+            // xmul has 4 FP16 lanes in low 64 bits.
+
+            as_.Pslldq(xmul, int8_t{8});
+            as_.Por(xlo, xmul);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          }
+          return;
+        }
+        // endregion
         if (!host_platform::kHasFMA) { success_ = false; return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { success_ = false; return; }
@@ -8158,6 +8405,171 @@ class LiteTranslator {
       success_ = false;
       return;
     }
+    // region digitalis: FP16 vector by-element FMLA/FMLS/FMUL (size=00).
+    //
+    // Armv8.2-FP16.  Decoder routes size=0b00 with U=0 and opcode
+    // ∈ {0001 FMLA, 0101 FMLS, 1001 FMUL} here; FMULX FP16 by-element
+    // does not exist (U=1 is rejected by the decoder at size=0b00).
+    // Index encodes one of 8 FP16 lanes of Vm.8H; Q selects .4H or
+    // .8H destination.
+    //
+    // FMUL: FP32 round-trip is exact — the product of two FP16
+    // numbers has at most 22 mantissa bits, which fits in FP32's 24
+    // exactly, and the final Vcvtps2ph applies one round to FP16.
+    //
+    // FMLA / FMLS: the interpreter performs the multiply-add in
+    // binary64 (std::fma((double)a, (double)b, (double)d)) and
+    // narrows once to FP16, so we promote the widened FP32 lanes to
+    // FP64 and use VFMADD231PD / VFNMADD231PD — the same FP64
+    // round-trip shape as the three-same FP16 FMLA/FMLS path
+    // implemented in handoff-129.  An FP32-only round-trip would
+    // double-round and diverge from the interpreter for some inputs.
+    if (args.size == 0b00) {
+      if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
+          args.opcode != Op::kFmul) {
+        success_ = false; return;
+      }
+      const bool is_fma_fp16 =
+          (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
+      const bool is_fmls_fp16 = (args.opcode == Op::kFmls);
+      if (is_fma_fp16 && !host_platform::kHasFMA) { success_ = false; return; }
+      if (!host_platform::kHasF16C) { success_ = false; return; }
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      // Broadcast Vm.h[index] to xm_f32 as 4 identical FP32 lanes.
+      // Strategy: load Vm.8H into xm_f32, shift the high quad down
+      // if index >= 4 (Psrldq 8), then Pshuflw with imm = (i:i:i:i)
+      // (i = index & 3) replicates that FP16 lane into all 4 low
+      // 16-bit lanes; Vcvtph2ps then widens to 4 identical FP32
+      // lanes.  Both .8H passes reuse this broadcast.
+      SimdRegister xm_f32 = AllocTempSimdReg();
+      if (xm_f32 == no_simd_register) { success_ = false; return; }
+      as_.Movdqu(xm_f32, {.base = Assembler::rbp, .disp = vm_off});
+      if (args.index >= 4) {
+        as_.Psrldq(xm_f32, int8_t{8});
+      }
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm_f32, xm_f32, imm);
+      }
+      as_.Vcvtph2ps(xm_f32, xm_f32);
+
+      if (!is_fma_fp16) {
+        // FMUL .4H / .8H — Mulps + Vcvtps2ph, no FP64 promotion.
+        SimdRegister xn_f32 = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        if (xn_f32 == no_simd_register || xres == no_simd_register) {
+          success_ = false; return;
+        }
+        if (!args.q) {
+          as_.Movq(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn_f32, xn_f32);
+          as_.Mulps(xn_f32, xm_f32);
+          as_.Vcvtps2ph(xres, xn_f32, int8_t{0});
+          // Vcvtps2ph auto-zeroes upper 64 bits.
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        } else {
+          SimdRegister xlo = AllocTempSimdReg();
+          SimdRegister xn_hi = AllocTempSimdReg();
+          if (xlo == no_simd_register || xn_hi == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movq(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn_f32, xn_f32);
+          as_.Mulps(xn_f32, xm_f32);
+          as_.Vcvtps2ph(xlo, xn_f32, int8_t{0});
+          as_.Movdqu(xn_hi, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Vcvtph2ps(xn_f32, xn_hi);
+          as_.Mulps(xn_f32, xm_f32);
+          as_.Vcvtps2ph(xres, xn_f32, int8_t{0});
+          as_.Pslldq(xres, int8_t{8});
+          as_.Por(xlo, xres);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+        }
+        return;
+      }
+
+      // FMLA / FMLS — FP16 -> FP32 -> FP64 round-trip, mirrors the
+      // three-same FP16 FMLA/FMLS path.  xm_f32 already holds the
+      // broadcast FP32 multiplier in all 4 lanes — both halves of
+      // every FP64 pass read the same xm_pd.
+      SimdRegister xn_f32 = AllocTempSimdReg();
+      SimdRegister xd_f32 = AllocTempSimdReg();
+      SimdRegister xn_pd = AllocTempSimdReg();
+      SimdRegister xm_pd = AllocTempSimdReg();
+      SimdRegister xd_pd = AllocTempSimdReg();
+      SimdRegister xres = AllocTempSimdReg();
+      SimdRegister xlo = args.q ? AllocTempSimdReg() : no_simd_register;
+      if (xn_f32 == no_simd_register || xd_f32 == no_simd_register ||
+          xn_pd == no_simd_register || xm_pd == no_simd_register ||
+          xd_pd == no_simd_register || xres == no_simd_register ||
+          (args.q && xlo == no_simd_register)) {
+        success_ = false; return;
+      }
+
+      auto emit_quad = [&]() {
+        // Pass 1: low 2 FP32 lanes -> 2 FP64.
+        as_.Vcvtps2pd(xn_pd, xn_f32);
+        as_.Vcvtps2pd(xm_pd, xm_f32);
+        as_.Vcvtps2pd(xd_pd, xd_f32);
+        if (is_fmls_fp16) as_.Vfnmadd231pd(xd_pd, xn_pd, xm_pd);
+        else              as_.Vfmadd231pd(xd_pd, xn_pd, xm_pd);
+        as_.Vcvtpd2ps(xres, xd_pd);
+
+        // Pass 2: shift high 2 FP32 lanes down, FMA, recombine.
+        // xm_f32's high lanes equal its low lanes (broadcast).
+        as_.Psrldq(xn_f32, int8_t{8});
+        as_.Vcvtps2pd(xn_pd, xn_f32);
+        as_.Psrldq(xd_f32, int8_t{8});
+        as_.Vcvtps2pd(xd_pd, xd_f32);
+        if (is_fmls_fp16) as_.Vfnmadd231pd(xd_pd, xn_pd, xm_pd);
+        else              as_.Vfmadd231pd(xd_pd, xn_pd, xm_pd);
+        as_.Vcvtpd2ps(xn_f32, xd_pd);
+
+        as_.Pslldq(xn_f32, int8_t{8});
+        as_.Por(xres, xn_f32);
+      };
+
+      if (!args.q) {
+        // .4H — 4 FP16 lanes (low 64 bits).
+        as_.Movq(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Vcvtph2ps(xn_f32, xn_f32);
+        as_.Movq(xd_f32, {.base = Assembler::rbp, .disp = vd_off});
+        as_.Vcvtph2ps(xd_f32, xd_f32);
+        emit_quad();
+        as_.Vcvtps2ph(xres, xres, int8_t{0});
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+      } else {
+        // .8H — low quad + high quad, recombine via Pslldq + Por.
+        as_.Movq(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Vcvtph2ps(xn_f32, xn_f32);
+        as_.Movq(xd_f32, {.base = Assembler::rbp, .disp = vd_off});
+        as_.Vcvtph2ps(xd_f32, xd_f32);
+        emit_quad();
+        as_.Vcvtps2ph(xlo, xres, int8_t{0});
+
+        as_.Movdqu(xn_f32, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Psrldq(xn_f32, int8_t{8});
+        as_.Vcvtph2ps(xn_f32, xn_f32);
+        as_.Movdqu(xd_f32, {.base = Assembler::rbp, .disp = vd_off});
+        as_.Psrldq(xd_f32, int8_t{8});
+        as_.Vcvtph2ps(xd_f32, xd_f32);
+        emit_quad();
+        as_.Vcvtps2ph(xres, xres, int8_t{0});
+
+        as_.Pslldq(xres, int8_t{8});
+        as_.Por(xlo, xres);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+      }
+      return;
+    }
+    // endregion
     if (args.size != 0b10 && args.size != 0b11) {
       success_ = false;
       return;
@@ -8296,6 +8708,198 @@ class LiteTranslator {
       // Zero upper 64 bits (D-register semantics).
       as_.Pslldq(xmm_result, int8_t{8});
       as_.Psrldq(xmm_result, int8_t{8});
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+  }
+  // endregion
+
+  // region digitalis
+  // AdvSIMD scalar x indexed element — JIT lowering for FMULX scalar by
+  // element only.  Same saturation shape as the three-same FMULX JIT
+  // (handoff #120) and the vector by-element FMULX (handoff #124), but
+  // applied to a single lane; the upper lanes of Vd are always zeroed
+  // (scalar destination semantics).
+  void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
+    using Op = Decoder::AdvSimdScalarXIdxOpcode;
+    if (args.opcode != Op::kFmulx && args.opcode != Op::kFmul &&
+        args.opcode != Op::kFmla && args.opcode != Op::kFmls) {
+      success_ = false;
+      return;
+    }
+    if (args.size != 0b10 && args.size != 0b11) {
+      success_ = false;
+      return;
+    }
+    const bool needs_fma = (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
+    if (needs_fma && !host_platform::kHasFMA) {
+      success_ = false;
+      return;
+    }
+    const bool is_double = (args.size == 0b11);
+
+    // FMUL / FMLA / FMLS — simpler scalar lowering without the FMULX
+    // saturation shape.  Load Vn/Vm into XMM regs, broadcast the indexed
+    // lane of Vm into lane 0 (Pshufd works regardless of the upper-lane
+    // garbage we'll later zero), then issue the scalar SS/SD instruction.
+    if (args.opcode != Op::kFmulx) {
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      SimdRegister xmm_m = AllocTempSimdReg();
+      if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+        success_ = false;
+        return;
+      }
+      as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Move the indexed lane of Vm into lane 0.  Use Pshufd to broadcast
+      // (the upper lanes are about to be zeroed anyway).
+      if (is_double) {
+        const int8_t imm = (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
+        as_.Pshufd(xmm_m, xmm_m, imm);
+      } else {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xmm_m, xmm_m, imm);
+      }
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kFmul) {
+        // Scalar multiply: lane 0 of xmm_n = Vn.lane0 * Vm.lane[index].
+        // Upper lanes of xmm_n still hold Vn — zero them below.
+        if (is_double) as_.Mulsd(xmm_n, xmm_m);
+        else           as_.Mulss(xmm_n, xmm_m);
+        xmm_result = xmm_n;
+      } else {
+        // FMLA / FMLS: Vd.lane0 = Vd.lane0 ± Vn.lane0 * Vm.lane[index].
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_d == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = vd_off});
+        if (args.opcode == Op::kFmla) {
+          if (is_double) as_.Vfmadd231sd(xmm_d, xmm_n, xmm_m);
+          else           as_.Vfmadd231ss(xmm_d, xmm_n, xmm_m);
+        } else {
+          // FMLS: Vd = Vd + (-Vn)*Vm  (single fused rounding).
+          if (is_double) as_.Vfnmadd231sd(xmm_d, xmm_n, xmm_m);
+          else           as_.Vfnmadd231ss(xmm_d, xmm_n, xmm_m);
+        }
+        xmm_result = xmm_d;
+      }
+
+      // Scalar destination: zero the upper lanes of Vd.
+      if (is_double) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      } else {
+        as_.Pslldq(xmm_result, int8_t{12});
+        as_.Psrldq(xmm_result, int8_t{12});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+
+    // FMULX path follows below — broadcast shape + saturation override.
+
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+      success_ = false;
+      return;
+    }
+
+    as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+    as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+
+    // Broadcast lane args.index of xmm_m across all lanes — same layout as
+    // the vector by-element FMULX path.  The broadcast lets us reuse the
+    // FMULX saturation shape verbatim; we only need to zero the upper
+    // lanes of the result afterwards.
+    if (is_double) {
+      const int8_t imm = (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
+      as_.Pshufd(xmm_m, xmm_m, imm);
+    } else {
+      const uint8_t i = args.index & 0b11;
+      const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+      as_.Pshufd(xmm_m, xmm_m, imm);
+    }
+
+    // FMULX saturation: mul = a*b; if mul is NaN and neither input was NaN
+    // (the (±0,±inf) case), return ±2.0 with sign = sign(a)^sign(b).
+    SimdRegister xmm_mul = AllocTempSimdReg();
+    SimdRegister xmm_mul_unord = AllocTempSimdReg();
+    SimdRegister xmm_input_unord = AllocTempSimdReg();
+    SimdRegister xmm_two = AllocTempSimdReg();
+    if (xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+        xmm_input_unord == no_simd_register || xmm_two == no_simd_register) {
+      success_ = false;
+      return;
+    }
+
+    // mul = a * broadcast_b
+    as_.Movdqa(xmm_mul, xmm_n);
+    if (is_double) as_.Mulpd(xmm_mul, xmm_m);
+    else           as_.Mulps(xmm_mul, xmm_m);
+
+    // mul_unord = cmpunord(mul, mul)
+    as_.Movdqa(xmm_mul_unord, xmm_mul);
+    if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
+    else           as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+    // input_unord = cmpunord(a, broadcast_b)
+    as_.Movdqa(xmm_input_unord, xmm_n);
+    if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
+    else           as_.Cmpunordps(xmm_input_unord, xmm_m);
+
+    // special_mask = mul_unord AND NOT input_unord.
+    as_.Pandn(xmm_input_unord, xmm_mul_unord);
+
+    // two_signed: ((a XOR broadcast_b) AND sign_mask) OR bits(+2.0).
+    if (is_double) as_.Xorpd(xmm_n, xmm_m);
+    else           as_.Xorps(xmm_n, xmm_m);
+    as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+    if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
+    else           as_.Pslld(xmm_mul_unord, int8_t{31});
+    as_.Pand(xmm_n, xmm_mul_unord);
+
+    Register tmp_gpr = AllocTempReg();
+    if (tmp_gpr == Assembler::no_register) { return; }
+    if (is_double) {
+      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});
+      as_.Movq(xmm_two, tmp_gpr);
+      as_.Punpcklqdq(xmm_two, xmm_two);
+    } else {
+      as_.Movl(tmp_gpr, int32_t{0x40000000});
+      as_.Movd(xmm_two, tmp_gpr);
+      as_.Pshufd(xmm_two, xmm_two, int8_t{0});
+    }
+    as_.Por(xmm_n, xmm_two);
+
+    // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+    as_.Movdqa(xmm_m, xmm_n);
+    as_.Pand(xmm_m, xmm_input_unord);
+    as_.Pandn(xmm_input_unord, xmm_mul);
+    as_.Por(xmm_input_unord, xmm_m);
+
+    SimdRegister xmm_result = xmm_input_unord;
+
+    // Scalar destination: keep only the low lane and zero the rest.
+    // FP32: low 4 bytes -> low 32 bits of Vd; FP64: low 8 bytes -> low
+    // 64 bits of Vd.
+    if (is_double) {
+      // PSLLDQ 8 + PSRLDQ 8 zeroes the upper 64 bits.
+      as_.Pslldq(xmm_result, int8_t{8});
+      as_.Psrldq(xmm_result, int8_t{8});
+    } else {
+      // PSLLDQ 12 + PSRLDQ 12 zeroes the upper 96 bits.
+      as_.Pslldq(xmm_result, int8_t{12});
+      as_.Psrldq(xmm_result, int8_t{12});
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
   }

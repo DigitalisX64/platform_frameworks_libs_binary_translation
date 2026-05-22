@@ -4772,6 +4772,292 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec2DRegular) {
   EXPECT_DOUBLE_EQ(r[1], -1.0);
 }
 
+// FMULX scalar-by-element encoders (AdvSIMD scalar x indexed element).
+// Verified with aarch64-linux-gnu-as / objdump:
+//   FMULX s0, s1, v2.s[0]   = 0x7F829020   (size=10, L=0, H=0)
+//   FMULX s0, s1, v2.s[1]   = 0x7FA29020   (size=10, L=1, H=0)
+//   FMULX s0, s1, v2.s[2]   = 0x7F829820   (size=10, L=0, H=1)
+//   FMULX s0, s1, v2.s[3]   = 0x7FA29820   (size=10, L=1, H=1)
+//   FMULX d0, d1, v2.d[0]   = 0x7FC29020   (size=11, H=0)
+//   FMULX d0, d1, v2.d[1]   = 0x7FC29820   (size=11, H=1)
+//   FMULX s7, s9, v11.s[2]  = 0x7F8B9927   (M=0, Rm[3:0]=1011, H=1, L=0)
+// L lives at bit21; H lives at bit11.  Rm[3:0] at bits[19:16]; M at bit20.
+constexpr uint32_t FmulxIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x7F809000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // size=11 (bit22 set in addition to bit23); L must be 0; index = H only.
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x7FC09000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMULX scalar FP32: (+0 * +inf) -> +2.  Confirms the (zero,inf) saturation
+// override fires on the scalar by-element path.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarSPosZeroPosInfReturnsPlusTwo) {
+  const float inf = std::numeric_limits<float>::infinity();
+  // Vn.s[0] = +0; Vm.s[1] = +inf — index 1 broadcasts the saturating lane.
+  StoreVec4S(state_.cpu, 1, 0.0f, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, inf, 9.9f, 9.9f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulxIdxScalarS(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  // Scalar destination must zero the upper three S-lanes of Vd.
+  uint32_t lane1_bits, lane2_bits, lane3_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1_bits, 0u);
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMULX scalar FP64: (-0 * +inf) -> -2.  Sign comes from XOR of operands.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarDNegZeroPosInfReturnsMinusTwo) {
+  const double inf = std::numeric_limits<double>::infinity();
+  StoreVec2D(state_.cpu, 1, -0.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 9.9, inf);  // Vm.d[1] = +inf
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulxIdxScalarD(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], -2.0);
+  // Scalar destination must zero the upper D-lane of Vd.
+  uint64_t lane1_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1_bits, 0ULL);
+}
+
+// FMULX scalar with NaN input must propagate NaN — not get replaced by ±2.0.
+// The saturation override fires only when (mul is NaN) AND (neither input is NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarSNaNPropagation) {
+  const float qnan = std::nanf("");
+  // Vn.s[0] = qnan; Vm.s[0] = 1.0 (finite).
+  StoreVec4S(state_.cpu, 1, qnan, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 1.0f, 9.9f, 9.9f, 9.9f);
+  static const uint32_t code[] = {FmulxIdxScalarS(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0])) << "expected NaN at scalar lane, got " << r[0];
+}
+
+// FMULX scalar finite multiply — sanity that ordinary multiplies are not
+// disturbed by the saturation path.  Use FP32, lane index 3 to also exercise
+// the bit21/bit11 packing.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarSRegular) {
+  StoreVec4S(state_.cpu, 1, 2.5f, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, -4.0f);  // Vm.s[3] = -4.0
+  static const uint32_t code[] = {FmulxIdxScalarS(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], -10.0f);   // 2.5 * -4
+  uint32_t lane1_bits, lane2_bits, lane3_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1_bits, 0u);
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMULX scalar FP64 lane[0] broadcast: confirms the H=0 encoding selects
+// Vm.d[0] and not Vm.d[1].
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 3.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 0.5, 9.9);  // Vm.d[0] = 0.5
+  static const uint32_t code[] = {FmulxIdxScalarD(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  uint64_t lane1_bits;
+  std::memcpy(&lane1_bits, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1_bits, 0ULL);
+}
+
+// FMUL / FMLA / FMLS scalar-by-element encoders.  Same encoding shape as
+// FMULX scalar except U=0 and (opcode=1001/0001/0101).  Verified with
+// aarch64-linux-gnu-as / objdump:
+//   fmul  s0, s1, v2.s[0]  = 0x5F829020
+//   fmul  d0, d1, v2.d[0]  = 0x5FC29020
+//   fmla  s0, s1, v2.s[0]  = 0x5F821020
+//   fmla  d0, d1, v2.d[1]  = 0x5FC21820
+//   fmls  s0, s1, v2.s[0]  = 0x5F825020
+//   fmls  d0, d1, v2.d[0]  = 0x5FC25020
+constexpr uint32_t FmulIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5F809000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5FC09000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5F801000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5FC01000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxScalarS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 0) & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5F805000u | (L << 21) | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxScalarD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t H = k & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  uint32_t Rm_lo = rm & 0xFu;
+  return 0x5FC05000u | (M << 20) | (Rm_lo << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMUL scalar FP32: regular finite multiply, lane index 3 exercises both
+// L (bit21) and H (bit11) of the index encoding.  Upper-lane zero check
+// confirms scalar destination semantics.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxScalarSRegular) {
+  StoreVec4S(state_.cpu, 1, 2.5f, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, -4.0f);  // Vm.s[3] = -4.0
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulIdxScalarS(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], -10.0f);  // 2.5 * -4
+  uint32_t lane1, lane2, lane3;
+  std::memcpy(&lane1, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1, 0u);
+  EXPECT_EQ(lane2, 0u);
+  EXPECT_EQ(lane3, 0u);
+}
+
+// FMUL scalar FP64: confirms H=1 selects Vm.d[1].
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 6.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 9.9, 0.25);  // Vm.d[1] = 0.25
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulIdxScalarD(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);  // 6.0 * 0.25
+  uint64_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1, 0ULL);
+}
+
+// FMLA scalar FP32: Vd = Vd + Vn * Vm[index], with fused-vs-unfused
+// divergence proving the lowering uses VFMADD231SS rather than
+// (Vn*Vm)+Vd through Mulss+Addss.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxScalarSFusedRounding) {
+  const float a = 1.0f + std::ldexp(1.0f, -12);
+  StoreVec4S(state_.cpu, 1, a, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, a, 9.9f, 9.9f, 9.9f);  // Vm.s[0] = a
+  StoreVec4S(state_.cpu, 0, -1.0f, 99.f, 99.f, 99.f);
+  static const uint32_t code[] = {FmlaIdxScalarS(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  const float expected = std::fmaf(a, a, -1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+  // Upper-lane zero check.
+  uint32_t lane1, lane2, lane3;
+  std::memcpy(&lane1, &r[1], sizeof(uint32_t));
+  std::memcpy(&lane2, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane1, 0u);
+  EXPECT_EQ(lane2, 0u);
+  EXPECT_EQ(lane3, 0u);
+}
+
+// FMLA scalar FP64: confirms FMA semantics and FP64 path through
+// VFMADD231SD on the H=1 (Vm.d[1]) lane.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 2.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 9.9, 3.0);  // Vm.d[1] = 3.0
+  StoreVec2D(state_.cpu, 0, 1.5, 99.0);
+  static const uint32_t code[] = {FmlaIdxScalarD(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.5);  // 1.5 + 2.0 * 3.0
+  uint64_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1, 0ULL);
+}
+
+// FMLS scalar FP32: Vd = Vd - Vn * Vm[index] (single fused rounding).
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarSFusedRounding) {
+  const float a = 1.0f + std::ldexp(1.0f, -12);
+  StoreVec4S(state_.cpu, 1, a, 99.f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, a, 9.9f);  // Vm.s[2] = a
+  StoreVec4S(state_.cpu, 0, 1.0f, 99.f, 99.f, 99.f);
+  static const uint32_t code[] = {FmlsIdxScalarS(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  // Vd = 1.0 - a*a  = std::fma(-a, a, 1.0)
+  const float expected = std::fmaf(-a, a, 1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+  uint32_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint32_t));
+  EXPECT_EQ(lane1, 0u);
+}
+
+// FMLS scalar FP64: regular finite path, sanity check.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarDRegular) {
+  StoreVec2D(state_.cpu, 1, 4.0, 99.0);
+  StoreVec2D(state_.cpu, 2, 2.5, 9.9);  // Vm.d[0] = 2.5
+  StoreVec2D(state_.cpu, 0, 12.0, 99.0);
+  static const uint32_t code[] = {FmlsIdxScalarD(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 2.0);  // 12.0 - 4.0 * 2.5
+  uint64_t lane1;
+  std::memcpy(&lane1, &r[1], sizeof(uint64_t));
+  EXPECT_EQ(lane1, 0ULL);
+}
+
 // Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs
 // from (a*b)+d in float, proving the lowering uses VFMADD231PS.
 TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {
@@ -4794,6 +5080,670 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {
   std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
   std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
   EXPECT_EQ(r0_bits, ex_bits);
+}
+// endregion
+
+// region digitalis: FP16 vector FRECPS / FRSQRTS .4H / .8H — F16C round-trip
+// JIT.  Encodings (verified via aarch64-linux-gnu-as):
+//   FRECPS  Vd.4H, Vn.4H, Vm.4H = 0x0E403C00 | (rm<<16) | (rn<<5) | rd
+//   FRECPS  Vd.8H, Vn.8H, Vm.8H = 0x4E403C00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.4H, Vn.4H, Vm.4H = 0x0EC03C00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.8H, Vn.8H, Vm.8H = 0x4EC03C00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FrecpsVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E403C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E403C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EC03C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EC03C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+static void StoreVec8H(CPUState& cpu, unsigned idx, const uint16_t lanes[8]) {
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void LoadVec8H(const CPUState& cpu, unsigned idx, uint16_t out[8]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+
+// FP16 bit pattern constants used by the tests below.
+constexpr uint16_t kHalf_1_0  = 0x3C00;
+constexpr uint16_t kHalf_2_0  = 0x4000;
+constexpr uint16_t kHalf_0_5  = 0x3800;
+constexpr uint16_t kHalf_neg2_0 = 0xC000;
+constexpr uint16_t kHalf_neg0_5 = 0xB800;
+constexpr uint16_t kHalf_4_0  = 0x4400;
+constexpr uint16_t kHalf_0_25 = 0x3400;
+constexpr uint16_t kHalf_pos0 = 0x0000;
+constexpr uint16_t kHalf_neg0 = 0x8000;
+constexpr uint16_t kHalf_pos_inf = 0x7C00;
+constexpr uint16_t kHalf_neg_inf = 0xFC00;
+constexpr uint16_t kHalf_qNaN = 0x7E00;
+constexpr uint16_t kHalf_1_5  = 0x3E00;
+constexpr uint16_t kHalf_3_0  = 0x4200;
+
+// FRECPS .4H — Newton step for reciprocal lane-by-lane.  Lanes 4..7 of Vd
+// must be zeroed by the FP16 round-trip path (Q=0 -> upper 64 bits zero).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg2_0, kHalf_4_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_0_25,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN,
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);  // 2 - 1*1
+  EXPECT_EQ(r[1], kHalf_1_0);  // 2 - 0.5*2
+  EXPECT_EQ(r[2], kHalf_1_0);  // 2 - (-2)*(-0.5)
+  EXPECT_EQ(r[3], kHalf_1_0);  // 2 - 4*0.25
+  // Upper 64 bits (lanes 4..7) zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FRECPS .4H — (±0, ±inf) crosses must produce +2.0 (no sign flip),
+// not the default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4HZeroTimesInfSaturation) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_neg_inf, kHalf_pos0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_pos_inf, kHalf_pos_inf, kHalf_pos0, kHalf_neg_inf,
+                                0, 0, 0, 0};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN,
+                        0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_2_0);
+  EXPECT_EQ(r[1], kHalf_2_0);
+  EXPECT_EQ(r[2], kHalf_2_0);
+  EXPECT_EQ(r[3], kHalf_2_0);
+}
+
+// FRECPS .4H — NaN input yields default qNaN, not the saturation constant.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4HNaNInputDefaultsToQnan) {
+  const uint16_t n_lanes[8] = {kHalf_qNaN, kHalf_pos0,    kHalf_1_0, kHalf_1_0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_1_0,  kHalf_pos_inf, kHalf_1_0, kHalf_qNaN, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  // Lane 0/3: NaN input -> qNaN.
+  EXPECT_EQ(r[0], kHalf_qNaN);
+  EXPECT_EQ(r[3], kHalf_qNaN);
+  // Lane 1: (+0, +inf) cross -> +2.0.
+  EXPECT_EQ(r[1], kHalf_2_0);
+  // Lane 2: 2 - 1*1 = 1.
+  EXPECT_EQ(r[2], kHalf_1_0);
+}
+
+// FRSQRTS .4H — Newton step (3 - a*b) / 2, lane by lane.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg2_0, kHalf_0_5, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrsqrtsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);  // (3 - 1*1) / 2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);  // (3 - 2*0.5) / 2 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);  // (3 - (-2)*(-0.5)) / 2 = 1
+  EXPECT_EQ(r[3], kHalf_0_5);  // (3 - 0.5*4) / 2 = 0.5
+}
+
+// FRSQRTS .4H — (±0, ±inf) crosses must produce +1.5 (no sign flip).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec4HZeroTimesInfSaturation) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_neg_inf, kHalf_pos0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_pos_inf, kHalf_pos_inf, kHalf_pos0, kHalf_neg_inf, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrsqrtsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_5);
+  EXPECT_EQ(r[1], kHalf_1_5);
+  EXPECT_EQ(r[2], kHalf_1_5);
+  EXPECT_EQ(r[3], kHalf_1_5);
+}
+
+// FRECPS .8H — exercises the 2-pass XMM path (low 4 lanes then high 4).
+// Mix regular Newton-step lanes (0-3) and saturation lanes (4-7).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec8HTwoPassMixed) {
+  const uint16_t n_lanes[8] = {kHalf_1_0,    kHalf_0_5,    kHalf_neg2_0, kHalf_4_0,
+                                kHalf_pos0,   kHalf_neg0,   kHalf_neg_inf, kHalf_pos0};
+  const uint16_t m_lanes[8] = {kHalf_1_0,    kHalf_2_0,    kHalf_neg0_5, kHalf_0_25,
+                                kHalf_pos_inf, kHalf_pos_inf, kHalf_pos0,    kHalf_neg_inf};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  // Lanes 0-3 (low pass): regular Newton step -> 1.0h.
+  EXPECT_EQ(r[0], kHalf_1_0);
+  EXPECT_EQ(r[1], kHalf_1_0);
+  EXPECT_EQ(r[2], kHalf_1_0);
+  EXPECT_EQ(r[3], kHalf_1_0);
+  // Lanes 4-7 (high pass): (zero, inf) cross -> +2.0h.
+  EXPECT_EQ(r[4], kHalf_2_0);
+  EXPECT_EQ(r[5], kHalf_2_0);
+  EXPECT_EQ(r[6], kHalf_2_0);
+  EXPECT_EQ(r[7], kHalf_2_0);
+}
+
+// FRSQRTS .8H — same two-pass split, all lanes regular Newton step.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec8HTwoPassRegular) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg2_0, kHalf_0_5,
+                                kHalf_1_0, kHalf_0_5, kHalf_4_0,    kHalf_2_0};
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_2_0, kHalf_0_25,   kHalf_0_5};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrsqrtsVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);  // (3 - 1*1)/2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);  // (3 - 2*0.5)/2 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);  // (3 - (-2)*(-0.5))/2 = 1
+  EXPECT_EQ(r[3], kHalf_0_5);  // (3 - 0.5*4)/2 = 0.5
+  EXPECT_EQ(r[4], kHalf_1_0);  // (3 - 1*1)/2 = 1
+  EXPECT_EQ(r[5], kHalf_1_0);  // (3 - 0.5*2)/2 = 1
+  EXPECT_EQ(r[6], kHalf_1_0);  // (3 - 4*0.25)/2 = 1
+  EXPECT_EQ(r[7], kHalf_1_0);  // (3 - 2*0.5)/2 = 1
+}
+// endregion
+
+// region digitalis: FP16 vector FMLA / FMLS .4H / .8H — FP16 -> FP32 -> FP64
+// round-trip JIT.  Encodings (verified via aarch64-linux-gnu-as -march=
+// armv8.2-a+fp16):
+//   FMLA Vd.4H, Vn.4H, Vm.4H = 0x0E400C00 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.8H, Vn.8H, Vm.8H = 0x4E400C00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.4H, Vn.4H, Vm.4H = 0x0EC00C00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.8H, Vn.8H, Vm.8H = 0x4EC00C00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmlaVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E400C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E400C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EC00C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EC00C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMLA .4H lane-by-lane: Vd[i] = Vd[i] + Vn[i] * Vm[i].  Upper 64 bits
+// of Vd zeroed by the FP16 round-trip path (Q=0 invariant).
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  // d_init: 1.0, 1.0, 3.0, -1.0  -> r = 3.0, 2.0, 1.0, 0.0
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,  // -1.0h
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   // 1 + 1*2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   // 1 + 2*0.5 = 2
+  EXPECT_EQ(r[2], kHalf_1_0);   // 3 + (-0.5)*4 = 1
+  EXPECT_EQ(r[3], kHalf_pos0);  // -1 + 4*0.25 = 0
+  // Upper 64 bits (lanes 4..7) zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLS .4H lane-by-lane: Vd[i] = Vd[i] - Vn[i] * Vm[i].
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                0, 0, 0, 0};
+  // d_init: 3.0, 2.0, -1.0, 2.0  -> r = 1.0, 1.0, 1.0, 1.0
+  uint16_t d_init[8] = {kHalf_3_0, kHalf_2_0,
+                        0xBC00,  // -1.0h
+                        kHalf_2_0,
+                        0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   // 3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   // 2 - 2*0.5 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);   // -1 - (-0.5)*4 = -1 + 2 = 1
+  EXPECT_EQ(r[3], kHalf_1_0);   // 2 - 4*0.25 = 1
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLA .8H: 8 lanes, exercises both pass paths (low 4 and high 4).
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec8HTwoPassMixed) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_1_0,    kHalf_2_0, kHalf_4_0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                kHalf_1_0, kHalf_neg2_0, kHalf_2_0, kHalf_0_5};
+  // d_init: 1, 1, 3, -1, 0, 3, -2, 0  -> 3, 2, 1, 0, 1, 1, 2, 2
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,    // -1
+                        kHalf_pos0, kHalf_3_0,
+                        0xC000,    // -2
+                        kHalf_pos0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   // 1 + 1*2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   // 1 + 2*0.5 = 2
+  EXPECT_EQ(r[2], kHalf_1_0);   // 3 + (-0.5)*4 = 1
+  EXPECT_EQ(r[3], kHalf_pos0);  // -1 + 4*0.25 = 0
+  EXPECT_EQ(r[4], kHalf_1_0);   // 0 + 1*1 = 1
+  EXPECT_EQ(r[5], kHalf_1_0);   // 3 + 1*(-2) = 1
+  EXPECT_EQ(r[6], kHalf_2_0);   // -2 + 2*2 = 2
+  EXPECT_EQ(r[7], kHalf_2_0);   // 0 + 4*0.5 = 2
+}
+
+// FMLS .8H: same two-pass exercise as FMLA .8H.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec8HTwoPassRegular) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_2_0, kHalf_1_0,    kHalf_4_0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                kHalf_2_0, kHalf_0_5, kHalf_1_0,    kHalf_0_25};
+  // d_init: 3, 2, -1, 2, 4, 3, 2, 2  -> 1, 1, 1, 1, 2, 2, 1, 1
+  uint16_t d_init[8] = {kHalf_3_0, kHalf_2_0,
+                        0xBC00,   // -1
+                        kHalf_2_0,
+                        kHalf_4_0, kHalf_3_0, kHalf_2_0, kHalf_2_0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   // 3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   // 2 - 2*0.5 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);   // -1 - (-0.5)*4 = 1
+  EXPECT_EQ(r[3], kHalf_1_0);   // 2 - 4*0.25 = 1
+  EXPECT_EQ(r[4], kHalf_2_0);   // 4 - 1*2 = 2
+  EXPECT_EQ(r[5], kHalf_2_0);   // 3 - 2*0.5 = 2
+  EXPECT_EQ(r[6], kHalf_1_0);   // 2 - 1*1 = 1
+  EXPECT_EQ(r[7], kHalf_1_0);   // 2 - 4*0.25 = 1
+}
+
+// Fused-vs-unfused rounding divergence on FMLA .4H.  Picks (a, b, d)
+// such that fma((double)a, (double)b, (double)d) narrowed to half
+// differs from (float(a*b) + d) narrowed to half — proves the FP64
+// round-trip path matches the interpreter's binary64 oracle for a
+// case where the intermediate FP32 sum would double-round to a
+// different FP16 result.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4HFusedRounding) {
+  // a = 1.0h + 2^-10 ulp = 0x3C01  (smallest > 1.0h in FP16, ~= 1.0009766)
+  // b = same
+  // d = -1.0h = 0xBC00
+  // Exact product in FP64: (1 + 2^-10)*(1 + 2^-10) = 1 + 2^-9 + 2^-20.
+  // Fused (interpreter): fma(a, b, -1) -> (2^-9 + 2^-20) ~ 0.0019536...
+  //   narrowed to FP16 (1 mantissa ULP around 0.001953125 is 2^-10*ulp_exp)
+  //   -- the value 2^-9 + 2^-20 = 0.001953125 + 0.00000095367...
+  //   rounded to nearest FP16 in the range [2^-9, 2^-8) where the ULP
+  //   is 2^-19, equals 0x1801 (representable bits set so the trailing
+  //   2^-20 bit rounds up to next ULP).
+  // We don't precompute the expected bit pattern here — instead we
+  // compute the oracle by mimicking the interpreter formula directly
+  // and compare to the JIT result.
+  auto half_to_float = [](uint16_t h) -> float {
+    uint32_t s = (h >> 15) & 1;
+    uint32_t e = (h >> 10) & 0x1F;
+    uint32_t f = h & 0x3FF;
+    uint32_t bits;
+    if (e == 0) {
+      if (f == 0) {
+        bits = s << 31;
+      } else {
+        // Subnormal half -> normal float.
+        while ((f & 0x400) == 0) { f <<= 1; e--; }
+        e++; f &= 0x3FF;
+        bits = (s << 31) | ((e + 127 - 15) << 23) | (f << 13);
+      }
+    } else if (e == 31) {
+      bits = (s << 31) | (0xFF << 23) | (f << 13);
+    } else {
+      bits = (s << 31) | ((e + 127 - 15) << 23) | (f << 13);
+    }
+    float r;
+    std::memcpy(&r, &bits, 4);
+    return r;
+  };
+  const uint16_t ha = 0x3C01;  // 1 + 2^-10
+  const uint16_t hd = 0xBC00;  // -1.0
+  const float a = half_to_float(ha);
+  const float d = half_to_float(hd);
+  // Interpreter oracle:
+  //   double r64 = std::fma((double)a, (double)a, (double)d);
+  //   uint16_t expected = FpSingleToHalf((float)r64);
+  // FpSingleToHalf does correct round-to-nearest-even FP32->FP16; we
+  // emulate by going through Vcvtps2ph in the same direction below.
+  // Simpler: just verify the JIT result matches by computing both
+  // paths and comparing.
+  const double r64 = std::fma(static_cast<double>(a),
+                              static_cast<double>(a),
+                              static_cast<double>(d));
+  const float r32 = static_cast<float>(r64);
+  uint32_t r32_bits;
+  std::memcpy(&r32_bits, &r32, 4);
+  // Convert FP32 -> FP16 (round-to-nearest-even).
+  auto float_to_half_rne = [](uint32_t f) -> uint16_t {
+    uint32_t s = (f >> 31) & 1;
+    int32_t e = static_cast<int32_t>((f >> 23) & 0xFF) - 127;
+    uint32_t m = f & 0x7FFFFF;
+    if (e == 128) {  // inf or NaN
+      if (m == 0) return (s << 15) | 0x7C00;
+      return (s << 15) | 0x7C00 | (m >> 13) | (m == 0 ? 1 : 0);
+    }
+    if (e > 15) return (s << 15) | 0x7C00;  // overflow -> inf
+    if (e < -24) return (s << 15);          // underflow -> +/-0
+    if (e < -14) {
+      // Subnormal half.
+      m |= 0x800000;
+      int shift = -14 - e + 13;
+      uint32_t round_bits = m & ((1u << shift) - 1);
+      uint32_t halfmant = m >> shift;
+      uint32_t halfbit = 1u << (shift - 1);
+      if (round_bits > halfbit ||
+          (round_bits == halfbit && (halfmant & 1))) halfmant++;
+      return (s << 15) | (halfmant & 0x3FF);
+    }
+    uint32_t halfmant = m >> 13;
+    uint32_t round_bits = m & 0x1FFF;
+    if (round_bits > 0x1000 ||
+        (round_bits == 0x1000 && (halfmant & 1))) {
+      halfmant++;
+      if (halfmant == 0x400) { halfmant = 0; e++; }
+    }
+    return (s << 15) | ((e + 15) << 10) | halfmant;
+  };
+  const uint16_t expected = float_to_half_rne(r32_bits);
+
+  const uint16_t n_lanes[8] = {ha, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {ha, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {hd, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], expected);
+}
+// endregion
+
+// region digitalis: FP16 vector by-element FMLA / FMLS / FMUL .4H / .8H.
+// Decoder dispatches size=0b00, U=0, opcode ∈ {0001 FMLA, 0101 FMLS,
+// 1001 FMUL} to AdvSimdVecXIndexedElement.  Encoding (verified via
+// aarch64-linux-gnu-as -march=armv8.2-a+fp16):
+//   FMLA Vd.4H, Vn.4H, Vm.h[0] = 0x0F021000 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.4H, Vn.4H, Vm.h[7] = 0x0F321800 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.8H, Vn.8H, Vm.h[0] = 0x4F021000
+//   FMLS Vd.4H, Vn.4H, Vm.h[0] = 0x0F025000
+//   FMUL Vd.4H, Vn.4H, Vm.h[0] = 0x0F029000
+// Index encoding: 3 bits (0..7); H = (idx>>2)&1 (bit 11), L = (idx>>1)&1
+// (bit 21), M = idx&1 (bit 20).  Vm restricted to V0..V15 (only 4-bit
+// Rm field; M is consumed by the index).
+constexpr uint32_t FmlaIdxVec4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F001000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxVec8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F001000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxVec4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F005000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxVec8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F005000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdxVec4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F009000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdxVec8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F009000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMLA .4H by element index 2: broadcast Vm.h[2] across all 4 lanes
+// of Vn, multiply-add into Vd.  Vm.h[2] = 2.0h; Vn = {1, 0.5, -0.5, 4};
+// Vd = {1, 1, 3, -1} -> r = {3, 2, 2, 7} after Vd += Vn * 2.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4HBroadcastsLane) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  // Vm: lane 2 = 2.0h, others arbitrary (must not be read).
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_2_0, kHalf_4_0,
+                                kHalf_neg2_0, kHalf_0_25, kHalf_neg0_5, kHalf_3_0};
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,  // -1.0h
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaIdxVec4H(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   //  1 + 1*2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   //  1 + 0.5*2 = 2
+  EXPECT_EQ(r[2], kHalf_2_0);   //  3 + (-0.5)*2 = 2
+  EXPECT_EQ(r[3], 0x4700);      // -1 + 4*2 = 7.0h = 0x4700
+  // Upper 64 bits (lanes 4..7) zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLS .4H by element index 0: broadcast Vm.h[0] = 2.0h.
+// Vn = {1, 2, -0.5, 4}, Vd = {3, 5, -1, 10} -> r = {1, 1, 0, 2}.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxVec4HBroadcastsLane) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0x5555, 0x5555, 0x5555,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  // Vd init: 3.0, 5.0, -1.0, 10.0
+  uint16_t d_init[8] = {kHalf_3_0,
+                        0x4500,  // 5.0h
+                        0xBC00,  // -1.0h
+                        0x4900,  // 10.0h
+                        0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsIdxVec4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   //  3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   //  5 - 2*2 = 1
+  EXPECT_EQ(r[2], kHalf_pos0);  // -1 - (-0.5)*2 = 0
+  EXPECT_EQ(r[3], kHalf_2_0);   // 10 - 4*2 = 2
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLA .8H by element index 5: broadcast Vm.h[5] (in the high quad of Vm).
+// Exercises (a) the index >= 4 high-quad Psrldq shift in the broadcast
+// path, (b) both low and high 4-lane passes in the .8H destination.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec8HHighLaneBroadcast) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_2_0, kHalf_1_0,    kHalf_4_0,    kHalf_0_5};
+  // Vm.h[5] = 2.0h; other lanes must not contribute.
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, 0x5555,
+                                0x5555, kHalf_2_0, 0x5555, 0x5555};
+  // Vd init: 1, 1, 3, -1, 0, 3, -2, 0
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,
+                        kHalf_pos0, kHalf_3_0,
+                        0xC000,    // -2.0h
+                        kHalf_pos0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaIdxVec8H(0, 1, 2, /*k=*/5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   //  1 +  1.0 * 2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   //  1 +  0.5 * 2 = 2
+  EXPECT_EQ(r[2], kHalf_2_0);   //  3 + -0.5 * 2 = 2
+  EXPECT_EQ(r[3], 0x4700);      // -1 +  4   * 2 = 7
+  EXPECT_EQ(r[4], kHalf_4_0);   //  0 +  2   * 2 = 4
+  EXPECT_EQ(r[5], 0x4500);      //  3 +  1   * 2 = 5
+  EXPECT_EQ(r[6], 0x4600);      // -2 +  4   * 2 = 6
+  EXPECT_EQ(r[7], kHalf_1_0);   //  0 +  0.5 * 2 = 1
+}
+
+// FMLS .8H by element index 7 (last lane).
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxVec8HHighLaneBroadcast) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_2_0, kHalf_1_0,    kHalf_4_0};
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, 0x5555,
+                                0x5555, 0x5555, 0x5555, kHalf_2_0};
+  // Vd init: 3, 5, -1, 10, 4, 5, 3, 9
+  uint16_t d_init[8] = {kHalf_3_0,
+                        0x4500,    // 5
+                        0xBC00,    // -1
+                        0x4900,    // 10
+                        kHalf_4_0,
+                        0x4500,    // 5
+                        kHalf_3_0,
+                        0x4880};   // 9.0h
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsIdxVec8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   //  3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   //  5 - 2*2 = 1
+  EXPECT_EQ(r[2], kHalf_pos0);  // -1 - (-0.5)*2 = 0
+  EXPECT_EQ(r[3], kHalf_2_0);   // 10 - 4*2 = 2
+  EXPECT_EQ(r[4], kHalf_2_0);   //  4 - 1*2 = 2
+  EXPECT_EQ(r[5], kHalf_1_0);   //  5 - 2*2 = 1
+  EXPECT_EQ(r[6], kHalf_1_0);   //  3 - 1*2 = 1
+  EXPECT_EQ(r[7], kHalf_1_0);   //  9 - 4*2 = 1
+}
+
+// FMUL .4H by element index 3: result = Vn * Vm.h[3].
+// Vm.h[3] = 0.5h; Vn = {1, 2, -4, 8} -> r = {0.5, 1, -2, 4}.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec4HBroadcastsLane) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0,
+                                0xC400,   // -4.0h
+                                0x4800,   //  8.0h
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, kHalf_0_5,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulIdxVec4H(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_0_5);     //  1   * 0.5 = 0.5
+  EXPECT_EQ(r[1], kHalf_1_0);     //  2   * 0.5 = 1
+  EXPECT_EQ(r[2], kHalf_neg2_0);  // -4   * 0.5 = -2
+  EXPECT_EQ(r[3], kHalf_4_0);     //  8   * 0.5 = 4
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMUL .8H by element index 4 (low lane of high quad).
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec8HTwoPass) {
+  const uint16_t n_lanes[8] = {kHalf_1_0,   kHalf_2_0,   kHalf_neg2_0, kHalf_4_0,
+                                kHalf_0_5,   kHalf_neg0_5, kHalf_3_0,    kHalf_1_0};
+  // Vm.h[4] = 2.0h.
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, 0x5555,
+                                kHalf_2_0, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB,
+                        0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulIdxVec8H(0, 1, 2, /*k=*/4)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_2_0);     //  1   * 2
+  EXPECT_EQ(r[1], kHalf_4_0);     //  2   * 2
+  EXPECT_EQ(r[2], 0xC400);        // -2*2 = -4 = 0xC400
+  EXPECT_EQ(r[3], 0x4800);        //  4*2 = 8.0h
+  EXPECT_EQ(r[4], kHalf_1_0);     //  0.5*2 = 1
+  EXPECT_EQ(r[5], 0xBC00);        // -0.5*2 = -1.0h = 0xBC00
+  EXPECT_EQ(r[6], 0x4600);        //  3*2 = 6.0h
+  EXPECT_EQ(r[7], kHalf_2_0);     //  1*2 = 2
 }
 // endregion
 
