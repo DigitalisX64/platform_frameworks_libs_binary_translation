@@ -57,6 +57,8 @@ constexpr size_t kReservedOff = 288;
 // Bionic-spec offsets inside the first chained _aarch64_ctx block.
 constexpr size_t kFpsimdHeadMagicOff = 0;
 constexpr size_t kFpsimdHeadSizeOff = 4;
+constexpr size_t kFpsimdFpsrOff = 8;
+constexpr size_t kFpsimdFpcrOff = 12;
 constexpr size_t kFpsimdVregsOff = 16;
 constexpr size_t kFpsimdContextSize = 528;
 constexpr uint32_t kFpsimdMagic = 0x46508001U;
@@ -77,6 +79,12 @@ void FillCpuState(CPUState* cpu) {
   cpu->sp = 0xBB00BB00BB00BB00ULL;
   cpu->insn_addr = 0xCC00CC00CC00CC00ULL;
   cpu->flags = 0xABCDU;
+  // FPSR bit 27 (QC, saturation) + bit 7 (IDC) — distinct, non-zero pattern
+  // that maps onto bits we actually emulate.
+  cpu->emulated_fpsr = (1U << 27) | (1U << 7);
+  // FPCR bits 23-22 (RMode = round toward zero) + bit 24 (FZ) + bit 15
+  // (default NaN) — a realistic non-zero rounding/control pattern.
+  cpu->cached_fpcr = (0x3U << 22) | (1U << 24) | (1U << 15);
   for (size_t i = 0; i < 32; ++i) {
     const __uint128_t hi = (__uint128_t)(0xF1F2F3F4F5F6F7F8ULL + i) << 64;
     cpu->v[i] = hi | (0x1000 + i);
@@ -125,6 +133,12 @@ TEST(UContextLayout, FpsimdEmbeddedInReservedWithBionicMagic) {
   EXPECT_EQ(ReadAt<uint32_t>(reserved, kFpsimdHeadSizeOff),
             static_cast<uint32_t>(kFpsimdContextSize));
 
+  // FPSR/FPCR must be populated from the matching CPUState fields. Bionic
+  // signal handlers reading uc_mcontext to inspect saturation (QC) or the
+  // rounding mode expect these at offsets 8/12 inside the FPSIMD block.
+  EXPECT_EQ(ReadAt<uint32_t>(reserved, kFpsimdFpsrOff), cpu.emulated_fpsr);
+  EXPECT_EQ(ReadAt<uint32_t>(reserved, kFpsimdFpcrOff), cpu.cached_fpcr);
+
   for (size_t i = 0; i < 32; ++i) {
     __uint128_t got =
         ReadAt<__uint128_t>(reserved, kFpsimdVregsOff + i * 16);
@@ -157,6 +171,8 @@ TEST(UContextLayout, RestoreRoundTrip) {
   EXPECT_EQ(restored.sp, orig.sp);
   EXPECT_EQ(restored.insn_addr, orig.insn_addr);
   EXPECT_EQ(restored.flags, orig.flags);
+  EXPECT_EQ(restored.emulated_fpsr, orig.emulated_fpsr) << "fpsr round-trip";
+  EXPECT_EQ(restored.cached_fpcr, orig.cached_fpcr) << "fpcr round-trip";
   for (size_t i = 0; i < 32; ++i) {
     EXPECT_EQ(restored.v[i], orig.v[i]) << "v[" << i << "] round-trip";
   }
@@ -181,6 +197,12 @@ TEST(UContextLayout, RestoreHonorsHandlerWritesToReserved) {
         ((__uint128_t)(0x1234'5678'9ABC'DEF0ULL + i) << 64) | (0x9000 + i);
     std::memcpy(reserved + kFpsimdVregsOff + i * 16, &modified, 16);
   }
+  // Handler also clears fpsr saturation (QC) — a common recovery pattern —
+  // and flips fpcr's rounding mode to RN (00).
+  const uint32_t handler_fpsr = (1U << 7);  // only IDC, QC cleared
+  const uint32_t handler_fpcr = (1U << 24) | (1U << 15);  // FZ + DN, RMode=RN
+  std::memcpy(reserved + kFpsimdFpsrOff, &handler_fpsr, sizeof(handler_fpsr));
+  std::memcpy(reserved + kFpsimdFpcrOff, &handler_fpcr, sizeof(handler_fpcr));
 
   CPUState restored{};
   ctx.Restore(&restored);
@@ -192,6 +214,10 @@ TEST(UContextLayout, RestoreHonorsHandlerWritesToReserved) {
         << "Restore must read vregs from __reserved (the handler's writes), "
            "not from a private backing copy";
   }
+  EXPECT_EQ(restored.emulated_fpsr, handler_fpsr)
+      << "Restore must read fpsr from __reserved so handler writes propagate";
+  EXPECT_EQ(restored.cached_fpcr, handler_fpcr)
+      << "Restore must read fpcr from __reserved so handler writes propagate";
 }
 
 }  // namespace berberis

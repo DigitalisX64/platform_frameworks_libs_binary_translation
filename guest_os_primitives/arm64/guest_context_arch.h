@@ -61,9 +61,16 @@ class GuestContext {
         reinterpret_cast<Guest_fpsimd_context*>(ctx_.uc_mcontext.__reserved);
     fpsimd->head.magic = FPSIMD_MAGIC;
     fpsimd->head.size = sizeof(Guest_fpsimd_context);
+    // FPSR bit layout (ARM ARM C5.2.8): bits[31:27]=N,Z,C,V,QC; bit[7]=IDC;
+    // bit[4]=IXC; etc. Bionic-built handlers reading uc_mcontext FPSIMD see
+    // QC (saturation) — populated when SIMD ops saturate — as well as IDC
+    // for the emulated input-denormal flag. We don't currently emulate the
+    // arithmetic exception bits beyond IDC, so this is the full set of FPSR
+    // bits we can faithfully report.
+    fpsimd->fpsr = cpu->emulated_fpsr;
+    fpsimd->fpcr = cpu->cached_fpcr;
     static_assert(sizeof(cpu->v) == sizeof(fpsimd->vregs));
     memcpy(fpsimd->vregs, cpu->v, sizeof(fpsimd->vregs));
-    // TODO: save fpsr/fpcr properly.
   }
 
   void Restore(CPUState* cpu) const {
@@ -78,11 +85,14 @@ class GuestContext {
 
     // Restore FPSIMD from the chained block at the start of __reserved.
     // If the guest handler clobbered or unchained the FPSIMD context, the
-    // magic check fails and we leave cpu->v at the values copied from cpu_.
+    // magic check fails and we leave cpu->v / fpsr / fpcr at the values
+    // copied from cpu_.
     const auto* fpsimd =
         reinterpret_cast<const Guest_fpsimd_context*>(ctx_.uc_mcontext.__reserved);
     if (fpsimd->head.magic == FPSIMD_MAGIC) {
       memcpy(cpu->v, fpsimd->vregs, sizeof(fpsimd->vregs));
+      cpu->emulated_fpsr = fpsimd->fpsr;
+      cpu->cached_fpcr = fpsimd->fpcr;
     }
   }
 
