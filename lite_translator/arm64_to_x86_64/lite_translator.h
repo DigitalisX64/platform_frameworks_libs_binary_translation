@@ -4094,16 +4094,17 @@ class LiteTranslator {
     //                              at the wide lane.
     //   SADDW/UADDW/SSUBW/USUBW — Vn is already wide (loaded as 128b),
     //                              widen only Vm, then add/sub.
-    //   SABDL/UABDL              — widen both, compute max-min at wide
-    //                              lane width (= absolute difference,
-    //                              valid because zero/sign-extending
-    //                              keeps the subtraction within the
-    //                              signed range of the wider type).
+    //   SABDL/UABDL              — widen both, compute abs diff at the
+    //                              wider lane width.  size=00/01 uses
+    //                              max(a,b)-min(a,b) (PMAXS*/PMINS* for
+    //                              signed, PMAXU*/PMINU* for unsigned).
+    //                              size=10 (32→64) lacks SSE 64-bit
+    //                              max/min, so it instead does Psubq
+    //                              followed by a Pcmpgtq-against-zero
+    //                              signed-abs (mask = (0 > diff) per
+    //                              qword; abs = (diff ^ mask) - mask).
     //   SABAL/UABAL              — same abs diff, then accumulate into Vd.
-    // size=10 (32→64) for the ABDL/ABAL forms needs 64-bit lane-wise
-    // max/min, neither of which is in SSE — that case bails to the
-    // interpreter (success_ = false). All other size/Q/sign combinations
-    // are JIT-lowered.
+    // All size/Q/sign combinations are JIT-lowered.
     {
       const bool is_addl = (args.opcode == Op::kSaddl || args.opcode == Op::kUaddl);
       const bool is_subl = (args.opcode == Op::kSsubl || args.opcode == Op::kUsubl);
@@ -4114,11 +4115,6 @@ class LiteTranslator {
 
       if (is_addl || is_subl || is_addw || is_subw || is_abdl || is_abal) {
         if (args.size > 0b10) { Undefined(); return; }
-        if ((is_abdl || is_abal) && args.size == 0b10) {
-          // No 64-bit lane-wise signed/unsigned max/min in SSE.
-          success_ = false;
-          return;
-        }
         const bool addsub_signed = (args.opcode == Op::kSaddl ||
                                     args.opcode == Op::kSsubl ||
                                     args.opcode == Op::kSaddw ||
@@ -4178,9 +4174,43 @@ class LiteTranslator {
           return;
         }
 
-        // ABDL / ABAL: abs(a - b) = max(a, b) - min(a, b) at the widened
-        // lane width. After widening both operands, signed and unsigned
-        // halves diverge in *which* max/min flavour to pick.
+        // ABDL / ABAL: abs(a - b)
+        //
+        // size=00/01 (8b/16b → 16b/32b): use max(a, b) - min(a, b) at the
+        // widened lane width.  Signed/unsigned divergence picks the
+        // PMAXS*/PMINS* vs PMAXU*/PMINU* flavour.
+        //
+        // size=10 (32b → 64b): no 64-bit lane-wise signed/unsigned max/min
+        // in SSE (PMAXSQ/PMINSQ/PMAXUQ/PMINUQ are AVX-512).  Instead compute
+        // diff = a - b at 64-bit lane width (Psubq after the widening done
+        // above), then apply a 2-instruction signed-abs primitive built
+        // from Pcmpgtq against zero: mask = (0 > diff) per qword (which is
+        // -1 where diff < 0, else 0); abs(diff) = (diff ^ mask) - mask.
+        // Pcmpgtq is SSE4.2.  This works for both signed and unsigned
+        // inputs because the widening (Pmovsxdq vs Pmovzxdq) already
+        // injected the correct extension; the subtraction at 64-bit lane
+        // width then yields a signed diff whose absolute value is the same
+        // for both signed and unsigned interpretations of the inputs.
+        if (args.size == 0b10) {
+          as_.Psubq(xn_as, xm_as);                          // diff = a - b
+          SimdRegister mask = AllocTempSimdReg();
+          if (mask == no_simd_register) { success_ = false; return; }
+          as_.Pxor(mask, mask);
+          as_.Pcmpgtq(mask, xn_as);                         // -1 if diff<0
+          as_.Pxor(xn_as, mask);
+          as_.Psubq(xn_as, mask);                           // = abs(diff)
+          if (is_abal) {
+            SimdRegister xd_as = AllocTempSimdReg();
+            if (xd_as == no_simd_register) { success_ = false; return; }
+            as_.Movdqu(xd_as, {.base = Assembler::rbp, .disp = vd_off_as});
+            as_.Paddq(xd_as, xn_as);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_as}, xd_as);
+            return;
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_as}, xn_as);
+          return;
+        }
+
         SimdRegister xmax = AllocTempSimdReg();
         if (xmax == no_simd_register) { success_ = false; return; }
         as_.Movdqa(xmax, xn_as);  // save original Vn

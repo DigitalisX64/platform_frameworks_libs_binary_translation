@@ -3379,6 +3379,109 @@ TEST_F(Arm64LiteTranslateRegionTest, UcvtfV2dBit63Set) {
 }
 // endregion
 
+// region digitalis - SABDL/UABDL/SABAL/UABAL .2D (size=10): Psubq +
+// Pcmpgtq-against-zero signed-abs primitive (no SSE 64-bit max/min).
+
+// SABDL .2D (Q=0): signed 32→64 widening + abs diff.  Lane 1 exercises the
+// extreme INT32_MIN/INT32_MAX boundary: |-2^31 - (2^31-1)| = 2^32 - 1.
+TEST_F(Arm64LiteTranslateRegionTest, SabdlV2dSigned) {
+  state_.cpu.v[0] = 0;
+  state_.cpu.v[1] = 0;
+  auto* a = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  auto* b = reinterpret_cast<int32_t*>(&state_.cpu.v[1]);
+  a[0] = 5;            b[0] = 3;
+  a[1] = INT32_MIN;    b[1] = INT32_MAX;
+  a[2] = 0x7BADBEEF;   b[2] = 0x12345678;  // garbage (Q=0 ignores upper half)
+  a[3] = 0x0BADC0DE;   b[3] = 0xCAFEBABE;
+  // Vd encoded as v0, but we want Rn=1, Rm=1... no — SABDL .2D Vd.2D, Vn.2S, Vm.2S
+  // with Rd=2, Rn=0, Rm=1 to keep them distinct.
+  state_.cpu.v[2] = 0xAAAAAAAAAAAAAAAAull;  // marker to verify overwrite
+  constexpr uint32_t code_inst = 0x0EA17002;  // SABDL v2.2D, v0.2S, v1.2S
+  static const uint32_t code[] = {code_inst};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[2]);
+  EXPECT_EQ(out[0], int64_t{2});                                    // |5 - 3|
+  EXPECT_EQ(out[1], int64_t{UINT32_MAX});                           // |INT32_MIN - INT32_MAX|
+}
+
+// SABDL2 .2D (Q=1): same op as SABDL but reads upper half of Vn/Vm.
+TEST_F(Arm64LiteTranslateRegionTest, Sabdl2V2dUpperHalf) {
+  state_.cpu.v[0] = 0;
+  state_.cpu.v[1] = 0;
+  auto* a = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  auto* b = reinterpret_cast<int32_t*>(&state_.cpu.v[1]);
+  a[0] = 0x12345678; b[0] = 0xDEADBEEF;  // garbage (Q=1 ignores lower half)
+  a[1] = 0x7BADBEEF; b[1] = 0xCAFEBABE;
+  a[2] = -7;           b[2] = 3;              // |-7 - 3| = 10
+  a[3] = INT32_MAX;    b[3] = INT32_MIN;      // INT32_MAX - INT32_MIN = 2^32 - 1
+  state_.cpu.v[2] = 0xAAAAAAAAAAAAAAAAull;
+  constexpr uint32_t code_inst = 0x4EA17002;  // SABDL2 v2.2D, v0.4S, v1.4S
+  static const uint32_t code[] = {code_inst};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[2]);
+  EXPECT_EQ(out[0], int64_t{10});
+  EXPECT_EQ(out[1], int64_t{UINT32_MAX});
+}
+
+// UABDL .2D (Q=0): unsigned 32→64 widening + abs diff.  Lane 1 exercises
+// UINT32_MAX − 0 = 4294967295.
+TEST_F(Arm64LiteTranslateRegionTest, UabdlV2dUnsigned) {
+  state_.cpu.v[0] = 0;
+  state_.cpu.v[1] = 0;
+  auto* a = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  auto* b = reinterpret_cast<uint32_t*>(&state_.cpu.v[1]);
+  a[0] = 20;          b[0] = 10;
+  a[1] = UINT32_MAX;  b[1] = 0;
+  state_.cpu.v[2] = 0xAAAAAAAAAAAAAAAAull;
+  constexpr uint32_t code_inst = 0x2EA17002;  // UABDL v2.2D, v0.2S, v1.2S
+  static const uint32_t code[] = {code_inst};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[2]);
+  EXPECT_EQ(out[0], uint64_t{10});
+  EXPECT_EQ(out[1], uint64_t{UINT32_MAX});
+}
+
+// SABAL .2D (Q=0): SABDL + accumulate into existing Vd.
+TEST_F(Arm64LiteTranslateRegionTest, SabalV2dAccumulates) {
+  state_.cpu.v[0] = 0;
+  state_.cpu.v[1] = 0;
+  auto* a = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  auto* b = reinterpret_cast<int32_t*>(&state_.cpu.v[1]);
+  a[0] = 5;            b[0] = 3;
+  a[1] = INT32_MIN;    b[1] = INT32_MAX;
+  state_.cpu.v[2] = 0;
+  auto* vd = reinterpret_cast<int64_t*>(&state_.cpu.v[2]);
+  vd[0] = 100;
+  vd[1] = 200;
+  constexpr uint32_t code_inst = 0x0EA15002;  // SABAL v2.2D, v0.2S, v1.2S
+  static const uint32_t code[] = {code_inst};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[2]);
+  EXPECT_EQ(out[0], int64_t{102});                                  // 100 + 2
+  EXPECT_EQ(out[1], int64_t{200} + int64_t{UINT32_MAX});            // 200 + 2^32-1
+}
+
+// UABAL .2D (Q=0): UABDL + accumulate.
+TEST_F(Arm64LiteTranslateRegionTest, UabalV2dAccumulates) {
+  state_.cpu.v[0] = 0;
+  state_.cpu.v[1] = 0;
+  auto* a = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  auto* b = reinterpret_cast<uint32_t*>(&state_.cpu.v[1]);
+  a[0] = 20;          b[0] = 10;
+  a[1] = UINT32_MAX;  b[1] = 0;
+  state_.cpu.v[2] = 0;
+  auto* vd = reinterpret_cast<uint64_t*>(&state_.cpu.v[2]);
+  vd[0] = 1000;
+  vd[1] = 2000;
+  constexpr uint32_t code_inst = 0x2EA15002;  // UABAL v2.2D, v0.2S, v1.2S
+  static const uint32_t code[] = {code_inst};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[2]);
+  EXPECT_EQ(out[0], uint64_t{1010});                                // 1000 + 10
+  EXPECT_EQ(out[1], uint64_t{2000} + uint64_t{UINT32_MAX});         // 2000 + 2^32-1
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
