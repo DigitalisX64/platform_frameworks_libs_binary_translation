@@ -1993,6 +1993,85 @@ TEST_F(Arm64LiteTranslateRegionTest, BarriersDoNotBreakRegion) {
 }
 // endregion
 
+// region digitalis - FCVT*S/U scalar saturation diagnostic tests.
+// Used to debug the unsigned sf=1 +Inf saturation path (handoff-99).
+constexpr uint32_t kFcvtnuXd0 = 0x9E610000;  // FCVTNU X0, D0
+constexpr uint32_t kFcvtpuXs0 = 0x9E290000;  // FCVTPU X0, S0
+constexpr uint32_t kFcvtmsXs0 = 0x9E300000;  // FCVTMS X0, S0
+constexpr uint32_t kFcvtnuWd0 = 0x1E610000;  // FCVTNU W0, D0
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnuXdPosInfSaturates) {
+  // FCVTNU X0, D0 with D0 = +Inf -> expected UINT64_MAX.
+  state_.cpu.v[0] = 0;
+  // FP64 +Inf is 0x7FF0000000000000.  Low 64 of v[0] holds the value.
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {kFcvtnuXd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtpuXsPosInfSaturates) {
+  // FCVTPU X0, S0 with S0 = +Inf (FP32) -> expected UINT64_MAX.
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7F800000u;
+  static const uint32_t code[] = {kFcvtpuXs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtmsXsNanReturnsZero) {
+  // FCVTMS X0, S0 with S0 = QNaN -> expected 0.
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7FC00000u;
+  static const uint32_t code[] = {kFcvtmsXs0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnuWdPosInfSaturates) {
+  // FCVTNU W0, D0 with D0 = +Inf -> expected UINT32_MAX (zero-extended to W).
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {kFcvtnuWd0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(UINT32_MAX));
+}
+
+// LDR d0, [x1] + FCVTNU x0, d0 — simulates the in-app probe call sequence.
+// LDR d0, [x1]: 1111_1101_0100_0000_0000_0000_0010_0000 = 0xFD400020
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnuXdFromMemoryPosInfSaturates) {
+  static uint64_t fp_storage = 0x7FF0000000000000ULL;
+  state_.cpu.x[1] = ToGuestAddr(&fp_storage);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {
+      0xFD400020,         // LDR D0, [X1]
+      kFcvtnuXd0,         // FCVTNU X0, D0
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+// DISABLED diagnostic: shows that when 13 prior MOVZ map all 13 GP slots,
+// IsGpRegPoolLow terminates the JIT region before reaching the FCVTNU.
+// This is the on-device scenario where the interpreter ARM-saturation fix
+// in interpreter.h (handoff-99) catches the FCVTNU instead.  The Run()
+// framework only translates one region and does not invoke the interpreter
+// fallback, so this test cannot pass without separate interpreter coverage.
+TEST_F(Arm64LiteTranslateRegionTest, DISABLED_FcvtnuXdPosInfWithRegPressure) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {
+      MovzX(2, 1), MovzX(3, 2), MovzX(4, 3), MovzX(5, 4),
+      MovzX(6, 5), MovzX(7, 6), MovzX(8, 7), MovzX(9, 8),
+      MovzX(10, 9), MovzX(11, 10), MovzX(12, 11), MovzX(13, 12),
+      MovzX(14, 13),                     // 13 mappings (matches GP pool size)
+      kFcvtnuXd0,                        // FCVTNU X0, D0
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

@@ -2945,6 +2945,172 @@ class LiteTranslator {
       }
       return;
     }
+
+    // FCVTNS/PS/MS (signed) and FCVTNU/PU/MU (unsigned) scalar FP -> int.
+    //   rmode in {00, 01, 10}, opcode in {000, 001}, ftype in {00, 01}.
+    //
+    //   rmode  insn family               ROUNDSS/ROUNDSD imm
+    //    00    FCVTNS / FCVTNU (RNE)     0x00
+    //    01    FCVTPS / FCVTPU (ceil)    0x02  (round toward +inf)
+    //    10    FCVTMS / FCVTMU (floor)   0x01  (round toward -inf)
+    //
+    // Strategy: round the FP value in FP domain via ROUNDSS/ROUNDSD, then
+    // reuse the FCVTZS / FCVTZU saturation fix-up verbatim (the result of
+    // ROUNDSS on a finite value is always a representable integer, so the
+    // subsequent truncating cvtt is a no-op for in-range inputs and still
+    // produces the x86 INT_MIN indefinite on out-of-range / Inf — exactly
+    // the input the saturation fix-up expects).  NaN, ±Inf and the sign of
+    // zero pass through ROUNDSS/ROUNDSD unchanged, so the NaN-check (PF=1
+    // from Ucomi self) and the FP-sign-bit branch still classify them
+    // correctly.  FCVTAS / FCVTAU (rmode=00, opcode in {100, 101}, ties-
+    // away-from-zero) has no native x86 ROUND mode and is left to the
+    // interpreter for now.
+    if ((rmode == 0b00 || rmode == 0b01 || rmode == 0b10) &&
+        (opcode == 0b000 || opcode == 0b001) &&
+        (args.ftype == 0b00 || args.ftype == 0b01)) {
+      // round_imm: imm[1:0] = rounding mode, imm[3] = suppress inexact (we
+      // don't model FPSR).
+      int8_t round_imm;
+      if (rmode == 0b00) round_imm = int8_t{0x08};       // RNE + suppress
+      else if (rmode == 0b01) round_imm = int8_t{0x0A};  // round toward +inf + suppress
+      else round_imm = int8_t{0x09};                     // round toward -inf + suppress
+      const bool is_unsigned = (opcode == 0b001);
+
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      Register sign_tmp = AllocTempReg();
+      if (sign_tmp == no_register) { success_ = false; return; }
+      int32_t src_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      if (args.ftype == 0b00) {
+        as_.Movss(xmm, {.base = Assembler::rbp, .disp = src_off});
+        as_.Roundss(xmm, xmm, round_imm);
+      } else {
+        as_.Movsd(xmm, {.base = Assembler::rbp, .disp = src_off});
+        as_.Roundsd(xmm, xmm, round_imm);
+      }
+
+      if (!is_unsigned) {
+        // FCVTNS / FCVTPS / FCVTMS: signed saturation fix-up (mirror of
+        // FCVTZS above, applied to the now-rounded xmm).
+        if (args.sf) {
+          if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+          else as_.Cvttsd2siq(tmp, xmm);
+        } else {
+          if (args.ftype == 0b00) as_.Cvttss2sil(tmp, xmm);
+          else as_.Cvttsd2sil(tmp, xmm);
+        }
+        Assembler::Label* nan_path = as_.MakeLabel();
+        Assembler::Label* done = as_.MakeLabel();
+        if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+        else as_.Ucomisd(xmm, xmm);
+        as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+        if (args.ftype == 0b00) {
+          as_.Movd(sign_tmp, xmm);
+          as_.Testl(sign_tmp, sign_tmp);
+        } else {
+          as_.Movq(sign_tmp, xmm);
+          as_.Testq(sign_tmp, sign_tmp);
+        }
+        as_.Jcc(Assembler::Condition::kNegative, *done);
+        if (args.sf) as_.Testq(tmp, tmp);
+        else as_.Testl(tmp, tmp);
+        as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+        if (args.sf) {
+          as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+        } else {
+          as_.Movl(tmp, int32_t{INT32_MAX});
+        }
+        as_.Jmp(*done);
+        as_.Bind(nan_path);
+        if (args.sf) as_.Xorq(tmp, tmp);
+        else as_.Xorl(tmp, tmp);
+        as_.Bind(done);
+      } else {
+        // FCVTNU / FCVTPU / FCVTMU: unsigned saturation fix-up (mirror of
+        // FCVTZU above, applied to the now-rounded xmm).
+        Assembler::Label* zero_path = as_.MakeLabel();
+        Assembler::Label* done = as_.MakeLabel();
+        if (args.ftype == 0b00) as_.Ucomiss(xmm, xmm);
+        else as_.Ucomisd(xmm, xmm);
+        as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+        if (args.ftype == 0b00) {
+          as_.Movd(sign_tmp, xmm);
+          as_.Testl(sign_tmp, sign_tmp);
+        } else {
+          as_.Movq(sign_tmp, xmm);
+          as_.Testq(sign_tmp, sign_tmp);
+        }
+        as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+        if (!args.sf) {
+          // sf=0 (uint32): cvtt-Q gives int64 in [0, UINT32_MAX] iff the
+          // upper 32 bits are zero; non-zero means overflow.
+          if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+          else as_.Cvttsd2siq(tmp, xmm);
+          as_.Movq(sign_tmp, tmp);
+          as_.Shrq(sign_tmp, int8_t{32});
+          as_.Testq(sign_tmp, sign_tmp);
+          as_.Jcc(Assembler::Condition::kZero, *done);
+          as_.Movl(tmp, int32_t{-1});  // UINT32_MAX
+          as_.Jmp(*done);
+          as_.Bind(zero_path);
+          as_.Xorq(tmp, tmp);
+        } else {
+          // sf=1 (uint64): offset-trick for FP in [2^63, 2^64); saturate
+          // to UINT64_MAX for FP >= 2^64 (incl +Inf).
+          SimdRegister bound_xmm = AllocTempSimdReg();
+          if (bound_xmm == no_simd_register) { success_ = false; return; }
+          Assembler::Label* sat_max = as_.MakeLabel();
+          Assembler::Label* direct_path = as_.MakeLabel();
+          if (args.ftype == 0b00) {
+            as_.Movl(tmp, int32_t{0x5F000000});               // FP32(2^63)
+            as_.Movd(bound_xmm, tmp);
+          } else {
+            as_.Movq(tmp, static_cast<int64_t>(0x43E0000000000000LL));  // FP64(2^63)
+            as_.Movq(bound_xmm, tmp);
+          }
+          if (args.ftype == 0b00) as_.Ucomiss(xmm, bound_xmm);
+          else as_.Ucomisd(xmm, bound_xmm);
+          as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+          SimdRegister bound2_xmm = AllocTempSimdReg();
+          if (bound2_xmm == no_simd_register) { success_ = false; return; }
+          if (args.ftype == 0b00) {
+            as_.Movl(tmp, int32_t{0x5F800000});               // FP32(2^64)
+            as_.Movd(bound2_xmm, tmp);
+          } else {
+            as_.Movq(tmp, static_cast<int64_t>(0x43F0000000000000LL));  // FP64(2^64)
+            as_.Movq(bound2_xmm, tmp);
+          }
+          if (args.ftype == 0b00) as_.Ucomiss(xmm, bound2_xmm);
+          else as_.Ucomisd(xmm, bound2_xmm);
+          as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+          if (args.ftype == 0b00) {
+            as_.Subss(xmm, bound_xmm);
+            as_.Cvttss2siq(tmp, xmm);
+          } else {
+            as_.Subsd(xmm, bound_xmm);
+            as_.Cvttsd2siq(tmp, xmm);
+          }
+          as_.Btsq(tmp, int8_t{63});
+          as_.Jmp(*done);
+          as_.Bind(sat_max);
+          as_.Movq(tmp, static_cast<int64_t>(-1));  // UINT64_MAX
+          as_.Jmp(*done);
+          as_.Bind(direct_path);
+          if (args.ftype == 0b00) as_.Cvttss2siq(tmp, xmm);
+          else as_.Cvttsd2siq(tmp, xmm);
+          as_.Jmp(*done);
+          as_.Bind(zero_path);
+          as_.Xorq(tmp, tmp);
+        }
+        as_.Bind(done);
+      }
+      if (args.rd < 31) {
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
     // endregion
 
     Undefined();
