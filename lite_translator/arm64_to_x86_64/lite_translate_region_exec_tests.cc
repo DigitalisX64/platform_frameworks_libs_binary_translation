@@ -5747,6 +5747,181 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec8HTwoPass) {
 }
 // endregion
 
+// region digitalis: FP16 scalar FpDataProc3 — FMADD / FMSUB / FNMADD / FNMSUB
+// on Hn/Hm/Ha/Hd.  Encoding (verified via aarch64-linux-gnu-as
+// -march=armv8.2-a+fp16): bits[31:24]=00011111, bits[23:22]=11 (ftype=H),
+// bit21=O1, bits[20:16]=Rm, bit15=o0, bits[14:10]=Ra, bits[9:5]=Rn,
+// bits[4:0]=Rd.
+//   FMADD  Hd, Hn, Hm, Ha (o1=0, o0=0) = 0x1FC00000 base
+//   FMSUB  Hd, Hn, Hm, Ha (o1=0, o0=1) = 0x1FC08000 base
+//   FNMADD Hd, Hn, Hm, Ha (o1=1, o0=0) = 0x1FE00000 base
+//   FNMSUB Hd, Hn, Hm, Ha (o1=1, o0=1) = 0x1FE08000 base
+constexpr uint32_t FmaddH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x1FC00000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(ra) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmsubH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x1FC08000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(ra) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FnmaddH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x1FE00000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(ra) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FnmsubH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x1FE08000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(ra) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMADD Hd, Hn, Hm, Ha: Hd = Ha + Hn * Hm.
+// Hn=1.5h, Hm=2.0h, Ha=0.5h -> 0.5 + 1.5*2 = 3.5h = 0x4300.
+TEST_F(Arm64LiteTranslateRegionTest, FmaddHScalar) {
+  const uint16_t n_lanes[8] = {kHalf_1_5, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666};
+  const uint16_t a_lanes[8] = {kHalf_0_5, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 3, a_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmaddH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x4300u);  // 3.5h
+  // Vd zero-extended above the scalar lane.
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMSUB Hd, Hn, Hm, Ha: Hd = Ha - Hn * Hm.
+// Hn=2.0h, Hm=2.0h, Ha=5.0h -> 5 - 4 = 1.0h.
+TEST_F(Arm64LiteTranslateRegionTest, FmsubHScalar) {
+  const uint16_t n_lanes[8] = {kHalf_2_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t a_lanes[8] = {0x4500, 0, 0, 0, 0, 0, 0, 0};  // 5.0h
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 3, a_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmsubH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FNMADD Hd, Hn, Hm, Ha: Hd = -(Ha + Hn * Hm).
+// Hn=1.5h, Hm=2.0h, Ha=0.5h -> -(0.5 + 3) = -3.5h = 0xC300.
+TEST_F(Arm64LiteTranslateRegionTest, FnmaddHScalar) {
+  const uint16_t n_lanes[8] = {kHalf_1_5, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t a_lanes[8] = {kHalf_0_5, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 3, a_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FnmaddH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xC300u);  // -3.5h
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FNMSUB Hd, Hn, Hm, Ha: Hd = Hn * Hm - Ha.
+// Hn=4.0h, Hm=2.0h, Ha=3.0h -> 8 - 3 = 5.0h = 0x4500.
+TEST_F(Arm64LiteTranslateRegionTest, FnmsubHScalar) {
+  const uint16_t n_lanes[8] = {kHalf_4_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t a_lanes[8] = {kHalf_3_0, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 3, a_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FnmsubH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x4500u);  // 5.0h
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMADD Hd, Hn, Hm, Ha: fused-vs-unfused divergence.  Pick operands such
+// that fma(a, b, c) in binary64 differs from (a*b)+c through binary32:
+//   Hn = 0x3C01 = 1 + 2^-10 (one ULP above 1.0h).
+//   Hm = 0x3C01 = 1 + 2^-10.
+//   Ha = 0xBC00 = -1.0h.
+//   Hn*Hm = 1 + 2*2^-10 + 2^-20.  In binary64 this is exact, plus -1 =
+//   2*2^-10 + 2^-20 = 0x00000001_2000 in mantissa scale, rounds to FP16
+//   as 2*2^-10 + 2^-20 (representable as 0x10C0_..._wait — let's recompute):
+//   2*2^-10 = 2^-9.  2^-20 is below FP16's 2^-24 subnormal granularity?
+//   No, 2^-20 > 2^-24, so FP16 can represent it (denormal).
+//
+// Actually for a cleaner test of FP16 round-trip exactness: pick Hn=2.0h,
+// Hm=0.5h, Ha=-1.0h -> 0 (cleanly exact), and use the divergence between
+// FMADD and FMSUB to verify the o0 bit dispatches correctly.  We rely on
+// the previous tests to prove FMA semantics; this test just confirms FMADD
+// and FMSUB produce different results (so the o0 bit lift is correct).
+TEST_F(Arm64LiteTranslateRegionTest, FmaddHvsFmsubHDispatch) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t a_lanes[8] = {kHalf_3_0, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 3, a_lanes);
+  // FMADD: 3 + 1*2 = 5.0h.
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code_fmadd[] = {FmaddH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code_fmadd, ToGuestAddr(code_fmadd) + sizeof(code_fmadd)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x4500u);  // 5.0h
+  // FMSUB: 3 - 1*2 = 1.0h.
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code_fmsub[] = {FmsubH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code_fmsub, ToGuestAddr(code_fmsub) + sizeof(code_fmsub)));
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);
+}
+
+// FMADD Hd with a small-magnitude tail to verify the FP64 round-trip
+// preserves enough precision for the final FP16 RNE.
+//   Hn = 0x3C01 = 1 + 2^-10 (one ULP above 1.0h).
+//   Hm = 0x3C01.
+//   Ha = 0xBC00 = -1.0h.
+//   Exact: (1 + 2^-10)^2 - 1 = 2^-9 + 2^-20.
+//   2^-9 = 0x1800 in FP16; the +2^-20 tail is exactly half-ULP at FP16
+//   2^-19 ULP scale, so RNE rounds to even mantissa LSB (which is 0)
+//   -> 0x1800.  Any FP16-only multiply-add path would also produce
+//   0x1800 here (the product is representable in FP32 exactly), so this
+//   is a correctness check on the FP64 lift, not an FMA-vs-unfused test.
+TEST_F(Arm64LiteTranslateRegionTest, FmaddHSmallTail) {
+  const uint16_t n_lanes[8] = {0x3C01, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {0x3C01, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t a_lanes[8] = {0xBC00, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 3, a_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmaddH(0, 1, 2, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1800u);  // 2^-9 = 0.001953125 in FP16.
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

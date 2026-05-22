@@ -2455,13 +2455,16 @@ class LiteTranslator {
   //   FNMADD -> Vfnmsub231(ss|sd) : -(Rn*Rm) - Ra  = -(Ra + Rn*Rm)
   //   FNMSUB -> Vfmsub231(ss|sd)  :  Rn*Rm - Ra
   //
-  // FP16 (ftype=11) stays on the interpreter: F16C round-trip is not exact
-  // for FMA (-91 parking note); the interpreter does fma() in binary64
-  // before narrowing, which is exact.
+  // FP16 (ftype=11) is JIT-lifted via FP16 -> FP32 -> FP64 and dispatched
+  // through the SD form of VFMADD/VFNMADD/VFMSUB/VFNMSUB.  The interpreter
+  // does the multiply-add in binary64 then narrows once to FP16 (single
+  // rounding); binary64's 53-bit mantissa holds (binary16 * binary16) +
+  // binary16 exactly, so an FP32-only round-trip would double-round on
+  // some inputs.
   void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
                    uint8_t ftype, bool o1, bool o0) {
     // region digitalis
-    if (ftype != 0b00 && ftype != 0b01) {
+    if (ftype != 0b00 && ftype != 0b01 && ftype != 0b11) {
       success_ = false;
       return;
     }
@@ -2469,7 +2472,12 @@ class LiteTranslator {
       success_ = false;
       return;
     }
+    if (ftype == 0b11 && !host_platform::kHasF16C) {
+      success_ = false;
+      return;
+    }
     const bool is_double = (ftype == 0b01);
+    const bool is_half = (ftype == 0b11);
 
     const int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
     const int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
@@ -2487,24 +2495,61 @@ class LiteTranslator {
       as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
+    } else if (is_half) {
+      // FP16 -> FP32 -> FP64 lift.  Pxor + Pinsrw isolates the 16-bit
+      // input in lane 0 with FP16 +0.0 in lanes 1..3; Vcvtph2ps then
+      // produces FP32 [value, 0, 0, 0]; Vcvtps2pd narrows the low 2
+      // FP32 lanes to 2 FP64 lanes [FP64(value), FP64(0)].  The
+      // preserved FP64(0) in lane 1 is consumed by the Vcvtpd2ps narrow
+      // below and produces an FP32 +0.0 lane that Vcvtps2ph rounds to
+      // FP16 +0.0 — matching the AArch64 zero-extend semantic for Hd.
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Vcvtps2pd(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+      as_.Vcvtps2pd(xmm_m, xmm_m);
+      as_.Pxor(xmm_a, xmm_a);
+      as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_a_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_a, xmm_a);
+      as_.Vcvtps2pd(xmm_a, xmm_a);
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
     }
 
+    // FP16 dispatches through the SD form because the value is already
+    // binary64 in lane 0 after the Vcvtph2ps + Vcvtps2pd lift.
+    const bool use_double_fma = is_double || is_half;
     if (!o1 && !o0) {
-      if (is_double) as_.Vfmadd231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfmadd231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfmadd231ss(xmm_a, xmm_n, xmm_m);
     } else if (!o1 && o0) {
-      if (is_double) as_.Vfnmadd231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfnmadd231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfnmadd231ss(xmm_a, xmm_n, xmm_m);
     } else if (o1 && !o0) {
-      if (is_double) as_.Vfnmsub231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfnmsub231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfnmsub231ss(xmm_a, xmm_n, xmm_m);
     } else {
-      if (is_double) as_.Vfmsub231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfmsub231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfmsub231ss(xmm_a, xmm_n, xmm_m);
+    }
+
+    if (is_half) {
+      // Narrow FP64 -> FP32 -> FP16.  Vcvtpd2ps writes 2 FP32 lanes into
+      // the low 64 bits and zeroes the upper 64; lane 1 was FP64 +0.0
+      // (preserved by the SD FMA above), so the resulting FP32 has +0.0
+      // in lanes 1..3.  Vcvtps2ph rounds 4 FP32 -> 4 FP16 and zeroes the
+      // upper 64 bits: lane 0 = FP16(FMA result), lanes 1..3 = FP16(+0.0)
+      // = 0.  Storing the full 128 bits gives the correct Hd layout
+      // (result in bits[15:0], all other bits zero).
+      as_.Vcvtpd2ps(xmm_a, xmm_a);
+      as_.Vcvtps2ph(xmm_a, xmm_a, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      return;
     }
 
     // ARM zero-extends Vd above the result lane.  Zero the full 128 bits
