@@ -4135,6 +4135,103 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // region digitalis: FMULX vector three-same (FP32 .2S/.4S, FP64 .2D).
+      //
+      // Direct lift of the AdvSimdScalarThreeSame FMULX scalar pattern to
+      // packed PS/PD:
+      //   mul         = a * b
+      //   mul_unord   = cmpunord(mul, mul)       (-1 per lane iff mul is NaN)
+      //   input_unord = cmpunord(a, b)           (-1 per lane iff a or b is NaN)
+      //   special     = mul_unord AND NOT input_unord
+      //   two_signed  = ((a XOR b) AND sign_mask) OR bits-of(+2.0)
+      //   result      = (mul AND NOT special) OR (two_signed AND special)
+      //
+      // The PCMPEQD + PSLLQ/PSLLD idiom builds the per-lane sign mask
+      // (0x80000000... per FP32 lane or 0x8000000000000000... per FP64
+      // lane) — no GPR temp needed for that mask.
+      //
+      // The +2.0 broadcast uses MOVD/MOVQ from a GPR temp into XMM lane 0,
+      // then PSHUFD (FP32, broadcast lane 0 to all four 32-bit lanes) or
+      // PUNPCKLQDQ (FP64, broadcast low 64 bits to both 64-bit lanes;
+      // SSE2-only so available on every host we target).
+      //
+      // FP16 .4H/.8H still bails to the interpreter — args.is_fp16 path.
+      case Decoder::AdvSimdThreeSameOpcode::kFmulxV: {
+        if (args.is_fp16) { success_ = false; return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { success_ = false; return; }
+
+        SimdRegister xmm_n = AllocTempSimdReg();
+        SimdRegister xmm_m = AllocTempSimdReg();
+        SimdRegister xmm_mul = AllocTempSimdReg();
+        SimdRegister xmm_mul_unord = AllocTempSimdReg();
+        SimdRegister xmm_input_unord = AllocTempSimdReg();
+        SimdRegister xmm_two = AllocTempSimdReg();
+        if (xmm_n == no_simd_register || xmm_m == no_simd_register ||
+            xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+            xmm_input_unord == no_simd_register || xmm_two == no_simd_register) {
+          success_ = false; return;
+        }
+
+        load_full(xmm_n, vn_off);
+        load_full(xmm_m, vm_off);
+
+        // mul = a * b
+        as_.Movdqa(xmm_mul, xmm_n);
+        if (is_double) as_.Mulpd(xmm_mul, xmm_m);
+        else            as_.Mulps(xmm_mul, xmm_m);
+
+        // mul_unord = cmpunord(mul, mul)
+        as_.Movdqa(xmm_mul_unord, xmm_mul);
+        if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
+        else            as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+        // input_unord = cmpunord(a, b)
+        as_.Movdqa(xmm_input_unord, xmm_n);
+        if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
+        else            as_.Cmpunordps(xmm_input_unord, xmm_m);
+
+        // special_mask = mul_unord AND NOT input_unord (Pandn writes its
+        // destination as (NOT dst) AND src, so result lands in xmm_input_unord).
+        as_.Pandn(xmm_input_unord, xmm_mul_unord);
+
+        // two_signed: build ((a XOR b) AND sign_mask) OR bits-of(+2.0).
+        // Reuse xmm_n as the XOR result; xmm_mul_unord as the sign mask.
+        if (is_double) as_.Xorpd(xmm_n, xmm_m);
+        else            as_.Xorps(xmm_n, xmm_m);
+        as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+        if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
+        else            as_.Pslld(xmm_mul_unord, int8_t{31});
+        as_.Pand(xmm_n, xmm_mul_unord);
+
+        // Broadcast bits of +2.0 into all lanes of xmm_two.
+        Register tmp_gpr = AllocTempReg();
+        if (is_double) {
+          as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});
+          as_.Movq(xmm_two, tmp_gpr);
+          // PUNPCKLQDQ duplicates the low 64 bits into both lanes.
+          as_.Punpcklqdq(xmm_two, xmm_two);
+        } else {
+          as_.Movl(tmp_gpr, int32_t{0x40000000});
+          as_.Movd(xmm_two, tmp_gpr);
+          // PSHUFD imm=0 broadcasts lane 0 to all four 32-bit lanes.
+          as_.Pshufd(xmm_two, xmm_two, int8_t{0});
+        }
+        as_.Por(xmm_n, xmm_two);
+        // xmm_n now holds ±2.0 per lane (sign = sign(a) XOR sign(b)).
+
+        // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+        // Reuse xmm_m as the masked-±2.0; reuse xmm_input_unord as the result.
+        as_.Movdqa(xmm_m, xmm_n);
+        as_.Pand(xmm_m, xmm_input_unord);          // m = ±2.0 AND special
+        as_.Pandn(xmm_input_unord, xmm_mul);       // input_unord = NOT(special) AND mul
+        as_.Por(xmm_input_unord, xmm_m);           // result in xmm_input_unord.
+
+        if (!args.q) mask_low64(xmm_input_unord);
+        store_full(vd_off, xmm_input_unord);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;

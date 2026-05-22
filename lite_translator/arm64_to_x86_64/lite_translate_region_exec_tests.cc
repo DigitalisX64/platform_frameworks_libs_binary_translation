@@ -3965,6 +3965,126 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSNewtonStepOnOne) {
 }
 // endregion
 
+// region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// Identical semantics to FMULX scalar, just lane-parallel.  Each lane
+// applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
+// with sign = sign(a) XOR sign(b) per-lane.
+//
+// Encoding (per ARM ARM C7.2.149 "FMULX (vector)" and llvm-mc verification):
+//   FMULX Vd.2S, Vn.2S, Vm.2S = 0x0E22DC00 | (rm<<16) | (rn<<5) | rd
+//   FMULX Vd.4S, Vn.4S, Vm.4S = 0x4E22DC00 | (rm<<16) | (rn<<5) | rd
+//   FMULX Vd.2D, Vn.2D, Vm.2D = 0x4E62DC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmulxVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Helpers for 4-lane FP32 / 2-lane FP64 vector inputs.
+static void StoreVec4S(CPUState& cpu, unsigned idx,
+                       float a0, float a1, float a2, float a3) {
+  float lanes[4] = {a0, a1, a2, a3};
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void StoreVec2D(CPUState& cpu, unsigned idx, double a0, double a1) {
+  double lanes[2] = {a0, a1};
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void LoadVec4S(const CPUState& cpu, unsigned idx, float out[4]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+static void LoadVec2D(const CPUState& cpu, unsigned idx, double out[2]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+
+// .4S: lane 0 finite multiply; lane 1 (+0,+inf); lane 2 (-0,+inf); lane 3 finite.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4SAllLanes) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 3.0f, 0.0f, -0.0f, -2.5f);
+  StoreVec4S(state_.cpu, 2, 4.0f, inf, inf, 2.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 12.0f);   // 3 * 4
+  EXPECT_FLOAT_EQ(r[1], 2.0f);    // (+0, +inf) -> +2
+  EXPECT_FLOAT_EQ(r[2], -2.0f);   // (-0, +inf) -> -2
+  EXPECT_FLOAT_EQ(r[3], -5.0f);   // -2.5 * 2
+}
+
+// .2S: q=0 form; upper 64 bits of Vd must be zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2SUpperZero) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 2.0f, -inf, 0.0f, 0.0f);  // lanes 2,3 ignored
+  StoreVec4S(state_.cpu, 2, 3.0f, 0.0f, 0.0f, 0.0f);
+  // Pre-fill Vd with sentinel — the .2S store must clobber upper lanes to zero.
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FmulxVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 6.0f);     // 2 * 3
+  EXPECT_FLOAT_EQ(r[1], -2.0f);    // (-inf, +0) -> -2
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);  // upper 64 bits zeroed by .2S form
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// .2D: lane 0 finite multiply; lane 1 (+inf, -0) -> -2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DAllLanes) {
+  const double inf = std::numeric_limits<double>::infinity();
+  StoreVec2D(state_.cpu, 1, 0.5, inf);
+  StoreVec2D(state_.cpu, 2, -3.0, -0.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulxVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], -1.5);
+  EXPECT_DOUBLE_EQ(r[1], -2.0);   // (+inf, -0) -> -2
+}
+
+// .4S NaN propagation: lane 0 has a NaN input → standard NaN result, no
+// saturation override.  (Distinguishes from the (0,inf) special case.)
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4SNaNNotSpecialCase) {
+  const float qnan = std::nanf("");
+  StoreVec4S(state_.cpu, 1, qnan, 0.0f, 1.0f, 2.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, std::numeric_limits<float>::infinity(),
+             3.0f, 0.0f);
+  static const uint32_t code[] = {FmulxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0]));   // NaN input propagates, NOT replaced by ±2.0
+  EXPECT_FLOAT_EQ(r[1], 2.0f);     // (+0, +inf) saturation
+  EXPECT_FLOAT_EQ(r[2], 3.0f);     // 1 * 3
+  EXPECT_FLOAT_EQ(r[3], 0.0f);     // 2 * 0 (no inf side)
+}
+
+// .2D regular finite path — sanity that nothing breaks lane 1 when neither
+// input is special.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
+  StoreVec2D(state_.cpu, 1, 2.0, -4.0);
+  StoreVec2D(state_.cpu, 2, 3.5, 0.25);
+  static const uint32_t code[] = {FmulxVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.0);
+  EXPECT_DOUBLE_EQ(r[1], -1.0);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
