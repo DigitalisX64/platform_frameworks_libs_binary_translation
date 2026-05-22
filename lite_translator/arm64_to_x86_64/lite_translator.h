@@ -6871,10 +6871,183 @@ class LiteTranslator {
   // endregion
 
   // region digitalis
-  // FCCMP / FCCMPE: fall back to interpreter (condition-dependent flag write
-  // makes this awkward in JIT; cost is one interpreter dispatch per FCCMP).
-  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& /*args*/) {
-    success_ = false;
+  // FCCMP / FCCMPE: if cond evaluates true, perform UCOMISS/UCOMISD and map
+  // x86 EFLAGS -> ARM NZCV via EmitStoreArmFpNZCV (same as FCMP); otherwise
+  // write the immediate NZCV field directly to ThreadState::cpu.flags.
+  //
+  // The decoder only routes ftype 00 (S) and 01 (D) to this consumer; FP16
+  // FCCMP is not encoded by the ARM ARM (the H-variant uses a separate
+  // FpDataProc1-like family, not handled here).
+  //
+  // Layout mirrors the integer ConditionalSelect / FCSEL NZCV decoder:
+  //   1. Read existing flags into flags_reg (Btl source).
+  //   2. Write the nzcv immediate into ThreadState::cpu.flags (FALSE default).
+  //   3. Condition switch: each arm Jcc-s to `done` if the condition is FALSE
+  //      (so the imm just written wins).
+  //   4. Fall-through = condition TRUE: do the UCOMIS compare, then
+  //      EmitStoreArmFpNZCV reads x86 EFLAGS and overwrites cpu.flags.
+  //   5. done.
+  //
+  // The 'signal_nans' (FCCMPE) bit only changes the FP-exception behaviour
+  // (signal vs quiet) — the architectural NZCV output is identical for both
+  // FCCMP and FCCMPE.  UCOMISS/UCOMISD on x86 already signal on SNaN by
+  // setting #IA (matching FCCMPE), so we ignore the bit here; the host's
+  // SIMD floating-point exception path follows the same trap behaviour as
+  // a plain FpCompare.
+  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args) {
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
+      success_ = false;
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    if (xmm_n == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_m == no_simd_register) { success_ = false; return; }
+    Register flags_reg = AllocTempReg();
+    if (flags_reg == no_register) { success_ = false; return; }
+    Register imm_reg = AllocTempReg();
+    if (imm_reg == no_register) { success_ = false; return; }
+
+    const int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    const int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    const int32_t flags_off = offsetof(ThreadState, cpu.flags);
+
+    // ARM NZCV layout matches CPUState::kFlag{Negative,Zero,Carry,Overflow}:
+    //   N = bit 15, Z = bit 14, C = bit 8, V = bit 0.
+    const int32_t imm_flags =
+        ((args.nzcv & 0b1000) ? 0x8000 : 0) |
+        ((args.nzcv & 0b0100) ? 0x4000 : 0) |
+        ((args.nzcv & 0b0010) ? 0x0100 : 0) |
+        ((args.nzcv & 0b0001) ? 0x0001 : 0);
+
+    // Step 1: snapshot flags for the condition test.
+    as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = flags_off});
+
+    // Step 2: write nzcv imm as the FALSE-branch default.
+    as_.Movl(imm_reg, imm_flags);
+    as_.Movw({.base = Assembler::rbp, .disp = flags_off}, imm_reg);
+
+    Assembler::Label* done = as_.MakeLabel();
+
+    // Step 3: condition switch (same shape as FCSEL — each arm jumps to
+    // `done` if the condition is FALSE).
+    switch (args.cond) {
+      case Decoder::Condition::kEq:
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kNe:
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kCs:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kCc:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kMi:
+        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kPl:
+        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kVs:
+        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kVc:
+        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kHi:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kLs: {
+        Assembler::Label* true_path = as_.MakeLabel();
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *true_path);
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Bind(true_path);
+        break;
+      }
+      case Decoder::Condition::kGe: {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kLt: {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kGt: {
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kLe: {
+        Assembler::Label* true_path = as_.MakeLabel();
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *true_path);
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Bind(true_path);
+        break;
+      }
+      case Decoder::Condition::kAl:
+      case Decoder::Condition::kNv:
+        // Reserved on FCCMP per the ARM ARM; ConditionalSelect/FCSEL treat
+        // these as always-true, so we fall through to the compare path too.
+        break;
+    }
+
+    // Step 4: condition TRUE path — perform the FP compare.  UCOMIS sets
+    // ZF/PF/CF; EmitStoreArmFpNZCV reads them and writes ARM NZCV.
+    if (is_double) {
+      as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      as_.Ucomisd(xmm_n, xmm_m);
+    } else {
+      as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      as_.Ucomiss(xmm_n, xmm_m);
+    }
+    EmitStoreArmFpNZCV();
+
+    as_.Bind(done);
   }
   // endregion
 
