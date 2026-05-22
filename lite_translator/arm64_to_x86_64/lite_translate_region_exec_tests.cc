@@ -2666,6 +2666,70 @@ TEST_F(Arm64LiteTranslateRegionTest, FrintiV4s) {
   EXPECT_EQ(lanes[2], 0x3F800000u);
   EXPECT_EQ(lanes[3], 0xBF800000u);
 }
+
+// FCVTZS vector FP32 -> S32 truncating.  Encoding per ARM ARM C7.2
+// "Advanced SIMD two-register miscellaneous": opcode=11011, bit23=1
+// (a=1), bit22=0 (sz=0, FP32 lanes), U=0.  Hand-derived:
+//   fcvtzs v0.4s, v0.4s = 0x4EA1B800  (Q=1)
+//   fcvtzs v0.2s, v0.2s = 0x0EA1B800  (Q=0)
+constexpr uint32_t kFcvtzsV4s00 = 0x4EA1B800;
+constexpr uint32_t kFcvtzsV2s00 = 0x0EA1B800;
+
+// Mixed normal lanes: positive truncation, negative truncation, exact
+// integer, and zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV4sNormalLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4048F5C3u;  // 3.14f -> 3
+  lanes[1] = 0xC048F5C3u;  // -3.14f -> -3
+  lanes[2] = 0x40A00000u;  // 5.0f -> 5
+  lanes[3] = 0x00000000u;  // +0.0f -> 0
+  static const uint32_t code[] = {kFcvtzsV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3);
+  EXPECT_EQ(out[1], -3);
+  EXPECT_EQ(out[2], 5);
+  EXPECT_EQ(out[3], 0);
+}
+
+// Saturation boundaries: NaN -> 0, +Inf -> INT32_MAX, -Inf -> INT32_MIN,
+// finite > 2^31 -> INT32_MAX.  These are the cases where x86
+// CVTTPS2DQ returns INT32_MIN (0x80000000) and ARM expects a different
+// saturated value -- exercises the NaN-mask + pos-overflow fix-up.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV4sSaturationBoundaries) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FC00000u;  // qNaN -> 0
+  lanes[1] = 0x7F800000u;  // +Inf -> INT32_MAX
+  lanes[2] = 0xFF800000u;  // -Inf -> INT32_MIN
+  lanes[3] = 0x4F000000u;  // 2^31 (=2147483648.0f) -> INT32_MAX
+  static const uint32_t code[] = {kFcvtzsV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0);
+  EXPECT_EQ(out[1], INT32_MAX);
+  EXPECT_EQ(out[2], INT32_MIN);
+  EXPECT_EQ(out[3], INT32_MAX);
+}
+
+// .2S form (Q=0): only the low 64 bits are operative; the upper 64 must
+// be zeroed regardless of prior content.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV2sZeroesUpperHalf) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4048F5C3u;  // 3.14f -> 3
+  lanes[1] = 0xC048F5C3u;  // -3.14f -> -3
+  lanes[2] = 0xDEADBEEFu;  // garbage; must be zeroed
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFcvtzsV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3);
+  EXPECT_EQ(out[1], -3);
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
 // endregion
 
 }  // namespace

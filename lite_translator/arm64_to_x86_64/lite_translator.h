@@ -6456,6 +6456,64 @@ class LiteTranslator {
       //   narrow imm=0). Per the standing rule, F16C round-trip is
       //   exact for FP16 unary FSQRT. The .8H form splits the upper 4
       //   half-lanes into a second F16C round-trip (no AVX YMM path).
+      // region digitalis
+      // FCVTZS V (vector FP→signed int, truncating).  Handles .2S / .4S
+      // (FP32 → S32) directly with CVTTPS2DQ plus an ARM-vs-x86 saturation
+      // fix-up.  FP16 and FP64 (.2D) bail to the interpreter.
+      //
+      // x86 CVTTPS2DQ returns 0x80000000 (INT32_MIN) for NaN, ±Inf, and any
+      // out-of-range FP.  ARM wants: NaN → 0, value ≥ 2^31 → INT32_MAX,
+      // value < -2^31 → INT32_MIN.  Algorithm:
+      //   1. Convert via CVTTPS2DQ.
+      //   2. Build NaN mask (CMPUNORDPS src,src) and clear NaN lanes in
+      //      the result (PANDN).
+      //   3. Detect "result == INT32_MIN" (PCMPEQD).
+      //   4. Detect "src non-negative" — PSRAD src,31 gives 0 for non-neg
+      //      lanes; the FP sign bit IS the MSB.
+      //   5. Positive-overflow mask = (result == INT32_MIN) AND (src non-neg).
+      //      NaN-lanes-in-result are already 0 after step 2, so they don't
+      //      match INT32_MIN — naturally excluded.
+      //   6. Flip INT32_MIN → INT32_MAX in pos-overflow lanes via PXOR
+      //      with the all-1s mask (0x80000000 ^ 0xFFFFFFFF = 0x7FFFFFFF).
+      // Negative-overflow lanes need no fix-up — INT32_MIN is the correct
+      // ARM-saturated value.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10) { success_ = false; return; }  // FP64 deferred
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister x_dst = AllocTempSimdReg();
+        SimdRegister x_mask = AllocTempSimdReg();
+        SimdRegister x_eqmin = AllocTempSimdReg();
+        if (xn == no_simd_register || x_dst == no_simd_register ||
+            x_mask == no_simd_register || x_eqmin == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // 1. Primary conversion.
+        as_.Movdqa(x_dst, xn);
+        as_.Cvttps2dq(x_dst, x_dst);
+        // 2. NaN mask -> zero those lanes in x_dst.
+        as_.Movdqa(x_mask, xn);
+        as_.Cmpunordps(x_mask, x_mask);  // 1s in NaN lanes
+        as_.Pandn(x_mask, x_dst);         // x_mask = ~nan_mask & x_dst
+        as_.Movdqa(x_dst, x_mask);
+        // 3. Broadcast INT32_MIN constant.
+        as_.Pcmpeqd(x_mask, x_mask);
+        as_.Pslld(x_mask, int8_t{31});    // 0x80000000 per lane
+        // 4. result == INT32_MIN ?
+        as_.Movdqa(x_eqmin, x_dst);
+        as_.Pcmpeqd(x_eqmin, x_mask);
+        // 5. src non-negative ?  PSRAD by 31: 0 if non-neg, all-1s if neg.
+        as_.Movdqa(x_mask, xn);
+        as_.Psrad(x_mask, int8_t{31});    // 1s = negative
+        as_.Pandn(x_mask, x_eqmin);       // x_mask = ~neg & eqmin = pos-ovf
+        // 6. Flip INT_MIN -> INT_MAX in pos-overflow lanes.
+        as_.Pxor(x_dst, x_mask);
+        if (!args.q) mask_low64(x_dst);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
         if (args.is_fp16) {
           if (!host_platform::kHasF16C) { success_ = false; return; }
