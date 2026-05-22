@@ -3269,6 +3269,116 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtauV2dTiesAwayAndSat) {
 }
 // endregion
 
+// region digitalis - SCVTF / UCVTF V: vector int -> FP for .2S, .4S, .2D.
+constexpr uint32_t kScvtfV4s00 = 0x4E21D800;
+constexpr uint32_t kScvtfV2s00 = 0x0E21D800;
+constexpr uint32_t kScvtfV2d00 = 0x4E61D800;
+constexpr uint32_t kUcvtfV4s00 = 0x6E21D800;
+constexpr uint32_t kUcvtfV2s00 = 0x2E21D800;
+constexpr uint32_t kUcvtfV2d00 = 0x6E61D800;
+
+// SCVTF .4S: signed int32 -> FP32 in all four lanes.
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfV4sBasic) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0;
+  lanes[1] = 1;
+  lanes[2] = -1;
+  lanes[3] = INT32_MIN;  // -2^31
+  static const uint32_t code[] = {kScvtfV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<float*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0.0f);
+  EXPECT_EQ(out[1], 1.0f);
+  EXPECT_EQ(out[2], -1.0f);
+  EXPECT_EQ(out[3], -2147483648.0f);
+}
+
+// SCVTF .2S (Q=0): low 64 bits computed, upper 64 zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfV2sZeroesUpperHalf) {
+  state_.cpu.v[0] = 0;
+  auto* in = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  in[0] = 7;
+  in[1] = -42;
+  in[2] = 0x12345678;  // garbage; must be zeroed
+  in[3] = 0x7BADBEEF;
+  static const uint32_t code[] = {kScvtfV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<float*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 7.0f);
+  EXPECT_EQ(out[1], -42.0f);
+  auto* out_u = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out_u[2], 0u);
+  EXPECT_EQ(out_u[3], 0u);
+}
+
+// SCVTF .2D: signed int64 -> FP64.  2^53 (largest exact int53) round-trips
+// exactly; -2^53 also exact.
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfV2dBasic) {
+  state_.cpu.v[0] = 0;
+  auto* in = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  in[0] = int64_t{1} << 53;       // 9007199254740992
+  in[1] = -(int64_t{1} << 53);
+  static const uint32_t code[] = {kScvtfV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<double*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 9007199254740992.0);
+  EXPECT_EQ(out[1], -9007199254740992.0);
+}
+
+// UCVTF .4S: unsigned int32 -> FP32.  Values >= 2^31 require the MSB-set
+// addend (otherwise signed conversion would yield negative results).
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfV4sMsbAddend) {
+  state_.cpu.v[0] = 0;
+  auto* in = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  in[0] = 0u;
+  in[1] = 1u;
+  in[2] = uint32_t{1} << 31;     // 2^31, MSB just set
+  in[3] = UINT32_MAX;             // 2^32 - 1 (rounds up to 2^32 in FP32)
+  static const uint32_t code[] = {kUcvtfV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<float*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0.0f);
+  EXPECT_EQ(out[1], 1.0f);
+  EXPECT_EQ(out[2], 2147483648.0f);   // 2^31
+  // UINT32_MAX = 4294967295; nearest FP32 is 2^32 = 4294967296.0f.
+  EXPECT_EQ(out[3], 4294967296.0f);
+}
+
+// UCVTF .2S (Q=0): low 64 bits computed, upper 64 zeroed; also exercises
+// the unsigned MSB-addend path with bit31 set in lane 1.
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfV2sZeroesUpperHalf) {
+  state_.cpu.v[0] = 0;
+  auto* in = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  in[0] = 5u;
+  in[1] = uint32_t{1} << 31;     // 2^31
+  in[2] = 0xDEADBEEFu;
+  in[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kUcvtfV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<float*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 5.0f);
+  EXPECT_EQ(out[1], 2147483648.0f);
+  auto* out_u = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out_u[2], 0u);
+  EXPECT_EQ(out_u[3], 0u);
+}
+
+// UCVTF .2D: unsigned int64 -> FP64.  Exercises both the direct convert
+// (bit63 clear) and the halve|LSB round-to-odd path (bit63 set).
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfV2dBit63Set) {
+  state_.cpu.v[0] = 0;
+  auto* in = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  in[0] = uint64_t{1} << 63;      // 2^63, exactly representable
+  in[1] = UINT64_MAX;             // 2^64 - 1, rounds up to 2^64
+  static const uint32_t code[] = {kUcvtfV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<double*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 9223372036854775808.0);   // 2^63
+  EXPECT_EQ(out[1], 18446744073709551616.0);  // 2^64 (UINT64_MAX rounds up)
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

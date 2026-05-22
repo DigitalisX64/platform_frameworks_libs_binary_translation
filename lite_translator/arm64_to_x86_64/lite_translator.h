@@ -7181,6 +7181,122 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // Vector SCVTF / UCVTF (signed/unsigned integer -> FP).
+      //
+      // Encoding: opcode=11101, bit23=0 (bit23=1 is FRECPE / FRSQRTE).  The
+      // decoder forces bit23=0 for this case so `args.size & 0b10` is always
+      // 0; `args.size & 1` selects FP32 (.2S/.4S) vs FP64 (.2D).
+      //
+      // FP32 .2S / .4S:
+      //   SCVTF:  single Cvtdq2ps -- x86 signed int32 -> FP32 matches ARM.
+      //   UCVTF:  Cvtdq2ps treats the input as signed, so values with bit31
+      //           set come out as their negative two's-complement
+      //           equivalent.  Recover the unsigned representation by
+      //           per-lane adding 2^32 (FP32 bits 0x4F800000) wherever bit31
+      //           was set:
+      //             msb_mask = Psrad(xn, 31)      // 0 or all-1s
+      //             signed_fp = Cvtdq2ps(xn)
+      //             addend = (FP 2^32) & msb_mask   // 2^32 where MSB set
+      //             result = signed_fp + addend
+      //           For values < 2^31: msb_mask = 0, addend = 0, result =
+      //           signed_fp (correct).  For values >= 2^31: signed
+      //           interpretation = value - 2^32, so adding 2^32 recovers
+      //           the unsigned value.  2^32 = 4294967296.0 is exactly
+      //           representable in FP32 (single power of two).
+      //
+      // FP64 .2D (Q must be 1; .1D reserved):
+      //   SCVTF:  per-lane Cvtsi2sdq from memory.
+      //   UCVTF:  per-lane unsigned-int64 -> FP64 via the "halve | LSB"
+      //           round-to-odd trick (matches the scalar UCVTF Xd Dn JIT
+      //           lowering at the top of FpIntConversion).  For values
+      //           with bit63 clear the conversion is direct; for bit63 set
+      //           (negative as int64), halve the value (logical shr 1)
+      //           preserving the LSB via OR, convert as signed, then double
+      //           back via Addsd.  This avoids the Cvtsi2sdq overflow when
+      //           the input has bit63 set, and the LSB preservation keeps
+      //           the conversion correctly rounded.
+      // region digitalis
+      case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
+        if (args.is_fp16) { success_ = false; return; }
+        const bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV);
+        if ((args.size & 1) == 1) {
+          // ---------------- FP64 .2D path ----------------
+          if (!args.q) { success_ = false; return; }   // .1D reserved
+          SimdRegister xmm = AllocTempSimdReg();
+          if (xmm == no_simd_register) { success_ = false; return; }
+          if (!is_unsigned) {
+            // SCVTF V .2D: per-lane direct convert from memory.
+            for (int lane = 0; lane < 2; ++lane) {
+              as_.Cvtsi2sdq(
+                  xmm, {.base = Assembler::rbp, .disp = vn_off + lane * 8});
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                       xmm);
+            }
+            return;
+          }
+          // UCVTF V .2D: per-lane halve-OR-LSB trick for bit63-set values.
+          Register tmp = AllocTempReg();
+          Register low_bit = AllocTempReg();
+          if (tmp == no_register || low_bit == no_register) {
+            success_ = false; return;
+          }
+          for (int lane = 0; lane < 2; ++lane) {
+            as_.Movq(tmp,
+                     {.base = Assembler::rbp, .disp = vn_off + lane * 8});
+            Assembler::Label* neg_path = as_.MakeLabel();
+            Assembler::Label* done = as_.MakeLabel();
+            as_.Testq(tmp, tmp);
+            as_.Jcc(Assembler::Condition::kNegative, *neg_path);
+            as_.Cvtsi2sdq(xmm, tmp);
+            as_.Jmp(*done);
+            as_.Bind(neg_path);
+            as_.Movq(low_bit, tmp);
+            as_.Andq(low_bit, static_cast<int32_t>(1));
+            as_.Shrq(tmp, static_cast<int8_t>(1));
+            as_.Orq(tmp, low_bit);
+            as_.Cvtsi2sdq(xmm, tmp);
+            as_.Addsd(xmm, xmm);
+            as_.Bind(done);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                     xmm);
+          }
+          return;
+        }
+        // ---------------- FP32 .2S / .4S path ----------------
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (!is_unsigned) {
+          // SCVTF V: signed int32 -> FP32 is native.
+          as_.Cvtdq2ps(xn, xn);
+          if (!args.q) mask_low64(xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        // UCVTF V .2S/.4S: Cvtdq2ps + per-lane 2^32 addend for MSB-set
+        // lanes.  Bit-level: addend = (broadcast 0x4F800000) & psrad(xn, 31).
+        SimdRegister msb = AllocTempSimdReg();
+        SimdRegister addend = AllocTempSimdReg();
+        Register gp_tmp = AllocTempReg();
+        if (msb == no_simd_register || addend == no_simd_register ||
+            gp_tmp == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqa(msb, xn);
+        as_.Psrad(msb, int8_t{31});               // 0 or all-1s per lane
+        as_.Cvtdq2ps(xn, xn);                      // signed convert
+        as_.Movl(gp_tmp, int32_t{0x4F800000});      // 2^32 (FP32 bits)
+        as_.Movd(addend, gp_tmp);
+        as_.Pshufd(addend, addend, int8_t{0x00});
+        as_.Pand(addend, msb);                      // 2^32 where MSB set
+        as_.Addps(xn, addend);
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
         if (args.is_fp16) {
           if (!host_platform::kHasF16C) { success_ = false; return; }
