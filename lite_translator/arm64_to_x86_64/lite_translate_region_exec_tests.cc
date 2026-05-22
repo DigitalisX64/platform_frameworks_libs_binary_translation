@@ -6775,6 +6775,207 @@ TEST_F(Arm64LiteTranslateRegionTest, FmovScalarDoubleZeroExtends) {
 }
 // endregion
 
+// region digitalis - FP scalar arithmetic edges
+//
+// Scalar FP two-source ops (FpDataProc2 family).  Pins the architectural
+// behaviour of FADD / FSUB / FMUL / FDIV at S (ftype=00) and D (ftype=01)
+// precision for the IEEE-754 edge categories required by §D1's verify
+// gate: NaN propagation, ±Inf − ±Inf / ±0 × ±Inf invalid-op → default
+// NaN, ±0 sign handling under round-to-nearest-even, denormal arithmetic,
+// and the integer-zero divide → ±Inf result.  These exercise the JIT
+// emit path at `lite_translator.h:6632` (SSE Addss/Subss/Mulss/Divss
+// and the SD-form for D).
+//
+//   Encoding (FpDataProc2, M=0):
+//     0 0 0 11110 ftype 1 Rm opcode 10 Rn Rd
+//     ftype: 00 = S (FP32), 01 = D (FP64)
+//     opcode: 0000 FMUL, 0001 FDIV, 0010 FADD, 0011 FSUB
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e232841 fadd s1,s2,s3 / 1e632841 fadd d1,d2,d3
+//   1e233841 fsub s1,s2,s3 / 1e633841 fsub d1,d2,d3
+//   1e230841 fmul s1,s2,s3 / 1e630841 fmul d1,d2,d3
+//   1e231841 fdiv s1,s2,s3 / 1e631841 fdiv d1,d2,d3
+constexpr uint32_t FpBinaryScalar(uint32_t base, uint8_t rd, uint8_t rn,
+                                  uint8_t rm) {
+  return base | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E202800, rd, rn, rm);
+}
+constexpr uint32_t FaddD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E602800, rd, rn, rm);
+}
+constexpr uint32_t FsubS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E203800, rd, rn, rm);
+}
+constexpr uint32_t FsubD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E603800, rd, rn, rm);
+}
+// FmulS already defined at the top of the file (line 107).
+constexpr uint32_t FmulD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E600800, rd, rn, rm);
+}
+constexpr uint32_t FdivS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E201800, rd, rn, rm);
+}
+constexpr uint32_t FdivD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E601800, rd, rn, rm);
+}
+
+// FADD S — NaN operand poisons the result (quiet NaN propagates).
+TEST_F(Arm64LiteTranslateRegionTest, FaddSNanPropagates) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  StoreFp32(state_.cpu, 2, 1.0f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+  // Architectural zero-extend of V[0]'s upper 96 bits.
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FADD D — invalid-op (+∞ + −∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FaddDInfMinusInfIsNan) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  StoreFp64(state_.cpu, 2, -std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FaddD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FADD S — adding the smallest positive denormal to itself stays exact.
+TEST_F(Arm64LiteTranslateRegionTest, FaddSDenormalDoubles) {
+  const float denorm = std::numeric_limits<float>::denorm_min();
+  StoreFp32(state_.cpu, 1, denorm);
+  StoreFp32(state_.cpu, 2, denorm);
+  static const uint32_t code[] = {FaddS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), denorm + denorm);
+}
+
+// FADD D — round-to-nearest-even default: +0.0 + -0.0 = +0.0.
+TEST_F(Arm64LiteTranslateRegionTest, FaddDPosZeroPlusNegZeroIsPosZero) {
+  StoreFp64(state_.cpu, 1, +0.0);
+  StoreFp64(state_.cpu, 2, -0.0);
+  static const uint32_t code[] = {FaddD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const double res = LoadFp64(state_.cpu, 0);
+  EXPECT_EQ(res, 0.0);
+  EXPECT_FALSE(std::signbit(res));
+}
+
+// FSUB S — NaN on the RHS poisons the result.
+TEST_F(Arm64LiteTranslateRegionTest, FsubSSubtractNan) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, std::numeric_limits<float>::quiet_NaN());
+  static const uint32_t code[] = {FsubS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FSUB D — invalid-op (+∞ − +∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FsubDInfMinusInfIsNan) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  StoreFp64(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FsubD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FSUB S — +0.0 - +0.0 produces +0.0 under round-to-nearest-even.
+TEST_F(Arm64LiteTranslateRegionTest, FsubSPosZeroMinusPosZero) {
+  StoreFp32(state_.cpu, 1, +0.0f);
+  StoreFp32(state_.cpu, 2, +0.0f);
+  static const uint32_t code[] = {FsubS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const float res = LoadFp32(state_.cpu, 0);
+  EXPECT_EQ(res, 0.0f);
+  EXPECT_FALSE(std::signbit(res));
+}
+
+// FMUL S — invalid-op (0 × ∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmulSZeroTimesInfIsNan) {
+  StoreFp32(state_.cpu, 1, 0.0f);
+  StoreFp32(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FmulS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FMUL D — NaN × finite poisons the product.
+TEST_F(Arm64LiteTranslateRegionTest, FmulDNanTimesFinite) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::quiet_NaN());
+  StoreFp64(state_.cpu, 2, 2.0);
+  static const uint32_t code[] = {FmulD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FMUL S — denormal × 2 stays denormal (or barely above) and is exact.
+TEST_F(Arm64LiteTranslateRegionTest, FmulSDenormalTimesTwo) {
+  const float denorm = std::numeric_limits<float>::denorm_min();
+  StoreFp32(state_.cpu, 1, denorm);
+  StoreFp32(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FmulS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), denorm * 2.0f);
+}
+
+// FMUL D — invalid-op (-0 × +∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmulDNegZeroTimesPosInf) {
+  StoreFp64(state_.cpu, 1, -0.0);
+  StoreFp64(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FmulD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FDIV S — finite / +0 yields +∞ (divide-by-zero exception default result).
+TEST_F(Arm64LiteTranslateRegionTest, FdivSOneOverPosZeroIsPosInf) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, +0.0f);
+  static const uint32_t code[] = {FdivS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const float res = LoadFp32(state_.cpu, 0);
+  EXPECT_TRUE(std::isinf(res));
+  EXPECT_FALSE(std::signbit(res));
+}
+
+// FDIV D — −finite / +0 yields −∞ (sign propagates).
+TEST_F(Arm64LiteTranslateRegionTest, FdivDNegOneOverPosZeroIsNegInf) {
+  StoreFp64(state_.cpu, 1, -1.0);
+  StoreFp64(state_.cpu, 2, +0.0);
+  static const uint32_t code[] = {FdivD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const double res = LoadFp64(state_.cpu, 0);
+  EXPECT_TRUE(std::isinf(res));
+  EXPECT_TRUE(std::signbit(res));
+}
+
+// FDIV S — invalid-op (0 / 0) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FdivSZeroOverZeroIsNan) {
+  StoreFp32(state_.cpu, 1, +0.0f);
+  StoreFp32(state_.cpu, 2, +0.0f);
+  static const uint32_t code[] = {FdivS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FDIV D — invalid-op (+∞ / +∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FdivDInfOverInfIsNan) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  StoreFp64(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FdivD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
