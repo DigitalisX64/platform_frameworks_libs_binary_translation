@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 #include "../faulty_memory_accesses.h"
@@ -4199,6 +4200,8 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFabdV:
       // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
+      case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
+      case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
       // endregion
         {
         // region digitalis: FP16 vector lanes via float round-trip.
@@ -4283,6 +4286,12 @@ class Interpreter {
                 break;
               case Decoder::AdvSimdThreeSameOpcode::kFabdV:
                 rh = FpSingleToHalf(std::fabs(a - b)); break;
+              // region digitalis: FP16 vector FRECPS / FRSQRTS via FP32.
+              case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
+                rh = FpSingleToHalf(FrecpsScalar<float>(a, b)); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
+                rh = FpSingleToHalf(FrsqrtsScalar<float>(a, b)); break;
+              // endregion
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
@@ -4347,6 +4356,12 @@ class Interpreter {
               }
               case Decoder::AdvSimdThreeSameOpcode::kFabdV:
                 r = std::fabs(a - b); break;
+              // region digitalis
+              case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
+                r = FrecpsScalar<double>(a, b); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
+                r = FrsqrtsScalar<double>(a, b); break;
+              // endregion
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
@@ -4400,6 +4415,12 @@ class Interpreter {
               }
               case Decoder::AdvSimdThreeSameOpcode::kFabdV:
                 r = std::fabs(a - b); break;
+              // region digitalis
+              case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
+                r = FrecpsScalar<float>(a, b); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
+                r = FrsqrtsScalar<float>(a, b); break;
+              // endregion
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
@@ -5012,7 +5033,12 @@ class Interpreter {
       case Decoder::AdvSimdScalarThreeSameOpcode::kFcmge:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFacgt:
-      case Decoder::AdvSimdScalarThreeSameOpcode::kFacge: {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
+      // region digitalis
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts:
+      // endregion
+        {
         __uint128_t src_n = state_->cpu.v[args.rn];
         __uint128_t src_m = state_->cpu.v[args.rm];
         __uint128_t result = 0;
@@ -5054,6 +5080,17 @@ class Interpreter {
               r16 = (std::fabs(a) > std::fabs(b)) ? uint16_t{0xFFFF}
                                                   : uint16_t{0};
               break;
+            // region digitalis: FP16 scalar FRECPS / FRSQRTS — same widen/narrow
+            // round-trip pattern.  Compute the refinement step in FP32 (exact
+            // for any single FP16 op since FP32 strictly contains FP16's
+            // mantissa precision) then narrow back to FP16 via one rounding.
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps:
+              r16 = FpSingleToHalf(FrecpsScalar<float>(a, b));
+              break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts:
+              r16 = FpSingleToHalf(FrsqrtsScalar<float>(a, b));
+              break;
+            // endregion
             default:
               Undefined();
               return;
@@ -5088,6 +5125,18 @@ class Interpreter {
               r64 = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
             case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
               r64 = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
+            // region digitalis
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps: {
+              double d = FrecpsScalar<double>(a, b);
+              memcpy(&r64, &d, sizeof(r64));
+              break;
+            }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts: {
+              double d = FrsqrtsScalar<double>(a, b);
+              memcpy(&r64, &d, sizeof(r64));
+              break;
+            }
+            // endregion
             default: r64 = 0; break;
           }
           result = static_cast<__uint128_t>(r64);
@@ -5117,6 +5166,18 @@ class Interpreter {
               r32 = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFu : 0; break;
             case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
               r32 = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFu : 0; break;
+            // region digitalis
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps: {
+              float f = FrecpsScalar<float>(a, b);
+              memcpy(&r32, &f, sizeof(r32));
+              break;
+            }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts: {
+              float f = FrsqrtsScalar<float>(a, b);
+              memcpy(&r32, &f, sizeof(r32));
+              break;
+            }
+            // endregion
             default: r32 = 0; break;
           }
           result = static_cast<__uint128_t>(r32);
@@ -7303,6 +7364,44 @@ class Interpreter {
       return neg ? FpType{-2} : FpType{2};
     }
     return a * b;
+  }
+
+  // FRECPS scalar semantics: (2.0 - a*b), used as a Newton-Raphson refinement
+  // step after FRECPE.  Per ARM ARM C7.2.151 FRECPS:
+  //   - if either operand is NaN, the default NaN is returned
+  //   - if exactly one operand is ±0 and the other is ±inf, result is +2.0
+  //     (unsigned — unlike FMULX which preserves XOR sign)
+  //   - otherwise: FPRecipStepFused = FMA(-a, b, 2.0)  (single rounding)
+  template <typename FpType>
+  static FpType FrecpsScalar(FpType a, FpType b) {
+    if (std::isnan(a) || std::isnan(b)) {
+      return std::numeric_limits<FpType>::quiet_NaN();
+    }
+    if ((a == FpType{0} && std::isinf(b)) ||
+        (std::isinf(a) && b == FpType{0})) {
+      return FpType{2};
+    }
+    return std::fma(-a, b, FpType{2});
+  }
+
+  // FRSQRTS scalar semantics: (3.0 - a*b)/2, used as a Newton-Raphson
+  // refinement step after FRSQRTE.  Per ARM ARM C7.2.155 FRSQRTS:
+  //   - if either operand is NaN, the default NaN is returned
+  //   - if exactly one operand is ±0 and the other is ±inf, result is +1.5
+  //   - otherwise: FPRSqrtStepFused = FMA(-a, b, 3.0) / 2  (FMA single rounding,
+  //     then divide-by-two is exact since it's just an exponent decrement for
+  //     non-denormals; for denormals the divide-by-two is also exact in IEEE
+  //     binary FP)
+  template <typename FpType>
+  static FpType FrsqrtsScalar(FpType a, FpType b) {
+    if (std::isnan(a) || std::isnan(b)) {
+      return std::numeric_limits<FpType>::quiet_NaN();
+    }
+    if ((a == FpType{0} && std::isinf(b)) ||
+        (std::isinf(a) && b == FpType{0})) {
+      return FpType{1.5};
+    }
+    return std::fma(-a, b, FpType{3}) / FpType{2};
   }
   // endregion
 
