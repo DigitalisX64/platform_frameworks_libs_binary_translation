@@ -1252,7 +1252,15 @@ class Decoder {
     uint8_t rd;
     uint8_t rn;
     uint8_t rm;
-    uint8_t size;   // integer: full size field; FP: 0 -> S (32-bit), 1 -> D (64-bit)
+    uint8_t size;   // integer: full size field; FP: 0 -> S (32-bit), 1 -> D (64-bit);
+                    // FP16 scalar three-same: 0 (unused — interpreter checks is_fp16).
+    // region digitalis: Armv8.2-FP16 scalar three-same.  When true, the
+    // interpreter reads the low 16 bits of Vn/Vm as binary16 and performs
+    // a widen-op-narrow round-trip through FP32 (FpHalfToSingle ->
+    // semantic helper -> FpSingleToHalf).  Bit-exact for the FMULX
+    // saturation case because ±2.0 is exactly representable in FP16.
+    bool is_fp16 = false;
+    // endregion
   };
 
   // AdvSIMD scalar pairwise opcodes.
@@ -2489,6 +2497,25 @@ class Decoder {
       DecodeAdvSimdScalarThreeSame();
       return;
     }
+
+    // region digitalis: Armv8.2-FP16 scalar three-same.
+    // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
+    //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
+    // i.e. bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=a, bit22=1,
+    //      bit21=0, bits[15:14]=00, bits[13:11]=opcode_3, bit10=1.
+    // Must precede the FpFixedPointConversion check below, which would
+    // otherwise misroute this encoding (FpFixedPointConversion only gates
+    // on bits[28:24]=11110 && !bit21 — it doesn't constrain bit30, even
+    // though its own encoding requires bit30=0).
+    // Distinct from std scalar three-same (bit21=1 there, =0 here) and
+    // from scalar copy (bits[23:21]=000 there; bits[23:21]=`a 1 0` here).
+    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
+        GetBits<22, 1>() && !GetBits<21, 1>() &&
+        !GetBits<15, 1>() && !GetBits<14, 1>() && GetBits<10, 1>()) {
+      DecodeAdvSimdScalarFp16ThreeSame();
+      return;
+    }
+    // endregion
 
     // region digitalis
     // Cryptographic three-register SHA (SHA1C/SHA1P/SHA1M/SHA1SU0,
@@ -3832,6 +3859,61 @@ class Decoder {
         .is_fp16 = true,
     };
     insn_consumer_->AdvSimdThreeSame(args);
+  }
+  // endregion
+
+  // region digitalis: Armv8.2-FP16 scalar three-same.
+  // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
+  //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
+  // where a = bit23, opcode_3 = bits[13:11] (3 bits).
+  // Opcode table (the scalar-allocated subset; cells marked "—" are
+  // reserved/Undefined in the scalar encoding):
+  //   a=0,U=0,op=011  FMULX   (saturation: ±0 * ±inf -> ±2.0)
+  //   a=0,U=0,op=100  FCMEQ
+  //   a=0,U=0,op=111  FRECPS  (interpreter not implemented yet)
+  //   a=1,U=0,op=111  FRSQRTS (interpreter not implemented yet)
+  //   a=0,U=1,op=100  FCMGE
+  //   a=0,U=1,op=101  FACGE
+  //   a=1,U=1,op=010  FABD
+  //   a=1,U=1,op=100  FCMGT
+  //   a=1,U=1,op=101  FACGT
+  // This cycle wires FMULX only (the handoff-105 follow-up); the other
+  // opcodes route to Undefined() until their interpreter handlers are
+  // grown.  Reuses the std AdvSimdScalarThreeSameOpcode enum with the
+  // is_fp16=true flag, mirroring the FP16 vector three-same pattern.
+  void DecodeAdvSimdScalarFp16ThreeSame() {
+    bool u = GetBits<29, 1>();
+    bool a = GetBits<23, 1>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t opcode_3 = GetBits<11, 3>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    AdvSimdScalarThreeSameOpcode op;
+    bool ok = false;
+    if (!u && !a) {
+      // FMULX FP16 (the cycle's primary target).
+      if (opcode_3 == 0b011) {
+        op = AdvSimdScalarThreeSameOpcode::kFmulx;
+        ok = true;
+      }
+    }
+    // Other allocations (FCMEQ/FCMGE/FCMGT/FABD/FACGE/FACGT/FRECPS/FRSQRTS
+    // FP16 scalar) are reserved until their interpreter handlers land.
+    if (!ok) {
+      Undefined();
+      return;
+    }
+
+    const AdvSimdScalarThreeSameArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .size = 0,         // unused for FP16 path (interpreter checks is_fp16).
+        .is_fp16 = true,
+    };
+    insn_consumer_->AdvSimdScalarThreeSame(args);
   }
   // endregion
 

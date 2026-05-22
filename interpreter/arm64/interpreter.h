@@ -5016,6 +5016,31 @@ class Interpreter {
         __uint128_t src_n = state_->cpu.v[args.rn];
         __uint128_t src_m = state_->cpu.v[args.rm];
         __uint128_t result = 0;
+        // region digitalis: FP16 scalar three-same — widen/narrow round-trip
+        // through FP32.  Bit-exact for the FMULX ±2.0 saturation case
+        // because ±2.0 is exactly representable in FP16.  Only FMULX is
+        // wired in this cycle (handoff-105 follow-up); other FP16 scalar
+        // three-same opcodes route to Undefined via the decoder.
+        if (args.is_fp16) {
+          uint16_t hn = static_cast<uint16_t>(src_n);
+          uint16_t hm = static_cast<uint16_t>(src_m);
+          float a = FpHalfToSingle(hn);
+          float b = FpHalfToSingle(hm);
+          uint16_t r16 = 0;
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFmulx: {
+              float f = FmulxScalar<float>(a, b);
+              r16 = FpSingleToHalf(f);
+              break;
+            }
+            default:
+              Undefined();
+              return;
+          }
+          state_->cpu.v[args.rd] = static_cast<__uint128_t>(r16);
+          return;
+        }
+        // endregion
         if (args.size == 1) {
           double a, b;
           memcpy(&a, &src_n, sizeof(a));
