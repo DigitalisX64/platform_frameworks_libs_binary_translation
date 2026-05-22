@@ -4196,7 +4196,11 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFcmgtV:
       case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
       case Decoder::AdvSimdThreeSameOpcode::kFacgtV:
-      case Decoder::AdvSimdThreeSameOpcode::kFabdV: {
+      case Decoder::AdvSimdThreeSameOpcode::kFabdV:
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
+      // endregion
+        {
         // region digitalis: FP16 vector lanes via float round-trip.
         // Promote each 2-byte half to binary32, do the op in binary32 (which
         // is exact for any single FP16 op because binary32's 24-bit mantissa
@@ -4221,6 +4225,10 @@ class Interpreter {
                 rh = FpSingleToHalf(a - b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulV:
                 rh = FpSingleToHalf(a * b); break;
+              // region digitalis
+              case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
+                rh = FpSingleToHalf(FmulxScalar<float>(a, b)); break;
+              // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFdivV:
                 rh = FpSingleToHalf(a / b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: {
@@ -4295,6 +4303,10 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFaddV: r = a + b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFsubV: r = a - b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
+              // region digitalis
+              case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
+                r = FmulxScalar<double>(a, b); break;
+              // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
               // FMAX/FMIN: IEEE 754-2008 max/min — if either is NaN, result is NaN.
@@ -4347,6 +4359,10 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFaddV: r = a + b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFsubV: r = a - b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
+              // region digitalis
+              case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
+                r = FmulxScalar<float>(a, b); break;
+              // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
@@ -6186,6 +6202,11 @@ class Interpreter {
           case Decoder::AdvSimdVecXIdxOpcode::kFmul:
             r = n * m_indexed;
             break;
+          // region digitalis
+          case Decoder::AdvSimdVecXIdxOpcode::kFmulx:
+            r = FmulxScalar<float>(n, m_indexed);
+            break;
+          // endregion
           default:
             Undefined();
             return;
@@ -6228,6 +6249,13 @@ class Interpreter {
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
             break;
           }
+          // region digitalis
+          case Decoder::AdvSimdVecXIdxOpcode::kFmulx: {
+            float r = FmulxScalar<float>(src, indexed);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+            break;
+          }
+          // endregion
           default:
             Undefined();
             return;
@@ -6263,6 +6291,13 @@ class Interpreter {
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
             break;
           }
+          // region digitalis
+          case Decoder::AdvSimdVecXIdxOpcode::kFmulx: {
+            double r = FmulxScalar<double>(src, indexed);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
+            break;
+          }
+          // endregion
           default:
             Undefined();
             return;
@@ -7197,6 +7232,22 @@ class Interpreter {
     }
     return sign | static_cast<uint16_t>((exp + 15) << 10) | static_cast<uint16_t>(frac >> 13);
   }
+
+  // region digitalis
+  // FMULX scalar semantics, parameterized by FP type.  Same as a * b except
+  // the (zero * infinity) saturation case is replaced by ±2.0 (sign = sign of
+  // a XOR sign of b), per ARM ARM C7.2.149 FMULX.  Standard FP NaN
+  // propagation otherwise.
+  template <typename FpType>
+  static FpType FmulxScalar(FpType a, FpType b) {
+    if ((a == FpType{0} && std::isinf(b)) ||
+        (std::isinf(a) && b == FpType{0})) {
+      bool neg = std::signbit(a) ^ std::signbit(b);
+      return neg ? FpType{-2} : FpType{2};
+    }
+    return a * b;
+  }
+  // endregion
 
   static float FpHalfToSingle(uint16_t h) {
     uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;

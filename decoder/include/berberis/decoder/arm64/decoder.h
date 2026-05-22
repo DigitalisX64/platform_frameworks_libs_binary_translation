@@ -892,6 +892,13 @@ class Decoder {
     kFacgeV,    // FACGE  (vector): op_high=0, opcode=11101, U=1
     kFacgtV,    // FACGT  (vector): op_high=1, opcode=11101, U=1
     kFabdV,     // FABD   (vector): op_high=1, opcode=11010, U=1
+    // region digitalis
+    kFmulxV,    // FMULX  (vector): op_high=0, opcode=11011, U=0
+                // FP16-three-same encoding: a=0, opcode_3=011, U=0.
+                // Same as kFmulV but with the ARM-defined ±0 * ±inf -> ±2.0
+                // saturation (instead of NaN), used by libm reciprocal
+                // refinement loops.  Interpreter-only.
+    // endregion
     // endregion
   };
 
@@ -1308,6 +1315,10 @@ class Decoder {
     kFmla,    // FMLA (by element)
     kFmls,    // FMLS (by element)
     kFmul,    // FMUL (by element)
+    // region digitalis
+    kFmulx,   // FMULX (by element): U=1, opcode=1001.  Same lane semantics as
+              // kFmul except (±0 * ±inf) lanes return ±2.0 instead of NaN.
+    // endregion
     kMul,     // MUL (by element)
     kMla,     // MLA (by element)
     kMls,     // MLS (by element)
@@ -3769,9 +3780,12 @@ class Decoder {
           case 0b000: op = AdvSimdThreeSameOpcode::kFmaxnmV; ok = true; break;
           case 0b001: op = AdvSimdThreeSameOpcode::kFmlaV;   ok = true; break;
           case 0b010: op = AdvSimdThreeSameOpcode::kFaddV;   ok = true; break;
+          // region digitalis: FP16 FMULX (a=0, U=0, opcode_3=011).
+          case 0b011: op = AdvSimdThreeSameOpcode::kFmulxV;  ok = true; break;
+          // endregion
           case 0b100: op = AdvSimdThreeSameOpcode::kFcmeqV;  ok = true; break;
           case 0b110: op = AdvSimdThreeSameOpcode::kFmaxV;   ok = true; break;
-          default: break;  // 011 FMULX, 101 reserved, 111 FRECPS — Undefined.
+          default: break;  // 101 reserved, 111 FRECPS — Undefined.
         }
       } else {
         switch (opcode_3) {
@@ -4013,8 +4027,12 @@ class Decoder {
             op = AdvSimdThreeSameOpcode::kFaddV;
             break;
           case 0b11011:
-            if (!u) { ok = false; break; }  // FMULX not implemented
-            op = AdvSimdThreeSameOpcode::kFmulV;
+            // region digitalis: U=0 -> FMULX (kFmulxV), U=1 -> FMUL (kFmulV).
+            // Previously U=0 routed to ok=false; the interpreter now grows
+            // the FMULX special case (±0 * ±inf -> ±2.0) so we can dispatch.
+            op = u ? AdvSimdThreeSameOpcode::kFmulV
+                   : AdvSimdThreeSameOpcode::kFmulxV;
+            // endregion
             break;
           case 0b11001:
             if (u) { ok = false; break; }   // U=1 reserved here
@@ -4970,28 +4988,15 @@ class Decoder {
         op = AdvSimdVecXIdxOpcode::kFmls;
         break;
       case 0b1001:
-        // region digitalis follow-up (handoff-68): reject FMULX-by-
-        // element until the interpreter implements it.  Per ARM ARM C7.2
+        // region digitalis: FMUL/FMULX by element.  Per ARM ARM C7.2
         // AdvSIMD-vector-x-indexed-element:
-        //   U=0, opcode=1001 -> FMUL  (by element) — kept as kFmul.
-        //   U=1, opcode=1001 -> FMULX (by element, Armv8.2-FP — multiply-extended
-        //     with NaN-preserving semantics: FMULX(±0, ±inf) = ±2.0 rather than
-        //     NaN, used by libm reciprocal-estimate refinements).
-        // The previous code (`u ? kFmul : kFmul`) was a tautology that silently
-        // routed FMULX to FMUL.  Same family as the handoff-67 fix at
-        // case 0b1000: silent wrong-result decoding is worse than a SIGILL —
-        // an FMULX whose input includes a ±0/±inf pair will produce a NaN
-        // under kFmul vs the ARM-required ±2.0, breaking libm reciprocal
-        // refinement loops.  No current sample emits FMULX (NDK clang doesn't
-        // generate it by default; libm uses VFMUL not VFMULX in the shipped
-        // bionic), so flipping to Undefined() is forward-compatible.
-        // Implementing FMULX in the interpreter is the next-cycle follow-up
-        // when a sample needs it.
-        if (u) {
-          Undefined();
-          return;
-        }
-        op = AdvSimdVecXIdxOpcode::kFmul;
+        //   U=0, opcode=1001 -> FMUL  (by element) -> kFmul.
+        //   U=1, opcode=1001 -> FMULX (by element, Armv8.2-FP) -> kFmulx.
+        // FMULX differs from FMUL only in the ±0 * ±inf saturation case (it
+        // produces ±2.0 rather than NaN), used by libm reciprocal-estimate
+        // refinement loops.  Interpreter implements both via FmulxScalar.
+        op = u ? AdvSimdVecXIdxOpcode::kFmulx
+               : AdvSimdVecXIdxOpcode::kFmul;
         break;
         // endregion
       case 0b1000:
