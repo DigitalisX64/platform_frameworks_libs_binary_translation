@@ -80,6 +80,8 @@ constexpr uint8_t kCondEQ = 0;
 constexpr uint8_t kCondNE = 1;
 constexpr uint8_t kCondCS = 0x2;
 constexpr uint8_t kCondCC = 0x3;
+constexpr uint8_t kCondMI = 0x4;
+constexpr uint8_t kCondPL = 0x5;
 constexpr uint8_t kCondHI = 0x8;
 constexpr uint8_t kCondLS = 0x9;
 constexpr uint8_t kCondGE = 0xA;
@@ -6323,6 +6325,133 @@ TEST_F(Arm64LiteTranslateRegionTest, FcselSLeTrueViaZ) {
   };
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(LoadFp32(state_.cpu, 0), 7.0f);
+}
+
+// FCSEL S — NE taken (Z=0): Vd = Vn.  Also asserts V[rd] high 96 bits
+// are zero (Movss into a pre-PXOR-cleared register, then 128-bit
+// Movdqu store).
+TEST_F(Arm64LiteTranslateRegionTest, FcselSNeTrueZeroExtendsVd) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  StoreFp32(state_.cpu, 2, 2.5f);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // Z=0 (result 5-10=-5) -> NE true
+      FcselS(0, 1, 2, kCondNE),      // NE -> Vd = Vn (1.5f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.5f);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 4; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselSNeFalse) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  StoreFp32(state_.cpu, 2, 2.5f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> NE false
+      FcselS(0, 1, 2, kCondNE),      // NE -> Vd = Vm (2.5f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.5f);
+}
+
+// FCSEL D — MI taken (N=1): Vd = Vn.  Pins FCSEL D's high-64-bit zero
+// extend on the V[rn] (TRUE) load path; Movsd into the XMM clears the
+// upper 64 bits, then the 128-bit Movdqu writes both lanes to V[rd].
+TEST_F(Arm64LiteTranslateRegionTest, FcselDMiTrueZeroExtendsVd) {
+  StoreFp64(state_.cpu, 1, 3.14159);
+  StoreFp64(state_.cpu, 2, 2.71828);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // N=1 (negative result) -> MI true
+      FcselD(0, 1, 2, kCondMI),      // MI -> Vd = Vn (3.14159)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.14159);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselDMiFalse) {
+  StoreFp64(state_.cpu, 1, 3.14159);
+  StoreFp64(state_.cpu, 2, 2.71828);
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),                 // N=0 (positive result) -> MI false
+      FcselD(0, 1, 2, kCondMI),      // MI -> Vd = Vm (2.71828)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.71828);
+}
+
+// FCSEL S — PL taken (N=0): Vd = Vn.
+TEST_F(Arm64LiteTranslateRegionTest, FcselSPlTrue) {
+  StoreFp32(state_.cpu, 1, 11.0f);
+  StoreFp32(state_.cpu, 2, 22.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),                 // N=0 (positive result) -> PL true
+      FcselS(0, 1, 2, kCondPL),      // PL -> Vd = Vn (11.0f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 11.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselSPlFalse) {
+  StoreFp32(state_.cpu, 1, 11.0f);
+  StoreFp32(state_.cpu, 2, 22.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // N=1 (negative result) -> PL false
+      FcselS(0, 1, 2, kCondPL),      // PL -> Vd = Vm (22.0f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 22.0f);
+}
+
+// FCSEL D — EQ taken: pins FCSEL D's high-64-bit zero extend on the
+// V[rn] (TRUE) load path under the EQ encoding (the existing
+// FcselSEqTrueZeroExtendsVd covers the S form; this completes the
+// symmetric pin at the D form).
+TEST_F(Arm64LiteTranslateRegionTest, FcselDEqTrueZeroExtendsVd) {
+  StoreFp64(state_.cpu, 1, 1.5);
+  StoreFp64(state_.cpu, 2, 2.5);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> EQ true
+      FcselD(0, 1, 2, kCondEQ),      // EQ -> Vd = Vn (1.5)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 1.5);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+// FCSEL D — NE false: pins FCSEL D's high-64-bit zero extend on the
+// V[rm] (FALSE default) load path -- the JIT emits the V[rm] Movsd
+// before the condition switch, so a FALSE outcome exercises a distinct
+// register-write arm from the TRUE-overwrite path pinned above.
+TEST_F(Arm64LiteTranslateRegionTest, FcselDNeFalseZeroExtendsVd) {
+  StoreFp64(state_.cpu, 1, 1.5);
+  StoreFp64(state_.cpu, 2, 2.5);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> NE false
+      FcselD(0, 1, 2, kCondNE),      // NE -> Vd = Vm (2.5)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.5);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
 }
 // endregion
 
