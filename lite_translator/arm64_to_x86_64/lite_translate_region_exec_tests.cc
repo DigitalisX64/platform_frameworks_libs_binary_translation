@@ -6183,6 +6183,149 @@ TEST_F(Arm64LiteTranslateRegionTest, MulVsMlaIdxDispatch) {
 }
 // endregion
 
+// region digitalis - FCSEL JIT
+//
+// FCSEL Sd|Dd|Hd, Sn, Sm, cond
+//   Encoding: 0001 1110 <ftype:2> 1 Rm cond 11 Rn Rd
+//   ftype: 00 = S (FP32), 01 = D (FP64), 11 = H (FP16).
+//   Base: 0x1E200C00 (S) / 0x1E600C00 (D) / 0x1EE00C00 (H).
+constexpr uint32_t FcselScalar(uint32_t base, uint8_t rd, uint8_t rn,
+                               uint8_t rm, uint8_t cond) {
+  return base | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcselS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return FcselScalar(0x1E200C00, rd, rn, rm, cond);
+}
+constexpr uint32_t FcselD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return FcselScalar(0x1E600C00, rd, rn, rm, cond);
+}
+constexpr uint32_t FcselH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return FcselScalar(0x1EE00C00, rd, rn, rm, cond);
+}
+
+// Helpers to seed V registers with scalar FP values, preserving the
+// 128-bit alignment expected by the FCSEL store path.
+void StoreFp32(CPUState& cpu, uint8_t v, float val) {
+  cpu.v[v] = 0;
+  std::memcpy(&cpu.v[v], &val, sizeof(val));
+}
+void StoreFp64(CPUState& cpu, uint8_t v, double val) {
+  cpu.v[v] = 0;
+  std::memcpy(&cpu.v[v], &val, sizeof(val));
+}
+void StoreFp16Bits(CPUState& cpu, uint8_t v, uint16_t bits) {
+  cpu.v[v] = 0;
+  std::memcpy(&cpu.v[v], &bits, sizeof(bits));
+}
+float LoadFp32(const CPUState& cpu, uint8_t v) {
+  float val;
+  std::memcpy(&val, &cpu.v[v], sizeof(val));
+  return val;
+}
+double LoadFp64(const CPUState& cpu, uint8_t v) {
+  double val;
+  std::memcpy(&val, &cpu.v[v], sizeof(val));
+  return val;
+}
+uint16_t LoadFp16Bits(const CPUState& cpu, uint8_t v) {
+  uint16_t bits;
+  std::memcpy(&bits, &cpu.v[v], sizeof(bits));
+  return bits;
+}
+
+// FCSEL S — EQ taken: Z=1 -> Vd = Vn.  Also confirms V[rd] high lanes
+// are zeroed (the architectural requirement we satisfy by emitting a
+// 128-bit MOVDQU off an XMM whose upper lanes were cleared by MOVSS).
+TEST_F(Arm64LiteTranslateRegionTest, FcselSEqTrueZeroExtendsVd) {
+  StoreFp32(state_.cpu, 1, 1.25f);
+  StoreFp32(state_.cpu, 2, 2.5f);
+  // Pre-pollute V[0] high lanes; FCSEL must zero them.
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1
+      FcselS(0, 1, 2, kCondEQ),      // EQ -> Vd = Vn (1.25f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.25f);
+  // High 96 bits of V[0] must be zero.
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 4; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselSEqFalse) {
+  StoreFp32(state_.cpu, 1, 1.25f);
+  StoreFp32(state_.cpu, 2, 2.5f);
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),                 // Z=0
+      FcselS(0, 1, 2, kCondEQ),      // EQ -> Vd = Vm (2.5f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.5f);
+}
+
+// FCSEL D — LT taken (N=1, V=0 -> N!=V).
+TEST_F(Arm64LiteTranslateRegionTest, FcselDLtTrue) {
+  StoreFp64(state_.cpu, 1, 3.14159);
+  StoreFp64(state_.cpu, 2, 2.71828);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // N=1, V=0 -> LT true
+      FcselD(0, 1, 2, kCondLT),      // LT -> Vd = Vn (3.14159)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.14159);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcselDGeFalse) {
+  StoreFp64(state_.cpu, 1, 3.14159);
+  StoreFp64(state_.cpu, 2, 2.71828);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                // N=1, V=0 -> GE false
+      FcselD(0, 1, 2, kCondGE),      // GE -> Vd = Vm (2.71828)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.71828);
+}
+
+// FCSEL H — HI taken (C=1, Z=0): exercises the FP16 PXOR+PINSRW load.
+TEST_F(Arm64LiteTranslateRegionTest, FcselHHiTrue) {
+  // Binary16: 0x3C00 = 1.0h, 0x4000 = 2.0h.
+  StoreFp16Bits(state_.cpu, 1, 0x3C00);
+  StoreFp16Bits(state_.cpu, 2, 0x4000);
+  state_.cpu.v[0] = static_cast<__uint128_t>(0xdeadbeefcafebabeULL) << 64;
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),                 // C=1, Z=0 -> HI true
+      FcselH(0, 1, 2, kCondHI),      // HI -> Vd = Vn (0x3C00)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), 0x3C00u);
+  uint8_t bytes[16];
+  std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
+  for (int i = 2; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
+}
+
+// FCSEL S — LE taken via Z=1 (compound condition where the kLs/kLe
+// shortcut early-binds true_path).
+TEST_F(Arm64LiteTranslateRegionTest, FcselSLeTrueViaZ) {
+  StoreFp32(state_.cpu, 1, 7.0f);
+  StoreFp32(state_.cpu, 2, 9.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                 // Z=1 -> LE true via the Z-branch
+      FcselS(0, 1, 2, kCondLE),      // LE -> Vd = Vn (7.0f)
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 7.0f);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

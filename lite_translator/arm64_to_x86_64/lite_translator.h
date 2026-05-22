@@ -2423,10 +2423,169 @@ class LiteTranslator {
   }
 
   // region digitalis
-  // FCSEL: fall back to interpreter (condition flag checking complex in JIT)
-  void FpCondSelect(uint8_t /*rd*/, uint8_t /*rn*/, uint8_t /*rm*/,
-                    uint8_t /*ftype*/, Decoder::Condition /*cond*/) {
-    success_ = false;  // interpreter fallback
+  // FCSEL Sd|Dd|Hd, Sn|Dn|Hn, Sm|Dm|Hm, cond.
+  //   if ConditionHolds(cond) then result = V[rn] else result = V[rm];
+  //   V[rd] = ZeroExtend(result, 128);
+  // ftype: 00 = S (FP32), 01 = D (FP64), 11 = H (FP16).  Encoding 10 is
+  // reserved on ARM64 -- bail to the interpreter for safety.
+  //
+  // The chosen value is loaded into an XMM with the high lanes zero-
+  // extended: MOVSS / MOVSD do this naturally; for FP16 the register is
+  // first cleared with PXOR before PINSRW.  A 128-bit MOVDQU then writes
+  // V[rd], matching the interpreter's `state_->cpu.v[rd] = 0` followed
+  // by a sized partial copy.
+  //
+  // The condition switch mirrors ConditionalSelect() exactly (bit 14=Z,
+  // 15=N, 8=C, 0=V in ThreadState::cpu.flags) -- the convention is "jump
+  // to `done` if the condition is FALSE" so the fall-through path loads
+  // V[rn] (the true case).
+  void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm,
+                    uint8_t ftype, Decoder::Condition cond) {
+    if (ftype != 0b00 && ftype != 0b01 && ftype != 0b11) {
+      success_ = false;
+      return;
+    }
+
+    SimdRegister xmm = AllocTempSimdReg();
+    if (xmm == no_simd_register) { success_ = false; return; }
+    Register flags_reg = AllocTempReg();
+    if (flags_reg == no_register) { success_ = false; return; }
+
+    const int32_t v_rn_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+    const int32_t v_rm_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    const int32_t v_rd_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+    const int32_t flags_off = offsetof(ThreadState, cpu.flags);
+
+    auto load_fp = [&](int32_t off) {
+      switch (ftype) {
+        case 0b00:
+          as_.Movss(xmm, {.base = Assembler::rbp, .disp = off});
+          break;
+        case 0b01:
+          as_.Movsd(xmm, {.base = Assembler::rbp, .disp = off});
+          break;
+        case 0b11:
+          as_.Pxor(xmm, xmm);
+          as_.Pinsrw(xmm, {.base = Assembler::rbp, .disp = off}, int8_t{0});
+          break;
+      }
+    };
+
+    // Default: load V[rm] (the condition-FALSE result).
+    load_fp(v_rm_off);
+
+    // Read NZCV (low 16 bits of ThreadState::cpu.flags).
+    as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = flags_off});
+
+    Assembler::Label* done = as_.MakeLabel();
+
+    switch (cond) {
+      case Decoder::Condition::kEq:
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kNe:
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kCs:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kCc:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kMi:
+        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kPl:
+        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kVs:
+        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kVc:
+        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kHi:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kLs: {
+        Assembler::Label* true_path = as_.MakeLabel();
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *true_path);
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Bind(true_path);
+        break;
+      }
+      case Decoder::Condition::kGe: {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kLt: {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kGt: {
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kLe: {
+        Assembler::Label* true_path = as_.MakeLabel();
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *true_path);
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Bind(true_path);
+        break;
+      }
+      case Decoder::Condition::kAl:
+      case Decoder::Condition::kNv:
+        // Reserved encodings on FCSEL; ConditionalSelect treats them
+        // as always-true (fall through to the V[rn] override).
+        break;
+    }
+
+    // Condition TRUE: overwrite with V[rn].
+    load_fp(v_rn_off);
+
+    as_.Bind(done);
+
+    as_.Movdqu({.base = Assembler::rbp, .disp = v_rd_off}, xmm);
   }
 
   // FP <-> fixed-point conversion: fall back to interpreter
