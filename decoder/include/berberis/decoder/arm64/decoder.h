@@ -1241,6 +1241,9 @@ class Decoder {
     kFcmeq,   // FCMEQ (scalar, FP): U=0, bit23=0, opcode=11100
     kFacgt,   // FACGT (scalar, FP): U=1, bit23=1, opcode=11101
     kFacge,   // FACGE (scalar, FP): U=1, bit23=0, opcode=11101
+    kFmulx,   // FMULX (scalar, FP): U=0, bit23=1, opcode=11011.
+              // Identical to FMUL except (±0 * ±inf) lanes return ±2.0
+              // instead of NaN — see Interpreter::FmulxScalar<>.
     // endregion
   };
 
@@ -4508,8 +4511,10 @@ class Decoder {
 
     // FP scalar three-same opcodes live in the same encoding class but the
     // size field is interpreted as bit23=Fp-discriminator (1), bit22=sz.
-    // Distinguish FP by opcode: 11010 (FABD), 11100 (FCMxx), 11101 (FAC..).
-    if (opcode == 0b11010 || opcode == 0b11100 || opcode == 0b11101) {
+    // Distinguish FP by opcode: 11010 (FABD), 11011 (FMULX), 11100 (FCMxx),
+    // 11101 (FAC..).
+    if (opcode == 0b11010 || opcode == 0b11011 || opcode == 0b11100 ||
+        opcode == 0b11101) {
       is_fp = true;
       bool bit23 = (size >> 1) & 1;
       uint8_t sz = size & 1;  // 0 -> S, 1 -> D
@@ -4517,6 +4522,12 @@ class Decoder {
         case 0b11010:
           if (!u || !bit23) { Undefined(); return; }
           op = AdvSimdScalarThreeSameOpcode::kFabd;
+          break;
+        case 0b11011:
+          // FMULX (scalar): U=0, bit23=1, opcode=11011. Other combinations of
+          // (U, bit23) at opcode=11011 are unallocated in the scalar encoding.
+          if (!u && bit23) op = AdvSimdScalarThreeSameOpcode::kFmulx;
+          else { Undefined(); return; }
           break;
         case 0b11100:
           if (u && bit23) op = AdvSimdScalarThreeSameOpcode::kFcmgt;

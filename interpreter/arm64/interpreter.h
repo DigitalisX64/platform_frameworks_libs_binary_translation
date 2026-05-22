@@ -5007,6 +5007,7 @@ class Interpreter {
     // FP scalar ops: dispatch separately because size encodes S (0) vs D (1).
     switch (args.opcode) {
       case Decoder::AdvSimdScalarThreeSameOpcode::kFabd:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kFmulx:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFcmge:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
@@ -5023,6 +5024,11 @@ class Interpreter {
           switch (args.opcode) {
             case Decoder::AdvSimdScalarThreeSameOpcode::kFabd: {
               double d = std::fabs(a - b);
+              memcpy(&r64, &d, sizeof(r64));
+              break;
+            }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFmulx: {
+              double d = FmulxScalar<double>(a, b);
               memcpy(&r64, &d, sizeof(r64));
               break;
             }
@@ -5047,6 +5053,11 @@ class Interpreter {
           switch (args.opcode) {
             case Decoder::AdvSimdScalarThreeSameOpcode::kFabd: {
               float f = std::fabs(a - b);
+              memcpy(&r32, &f, sizeof(r32));
+              break;
+            }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFmulx: {
+              float f = FmulxScalar<float>(a, b);
               memcpy(&r32, &f, sizeof(r32));
               break;
             }
