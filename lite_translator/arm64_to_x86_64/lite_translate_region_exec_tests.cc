@@ -6326,6 +6326,878 @@ TEST_F(Arm64LiteTranslateRegionTest, FcselSLeTrueViaZ) {
 }
 // endregion
 
+// region digitalis - FCCMP / FCCMPE JIT
+//
+// FCCMP Sn, Sm, #nzcv, cond   /   FCCMP Dn, Dm, #nzcv, cond
+//   Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv
+//   ftype: 00=S, 01=D.  op: 0=FCCMP, 1=FCCMPE.
+//   Base: 0x1E200400 (FCCMP S) / 0x1E600400 (FCCMP D); add 0x10 for FCCMPE.
+constexpr uint32_t FccmpScalar(uint32_t base, uint8_t rn, uint8_t rm,
+                               uint8_t cond, uint8_t nzcv) {
+  return base | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | (nzcv & 0xF);
+}
+constexpr uint32_t FccmpS(uint8_t rn, uint8_t rm, uint8_t cond, uint8_t nzcv) {
+  return FccmpScalar(0x1E200400, rn, rm, cond, nzcv);
+}
+constexpr uint32_t FccmpD(uint8_t rn, uint8_t rm, uint8_t cond, uint8_t nzcv) {
+  return FccmpScalar(0x1E600400, rn, rm, cond, nzcv);
+}
+constexpr uint32_t FccmpeS(uint8_t rn, uint8_t rm, uint8_t cond, uint8_t nzcv) {
+  return FccmpScalar(0x1E200410, rn, rm, cond, nzcv);
+}
+
+// Read the ARM NZCV bits from ThreadState::cpu.flags into a 4-bit value
+// (N=bit3, Z=bit2, C=bit1, V=bit0).  The CPUState flag-bit layout is
+// N=bit15, Z=bit14, C=bit8, V=bit0 of the 16-bit flags field.
+uint8_t ReadArmNzcv(const CPUState& cpu) {
+  return ((cpu.flags >> 15) & 1) << 3 |
+         ((cpu.flags >> 14) & 1) << 2 |
+         ((cpu.flags >> 8) & 1) << 1 |
+         (cpu.flags & 1);
+}
+
+// FCCMP S — condition TRUE, ordered equal: flags <- 0110 (Z=1, C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpSCondTrueOrderedEqual) {
+  StoreFp32(state_.cpu, 1, 3.5f);
+  StoreFp32(state_.cpu, 2, 3.5f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                       // Z=1 -> EQ true
+      FccmpS(1, 2, kCondEQ, 0b1010),       // EQ true: compare V1,V2 -> eq
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);  // N=0,Z=1,C=1,V=0
+}
+
+// FCCMP S — condition TRUE, ordered less: flags <- 1000 (N=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpSCondTrueOrderedLess) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                       // Z=1 -> EQ true
+      FccmpS(1, 2, kCondEQ, 0b0101),       // EQ true: compare V1<V2 -> lt
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);
+}
+
+// FCCMP S — condition TRUE, ordered greater: flags <- 0010 (C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpSCondTrueOrderedGreater) {
+  StoreFp32(state_.cpu, 1, 9.0f);
+  StoreFp32(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                       // Z=1 -> EQ true
+      FccmpS(1, 2, kCondEQ, 0b1100),       // EQ true: compare V1>V2 -> gt
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0010u);
+}
+
+// FCCMP S — condition TRUE, unordered (NaN): flags <- 0011 (C=1, V=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpSCondTrueUnordered) {
+  StoreFp32(state_.cpu, 1, std::nanf(""));
+  StoreFp32(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                       // Z=1 -> EQ true
+      FccmpS(1, 2, kCondEQ, 0b1000),       // EQ true: compare NaN,1 -> uo
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCCMP D — condition FALSE: nzcv immediate is written to flags.
+TEST_F(Arm64LiteTranslateRegionTest, FccmpDCondFalseWritesImmediate) {
+  StoreFp64(state_.cpu, 1, 7.0);
+  StoreFp64(state_.cpu, 2, 7.0);  // would yield "equal" if compared
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                       // Z=0, N=1 -> EQ false
+      FccmpD(1, 2, kCondEQ, 0b1011),        // EQ false: flags <- N,Z=0,C,V
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1011u);
+}
+
+// FCCMPE S — quiet-vs-signalling NaN bit does not alter NZCV output
+// (the architectural flags result is identical to FCCMP).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpeSBehavesLikeFccmpForNzcv) {
+  StoreFp32(state_.cpu, 1, 4.0f);
+  StoreFp32(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                        // Z=1 -> EQ true
+      FccmpeS(1, 2, kCondEQ, 0b0000),       // EQ true: compare 4<5 -> lt
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);  // N=1 (less)
+}
+
+// FCCMP D — compound condition (kLt: N XOR V).  Set NZCV so N=1, V=0
+// (kLt TRUE).  FP compare V1 == V2 should produce Z=1,C=1 (eq).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpDCompoundLtTrue) {
+  StoreFp64(state_.cpu, 1, -2.5);
+  StoreFp64(state_.cpu, 2, -2.5);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                       // N=1, V=0 -> LT true
+      FccmpD(1, 2, kCondLT, 0b1111),        // LT true: do FP compare
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);  // equal -> Z=1,C=1
+}
+// endregion
+
+// region digitalis - FCMP NaN
+//
+// FCMP Sn, Sm / FCMP Dn, Dm / FCMP Sn, #0.0 / FCMP Dn, #0.0
+// FCMPE variants share the same NZCV mapping (the quiet-vs-signalling NaN
+// bit only changes FP-exception behaviour, not the architectural output).
+//
+//   Encoding: M S 11110 ftype 1 Rm op 1000 Rn opcode2
+//     opcode2[3] = with_zero (Rm field then = 0)
+//     opcode2[4] = signal_nans (FCMPE)
+//   Base FCMP S Rn, Rm : 0x1E202020
+//   Base FCMP D Rn, Rm : 0x1E602020
+//   Base FCMP S Rn, #0 : 0x1E202028
+//   Base FCMP D Rn, #0 : 0x1E602028
+//   Base FCMPE S Rn, Rm: 0x1E202030
+//   Base FCMPE S Rn, #0: 0x1E202038
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e222020 fcmp s1, s2 / 1e622020 fcmp d1, d2
+//   1e202028 fcmp s1, #0.0 / 1e602028 fcmp d1, #0.0
+//   1e222030 fcmpe s1, s2 / 1e202038 fcmpe s1, #0.0
+//
+// ARM FPCompare(Vn, Vm) -> NZCV mapping:
+//   Vn or Vm NaN     : 0b0011 (unordered)
+//   Vn == Vm         : 0b0110 (equal)
+//   Vn  < Vm         : 0b1000 (less than)
+//   Vn  > Vm         : 0b0010 (greater than)
+constexpr uint32_t FcmpScalar(uint32_t base, uint8_t rn, uint8_t rm) {
+  return base | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpS(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E202020, rn, rm);
+}
+constexpr uint32_t FcmpD(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E602020, rn, rm);
+}
+constexpr uint32_t FcmpSZero(uint8_t rn) {
+  return 0x1E202028 | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpDZero(uint8_t rn) {
+  return 0x1E602028 | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpeS(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E202030, rn, rm);
+}
+
+// FCMP S — unordered (NaN operand): NZCV = 0b0011 (C=1, V=1).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSUnordered) {
+  StoreFp32(state_.cpu, 1, std::nanf(""));
+  StoreFp32(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {
+      FcmpS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCMP S — ordered equal: NZCV = 0b0110 (Z=1, C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSOrderedEqual) {
+  StoreFp32(state_.cpu, 1, 3.5f);
+  StoreFp32(state_.cpu, 2, 3.5f);
+  static const uint32_t code[] = {
+      FcmpS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMP S — ordered less: NZCV = 0b1000 (N=1).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSOrderedLess) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {
+      FcmpS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);
+}
+
+// FCMP D — ordered equal (with widened FP64): NZCV = 0b0110.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDOrderedEqual) {
+  StoreFp64(state_.cpu, 1, 1.0);
+  StoreFp64(state_.cpu, 2, 1.0);
+  static const uint32_t code[] = {
+      FcmpD(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMP D — unordered (Vm is a quiet NaN): NZCV = 0b0011.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDUnordered) {
+  StoreFp64(state_.cpu, 1, 1.0);
+  StoreFp64(state_.cpu, 2, std::nan(""));
+  static const uint32_t code[] = {
+      FcmpD(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCMP S, #0.0 — Vn > 0 produces NZCV = 0b0010 (C=1 only).
+// Exercises the with_zero path (opcode2[3]=1, Rm field unused).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpSWithZeroGreater) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  static const uint32_t code[] = {
+      FcmpSZero(1),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0010u);
+}
+
+// FCMP D, #0.0 — Vn == 0 produces NZCV = 0b0110.  +0.0 == -0.0 by FP
+// equality, so this also implicitly proves the zero-form pulls a true
+// +0.0 (Pxor) for the Vm side rather than reading uninitialised lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDWithZeroEqual) {
+  StoreFp64(state_.cpu, 1, 0.0);
+  static const uint32_t code[] = {
+      FcmpDZero(1),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMPE S — signal_nans bit does not alter NZCV (mirrors the FCCMP/FCCMPE
+// invariant).  Unordered input still yields 0b0011.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpeSUnorderedMatchesFcmp) {
+  StoreFp32(state_.cpu, 1, std::nanf(""));
+  StoreFp32(state_.cpu, 2, 4.0f);
+  static const uint32_t code[] = {
+      FcmpeS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+// endregion
+
+// region digitalis - FP scalar unary
+//
+// Scalar FP one-source ops (FpDataProc1 family).  These pin the
+// architectural behaviour of the FP32 / FP64 JIT lowerings at
+// `lite_translator.h:6211` — FMOV, FABS, FNEG, FSQRT, and the FCVT
+// between-precision variants.  FP16 paths are covered separately by
+// the E1 test block; here we focus on the S/D forms exercised by §D2.
+//
+//   Encoding (FpDataProc1, sf=0): M 0 0 11110 ftype 1 opcode 10000 Rn Rd
+//     ftype: 00 = S (FP32), 01 = D (FP64)
+//     opcode (bits[20:15]):
+//       000000 FMOV       000001 FABS       000010 FNEG
+//       000011 FSQRT
+//       000100 FCVT  (S<->D, dst precision selected by ftype)
+//       000101 FCVT  (S->D when ftype=00, D->S when ftype=01)
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e20c041 fabs s1, s2 / 1e60c041 fabs d1, d2
+//   1e214041 fneg s1, s2 / 1e614041 fneg d1, d2
+//   1e21c041 fsqrt s1, s2 / 1e61c041 fsqrt d1, d2
+//   1e624041 fcvt s1, d2 / 1e22c041 fcvt d1, s2
+//   1e204041 fmov s1, s2 / 1e604041 fmov d1, d2
+constexpr uint32_t FpUnaryScalar(uint32_t base, uint8_t rd, uint8_t rn) {
+  return base | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabsS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E20C000, rd, rn);
+}
+constexpr uint32_t FabsD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E60C000, rd, rn);
+}
+constexpr uint32_t FnegS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E214000, rd, rn);
+}
+constexpr uint32_t FnegD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E614000, rd, rn);
+}
+constexpr uint32_t FsqrtS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E21C000, rd, rn);
+}
+constexpr uint32_t FsqrtD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E61C000, rd, rn);
+}
+// FCVT Dd, Sn (single-precision Rn widened to double in Rd).
+constexpr uint32_t FcvtDFromS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E22C000, rd, rn);
+}
+// FCVT Sd, Dn (double-precision Rn narrowed to single in Rd).
+constexpr uint32_t FcvtSFromD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E624000, rd, rn);
+}
+constexpr uint32_t FmovS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E204000, rd, rn);
+}
+constexpr uint32_t FmovD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E604000, rd, rn);
+}
+
+// FABS S — positive input unchanged.
+TEST_F(Arm64LiteTranslateRegionTest, FabsSPositive) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};  // poison Vd to verify zero-extend.
+  static const uint32_t code[] = {FabsS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.5f);
+  // Upper 96 bits of V[0] must be zeroed (architectural scalar-FP write).
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FABS S — negative input flipped to positive.
+TEST_F(Arm64LiteTranslateRegionTest, FabsSNegative) {
+  StoreFp32(state_.cpu, 1, -3.25f);
+  static const uint32_t code[] = {FabsS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 3.25f);
+}
+
+// FABS D — negative double becomes positive double.
+TEST_F(Arm64LiteTranslateRegionTest, FabsDNegative) {
+  StoreFp64(state_.cpu, 1, -7.5);
+  static const uint32_t code[] = {FabsD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 7.5);
+}
+
+// FNEG S — positive becomes negative; high lanes zero-extended.
+TEST_F(Arm64LiteTranslateRegionTest, FnegSPositive) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FnegS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -1.5f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FNEG D — negative becomes positive (sign-bit flip is symmetric).
+TEST_F(Arm64LiteTranslateRegionTest, FnegDNegative) {
+  StoreFp64(state_.cpu, 1, -4.0);
+  static const uint32_t code[] = {FnegD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 4.0);
+}
+
+// FSQRT S — exact integer square root.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtSExact) {
+  StoreFp32(state_.cpu, 1, 4.0f);
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.0f);
+}
+
+// FSQRT D — exact integer square root in FP64.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtDExact) {
+  StoreFp64(state_.cpu, 1, 9.0);
+  static const uint32_t code[] = {FsqrtD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.0);
+}
+
+// FSQRT S — negative input yields NaN per IEEE-754 default exception.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtSNegativeProducesNan) {
+  StoreFp32(state_.cpu, 1, -1.0f);
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FCVT Dd, Sn — single-precision widens to double exactly.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtSingleToDouble) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FcvtDFromS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 1.5);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FCVT Sd, Dn — double narrows to single (1.5 is exact in both).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtDoubleToSingleExact) {
+  StoreFp64(state_.cpu, 1, 1.5);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FcvtSFromD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.5f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FMOV S — bitwise copy of the low 32 bits with high lanes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmovScalarSingleZeroExtends) {
+  StoreFp32(state_.cpu, 1, -3.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmovS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -3.5f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FMOV D — bitwise copy of the low 64 bits with high lane zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmovScalarDoubleZeroExtends) {
+  StoreFp64(state_.cpu, 1, 2.71828);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmovD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.71828);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+// endregion
+
+// region digitalis - FP scalar arithmetic edges
+//
+// Scalar FP two-source ops (FpDataProc2 family).  Pins the architectural
+// behaviour of FADD / FSUB / FMUL / FDIV at S (ftype=00) and D (ftype=01)
+// precision for the IEEE-754 edge categories required by §D1's verify
+// gate: NaN propagation, ±Inf − ±Inf / ±0 × ±Inf invalid-op → default
+// NaN, ±0 sign handling under round-to-nearest-even, denormal arithmetic,
+// and the integer-zero divide → ±Inf result.  These exercise the JIT
+// emit path at `lite_translator.h:6632` (SSE Addss/Subss/Mulss/Divss
+// and the SD-form for D).
+//
+//   Encoding (FpDataProc2, M=0):
+//     0 0 0 11110 ftype 1 Rm opcode 10 Rn Rd
+//     ftype: 00 = S (FP32), 01 = D (FP64)
+//     opcode: 0000 FMUL, 0001 FDIV, 0010 FADD, 0011 FSUB
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e232841 fadd s1,s2,s3 / 1e632841 fadd d1,d2,d3
+//   1e233841 fsub s1,s2,s3 / 1e633841 fsub d1,d2,d3
+//   1e230841 fmul s1,s2,s3 / 1e630841 fmul d1,d2,d3
+//   1e231841 fdiv s1,s2,s3 / 1e631841 fdiv d1,d2,d3
+constexpr uint32_t FpBinaryScalar(uint32_t base, uint8_t rd, uint8_t rn,
+                                  uint8_t rm) {
+  return base | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E202800, rd, rn, rm);
+}
+constexpr uint32_t FaddD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E602800, rd, rn, rm);
+}
+constexpr uint32_t FsubS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E203800, rd, rn, rm);
+}
+constexpr uint32_t FsubD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E603800, rd, rn, rm);
+}
+// FmulS already defined at the top of the file (line 107).
+constexpr uint32_t FmulD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E600800, rd, rn, rm);
+}
+constexpr uint32_t FdivS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E201800, rd, rn, rm);
+}
+constexpr uint32_t FdivD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return FpBinaryScalar(0x1E601800, rd, rn, rm);
+}
+
+// FADD S — NaN operand poisons the result (quiet NaN propagates).
+TEST_F(Arm64LiteTranslateRegionTest, FaddSNanPropagates) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  StoreFp32(state_.cpu, 2, 1.0f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+  // Architectural zero-extend of V[0]'s upper 96 bits.
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FADD D — invalid-op (+∞ + −∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FaddDInfMinusInfIsNan) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  StoreFp64(state_.cpu, 2, -std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FaddD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FADD S — adding the smallest positive denormal to itself stays exact.
+TEST_F(Arm64LiteTranslateRegionTest, FaddSDenormalDoubles) {
+  const float denorm = std::numeric_limits<float>::denorm_min();
+  StoreFp32(state_.cpu, 1, denorm);
+  StoreFp32(state_.cpu, 2, denorm);
+  static const uint32_t code[] = {FaddS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), denorm + denorm);
+}
+
+// FADD D — round-to-nearest-even default: +0.0 + -0.0 = +0.0.
+TEST_F(Arm64LiteTranslateRegionTest, FaddDPosZeroPlusNegZeroIsPosZero) {
+  StoreFp64(state_.cpu, 1, +0.0);
+  StoreFp64(state_.cpu, 2, -0.0);
+  static const uint32_t code[] = {FaddD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const double res = LoadFp64(state_.cpu, 0);
+  EXPECT_EQ(res, 0.0);
+  EXPECT_FALSE(std::signbit(res));
+}
+
+// FSUB S — NaN on the RHS poisons the result.
+TEST_F(Arm64LiteTranslateRegionTest, FsubSSubtractNan) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, std::numeric_limits<float>::quiet_NaN());
+  static const uint32_t code[] = {FsubS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FSUB D — invalid-op (+∞ − +∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FsubDInfMinusInfIsNan) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  StoreFp64(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FsubD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FSUB S — +0.0 - +0.0 produces +0.0 under round-to-nearest-even.
+TEST_F(Arm64LiteTranslateRegionTest, FsubSPosZeroMinusPosZero) {
+  StoreFp32(state_.cpu, 1, +0.0f);
+  StoreFp32(state_.cpu, 2, +0.0f);
+  static const uint32_t code[] = {FsubS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const float res = LoadFp32(state_.cpu, 0);
+  EXPECT_EQ(res, 0.0f);
+  EXPECT_FALSE(std::signbit(res));
+}
+
+// FMUL S — invalid-op (0 × ∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmulSZeroTimesInfIsNan) {
+  StoreFp32(state_.cpu, 1, 0.0f);
+  StoreFp32(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FmulS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FMUL D — NaN × finite poisons the product.
+TEST_F(Arm64LiteTranslateRegionTest, FmulDNanTimesFinite) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::quiet_NaN());
+  StoreFp64(state_.cpu, 2, 2.0);
+  static const uint32_t code[] = {FmulD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FMUL S — denormal × 2 stays denormal (or barely above) and is exact.
+TEST_F(Arm64LiteTranslateRegionTest, FmulSDenormalTimesTwo) {
+  const float denorm = std::numeric_limits<float>::denorm_min();
+  StoreFp32(state_.cpu, 1, denorm);
+  StoreFp32(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FmulS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), denorm * 2.0f);
+}
+
+// FMUL D — invalid-op (-0 × +∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmulDNegZeroTimesPosInf) {
+  StoreFp64(state_.cpu, 1, -0.0);
+  StoreFp64(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FmulD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+
+// FDIV S — finite / +0 yields +∞ (divide-by-zero exception default result).
+TEST_F(Arm64LiteTranslateRegionTest, FdivSOneOverPosZeroIsPosInf) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  StoreFp32(state_.cpu, 2, +0.0f);
+  static const uint32_t code[] = {FdivS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const float res = LoadFp32(state_.cpu, 0);
+  EXPECT_TRUE(std::isinf(res));
+  EXPECT_FALSE(std::signbit(res));
+}
+
+// FDIV D — −finite / +0 yields −∞ (sign propagates).
+TEST_F(Arm64LiteTranslateRegionTest, FdivDNegOneOverPosZeroIsNegInf) {
+  StoreFp64(state_.cpu, 1, -1.0);
+  StoreFp64(state_.cpu, 2, +0.0);
+  static const uint32_t code[] = {FdivD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const double res = LoadFp64(state_.cpu, 0);
+  EXPECT_TRUE(std::isinf(res));
+  EXPECT_TRUE(std::signbit(res));
+}
+
+// FDIV S — invalid-op (0 / 0) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FdivSZeroOverZeroIsNan) {
+  StoreFp32(state_.cpu, 1, +0.0f);
+  StoreFp32(state_.cpu, 2, +0.0f);
+  static const uint32_t code[] = {FdivS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FDIV D — invalid-op (+∞ / +∞) yields a NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FdivDInfOverInfIsNan) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  StoreFp64(state_.cpu, 2, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FdivD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
+}
+// endregion
+
+// region digitalis - FP scalar↔int conversion edges
+//
+// Scalar FCVTZS / FCVTZU (FP → integer, truncate-toward-zero) and SCVTF /
+// UCVTF (integer → FP) JIT lowerings live in `FpIntConversion` at
+// `lite_translator.h:2771`.  §D4's verify gate calls out three edge
+// categories that the JIT must get right regardless of what x86 cvtt /
+// cvtsi2 happen to produce: NaN → 0 (FCVTZS / FCVTZU), ±Inf saturation,
+// and the unsigned overflow boundary (FCVTZU returning UINT_MAX rather
+// than the x86 indefinite, FCVTZS returning INT_MAX for FP > INT_MAX).
+//
+//   Encoding (Floating-point ↔ Integer conversion, scalar):
+//     sf | 0011110 ftype 1 rmode opcode 000000 Rn Rd
+//     rmode=11 opcode=000 -> FCVTZS,    rmode=11 opcode=001 -> FCVTZU,
+//     rmode=00 opcode=010 -> SCVTF,     rmode=00 opcode=011 -> UCVTF.
+//     ftype: 00 = S (FP32), 01 = D (FP64).
+//     sf:    0  = W destination (or source), 1 = X destination (or source).
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e380041 fcvtzs w1,s2 / 9e380041 fcvtzs x1,s2
+//   1e780041 fcvtzs w1,d2 / 9e780041 fcvtzs x1,d2
+//   1e390041 fcvtzu w1,s2 / 9e390041 fcvtzu x1,s2
+//   1e790041 fcvtzu w1,d2 / 9e790041 fcvtzu x1,d2
+//   1e220020 scvtf  s0,w1 / 9e220020 scvtf  s0,x1
+//   1e620020 scvtf  d0,w1 / 9e620020 scvtf  d0,x1
+//   1e230020 ucvtf  s0,w1 / 9e230020 ucvtf  s0,x1
+//   1e630020 ucvtf  d0,w1 / 9e630020 ucvtf  d0,x1
+constexpr uint32_t FpIntConv(uint32_t base, uint8_t rd, uint8_t rn) {
+  return base | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcvtzsWS(uint8_t wd, uint8_t sn) {
+  return FpIntConv(0x1E380000, wd, sn);
+}
+constexpr uint32_t FcvtzsXD(uint8_t xd, uint8_t dn) {
+  return FpIntConv(0x9E780000, xd, dn);
+}
+constexpr uint32_t FcvtzuWS(uint8_t wd, uint8_t sn) {
+  return FpIntConv(0x1E390000, wd, sn);
+}
+constexpr uint32_t FcvtzuXD(uint8_t xd, uint8_t dn) {
+  return FpIntConv(0x9E790000, xd, dn);
+}
+constexpr uint32_t ScvtfSW(uint8_t sd, uint8_t wn) {
+  return FpIntConv(0x1E220000, sd, wn);
+}
+constexpr uint32_t UcvtfDX(uint8_t dd, uint8_t xn) {
+  return FpIntConv(0x9E630000, dd, xn);
+}
+
+// FCVTZS Wd, Sn — qNaN source must yield 0, not x86 cvtt's INT32_MIN
+// "indefinite".  Exercises the PF=1 nan_path branch in the JIT (see
+// `lite_translator.h:2970`'s `Ucomis` + `Jcc kParityEven` arm).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsWSNanToZero) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzsWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);  // W-form: zero-extended to 64.
+}
+
+// FCVTZS Wd, Sn — +Inf must saturate to INT32_MAX.  x86 cvtt returns
+// INT32_MIN here; the JIT's pos-overflow fix-up writes INT32_MAX after
+// observing FP-sign=0 and tmp==INT32_MIN.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsWSPosInfSaturatesMax) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FcvtzsWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int32_t>(state_.cpu.x[0]), INT32_MAX);
+}
+
+// FCVTZS Wd, Sn — −Inf saturates to INT32_MIN.  This matches x86 cvtt's
+// indefinite return for negative overflow, so the JIT's FP-sign=1 keep-
+// tmp branch is what must fire.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsWSNegInfSaturatesMin) {
+  StoreFp32(state_.cpu, 1, -std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FcvtzsWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int32_t>(state_.cpu.x[0]), INT32_MIN);
+}
+
+// FCVTZS Xd, Dn — qNaN source yields 0 (64-bit path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsXDNanToZero) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzsXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZS Xd, Dn — +Inf saturates to INT64_MAX (the pos-overflow fix-up).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsXDPosInfSaturatesMax) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FcvtzsXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[0]), INT64_MAX);
+}
+
+// FCVTZS Xd, Dn — −Inf saturates to INT64_MIN.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsXDNegInfSaturatesMin) {
+  StoreFp64(state_.cpu, 1, -std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FcvtzsXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[0]), INT64_MIN);
+}
+
+// FCVTZU Wd, Sn — qNaN yields 0 (unsigned NaN→0 mirrors signed).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSNanToZero) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Wd, Sn — +Inf saturates to UINT32_MAX.  Exercises the W-form
+// upper-32 saturation path that detects out-of-u32-range cvtt-q result.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSPosInfSaturatesMax) {
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.x[0]), UINT32_MAX);
+}
+
+// FCVTZU Wd, Sn — −Inf clamps to 0 (negative inputs all clamp to 0 in
+// ARM FCVTZU).  The FP-sign-bit-set branch jumps to the zero path.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSNegInfClampsZero) {
+  StoreFp32(state_.cpu, 1, -std::numeric_limits<float>::infinity());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Wd, Sn — exactly UINT32_MAX (2^32 - 1) is *not* exactly
+// representable in FP32; the nearest representable below 2^32 is
+// 0x4F7FFFFF (~4.2949666e9, exactly 4294967040).  This is the largest
+// in-range FP32 value, and it must truncate to 4294967040 (not saturate
+// — the JIT only saturates when the cvtt-q result exceeds UINT32_MAX).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWSLargestInRange) {
+  // 0x4F7FFFFF = (float)4294967040.0
+  StoreFp32(state_.cpu, 1, 4294967040.0f);
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.x[0]), 4294967040u);
+}
+
+// FCVTZU Wd, Sn — overflow just above 2^32 saturates to UINT32_MAX.
+// 0x4F800000 = 2^32 = 4294967296.0f; the cvtt-q result equals UINT32_MAX+1,
+// which the JIT's upper-32 saturation detects and clamps.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuWS2p32SaturatesMax) {
+  StoreFp32(state_.cpu, 1, 4294967296.0f);  // 2^32
+  static const uint32_t code[] = {FcvtzuWS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.x[0]), UINT32_MAX);
+}
+
+// FCVTZU Xd, Dn — qNaN yields 0 (64-bit path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXDNanToZero) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Xd, Dn — +Inf saturates to UINT64_MAX (the > 2^64 sat_max path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXDPosInfSaturatesMax) {
+  StoreFp64(state_.cpu, 1, std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+// FCVTZU Xd, Dn — −Inf clamps to 0 (negative-clamp path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXDNegInfClampsZero) {
+  StoreFp64(state_.cpu, 1, -std::numeric_limits<double>::infinity());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+}
+
+// FCVTZU Xd, Dn — 2^64 saturates to UINT64_MAX (the >= 2^64 boundary).
+// 0x43F0000000000000 = (double)2^64.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuXD2p64SaturatesMax) {
+  const uint64_t bits = 0x43F0000000000000ULL;
+  double val;
+  std::memcpy(&val, &bits, sizeof(val));
+  StoreFp64(state_.cpu, 1, val);  // 2^64
+  static const uint32_t code[] = {FcvtzuXD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
+}
+
+// SCVTF Sd, Wn — INT32_MIN converts to -2147483648.0f exactly (the
+// boundary the L-form CVTSI2SSL must sign-extend correctly).  Also
+// pins the architectural zero-extend of V[rd]'s upper 96 bits via the
+// pre-PXOR + Movdqu pattern in the JIT.
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfSWInt32MinExact) {
+  state_.cpu.x[1] = static_cast<uint64_t>(static_cast<uint32_t>(INT32_MIN));
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {ScvtfSW(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -2147483648.0f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// UCVTF Dd, Xn — 64-bit unsigned with the high bit set exercises the
+// halve / round-to-odd / convert / double JIT fix-up at
+// `lite_translator.h:2884`.  UINT64_MAX is the boundary; the result
+// rounds to 2^64 exactly under round-to-nearest-even.
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfDXUint64MaxRoundsTo2p64) {
+  state_.cpu.x[1] = UINT64_MAX;
+  static const uint32_t code[] = {UcvtfDX(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const double expected = static_cast<double>(UINT64_MAX);  // 2^64
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), expected);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
