@@ -4481,6 +4481,215 @@ TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4SFusedRounding) {
 }
 // endregion
 
+// region digitalis: AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL at
+// FP32 (.2S / .4S) and FP64 (.2D).
+//
+// ARM ARM encoding:
+//   0 Q 0 01111 size L M Rm[3:0] opcode H 0 Rn Rd
+//   size=10 (FP32): index = (H<<1)|L                  (range 0..3)
+//   size=11 (FP64): index = H, L must be 0, Q must be 1 (.2D only)
+//   opcode=0001 (FMLA), 0101 (FMLS), 1001 (FMUL with U=0).
+// Verified with aarch64-linux-gnu-as / objdump:
+//   FMLA v0.4s, v1.4s, v2.s[0] = 0x4F821020
+//   FMLA v0.4s, v1.4s, v2.s[3] = 0x4FA21820
+//   FMLA v0.2s, v1.2s, v2.s[1] = 0x0FA21020
+//   FMLA v0.2d, v1.2d, v2.d[0] = 0x4FC21020
+//   FMLA v0.2d, v1.2d, v2.d[1] = 0x4FC21820
+//   FMLS v0.4s, v1.4s, v2.s[0] = 0x4F825020
+//   FMUL v0.4s, v1.4s, v2.s[0] = 0x4F829020
+constexpr uint32_t FmlaIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // FP32: L = k&1 (bit 21), H = (k>>1)&1 (bit 11).
+  return 0x4F801000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F801000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdx2D(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // FP64: index = H only (bit 11).
+  return 0x4FC01000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F805000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdx2D(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4FC05000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F809000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F809000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdx2D(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4FC09000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMLA .4S by-element: broadcast Vm.s[k] across all four lanes, then Vd += Vn*Vm.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SBroadcastsLane) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, -1.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 5.0f, 9.9f);  // Vm.s[2] = 5.0
+  StoreVec4S(state_.cpu, 0, 1.0f, 1.0f, 1.0f, 1.0f);
+  static const uint32_t code[] = {FmlaIdx4S(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 11.0f);   // 1 + 2*5
+  EXPECT_FLOAT_EQ(r[1], 16.0f);   // 1 + 3*5
+  EXPECT_FLOAT_EQ(r[2], -4.0f);   // 1 + -1*5
+  EXPECT_FLOAT_EQ(r[3], 21.0f);   // 1 + 4*5
+}
+
+// FMLA .2S q=0: upper 64 bits of Vd must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 4.0f, 9.9f, 9.9f);  // Vm.s[1] = 4.0
+  StoreVec4S(state_.cpu, 0, 1.0f, 8.0f, 7.0f, 7.0f);
+  static const uint32_t code[] = {FmlaIdx2S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 9.0f);   // 1 + 2*4
+  EXPECT_FLOAT_EQ(r[1], 20.0f);  // 8 + 3*4
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMLA .2D by-element: index = 0 or 1 of Vm.2D.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec2DBroadcastsLane) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 9.9, 2.0);  // Vm.d[1] = 2.0
+  StoreVec2D(state_.cpu, 0, 1.0, 10.0);
+  static const uint32_t code[] = {FmlaIdx2D(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 2.0);   // 1 + 0.5*2
+  EXPECT_DOUBLE_EQ(r[1], 4.0);   // 10 + -3*2
+}
+
+// FMLS .4S by-element: Vd -= Vn * Vm.s[k].
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxVec4SBroadcastsLane) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, -1.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, 9.9f, 9.9f, 9.9f);  // Vm.s[0] = 5.0
+  StoreVec4S(state_.cpu, 0, 11.0f, 16.0f, -4.0f, 21.0f);
+  static const uint32_t code[] = {FmlsIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);    // 11 - 2*5
+  EXPECT_FLOAT_EQ(r[1], 1.0f);    // 16 - 3*5
+  EXPECT_FLOAT_EQ(r[2], 1.0f);    // -4 - (-1)*5
+  EXPECT_FLOAT_EQ(r[3], 1.0f);    // 21 - 4*5
+}
+
+// FMLS .2D by-element.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxVec2DBroadcastsLane) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 9.9, 2.0);  // Vm.d[1] = 2.0
+  StoreVec2D(state_.cpu, 0, 10.0, 4.0);
+  static const uint32_t code[] = {FmlsIdx2D(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 9.0);    // 10 - 0.5*2
+  EXPECT_DOUBLE_EQ(r[1], 10.0);   // 4 - -3*2
+}
+
+// FMUL .4S by-element: Vd = Vn * Vm.s[k] (no accumulator).
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec4SBroadcastsLane) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, -1.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, -7.0f);  // Vm.s[3] = -7.0
+  StoreVec4S(state_.cpu, 0, 99.f, 99.f, 99.f, 99.f);  // Should be overwritten.
+  static const uint32_t code[] = {FmulIdx4S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], -14.0f);  // 2 * -7
+  EXPECT_FLOAT_EQ(r[1], -21.0f);  // 3 * -7
+  EXPECT_FLOAT_EQ(r[2], 7.0f);    // -1 * -7
+  EXPECT_FLOAT_EQ(r[3], -28.0f);  // 4 * -7
+}
+
+// FMUL .2S q=0: upper 64 bits zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, 99.f, 99.f);
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, 4.0f);  // Vm.s[3] = 4.0
+  StoreVec4S(state_.cpu, 0, 99.f, 99.f, 7.f, 7.f);
+  static const uint32_t code[] = {FmulIdx2S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 8.0f);
+  EXPECT_FLOAT_EQ(r[1], 12.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMUL .2D by-element.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec2DBroadcastsLane) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 6.0, 9.9);  // Vm.d[0] = 6.0
+  StoreVec2D(state_.cpu, 0, 99., 99.);  // Should be overwritten.
+  static const uint32_t code[] = {FmulIdx2D(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 3.0);   // 0.5 * 6
+  EXPECT_DOUBLE_EQ(r[1], -18.0); // -3 * 6
+}
+
+// Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs
+// from (a*b)+d in float, proving the lowering uses VFMADD231PS.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {
+  // Triple (a, b, d) where the trailing bit of a*b is lost by an
+  // intermediate rounding but kept by fused FMA.  Same shape as
+  // FmlaVec4SFusedRounding above (three-same form).
+  //   a = 1 + 2^-12, b = a, d = -1.0
+  //   fused result: 2^-11 + 2^-24
+  //   unfused     : 2^-11
+  const float a = 1.0f + std::ldexp(1.0f, -12);
+  StoreVec4S(state_.cpu, 1, a, 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 2, a, 0.f, 0.f, 0.f);  // Vm.s[0] = a
+  StoreVec4S(state_.cpu, 0, -1.0f, 0.f, 0.f, 0.f);
+  static const uint32_t code[] = {FmlaIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  const float expected = std::fmaf(a, a, -1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

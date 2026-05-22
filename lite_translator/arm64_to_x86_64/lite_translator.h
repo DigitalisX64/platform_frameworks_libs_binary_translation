@@ -8128,9 +8128,105 @@ class LiteTranslator {
   }
 
   // region digitalis
+  // region digitalis: AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL at
+  // FP32 (.2S/.4S) and FP64 (.2D).  Shape:
+  //   1. Load Vn into xmm_n.
+  //   2. Load Vm; broadcast lane args.index across all lanes with PSHUFD
+  //      (FP32: imm = (i<<6)|(i<<4)|(i<<2)|i; FP64: imm = 0x44 for i=0,
+  //      0xEE for i=1).
+  //   3. For FMLA: load Vd, then VFMADD231PS/PD(d, n, m).
+  //      For FMLS: load Vd, then VFNMADD231PS/PD(d, n, m).
+  //      For FMUL: MULPS/MULPD(n, m), result in n.
+  //   4. If Q=0, mask the upper 64 bits.
+  //   5. Store back to Vd.
+  //
+  // FP16 (size=00) stays interpreter — needs F16C round-trip + binary64
+  // FMA for bit-exact match against std::fma(double, double, double) +
+  // FpSingleToHalf.  Plan §E2 / §H1 (handoff #122 next-step item 1).
+  //
+  // Integer MUL/MLA/MLS by-element (size=01/10) stays interpreter — that
+  // is a separate JIT family not bundled here.  Could be added later.
+  //
+  // FMULX by-element stays interpreter — needs the (±0,±inf) -> ±2.0
+  // saturation override (the layered-select from the three-same JIT
+  // landed in handoff #120).  Defer; the interpreter is correct via
+  // FmulxScalar<T>.
+  //
+  // Reserved .1D shape (size=11 && q=0) and hosts without FMA bail.
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
-    UNUSED(args);
-    Undefined();
+    using Op = Decoder::AdvSimdVecXIdxOpcode;
+    if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
+        args.opcode != Op::kFmul) {
+      success_ = false;
+      return;
+    }
+    if (args.size != 0b10 && args.size != 0b11) {
+      success_ = false;
+      return;
+    }
+    const bool is_double = (args.size == 0b11);
+    if (is_double && !args.q) { success_ = false; return; }
+
+    const bool needs_fma =
+        (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
+    if (needs_fma && !host_platform::kHasFMA) {
+      success_ = false;
+      return;
+    }
+
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    SimdRegister xmm_n = AllocTempSimdReg();
+    SimdRegister xmm_m = AllocTempSimdReg();
+    if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+      success_ = false;
+      return;
+    }
+
+    as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+    as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+
+    // Broadcast lane args.index of xmm_m across all lanes.
+    if (is_double) {
+      // FP64: index 0 -> 0x44 (lanes 0,1,0,1 -> [lo,hi,lo,hi] copies low qword);
+      //       index 1 -> 0xEE (lanes 2,3,2,3 -> copies high qword).
+      const int8_t imm = (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
+      as_.Pshufd(xmm_m, xmm_m, imm);
+    } else {
+      // FP32: replicate the same 2-bit field 4 times.
+      const uint8_t i = args.index & 0b11;
+      const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+      as_.Pshufd(xmm_m, xmm_m, imm);
+    }
+
+    SimdRegister xmm_result = no_simd_register;
+    if (args.opcode == Op::kFmul) {
+      if (is_double) as_.Mulpd(xmm_n, xmm_m);
+      else            as_.Mulps(xmm_n, xmm_m);
+      xmm_result = xmm_n;
+    } else {
+      SimdRegister xmm_d = AllocTempSimdReg();
+      if (xmm_d == no_simd_register) { success_ = false; return; }
+      as_.Movdqu(xmm_d, {.base = Assembler::rbp, .disp = vd_off});
+      if (args.opcode == Op::kFmla) {
+        if (is_double) as_.Vfmadd231pd(xmm_d, xmm_n, xmm_m);
+        else            as_.Vfmadd231ps(xmm_d, xmm_n, xmm_m);
+      } else {
+        // FMLS:  Vd = Vd + (-Vn)*Vm  (single fused rounding).
+        if (is_double) as_.Vfnmadd231pd(xmm_d, xmm_n, xmm_m);
+        else            as_.Vfnmadd231ps(xmm_d, xmm_n, xmm_m);
+      }
+      xmm_result = xmm_d;
+    }
+
+    if (!args.q) {
+      // Zero upper 64 bits (D-register semantics).
+      as_.Pslldq(xmm_result, int8_t{8});
+      as_.Psrldq(xmm_result, int8_t{8});
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
   }
   // endregion
 
