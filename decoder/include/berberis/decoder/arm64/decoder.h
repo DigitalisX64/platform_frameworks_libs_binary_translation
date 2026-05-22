@@ -898,6 +898,16 @@ class Decoder {
                 // Same as kFmulV but with the ARM-defined ±0 * ±inf -> ±2.0
                 // saturation (instead of NaN), used by libm reciprocal
                 // refinement loops.  Interpreter-only.
+    kFrecpsV,   // FRECPS  (vector): op_high=0, opcode=11111, U=0
+                // FP16-three-same encoding: a=0, opcode_3=111, U=0.
+                // Reciprocal step: (2.0 - a*b), with (0 * inf) -> +2.0
+                // saturation, used as Newton-Raphson refinement after FRECPE.
+                // Interpreter-only.
+    kFrsqrtsV,  // FRSQRTS (vector): op_high=1, opcode=11111, U=0
+                // FP16-three-same encoding: a=1, opcode_3=111, U=0.
+                // Reciprocal square-root step: (3.0 - a*b)/2, with (0 * inf)
+                // -> +1.5 saturation, used as Newton-Raphson refinement after
+                // FRSQRTE.  Interpreter-only.
     // endregion
     // endregion
   };
@@ -1244,6 +1254,12 @@ class Decoder {
     kFmulx,   // FMULX (scalar, FP): U=0, bit23=1, opcode=11011.
               // Identical to FMUL except (±0 * ±inf) lanes return ±2.0
               // instead of NaN — see Interpreter::FmulxScalar<>.
+    kFrecps,  // FRECPS (scalar, FP): U=0, bit23=0, opcode=11111.
+              // Reciprocal step: (2.0 - a*b) with (0*inf) -> +2.0 saturation.
+              // FP16 scalar variant: a=0, U=0, opcode_3=111.
+    kFrsqrts, // FRSQRTS (scalar, FP): U=0, bit23=1, opcode=11111.
+              // Reciprocal sqrt step: (3.0 - a*b)/2 with (0*inf) -> +1.5
+              // saturation. FP16 scalar variant: a=1, U=0, opcode_3=111.
     // endregion
   };
 
@@ -3815,7 +3831,10 @@ class Decoder {
           // endregion
           case 0b100: op = AdvSimdThreeSameOpcode::kFcmeqV;  ok = true; break;
           case 0b110: op = AdvSimdThreeSameOpcode::kFmaxV;   ok = true; break;
-          default: break;  // 101 reserved, 111 FRECPS — Undefined.
+          // region digitalis: FP16 FRECPS (a=0, U=0, opcode_3=111).
+          case 0b111: op = AdvSimdThreeSameOpcode::kFrecpsV; ok = true; break;
+          // endregion
+          default: break;  // 101 reserved — Undefined.
         }
       } else {
         switch (opcode_3) {
@@ -3823,7 +3842,10 @@ class Decoder {
           case 0b001: op = AdvSimdThreeSameOpcode::kFmlsV;   ok = true; break;
           case 0b010: op = AdvSimdThreeSameOpcode::kFsubV;   ok = true; break;
           case 0b110: op = AdvSimdThreeSameOpcode::kFminV;   ok = true; break;
-          default: break;  // 011 reserved, 100 reserved, 101 reserved, 111 FRSQRTS — Undefined.
+          // region digitalis: FP16 FRSQRTS (a=1, U=0, opcode_3=111).
+          case 0b111: op = AdvSimdThreeSameOpcode::kFrsqrtsV; ok = true; break;
+          // endregion
+          default: break;  // 011 reserved, 100 reserved, 101 reserved — Undefined.
         }
       }
     } else {
@@ -3911,9 +3933,18 @@ class Decoder {
     } else if (a && u && opcode_3 == 0b101) {
       op = AdvSimdScalarThreeSameOpcode::kFacgt;
       ok = true;
+    } else if (!a && !u && opcode_3 == 0b111) {
+      // region digitalis: FP16 scalar FRECPS (a=0, U=0, opcode_3=111).
+      op = AdvSimdScalarThreeSameOpcode::kFrecps;
+      ok = true;
+      // endregion
+    } else if (a && !u && opcode_3 == 0b111) {
+      // region digitalis: FP16 scalar FRSQRTS (a=1, U=0, opcode_3=111).
+      op = AdvSimdScalarThreeSameOpcode::kFrsqrts;
+      ok = true;
+      // endregion
     }
-    // FRECPS (a=0,U=0,op=111), FRSQRTS (a=1,U=0,op=111), and reserved
-    // (a,U,op) combinations route to Undefined().
+    // Reserved (a,U,op) combinations route to Undefined().
     if (!ok) {
       Undefined();
       return;
@@ -4147,7 +4178,8 @@ class Decoder {
             op = u ? AdvSimdThreeSameOpcode::kFcmgeV : AdvSimdThreeSameOpcode::kFcmeqV;
             break;
           case 0b11101:
-            if (!u) { ok = false; break; }  // FRECPS — not implemented
+            // op_high=0, opcode=11101: FACGE (U=1); U=0 is reserved.
+            if (!u) { ok = false; break; }
             op = AdvSimdThreeSameOpcode::kFacgeV;
             break;
           case 0b11110:
@@ -4155,8 +4187,10 @@ class Decoder {
             op = AdvSimdThreeSameOpcode::kFmaxV;
             break;
           case 0b11111:
-            if (!u) { ok = false; break; }  // FRECPS-low — not implemented
-            op = AdvSimdThreeSameOpcode::kFdivV;
+            // region digitalis: op_high=0, opcode=11111: FRECPS (U=0) / FDIV (U=1).
+            op = u ? AdvSimdThreeSameOpcode::kFdivV
+                   : AdvSimdThreeSameOpcode::kFrecpsV;
+            // endregion
             break;
           // endregion
           default: ok = false; break;
@@ -4181,12 +4215,20 @@ class Decoder {
             op = AdvSimdThreeSameOpcode::kFcmgtV;
             break;
           case 0b11101:
-            if (!u) { ok = false; break; }  // FRSQRTS — not implemented
+            // op_high=1, opcode=11101: FACGT (U=1); U=0 is reserved.
+            if (!u) { ok = false; break; }
             op = AdvSimdThreeSameOpcode::kFacgtV;
             break;
           case 0b11110:
             if (u) { ok = false; break; }   // FMINP — not implemented
             op = AdvSimdThreeSameOpcode::kFminV;
+            break;
+          case 0b11111:
+            // region digitalis: op_high=1, opcode=11111: FRSQRTS (U=0);
+            // U=1 is reserved.
+            if (u) { ok = false; break; }
+            op = AdvSimdThreeSameOpcode::kFrsqrtsV;
+            // endregion
             break;
           // endregion
           default: ok = false; break;
@@ -4608,9 +4650,9 @@ class Decoder {
     // FP scalar three-same opcodes live in the same encoding class but the
     // size field is interpreted as bit23=Fp-discriminator (1), bit22=sz.
     // Distinguish FP by opcode: 11010 (FABD), 11011 (FMULX), 11100 (FCMxx),
-    // 11101 (FAC..).
+    // 11101 (FAC..), 11111 (FRECPS / FRSQRTS).
     if (opcode == 0b11010 || opcode == 0b11011 || opcode == 0b11100 ||
-        opcode == 0b11101) {
+        opcode == 0b11101 || opcode == 0b11111) {
       is_fp = true;
       bool bit23 = (size >> 1) & 1;
       uint8_t sz = size & 1;  // 0 -> S, 1 -> D
@@ -4640,6 +4682,19 @@ class Decoder {
           if (u && bit23) op = AdvSimdScalarThreeSameOpcode::kFacgt;
           else if (u && !bit23) op = AdvSimdScalarThreeSameOpcode::kFacge;
           else { Undefined(); return; }
+          break;
+        case 0b11111:
+          // region digitalis: FRECPS (U=0, bit23=0) / FRSQRTS (U=0, bit23=1).
+          // Per ARM ARM C7.2.151 "FRECPS" and C7.2.155 "FRSQRTS":
+          //   01 0 11110 0 sz 1 Rm 11111 1 Rn Rd   (FRECPS)
+          //   01 0 11110 1 sz 1 Rm 11111 1 Rn Rd   (FRSQRTS)
+          // Verified: frecps s0,s1,s2=0x5E22FC20, frecps d0,d1,d2=0x5E62FC20,
+          //           frsqrts s0,s1,s2=0x5EA2FC20, frsqrts d0,d1,d2=0x5EE2FC20.
+          // U=1 at opcode=11111 is unallocated in the scalar encoding.
+          if (u) { Undefined(); return; }
+          op = bit23 ? AdvSimdScalarThreeSameOpcode::kFrsqrts
+                     : AdvSimdScalarThreeSameOpcode::kFrecps;
+          // endregion
           break;
         default:
           Undefined();
