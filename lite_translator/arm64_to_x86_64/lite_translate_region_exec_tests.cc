@@ -4085,6 +4085,183 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
 }
 // endregion
 
+// region digitalis: FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// ARM ARM defines FMLA/FMLS as fused multiply-accumulate (one rounding).
+// The lowering uses Vfmadd231(ps|pd) / Vfnmadd231(ps|pd).  Tests pick
+// operand triples whose products are exactly representable in the target
+// precision so fused and unfused results agree, sidestepping any oracle
+// ambiguity between this lowering and the interpreter's `d + a*b`
+// formulation.
+//
+// Encoding (per ARM ARM C7.2.135 "FMLA (vector)" / C7.2.136 "FMLS (vector)"
+// and aarch64-linux-gnu-as verification):
+//   FMLA Vd.2S, Vn.2S, Vm.2S = 0x0E20CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.4S, Vn.4S, Vm.4S = 0x4E20CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.2D, Vn.2D, Vm.2D = 0x4E60CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.2S, Vn.2S, Vm.2S = 0x0EA0CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.4S, Vn.4S, Vm.4S = 0x4EA0CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.2D, Vn.2D, Vm.2D = 0x4EE0CC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmlaVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// .4S FMLA: Vd[i] += Vn[i] * Vm[i] across four lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4SAllLanes) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 1.5f, -3.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, 4.0f, 0.5f, -2.0f);
+  StoreVec4S(state_.cpu, 0, 1.0f, 2.0f, 10.0f, 0.0f);
+  static const uint32_t code[] = {FmlaVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 7.0f);   // 1 + 2*3
+  EXPECT_FLOAT_EQ(r[1], 8.0f);   // 2 + 1.5*4
+  EXPECT_FLOAT_EQ(r[2], 8.5f);   // 10 + (-3)*0.5
+  EXPECT_FLOAT_EQ(r[3], -8.0f);  // 0 + 4*-2
+}
+
+// .2S FMLA: q=0 form; upper 64 bits of Vd must be zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, 99.0f, 99.0f);   // lanes 2,3 ignored
+  StoreVec4S(state_.cpu, 2, 5.0f, -1.5f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, 1.0f, 8.0f, 7.0f, 7.0f);     // sentinel uppers
+  static const uint32_t code[] = {FmlaVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 11.0f);  // 1 + 2*5
+  EXPECT_FLOAT_EQ(r[1], 3.5f);   // 8 + 3*-1.5
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);     // upper 64 bits zeroed by .2S form
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// .2D FMLA: two FP64 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec2DAllLanes) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 6.0, 2.0);
+  StoreVec2D(state_.cpu, 0, 1.0, 10.0);
+  static const uint32_t code[] = {FmlaVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 4.0);   // 1 + 0.5*6
+  EXPECT_DOUBLE_EQ(r[1], 4.0);   // 10 + -3*2
+}
+
+// .4S FMLS: Vd[i] -= Vn[i] * Vm[i].
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec4SAllLanes) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 1.5f, -3.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, 4.0f, 0.5f, -2.0f);
+  StoreVec4S(state_.cpu, 0, 10.0f, 2.0f, 0.0f, 1.0f);
+  static const uint32_t code[] = {FmlsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 4.0f);    // 10 - 2*3
+  EXPECT_FLOAT_EQ(r[1], -4.0f);   // 2 - 1.5*4
+  EXPECT_FLOAT_EQ(r[2], 1.5f);    // 0 - (-3)*0.5
+  EXPECT_FLOAT_EQ(r[3], 9.0f);    // 1 - 4*-2
+}
+
+// .2S FMLS: q=0 form; upper 64 bits of Vd must be zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, -1.5f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, 11.0f, 8.0f, 7.0f, 7.0f);
+  static const uint32_t code[] = {FmlsVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);    // 11 - 2*5
+  EXPECT_FLOAT_EQ(r[1], 12.5f);   // 8 - 3*-1.5
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// .2D FMLS.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec2DAllLanes) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 6.0, 2.0);
+  StoreVec2D(state_.cpu, 0, 10.0, 4.0);
+  static const uint32_t code[] = {FmlsVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.0);    // 10 - 0.5*6
+  EXPECT_DOUBLE_EQ(r[1], 10.0);   // 4 - -3*2
+}
+
+// Fused-vs-unfused divergence: pick (a, b, d) such that a*b in FP32 is not
+// exact but fma(a, b, d) differs from (a*b)+d.  Validates the lowering is
+// using the FMA path (single rounding), not MUL+ADD.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4SFusedRounding) {
+  // a = 1 + 2^-23  (smallest float > 1)
+  // b = 1 + 2^-23
+  // exact product = 1 + 2^-22 + 2^-46
+  // d = -1
+  // unfused: float(a*b) = 1 + 2^-22 (the 2^-46 bit is lost), then + -1
+  //   = 2^-22 = 2.384185791015625e-07.
+  // fused: fma rounds (a*b + d) = (1 + 2^-22 + 2^-46) - 1 = 2^-22 + 2^-46,
+  //   which rounds to nearest float — the trailing 2^-46 bit rounds up to
+  //   2^-22 + 2^-23 (next representable above 2^-22 in the normal range
+  //   would be 2^-22*(1+2^-23) = 2^-22 + 2^-45; but here the result has
+  //   magnitude 2^-22 so the ulp is 2^-22 * 2^-23 = 2^-45, and 2^-46 rounds
+  //   down to 0).  So the rounded fused result is exactly 2^-22 + 0 = 2^-22.
+  //
+  // (Hence for this triple fused and unfused happen to agree.)  We instead
+  // use a triple where fused vs unfused differ in the last bit:
+  //   a = 0x3F800001 (1 + ulp), b = 0x3F800001, d = -1.0.
+  // Already covered above.  Use a sharper case:
+  //   a = float(1 + 2^-12), b = a (so a*b = 1 + 2^-11 + 2^-24, exactly
+  //     representable in float), d = -1.0.
+  //   fused = 2^-11 + 2^-24.
+  //   unfused = (1 + 2^-11 + 2^-24) - 1; the parenthesised value rounds to
+  //     1 + 2^-11 (the 2^-24 bit is below the ULP near 1, which is 2^-23),
+  //     then subtract 1 -> 2^-11.
+  //   Difference: fused = 2^-11 + 2^-24, unfused = 2^-11.
+  StoreVec4S(state_.cpu, 1, 1.0f + std::ldexp(1.0f, -12), 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 2, 1.0f + std::ldexp(1.0f, -12), 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 0, -1.0f, 0.f, 0.f, 0.f);
+  static const uint32_t code[] = {FmlaVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  const float expected =
+      std::fmaf(1.0f + std::ldexp(1.0f, -12), 1.0f + std::ldexp(1.0f, -12), -1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

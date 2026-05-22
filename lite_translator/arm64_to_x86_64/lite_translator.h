@@ -4232,6 +4232,60 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: FMLA / FMLS vector three-same (FP32 .2S/.4S, FP64 .2D).
+      //
+      // ARM ARM defines FMLA/FMLS as fused multiply-accumulate (single
+      // rounding for the whole multiply-add).  x86 FMA3 packed forms have
+      // matching semantics:
+      //   FMLA  Vd <- Vd + Vn*Vm  ->  VFMADD231PS / VFMADD231PD
+      //   FMLS  Vd <- Vd - Vn*Vm  ->  VFNMADD231PS / VFNMADD231PD
+      // Same shape as the existing scalar FMADD/FMSUB JIT in FpDataProc3.
+      //
+      // FP16 .4H/.8H continues to bail to the interpreter: it does the
+      // multiply-accumulate in binary64 then narrows once back to half via
+      // FpSingleToHalf, which is exact.  An F16C round-trip + packed
+      // VFMADD on the binary32 promotion would not match bit-for-bit
+      // because the intermediate sum can lose precision against the
+      // binary64 oracle for sub-normal results.
+      //
+      // Reserved .1D shape (size=01 && q=0) bails too.  Hosts without
+      // FMA3 fall back to the interpreter (no MUL+ADD pair — that would
+      // double-round, violating ARM's fused semantics).
+      case Decoder::AdvSimdThreeSameOpcode::kFmlaV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmlsV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (!host_platform::kHasFMA) { success_ = false; return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { success_ = false; return; }
+
+        SimdRegister xmm_n = AllocTempSimdReg();
+        SimdRegister xmm_m = AllocTempSimdReg();
+        SimdRegister xmm_d = AllocTempSimdReg();
+        if (xmm_n == no_simd_register || xmm_m == no_simd_register ||
+            xmm_d == no_simd_register) {
+          success_ = false; return;
+        }
+
+        load_full(xmm_n, vn_off);
+        load_full(xmm_m, vm_off);
+        load_full(xmm_d, vd_off);
+
+        const bool is_fmls =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV);
+        if (is_fmls) {
+          // Vd = Vd + (-Vn)*Vm  -- single fused rounding.
+          if (is_double) as_.Vfnmadd231pd(xmm_d, xmm_n, xmm_m);
+          else            as_.Vfnmadd231ps(xmm_d, xmm_n, xmm_m);
+        } else {
+          if (is_double) as_.Vfmadd231pd(xmm_d, xmm_n, xmm_m);
+          else            as_.Vfmadd231ps(xmm_d, xmm_n, xmm_m);
+        }
+
+        if (!args.q) mask_low64(xmm_d);
+        store_full(vd_off, xmm_d);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
