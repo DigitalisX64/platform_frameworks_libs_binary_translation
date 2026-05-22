@@ -5083,6 +5083,207 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {
 }
 // endregion
 
+// region digitalis: FP16 vector FRECPS / FRSQRTS .4H / .8H — F16C round-trip
+// JIT.  Encodings (verified via aarch64-linux-gnu-as):
+//   FRECPS  Vd.4H, Vn.4H, Vm.4H = 0x0E403C00 | (rm<<16) | (rn<<5) | rd
+//   FRECPS  Vd.8H, Vn.8H, Vm.8H = 0x4E403C00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.4H, Vn.4H, Vm.4H = 0x0EC03C00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.8H, Vn.8H, Vm.8H = 0x4EC03C00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FrecpsVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E403C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E403C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EC03C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EC03C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+static void StoreVec8H(CPUState& cpu, unsigned idx, const uint16_t lanes[8]) {
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void LoadVec8H(const CPUState& cpu, unsigned idx, uint16_t out[8]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+
+// FP16 bit pattern constants used by the tests below.
+constexpr uint16_t kHalf_1_0  = 0x3C00;
+constexpr uint16_t kHalf_2_0  = 0x4000;
+constexpr uint16_t kHalf_0_5  = 0x3800;
+constexpr uint16_t kHalf_neg2_0 = 0xC000;
+constexpr uint16_t kHalf_neg0_5 = 0xB800;
+constexpr uint16_t kHalf_4_0  = 0x4400;
+constexpr uint16_t kHalf_0_25 = 0x3400;
+constexpr uint16_t kHalf_pos0 = 0x0000;
+constexpr uint16_t kHalf_neg0 = 0x8000;
+constexpr uint16_t kHalf_pos_inf = 0x7C00;
+constexpr uint16_t kHalf_neg_inf = 0xFC00;
+constexpr uint16_t kHalf_qNaN = 0x7E00;
+constexpr uint16_t kHalf_1_5  = 0x3E00;
+constexpr uint16_t kHalf_3_0  = 0x4200;
+
+// FRECPS .4H — Newton step for reciprocal lane-by-lane.  Lanes 4..7 of Vd
+// must be zeroed by the FP16 round-trip path (Q=0 -> upper 64 bits zero).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg2_0, kHalf_4_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_0_25,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN,
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);  // 2 - 1*1
+  EXPECT_EQ(r[1], kHalf_1_0);  // 2 - 0.5*2
+  EXPECT_EQ(r[2], kHalf_1_0);  // 2 - (-2)*(-0.5)
+  EXPECT_EQ(r[3], kHalf_1_0);  // 2 - 4*0.25
+  // Upper 64 bits (lanes 4..7) zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FRECPS .4H — (±0, ±inf) crosses must produce +2.0 (no sign flip),
+// not the default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4HZeroTimesInfSaturation) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_neg_inf, kHalf_pos0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_pos_inf, kHalf_pos_inf, kHalf_pos0, kHalf_neg_inf,
+                                0, 0, 0, 0};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN,
+                        0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_2_0);
+  EXPECT_EQ(r[1], kHalf_2_0);
+  EXPECT_EQ(r[2], kHalf_2_0);
+  EXPECT_EQ(r[3], kHalf_2_0);
+}
+
+// FRECPS .4H — NaN input yields default qNaN, not the saturation constant.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4HNaNInputDefaultsToQnan) {
+  const uint16_t n_lanes[8] = {kHalf_qNaN, kHalf_pos0,    kHalf_1_0, kHalf_1_0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_1_0,  kHalf_pos_inf, kHalf_1_0, kHalf_qNaN, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  // Lane 0/3: NaN input -> qNaN.
+  EXPECT_EQ(r[0], kHalf_qNaN);
+  EXPECT_EQ(r[3], kHalf_qNaN);
+  // Lane 1: (+0, +inf) cross -> +2.0.
+  EXPECT_EQ(r[1], kHalf_2_0);
+  // Lane 2: 2 - 1*1 = 1.
+  EXPECT_EQ(r[2], kHalf_1_0);
+}
+
+// FRSQRTS .4H — Newton step (3 - a*b) / 2, lane by lane.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg2_0, kHalf_0_5, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrsqrtsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);  // (3 - 1*1) / 2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);  // (3 - 2*0.5) / 2 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);  // (3 - (-2)*(-0.5)) / 2 = 1
+  EXPECT_EQ(r[3], kHalf_0_5);  // (3 - 0.5*4) / 2 = 0.5
+}
+
+// FRSQRTS .4H — (±0, ±inf) crosses must produce +1.5 (no sign flip).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec4HZeroTimesInfSaturation) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_neg_inf, kHalf_pos0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_pos_inf, kHalf_pos_inf, kHalf_pos0, kHalf_neg_inf, 0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrsqrtsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_5);
+  EXPECT_EQ(r[1], kHalf_1_5);
+  EXPECT_EQ(r[2], kHalf_1_5);
+  EXPECT_EQ(r[3], kHalf_1_5);
+}
+
+// FRECPS .8H — exercises the 2-pass XMM path (low 4 lanes then high 4).
+// Mix regular Newton-step lanes (0-3) and saturation lanes (4-7).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec8HTwoPassMixed) {
+  const uint16_t n_lanes[8] = {kHalf_1_0,    kHalf_0_5,    kHalf_neg2_0, kHalf_4_0,
+                                kHalf_pos0,   kHalf_neg0,   kHalf_neg_inf, kHalf_pos0};
+  const uint16_t m_lanes[8] = {kHalf_1_0,    kHalf_2_0,    kHalf_neg0_5, kHalf_0_25,
+                                kHalf_pos_inf, kHalf_pos_inf, kHalf_pos0,    kHalf_neg_inf};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrecpsVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  // Lanes 0-3 (low pass): regular Newton step -> 1.0h.
+  EXPECT_EQ(r[0], kHalf_1_0);
+  EXPECT_EQ(r[1], kHalf_1_0);
+  EXPECT_EQ(r[2], kHalf_1_0);
+  EXPECT_EQ(r[3], kHalf_1_0);
+  // Lanes 4-7 (high pass): (zero, inf) cross -> +2.0h.
+  EXPECT_EQ(r[4], kHalf_2_0);
+  EXPECT_EQ(r[5], kHalf_2_0);
+  EXPECT_EQ(r[6], kHalf_2_0);
+  EXPECT_EQ(r[7], kHalf_2_0);
+}
+
+// FRSQRTS .8H — same two-pass split, all lanes regular Newton step.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec8HTwoPassRegular) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg2_0, kHalf_0_5,
+                                kHalf_1_0, kHalf_0_5, kHalf_4_0,    kHalf_2_0};
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_2_0, kHalf_0_25,   kHalf_0_5};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FrsqrtsVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);  // (3 - 1*1)/2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);  // (3 - 2*0.5)/2 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);  // (3 - (-2)*(-0.5))/2 = 1
+  EXPECT_EQ(r[3], kHalf_0_5);  // (3 - 0.5*4)/2 = 0.5
+  EXPECT_EQ(r[4], kHalf_1_0);  // (3 - 1*1)/2 = 1
+  EXPECT_EQ(r[5], kHalf_1_0);  // (3 - 0.5*2)/2 = 1
+  EXPECT_EQ(r[6], kHalf_1_0);  // (3 - 4*0.25)/2 = 1
+  EXPECT_EQ(r[7], kHalf_1_0);  // (3 - 2*0.5)/2 = 1
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
