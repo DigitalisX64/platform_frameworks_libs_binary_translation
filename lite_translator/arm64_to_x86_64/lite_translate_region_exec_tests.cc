@@ -5922,6 +5922,267 @@ TEST_F(Arm64LiteTranslateRegionTest, FmaddHSmallTail) {
 }
 // endregion
 
+// region digitalis: integer MUL/MLA/MLS by-element JIT tests.
+//
+// Encoding: 0 Q U 01111 size L M Rm[3:0] opcode H 0 Rn Rd.
+//   - halfword (size=01): index = H:L:M (3 bits, 0..7), Vm restricted to V0..V15.
+//   - word     (size=10): index = H:L   (2 bits, 0..3), Vm full V0..V31 (M = Vm bit4).
+// (opcode, U) selects integer op:
+//   MUL: opc=1000, U=0
+//   MLA: opc=0000, U=1
+//   MLS: opc=0100, U=1
+//
+// Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+//   mul  v0.4h, v1.4h, v2.h[0] = 0x0F428020
+//   mul  v0.4h, v1.4h, v2.h[7] = 0x0F728820
+//   mul  v0.8h, v1.8h, v2.h[7] = 0x4F728820
+//   mul  v0.2s, v1.2s, v2.s[1] = 0x0FA28020
+//   mul  v0.4s, v1.4s, v2.s[3] = 0x4FA28820
+//   mla  v0.4h, v1.4h, v2.h[0] = 0x2F420020
+//   mla  v0.4s, v1.4s, v2.s[2] = 0x6F820820
+//   mls  v0.8h, v1.8h, v2.h[5] = 0x6F524820
+//   mls  v0.4s, v1.4s, v2.s[1] = 0x6FA24020
+constexpr uint32_t MulIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // Q=0, U=0, size=01, opc=1000, halfword.  Vm in V0..V15: only Rm[3:0] used.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x0F408000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MulIdx8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F408000u | (((k >> 1) & 1u) << 21) | ((k & 1u) << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (((k >> 2) & 1u) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MulIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // Q=0, U=0, size=10, opc=1000, word.  index = H:L (2 bits).
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x0F808000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MulIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x4F808000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MlaIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // U=1, opc=0000 -> base 0x2F400000 for Q=0 size=01.
+  return 0x2F400000u | (((k >> 1) & 1u) << 21) | ((k & 1u) << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (((k >> 2) & 1u) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MlaIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x6F800000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MlsIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // U=1, opc=0100 -> base 0x2F404000 for Q=0 size=01.
+  return 0x2F404000u | (((k >> 1) & 1u) << 21) | ((k & 1u) << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (((k >> 2) & 1u) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MlsIdx8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x6F404000u | (((k >> 1) & 1u) << 21) | ((k & 1u) << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (((k >> 2) & 1u) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t MlsIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x6F804000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Helpers for 32-bit integer 4-lane Vec storage.
+static void StoreVec4SInt(CPUState& cpu, unsigned idx,
+                          int32_t a0, int32_t a1, int32_t a2, int32_t a3) {
+  int32_t lanes[4] = {a0, a1, a2, a3};
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void LoadVec4SInt(const CPUState& cpu, unsigned idx, int32_t out[4]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+
+// MUL .4h, lane 0 (low quad).
+TEST_F(Arm64LiteTranslateRegionTest, MulIdxVec4HLowLane) {
+  const uint16_t n_lanes[8] = {2, 3, 0xFFFF, 4, 99, 99, 99, 99};  // Vn.4h = {2, 3, -1, 4}
+  const uint16_t m_lanes[8] = {5, 99, 99, 99, 99, 99, 99, 99};    // Vm.h[0] = 5
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {MulIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 10u);
+  EXPECT_EQ(r[1], 15u);
+  EXPECT_EQ(r[2], static_cast<uint16_t>(-5));  // -1 * 5 mod 2^16
+  EXPECT_EQ(r[3], 20u);
+  // .4h: upper 64 bits must be zero.
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// MUL .8h, lane 7 (high quad) — exercises the args.index >= 4 Psrldq path.
+TEST_F(Arm64LiteTranslateRegionTest, MulIdxVec8HHighLane) {
+  const uint16_t n_lanes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const uint16_t m_lanes[8] = {99, 99, 99, 99, 99, 99, 99, 10};   // Vm.h[7] = 10
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {MulIdx8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  for (int i = 0; i < 8; i++) {
+    EXPECT_EQ(r[i], static_cast<uint16_t>((i + 1) * 10)) << "lane " << i;
+  }
+}
+
+// MLA .4h: Vd = Vd + Vn * broadcast(Vm.h[k]).
+TEST_F(Arm64LiteTranslateRegionTest, MlaIdxVec4H) {
+  const uint16_t n_lanes[8] = {2, 3, 0xFFFF, 4, 99, 99, 99, 99};
+  const uint16_t m_lanes[8] = {5, 99, 99, 99, 99, 99, 99, 99};    // Vm.h[0] = 5
+  const uint16_t d_init[8] = {1, 1, 1, 1, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {MlaIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 11u);                          // 1 + 2*5
+  EXPECT_EQ(r[1], 16u);                          // 1 + 3*5
+  EXPECT_EQ(r[2], static_cast<uint16_t>(-4));    // 1 + -1*5
+  EXPECT_EQ(r[3], 21u);                          // 1 + 4*5
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// MLS .8h: Vd = Vd - Vn * broadcast(Vm.h[k]).  Use lane 5 (high quad).
+TEST_F(Arm64LiteTranslateRegionTest, MlsIdxVec8H) {
+  uint16_t n_lanes[8];
+  for (int i = 0; i < 8; i++) n_lanes[i] = 2;
+  const uint16_t m_lanes[8] = {99, 99, 99, 99, 99, 3, 99, 99};    // Vm.h[5] = 3
+  uint16_t d_init[8];
+  for (int i = 0; i < 8; i++) d_init[i] = 10;
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {MlsIdx8H(0, 1, 2, /*k=*/5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  for (int i = 0; i < 8; i++) {
+    EXPECT_EQ(r[i], 4u) << "lane " << i;          // 10 - 2*3 = 4
+  }
+}
+
+// MUL .4s, lane 3 (high lane).
+TEST_F(Arm64LiteTranslateRegionTest, MulIdxVec4S) {
+  StoreVec4SInt(state_.cpu, 1, 2, 3, -1, 4);
+  StoreVec4SInt(state_.cpu, 2, 99, 99, 99, -5);   // Vm.s[3] = -5
+  StoreVec4SInt(state_.cpu, 0, 0x77777777, 0x77777777, 0x77777777, 0x77777777);
+  static const uint32_t code[] = {MulIdx4S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], -10);
+  EXPECT_EQ(r[1], -15);
+  EXPECT_EQ(r[2], 5);
+  EXPECT_EQ(r[3], -20);
+}
+
+// MUL .2s, Q=0 — upper 64 bits of Vd must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, MulIdxVec2SUpperZero) {
+  StoreVec4SInt(state_.cpu, 1, 7, -3, 99, 99);
+  StoreVec4SInt(state_.cpu, 2, 99, 4, 99, 99);    // Vm.s[1] = 4
+  StoreVec4SInt(state_.cpu, 0, 0x77777777, 0x77777777, 0x77777777, 0x77777777);
+  static const uint32_t code[] = {MulIdx2S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 28);
+  EXPECT_EQ(r[1], -12);
+  EXPECT_EQ(r[2], 0);
+  EXPECT_EQ(r[3], 0);
+}
+
+// MLA .4s: Vd = Vd + Vn * broadcast(Vm.s[k]).
+TEST_F(Arm64LiteTranslateRegionTest, MlaIdxVec4S) {
+  StoreVec4SInt(state_.cpu, 1, 2, 3, -1, 4);
+  StoreVec4SInt(state_.cpu, 2, 99, 99, 5, 99);    // Vm.s[2] = 5
+  StoreVec4SInt(state_.cpu, 0, 1, 1, 1, 1);
+  static const uint32_t code[] = {MlaIdx4S(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 11);    // 1 + 2*5
+  EXPECT_EQ(r[1], 16);    // 1 + 3*5
+  EXPECT_EQ(r[2], -4);    // 1 + -1*5
+  EXPECT_EQ(r[3], 21);    // 1 + 4*5
+}
+
+// MLS .4s: Vd = Vd - Vn * broadcast(Vm.s[k]).
+TEST_F(Arm64LiteTranslateRegionTest, MlsIdxVec4S) {
+  StoreVec4SInt(state_.cpu, 1, 2, 3, -1, 4);
+  StoreVec4SInt(state_.cpu, 2, 99, 5, 99, 99);    // Vm.s[1] = 5
+  StoreVec4SInt(state_.cpu, 0, 11, 16, -4, 21);
+  static const uint32_t code[] = {MlsIdx4S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 1);     // 11 - 2*5
+  EXPECT_EQ(r[1], 1);     // 16 - 3*5
+  EXPECT_EQ(r[2], 1);     // -4 - (-1)*5
+  EXPECT_EQ(r[3], 1);     // 21 - 4*5
+}
+
+// MUL .4h vs MLA .4h dispatch — same operands, two different ops produce
+// distinct results.  Confirms the (U, opcode) tuple dispatches to the right
+// integer op rather than aliasing.
+TEST_F(Arm64LiteTranslateRegionTest, MulVsMlaIdxDispatch) {
+  const uint16_t n_lanes[8] = {3, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t d_init[8] = {100, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // MUL: r0 = 3 * 7 = 21
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code_mul[] = {MulIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code_mul, ToGuestAddr(code_mul) + sizeof(code_mul)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 21u);
+  // MLA: r0 = 100 + 3 * 7 = 121
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code_mla[] = {MlaIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code_mla, ToGuestAddr(code_mla) + sizeof(code_mla)));
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 121u);
+  // MLS: r0 = 100 - 3 * 7 = 79
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code_mls[] = {MlsIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code_mls, ToGuestAddr(code_mls) + sizeof(code_mls)));
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 79u);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

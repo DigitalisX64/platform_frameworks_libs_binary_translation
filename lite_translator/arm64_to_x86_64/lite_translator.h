@@ -8445,6 +8445,98 @@ class LiteTranslator {
   // Reserved .1D shape (size=11 && q=0) and hosts without FMA bail.
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
     using Op = Decoder::AdvSimdVecXIdxOpcode;
+    // region digitalis: integer MUL/MLA/MLS by-element (halfword .4h/.8h
+    // size=01, word .2s/.4s size=10).
+    //
+    // Vd = Vn op (Vm.lane[index] broadcast across destination lanes), with
+    //   MUL: Vd = Vn * broadcast(Vm[index])
+    //   MLA: Vd = Vd + Vn * broadcast(Vm[index])
+    //   MLS: Vd = Vd - Vn * broadcast(Vm[index])
+    // No saturation, no widening — the bottom esize bits of each lane-wise
+    // host product match the architecturally-defined result modulo 2^esize.
+    //
+    // Broadcast:
+    //   - halfword: index = H:L:M (3 bits, 0..7).  If index >= 4 shift Vm
+    //     down by 8 bytes so the target lane sits in the low quad, then
+    //     Pshuflw with imm = (i:i:i:i) (i = index & 3) replicates it across
+    //     the low 4 halfword lanes, and Pshufd 0x44 mirrors low qword into
+    //     high qword for all 8 lanes.
+    //   - word: index = H:L (2 bits, 0..3).  Pshufd with i:i:i:i broadcasts
+    //     directly across 4 word lanes.
+    //
+    // !Q: zero upper 64 bits (D-register semantics) via Pslldq/Psrldq 8.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+    //   mul  v0.4h, v1.4h, v2.h[0] = 0x0F428020
+    //   mul  v0.8h, v1.8h, v2.h[7] = 0x4F728820
+    //   mul  v0.2s, v1.2s, v2.s[1] = 0x0FA28020
+    //   mul  v0.4s, v1.4s, v2.s[3] = 0x4FA28820
+    //   mla  v0.4h, v1.4h, v2.h[0] = 0x2F420020
+    //   mla  v0.4s, v1.4s, v2.s[2] = 0x6F820820
+    //   mls  v0.8h, v1.8h, v2.h[5] = 0x6F524820
+    //   mls  v0.4s, v1.4s, v2.s[1] = 0x6FA24020
+    if (args.opcode == Op::kMul || args.opcode == Op::kMla ||
+        args.opcode == Op::kMls) {
+      if (args.size != 0b01 && args.size != 0b10) { success_ = false; return; }
+      const bool is_halfword = (args.size == 0b01);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      if (is_halfword) {
+        if (args.index >= 4) {
+          as_.Psrldq(xm, int8_t{8});
+        }
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      } else {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xm, xm, imm);
+      }
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kMul) {
+        if (is_halfword) as_.Pmullw(xn, xm);
+        else             as_.Pmulld(xn, xm);  // SSE4.1
+        xmm_result = xn;
+      } else {
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (is_halfword) as_.Pmullw(xn, xm);
+        else             as_.Pmulld(xn, xm);  // SSE4.1
+        if (args.opcode == Op::kMla) {
+          if (is_halfword) as_.Paddw(xd, xn);
+          else             as_.Paddd(xd, xn);
+        } else {
+          if (is_halfword) as_.Psubw(xd, xn);
+          else             as_.Psubd(xd, xn);
+        }
+        xmm_result = xd;
+      }
+
+      if (!args.q) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
