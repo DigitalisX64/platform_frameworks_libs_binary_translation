@@ -6513,6 +6513,91 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
         return;
       }
+      // FCVTZU V (vector FP->unsigned int, truncating).  Handles .2S /
+      // .4S (FP32 -> U32) directly with a CVTTPS2DQ-based lowering and
+      // a "subtract 2^31" offset trick.  FP16 and FP64 (.2D) bail to
+      // the interpreter.
+      //
+      // ARM FCVTZU saturation rules:
+      //   NaN              -> 0
+      //   FP < 0 (incl -0) -> 0
+      //   FP >= 2^32       -> UINT32_MAX (0xFFFFFFFF)
+      //   FP in [0, 2^32)  -> truncate toward zero
+      //
+      // Algorithm:
+      //   1. Clamp negative and NaN inputs to 0 via MAXPS(src, zero).
+      //      MAXPS returns the second operand when the first is NaN
+      //      (and for +0/-0 pairs), so NaN and negative lanes collapse
+      //      to 0 in a single instruction.
+      //   2. Build the FP32 constant 2^31 (0x4F000000) broadcast per
+      //      lane via a Movd + Pshufd from a GP scratch.
+      //   3. needs_offset mask = (2^31 <= src_clamped) via CMPLEPS.
+      //   4. offset_amount = 2^31 where needs_offset, else 0 (PAND).
+      //   5. src_for_cvt = src_clamped - offset_amount.  The subtract is
+      //      exact in FP32 in the [2^31, 2^32) range (both operands at
+      //      the same exponent step).  Result lands in [0, 2^31] -- the
+      //      [0, 2^31) inputs pass through unchanged because their
+      //      needs_offset mask is 0.
+      //   6. too_big mask = (2^31 <= src_for_cvt).  Equivalent to
+      //      original >= 2^32 (since src_for_cvt = original - 2^31 for
+      //      values that hit the offset, and src_for_cvt < 2^31 for
+      //      values that didn't).  +Inf falls in this bucket.
+      //   7. CVTTPS2DQ converts.  Inputs <= 2^31; the boundary case
+      //      (2^31 exact) saturates to 0x80000000 = INT32_MIN, but the
+      //      too_big mask catches that lane and overwrites with all-1s.
+      //   8. Build 0x80000000 per lane via PCMPEQD + PSLLD 31.
+      //      AND with needs_offset, then OR into the result -- this
+      //      restores the high bit for values in [2^31, 2^32) whose
+      //      true unsigned representation has bit 31 set.
+      //   9. OR with too_big -- bits-1 lanes become 0xFFFFFFFF, lanes
+      //      with too_big=0 are unchanged.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size != 0b10) { success_ = false; return; }  // FP64 deferred
+        SimdRegister x_dst = AllocTempSimdReg();
+        SimdRegister x_pow31 = AllocTempSimdReg();
+        SimdRegister x_needs_off = AllocTempSimdReg();
+        SimdRegister x_scratch = AllocTempSimdReg();
+        if (x_dst == no_simd_register || x_pow31 == no_simd_register ||
+            x_needs_off == no_simd_register || x_scratch == no_simd_register) {
+          success_ = false; return;
+        }
+        Register gp_tmp = AllocTempReg();
+        if (gp_tmp == no_register) { success_ = false; return; }
+        // 1. Load src and clamp neg/NaN to 0 via MAXPS with zero.
+        as_.Movdqu(x_dst, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(x_scratch, x_scratch);          // 0.0 per lane
+        as_.Maxps(x_dst, x_scratch);             // NaN/neg -> 0
+        // 2. Broadcast 2^31 = 0x4F000000 to all four FP32 lanes.
+        as_.Movl(gp_tmp, int32_t{0x4F000000});
+        as_.Movd(x_pow31, gp_tmp);
+        as_.Pshufd(x_pow31, x_pow31, int8_t{0x00});
+        // 3. needs_offset = (2^31 <= src_clamped).
+        as_.Movdqa(x_needs_off, x_pow31);
+        as_.Cmpleps(x_needs_off, x_dst);
+        // 4. offset_amount = 2^31 where needs_offset (reuse x_scratch).
+        as_.Movdqa(x_scratch, x_pow31);
+        as_.Pand(x_scratch, x_needs_off);
+        // 5. src_for_cvt = src_clamped - offset_amount.
+        as_.Subps(x_dst, x_scratch);
+        // 6. too_big = (2^31 <= src_for_cvt).  Reuse x_scratch for mask.
+        as_.Movdqa(x_scratch, x_pow31);
+        as_.Cmpleps(x_scratch, x_dst);
+        // 7. CVTTPS2DQ; in-range lanes get correct s32, too_big lanes
+        //    saturate to 0x80000000 (overwritten below).
+        as_.Cvttps2dq(x_dst, x_dst);
+        // 8. Build 0x80000000 per lane via self-PCMPEQD + PSLLD 31.
+        //    Overwrite x_pow31; its compare-constant role is done.
+        as_.Pcmpeqd(x_pow31, x_pow31);
+        as_.Pslld(x_pow31, int8_t{31});
+        as_.Pand(x_pow31, x_needs_off);          // 0x80000000 where subtracted
+        as_.Por(x_dst, x_pow31);
+        // 9. Saturate too-big lanes to 0xFFFFFFFF.
+        as_.Por(x_dst, x_scratch);
+        if (!args.q) mask_low64(x_dst);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
+        return;
+      }
       // endregion
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
         if (args.is_fp16) {

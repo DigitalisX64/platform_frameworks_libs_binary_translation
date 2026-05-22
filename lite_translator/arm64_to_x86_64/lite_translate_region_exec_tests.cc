@@ -2730,6 +2730,70 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV2sZeroesUpperHalf) {
   EXPECT_EQ(lanes[2], 0u);
   EXPECT_EQ(lanes[3], 0u);
 }
+
+// FCVTZU vector FP32 -> U32 truncating.  Same encoding shape as FCVTZS
+// (opcode=11011, bit23=1, sz=0) but with U=1 (bit29).  Hand-derived:
+//   fcvtzu v0.4s, v0.4s = 0x6EA1B800  (Q=1, U=1)
+//   fcvtzu v0.2s, v0.2s = 0x2EA1B800  (Q=0, U=1)
+constexpr uint32_t kFcvtzuV4s00 = 0x6EA1B800;
+constexpr uint32_t kFcvtzuV2s00 = 0x2EA1B800;
+
+// Mixed normal lanes: in-range positive, negative clamps to 0,
+// exact integer, and a value in [2^31, 2^32) that exercises the
+// subtract-2^31 offset trick.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV4sNormalLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4048F5C3u;  // 3.14f -> 3
+  lanes[1] = 0xC048F5C3u;  // -3.14f -> 0 (negative clamps)
+  lanes[2] = 0x40A00000u;  // 5.0f -> 5
+  lanes[3] = 0x4F000001u;  // 2^31 + 256 = 2147483904.0f -> 0x80000100
+  static const uint32_t code[] = {kFcvtzuV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3u);
+  EXPECT_EQ(out[1], 0u);
+  EXPECT_EQ(out[2], 5u);
+  EXPECT_EQ(out[3], 0x80000100u);
+}
+
+// Saturation boundaries: NaN -> 0, +Inf -> UINT32_MAX, -Inf -> 0
+// (negative clamp), 2^32 (=0x4F800000) -> UINT32_MAX.  Exercises the
+// MAXPS-clamps-neg/NaN path and the too_big saturation path.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV4sSaturationBoundaries) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FC00000u;  // qNaN -> 0
+  lanes[1] = 0x7F800000u;  // +Inf -> UINT32_MAX
+  lanes[2] = 0xFF800000u;  // -Inf -> 0
+  lanes[3] = 0x4F800000u;  // 2^32 = 4294967296.0f -> UINT32_MAX
+  static const uint32_t code[] = {kFcvtzuV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0u);
+  EXPECT_EQ(out[1], UINT32_MAX);
+  EXPECT_EQ(out[2], 0u);
+  EXPECT_EQ(out[3], UINT32_MAX);
+}
+
+// .2S form (Q=0): low 64 bits computed (one lane in [0,2^31), one in
+// [2^31, 2^32) to exercise the offset trick under Q=0), upper 64 must
+// be zeroed regardless of prior content.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV2sZeroesUpperHalf) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4048F5C3u;  // 3.14f -> 3
+  lanes[1] = 0x4F000001u;  // 2^31 + 256 -> 0x80000100 (offset trick)
+  lanes[2] = 0xDEADBEEFu;  // garbage; must be zeroed
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFcvtzuV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3u);
+  EXPECT_EQ(out[1], 0x80000100u);
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
 // endregion
 
 }  // namespace
