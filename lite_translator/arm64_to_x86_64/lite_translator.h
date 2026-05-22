@@ -7496,17 +7496,18 @@ class LiteTranslator {
     Undefined();
   }
 
-  // region digitalis: FMULX (scalar three-same, FP32/FP64) JIT.
+  // region digitalis: FMULX / FRECPS / FRSQRTS (scalar three-same, FP32/FP64)
+  // JIT.
   //
   // FMULX is identical to FMUL except the (zero * infinity) saturation case
   // returns ±2.0 (sign = sign(a) XOR sign(b)) instead of the FMUL-produced
   // NaN.  See Interpreter::FmulxScalar<> for the reference semantics.
   //
-  // Strategy (branchless): always compute mul = a * b first.  The result is
-  // NaN iff one of {a, b} is NaN OR {a, b} is the (0, ±inf) / (±inf, 0) pair.
-  // We construct a mask that is all-ones iff the special case (0*inf) fired
-  // — that is, "mul is NaN AND neither input is NaN" — then blend mul with
-  // ±2.0 under that mask:
+  // FMULX strategy (branchless): always compute mul = a * b first.  The
+  // result is NaN iff one of {a, b} is NaN OR {a, b} is the (0, ±inf) /
+  // (±inf, 0) pair.  We construct a mask that is all-ones iff the special
+  // case (0*inf) fired — that is, "mul is NaN AND neither input is NaN" —
+  // then blend mul with ±2.0 under that mask:
   //
   //   special_mask = cmpunord(mul, mul) AND NOT cmpunord(a, b)
   //                = "mul became NaN purely from 0*inf"
@@ -7519,12 +7520,37 @@ class LiteTranslator {
   // sign(b) (XOR of the source sign bits), matching std::signbit(a) ^
   // std::signbit(b) in the interpreter.
   //
+  // FRECPS  semantics (ARM ARM C7.2.151): FPRecipStepFused = FMA(-a,b,2.0).
+  //   - either input NaN  -> default qNaN
+  //   - (±0, ±inf) cross  -> +2.0 (unsigned — note: not ±2.0 like FMULX)
+  //   - otherwise         -> single-rounded (2.0 - a*b) via VFNMADD231.
+  // FRSQRTS semantics (ARM ARM C7.2.155): FPRSqrtStepFused = FMA(-a,b,3.0)/2.
+  //   - either input NaN  -> default qNaN
+  //   - (±0, ±inf) cross  -> +1.5
+  //   - otherwise         -> (3.0 - a*b) via VFNMADD231, then /2.0 (the
+  //                          divide-by-2 is exact in IEEE binary FP, so
+  //                          the overall single-rounded property carries
+  //                          through from the FMA).
+  // FRECPS / FRSQRTS strategy: build two masks (input_unord, special_mask)
+  // exactly like FMULX, then layered-select between fma_normal, the K_sat
+  // saturation constant (+2.0 / +1.5), and the default qNaN.  Saturation
+  // constant is sign-fixed positive here (no XOR-sign step).  NaN input must
+  // be replaced with the default qNaN even though FMA naturally propagates
+  // one of the input NaNs — the ARM ARM mandates the default-NaN payload.
+  //
   // Other opcodes in this dispatch class (FABD, FCMxx, FACxx) and the FP16
   // path (is_fp16=true) bail to the interpreter via success_=false — they
   // are JIT follow-ups; the interpreter handles them correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
     if (args.is_fp16) { success_ = false; return; }
-    if (args.opcode != Decoder::AdvSimdScalarThreeSameOpcode::kFmulx) {
+    const auto opc = args.opcode;
+    const bool is_fmulx = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFmulx);
+    const bool is_frecps = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrecps);
+    const bool is_frsqrts = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts);
+    if (!is_fmulx && !is_frecps && !is_frsqrts) {
+      success_ = false; return;
+    }
+    if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
       success_ = false; return;
     }
 
@@ -7532,6 +7558,128 @@ class LiteTranslator {
     int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (is_frecps || is_frsqrts) {
+      // Constants: K_fma (the additive in FMA(-a,b,K)) and K_sat (the
+      // saturation value when (0,inf) cross).
+      const int64_t k_fma_bits_d  = is_frecps ? int64_t{0x4000000000000000LL}
+                                              : int64_t{0x4008000000000000LL};
+      const int32_t k_fma_bits_s  = is_frecps ? int32_t{0x40000000}
+                                              : int32_t{0x40400000};
+      const int64_t k_sat_bits_d  = is_frecps ? int64_t{0x4000000000000000LL}
+                                              : int64_t{0x3FF8000000000000LL};
+      const int32_t k_sat_bits_s  = is_frecps ? int32_t{0x40000000}
+                                              : int32_t{0x3FC00000};
+      const int64_t qnan_bits_d   = int64_t{0x7FF8000000000000LL};
+      const int32_t qnan_bits_s   = int32_t{0x7FC00000};
+      const int64_t two_bits_d    = int64_t{0x4000000000000000LL};
+      const int32_t two_bits_s    = int32_t{0x40000000};
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      SimdRegister xmm_m = AllocTempSimdReg();
+      SimdRegister xmm_mul = AllocTempSimdReg();
+      SimdRegister xmm_iu = AllocTempSimdReg();
+      SimdRegister xmm_special = AllocTempSimdReg();
+      if (xmm_n == no_simd_register || xmm_m == no_simd_register ||
+          xmm_mul == no_simd_register || xmm_iu == no_simd_register ||
+          xmm_special == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Load a, b.
+      if (is_double) {
+        as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      } else {
+        as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
+      }
+
+      // mul = a * b (only its NaN bit is observed via cmpunord below).
+      as_.Movdqa(xmm_mul, xmm_n);
+      if (is_double) as_.Mulsd(xmm_mul, xmm_m);
+      else            as_.Mulss(xmm_mul, xmm_m);
+
+      // input_unord = cmpunord(a, b): all-ones iff a or b is NaN.
+      as_.Movdqa(xmm_iu, xmm_n);
+      if (is_double) as_.Cmpunordpd(xmm_iu, xmm_m);
+      else            as_.Cmpunordps(xmm_iu, xmm_m);
+
+      // mul_unord = cmpunord(mul, mul): all-ones iff mul is NaN.  Store
+      // in-place over xmm_mul (the actual product is no longer needed).
+      if (is_double) as_.Cmpunordpd(xmm_mul, xmm_mul);
+      else            as_.Cmpunordps(xmm_mul, xmm_mul);
+
+      // special_mask = (NOT input_unord) AND mul_unord.  Preserve input_unord.
+      as_.Movdqa(xmm_special, xmm_iu);
+      as_.Pandn(xmm_special, xmm_mul);
+      // xmm_mul is now free as scratch.
+
+      // Normal-path result = K_fma - a*b via VFNMADD231.  Load K_fma into
+      // xmm_mul (the destination), then VFNMADD231(dest, n, m) -> dest -= n*m.
+      Register tmp_gpr = AllocTempReg();
+      if (is_double) {
+        as_.Movq(tmp_gpr, k_fma_bits_d);
+        as_.Movq(xmm_mul, tmp_gpr);
+        as_.Vfnmadd231sd(xmm_mul, xmm_n, xmm_m);
+      } else {
+        as_.Movl(tmp_gpr, k_fma_bits_s);
+        as_.Movd(xmm_mul, tmp_gpr);
+        as_.Vfnmadd231ss(xmm_mul, xmm_n, xmm_m);
+      }
+
+      // FRSQRTS: divide by 2 (exact one-exponent decrement).  Reuse xmm_n
+      // as scratch — a is no longer needed past this point.
+      if (is_frsqrts) {
+        if (is_double) {
+          as_.Movq(tmp_gpr, two_bits_d);
+          as_.Movq(xmm_n, tmp_gpr);
+          as_.Divsd(xmm_mul, xmm_n);
+        } else {
+          as_.Movl(tmp_gpr, two_bits_s);
+          as_.Movd(xmm_n, tmp_gpr);
+          as_.Divss(xmm_mul, xmm_n);
+        }
+      }
+      // xmm_mul now holds fma_result.  xmm_n, xmm_m are free as scratch
+      // (we reuse them as constant-load targets below).
+
+      // First select: result_first = special_mask ? K_sat : fma_result.
+      // Build K_sat in xmm_n.
+      if (is_double) {
+        as_.Movq(tmp_gpr, k_sat_bits_d);
+        as_.Movq(xmm_n, tmp_gpr);
+      } else {
+        as_.Movl(tmp_gpr, k_sat_bits_s);
+        as_.Movd(xmm_n, tmp_gpr);
+      }
+      as_.Pand(xmm_n, xmm_special);       // xmm_n = K_sat AND special
+      as_.Pandn(xmm_special, xmm_mul);    // xmm_special = (NOT special) AND fma
+      as_.Por(xmm_n, xmm_special);        // xmm_n = result_first
+
+      // Second select: result_final = input_unord ? qnan : result_first.
+      // Build qnan in xmm_m (b is no longer needed).
+      if (is_double) {
+        as_.Movq(tmp_gpr, qnan_bits_d);
+        as_.Movq(xmm_m, tmp_gpr);
+      } else {
+        as_.Movl(tmp_gpr, qnan_bits_s);
+        as_.Movd(xmm_m, tmp_gpr);
+      }
+      as_.Pand(xmm_m, xmm_iu);            // xmm_m = qnan AND iu
+      as_.Pandn(xmm_iu, xmm_n);           // xmm_iu = (NOT iu) AND result_first
+      as_.Por(xmm_m, xmm_iu);             // xmm_m = result_final
+
+      // Zero Vd above the result lane, then write the scalar lane 0.
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_n);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_m);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_m);
+      }
+      return;
+    }
 
     SimdRegister xmm_n = AllocTempSimdReg();
     SimdRegister xmm_m = AllocTempSimdReg();

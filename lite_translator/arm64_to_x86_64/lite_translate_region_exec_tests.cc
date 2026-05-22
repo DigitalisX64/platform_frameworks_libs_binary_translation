@@ -3776,6 +3776,195 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSZeroTimesFinite) {
 }
 // endregion
 
+// region digitalis: FRECPS / FRSQRTS scalar three-same JIT (FP32/FP64).
+// FRECPS  = std::fma(-a, b, 2.0); FRSQRTS = std::fma(-a, b, 3.0)/2.
+// Special cases: NaN input -> default qNaN; (±0,±inf) cross -> +2.0/+1.5.
+// Encoding (per ARM ARM C7.2.151/155 and llvm-mc verification):
+//   FRECPS  Sd, Sn, Sm = 0x5E22FC00 | (rm<<16) | (rn<<5) | rd
+//   FRECPS  Dd, Dn, Dm = 0x5E62FC00 | ...
+//   FRSQRTS Sd, Sn, Sm = 0x5EA2FC00 | ...
+//   FRSQRTS Dd, Dn, Dm = 0x5EE2FC00 | ...
+constexpr uint32_t FrecpsScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E20FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpsScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E60FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5EA0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5EE0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FRECPS finite (S): 2 - 0.5*3 = 0.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSRegular) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.5f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.0f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.5f);
+  // Upper lanes must be zero.
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FRECPS finite (D): 2 - 1*1 = 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarDRegular) {
+  StoreScalarToV<double>(state_.cpu, 1, 1.0);
+  StoreScalarToV<double>(state_.cpu, 2, 1.0);
+  static const uint32_t code[] = {FrecpsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 1.0);
+}
+
+// FRECPS saturation (S): +0 * +inf -> +2.0 (unsigned, unlike FMULX).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSZeroTimesInf) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRECPS saturation (S): -0 * +inf -> +2.0 (still unsigned — FRECPS does
+// NOT XOR sign bits like FMULX would).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSNegZeroTimesInf) {
+  StoreScalarToV<float>(state_.cpu, 1, -0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRECPS saturation (D): -inf * +0 -> +2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarDNegInfTimesZero) {
+  StoreScalarToV<double>(state_.cpu, 1, -std::numeric_limits<double>::infinity());
+  StoreScalarToV<double>(state_.cpu, 2, 0.0);
+  static const uint32_t code[] = {FrecpsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 2.0);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRECPS NaN input (S): default qNaN, not the input NaN payload.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSNaNInput) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+  // Default qNaN: positive, exponent all ones, MSB of mantissa set.
+  uint32_t bits;
+  std::memcpy(&bits, &result, sizeof(bits));
+  EXPECT_EQ(bits & 0xFFC00000u, 0x7FC00000u);  // sign=0, exp=0xFF, frac MSB=1
+}
+
+// FRECPS zero * finite: ordinary FMA returns +K_fma. fma(-0, 5, 2) = 2.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSZeroTimesFinite) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+}
+
+// FRSQRTS finite (S): (3 - 1*1)/2 = 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSRegular) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FrsqrtsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.0f);
+}
+
+// FRSQRTS finite (D): (3 - 0.5*4)/2 = 0.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarDRegular) {
+  StoreScalarToV<double>(state_.cpu, 1, 0.5);
+  StoreScalarToV<double>(state_.cpu, 2, 4.0);
+  static const uint32_t code[] = {FrsqrtsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 0.5);
+}
+
+// FRSQRTS saturation (S): +inf * 0 -> +1.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSInfTimesZero) {
+  StoreScalarToV<float>(state_.cpu, 1, std::numeric_limits<float>::infinity());
+  StoreScalarToV<float>(state_.cpu, 2, 0.0f);
+  static const uint32_t code[] = {FrsqrtsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.5f);
+}
+
+// FRSQRTS saturation (D): -0 * -inf -> +1.5 (unsigned saturation).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarDNegZeroTimesNegInf) {
+  StoreScalarToV<double>(state_.cpu, 1, -0.0);
+  StoreScalarToV<double>(state_.cpu, 2, -std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FrsqrtsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 1.5);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRSQRTS NaN input (D): default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarDNaNInput) {
+  StoreScalarToV<double>(state_.cpu, 1, 1.0);
+  StoreScalarToV<double>(state_.cpu, 2, std::nan(""));
+  static const uint32_t code[] = {FrsqrtsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_TRUE(std::isnan(result));
+  uint64_t bits;
+  std::memcpy(&bits, &result, sizeof(bits));
+  EXPECT_EQ(bits & 0xFFF8000000000000ULL, 0x7FF8000000000000ULL);
+}
+
+// FRSQRTS Newton step for 1/sqrt(1) iteration: e=1 already exact ->
+// (3 - 1*1)/2 = 1 (S form).  Sanity for the typical NR refinement use.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSNewtonStepOnOne) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);  // x
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);  // e*e (already 1)
+  static const uint32_t code[] = {FrsqrtsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.0f);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
