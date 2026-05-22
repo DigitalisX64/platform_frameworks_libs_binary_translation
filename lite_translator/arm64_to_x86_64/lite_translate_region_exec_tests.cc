@@ -5523,6 +5523,230 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4HFusedRounding) {
 }
 // endregion
 
+// region digitalis: FP16 vector by-element FMLA / FMLS / FMUL .4H / .8H.
+// Decoder dispatches size=0b00, U=0, opcode ∈ {0001 FMLA, 0101 FMLS,
+// 1001 FMUL} to AdvSimdVecXIndexedElement.  Encoding (verified via
+// aarch64-linux-gnu-as -march=armv8.2-a+fp16):
+//   FMLA Vd.4H, Vn.4H, Vm.h[0] = 0x0F021000 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.4H, Vn.4H, Vm.h[7] = 0x0F321800 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.8H, Vn.8H, Vm.h[0] = 0x4F021000
+//   FMLS Vd.4H, Vn.4H, Vm.h[0] = 0x0F025000
+//   FMUL Vd.4H, Vn.4H, Vm.h[0] = 0x0F029000
+// Index encoding: 3 bits (0..7); H = (idx>>2)&1 (bit 11), L = (idx>>1)&1
+// (bit 21), M = idx&1 (bit 20).  Vm restricted to V0..V15 (only 4-bit
+// Rm field; M is consumed by the index).
+constexpr uint32_t FmlaIdxVec4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F001000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxVec8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F001000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxVec4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F005000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxVec8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F005000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdxVec4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x0F009000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulIdxVec8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F009000u | (static_cast<uint32_t>(rm & 0xF) << 16) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 21) |
+         (static_cast<uint32_t>((k >> 2) & 1) << 11) |
+         (static_cast<uint32_t>(k & 1) << 20) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMLA .4H by element index 2: broadcast Vm.h[2] across all 4 lanes
+// of Vn, multiply-add into Vd.  Vm.h[2] = 2.0h; Vn = {1, 0.5, -0.5, 4};
+// Vd = {1, 1, 3, -1} -> r = {3, 2, 2, 7} after Vd += Vn * 2.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4HBroadcastsLane) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  // Vm: lane 2 = 2.0h, others arbitrary (must not be read).
+  const uint16_t m_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_2_0, kHalf_4_0,
+                                kHalf_neg2_0, kHalf_0_25, kHalf_neg0_5, kHalf_3_0};
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,  // -1.0h
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaIdxVec4H(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   //  1 + 1*2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   //  1 + 0.5*2 = 2
+  EXPECT_EQ(r[2], kHalf_2_0);   //  3 + (-0.5)*2 = 2
+  EXPECT_EQ(r[3], 0x4700);      // -1 + 4*2 = 7.0h = 0x4700
+  // Upper 64 bits (lanes 4..7) zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLS .4H by element index 0: broadcast Vm.h[0] = 2.0h.
+// Vn = {1, 2, -0.5, 4}, Vd = {3, 5, -1, 10} -> r = {1, 1, 0, 2}.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxVec4HBroadcastsLane) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, 0x5555, 0x5555, 0x5555,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  // Vd init: 3.0, 5.0, -1.0, 10.0
+  uint16_t d_init[8] = {kHalf_3_0,
+                        0x4500,  // 5.0h
+                        0xBC00,  // -1.0h
+                        0x4900,  // 10.0h
+                        0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsIdxVec4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   //  3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   //  5 - 2*2 = 1
+  EXPECT_EQ(r[2], kHalf_pos0);  // -1 - (-0.5)*2 = 0
+  EXPECT_EQ(r[3], kHalf_2_0);   // 10 - 4*2 = 2
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLA .8H by element index 5: broadcast Vm.h[5] (in the high quad of Vm).
+// Exercises (a) the index >= 4 high-quad Psrldq shift in the broadcast
+// path, (b) both low and high 4-lane passes in the .8H destination.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec8HHighLaneBroadcast) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_2_0, kHalf_1_0,    kHalf_4_0,    kHalf_0_5};
+  // Vm.h[5] = 2.0h; other lanes must not contribute.
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, 0x5555,
+                                0x5555, kHalf_2_0, 0x5555, 0x5555};
+  // Vd init: 1, 1, 3, -1, 0, 3, -2, 0
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,
+                        kHalf_pos0, kHalf_3_0,
+                        0xC000,    // -2.0h
+                        kHalf_pos0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaIdxVec8H(0, 1, 2, /*k=*/5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   //  1 +  1.0 * 2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   //  1 +  0.5 * 2 = 2
+  EXPECT_EQ(r[2], kHalf_2_0);   //  3 + -0.5 * 2 = 2
+  EXPECT_EQ(r[3], 0x4700);      // -1 +  4   * 2 = 7
+  EXPECT_EQ(r[4], kHalf_4_0);   //  0 +  2   * 2 = 4
+  EXPECT_EQ(r[5], 0x4500);      //  3 +  1   * 2 = 5
+  EXPECT_EQ(r[6], 0x4600);      // -2 +  4   * 2 = 6
+  EXPECT_EQ(r[7], kHalf_1_0);   //  0 +  0.5 * 2 = 1
+}
+
+// FMLS .8H by element index 7 (last lane).
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxVec8HHighLaneBroadcast) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_2_0, kHalf_1_0,    kHalf_4_0};
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, 0x5555,
+                                0x5555, 0x5555, 0x5555, kHalf_2_0};
+  // Vd init: 3, 5, -1, 10, 4, 5, 3, 9
+  uint16_t d_init[8] = {kHalf_3_0,
+                        0x4500,    // 5
+                        0xBC00,    // -1
+                        0x4900,    // 10
+                        kHalf_4_0,
+                        0x4500,    // 5
+                        kHalf_3_0,
+                        0x4880};   // 9.0h
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsIdxVec8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   //  3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   //  5 - 2*2 = 1
+  EXPECT_EQ(r[2], kHalf_pos0);  // -1 - (-0.5)*2 = 0
+  EXPECT_EQ(r[3], kHalf_2_0);   // 10 - 4*2 = 2
+  EXPECT_EQ(r[4], kHalf_2_0);   //  4 - 1*2 = 2
+  EXPECT_EQ(r[5], kHalf_1_0);   //  5 - 2*2 = 1
+  EXPECT_EQ(r[6], kHalf_1_0);   //  3 - 1*2 = 1
+  EXPECT_EQ(r[7], kHalf_1_0);   //  9 - 4*2 = 1
+}
+
+// FMUL .4H by element index 3: result = Vn * Vm.h[3].
+// Vm.h[3] = 0.5h; Vn = {1, 2, -4, 8} -> r = {0.5, 1, -2, 4}.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec4HBroadcastsLane) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0,
+                                0xC400,   // -4.0h
+                                0x4800,   //  8.0h
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, kHalf_0_5,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulIdxVec4H(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_0_5);     //  1   * 0.5 = 0.5
+  EXPECT_EQ(r[1], kHalf_1_0);     //  2   * 0.5 = 1
+  EXPECT_EQ(r[2], kHalf_neg2_0);  // -4   * 0.5 = -2
+  EXPECT_EQ(r[3], kHalf_4_0);     //  8   * 0.5 = 4
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMUL .8H by element index 4 (low lane of high quad).
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec8HTwoPass) {
+  const uint16_t n_lanes[8] = {kHalf_1_0,   kHalf_2_0,   kHalf_neg2_0, kHalf_4_0,
+                                kHalf_0_5,   kHalf_neg0_5, kHalf_3_0,    kHalf_1_0};
+  // Vm.h[4] = 2.0h.
+  const uint16_t m_lanes[8] = {0x5555, 0x5555, 0x5555, 0x5555,
+                                kHalf_2_0, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB,
+                        0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulIdxVec8H(0, 1, 2, /*k=*/4)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_2_0);     //  1   * 2
+  EXPECT_EQ(r[1], kHalf_4_0);     //  2   * 2
+  EXPECT_EQ(r[2], 0xC400);        // -2*2 = -4 = 0xC400
+  EXPECT_EQ(r[3], 0x4800);        //  4*2 = 8.0h
+  EXPECT_EQ(r[4], kHalf_1_0);     //  0.5*2 = 1
+  EXPECT_EQ(r[5], 0xBC00);        // -0.5*2 = -1.0h = 0xBC00
+  EXPECT_EQ(r[6], 0x4600);        //  3*2 = 6.0h
+  EXPECT_EQ(r[7], kHalf_2_0);     //  1*2 = 2
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
