@@ -6589,6 +6589,192 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmpeSUnorderedMatchesFcmp) {
 }
 // endregion
 
+// region digitalis - FP scalar unary
+//
+// Scalar FP one-source ops (FpDataProc1 family).  These pin the
+// architectural behaviour of the FP32 / FP64 JIT lowerings at
+// `lite_translator.h:6211` — FMOV, FABS, FNEG, FSQRT, and the FCVT
+// between-precision variants.  FP16 paths are covered separately by
+// the E1 test block; here we focus on the S/D forms exercised by §D2.
+//
+//   Encoding (FpDataProc1, sf=0): M 0 0 11110 ftype 1 opcode 10000 Rn Rd
+//     ftype: 00 = S (FP32), 01 = D (FP64)
+//     opcode (bits[20:15]):
+//       000000 FMOV       000001 FABS       000010 FNEG
+//       000011 FSQRT
+//       000100 FCVT  (S<->D, dst precision selected by ftype)
+//       000101 FCVT  (S->D when ftype=00, D->S when ftype=01)
+//
+// Cross-verified with `aarch64-linux-gnu-as -march=armv8.2-a+fp16 -c`:
+//   1e20c041 fabs s1, s2 / 1e60c041 fabs d1, d2
+//   1e214041 fneg s1, s2 / 1e614041 fneg d1, d2
+//   1e21c041 fsqrt s1, s2 / 1e61c041 fsqrt d1, d2
+//   1e624041 fcvt s1, d2 / 1e22c041 fcvt d1, s2
+//   1e204041 fmov s1, s2 / 1e604041 fmov d1, d2
+constexpr uint32_t FpUnaryScalar(uint32_t base, uint8_t rd, uint8_t rn) {
+  return base | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabsS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E20C000, rd, rn);
+}
+constexpr uint32_t FabsD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E60C000, rd, rn);
+}
+constexpr uint32_t FnegS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E214000, rd, rn);
+}
+constexpr uint32_t FnegD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E614000, rd, rn);
+}
+constexpr uint32_t FsqrtS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E21C000, rd, rn);
+}
+constexpr uint32_t FsqrtD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E61C000, rd, rn);
+}
+// FCVT Dd, Sn (single-precision Rn widened to double in Rd).
+constexpr uint32_t FcvtDFromS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E22C000, rd, rn);
+}
+// FCVT Sd, Dn (double-precision Rn narrowed to single in Rd).
+constexpr uint32_t FcvtSFromD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E624000, rd, rn);
+}
+constexpr uint32_t FmovS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E204000, rd, rn);
+}
+constexpr uint32_t FmovD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E604000, rd, rn);
+}
+
+// FABS S — positive input unchanged.
+TEST_F(Arm64LiteTranslateRegionTest, FabsSPositive) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};  // poison Vd to verify zero-extend.
+  static const uint32_t code[] = {FabsS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.5f);
+  // Upper 96 bits of V[0] must be zeroed (architectural scalar-FP write).
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FABS S — negative input flipped to positive.
+TEST_F(Arm64LiteTranslateRegionTest, FabsSNegative) {
+  StoreFp32(state_.cpu, 1, -3.25f);
+  static const uint32_t code[] = {FabsS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 3.25f);
+}
+
+// FABS D — negative double becomes positive double.
+TEST_F(Arm64LiteTranslateRegionTest, FabsDNegative) {
+  StoreFp64(state_.cpu, 1, -7.5);
+  static const uint32_t code[] = {FabsD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 7.5);
+}
+
+// FNEG S — positive becomes negative; high lanes zero-extended.
+TEST_F(Arm64LiteTranslateRegionTest, FnegSPositive) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FnegS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -1.5f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FNEG D — negative becomes positive (sign-bit flip is symmetric).
+TEST_F(Arm64LiteTranslateRegionTest, FnegDNegative) {
+  StoreFp64(state_.cpu, 1, -4.0);
+  static const uint32_t code[] = {FnegD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 4.0);
+}
+
+// FSQRT S — exact integer square root.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtSExact) {
+  StoreFp32(state_.cpu, 1, 4.0f);
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.0f);
+}
+
+// FSQRT D — exact integer square root in FP64.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtDExact) {
+  StoreFp64(state_.cpu, 1, 9.0);
+  static const uint32_t code[] = {FsqrtD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.0);
+}
+
+// FSQRT S — negative input yields NaN per IEEE-754 default exception.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtSNegativeProducesNan) {
+  StoreFp32(state_.cpu, 1, -1.0f);
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LoadFp32(state_.cpu, 0)));
+}
+
+// FCVT Dd, Sn — single-precision widens to double exactly.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtSingleToDouble) {
+  StoreFp32(state_.cpu, 1, 1.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FcvtDFromS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 1.5);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FCVT Sd, Dn — double narrows to single (1.5 is exact in both).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtDoubleToSingleExact) {
+  StoreFp64(state_.cpu, 1, 1.5);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FcvtSFromD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.5f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FMOV S — bitwise copy of the low 32 bits with high lanes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmovScalarSingleZeroExtends) {
+  StoreFp32(state_.cpu, 1, -3.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmovS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -3.5f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FMOV D — bitwise copy of the low 64 bits with high lane zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmovScalarDoubleZeroExtends) {
+  StoreFp64(state_.cpu, 1, 2.71828);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmovD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 2.71828);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
