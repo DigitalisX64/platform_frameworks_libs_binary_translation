@@ -6948,6 +6948,238 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
         return;
       }
+      // Vector FCVTAS / FCVTAU (round-to-nearest, ties-away-from-zero, FP -> int).
+      //
+      // x86 ROUNDPS/ROUNDPD have no ties-away rounding mode (only RNE/floor/
+      // ceil/trunc/MXCSR).  Reuse the FRINTA V trick: per lane,
+      //     addend = copysign(0.5, x)              (gated to 0 when |x| >= 2^p)
+      //     FCVTA*(x) = trunc(x + addend)
+      // where p is the FP mantissa precision (23 for FP32, 52 for FP64).
+      // The magnitude gate is required to avoid the ties-to-even bump on
+      // odd-mantissa integers >= 2^p (handoff-79): for |x| >= 2^p, x is
+      // already integer in its FP type, so the addend must be zero.
+      //
+      // After the FRINTA add-and-trunc step, xn holds the round-to-nearest-
+      // ties-away of the input as an integer-valued FP.  Saturation:
+      //   FP64 .2D:        per-lane scalar Cvttsd2siq + signed/unsigned fix-up
+      //   FP32 .2S/.4S:    vector CVTTPS2DQ + FCVTZ{S,U} V saturation fix-up
+      // FP16 .4H/.8H bails to the interpreter (matches FCVTNS V etc.).
+      //
+      // ROUNDPS/PD imm=3 = truncate-toward-zero + suppress-inexact.  NaN/
+      // +/-Inf/sign-of-zero pass through ADDPS/ADDPD and ROUNDPS/PD
+      // unchanged, so the saturation classifiers still distinguish them.
+      // region digitalis
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtasV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtauV: {
+        if (args.is_fp16) { success_ = false; return; }
+        const bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtauV);
+        if ((args.size & 1) == 1) {
+          // ---------------- FP64 .2D path ----------------
+          if (!args.q) { success_ = false; return; }   // .1D reserved
+          if (!host_platform::kHasSSE4_2) { success_ = false; return; }
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister copysign = AllocTempSimdReg();
+          SimdRegister half = AllocTempSimdReg();
+          SimdRegister abs_bits = AllocTempSimdReg();
+          Register gp_half = AllocTempReg();
+          if (xn == no_simd_register || copysign == no_simd_register ||
+              half == no_simd_register || abs_bits == no_simd_register ||
+              gp_half == no_register) {
+            success_ = false; return;
+          }
+          // FRINTA dance (vector form): build per-lane addend gated by
+          // |x| < 2^52, add to xn, ROUNDPD imm=3.
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Pcmpeqd(abs_bits, abs_bits);
+          as_.Psrlq(abs_bits, int8_t{1});                 // 0x7FFF.. per lane
+          as_.Pand(abs_bits, xn);                          // |bits(xn)|
+          as_.Pcmpeqd(copysign, copysign);
+          as_.Psllq(copysign, int8_t{63});                 // 0x8000.. per lane
+          as_.Pand(copysign, xn);                          // sign bit of xn
+          as_.Movq(gp_half, int64_t{0x3FE0000000000000LL});  // 0.5 (FP64)
+          as_.Movq(half, gp_half);
+          as_.Pshufd(half, half, static_cast<int8_t>(0x44));
+          as_.Por(copysign, half);                          // sign(xn) | 0.5
+          as_.Movq(gp_half, int64_t{0x4330000000000000LL});  // 2^52 (FP64)
+          as_.Movq(half, gp_half);
+          as_.Pshufd(half, half, static_cast<int8_t>(0x44));
+          as_.Pcmpgtq(half, abs_bits);                       // 1s where |x| < 2^52
+          as_.Pand(copysign, half);                          // zero addend if already int
+          as_.Addpd(xn, copysign);
+          as_.Roundpd(xn, xn, int8_t{0x03});                  // trunc + suppress-inexact
+          // Per-lane saturation.  Lane 0 reads xn directly; lane 1 uses
+          // Pshufd(xmm, xn, 0xEE) to splat xn dwords[2:3] into xmm dword[0:1].
+          SimdRegister xmm = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          Register sign_tmp = AllocTempReg();
+          if (xmm == no_simd_register || tmp == no_register ||
+              sign_tmp == no_register) {
+            success_ = false; return;
+          }
+          if (!is_unsigned) {
+            for (int lane = 0; lane < 2; ++lane) {
+              if (lane == 0) {
+                as_.Movdqa(xmm, xn);
+              } else {
+                as_.Pshufd(xmm, xn, static_cast<int8_t>(0xEE));
+              }
+              as_.Cvttsd2siq(tmp, xmm);
+              Assembler::Label* nan_path = as_.MakeLabel();
+              Assembler::Label* done = as_.MakeLabel();
+              as_.Ucomisd(xmm, xmm);
+              as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+              as_.Movq(sign_tmp, xmm);
+              as_.Testq(sign_tmp, sign_tmp);
+              as_.Jcc(Assembler::Condition::kNegative, *done);
+              as_.Testq(tmp, tmp);
+              as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+              as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+              as_.Jmp(*done);
+              as_.Bind(nan_path);
+              as_.Xorq(tmp, tmp);
+              as_.Bind(done);
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                       tmp);
+            }
+          } else {
+            SimdRegister bound_xmm = AllocTempSimdReg();
+            SimdRegister bound2_xmm = AllocTempSimdReg();
+            if (bound_xmm == no_simd_register || bound2_xmm == no_simd_register) {
+              success_ = false; return;
+            }
+            as_.Movq(tmp, int64_t{0x43E0000000000000LL});   // 2^63 (FP64)
+            as_.Movq(bound_xmm, tmp);
+            as_.Movq(tmp, int64_t{0x43F0000000000000LL});   // 2^64 (FP64)
+            as_.Movq(bound2_xmm, tmp);
+            for (int lane = 0; lane < 2; ++lane) {
+              if (lane == 0) {
+                as_.Movdqa(xmm, xn);
+              } else {
+                as_.Pshufd(xmm, xn, static_cast<int8_t>(0xEE));
+              }
+              Assembler::Label* zero_path = as_.MakeLabel();
+              Assembler::Label* direct_path = as_.MakeLabel();
+              Assembler::Label* sat_max = as_.MakeLabel();
+              Assembler::Label* done = as_.MakeLabel();
+              as_.Ucomisd(xmm, xmm);
+              as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+              as_.Movq(sign_tmp, xmm);
+              as_.Testq(sign_tmp, sign_tmp);
+              as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+              as_.Ucomisd(xmm, bound_xmm);
+              as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+              as_.Ucomisd(xmm, bound2_xmm);
+              as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+              as_.Subsd(xmm, bound_xmm);
+              as_.Cvttsd2siq(tmp, xmm);
+              as_.Btsq(tmp, int8_t{63});
+              as_.Jmp(*done);
+              as_.Bind(sat_max);
+              as_.Movq(tmp, static_cast<int64_t>(-1));
+              as_.Jmp(*done);
+              as_.Bind(direct_path);
+              as_.Cvttsd2siq(tmp, xmm);
+              as_.Jmp(*done);
+              as_.Bind(zero_path);
+              as_.Xorq(tmp, tmp);
+              as_.Bind(done);
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                       tmp);
+            }
+          }
+          return;
+        }
+        // ---------------- FP32 .2S / .4S path ----------------
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister copysign = AllocTempSimdReg();
+        SimdRegister half = AllocTempSimdReg();
+        SimdRegister abs_bits = AllocTempSimdReg();
+        Register gp_half = AllocTempReg();
+        if (xn == no_simd_register || copysign == no_simd_register ||
+            half == no_simd_register || abs_bits == no_simd_register ||
+            gp_half == no_register) {
+          success_ = false; return;
+        }
+        // FRINTA dance (FP32 form): build per-lane addend gated by |x| < 2^23,
+        // ADDPS, ROUNDPS imm=3.
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pcmpeqd(abs_bits, abs_bits);
+        as_.Psrld(abs_bits, int8_t{1});                  // 0x7FFFFFFF per lane
+        as_.Pand(abs_bits, xn);                           // |bits(xn)|
+        as_.Pcmpeqd(copysign, copysign);
+        as_.Pslld(copysign, int8_t{31});                  // 0x80000000 per lane
+        as_.Pand(copysign, xn);                            // sign bit of xn
+        as_.Movl(gp_half, int32_t{0x3F000000});            // 0.5 (FP32)
+        as_.Movd(half, gp_half);
+        as_.Pshufd(half, half, static_cast<int8_t>(0x00));
+        as_.Por(copysign, half);                           // sign(xn) | 0.5
+        as_.Movl(gp_half, int32_t{0x4B000000});            // 2^23 (FP32)
+        as_.Movd(half, gp_half);
+        as_.Pshufd(half, half, static_cast<int8_t>(0x00));
+        as_.Pcmpgtd(half, abs_bits);                        // 1s where |x| < 2^23
+        as_.Pand(copysign, half);                            // zero addend if already int
+        as_.Addps(xn, copysign);
+        as_.Roundps(xn, xn, int8_t{0x03});                    // trunc + suppress-inexact
+        if (!is_unsigned) {
+          // FCVTZS V .2S/.4S saturation fix-up.
+          SimdRegister x_dst = AllocTempSimdReg();
+          SimdRegister x_mask = AllocTempSimdReg();
+          SimdRegister x_eqmin = AllocTempSimdReg();
+          if (x_dst == no_simd_register || x_mask == no_simd_register ||
+              x_eqmin == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(x_dst, xn);
+          as_.Cvttps2dq(x_dst, x_dst);
+          as_.Movdqa(x_mask, xn);
+          as_.Cmpunordps(x_mask, x_mask);                   // NaN lanes
+          as_.Pandn(x_mask, x_dst);                          // ~NaN & x_dst
+          as_.Movdqa(x_dst, x_mask);
+          as_.Pcmpeqd(x_mask, x_mask);
+          as_.Pslld(x_mask, int8_t{31});                     // INT32_MIN per lane
+          as_.Movdqa(x_eqmin, x_dst);
+          as_.Pcmpeqd(x_eqmin, x_mask);                      // result == INT32_MIN?
+          as_.Movdqa(x_mask, xn);
+          as_.Psrad(x_mask, int8_t{31});                     // 1s = src negative
+          as_.Pandn(x_mask, x_eqmin);                        // ~neg & eqmin = pos-ovf
+          as_.Pxor(x_dst, x_mask);                            // flip INT_MIN -> INT_MAX
+          if (!args.q) mask_low64(x_dst);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
+        } else {
+          // FCVTZU V .2S/.4S saturation fix-up (offset-by-2^31 trick).
+          SimdRegister x_dst = AllocTempSimdReg();
+          SimdRegister x_pow31 = AllocTempSimdReg();
+          SimdRegister x_needs_off = AllocTempSimdReg();
+          SimdRegister x_scratch = AllocTempSimdReg();
+          if (x_dst == no_simd_register || x_pow31 == no_simd_register ||
+              x_needs_off == no_simd_register || x_scratch == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(x_dst, xn);
+          as_.Pxor(x_scratch, x_scratch);                    // 0.0 per lane
+          as_.Maxps(x_dst, x_scratch);                        // NaN/neg -> 0
+          as_.Movl(gp_half, int32_t{0x4F000000});             // 2^31 (FP32)
+          as_.Movd(x_pow31, gp_half);
+          as_.Pshufd(x_pow31, x_pow31, int8_t{0x00});
+          as_.Movdqa(x_needs_off, x_pow31);
+          as_.Cmpleps(x_needs_off, x_dst);                    // 2^31 <= clamped src
+          as_.Movdqa(x_scratch, x_pow31);
+          as_.Pand(x_scratch, x_needs_off);
+          as_.Subps(x_dst, x_scratch);
+          as_.Movdqa(x_scratch, x_pow31);
+          as_.Cmpleps(x_scratch, x_dst);                       // 2^31 <= shifted src
+          as_.Cvttps2dq(x_dst, x_dst);
+          as_.Pcmpeqd(x_pow31, x_pow31);
+          as_.Pslld(x_pow31, int8_t{31});                       // 0x80000000 per lane
+          as_.Pand(x_pow31, x_needs_off);
+          as_.Por(x_dst, x_pow31);
+          as_.Por(x_dst, x_scratch);                            // saturate too-big
+          if (!args.q) mask_low64(x_dst);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
+        }
+        return;
+      }
       // endregion
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
         if (args.is_fp16) {

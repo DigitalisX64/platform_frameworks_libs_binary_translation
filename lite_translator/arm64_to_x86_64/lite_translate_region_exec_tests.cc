@@ -3160,6 +3160,113 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtmuV4sFloorAndNegClamp) {
   EXPECT_EQ(out[2], 3u);
   EXPECT_EQ(out[3], 0u);
 }
+
+// FCVTAS / FCVTAU: round-to-nearest ties-away-from-zero, FP -> int.
+//   FCVTAS V .4S = 0x4E21C800 (Q=1, U=0, bit23=0, sz=0, opcode=11100)
+//   FCVTAS V .2S = 0x0E21C800 (Q=0)
+//   FCVTAS V .2D = 0x4E61C800 (sz=1)
+//   FCVTAU V .4S = 0x6E21C800 (U=1)
+//   FCVTAU V .2D = 0x6E61C800
+constexpr uint32_t kFcvtasV4s00 = 0x4E21C800;
+constexpr uint32_t kFcvtasV2s00 = 0x0E21C800;
+constexpr uint32_t kFcvtasV2d00 = 0x4E61C800;
+constexpr uint32_t kFcvtauV4s00 = 0x6E21C800;
+constexpr uint32_t kFcvtauV2d00 = 0x6E61C800;
+
+// FCVTAS .4S ties-away: 2.5f -> 3 (RNE -> 2, ties to even), -2.5f -> -3,
+// +Inf -> INT32_MAX (saturation), 2^23+1 -> 2^23+1 (magnitude-gate check;
+// without the gate, addend=+0.5 would FP-round to 2^23+2).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasV4sTiesAwayAndSat) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 3 (ties away)
+  lanes[1] = 0xC0200000u;  // -2.5f -> -3
+  lanes[2] = 0x7F800000u;  // +Inf -> INT32_MAX
+  lanes[3] = 0x4B000001u;  // 2^23 + 1 = 8388609.0f -> 8388609 (gate test)
+  static const uint32_t code[] = {kFcvtasV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3);
+  EXPECT_EQ(out[1], -3);
+  EXPECT_EQ(out[2], INT32_MAX);
+  EXPECT_EQ(out[3], 8388609);
+}
+
+// FCVTAS .2S (Q=0): low 64 bits computed, upper 64 zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasV2sZeroesUpperHalf) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 3 (ties away)
+  lanes[1] = 0xC0200000u;  // -2.5f -> -3
+  lanes[2] = 0xDEADBEEFu;  // garbage; must be zeroed
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFcvtasV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3);
+  EXPECT_EQ(out[1], -3);
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
+
+// FCVTAS .2D ties-away: 0.5 -> 1 (RNE -> 0, ties to even), -0.5 -> -1.
+// NaN -> 0, +Inf -> INT64_MAX would saturate the second lane in a separate
+// test; this test focuses on the half-tie distinguishing case.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasV2dTiesAway) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x3FE0000000000000ULL;  // 0.5 -> 1 (ties away)
+  lanes[1] = 0xBFE0000000000000ULL;  // -0.5 -> -1
+  static const uint32_t code[] = {kFcvtasV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 1);
+  EXPECT_EQ(out[1], -1);
+}
+
+// FCVTAS .2D saturation: +Inf -> INT64_MAX (pos-overflow), NaN -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtasV2dSaturation) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FF0000000000000ULL;  // +Inf -> INT64_MAX
+  lanes[1] = 0x7FF8000000000000ULL;  // qNaN -> 0
+  static const uint32_t code[] = {kFcvtasV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], INT64_MAX);
+  EXPECT_EQ(out[1], 0);
+}
+
+// FCVTAU .4S ties-away unsigned: 2.5f -> 3, -0.5f -> 0 (negative -> 0
+// clamp), +Inf -> UINT32_MAX, 2^32 -> UINT32_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtauV4sTiesAwayAndSat) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 3 (ties away)
+  lanes[1] = 0xBF000000u;  // -0.5f -> 0 (round to -1, negative -> 0)
+  lanes[2] = 0x7F800000u;  // +Inf -> UINT32_MAX
+  lanes[3] = 0x4F800000u;  // 2^32 -> UINT32_MAX
+  static const uint32_t code[] = {kFcvtauV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3u);
+  EXPECT_EQ(out[1], 0u);
+  EXPECT_EQ(out[2], UINT32_MAX);
+  EXPECT_EQ(out[3], UINT32_MAX);
+}
+
+// FCVTAU .2D ties-away unsigned: 0.5 -> 1, -0.5 -> 0, 2^64 -> UINT64_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtauV2dTiesAwayAndSat) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x3FE0000000000000ULL;  // 0.5 -> 1 (ties away)
+  lanes[1] = 0x43F0000000000000ULL;  // 2^64 -> UINT64_MAX
+  static const uint32_t code[] = {kFcvtauV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 1u);
+  EXPECT_EQ(out[1], UINT64_MAX);
+}
 // endregion
 
 }  // namespace
