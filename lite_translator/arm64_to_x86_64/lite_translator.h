@@ -2423,10 +2423,169 @@ class LiteTranslator {
   }
 
   // region digitalis
-  // FCSEL: fall back to interpreter (condition flag checking complex in JIT)
-  void FpCondSelect(uint8_t /*rd*/, uint8_t /*rn*/, uint8_t /*rm*/,
-                    uint8_t /*ftype*/, Decoder::Condition /*cond*/) {
-    success_ = false;  // interpreter fallback
+  // FCSEL Sd|Dd|Hd, Sn|Dn|Hn, Sm|Dm|Hm, cond.
+  //   if ConditionHolds(cond) then result = V[rn] else result = V[rm];
+  //   V[rd] = ZeroExtend(result, 128);
+  // ftype: 00 = S (FP32), 01 = D (FP64), 11 = H (FP16).  Encoding 10 is
+  // reserved on ARM64 -- bail to the interpreter for safety.
+  //
+  // The chosen value is loaded into an XMM with the high lanes zero-
+  // extended: MOVSS / MOVSD do this naturally; for FP16 the register is
+  // first cleared with PXOR before PINSRW.  A 128-bit MOVDQU then writes
+  // V[rd], matching the interpreter's `state_->cpu.v[rd] = 0` followed
+  // by a sized partial copy.
+  //
+  // The condition switch mirrors ConditionalSelect() exactly (bit 14=Z,
+  // 15=N, 8=C, 0=V in ThreadState::cpu.flags) -- the convention is "jump
+  // to `done` if the condition is FALSE" so the fall-through path loads
+  // V[rn] (the true case).
+  void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm,
+                    uint8_t ftype, Decoder::Condition cond) {
+    if (ftype != 0b00 && ftype != 0b01 && ftype != 0b11) {
+      success_ = false;
+      return;
+    }
+
+    SimdRegister xmm = AllocTempSimdReg();
+    if (xmm == no_simd_register) { success_ = false; return; }
+    Register flags_reg = AllocTempReg();
+    if (flags_reg == no_register) { success_ = false; return; }
+
+    const int32_t v_rn_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+    const int32_t v_rm_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    const int32_t v_rd_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+    const int32_t flags_off = offsetof(ThreadState, cpu.flags);
+
+    auto load_fp = [&](int32_t off) {
+      switch (ftype) {
+        case 0b00:
+          as_.Movss(xmm, {.base = Assembler::rbp, .disp = off});
+          break;
+        case 0b01:
+          as_.Movsd(xmm, {.base = Assembler::rbp, .disp = off});
+          break;
+        case 0b11:
+          as_.Pxor(xmm, xmm);
+          as_.Pinsrw(xmm, {.base = Assembler::rbp, .disp = off}, int8_t{0});
+          break;
+      }
+    };
+
+    // Default: load V[rm] (the condition-FALSE result).
+    load_fp(v_rm_off);
+
+    // Read NZCV (low 16 bits of ThreadState::cpu.flags).
+    as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = flags_off});
+
+    Assembler::Label* done = as_.MakeLabel();
+
+    switch (cond) {
+      case Decoder::Condition::kEq:
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kNe:
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kCs:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kCc:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kMi:
+        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kPl:
+        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kVs:
+        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      case Decoder::Condition::kVc:
+        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kHi:
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      case Decoder::Condition::kLs: {
+        Assembler::Label* true_path = as_.MakeLabel();
+        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Jcc(Condition::kNotCarry, *true_path);
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Bind(true_path);
+        break;
+      }
+      case Decoder::Condition::kGe: {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kLt: {
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kGt: {
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *done);
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kCarry, *done);
+        break;
+      }
+      case Decoder::Condition::kLe: {
+        Assembler::Label* true_path = as_.MakeLabel();
+        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Jcc(Condition::kCarry, *true_path);
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return; }
+        as_.Movl(tmp, flags_reg);
+        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Xorl(tmp, flags_reg);
+        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Jcc(Condition::kNotCarry, *done);
+        as_.Bind(true_path);
+        break;
+      }
+      case Decoder::Condition::kAl:
+      case Decoder::Condition::kNv:
+        // Reserved encodings on FCSEL; ConditionalSelect treats them
+        // as always-true (fall through to the V[rn] override).
+        break;
+    }
+
+    // Condition TRUE: overwrite with V[rn].
+    load_fp(v_rn_off);
+
+    as_.Bind(done);
+
+    as_.Movdqu({.base = Assembler::rbp, .disp = v_rd_off}, xmm);
   }
 
   // FP <-> fixed-point conversion: fall back to interpreter
@@ -2455,13 +2614,16 @@ class LiteTranslator {
   //   FNMADD -> Vfnmsub231(ss|sd) : -(Rn*Rm) - Ra  = -(Ra + Rn*Rm)
   //   FNMSUB -> Vfmsub231(ss|sd)  :  Rn*Rm - Ra
   //
-  // FP16 (ftype=11) stays on the interpreter: F16C round-trip is not exact
-  // for FMA (-91 parking note); the interpreter does fma() in binary64
-  // before narrowing, which is exact.
+  // FP16 (ftype=11) is JIT-lifted via FP16 -> FP32 -> FP64 and dispatched
+  // through the SD form of VFMADD/VFNMADD/VFMSUB/VFNMSUB.  The interpreter
+  // does the multiply-add in binary64 then narrows once to FP16 (single
+  // rounding); binary64's 53-bit mantissa holds (binary16 * binary16) +
+  // binary16 exactly, so an FP32-only round-trip would double-round on
+  // some inputs.
   void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
                    uint8_t ftype, bool o1, bool o0) {
     // region digitalis
-    if (ftype != 0b00 && ftype != 0b01) {
+    if (ftype != 0b00 && ftype != 0b01 && ftype != 0b11) {
       success_ = false;
       return;
     }
@@ -2469,7 +2631,12 @@ class LiteTranslator {
       success_ = false;
       return;
     }
+    if (ftype == 0b11 && !host_platform::kHasF16C) {
+      success_ = false;
+      return;
+    }
     const bool is_double = (ftype == 0b01);
+    const bool is_half = (ftype == 0b11);
 
     const int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
     const int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
@@ -2487,24 +2654,61 @@ class LiteTranslator {
       as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
+    } else if (is_half) {
+      // FP16 -> FP32 -> FP64 lift.  Pxor + Pinsrw isolates the 16-bit
+      // input in lane 0 with FP16 +0.0 in lanes 1..3; Vcvtph2ps then
+      // produces FP32 [value, 0, 0, 0]; Vcvtps2pd narrows the low 2
+      // FP32 lanes to 2 FP64 lanes [FP64(value), FP64(0)].  The
+      // preserved FP64(0) in lane 1 is consumed by the Vcvtpd2ps narrow
+      // below and produces an FP32 +0.0 lane that Vcvtps2ph rounds to
+      // FP16 +0.0 — matching the AArch64 zero-extend semantic for Hd.
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Vcvtps2pd(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+      as_.Vcvtps2pd(xmm_m, xmm_m);
+      as_.Pxor(xmm_a, xmm_a);
+      as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_a_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_a, xmm_a);
+      as_.Vcvtps2pd(xmm_a, xmm_a);
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_a_off});
     }
 
+    // FP16 dispatches through the SD form because the value is already
+    // binary64 in lane 0 after the Vcvtph2ps + Vcvtps2pd lift.
+    const bool use_double_fma = is_double || is_half;
     if (!o1 && !o0) {
-      if (is_double) as_.Vfmadd231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfmadd231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfmadd231ss(xmm_a, xmm_n, xmm_m);
     } else if (!o1 && o0) {
-      if (is_double) as_.Vfnmadd231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfnmadd231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfnmadd231ss(xmm_a, xmm_n, xmm_m);
     } else if (o1 && !o0) {
-      if (is_double) as_.Vfnmsub231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfnmsub231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfnmsub231ss(xmm_a, xmm_n, xmm_m);
     } else {
-      if (is_double) as_.Vfmsub231sd(xmm_a, xmm_n, xmm_m);
+      if (use_double_fma) as_.Vfmsub231sd(xmm_a, xmm_n, xmm_m);
       else as_.Vfmsub231ss(xmm_a, xmm_n, xmm_m);
+    }
+
+    if (is_half) {
+      // Narrow FP64 -> FP32 -> FP16.  Vcvtpd2ps writes 2 FP32 lanes into
+      // the low 64 bits and zeroes the upper 64; lane 1 was FP64 +0.0
+      // (preserved by the SD FMA above), so the resulting FP32 has +0.0
+      // in lanes 1..3.  Vcvtps2ph rounds 4 FP32 -> 4 FP16 and zeroes the
+      // upper 64 bits: lane 0 = FP16(FMA result), lanes 1..3 = FP16(+0.0)
+      // = 0.  Storing the full 128 bits gives the correct Hd layout
+      // (result in bits[15:0], all other bits zero).
+      as_.Vcvtpd2ps(xmm_a, xmm_a);
+      as_.Vcvtps2ph(xmm_a, xmm_a, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      return;
     }
 
     // ARM zero-extends Vd above the result lane.  Zero the full 128 bits
@@ -8400,6 +8604,98 @@ class LiteTranslator {
   // Reserved .1D shape (size=11 && q=0) and hosts without FMA bail.
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
     using Op = Decoder::AdvSimdVecXIdxOpcode;
+    // region digitalis: integer MUL/MLA/MLS by-element (halfword .4h/.8h
+    // size=01, word .2s/.4s size=10).
+    //
+    // Vd = Vn op (Vm.lane[index] broadcast across destination lanes), with
+    //   MUL: Vd = Vn * broadcast(Vm[index])
+    //   MLA: Vd = Vd + Vn * broadcast(Vm[index])
+    //   MLS: Vd = Vd - Vn * broadcast(Vm[index])
+    // No saturation, no widening — the bottom esize bits of each lane-wise
+    // host product match the architecturally-defined result modulo 2^esize.
+    //
+    // Broadcast:
+    //   - halfword: index = H:L:M (3 bits, 0..7).  If index >= 4 shift Vm
+    //     down by 8 bytes so the target lane sits in the low quad, then
+    //     Pshuflw with imm = (i:i:i:i) (i = index & 3) replicates it across
+    //     the low 4 halfword lanes, and Pshufd 0x44 mirrors low qword into
+    //     high qword for all 8 lanes.
+    //   - word: index = H:L (2 bits, 0..3).  Pshufd with i:i:i:i broadcasts
+    //     directly across 4 word lanes.
+    //
+    // !Q: zero upper 64 bits (D-register semantics) via Pslldq/Psrldq 8.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+    //   mul  v0.4h, v1.4h, v2.h[0] = 0x0F428020
+    //   mul  v0.8h, v1.8h, v2.h[7] = 0x4F728820
+    //   mul  v0.2s, v1.2s, v2.s[1] = 0x0FA28020
+    //   mul  v0.4s, v1.4s, v2.s[3] = 0x4FA28820
+    //   mla  v0.4h, v1.4h, v2.h[0] = 0x2F420020
+    //   mla  v0.4s, v1.4s, v2.s[2] = 0x6F820820
+    //   mls  v0.8h, v1.8h, v2.h[5] = 0x6F524820
+    //   mls  v0.4s, v1.4s, v2.s[1] = 0x6FA24020
+    if (args.opcode == Op::kMul || args.opcode == Op::kMla ||
+        args.opcode == Op::kMls) {
+      if (args.size != 0b01 && args.size != 0b10) { success_ = false; return; }
+      const bool is_halfword = (args.size == 0b01);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      if (is_halfword) {
+        if (args.index >= 4) {
+          as_.Psrldq(xm, int8_t{8});
+        }
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      } else {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xm, xm, imm);
+      }
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kMul) {
+        if (is_halfword) as_.Pmullw(xn, xm);
+        else             as_.Pmulld(xn, xm);  // SSE4.1
+        xmm_result = xn;
+      } else {
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (is_halfword) as_.Pmullw(xn, xm);
+        else             as_.Pmulld(xn, xm);  // SSE4.1
+        if (args.opcode == Op::kMla) {
+          if (is_halfword) as_.Paddw(xd, xn);
+          else             as_.Paddd(xd, xn);
+        } else {
+          if (is_halfword) as_.Psubw(xd, xn);
+          else             as_.Psubd(xd, xn);
+        }
+        xmm_result = xd;
+      }
+
+      if (!args.q) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
