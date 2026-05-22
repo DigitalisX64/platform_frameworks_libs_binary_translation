@@ -2279,6 +2279,82 @@ TEST_F(Arm64LiteTranslateRegionTest, FrintaSs0p6) {
   EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
             0x3F800000u);  // 1.0f
 }
+
+// Vector FRINTA: FRINTA Vd.2S/4S/2D, Vn.2S/4S/2D.  Same opcode=11000,
+// U=1, a=0 form as scalar but on AdvSIMD two-reg misc.  Verified
+// encodings via llvm-mc + decoder comment at decoder.h:4391:
+//   frinta v0.2s, v0.2s = 0x2E218800  (Q=0, size=00)
+//   frinta v0.4s, v0.4s = 0x6E218800  (Q=1, size=00)
+//   frinta v0.2d, v0.2d = 0x6E618800  (Q=1, size=01)
+constexpr uint32_t kFrintaV2s00 = 0x2E218800;
+constexpr uint32_t kFrintaV4s00 = 0x6E218800;
+constexpr uint32_t kFrintaV2d00 = 0x6E618800;
+
+// Vector magnitude-gate: mixed lanes -- one already-integer above the
+// FP32 mantissa-overflow boundary (2^23), one ordinary ties-away input.
+// Pre-fix, the add-of-0.5 + ROUNDPS path bumped odd-mantissa integers
+// to the next even because RNE round-half-to-even fires on the
+// half-bit-below-LSB tie.
+TEST_F(Arm64LiteTranslateRegionTest, FrintaV4sMagnitudeGateMixedLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4B000001u;  // 2^23 + 1 = 8388609.0f (already integer)
+  lanes[1] = 0x40200000u;  // 2.5f          -> 3.0f
+  lanes[2] = 0xC0200000u;  // -2.5f         -> -3.0f
+  lanes[3] = 0xCB000001u;  // -(2^23 + 1)   (already integer; odd-mantissa)
+  static const uint32_t code[] = {kFrintaV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x4B000001u);   // 8388609.0f unchanged
+  EXPECT_EQ(lanes[1], 0x40400000u);   // 3.0f
+  EXPECT_EQ(lanes[2], 0xC0400000u);   // -3.0f
+  EXPECT_EQ(lanes[3], 0xCB000001u);   // -8388609.0f unchanged
+}
+
+// .2S form: low 64 bits live, high 64 must be zeroed (Q=0).
+TEST_F(Arm64LiteTranslateRegionTest, FrintaV2sMagnitudeGateMixedLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4B000001u;  // 2^23 + 1   (already integer)
+  lanes[1] = 0x3F19999Au;  // 0.6f       -> 1.0f
+  lanes[2] = 0xDEADBEEFu;  // garbage in upper 64; must be zeroed
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFrintaV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x4B000001u);
+  EXPECT_EQ(lanes[1], 0x3F800000u);
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
+
+// .2D form: FP64 mantissa-overflow boundary at 2^52.
+TEST_F(Arm64LiteTranslateRegionTest, FrintaV2dMagnitudeGateMixedLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4330000000000001ULL;  // 2^52 + 1   (already integer; odd)
+  lanes[1] = 0x3FE0000000000000ULL;  // 0.5d        -> 1.0d
+  static const uint32_t code[] = {kFrintaV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x4330000000000001ULL);   // 4503599627370497 unchanged
+  EXPECT_EQ(lanes[1], 0x3FF0000000000000ULL);   // 1.0d
+}
+
+// NaN / Inf must propagate through the vector path unchanged.  The
+// magnitude gate puts NaN/Inf bits above the threshold, so the addend
+// is zeroed and ROUNDPS/PD preserves NaN/Inf per Intel SDM.
+TEST_F(Arm64LiteTranslateRegionTest, FrintaV4sNanInfPropagate) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FC00000u;  // qNaN
+  lanes[1] = 0x7F800000u;  // +Inf
+  lanes[2] = 0xFF800000u;  // -Inf
+  lanes[3] = 0x40200000u;  // 2.5f -> 3.0f
+  static const uint32_t code[] = {kFrintaV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x7FC00000u);   // qNaN unchanged
+  EXPECT_EQ(lanes[1], 0x7F800000u);   // +Inf unchanged
+  EXPECT_EQ(lanes[2], 0xFF800000u);   // -Inf unchanged
+  EXPECT_EQ(lanes[3], 0x40400000u);   // 3.0f
+}
 // endregion
 
 }  // namespace

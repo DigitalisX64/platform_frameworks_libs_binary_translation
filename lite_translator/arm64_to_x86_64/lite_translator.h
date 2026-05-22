@@ -6338,15 +6338,38 @@ class LiteTranslator {
           }
           return;
         }
-        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        // args.size for the FP variant of two-reg misc carries
+        // (bit23=a, bit22=sz).  The decoder only dispatches kFrintaV when
+        // bit23==0, so args.size is 0b00 (FP32 .2S/.4S) or 0b01 (FP64 .2D).
+        // Reject any sneaky out-of-range size defensively; mirrors the
+        // interpreter's `args.size & 1` FP32/FP64 dispatch (interpreter.h
+        // around line 5850).
+        if (args.size > 1) { Undefined(); return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { Undefined(); return; }
+        // FP64 magnitude gate uses PCMPGTQ (SSE4.2).  Bail to interpreter
+        // on hosts that lack it (test only; Digitalis target CPUs have it).
+        if (is_double && !host_platform::kHasSSE4_2) {
+          success_ = false; return;
+        }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister copysign = AllocTempSimdReg();
         SimdRegister half = AllocTempSimdReg();
+        SimdRegister abs_bits = AllocTempSimdReg();
         if (xn == no_simd_register || copysign == no_simd_register ||
-            half == no_simd_register) { Undefined(); return; }
+            half == no_simd_register || abs_bits == no_simd_register) {
+          Undefined(); return;
+        }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // Per-lane |bits(xn)| -- IEEE-754 bits compare as unsigned int for
+        // non-negative values; clearing the sign bit gives |bits(xn)|.
+        as_.Pcmpeqd(abs_bits, abs_bits);              // all-ones
+        if (is_double) {
+          as_.Psrlq(abs_bits, int8_t{1});             // 0x7FFF.. per lane
+        } else {
+          as_.Psrld(abs_bits, int8_t{1});             // 0x7FFFFFFF per lane
+        }
+        as_.Pand(abs_bits, xn);                       // |bits(xn)|
         // Build the sign-bit mask in copysign, then AND with xn to extract
         // per-lane sign bits.
         as_.Pcmpeqd(copysign, copysign);
@@ -6374,6 +6397,35 @@ class LiteTranslator {
         }
         // copysign |= half  -> per-lane sign(xn) * 0.5.
         as_.Por(copysign, half);
+        // Per-lane magnitude gate.  Broadcast the threshold bit pattern
+        // (FP32 2^23 = 0x4B000000; FP64 2^52 = 0x4330000000000000) into
+        // `half` (its 0.5 contents are no longer needed) and per-lane
+        // signed-compare (threshold > abs_bits).  Both operands have
+        // their sign bits clear (threshold is positive; abs_bits had its
+        // sign bit masked), so signed and unsigned compare agree.
+        //
+        //   |x| <  threshold  ->  mask = all-ones  ->  addend preserved
+        //                          (add-half-and-trunc rounds correctly)
+        //   |x| >= threshold  ->  mask = 0         ->  addend zeroed
+        //                          (xn+0 = xn; ROUNDPS/PD is no-op for
+        //                          already-integer x, and propagates
+        //                          NaN/Inf unchanged per Intel SDM).
+        //
+        // Without this gate, RNE round-half-to-even would bump
+        // odd-mantissa integers >= 2^23 (FP32) / >= 2^52 (FP64) to the
+        // next even because the 0.5 nudge lands a tie below the LSB.
+        if (is_double) {
+          as_.Movq(gp_half, int64_t{0x4330000000000000LL});  // 2^52
+          as_.Movq(half, gp_half);
+          as_.Pshufd(half, half, static_cast<int8_t>(0x44));
+          as_.Pcmpgtq(half, abs_bits);
+        } else {
+          as_.Movl(gp_half, int32_t{0x4B000000});            // 2^23
+          as_.Movd(half, gp_half);
+          as_.Pshufd(half, half, static_cast<int8_t>(0x00));
+          as_.Pcmpgtd(half, abs_bits);
+        }
+        as_.Pand(copysign, half);   // zero addend in already-integer lanes
         // xn += copysign(0.5, xn); truncate toward zero.
         if (is_double) {
           as_.Addpd(xn, copysign);
