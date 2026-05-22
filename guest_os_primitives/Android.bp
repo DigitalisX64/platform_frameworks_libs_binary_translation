@@ -245,6 +245,30 @@ cc_library_static {
         "libberberis_guest_os_primitives_arm64_headers",
     ],
 }
+
+cc_test_library {
+    name: "libberberis_guest_os_primitives_arm64_unit_tests",
+    defaults: ["berberis_test_library_defaults_64"],
+    srcs: [
+        "arm64/ucontext_layout_test.cc",
+    ],
+    local_include_dirs: ["arm64"],
+    // Compile the test against the ARM64 guest ABI. The default
+    // berberis_test_library_defaults inherits -DNATIVE_BRIDGE_GUEST_ARCH_RISCV64
+    // which is wrong for an arm64-guest test; explicitly override.
+    cflags: [
+        "-UNATIVE_BRIDGE_GUEST_ARCH_RISCV64",
+        "-DNATIVE_BRIDGE_GUEST_ARCH_ARM64",
+    ],
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_guest_abi_arm64_headers",
+        "libberberis_guest_os_primitives_headers",
+        "libberberis_guest_os_primitives_arm64_headers",
+        "libberberis_guest_state_headers",
+        "libberberis_guest_state_arm64_headers",
+    ],
+}
 // endregion
 
 filegroup {
