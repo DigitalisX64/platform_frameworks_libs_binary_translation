@@ -4544,6 +4544,30 @@ constexpr uint32_t FmulIdx2D(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
          (static_cast<uint32_t>(k & 1) << 11) |
          (static_cast<uint32_t>(rn) << 5) | rd;
 }
+// FMULX (by element): same encoding as FMUL except U=1 (bit 29 set).
+// Verified with aarch64-linux-gnu-as / objdump:
+//   FMULX v0.4s, v1.4s, v2.s[0] = 0x6F829020
+//   FMULX v0.4s, v1.4s, v2.s[3] = 0x6FA29820
+//   FMULX v0.2s, v1.2s, v2.s[1] = 0x2FA29020
+//   FMULX v0.2d, v1.2d, v2.d[0] = 0x6FC29020
+//   FMULX v0.2d, v1.2d, v2.d[1] = 0x6FC29820
+constexpr uint32_t FmulxIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x6F809000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x2F809000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 21) |
+         (static_cast<uint32_t>((k >> 1) & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxIdx2D(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x6FC09000u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(k & 1) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
 
 // FMLA .4S by-element: broadcast Vm.s[k] across all four lanes, then Vd += Vn*Vm.
 TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SBroadcastsLane) {
@@ -4663,6 +4687,89 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec2DBroadcastsLane) {
   LoadVec2D(state_.cpu, 0, r);
   EXPECT_DOUBLE_EQ(r[0], 3.0);   // 0.5 * 6
   EXPECT_DOUBLE_EQ(r[1], -18.0); // -3 * 6
+}
+
+// FMULX .4S by-element: each lane = Vn[i] * broadcast_b, with (±0,±inf)
+// saturation replacing NaN by ±2.0.  Pick lane assignment so the
+// broadcast lane mixes finite + inf scenarios with different sign sources.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec4SSaturation) {
+  const float inf = std::numeric_limits<float>::infinity();
+  // Broadcast Vm.s[1] = +inf across all four lanes.
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, 3.0f, -inf);
+  StoreVec4S(state_.cpu, 2, 9.9f, inf, 9.9f, 9.9f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulxIdx4S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);    // (+0,  +inf) -> +2
+  EXPECT_FLOAT_EQ(r[1], -2.0f);   // (-0,  +inf) -> -2
+  EXPECT_FLOAT_EQ(r[2], inf);     // 3 * +inf = +inf (no saturation)
+  EXPECT_FLOAT_EQ(r[3], -inf);    // -inf * +inf = -inf (no saturation)
+}
+
+// FMULX .2S q=0 broadcast lane index + upper-64-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec2SUpperZero) {
+  const float inf = std::numeric_limits<float>::infinity();
+  // Broadcast Vm.s[3] = -inf.
+  StoreVec4S(state_.cpu, 1, 0.0f, 2.5f, 99.f, 99.f);  // lanes 2/3 of Vn ignored
+  StoreVec4S(state_.cpu, 2, 9.9f, 9.9f, 9.9f, -inf);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.f, 7.f);
+  static const uint32_t code[] = {FmulxIdx2S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], -2.0f);   // (+0, -inf) -> -2
+  EXPECT_FLOAT_EQ(r[1], -inf);    // 2.5 * -inf = -inf (no saturation)
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMULX .2D by-element: broadcast high qword; covers the (inf, -0) sign mix.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec2DBroadcastsLane) {
+  const double inf = std::numeric_limits<double>::infinity();
+  // Broadcast Vm.d[1] = -0.0.
+  StoreVec2D(state_.cpu, 1, inf, -2.0);
+  StoreVec2D(state_.cpu, 2, 9.9, -0.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulxIdx2D(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], -2.0);   // (+inf, -0) -> -2
+  EXPECT_DOUBLE_EQ(r[1], 0.0);    // -2 * -0 = +0 (no saturation)
+}
+
+// FMULX NaN input must propagate, NOT be replaced by ±2.0 — the saturation
+// override fires only when mul is NaN AND neither input is NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec4SNaNPropagation) {
+  const float qnan = std::nanf("");
+  // Broadcast Vm.s[0] = qnan; Vn has finite lanes.
+  StoreVec4S(state_.cpu, 1, 2.0f, -3.0f, 0.5f, 1.5f);
+  StoreVec4S(state_.cpu, 2, qnan, 9.9f, 9.9f, 9.9f);
+  static const uint32_t code[] = {FmulxIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(std::isnan(r[i])) << "lane " << i << " expected NaN, got " << r[i];
+  }
+}
+
+// FMULX .2D regular finite — sanity that the saturation path doesn't disturb
+// ordinary multiplies.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxVec2DRegular) {
+  StoreVec2D(state_.cpu, 1, 2.0, -4.0);
+  StoreVec2D(state_.cpu, 2, 0.25, 9.9);  // Vm.d[0] = 0.25
+  static const uint32_t code[] = {FmulxIdx2D(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.5);
+  EXPECT_DOUBLE_EQ(r[1], -1.0);
 }
 
 // Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs

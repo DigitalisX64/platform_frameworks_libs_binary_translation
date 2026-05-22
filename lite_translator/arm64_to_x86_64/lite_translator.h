@@ -8128,8 +8128,8 @@ class LiteTranslator {
   }
 
   // region digitalis
-  // region digitalis: AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL at
-  // FP32 (.2S/.4S) and FP64 (.2D).  Shape:
+  // region digitalis: AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL /
+  // FMULX at FP32 (.2S/.4S) and FP64 (.2D).  Shape:
   //   1. Load Vn into xmm_n.
   //   2. Load Vm; broadcast lane args.index across all lanes with PSHUFD
   //      (FP32: imm = (i<<6)|(i<<4)|(i<<2)|i; FP64: imm = 0x44 for i=0,
@@ -8137,26 +8137,24 @@ class LiteTranslator {
   //   3. For FMLA: load Vd, then VFMADD231PS/PD(d, n, m).
   //      For FMLS: load Vd, then VFNMADD231PS/PD(d, n, m).
   //      For FMUL: MULPS/MULPD(n, m), result in n.
+  //      For FMULX: same MULPS/MULPD then the three-same FMULX saturation
+  //      override — (±0, ±inf) lanes get ±2.0 (sign = sign(a) XOR sign(b))
+  //      while NaN inputs and other normals stay as IEEE multiply.
   //   4. If Q=0, mask the upper 64 bits.
   //   5. Store back to Vd.
   //
   // FP16 (size=00) stays interpreter — needs F16C round-trip + binary64
   // FMA for bit-exact match against std::fma(double, double, double) +
-  // FpSingleToHalf.  Plan §E2 / §H1 (handoff #122 next-step item 1).
+  // FpSingleToHalf.
   //
   // Integer MUL/MLA/MLS by-element (size=01/10) stays interpreter — that
   // is a separate JIT family not bundled here.  Could be added later.
-  //
-  // FMULX by-element stays interpreter — needs the (±0,±inf) -> ±2.0
-  // saturation override (the layered-select from the three-same JIT
-  // landed in handoff #120).  Defer; the interpreter is correct via
-  // FmulxScalar<T>.
   //
   // Reserved .1D shape (size=11 && q=0) and hosts without FMA bail.
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
     using Op = Decoder::AdvSimdVecXIdxOpcode;
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
-        args.opcode != Op::kFmul) {
+        args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
       return;
     }
@@ -8206,6 +8204,79 @@ class LiteTranslator {
       if (is_double) as_.Mulpd(xmm_n, xmm_m);
       else            as_.Mulps(xmm_n, xmm_m);
       xmm_result = xmm_n;
+    } else if (args.opcode == Op::kFmulx) {
+      // FMULX = FMUL except (±0 * ±inf) lanes return ±2.0 (sign =
+      // sign(a) XOR sign(b)).  Direct lift of the three-same FMULX
+      // saturation override (handoff #120) on top of the broadcasted Vm.
+      //
+      //   mul         = a * broadcast_b
+      //   mul_unord   = cmpunord(mul, mul)        (-1 per lane if mul is NaN)
+      //   input_unord = cmpunord(a, broadcast_b)  (-1 per lane if a or b NaN)
+      //   special     = mul_unord AND NOT input_unord
+      //   sign_mask   = PCMPEQD + PSLLD/Q  -> 0x80000000... per lane
+      //   two_signed  = ((a XOR broadcast_b) AND sign_mask) OR bits(+2.0)
+      //   result      = (mul AND NOT special) OR (two_signed AND special)
+      SimdRegister xmm_mul = AllocTempSimdReg();
+      SimdRegister xmm_mul_unord = AllocTempSimdReg();
+      SimdRegister xmm_input_unord = AllocTempSimdReg();
+      SimdRegister xmm_two = AllocTempSimdReg();
+      if (xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+          xmm_input_unord == no_simd_register || xmm_two == no_simd_register) {
+        success_ = false;
+        return;
+      }
+
+      // mul = a * broadcast_b
+      as_.Movdqa(xmm_mul, xmm_n);
+      if (is_double) as_.Mulpd(xmm_mul, xmm_m);
+      else            as_.Mulps(xmm_mul, xmm_m);
+
+      // mul_unord = cmpunord(mul, mul)
+      as_.Movdqa(xmm_mul_unord, xmm_mul);
+      if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
+      else            as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+      // input_unord = cmpunord(a, broadcast_b)
+      as_.Movdqa(xmm_input_unord, xmm_n);
+      if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
+      else            as_.Cmpunordps(xmm_input_unord, xmm_m);
+
+      // special_mask = mul_unord AND NOT input_unord (Pandn writes
+      // (NOT dst) AND src, so result lands in xmm_input_unord).
+      as_.Pandn(xmm_input_unord, xmm_mul_unord);
+
+      // two_signed: build ((a XOR broadcast_b) AND sign_mask) OR bits(+2.0).
+      // Reuse xmm_n as the XOR result; reuse xmm_mul_unord as the sign mask.
+      if (is_double) as_.Xorpd(xmm_n, xmm_m);
+      else            as_.Xorps(xmm_n, xmm_m);
+      as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+      if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
+      else            as_.Pslld(xmm_mul_unord, int8_t{31});
+      as_.Pand(xmm_n, xmm_mul_unord);
+
+      // Broadcast bits of +2.0 into all lanes of xmm_two.
+      Register tmp_gpr = AllocTempReg();
+      if (tmp_gpr == Assembler::no_register) { return; }
+      if (is_double) {
+        as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});
+        as_.Movq(xmm_two, tmp_gpr);
+        as_.Punpcklqdq(xmm_two, xmm_two);
+      } else {
+        as_.Movl(tmp_gpr, int32_t{0x40000000});
+        as_.Movd(xmm_two, tmp_gpr);
+        as_.Pshufd(xmm_two, xmm_two, int8_t{0});
+      }
+      as_.Por(xmm_n, xmm_two);
+      // xmm_n now holds ±2.0 per lane.
+
+      // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+      // Reuse xmm_m as the masked ±2.0; reuse xmm_input_unord as the result.
+      as_.Movdqa(xmm_m, xmm_n);
+      as_.Pand(xmm_m, xmm_input_unord);
+      as_.Pandn(xmm_input_unord, xmm_mul);
+      as_.Por(xmm_input_unord, xmm_m);
+
+      xmm_result = xmm_input_unord;
     } else {
       SimdRegister xmm_d = AllocTempSimdReg();
       if (xmm_d == no_simd_register) { success_ = false; return; }
