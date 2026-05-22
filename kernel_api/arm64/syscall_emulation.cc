@@ -71,11 +71,71 @@ long RunGuestSyscall___NR_fadvise64(long arg_1, long arg_2, long arg_3, long arg
 }
 #endif
 
+// region digitalis - ioctl translation
+//
+// Both arm64 and x86_64 use the asm-generic ioctl encoding
+// (<asm-generic/ioctl.h>) -- bionic's kernel-headers include
+// <asm-generic/ioctl.h> from asm-arm64/asm/ioctl.h and asm-x86/asm/ioctl.h
+// alike. The 32-bit cmd layout is:
+//
+//   bits [31:30] dir | [29:16] size | [15:8] type | [7:0] nr
+//
+// Both architectures are LP64 (`long` = 8 bytes, pointer = 8 bytes, alignof
+// identical), so for ioctls whose payload struct contains only fixed-width
+// integers, __u64, pointers, or `long`, the encoded size -- and therefore the
+// full cmd -- is bitwise-identical between arm64 and x86_64. This covers every
+// Android ioctl family currently exercised by the sample suite and by the
+// prebuilt third-party APKs we test against: ASHMEM, binder, fbdev, evdev,
+// tty, DRM, V4L2, ION, gralloc, sndcontrol, uhid, etc.
+//
+// The hook below decodes the cmd into (dir, size, type, nr) so a future
+// per-family conversion can be inserted if a struct ever turns up whose
+// layout actually differs (none today). For now every cmd is passed through
+// unmodified after a structured TRACE.
+namespace {
+
+constexpr struct {
+  uint8_t type;
+  const char* family;
+} kKnownIoctlFamilies[] = {
+    {0x77, "ashmem"},     // <linux/ashmem.h>           __ASHMEMIOC = 0x77
+    {'b', "binder"},      // <linux/android/binder.h>
+    {'F', "fbdev"},       // <linux/fb.h>
+    {'E', "evdev"},       // <linux/input.h>
+    {'T', "tty"},         // <asm-generic/ioctls.h>
+    {'d', "drm"},         // <drm/drm.h>
+    {'V', "v4l2"},        // <linux/videodev2.h>
+    {'I', "ion-iio"},     // <linux/ion.h>, <linux/iio/...>
+    {0xF7, "uhid"},       // <linux/uhid.h>
+    {'M', "sndcontrol"},  // <sound/asound.h>
+    {'U', "sndtimer"},    // <sound/asound.h>           SNDRV_TIMER_*
+    {'A', "sndpcm"},      // <sound/asound.h>           SNDRV_PCM_*
+    {0x12, "blkdev"},     // <linux/fs.h>               BLK*
+};
+
+const char* IoctlFamilyName(uint8_t type) {
+  for (const auto& entry : kKnownIoctlFamilies) {
+    if (entry.type == type) return entry.family;
+  }
+  return "unknown";
+}
+
+}  // namespace
+
 long RunGuestSyscall___NR_ioctl(long arg_1, long arg_2, long arg_3) {
-  // TODO(b/128614662): translate!
-  TRACE("unimplemented ioctl 0x%lx, running host syscall as is", arg_2);
+  const unsigned long cmd = static_cast<unsigned long>(arg_2);
+  const unsigned int dir = (cmd >> 30) & 0x3u;        // _IOC_DIR
+  const unsigned int size = (cmd >> 16) & 0x3FFFu;    // _IOC_SIZE (14 bits)
+  const unsigned int type = (cmd >> 8) & 0xFFu;       // _IOC_TYPE
+  const unsigned int nr = cmd & 0xFFu;                // _IOC_NR
+  TRACE(
+      "ioctl fd=%ld cmd=0x%lx dir=%u type=0x%02x(%s) nr=0x%02x size=%u"
+      " -- arm64/x86_64 LP64 cmd identical, passing through",
+      arg_1, cmd, dir, type, IoctlFamilyName(static_cast<uint8_t>(type)), nr,
+      size);
   return syscall(__NR_ioctl, arg_1, arg_2, arg_3);
 }
+// endregion
 
 long RunGuestSyscall___NR_newfstatat(long arg_1, long arg_2, long arg_3, long arg_4) {
   struct stat host_stat;
