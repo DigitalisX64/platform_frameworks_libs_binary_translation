@@ -2638,9 +2638,20 @@ class Decoder {
       return;
     }
 
-    // Floating-point data-processing (3 source): bit31=0, bits[28:24]=11111
-    // FMADD, FMSUB, FNMADD, FNMSUB
-    if (!bit31 && GetBits<24, 5>() == 0b11111) {
+    // Floating-point data-processing (3 source): bit31=0, bit30=0, bit29=0,
+    // bits[28:24]=11111.  FMADD, FMSUB, FNMADD, FNMSUB.
+    // region digitalis: require bit30=0 (M) and bit29=0 (S) per ARM ARM
+    // encoding "M=0 S=0 11111 ftype o1 0 Rm o0 Ra Rn Rd".  Without these
+    // constraints the prefix also catches the "AdvSIMD scalar x indexed
+    // element" family (bit30=1, bits[28:24]=11111) — e.g. FMULX scalar
+    // by-element (U=1, opcode=1001) was silently mis-routed into
+    // FpDataProc3 as garbage FMADD/FMSUB, producing wrong math without
+    // any SIGILL.  Tightening here routes the scalar-x-indexed encodings
+    // to the final Undefined() (no implementation yet) so the failure
+    // mode is a diagnostic SIGILL rather than corrupted arithmetic.
+    // endregion
+    if (!bit31 && !GetBits<30, 1>() && !GetBits<29, 1>() &&
+        GetBits<24, 5>() == 0b11111) {
       DecodeFpDataProc3();
       return;
     }
