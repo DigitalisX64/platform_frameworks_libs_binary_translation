@@ -6459,11 +6459,15 @@ class LiteTranslator {
       // region digitalis
       // FCVTZS V (vector FP→signed int, truncating).  Handles .2S / .4S
       // (FP32 → S32) directly with CVTTPS2DQ plus an ARM-vs-x86 saturation
-      // fix-up.  FP16 and FP64 (.2D) bail to the interpreter.
+      // fix-up; .2D (FP64 → S64) via per-lane scalar Cvttsd2siq + scalar
+      // saturation fix-up because x86 CVTTPD2DQ produces only 32-bit
+      // outputs (a per-lane scalar path is the cleanest AVX-1-compatible
+      // lowering — AVX-512 VCVTTPD2QQ would be the SIMD-native alternative).
+      // FP16 bails to the interpreter.
       //
-      // x86 CVTTPS2DQ returns 0x80000000 (INT32_MIN) for NaN, ±Inf, and any
-      // out-of-range FP.  ARM wants: NaN → 0, value ≥ 2^31 → INT32_MAX,
-      // value < -2^31 → INT32_MIN.  Algorithm:
+      // FP32 algorithm.  x86 CVTTPS2DQ returns 0x80000000 (INT32_MIN) for
+      // NaN, ±Inf, and any out-of-range FP.  ARM wants: NaN → 0,
+      // value ≥ 2^31 → INT32_MAX, value < -2^31 → INT32_MIN.
       //   1. Convert via CVTTPS2DQ.
       //   2. Build NaN mask (CMPUNORDPS src,src) and clear NaN lanes in
       //      the result (PANDN).
@@ -6477,9 +6481,47 @@ class LiteTranslator {
       //      with the all-1s mask (0x80000000 ^ 0xFFFFFFFF = 0x7FFFFFFF).
       // Negative-overflow lanes need no fix-up — INT32_MIN is the correct
       // ARM-saturated value.
+      //
+      // FP64 (.2D) algorithm.  Emit the scalar FCVTZS-D fix-up twice (once
+      // per lane).  For each lane: Movsd-load the FP64, Cvttsd2siq, then
+      // classify by PF (NaN) and the FP sign bit (raw Movq to GP) — same
+      // structure as the scalar FCVTZS path at the top of FpIntConversion.
+      // .1D (size=11, Q=0) is reserved per ARM ARM; bail.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV: {
         if (args.is_fp16) { success_ = false; return; }
-        if (args.size != 0b10) { success_ = false; return; }  // FP64 deferred
+        if (args.size == 0b11) {
+          if (!args.q) { success_ = false; return; }  // .1D reserved
+          SimdRegister xmm = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          Register sign_tmp = AllocTempReg();
+          if (xmm == no_simd_register || tmp == no_register ||
+              sign_tmp == no_register) {
+            success_ = false; return;
+          }
+          for (int lane = 0; lane < 2; ++lane) {
+            as_.Movsd(xmm,
+                      {.base = Assembler::rbp, .disp = vn_off + lane * 8});
+            as_.Cvttsd2siq(tmp, xmm);
+            Assembler::Label* nan_path = as_.MakeLabel();
+            Assembler::Label* done = as_.MakeLabel();
+            as_.Ucomisd(xmm, xmm);
+            as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+            as_.Movq(sign_tmp, xmm);
+            as_.Testq(sign_tmp, sign_tmp);
+            as_.Jcc(Assembler::Condition::kNegative, *done);
+            as_.Testq(tmp, tmp);
+            as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+            as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+            as_.Jmp(*done);
+            as_.Bind(nan_path);
+            as_.Xorq(tmp, tmp);
+            as_.Bind(done);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                     tmp);
+          }
+          return;
+        }
+        if (args.size != 0b10) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister x_dst = AllocTempSimdReg();
         SimdRegister x_mask = AllocTempSimdReg();
@@ -6515,10 +6557,12 @@ class LiteTranslator {
       }
       // FCVTZU V (vector FP->unsigned int, truncating).  Handles .2S /
       // .4S (FP32 -> U32) directly with a CVTTPS2DQ-based lowering and
-      // a "subtract 2^31" offset trick.  FP16 and FP64 (.2D) bail to
-      // the interpreter.
+      // a "subtract 2^31" offset trick; .2D (FP64 -> U64) via per-lane
+      // scalar Cvttsd2siq with the scalar "subtract 2^63" offset trick
+      // for the [2^63, 2^64) range.  FP16 bails to the interpreter.
       //
-      // ARM FCVTZU saturation rules:
+      // ARM FCVTZU saturation rules (for both FP32->U32 and FP64->U64
+      // with the obvious bound substitution):
       //   NaN              -> 0
       //   FP < 0 (incl -0) -> 0
       //   FP >= 2^32       -> UINT32_MAX (0xFFFFFFFF)
@@ -6553,7 +6597,76 @@ class LiteTranslator {
       //      with too_big=0 are unchanged.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
         if (args.is_fp16) { success_ = false; return; }
-        if (args.size != 0b10) { success_ = false; return; }  // FP64 deferred
+        if (args.size == 0b11) {
+          if (!args.q) { success_ = false; return; }  // .1D reserved
+          // Per-lane scalar FCVTZU-D.  Mirror of the sf=1 scalar
+          // FCVTZU-D path at the top of FpIntConversion: NaN -> 0,
+          // negative -> 0, FP < 2^63 -> direct cvtt-Q, FP in
+          // [2^63, 2^64) -> subtract 2^63 (exact in FP64 at that
+          // exponent step) + cvtt + bit 63 set, FP >= 2^64 ->
+          // UINT64_MAX.
+          SimdRegister xmm = AllocTempSimdReg();
+          SimdRegister bound_xmm = AllocTempSimdReg();    // FP64(2^63)
+          SimdRegister bound2_xmm = AllocTempSimdReg();   // FP64(2^64)
+          Register tmp = AllocTempReg();
+          Register sign_tmp = AllocTempReg();
+          if (xmm == no_simd_register || bound_xmm == no_simd_register ||
+              bound2_xmm == no_simd_register || tmp == no_register ||
+              sign_tmp == no_register) {
+            success_ = false; return;
+          }
+          // Pre-load 2^63 and 2^64 FP64 constants; survive across both
+          // lane emits because we only Subsd into xmm.
+          as_.Movq(tmp, static_cast<int64_t>(0x43E0000000000000LL));
+          as_.Movq(bound_xmm, tmp);
+          as_.Movq(tmp, static_cast<int64_t>(0x43F0000000000000LL));
+          as_.Movq(bound2_xmm, tmp);
+          for (int lane = 0; lane < 2; ++lane) {
+            as_.Movsd(xmm,
+                      {.base = Assembler::rbp, .disp = vn_off + lane * 8});
+            Assembler::Label* zero_path = as_.MakeLabel();
+            Assembler::Label* direct_path = as_.MakeLabel();
+            Assembler::Label* sat_max = as_.MakeLabel();
+            Assembler::Label* done = as_.MakeLabel();
+            // NaN -> 0.
+            as_.Ucomisd(xmm, xmm);
+            as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+            // FP < 0 -> 0 (and -0.0 falls through to direct_path with
+            // cvtt-Q(-0.0) = 0, also correct).
+            as_.Movq(sign_tmp, xmm);
+            as_.Testq(sign_tmp, sign_tmp);
+            as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+            // FP < 2^63 -> direct cvtt-Q gives the exact u64.
+            as_.Ucomisd(xmm, bound_xmm);
+            as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+            // FP >= 2^64 -> UINT64_MAX.
+            as_.Ucomisd(xmm, bound2_xmm);
+            as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+            // FP in [2^63, 2^64): subtract 2^63 (exact at this
+            // exponent step), cvtt, OR bit 63 back in.
+            as_.Subsd(xmm, bound_xmm);
+            as_.Cvttsd2siq(tmp, xmm);
+            as_.Btsq(tmp, int8_t{63});
+            as_.Jmp(*done);
+
+            as_.Bind(sat_max);
+            as_.Movq(tmp, static_cast<int64_t>(-1));  // UINT64_MAX
+            as_.Jmp(*done);
+
+            as_.Bind(direct_path);
+            as_.Cvttsd2siq(tmp, xmm);
+            as_.Jmp(*done);
+
+            as_.Bind(zero_path);
+            as_.Xorq(tmp, tmp);
+
+            as_.Bind(done);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                     tmp);
+          }
+          return;
+        }
+        if (args.size != 0b10) { success_ = false; return; }
         SimdRegister x_dst = AllocTempSimdReg();
         SimdRegister x_pow31 = AllocTempSimdReg();
         SimdRegister x_needs_off = AllocTempSimdReg();

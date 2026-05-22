@@ -2794,6 +2794,105 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV2sZeroesUpperHalf) {
   EXPECT_EQ(lanes[2], 0u);
   EXPECT_EQ(lanes[3], 0u);
 }
+
+// FCVTZS / FCVTZU vector FP64 -> S64/U64 truncating.  Encoding per
+// ARM ARM C7.2 "Advanced SIMD two-register miscellaneous": opcode=11011,
+// bit23=1 (a=1), bit22=1 (sz=1, FP64 lanes), Q=1.  Hand-derived from
+// the FP32 .4S encoding by setting bit22:
+//   fcvtzs v0.2d, v0.2d = 0x4EE1B800  (Q=1, U=0, sz=1)
+//   fcvtzu v0.2d, v0.2d = 0x6EE1B800  (Q=1, U=1, sz=1)
+constexpr uint32_t kFcvtzsV2d00 = 0x4EE1B800;
+constexpr uint32_t kFcvtzuV2d00 = 0x6EE1B800;
+
+// Two normal lanes: positive truncation and negative truncation.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV2dNormalLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40091EB851EB851FULL;  // 3.14 -> 3
+  lanes[1] = 0xC0091EB851EB851FULL;  // -3.14 -> -3
+  static const uint32_t code[] = {kFcvtzsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3);
+  EXPECT_EQ(out[1], -3);
+}
+
+// Saturation: NaN -> 0, +Inf -> INT64_MAX.  Exercises the NaN path
+// (Ucomisd PF=1) and the positive-overflow path (Cvttsd2siq returns
+// INT64_MIN for +Inf; sign-of-FP non-negative triggers INT64_MAX
+// fix-up).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV2dSaturationNanAndPosInf) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FF8000000000000ULL;  // qNaN -> 0
+  lanes[1] = 0x7FF0000000000000ULL;  // +Inf -> INT64_MAX
+  static const uint32_t code[] = {kFcvtzsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0);
+  EXPECT_EQ(out[1], INT64_MAX);
+}
+
+// Saturation: -Inf -> INT64_MIN (already correct from Cvttsd2siq's
+// indefinite, sign-of-FP-negative branch keeps tmp); FP exactly 2^63
+// -> INT64_MAX (positive overflow, sign-of-FP non-negative + tmp ==
+// INT64_MIN triggers the fix-up).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsV2dSaturationNegInfAndPos2p63) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0xFFF0000000000000ULL;  // -Inf -> INT64_MIN
+  lanes[1] = 0x43E0000000000000ULL;  // 2^63 -> INT64_MAX (positive overflow)
+  static const uint32_t code[] = {kFcvtzsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], INT64_MIN);
+  EXPECT_EQ(out[1], INT64_MAX);
+}
+
+// FCVTZU .2D: normal positive truncation in one lane, negative clamp
+// (ARM FCVTZU clamps negatives, including -0.0, to 0) in the other.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV2dNormalLanes) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40091EB851EB851FULL;  // 3.14 -> 3
+  lanes[1] = 0xC0091EB851EB851FULL;  // -3.14 -> 0 (negative clamps)
+  static const uint32_t code[] = {kFcvtzuV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3u);
+  EXPECT_EQ(out[1], 0u);
+}
+
+// FCVTZU .2D saturation: NaN -> 0 (Ucomisd PF=1, zero_path), +Inf ->
+// UINT64_MAX (FP >= 2^64 -> sat_max).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV2dSaturationBoundaries) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FF8000000000000ULL;  // qNaN -> 0
+  lanes[1] = 0x7FF0000000000000ULL;  // +Inf -> UINT64_MAX
+  static const uint32_t code[] = {kFcvtzuV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0u);
+  EXPECT_EQ(out[1], UINT64_MAX);
+}
+
+// FCVTZU .2D offset trick: FP in [2^63, 2^64) exercises the
+// subtract-2^63 + cvtt + bit-63 path; FP = 2^64 saturates to
+// UINT64_MAX.  The first lane uses FP64 0x43E0000000000001 which is
+// the next representable FP64 after 2^63 — equal to 2^63 + 2^11
+// = 0x8000000000000800 as a u64.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV2dOffsetTrickAndSat2p64) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x43E0000000000001ULL;  // 2^63 + 2^11 = next FP64 after 2^63
+  lanes[1] = 0x43F0000000000000ULL;  // 2^64 -> UINT64_MAX (>= bound)
+  static const uint32_t code[] = {kFcvtzuV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0x8000000000000800ULL);
+  EXPECT_EQ(out[1], UINT64_MAX);
+}
 // endregion
 
 }  // namespace
