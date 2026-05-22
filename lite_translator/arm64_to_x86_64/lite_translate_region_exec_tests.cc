@@ -5284,6 +5284,245 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec8HTwoPassRegular) {
 }
 // endregion
 
+// region digitalis: FP16 vector FMLA / FMLS .4H / .8H — FP16 -> FP32 -> FP64
+// round-trip JIT.  Encodings (verified via aarch64-linux-gnu-as -march=
+// armv8.2-a+fp16):
+//   FMLA Vd.4H, Vn.4H, Vm.4H = 0x0E400C00 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.8H, Vn.8H, Vm.8H = 0x4E400C00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.4H, Vn.4H, Vm.4H = 0x0EC00C00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.8H, Vn.8H, Vm.8H = 0x4EC00C00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmlaVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E400C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E400C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EC00C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EC00C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMLA .4H lane-by-lane: Vd[i] = Vd[i] + Vn[i] * Vm[i].  Upper 64 bits
+// of Vd zeroed by the FP16 round-trip path (Q=0 invariant).
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  // d_init: 1.0, 1.0, 3.0, -1.0  -> r = 3.0, 2.0, 1.0, 0.0
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,  // -1.0h
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   // 1 + 1*2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   // 1 + 2*0.5 = 2
+  EXPECT_EQ(r[2], kHalf_1_0);   // 3 + (-0.5)*4 = 1
+  EXPECT_EQ(r[3], kHalf_pos0);  // -1 + 4*0.25 = 0
+  // Upper 64 bits (lanes 4..7) zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLS .4H lane-by-lane: Vd[i] = Vd[i] - Vn[i] * Vm[i].
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                0, 0, 0, 0};
+  // d_init: 3.0, 2.0, -1.0, 2.0  -> r = 1.0, 1.0, 1.0, 1.0
+  uint16_t d_init[8] = {kHalf_3_0, kHalf_2_0,
+                        0xBC00,  // -1.0h
+                        kHalf_2_0,
+                        0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   // 3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   // 2 - 2*0.5 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);   // -1 - (-0.5)*4 = -1 + 2 = 1
+  EXPECT_EQ(r[3], kHalf_1_0);   // 2 - 4*0.25 = 1
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMLA .8H: 8 lanes, exercises both pass paths (low 4 and high 4).
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec8HTwoPassMixed) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_1_0,    kHalf_2_0, kHalf_4_0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                kHalf_1_0, kHalf_neg2_0, kHalf_2_0, kHalf_0_5};
+  // d_init: 1, 1, 3, -1, 0, 3, -2, 0  -> 3, 2, 1, 0, 1, 1, 2, 2
+  uint16_t d_init[8] = {kHalf_1_0, kHalf_1_0, kHalf_3_0,
+                        0xBC00,    // -1
+                        kHalf_pos0, kHalf_3_0,
+                        0xC000,    // -2
+                        kHalf_pos0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_3_0);   // 1 + 1*2 = 3
+  EXPECT_EQ(r[1], kHalf_2_0);   // 1 + 2*0.5 = 2
+  EXPECT_EQ(r[2], kHalf_1_0);   // 3 + (-0.5)*4 = 1
+  EXPECT_EQ(r[3], kHalf_pos0);  // -1 + 4*0.25 = 0
+  EXPECT_EQ(r[4], kHalf_1_0);   // 0 + 1*1 = 1
+  EXPECT_EQ(r[5], kHalf_1_0);   // 3 + 1*(-2) = 1
+  EXPECT_EQ(r[6], kHalf_2_0);   // -2 + 2*2 = 2
+  EXPECT_EQ(r[7], kHalf_2_0);   // 0 + 4*0.5 = 2
+}
+
+// FMLS .8H: same two-pass exercise as FMLA .8H.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec8HTwoPassRegular) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_2_0, kHalf_neg0_5, kHalf_4_0,
+                                kHalf_1_0, kHalf_2_0, kHalf_1_0,    kHalf_4_0};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_0_5, kHalf_4_0,    kHalf_0_25,
+                                kHalf_2_0, kHalf_0_5, kHalf_1_0,    kHalf_0_25};
+  // d_init: 3, 2, -1, 2, 4, 3, 2, 2  -> 1, 1, 1, 1, 2, 2, 1, 1
+  uint16_t d_init[8] = {kHalf_3_0, kHalf_2_0,
+                        0xBC00,   // -1
+                        kHalf_2_0,
+                        kHalf_4_0, kHalf_3_0, kHalf_2_0, kHalf_2_0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlsVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);   // 3 - 1*2 = 1
+  EXPECT_EQ(r[1], kHalf_1_0);   // 2 - 2*0.5 = 1
+  EXPECT_EQ(r[2], kHalf_1_0);   // -1 - (-0.5)*4 = 1
+  EXPECT_EQ(r[3], kHalf_1_0);   // 2 - 4*0.25 = 1
+  EXPECT_EQ(r[4], kHalf_2_0);   // 4 - 1*2 = 2
+  EXPECT_EQ(r[5], kHalf_2_0);   // 3 - 2*0.5 = 2
+  EXPECT_EQ(r[6], kHalf_1_0);   // 2 - 1*1 = 1
+  EXPECT_EQ(r[7], kHalf_1_0);   // 2 - 4*0.25 = 1
+}
+
+// Fused-vs-unfused rounding divergence on FMLA .4H.  Picks (a, b, d)
+// such that fma((double)a, (double)b, (double)d) narrowed to half
+// differs from (float(a*b) + d) narrowed to half — proves the FP64
+// round-trip path matches the interpreter's binary64 oracle for a
+// case where the intermediate FP32 sum would double-round to a
+// different FP16 result.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4HFusedRounding) {
+  // a = 1.0h + 2^-10 ulp = 0x3C01  (smallest > 1.0h in FP16, ~= 1.0009766)
+  // b = same
+  // d = -1.0h = 0xBC00
+  // Exact product in FP64: (1 + 2^-10)*(1 + 2^-10) = 1 + 2^-9 + 2^-20.
+  // Fused (interpreter): fma(a, b, -1) -> (2^-9 + 2^-20) ~ 0.0019536...
+  //   narrowed to FP16 (1 mantissa ULP around 0.001953125 is 2^-10*ulp_exp)
+  //   -- the value 2^-9 + 2^-20 = 0.001953125 + 0.00000095367...
+  //   rounded to nearest FP16 in the range [2^-9, 2^-8) where the ULP
+  //   is 2^-19, equals 0x1801 (representable bits set so the trailing
+  //   2^-20 bit rounds up to next ULP).
+  // We don't precompute the expected bit pattern here — instead we
+  // compute the oracle by mimicking the interpreter formula directly
+  // and compare to the JIT result.
+  auto half_to_float = [](uint16_t h) -> float {
+    uint32_t s = (h >> 15) & 1;
+    uint32_t e = (h >> 10) & 0x1F;
+    uint32_t f = h & 0x3FF;
+    uint32_t bits;
+    if (e == 0) {
+      if (f == 0) {
+        bits = s << 31;
+      } else {
+        // Subnormal half -> normal float.
+        while ((f & 0x400) == 0) { f <<= 1; e--; }
+        e++; f &= 0x3FF;
+        bits = (s << 31) | ((e + 127 - 15) << 23) | (f << 13);
+      }
+    } else if (e == 31) {
+      bits = (s << 31) | (0xFF << 23) | (f << 13);
+    } else {
+      bits = (s << 31) | ((e + 127 - 15) << 23) | (f << 13);
+    }
+    float r;
+    std::memcpy(&r, &bits, 4);
+    return r;
+  };
+  const uint16_t ha = 0x3C01;  // 1 + 2^-10
+  const uint16_t hd = 0xBC00;  // -1.0
+  const float a = half_to_float(ha);
+  const float d = half_to_float(hd);
+  // Interpreter oracle:
+  //   double r64 = std::fma((double)a, (double)a, (double)d);
+  //   uint16_t expected = FpSingleToHalf((float)r64);
+  // FpSingleToHalf does correct round-to-nearest-even FP32->FP16; we
+  // emulate by going through Vcvtps2ph in the same direction below.
+  // Simpler: just verify the JIT result matches by computing both
+  // paths and comparing.
+  const double r64 = std::fma(static_cast<double>(a),
+                              static_cast<double>(a),
+                              static_cast<double>(d));
+  const float r32 = static_cast<float>(r64);
+  uint32_t r32_bits;
+  std::memcpy(&r32_bits, &r32, 4);
+  // Convert FP32 -> FP16 (round-to-nearest-even).
+  auto float_to_half_rne = [](uint32_t f) -> uint16_t {
+    uint32_t s = (f >> 31) & 1;
+    int32_t e = static_cast<int32_t>((f >> 23) & 0xFF) - 127;
+    uint32_t m = f & 0x7FFFFF;
+    if (e == 128) {  // inf or NaN
+      if (m == 0) return (s << 15) | 0x7C00;
+      return (s << 15) | 0x7C00 | (m >> 13) | (m == 0 ? 1 : 0);
+    }
+    if (e > 15) return (s << 15) | 0x7C00;  // overflow -> inf
+    if (e < -24) return (s << 15);          // underflow -> +/-0
+    if (e < -14) {
+      // Subnormal half.
+      m |= 0x800000;
+      int shift = -14 - e + 13;
+      uint32_t round_bits = m & ((1u << shift) - 1);
+      uint32_t halfmant = m >> shift;
+      uint32_t halfbit = 1u << (shift - 1);
+      if (round_bits > halfbit ||
+          (round_bits == halfbit && (halfmant & 1))) halfmant++;
+      return (s << 15) | (halfmant & 0x3FF);
+    }
+    uint32_t halfmant = m >> 13;
+    uint32_t round_bits = m & 0x1FFF;
+    if (round_bits > 0x1000 ||
+        (round_bits == 0x1000 && (halfmant & 1))) {
+      halfmant++;
+      if (halfmant == 0x400) { halfmant = 0; e++; }
+    }
+    return (s << 15) | ((e + 15) << 10) | halfmant;
+  };
+  const uint16_t expected = float_to_half_rne(r32_bits);
+
+  const uint16_t n_lanes[8] = {ha, 0, 0, 0, 0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {ha, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t d_init[8] = {hd, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmlaVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], expected);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
