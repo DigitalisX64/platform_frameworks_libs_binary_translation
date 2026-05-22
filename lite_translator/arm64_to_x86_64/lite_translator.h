@@ -4286,6 +4286,153 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: FRECPS / FRSQRTS vector three-same (FP32 .2S/.4S, FP64 .2D).
+      //
+      // Lane-parallel lift of the scalar FRECPS/FRSQRTS JIT path
+      // (AdvSimdScalarThreeSame).  Same single-rounded structure:
+      //
+      //   FRECPS  result = 2 - a*b                    (special-case overrides)
+      //   FRSQRTS result = (3 - a*b) / 2              (divide-by-2 is exact)
+      //
+      // Implemented as VFNMADD231PD/PS of (K_fma - a*b) into a destination
+      // pre-loaded with broadcast K_fma.  The special-case override fires
+      // when a*b is NaN but neither input is NaN — i.e. the (±0, ±inf)
+      // cross — and replaces the lane with the saturation constant K_sat
+      // (positive +2.0 for FRECPS, +1.5 for FRSQRTS; sign is *not* fixed
+      // up from sign(a) XOR sign(b), unlike FMULX).  NaN inputs override
+      // the lane with the default qNaN.
+      //
+      // FP16 .4H/.8H bails to the interpreter (FP16 path is item 1 of
+      // -121's follow-ups — needs the FP16->FP64 round-trip).  Hosts
+      // without FMA3 bail too (no MUL+SUB fallback — that would
+      // double-round, violating ARM's fused semantics).  Reserved .1D
+      // shape (size=01 && q=0) bails.
+      case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
+      case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (!host_platform::kHasFMA) { success_ = false; return; }
+        const bool is_double = (args.size & 1);
+        if (is_double && !args.q) { success_ = false; return; }
+        const bool is_frecps =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFrecpsV);
+
+        // Constants (lane-broadcasted below).
+        const int64_t k_fma_bits_d = is_frecps ? int64_t{0x4000000000000000LL}   // +2.0
+                                                : int64_t{0x4008000000000000LL};  // +3.0
+        const int32_t k_fma_bits_s = is_frecps ? int32_t{0x40000000}              // +2.0
+                                                : int32_t{0x40400000};             // +3.0
+        const int64_t k_sat_bits_d = is_frecps ? int64_t{0x4000000000000000LL}   // +2.0
+                                                : int64_t{0x3FF8000000000000LL};  // +1.5
+        const int32_t k_sat_bits_s = is_frecps ? int32_t{0x40000000}              // +2.0
+                                                : int32_t{0x3FC00000};             // +1.5
+        const int64_t qnan_bits_d  = int64_t{0x7FF8000000000000LL};
+        const int32_t qnan_bits_s  = int32_t{0x7FC00000};
+        const int64_t two_bits_d   = int64_t{0x4000000000000000LL};
+        const int32_t two_bits_s   = int32_t{0x40000000};
+
+        SimdRegister xmm_n = AllocTempSimdReg();
+        SimdRegister xmm_m = AllocTempSimdReg();
+        SimdRegister xmm_mul = AllocTempSimdReg();
+        SimdRegister xmm_iu = AllocTempSimdReg();
+        SimdRegister xmm_special = AllocTempSimdReg();
+        if (xmm_n == no_simd_register || xmm_m == no_simd_register ||
+            xmm_mul == no_simd_register || xmm_iu == no_simd_register ||
+            xmm_special == no_simd_register) {
+          success_ = false; return;
+        }
+
+        load_full(xmm_n, vn_off);
+        load_full(xmm_m, vm_off);
+
+        // mul = a * b (only its NaN bit is observed via cmpunord below).
+        as_.Movdqa(xmm_mul, xmm_n);
+        if (is_double) as_.Mulpd(xmm_mul, xmm_m);
+        else            as_.Mulps(xmm_mul, xmm_m);
+
+        // input_unord = cmpunord(a, b): per-lane all-ones iff a or b NaN.
+        as_.Movdqa(xmm_iu, xmm_n);
+        if (is_double) as_.Cmpunordpd(xmm_iu, xmm_m);
+        else            as_.Cmpunordps(xmm_iu, xmm_m);
+
+        // mul_unord = cmpunord(mul, mul) reused in xmm_mul (product value
+        // no longer needed past this point — only its NaN bit matters).
+        if (is_double) as_.Cmpunordpd(xmm_mul, xmm_mul);
+        else            as_.Cmpunordps(xmm_mul, xmm_mul);
+
+        // special_mask = (NOT input_unord) AND mul_unord.  Pandn writes
+        // (NOT dst) AND src.  Keep input_unord alive in xmm_iu.
+        as_.Movdqa(xmm_special, xmm_iu);
+        as_.Pandn(xmm_special, xmm_mul);
+        // xmm_mul now free as scratch.
+
+        // Normal-path result = K_fma - a*b via VFNMADD231(dst, n, m):
+        // load broadcast K_fma into xmm_mul, then dst -= n*m in-place.
+        Register tmp_gpr = AllocTempReg();
+        if (is_double) {
+          as_.Movq(tmp_gpr, k_fma_bits_d);
+          as_.Movq(xmm_mul, tmp_gpr);
+          as_.Punpcklqdq(xmm_mul, xmm_mul);
+          as_.Vfnmadd231pd(xmm_mul, xmm_n, xmm_m);
+        } else {
+          as_.Movl(tmp_gpr, k_fma_bits_s);
+          as_.Movd(xmm_mul, tmp_gpr);
+          as_.Pshufd(xmm_mul, xmm_mul, int8_t{0});
+          as_.Vfnmadd231ps(xmm_mul, xmm_n, xmm_m);
+        }
+
+        // FRSQRTS: divide by 2 (one-exponent decrement; exact under IEEE
+        // binary FP — the rounding-once invariant carries through).
+        // Reuse xmm_n as a broadcast-2.0 scratch; a is no longer needed.
+        if (!is_frecps) {
+          if (is_double) {
+            as_.Movq(tmp_gpr, two_bits_d);
+            as_.Movq(xmm_n, tmp_gpr);
+            as_.Punpcklqdq(xmm_n, xmm_n);
+            as_.Divpd(xmm_mul, xmm_n);
+          } else {
+            as_.Movl(tmp_gpr, two_bits_s);
+            as_.Movd(xmm_n, tmp_gpr);
+            as_.Pshufd(xmm_n, xmm_n, int8_t{0});
+            as_.Divps(xmm_mul, xmm_n);
+          }
+        }
+        // xmm_mul now holds fma_result.  xmm_n, xmm_m are free as scratch.
+
+        // First select: result_first = special_mask ? K_sat : fma_result.
+        // Broadcast K_sat into xmm_n.
+        if (is_double) {
+          as_.Movq(tmp_gpr, k_sat_bits_d);
+          as_.Movq(xmm_n, tmp_gpr);
+          as_.Punpcklqdq(xmm_n, xmm_n);
+        } else {
+          as_.Movl(tmp_gpr, k_sat_bits_s);
+          as_.Movd(xmm_n, tmp_gpr);
+          as_.Pshufd(xmm_n, xmm_n, int8_t{0});
+        }
+        as_.Pand(xmm_n, xmm_special);       // xmm_n = K_sat AND special
+        as_.Pandn(xmm_special, xmm_mul);    // xmm_special = (NOT special) AND fma
+        as_.Por(xmm_n, xmm_special);        // xmm_n = result_first
+
+        // Second select: result_final = input_unord ? qnan : result_first.
+        // Broadcast qNaN into xmm_m (b is no longer needed).
+        if (is_double) {
+          as_.Movq(tmp_gpr, qnan_bits_d);
+          as_.Movq(xmm_m, tmp_gpr);
+          as_.Punpcklqdq(xmm_m, xmm_m);
+        } else {
+          as_.Movl(tmp_gpr, qnan_bits_s);
+          as_.Movd(xmm_m, tmp_gpr);
+          as_.Pshufd(xmm_m, xmm_m, int8_t{0});
+        }
+        as_.Pand(xmm_m, xmm_iu);            // xmm_m = qnan AND iu
+        as_.Pandn(xmm_iu, xmm_n);           // xmm_iu = (NOT iu) AND result_first
+        as_.Por(xmm_m, xmm_iu);             // xmm_m = result_final
+
+        if (!args.q) mask_low64(xmm_m);
+        store_full(vd_off, xmm_m);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
