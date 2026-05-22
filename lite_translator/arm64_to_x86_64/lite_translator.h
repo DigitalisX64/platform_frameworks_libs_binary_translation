@@ -6711,6 +6711,152 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x_dst);
         return;
       }
+      // FCVTNS/PS/MS (signed) and FCVTNU/PU/MU (unsigned) vector FP -> int
+      // with explicit rounding mode.  ARM rmode -> ROUNDSD imm:
+      //   FCVTNS / FCVTNU  RNE             imm=0x08 (RNE + suppress-inexact)
+      //   FCVTPS / FCVTPU  round +inf      imm=0x0A
+      //   FCVTMS / FCVTMU  round -inf      imm=0x09
+      //
+      // Strategy mirrors the scalar FCVTNS/PS/MS path at lite_translator.h
+      // ~2949: ROUNDSD the FP value first, then reuse the FCVTZS / FCVTZU
+      // saturation classifier verbatim.  After ROUNDSD, finite values are
+      // exact integers in FP domain, and NaN/+/-Inf/sign-of-zero pass through
+      // unchanged so the classifier still distinguishes them correctly.
+      //
+      // .2D path: per-lane scalar Roundsd + Cvttsd2siq, identical scaffolding
+      // to the FCVTZS V / FCVTZU V .2D paths above.  .2S/.4S (FP32) bails to
+      // the interpreter for now — that's items §C4(a)/(b) on the Next list.
+      // FP16 bails as well.
+      //
+      // Size selector: bits[23:22] = (bit23='a', bit22='sz').  bit23 is
+      // baked into the opcode dispatch (FCVTPS/PU have bit23=1, FCVTNS/NU/
+      // MS/MU have bit23=0), so `args.size` carries both — use
+      // `(args.size & 1)` as the canonical FP32-vs-FP64 selector that
+      // works for both bit23 halves.  FP64 .2D corresponds to:
+      //   FCVTPS/PU (bit23=1, sz=1): args.size == 0b11
+      //   FCVTNS/NU/MS/MU (bit23=0, sz=1): args.size == 0b01
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpsV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmsV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if ((args.size & 1) == 0) { success_ = false; return; }  // FP32 .2S/.4S
+        if (!args.q) { success_ = false; return; }  // .1D reserved
+        int8_t round_imm;
+        if (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnsV) {
+          round_imm = int8_t{0x08};   // RNE + suppress-inexact
+        } else if (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpsV) {
+          round_imm = int8_t{0x0A};   // toward +inf
+        } else {
+          round_imm = int8_t{0x09};   // toward -inf
+        }
+        SimdRegister xmm = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        Register sign_tmp = AllocTempReg();
+        if (xmm == no_simd_register || tmp == no_register ||
+            sign_tmp == no_register) {
+          success_ = false; return;
+        }
+        for (int lane = 0; lane < 2; ++lane) {
+          as_.Movsd(xmm,
+                    {.base = Assembler::rbp, .disp = vn_off + lane * 8});
+          as_.Roundsd(xmm, xmm, round_imm);
+          as_.Cvttsd2siq(tmp, xmm);
+          Assembler::Label* nan_path = as_.MakeLabel();
+          Assembler::Label* done = as_.MakeLabel();
+          as_.Ucomisd(xmm, xmm);
+          as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+          as_.Movq(sign_tmp, xmm);
+          as_.Testq(sign_tmp, sign_tmp);
+          as_.Jcc(Assembler::Condition::kNegative, *done);
+          as_.Testq(tmp, tmp);
+          as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+          as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+          as_.Jmp(*done);
+          as_.Bind(nan_path);
+          as_.Xorq(tmp, tmp);
+          as_.Bind(done);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                   tmp);
+        }
+        return;
+      }
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnuV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpuV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtmuV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if ((args.size & 1) == 0) { success_ = false; return; }  // FP32 .2S/.4S
+        if (!args.q) { success_ = false; return; }  // .1D reserved
+        int8_t round_imm;
+        if (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtnuV) {
+          round_imm = int8_t{0x08};   // RNE + suppress-inexact
+        } else if (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtpuV) {
+          round_imm = int8_t{0x0A};   // toward +inf
+        } else {
+          round_imm = int8_t{0x09};   // toward -inf
+        }
+        SimdRegister xmm = AllocTempSimdReg();
+        SimdRegister bound_xmm = AllocTempSimdReg();    // FP64(2^63)
+        SimdRegister bound2_xmm = AllocTempSimdReg();   // FP64(2^64)
+        Register tmp = AllocTempReg();
+        Register sign_tmp = AllocTempReg();
+        if (xmm == no_simd_register || bound_xmm == no_simd_register ||
+            bound2_xmm == no_simd_register || tmp == no_register ||
+            sign_tmp == no_register) {
+          success_ = false; return;
+        }
+        // Pre-load 2^63 and 2^64 FP64 constants; survive across both
+        // lane emits because we only Subsd into xmm.  Same as FCVTZU V .2D.
+        as_.Movq(tmp, static_cast<int64_t>(0x43E0000000000000LL));
+        as_.Movq(bound_xmm, tmp);
+        as_.Movq(tmp, static_cast<int64_t>(0x43F0000000000000LL));
+        as_.Movq(bound2_xmm, tmp);
+        for (int lane = 0; lane < 2; ++lane) {
+          as_.Movsd(xmm,
+                    {.base = Assembler::rbp, .disp = vn_off + lane * 8});
+          as_.Roundsd(xmm, xmm, round_imm);
+          Assembler::Label* zero_path = as_.MakeLabel();
+          Assembler::Label* direct_path = as_.MakeLabel();
+          Assembler::Label* sat_max = as_.MakeLabel();
+          Assembler::Label* done = as_.MakeLabel();
+          // NaN -> 0 (Roundsd passes NaN through).
+          as_.Ucomisd(xmm, xmm);
+          as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+          // FP < 0 (sign bit set) -> 0.  Roundsd preserves the sign of
+          // zero, so e.g. ceil(-0.5) = -0.0 still classifies as negative
+          // here and clamps to 0 -- matching ARM FCVT*U behavior.
+          as_.Movq(sign_tmp, xmm);
+          as_.Testq(sign_tmp, sign_tmp);
+          as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+          // FP < 2^63 -> direct cvtt-Q gives the exact u64.
+          as_.Ucomisd(xmm, bound_xmm);
+          as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+          // FP >= 2^64 -> UINT64_MAX.
+          as_.Ucomisd(xmm, bound2_xmm);
+          as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+          // FP in [2^63, 2^64): subtract 2^63 (exact at this exponent
+          // step), cvtt, OR bit 63 back in.
+          as_.Subsd(xmm, bound_xmm);
+          as_.Cvttsd2siq(tmp, xmm);
+          as_.Btsq(tmp, int8_t{63});
+          as_.Jmp(*done);
+
+          as_.Bind(sat_max);
+          as_.Movq(tmp, static_cast<int64_t>(-1));  // UINT64_MAX
+          as_.Jmp(*done);
+
+          as_.Bind(direct_path);
+          as_.Cvttsd2siq(tmp, xmm);
+          as_.Jmp(*done);
+
+          as_.Bind(zero_path);
+          as_.Xorq(tmp, tmp);
+
+          as_.Bind(done);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + lane * 8},
+                   tmp);
+        }
+        return;
+      }
       // endregion
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
         if (args.is_fp16) {

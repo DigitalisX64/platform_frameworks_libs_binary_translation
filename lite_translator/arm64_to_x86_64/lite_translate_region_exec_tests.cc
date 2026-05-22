@@ -2893,6 +2893,124 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtzuV2dOffsetTrickAndSat2p64) {
   EXPECT_EQ(out[0], 0x8000000000000800ULL);
   EXPECT_EQ(out[1], UINT64_MAX);
 }
+
+// FCVT[NS|PS|MS|NU|PU|MU] vector FP64 -> S64/U64 with explicit rounding.
+// Encoding per ARM ARM C7.2:
+//   FCVTNS V .2D = 0x4E61A800 (Q=1, U=0, bit23=0, bit22=1, opcode=11010)
+//   FCVTPS V .2D = 0x4EE1A800 (Q=1, U=0, bit23=1, bit22=1, opcode=11010)
+//   FCVTMS V .2D = 0x4E61B800 (Q=1, U=0, bit23=0, bit22=1, opcode=11011)
+//   FCVTNU V .2D = 0x6E61A800 (U=1 variant of FCVTNS)
+//   FCVTPU V .2D = 0x6EE1A800 (U=1 variant of FCVTPS)
+//   FCVTMU V .2D = 0x6E61B800 (U=1 variant of FCVTMS)
+constexpr uint32_t kFcvtnsV2d00 = 0x4E61A800;
+constexpr uint32_t kFcvtpsV2d00 = 0x4EE1A800;
+constexpr uint32_t kFcvtmsV2d00 = 0x4E61B800;
+constexpr uint32_t kFcvtnuV2d00 = 0x6E61A800;
+constexpr uint32_t kFcvtpuV2d00 = 0x6EE1A800;
+constexpr uint32_t kFcvtmuV2d00 = 0x6E61B800;
+
+// FCVTNS round-to-nearest ties-even: 3.5 -> 4 (ties up to even), -3.5 ->
+// -4 (ties to even, -3 is odd so -3.5 rounds to -4).  Differs from trunc
+// (3, -3) and floor (3, -4).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnsV2dRoundToEven) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x400C000000000000ULL;  // 3.5 -> 4
+  lanes[1] = 0xC00C000000000000ULL;  // -3.5 -> -4
+  static const uint32_t code[] = {kFcvtnsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 4);
+  EXPECT_EQ(out[1], -4);
+}
+
+// FCVTNS .2D saturation: NaN -> 0, +Inf -> INT64_MAX.  Roundsd preserves
+// NaN and Inf; the saturation classifier produces ARM-correct outputs.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnsV2dSaturationNanAndPosInf) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x7FF8000000000000ULL;  // qNaN -> 0
+  lanes[1] = 0x7FF0000000000000ULL;  // +Inf -> INT64_MAX
+  static const uint32_t code[] = {kFcvtnsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 0);
+  EXPECT_EQ(out[1], INT64_MAX);
+}
+
+// FCVTPS round toward +inf (ceiling): 2.1 -> 3, -2.9 -> -2.  Differs from
+// trunc (2, -2) and from FCVTNS (2, -3) and FCVTMS (2, -3).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtpsV2dCeiling) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40006CCCCCCCCCCDULL;  // 2.1 -> 3
+  lanes[1] = 0xC00733333333333BULL;  // -2.9 -> -2
+  static const uint32_t code[] = {kFcvtpsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3);
+  EXPECT_EQ(out[1], -2);
+}
+
+// FCVTMS round toward -inf (floor): 2.9 -> 2, -2.1 -> -3.  Differs from
+// trunc (2, -2) and FCVTPS (3, -2).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtmsV2dFloor) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4007333333333333ULL;  // 2.9 -> 2
+  lanes[1] = 0xC0006CCCCCCCCCCDULL;  // -2.1 -> -3
+  static const uint32_t code[] = {kFcvtmsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<int64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 2);
+  EXPECT_EQ(out[1], -3);
+}
+
+// FCVTNU .2D: round-to-nearest ties-even for unsigned target.
+//   2.5 -> 2 (ties to even, 2 is even).
+//   -0.5 -> 0 (rounds to -0.0 by ties-to-even since 0 is even; sign bit
+//             set classifies as negative -> clamp to 0).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnuV2dRoundToEvenAndNegClamp) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4004000000000000ULL;  // 2.5 -> 2 (ties to even)
+  lanes[1] = 0xBFE0000000000000ULL;  // -0.5 -> 0 (round to -0.0, clamp)
+  static const uint32_t code[] = {kFcvtnuV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 2u);
+  EXPECT_EQ(out[1], 0u);
+}
+
+// FCVTPU .2D: ceiling for unsigned target.
+//   0.1 -> 1 (ceil of 0.1).
+//   2^64 -> UINT64_MAX (saturation; ceil(2^64)=2^64 hits >= 2^64 path).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtpuV2dCeilAndSat) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x3FB999999999999AULL;  // 0.1 -> 1
+  lanes[1] = 0x43F0000000000000ULL;  // 2^64 -> UINT64_MAX
+  static const uint32_t code[] = {kFcvtpuV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 1u);
+  EXPECT_EQ(out[1], UINT64_MAX);
+}
+
+// FCVTMU .2D: floor for unsigned target.
+//   3.9 -> 3 (floor).
+//   -0.5 -> 0 (floor of -0.5 = -1, sign bit set -> clamp to 0).
+TEST_F(Arm64LiteTranslateRegionTest, FcvtmuV2dFloorAndNegClamp) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x400F333333333333ULL;  // 3.9 -> 3
+  lanes[1] = 0xBFE0000000000000ULL;  // -0.5 -> 0 (floor to -1, clamp)
+  static const uint32_t code[] = {kFcvtmuV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  auto* out = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(out[0], 3u);
+  EXPECT_EQ(out[1], 0u);
+}
 // endregion
 
 }  // namespace
