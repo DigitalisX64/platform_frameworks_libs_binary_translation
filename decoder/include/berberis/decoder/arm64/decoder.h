@@ -892,6 +892,13 @@ class Decoder {
     kFacgeV,    // FACGE  (vector): op_high=0, opcode=11101, U=1
     kFacgtV,    // FACGT  (vector): op_high=1, opcode=11101, U=1
     kFabdV,     // FABD   (vector): op_high=1, opcode=11010, U=1
+    // region digitalis
+    kFmulxV,    // FMULX  (vector): op_high=0, opcode=11011, U=0
+                // FP16-three-same encoding: a=0, opcode_3=011, U=0.
+                // Same as kFmulV but with the ARM-defined ±0 * ±inf -> ±2.0
+                // saturation (instead of NaN), used by libm reciprocal
+                // refinement loops.  Interpreter-only.
+    // endregion
     // endregion
   };
 
@@ -1234,6 +1241,9 @@ class Decoder {
     kFcmeq,   // FCMEQ (scalar, FP): U=0, bit23=0, opcode=11100
     kFacgt,   // FACGT (scalar, FP): U=1, bit23=1, opcode=11101
     kFacge,   // FACGE (scalar, FP): U=1, bit23=0, opcode=11101
+    kFmulx,   // FMULX (scalar, FP): U=0, bit23=1, opcode=11011.
+              // Identical to FMUL except (±0 * ±inf) lanes return ±2.0
+              // instead of NaN — see Interpreter::FmulxScalar<>.
     // endregion
   };
 
@@ -1242,7 +1252,15 @@ class Decoder {
     uint8_t rd;
     uint8_t rn;
     uint8_t rm;
-    uint8_t size;   // integer: full size field; FP: 0 -> S (32-bit), 1 -> D (64-bit)
+    uint8_t size;   // integer: full size field; FP: 0 -> S (32-bit), 1 -> D (64-bit);
+                    // FP16 scalar three-same: 0 (unused — interpreter checks is_fp16).
+    // region digitalis: Armv8.2-FP16 scalar three-same.  When true, the
+    // interpreter reads the low 16 bits of Vn/Vm as binary16 and performs
+    // a widen-op-narrow round-trip through FP32 (FpHalfToSingle ->
+    // semantic helper -> FpSingleToHalf).  Bit-exact for the FMULX
+    // saturation case because ±2.0 is exactly representable in FP16.
+    bool is_fp16 = false;
+    // endregion
   };
 
   // AdvSIMD scalar pairwise opcodes.
@@ -1308,6 +1326,10 @@ class Decoder {
     kFmla,    // FMLA (by element)
     kFmls,    // FMLS (by element)
     kFmul,    // FMUL (by element)
+    // region digitalis
+    kFmulx,   // FMULX (by element): U=1, opcode=1001.  Same lane semantics as
+              // kFmul except (±0 * ±inf) lanes return ±2.0 instead of NaN.
+    // endregion
     kMul,     // MUL (by element)
     kMla,     // MLA (by element)
     kMls,     // MLS (by element)
@@ -2475,6 +2497,25 @@ class Decoder {
       DecodeAdvSimdScalarThreeSame();
       return;
     }
+
+    // region digitalis: Armv8.2-FP16 scalar three-same.
+    // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
+    //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
+    // i.e. bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=a, bit22=1,
+    //      bit21=0, bits[15:14]=00, bits[13:11]=opcode_3, bit10=1.
+    // Must precede the FpFixedPointConversion check below, which would
+    // otherwise misroute this encoding (FpFixedPointConversion only gates
+    // on bits[28:24]=11110 && !bit21 — it doesn't constrain bit30, even
+    // though its own encoding requires bit30=0).
+    // Distinct from std scalar three-same (bit21=1 there, =0 here) and
+    // from scalar copy (bits[23:21]=000 there; bits[23:21]=`a 1 0` here).
+    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
+        GetBits<22, 1>() && !GetBits<21, 1>() &&
+        !GetBits<15, 1>() && !GetBits<14, 1>() && GetBits<10, 1>()) {
+      DecodeAdvSimdScalarFp16ThreeSame();
+      return;
+    }
+    // endregion
 
     // region digitalis
     // Cryptographic three-register SHA (SHA1C/SHA1P/SHA1M/SHA1SU0,
@@ -3769,9 +3810,12 @@ class Decoder {
           case 0b000: op = AdvSimdThreeSameOpcode::kFmaxnmV; ok = true; break;
           case 0b001: op = AdvSimdThreeSameOpcode::kFmlaV;   ok = true; break;
           case 0b010: op = AdvSimdThreeSameOpcode::kFaddV;   ok = true; break;
+          // region digitalis: FP16 FMULX (a=0, U=0, opcode_3=011).
+          case 0b011: op = AdvSimdThreeSameOpcode::kFmulxV;  ok = true; break;
+          // endregion
           case 0b100: op = AdvSimdThreeSameOpcode::kFcmeqV;  ok = true; break;
           case 0b110: op = AdvSimdThreeSameOpcode::kFmaxV;   ok = true; break;
-          default: break;  // 011 FMULX, 101 reserved, 111 FRECPS — Undefined.
+          default: break;  // 101 reserved, 111 FRECPS — Undefined.
         }
       } else {
         switch (opcode_3) {
@@ -3815,6 +3859,75 @@ class Decoder {
         .is_fp16 = true,
     };
     insn_consumer_->AdvSimdThreeSame(args);
+  }
+  // endregion
+
+  // region digitalis: Armv8.2-FP16 scalar three-same.
+  // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
+  //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
+  // where a = bit23, opcode_3 = bits[13:11] (3 bits).
+  // Opcode table (the scalar-allocated subset; cells marked "—" are
+  // reserved/Undefined in the scalar encoding):
+  //   a=0,U=0,op=011  FMULX   (saturation: ±0 * ±inf -> ±2.0)
+  //   a=0,U=0,op=100  FCMEQ
+  //   a=0,U=0,op=111  FRECPS  (interpreter not implemented yet)
+  //   a=1,U=0,op=111  FRSQRTS (interpreter not implemented yet)
+  //   a=0,U=1,op=100  FCMGE
+  //   a=0,U=1,op=101  FACGE
+  //   a=1,U=1,op=010  FABD
+  //   a=1,U=1,op=100  FCMGT
+  //   a=1,U=1,op=101  FACGT
+  // Reuses the std AdvSimdScalarThreeSameOpcode enum with the is_fp16=true
+  // flag, mirroring the FP16 vector three-same pattern.  FRECPS/FRSQRTS
+  // (op=111) remain Undefined() until interpreter handlers land.
+  void DecodeAdvSimdScalarFp16ThreeSame() {
+    bool u = GetBits<29, 1>();
+    bool a = GetBits<23, 1>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t opcode_3 = GetBits<11, 3>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    AdvSimdScalarThreeSameOpcode op;
+    bool ok = false;
+    if (!a && !u && opcode_3 == 0b011) {
+      op = AdvSimdScalarThreeSameOpcode::kFmulx;
+      ok = true;
+    } else if (!a && !u && opcode_3 == 0b100) {
+      op = AdvSimdScalarThreeSameOpcode::kFcmeq;
+      ok = true;
+    } else if (!a && u && opcode_3 == 0b100) {
+      op = AdvSimdScalarThreeSameOpcode::kFcmge;
+      ok = true;
+    } else if (!a && u && opcode_3 == 0b101) {
+      op = AdvSimdScalarThreeSameOpcode::kFacge;
+      ok = true;
+    } else if (a && u && opcode_3 == 0b010) {
+      op = AdvSimdScalarThreeSameOpcode::kFabd;
+      ok = true;
+    } else if (a && u && opcode_3 == 0b100) {
+      op = AdvSimdScalarThreeSameOpcode::kFcmgt;
+      ok = true;
+    } else if (a && u && opcode_3 == 0b101) {
+      op = AdvSimdScalarThreeSameOpcode::kFacgt;
+      ok = true;
+    }
+    // FRECPS (a=0,U=0,op=111), FRSQRTS (a=1,U=0,op=111), and reserved
+    // (a,U,op) combinations route to Undefined().
+    if (!ok) {
+      Undefined();
+      return;
+    }
+
+    const AdvSimdScalarThreeSameArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .size = 0,         // unused for FP16 path (interpreter checks is_fp16).
+        .is_fp16 = true,
+    };
+    insn_consumer_->AdvSimdScalarThreeSame(args);
   }
   // endregion
 
@@ -4013,8 +4126,12 @@ class Decoder {
             op = AdvSimdThreeSameOpcode::kFaddV;
             break;
           case 0b11011:
-            if (!u) { ok = false; break; }  // FMULX not implemented
-            op = AdvSimdThreeSameOpcode::kFmulV;
+            // region digitalis: U=0 -> FMULX (kFmulxV), U=1 -> FMUL (kFmulV).
+            // Previously U=0 routed to ok=false; the interpreter now grows
+            // the FMULX special case (±0 * ±inf -> ±2.0) so we can dispatch.
+            op = u ? AdvSimdThreeSameOpcode::kFmulV
+                   : AdvSimdThreeSameOpcode::kFmulxV;
+            // endregion
             break;
           case 0b11001:
             if (u) { ok = false; break; }   // U=1 reserved here
@@ -4490,8 +4607,10 @@ class Decoder {
 
     // FP scalar three-same opcodes live in the same encoding class but the
     // size field is interpreted as bit23=Fp-discriminator (1), bit22=sz.
-    // Distinguish FP by opcode: 11010 (FABD), 11100 (FCMxx), 11101 (FAC..).
-    if (opcode == 0b11010 || opcode == 0b11100 || opcode == 0b11101) {
+    // Distinguish FP by opcode: 11010 (FABD), 11011 (FMULX), 11100 (FCMxx),
+    // 11101 (FAC..).
+    if (opcode == 0b11010 || opcode == 0b11011 || opcode == 0b11100 ||
+        opcode == 0b11101) {
       is_fp = true;
       bool bit23 = (size >> 1) & 1;
       uint8_t sz = size & 1;  // 0 -> S, 1 -> D
@@ -4499,6 +4618,12 @@ class Decoder {
         case 0b11010:
           if (!u || !bit23) { Undefined(); return; }
           op = AdvSimdScalarThreeSameOpcode::kFabd;
+          break;
+        case 0b11011:
+          // FMULX (scalar): U=0, bit23=1, opcode=11011. Other combinations of
+          // (U, bit23) at opcode=11011 are unallocated in the scalar encoding.
+          if (!u && bit23) op = AdvSimdScalarThreeSameOpcode::kFmulx;
+          else { Undefined(); return; }
           break;
         case 0b11100:
           if (u && bit23) op = AdvSimdScalarThreeSameOpcode::kFcmgt;
@@ -4970,28 +5095,15 @@ class Decoder {
         op = AdvSimdVecXIdxOpcode::kFmls;
         break;
       case 0b1001:
-        // region digitalis follow-up (handoff-68): reject FMULX-by-
-        // element until the interpreter implements it.  Per ARM ARM C7.2
+        // region digitalis: FMUL/FMULX by element.  Per ARM ARM C7.2
         // AdvSIMD-vector-x-indexed-element:
-        //   U=0, opcode=1001 -> FMUL  (by element) — kept as kFmul.
-        //   U=1, opcode=1001 -> FMULX (by element, Armv8.2-FP — multiply-extended
-        //     with NaN-preserving semantics: FMULX(±0, ±inf) = ±2.0 rather than
-        //     NaN, used by libm reciprocal-estimate refinements).
-        // The previous code (`u ? kFmul : kFmul`) was a tautology that silently
-        // routed FMULX to FMUL.  Same family as the handoff-67 fix at
-        // case 0b1000: silent wrong-result decoding is worse than a SIGILL —
-        // an FMULX whose input includes a ±0/±inf pair will produce a NaN
-        // under kFmul vs the ARM-required ±2.0, breaking libm reciprocal
-        // refinement loops.  No current sample emits FMULX (NDK clang doesn't
-        // generate it by default; libm uses VFMUL not VFMULX in the shipped
-        // bionic), so flipping to Undefined() is forward-compatible.
-        // Implementing FMULX in the interpreter is the next-cycle follow-up
-        // when a sample needs it.
-        if (u) {
-          Undefined();
-          return;
-        }
-        op = AdvSimdVecXIdxOpcode::kFmul;
+        //   U=0, opcode=1001 -> FMUL  (by element) -> kFmul.
+        //   U=1, opcode=1001 -> FMULX (by element, Armv8.2-FP) -> kFmulx.
+        // FMULX differs from FMUL only in the ±0 * ±inf saturation case (it
+        // produces ±2.0 rather than NaN), used by libm reciprocal-estimate
+        // refinement loops.  Interpreter implements both via FmulxScalar.
+        op = u ? AdvSimdVecXIdxOpcode::kFmulx
+               : AdvSimdVecXIdxOpcode::kFmul;
         break;
         // endregion
       case 0b1000:
