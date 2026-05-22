@@ -3480,6 +3480,152 @@ TEST_F(Arm64LiteTranslateRegionTest, UabalV2dAccumulates) {
   EXPECT_EQ(out[0], uint64_t{1010});                                // 1000 + 10
   EXPECT_EQ(out[1], uint64_t{2000} + uint64_t{UINT32_MAX});         // 2000 + 2^32-1
 }
+
+// FJCVTZS Wd, Dn — Armv8.3-JSCVT: ECMAScript ToInt32 of a double-precision FP.
+// Encoding: rmode=11, opcode=110, ftype=01, sf=0 → 0x1E7E0000 base.
+// With Rd=2 (W2), Rn=0 (D0): 0x1E7E0002.
+constexpr uint32_t kFjcvtzsW2D0 = 0x1E7E0002;
+
+// Helper: load a double into V0 (FJCVTZS reads D0 / lower 64 bits of V0).
+static void StoreDoubleToV0(berberis::ThreadState& s, double d) {
+  s.cpu.v[0] = 0;
+  memcpy(&s.cpu.v[0], &d, sizeof(d));
+}
+
+// 1. In-range exact integer: 5.0 → 5, exact (Z=1).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsInRangeExactPositive) {
+  StoreDoubleToV0(state_, 5.0);
+  state_.cpu.flags = 0xDEAD;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{5});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0x4000});  // Z=1, N=C=V=0
+}
+
+// 2. In-range exact negative integer: -3.0 → 0xFFFFFFFD, exact (Z=1).
+//    Verifies sign-extension and zero-extension to Wd write semantics.
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsInRangeExactNegative) {
+  StoreDoubleToV0(state_, -3.0);
+  state_.cpu.flags = 0xDEAD;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0xFFFFFFFDULL});  // -3 as uint32, zero-ext to 64
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0x4000});  // Z=1
+}
+
+// 3. Non-integer in range: 3.14 → trunc(3.14) = 3, not exact (Z=0).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsInRangeNonInteger) {
+  StoreDoubleToV0(state_, 3.14);
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{3});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});  // all flags clear
+}
+
+// 4. NaN → 0, not exact (Z=0).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsNaN) {
+  state_.cpu.v[0] = 0;
+  uint64_t qnan_bits = 0x7FF8000000000000ULL;
+  memcpy(&state_.cpu.v[0], &qnan_bits, 8);
+  state_.cpu.flags = 0xFFFF;  // start with everything set
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});  // Z=0 for NaN
+}
+
+// 5. +Infinity → 0, not exact (Z=0).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsPositiveInfinity) {
+  state_.cpu.v[0] = 0;
+  uint64_t pinf_bits = 0x7FF0000000000000ULL;
+  memcpy(&state_.cpu.v[0], &pinf_bits, 8);
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});
+}
+
+// 6. -Infinity → 0, not exact (Z=0).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsNegativeInfinity) {
+  state_.cpu.v[0] = 0;
+  uint64_t ninf_bits = 0xFFF0000000000000ULL;
+  memcpy(&state_.cpu.v[0], &ninf_bits, 8);
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});
+}
+
+// 7. -0.0 → 0, exact (Z=1, because trunc(-0) == d in FP).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsNegativeZero) {
+  StoreDoubleToV0(state_, -0.0);
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0x4000});  // Z=1
+}
+
+// 8. Out-of-range positive: 2^31 = 2147483648.0 → ECMAScript ToInt32 = -2^31
+//    (signed-wrap of 0x80000000), zero-extended to 64-bit Wd = 0x80000000.
+//    Not exact (Z=0, since 2147483648 != -2147483648 as doubles).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsOutOfRangePositive) {
+  StoreDoubleToV0(state_, 2147483648.0);  // 2^31
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0x80000000ULL});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});
+}
+
+// 9. Out-of-range negative: -(2^31 + 1) = -2147483649.0 → ECMAScript ToInt32
+//    = 2147483647 (0x7FFFFFFF).  Not exact (Z=0).
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsOutOfRangeNegative) {
+  StoreDoubleToV0(state_, -2147483649.0);
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0x7FFFFFFFULL});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});
+}
+
+// 10. Modular reduction: 2^32 + 5 = 4294967301.0 → ToInt32 = 5.
+//     Verifies the d - trunc(d/2^32)*2^32 path produces the correct
+//     low-32-bit result for values well past INT32_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsModularReduction) {
+  StoreDoubleToV0(state_, 4294967301.0);  // 2^32 + 5
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{5});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});
+}
+
+// 11. Very large finite double whose mathematical low-32 is non-zero:
+//     2^53 is the largest integer FP64 can represent exactly with the
+//     LSB still at unit position; 2^53 mod 2^32 = 0.  Verify result = 0.
+TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsTwoToTheFiftyThree) {
+  StoreDoubleToV0(state_, 9007199254740992.0);  // 2^53
+  state_.cpu.flags = 0;
+  state_.cpu.x[2] = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {kFjcvtzsW2D0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
+  EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});  // not exact: d != 0
+}
 // endregion
 
 }  // namespace

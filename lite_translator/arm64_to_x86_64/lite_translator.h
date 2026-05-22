@@ -3317,6 +3317,110 @@ class LiteTranslator {
     }
     // endregion
 
+    // region digitalis (FJCVTZS — Armv8.3-JSCVT, double -> int32 ECMAScript ToInt32)
+    //
+    // FJCVTZS Wd, Dn: rmode=11, opcode=110, ftype=01, sf=0.
+    //
+    // ARM ARM C7.2.110 semantics: NaN/±Inf -> 0; otherwise apply ECMAScript
+    // ToInt32 to trunc(d) -- i.e. take trunc(d) modulo 2^32, signed.  Sets
+    // PSTATE.Z = 1 iff the input was a finite integer-valued double in
+    // [INT32_MIN, INT32_MAX] (i.e., ToInt32 was exact); N = C = V = 0 always.
+    //
+    // Universal inline lowering (works for NaN, ±Inf, and every finite
+    // input including the |d| > 2^31 ECMAScript modular-reduction case):
+    //
+    //   q   = trunc(d / 2^32)             ; ROUNDSD imm=0x03 (trunc + suppress)
+    //   rem = d - q * 2^32                ; |rem| < 2^32 for finite d, NaN for ±Inf/NaN
+    //   tmp = Cvttsd2siq(rem)             ; rem fits in int64 exactly; NaN -> INT64_MIN
+    //   result_wd = (uint32_t)tmp         ; low 32 bits = ECMAScript ToInt32
+    //
+    // Why this is exact:
+    //   - Finite d: ROUNDSD-trunc(d/2^32) computes the FP integer quotient
+    //     in [-2^21, 2^21] (since |d|/2^32 <= 2^21 once |d| fits in FP64's
+    //     2^1024 range and |trunc(d/2^32)| <= 2^21 when |d| < 2^53; for larger
+    //     |d| both sides become multiples of higher powers of 2 and the
+    //     subtraction is still exact at FP64 precision).  q * 2^32 is exact
+    //     because 2^32 is a power of two and the product can't gain
+    //     precision.  d - q*2^32 has magnitude < 2^32 so Cvttsd2siq is exact.
+    //   - NaN: every arithmetic step propagates NaN; Cvttsd2siq(NaN) =
+    //     INT64_MIN, whose low 32 bits are zero -- matching ARM's "NaN -> 0".
+    //   - ±Inf: q = ±Inf, q * 2^32 = ±Inf, d - q*2^32 = Inf - Inf = NaN, then
+    //     the NaN path above applies -- result = 0.
+    //
+    // Exactness for the Z flag:
+    //   back = (int32_t)result, converted to FP64 (Cvtsi2sdl reads low 32 of tmp
+    //   as int32 and produces the exact FP64).  Z = 1 iff Ucomisd(back, d) is
+    //   ordered-equal (ZF=1 AND PF=0).  For NaN/Inf, ordered-equal is false;
+    //   for in-range integers, back == d.  For out-of-range or non-integer
+    //   inputs, back != d.
+    if (rmode == 0b11 && opcode == 0b110 && args.ftype == 0b01 && !args.sf) {
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      SimdRegister q_xmm = AllocTempSimdReg();
+      if (q_xmm == no_simd_register) { success_ = false; return; }
+      SimdRegister scale_xmm = AllocTempSimdReg();
+      if (scale_xmm == no_simd_register) { success_ = false; return; }
+      SimdRegister rem_xmm = AllocTempSimdReg();
+      if (rem_xmm == no_simd_register) { success_ = false; return; }
+      SimdRegister back_xmm = AllocTempSimdReg();
+      if (back_xmm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      Register flags_tmp = AllocTempReg();
+      if (flags_tmp == no_register) { success_ = false; return; }
+
+      int32_t src_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+
+      // Load d into xmm.
+      as_.Movsd(xmm, {.base = Assembler::rbp, .disp = src_off});
+
+      // Materialize 2^32 as FP64 constant in scale_xmm via GP scratch.
+      // FP64(2^32) bit pattern: exponent = 1023 + 32 = 1055 = 0x41F, mantissa = 0
+      // => 0x41F0000000000000.
+      as_.Movq(tmp, static_cast<int64_t>(0x41F0000000000000LL));
+      as_.Movq(scale_xmm, tmp);
+
+      // q_xmm = trunc(d / 2^32).
+      as_.Movsd(q_xmm, xmm);
+      as_.Divsd(q_xmm, scale_xmm);
+      as_.Roundsd(q_xmm, q_xmm, int8_t{0x03});  // truncate-toward-zero + suppress
+
+      // rem_xmm = d - q_xmm * 2^32.
+      as_.Mulsd(q_xmm, scale_xmm);
+      as_.Movsd(rem_xmm, xmm);
+      as_.Subsd(rem_xmm, q_xmm);
+
+      // tmp = (int64)trunc(rem); NaN -> INT64_MIN (0x8000000000000000), so
+      // low 32 bits = 0 which is the ARM-mandated NaN/Inf result.
+      as_.Cvttsd2siq(tmp, rem_xmm);
+
+      // Exactness: back_xmm = (int32_t)tmp converted to FP64.  Cvtsi2sdl reads
+      // the low 32 of tmp as int32 and sign-extends in the FP convert, so the
+      // exactness comparison is against the same value that gets written to Wd.
+      as_.Cvtsi2sdl(back_xmm, tmp);
+      as_.Ucomisd(back_xmm, xmm);
+
+      // flags = (ZF=1 AND PF=0) ? 0x4000 : 0 (only Z bit; N/C/V always 0).
+      // The two MOVs and the two Jcc don't perturb the Ucomisd flags read.
+      Assembler::Label* skip_exact = as_.MakeLabel();
+      as_.Movl(flags_tmp, int32_t{0});           // default: not exact
+      as_.Jcc(Assembler::Condition::kParityEven, *skip_exact);  // NaN
+      as_.Jcc(Assembler::Condition::kNotEqual, *skip_exact);    // not equal
+      as_.Movl(flags_tmp, int32_t{0x4000});      // exact: Z bit
+      as_.Bind(skip_exact);
+      int32_t flags_offset = offsetof(ThreadState, cpu.flags);
+      as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, flags_tmp);
+
+      if (args.rd < 31) {
+        // Zero-extend low 32 of tmp into the full 64-bit guest register
+        // (Wd write semantics).  Movl on x86-64 auto-zeros the upper 32.
+        as_.Movl(tmp, tmp);
+        SetReg(args.rd, tmp);
+      }
+      return;
+    }
+    // endregion
+
     Undefined();
   }
 
