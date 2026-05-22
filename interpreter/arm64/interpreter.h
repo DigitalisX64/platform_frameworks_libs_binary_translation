@@ -5018,9 +5018,10 @@ class Interpreter {
         __uint128_t result = 0;
         // region digitalis: FP16 scalar three-same — widen/narrow round-trip
         // through FP32.  Bit-exact for the FMULX ±2.0 saturation case
-        // because ±2.0 is exactly representable in FP16.  Only FMULX is
-        // wired in this cycle (handoff-105 follow-up); other FP16 scalar
-        // three-same opcodes route to Undefined via the decoder.
+        // because ±2.0 is exactly representable in FP16; bit-exact for FABD
+        // because FP32 subtraction of two FP16 inputs is exact and the
+        // single narrow back to FP16 applies one rounding.  Compares are
+        // exact because widening to FP32 is value-preserving.
         if (args.is_fp16) {
           uint16_t hn = static_cast<uint16_t>(src_n);
           uint16_t hm = static_cast<uint16_t>(src_m);
@@ -5033,6 +5034,26 @@ class Interpreter {
               r16 = FpSingleToHalf(f);
               break;
             }
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFabd:
+              r16 = FpSingleToHalf(std::fabs(a - b));
+              break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
+              r16 = (a == b) ? uint16_t{0xFFFF} : uint16_t{0};
+              break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmge:
+              r16 = (a >= b) ? uint16_t{0xFFFF} : uint16_t{0};
+              break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt:
+              r16 = (a > b) ? uint16_t{0xFFFF} : uint16_t{0};
+              break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
+              r16 = (std::fabs(a) >= std::fabs(b)) ? uint16_t{0xFFFF}
+                                                   : uint16_t{0};
+              break;
+            case Decoder::AdvSimdScalarThreeSameOpcode::kFacgt:
+              r16 = (std::fabs(a) > std::fabs(b)) ? uint16_t{0xFFFF}
+                                                  : uint16_t{0};
+              break;
             default:
               Undefined();
               return;

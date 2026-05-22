@@ -3877,10 +3877,9 @@ class Decoder {
   //   a=1,U=1,op=010  FABD
   //   a=1,U=1,op=100  FCMGT
   //   a=1,U=1,op=101  FACGT
-  // This cycle wires FMULX only (the handoff-105 follow-up); the other
-  // opcodes route to Undefined() until their interpreter handlers are
-  // grown.  Reuses the std AdvSimdScalarThreeSameOpcode enum with the
-  // is_fp16=true flag, mirroring the FP16 vector three-same pattern.
+  // Reuses the std AdvSimdScalarThreeSameOpcode enum with the is_fp16=true
+  // flag, mirroring the FP16 vector three-same pattern.  FRECPS/FRSQRTS
+  // (op=111) remain Undefined() until interpreter handlers land.
   void DecodeAdvSimdScalarFp16ThreeSame() {
     bool u = GetBits<29, 1>();
     bool a = GetBits<23, 1>();
@@ -3891,15 +3890,30 @@ class Decoder {
 
     AdvSimdScalarThreeSameOpcode op;
     bool ok = false;
-    if (!u && !a) {
-      // FMULX FP16 (the cycle's primary target).
-      if (opcode_3 == 0b011) {
-        op = AdvSimdScalarThreeSameOpcode::kFmulx;
-        ok = true;
-      }
+    if (!a && !u && opcode_3 == 0b011) {
+      op = AdvSimdScalarThreeSameOpcode::kFmulx;
+      ok = true;
+    } else if (!a && !u && opcode_3 == 0b100) {
+      op = AdvSimdScalarThreeSameOpcode::kFcmeq;
+      ok = true;
+    } else if (!a && u && opcode_3 == 0b100) {
+      op = AdvSimdScalarThreeSameOpcode::kFcmge;
+      ok = true;
+    } else if (!a && u && opcode_3 == 0b101) {
+      op = AdvSimdScalarThreeSameOpcode::kFacge;
+      ok = true;
+    } else if (a && u && opcode_3 == 0b010) {
+      op = AdvSimdScalarThreeSameOpcode::kFabd;
+      ok = true;
+    } else if (a && u && opcode_3 == 0b100) {
+      op = AdvSimdScalarThreeSameOpcode::kFcmgt;
+      ok = true;
+    } else if (a && u && opcode_3 == 0b101) {
+      op = AdvSimdScalarThreeSameOpcode::kFacgt;
+      ok = true;
     }
-    // Other allocations (FCMEQ/FCMGE/FCMGT/FABD/FACGE/FACGT/FRECPS/FRSQRTS
-    // FP16 scalar) are reserved until their interpreter handlers land.
+    // FRECPS (a=0,U=0,op=111), FRSQRTS (a=1,U=0,op=111), and reserved
+    // (a,U,op) combinations route to Undefined().
     if (!ok) {
       Undefined();
       return;
