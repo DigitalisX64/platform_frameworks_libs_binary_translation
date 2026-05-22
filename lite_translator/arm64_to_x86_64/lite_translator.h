@@ -6245,7 +6245,14 @@ class LiteTranslator {
           }
           return;
         }
-        if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
+        // args.size for the FP variant of two-reg misc carries
+        // (bit23=a, bit22=sz).  For the FRINTN/M/P/Z/X/I family the
+        // decoder dispatches both bit23 values (decoder.h lines
+        // 4397-4414): FRINTN/M/X come from bit23=0 (args.size 0b00/0b01),
+        // FRINTP/Z/I from bit23=1 (args.size 0b10/0b11).  All four
+        // values are valid here; only bit22 (the low bit) selects
+        // FP32 vs FP64.  Mirrors the interpreter's `args.size & 1`
+        // dispatch in interpreter.h.
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();

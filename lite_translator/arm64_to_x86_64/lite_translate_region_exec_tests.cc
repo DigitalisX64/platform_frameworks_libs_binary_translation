@@ -2355,6 +2355,317 @@ TEST_F(Arm64LiteTranslateRegionTest, FrintaV4sNanInfPropagate) {
   EXPECT_EQ(lanes[2], 0xFF800000u);   // -Inf unchanged
   EXPECT_EQ(lanes[3], 0x40400000u);   // 3.0f
 }
+
+// Vector FABS / FNEG / FSQRT (FP32 .2S/.4S, FP64 .2D).  These are the
+// standard (non-FP16) two-reg-misc forms.  Per ARM ARM and decoder.h
+// (case 0b01111 and 0b11111), bit23 is fixed to 1 in the encoding,
+// so args.size carries (bit23=1, bit22=sz) and is 0b10 (FP32) or
+// 0b11 (FP64) -- the existing JIT size check `args.size != 0b10 &&
+// args.size != 0b11` accepts the valid encodings.
+// Encodings verified by hand-derivation from ARM ARM C7.2:
+//   fabs  v0.2s, v0.2s = 0x0EA0F800  (Q=0, U=0, sz=0)
+//   fabs  v0.4s, v0.4s = 0x4EA0F800  (Q=1, U=0, sz=0)
+//   fabs  v0.2d, v0.2d = 0x4EE0F800  (Q=1, U=0, sz=1)
+//   fneg  v0.2s, v0.2s = 0x2EA0F800  (Q=0, U=1, sz=0)
+//   fneg  v0.4s, v0.4s = 0x6EA0F800  (Q=1, U=1, sz=0)
+//   fneg  v0.2d, v0.2d = 0x6EE0F800  (Q=1, U=1, sz=1)
+//   fsqrt v0.2s, v0.2s = 0x2EA1F800  (Q=0, U=1, sz=0, opcode=11111)
+//   fsqrt v0.4s, v0.4s = 0x6EA1F800  (Q=1, U=1, sz=0)
+//   fsqrt v0.2d, v0.2d = 0x6EE1F800  (Q=1, U=1, sz=1)
+constexpr uint32_t kFabsV2s00 = 0x0EA0F800;
+constexpr uint32_t kFabsV4s00 = 0x4EA0F800;
+constexpr uint32_t kFabsV2d00 = 0x4EE0F800;
+constexpr uint32_t kFnegV2s00 = 0x2EA0F800;
+constexpr uint32_t kFnegV4s00 = 0x6EA0F800;
+constexpr uint32_t kFnegV2d00 = 0x6EE0F800;
+constexpr uint32_t kFsqrtV2s00 = 0x2EA1F800;
+constexpr uint32_t kFsqrtV4s00 = 0x6EA1F800;
+constexpr uint32_t kFsqrtV2d00 = 0x6EE1F800;
+
+// FABS .4S: clear sign bit per FP32 lane.  Bit-exact bit ops.
+TEST_F(Arm64LiteTranslateRegionTest, FabsV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0xC0200000u;  // -2.5f
+  lanes[1] = 0x40200000u;  // 2.5f (unchanged)
+  lanes[2] = 0xFF800000u;  // -Inf -> +Inf
+  lanes[3] = 0x80000000u;  // -0.0f -> +0.0f
+  static const uint32_t code[] = {kFabsV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40200000u);  // 2.5f
+  EXPECT_EQ(lanes[1], 0x40200000u);  // 2.5f
+  EXPECT_EQ(lanes[2], 0x7F800000u);  // +Inf
+  EXPECT_EQ(lanes[3], 0x00000000u);  // +0.0f
+}
+
+// FABS .2S: low-64-bit form must zero the upper 64 bits.
+TEST_F(Arm64LiteTranslateRegionTest, FabsV2s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0xBF800000u;  // -1.0f -> 1.0f
+  lanes[1] = 0xC0000000u;  // -2.0f -> 2.0f
+  lanes[2] = 0xDEADBEEFu;  // garbage; must be zeroed
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFabsV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x3F800000u);  // 1.0f
+  EXPECT_EQ(lanes[1], 0x40000000u);  // 2.0f
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
+
+// FABS .2D: clear sign bit per FP64 lane.
+TEST_F(Arm64LiteTranslateRegionTest, FabsV2d) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0xC000000000000000ULL;  // -2.0d -> 2.0d
+  lanes[1] = 0xFFF0000000000000ULL;  // -Inf  -> +Inf
+  static const uint32_t code[] = {kFabsV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x4000000000000000ULL);  // 2.0d
+  EXPECT_EQ(lanes[1], 0x7FF0000000000000ULL);  // +Inf
+}
+
+// FNEG .4S: flip sign bit per FP32 lane.
+TEST_F(Arm64LiteTranslateRegionTest, FnegV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0xC0200000u;  // -2.5f -> 2.5f
+  lanes[1] = 0x40200000u;  // 2.5f  -> -2.5f
+  lanes[2] = 0x00000000u;  // +0.0f -> -0.0f
+  lanes[3] = 0x7F800000u;  // +Inf  -> -Inf
+  static const uint32_t code[] = {kFnegV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40200000u);  // 2.5f
+  EXPECT_EQ(lanes[1], 0xC0200000u);  // -2.5f
+  EXPECT_EQ(lanes[2], 0x80000000u);  // -0.0f
+  EXPECT_EQ(lanes[3], 0xFF800000u);  // -Inf
+}
+
+// FNEG .2S: Q=0; upper 64 must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FnegV2s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x3F800000u;  // 1.0f -> -1.0f
+  lanes[1] = 0xC0000000u;  // -2.0f -> 2.0f
+  lanes[2] = 0xDEADBEEFu;  // upper must be zeroed
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFnegV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0xBF800000u);  // -1.0f
+  EXPECT_EQ(lanes[1], 0x40000000u);  // 2.0f
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
+
+// FNEG .2D: flip sign bit per FP64 lane.
+TEST_F(Arm64LiteTranslateRegionTest, FnegV2d) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4000000000000000ULL;  // 2.0d -> -2.0d
+  lanes[1] = 0xBFF0000000000000ULL;  // -1.0d -> 1.0d
+  static const uint32_t code[] = {kFnegV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0xC000000000000000ULL);  // -2.0d
+  EXPECT_EQ(lanes[1], 0x3FF0000000000000ULL);  // 1.0d
+}
+
+// FSQRT .4S: per-lane square root.  Exact for perfect squares.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40800000u;  // 4.0f  -> 2.0f
+  lanes[1] = 0x41100000u;  // 9.0f  -> 3.0f
+  lanes[2] = 0x42200000u;  // 40.0f -> sqrt(40)f (not exact)
+  lanes[3] = 0x3F800000u;  // 1.0f  -> 1.0f
+  static const uint32_t code[] = {kFsqrtV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);  // 2.0f
+  EXPECT_EQ(lanes[1], 0x40400000u);  // 3.0f
+  // sqrt(40.0f) in FP32 RNE: ~6.32455532f = 0x40CA62C2 (host hw SQRTPS).
+  EXPECT_EQ(lanes[2], 0x40CA62C2u);
+  EXPECT_EQ(lanes[3], 0x3F800000u);  // 1.0f
+}
+
+// FSQRT .2S: Q=0; upper 64 must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtV2s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40800000u;  // 4.0f -> 2.0f
+  lanes[1] = 0x41100000u;  // 9.0f -> 3.0f
+  lanes[2] = 0xDEADBEEFu;
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFsqrtV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);
+  EXPECT_EQ(lanes[1], 0x40400000u);
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
+
+// FSQRT .2D: per-lane FP64 square root.
+TEST_F(Arm64LiteTranslateRegionTest, FsqrtV2d) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4010000000000000ULL;  // 4.0d -> 2.0d
+  lanes[1] = 0x4022000000000000ULL;  // 9.0d -> 3.0d
+  static const uint32_t code[] = {kFsqrtV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x4000000000000000ULL);  // 2.0d
+  EXPECT_EQ(lanes[1], 0x4008000000000000ULL);  // 3.0d
+}
+
+// Vector FRINTN/M/P/Z/X/I (FP32 .2S/.4S, FP64 .2D).  The JIT handler
+// at lite_translator.h:6248 historically gated on `args.size != 0b10
+// && args.size != 0b11`, which only matches the bit23=1 half of the
+// FRINT-family encoding space.  FRINTN/M/X have bit23=0 (decoder.h
+// line 4397-4414 dispatches them under `!GetBits<23, 1>()`), so their
+// args.size is 0b00 (FP32) or 0b01 (FP64) -- silently rejected to
+// the interpreter.  FRINTP/Z/I have bit23=1; args.size is 0b10/0b11
+// -- reachable.  Encodings verified against the decoder.h comment at
+// lines 4389-4396:
+//   frintn v0.4s = 0x4E218800  (a=0,U=0,opcode=11000)
+//   frintn v0.2s = 0x0E218800  (Q=0)
+//   frintn v0.2d = 0x4E618800  (sz=1, Q=1)
+//   frintm v0.4s = 0x4E219800  (a=0,U=0,opcode=11001)
+//   frintx v0.4s = 0x6E219800  (a=0,U=1,opcode=11001)
+//   frintp v0.4s = 0x4EA18800  (a=1,U=0,opcode=11000)
+//   frintz v0.4s = 0x4EA19800  (a=1,U=0,opcode=11001)
+//   frinti v0.4s = 0x6EA19800  (a=1,U=1,opcode=11001)
+constexpr uint32_t kFrintnV4s00 = 0x4E218800;
+constexpr uint32_t kFrintnV2s00 = 0x0E218800;
+constexpr uint32_t kFrintnV2d00 = 0x4E618800;
+constexpr uint32_t kFrintmV4s00 = 0x4E219800;
+constexpr uint32_t kFrintxV4s00 = 0x6E219800;
+constexpr uint32_t kFrintpV4s00 = 0x4EA18800;
+constexpr uint32_t kFrintzV4s00 = 0x4EA19800;
+constexpr uint32_t kFrintiV4s00 = 0x6EA19800;
+
+// FRINTN .4S (round to nearest, ties to even).  Ties: 2.5 -> 2.0, 3.5 -> 4.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrintnV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f  -> 2.0f (tie to even)
+  lanes[1] = 0x40600000u;  // 3.5f  -> 4.0f (tie to even)
+  lanes[2] = 0x3F19999Au;  // 0.6f  -> 1.0f
+  lanes[3] = 0xBF19999Au;  // -0.6f -> -1.0f
+  static const uint32_t code[] = {kFrintnV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);  // 2.0f
+  EXPECT_EQ(lanes[1], 0x40800000u);  // 4.0f
+  EXPECT_EQ(lanes[2], 0x3F800000u);  // 1.0f
+  EXPECT_EQ(lanes[3], 0xBF800000u);  // -1.0f
+}
+
+// FRINTN .2S: Q=0 form.
+TEST_F(Arm64LiteTranslateRegionTest, FrintnV2s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 2.0f
+  lanes[1] = 0x3F19999Au;  // 0.6f -> 1.0f
+  lanes[2] = 0xDEADBEEFu;
+  lanes[3] = 0xCAFEBABEu;
+  static const uint32_t code[] = {kFrintnV2s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);
+  EXPECT_EQ(lanes[1], 0x3F800000u);
+  EXPECT_EQ(lanes[2], 0u);
+  EXPECT_EQ(lanes[3], 0u);
+}
+
+// FRINTN .2D: FP64 tie-to-even.
+TEST_F(Arm64LiteTranslateRegionTest, FrintnV2d) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint64_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x4004000000000000ULL;  // 2.5d -> 2.0d
+  lanes[1] = 0x400C000000000000ULL;  // 3.5d -> 4.0d
+  static const uint32_t code[] = {kFrintnV2d00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x4000000000000000ULL);  // 2.0d
+  EXPECT_EQ(lanes[1], 0x4010000000000000ULL);  // 4.0d
+}
+
+// FRINTM .4S (round toward -inf, floor).
+TEST_F(Arm64LiteTranslateRegionTest, FrintmV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 2.0f
+  lanes[1] = 0xC0200000u;  // -2.5f -> -3.0f
+  lanes[2] = 0x3F19999Au;  // 0.6f -> 0.0f
+  lanes[3] = 0xBF19999Au;  // -0.6f -> -1.0f
+  static const uint32_t code[] = {kFrintmV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);  // 2.0f
+  EXPECT_EQ(lanes[1], 0xC0400000u);  // -3.0f
+  EXPECT_EQ(lanes[2], 0x00000000u);  // 0.0f
+  EXPECT_EQ(lanes[3], 0xBF800000u);  // -1.0f
+}
+
+// FRINTX .4S (round per MXCSR; default RNE matches FRINTN result).
+TEST_F(Arm64LiteTranslateRegionTest, FrintxV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 2.0f (tie to even, MXCSR default RNE)
+  lanes[1] = 0x40600000u;  // 3.5f -> 4.0f
+  lanes[2] = 0x3F19999Au;  // 0.6f -> 1.0f
+  lanes[3] = 0xBF19999Au;  // -0.6f -> -1.0f
+  static const uint32_t code[] = {kFrintxV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);
+  EXPECT_EQ(lanes[1], 0x40800000u);
+  EXPECT_EQ(lanes[2], 0x3F800000u);
+  EXPECT_EQ(lanes[3], 0xBF800000u);
+}
+
+// FRINTP .4S (round toward +inf, ceil).  These bit23=1 paths are
+// already reachable pre-fix and serve as a positive control.
+TEST_F(Arm64LiteTranslateRegionTest, FrintpV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 3.0f
+  lanes[1] = 0xC0200000u;  // -2.5f -> -2.0f
+  lanes[2] = 0x3F19999Au;  // 0.6f -> 1.0f
+  lanes[3] = 0xBF19999Au;  // -0.6f -> -0.0f
+  static const uint32_t code[] = {kFrintpV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40400000u);  // 3.0f
+  EXPECT_EQ(lanes[1], 0xC0000000u);  // -2.0f
+  EXPECT_EQ(lanes[2], 0x3F800000u);  // 1.0f
+  EXPECT_EQ(lanes[3], 0x80000000u);  // -0.0f
+}
+
+// FRINTZ .4S (round toward zero, trunc).
+TEST_F(Arm64LiteTranslateRegionTest, FrintzV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;  // 2.5f -> 2.0f
+  lanes[1] = 0xC0200000u;  // -2.5f -> -2.0f
+  lanes[2] = 0x3F19999Au;  // 0.6f -> 0.0f
+  lanes[3] = 0xBF19999Au;  // -0.6f -> -0.0f
+  static const uint32_t code[] = {kFrintzV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);  // 2.0f
+  EXPECT_EQ(lanes[1], 0xC0000000u);  // -2.0f
+  EXPECT_EQ(lanes[2], 0x00000000u);  // +0.0f
+  EXPECT_EQ(lanes[3], 0x80000000u);  // -0.0f
+}
+
+// FRINTI .4S (round per FPCR; default RNE matches FRINTN).  Positive
+// control for the bit23=1, U=1 corner.
+TEST_F(Arm64LiteTranslateRegionTest, FrintiV4s) {
+  state_.cpu.v[0] = 0;
+  auto* lanes = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  lanes[0] = 0x40200000u;
+  lanes[1] = 0x40600000u;
+  lanes[2] = 0x3F19999Au;
+  lanes[3] = 0xBF19999Au;
+  static const uint32_t code[] = {kFrintiV4s00};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(lanes[0], 0x40000000u);
+  EXPECT_EQ(lanes[1], 0x40800000u);
+  EXPECT_EQ(lanes[2], 0x3F800000u);
+  EXPECT_EQ(lanes[3], 0xBF800000u);
+}
 // endregion
 
 }  // namespace
