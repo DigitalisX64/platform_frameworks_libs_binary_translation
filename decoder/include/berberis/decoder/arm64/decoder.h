@@ -2038,7 +2038,6 @@ class Decoder {
     uint8_t op_28_27 = GetBits<27, 2>();
     uint8_t op_26 = GetBits<26, 1>();
     uint8_t op_24 = GetBits<24, 1>();
-    uint8_t op_23 = GetBits<23, 1>();
     uint8_t op4 = GetBits<10, 2>();
 
     // region digitalis
