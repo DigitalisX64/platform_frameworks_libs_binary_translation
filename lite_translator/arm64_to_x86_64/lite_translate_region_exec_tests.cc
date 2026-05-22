@@ -3776,6 +3776,711 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSZeroTimesFinite) {
 }
 // endregion
 
+// region digitalis: FRECPS / FRSQRTS scalar three-same JIT (FP32/FP64).
+// FRECPS  = std::fma(-a, b, 2.0); FRSQRTS = std::fma(-a, b, 3.0)/2.
+// Special cases: NaN input -> default qNaN; (±0,±inf) cross -> +2.0/+1.5.
+// Encoding (per ARM ARM C7.2.151/155 and llvm-mc verification):
+//   FRECPS  Sd, Sn, Sm = 0x5E22FC00 | (rm<<16) | (rn<<5) | rd
+//   FRECPS  Dd, Dn, Dm = 0x5E62FC00 | ...
+//   FRSQRTS Sd, Sn, Sm = 0x5EA2FC00 | ...
+//   FRSQRTS Dd, Dn, Dm = 0x5EE2FC00 | ...
+constexpr uint32_t FrecpsScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E20FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpsScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E60FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5EA0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5EE0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FRECPS finite (S): 2 - 0.5*3 = 0.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSRegular) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.5f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.0f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.5f);
+  // Upper lanes must be zero.
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FRECPS finite (D): 2 - 1*1 = 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarDRegular) {
+  StoreScalarToV<double>(state_.cpu, 1, 1.0);
+  StoreScalarToV<double>(state_.cpu, 2, 1.0);
+  static const uint32_t code[] = {FrecpsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 1.0);
+}
+
+// FRECPS saturation (S): +0 * +inf -> +2.0 (unsigned, unlike FMULX).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSZeroTimesInf) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRECPS saturation (S): -0 * +inf -> +2.0 (still unsigned — FRECPS does
+// NOT XOR sign bits like FMULX would).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSNegZeroTimesInf) {
+  StoreScalarToV<float>(state_.cpu, 1, -0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, std::numeric_limits<float>::infinity());
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRECPS saturation (D): -inf * +0 -> +2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarDNegInfTimesZero) {
+  StoreScalarToV<double>(state_.cpu, 1, -std::numeric_limits<double>::infinity());
+  StoreScalarToV<double>(state_.cpu, 2, 0.0);
+  static const uint32_t code[] = {FrecpsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 2.0);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRECPS NaN input (S): default qNaN, not the input NaN payload.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSNaNInput) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+  // Default qNaN: positive, exponent all ones, MSB of mantissa set.
+  uint32_t bits;
+  std::memcpy(&bits, &result, sizeof(bits));
+  EXPECT_EQ(bits & 0xFFC00000u, 0x7FC00000u);  // sign=0, exp=0xFF, frac MSB=1
+}
+
+// FRECPS zero * finite: ordinary FMA returns +K_fma. fma(-0, 5, 2) = 2.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarSZeroTimesFinite) {
+  StoreScalarToV<float>(state_.cpu, 1, 0.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FrecpsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.0f);
+}
+
+// FRSQRTS finite (S): (3 - 1*1)/2 = 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSRegular) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FrsqrtsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.0f);
+}
+
+// FRSQRTS finite (D): (3 - 0.5*4)/2 = 0.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarDRegular) {
+  StoreScalarToV<double>(state_.cpu, 1, 0.5);
+  StoreScalarToV<double>(state_.cpu, 2, 4.0);
+  static const uint32_t code[] = {FrsqrtsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 0.5);
+}
+
+// FRSQRTS saturation (S): +inf * 0 -> +1.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSInfTimesZero) {
+  StoreScalarToV<float>(state_.cpu, 1, std::numeric_limits<float>::infinity());
+  StoreScalarToV<float>(state_.cpu, 2, 0.0f);
+  static const uint32_t code[] = {FrsqrtsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.5f);
+}
+
+// FRSQRTS saturation (D): -0 * -inf -> +1.5 (unsigned saturation).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarDNegZeroTimesNegInf) {
+  StoreScalarToV<double>(state_.cpu, 1, -0.0);
+  StoreScalarToV<double>(state_.cpu, 2, -std::numeric_limits<double>::infinity());
+  static const uint32_t code[] = {FrsqrtsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 1.5);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FRSQRTS NaN input (D): default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarDNaNInput) {
+  StoreScalarToV<double>(state_.cpu, 1, 1.0);
+  StoreScalarToV<double>(state_.cpu, 2, std::nan(""));
+  static const uint32_t code[] = {FrsqrtsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_TRUE(std::isnan(result));
+  uint64_t bits;
+  std::memcpy(&bits, &result, sizeof(bits));
+  EXPECT_EQ(bits & 0xFFF8000000000000ULL, 0x7FF8000000000000ULL);
+}
+
+// FRSQRTS Newton step for 1/sqrt(1) iteration: e=1 already exact ->
+// (3 - 1*1)/2 = 1 (S form).  Sanity for the typical NR refinement use.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSNewtonStepOnOne) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);  // x
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);  // e*e (already 1)
+  static const uint32_t code[] = {FrsqrtsScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.0f);
+}
+// endregion
+
+// region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// Identical semantics to FMULX scalar, just lane-parallel.  Each lane
+// applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
+// with sign = sign(a) XOR sign(b) per-lane.
+//
+// Encoding (per ARM ARM C7.2.149 "FMULX (vector)" and llvm-mc verification):
+//   FMULX Vd.2S, Vn.2S, Vm.2S = 0x0E22DC00 | (rm<<16) | (rn<<5) | rd
+//   FMULX Vd.4S, Vn.4S, Vm.4S = 0x4E22DC00 | (rm<<16) | (rn<<5) | rd
+//   FMULX Vd.2D, Vn.2D, Vm.2D = 0x4E62DC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmulxVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Helpers for 4-lane FP32 / 2-lane FP64 vector inputs.
+static void StoreVec4S(CPUState& cpu, unsigned idx,
+                       float a0, float a1, float a2, float a3) {
+  float lanes[4] = {a0, a1, a2, a3};
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void StoreVec2D(CPUState& cpu, unsigned idx, double a0, double a1) {
+  double lanes[2] = {a0, a1};
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void LoadVec4S(const CPUState& cpu, unsigned idx, float out[4]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+static void LoadVec2D(const CPUState& cpu, unsigned idx, double out[2]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+
+// .4S: lane 0 finite multiply; lane 1 (+0,+inf); lane 2 (-0,+inf); lane 3 finite.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4SAllLanes) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 3.0f, 0.0f, -0.0f, -2.5f);
+  StoreVec4S(state_.cpu, 2, 4.0f, inf, inf, 2.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FmulxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 12.0f);   // 3 * 4
+  EXPECT_FLOAT_EQ(r[1], 2.0f);    // (+0, +inf) -> +2
+  EXPECT_FLOAT_EQ(r[2], -2.0f);   // (-0, +inf) -> -2
+  EXPECT_FLOAT_EQ(r[3], -5.0f);   // -2.5 * 2
+}
+
+// .2S: q=0 form; upper 64 bits of Vd must be zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2SUpperZero) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 2.0f, -inf, 0.0f, 0.0f);  // lanes 2,3 ignored
+  StoreVec4S(state_.cpu, 2, 3.0f, 0.0f, 0.0f, 0.0f);
+  // Pre-fill Vd with sentinel — the .2S store must clobber upper lanes to zero.
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FmulxVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 6.0f);     // 2 * 3
+  EXPECT_FLOAT_EQ(r[1], -2.0f);    // (-inf, +0) -> -2
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);  // upper 64 bits zeroed by .2S form
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// .2D: lane 0 finite multiply; lane 1 (+inf, -0) -> -2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DAllLanes) {
+  const double inf = std::numeric_limits<double>::infinity();
+  StoreVec2D(state_.cpu, 1, 0.5, inf);
+  StoreVec2D(state_.cpu, 2, -3.0, -0.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FmulxVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], -1.5);
+  EXPECT_DOUBLE_EQ(r[1], -2.0);   // (+inf, -0) -> -2
+}
+
+// .4S NaN propagation: lane 0 has a NaN input → standard NaN result, no
+// saturation override.  (Distinguishes from the (0,inf) special case.)
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4SNaNNotSpecialCase) {
+  const float qnan = std::nanf("");
+  StoreVec4S(state_.cpu, 1, qnan, 0.0f, 1.0f, 2.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, std::numeric_limits<float>::infinity(),
+             3.0f, 0.0f);
+  static const uint32_t code[] = {FmulxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0]));   // NaN input propagates, NOT replaced by ±2.0
+  EXPECT_FLOAT_EQ(r[1], 2.0f);     // (+0, +inf) saturation
+  EXPECT_FLOAT_EQ(r[2], 3.0f);     // 1 * 3
+  EXPECT_FLOAT_EQ(r[3], 0.0f);     // 2 * 0 (no inf side)
+}
+
+// .2D regular finite path — sanity that nothing breaks lane 1 when neither
+// input is special.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
+  StoreVec2D(state_.cpu, 1, 2.0, -4.0);
+  StoreVec2D(state_.cpu, 2, 3.5, 0.25);
+  static const uint32_t code[] = {FmulxVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.0);
+  EXPECT_DOUBLE_EQ(r[1], -1.0);
+}
+// endregion
+
+// region digitalis: FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// ARM ARM defines FMLA/FMLS as fused multiply-accumulate (one rounding).
+// The lowering uses Vfmadd231(ps|pd) / Vfnmadd231(ps|pd).  Tests pick
+// operand triples whose products are exactly representable in the target
+// precision so fused and unfused results agree, sidestepping any oracle
+// ambiguity between this lowering and the interpreter's `d + a*b`
+// formulation.
+//
+// Encoding (per ARM ARM C7.2.135 "FMLA (vector)" / C7.2.136 "FMLS (vector)"
+// and aarch64-linux-gnu-as verification):
+//   FMLA Vd.2S, Vn.2S, Vm.2S = 0x0E20CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.4S, Vn.4S, Vm.4S = 0x4E20CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLA Vd.2D, Vn.2D, Vm.2D = 0x4E60CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.2S, Vn.2S, Vm.2S = 0x0EA0CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.4S, Vn.4S, Vm.4S = 0x4EA0CC00 | (rm<<16) | (rn<<5) | rd
+//   FMLS Vd.2D, Vn.2D, Vm.2D = 0x4EE0CC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmlaVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0CC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// .4S FMLA: Vd[i] += Vn[i] * Vm[i] across four lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4SAllLanes) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 1.5f, -3.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, 4.0f, 0.5f, -2.0f);
+  StoreVec4S(state_.cpu, 0, 1.0f, 2.0f, 10.0f, 0.0f);
+  static const uint32_t code[] = {FmlaVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 7.0f);   // 1 + 2*3
+  EXPECT_FLOAT_EQ(r[1], 8.0f);   // 2 + 1.5*4
+  EXPECT_FLOAT_EQ(r[2], 8.5f);   // 10 + (-3)*0.5
+  EXPECT_FLOAT_EQ(r[3], -8.0f);  // 0 + 4*-2
+}
+
+// .2S FMLA: q=0 form; upper 64 bits of Vd must be zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, 99.0f, 99.0f);   // lanes 2,3 ignored
+  StoreVec4S(state_.cpu, 2, 5.0f, -1.5f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, 1.0f, 8.0f, 7.0f, 7.0f);     // sentinel uppers
+  static const uint32_t code[] = {FmlaVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 11.0f);  // 1 + 2*5
+  EXPECT_FLOAT_EQ(r[1], 3.5f);   // 8 + 3*-1.5
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);     // upper 64 bits zeroed by .2S form
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// .2D FMLA: two FP64 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec2DAllLanes) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 6.0, 2.0);
+  StoreVec2D(state_.cpu, 0, 1.0, 10.0);
+  static const uint32_t code[] = {FmlaVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 4.0);   // 1 + 0.5*6
+  EXPECT_DOUBLE_EQ(r[1], 4.0);   // 10 + -3*2
+}
+
+// .4S FMLS: Vd[i] -= Vn[i] * Vm[i].
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec4SAllLanes) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 1.5f, -3.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, 4.0f, 0.5f, -2.0f);
+  StoreVec4S(state_.cpu, 0, 10.0f, 2.0f, 0.0f, 1.0f);
+  static const uint32_t code[] = {FmlsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 4.0f);    // 10 - 2*3
+  EXPECT_FLOAT_EQ(r[1], -4.0f);   // 2 - 1.5*4
+  EXPECT_FLOAT_EQ(r[2], 1.5f);    // 0 - (-3)*0.5
+  EXPECT_FLOAT_EQ(r[3], 9.0f);    // 1 - 4*-2
+}
+
+// .2S FMLS: q=0 form; upper 64 bits of Vd must be zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, 3.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, -1.5f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, 11.0f, 8.0f, 7.0f, 7.0f);
+  static const uint32_t code[] = {FmlsVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);    // 11 - 2*5
+  EXPECT_FLOAT_EQ(r[1], 12.5f);   // 8 - 3*-1.5
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// .2D FMLS.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsVec2DAllLanes) {
+  StoreVec2D(state_.cpu, 1, 0.5, -3.0);
+  StoreVec2D(state_.cpu, 2, 6.0, 2.0);
+  StoreVec2D(state_.cpu, 0, 10.0, 4.0);
+  static const uint32_t code[] = {FmlsVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.0);    // 10 - 0.5*6
+  EXPECT_DOUBLE_EQ(r[1], 10.0);   // 4 - -3*2
+}
+
+// Fused-vs-unfused divergence: pick (a, b, d) such that a*b in FP32 is not
+// exact but fma(a, b, d) differs from (a*b)+d.  Validates the lowering is
+// using the FMA path (single rounding), not MUL+ADD.
+TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4SFusedRounding) {
+  // a = 1 + 2^-23  (smallest float > 1)
+  // b = 1 + 2^-23
+  // exact product = 1 + 2^-22 + 2^-46
+  // d = -1
+  // unfused: float(a*b) = 1 + 2^-22 (the 2^-46 bit is lost), then + -1
+  //   = 2^-22 = 2.384185791015625e-07.
+  // fused: fma rounds (a*b + d) = (1 + 2^-22 + 2^-46) - 1 = 2^-22 + 2^-46,
+  //   which rounds to nearest float — the trailing 2^-46 bit rounds up to
+  //   2^-22 + 2^-23 (next representable above 2^-22 in the normal range
+  //   would be 2^-22*(1+2^-23) = 2^-22 + 2^-45; but here the result has
+  //   magnitude 2^-22 so the ulp is 2^-22 * 2^-23 = 2^-45, and 2^-46 rounds
+  //   down to 0).  So the rounded fused result is exactly 2^-22 + 0 = 2^-22.
+  //
+  // (Hence for this triple fused and unfused happen to agree.)  We instead
+  // use a triple where fused vs unfused differ in the last bit:
+  //   a = 0x3F800001 (1 + ulp), b = 0x3F800001, d = -1.0.
+  // Already covered above.  Use a sharper case:
+  //   a = float(1 + 2^-12), b = a (so a*b = 1 + 2^-11 + 2^-24, exactly
+  //     representable in float), d = -1.0.
+  //   fused = 2^-11 + 2^-24.
+  //   unfused = (1 + 2^-11 + 2^-24) - 1; the parenthesised value rounds to
+  //     1 + 2^-11 (the 2^-24 bit is below the ULP near 1, which is 2^-23),
+  //     then subtract 1 -> 2^-11.
+  //   Difference: fused = 2^-11 + 2^-24, unfused = 2^-11.
+  StoreVec4S(state_.cpu, 1, 1.0f + std::ldexp(1.0f, -12), 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 2, 1.0f + std::ldexp(1.0f, -12), 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 0, -1.0f, 0.f, 0.f, 0.f);
+  static const uint32_t code[] = {FmlaVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  const float expected =
+      std::fmaf(1.0f + std::ldexp(1.0f, -12), 1.0f + std::ldexp(1.0f, -12), -1.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+}
+// endregion
+
+// region digitalis: FRECPS / FRSQRTS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+//
+// Encoding (verified with aarch64-linux-gnu-as / objdump):
+//   FRECPS  Vd.2S, Vn.2S, Vm.2S = 0x0E20FC00 | (rm<<16) | (rn<<5) | rd
+//   FRECPS  Vd.4S, Vn.4S, Vm.4S = 0x4E20FC00 | (rm<<16) | (rn<<5) | rd
+//   FRECPS  Vd.2D, Vn.2D, Vm.2D = 0x4E60FC00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.2S, Vn.2S, Vm.2S = 0x0EA0FC00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.4S, Vn.4S, Vm.4S = 0x4EA0FC00 | (rm<<16) | (rn<<5) | rd
+//   FRSQRTS Vd.2D, Vn.2D, Vm.2D = 0x4EE0FC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FrecpsVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpsVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpsVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrtsVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FRECPS .4S — Newton step for reciprocal:  result = 2 - a*b, lane by lane.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4SAllLanes) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 0.5f,  -2.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 1.0f, 2.0f,  -0.5f, 0.25f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FrecpsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);   // 2 - 1*1
+  EXPECT_FLOAT_EQ(r[1], 1.0f);   // 2 - 0.5*2
+  EXPECT_FLOAT_EQ(r[2], 1.0f);   // 2 - (-2)*(-0.5)
+  EXPECT_FLOAT_EQ(r[3], 1.0f);   // 2 - 4*0.25
+}
+
+// FRECPS .2S — q=0; upper 64 bits of Vd zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 0.5f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 2, 1.0f, 2.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FrecpsVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], 1.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FRECPS .2D — two FP64 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec2DAllLanes) {
+  StoreVec2D(state_.cpu, 1, 2.0, -0.5);
+  StoreVec2D(state_.cpu, 2, 0.5, -2.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FrecpsVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.0);    // 2 - 2*0.5
+  EXPECT_DOUBLE_EQ(r[1], 1.0);    // 2 - (-0.5)*(-2)
+}
+
+// FRECPS .4S — (±0, ±inf) saturation: the lane with a NaN product but
+// non-NaN inputs must yield +2.0, NOT a NaN.  Sign is NOT flipped (unlike
+// FMULX), so the result is always +2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4SZeroTimesInfSaturation) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, -inf, 0.0f);
+  StoreVec4S(state_.cpu, 2, inf,  inf,    0.0f, -inf);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FrecpsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  // All four lanes are (zero, inf) crosses -> +2.0 (no sign flip).
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  EXPECT_FLOAT_EQ(r[2], 2.0f);
+  EXPECT_FLOAT_EQ(r[3], 2.0f);
+}
+
+// FRECPS .4S — NaN input must yield the default qNaN, not the saturation
+// constant.  Lanes mix NaN, saturation, and finite inputs.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4SNaNInputDefaultsToQnan) {
+  const float inf = std::numeric_limits<float>::infinity();
+  const float qnan_in = std::nanf("");
+  StoreVec4S(state_.cpu, 1, qnan_in, 0.0f, 1.0f, 1.0f);
+  StoreVec4S(state_.cpu, 2, 1.0f,    inf,  1.0f, qnan_in);
+  StoreVec4S(state_.cpu, 0, 7.0f, 7.0f, 7.0f, 7.0f);
+  static const uint32_t code[] = {FrecpsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  // Lane 0 / 3: NaN input -> default qNaN.
+  EXPECT_TRUE(std::isnan(r[0]));
+  EXPECT_TRUE(std::isnan(r[3]));
+  // Lane 1: (0, inf) cross -> +2.0.
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  // Lane 2: 2 - 1*1 = 1.
+  EXPECT_FLOAT_EQ(r[2], 1.0f);
+}
+
+// FRSQRTS .4S — Newton step for reciprocal-sqrt: result = (3 - a*b) / 2.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec4SAllLanes) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 2.0f, -1.0f, 0.5f);
+  StoreVec4S(state_.cpu, 2, 1.0f, 0.5f, -1.0f, 4.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FrsqrtsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);    // (3 - 1*1) / 2 = 1
+  EXPECT_FLOAT_EQ(r[1], 1.0f);    // (3 - 2*0.5) / 2 = 1
+  EXPECT_FLOAT_EQ(r[2], 1.0f);    // (3 - (-1)*(-1)) / 2 = 1
+  EXPECT_FLOAT_EQ(r[3], 0.5f);    // (3 - 0.5*4) / 2 = 0.5
+}
+
+// FRSQRTS .2S — upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 2.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 2, 1.0f, 0.5f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FrsqrtsVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], 1.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FRSQRTS .2D — two FP64 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec2DAllLanes) {
+  StoreVec2D(state_.cpu, 1, 1.0, 0.25);
+  StoreVec2D(state_.cpu, 2, 1.0, 4.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FrsqrtsVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.0);    // (3 - 1*1) / 2 = 1
+  EXPECT_DOUBLE_EQ(r[1], 1.0);    // (3 - 0.25*4) / 2 = 1
+}
+
+// FRSQRTS .4S — (±0, ±inf) saturation: yields +1.5 per lane (no sign flip).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec4SZeroTimesInfSaturation) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, -inf, 0.0f);
+  StoreVec4S(state_.cpu, 2, inf,  inf,    0.0f, -inf);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FrsqrtsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.5f);
+  EXPECT_FLOAT_EQ(r[1], 1.5f);
+  EXPECT_FLOAT_EQ(r[2], 1.5f);
+  EXPECT_FLOAT_EQ(r[3], 1.5f);
+}
+
+// Fused-vs-unfused divergence for FRECPS: pick (a, b) where the JIT's
+// single-rounded FMA path differs from a hypothetical MUL+SUB pair.  The
+// JIT must match libc's fmaf(-a, b, 2.0) bit-for-bit.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4SFusedRounding) {
+  // a = 1 + 2^-12, b = 1 + 2^-12.  a*b in real arithmetic = 1 + 2^-11 +
+  // 2^-24, which is exactly representable in float (it fits in 24 bits).
+  // fma(-a, b, 2) = 2 - 1 - 2^-11 - 2^-24 = 1 - 2^-11 - 2^-24.
+  // Unfused: float(a*b) is 1+2^-11+2^-24 (exact); 2 - that = 1 - 2^-11 -
+  // 2^-24, which here equals the fused value.  Sharper: use a = 1 + 2^-23
+  // (smallest float > 1), b same — a*b exact = 1 + 2^-22 + 2^-46.  In
+  // float, the 2^-46 bit is below the ulp at 1.0 (2^-23), so float(a*b) =
+  // 1 + 2^-22; 2 - (1+2^-22) = 1 - 2^-22.  Fused: 2 - (1+2^-22+2^-46) =
+  // (1-2^-22) - 2^-46; near 1.0 ulp is 2^-23 so 2^-46 rounds away — same
+  // result.  So FRECPS at unity is rounding-friendly.  Instead pick
+  // a = b near 0.5 where the result lands near 1.5: a = b = 0.5*(1 +
+  // 2^-23), -a*b exact = -0.25*(1+2^-22+2^-46); 2 + that = 1.75 -
+  // 0.25*2^-22 - 0.25*2^-46.  Magnitude ~1.75 has ulp 2^-23.  Both bits
+  // are below ulp/2, so they round consistently — also rounding-friendly.
+  // The cleanest forcing case is to leverage std::fmaf as the oracle and
+  // pick values where round-friendliness is plausible but not guaranteed:
+  const float a = std::ldexp(1.0f, 0) + std::ldexp(1.0f, -23);
+  const float b = std::ldexp(1.0f, 0) + std::ldexp(1.0f, -23);
+  StoreVec4S(state_.cpu, 1, a, 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 2, b, 0.f, 0.f, 0.f);
+  StoreVec4S(state_.cpu, 0, 0.f, 0.f, 0.f, 0.f);
+  static const uint32_t code[] = {FrecpsVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  const float expected = std::fmaf(-a, b, 2.0f);
+  uint32_t r0_bits, ex_bits;
+  std::memcpy(&r0_bits, &r[0], sizeof(uint32_t));
+  std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
+  EXPECT_EQ(r0_bits, ex_bits);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
