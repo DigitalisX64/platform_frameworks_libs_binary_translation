@@ -1038,6 +1038,25 @@ class Decoder {
     kSubhn,
     kRsubhn,
     // endregion
+    // region digitalis - signed saturating doubling multiply long.
+    //   SQDMULL / SQDMULL2 : U=0, opcode=1101
+    // For each lane, signed multiply two narrow source elements and double
+    // the product. Saturate the result to the wide signed range; the only
+    // input pair that saturates is (INT_MIN, INT_MIN), which produces
+    // INT_MAX_out instead of -INT_MIN_out (which would overflow). size
+    // encodes narrow elem width: 01 -> .4s from .4h (in 16, out 32),
+    // 10 -> .2d from .2s (in 32, out 64). size=00 and size=11 are reserved
+    // for SQDMULL (size=11 is already rejected by the top-of-routine guard;
+    // size=00 is rejected explicitly in the opcode arm). Q=0 reads lower
+    // 64 bits of each source; Q=1 reads upper 64 bits. Wide result fully
+    // overwrites Vd.
+    // llvm-mc verified encodings:
+    //   sqdmull  v0.4s, v1.4h, v2.4h -> 0x0e62d020 (Q=0, size=01)
+    //   sqdmull2 v0.4s, v1.8h, v2.8h -> 0x4e62d020 (Q=1, size=01)
+    //   sqdmull  v0.2d, v1.2s, v2.2s -> 0x0ea2d020 (Q=0, size=10)
+    //   sqdmull2 v0.2d, v1.4s, v2.4s -> 0x4ea2d020 (Q=1, size=10)
+    kSqdmull,
+    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -4494,6 +4513,17 @@ class Decoder {
       // RSUBHN/RSUBHN2 (U=1). size=11 already rejected above.
       case 0b0110:
         op = u ? AdvSimdThreeDiffOpcode::kRsubhn : AdvSimdThreeDiffOpcode::kSubhn;
+        break;
+      // endregion
+      // region digitalis - signed saturating doubling multiply long:
+      // SQDMULL / SQDMULL2 (U=0, opcode=1101). U=1 with opcode=1101 is
+      // unallocated. size=00 is reserved (only halfword and word inputs
+      // are defined); size=11 is already rejected by the top-of-routine
+      // size guard.
+      case 0b1101:
+        if (u != 0) { Undefined(); return; }
+        if (size == 0b00) { Undefined(); return; }
+        op = AdvSimdThreeDiffOpcode::kSqdmull;
         break;
       // endregion
       case 0b0111:

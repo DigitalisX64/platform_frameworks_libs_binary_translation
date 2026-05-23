@@ -1911,6 +1911,33 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - signed saturating doubling multiply long:
+      //   Vd_wide[i] = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
+      // The only input pair that overflows the wide signed range is
+      // (INT_MIN, INT_MIN), which yields a positive product whose double
+      // exceeds INT_MAX_out. Every other lane fits safely in int64_t even
+      // for the 32->64 widening: max non-INT_MIN-squared abs product is
+      // |INT32_MIN * (INT32_MIN+1)| = 0x3FFFFFFF80000000, and doubling
+      // gives 0x7FFFFFFF00000000, well within int64_t. The decoder
+      // rejects size=00 and size=11.
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmull: {
+        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+        int64_t int_max_out =
+            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t sn = get_signed(src_n, i);
+          int64_t sm = get_signed(src_m, i);
+          int64_t doubled;
+          if (sn == int_min_in && sm == int_min_in) {
+            doubled = int_max_out;
+          } else {
+            doubled = 2 * sn * sm;
+          }
+          set_result(i, static_cast<uint64_t>(doubled));
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;
