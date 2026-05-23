@@ -1607,6 +1607,19 @@ class Decoder {
     // endregion
     kSshll,
     kUshll,
+    // region digitalis: scalar fixed-point conversion shift-by-imm family.
+    // Opcodes 11100 (SCVTF/UCVTF) and 11111 (FCVTZS/FCVTZU) of
+    // DecodeAdvSimdScalarShiftByImm — convert between fixed-point integer
+    // and floating-point with the encoded shift as fractional-bit count.
+    // S (immh=01xx) and D (immh=1xxx) widths only; FP16 (immh=001x) is
+    // deferred and rejected by the decoder. The Fixed suffix distinguishes
+    // these from the no-shift AdvSimd two-reg-misc SCVTF/UCVTF/FCVTZS/FCVTZU
+    // already present in AdvSimdScalarTwoRegMiscOpcode / AdvSimdTwoRegMiscOpcode.
+    kScvtfFixed,
+    kUcvtfFixed,
+    kFcvtzsFixed,
+    kFcvtzuFixed,
+    // endregion
   };
 
   struct AdvSimdShiftImmArgs {
@@ -6167,6 +6180,26 @@ class Decoder {
       case 0b10011:
         if (immh & 0b1000) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUqrshrn : AdvSimdShiftImmOpcode::kSqrshrn;
+        break;
+      // Scalar fixed-point conversion (ARM ARM C4.1.6.10, opcodes 11100 / 11111).
+      //   opcode | U=0     | U=1
+      //   -------+---------+---------
+      //   11100  | SCVTF   | UCVTF
+      //   11111  | FCVTZS  | FCVTZU
+      // Width comes from immh: immh=01xx → S (32-bit float, 32-bit fixed),
+      // immh=1xxx → D (64-bit float, 64-bit fixed). immh=001x is the FP16
+      // variant (deferred — rejected here so SIGILL fires rather than
+      // silent wrong-result), immh=0001/0000 are unallocated for these
+      // opcodes (top-level dispatch already gates immh!=0).
+      case 0b11100:
+        if (!(immh & 0b1100)) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kUcvtfFixed
+               : AdvSimdShiftImmOpcode::kScvtfFixed;
+        break;
+      case 0b11111:
+        if (!(immh & 0b1100)) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kFcvtzuFixed
+               : AdvSimdShiftImmOpcode::kFcvtzsFixed;
         break;
       default:
         Undefined();

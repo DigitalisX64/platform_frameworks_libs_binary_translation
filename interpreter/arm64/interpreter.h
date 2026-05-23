@@ -8060,6 +8060,121 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis: scalar fixed-point conversion (SCVTF / UCVTF /
+      // FCVTZS / FCVTZU at S / D). The decoder dispatches these only from
+      // DecodeAdvSimdScalarShiftByImm, so args.scalar is always true here
+      // (and args.q is false). esize is 4 (S) or 8 (D); FP16 is rejected
+      // by the decoder. rshift already equals the encoded fbits — for
+      // esize=4, rshift = 64 - (immh:immb) ∈ [1..32]; for esize=8,
+      // rshift = 128 - (immh:immb) ∈ [1..64]. Result is left-zeroed at
+      // function entry, so writing the low esize bytes satisfies the
+      // ARM ARM "Vd[127:esize] = 0" scalar requirement.
+      case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          int32_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          float fval = static_cast<float>(static_cast<double>(ival) / scale);
+          memcpy(&result, &fval, sizeof(fval));
+        } else {
+          int64_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          double fval = static_cast<double>(ival) / scale;
+          memcpy(&result, &fval, sizeof(fval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          uint32_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          float fval = static_cast<float>(static_cast<double>(ival) / scale);
+          memcpy(&result, &fval, sizeof(fval));
+        } else {
+          uint64_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          double fval = static_cast<double>(ival) / scale;
+          memcpy(&result, &fval, sizeof(fval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kFcvtzsFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = static_cast<double>(fval) * scale;
+          int32_t ival;
+          if (std::isnan(scaled)) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(INT32_MAX)) {
+            ival = INT32_MAX;
+          } else if (scaled <= static_cast<double>(INT32_MIN)) {
+            ival = INT32_MIN;
+          } else {
+            ival = static_cast<int32_t>(trunc(scaled));
+          }
+          uint32_t uval;
+          memcpy(&uval, &ival, sizeof(uval));
+          memcpy(&result, &uval, sizeof(uval));
+        } else {
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = fval * scale;
+          int64_t ival;
+          if (std::isnan(scaled)) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(INT64_MAX)) {
+            ival = INT64_MAX;
+          } else if (scaled <= static_cast<double>(INT64_MIN)) {
+            ival = INT64_MIN;
+          } else {
+            ival = static_cast<int64_t>(trunc(scaled));
+          }
+          uint64_t uval;
+          memcpy(&uval, &ival, sizeof(uval));
+          memcpy(&result, &uval, sizeof(uval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kFcvtzuFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = static_cast<double>(fval) * scale;
+          uint32_t ival;
+          if (std::isnan(scaled) || scaled < 0.0) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(UINT32_MAX)) {
+            ival = UINT32_MAX;
+          } else {
+            ival = static_cast<uint32_t>(trunc(scaled));
+          }
+          memcpy(&result, &ival, sizeof(ival));
+        } else {
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = fval * scale;
+          uint64_t ival;
+          if (std::isnan(scaled) || scaled < 0.0) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(UINT64_MAX)) {
+            ival = UINT64_MAX;
+          } else {
+            ival = static_cast<uint64_t>(trunc(scaled));
+          }
+          memcpy(&result, &ival, sizeof(ival));
+        }
+        break;
+      }
+      // endregion
+
       default:
         Undefined();
         return;
