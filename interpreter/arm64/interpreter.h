@@ -7534,7 +7534,14 @@ class Interpreter {
     uint8_t rshift = (2 * bits) - ((immh << 3) | args.immb);  // for right shifts: shift = 2*esize*8 - (immh:immb)
 
     uint8_t vec_len = args.q ? 16 : 8;
-    uint8_t num_elements = vec_len / esize;
+    // region digitalis
+    // Scalar shift-by-immediate (DecodeAdvSimdScalarShiftByImm) sets
+    // args.scalar=true to force single-lane semantics regardless of
+    // esize.  For B/H/S esize this overrides the vector lane count
+    // (16/8/4/2/1) → 1, so only the lowest element is read/written;
+    // the zero-initialised result keeps Vd[127:esize] = 0 per ARM ARM.
+    // endregion
+    uint8_t num_elements = args.scalar ? 1 : (vec_len / esize);
     uint64_t emask = ElementMask(esize);
 
     switch (args.opcode) {
@@ -7639,7 +7646,15 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;  // always from full 128-bit source
+        // region digitalis
+        // Scalar narrow-shift dispatch (DecodeAdvSimdScalarShiftByImm)
+        // sets args.scalar=true (and q=false) to mean: read exactly one
+        // source element of src_esize bits and write Vd[esize-1:0],
+        // leaving Vd[127:esize] = 0. The dst_offset / result-init
+        // expressions already produce dst_offset=0 and result=0 when
+        // q=false, so only src_count needs the per-scalar override.
+        // endregion
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         // Q=0: write lower half, Q=1: write upper half (SHRN2).
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
@@ -7841,7 +7856,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7869,7 +7886,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7897,7 +7916,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7931,7 +7952,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7960,7 +7983,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7986,7 +8011,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -8013,7 +8040,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -8026,6 +8055,121 @@ class Interpreter {
           if (shifted > sat_max) shifted = sat_max;
           uint64_t r = shifted & sat_max;
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis: scalar fixed-point conversion (SCVTF / UCVTF /
+      // FCVTZS / FCVTZU at S / D). The decoder dispatches these only from
+      // DecodeAdvSimdScalarShiftByImm, so args.scalar is always true here
+      // (and args.q is false). esize is 4 (S) or 8 (D); FP16 is rejected
+      // by the decoder. rshift already equals the encoded fbits — for
+      // esize=4, rshift = 64 - (immh:immb) ∈ [1..32]; for esize=8,
+      // rshift = 128 - (immh:immb) ∈ [1..64]. Result is left-zeroed at
+      // function entry, so writing the low esize bytes satisfies the
+      // ARM ARM "Vd[127:esize] = 0" scalar requirement.
+      case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          int32_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          float fval = static_cast<float>(static_cast<double>(ival) / scale);
+          memcpy(&result, &fval, sizeof(fval));
+        } else {
+          int64_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          double fval = static_cast<double>(ival) / scale;
+          memcpy(&result, &fval, sizeof(fval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          uint32_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          float fval = static_cast<float>(static_cast<double>(ival) / scale);
+          memcpy(&result, &fval, sizeof(fval));
+        } else {
+          uint64_t ival;
+          memcpy(&ival, &src, sizeof(ival));
+          double fval = static_cast<double>(ival) / scale;
+          memcpy(&result, &fval, sizeof(fval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kFcvtzsFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = static_cast<double>(fval) * scale;
+          int32_t ival;
+          if (std::isnan(scaled)) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(INT32_MAX)) {
+            ival = INT32_MAX;
+          } else if (scaled <= static_cast<double>(INT32_MIN)) {
+            ival = INT32_MIN;
+          } else {
+            ival = static_cast<int32_t>(trunc(scaled));
+          }
+          uint32_t uval;
+          memcpy(&uval, &ival, sizeof(uval));
+          memcpy(&result, &uval, sizeof(uval));
+        } else {
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = fval * scale;
+          int64_t ival;
+          if (std::isnan(scaled)) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(INT64_MAX)) {
+            ival = INT64_MAX;
+          } else if (scaled <= static_cast<double>(INT64_MIN)) {
+            ival = INT64_MIN;
+          } else {
+            ival = static_cast<int64_t>(trunc(scaled));
+          }
+          uint64_t uval;
+          memcpy(&uval, &ival, sizeof(uval));
+          memcpy(&result, &uval, sizeof(uval));
+        }
+        break;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kFcvtzuFixed: {
+        if (esize != 4 && esize != 8) { Undefined(); return; }
+        double scale = static_cast<double>(uint64_t{1} << rshift);
+        if (esize == 4) {
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = static_cast<double>(fval) * scale;
+          uint32_t ival;
+          if (std::isnan(scaled) || scaled < 0.0) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(UINT32_MAX)) {
+            ival = UINT32_MAX;
+          } else {
+            ival = static_cast<uint32_t>(trunc(scaled));
+          }
+          memcpy(&result, &ival, sizeof(ival));
+        } else {
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double scaled = fval * scale;
+          uint64_t ival;
+          if (std::isnan(scaled) || scaled < 0.0) {
+            ival = 0;
+          } else if (scaled >= static_cast<double>(UINT64_MAX)) {
+            ival = UINT64_MAX;
+          } else {
+            ival = static_cast<uint64_t>(trunc(scaled));
+          }
+          memcpy(&result, &ival, sizeof(ival));
         }
         break;
       }

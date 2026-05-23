@@ -1607,6 +1607,19 @@ class Decoder {
     // endregion
     kSshll,
     kUshll,
+    // region digitalis: scalar fixed-point conversion shift-by-imm family.
+    // Opcodes 11100 (SCVTF/UCVTF) and 11111 (FCVTZS/FCVTZU) of
+    // DecodeAdvSimdScalarShiftByImm — convert between fixed-point integer
+    // and floating-point with the encoded shift as fractional-bit count.
+    // S (immh=01xx) and D (immh=1xxx) widths only; FP16 (immh=001x) is
+    // deferred and rejected by the decoder. The Fixed suffix distinguishes
+    // these from the no-shift AdvSimd two-reg-misc SCVTF/UCVTF/FCVTZS/FCVTZU
+    // already present in AdvSimdScalarTwoRegMiscOpcode / AdvSimdTwoRegMiscOpcode.
+    kScvtfFixed,
+    kUcvtfFixed,
+    kFcvtzsFixed,
+    kFcvtzuFixed,
+    // endregion
   };
 
   struct AdvSimdShiftImmArgs {
@@ -1617,6 +1630,13 @@ class Decoder {
     uint8_t immb;     // immb field (bits[18:16])
     bool q;           // Q bit
     bool u;           // U bit
+    // region digitalis
+    // Scalar shift-by-immediate dispatch sets this; vector dispatch leaves
+    // it false.  When set, the consumer must process exactly one element
+    // regardless of esize (overrides num_elements = vec_len / esize), and
+    // must zero the upper 64 bits of Vd to match ARM ARM scalar semantics.
+    // endregion
+    bool scalar = false;
   };
   // endregion
 
@@ -6042,17 +6062,21 @@ class Decoder {
   //   00110  | SRSRA    | URSRA     | scalar D only
   //   01000  | —        | SRI       | scalar D only
   //   01010  | SHL      | SLI       | scalar D only
-  //   01100  | —        | SQSHLU    | scalar B/H/S/D (this cycle: D only)
-  //   01110  | SQSHL    | UQSHL     | scalar B/H/S/D (this cycle: D only)
+  //   01100  | —        | SQSHLU    | scalar B/H/S/D (all dispatched)
+  //   01110  | SQSHL    | UQSHL     | scalar B/H/S/D (all dispatched)
+  //   10000  | —        | SQSHRUN   | scalar B/H/S
+  //   10001  | —        | SQRSHRUN  | scalar B/H/S
+  //   10010  | SQSHRN   | UQSHRN    | scalar B/H/S
+  //   10011  | SQRSHRN  | UQRSHRN   | scalar B/H/S
   //
-  // The non-saturating ops are spec'd by ARM ARM as scalar D-only; the
-  // saturating ops accept all four sizes but only the D variant maps
-  // cleanly onto the existing vector interpreter via num_elements=1
-  // (esize=8, vec_len=8).  Non-D saturating shifts and the narrow
-  // (opcode 10xxx) / fixed-point conversion (opcode 11xxx) variants
-  // fall through to Undefined() until follow-up cycles add their own
-  // single-lane interpreter arms — see the carried "what should be
-  // done next" list.
+  // The non-saturating ops (rows 00000..01010) are spec'd by ARM ARM as
+  // scalar D-only; the saturating shifts (rows 01100/01110) accept all
+  // four sizes; the narrow shifts (rows 10000..10011) accept B/H/S
+  // destination (source is 2*dest_esize bits) — immh=1xxx is unallocated
+  // for them because there is no scalar narrow-to-D form. Fixed-point
+  // conversion (opcode 11xxx) still falls through to Undefined() until a
+  // follow-up cycle adds its single-lane interpreter arm — see the
+  // carried "what should be done next" list.
   //
   void DecodeAdvSimdScalarShiftByImm() {
     bool u = GetBits<29, 1>();
@@ -6067,29 +6091,36 @@ class Decoder {
     // defensive double-check.
     if (immh == 0) { Undefined(); return; }
 
-    // All currently dispatched scalar shift-by-imm ops are D-form
-    // (immh=1xxx).  Reject non-D immh values up front so SIGILL fires
-    // for the unimplemented B/H/S saturating-shift, narrow-shift, and
-    // fixed-point-conversion scalar variants rather than silently
-    // producing wrong-lane-count results from the vector interpreter.
-    if (!(immh & 0b1000)) { Undefined(); return; }
-
     AdvSimdShiftImmOpcode op;
 
+    // Per ARM ARM C4.1.6.10 the "simple" shifts (SSHR / USHR / SSRA /
+    // USRA / SRSHR / URSHR / SRSRA / URSRA / SHL / SLI / SRI) are
+    // spec'd as scalar D-only — their B/H/S encodings are unallocated.
+    // Reject non-D immh for these to fire SIGILL on bogus encodings
+    // rather than silently producing wrong results.
+    //
+    // The saturating shifts (SQSHL / UQSHL / SQSHLU) accept B/H/S/D
+    // scalar — gate them on immh!=0 (any element size) so all four
+    // widths dispatch.
     switch (opcode) {
       case 0b00000:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUshr : AdvSimdShiftImmOpcode::kSshr;
         break;
       case 0b00010:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUsra : AdvSimdShiftImmOpcode::kSsra;
         break;
       case 0b00100:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUrshr : AdvSimdShiftImmOpcode::kSrshr;
         break;
       case 0b00110:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUrsra : AdvSimdShiftImmOpcode::kSrsra;
         break;
       case 0b01000:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         if (u) {
           op = AdvSimdShiftImmOpcode::kSri;
         } else {
@@ -6097,9 +6128,11 @@ class Decoder {
         }
         break;
       case 0b01010:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kSli : AdvSimdShiftImmOpcode::kShl;
         break;
       case 0b01100:
+        // SQSHLU: scalar B/H/S/D — accept any non-zero immh.
         if (u) {
           op = AdvSimdShiftImmOpcode::kSqshlu;
         } else {
@@ -6107,18 +6140,78 @@ class Decoder {
         }
         break;
       case 0b01110:
+        // SQSHL/UQSHL: scalar B/H/S/D — accept any non-zero immh.
         op = u ? AdvSimdShiftImmOpcode::kUqshl : AdvSimdShiftImmOpcode::kSqshl;
+        break;
+      // Scalar narrow-shift dispatch (ARM ARM C4.1.6.10, opcodes 10000..10011).
+      // Source is 2*esize bits, destination is esize bits, with saturation
+      // (and optional rounding for the "R" variants). Maps:
+      //   opcode | U=0       | U=1
+      //   -------+-----------+-----------
+      //   10000  | —         | SQSHRUN
+      //   10001  | —         | SQRSHRUN
+      //   10010  | SQSHRN    | UQSHRN
+      //   10011  | SQRSHRN   | UQRSHRN
+      // Per ARM ARM these accept B/H/S destination (immh = 0001 / 001x /
+      // 01xx); immh = 1xxx is unallocated (would need a D destination,
+      // but ARM has no scalar narrow-to-D form). The U=0 variants of
+      // opcode 10000/10001 are also unallocated (no SHRN / RSHRN
+      // scalar — those are vector-only).
+      case 0b10000:
+        if (immh & 0b1000) { Undefined(); return; }
+        if (u) {
+          op = AdvSimdShiftImmOpcode::kSqshrun;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b10001:
+        if (immh & 0b1000) { Undefined(); return; }
+        if (u) {
+          op = AdvSimdShiftImmOpcode::kSqrshrun;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b10010:
+        if (immh & 0b1000) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kUqshrn : AdvSimdShiftImmOpcode::kSqshrn;
+        break;
+      case 0b10011:
+        if (immh & 0b1000) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kUqrshrn : AdvSimdShiftImmOpcode::kSqrshrn;
+        break;
+      // Scalar fixed-point conversion (ARM ARM C4.1.6.10, opcodes 11100 / 11111).
+      //   opcode | U=0     | U=1
+      //   -------+---------+---------
+      //   11100  | SCVTF   | UCVTF
+      //   11111  | FCVTZS  | FCVTZU
+      // Width comes from immh: immh=01xx → S (32-bit float, 32-bit fixed),
+      // immh=1xxx → D (64-bit float, 64-bit fixed). immh=001x is the FP16
+      // variant (deferred — rejected here so SIGILL fires rather than
+      // silent wrong-result), immh=0001/0000 are unallocated for these
+      // opcodes (top-level dispatch already gates immh!=0).
+      case 0b11100:
+        if (!(immh & 0b1100)) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kUcvtfFixed
+               : AdvSimdShiftImmOpcode::kScvtfFixed;
+        break;
+      case 0b11111:
+        if (!(immh & 0b1100)) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kFcvtzuFixed
+               : AdvSimdShiftImmOpcode::kFcvtzsFixed;
         break;
       default:
         Undefined();
         return;
     }
 
-    // q=false ⇒ vec_len=8 ⇒ num_elements = 8/8 = 1 for D-form ⇒ the
-    // existing AdvSimdShiftByImm interpreter executes a single-lane
-    // shift, exactly matching the ARM ARM scalar semantics.  The
-    // upper 64 bits of Vd are zeroed by the consumer's full-128-bit
-    // writeback because `result` is initialised to 0 before the loop.
+    // scalar=true forces the consumer to process exactly one element
+    // regardless of esize, matching ARM ARM scalar semantics:
+    //   Vd[esize-1:0] = op(Vn[esize-1:0]); Vd[127:esize] = 0.
+    // q=false is preserved for downstream code that hasn't yet been
+    // updated to honour the scalar flag; setting both keeps lane
+    // counts conservative (≤2 lanes for the legacy code paths).
     const AdvSimdShiftImmArgs args = {
         .opcode = op,
         .rd = rd,
@@ -6127,6 +6220,7 @@ class Decoder {
         .immb = immb,
         .q = false,
         .u = u,
+        .scalar = true,
     };
     insn_consumer_->AdvSimdShiftByImm(args);
   }

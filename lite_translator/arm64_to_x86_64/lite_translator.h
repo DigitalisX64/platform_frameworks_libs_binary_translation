@@ -10668,6 +10668,16 @@ class LiteTranslator {
   // endregion
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
+    // region digitalis
+    // Scalar shift-by-immediate (B/H/S/D) bails to interpreter — the
+    // JIT lowerings below use parallel x86 shifts on all lanes within
+    // the lower 64 bits of Vn, which produces wrong values in
+    // Vd[esize:63] for scalar B/H/S semantics (only Vd[esize-1:0]
+    // should be written, with Vd[127:esize] zeroed).  The interpreter
+    // honours args.scalar via num_elements=1 and a zero-initialised
+    // result, matching ARM ARM exactly.
+    if (args.scalar) { success_ = false; return; }
+    // endregion
     // region digitalis - JIT for USHLL (unsigned shift-left long) at
     // 8B→8H / 4H→4S widening, used by calculate_gnu_hash_neon and many
     // SIMD widening expansions. Other shift-imm opcodes fall back.
