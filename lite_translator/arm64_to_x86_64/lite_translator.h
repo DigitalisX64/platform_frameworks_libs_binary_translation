@@ -2129,8 +2129,9 @@ class LiteTranslator {
          args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltVec ||
          args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbIdx ||
          args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
-    if (!is_bfdot && !is_bfmlal) {
-      // BFMMLA — interpreter fallback for now.
+    const bool is_bfmmla =
+        (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmmla);
+    if (!is_bfdot && !is_bfmlal && !is_bfmmla) {
       success_ = false;
       return;
     }
@@ -2138,6 +2139,93 @@ class LiteTranslator {
     const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (is_bfmmla) {
+      // BFMMLA: 2x2 FP32 output matrix from 2x4 BF16 row inputs.
+      // Per ARM ARM C7.2.55 (and interpreter.h:1501):
+      //   for i, j in [0..2):
+      //     Vd.s[i*2 + j] += Σ_{k∈[0..4)} Bf16ToFloat(Vn.h[i*4 + k]) *
+      //                                   Bf16ToFloat(Vm.h[j*4 + k])
+      // Q is always 1 (decoder rejects Q=0).
+      //
+      // Output lane layout in Vd:
+      //   lane0 = (0,0) = Vn_row0 · Vm_row0   (h[0..3] · h[0..3])
+      //   lane1 = (0,1) = Vn_row0 · Vm_row1   (h[0..3] · h[4..7])
+      //   lane2 = (1,0) = Vn_row1 · Vm_row0   (h[4..7] · h[0..3])
+      //   lane3 = (1,1) = Vn_row1 · Vm_row1   (h[4..7] · h[4..7])
+      //
+      // SSE3 lowering (no AVX-512-BF16 dependency):
+      //   1. Widen each row to 4 FP32 via PMOVZXWD + PSLLD $16 — 4 temps.
+      //   2. Per row, compute two 4-FP32 product vectors via MULPS, then
+      //      collapse each to a scalar dot via two HADDPS rounds:
+      //        HADDPS prod_a, prod_b  -> [pair0_a, pair1_a, pair0_b, pair1_b]
+      //        HADDPS that, itself   -> [dot_a, dot_b, dot_a, dot_b]
+      //      The low 64 bits then hold (dot_a, dot_b).
+      //   3. MOVLHPS packs the row-1 low-64 (dot_10, dot_11) into the
+      //      high-64 of the row-0 register that already holds (dot_00,
+      //      dot_01), yielding [dot_00, dot_01, dot_10, dot_11] — the
+      //      exact Vd lane order required by the ARM ARM matrix layout.
+      //   4. ADDPS against Vd, MOVDQU store.
+      //
+      // Temp register budget: 5 SimdRegisters
+      //   (xmm_n0, xmm_n1, xmm_m0, xmm_m1, xmm_tmp).  AllocTempSimdReg
+      //   failure routes through success_=false (region-aware spill
+      //   fallback to interpreter).
+      SimdRegister xmm_n0 = AllocTempSimdReg();
+      if (xmm_n0 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_n1 = AllocTempSimdReg();
+      if (xmm_n1 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_m0 = AllocTempSimdReg();
+      if (xmm_m0 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_m1 = AllocTempSimdReg();
+      if (xmm_m1 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_tmp = AllocTempSimdReg();
+      if (xmm_tmp == no_simd_register) { success_ = false; return; }
+
+      // Widen Vn into row 0 / row 1 FP32 vectors.
+      as_.Pmovzxwd(xmm_n0, {.base = Assembler::rbp, .disp = vn_off + 0});
+      as_.Pslld(xmm_n0, static_cast<int8_t>(16));
+      as_.Pmovzxwd(xmm_n1, {.base = Assembler::rbp, .disp = vn_off + 8});
+      as_.Pslld(xmm_n1, static_cast<int8_t>(16));
+
+      // Widen Vm into row 0 / row 1 FP32 vectors.
+      as_.Pmovzxwd(xmm_m0, {.base = Assembler::rbp, .disp = vm_off + 0});
+      as_.Pslld(xmm_m0, static_cast<int8_t>(16));
+      as_.Pmovzxwd(xmm_m1, {.base = Assembler::rbp, .disp = vm_off + 8});
+      as_.Pslld(xmm_m1, static_cast<int8_t>(16));
+
+      // Row 0 dot products: (0,0) and (0,1).
+      // xmm_tmp = xmm_n0 * xmm_m0 (preserving xmm_n0 for the (0,1) product).
+      as_.Movdqa(xmm_tmp, xmm_n0);
+      as_.Mulps(xmm_tmp, xmm_m0);
+      // xmm_n0 = xmm_n0 * xmm_m1 (xmm_n0 source no longer needed after this).
+      as_.Mulps(xmm_n0, xmm_m1);
+      // HADDPS xmm_tmp, xmm_n0 -> [pair0_00, pair1_00, pair0_01, pair1_01].
+      as_.Haddps(xmm_tmp, xmm_n0);
+      // HADDPS xmm_tmp, xmm_tmp -> [dot_00, dot_01, dot_00, dot_01].
+      as_.Haddps(xmm_tmp, xmm_tmp);
+      // Now xmm_tmp[63:0] = (dot_00, dot_01).
+
+      // Row 1 dot products: (1,0) and (1,1).  Reuse the now-free xmm_n0
+      // as scratch.
+      as_.Movdqa(xmm_n0, xmm_n1);
+      as_.Mulps(xmm_n0, xmm_m0);
+      as_.Mulps(xmm_n1, xmm_m1);
+      as_.Haddps(xmm_n0, xmm_n1);
+      as_.Haddps(xmm_n0, xmm_n0);
+      // Now xmm_n0[63:0] = (dot_10, dot_11).
+
+      // Pack the two row halves into one xmm: MOVLHPS xmm_tmp, xmm_n0
+      // copies xmm_n0[63:0] (= (dot_10, dot_11)) into xmm_tmp[127:64]
+      // while leaving xmm_tmp[63:0] (= (dot_00, dot_01)) untouched.
+      // Result: xmm_tmp = [dot_00, dot_01, dot_10, dot_11].
+      as_.Movlhps(xmm_tmp, xmm_n0);
+
+      // Accumulate into Vd and store all 16 bytes.
+      as_.Addps(xmm_tmp, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_tmp);
+      return;
+    }
 
     if (is_bfmlal) {
       const bool is_bft =
