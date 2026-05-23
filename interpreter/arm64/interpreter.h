@@ -4206,6 +4206,28 @@ class Interpreter {
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t { return a * b; });
         break;
+      // region digitalis - PMUL polynomial multiply (byte lanes).
+      // For each byte lane: multiply two 8-bit polynomials over GF(2),
+      // keeping only the low 8 bits of the product. The decoder restricts
+      // PMUL to size=00, so esize is always 1 byte here.
+      case Decoder::AdvSimdThreeSameOpcode::kPmul: {
+        auto poly_mul_low8 = [](uint8_t a, uint8_t b) -> uint8_t {
+          uint16_t res = 0;
+          for (unsigned i = 0; i < 8; ++i) {
+            if ((b >> i) & 1u) {
+              res ^= (static_cast<uint16_t>(a) << i);
+            }
+          }
+          return static_cast<uint8_t>(res);
+        };
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint8_t a = reinterpret_cast<const uint8_t*>(&src_n)[i];
+          uint8_t b = reinterpret_cast<const uint8_t*>(&src_m)[i];
+          reinterpret_cast<uint8_t*>(&result)[i] = poly_mul_low8(a, b);
+        }
+        break;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
         // MLA: Vd[i] = Vd[i] + Vn[i] * Vm[i]
         uint64_t emask = ElementMask(esize);

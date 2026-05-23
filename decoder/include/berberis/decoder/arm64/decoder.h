@@ -924,6 +924,14 @@ class Decoder {
     kSaba,      // SABA (vector): U=0, opcode=01111
     kUaba,      // UABA (vector): U=1, opcode=01111
     // endregion
+    // region digitalis - PMUL polynomial multiply (byte-lane GF(2) multiply).
+    // .8b/.16b only; size=01/10/11 reserved per ARM ARM.
+    // Verified with llvm-mc:
+    //   pmul v0.8b,v1.8b,v2.8b   = 0x2e229c20 (opcode=10011, U=1, size=00, Q=0)
+    //   pmul v0.16b,v1.16b,v2.16b = 0x6e229c20 (opcode=10011, U=1, size=00, Q=1)
+    //   pmul v0.4h / v0.4s        invalid (size=01/10 reserved)
+    kPmul,      // PMUL (vector): U=1, opcode=10011, size=00
+    // endregion
     // endregion
   };
 
@@ -4215,8 +4223,15 @@ class Decoder {
       if (u) { Undefined(); return; }
       op = AdvSimdThreeSameOpcode::kAddp;
     } else if (opcode == 0b10011) {
-      if (u) { Undefined(); return; }
-      op = AdvSimdThreeSameOpcode::kMul;
+      // region digitalis: U=1 -> PMUL polynomial multiply (size=00 only).
+      // Previously U=1 routed to Undefined(); now dispatched to kPmul.
+      if (u) {
+        if (size != 0b00) { Undefined(); return; }
+        op = AdvSimdThreeSameOpcode::kPmul;
+      } else {
+        op = AdvSimdThreeSameOpcode::kMul;
+      }
+      // endregion
     } else if (opcode == 0b10010) {
       op = u ? AdvSimdThreeSameOpcode::kMls : AdvSimdThreeSameOpcode::kMla;
     // region digitalis
