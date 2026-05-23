@@ -932,6 +932,20 @@ class Decoder {
     //   pmul v0.4h / v0.4s        invalid (size=01/10 reserved)
     kPmul,      // PMUL (vector): U=1, opcode=10011, size=00
     // endregion
+    // region digitalis - SQDMULH / SQRDMULH saturating doubling multiply high.
+    // .4h/.8h/.2s/.4s; size=00 and size=11 reserved per ARM ARM.
+    // Semantics (per lane): high half of (2 * signed(Vn[i]) * signed(Vm[i]) +
+    // round), saturated to the destination element's signed range. SQRDMULH
+    // adds round = 1 << (esize_bits - 1); SQDMULH uses round = 0.
+    // Verified with llvm-mc:
+    //   sqdmulh  v0.4h,v1.4h,v2.4h = 0x0e62b420 (opcode=10110, U=0, size=01)
+    //   sqdmulh  v0.4s,v1.4s,v2.4s = 0x4ea2b420 (Q=1, size=10)
+    //   sqrdmulh v0.4h,v1.4h,v2.4h = 0x2e62b420 (opcode=10110, U=1, size=01)
+    //   sqrdmulh v0.4s,v1.4s,v2.4s = 0x6ea2b420 (Q=1, U=1, size=10)
+    //   sqdmulh v0.8b / v0.2d      invalid (size=00/11 reserved)
+    kSqdmulh,   // SQDMULH (vector):  U=0, opcode=10110
+    kSqrdmulh,  // SQRDMULH (vector): U=1, opcode=10110
+    // endregion
     // endregion
   };
 
@@ -4234,6 +4248,12 @@ class Decoder {
       // endregion
     } else if (opcode == 0b10010) {
       op = u ? AdvSimdThreeSameOpcode::kMls : AdvSimdThreeSameOpcode::kMla;
+    // region digitalis: SQDMULH (U=0) / SQRDMULH (U=1) saturating doubling
+    // multiply high. size=00 and size=11 are reserved per ARM ARM.
+    } else if (opcode == 0b10110) {
+      if (size == 0b00 || size == 0b11) { Undefined(); return; }
+      op = u ? AdvSimdThreeSameOpcode::kSqrdmulh : AdvSimdThreeSameOpcode::kSqdmulh;
+    // endregion
     // region digitalis
     } else if (opcode == 0b10100) {
       op = u ? AdvSimdThreeSameOpcode::kUmaxp : AdvSimdThreeSameOpcode::kSmaxp;
