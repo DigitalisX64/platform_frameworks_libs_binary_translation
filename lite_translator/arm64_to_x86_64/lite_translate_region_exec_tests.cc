@@ -10939,6 +10939,118 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGenVec2S_FromW7) {
 }
 // endregion
 
+// region digitalis: INS (element) JIT
+// INS Vd.<T>[dst_idx], Vn.<T>[src_idx] — copy one esize-byte lane from Vn
+// to one lane of Vd, leaving every other lane of Vd unchanged.  These
+// tests pin the new JIT path's correctness on the four lane widths
+// (B/H/S/D), the self-INS (rd == rn) aliasing case, and the "don't
+// touch the other lanes" property that distinguishes INS-element from
+// DUP/scalar broadcasts.
+//
+// Encodings verified via aarch64-linux-gnu-as round-trip.
+constexpr uint32_t kInsElemB0_FromB1   = 0x6e010c20;  // ins v0.b[0], v1.b[1]
+constexpr uint32_t kInsElemB5_FromB10  = 0x6e0b5420;  // ins v0.b[5], v1.b[10]
+constexpr uint32_t kInsElemH3_FromH1   = 0x6e0e1420;  // ins v0.h[3], v1.h[1]
+constexpr uint32_t kInsElemS2_FromS0   = 0x6e140420;  // ins v0.s[2], v1.s[0]
+constexpr uint32_t kInsElemD1_FromD0   = 0x6e180420;  // ins v0.d[1], v1.d[0]
+constexpr uint32_t kInsElemSelfS0FromS3 = 0x6e046400; // ins v0.s[0], v0.s[3]
+
+TEST_F(Arm64LiteTranslateRegionTest, InsElemB0_FromB1) {
+  // ins v0.b[0], v1.b[1]  — only byte 0 of v0 changes (to 0xAB),
+  // every other byte of v0 keeps the sentinel.
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  uint8_t v1[16] = {0x11, 0xAB, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                    0x88, 0x99, 0xAA, 0xBB, 0xDD, 0xEE, 0xFF, 0x00};
+  std::memcpy(&state_.cpu.v[1], v1, 16);
+  static const uint32_t code[] = {kInsElemB0_FromB1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xABu) << "dst lane 0 took src v1.b[1]";
+  for (int i = 1; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0xCCu) << "untouched byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, InsElemB5_FromB10) {
+  // ins v0.b[5], v1.b[10]  — high-index source + non-zero dst index.
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  uint8_t v1[16] = {0};
+  v1[10] = 0xAB;
+  std::memcpy(&state_.cpu.v[1], v1, 16);
+  static const uint32_t code[] = {kInsElemB5_FromB10};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected = (i == 5) ? 0xAB : 0x55;
+    EXPECT_EQ(r[i], expected) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, InsElemH3_FromH1) {
+  // ins v0.h[3], v1.h[1]  — halfword copy from src idx 1 to dst idx 3.
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  uint16_t v1[8] = {0x1111, 0xBEEF, 0x2222, 0x3333,
+                    0x4444, 0x5555, 0x6666, 0x7777};
+  std::memcpy(&state_.cpu.v[1], v1, 16);
+  static const uint32_t code[] = {kInsElemH3_FromH1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t expected = (i == 3) ? 0xBEEFu : 0xCCCCu;
+    EXPECT_EQ(r[i], expected) << "halfword " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, InsElemS2_FromS0) {
+  // ins v0.s[2], v1.s[0]  — 32-bit lane copy.
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  uint32_t v1[4] = {0xDEADBEEFu, 0x11111111u, 0x22222222u, 0x33333333u};
+  std::memcpy(&state_.cpu.v[1], v1, 16);
+  static const uint32_t code[] = {kInsElemS2_FromS0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xAAAAAAAAu) << "s lane 0 untouched";
+  EXPECT_EQ(r[1], 0xAAAAAAAAu) << "s lane 1 untouched";
+  EXPECT_EQ(r[2], 0xDEADBEEFu) << "s lane 2 took v1.s[0]";
+  EXPECT_EQ(r[3], 0xAAAAAAAAu) << "s lane 3 untouched";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, InsElemD1_FromD0) {
+  // ins v0.d[1], v1.d[0]  — 64-bit lane copy; the full 64 bits must
+  // make it across (pins the Movq-not-Movl discipline for the doubleword
+  // form).
+  std::memset(&state_.cpu.v[0], 0x77, 16);
+  uint64_t v1[2] = {0xFEEDFACECAFEBABEULL, 0x0123456789ABCDEFULL};
+  std::memcpy(&state_.cpu.v[1], v1, 16);
+  static const uint32_t code[] = {kInsElemD1_FromD0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x7777777777777777ULL) << "d lane 0 untouched";
+  EXPECT_EQ(r[1], 0xFEEDFACECAFEBABEULL) << "d lane 1 took full 64 bits";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, InsElemSelfS0FromS3) {
+  // ins v0.s[0], v0.s[3]  — rd == rn aliasing: load Vn.s[3] then store
+  // back to Vd.s[0].  Verifies the JIT loads into a temp register before
+  // touching Vd, so the source isn't clobbered mid-copy.
+  uint32_t v0[4] = {0x00000000u, 0x11111111u, 0x22222222u, 0xCAFEF00Du};
+  std::memcpy(&state_.cpu.v[0], v0, 16);
+  static const uint32_t code[] = {kInsElemSelfS0FromS3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xCAFEF00Du) << "s lane 0 took s lane 3";
+  EXPECT_EQ(r[1], 0x11111111u) << "s lane 1 untouched";
+  EXPECT_EQ(r[2], 0x22222222u) << "s lane 2 untouched";
+  EXPECT_EQ(r[3], 0xCAFEF00Du) << "s lane 3 (source) preserved";
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

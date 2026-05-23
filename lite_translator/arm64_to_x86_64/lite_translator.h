@@ -3739,6 +3739,53 @@ class LiteTranslator {
       return;
     }
 
+    // INS (element): copy Vn.B/H/S/D[src_index] -> Vd.B/H/S/D[dst_index].
+    // dst_index already decoded from imm5 above as `index`; src_index lives
+    // in imm4 and must be decoded against the same esize (decoder enforces
+    // Q=1 so the full 128-bit Vd is in play).  All other lanes of Vd stay
+    // untouched, so we route through a single GP temp: load the source lane
+    // from Vn memory, store to the dest lane of Vd memory.  The two-step
+    // memory copy is correct for the `rd == rn` self-INS case (e.g.
+    // INS V0.S[0], V0.S[3]) because the load completes before the store
+    // touches Vd.  Doubleword variant uses Movq/Movq so the upper 32 bits
+    // of the element propagate intact (same movq-vs-movd discipline as
+    // DUP-general).
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kInsElement && esize != 0) {
+      uint8_t src_index;
+      switch (esize) {
+        case 1: src_index =  args.imm4       & 0xF; break;
+        case 2: src_index = (args.imm4 >> 1) & 0x7; break;
+        case 4: src_index = (args.imm4 >> 2) & 0x3; break;
+        default /* esize == 8 */:
+                src_index = (args.imm4 >> 3) & 0x1; break;
+      }
+      int32_t off_vn =
+          offsetof(ThreadState, cpu.v[0]) + args.rn * 16 + src_index * esize;
+      int32_t off_vd =
+          offsetof(ThreadState, cpu.v[0]) + args.rd * 16 + index * esize;
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      switch (esize) {
+        case 1:
+          as_.Movzxbl(tmp, {.base = Assembler::rbp, .disp = off_vn});
+          as_.Movb({.base = Assembler::rbp, .disp = off_vd}, tmp);
+          break;
+        case 2:
+          as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = off_vn});
+          as_.Movw({.base = Assembler::rbp, .disp = off_vd}, tmp);
+          break;
+        case 4:
+          as_.Movl(tmp, {.base = Assembler::rbp, .disp = off_vn});
+          as_.Movl({.base = Assembler::rbp, .disp = off_vd}, tmp);
+          break;
+        case 8:
+          as_.Movq(tmp, {.base = Assembler::rbp, .disp = off_vn});
+          as_.Movq({.base = Assembler::rbp, .disp = off_vd}, tmp);
+          break;
+      }
+      return;
+    }
+
     // DUP (element): broadcast Vn[index] (one esize-byte element) to all
     // lanes of Vd.  Q=0 fills lower 64 bits and zeros upper 64; Q=1 fills
     // 128 bits.  Valid (esize, Q) pairs per ARM ARM:
