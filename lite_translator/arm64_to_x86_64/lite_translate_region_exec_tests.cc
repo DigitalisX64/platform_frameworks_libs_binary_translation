@@ -7199,6 +7199,12 @@ constexpr uint32_t FcmpDZero(uint8_t rn) {
 constexpr uint32_t FcmpeS(uint8_t rn, uint8_t rm) {
   return FcmpScalar(0x1E202030, rn, rm);
 }
+constexpr uint32_t FcmpeD(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1E602030, rn, rm);
+}
+constexpr uint32_t FcmpH(uint8_t rn, uint8_t rm) {
+  return FcmpScalar(0x1EE02020, rn, rm);
+}
 
 // FCMP S — unordered (NaN operand): NZCV = 0b0011 (C=1, V=1).
 TEST_F(Arm64LiteTranslateRegionTest, FcmpSUnordered) {
@@ -7285,6 +7291,61 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmpeSUnorderedMatchesFcmp) {
   StoreFp32(state_.cpu, 2, 4.0f);
   static const uint32_t code[] = {
       FcmpeS(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCMP D — ordered less: NZCV = 0b1000 (N=1).  Pairs with FcmpDOrderedEqual
+// and FcmpDUnordered to fully cover the D-form NZCV outcome matrix.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpDOrderedLess) {
+  StoreFp64(state_.cpu, 1, 1.0);
+  StoreFp64(state_.cpu, 2, 2.0);
+  static const uint32_t code[] = {
+      FcmpD(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);
+}
+
+// FCMPE D — signalling-NaN variant on D form: NZCV unchanged from FCMP D.
+// Confirms the FCMPE D dispatch routes through the same UCOMISD path.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpeDUnorderedMatchesFcmp) {
+  StoreFp64(state_.cpu, 1, std::nan(""));
+  StoreFp64(state_.cpu, 2, 2.0);
+  static const uint32_t code[] = {
+      FcmpeD(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCMP H — ordered equal on FP16 (1.0 vs 1.0).  Exercises the H ftype arm
+// of FpCompare which widens both operands via Vcvtph2ps (F16C) before
+// UCOMISS.  Skipped on hosts without F16C (the lowering returns
+// success_=false and the region falls back to the interpreter).
+TEST_F(Arm64LiteTranslateRegionTest, FcmpHOrderedEqual) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FCMP H JIT path uses fallback.";
+  }
+  StoreFp16Bits(state_.cpu, 1, 0x3C00);  // 1.0
+  StoreFp16Bits(state_.cpu, 2, 0x3C00);  // 1.0
+  static const uint32_t code[] = {
+      FcmpH(1, 2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCMP H — unordered (qNaN operand).  Same F16C gate as FcmpHOrderedEqual.
+TEST_F(Arm64LiteTranslateRegionTest, FcmpHUnordered) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FCMP H JIT path uses fallback.";
+  }
+  StoreFp16Bits(state_.cpu, 1, 0x7E00);  // qNaN
+  StoreFp16Bits(state_.cpu, 2, 0x3C00);  // 1.0
+  static const uint32_t code[] = {
+      FcmpH(1, 2),
   };
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
