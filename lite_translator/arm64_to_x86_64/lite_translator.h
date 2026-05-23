@@ -11075,6 +11075,161 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: SQSHL / UQSHL / SQSHLU vector shift-by-immediate
+      // JIT (saturating left-shift family).
+      //
+      // Per-lane semantics:
+      //   SQSHL  Vd<i> = signed_saturate(Vn<i> << shift)   signed in/out
+      //   UQSHL  Vd<i> = unsigned_saturate(Vn<i> << shift) unsigned in/out
+      //   SQSHLU Vd<i> = unsigned_saturate(max(Vn<i>,0) << shift)
+      //                                                    signed in, unsigned out
+      //
+      // shift ∈ [0, esize-1], esize ∈ {16, 32}. Byte and .2D bail to interp.
+      //
+      // Saturation detection via shift-and-recover:
+      //   shifted   = PSLL{W,D}(Vn, shift)
+      //   recovered = PSRA{W,D} (signed) or PSRL{W,D} (unsigned) of shifted
+      //   eq_mask   = PCMPEQ{W,D}(recovered, Vn): all-ones if no overflow
+      //
+      // Saturation value per lane:
+      //   UQSHL  → UINT_MAX (all-ones)
+      //   SQSHL  → INT_MAX if Vn ≥ 0 else INT_MIN.  Built as
+      //                  INT_MAX XOR neg_mask, where neg_mask =
+      //                  PCMPGT{W,D}(zero, Vn) and INT_MAX =
+      //                  PSRL{W,D}(all_ones, 1).
+      //   SQSHLU → UINT_MAX. Negative inputs are pre-zeroed (pos_xn =
+      //                  ANDN(neg_mask, Vn)) so that UQSHL applied to
+      //                  pos_xn yields the architectural 0-result for
+      //                  negative inputs without any extra blend.
+      //
+      // Final blend: result = (eq_mask & shifted) | (~eq_mask & sat).
+      //
+      // x86 saturation matches ARM at the boundary in every case:
+      //   - shift==0: PSLL(Vn,0)=Vn (Intel: count=0 no-op); PSR{A,L}(Vn,0)=Vn;
+      //     eq_mask=all-ones; no saturation; result=Vn (SQSHL/UQSHL) or
+      //     max(Vn,0) (SQSHLU). ✓
+      //   - SQSHL  shift=esize-1, Vn=INT_MIN: PSLLW(0x8000,1)=0; PSRAW(0,1)=0;
+      //     0 ≠ 0x8000 → overflow; neg_mask=all-ones; sat = INT_MAX XOR
+      //     0xFFFF = INT_MIN. Matches arch (INT_MIN<<1 saturates to INT_MIN). ✓
+      //   - UQSHL shift=1, Vn=0x8000: PSLLW(0x8000,1)=0; PSRLW(0,1)=0;
+      //     0 ≠ 0x8000 → overflow; sat=UINT_MAX. Matches arch (0x8000<<1
+      //     overflows uint16, saturates to 0xFFFF). ✓
+      //
+      // Bail cases:
+      //   - byte (immh=0001): no PSLLB / PSRAB / PSRLB / PCMPGTB pre AVX-512BW.
+      //     PCMPEQB and PCMPGTB do exist in SSE2, but the parallel shifts
+      //     don't. Bails to interpreter.
+      //   - .2D (immh & 0b1000):
+      //       SQSHL needs PSRAQ which is AVX-512F-VL only.
+      //       UQSHL / SQSHLU could be implemented (PSLLQ/PSRLQ/PCMPEQQ/
+      //       PCMPGTQ all exist in SSE4.x) but we bail uniformly to keep
+      //       this cycle focused. A follow-up cycle can JIT the .2D forms.
+      case Decoder::AdvSimdShiftImmOpcode::kSqshl:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshl:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshlu: {
+        const uint8_t immh = args.immh;
+        if (immh == 0) { success_ = false; return; }
+        const bool is_byte = (immh == 0b0001);
+        if (is_byte) { success_ = false; return; }
+        const bool is_dword = (immh & 0b1000) != 0;
+        if (is_dword) { success_ = false; return; }
+        uint8_t esize_bits;
+        if (immh & 0b0100) {
+          esize_bits = 32;
+        } else /* immh & 0b0010 */ {
+          esize_bits = 16;
+        }
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        const uint8_t shift_count =
+            static_cast<uint8_t>(immh_immb - esize_bits);  // [0, esize-1]
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl);
+        const bool is_sqshlu =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshlu);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xs = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xt = AllocTempSimdReg();
+        if (xn == no_simd_register || xs == no_simd_register ||
+            xm == no_simd_register || xt == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+
+        if (is_sqshlu) {
+          // pos_xn = (Vn < 0) ? 0 : Vn.  Pre-zero negative lanes so the
+          // UQSHL pipeline below yields the architectural 0 result.
+          as_.Pxor(xt, xt);
+          switch (esize_bits) {
+            case 16: as_.Pcmpgtw(xt, xn); break;
+            case 32: as_.Pcmpgtd(xt, xn); break;
+          }
+          // xt = neg_mask (0xFFFF / 0xFFFFFFFF where xn < 0).
+          as_.Pandn(xt, xn);                   // xt = ~neg_mask & xn = pos_xn
+          as_.Movdqa(xn, xt);                  // xn := pos_xn for the rest
+        }
+
+        // xs = xn << shift_count.
+        as_.Movdqa(xs, xn);
+        switch (esize_bits) {
+          case 16: as_.Psllw(xs, cnt); break;
+          case 32: as_.Pslld(xs, cnt); break;
+        }
+        // xm = recover(xs, shift_count) using arith shift (signed) or
+        // logical shift (unsigned).
+        as_.Movdqa(xm, xs);
+        if (is_signed) {
+          switch (esize_bits) {
+            case 16: as_.Psraw(xm, cnt); break;
+            case 32: as_.Psrad(xm, cnt); break;
+          }
+        } else {
+          switch (esize_bits) {
+            case 16: as_.Psrlw(xm, cnt); break;
+            case 32: as_.Psrld(xm, cnt); break;
+          }
+        }
+        // xm = eq_mask: per-lane all-ones if no overflow, else 0.
+        switch (esize_bits) {
+          case 16: as_.Pcmpeqw(xm, xn); break;
+          case 32: as_.Pcmpeqd(xm, xn); break;
+        }
+
+        // Build saturation value in xt.
+        if (is_signed) {
+          // SQSHL: sat = INT_MAX XOR neg_mask(xn).
+          as_.Pxor(xt, xt);
+          switch (esize_bits) {
+            case 16: as_.Pcmpgtw(xt, xn); break;
+            case 32: as_.Pcmpgtd(xt, xn); break;
+          }
+          // xn is now free; reuse to hold INT_MAX = PSRL(all_ones, 1).
+          as_.Pcmpeqd(xn, xn);                 // all-ones
+          switch (esize_bits) {
+            case 16: as_.Psrlw(xn, int8_t{1}); break;
+            case 32: as_.Psrld(xn, int8_t{1}); break;
+          }
+          as_.Pxor(xt, xn);                    // xt = INT_MAX XOR neg_mask
+        } else {
+          // UQSHL / SQSHLU: sat = UINT_MAX (all-ones) per lane.
+          as_.Pcmpeqd(xt, xt);
+        }
+
+        // Blend: result = (eq_mask & shifted) | (~eq_mask & sat) in xs.
+        as_.Pand(xs, xm);                      // xs = eq_mask & shifted
+        as_.Pandn(xm, xt);                     // xm = ~eq_mask & sat
+        as_.Por(xs, xm);                       // xs = blended result
+
+        if (!args.q) {
+          // Zero upper 64 bits of Vd (D-register semantics).
+          as_.Pslldq(xs, int8_t{8});
+          as_.Psrldq(xs, int8_t{8});
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xs);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
