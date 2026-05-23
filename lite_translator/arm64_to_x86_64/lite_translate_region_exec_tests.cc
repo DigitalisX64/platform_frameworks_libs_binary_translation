@@ -8815,6 +8815,575 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec4S) {
 }
 // endregion
 
+// region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
+//
+// Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",
+// cross-checked against aarch64-linux-gnu-as output):
+//   abs v0.16b, v1.16b = 0x4E20B820 (Q=1, U=0, size=00, opcode=01011)
+//   abs v0.8h,  v1.8h  = 0x4E60B820 (Q=1, U=0, size=01)
+//   abs v0.4s,  v1.4s  = 0x4EA0B820 (Q=1, U=0, size=10)
+//   abs v0.2s,  v1.2s  = 0x0EA0B820 (Q=0, U=0, size=10)
+//   neg v0.16b, v1.16b = 0x6E20B820 (Q=1, U=1, size=00, opcode=01011)
+//   neg v0.4s,  v1.4s  = 0x6EA0B820 (Q=1, U=1, size=10)
+//   neg v0.2d,  v1.2d  = 0x6EE0B820 (Q=1, U=1, size=11)
+//   neg v0.2s,  v1.2s  = 0x2EA0B820 (Q=0, U=1, size=10)
+//   mvn v0.16b, v1.16b = 0x6E205820 (Q=1, U=1, size=00, opcode=00101) -- NOT
+//   mvn v0.8b,  v1.8b  = 0x2E205820 (Q=0, U=1, size=00, opcode=00101) -- NOT
+constexpr uint32_t kAbsVec16B = 0x4E20B820;
+constexpr uint32_t kAbsVec8H  = 0x4E60B820;
+constexpr uint32_t kAbsVec4S  = 0x4EA0B820;
+constexpr uint32_t kAbsVec2S  = 0x0EA0B820;
+constexpr uint32_t kNegVec16B = 0x6E20B820;
+constexpr uint32_t kNegVec4S  = 0x6EA0B820;
+constexpr uint32_t kNegVec2D  = 0x6EE0B820;
+constexpr uint32_t kNegVec2S  = 0x2EA0B820;
+constexpr uint32_t kNotVec16B = 0x6E205820;
+constexpr uint32_t kNotVec8B  = 0x2E205820;
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec16B) {
+  int8_t in[16] = {0, 1, -1, 127, -128, -64, 64, -100, 100, -7, 7, 0, 23, -23, -1, INT8_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // ARM ABS leaves INT8_MIN as INT8_MIN (no saturation in ABS).
+  int8_t want[16] = {0, 1, 1, 127, INT8_MIN, 64, 64, 100, 100, 7, 7, 0, 23, 23, 1, INT8_MAX};
+  for (int i = 0; i < 16; ++i) EXPECT_EQ(r[i], want[i]) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec8H) {
+  int16_t in[8] = {0, -1, 32767, -32768, 1234, -1234, -7, 7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  int16_t want[8] = {0, 1, 32767, INT16_MIN, 1234, 1234, 7, 7};
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], want[i]) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec4S) {
+  int32_t in[4] = {-1, INT32_MIN, INT32_MAX, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 1);
+  EXPECT_EQ(r[1], INT32_MIN);  // INT_MIN stays INT_MIN
+  EXPECT_EQ(r[2], INT32_MAX);
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec2SUpperZero) {
+  int32_t in[4] = {-9, 9, 0x12345678, 0x55AA55AA};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 9);
+  EXPECT_EQ(r[1], 9);
+  EXPECT_EQ(r[2], 0);  // upper half zeroed
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec16B) {
+  int8_t in[16] = {0, 1, -1, 127, -128, 50, -50, 99, -99, 7, -7, 33, -33, 1, 0, INT8_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    // ARM NEG wraps: -INT_MIN = INT_MIN (same as x86 PSUBB from zero).
+    int8_t want = static_cast<int8_t>(-static_cast<int32_t>(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec4S) {
+  int32_t in[4] = {1, -1, INT32_MIN, INT32_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], -1);
+  EXPECT_EQ(r[1], 1);
+  EXPECT_EQ(r[2], INT32_MIN);  // wraps
+  EXPECT_EQ(r[3], -INT32_MAX);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec2D) {
+  int64_t in[2] = {INT64_MIN, 0x1122334455667788LL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec2D};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT64_MIN);  // wraps
+  EXPECT_EQ(r[1], -0x1122334455667788LL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec2SUpperZero) {
+  int32_t in[4] = {-3, 4, 0x7FFFFFFF, static_cast<int32_t>(0x80000000)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 3);
+  EXPECT_EQ(r[1], -4);
+  EXPECT_EQ(r[2], 0);
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NotVec16B) {
+  uint8_t in[16] = {0x00, 0xFF, 0xA5, 0x5A, 0x12, 0xED, 0x80, 0x7F,
+                    0x33, 0xCC, 0xAB, 0x54, 0x01, 0xFE, 0xDE, 0xAD};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNotVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) EXPECT_EQ(r[i], static_cast<uint8_t>(~in[i])) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NotVec8BUpperZero) {
+  uint8_t in[16] = {0x00, 0xFF, 0xA5, 0x5A, 0x12, 0xED, 0x80, 0x7F,
+                    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNotVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], static_cast<uint8_t>(~in[i])) << "lane " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper-half lane " << i;
+}
+// endregion
+
+// region digitalis: CMGT / CMGE / CMLE / CMLT vector-vs-zero two-reg-misc JIT
+//
+// Encodings (verified against aarch64-linux-gnu-as):
+//   cmgt v0.16b, v1.16b, #0 = 0x4E208820   (Q=1, U=0, opcode=01000, size=00)
+//   cmgt v0.8h,  v1.8h,  #0 = 0x4E608820   (Q=1, U=0, opcode=01000, size=01)
+//   cmgt v0.4s,  v1.4s,  #0 = 0x4EA08820   (Q=1, U=0, opcode=01000, size=10)
+//   cmgt v0.2s,  v1.2s,  #0 = 0x0EA08820   (Q=0, U=0, opcode=01000, size=10)
+//   cmge v0.16b, v1.16b, #0 = 0x6E208820   (Q=1, U=1, opcode=01000, size=00)
+//   cmge v0.4s,  v1.4s,  #0 = 0x6EA08820   (Q=1, U=1, opcode=01000, size=10)
+//   cmge v0.2s,  v1.2s,  #0 = 0x2EA08820   (Q=0, U=1, opcode=01000, size=10)
+//   cmle v0.16b, v1.16b, #0 = 0x6E209820   (Q=1, U=1, opcode=01001, size=00)
+//   cmle v0.8h,  v1.8h,  #0 = 0x6E609820   (Q=1, U=1, opcode=01001, size=01)
+//   cmlt v0.16b, v1.16b, #0 = 0x4E20A820   (Q=1, U=0, opcode=01010, size=00)
+//   cmlt v0.4s,  v1.4s,  #0 = 0x4EA0A820   (Q=1, U=0, opcode=01010, size=10)
+constexpr uint32_t kCmgtZeroVec16B = 0x4E208820;
+constexpr uint32_t kCmgtZeroVec8H  = 0x4E608820;
+constexpr uint32_t kCmgtZeroVec4S  = 0x4EA08820;
+constexpr uint32_t kCmgtZeroVec2S  = 0x0EA08820;
+constexpr uint32_t kCmgeZeroVec16B = 0x6E208820;
+constexpr uint32_t kCmgeZeroVec4S  = 0x6EA08820;
+constexpr uint32_t kCmgeZeroVec2S  = 0x2EA08820;
+constexpr uint32_t kCmleZeroVec16B = 0x6E209820;
+constexpr uint32_t kCmleZeroVec8H  = 0x6E609820;
+constexpr uint32_t kCmltZeroVec16B = 0x4E20A820;
+constexpr uint32_t kCmltZeroVec4S  = 0x4EA0A820;
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgtZeroVec16B) {
+  int8_t in[16] = {0, 1, -1, INT8_MAX, INT8_MIN, -50, 50, 0,
+                   -1, 7, -7, 99, -99, 0, INT8_MAX, INT8_MIN};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgtZeroVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = (in[i] > 0) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgtZeroVec8H) {
+  int16_t in[8] = {0, -1, 1, INT16_MAX, INT16_MIN, 1234, -1234, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgtZeroVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = (in[i] > 0) ? 0xFFFFu : 0x0000u;
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgtZeroVec4S) {
+  int32_t in[4] = {INT32_MIN, -1, 0, INT32_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgtZeroVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  EXPECT_EQ(r[1], 0u);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0xFFFFFFFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgtZeroVec2SUpperZero) {
+  int32_t in[4] = {5, -5, 0x12345678, static_cast<int32_t>(0xDEADBEEF)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgtZeroVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);
+  EXPECT_EQ(r[1], 0u);
+  EXPECT_EQ(r[2], 0u);  // upper half zeroed
+  EXPECT_EQ(r[3], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgeZeroVec16B) {
+  int8_t in[16] = {0, 1, -1, INT8_MAX, INT8_MIN, -50, 50, 0,
+                   -1, 7, -7, 99, -99, 0, INT8_MAX, INT8_MIN};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgeZeroVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = (in[i] >= 0) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgeZeroVec4S) {
+  int32_t in[4] = {INT32_MIN, -1, 0, INT32_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgeZeroVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  EXPECT_EQ(r[1], 0u);
+  EXPECT_EQ(r[2], 0xFFFFFFFFu);
+  EXPECT_EQ(r[3], 0xFFFFFFFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgeZeroVec2SUpperZero) {
+  int32_t in[4] = {0, -1, static_cast<int32_t>(0xAABBCCDD), 0x11223344};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmgeZeroVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);  // 0 >= 0
+  EXPECT_EQ(r[1], 0u);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmleZeroVec16B) {
+  int8_t in[16] = {0, 1, -1, INT8_MAX, INT8_MIN, -50, 50, 0,
+                   -1, 7, -7, 99, -99, 0, INT8_MAX, INT8_MIN};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmleZeroVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = (in[i] <= 0) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmleZeroVec8H) {
+  int16_t in[8] = {0, -1, 1, INT16_MAX, INT16_MIN, 1234, -1234, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmleZeroVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = (in[i] <= 0) ? 0xFFFFu : 0x0000u;
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmltZeroVec16B) {
+  int8_t in[16] = {0, 1, -1, INT8_MAX, INT8_MIN, -50, 50, 0,
+                   -1, 7, -7, 99, -99, 0, INT8_MAX, INT8_MIN};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmltZeroVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = (in[i] < 0) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmltZeroVec4S) {
+  int32_t in[4] = {INT32_MIN, -1, 0, INT32_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCmltZeroVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);
+  EXPECT_EQ(r[2], 0u);  // 0 < 0 false
+  EXPECT_EQ(r[3], 0u);
+}
+// endregion
+
+// region digitalis: CNT vector two-reg-misc JIT (popcount nibble-LUT via PSHUFB)
+constexpr uint32_t kCntVec16B = 0x4E205820;  // cnt v0.16b, v1.16b
+constexpr uint32_t kCntVec8B  = 0x0E205820;  // cnt v0.8b,  v1.8b
+
+TEST_F(Arm64LiteTranslateRegionTest, CntVec16B) {
+  // Cover all bit patterns: 0, all-ones, alternating, single-bit, boundaries.
+  uint8_t in[16] = {0x00, 0xFF, 0x01, 0x80, 0x55, 0xAA, 0x7F, 0x0F,
+                    0xF0, 0x11, 0x22, 0x44, 0x88, 0xC3, 0x3C, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCntVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = static_cast<uint8_t>(__builtin_popcount(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CntVec8BUpperZero) {
+  // Q=0 form must zero the upper 64 bits of Vd.  Use a non-zero pattern in
+  // bytes 8..15 of Vn to confirm those don't leak.
+  uint8_t in[16] = {0x00, 0xFF, 0x55, 0xAA, 0x01, 0x80, 0x7F, 0x0F,
+                    0x33, 0xCC, 0xF0, 0x0F, 0xAA, 0x55, 0xFF, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kCntVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint8_t want = static_cast<uint8_t>(__builtin_popcount(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+// endregion
+
+// region digitalis: RBIT vector two-reg-misc JIT (bit-reverse nibble-LUT via PSHUFB pair)
+constexpr uint32_t kRbitVec16B = 0x6E605820;  // rbit v0.16b, v1.16b
+constexpr uint32_t kRbitVec8B  = 0x2E605820;  // rbit v0.8b,  v1.8b
+
+namespace {
+inline uint8_t ReverseBits8(uint8_t b) {
+  uint8_t r = 0;
+  for (int i = 0; i < 8; ++i) r |= ((b >> i) & 1u) << (7 - i);
+  return r;
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, RbitVec16B) {
+  // Cover bit patterns that exercise both nibble lookups: 0, all-ones,
+  // alternating, single-bit (boundary positions), nibble-aligned values.
+  uint8_t in[16] = {0x00, 0xFF, 0x01, 0x80, 0x55, 0xAA, 0x7F, 0x0F,
+                    0xF0, 0x11, 0x22, 0x44, 0x88, 0xC3, 0x3C, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRbitVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = ReverseBits8(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RbitVec8BUpperZero) {
+  // Q=0 form must zero the upper 64 bits of Vd.  Non-zero pattern in
+  // bytes 8..15 of Vn confirms those don't leak into Vd.
+  uint8_t in[16] = {0x00, 0xFF, 0x55, 0xAA, 0x01, 0x80, 0x7F, 0x0F,
+                    0x33, 0xCC, 0xF0, 0x0F, 0xAA, 0x55, 0xFF, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRbitVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint8_t want = ReverseBits8(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+// endregion
+
+// region digitalis: CLZ vector two-reg-misc JIT (per-lane PEXTR + BSR + XOR + PINSR)
+constexpr uint32_t kClzVec16B = 0x6E204820;  // clz v0.16b, v1.16b
+constexpr uint32_t kClzVec8B  = 0x2E204820;  // clz v0.8b,  v1.8b
+constexpr uint32_t kClzVec8H  = 0x6E604820;  // clz v0.8h,  v1.8h
+constexpr uint32_t kClzVec4H  = 0x2E604820;  // clz v0.4h,  v1.4h
+constexpr uint32_t kClzVec4S  = 0x6EA04820;  // clz v0.4s,  v1.4s
+constexpr uint32_t kClzVec2S  = 0x2EA04820;  // clz v0.2s,  v1.2s
+
+namespace {
+inline uint32_t Clz8(uint8_t v) {
+  if (v == 0) return 8;
+  uint32_t n = 0;
+  while ((v & 0x80) == 0) { ++n; v = static_cast<uint8_t>(v << 1); }
+  return n;
+}
+inline uint32_t Clz16(uint16_t v) {
+  if (v == 0) return 16;
+  uint32_t n = 0;
+  while ((v & 0x8000u) == 0) { ++n; v = static_cast<uint16_t>(v << 1); }
+  return n;
+}
+inline uint32_t Clz32(uint32_t v) {
+  if (v == 0) return 32;
+  uint32_t n = 0;
+  while ((v & 0x80000000u) == 0) { ++n; v <<= 1; }
+  return n;
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec16B) {
+  // Cover zero, all-ones, single-bit (boundary positions), and mid-range
+  // values so each lane exercises a distinct CLZ result in 0..8.
+  uint8_t in[16] = {0x00, 0xFF, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04,
+                    0x02, 0x01, 0x7F, 0x55, 0xAA, 0xC3, 0x3C, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = static_cast<uint8_t>(Clz8(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec8BUpperZero) {
+  // Q=0 form must zero the upper 64 bits of Vd; pattern in bytes 8..15
+  // of Vn confirms that low lanes are computed and high lanes are zeroed.
+  uint8_t in[16] = {0x00, 0xFF, 0x80, 0x01, 0x40, 0x02, 0x20, 0x04,
+                    0x33, 0xCC, 0xF0, 0x0F, 0xAA, 0x55, 0xFF, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint8_t want = static_cast<uint8_t>(Clz8(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec8H) {
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8000, 0x4000, 0x0001, 0x00FF, 0x7FFF, 0x1234};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>(Clz16(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec4HUpperZero) {
+  // Q=0 form must zero upper 64 bits.
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8000, 0x0001,
+                    0x1111, 0x2222, 0x3333, 0x4444};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec4H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint16_t want = static_cast<uint16_t>(Clz16(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec4S) {
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0x80000000u, 0x00000001u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint32_t want = Clz32(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec2SUpperZero) {
+  uint32_t in[4] = {0x00000000u, 0x00ABCDEFu, 0xDEADBEEFu, 0x12345678u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = Clz32(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

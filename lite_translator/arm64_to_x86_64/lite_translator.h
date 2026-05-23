@@ -7552,6 +7552,59 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 -- per-lane signed compare against 0.
+      //   CMGT (Vn > 0)  ->  PCMPGTx(Vn, 0)
+      //   CMLT (Vn < 0)  ->  PCMPGTx(0, Vn)
+      //   CMGE (Vn >= 0) ->  ~PCMPGTx(0, Vn)   (XOR with all-ones)
+      //   CMLE (Vn <= 0) ->  ~PCMPGTx(Vn, 0)
+      // Integer signed compare only — FP16 form (args.is_fp16) bails to interp
+      // via success_=false. .2D (size=11) needs PCMPGTQ (SSE4.2) and bails too;
+      // the interpreter handles both fallbacks correctly.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size == 0b11) { success_ = false; return; }  // .2D needs PCMPGTQ
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        // (Vn > 0) for CMGT/CMLE; (0 > Vn) for CMLT/CMGE.
+        const bool n_gt_z =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero);
+        if (n_gt_z) {
+          switch (args.size) {
+            case 0b00: as_.Pcmpgtb(xn, xz); break;
+            case 0b01: as_.Pcmpgtw(xn, xz); break;
+            case 0b10: as_.Pcmpgtd(xn, xz); break;
+            default: success_ = false; return;
+          }
+        } else {
+          switch (args.size) {
+            case 0b00: as_.Pcmpgtb(xz, xn); break;
+            case 0b01: as_.Pcmpgtw(xz, xn); break;
+            case 0b10: as_.Pcmpgtd(xz, xn); break;
+            default: success_ = false; return;
+          }
+          as_.Movdqa(xn, xz);
+        }
+        // CMGE = NOT(0 > Vn); CMLE = NOT(Vn > 0). Invert via XOR with all-ones.
+        const bool invert =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero);
+        if (invert) {
+          SimdRegister allones = AllocTempSimdReg();
+          if (allones == no_simd_register) { success_ = false; return; }
+          as_.Pcmpeqd(allones, allones);
+          as_.Pxor(xn, allones);
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
@@ -7652,6 +7705,264 @@ class LiteTranslator {
         as_.Por(xn, xt);
         if (!args.q) mask_low64(xn);
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // ABS V.<T>, V.<T> -- per-lane integer absolute value.
+      //   size=00 .8B/.16B  -> mask = PCMPGTB(0, Vn); Vd = PSUBB(PXOR(Vn, mask), mask)
+      //   size=01 .4H/.8H   -> same with PCMPGTW/PSUBW
+      //   size=10 .2S/.4S   -> same with PCMPGTD/PSUBD
+      //   size=11 .2D       -> needs PCMPGTQ (SSE4.2); JIT-bail to interp via success_=false.
+      // Identity: (Vn ^ sign_mask) - sign_mask  where sign_mask = -1 if Vn<0 else 0.
+      //   Vn>=0: (Vn ^ 0) - 0 = Vn
+      //   Vn<0 : (Vn ^ -1) - (-1) = (~Vn) + 1 = -Vn
+      // Avoids depending on SSSE3 PABSB/W/D (not currently in the assembler defs).
+      // INT_MIN stays INT_MIN (matches ARM ABS semantics for the most-negative lane).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
+        if (args.size == 0b11) { success_ = false; return; }  // .2D needs PCMPGTQ — bail to interp
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister mask = AllocTempSimdReg();
+        if (xn == no_simd_register || mask == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(mask, mask);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(mask, xn); break;
+          case 0b01: as_.Pcmpgtw(mask, xn); break;
+          case 0b10: as_.Pcmpgtd(mask, xn); break;
+          default: success_ = false; return;
+        }
+        as_.Pxor(xn, mask);
+        switch (args.size) {
+          case 0b00: as_.Psubb(xn, mask); break;
+          case 0b01: as_.Psubw(xn, mask); break;
+          case 0b10: as_.Psubd(xn, mask); break;
+          default: success_ = false; return;
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // NEG V.<T>, V.<T> -- per-lane integer negation: Vd = 0 - Vn.
+      //   size=00 -> PSUBB; size=01 -> PSUBW; size=10 -> PSUBD; size=11 -> PSUBQ.
+      // All four widths are SSE2-direct. size=11 with Q=0 (.1D) is reserved and
+      // bails to Undefined to mirror the decoder's general size/Q reservation
+      // pattern; the interpreter never sees that encoding either.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNeg: {
+        if (args.size == 0b11 && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        switch (args.size) {
+          case 0b00: as_.Psubb(xz, xn); break;
+          case 0b01: as_.Psubw(xz, xn); break;
+          case 0b10: as_.Psubd(xz, xn); break;
+          case 0b11: as_.Psubq(xz, xn); break;
+          default: success_ = false; return;
+        }
+        if (!args.q) mask_low64(xz);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xz);
+        return;
+      }
+      // CNT V.16B / V.8B -- per-byte population count (set-bit count).
+      // Lowering: Mula-Wojcik nibble-LUT via PSHUFB.
+      //   table = {0,1,1,2, 1,2,2,3, 1,2,2,3, 2,3,3,4}  (popcount per nibble)
+      //   low_nibbles  = Vn & 0x0F
+      //   high_nibbles = (Vn >> 4) & 0x0F        (PSRLW shifts by word; mask
+      //                                           keeps just the nibble we want)
+      //   Vd = PSHUFB(table, low_nibbles) + PSHUFB(table, high_nibbles)
+      // CNT has only one encoded size (size=00 → 8B/16B); any other size is
+      // unallocated and never reaches this case via the decoder, but bail
+      // defensively just in case.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCnt: {
+        if (args.size != 0b00) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xt_hi = AllocTempSimdReg();
+        SimdRegister xtable_lo = AllocTempSimdReg();
+        SimdRegister xtable_hi = AllocTempSimdReg();
+        SimdRegister xmask = AllocTempSimdReg();
+        if (xn == no_simd_register || xt_hi == no_simd_register ||
+            xtable_lo == no_simd_register || xtable_hi == no_simd_register ||
+            xmask == no_simd_register) {
+          success_ = false; return;
+        }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        // Build the popcount nibble table:
+        //   bytes  0..7 = {0,1,1,2,1,2,2,3} → 0x0302020102010100 (little-endian)
+        //   bytes  8..15= {1,2,2,3,2,3,3,4} → 0x0403030203020201
+        as_.Movq(r1, static_cast<int64_t>(0x0302020102010100LL));
+        as_.Movq(xtable_lo, r1);
+        as_.Movq(r1, static_cast<int64_t>(0x0403030203020201LL));
+        as_.Pinsrq(xtable_lo, r1, int8_t{1});
+        // We need the table twice (PSHUFB is destructive); keep a second copy.
+        as_.Movdqa(xtable_hi, xtable_lo);
+        // Build the 0x0F low-nibble mask, broadcast to all 16 bytes.
+        as_.Movq(r1, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+        as_.Movq(xmask, r1);
+        as_.Punpcklqdq(xmask, xmask);
+        // Load Vn; split into low and high nibbles.
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqa(xt_hi, xn);
+        as_.Psrlw(xt_hi, int8_t{4});   // shift 16-bit lanes right by 4
+        as_.Pand(xt_hi, xmask);        // keep low nibble of each byte
+        as_.Pand(xn, xmask);
+        // PSHUFB(dst, src): for each byte i, dst[i] = dst[src[i] & 0x0F] (if
+        // src[i] high bit clear). After PAND with 0x0F the high bits are 0, so
+        // the table is indexed by the nibble value directly.
+        as_.Pshufb(xtable_lo, xn);
+        as_.Pshufb(xtable_hi, xt_hi);
+        as_.Paddb(xtable_lo, xtable_hi);
+        if (!args.q) mask_low64(xtable_lo);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xtable_lo);
+        return;
+      }
+      // NOT V.16B / V.8B (size=00) -- per-lane bitwise NOT: Vd = ~Vn.
+      // RBIT V.16B / V.8B (size=01) -- per-byte bit reversal.
+      // The decoder routes opcode=00101+U=1 to kNot for both encodings,
+      // discriminated by size: size=00 → NOT, size=01 → RBIT.
+      //
+      // RBIT lowering: two-PSHUFB nibble-LUT.  For input byte b = (H<<4) | L:
+      //   reverse_bits(b) = (reverse_4(L) << 4) | reverse_4(H)
+      // where reverse_4 is the 4-bit bit-reverse.  Two lookup tables:
+      //   low_table[i]  = reverse_4(i)              -- lookup result occupies low nibble
+      //   high_table[i] = reverse_4(i) << 4         -- lookup result occupies high nibble
+      // Then:
+      //   t_lo = Vn & 0x0F       (low nibbles)
+      //   t_hi = (Vn >> 4) & 0x0F (high nibbles, via 16-bit PSRLW + PAND)
+      //   Vd   = PSHUFB(high_table, t_lo) | PSHUFB(low_table, t_hi)
+      // The two PSHUFB results have disjoint nibble positions, so POR or
+      // PADDB combine equivalently; we use POR to match the read-as-bits
+      // shape of the operation.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNot: {
+        if (args.size == 0b00) {
+          // NOT: trivial bitwise complement.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister allones = AllocTempSimdReg();
+          if (xn == no_simd_register || allones == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Pcmpeqd(allones, allones);
+          as_.Pxor(xn, allones);
+          if (!args.q) mask_low64(xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        if (args.size == 0b01) {
+          // RBIT: two-PSHUFB nibble-LUT bit reversal.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xlow_table = AllocTempSimdReg();
+          SimdRegister xhigh_table = AllocTempSimdReg();
+          SimdRegister xmask = AllocTempSimdReg();
+          if (xn == no_simd_register || xn_hi == no_simd_register ||
+              xlow_table == no_simd_register || xhigh_table == no_simd_register ||
+              xmask == no_simd_register) {
+            success_ = false; return;
+          }
+          Register r1 = AllocTempReg();
+          if (r1 == no_register) { success_ = false; return; }
+          // Build low_table = {0,8,4,12,2,10,6,14, 1,9,5,13,3,11,7,15}.
+          //   bytes  0..7 → 0x0E060A020C040800
+          //   bytes 8..15 → 0x0F070B030D050901
+          as_.Movq(r1, static_cast<int64_t>(0x0E060A020C040800LL));
+          as_.Movq(xlow_table, r1);
+          as_.Movq(r1, static_cast<int64_t>(0x0F070B030D050901LL));
+          as_.Pinsrq(xlow_table, r1, int8_t{1});
+          // Build high_table = {0,0x80,0x40,0xC0,0x20,0xA0,0x60,0xE0,
+          //                     0x10,0x90,0x50,0xD0,0x30,0xB0,0x70,0xF0}.
+          //   bytes  0..7 → 0xE060A020C0408000
+          //   bytes 8..15 → 0xF070B030D0509010
+          as_.Movq(r1, static_cast<int64_t>(0xE060A020C0408000ULL));
+          as_.Movq(xhigh_table, r1);
+          as_.Movq(r1, static_cast<int64_t>(0xF070B030D0509010ULL));
+          as_.Pinsrq(xhigh_table, r1, int8_t{1});
+          // Build 0x0F broadcast mask.
+          as_.Movq(r1, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+          as_.Movq(xmask, r1);
+          as_.Punpcklqdq(xmask, xmask);
+          // Load Vn; split into low and high nibbles.
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqa(xn_hi, xn);
+          as_.Psrlw(xn_hi, int8_t{4});  // 16-bit-lane shift; bits leak between
+                                        // adjacent bytes but PAND below filters
+                                        // each byte's high nibble cleanly.
+          as_.Pand(xn_hi, xmask);
+          as_.Pand(xn, xmask);
+          // Dual PSHUFB: high_table looked up by low nibbles → high-nibble of
+          // result; low_table looked up by high nibbles → low-nibble of result.
+          // PSHUFB is destructive in its first operand; tables consumed here.
+          as_.Pshufb(xhigh_table, xn);
+          as_.Pshufb(xlow_table, xn_hi);
+          as_.Por(xhigh_table, xlow_table);
+          if (!args.q) mask_low64(xhigh_table);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xhigh_table);
+          return;
+        }
+        // size=10 / size=11 are reserved for this opcode group.
+        success_ = false;
+        return;
+      }
+      // CLZ V.<T>, V.<T> -- per-lane count leading zeros.
+      //   size=00 .8B/.16B  -> 8-bit lane CLZ (result 0..8)
+      //   size=01 .4H/.8H   -> 16-bit lane CLZ (result 0..16)
+      //   size=10 .2S/.4S   -> 32-bit lane CLZ (result 0..32)
+      //   size=11           -> reserved per ARM ARM; decoder never routes here,
+      //                        but bail defensively via success_=false.
+      // Per-lane lowering: PEXTR{B,W,D} → scalar CLZ via BSR (with zero-input
+      // branch to lane_bits) → XOR with lane_bits-1 → PINSR{B,W,D}.  The
+      // BSR+XOR trick matches the scalar CLZ lowering already used in this
+      // file at the integer scalar dispatch (BSR returns the MSB position
+      // 0..lane_bits-1; XOR with lane_bits-1 (= 2^k - 1, all-ones in low k
+      // bits) flips to (lane_bits - 1) - BSR with no borrow).  The zero-input
+      // case takes the forward branch and stores lane_bits unchanged.
+      //
+      // BSR is undefined on zero on Intel CPUs (AMD sets dst to operand size,
+      // but we don't rely on that), so the TEST+JZ guard is necessary.
+      //
+      // Per-lane round-trip is acceptable for CLZ — rarely on the hot path.
+      // An AVX-512-CD VPLZCNTD/Q gate is possible (size=10 only) but not
+      // implemented here; the lowering is uniform across sizes and the
+      // BSR-based scalar path is portable to any x86_64 host.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kClz: {
+        if (args.size == 0b11) { success_ = false; return; }
+        const uint8_t lane_bits = static_cast<uint8_t>(8u << args.size);
+        const uint8_t bytes_per_lane = static_cast<uint8_t>(1u << args.size);
+        const int lanes_per_vec = (args.q ? 16 : 8) / bytes_per_lane;
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xd == no_simd_register) {
+          success_ = false; return;
+        }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xd, xd);
+        for (int i = 0; i < lanes_per_vec; ++i) {
+          switch (args.size) {
+            case 0b00: as_.Pextrb(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pextrw(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pextrd(r1, xn, static_cast<int8_t>(i)); break;
+          }
+          auto* nonzero = as_.MakeLabel();
+          auto* done = as_.MakeLabel();
+          as_.Testl(r1, r1);
+          as_.Jcc(Condition::kNotZero, *nonzero);
+          as_.Movl(r1, static_cast<int32_t>(lane_bits));
+          as_.Jmp(*done);
+          as_.Bind(nonzero);
+          as_.Bsrl(r1, r1);
+          as_.Xorl(r1, static_cast<int8_t>(lane_bits - 1));
+          as_.Bind(done);
+          switch (args.size) {
+            case 0b00: as_.Pinsrb(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pinsrw(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pinsrd(xd, r1, static_cast<int8_t>(i)); break;
+          }
+        }
+        if (!args.q) mask_low64(xd);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
