@@ -1057,6 +1057,23 @@ class Decoder {
     //   sqdmull2 v0.2d, v1.4s, v2.4s -> 0x4ea2d020 (Q=1, size=10)
     kSqdmull,
     // endregion
+    // region digitalis - signed saturating doubling multiply-accumulate long.
+    //   SQDMLAL / SQDMLAL2 : U=0, opcode=1001
+    // For each lane: addend = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
+    //   (first-stage saturation, identical to SQDMULL).
+    //                Vd_wide[i] = SignedSat(Vd_wide[i] + addend)
+    //   (second-stage saturation on the wide accumulate).
+    // size/Q semantics match SQDMULL: size=01 -> .4s from .4h, size=10 ->
+    // .2d from .2s; size=00 and size=11 are reserved. Q=0 reads lower
+    // 64 bits of each source; Q=1 reads upper 64 bits. Vd is read-modify-
+    // write (wide accumulator) rather than fully overwritten.
+    // llvm-mc verified encodings:
+    //   sqdmlal  v0.4s, v1.4h, v2.4h -> 0x0e629020 (Q=0, size=01)
+    //   sqdmlal2 v0.4s, v1.8h, v2.8h -> 0x4e629020 (Q=1, size=01)
+    //   sqdmlal  v0.2d, v1.2s, v2.2s -> 0x0ea29020 (Q=0, size=10)
+    //   sqdmlal2 v0.2d, v1.4s, v2.4s -> 0x4ea29020 (Q=1, size=10)
+    kSqdmlal,
+    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -4524,6 +4541,17 @@ class Decoder {
         if (u != 0) { Undefined(); return; }
         if (size == 0b00) { Undefined(); return; }
         op = AdvSimdThreeDiffOpcode::kSqdmull;
+        break;
+      // endregion
+      // region digitalis - signed saturating doubling multiply-accumulate
+      // long: SQDMLAL / SQDMLAL2 (U=0, opcode=1001). U=1 with opcode=1001
+      // is unallocated. size=00 is reserved (only halfword and word inputs
+      // are defined); size=11 is already rejected by the top-of-routine
+      // size guard.
+      case 0b1001:
+        if (u != 0) { Undefined(); return; }
+        if (size == 0b00) { Undefined(); return; }
+        op = AdvSimdThreeDiffOpcode::kSqdmlal;
         break;
       // endregion
       case 0b0111:

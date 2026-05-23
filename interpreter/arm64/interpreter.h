@@ -1938,6 +1938,66 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - signed saturating doubling multiply-accumulate
+      // long: Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2*sn*sm)).
+      // Two stages of saturation:
+      //   (1) compute the doubled product with input-based saturation
+      //       (same as kSqdmull; only (INT_MIN_in, INT_MIN_in) saturates,
+      //       to INT_MAX_out);
+      //   (2) saturate the wide signed accumulator add against the
+      //       wide signed range [INT_MIN_out, INT_MAX_out].
+      // For out_esize=4 (in=16), int64_t has 32-bit headroom for both
+      // operands and the sum, so a plain int64_t add + compare suffices.
+      // For out_esize=8 (in=32), the sum can overflow int64_t; use
+      // unsigned wrap + signed-overflow detection (same-sign operands,
+      // result sign differs).
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlal: {
+        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+        int64_t int_max_out =
+            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+        int64_t int_min_out =
+            (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t sn = get_signed(src_n, i);
+          int64_t sm = get_signed(src_m, i);
+          int64_t addend;
+          if (sn == int_min_in && sm == int_min_in) {
+            addend = int_max_out;
+          } else {
+            addend = 2 * sn * sm;
+          }
+          // Sign-extend the existing accumulator lane to int64_t.
+          uint64_t acc_raw = get_accum(i);
+          int64_t acc;
+          if (out_esize == 8) {
+            acc = static_cast<int64_t>(acc_raw);
+          } else {
+            uint8_t shift = (8 - out_esize) * 8;
+            acc = static_cast<int64_t>(acc_raw << shift) >> shift;
+          }
+          int64_t sum;
+          if (out_esize == 8) {
+            uint64_t usum = static_cast<uint64_t>(acc) + static_cast<uint64_t>(addend);
+            sum = static_cast<int64_t>(usum);
+            bool a_neg = acc < 0;
+            bool b_neg = addend < 0;
+            bool s_neg = sum < 0;
+            if (a_neg == b_neg && a_neg != s_neg) {
+              sum = a_neg ? int_min_out : int_max_out;
+            }
+          } else {
+            sum = acc + addend;
+            if (sum > int_max_out) {
+              sum = int_max_out;
+            } else if (sum < int_min_out) {
+              sum = int_min_out;
+            }
+          }
+          set_result(i, static_cast<uint64_t>(sum));
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;
