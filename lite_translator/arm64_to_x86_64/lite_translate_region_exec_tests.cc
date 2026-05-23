@@ -10688,6 +10688,187 @@ TEST_F(Arm64LiteTranslateRegionTest, DupElemVec2DIdx1) {
 }
 // endregion
 
+// region digitalis: EXT q=0 vector JIT
+//
+// EXT Vd.8B, Vn.8B, Vm.8B, #imm  ->  result[0..7] =
+//   Vn[imm..7] || Vm[0..imm-1]   (an 8-byte rotating window over Vn:Vm)
+//   result[8..15] = 0  (Q=0 upper-zero requirement)
+//
+// JIT lowering at lite_translator.h (AdvSimdExtract, q=0 branch):
+//   Movq xn, [vn]          // xn = [Vn[0..7], 0]
+//   Movq xm, [vm]          // xm = [Vm[0..7], 0]
+//   Punpcklqdq xn, xm      // xn = [Vn[0..7], Vm[0..7]]
+//   Psrldq xn, index       // shift right by `index` bytes
+//   Pslldq xn, 8           // zero low 8 bytes
+//   Psrldq xn, 8           // shift wanted bytes back to low; zero upper
+//   Movdqu [vd], xn
+//
+// Reserved (index >= 8) bails to interpreter via success_ = false.
+constexpr uint32_t kExtVec8B_idx0 = 0x2e020020;  // ext v0.8b, v1.8b, v2.8b, #0
+constexpr uint32_t kExtVec8B_idx1 = 0x2e020820;  // ext v0.8b, v1.8b, v2.8b, #1
+constexpr uint32_t kExtVec8B_idx3 = 0x2e021820;  // ext v0.8b, v1.8b, v2.8b, #3
+constexpr uint32_t kExtVec8B_idx5 = 0x2e022820;  // ext v0.8b, v1.8b, v2.8b, #5
+constexpr uint32_t kExtVec8B_idx7 = 0x2e023820;  // ext v0.8b, v1.8b, v2.8b, #7
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec8BIdx0) {
+  // index=0: result low 8 bytes = Vn[0..7]; upper 8 bytes = 0.
+  // Seed Vn[8..15] and Vm with sentinel garbage to pin the upper-zero
+  // behavior (no leak through PSLLDQ-8 / PSRLDQ-8) and the Vm-exclusion
+  // (no Vm bytes when index==0).
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8, 0xE7};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec8B_idx0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], vn[i]) << "lower byte " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec8BIdx1) {
+  // index=1: result low 8 bytes = Vn[1..7] || Vm[0]; upper = 0.
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8, 0xE7};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec8B_idx1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // result = [Vn[1..7], Vm[0]]
+  uint8_t expected[8] = {vn[1], vn[2], vn[3], vn[4], vn[5], vn[6], vn[7], vm[0]};
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], expected[i]) << "lower byte " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec8BIdx3) {
+  // index=3: result = [Vn[3..7], Vm[0..2]]; upper = 0.
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8, 0xE7};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec8B_idx3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint8_t expected[8] = {vn[3], vn[4], vn[5], vn[6], vn[7],
+                         vm[0], vm[1], vm[2]};
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], expected[i]) << "lower byte " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec8BIdx5) {
+  // index=5: result = [Vn[5..7], Vm[0..4]]; upper = 0.
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8, 0xE7};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec8B_idx5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint8_t expected[8] = {vn[5], vn[6], vn[7],
+                         vm[0], vm[1], vm[2], vm[3], vm[4]};
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], expected[i]) << "lower byte " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec8BIdx7) {
+  // index=7: result = [Vn[7], Vm[0..6]]; upper = 0.
+  // Pins the boundary case where exactly one Vn byte survives.
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8, 0xE7};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec8B_idx7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint8_t expected[8] = {vn[7], vm[0], vm[1], vm[2],
+                         vm[3], vm[4], vm[5], vm[6]};
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], expected[i]) << "lower byte " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+// EXT q=1 with odd imm4 — regression pins for the decoder dispatch bug
+// where EXT was mis-routed to AdvSimdPermute (UZP/TRN/ZIP) when imm4
+// had its low bit set (bit 11 of the encoding = 1).  AdvSimdPermute's
+// predicate matched on bits[11:10]=10 without checking bit 29, but
+// Permute requires bit 29 = 0 while EXT has bit 29 = 1.  Fixed in
+// decoder.h:AdvSIMD permute dispatch.
+constexpr uint32_t kExtVec16B_idx1  = 0x6e020820;  // ext v0.16b, v1.16b, v2.16b, #1
+constexpr uint32_t kExtVec16B_idx7  = 0x6e023820;  // ext v0.16b, v1.16b, v2.16b, #7
+constexpr uint32_t kExtVec16B_idx15 = 0x6e027820;  // ext v0.16b, v1.16b, v2.16b, #15
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec16BIdx1OddImm) {
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec16B_idx1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Result = Vn[1..15] || Vm[0].
+  for (int i = 0; i < 15; ++i) EXPECT_EQ(r[i], vn[1 + i]) << "byte " << i;
+  EXPECT_EQ(r[15], vm[0]) << "byte 15";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec16BIdx7OddImm) {
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec16B_idx7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Result = Vn[7..15] || Vm[0..6].
+  for (int i = 0; i < 9; ++i) EXPECT_EQ(r[i], vn[7 + i]) << "byte " << i;
+  for (int i = 9; i < 16; ++i) EXPECT_EQ(r[i], vm[i - 9]) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ExtVec16BIdx15OddImm) {
+  uint8_t vn[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+  uint8_t vm[16] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kExtVec16B_idx15};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Result = Vn[15] || Vm[0..14].
+  EXPECT_EQ(r[0], vn[15]) << "byte 0";
+  for (int i = 1; i < 16; ++i) EXPECT_EQ(r[i], vm[i - 1]) << "byte " << i;
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

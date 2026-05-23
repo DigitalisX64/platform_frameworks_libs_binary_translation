@@ -5744,13 +5744,39 @@ class LiteTranslator {
     //   result = (Vn >> (index*8)) | (Vm << ((vlen-index)*8))
     // For q=1 this is a 16-byte window; for q=0 it's an 8-byte window.
     if (!q) {
-      // 64-bit form: handle index 0..7. The simplest correct route is
-      // to pack Vm:Vn into a 16-byte register, shift right by index
-      // bytes, then mask to low 8 bytes. For now fall back to interp
-      // for q=0 to keep the change small (calculate_gnu_hash_neon's ext
-      // uses q=1).
-      UNUSED(rd, rn, rm, index);
-      Undefined();
+      // 64-bit form: 8-byte window, index 0..7.  ARM ARM marks
+      // imm4[3]=1 (index >= 8) as UNDEFINED for Q=0.
+      if (index >= 8) { Undefined(); return; }
+
+      const int32_t vn_off_q0 = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+      const int32_t vm_off_q0 = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+      const int32_t vd_off_q0 = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+
+      SimdRegister xn_q0 = AllocTempSimdReg();
+      SimdRegister xm_q0 = AllocTempSimdReg();
+      if (xn_q0 == no_simd_register || xm_q0 == no_simd_register) {
+        success_ = false;
+        return;
+      }
+      // Movq into XMM loads 8 bytes and zero-extends the upper 64 bits,
+      // matching the Q=0 view of Vn/Vm.
+      as_.Movq(xn_q0, {.base = Assembler::rbp, .disp = vn_off_q0});
+      as_.Movq(xm_q0, {.base = Assembler::rbp, .disp = vm_off_q0});
+      // Concatenate Vn:Vm into a single 16-byte register so PSRLDQ can
+      // walk a contiguous window: low 8 bytes hold Vn, high 8 bytes
+      // hold Vm.
+      as_.Punpcklqdq(xn_q0, xm_q0);
+      // Shift right by `index` bytes; PSRLDQ zero-fills the high end.
+      // The wanted 8-byte window now sits in the low 8 bytes of xn.
+      if (index != 0) {
+        as_.Psrldq(xn_q0, static_cast<int8_t>(index));
+      }
+      // Force the upper 64 bits of the result to zero: PSLLDQ-8 followed
+      // by PSRLDQ-8 shuttles the wanted 8 bytes through the upper half
+      // and back, clearing the previously-occupied high bytes.
+      as_.Pslldq(xn_q0, int8_t{8});
+      as_.Psrldq(xn_q0, int8_t{8});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_q0}, xn_q0);
       return;
     }
     int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
