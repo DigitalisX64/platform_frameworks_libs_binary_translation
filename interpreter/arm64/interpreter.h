@@ -1841,6 +1841,225 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - narrowing high: Vd(narrow) = ((Vn + Vm) [+ round]) >>
+      // narrow_bits. ADDHN: round=0. RADDHN: round=1<<(narrow_bits-1). Q=0 writes
+      // narrow lanes to lower 64 bits of Vd (upper cleared); Q=1 writes narrow
+      // lanes to upper 64 bits (lower preserved). size encodes narrow elem width;
+      // sources Vn/Vm are wide (2*in_esize per lane).
+      case Decoder::AdvSimdThreeDiffOpcode::kAddhn:
+      case Decoder::AdvSimdThreeDiffOpcode::kRaddhn: {
+        uint8_t narrow_bits = in_esize * 8;
+        uint64_t round = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kRaddhn)
+                             ? (1ULL << (narrow_bits - 1))
+                             : 0;
+        uint8_t narrow_lanes[8] = {0};
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0;
+          uint64_t b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * out_esize, out_esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * out_esize, out_esize);
+          uint64_t sum = a + b + round;
+          if (out_esize < 8) {
+            // Mask to wide width before taking the high half. For out_esize==8
+            // we skip the mask: shifting `(1ULL << 64) - 1` is UB, and the
+            // natural uint64_t wrap already gives the wide-bit-width sum.
+            sum &= (1ULL << (out_esize * 8)) - 1;
+          }
+          uint64_t high = sum >> narrow_bits;
+          memcpy(narrow_lanes + i * in_esize, &high, in_esize);
+        }
+        // Q=0: `result` was initialized to 0 at function entry, so upper 64
+        // bits already cleared. Q=1: copy dst so lower 64 bits are preserved
+        // before we overwrite the upper half.
+        if (args.q) {
+          result = dst;
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + (args.q ? 8 : 0), narrow_lanes, 8);
+        break;
+      }
+      // endregion
+      // region digitalis - narrowing high subtract: Vd(narrow) =
+      //   ((Vn - Vm) [+ round]) >> narrow_bits.
+      // SUBHN: round=0. RSUBHN: round=1<<(narrow_bits-1). Q semantics and
+      // source/dest shapes are identical to ADDHN/RADDHN. Two's-complement
+      // wrap of `a - b` modulo 2^(out_esize*8) is implicit via the uint64_t
+      // subtract + mask: the high-half bits we shift out are the wide-width
+      // result regardless of borrow.
+      case Decoder::AdvSimdThreeDiffOpcode::kSubhn:
+      case Decoder::AdvSimdThreeDiffOpcode::kRsubhn: {
+        uint8_t narrow_bits = in_esize * 8;
+        uint64_t round = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kRsubhn)
+                             ? (1ULL << (narrow_bits - 1))
+                             : 0;
+        uint8_t narrow_lanes[8] = {0};
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0;
+          uint64_t b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * out_esize, out_esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * out_esize, out_esize);
+          uint64_t diff = a - b + round;
+          if (out_esize < 8) {
+            diff &= (1ULL << (out_esize * 8)) - 1;
+          }
+          uint64_t high = diff >> narrow_bits;
+          memcpy(narrow_lanes + i * in_esize, &high, in_esize);
+        }
+        if (args.q) {
+          result = dst;
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + (args.q ? 8 : 0), narrow_lanes, 8);
+        break;
+      }
+      // endregion
+      // region digitalis - signed saturating doubling multiply long:
+      //   Vd_wide[i] = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
+      // The only input pair that overflows the wide signed range is
+      // (INT_MIN, INT_MIN), which yields a positive product whose double
+      // exceeds INT_MAX_out. Every other lane fits safely in int64_t even
+      // for the 32->64 widening: max non-INT_MIN-squared abs product is
+      // |INT32_MIN * (INT32_MIN+1)| = 0x3FFFFFFF80000000, and doubling
+      // gives 0x7FFFFFFF00000000, well within int64_t. The decoder
+      // rejects size=00 and size=11.
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmull: {
+        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+        int64_t int_max_out =
+            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t sn = get_signed(src_n, i);
+          int64_t sm = get_signed(src_m, i);
+          int64_t doubled;
+          if (sn == int_min_in && sm == int_min_in) {
+            doubled = int_max_out;
+          } else {
+            doubled = 2 * sn * sm;
+          }
+          set_result(i, static_cast<uint64_t>(doubled));
+        }
+        break;
+      }
+      // endregion
+      // region digitalis - signed saturating doubling multiply-accumulate
+      // long: Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2*sn*sm)).
+      // Two stages of saturation:
+      //   (1) compute the doubled product with input-based saturation
+      //       (same as kSqdmull; only (INT_MIN_in, INT_MIN_in) saturates,
+      //       to INT_MAX_out);
+      //   (2) saturate the wide signed accumulator add against the
+      //       wide signed range [INT_MIN_out, INT_MAX_out].
+      // For out_esize=4 (in=16), int64_t has 32-bit headroom for both
+      // operands and the sum, so a plain int64_t add + compare suffices.
+      // For out_esize=8 (in=32), the sum can overflow int64_t; use
+      // unsigned wrap + signed-overflow detection (same-sign operands,
+      // result sign differs).
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlal: {
+        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+        int64_t int_max_out =
+            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+        int64_t int_min_out =
+            (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t sn = get_signed(src_n, i);
+          int64_t sm = get_signed(src_m, i);
+          int64_t addend;
+          if (sn == int_min_in && sm == int_min_in) {
+            addend = int_max_out;
+          } else {
+            addend = 2 * sn * sm;
+          }
+          // Sign-extend the existing accumulator lane to int64_t.
+          uint64_t acc_raw = get_accum(i);
+          int64_t acc;
+          if (out_esize == 8) {
+            acc = static_cast<int64_t>(acc_raw);
+          } else {
+            uint8_t shift = (8 - out_esize) * 8;
+            acc = static_cast<int64_t>(acc_raw << shift) >> shift;
+          }
+          int64_t sum;
+          if (out_esize == 8) {
+            uint64_t usum = static_cast<uint64_t>(acc) + static_cast<uint64_t>(addend);
+            sum = static_cast<int64_t>(usum);
+            bool a_neg = acc < 0;
+            bool b_neg = addend < 0;
+            bool s_neg = sum < 0;
+            if (a_neg == b_neg && a_neg != s_neg) {
+              sum = a_neg ? int_min_out : int_max_out;
+            }
+          } else {
+            sum = acc + addend;
+            if (sum > int_max_out) {
+              sum = int_max_out;
+            } else if (sum < int_min_out) {
+              sum = int_min_out;
+            }
+          }
+          set_result(i, static_cast<uint64_t>(sum));
+        }
+        break;
+      }
+      // endregion
+      // region digitalis - signed saturating doubling multiply-subtract
+      // long: Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2*sn*sm)).
+      // Same two-stage saturation as SQDMLAL with sign flipped on the
+      // second-stage accumulate. Stage 1 is identical to SQDMULL/SQDMLAL;
+      // since the SQDMULL output range is [INT_MIN_out+1, INT_MAX_out]
+      // (never reaches INT_MIN_out exactly), negating `addend` is safe
+      // without a separate clamp.
+      // For out_esize=4 (in=16), int64_t has 32-bit headroom for both
+      // operands and the difference, so a plain int64_t subtract +
+      // compare suffices. For out_esize=8 (in=32), the difference can
+      // overflow int64_t; use unsigned wrap + signed-overflow detection
+      // (different-sign operands, result sign matches the subtrahend).
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlsl: {
+        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+        int64_t int_max_out =
+            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+        int64_t int_min_out =
+            (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t sn = get_signed(src_n, i);
+          int64_t sm = get_signed(src_m, i);
+          int64_t addend;
+          if (sn == int_min_in && sm == int_min_in) {
+            addend = int_max_out;
+          } else {
+            addend = 2 * sn * sm;
+          }
+          // Sign-extend the existing accumulator lane to int64_t.
+          uint64_t acc_raw = get_accum(i);
+          int64_t acc;
+          if (out_esize == 8) {
+            acc = static_cast<int64_t>(acc_raw);
+          } else {
+            uint8_t shift = (8 - out_esize) * 8;
+            acc = static_cast<int64_t>(acc_raw << shift) >> shift;
+          }
+          int64_t diff;
+          if (out_esize == 8) {
+            uint64_t udiff = static_cast<uint64_t>(acc) - static_cast<uint64_t>(addend);
+            diff = static_cast<int64_t>(udiff);
+            // Signed subtraction overflows when the operands have
+            // different signs and the result's sign matches the
+            // subtrahend's sign.
+            bool a_neg = acc < 0;
+            bool b_neg = addend < 0;
+            bool d_neg = diff < 0;
+            if (a_neg != b_neg && d_neg == b_neg) {
+              diff = a_neg ? int_min_out : int_max_out;
+            }
+          } else {
+            diff = acc - addend;
+            if (diff > int_max_out) {
+              diff = int_max_out;
+            } else if (diff < int_min_out) {
+              diff = int_min_out;
+            }
+          }
+          set_result(i, static_cast<uint64_t>(diff));
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;

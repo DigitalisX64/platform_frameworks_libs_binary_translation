@@ -1002,6 +1002,95 @@ class Decoder {
     //   size=01,10 are RESERVED. Used by libz CRC32 acceleration.
     kPmull,
     // endregion
+    // region digitalis - narrowing high (add/sub of two wide vectors, take high
+    // half of each result lane, write to half-width destination).
+    //   ADDHN  / ADDHN2  : U=0, opcode=0100, round=0
+    //   RADDHN / RADDHN2 : U=1, opcode=0100, round=1<<(narrow_bits-1)
+    // size encodes narrow-elem width: 00->8b dest from .8h, 01->.4h from .4s,
+    // 10->.2s from .2d. size=11 reserved. Q=0 writes lower 64 bits of Vd
+    // (upper cleared); Q=1 writes upper 64 bits (lower preserved).
+    // llvm-mc verified encodings:
+    //   addhn   v0.8b,  v1.8h, v2.8h -> 0x0e224020 (size=00, Q=0, U=0)
+    //   addhn2  v0.16b, v1.8h, v2.8h -> 0x4e224020 (size=00, Q=1)
+    //   addhn   v0.4h,  v1.4s, v2.4s -> 0x0e624020 (size=01)
+    //   addhn   v0.2s,  v1.2d, v2.2d -> 0x0ea24020 (size=10)
+    //   raddhn  v0.8b,  v1.8h, v2.8h -> 0x2e224020 (U=1)
+    //   raddhn  v0.4h,  v1.4s, v2.4s -> 0x2e624020
+    //   raddhn  v0.2s,  v1.2d, v2.2d -> 0x2ea24020
+    kAddhn,
+    kRaddhn,
+    // endregion
+    // region digitalis - narrowing high subtract (subtract two wide vectors,
+    // take high half of each result lane, write to half-width destination).
+    //   SUBHN  / SUBHN2  : U=0, opcode=0110, round=0
+    //   RSUBHN / RSUBHN2 : U=1, opcode=0110, round=1<<(narrow_bits-1)
+    // size encodes narrow-elem width: 00->.8b from .8h, 01->.4h from .4s,
+    // 10->.2s from .2d. size=11 reserved. Q=0 writes lower 64 bits of Vd
+    // (upper cleared); Q=1 writes upper 64 bits (lower preserved).
+    // llvm-mc verified encodings:
+    //   subhn   v0.8b,  v1.8h, v2.8h -> 0x0e226020 (size=00, Q=0, U=0)
+    //   subhn2  v0.16b, v1.8h, v2.8h -> 0x4e226020 (size=00, Q=1)
+    //   subhn   v0.4h,  v1.4s, v2.4s -> 0x0e626020 (size=01)
+    //   subhn   v0.2s,  v1.2d, v2.2d -> 0x0ea26020 (size=10)
+    //   rsubhn  v0.8b,  v1.8h, v2.8h -> 0x2e226020 (U=1)
+    //   rsubhn  v0.4h,  v1.4s, v2.4s -> 0x2e626020
+    //   rsubhn  v0.2s,  v1.2d, v2.2d -> 0x2ea26020
+    kSubhn,
+    kRsubhn,
+    // endregion
+    // region digitalis - signed saturating doubling multiply long.
+    //   SQDMULL / SQDMULL2 : U=0, opcode=1101
+    // For each lane, signed multiply two narrow source elements and double
+    // the product. Saturate the result to the wide signed range; the only
+    // input pair that saturates is (INT_MIN, INT_MIN), which produces
+    // INT_MAX_out instead of -INT_MIN_out (which would overflow). size
+    // encodes narrow elem width: 01 -> .4s from .4h (in 16, out 32),
+    // 10 -> .2d from .2s (in 32, out 64). size=00 and size=11 are reserved
+    // for SQDMULL (size=11 is already rejected by the top-of-routine guard;
+    // size=00 is rejected explicitly in the opcode arm). Q=0 reads lower
+    // 64 bits of each source; Q=1 reads upper 64 bits. Wide result fully
+    // overwrites Vd.
+    // llvm-mc verified encodings:
+    //   sqdmull  v0.4s, v1.4h, v2.4h -> 0x0e62d020 (Q=0, size=01)
+    //   sqdmull2 v0.4s, v1.8h, v2.8h -> 0x4e62d020 (Q=1, size=01)
+    //   sqdmull  v0.2d, v1.2s, v2.2s -> 0x0ea2d020 (Q=0, size=10)
+    //   sqdmull2 v0.2d, v1.4s, v2.4s -> 0x4ea2d020 (Q=1, size=10)
+    kSqdmull,
+    // endregion
+    // region digitalis - signed saturating doubling multiply-accumulate long.
+    //   SQDMLAL / SQDMLAL2 : U=0, opcode=1001
+    // For each lane: addend = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
+    //   (first-stage saturation, identical to SQDMULL).
+    //                Vd_wide[i] = SignedSat(Vd_wide[i] + addend)
+    //   (second-stage saturation on the wide accumulate).
+    // size/Q semantics match SQDMULL: size=01 -> .4s from .4h, size=10 ->
+    // .2d from .2s; size=00 and size=11 are reserved. Q=0 reads lower
+    // 64 bits of each source; Q=1 reads upper 64 bits. Vd is read-modify-
+    // write (wide accumulator) rather than fully overwritten.
+    // llvm-mc verified encodings:
+    //   sqdmlal  v0.4s, v1.4h, v2.4h -> 0x0e629020 (Q=0, size=01)
+    //   sqdmlal2 v0.4s, v1.8h, v2.8h -> 0x4e629020 (Q=1, size=01)
+    //   sqdmlal  v0.2d, v1.2s, v2.2s -> 0x0ea29020 (Q=0, size=10)
+    //   sqdmlal2 v0.2d, v1.4s, v2.4s -> 0x4ea29020 (Q=1, size=10)
+    kSqdmlal,
+    // endregion
+    // region digitalis - signed saturating doubling multiply-subtract long.
+    //   SQDMLSL / SQDMLSL2 : U=0, opcode=1011
+    // For each lane: addend = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
+    //   (first-stage saturation, identical to SQDMULL/SQDMLAL).
+    //                Vd_wide[i] = SignedSat(Vd_wide[i] - addend)
+    //   (second-stage saturation on the wide accumulate subtract).
+    // size/Q semantics match SQDMULL/SQDMLAL: size=01 -> .4s from .4h,
+    // size=10 -> .2d from .2s; size=00 and size=11 are reserved. Q=0 reads
+    // lower 64 bits of each source; Q=1 reads upper 64 bits. Vd is
+    // read-modify-write (wide accumulator) rather than fully overwritten.
+    // llvm-mc verified encodings:
+    //   sqdmlsl  v0.4s, v1.4h, v2.4h -> 0x0e62b020 (Q=0, size=01)
+    //   sqdmlsl2 v0.4s, v1.8h, v2.8h -> 0x4e62b020 (Q=1, size=01)
+    //   sqdmlsl  v0.2d, v1.2s, v2.2s -> 0x0ea2b020 (Q=0, size=10)
+    //   sqdmlsl2 v0.2d, v1.4s, v2.4s -> 0x4ea2b020 (Q=1, size=10)
+    kSqdmlsl,
+    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -4445,9 +4534,54 @@ class Decoder {
       case 0b0010:
         op = u ? AdvSimdThreeDiffOpcode::kUsubl : AdvSimdThreeDiffOpcode::kSsubl;
         break;
+      // region digitalis - narrowing high: ADDHN/ADDHN2 (U=0), RADDHN/RADDHN2 (U=1).
+      // size=11 already rejected above.
+      case 0b0100:
+        op = u ? AdvSimdThreeDiffOpcode::kRaddhn : AdvSimdThreeDiffOpcode::kAddhn;
+        break;
+      // endregion
       case 0b0101:
         op = u ? AdvSimdThreeDiffOpcode::kUabal : AdvSimdThreeDiffOpcode::kSabal;
         break;
+      // region digitalis - narrowing high subtract: SUBHN/SUBHN2 (U=0),
+      // RSUBHN/RSUBHN2 (U=1). size=11 already rejected above.
+      case 0b0110:
+        op = u ? AdvSimdThreeDiffOpcode::kRsubhn : AdvSimdThreeDiffOpcode::kSubhn;
+        break;
+      // endregion
+      // region digitalis - signed saturating doubling multiply long:
+      // SQDMULL / SQDMULL2 (U=0, opcode=1101). U=1 with opcode=1101 is
+      // unallocated. size=00 is reserved (only halfword and word inputs
+      // are defined); size=11 is already rejected by the top-of-routine
+      // size guard.
+      case 0b1101:
+        if (u != 0) { Undefined(); return; }
+        if (size == 0b00) { Undefined(); return; }
+        op = AdvSimdThreeDiffOpcode::kSqdmull;
+        break;
+      // endregion
+      // region digitalis - signed saturating doubling multiply-accumulate
+      // long: SQDMLAL / SQDMLAL2 (U=0, opcode=1001). U=1 with opcode=1001
+      // is unallocated. size=00 is reserved (only halfword and word inputs
+      // are defined); size=11 is already rejected by the top-of-routine
+      // size guard.
+      case 0b1001:
+        if (u != 0) { Undefined(); return; }
+        if (size == 0b00) { Undefined(); return; }
+        op = AdvSimdThreeDiffOpcode::kSqdmlal;
+        break;
+      // endregion
+      // region digitalis - signed saturating doubling multiply-subtract
+      // long: SQDMLSL / SQDMLSL2 (U=0, opcode=1011). U=1 with opcode=1011
+      // is unallocated. size=00 is reserved (only halfword and word inputs
+      // are defined); size=11 is already rejected by the top-of-routine
+      // size guard.
+      case 0b1011:
+        if (u != 0) { Undefined(); return; }
+        if (size == 0b00) { Undefined(); return; }
+        op = AdvSimdThreeDiffOpcode::kSqdmlsl;
+        break;
+      // endregion
       case 0b0111:
         op = u ? AdvSimdThreeDiffOpcode::kUabdl : AdvSimdThreeDiffOpcode::kSabdl;
         break;
