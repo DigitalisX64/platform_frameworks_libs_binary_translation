@@ -909,6 +909,13 @@ class Decoder {
                 // -> +1.5 saturation, used as Newton-Raphson refinement after
                 // FRSQRTE.  Interpreter-only.
     // endregion
+    // region digitalis - SABD/UABD: vector absolute difference at .8b/.16b/
+    // .4h/.8h/.2s/.4s. size=11 (64-bit lane) is reserved.  Verified with
+    // llvm-mc:  sabd v0.8b,v1.8b,v2.8b = 0x0e227420 (opcode=01110, U=0);
+    //           uabd v0.8b,v1.8b,v2.8b = 0x2e227420 (opcode=01110, U=1).
+    kSabd,      // SABD (vector): U=0, opcode=01110
+    kUabd,      // UABD (vector): U=1, opcode=01110
+    // endregion
     // endregion
   };
 
@@ -4209,6 +4216,10 @@ class Decoder {
       op = u ? AdvSimdThreeSameOpcode::kUmaxp : AdvSimdThreeSameOpcode::kSmaxp;
     } else if (opcode == 0b10101) {
       op = u ? AdvSimdThreeSameOpcode::kUminp : AdvSimdThreeSameOpcode::kSminp;
+    } else if (opcode == 0b01110) {
+      // SABD/UABD: absolute-difference vector. size=11 reserved.
+      if (size == 0b11) { Undefined(); return; }
+      op = u ? AdvSimdThreeSameOpcode::kUabd : AdvSimdThreeSameOpcode::kSabd;
     } else if ((opcode & 0b11000) == 0b11000) {
       // FP three-same (vector). bits[23] = op_high, bits[22] = sz.
       // The 'size' field as read above is {op_high, sz} for this encoding;

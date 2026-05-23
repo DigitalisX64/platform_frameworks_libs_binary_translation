@@ -3928,6 +3928,25 @@ class Interpreter {
             });
         break;
 
+      // region digitalis - SABD/UABD: absolute-difference vector.
+      // Signed: |a - b| computed via the sign of the difference; for
+      // INT_MIN inputs the difference fits in int64_t after sign-extension
+      // because esize is at most 4 (32-bit lanes).
+      case Decoder::AdvSimdThreeSameOpcode::kSabd:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t {
+              int64_t d = a - b;
+              return d < 0 ? -d : d;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUabd:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return a > b ? (a - b) : (b - a);
+            });
+        break;
+      // endregion
+
       // --- Halving add/sub ---
       case Decoder::AdvSimdThreeSameOpcode::kShadd:
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
