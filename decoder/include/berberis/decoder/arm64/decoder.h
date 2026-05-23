@@ -4906,18 +4906,19 @@ class Decoder {
         op = u ? AdvSimdTwoRegMiscOpcode::kNeg : AdvSimdTwoRegMiscOpcode::kAbs;
         break;
       case 0b10010:
-        if (u) { Undefined(); return; }
-        op = AdvSimdTwoRegMiscOpcode::kXtn;
+        // region digitalis - opcode=10010 splits on U: XTN (U=0) / SQXTUN (U=1).
+        // Sizes 00/01/10 are valid; size=11 has no encoded narrow form for SQXTUN.
+        // XTN at size=11 already routes to Undefined via the existing dispatch in
+        // DecodeAdvSimd that gates on the Q/size combination, but we gate here too
+        // for the SQXTUN arm to mirror the ARM ARM.
+        if (u) {
+          if (size == 0b11) { Undefined(); return; }
+          op = AdvSimdTwoRegMiscOpcode::kSqxtun;
+        } else {
+          op = AdvSimdTwoRegMiscOpcode::kXtn;
+        }
         break;
-      // region digitalis - SQXTUN/SQXTUN2 at opcode 10011 (U=1 only).
-      // Sizes 00/01/10 are valid; size=11 has no encoded narrow form.
-      // U=0 with opcode=10011 is unallocated.
-      case 0b10011:
-        if (!u) { Undefined(); return; }
-        if (size == 0b11) { Undefined(); return; }
-        op = AdvSimdTwoRegMiscOpcode::kSqxtun;
-        break;
-      // endregion
+        // endregion
       case 0b10100:
         if (u) {
           op = AdvSimdTwoRegMiscOpcode::kUqxtn;
