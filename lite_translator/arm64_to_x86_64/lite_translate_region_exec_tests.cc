@@ -7475,6 +7475,121 @@ TEST_F(Arm64LiteTranslateRegionTest, FmovScalarDoubleZeroExtends) {
               sizeof(hi64));
   EXPECT_EQ(hi64, 0u);
 }
+
+// Scalar FRINT{N,M,P,Z} encodings cross-verified with
+// `aarch64-linux-gnu-as`:
+//   1e244041 frintn s1, s2 / 1e644041 frintn d1, d2  (ties-to-even, RNE)
+//   1e254041 frintm s1, s2 / 1e654041 frintm d1, d2  (toward -inf)
+//   1e24c041 frintp s1, s2 / 1e64c041 frintp d1, d2  (toward +inf)
+//   1e25c041 frintz s1, s2 / 1e65c041 frintz d1, d2  (toward zero)
+// The JIT path at `lite_translator.h:8001` lowers these via
+// ROUNDSS/ROUNDSD imm[1:0]={00,01,10,11} respectively (bit 2 forced
+// clear; Berberis does not sync MXCSR.RC with FPCR.RMode).
+constexpr uint32_t FrintnS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E244000, rd, rn);
+}
+constexpr uint32_t FrintnD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E644000, rd, rn);
+}
+constexpr uint32_t FrintmS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E254000, rd, rn);
+}
+constexpr uint32_t FrintpS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E24C000, rd, rn);
+}
+constexpr uint32_t FrintzS(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E25C000, rd, rn);
+}
+constexpr uint32_t FrintzD(uint8_t rd, uint8_t rn) {
+  return FpUnaryScalar(0x1E65C000, rd, rn);
+}
+
+// FRINTN S — RNE rounds 2.5 -> 2.0 (banker's rounding).
+TEST_F(Arm64LiteTranslateRegionTest, FrintnSTiesToEvenDown) {
+  StoreFp32(state_.cpu, 1, 2.5f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FrintnS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.0f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+// FRINTN S — RNE rounds 3.5 -> 4.0 (banker's rounding, opposite parity).
+TEST_F(Arm64LiteTranslateRegionTest, FrintnSTiesToEvenUp) {
+  StoreFp32(state_.cpu, 1, 3.5f);
+  static const uint32_t code[] = {FrintnS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 4.0f);
+}
+
+// FRINTN D — same banker's-rounding behavior at FP64.
+TEST_F(Arm64LiteTranslateRegionTest, FrintnDTiesToEvenDown) {
+  StoreFp64(state_.cpu, 1, 0.5);
+  static const uint32_t code[] = {FrintnD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 0.0);
+}
+
+// FRINTM S — toward -inf: 1.7 -> 1.0 and -1.2 -> -2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrintmSPositive) {
+  StoreFp32(state_.cpu, 1, 1.7f);
+  static const uint32_t code[] = {FrintmS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintmSNegative) {
+  StoreFp32(state_.cpu, 1, -1.2f);
+  static const uint32_t code[] = {FrintmS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -2.0f);
+}
+
+// FRINTP S — toward +inf: 1.2 -> 2.0 and -1.7 -> -1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrintpSPositive) {
+  StoreFp32(state_.cpu, 1, 1.2f);
+  static const uint32_t code[] = {FrintpS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 2.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintpSNegative) {
+  StoreFp32(state_.cpu, 1, -1.7f);
+  static const uint32_t code[] = {FrintpS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -1.0f);
+}
+
+// FRINTZ S — truncate toward zero: 1.7 -> 1.0 and -1.7 -> -1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrintzSPositive) {
+  StoreFp32(state_.cpu, 1, 1.7f);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FrintzS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), 1.0f);
+  uint64_t hi64;
+  std::memcpy(&hi64, reinterpret_cast<const char*>(&state_.cpu.v[0]) + 8,
+              sizeof(hi64));
+  EXPECT_EQ(hi64, 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FrintzSNegative) {
+  StoreFp32(state_.cpu, 1, -1.7f);
+  static const uint32_t code[] = {FrintzS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp32(state_.cpu, 0), -1.0f);
+}
+
+// FRINTZ D — truncation at FP64.
+TEST_F(Arm64LiteTranslateRegionTest, FrintzDPositive) {
+  StoreFp64(state_.cpu, 1, 3.9);
+  static const uint32_t code[] = {FrintzD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.0);
+}
 // endregion
 
 // region digitalis - FP scalar arithmetic edges
