@@ -493,6 +493,13 @@ class Interpreter {
       case Decoder::SystemReg::kFpcr:
         return state_->cpu.cached_fpcr;
       case Decoder::SystemReg::kFpsr:
+        // region digitalis: Plan §L1 — host MXCSR cumulative exception
+        // bits set by any FP op (interpreter OR JIT-emitted) reflect into
+        // emulated_fpsr at MRS-read time. MXCSR bits are sticky on x86
+        // (just like FPSR is on ARM), so this lazy mirror is sufficient
+        // for cumulative-flag semantics without per-op JIT instrumentation.
+        MirrorHostMxcsrToFpsr();
+        // endregion
         return state_->cpu.emulated_fpsr;
       // region digitalis
       case Decoder::SystemReg::kCtrEl0:
@@ -553,6 +560,11 @@ class Interpreter {
         break;
       case Decoder::SystemReg::kFpsr:
         state_->cpu.emulated_fpsr = static_cast<uint32_t>(value);
+        // region digitalis: Plan §L1 — clear host MXCSR cumulative exception
+        // bits when guest writes FPSR. Without this, future MRS-reads would
+        // re-merge stale MXCSR bits that the guest believed it had cleared.
+        ClearHostMxcsrExceptions();
+        // endregion
         break;
       default:
         Undefined();
@@ -8295,6 +8307,53 @@ class Interpreter {
     asm volatile("ldmxcsr %0" : : "m"(mxcsr));
 #else
     (void)fpcr;
+#endif
+  }
+
+  // Clear the host x86 MXCSR cumulative exception flags (bits 0-5: IE/DE/ZE/
+  // OE/UE/PE). Plan §L1: called from the kFpsr MSR write case so that a
+  // guest-side FPSR clear also resets the host sticky bits — otherwise the
+  // next MRS read would re-mirror stale exceptions the guest believed
+  // cleared.
+  static void ClearHostMxcsrExceptions() {
+#if defined(__x86_64__)
+    uint32_t mxcsr;
+    asm volatile("stmxcsr %0" : "=m"(mxcsr));
+    mxcsr &= ~0b111111u;
+    asm volatile("ldmxcsr %0" : : "m"(mxcsr));
+#endif
+  }
+
+  // Read host x86 MXCSR cumulative exception flags, map them to ARM FPSR
+  // bit positions, and OR (cumulatively) into emulated_fpsr. Plan §L1:
+  // called from the kFpsr MRS read case (lazy mirror). MXCSR sticky bits
+  // accumulate across all host FP ops — both interpreter and JIT-emitted —
+  // so this single readback at MRS time captures the full cumulative
+  // exception state without per-op JIT instrumentation.
+  //
+  //   MXCSR[0] IE (invalid)   -> FPSR[0] IOC
+  //   MXCSR[1] DE (denormal)  -> FPSR[7] IDC
+  //   MXCSR[2] ZE (div-zero)  -> FPSR[1] DZC
+  //   MXCSR[3] OE (overflow)  -> FPSR[2] OFC
+  //   MXCSR[4] UE (underflow) -> FPSR[3] UFC
+  //   MXCSR[5] PE (inexact)   -> FPSR[4] IXC
+  //
+  // Bit positions per ARM ARM C5.2.8 (FPSR) and Intel SDM 11.6.6 (MXCSR).
+  // The flags are sticky on both architectures, so OR-into matches the
+  // cumulative ARM semantics naturally.
+  void MirrorHostMxcsrToFpsr() {
+#if defined(__x86_64__)
+    uint32_t mxcsr;
+    asm volatile("stmxcsr %0" : "=m"(mxcsr));
+    uint32_t exc = mxcsr & 0b111111u;
+    uint32_t fpsr_add =
+        (((exc >> 0) & 1u) << 0) |   // IE -> IOC
+        (((exc >> 1) & 1u) << 7) |   // DE -> IDC
+        (((exc >> 2) & 1u) << 1) |   // ZE -> DZC
+        (((exc >> 3) & 1u) << 2) |   // OE -> OFC
+        (((exc >> 4) & 1u) << 3) |   // UE -> UFC
+        (((exc >> 5) & 1u) << 4);    // PE -> IXC
+    state_->cpu.emulated_fpsr |= fpsr_add;
 #endif
   }
 
