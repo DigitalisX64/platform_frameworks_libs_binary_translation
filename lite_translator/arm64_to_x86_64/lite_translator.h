@@ -7764,6 +7764,59 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xz);
         return;
       }
+      // CNT V.16B / V.8B -- per-byte population count (set-bit count).
+      // Lowering: Mula-Wojcik nibble-LUT via PSHUFB.
+      //   table = {0,1,1,2, 1,2,2,3, 1,2,2,3, 2,3,3,4}  (popcount per nibble)
+      //   low_nibbles  = Vn & 0x0F
+      //   high_nibbles = (Vn >> 4) & 0x0F        (PSRLW shifts by word; mask
+      //                                           keeps just the nibble we want)
+      //   Vd = PSHUFB(table, low_nibbles) + PSHUFB(table, high_nibbles)
+      // CNT has only one encoded size (size=00 → 8B/16B); any other size is
+      // unallocated and never reaches this case via the decoder, but bail
+      // defensively just in case.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCnt: {
+        if (args.size != 0b00) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xt_hi = AllocTempSimdReg();
+        SimdRegister xtable_lo = AllocTempSimdReg();
+        SimdRegister xtable_hi = AllocTempSimdReg();
+        SimdRegister xmask = AllocTempSimdReg();
+        if (xn == no_simd_register || xt_hi == no_simd_register ||
+            xtable_lo == no_simd_register || xtable_hi == no_simd_register ||
+            xmask == no_simd_register) {
+          success_ = false; return;
+        }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        // Build the popcount nibble table:
+        //   bytes  0..7 = {0,1,1,2,1,2,2,3} → 0x0302020102010100 (little-endian)
+        //   bytes  8..15= {1,2,2,3,2,3,3,4} → 0x0403030203020201
+        as_.Movq(r1, static_cast<int64_t>(0x0302020102010100LL));
+        as_.Movq(xtable_lo, r1);
+        as_.Movq(r1, static_cast<int64_t>(0x0403030203020201LL));
+        as_.Pinsrq(xtable_lo, r1, int8_t{1});
+        // We need the table twice (PSHUFB is destructive); keep a second copy.
+        as_.Movdqa(xtable_hi, xtable_lo);
+        // Build the 0x0F low-nibble mask, broadcast to all 16 bytes.
+        as_.Movq(r1, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+        as_.Movq(xmask, r1);
+        as_.Punpcklqdq(xmask, xmask);
+        // Load Vn; split into low and high nibbles.
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqa(xt_hi, xn);
+        as_.Psrlw(xt_hi, int8_t{4});   // shift 16-bit lanes right by 4
+        as_.Pand(xt_hi, xmask);        // keep low nibble of each byte
+        as_.Pand(xn, xmask);
+        // PSHUFB(dst, src): for each byte i, dst[i] = dst[src[i] & 0x0F] (if
+        // src[i] high bit clear). After PAND with 0x0F the high bits are 0, so
+        // the table is indexed by the nibble value directly.
+        as_.Pshufb(xtable_lo, xn);
+        as_.Pshufb(xtable_hi, xt_hi);
+        as_.Paddb(xtable_lo, xtable_hi);
+        if (!args.q) mask_low64(xtable_lo);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xtable_lo);
+        return;
+      }
       // NOT V.16B / V.8B  -- per-lane bitwise NOT: Vd = ~Vn.
       // The decoder routes opcode=00101+U=1 to kNot for both size=00 (NOT) and
       // size=01 (RBIT); only NOT (size=00) has a trivial x86 lowering.  RBIT
