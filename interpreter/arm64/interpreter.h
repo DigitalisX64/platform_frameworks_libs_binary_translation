@@ -493,6 +493,13 @@ class Interpreter {
       case Decoder::SystemReg::kFpcr:
         return state_->cpu.cached_fpcr;
       case Decoder::SystemReg::kFpsr:
+        // region digitalis: Plan §L1 — host MXCSR cumulative exception
+        // bits set by any FP op (interpreter OR JIT-emitted) reflect into
+        // emulated_fpsr at MRS-read time. MXCSR bits are sticky on x86
+        // (just like FPSR is on ARM), so this lazy mirror is sufficient
+        // for cumulative-flag semantics without per-op JIT instrumentation.
+        MirrorHostMxcsrToFpsr();
+        // endregion
         return state_->cpu.emulated_fpsr;
       // region digitalis
       case Decoder::SystemReg::kCtrEl0:
@@ -534,9 +541,30 @@ class Interpreter {
       }
       case Decoder::SystemReg::kFpcr:
         state_->cpu.cached_fpcr = static_cast<uint32_t>(value);
+        // region digitalis
+        // Mirror the ARM FPCR rounding-mode and flush-to-zero bits into the
+        // host x86 MXCSR so subsequent interpreted FP ops observe the guest-
+        // requested rounding mode and denormal behaviour. ARM RMode at
+        // FPCR[23:22] maps to MXCSR[14:13] (RC) with a bit-swap because ARM
+        // encodes RP/RM = 01/10 while x86 encodes RD/RU = 01/10 (round-toward-
+        // positive on ARM is the same direction as round-up on x86, but the
+        // 2-bit field encoding is the inverse). ARM FZ at FPCR[24] flushes
+        // both input and output denormals, so it maps to BOTH MXCSR FTZ
+        // (bit 15, output flush) and MXCSR DAZ (bit 6, input flush). Other
+        // FPCR fields (DN, AHP, exception enables, FZ16) have no clean x86
+        // analog; exception enables are intentionally left masked so host FP
+        // never raises SIGFPE. This is the foundation for §L1 — per-op
+        // MXCSR->FPSR cumulative-flag mirroring is a follow-up.
+        ProgramHostMxcsrFromFpcr(static_cast<uint32_t>(value));
+        // endregion
         break;
       case Decoder::SystemReg::kFpsr:
         state_->cpu.emulated_fpsr = static_cast<uint32_t>(value);
+        // region digitalis: Plan §L1 — clear host MXCSR cumulative exception
+        // bits when guest writes FPSR. Without this, future MRS-reads would
+        // re-merge stale MXCSR bits that the guest believed it had cleared.
+        ClearHostMxcsrExceptions();
+        // endregion
         break;
       default:
         Undefined();
@@ -1837,28 +1865,40 @@ class Interpreter {
           set_result(i, static_cast<uint64_t>(get_signed(src_n, i) - get_signed(src_m, i)));
         }
         break;
+      // region digitalis - widening multiply-accumulate / multiply-subtract.
+      // Four arms parameterized by (is_signed, is_sub). Encodings differ only
+      // in U (bit29: signed/unsigned) and bit13 (op: add/sub); decoder maps to
+      // distinct enum values. Wraparound is the defined behaviour for both
+      // signed and unsigned widening multiply-accumulate, so the unsigned
+      // accumulator add/sub (well-defined mod 2^64) yields the same bit
+      // pattern as the original signed-then-cast code without the UB risk on
+      // signed overflow. Same fan-in shape as the SADDW/SSUBW/UADDW/USUBW arm
+      // at line 1904 (four-way (is_signed, is_sub) fan-in) and the SQDMLAL +
+      // SQDMLSL collapse below.
       case Decoder::AdvSimdThreeDiffOpcode::kUmlal:
-        for (uint8_t i = 0; i < num_elements; i++) {
-          set_result(i, get_accum(i) + get_unsigned(src_n, i) * get_unsigned(src_m, i));
-        }
-        break;
       case Decoder::AdvSimdThreeDiffOpcode::kSmlal:
-        for (uint8_t i = 0; i < num_elements; i++) {
-          int64_t prod = get_signed(src_n, i) * get_signed(src_m, i);
-          set_result(i, static_cast<uint64_t>(static_cast<int64_t>(get_accum(i)) + prod));
-        }
-        break;
       case Decoder::AdvSimdThreeDiffOpcode::kUmlsl:
+      case Decoder::AdvSimdThreeDiffOpcode::kSmlsl: {
+        bool is_signed = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSmlal ||
+                          args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSmlsl);
+        bool is_sub    = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kUmlsl ||
+                          args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSmlsl);
         for (uint8_t i = 0; i < num_elements; i++) {
-          set_result(i, get_accum(i) - get_unsigned(src_n, i) * get_unsigned(src_m, i));
+          uint64_t prod;
+          if (is_signed) {
+            // get_signed sign-extends from in_esize to int64_t. For all
+            // supported in_esize (1, 2, 4), |sn * sm| <= 2^62, so the signed
+            // multiplication never overflows int64_t.
+            prod = static_cast<uint64_t>(get_signed(src_n, i) * get_signed(src_m, i));
+          } else {
+            prod = get_unsigned(src_n, i) * get_unsigned(src_m, i);
+          }
+          uint64_t accum = get_accum(i);
+          set_result(i, is_sub ? accum - prod : accum + prod);
         }
         break;
-      case Decoder::AdvSimdThreeDiffOpcode::kSmlsl:
-        for (uint8_t i = 0; i < num_elements; i++) {
-          int64_t prod = get_signed(src_n, i) * get_signed(src_m, i);
-          set_result(i, static_cast<uint64_t>(static_cast<int64_t>(get_accum(i)) - prod));
-        }
-        break;
+      }
+      // endregion
       case Decoder::AdvSimdThreeDiffOpcode::kUmull:
         for (uint8_t i = 0; i < num_elements; i++) {
           set_result(i, get_unsigned(src_n, i) * get_unsigned(src_m, i));
@@ -2024,20 +2064,30 @@ class Interpreter {
         break;
       }
       // endregion
-      // region digitalis - signed saturating doubling multiply-accumulate
-      // long: Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2*sn*sm)).
+      // region digitalis - signed saturating doubling multiply-accumulate /
+      // multiply-subtract long:
+      //   SQDMLAL: Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2*sn*sm)).
+      //   SQDMLSL: Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2*sn*sm)).
       // Two stages of saturation:
       //   (1) compute the doubled product with input-based saturation
       //       (same as kSqdmull; only (INT_MIN_in, INT_MIN_in) saturates,
       //       to INT_MAX_out);
-      //   (2) saturate the wide signed accumulator add against the
-      //       wide signed range [INT_MIN_out, INT_MAX_out].
+      //   (2) saturate the wide signed accumulator add (SQDMLAL) or
+      //       subtract (SQDMLSL) against the wide signed range
+      //       [INT_MIN_out, INT_MAX_out].
+      // SQDMLSL is folded into the SQDMLAL path by negating `addend`,
+      // which is safe because stage-1 output range is
+      // [INT_MIN_out+1, INT_MAX_out] (never reaches INT_MIN_out exactly,
+      // since 2*sn*sm = INT_MIN_out would require |sn*sm| = 2^(out_bits-1)
+      // which is unreachable from the narrower input range).
       // For out_esize=4 (in=16), int64_t has 32-bit headroom for both
       // operands and the sum, so a plain int64_t add + compare suffices.
       // For out_esize=8 (in=32), the sum can overflow int64_t; use
       // unsigned wrap + signed-overflow detection (same-sign operands,
       // result sign differs).
-      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlal: {
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlal:
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlsl: {
+        bool is_sub = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSqdmlsl);
         int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
         int64_t int_max_out =
             (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
@@ -2051,6 +2101,9 @@ class Interpreter {
             addend = int_max_out;
           } else {
             addend = 2 * sn * sm;
+          }
+          if (is_sub) {
+            addend = -addend;
           }
           // Sign-extend the existing accumulator lane to int64_t.
           uint64_t acc_raw = get_accum(i);
@@ -2080,68 +2133,6 @@ class Interpreter {
             }
           }
           set_result(i, static_cast<uint64_t>(sum));
-        }
-        break;
-      }
-      // endregion
-      // region digitalis - signed saturating doubling multiply-subtract
-      // long: Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2*sn*sm)).
-      // Same two-stage saturation as SQDMLAL with sign flipped on the
-      // second-stage accumulate. Stage 1 is identical to SQDMULL/SQDMLAL;
-      // since the SQDMULL output range is [INT_MIN_out+1, INT_MAX_out]
-      // (never reaches INT_MIN_out exactly), negating `addend` is safe
-      // without a separate clamp.
-      // For out_esize=4 (in=16), int64_t has 32-bit headroom for both
-      // operands and the difference, so a plain int64_t subtract +
-      // compare suffices. For out_esize=8 (in=32), the difference can
-      // overflow int64_t; use unsigned wrap + signed-overflow detection
-      // (different-sign operands, result sign matches the subtrahend).
-      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlsl: {
-        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
-        int64_t int_max_out =
-            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
-        int64_t int_min_out =
-            (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
-        for (uint8_t i = 0; i < num_elements; i++) {
-          int64_t sn = get_signed(src_n, i);
-          int64_t sm = get_signed(src_m, i);
-          int64_t addend;
-          if (sn == int_min_in && sm == int_min_in) {
-            addend = int_max_out;
-          } else {
-            addend = 2 * sn * sm;
-          }
-          // Sign-extend the existing accumulator lane to int64_t.
-          uint64_t acc_raw = get_accum(i);
-          int64_t acc;
-          if (out_esize == 8) {
-            acc = static_cast<int64_t>(acc_raw);
-          } else {
-            uint8_t shift = (8 - out_esize) * 8;
-            acc = static_cast<int64_t>(acc_raw << shift) >> shift;
-          }
-          int64_t diff;
-          if (out_esize == 8) {
-            uint64_t udiff = static_cast<uint64_t>(acc) - static_cast<uint64_t>(addend);
-            diff = static_cast<int64_t>(udiff);
-            // Signed subtraction overflows when the operands have
-            // different signs and the result's sign matches the
-            // subtrahend's sign.
-            bool a_neg = acc < 0;
-            bool b_neg = addend < 0;
-            bool d_neg = diff < 0;
-            if (a_neg != b_neg && d_neg == b_neg) {
-              diff = a_neg ? int_min_out : int_max_out;
-            }
-          } else {
-            diff = acc - addend;
-            if (diff > int_max_out) {
-              diff = int_max_out;
-            } else if (diff < int_min_out) {
-              diff = int_min_out;
-            }
-          }
-          set_result(i, static_cast<uint64_t>(diff));
         }
         break;
       }
@@ -8281,6 +8272,91 @@ class Interpreter {
 
  private:
   // region digitalis
+  // Program host x86 MXCSR rounding mode + FTZ/DAZ from an ARM FPCR value.
+  // Plan §L1 (FP exception flags) infrastructure: writing FPCR via MSR must
+  // program MXCSR rounding mode + DAZ/FTZ. Called from the kFpcr MSR case.
+  //
+  //   ARM FPCR[23:22] RMode: 00=RNE, 01=RP(+inf), 10=RM(-inf), 11=RZ
+  //   x86 MXCSR[14:13] RC:   00=RNE, 01=RD(-inf), 10=RU(+inf), 11=RZ
+  //
+  // The middle two encodings are swapped, so a 4-entry lookup table is the
+  // clearest mapping. FZ -> FTZ+DAZ because ARM FZ flushes both inputs and
+  // outputs, while x86 splits the two into separate bits. Exception masks
+  // (MXCSR bits 7-12) are forced to 1 so host FP never raises SIGFPE; we
+  // emulate exception flag reporting via emulated_fpsr instead. Other FPCR
+  // fields (DN, AHP, IDE/IXE/.../IOE, FZ16) have no clean x86 analog.
+  static void ProgramHostMxcsrFromFpcr(uint32_t fpcr) {
+#if defined(__x86_64__)
+    uint32_t mxcsr;
+    asm volatile("stmxcsr %0" : "=m"(mxcsr));
+    // Clear RC (bits 13-14), FTZ (bit 15), DAZ (bit 6).
+    mxcsr &= ~((0b11u << 13) | (1u << 15) | (1u << 6));
+    // Force all exception masks set (bits 7-12) so host FP doesn't trap.
+    mxcsr |= (0b111111u << 7);
+    static constexpr uint8_t kArmRmodeToX86Rc[4] = {
+        0b00,  // ARM RNE  -> x86 RNE
+        0b10,  // ARM RP   -> x86 RU
+        0b01,  // ARM RM   -> x86 RD
+        0b11,  // ARM RZ   -> x86 RZ
+    };
+    uint32_t arm_rmode = (fpcr >> 22) & 0b11;
+    mxcsr |= static_cast<uint32_t>(kArmRmodeToX86Rc[arm_rmode]) << 13;
+    if (fpcr & (1u << 24)) {  // FPCR.FZ
+      mxcsr |= (1u << 15) | (1u << 6);
+    }
+    asm volatile("ldmxcsr %0" : : "m"(mxcsr));
+#else
+    (void)fpcr;
+#endif
+  }
+
+  // Clear the host x86 MXCSR cumulative exception flags (bits 0-5: IE/DE/ZE/
+  // OE/UE/PE). Plan §L1: called from the kFpsr MSR write case so that a
+  // guest-side FPSR clear also resets the host sticky bits — otherwise the
+  // next MRS read would re-mirror stale exceptions the guest believed
+  // cleared.
+  static void ClearHostMxcsrExceptions() {
+#if defined(__x86_64__)
+    uint32_t mxcsr;
+    asm volatile("stmxcsr %0" : "=m"(mxcsr));
+    mxcsr &= ~0b111111u;
+    asm volatile("ldmxcsr %0" : : "m"(mxcsr));
+#endif
+  }
+
+  // Read host x86 MXCSR cumulative exception flags, map them to ARM FPSR
+  // bit positions, and OR (cumulatively) into emulated_fpsr. Plan §L1:
+  // called from the kFpsr MRS read case (lazy mirror). MXCSR sticky bits
+  // accumulate across all host FP ops — both interpreter and JIT-emitted —
+  // so this single readback at MRS time captures the full cumulative
+  // exception state without per-op JIT instrumentation.
+  //
+  //   MXCSR[0] IE (invalid)   -> FPSR[0] IOC
+  //   MXCSR[1] DE (denormal)  -> FPSR[7] IDC
+  //   MXCSR[2] ZE (div-zero)  -> FPSR[1] DZC
+  //   MXCSR[3] OE (overflow)  -> FPSR[2] OFC
+  //   MXCSR[4] UE (underflow) -> FPSR[3] UFC
+  //   MXCSR[5] PE (inexact)   -> FPSR[4] IXC
+  //
+  // Bit positions per ARM ARM C5.2.8 (FPSR) and Intel SDM 11.6.6 (MXCSR).
+  // The flags are sticky on both architectures, so OR-into matches the
+  // cumulative ARM semantics naturally.
+  void MirrorHostMxcsrToFpsr() {
+#if defined(__x86_64__)
+    uint32_t mxcsr;
+    asm volatile("stmxcsr %0" : "=m"(mxcsr));
+    uint32_t exc = mxcsr & 0b111111u;
+    uint32_t fpsr_add =
+        (((exc >> 0) & 1u) << 0) |   // IE -> IOC
+        (((exc >> 1) & 1u) << 7) |   // DE -> IDC
+        (((exc >> 2) & 1u) << 1) |   // ZE -> DZC
+        (((exc >> 3) & 1u) << 2) |   // OE -> OFC
+        (((exc >> 4) & 1u) << 3) |   // UE -> UFC
+        (((exc >> 5) & 1u) << 4);    // PE -> IXC
+    state_->cpu.emulated_fpsr |= fpsr_add;
+#endif
+  }
+
   // Compute element mask: all-ones for element of esize bytes.
   // Avoids UB from (1ULL << 64) when esize == 8.
   static uint64_t ElementMask(uint8_t esize) {
