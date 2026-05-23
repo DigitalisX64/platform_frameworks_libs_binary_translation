@@ -10869,6 +10869,76 @@ TEST_F(Arm64LiteTranslateRegionTest, ExtVec16BIdx15OddImm) {
 }
 // endregion
 
+// region digitalis: DUP (general) q=0 vector JIT
+// DUP Vd.8B, Wn / DUP Vd.2S, Wn — broadcast a GP register to the lower
+// 64 bits of Vd and zero the upper 64 bits per ARM D-register semantics.
+// The Q=1 forms (.16B / .4S / .2D) are already covered by MemsetPattern
+// and friends; these tests pin the new Q=0 path including the shared
+// PSLLDQ-8 / PSRLDQ-8 upper-zero tail.
+constexpr uint32_t kDupGenVec8B_W0 = 0x0e010c00;  // dup v0.8b, w0
+constexpr uint32_t kDupGenVec8B_W7 = 0x0e010ce0;  // dup v0.8b, w7
+constexpr uint32_t kDupGenVec2S_W0 = 0x0e040c00;  // dup v0.2s, w0
+constexpr uint32_t kDupGenVec2S_W7 = 0x0e040ce0;  // dup v0.2s, w7
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8B_FromW0) {
+  // dup v0.8b, w0  — fills v0[0..7] with byte 0xAB; v0[8..15] = 0.
+  std::memset(&state_.cpu.v[0], 0xCC, 16);  // sentinel: must be overwritten
+  state_.cpu.x[0] = 0x123456789abcdeabULL;   // low byte = 0xAB
+  static const uint32_t code[] = {kDupGenVec8B_W0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], 0xABu) << "lower byte " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8B_FromW7_ZeroByte) {
+  // dup v0.8b, w7  — w7 low byte = 0; v0[0..7] = 0; v0[8..15] = 0.
+  // Pre-seeds v0 with non-zero garbage so a stuck upper-half zeroing
+  // would surface as a sentinel leak.
+  std::memset(&state_.cpu.v[0], 0xFE, 16);
+  state_.cpu.x[7] = 0xDEADBEEFCAFE0000ULL;  // low byte = 0x00
+  static const uint32_t code[] = {kDupGenVec8B_W7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "byte " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec2S_FromW0) {
+  // dup v0.2s, w0  — fills v0.s[0] and v0.s[1] with 0xDEADBEEF;
+  // v0.s[2] and v0.s[3] zeroed.
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  state_.cpu.x[0] = 0x11223344DEADBEEFULL;  // low 32 bits = 0xDEADBEEF
+  static const uint32_t code[] = {kDupGenVec2S_W0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xDEADBEEFu) << "low s lane 0";
+  EXPECT_EQ(r[1], 0xDEADBEEFu) << "low s lane 1";
+  EXPECT_EQ(r[2], 0u) << "upper s lane 2";
+  EXPECT_EQ(r[3], 0u) << "upper s lane 3";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec2S_FromW7) {
+  // dup v0.2s, w7  — same as above but sourcing from x7 to exercise
+  // the Rn != 0 path.  Upper half of x7 (above bit 31) must be
+  // ignored by Movd; if it were Movq instead, the upper-zero tail
+  // would still zero v0.s[2..3] correctly, but this test pins the
+  // intended truncation semantics.
+  std::memset(&state_.cpu.v[0], 0x33, 16);
+  state_.cpu.x[7] = 0xFFFFFFFF12345678ULL;  // low 32 bits = 0x12345678
+  static const uint32_t code[] = {kDupGenVec2S_W7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x12345678u) << "low s lane 0";
+  EXPECT_EQ(r[1], 0x12345678u) << "low s lane 1";
+  EXPECT_EQ(r[2], 0u) << "upper s lane 2";
+  EXPECT_EQ(r[3], 0u) << "upper s lane 3";
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

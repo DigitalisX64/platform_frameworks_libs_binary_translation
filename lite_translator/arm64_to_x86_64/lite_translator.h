@@ -3822,10 +3822,15 @@ class LiteTranslator {
     // endregion
 
     // region digitalis - implement DUP (general) for memset fast path
-    if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupGeneral && args.q) {
-      // DUP (general), Q=1: broadcast GP register to all lanes of 128-bit SIMD register.
-      // imm5 encodes element size: bit0=1→B, bit1=1→H, bit2=1→W, bit3=1→X
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupGeneral) {
+      // DUP (general): broadcast GP register Rn to all lanes of Vd.
+      //   Q=1: full 128-bit broadcast (16B / 4S / 2D).
+      //   Q=0: low 64 bits = broadcast (8B / 2S), upper 64 bits zeroed per
+      //        ARM D-register semantics.  The D-lane Q=0 form (1D) is
+      //        ARM-reserved and bails via success_=false.
+      // imm5 encodes element size: bit0=1→B, bit1=1→H, bit2=1→W, bit3=1→X.
       uint8_t esize_bits = args.imm5 & 0xf;
+      if (esize_bits == 0x08 && !args.q) { success_ = false; return; }
       SimdRegister xmm = AllocTempSimdReg();
       if (xmm == no_simd_register) { Undefined(); return; }
       Register src = GetReg(args.rn);
@@ -3858,6 +3863,14 @@ class LiteTranslator {
       } else {
         Undefined();
         return;
+      }
+      if (!args.q) {
+        // Zero upper 64 bits per ARM D-register semantics (8B / 2S forms).
+        // For byte broadcast the upper half already holds the same byte;
+        // the shuttle is still needed to zero it.  For word broadcast the
+        // upper half holds two copies of the dword and must be zeroed.
+        as_.Pslldq(xmm, int8_t{8});
+        as_.Psrldq(xmm, int8_t{8});
       }
       int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
       as_.Movdqu({.base = Assembler::rbp, .disp = vreg_offset}, xmm);
