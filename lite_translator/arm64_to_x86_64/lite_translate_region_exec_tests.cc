@@ -4389,6 +4389,277 @@ TEST_F(Arm64LiteTranslateRegionTest, FdivVec2D) {
 }
 // endregion
 
+// region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
+// (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
+//   FMAX/FMIN  — IEEE: any NaN -> NaN result.
+//   FMAXNM/FMINNM — "max/min Number": one NaN -> return the non-NaN;
+//                    both NaN -> NaN.
+//   x86 MAXPS/MINPS — any NaN -> result = SRC2 (asymmetric).
+// JIT path implements both behaviors via the two-pass-OR (FMAX/FMIN) and
+// substitution (FMAXNM/FMINNM) lowerings, mirroring the FP16 path.
+//
+// Encoding (per ARM ARM C7.2 / aarch64-linux-gnu-as verification):
+//   FMAX Vd.4S = 0x4E20F400 | (rm<<16) | (rn<<5) | rd
+//   FMAX Vd.2D = 0x4E60F400 | (rm<<16) | (rn<<5) | rd
+//   FMAX Vd.2S = 0x0E20F400 | (rm<<16) | (rn<<5) | rd
+//   FMIN Vd.4S = 0x4EA0F400 | (rm<<16) | (rn<<5) | rd
+//   FMIN Vd.2D = 0x4EE0F400 | (rm<<16) | (rn<<5) | rd
+//   FMAXNM Vd.4S = 0x4E20C400 | (rm<<16) | (rn<<5) | rd
+//   FMAXNM Vd.2D = 0x4E60C400 | (rm<<16) | (rn<<5) | rd
+//   FMINNM Vd.4S = 0x4EA0C400 | (rm<<16) | (rn<<5) | rd
+//   FMINNM Vd.2D = 0x4EE0C400 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmaxVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Basic FMAX .4S: regular finite operands.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FmaxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], 3.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.75f);
+  EXPECT_FLOAT_EQ(r[3], 100.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FmaxVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  EXPECT_DOUBLE_EQ(r[1], 3.0);
+}
+
+// FMAX .4S NaN propagation: any NaN input -> NaN result.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4SNaN) {
+  // lane 0: a=NaN,  b=3.0  -> NaN
+  // lane 1: a=2.0,  b=NaN  -> NaN
+  // lane 2: a=NaN,  b=NaN  -> NaN
+  // lane 3: a=4.0,  b=5.0  -> 5.0  (sanity)
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FmaxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0]));
+  EXPECT_TRUE(std::isnan(r[1]));
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 5.0f);
+}
+
+// FMAX .2S (q=0): low 2 FP32 lanes; upper 64 bits of Vd must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -3.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 2, 2.0f, -1.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FmaxVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], -1.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMAX .4S with ±0 and ±inf: confirm IEEE semantics carry through.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4SInfZero) {
+  const float inf = std::numeric_limits<float>::infinity();
+  // lane 0: max(+0, -0) -> +0   (x86 MAXPS returns SRC2 when both equal, so
+  //                              the OR trick gives the same; either signed-0
+  //                              is allowed by ARM here)
+  // lane 1: max(-inf, 5) -> 5
+  // lane 2: max(+inf, 1e30) -> +inf
+  // lane 3: max(-inf, -inf) -> -inf
+  StoreVec4S(state_.cpu, 1, +0.0f, -inf, +inf, -inf);
+  StoreVec4S(state_.cpu, 2, -0.0f,  5.0f, 1e30f, -inf);
+  static const uint32_t code[] = {FmaxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0.0f);             // ±0 are both equal-to-zero
+  EXPECT_FLOAT_EQ(r[1], 5.0f);
+  EXPECT_EQ(r[2], inf);
+  EXPECT_EQ(r[3], -inf);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FminVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], -2.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.25f);
+  EXPECT_FLOAT_EQ(r[3], -0.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FminVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.25);
+  EXPECT_DOUBLE_EQ(r[1], -8.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminVec4SNaN) {
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FminVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0]));
+  EXPECT_TRUE(std::isnan(r[1]));
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 4.0f);
+}
+
+// FMAXNM .4S: regular finite operands.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FmaxnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], 3.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.75f);
+  EXPECT_FLOAT_EQ(r[3], 100.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FmaxnmVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  EXPECT_DOUBLE_EQ(r[1], 3.0);
+}
+
+// FMAXNM .4S NaN-suppressing: exactly one NaN -> return non-NaN; both NaN -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec4SNaN) {
+  // lane 0: a=NaN,  b=3.0   -> 3.0 (non-NaN wins)
+  // lane 1: a=2.0,  b=NaN   -> 2.0 (non-NaN wins)
+  // lane 2: a=NaN,  b=NaN   -> NaN (both NaN -> NaN)
+  // lane 3: a=4.0,  b=5.0   -> 5.0 (regular max)
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FmaxnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 5.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec2DNaN) {
+  StoreVec2D(state_.cpu, 1, std::nan(""), 4.0);
+  StoreVec2D(state_.cpu, 2, 3.0,          std::nan(""));
+  static const uint32_t code[] = {FmaxnmVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 3.0);
+  EXPECT_DOUBLE_EQ(r[1], 4.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FminnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], -2.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.25f);
+  EXPECT_FLOAT_EQ(r[3], -0.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FminnmVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.25);
+  EXPECT_DOUBLE_EQ(r[1], -8.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec4SNaN) {
+  // lane 0: a=NaN,  b=3.0   -> 3.0 (non-NaN wins)
+  // lane 1: a=2.0,  b=NaN   -> 2.0 (non-NaN wins)
+  // lane 2: a=NaN,  b=NaN   -> NaN
+  // lane 3: a=4.0,  b=5.0   -> 4.0 (regular min)
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FminnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 4.0f);
+}
+// endregion
+
 // region digitalis: FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // ARM ARM defines FMLA/FMLS as fused multiply-accumulate (one rounding).
 // The lowering uses Vfmadd231(ps|pd) / Vfnmadd231(ps|pd).  Tests pick

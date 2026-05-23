@@ -4580,7 +4580,7 @@ class LiteTranslator {
       case Decoder::AdvSimdThreeSameOpcode::kFminV:
       case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
       case Decoder::AdvSimdThreeSameOpcode::kFminnmV: {
-        // FP16 vector FMAX / FMIN / FMAXNM / FMINNM via F16C round-trip.
+        // FP vector FMAX / FMIN / FMAXNM / FMINNM.
         //
         // ARM and x86 disagree on NaN handling for MAX/MIN:
         //   - ARM FMAX/FMIN  (IEEE 754-2008): if either input is NaN, result is NaN.
@@ -4604,18 +4604,78 @@ class LiteTranslator {
         //     - neither          -> a' = a, b' = b -> MAXPS = max(a, b). ✓
         // FMINNM analogous with MINPS.
         //
-        // Round-trip is bit-exact for the non-NaN path because FP32's mantissa
-        // strictly contains FP16's. NaN-result bit patterns may differ from a
-        // canonical FP16 qNaN (0x7E00), but are still valid NaNs per ARM ARM
-        // default-NaN propagation rules.
-        //
-        // FP32 / FP64 forms (size = 00 / 01) still bail to the interpreter.
-        if (!args.is_fp16) { Undefined(); return; }
-        if (!host_platform::kHasF16C) { Undefined(); return; }
+        // FP16 round-trip is bit-exact for the non-NaN path because FP32's
+        // mantissa strictly contains FP16's. NaN-result bit patterns may
+        // differ from a canonical FP16 qNaN (0x7E00), but are still valid
+        // NaNs per ARM ARM default-NaN propagation rules.
         const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV);
         const bool is_nm  = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV);
+        if (!args.is_fp16) {
+          // FP32 (.2S/.4S, args.size=0) and FP64 (.2D, args.size=1).  The
+          // decoder filters sz=1 && !Q (the reserved .1D shape) to Undefined,
+          // so the JIT only sees .2S, .4S, and .2D here.  Both halves of
+          // each lowering match the FP16 path above structurally; differs
+          // only by op width (PS vs PD) and skips the F16C round-trip.
+          const bool is_double = (args.size & 1);
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          auto cmpunord = [&](SimdRegister dst, SimdRegister src) {
+            if (is_double) as_.Cmpunordpd(dst, src); else as_.Cmpunordps(dst, src);
+          };
+          auto minmax = [&](SimdRegister dst, SimdRegister src) {
+            if (is_double) {
+              if (is_max) as_.Maxpd(dst, src); else as_.Minpd(dst, src);
+            } else {
+              if (is_max) as_.Maxps(dst, src); else as_.Minps(dst, src);
+            }
+          };
+          if (!is_nm) {
+            // FMAX / FMIN — NaN-propagating: maxab|maxba|OR.
+            SimdRegister tmp = AllocTempSimdReg();
+            if (tmp == no_simd_register) { success_ = false; return; }
+            as_.Movdqa(tmp, xm);
+            minmax(tmp, xn);
+            minmax(xn, xm);
+            as_.Por(xn, tmp);
+          } else {
+            // FMAXNM / FMINNM — substitute NaN-lanes with the other operand,
+            // then min/max.
+            SimdRegister t_mask_a = AllocTempSimdReg();
+            SimdRegister t_mask_b = AllocTempSimdReg();
+            SimdRegister t_an_sub = AllocTempSimdReg();
+            SimdRegister t_bn_sub = AllocTempSimdReg();
+            if (t_mask_a == no_simd_register || t_mask_b == no_simd_register ||
+                t_an_sub == no_simd_register || t_bn_sub == no_simd_register) {
+              success_ = false; return;
+            }
+            as_.Movdqa(t_mask_a, xn);
+            cmpunord(t_mask_a, t_mask_a);   // 1s where a is NaN
+            as_.Movdqa(t_mask_b, xm);
+            cmpunord(t_mask_b, t_mask_b);   // 1s where b is NaN
+            as_.Movdqa(t_an_sub, t_mask_a);
+            as_.Pand(t_an_sub, xm);          // mask_a & b
+            as_.Movdqa(t_bn_sub, t_mask_b);
+            as_.Pand(t_bn_sub, xn);          // mask_b & a
+            as_.Pandn(t_mask_a, xn);         // ~mask_a & a
+            as_.Pandn(t_mask_b, xm);         // ~mask_b & b
+            as_.Por(t_mask_a, t_an_sub);     // a' in t_mask_a
+            as_.Por(t_mask_b, t_bn_sub);     // b' in t_mask_b
+            minmax(t_mask_a, t_mask_b);
+            as_.Movdqa(xn, t_mask_a);
+          }
+          // .2S (q=0, FP32 only) zeroes upper 64 bits of the destination.
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
         auto minmax_op = [&](SimdRegister dst, SimdRegister src) {
           if (is_max) {
             as_.Maxps(dst, src);
