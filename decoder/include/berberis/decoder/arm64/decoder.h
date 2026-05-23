@@ -1514,6 +1514,19 @@ class Decoder {
     kSrshlScalar,
     kUrshlScalar,
     // endregion
+    // region digitalis - scalar saturating doubling multiply high (H/S only).
+    //   size = 01 -> H, 10 -> S.  Lane widths B and D are unallocated for
+    //   this opcode; the decoder rejects them as Undefined.
+    //   Computes `Vd = sat_signed((2 * sext(Vn) * sext(Vm) + round) >>
+    //   bits_local)`, with `bits_local = 16` for H and `32` for S, and
+    //   `round = 1 << (bits_local - 1)` for SQRDMULH or `0` for SQDMULH.
+    //   See ARM ARM C7.2.301 / .305 (SQDMULH / SQRDMULH).
+    //   Encoding (scalar):
+    //     SQDMULH  <V>d, <V>n, <V>m  = 01 0 11110 size 1 Rm 1 0110 1 Rn Rd
+    //     SQRDMULH <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 1 0110 1 Rn Rd
+    kSqdmulhScalar,
+    kSqrdmulhScalar,
+    // endregion
   };
 
   struct AdvSimdScalarThreeSameArgs {
@@ -5182,10 +5195,14 @@ class Decoder {
       // single-lane fast paths for DSP saturation.  See ARM ARM
       // C7.2.282 / .284 (SQADD / SQSUB) and C7.2.317 / .319 (UQADD /
       // UQSUB).
-      // region digitalis: opcodes 00001 / 00011 / 01001 / 01011 are B/H/S/D-capable.
+      // region digitalis: opcodes 00001 / 00011 / 01001 / 01011 are B/H/S/D-capable;
+      // opcode 10110 (SQDMULH / SQRDMULH) is H/S-only (the per-arm guard
+      // below rejects B and D for it).  All other integer scalar-three-same
+      // opcodes accept D only.
       const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00011) ||
                              (opcode == 0b01001) || (opcode == 0b01011);
-      if (!all_sizes && size != 0b11) { Undefined(); return; }
+      const bool hs_only = (opcode == 0b10110);
+      if (!all_sizes && !hs_only && size != 0b11) { Undefined(); return; }
       // endregion
 
       switch (opcode) {
@@ -5220,6 +5237,15 @@ class Decoder {
         case 0b01010:
           op = u ? AdvSimdScalarThreeSameOpcode::kUrshlScalar
                  : AdvSimdScalarThreeSameOpcode::kSrshlScalar;
+          break;
+        // endregion
+        // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+        //   Per ARM ARM C7.2.301 / .305: only size=01 (H) and size=10 (S)
+        //   are allocated for this opcode; B and D are unallocated.
+        case 0b10110:
+          if (size != 0b01 && size != 0b10) { Undefined(); return; }
+          op = u ? AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqdmulhScalar;
           break;
         // endregion
         case 0b00110:

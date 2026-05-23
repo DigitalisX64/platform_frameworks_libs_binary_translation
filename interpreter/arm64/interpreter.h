@@ -5898,6 +5898,42 @@ class Interpreter {
         return;
       }
       // endregion
+      // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+      // Per ARM ARM C7.2.301 / .305:
+      //   Vd = sat_signed((2 * sext(Vn) * sext(Vm) + round) >> bits_local)
+      // with bits_local = 16 (size=01, H) or 32 (size=10, S), and
+      // round = 1 << (bits_local - 1) for SQRDMULH or 0 for SQDMULH.
+      // The doubled product for size=S reaches 2 * INT32_MIN * INT32_MIN =
+      // 2^63, which overflows int64_t by one — so the multiply is done
+      // in __int128 before the right shift and the saturation clamp.
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqdmulhScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 2 or 4
+        const uint8_t bits_local = esize * 8;           // 16 or 32
+        const int shift_to_64 = 64 - bits_local;
+        const int64_t sa =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rn])
+                                 << shift_to_64) >> shift_to_64;
+        const int64_t sb =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rm])
+                                 << shift_to_64) >> shift_to_64;
+        const __int128 round =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar)
+                ? (static_cast<__int128>(1) << (bits_local - 1))
+                : __int128{0};
+        const __int128 product =
+            (static_cast<__int128>(2) * sa * sb) + round;
+        int64_t res = static_cast<int64_t>(product >> bits_local);
+        const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+        const int64_t smin = -(int64_t{1} << (bits_local - 1));
+        if (res > smax) res = smax;
+        else if (res < smin) res = smin;
+        const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+        state_->cpu.v[args.rd] =
+            static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+        return;
+      }
+      // endregion
       default:
         break;
     }
