@@ -7552,6 +7552,59 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 -- per-lane signed compare against 0.
+      //   CMGT (Vn > 0)  ->  PCMPGTx(Vn, 0)
+      //   CMLT (Vn < 0)  ->  PCMPGTx(0, Vn)
+      //   CMGE (Vn >= 0) ->  ~PCMPGTx(0, Vn)   (XOR with all-ones)
+      //   CMLE (Vn <= 0) ->  ~PCMPGTx(Vn, 0)
+      // Integer signed compare only — FP16 form (args.is_fp16) bails to interp
+      // via success_=false. .2D (size=11) needs PCMPGTQ (SSE4.2) and bails too;
+      // the interpreter handles both fallbacks correctly.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
+        if (args.is_fp16) { success_ = false; return; }
+        if (args.size == 0b11) { success_ = false; return; }  // .2D needs PCMPGTQ
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        // (Vn > 0) for CMGT/CMLE; (0 > Vn) for CMLT/CMGE.
+        const bool n_gt_z =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero);
+        if (n_gt_z) {
+          switch (args.size) {
+            case 0b00: as_.Pcmpgtb(xn, xz); break;
+            case 0b01: as_.Pcmpgtw(xn, xz); break;
+            case 0b10: as_.Pcmpgtd(xn, xz); break;
+            default: success_ = false; return;
+          }
+        } else {
+          switch (args.size) {
+            case 0b00: as_.Pcmpgtb(xz, xn); break;
+            case 0b01: as_.Pcmpgtw(xz, xn); break;
+            case 0b10: as_.Pcmpgtd(xz, xn); break;
+            default: success_ = false; return;
+          }
+          as_.Movdqa(xn, xz);
+        }
+        // CMGE = NOT(0 > Vn); CMLE = NOT(Vn > 0). Invert via XOR with all-ones.
+        const bool invert =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero);
+        if (invert) {
+          SimdRegister allones = AllocTempSimdReg();
+          if (allones == no_simd_register) { success_ = false; return; }
+          as_.Pcmpeqd(allones, allones);
+          as_.Pxor(xn, allones);
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
