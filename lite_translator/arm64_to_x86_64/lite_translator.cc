@@ -17,9 +17,12 @@
 
 #include "lite_translator.h"
 
+#include <cstddef>
+
 #include "berberis/base/checks.h"
 #include "berberis/base/macros.h"
 #include "berberis/code_gen_lib/code_gen_lib.h"
+#include "berberis/guest_state/guest_state.h"
 
 namespace berberis {
 
@@ -30,14 +33,65 @@ using Condition = LiteTranslator::Condition;
 // Region exit methods.
 //
 
+// Capture host MXCSR cumulative exception bits and OR-mirror them into
+// emulated_fpsr at ARM FPSR bit positions, before exiting the JIT region.
+//
+// Why at region exit, not per FP op: the System V x86_64 ABI treats MXCSR
+// exception bits 0-5 as caller-saved status flags, so the C++ runtime in the
+// dispatch path (berberis_HandleInterpret, InterpretBatch, ...) is permitted
+// to clobber them. A lazy mirror in the interpreter MRS-FPSR handler reads
+// MXCSR after that C++ has already run and may have wiped the bits set by
+// JIT-emitted DIVSS/MULSS/SQRTSS/etc. Capturing here, while still in JIT
+// context, preserves the cumulative state for the interpreter to read out
+// of emulated_fpsr.
+//
+//   MXCSR[0] IE (invalid)   -> FPSR[0] IOC
+//   MXCSR[1] DE (denormal)  -> FPSR[7] IDC
+//   MXCSR[2] ZE (div-zero)  -> FPSR[1] DZC
+//   MXCSR[3] OE (overflow)  -> FPSR[2] OFC
+//   MXCSR[4] UE (underflow) -> FPSR[3] UFC
+//   MXCSR[5] PE (inexact)   -> FPSR[4] IXC
+//
+// (ARM ARM C5.2.8 / Intel SDM 11.6.6.)
+//
+// The translated code below uses rax/rcx/rdx as scratches (caller-saved at the
+// region boundary) and a 4-byte slot at [rsp] inside the JIT region's
+// kFrameSizeAtTranslatedCode-byte frame (already reserved by
+// berberis_RunGeneratedCode).
+void LiteTranslator::EmitMxcsrToFpsrMirror() {
+  // stmxcsr [rsp]
+  as_.Stmxcsr({.base = as_.rsp, .disp = 0});
+  // eax = MXCSR & 0x3F  (isolate exception bits 0-5)
+  as_.Movzxbl(as_.rax, {.base = as_.rsp, .disp = 0});
+  as_.Andl(as_.rax, int32_t{0x3F});
+  // edx = IE (bit 0 -> IOC bit 0)
+  as_.Movl(as_.rdx, as_.rax);
+  as_.Andl(as_.rdx, int32_t{0x01});
+  // ecx = (eax >> 1) & 0x1E  -- {ZE,OE,UE,PE} bits 2..5 -> {DZC,OFC,UFC,IXC} bits 1..4
+  as_.Movl(as_.rcx, as_.rax);
+  as_.Shrl(as_.rcx, int8_t{1});
+  as_.Andl(as_.rcx, int32_t{0x1E});
+  as_.Orl(as_.rdx, as_.rcx);
+  // ecx = (eax << 6) & 0x80  -- DE bit 1 -> IDC bit 7
+  as_.Movl(as_.rcx, as_.rax);
+  as_.Shll(as_.rcx, int8_t{6});
+  as_.Andl(as_.rcx, int32_t{0x80});
+  as_.Orl(as_.rdx, as_.rcx);
+  // or [rbp + offsetof(cpu.emulated_fpsr)], edx
+  int32_t fpsr_off = offsetof(ThreadState, cpu.emulated_fpsr);
+  as_.Orl({.base = as_.rbp, .disp = fpsr_off}, as_.rdx);
+}
+
 void LiteTranslator::ExitGeneratedCode(GuestAddr target) {
   StoreMappedRegs();
+  EmitMxcsrToFpsrMirror();
   as_.Movq(as_.rax, target);
   EmitExitGeneratedCode(&as_, as_.rax);
 }
 
 void LiteTranslator::ExitRegion(GuestAddr target) {
   StoreMappedRegs();
+  EmitMxcsrToFpsrMirror();
   if (params_.allow_dispatch) {
     EmitDirectDispatch(&as_, target, /* check_pending_signals */ true);
   } else {
@@ -48,10 +102,20 @@ void LiteTranslator::ExitRegion(GuestAddr target) {
 
 void LiteTranslator::ExitRegionIndirect(Register target) {
   StoreMappedRegs();
+  // Spill target across the mirror because EmitMxcsrToFpsrMirror clobbers
+  // rax/rcx/rdx, and target may live in rcx or rdx (both in the allocator
+  // pool). Allocate an extra 16-byte slot below rsp: lower 4 bytes for the
+  // mirror's stmxcsr scratch (referenced via [rsp+0]), upper 8 bytes for the
+  // spilled target. Restore rax with target's value, then restore rsp.
+  as_.Subq(as_.rsp, int32_t{16});
+  as_.Movq({.base = as_.rsp, .disp = 8}, target);
+  EmitMxcsrToFpsrMirror();
+  as_.Movq(as_.rax, {.base = as_.rsp, .disp = 8});
+  as_.Addq(as_.rsp, int32_t{16});
   if (params_.allow_dispatch) {
-    EmitIndirectDispatch(&as_, target);
+    EmitIndirectDispatch(&as_, as_.rax);
   } else {
-    EmitExitGeneratedCode(&as_, target);
+    EmitExitGeneratedCode(&as_, as_.rax);
   }
 }
 

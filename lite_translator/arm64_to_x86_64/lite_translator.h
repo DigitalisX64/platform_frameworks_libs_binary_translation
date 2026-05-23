@@ -157,6 +157,14 @@ class LiteTranslator {
   void ExitRegion(GuestAddr target);
   void ExitRegionIndirect(Register target);
 
+  // region digitalis
+  // Mirror host MXCSR cumulative exception bits into emulated_fpsr at ARM FPSR
+  // positions. Called from every region-exit path: System V x86_64 ABI lets
+  // C++ runtime callees clobber MXCSR exception bits, so the capture must
+  // happen here in JIT context, not in the interpreter MRS-FPSR handler.
+  void EmitMxcsrToFpsrMirror();
+  // endregion
+
   //
   // Instruction implementations.
   // Each method corresponds to a SemanticsPlayer callback.
