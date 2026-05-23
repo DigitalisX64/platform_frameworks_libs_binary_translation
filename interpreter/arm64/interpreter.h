@@ -1841,6 +1841,43 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - narrowing high: Vd(narrow) = ((Vn + Vm) [+ round]) >>
+      // narrow_bits. ADDHN: round=0. RADDHN: round=1<<(narrow_bits-1). Q=0 writes
+      // narrow lanes to lower 64 bits of Vd (upper cleared); Q=1 writes narrow
+      // lanes to upper 64 bits (lower preserved). size encodes narrow elem width;
+      // sources Vn/Vm are wide (2*in_esize per lane).
+      case Decoder::AdvSimdThreeDiffOpcode::kAddhn:
+      case Decoder::AdvSimdThreeDiffOpcode::kRaddhn: {
+        uint8_t narrow_bits = in_esize * 8;
+        uint64_t round = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kRaddhn)
+                             ? (1ULL << (narrow_bits - 1))
+                             : 0;
+        uint8_t narrow_lanes[8] = {0};
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0;
+          uint64_t b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * out_esize, out_esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * out_esize, out_esize);
+          uint64_t sum = a + b + round;
+          if (out_esize < 8) {
+            // Mask to wide width before taking the high half. For out_esize==8
+            // we skip the mask: shifting `(1ULL << 64) - 1` is UB, and the
+            // natural uint64_t wrap already gives the wide-bit-width sum.
+            sum &= (1ULL << (out_esize * 8)) - 1;
+          }
+          uint64_t high = sum >> narrow_bits;
+          memcpy(narrow_lanes + i * in_esize, &high, in_esize);
+        }
+        // Q=0: `result` was initialized to 0 at function entry, so upper 64
+        // bits already cleared. Q=1: copy dst so lower 64 bits are preserved
+        // before we overwrite the upper half.
+        if (args.q) {
+          result = dst;
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + (args.q ? 8 : 0), narrow_lanes, 8);
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;

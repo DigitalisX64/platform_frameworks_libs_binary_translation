@@ -1002,6 +1002,24 @@ class Decoder {
     //   size=01,10 are RESERVED. Used by libz CRC32 acceleration.
     kPmull,
     // endregion
+    // region digitalis - narrowing high (add/sub of two wide vectors, take high
+    // half of each result lane, write to half-width destination).
+    //   ADDHN  / ADDHN2  : U=0, opcode=0100, round=0
+    //   RADDHN / RADDHN2 : U=1, opcode=0100, round=1<<(narrow_bits-1)
+    // size encodes narrow-elem width: 00->8b dest from .8h, 01->.4h from .4s,
+    // 10->.2s from .2d. size=11 reserved. Q=0 writes lower 64 bits of Vd
+    // (upper cleared); Q=1 writes upper 64 bits (lower preserved).
+    // llvm-mc verified encodings:
+    //   addhn   v0.8b,  v1.8h, v2.8h -> 0x0e224020 (size=00, Q=0, U=0)
+    //   addhn2  v0.16b, v1.8h, v2.8h -> 0x4e224020 (size=00, Q=1)
+    //   addhn   v0.4h,  v1.4s, v2.4s -> 0x0e624020 (size=01)
+    //   addhn   v0.2s,  v1.2d, v2.2d -> 0x0ea24020 (size=10)
+    //   raddhn  v0.8b,  v1.8h, v2.8h -> 0x2e224020 (U=1)
+    //   raddhn  v0.4h,  v1.4s, v2.4s -> 0x2e624020
+    //   raddhn  v0.2s,  v1.2d, v2.2d -> 0x2ea24020
+    kAddhn,
+    kRaddhn,
+    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -4445,6 +4463,12 @@ class Decoder {
       case 0b0010:
         op = u ? AdvSimdThreeDiffOpcode::kUsubl : AdvSimdThreeDiffOpcode::kSsubl;
         break;
+      // region digitalis - narrowing high: ADDHN/ADDHN2 (U=0), RADDHN/RADDHN2 (U=1).
+      // size=11 already rejected above.
+      case 0b0100:
+        op = u ? AdvSimdThreeDiffOpcode::kRaddhn : AdvSimdThreeDiffOpcode::kAddhn;
+        break;
+      // endregion
       case 0b0101:
         op = u ? AdvSimdThreeDiffOpcode::kUabal : AdvSimdThreeDiffOpcode::kSabal;
         break;
