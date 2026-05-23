@@ -4097,6 +4097,61 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
+      // region digitalis - SQADD/UQADD/SQSUB/UQSUB vector for 8/16-bit lanes.
+      // x86 SSE2 has direct saturating add/sub for byte (PADD{S,US}B /
+      // PSUB{S,US}B) and halfword (PADD{S,US}W / PSUB{S,US}W) lanes, which
+      // match ARM's per-lane signed/unsigned saturation semantics exactly.
+      // 32/64-bit lanes have no direct SSE equivalent (would need CMP+BLEND
+      // saturate) and fall through to the interpreter via Undefined().
+      case Decoder::AdvSimdThreeSameOpcode::kSqadd: {
+        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        if (args.size == 0b00) as_.Paddsb(xn, xm); else as_.Paddsw(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUqadd: {
+        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        if (args.size == 0b00) as_.Paddusb(xn, xm); else as_.Paddusw(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kSqsub: {
+        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        if (args.size == 0b00) as_.Psubsb(xn, xm); else as_.Psubsw(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUqsub: {
+        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        if (args.size == 0b00) as_.Psubusb(xn, xm); else as_.Psubusw(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAnd: {
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();

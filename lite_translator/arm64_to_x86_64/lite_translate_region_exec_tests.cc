@@ -11096,6 +11096,240 @@ TEST_F(Arm64LiteTranslateRegionTest, InsElemSelfS0FromS3) {
 }
 // endregion
 
+// region digitalis: SQADD/UQADD/SQSUB/UQSUB vector JIT (byte/halfword)
+//
+// Encoding (DDI 0487 §C7.2 Advanced SIMD three same):
+//   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
+// SQADD/UQADD opcode = 0b00001 (U=0 signed / U=1 unsigned).
+// SQSUB/UQSUB opcode = 0b00101 (U=0 signed / U=1 unsigned).
+// JIT covers 8-bit (size=00) and 16-bit (size=01) lanes; 32/64-bit lanes
+// fall back to the interpreter (Undefined()) — x86 has no direct
+// saturating PADD/PSUB for those widths.
+
+TEST_F(Arm64LiteTranslateRegionTest, SqaddVec16BSaturate) {
+  // SQADD V0.16B, V1.16B, V2.16B — signed saturation at INT8 boundaries.
+  int8_t n[16] = {  127,  127, -128, -128,    0,    1,   -1,   50,
+                     10,  -10,   64,  -64,  100, -100,    7,   -7};
+  int8_t m[16] = {    1,  -1,   -1,    1,    0,    1,   -1,  100,
+                     20,  -20,  100, -100,   50,  -50,   -3,    3};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b00001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0],  127);   // 127 + 1   → saturate +127
+  EXPECT_EQ(r[1],  126);   // 127 + -1
+  EXPECT_EQ(r[2], -128);   // -128 + -1 → saturate -128
+  EXPECT_EQ(r[3], -127);   // -128 + 1
+  EXPECT_EQ(r[4],    0);
+  EXPECT_EQ(r[5],    2);
+  EXPECT_EQ(r[6],   -2);
+  EXPECT_EQ(r[7],  127);   // 50 + 100 = 150 → saturate +127
+  EXPECT_EQ(r[8],   30);
+  EXPECT_EQ(r[9],  -30);
+  EXPECT_EQ(r[10], 127);   // 64 + 100 = 164 → saturate +127
+  EXPECT_EQ(r[11],-128);   // -64 + -100 = -164 → saturate -128
+  EXPECT_EQ(r[12], 127);   // 100 + 50 = 150 → saturate +127
+  EXPECT_EQ(r[13],-128);   // -100 + -50 = -150 → saturate -128
+  EXPECT_EQ(r[14],   4);
+  EXPECT_EQ(r[15],  -4);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqaddVec8BUpperZero) {
+  // Q=0 .8B form: upper 8 bytes of Vd must be zero, including when V[0]
+  // had non-zero garbage pre-seed.
+  int8_t n[16] = {127, 0, 0, 0, 0, 0, 0, 0, 99, 99, 99, 99, 99, 99, 99, 99};
+  int8_t m[16] = {  1, 0, 0, 0, 0, 0, 0, 0, 99, 99, 99, 99, 99, 99, 99, 99};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0x77, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b00001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(static_cast<int8_t>(r[0]), 127);  // saturate
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqaddVec8HSaturate) {
+  int16_t n[8] = { 32767, 32767, -32768, -32768,     0,   100, -100,   200};
+  int16_t m[8] = {     1,    -1,     -1,      1,     0, 32700,-32700,   300};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b00001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0],  32767);    // saturate +
+  EXPECT_EQ(r[1],  32766);
+  EXPECT_EQ(r[2], -32768);    // saturate -
+  EXPECT_EQ(r[3], -32767);
+  EXPECT_EQ(r[4],      0);
+  EXPECT_EQ(r[5],  32767);    // 100 + 32700 = 32800 → saturate +
+  EXPECT_EQ(r[6], -32768);    // -100 + -32700 = -32800 → saturate -
+  EXPECT_EQ(r[7],    500);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqaddVec16BSaturate) {
+  uint8_t n[16] = {255, 255, 250,   1,   0, 128, 127, 200,
+                    10,  20,  30,  40,  50,  60,  70,  80};
+  uint8_t m[16] = {  1,   5,  10,   2, 255, 128,   1,  60,
+                     5,  10,  15,  20,  25,  30,  35,  40};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b00001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 255u);    // 255 + 1 → saturate
+  EXPECT_EQ(r[1], 255u);    // 255 + 5 → saturate
+  EXPECT_EQ(r[2], 255u);    // 250 + 10 → saturate
+  EXPECT_EQ(r[3],   3u);
+  EXPECT_EQ(r[4], 255u);    // 0 + 255
+  EXPECT_EQ(r[5], 255u);    // 128 + 128 → saturate
+  EXPECT_EQ(r[6], 128u);
+  EXPECT_EQ(r[7], 255u);    // 200 + 60 = 260 → saturate
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] + m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqaddVec8HSaturate) {
+  uint16_t n[8] = {65535, 65535, 65000,   100,    0, 32768, 30000,  1234};
+  uint16_t m[8] = {    1,    10,  1000,   200, 65535, 32768, 40000,  5678};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b00001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 65535u);
+  EXPECT_EQ(r[1], 65535u);
+  EXPECT_EQ(r[2], 65535u);
+  EXPECT_EQ(r[3],   300u);
+  EXPECT_EQ(r[4], 65535u);
+  EXPECT_EQ(r[5], 65535u);    // 32768 + 32768 = 65536 → saturate
+  EXPECT_EQ(r[6], 65535u);    // 30000 + 40000 = 70000 → saturate
+  EXPECT_EQ(r[7],  6912u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqsubVec16BSaturate) {
+  int8_t n[16] = {-128, -128,  127,  127,    0,    1,   -1,   50,
+                    10,  -10,  -50,   50,  100, -100,   60,  -60};
+  int8_t m[16] = {   1,   -1,   -1,    1,    0,    1,   -1,  100,
+                    20,  -20,  100, -100,  -50,   50,    7,   -7};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b00101, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], -128);   // -128 - 1   → saturate -
+  EXPECT_EQ(r[1], -127);   // -128 - -1 = -127
+  EXPECT_EQ(r[2],  127);   // 127 - -1 = 128 → saturate +
+  EXPECT_EQ(r[3],  126);
+  EXPECT_EQ(r[4],    0);
+  EXPECT_EQ(r[5],    0);
+  EXPECT_EQ(r[6],    0);
+  EXPECT_EQ(r[7], -50);    // 50 - 100
+  EXPECT_EQ(r[8], -10);
+  EXPECT_EQ(r[9],  10);
+  EXPECT_EQ(r[10], -128);  // -50 - 100 = -150 → saturate -
+  EXPECT_EQ(r[11],  127);  // 50 - -100 = 150 → saturate +
+  EXPECT_EQ(r[12],  127);  // 100 - -50 = 150 → saturate +
+  EXPECT_EQ(r[13], -128);  // -100 - 50 = -150 → saturate -
+  EXPECT_EQ(r[14],   53);
+  EXPECT_EQ(r[15],  -53);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqsubVec8HSaturate) {
+  int16_t n[8] = {-32768, -32768,  32767,  32767,     0,   100, -100, 12345};
+  int16_t m[8] = {     1,     -1,     -1,      1,     0, 32700,-32700,  -1};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b00101, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], -32768);
+  EXPECT_EQ(r[1], -32767);
+  EXPECT_EQ(r[2],  32767);
+  EXPECT_EQ(r[3],  32766);
+  EXPECT_EQ(r[4],      0);
+  EXPECT_EQ(r[5], -32600);
+  EXPECT_EQ(r[6],  32600);
+  EXPECT_EQ(r[7],  12346);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqsubVec16BSaturate) {
+  uint8_t n[16] = {  0,   0, 255, 100,  10,  20,  30,  40,
+                    50,  60,  70,  80,  90, 100, 110, 120};
+  uint8_t m[16] = {  1,  10,   1,  50,   5,  10,  15,  20,
+                    25,  30,  35,  40,  45,  50,  55,  60};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b00101, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);    // 0 - 1 → saturate 0
+  EXPECT_EQ(r[1], 0u);    // 0 - 10 → saturate 0
+  EXPECT_EQ(r[2], 254u);
+  EXPECT_EQ(r[3], 50u);
+  for (int i = 4; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] - m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqsubVec8HSaturate) {
+  uint16_t n[8] = {    0,    0, 65535,  1000,  100,    50,  30000, 10000};
+  uint16_t m[8] = {    1,  100,     1,   500, 1000, 65000,  10000,  5000};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memcpy(&state_.cpu.v[2], m, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b00101, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0],     0u);    // 0 - 1 → saturate
+  EXPECT_EQ(r[1],     0u);    // 0 - 100 → saturate
+  EXPECT_EQ(r[2], 65534u);
+  EXPECT_EQ(r[3],   500u);
+  EXPECT_EQ(r[4],     0u);    // 100 - 1000 → saturate
+  EXPECT_EQ(r[5],     0u);    // 50 - 65000 → saturate
+  EXPECT_EQ(r[6], 20000u);
+  EXPECT_EQ(r[7],  5000u);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
