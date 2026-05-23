@@ -9834,6 +9834,75 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // region digitalis - ADDV (across-lanes integer sum). Result is a single
+      // scalar in the lowest lane of Vd with all other bytes zeroed.
+      //
+      // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+      //   0 Q U 01110 size 11000 11011 10 Rn Rd, with U=0.
+      // Valid lane forms:
+      //   size=00 Q=0: ADDV B, V.8B    (sum 8 bytes  → 8-bit lane)
+      //   size=00 Q=1: ADDV B, V.16B   (sum 16 bytes → 8-bit lane)
+      //   size=01 Q=0: ADDV H, V.4H    (sum 4 hw     → 16-bit lane)
+      //   size=01 Q=1: ADDV H, V.8H    (sum 8 hw     → 16-bit lane)
+      //   size=10 Q=1: ADDV S, V.4S    (sum 4 dw     → 32-bit lane)
+      //   (size=10 Q=0 and size=11 are reserved; rejected here.)
+      //
+      // Byte path uses PSADBW (sum-of-absolute-differences vs 0), which
+      // produces 16-bit byte sums in qword-lane positions; halfword/dword
+      // paths use cascading PHADDW / PHADDD to collapse the vector.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAddv: {
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {
+            SimdRegister xz = AllocTempSimdReg();
+            if (xz == no_simd_register) { Undefined(); return; }
+            as_.Pxor(xz, xz);
+            // xn := [sum(bytes 0..7), 0..., sum(bytes 8..15), 0...] as
+            // 16-bit values in qword-lane positions.
+            as_.Psadbw(xn, xz);
+            if (args.q) {
+              // .16B: also fold in the high-qword sum.
+              SimdRegister xt = AllocTempSimdReg();
+              if (xt == no_simd_register) { Undefined(); return; }
+              as_.Pshufd(xt, xn, static_cast<int8_t>(0xEE));  // hi qword → lo qword
+              as_.Paddq(xn, xt);
+            }
+            // Keep only the low byte; zero the rest of Vd.
+            as_.Pslldq(xn, int8_t{15});
+            as_.Psrldq(xn, int8_t{15});
+            break;
+          }
+          case 0b01: {
+            // .4H: 2 cascading PHADDW collapses 4 halfwords → 1.
+            // .8H: 3 cascading PHADDW collapses 8 halfwords → 1.
+            as_.Phaddw(xn, xn);
+            as_.Phaddw(xn, xn);
+            if (args.q) as_.Phaddw(xn, xn);
+            // Keep only the low halfword (2 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{14});
+            as_.Psrldq(xn, int8_t{14});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) { Undefined(); return; }  // .2S reserved for ADDV.
+            // .4S: 2 cascading PHADDD collapses 4 dwords → 1.
+            as_.Phaddd(xn, xn);
+            as_.Phaddd(xn, xn);
+            // Keep only the low dword (4 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{12});
+            as_.Psrldq(xn, int8_t{12});
+            break;
+          }
+          default:
+            Undefined();
+            return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;

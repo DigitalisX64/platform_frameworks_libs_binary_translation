@@ -11503,6 +11503,152 @@ TEST_F(Arm64LiteTranslateRegionTest, AddpVec2D) {
 }
 // endregion
 
+// region digitalis: ADDV (across-lanes integer sum) vector JIT —
+// all 5 encoded lane forms.
+//
+// Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+//   0 Q U 01110 size 11000 opcode 10 Rn Rd
+// ADDV opcode = 0b11011, U = 0.  Valid lane forms:
+//   size=00, Q∈{0,1}: ADDV B, V.{8B,16B}
+//   size=01, Q∈{0,1}: ADDV H, V.{4H,8H}
+//   size=10, Q=1:     ADDV S, V.4S    (Q=0 reserved)
+//   size=11:          reserved
+//
+// Base bits: bits[28:24]=01110 (0x0E000000), bits[21:17]=11000
+// (0x00300000), bits[11:10]=10 (0x00000800).  Verified against
+// `uaddlv h0, v0.8b` = 0x2E303800 (U=1, opcode=00011, size=00, Q=0).
+constexpr uint32_t SimdAcrossLanes(uint8_t q, uint8_t u, uint8_t size,
+                                   uint8_t opcode, uint8_t rd, uint8_t rn) {
+  return 0x0E300800u |
+         (uint32_t{static_cast<uint8_t>(q & 1u)} << 30) |
+         (uint32_t{static_cast<uint8_t>(u & 1u)} << 29) |
+         (uint32_t{static_cast<uint8_t>(size & 3u)} << 22) |
+         (uint32_t{static_cast<uint8_t>(opcode & 0x1fu)} << 12) |
+         (uint32_t{static_cast<uint8_t>(rn & 0x1fu)} << 5) |
+         uint32_t{static_cast<uint8_t>(rd & 0x1fu)};
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec16B) {
+  // ADDV B, V.16B (Q=1, size=00): sum all 16 bytes → low 8 bits of Vd.
+  // Sum = 1+2+...+16 + (255+255) = 136 + 510 = 646; 646 mod 256 = 134.
+  uint8_t n[16] = {  1,   2,   3,   4,   5,   6,   7,   8,
+                     9,  10,  11,  12,  13,  14, 255, 255};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);  // pre-seed Vd to detect upper-zero
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  unsigned expected_full = 0;
+  for (int i = 0; i < 16; i++) expected_full += n[i];
+  EXPECT_EQ(r[0], static_cast<uint8_t>(expected_full));  // sum mod 256
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec8B) {
+  // ADDV B, V.8B (Q=0, size=00): sum low 8 bytes only; upper bytes of source
+  // are don't-care.  Sum = 1+2+...+8 = 36.
+  uint8_t n[16] = { 1,   2,   3,   4,   5,   6,   7,   8,
+                    0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x77, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 36u);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec8H) {
+  // ADDV H, V.8H (Q=1, size=01): sum all 8 halfwords → low 16 bits.
+  // Includes 16-bit wrap: 32768 + 32768 + 1 = 65537 mod 65536 = 1; full sum
+  // also includes 1000+2000+3000+4000+5000+6000 = 21000, so total =
+  // 1 + 21000 = 21001 (no overall wrap).
+  uint16_t n[8] = {32768, 32768,   1, 1000, 2000, 3000, 4000, 5000};
+  // sum = 32768+32768+1+1000+2000+3000+4000+5000 = 71537; mod 65536 = 6001.
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint32_t expected = 0;
+  for (int i = 0; i < 8; i++) expected += n[i];
+  EXPECT_EQ(r[0], static_cast<uint16_t>(expected));  // 6001
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec4H) {
+  // ADDV H, V.4H (Q=0, size=01): sum low 4 halfwords; upper 4 are don't-care.
+  uint16_t n[8] = {  100,   200,  1000,  2000,
+                   0xDEAD,0xDEAD,0xDEAD,0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 3300u);  // 100 + 200 + 1000 + 2000
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec4S) {
+  // ADDV S, V.4S (Q=1, size=10): sum all 4 dwords → low 32 bits, with the
+  // upper 96 bits of Vd zeroed.  Inputs pin 32-bit wrap: 0xFFFFFFFE + 5 =
+  // 0x1_00000003; +100 +200 = 0x1_0000012F; mod 2^32 = 0x12F = 303.
+  uint32_t n[4] = {0xFFFFFFFEu, 5u, 100u, 200u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 303u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec4SDoubleWrap) {
+  // ADDV S, V.4S (Q=1, size=10): pair-wrap pin.  Each pair sums to 2^32:
+  // (0xFFFFFFFF + 1) and (0x80000000 + 0x80000000); each pair wraps to 0;
+  // total = 0.  Verifies that the JIT correctly handles intermediate
+  // wrap-around without sign-extension drift.
+  uint32_t n[4] = {0xFFFFFFFFu, 0x00000001u, 0x80000000u, 0x80000000u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
