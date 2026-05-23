@@ -28,6 +28,7 @@
 #include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
+#include "berberis/runtime_primitives/platform.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
 
 namespace berberis {
@@ -8016,9 +8017,10 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec8BUpperZero) {
 // UMAX/UMIN, BIC/ORN/BSL/BIT/BIF) at one or two lane widths each.
 // The remaining gaps in the §C2 spec table are:
 //   - ADD/SUB/CMEQ: no dedicated vector tests at any width — add B/H/S/D.
-//     (CMEQ.2D bails to interp in the JIT — Pcmpeqq is SSE4_1; the JIT
-//     default branch sets success_=false, so .2D is omitted here and
-//     stays interp-only as the existing handler intends.)
+//     (CMEQ.2D now JITs via PCMPEQQ when host_platform::kHasSSE4_1 is set;
+//     CmeqVec2D below pins that path. The handler still bails via
+//     Undefined() on hosts without SSE4.1, matching the CMGT.2D/SSE4.2
+//     gate above it.)
 //   - AND/ORR/EOR: size-agnostic logical ops — add one each at the
 //     16B canonical shape, matching the BIC/ORN/BSL/BIT/BIF pattern.
 //   - MUL/MLA: B and H widths already pinned (MulVec16B, MulVec8H,
@@ -8305,6 +8307,28 @@ TEST_F(Arm64LiteTranslateRegionTest, CmeqVec4S) {
   EXPECT_EQ(r[1], 0u);                                    // -1 != 0
   EXPECT_EQ(r[2], 0xFFFFFFFFu);                          // MIN == MIN
   EXPECT_EQ(r[3], 0u);                                    // MAX != MAX-1
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqVec2D) {
+  // .2D: 64-bit lane equality via PCMPEQQ (SSE4.1). Modern x86_64 hosts
+  // have SSE4.1, so the JIT path is exercised; on hypothetical hosts
+  // without it the handler returns Undefined() and Run() would fail.
+  if (!host_platform::kHasSSE4_1) {
+    GTEST_SKIP() << "PCMPEQQ requires SSE4.1";
+  }
+  int64_t n_lanes[2] = {INT64_MIN, 0x123456789ABCDEF0LL};
+  int64_t m_lanes[2] = {INT64_MIN, 0x123456789ABCDEF1LL};
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xAA, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b11,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFull);  // INT64_MIN == INT64_MIN
+  EXPECT_EQ(r[1], 0ull);                    // differ in low nibble
 }
 
 TEST_F(Arm64LiteTranslateRegionTest, MulVec4S) {

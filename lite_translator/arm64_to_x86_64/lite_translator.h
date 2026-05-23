@@ -3982,6 +3982,10 @@ class LiteTranslator {
       }
       case Decoder::AdvSimdThreeSameOpcode::kCmeq: {
         // CMEQ Vd, Vn, Vm — lane-wise equality (-1 if equal, 0 otherwise).
+        // 64-bit lanes need SSE4.1 (PCMPEQQ); other widths are SSE2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_1) {
+          Undefined(); return;
+        }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
@@ -3991,7 +3995,8 @@ class LiteTranslator {
           case 0b00: as_.Pcmpeqb(xn, xm); break;
           case 0b01: as_.Pcmpeqw(xn, xm); break;
           case 0b10: as_.Pcmpeqd(xn, xm); break;
-          default: Undefined(); return;  // 64-bit Pcmpeqq is SSE4_1 — skip for now
+          case 0b11: as_.Pcmpeqq(xn, xm); break;
+          default: Undefined(); return;
         }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
