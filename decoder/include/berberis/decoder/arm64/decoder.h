@@ -1298,6 +1298,75 @@ class Decoder {
     kFrintzV,   // FRINTZ  (toward zero):           a=1, U=0, opcode=11001
     kFrintiV,   // FRINTI  (use current rounding):  a=1, U=1, opcode=11001
     // endregion
+    // region digitalis - SQABS / SQNEG (signed saturating abs / negate).
+    // Encoding: 0 Q U 01110 size 10000 00111 10 Rn Rd
+    //   sqabs v0.8b, v1.8b   = 0x0e207820  (Q=0, U=0, size=00)
+    //   sqabs v0.16b, v1.16b = 0x4e207820  (Q=1, U=0, size=00)
+    //   sqabs v0.4h, v1.4h   = 0x0e607820  (Q=0, U=0, size=01)
+    //   sqabs v0.8h, v1.8h   = 0x4e607820  (Q=1, U=0, size=01)
+    //   sqabs v0.2s, v1.2s   = 0x0ea07820  (Q=0, U=0, size=10)
+    //   sqabs v0.4s, v1.4s   = 0x4ea07820  (Q=1, U=0, size=10)
+    //   sqabs v0.2d, v1.2d   = 0x4ee07820  (Q=1, U=0, size=11)
+    //   sqneg ... = same with U=1.
+    // The only saturating input is INT_MIN_in: |INT_MIN| and -INT_MIN
+    // both overflow the signed range and clamp to INT_MAX. .1d (size=11,
+    // Q=0) is not encoded for either op.
+    kSqabs,     // SQABS: U=0, opcode=00111
+    kSqneg,     // SQNEG: U=1, opcode=00111
+    // endregion
+    // region digitalis - SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
+    // Encoding: 0 Q 1 01110 size 10000 10011 10 Rn Rd  (U=1 required;
+    // U=0 with opcode=10011 is unallocated). Sizes 00/01/10 only —
+    // size=11 is unallocated for the narrow group (the .1d / .2d
+    // destination form does not exist).
+    //   sqxtun  v0.8b,  v1.8h  = 0x2e212820  (Q=0, size=00, src=.8h  -> dst=.8b)
+    //   sqxtun2 v0.16b, v1.8h  = 0x6e212820  (Q=1, size=00, src=.8h  -> dst=.16b)
+    //   sqxtun  v0.4h,  v1.4s  = 0x2e612820  (Q=0, size=01, src=.4s  -> dst=.4h)
+    //   sqxtun2 v0.8h,  v1.4s  = 0x6e612820  (Q=1, size=01, src=.4s  -> dst=.8h)
+    //   sqxtun  v0.2s,  v1.2d  = 0x2ea12820  (Q=0, size=10, src=.2d  -> dst=.2s)
+    //   sqxtun2 v0.4s,  v1.2d  = 0x6ea12820  (Q=1, size=10, src=.2d  -> dst=.4s)
+    // Saturation rule: read each signed source lane, clamp to
+    // [0, UMAX_dst]: input<0 -> 0; input>UMAX_dst -> UMAX_dst;
+    // else cast to unsigned narrow. Q=0 writes low 64 bits of Vd
+    // (upper zeroed); Q=1 writes upper 64 bits and preserves lower.
+    kSqxtun,    // SQXTUN/SQXTUN2: U=1, opcode=10011
+    // endregion
+    // region digitalis - FCVTXN / FCVTXN2 (vector narrow FP64->FP32, round-to-odd).
+    // Encoding: 0 Q 1 01110 0 sz 10000 10110 10 Rn Rd  with sz=1 (size=01).
+    // U=1 distinguishes this from FCVTN (U=0, opcode=10110) and from BFCVTN
+    // (U=0, opcode=10110, size=10). Only FP64 (size=01) source is encoded; the
+    // destination is FP32. Q=0 writes 2 narrow lanes into low 64 bits of Vd
+    // (upper zeroed); Q=1 writes 2 narrow lanes into upper 64 bits and
+    // preserves lower.
+    //   fcvtxn  v0.2s, v1.2d  = 0x2e616820  (Q=0, U=1, size=01)
+    //   fcvtxn2 v0.4s, v1.2d  = 0x6e616820  (Q=1, U=1, size=01)
+    // Round-to-odd rule (used to avoid double-rounding when chaining narrow
+    // conversions): take the round-toward-zero result; if any bits were
+    // discarded, force the LSB of the result mantissa to 1.
+    kFcvtxn,    // FCVTXN/FCVTXN2: U=1, opcode=10110, size=01
+    // endregion
+    // region digitalis - across-lanes FP reductions FMAXV / FMINV /
+    // FMAXNMV / FMINNMV. These share AdvSIMD two-reg-misc dispatch path
+    // but live in the across-lanes group (bit20=1) with U=1 mandatory.
+    // The `size` field carries "o sz" (bit23=o picks max=0 / min=1;
+    // bit22=sz picks FP32=0 / FP16=1). The decoder splits max/min via
+    // bit23 into separate enum values so the interpreter only needs to
+    // know which of the four ops it is. FP16 is left to the FP16
+    // half-precision dispatcher; this enum covers the FP32 .4S form
+    // (Q=1 mandatory).
+    //   fmaxv   s0, v1.4s  = 0x6e30f820  (U=1, Q=1, size=00, opcode=01111)
+    //   fminv   s0, v1.4s  = 0x6eb0f820  (U=1, Q=1, size=10, opcode=01111)
+    //   fmaxnmv s0, v1.4s  = 0x6e30c820  (U=1, Q=1, size=00, opcode=01100)
+    //   fminnmv s0, v1.4s  = 0x6eb0c820  (U=1, Q=1, size=10, opcode=01100)
+    // Semantics: FMAXV/FMINV use IEEE 754-2008 max/min (any NaN -> NaN);
+    // FMAXNMV/FMINNMV use max-number/min-number (NaN excluded when other
+    // input is non-NaN). Result is a scalar lane in bottom 4 bytes of Vd
+    // (upper 96 bits zeroed by the routine's `result=0` init).
+    kFmaxv,     // FMAXV   (across .4S): opcode=01111, bit23=0
+    kFminv,     // FMINV   (across .4S): opcode=01111, bit23=1
+    kFmaxnmv,   // FMAXNMV (across .4S): opcode=01100, bit23=0
+    kFminnmv,   // FMINNMV (across .4S): opcode=01100, bit23=1
+    // endregion
     // endregion
   };
 
@@ -1336,17 +1405,28 @@ class Decoder {
   // AdvSIMD scalar two-reg misc opcodes.
   //
   enum class AdvSimdScalarTwoRegMiscOpcode : uint8_t {
-    kScvtf,   // SCVTF (scalar): signed int → float
-    kUcvtf,   // UCVTF (scalar): unsigned int → float
-    kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero
-    kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero
+    kScvtf,   // SCVTF  (scalar): signed int → float                       (opcode=11101, U=0; size ∈ {S,D})
+    kUcvtf,   // UCVTF  (scalar): unsigned int → float                     (opcode=11101, U=1; size ∈ {S,D})
+    kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero    (opcode=11011, U=0; size ∈ {S,D})
+    kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero  (opcode=11011, U=1; size ∈ {S,D})
+    // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
+    kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
+    kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
+    kSqxtun,  // SQXTUN (scalar): signed→unsigned saturating extract narrow (opcode=10010, U=1; size ∈ {B,H,S})
+    kFcvtxn,  // FCVTXN (scalar): FP64→FP32 round-to-odd narrow             (opcode=10110, U=1; size=01)
+    // endregion
   };
 
   struct AdvSimdScalarTwoRegMiscArgs {
     AdvSimdScalarTwoRegMiscOpcode opcode;
     uint8_t rd;
     uint8_t rn;
-    uint8_t size;   // 0=single, 1=double
+    // Raw 2-bit size field from the encoding.
+    //   For FP ops (SCVTF/UCVTF/FCVTZS/FCVTZU/FCVTXN), size matches the
+    //   ARM ARM "sz" bit conventions: 0 = single (FP32), 1 = double (FP64).
+    //   For integer ops (SQABS/SQNEG/SQXTUN), size selects the lane width
+    //   in bytes via `1 << size`: 0=B, 1=H, 2=S, 3=D.
+    uint8_t size;
   };
   // endregion
 
@@ -4664,6 +4744,14 @@ class Decoder {
       case 0b00110:
         op = u ? AdvSimdTwoRegMiscOpcode::kUadalp : AdvSimdTwoRegMiscOpcode::kSadalp;
         break;
+      // region digitalis - SQABS (U=0) / SQNEG (U=1) at opcode 00111.
+      // All four sizes are valid; size=11 (.2d) is Q=1-only — the .1d form
+      // (size=11, Q=0) is unallocated.
+      case 0b00111:
+        if (size == 0b11 && !q) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kSqneg : AdvSimdTwoRegMiscOpcode::kSqabs;
+        break;
+      // endregion
       case 0b01000:
         op = u ? AdvSimdTwoRegMiscOpcode::kCmgeZero : AdvSimdTwoRegMiscOpcode::kCmgtZero;
         break;
@@ -4710,6 +4798,15 @@ class Decoder {
         if (u) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kXtn;
         break;
+      // region digitalis - SQXTUN/SQXTUN2 at opcode 10011 (U=1 only).
+      // Sizes 00/01/10 are valid; size=11 has no encoded narrow form.
+      // U=0 with opcode=10011 is unallocated.
+      case 0b10011:
+        if (!u) { Undefined(); return; }
+        if (size == 0b11) { Undefined(); return; }
+        op = AdvSimdTwoRegMiscOpcode::kSqxtun;
+        break;
+      // endregion
       case 0b10100:
         if (u) {
           op = AdvSimdTwoRegMiscOpcode::kUqxtn;
@@ -4718,11 +4815,17 @@ class Decoder {
         }
         break;
       case 0b10110:
-        if (u) { Undefined(); return; }
-        // region digitalis BFCVTN/BFCVTN2 share opcode=10110
-        // with FCVTN; distinguished by size=10 (vs FCVTN's size=00/01).
-        // bit30 (q) selects BFCVTN (low half write) vs BFCVTN2 (high half).
-        if (size == 0b10) {
+        // region digitalis - opcode=10110 splits on U:
+        //   U=0 + size=10 -> BFCVTN/BFCVTN2 (FP32->BF16).
+        //   U=0 + size=00/01 -> FCVTN/FCVTN2 (FP16->? / FP64->FP32). Only
+        //     size=01 is currently implemented; size=00 is undefined here.
+        //   U=1 + size=01 -> FCVTXN/FCVTXN2 (FP64->FP32, round-to-odd).
+        //   U=1 + size!=01 -> unallocated.
+        // bit30 (q) selects low-half write (Q=0) vs high-half write (Q=1).
+        if (u) {
+          if (size != 0b01) { Undefined(); return; }
+          op = AdvSimdTwoRegMiscOpcode::kFcvtxn;
+        } else if (size == 0b10) {
           op = AdvSimdTwoRegMiscOpcode::kBfcvtn;
         } else {
           op = AdvSimdTwoRegMiscOpcode::kFcvtn;
@@ -4733,9 +4836,36 @@ class Decoder {
         if (u) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kFcvtl;
         break;
+      // region digitalis - bit20 splits opcode=01111 between
+      // FABS/FNEG (bit20=0, two-reg-misc) and across-lanes
+      // FMAXV/FMINV (bit20=1, U=1 mandatory). Without this split the
+      // FMAXV/FMINV (U=1) encoding silently misrouted to kFneg.
+      // bit23 picks max (0) vs min (1); size[0] (=bit22) picks
+      // FP32 (0) vs FP16 (1) — FP16 left to the FP16 dispatcher.
       case 0b01111:
-        op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
+        if (GetBits<20, 1>()) {
+          if (!u || (size & 1) || !q) { Undefined(); return; }
+          op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminv
+                                : AdvSimdTwoRegMiscOpcode::kFmaxv;
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
+        }
         break;
+      // endregion
+      // region digitalis - across-lanes FMAXNMV / FMINNMV
+      // (opcode=01100, bit20=1, U=1 mandatory). Two-reg-misc has no
+      // op at opcode=01100, so the entire case is across-lanes;
+      // pre-Digitalis decoder fell through to default Undefined()
+      // and these encodings would have raised SIGILL. bit23 picks
+      // max-number (0) vs min-number (1); size[0] picks FP precision
+      // (FP32 only here — FP16 left to the FP16 dispatcher).
+      case 0b01100:
+        if (!u || !GetBits<20, 1>()) { Undefined(); return; }
+        if ((size & 1) || !q) { Undefined(); return; }
+        op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminnmv
+                              : AdvSimdTwoRegMiscOpcode::kFmaxnmv;
+        break;
+      // endregion
       // region digitalis - opcode=11101 splits on bit23:
       //   bit23=0: SCVTF (U=0) / UCVTF (U=1) — vector int→FP.
       //   bit23=1: FRECPE (U=0) / FRSQRTE (U=1) — vector FP reciprocal estimate.
@@ -4875,6 +5005,39 @@ class Decoder {
         op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtzu
                : AdvSimdScalarTwoRegMiscOpcode::kFcvtzs;
         break;
+      // region digitalis - scalar SQABS / SQNEG / SQXTUN / FCVTXN.
+      // Scalar twins of the vector ops at the same opcode bits (00111,
+      // 10010, 10110); each is the one-lane collapse of the vector form.
+      // llvm-mc-21 encoding checks:
+      //   sqabs   b0, b1   → 0x5e207820  (U=0, opcode=00111, size=00)
+      //   sqabs   d0, d1   → 0x5ee07820  (U=0, opcode=00111, size=11)
+      //   sqneg   b0, b1   → 0x7e207820  (U=1, opcode=00111, size=00)
+      //   sqxtun  b0, h1   → 0x7e212820  (U=1, opcode=10010, size=00)
+      //   sqxtun  s0, d1   → 0x7ea12820  (U=1, opcode=10010, size=10)
+      //   fcvtxn  s0, d1   → 0x7e616820  (U=1, opcode=10110, size=01)
+      case 0b00111:
+        // SQABS (U=0) / SQNEG (U=1): single signed-saturating abs/neg.
+        // All four lane widths (B/H/S/D) are encoded.
+        op = u ? AdvSimdScalarTwoRegMiscOpcode::kSqneg
+               : AdvSimdScalarTwoRegMiscOpcode::kSqabs;
+        break;
+      case 0b10010:
+        // SQXTUN (U=1): single-lane signed→unsigned saturating narrow.
+        // size=00→B from H, 01→H from S, 10→S from D. size=11 unallocated.
+        // U=0 at this opcode is SQXTN; not implemented here (vector form
+        // also not shipped yet) — falls through to Undefined.
+        if (!u || size == 0b11) { Undefined(); return; }
+        op = AdvSimdScalarTwoRegMiscOpcode::kSqxtun;
+        break;
+      case 0b10110:
+        // FCVTXN (U=1, size=01): scalar FP64→FP32 round-to-odd.
+        // U=0 at this opcode bit pattern is reserved at the scalar level
+        // (BFCVTN/FCVTN are vector-only — no scalar BFCVTN scalar form
+        // exists), so reject anything else.
+        if (!u || size != 0b01) { Undefined(); return; }
+        op = AdvSimdScalarTwoRegMiscOpcode::kFcvtxn;
+        break;
+      // endregion
       default:
         Undefined();
         return;
@@ -4884,7 +5047,10 @@ class Decoder {
         .opcode = op,
         .rd = rd,
         .rn = rn,
-        .size = static_cast<uint8_t>(size & 1),  // 0=single, 1=double
+        // Raw 2-bit size. The pre-existing FP ops use only size ∈ {0,1};
+        // the new SQABS/SQNEG/SQXTUN family uses size ∈ {0..3}. See the
+        // struct doc-comment above.
+        .size = size,
     };
     insn_consumer_->AdvSimdScalarTwoRegMisc(args);
   }
