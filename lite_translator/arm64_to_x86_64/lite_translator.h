@@ -5705,8 +5705,97 @@ class LiteTranslator {
   // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
-    UNUSED(rd, rn, rm, size, opcode, q);
-    Undefined();
+    // region digitalis: ZIP1 / ZIP2 vector permute JIT
+    //
+    // opcode encoding (3 bits, from Decoder::DecodeAdvSimd at decoder.h:2808):
+    //   001=UZP1, 010=TRN1, 011=ZIP1, 101=UZP2, 110=TRN2, 111=ZIP2
+    //
+    // This cycle implements ZIP1 / ZIP2 (opcode 0b011 / 0b111) for all
+    // element sizes.  ZIP1 interleaves the LOWER half of each source;
+    // ZIP2 interleaves the UPPER half.  Both map directly to x86's
+    // PUNPCK family which has byte/word/dword/qword variants:
+    //
+    //   ZIP1 .16B / .8B  -> PUNPCKLBW xn, xm
+    //   ZIP2 .16B        -> PUNPCKHBW xn, xm
+    //   ZIP1 .8H  / .4H  -> PUNPCKLWD xn, xm
+    //   ZIP2 .8H         -> PUNPCKHWD xn, xm
+    //   ZIP1 .4S  / .2S  -> PUNPCKLDQ xn, xm
+    //   ZIP2 .4S         -> PUNPCKHDQ xn, xm
+    //   ZIP1 .2D         -> PUNPCKLQDQ xn, xm
+    //   ZIP2 .2D         -> PUNPCKHQDQ xn, xm
+    //
+    // Q=0 ZIP2 quirk: for .8B/.4H/.2S, ZIP2 interleaves the upper-half
+    // of each 8-byte source (bytes 4..7 of Vn with bytes 4..7 of Vm,
+    // etc.).  PUNPCKH uses bytes 8..15 of the 16-byte register, which
+    // are unspecified for .8B/.4H/.2S inputs — so we instead shift each
+    // source right by 4 bytes (PSRLDQ-4) and then PUNPCKL, which puts
+    // the (originally upper-half) bytes 4..7 at positions 0..3 of the
+    // shifted register where PUNPCKL picks them up.  The upper 8 bytes
+    // of the result are masked to zero per the Q=0 D-register rule.
+    //
+    // UZP1/UZP2 and TRN1/TRN2 remain on the interpreter pending later
+    // cycles; bail via success_=false here.
+    if (opcode != 0b011 && opcode != 0b111) {
+      UNUSED(rd, rn, rm, size);
+      success_ = false;
+      return;
+    }
+    if (size > 0b11) {
+      success_ = false;
+      return;
+    }
+    const bool is_zip2 = (opcode == 0b111);
+    // Q=0 .2D is reserved by the ARM ARM (encoding restricted).
+    if (!q && size == 0b11) {
+      success_ = false;
+      return;
+    }
+
+    SimdRegister xn = AllocTempSimdReg();
+    SimdRegister xm = AllocTempSimdReg();
+    if (xn == no_simd_register || xm == no_simd_register) {
+      success_ = false;
+      return;
+    }
+    int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + rn * 16;
+    int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+    as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+    as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+    if (!q && is_zip2) {
+      // Shift each source right by 4 bytes so the (originally upper-half)
+      // bytes 4..7 land at positions 0..3; PUNPCKL will then pick them up.
+      // Bytes that were at 8..15 are now at 4..11 and may be garbage for
+      // the .8B/.4H/.2S forms, but the Q=0 upper-zero mask below discards
+      // anything beyond the first 8 bytes of the result.
+      as_.Psrldq(xn, int8_t{4});
+      as_.Psrldq(xm, int8_t{4});
+    }
+
+    if (q && is_zip2) {
+      switch (size) {
+        case 0b00: as_.Punpckhbw(xn, xm); break;   // ZIP2 .16B
+        case 0b01: as_.Punpckhwd(xn, xm); break;   // ZIP2 .8H
+        case 0b10: as_.Punpckhdq(xn, xm); break;   // ZIP2 .4S
+        case 0b11: as_.Punpckhqdq(xn, xm); break;  // ZIP2 .2D
+      }
+    } else {
+      switch (size) {
+        case 0b00: as_.Punpcklbw(xn, xm); break;   // ZIP1 .16B/.8B, ZIP2 .8B (after shift)
+        case 0b01: as_.Punpcklwd(xn, xm); break;   // ZIP1 .8H/.4H,  ZIP2 .4H (after shift)
+        case 0b10: as_.Punpckldq(xn, xm); break;   // ZIP1 .4S/.2S,  ZIP2 .2S (after shift)
+        case 0b11: as_.Punpcklqdq(xn, xm); break;  // ZIP1 .2D       (Q=0 forbidden by ARM)
+      }
+    }
+
+    if (!q) {
+      // Zero upper 64 bits per D-register semantics.
+      as_.Pslldq(xn, int8_t{8});
+      as_.Psrldq(xn, int8_t{8});
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+    // endregion
   }
 
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
