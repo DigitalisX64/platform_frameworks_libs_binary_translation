@@ -4538,20 +4538,22 @@ class Interpreter {
       // (shift left by 1), saturate to the per-element signed range, and
       // return the high half. SQRDMULH adds a rounding constant of
       // 1 << (esize_bits - 1) before the shift; SQDMULH uses 0. The decoder
-      // restricts both to size=01 (16-bit) and size=10 (32-bit), so esize is
-      // either 2 or 4 and the product 2*sa*sb fits comfortably in int64_t.
+      // restricts both to size=01 (16-bit) and size=10 (32-bit). For size=S
+      // (32-bit) the doubled product 2 * INT32_MIN * INT32_MIN = 2^63 overflows
+      // int64_t by one, so the multiply is done in __int128 — same pattern as
+      // the scalar SQDMULH/SQRDMULH path below.
       case Decoder::AdvSimdThreeSameOpcode::kSqdmulh:
       case Decoder::AdvSimdThreeSameOpcode::kSqrdmulh: {
         uint8_t bits_local = esize * 8;
         int64_t smax = (1LL << (bits_local - 1)) - 1;
         int64_t smin = -(1LL << (bits_local - 1));
-        int64_t round = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh)
-                          ? (1LL << (bits_local - 1))
-                          : 0;
+        __int128 round = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh)
+                          ? (static_cast<__int128>(1) << (bits_local - 1))
+                          : __int128{0};
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
             [smax, smin, round, bits_local](int64_t a, int64_t b) -> int64_t {
-              int64_t product = (2 * a * b) + round;
-              int64_t high = product >> bits_local;
+              __int128 product = (static_cast<__int128>(2) * a * b) + round;
+              int64_t high = static_cast<int64_t>(product >> bits_local);
               if (high > smax) return smax;
               if (high < smin) return smin;
               return high;
