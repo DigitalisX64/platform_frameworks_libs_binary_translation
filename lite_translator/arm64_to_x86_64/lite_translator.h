@@ -3817,19 +3817,30 @@ class LiteTranslator {
 
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kMul: {
-        if (args.size != 0b10) { Undefined(); return; }   // only 32-bit lanes here
+        // region digitalis - MUL .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
+        // .16B/.8B (size=00) has no SSE single-op equivalent; .2D / scalar 64-bit
+        // is reserved by the ARM ARM. Both fall back to the interpreter.
+        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        as_.Pmulld(xn, xm);
+        if (args.size == 0b01) {
+          as_.Pmullw(xn, xm);
+        } else {
+          as_.Pmulld(xn, xm);
+        }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
+        // endregion
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
-        if (args.size != 0b10) { Undefined(); return; }   // only 32-bit lanes here
+        // region digitalis - MLA .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
+        // .16B/.8B (size=00) has no SSE single-op multiply equivalent; .2D / scalar 64-bit
+        // is reserved by the ARM ARM. Both fall back to the interpreter.
+        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         SimdRegister xd = AllocTempSimdReg();
@@ -3839,10 +3850,16 @@ class LiteTranslator {
         load_full(xn, vn_off);
         load_full(xm, vm_off);
         load_full(xd, vd_off);
-        as_.Pmulld(xn, xm);
-        as_.Paddd(xd, xn);
+        if (args.size == 0b01) {
+          as_.Pmullw(xn, xm);
+          as_.Paddw(xd, xn);
+        } else {
+          as_.Pmulld(xn, xm);
+          as_.Paddd(xd, xn);
+        }
         if (!args.q) mask_low64(xd);
         store_full(vd_off, xd);
+        // endregion
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
@@ -3929,6 +3946,315 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
+      case Decoder::AdvSimdThreeSameOpcode::kBic: {
+        // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
+        // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pandn(xm, xn);
+        if (!args.q) mask_low64(xm);
+        store_full(vd_off, xm);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kOrn: {
+        // ORN Vd, Vn, Vm: Vd = Vn OR NOT Vm.  Materialize ones via PCMPEQD self,
+        // XOR into xm to invert, then OR with xn.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister ones = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            ones == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pcmpeqd(ones, ones);
+        as_.Pxor(xm, ones);
+        as_.Por(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kBsl: {
+        // BSL Vd, Vn, Vm: Vd = (Vd AND Vn) | (NOT Vd AND Vm).
+        // Bitwise identity: ((Vn XOR Vm) AND Vd) XOR Vm equals the BSL result.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pxor(xn, xm);
+        as_.Pand(xn, xd);
+        as_.Pxor(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kBit: {
+        // BIT Vd, Vn, Vm: Vd = (Vm AND Vn) | (NOT Vm AND Vd) — "insert if true".
+        // Bitwise identity: ((Vd XOR Vn) AND Vm) XOR Vd.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pxor(xn, xd);
+        as_.Pand(xn, xm);
+        as_.Pxor(xn, xd);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kBif: {
+        // BIF Vd, Vn, Vm: Vd = (Vm AND Vd) | (NOT Vm AND Vn) — "insert if false".
+        // Bitwise identity: ((Vd XOR Vn) AND NOT Vm) XOR Vd.  Lower as a single
+        // PANDN to fold the NOT into the AND.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pxor(xn, xd);
+        as_.Pandn(xm, xn);
+        as_.Pxor(xd, xm);
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt: {
+        // CMGT Vd, Vn, Vm: lane-wise signed greater-than; result lane is
+        // all-ones if Vn > Vm.  64-bit lanes need SSE4.2 (PCMPGTQ); other
+        // widths are SSE2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xn, xm); break;
+          case 0b01: as_.Pcmpgtw(xn, xm); break;
+          case 0b10: as_.Pcmpgtd(xn, xm); break;
+          case 0b11: as_.Pcmpgtq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmhi: {
+        // CMHI Vd, Vn, Vm: lane-wise unsigned greater-than.  x86 has no
+        // unsigned vector compare, so flip the per-lane sign bit in both
+        // operands (XOR with 0x80…) and then use the signed PCMPGT*: this
+        // converts the unsigned ordering into the signed ordering that
+        // PCMPGT* implements.  64-bit lanes need SSE4.2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister sign = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            sign == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pcmpeqd(sign, sign);  // 0xFFFFFFFF per dword.
+        switch (args.size) {
+          case 0b00: {
+            // Need 0x80 in every byte.  Build via a GPR broadcast since
+            // there's no PSLLB shift on x86.
+            Register tmp = AllocTempReg();
+            if (tmp == Assembler::no_register) { Undefined(); return; }
+            as_.Movq(tmp, int64_t{static_cast<int64_t>(0x8080808080808080ULL)});
+            as_.Movq(sign, tmp);
+            as_.Punpcklqdq(sign, sign);
+            break;
+          }
+          case 0b01: as_.Psllw(sign, int8_t{15}); break;
+          case 0b10: as_.Pslld(sign, int8_t{31}); break;
+          case 0b11: as_.Psllq(sign, int8_t{63}); break;
+          default: Undefined(); return;
+        }
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xn, xm); break;
+          case 0b01: as_.Pcmpgtw(xn, xm); break;
+          case 0b10: as_.Pcmpgtd(xn, xm); break;
+          case 0b11: as_.Pcmpgtq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // region digitalis - CMGE/CMHS vector via PCMPGT + invert (sign-flip for CMHS)
+      case Decoder::AdvSimdThreeSameOpcode::kCmge: {
+        // CMGE Vd, Vn, Vm: lane-wise signed greater-than-or-equal.
+        // x86 has no PCMPGE; compute NOT(Vm > Vn) instead, since
+        //   (Vn >= Vm)  ==  !(Vm > Vn)  for total signed orderings.
+        // 64-bit lanes still need SSE4.2 (PCMPGTQ); other widths are SSE2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister ones = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            ones == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        // PCMPGT(xm, xn) -> xm > xn per lane.  Then XOR with all-ones to
+        // invert into (xn >= xm).
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xm, xn); break;
+          case 0b01: as_.Pcmpgtw(xm, xn); break;
+          case 0b10: as_.Pcmpgtd(xm, xn); break;
+          case 0b11: as_.Pcmpgtq(xm, xn); break;
+          default: Undefined(); return;
+        }
+        as_.Pcmpeqd(ones, ones);  // 0xFFFFFFFF per dword (== all-ones).
+        as_.Pxor(xm, ones);
+        if (!args.q) mask_low64(xm);
+        store_full(vd_off, xm);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmhs: {
+        // CMHS Vd, Vn, Vm: lane-wise unsigned greater-than-or-equal.
+        // Same shape as CMGE, but flip per-lane sign bits on both operands
+        // first to map unsigned ordering onto the signed PCMPGT*.
+        // 64-bit lanes need SSE4.2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister sign = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            sign == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pcmpeqd(sign, sign);  // 0xFFFFFFFF per dword; specialized below.
+        switch (args.size) {
+          case 0b00: {
+            // Need 0x80 in every byte (no PSLLB on x86).
+            Register tmp = AllocTempReg();
+            if (tmp == Assembler::no_register) { Undefined(); return; }
+            as_.Movq(tmp, int64_t{static_cast<int64_t>(0x8080808080808080ULL)});
+            as_.Movq(sign, tmp);
+            as_.Punpcklqdq(sign, sign);
+            break;
+          }
+          case 0b01: as_.Psllw(sign, int8_t{15}); break;
+          case 0b10: as_.Pslld(sign, int8_t{31}); break;
+          case 0b11: as_.Psllq(sign, int8_t{63}); break;
+          default: Undefined(); return;
+        }
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        // Reuse `sign` as the all-ones invert mask after this point.
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xm, xn); break;
+          case 0b01: as_.Pcmpgtw(xm, xn); break;
+          case 0b10: as_.Pcmpgtd(xm, xn); break;
+          case 0b11: as_.Pcmpgtq(xm, xn); break;
+          default: Undefined(); return;
+        }
+        as_.Pcmpeqd(sign, sign);  // 0xFFFFFFFF per dword.
+        as_.Pxor(xm, sign);
+        if (!args.q) mask_low64(xm);
+        store_full(vd_off, xm);
+        return;
+      }
+      // endregion
+      // region digitalis - SMAX/SMIN/UMAX/UMIN vector via PMAXS*/PMINS*/PMAXU*/PMINU*
+      case Decoder::AdvSimdThreeSameOpcode::kSmax:
+      case Decoder::AdvSimdThreeSameOpcode::kSmin:
+      case Decoder::AdvSimdThreeSameOpcode::kUmax:
+      case Decoder::AdvSimdThreeSameOpcode::kUmin: {
+        // S{MAX,MIN} / U{MAX,MIN} Vd.<T>, Vn.<T>, Vm.<T>: lane-wise signed
+        // or unsigned min/max.  x86 has direct lane-width-matched
+        // PMAXS/PMINS/PMAXU/PMINU instructions for all four arithmetic
+        // widths (8/16/32/64), except the .2D (64-bit) lane which has no
+        // SSE-era instruction (PMAXSQ/PMINSQ/PMAXUQ/PMINUQ only land with
+        // AVX-512F-VL).  Bail .2D to the interpreter; bail any size 0b00/0b01
+        // /0b10 case that needs SSE4.1 when SSE4.1 isn't available.
+        //
+        // Per-size SSE feature gate (table from Intel SDM Vol 2):
+        //   PMAXSB/PMINSB/PMAXSD/PMINSD/PMAXUW/PMINUW/PMAXUD/PMINUD -> SSE4.1.
+        //   PMAXSW/PMINSW/PMAXUB/PMINUB                              -> SSE2.
+        if (args.size == 0b11) {
+          // No SSE/AVX-2 instruction for 64-bit lanes.  Bail.
+          success_ = false;
+          return;
+        }
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+             args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmax);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+             args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmin);
+        // Need SSE4.1 for: signed-byte (PMAXSB/PMINSB), signed-dword
+        // (PMAXSD/PMINSD), unsigned-word (PMAXUW/PMINUW), unsigned-dword
+        // (PMAXUD/PMINUD).  SSE2 covers signed-word and unsigned-byte.
+        const bool needs_sse4_1 =
+            (is_signed && args.size == 0b00) ||
+            (is_signed && args.size == 0b10) ||
+            (!is_signed && args.size == 0b01) ||
+            (!is_signed && args.size == 0b10);
+        if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+          success_ = false;
+          return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        // xn := op(xn, xm) lane-wise.
+        switch (args.size) {
+          case 0b00:  // .16B / .8B
+            if (is_signed) {
+              if (is_max) as_.Pmaxsb(xn, xm); else as_.Pminsb(xn, xm);
+            } else {
+              if (is_max) as_.Pmaxub(xn, xm); else as_.Pminub(xn, xm);
+            }
+            break;
+          case 0b01:  // .8H / .4H
+            if (is_signed) {
+              if (is_max) as_.Pmaxsw(xn, xm); else as_.Pminsw(xn, xm);
+            } else {
+              if (is_max) as_.Pmaxuw(xn, xm); else as_.Pminuw(xn, xm);
+            }
+            break;
+          case 0b10:  // .4S / .2S
+            if (is_signed) {
+              if (is_max) as_.Pmaxsd(xn, xm); else as_.Pminsd(xn, xm);
+            } else {
+              if (is_max) as_.Pmaxud(xn, xm); else as_.Pminud(xn, xm);
+            }
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
