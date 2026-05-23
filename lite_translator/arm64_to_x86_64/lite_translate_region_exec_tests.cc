@@ -12750,6 +12750,258 @@ TEST_F(Arm64LiteTranslateRegionTest, SriVec2D) {
 }
 // endregion
 
+// region digitalis: SRSHR / URSHR / SRSRA / URSRA vector shift-by-immediate JIT
+// (rounding right-shift family).
+//
+// Opcode bits (15:11) per decoder.h:5375-5403:
+//   SRSHR opcode=00100 U=0   URSHR opcode=00100 U=1
+//   SRSRA opcode=00110 U=0   URSRA opcode=00110 U=1
+//
+// shift = 2*esize - immh:immb, range [1, esize].
+constexpr uint32_t kSrshrVec8H_3   = 0x4f1d2420;  // srshr v0.8h, v1.8h, #3
+constexpr uint32_t kSrshrVec4H_3   = 0x0f1d2420;  // srshr v0.4h, v1.4h, #3 (Q=0)
+constexpr uint32_t kSrshrVec4S_5   = 0x4f3b2420;  // srshr v0.4s, v1.4s, #5
+constexpr uint32_t kSrshrVec4S_1   = 0x4f3f2420;  // srshr v0.4s, v1.4s, #1 (cnt-1=0)
+constexpr uint32_t kSrshrVec8H_16  = 0x4f102420;  // srshr v0.8h, v1.8h, #16 (shift==esize)
+constexpr uint32_t kUrshrVec8H_3   = 0x6f1d2420;  // urshr v0.8h, v1.8h, #3
+constexpr uint32_t kUrshrVec4S_5   = 0x6f3b2420;  // urshr v0.4s, v1.4s, #5
+constexpr uint32_t kUrshrVec2D_11  = 0x6f752420;  // urshr v0.2d, v1.2d, #11
+constexpr uint32_t kUrshrVec8H_16  = 0x6f102420;  // urshr v0.8h, v1.8h, #16 (shift==esize)
+constexpr uint32_t kSrsraVec8H_3   = 0x4f1d3420;  // srsra v0.8h, v1.8h, #3
+constexpr uint32_t kSrsraVec4S_5   = 0x4f3b3420;  // srsra v0.4s, v1.4s, #5
+constexpr uint32_t kUrsraVec8H_3   = 0x6f1d3420;  // ursra v0.8h, v1.8h, #3
+constexpr uint32_t kUrsraVec4S_5   = 0x6f3b3420;  // ursra v0.4s, v1.4s, #5
+constexpr uint32_t kUrsraVec2D_11  = 0x6f753420;  // ursra v0.2d, v1.2d, #11
+
+// Reference: rounded signed right-shift (computed at width wider than esize).
+static int16_t SrshrRefI16(int16_t x, int n) {
+  return static_cast<int16_t>(
+      (static_cast<int32_t>(x) + (1 << (n - 1))) >> n);
+}
+static int32_t SrshrRefI32(int32_t x, int n) {
+  return static_cast<int32_t>(
+      (static_cast<int64_t>(x) + (1LL << (n - 1))) >> n);
+}
+static uint16_t UrshrRefU16(uint16_t x, int n) {
+  return static_cast<uint16_t>(
+      (static_cast<uint32_t>(x) + (1u << (n - 1))) >> n);
+}
+static uint32_t UrshrRefU32(uint32_t x, int n) {
+  return static_cast<uint32_t>(
+      (static_cast<uint64_t>(x) + (1ull << (n - 1))) >> n);
+}
+static uint64_t UrshrRefU64(uint64_t x, int n) {
+  __uint128_t big = static_cast<__uint128_t>(x) +
+                    (static_cast<__uint128_t>(1) << (n - 1));
+  return static_cast<uint64_t>(big >> n);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec8H) {
+  int16_t in_n[8] = {0, -1, 8, 7, INT16_MAX, INT16_MIN,
+                     0x1234, static_cast<int16_t>(0xABCD)};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);  // Vd irrelevant for SRSHR.
+  static const uint32_t code[] = {kSrshrVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SrshrRefI16(in_n[i], 3)) << "lane " << i << " in_n=" << in_n[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec4HUpperZero) {
+  int16_t in_n[8] = {-128, 256, INT16_MIN, INT16_MAX, 99, -99, 1, -1};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec4H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SrshrRefI16(in_n[i], 3)) << "lane " << i;
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec4S) {
+  int32_t in_n[4] = {INT32_MIN, -1, 0, INT32_MAX};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SrshrRefI32(in_n[i], 5)) << "lane " << i << " in_n=" << in_n[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec4SShift1) {
+  // Pin shift==1: exercises cnt_minus_1 = 0 path (PSRL(xr, 0) no-op).
+  // Also pins INT_MAX overflow case: SRSHR(INT32_MAX, 1) = (INT32_MAX+1)/2 = 2^30.
+  int32_t in_n[4] = {INT32_MAX, INT32_MIN, -3, 5};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec4S_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 1 << 30);                // (INT32_MAX + 1)/2 = 2^30
+  EXPECT_EQ(r[1], (INT32_MIN + 1) >> 1);   // SRSHR(INT32_MIN, 1)
+  EXPECT_EQ(r[2], (-3 + 1) >> 1);          // -1
+  EXPECT_EQ(r[3], (5 + 1) >> 1);           // 3
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec8HShiftEsize) {
+  // Pin shift==esize boundary: SRSHR(x, 16) = 0 for every signed 16-bit x.
+  int16_t in_n[8] = {INT16_MAX, INT16_MIN, -1, 0, 1, 0x7FFE, static_cast<int16_t>(0x8001), -42};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec8H_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "lane " << i << " in_n=" << in_n[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8H) {
+  uint16_t in_n[8] = {0x0000, 0xFFFF, 0x0008, 0x0007, 0x8000, 0x7FFF, 0x1234, 0xABCD};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUrshrVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], UrshrRefU16(in_n[i], 3))
+        << "lane " << i << " in_n=" << std::hex << in_n[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec4S) {
+  uint32_t in_n[4] = {0x00000000u, 0xFFFFFFFFu, 0x80000001u, 0x12345678u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUrshrVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], UrshrRefU32(in_n[i], 5)) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec2D) {
+  uint64_t in_n[2] = {0xFFFFFFFFFFFFFFFFull, 0x8000000000000001ull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUrshrVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], UrshrRefU64(in_n[i], 11)) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8HShiftEsize) {
+  // Pin shift==esize boundary: URSHR(x, 16) = MSB(x) (0 or 1).
+  uint16_t in_n[8] = {0xFFFF, 0x8000, 0x7FFF, 0x0000, 0x0001, 0xAAAA, 0x5555, 0x8001};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUrshrVec8H_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>((in_n[i] >> 15) & 1u);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << std::hex << in_n[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec8H) {
+  // SRSRA .8H shift=3: Vd += SRSHR(Vn, 3).
+  int16_t in_n[8] = {0, -1, 8, 7, INT16_MAX, INT16_MIN,
+                     0x1234, static_cast<int16_t>(0xABCD)};
+  int16_t in_d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSrsraVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t want = static_cast<int16_t>(in_d[i] + SrshrRefI16(in_n[i], 3));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec4S) {
+  int32_t in_n[4] = {INT32_MAX, INT32_MIN, -1, 0x12345678};
+  int32_t in_d[4] = {100, 200, 300, 400};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSrsraVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int32_t want = in_d[i] + SrshrRefI32(in_n[i], 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrsraVec8H) {
+  uint16_t in_n[8] = {0x0000, 0xFFFF, 0x0008, 0x0007, 0x8000, 0x7FFF, 0x1234, 0xABCD};
+  uint16_t in_d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUrsraVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>(in_d[i] + UrshrRefU16(in_n[i], 3));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrsraVec4S) {
+  uint32_t in_n[4] = {0x00000000u, 0xFFFFFFFFu, 0x80000001u, 0x12345678u};
+  uint32_t in_d[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUrsraVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint32_t want = in_d[i] + UrshrRefU32(in_n[i], 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrsraVec2D) {
+  uint64_t in_n[2] = {0xFFFFFFFFFFFFFFFFull, 0x8000000000000001ull};
+  uint64_t in_d[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUrsraVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint64_t want = in_d[i] + UrshrRefU64(in_n[i], 11);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
