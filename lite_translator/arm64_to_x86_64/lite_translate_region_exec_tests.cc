@@ -10879,6 +10879,9 @@ constexpr uint32_t kDupGenVec8B_W0 = 0x0e010c00;  // dup v0.8b, w0
 constexpr uint32_t kDupGenVec8B_W7 = 0x0e010ce0;  // dup v0.8b, w7
 constexpr uint32_t kDupGenVec2S_W0 = 0x0e040c00;  // dup v0.2s, w0
 constexpr uint32_t kDupGenVec2S_W7 = 0x0e040ce0;  // dup v0.2s, w7
+constexpr uint32_t kDupGenVec4H_W0 = 0x0e020c00;  // dup v0.4h, w0
+constexpr uint32_t kDupGenVec8H_W0 = 0x4e020c00;  // dup v0.8h, w0
+constexpr uint32_t kDupGenVec8H_W7 = 0x4e020ce0;  // dup v0.8h, w7
 
 TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8B_FromW0) {
   // dup v0.8b, w0  — fills v0[0..7] with byte 0xAB; v0[8..15] = 0.
@@ -10936,6 +10939,48 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGenVec2S_FromW7) {
   EXPECT_EQ(r[1], 0x12345678u) << "low s lane 1";
   EXPECT_EQ(r[2], 0u) << "upper s lane 2";
   EXPECT_EQ(r[3], 0u) << "upper s lane 3";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec4H_FromW0) {
+  // dup v0.4h, w0  — broadcast low halfword of w0 to v0.h[0..3];
+  // v0.h[4..7] (upper 64 bits) zeroed per ARM D-register semantics.
+  // Pre-seeds v0 so a missing upper-zero would leak the sentinel.
+  std::memset(&state_.cpu.v[0], 0x77, 16);
+  state_.cpu.x[0] = 0xDEADBEEF0000BEEFULL;  // low halfword = 0xBEEF
+  static const uint32_t code[] = {kDupGenVec4H_W0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) EXPECT_EQ(r[i], 0xBEEFu) << "low h lane " << i;
+  for (int i = 4; i < 8; ++i) EXPECT_EQ(r[i], 0u) << "upper h lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8H_FromW0) {
+  // dup v0.8h, w0  — broadcast low halfword of w0 to all 8 h lanes
+  // (Q=1, no upper-zero tail).
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  state_.cpu.x[0] = 0x123456780000ABCDULL;  // low halfword = 0xABCD
+  static const uint32_t code[] = {kDupGenVec8H_W0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], 0xABCDu) << "h lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8H_FromW7_HighBitsIgnored) {
+  // dup v0.8h, w7 with x7 having garbage in bits[31:16] — DUP general
+  // only consumes the low 16 bits of Wn for the H form, so the upper
+  // 16 bits of the 32-bit source must be ignored.  This pins that
+  // Pshuflw imm=0 selects halfword[0] (xmm bits[15:0]) and not a
+  // higher-numbered halfword that could have caught a stale value
+  // from the GP move.
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  state_.cpu.x[7] = 0xFFFFFFFFAAAA1234ULL;  // bits[15:0] = 0x1234; bits[31:16] = 0xAAAA
+  static const uint32_t code[] = {kDupGenVec8H_W7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], 0x1234u) << "h lane " << i;
 }
 // endregion
 

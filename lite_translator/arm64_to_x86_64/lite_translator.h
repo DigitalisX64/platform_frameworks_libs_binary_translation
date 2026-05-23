@@ -3901,6 +3901,15 @@ class LiteTranslator {
         if (zero_mask == no_simd_register) { Undefined(); return; }
         as_.Pxor(zero_mask, zero_mask);
         as_.Pshufb(xmm, zero_mask);
+      } else if (esize_bits == 0x02) {
+        // Halfword (16-bit) broadcast: Movd above placed Rn's low 32 bits in
+        // xmm[31:0]; the source halfword sits in xmm[15:0].  PSHUFLW with
+        // imm=0 broadcasts halfword[0] to all 4 low halfwords (xmm[63:0]).
+        // PSHUFD imm=0x44 then copies the low qword into the upper qword for
+        // Q=1 (.8H); for Q=0 (.4H) the upper-zero tail below clears the
+        // upper half.  Mirrors the proven UMOV-spill broadcast at line 6319.
+        as_.Pshuflw(xmm, xmm, static_cast<int8_t>(0));
+        if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
       } else if (esize_bits == 0x04) {
         // Word (32-bit) broadcast: PSHUFD(0) → broadcast low dword to all 4
         as_.Pshufd(xmm, xmm, static_cast<int8_t>(0));
