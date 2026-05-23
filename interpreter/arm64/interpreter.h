@@ -1837,28 +1837,40 @@ class Interpreter {
           set_result(i, static_cast<uint64_t>(get_signed(src_n, i) - get_signed(src_m, i)));
         }
         break;
+      // region digitalis - widening multiply-accumulate / multiply-subtract.
+      // Four arms parameterized by (is_signed, is_sub). Encodings differ only
+      // in U (bit29: signed/unsigned) and bit13 (op: add/sub); decoder maps to
+      // distinct enum values. Wraparound is the defined behaviour for both
+      // signed and unsigned widening multiply-accumulate, so the unsigned
+      // accumulator add/sub (well-defined mod 2^64) yields the same bit
+      // pattern as the original signed-then-cast code without the UB risk on
+      // signed overflow. Same fan-in shape as the SADDW/SSUBW/UADDW/USUBW arm
+      // at line 1904 (four-way (is_signed, is_sub) fan-in) and the SQDMLAL +
+      // SQDMLSL collapse below.
       case Decoder::AdvSimdThreeDiffOpcode::kUmlal:
-        for (uint8_t i = 0; i < num_elements; i++) {
-          set_result(i, get_accum(i) + get_unsigned(src_n, i) * get_unsigned(src_m, i));
-        }
-        break;
       case Decoder::AdvSimdThreeDiffOpcode::kSmlal:
-        for (uint8_t i = 0; i < num_elements; i++) {
-          int64_t prod = get_signed(src_n, i) * get_signed(src_m, i);
-          set_result(i, static_cast<uint64_t>(static_cast<int64_t>(get_accum(i)) + prod));
-        }
-        break;
       case Decoder::AdvSimdThreeDiffOpcode::kUmlsl:
+      case Decoder::AdvSimdThreeDiffOpcode::kSmlsl: {
+        bool is_signed = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSmlal ||
+                          args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSmlsl);
+        bool is_sub    = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kUmlsl ||
+                          args.opcode == Decoder::AdvSimdThreeDiffOpcode::kSmlsl);
         for (uint8_t i = 0; i < num_elements; i++) {
-          set_result(i, get_accum(i) - get_unsigned(src_n, i) * get_unsigned(src_m, i));
+          uint64_t prod;
+          if (is_signed) {
+            // get_signed sign-extends from in_esize to int64_t. For all
+            // supported in_esize (1, 2, 4), |sn * sm| <= 2^62, so the signed
+            // multiplication never overflows int64_t.
+            prod = static_cast<uint64_t>(get_signed(src_n, i) * get_signed(src_m, i));
+          } else {
+            prod = get_unsigned(src_n, i) * get_unsigned(src_m, i);
+          }
+          uint64_t accum = get_accum(i);
+          set_result(i, is_sub ? accum - prod : accum + prod);
         }
         break;
-      case Decoder::AdvSimdThreeDiffOpcode::kSmlsl:
-        for (uint8_t i = 0; i < num_elements; i++) {
-          int64_t prod = get_signed(src_n, i) * get_signed(src_m, i);
-          set_result(i, static_cast<uint64_t>(static_cast<int64_t>(get_accum(i)) - prod));
-        }
-        break;
+      }
+      // endregion
       case Decoder::AdvSimdThreeDiffOpcode::kUmull:
         for (uint8_t i = 0; i < num_elements; i++) {
           set_result(i, get_unsigned(src_n, i) * get_unsigned(src_m, i));
