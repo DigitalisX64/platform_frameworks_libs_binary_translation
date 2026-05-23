@@ -2987,6 +2987,27 @@ class Decoder {
     // endregion
 
     // region digitalis
+    // AdvSIMD scalar shift by immediate (ARM ARM C4.1.6.10):
+    //   bit31=0, bit30=1, bits[28:24]=11111, bit23=0, bit10=1, immh!=0.
+    // Sibling of vector AdvSimdShiftByImm (bits[28:24]=01111, also bit10=1),
+    // and of AdvSimdScalarXIndexedElement (same bits[28:24]=11111 but bit10=0).
+    // The encoding is bit-identical to the vector shift-by-immediate apart
+    // from bits[28:24] (and the absence of a Q bit — scalar always produces
+    // exactly one element).  By constructing AdvSimdShiftImmArgs with
+    // q=false and routing through the existing AdvSimdShiftByImm consumer,
+    // the interpreter naturally executes a single-lane shift (num_elements
+    // = vec_len / esize = 8 / 8 = 1 for D-form).  The dispatched
+    // implementations are intentionally limited this cycle to the shift
+    // ops where this num_elements=1 identity holds without additional
+    // post-masking (see DecodeAdvSimdScalarShiftByImm body).
+    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11111 &&
+        !GetBits<23, 1>() && GetBits<10, 1>() && GetBits<19, 4>() != 0) {
+      DecodeAdvSimdScalarShiftByImm();
+      return;
+    }
+    // endregion
+
+    // region digitalis
     // AdvSIMD three different: bit31=0, bits[28:24]=01110, bit21=1, bits[11:10]=00
     if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b00) {
       DecodeAdvSimdThreeDiff();
@@ -5998,6 +6019,113 @@ class Decoder {
         .immh = immh,
         .immb = immb,
         .q = q,
+        .u = u,
+    };
+    insn_consumer_->AdvSimdShiftByImm(args);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD scalar shift by immediate (ARM ARM C4.1.6.10).
+  // Encoding: 0 1 U 1 1 1 1 1 0 immh immb opcode 1 Rn Rd
+  //
+  // Scalar shift-by-immediate is the per-lane sibling of the vector
+  // shift-by-immediate routine just above.  Cycle scope is the
+  // D-form (immh=1xxx) "simple" shifts plus D-form saturating shifts:
+  //
+  //   opcode | U=0      | U=1       | sizes accepted by ARM ARM
+  //   -------+----------+-----------+---------------------------
+  //   00000  | SSHR     | USHR      | scalar D only
+  //   00010  | SSRA     | USRA      | scalar D only
+  //   00100  | SRSHR    | URSHR     | scalar D only
+  //   00110  | SRSRA    | URSRA     | scalar D only
+  //   01000  | —        | SRI       | scalar D only
+  //   01010  | SHL      | SLI       | scalar D only
+  //   01100  | —        | SQSHLU    | scalar B/H/S/D (this cycle: D only)
+  //   01110  | SQSHL    | UQSHL     | scalar B/H/S/D (this cycle: D only)
+  //
+  // The non-saturating ops are spec'd by ARM ARM as scalar D-only; the
+  // saturating ops accept all four sizes but only the D variant maps
+  // cleanly onto the existing vector interpreter via num_elements=1
+  // (esize=8, vec_len=8).  Non-D saturating shifts and the narrow
+  // (opcode 10xxx) / fixed-point conversion (opcode 11xxx) variants
+  // fall through to Undefined() until follow-up cycles add their own
+  // single-lane interpreter arms — see the carried "what should be
+  // done next" list.
+  //
+  void DecodeAdvSimdScalarShiftByImm() {
+    bool u = GetBits<29, 1>();
+    uint8_t immh = GetBits<19, 4>();
+    uint8_t immb = GetBits<16, 3>();
+    uint8_t opcode = GetBits<11, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+
+    // immh=0000 is the AdvSIMD modified-immediate carve-out; the
+    // top-level dispatch already gates on immh!=0, so this is just a
+    // defensive double-check.
+    if (immh == 0) { Undefined(); return; }
+
+    // All currently dispatched scalar shift-by-imm ops are D-form
+    // (immh=1xxx).  Reject non-D immh values up front so SIGILL fires
+    // for the unimplemented B/H/S saturating-shift, narrow-shift, and
+    // fixed-point-conversion scalar variants rather than silently
+    // producing wrong-lane-count results from the vector interpreter.
+    if (!(immh & 0b1000)) { Undefined(); return; }
+
+    AdvSimdShiftImmOpcode op;
+
+    switch (opcode) {
+      case 0b00000:
+        op = u ? AdvSimdShiftImmOpcode::kUshr : AdvSimdShiftImmOpcode::kSshr;
+        break;
+      case 0b00010:
+        op = u ? AdvSimdShiftImmOpcode::kUsra : AdvSimdShiftImmOpcode::kSsra;
+        break;
+      case 0b00100:
+        op = u ? AdvSimdShiftImmOpcode::kUrshr : AdvSimdShiftImmOpcode::kSrshr;
+        break;
+      case 0b00110:
+        op = u ? AdvSimdShiftImmOpcode::kUrsra : AdvSimdShiftImmOpcode::kSrsra;
+        break;
+      case 0b01000:
+        if (u) {
+          op = AdvSimdShiftImmOpcode::kSri;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b01010:
+        op = u ? AdvSimdShiftImmOpcode::kSli : AdvSimdShiftImmOpcode::kShl;
+        break;
+      case 0b01100:
+        if (u) {
+          op = AdvSimdShiftImmOpcode::kSqshlu;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b01110:
+        op = u ? AdvSimdShiftImmOpcode::kUqshl : AdvSimdShiftImmOpcode::kSqshl;
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
+    // q=false ⇒ vec_len=8 ⇒ num_elements = 8/8 = 1 for D-form ⇒ the
+    // existing AdvSimdShiftByImm interpreter executes a single-lane
+    // shift, exactly matching the ARM ARM scalar semantics.  The
+    // upper 64 bits of Vd are zeroed by the consumer's full-128-bit
+    // writeback because `result` is initialised to 0 before the loop.
+    const AdvSimdShiftImmArgs args = {
+        .opcode = op,
+        .rd = rd,
+        .rn = rn,
+        .immh = immh,
+        .immb = immb,
+        .q = false,
         .u = u,
     };
     insn_consumer_->AdvSimdShiftByImm(args);
