@@ -5857,6 +5857,47 @@ class Interpreter {
         state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
         return;
       }
+      // region digitalis: SRSHL / URSHL scalar (D only, non-saturating).
+      // Like SSHL / USHL but with rounding when shifting right.  Per ARM
+      // ARM C7.2.270 / .335, the rounding term `1 << (rshift-1)` is added
+      // before the right shift; left shifts behave identically to SSHL /
+      // USHL (no saturation — upper bits are discarded by the D-form mask
+      // on writeback).
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUrshlScalar: {
+        const uint64_t ua = static_cast<uint64_t>(state_->cpu.v[args.rn]);
+        const int sh = static_cast<int8_t>(
+            static_cast<uint64_t>(state_->cpu.v[args.rm]) & 0xFF);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar);
+        uint64_t r;
+        if (sh > 0) {
+          // Left shift, no saturation — discard upper bits.
+          r = (sh >= 64) ? uint64_t{0} : (ua << sh);
+        } else if (sh == 0) {
+          r = ua;
+        } else {
+          const int rshift = -sh;
+          if (rshift > 64) {
+            // Rounding right shift with rshift > 64 always rounds to 0
+            // for any 64-bit operand (the rounding term 2^(rshift-1)
+            // dominates and the quotient truncates to 0).
+            r = 0;
+          } else if (is_signed) {
+            const int64_t sa = static_cast<int64_t>(ua);
+            __int128 sum = static_cast<__int128>(sa) +
+                           (static_cast<__int128>(1) << (rshift - 1));
+            r = static_cast<uint64_t>(static_cast<int64_t>(sum >> rshift));
+          } else {
+            __uint128_t sum = static_cast<__uint128_t>(ua) +
+                              (static_cast<__uint128_t>(1) << (rshift - 1));
+            r = static_cast<uint64_t>(sum >> rshift);
+          }
+        }
+        state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+        return;
+      }
+      // endregion
       default:
         break;
     }

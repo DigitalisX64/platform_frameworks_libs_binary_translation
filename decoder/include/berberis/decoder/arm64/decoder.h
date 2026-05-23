@@ -1501,6 +1501,19 @@ class Decoder {
     kSqrshlScalar,
     kUqrshlScalar,
     // endregion
+    // region digitalis - scalar rounding shift left (D only, non-saturating).
+    //   size = 11 -> D (only valid lane width).
+    //   Shift amount is the low 8 bits of Vm (signed); negative shifts
+    //   are arithmetic right (signed) or logical right (unsigned), with
+    //   the standard rounding term `1 << (rshift-1)` added before the
+    //   right shift.  No saturation — bits beyond D are discarded.
+    //   See ARM ARM C7.2.270 / .335 (SRSHL / URSHL).
+    //   Encoding (scalar):
+    //     SRSHL  d, d, d  = 01 0 11110 11 1 Rm 0 1010 1 Rn Rd
+    //     URSHL  d, d, d  = 01 1 11110 11 1 Rm 0 1010 1 Rn Rd
+    kSrshlScalar,
+    kUrshlScalar,
+    // endregion
   };
 
   struct AdvSimdScalarThreeSameArgs {
@@ -5198,6 +5211,15 @@ class Decoder {
         case 0b01011:
           op = u ? AdvSimdScalarThreeSameOpcode::kUqrshlScalar
                  : AdvSimdScalarThreeSameOpcode::kSqrshlScalar;
+          break;
+        // endregion
+        // region digitalis: SRSHL / URSHL scalar (D only, non-saturating).
+        //   size=11 is the only valid lane width for this scalar form
+        //   (the all_sizes whitelist intentionally excludes 01010 so
+        //   the `size != 0b11` guard above already rejects B/H/S).
+        case 0b01010:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUrshlScalar
+                 : AdvSimdScalarThreeSameOpcode::kSrshlScalar;
           break;
         // endregion
         case 0b00110:
