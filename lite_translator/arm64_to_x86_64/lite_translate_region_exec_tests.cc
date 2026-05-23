@@ -4216,6 +4216,179 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
 }
 // endregion
 
+// region digitalis: FADD / FSUB / FMUL / FDIV vector three-same JIT
+// (FP32 .2S/.4S, FP64 .2D).  Direct lowering to ADDPS/PD, SUBPS/PD,
+// MULPS/PD, DIVPS/PD (all SSE2).  Tests pick operand pairs that are
+// exactly representable in the target precision so the result is the
+// same bit-pattern whether the lowering goes through the JIT path or
+// the interpreter fallback.
+//
+// Encoding (per ARM ARM C7.2 / aarch64-linux-gnu-as verification):
+//   FADD Vd.4S = 0x4E20D400 | (rm<<16) | (rn<<5) | rd
+//   FADD Vd.2D = 0x4E60D400 | (rm<<16) | (rn<<5) | rd
+//   FADD Vd.2S = 0x0E20D400 | (rm<<16) | (rn<<5) | rd
+//   FSUB Vd.4S = 0x4EA0D400 | (rm<<16) | (rn<<5) | rd
+//   FSUB Vd.2D = 0x4EE0D400 | (rm<<16) | (rn<<5) | rd
+//   FMUL Vd.4S = 0x6E20DC00 | (rm<<16) | (rn<<5) | rd
+//   FMUL Vd.2D = 0x6E60DC00 | (rm<<16) | (rn<<5) | rd
+//   FDIV Vd.4S = 0x6E20FC00 | (rm<<16) | (rn<<5) | rd
+//   FDIV Vd.2D = 0x6E60FC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FaddVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FsubVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FsubVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E60DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FdivVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FdivVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E60FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FaddVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FaddVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);
+  EXPECT_FLOAT_EQ(r[1], 1.0f);
+  EXPECT_FLOAT_EQ(r[2], 1.0f);
+  EXPECT_FLOAT_EQ(r[3], 100.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FaddVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FaddVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.75);
+  EXPECT_DOUBLE_EQ(r[1], -5.0);
+}
+
+// .2S (q=0): only the low 2 FP32 lanes participate; upper 64 bits of Vd
+// must be zeroed even though the JIT performs the ADDPS on uninitialized
+// upper lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FaddVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f,  4.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, -1.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FaddVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 5.0f);
+  EXPECT_FLOAT_EQ(r[1], 3.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FsubVec4S) {
+  StoreVec4S(state_.cpu, 1, 5.0f,  2.0f, 0.5f, -1.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f,  6.0f, 0.25f, 2.0f);
+  static const uint32_t code[] = {FsubVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], -4.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.25f);
+  EXPECT_FLOAT_EQ(r[3], -3.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FsubVec2D) {
+  StoreVec2D(state_.cpu, 1, 10.0,  -2.5);
+  StoreVec2D(state_.cpu, 2,  3.0,   0.5);
+  static const uint32_t code[] = {FsubVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.0);
+  EXPECT_DOUBLE_EQ(r[1], -3.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmulVec4S) {
+  StoreVec4S(state_.cpu, 1, 2.0f, -3.0f, 0.5f, 16.0f);
+  StoreVec4S(state_.cpu, 2, 4.0f,  2.0f, 8.0f,  0.25f);
+  static const uint32_t code[] = {FmulVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 8.0f);
+  EXPECT_FLOAT_EQ(r[1], -6.0f);
+  EXPECT_FLOAT_EQ(r[2], 4.0f);
+  EXPECT_FLOAT_EQ(r[3], 4.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmulVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -2.0);
+  StoreVec2D(state_.cpu, 2, 4.0,   8.0);
+  static const uint32_t code[] = {FmulVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 6.0);
+  EXPECT_DOUBLE_EQ(r[1], -16.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FdivVec4S) {
+  StoreVec4S(state_.cpu, 1, 8.0f,  -10.0f, 1.0f,  256.0f);
+  StoreVec4S(state_.cpu, 2, 2.0f,    4.0f, 8.0f,   16.0f);
+  static const uint32_t code[] = {FdivVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 4.0f);
+  EXPECT_FLOAT_EQ(r[1], -2.5f);
+  EXPECT_FLOAT_EQ(r[2], 0.125f);
+  EXPECT_FLOAT_EQ(r[3], 16.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FdivVec2D) {
+  StoreVec2D(state_.cpu, 1, 9.0,    -1.0);
+  StoreVec2D(state_.cpu, 2, 4.0,     8.0);
+  static const uint32_t code[] = {FdivVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 2.25);
+  EXPECT_DOUBLE_EQ(r[1], -0.125);
+}
+// endregion
+
 // region digitalis: FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // ARM ARM defines FMLA/FMLS as fused multiply-accumulate (one rounding).
 // The lowering uses Vfmadd231(ps|pd) / Vfnmadd231(ps|pd).  Tests pick

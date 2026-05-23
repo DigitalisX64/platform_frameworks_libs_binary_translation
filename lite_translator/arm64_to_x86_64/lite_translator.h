@@ -4315,12 +4315,42 @@ class LiteTranslator {
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
       case Decoder::AdvSimdThreeSameOpcode::kFdivV: {
-        // FP16 vector FADD/FSUB/FMUL/FDIV via F16C round-trip: widen each
-        // operand half to FP32, run the binary op at FP32, narrow back to
-        // FP16. The round-trip is bit-exact for any single FP16-input
-        // FADD/FSUB/FMUL/FDIV because FP32's 24-bit mantissa strictly
-        // contains FP16's 11. FP32/FP64 forms still bail to the interpreter.
-        if (!args.is_fp16) { Undefined(); return; }
+        // FP16 vector FADD/FSUB/FMUL/FDIV via F16C round-trip (below).
+        // FP32 (.2S/.4S) and FP64 (.2D) lower directly to SSE2 packed FP
+        // arithmetic: ADDPS/PD, SUBPS/PD, MULPS/PD, DIVPS/PD.  args.size=0
+        // selects FP32 (4-byte lanes); args.size=1 selects FP64 (8-byte
+        // lanes; the decoder already rejects sz=1 with Q=0).
+        if (!args.is_fp16) {
+          const bool is_double = (args.size & 1);
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          if (is_double) {
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV: as_.Addpd(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV: as_.Subpd(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV: as_.Mulpd(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV: as_.Divpd(xn, xm); break;
+              default: success_ = false; return;
+            }
+          } else {
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV: as_.Addps(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV: as_.Subps(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV: as_.Mulps(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV: as_.Divps(xn, xm); break;
+              default: success_ = false; return;
+            }
+          }
+          // .2S (q=0, FP32 only) zeroes the upper 64 bits of the destination.
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
         if (!host_platform::kHasF16C) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
