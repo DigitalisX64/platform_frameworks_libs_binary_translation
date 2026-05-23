@@ -11828,6 +11828,89 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: SHRN / SHRN2 vector shift-right-narrow JIT.
+      //
+      //   immh=0001 → src 16-bit (.8H), dst 8-bit  (.8B / .16B for SHRN2)
+      //   immh=001x → src 32-bit (.4S), dst 16-bit (.4H / .8H  for SHRN2)
+      //   immh=01xx → src 64-bit (.2D), dst 32-bit (.2S / .4S  for SHRN2)
+      //   immh=1xxx → undefined (src would be 128-bit) — bail to interp.
+      //
+      //   narrow_rshift = src_bits - (immh:immb)  ∈ [1, src_bits]
+      //
+      // x86 lowering: PSRL{W,D,Q} src by narrow_rshift, then PSHUFB to
+      // gather the low half of each src lane into the low 64 bits of the
+      // dst (upper 64 bits zeroed by 0x80 selectors).  PSRL count ≥ esize
+      // produces 0 per lane — matches the ARM `narrow_rshift >= src_bits`
+      // branch in the interpreter.
+      //
+      // Q=0 (SHRN):  store narrowed-in-low | zero-upper.
+      // Q=1 (SHRN2): preserve Vd[63:0], OR narrowed result into Vd[127:64].
+      case Decoder::AdvSimdShiftImmOpcode::kShrn: {
+        const uint8_t immh = args.immh;
+        if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
+        uint8_t src_bits;
+        if (immh & 0b0100) {
+          src_bits = 64;
+        } else if (immh & 0b0010) {
+          src_bits = 32;
+        } else /* immh == 0b0001 */ {
+          src_bits = 16;
+        }
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xmask = AllocTempSimdReg();
+        Register r1 = AllocTempReg();
+        if (xn == no_simd_register || xmask == no_simd_register ||
+            r1 == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        const int8_t cnt = static_cast<int8_t>(narrow_rshift);
+        switch (src_bits) {
+          case 16: as_.Psrlw(xn, cnt); break;
+          case 32: as_.Psrld(xn, cnt); break;
+          case 64: as_.Psrlq(xn, cnt); break;
+        }
+        // PSHUFB selectors: 0x80 in the upper 8 entries zeros the upper
+        // 64 bits of the result; the lower 8 entries gather the bytes
+        // that form the narrowed value of each source lane.
+        //   src 16-bit → low byte of each .8H lane = bytes 0,2,4,...,14.
+        //   src 32-bit → low half of each .4S lane = bytes 0,1,4,5,8,9,12,13.
+        //   src 64-bit → low word of each .2D lane = bytes 0,1,2,3,8,9,10,11.
+        int64_t mask_lo;
+        const int64_t mask_hi = static_cast<int64_t>(0x8080808080808080ULL);
+        switch (src_bits) {
+          case 16:
+            mask_lo = static_cast<int64_t>(0x0E0C0A0806040200LL);
+            break;
+          case 32:
+            mask_lo = static_cast<int64_t>(0x0D0C090805040100LL);
+            break;
+          case 64:
+            mask_lo = static_cast<int64_t>(0x0B0A090803020100LL);
+            break;
+          default: success_ = false; return;
+        }
+        as_.Movq(r1, mask_lo);
+        as_.Movq(xmask, r1);
+        as_.Movq(r1, mask_hi);
+        as_.Pinsrq(xmask, r1, int8_t{1});
+        as_.Pshufb(xn, xmask);
+        if (args.q) {
+          // SHRN2: preserve Vd[63:0]; place narrowed lanes in Vd[127:64].
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movq(xd, {.base = Assembler::rbp, .disp = vd_off});
+          as_.Pslldq(xn, int8_t{8});
+          as_.Por(xd, xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        } else {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
