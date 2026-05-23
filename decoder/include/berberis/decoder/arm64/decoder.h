@@ -2801,11 +2801,13 @@ class Decoder {
 
     // region digitalis
     // AdvSIMD permute (UZP1, TRN1, ZIP1, UZP2, TRN2, ZIP2):
-    // bit31=0, bits[28:24]=01110, bit21=0, bit15=0, bits[11:10]=10
+    // bit31=0, bit29=0, bits[28:24]=01110, bit21=0, bit15=0, bits[11:10]=10.
+    // The bit29=0 check disambiguates from EXT (bit29=1), which otherwise
+    // collides for odd imm4 (bit 11 of EXT's imm4 = 1 yields bits[10:11]=10).
     // Must be checked BEFORE two-reg misc since both share bits[11:10]=10 but
     // permute has bit21=0 while two-reg misc has bit21=1 (bits[21:17]=10000).
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<21, 1>() &&
-        !GetBits<15, 1>() && GetBits<10, 2>() == 0b10) {
+    if (!bit31 && !GetBits<29, 1>() && GetBits<24, 5>() == 0b01110 &&
+        !GetBits<21, 1>() && !GetBits<15, 1>() && GetBits<10, 2>() == 0b10) {
       uint8_t opcode = GetBits<12, 3>();
       insn_consumer_->AdvSimdPermute(
           GetBits<0, 5>(),   // rd
