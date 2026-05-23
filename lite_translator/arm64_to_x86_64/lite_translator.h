@@ -3738,6 +3738,87 @@ class LiteTranslator {
       }
       return;
     }
+
+    // DUP (element): broadcast Vn[index] (one esize-byte element) to all
+    // lanes of Vd.  Q=0 fills lower 64 bits and zeros upper 64; Q=1 fills
+    // 128 bits.  Valid (esize, Q) pairs per ARM ARM:
+    //   (1, 0/1) DUP Vd.8B/.16B, Vn.B[idx]    idx ∈ 0..15
+    //   (2, 0/1) DUP Vd.4H/.8H,  Vn.H[idx]    idx ∈ 0..7
+    //   (4, 0/1) DUP Vd.2S/.4S,  Vn.S[idx]    idx ∈ 0..3
+    //   (8, 1)   DUP Vd.2D,      Vn.D[idx]    idx ∈ 0..1
+    // (8, 0) is ARM-reserved.
+    //
+    // Lowering:
+    //   esize=1 → PSHUFB xmm, mask where mask = {idx}×16 → byte broadcast.
+    //   esize=2 → PSHUFB xmm, mask where mask = {idx*2, idx*2+1}×8 →
+    //             halfword broadcast.
+    //   esize=4 → PSHUFD xmm, xmm, imm = idx*0x55 (broadcast dword[idx]).
+    //   esize=8 → PSHUFD xmm, xmm, 0x44 (idx=0) or 0xEE (idx=1).
+    //
+    // Q=0 forms run the same lowering and then zero the upper 64 bits via
+    // PSLLDQ-8 / PSRLDQ-8 — for byte/halfword broadcast the result already
+    // has the same value in both halves, so the shared upper-zero tail is
+    // a no-op semantically; we keep it for uniformity with the rest of
+    // the Q=0 SIMD lowerings in this file.
+    //
+    // PSHUFB is SSSE3 (universal on x86_64 emulator hosts), PSHUFD is
+    // SSE2; no host gate needed.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupElement && esize != 0) {
+      if (esize == 8 && !args.q) { success_ = false; return; }
+
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { success_ = false; return; }
+      int32_t off_vn = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      as_.Movdqu(xmm, {.base = Assembler::rbp, .disp = off_vn});
+
+      if (esize == 1) {
+        // mask = 0x{idx}{idx}{idx}{idx}{idx}{idx}{idx}{idx} (each byte = idx).
+        SimdRegister mask = AllocTempSimdReg();
+        if (mask == no_simd_register) { success_ = false; return; }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        uint64_t mask_qword =
+            0x0101010101010101ULL * static_cast<uint64_t>(index);
+        as_.Movq(r1, static_cast<int64_t>(mask_qword));
+        as_.Movq(mask, r1);
+        as_.Pinsrq(mask, r1, int8_t{1});
+        as_.Pshufb(xmm, mask);
+      } else if (esize == 2) {
+        // mask qword = {b0,b1,b0,b1,b0,b1,b0,b1} where b0=idx*2, b1=idx*2+1.
+        SimdRegister mask = AllocTempSimdReg();
+        if (mask == no_simd_register) { success_ = false; return; }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        uint64_t b0 = static_cast<uint64_t>(index) * 2;
+        uint64_t b1 = b0 + 1;
+        uint64_t pair = (b1 << 8) | b0;
+        uint64_t mask_qword =
+            pair | (pair << 16) | (pair << 32) | (pair << 48);
+        as_.Movq(r1, static_cast<int64_t>(mask_qword));
+        as_.Movq(mask, r1);
+        as_.Pinsrq(mask, r1, int8_t{1});
+        as_.Pshufb(xmm, mask);
+      } else if (esize == 4) {
+        // PSHUFD imm = idx * 0x55: imm 0x00, 0x55, 0xAA, 0xFF broadcast
+        // dword[0], [1], [2], [3] respectively to all 4 dwords.
+        uint8_t imm = static_cast<uint8_t>(index * 0x55);
+        as_.Pshufd(xmm, xmm, static_cast<int8_t>(imm));
+      } else /* esize == 8 (Q=1 only; Q=0 rejected above) */ {
+        // PSHUFD imm 0x44 = (0)(1)(0)(1) — duplicate low qword to both
+        // halves.  imm 0xEE = (2)(3)(2)(3) — duplicate high qword.
+        uint8_t imm = (index == 0) ? 0x44 : 0xEE;
+        as_.Pshufd(xmm, xmm, static_cast<int8_t>(imm));
+      }
+
+      if (!args.q) {
+        // Zero upper 64 bits per ARM D-register semantics.
+        as_.Pslldq(xmm, int8_t{8});
+        as_.Psrldq(xmm, int8_t{8});
+      }
+      int32_t off_vd = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      as_.Movdqu({.base = Assembler::rbp, .disp = off_vd}, xmm);
+      return;
+    }
     // endregion
 
     // region digitalis - implement DUP (general) for memset fast path
