@@ -14605,6 +14605,178 @@ TEST_F(Arm64LiteTranslateRegionTest, ShrnVec8BShift8) {
 }
 // endregion
 
+// region digitalis: RSHRN / RSHRN2 vector rounding-shift-right-narrow
+// exec tests.  Pin the JIT lowering at lite_translator.h's
+// AdvSimdShiftByImm kRshrn case (PADDW/PADDD/PADDQ + PSRL{W,D,Q} +
+// PSHUFB).  Encodings verified with aarch64-linux-gnu-as -march=armv8-a.
+
+// rshrn  v0.8b,  v1.8h, #5
+constexpr uint32_t kRshrnVec8B_5    = 0x0F0B8C20;
+// rshrn2 v0.16b, v1.8h, #5
+constexpr uint32_t kRshrn2Vec16B_5  = 0x4F0B8C20;
+// rshrn  v0.4h,  v1.4s, #5
+constexpr uint32_t kRshrnVec4H_5    = 0x0F1B8C20;
+// rshrn2 v0.8h,  v1.4s, #5
+constexpr uint32_t kRshrn2Vec8H_5   = 0x4F1B8C20;
+// rshrn  v0.2s,  v1.2d, #11
+constexpr uint32_t kRshrnVec2S_11   = 0x0F358C20;
+// rshrn2 v0.4s,  v1.2d, #11
+constexpr uint32_t kRshrn2Vec4S_11  = 0x4F358C20;
+// rshrn  v0.8b,  v1.8h, #1  — minimum rshift; rounding = 1.
+constexpr uint32_t kRshrnVec8B_1    = 0x0F0F8C20;
+// rshrn  v0.8b,  v1.8h, #8  — boundary; rounding = 0x80, exercises
+// the lane-wide wrap when elem.high-byte == 0xFF.
+constexpr uint32_t kRshrnVec8B_8    = 0x0F088C20;
+
+static inline uint8_t  RshrnRefU8 (uint16_t e, uint8_t k) {
+  return static_cast<uint8_t>(((static_cast<uint32_t>(e) + (1u << (k - 1))) >> k) & 0xFFu);
+}
+static inline uint16_t RshrnRefU16(uint32_t e, uint8_t k) {
+  return static_cast<uint16_t>(((static_cast<uint64_t>(e) + (1ULL << (k - 1))) >> k) & 0xFFFFu);
+}
+static inline uint32_t RshrnRefU32(uint64_t e, uint8_t k) {
+  return static_cast<uint32_t>((((__uint128_t{e}) + (__uint128_t{1} << (k - 1))) >> k) & 0xFFFFFFFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RshrnVec8BShift5) {
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8001, 0x4321, 0x1234, 0xABCD, 0x00FF, 0xCAFE};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRshrnVec8B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], RshrnRefU8(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Rshrn2Vec16BShift5) {
+  uint16_t in[8]  = {0x0000, 0xFFFF, 0x8001, 0x4321, 0x1234, 0xABCD, 0x00FF, 0xCAFE};
+  uint8_t  vd[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                     0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10, 0x20};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kRshrn2Vec16B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low byte " << i << " was clobbered";
+  }
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i + 8], RshrnRefU8(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RshrnVec4HShift5) {
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0x80000001u, 0xDEADBEEFu};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRshrnVec4H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], RshrnRefU16(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Rshrn2Vec8HShift5) {
+  uint32_t in[4]  = {0x12345678u, 0x9ABCDEF0u, 0xFEDCBA98u, 0x76543210u};
+  uint16_t vd[8]  = {0xAAA0, 0xBBB1, 0xCCC2, 0xDDD3, 0x1000, 0x2000, 0x3000, 0x4000};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kRshrn2Vec8H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low halfword " << i << " clobbered";
+  }
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i + 4], RshrnRefU16(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RshrnVec2SShift11) {
+  uint64_t in[2] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRshrnVec2S_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], RshrnRefU32(in[i], 11)) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper word " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Rshrn2Vec4SShift11) {
+  uint64_t in[2] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL};
+  uint32_t vd[4] = {0x11111111u, 0x22222222u, 0xDEAD0000u, 0xBEEF0000u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kRshrn2Vec4S_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low word " << i << " clobbered";
+  }
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i + 2], RshrnRefU32(in[i], 11)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RshrnVec8BShift1) {
+  // shift=1, rounding=1.  Cover 0xFFFE → round 0xFFFF → shift 0x7FFF →
+  // narrow 0xFF and 0xFFFF → round 0x10000 (wraps to 0) → shift 0 → 0x00.
+  uint16_t in[8] = {0x0001, 0x0002, 0x0003, 0x000F, 0xFFFE, 0xFFFF, 0x7FFF, 0x4001};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRshrnVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], RshrnRefU8(in[i], 1))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RshrnVec8BShift8) {
+  // shift=8, rounding=0x80.  0xFFFF + 0x80 = 0x1007F (wide-add),
+  //   PADDW result = 0x007F, PSRLW8 = 0, narrow = 0x00.
+  // 0x80FF + 0x80 = 0x817F, PADDW = 0x817F, PSRLW8 = 0x81, narrow = 0x81.
+  uint16_t in[8] = {0xAB00, 0xCDFF, 0x1234, 0x80FF, 0x7F01, 0x00FF, 0xFFFE, 0x42AA};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRshrnVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], RshrnRefU8(in[i], 8))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
+  }
+}
+// endregion
+
 
 // region digitalis: SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
 //

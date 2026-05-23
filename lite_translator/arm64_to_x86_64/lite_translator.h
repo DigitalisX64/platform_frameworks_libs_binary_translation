@@ -11828,14 +11828,15 @@ class LiteTranslator {
         return;
       }
       // endregion
-      // region digitalis: SHRN / SHRN2 vector shift-right-narrow JIT.
+      // region digitalis: SHRN / SHRN2 / RSHRN / RSHRN2 vector
+      // shift-right-narrow JIT.
       //
-      //   immh=0001 → src 16-bit (.8H), dst 8-bit  (.8B / .16B for SHRN2)
-      //   immh=001x → src 32-bit (.4S), dst 16-bit (.4H / .8H  for SHRN2)
-      //   immh=01xx → src 64-bit (.2D), dst 32-bit (.2S / .4S  for SHRN2)
+      //   immh=0001 → src 16-bit (.8H), dst 8-bit  (.8B / .16B for Q=1)
+      //   immh=001x → src 32-bit (.4S), dst 16-bit (.4H / .8H  for Q=1)
+      //   immh=01xx → src 64-bit (.2D), dst 32-bit (.2S / .4S  for Q=1)
       //   immh=1xxx → undefined (src would be 128-bit) — bail to interp.
       //
-      //   narrow_rshift = src_bits - (immh:immb)  ∈ [1, src_bits]
+      //   narrow_rshift = src_bits - (immh:immb)  ∈ [1, src_bits/2]
       //
       // x86 lowering: PSRL{W,D,Q} src by narrow_rshift, then PSHUFB to
       // gather the low half of each src lane into the low 64 bits of the
@@ -11843,9 +11844,20 @@ class LiteTranslator {
       // produces 0 per lane — matches the ARM `narrow_rshift >= src_bits`
       // branch in the interpreter.
       //
-      // Q=0 (SHRN):  store narrowed-in-low | zero-upper.
-      // Q=1 (SHRN2): preserve Vd[63:0], OR narrowed result into Vd[127:64].
-      case Decoder::AdvSimdShiftImmOpcode::kShrn: {
+      // RSHRN adds the rounding constant (1 << (narrow_rshift - 1)) into
+      // every source lane via PADDW/PADDD/PADDQ before the right shift.
+      // The integer add wraps modulo lane width on x86 but the wrap is
+      // benign: the subsequent right shift drops at least narrow_rshift
+      // bits and PSHUFB then narrow-masks to dst_bits, so the high carry
+      // bit that the interpreter's 128-bit wide-add captures is always
+      // discarded.  narrow_rshift ∈ [1, src_bits/2] by the encoding
+      // constraints, so (narrow_rshift - 1) ≥ 0 and the rounding
+      // constant always fits in a single source lane.
+      //
+      // Q=0:        store narrowed-in-low | zero-upper.
+      // Q=1 ("2"):  preserve Vd[63:0], OR narrowed result into Vd[127:64].
+      case Decoder::AdvSimdShiftImmOpcode::kShrn:
+      case Decoder::AdvSimdShiftImmOpcode::kRshrn: {
         const uint8_t immh = args.immh;
         if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
         uint8_t src_bits;
@@ -11856,6 +11868,8 @@ class LiteTranslator {
         } else /* immh == 0b0001 */ {
           src_bits = 16;
         }
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn);
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
         const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
         SimdRegister xn = AllocTempSimdReg();
@@ -11866,6 +11880,36 @@ class LiteTranslator {
           success_ = false; return;
         }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_rounding) {
+          // Broadcast the per-lane rounding constant (1 << (rshift - 1))
+          // across all SIMD lanes, then PADDW/PADDD/PADDQ.  The 64-bit
+          // pattern packs the constant into every lane of the source
+          // element width.
+          const uint64_t round_lane = uint64_t{1} << (narrow_rshift - 1);
+          uint64_t round_pattern;
+          switch (src_bits) {
+            case 16:
+              round_pattern = round_lane * uint64_t{0x0001000100010001ULL};
+              break;
+            case 32:
+              round_pattern = round_lane * uint64_t{0x0000000100000001ULL};
+              break;
+            case 64:
+              round_pattern = round_lane;
+              break;
+            default: success_ = false; return;
+          }
+          SimdRegister xround = AllocTempSimdReg();
+          if (xround == no_simd_register) { success_ = false; return; }
+          as_.Movq(r1, static_cast<int64_t>(round_pattern));
+          as_.Movq(xround, r1);
+          as_.Pinsrq(xround, r1, int8_t{1});
+          switch (src_bits) {
+            case 16: as_.Paddw(xn, xround); break;
+            case 32: as_.Paddd(xn, xround); break;
+            case 64: as_.Paddq(xn, xround); break;
+          }
+        }
         const int8_t cnt = static_cast<int8_t>(narrow_rshift);
         switch (src_bits) {
           case 16: as_.Psrlw(xn, cnt); break;
