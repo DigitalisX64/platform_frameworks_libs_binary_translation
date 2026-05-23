@@ -3817,16 +3817,42 @@ class LiteTranslator {
 
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kMul: {
-        // region digitalis - MUL .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
-        // .16B/.8B (size=00) has no SSE single-op equivalent; .2D / scalar 64-bit
-        // is reserved by the ARM ARM. Both fall back to the interpreter.
-        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
+        // region digitalis - MUL .16B/.8B via PMOVZXBW + PMULLW + PACKUSWB (SSE4.1);
+        // .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
+        // .2D / scalar 64-bit is reserved by the ARM ARM and falls back to the interpreter.
+        if (args.size == 0b11) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        if (args.size == 0b01) {
+        if (args.size == 0b00) {
+          // Byte multiply: x86 has no PMULLB. Widen each 8 bytes to 16-bit
+          // words (low + high half separately), PMULLW, mask each result
+          // word to its low byte (so PACKUSWB doesn't saturate), then pack.
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmovzxbw(xn_hi, xn_hi);
+          as_.Pmovzxbw(xm_hi, xm_hi);
+          as_.Pmullw(xn, xm);
+          as_.Pmullw(xn_hi, xm_hi);
+          // Reuse xm as the 0x00FF×8 mask: PCMPEQB writes all-ones, PSRLW 8
+          // clears the high byte of each 16-bit lane.
+          as_.Pcmpeqb(xm, xm);
+          as_.Psrlw(xm, int8_t{8});
+          as_.Pand(xn, xm);
+          as_.Pand(xn_hi, xm);
+          as_.Packuswb(xn, xn_hi);
+        } else if (args.size == 0b01) {
           as_.Pmullw(xn, xm);
         } else {
           as_.Pmulld(xn, xm);
@@ -3837,10 +3863,10 @@ class LiteTranslator {
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
-        // region digitalis - MLA .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
-        // .16B/.8B (size=00) has no SSE single-op multiply equivalent; .2D / scalar 64-bit
-        // is reserved by the ARM ARM. Both fall back to the interpreter.
-        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
+        // region digitalis - MLA .16B/.8B via PMOVZXBW+PMULLW+PACKUSWB+PADDB (SSE4.1);
+        // .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
+        // .2D / scalar 64-bit is reserved by the ARM ARM and falls back to the interpreter.
+        if (args.size == 0b11) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         SimdRegister xd = AllocTempSimdReg();
@@ -3850,7 +3876,32 @@ class LiteTranslator {
         load_full(xn, vn_off);
         load_full(xm, vm_off);
         load_full(xd, vd_off);
-        if (args.size == 0b01) {
+        if (args.size == 0b00) {
+          // Byte MLA: same byte-multiply recipe as kMul (size=00) above,
+          // then PADDB into Vd. Adding at byte width gives the correct
+          // low-8-bit-truncated accumulate.
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmovzxbw(xn_hi, xn_hi);
+          as_.Pmovzxbw(xm_hi, xm_hi);
+          as_.Pmullw(xn, xm);
+          as_.Pmullw(xn_hi, xm_hi);
+          as_.Pcmpeqb(xm, xm);
+          as_.Psrlw(xm, int8_t{8});
+          as_.Pand(xn, xm);
+          as_.Pand(xn_hi, xm);
+          as_.Packuswb(xn, xn_hi);
+          as_.Paddb(xd, xn);
+        } else if (args.size == 0b01) {
           as_.Pmullw(xn, xm);
           as_.Paddw(xd, xn);
         } else {
