@@ -28,6 +28,7 @@
 #include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
+#include "berberis/runtime_primitives/platform.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
 
 namespace berberis {
@@ -4215,6 +4216,450 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
 }
 // endregion
 
+// region digitalis: FADD / FSUB / FMUL / FDIV vector three-same JIT
+// (FP32 .2S/.4S, FP64 .2D).  Direct lowering to ADDPS/PD, SUBPS/PD,
+// MULPS/PD, DIVPS/PD (all SSE2).  Tests pick operand pairs that are
+// exactly representable in the target precision so the result is the
+// same bit-pattern whether the lowering goes through the JIT path or
+// the interpreter fallback.
+//
+// Encoding (per ARM ARM C7.2 / aarch64-linux-gnu-as verification):
+//   FADD Vd.4S = 0x4E20D400 | (rm<<16) | (rn<<5) | rd
+//   FADD Vd.2D = 0x4E60D400 | (rm<<16) | (rn<<5) | rd
+//   FADD Vd.2S = 0x0E20D400 | (rm<<16) | (rn<<5) | rd
+//   FSUB Vd.4S = 0x4EA0D400 | (rm<<16) | (rn<<5) | rd
+//   FSUB Vd.2D = 0x4EE0D400 | (rm<<16) | (rn<<5) | rd
+//   FMUL Vd.4S = 0x6E20DC00 | (rm<<16) | (rn<<5) | rd
+//   FMUL Vd.2D = 0x6E60DC00 | (rm<<16) | (rn<<5) | rd
+//   FDIV Vd.4S = 0x6E20FC00 | (rm<<16) | (rn<<5) | rd
+//   FDIV Vd.2D = 0x6E60FC00 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FaddVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FsubVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FsubVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E60DC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FdivVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FdivVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E60FC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FaddVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FaddVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);
+  EXPECT_FLOAT_EQ(r[1], 1.0f);
+  EXPECT_FLOAT_EQ(r[2], 1.0f);
+  EXPECT_FLOAT_EQ(r[3], 100.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FaddVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  StoreVec2D(state_.cpu, 0, std::nan(""), std::nan(""));
+  static const uint32_t code[] = {FaddVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.75);
+  EXPECT_DOUBLE_EQ(r[1], -5.0);
+}
+
+// .2S (q=0): only the low 2 FP32 lanes participate; upper 64 bits of Vd
+// must be zeroed even though the JIT performs the ADDPS on uninitialized
+// upper lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FaddVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f,  4.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, -1.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FaddVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 5.0f);
+  EXPECT_FLOAT_EQ(r[1], 3.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FsubVec4S) {
+  StoreVec4S(state_.cpu, 1, 5.0f,  2.0f, 0.5f, -1.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f,  6.0f, 0.25f, 2.0f);
+  static const uint32_t code[] = {FsubVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], -4.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.25f);
+  EXPECT_FLOAT_EQ(r[3], -3.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FsubVec2D) {
+  StoreVec2D(state_.cpu, 1, 10.0,  -2.5);
+  StoreVec2D(state_.cpu, 2,  3.0,   0.5);
+  static const uint32_t code[] = {FsubVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 7.0);
+  EXPECT_DOUBLE_EQ(r[1], -3.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmulVec4S) {
+  StoreVec4S(state_.cpu, 1, 2.0f, -3.0f, 0.5f, 16.0f);
+  StoreVec4S(state_.cpu, 2, 4.0f,  2.0f, 8.0f,  0.25f);
+  static const uint32_t code[] = {FmulVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 8.0f);
+  EXPECT_FLOAT_EQ(r[1], -6.0f);
+  EXPECT_FLOAT_EQ(r[2], 4.0f);
+  EXPECT_FLOAT_EQ(r[3], 4.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmulVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -2.0);
+  StoreVec2D(state_.cpu, 2, 4.0,   8.0);
+  static const uint32_t code[] = {FmulVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 6.0);
+  EXPECT_DOUBLE_EQ(r[1], -16.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FdivVec4S) {
+  StoreVec4S(state_.cpu, 1, 8.0f,  -10.0f, 1.0f,  256.0f);
+  StoreVec4S(state_.cpu, 2, 2.0f,    4.0f, 8.0f,   16.0f);
+  static const uint32_t code[] = {FdivVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 4.0f);
+  EXPECT_FLOAT_EQ(r[1], -2.5f);
+  EXPECT_FLOAT_EQ(r[2], 0.125f);
+  EXPECT_FLOAT_EQ(r[3], 16.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FdivVec2D) {
+  StoreVec2D(state_.cpu, 1, 9.0,    -1.0);
+  StoreVec2D(state_.cpu, 2, 4.0,     8.0);
+  static const uint32_t code[] = {FdivVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 2.25);
+  EXPECT_DOUBLE_EQ(r[1], -0.125);
+}
+// endregion
+
+// region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
+// (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
+//   FMAX/FMIN  — IEEE: any NaN -> NaN result.
+//   FMAXNM/FMINNM — "max/min Number": one NaN -> return the non-NaN;
+//                    both NaN -> NaN.
+//   x86 MAXPS/MINPS — any NaN -> result = SRC2 (asymmetric).
+// JIT path implements both behaviors via the two-pass-OR (FMAX/FMIN) and
+// substitution (FMAXNM/FMINNM) lowerings, mirroring the FP16 path.
+//
+// Encoding (per ARM ARM C7.2 / aarch64-linux-gnu-as verification):
+//   FMAX Vd.4S = 0x4E20F400 | (rm<<16) | (rn<<5) | rd
+//   FMAX Vd.2D = 0x4E60F400 | (rm<<16) | (rn<<5) | rd
+//   FMAX Vd.2S = 0x0E20F400 | (rm<<16) | (rn<<5) | rd
+//   FMIN Vd.4S = 0x4EA0F400 | (rm<<16) | (rn<<5) | rd
+//   FMIN Vd.2D = 0x4EE0F400 | (rm<<16) | (rn<<5) | rd
+//   FMAXNM Vd.4S = 0x4E20C400 | (rm<<16) | (rn<<5) | rd
+//   FMAXNM Vd.2D = 0x4E60C400 | (rm<<16) | (rn<<5) | rd
+//   FMINNM Vd.4S = 0x4EA0C400 | (rm<<16) | (rn<<5) | rd
+//   FMINNM Vd.2D = 0x4EE0C400 | (rm<<16) | (rn<<5) | rd
+constexpr uint32_t FmaxVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0F400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E20C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E60C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EA0C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE0C400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Basic FMAX .4S: regular finite operands.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FmaxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], 3.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.75f);
+  EXPECT_FLOAT_EQ(r[3], 100.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FmaxVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  EXPECT_DOUBLE_EQ(r[1], 3.0);
+}
+
+// FMAX .4S NaN propagation: any NaN input -> NaN result.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4SNaN) {
+  // lane 0: a=NaN,  b=3.0  -> NaN
+  // lane 1: a=2.0,  b=NaN  -> NaN
+  // lane 2: a=NaN,  b=NaN  -> NaN
+  // lane 3: a=4.0,  b=5.0  -> 5.0  (sanity)
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FmaxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0]));
+  EXPECT_TRUE(std::isnan(r[1]));
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 5.0f);
+}
+
+// FMAX .2S (q=0): low 2 FP32 lanes; upper 64 bits of Vd must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -3.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 2, 2.0f, -1.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FmaxVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], -1.0f);
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// FMAX .4S with ±0 and ±inf: confirm IEEE semantics carry through.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4SInfZero) {
+  const float inf = std::numeric_limits<float>::infinity();
+  // lane 0: max(+0, -0) -> +0   (x86 MAXPS returns SRC2 when both equal, so
+  //                              the OR trick gives the same; either signed-0
+  //                              is allowed by ARM here)
+  // lane 1: max(-inf, 5) -> 5
+  // lane 2: max(+inf, 1e30) -> +inf
+  // lane 3: max(-inf, -inf) -> -inf
+  StoreVec4S(state_.cpu, 1, +0.0f, -inf, +inf, -inf);
+  StoreVec4S(state_.cpu, 2, -0.0f,  5.0f, 1e30f, -inf);
+  static const uint32_t code[] = {FmaxVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0.0f);             // ±0 are both equal-to-zero
+  EXPECT_FLOAT_EQ(r[1], 5.0f);
+  EXPECT_EQ(r[2], inf);
+  EXPECT_EQ(r[3], -inf);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FminVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], -2.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.25f);
+  EXPECT_FLOAT_EQ(r[3], -0.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FminVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.25);
+  EXPECT_DOUBLE_EQ(r[1], -8.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminVec4SNaN) {
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FminVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_TRUE(std::isnan(r[0]));
+  EXPECT_TRUE(std::isnan(r[1]));
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 4.0f);
+}
+
+// FMAXNM .4S: regular finite operands.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FmaxnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);
+  EXPECT_FLOAT_EQ(r[1], 3.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.75f);
+  EXPECT_FLOAT_EQ(r[3], 100.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FmaxnmVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  EXPECT_DOUBLE_EQ(r[1], 3.0);
+}
+
+// FMAXNM .4S NaN-suppressing: exactly one NaN -> return non-NaN; both NaN -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec4SNaN) {
+  // lane 0: a=NaN,  b=3.0   -> 3.0 (non-NaN wins)
+  // lane 1: a=2.0,  b=NaN   -> 2.0 (non-NaN wins)
+  // lane 2: a=NaN,  b=NaN   -> NaN (both NaN -> NaN)
+  // lane 3: a=4.0,  b=5.0   -> 5.0 (regular max)
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FmaxnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 5.0f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec2DNaN) {
+  StoreVec2D(state_.cpu, 1, std::nan(""), 4.0);
+  StoreVec2D(state_.cpu, 2, 3.0,          std::nan(""));
+  static const uint32_t code[] = {FmaxnmVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 3.0);
+  EXPECT_DOUBLE_EQ(r[1], 4.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.25f, 100.5f);
+  StoreVec4S(state_.cpu, 2, 2.0f,  3.0f, 0.75f,  -0.5f);
+  static const uint32_t code[] = {FminnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], -2.0f);
+  EXPECT_FLOAT_EQ(r[2], 0.25f);
+  EXPECT_FLOAT_EQ(r[3], -0.5f);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 0.25,  3.0);
+  static const uint32_t code[] = {FminnmVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.25);
+  EXPECT_DOUBLE_EQ(r[1], -8.0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec4SNaN) {
+  // lane 0: a=NaN,  b=3.0   -> 3.0 (non-NaN wins)
+  // lane 1: a=2.0,  b=NaN   -> 2.0 (non-NaN wins)
+  // lane 2: a=NaN,  b=NaN   -> NaN
+  // lane 3: a=4.0,  b=5.0   -> 4.0 (regular min)
+  StoreVec4S(state_.cpu, 1, std::nanf(""),  2.0f, std::nanf(""), 4.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, std::nanf(""), std::nanf(""), 5.0f);
+  static const uint32_t code[] = {FminnmVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  EXPECT_TRUE(std::isnan(r[2]));
+  EXPECT_FLOAT_EQ(r[3], 4.0f);
+}
+// endregion
+
 // region digitalis: FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // ARM ARM defines FMLA/FMLS as fused multiply-accumulate (one rounding).
 // The lowering uses Vfmadd231(ps|pd) / Vfnmadd231(ps|pd).  Tests pick
@@ -7938,6 +8383,435 @@ TEST_F(Arm64LiteTranslateRegionTest, UminVec4HUpperZero) {
   for (int i = 8; i < 16; i++) {
     EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
   }
+}
+// endregion
+
+// region digitalis - AdvSimdThreeSame JIT for MUL/MLA .16B/.8B
+// Closes the byte-lane (size=00) entries on the §C2 MUL/MLA row. x86 has
+// no PMULLB, so the lowering widens each 8 bytes to 16-bit words via
+// PMOVZXBW (low half then high half), PMULLW per half, masks each word
+// result to 0x00FF, then PACKUSWB packs back to 16 bytes. MLA byte adds
+// PADDB into Vd after pack. MUL encoding: U=0, opcode=0b10011. MLA: U=0,
+// opcode=0b10010.
+TEST_F(Arm64LiteTranslateRegionTest, MulVec16B) {
+  // .16B, Q=1, full 128-bit. Exercise all 16 lanes including signed-byte
+  // boundary values and the asymmetry between the low-8-byte and
+  // high-8-byte halves (different products in each half, to catch a
+  // wrong-half-pack bug).
+  int8_t n_lanes[16] = {1, -1, 2, 127, -128, 100, 0, 12,
+                        3, 5,  7, -16, 64,   33, -1, 99};
+  int8_t m_lanes[16] = {3, 7, -4, 2,   2,   -3,  9, 5,
+                        2, 4,  6, 8,   2,   3,   4, 5};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xAA, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 16; i++) {
+    int8_t expected = static_cast<int8_t>(
+        static_cast<int32_t>(n_lanes[i]) * static_cast<int32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MlaVec8BUpperZero) {
+  // .8B, Q=0: low 8 byte lanes are Vd += Vn*Vm; upper 8 bytes must be zeroed.
+  uint8_t n_lanes[16] = {1, 2,   3, 200, 17, 255, 50, 100,
+                         0, 0xCC, 0, 0,  0,  0,   0,  0};
+  uint8_t m_lanes[16] = {2, 3,   4, 3,   10, 2,   2,  3,
+                         0, 0xDD, 0, 0,  0,  0,   0,  0};
+  uint8_t d_init[16];
+  std::memset(d_init, 0xCC, 16);
+  d_init[0] = 5;  d_init[1] = 5; d_init[2] = 5; d_init[3] = 5;
+  d_init[4] = 5;  d_init[5] = 5; d_init[6] = 5; d_init[7] = 5;
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memcpy(&state_.cpu.v[0], d_init, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    uint8_t expected = static_cast<uint8_t>(
+        static_cast<uint32_t>(d_init[i]) +
+        static_cast<uint32_t>(n_lanes[i]) * static_cast<uint32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "low lane " << i;
+  }
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+  }
+}
+// endregion
+
+// region digitalis - §C2 spec-table single-width coverage gaps
+// Closes the §C2 plan-verify checkbox "Unit tests in
+// lite_translate_region_exec_tests.cc for one representative of each lane
+// width (B/H/S/D) per opcode." Earlier handoffs covered the
+// non-size-agnostic opcodes (MUL/MLA/CMGT/CMHI/CMGE/CMHS, SMAX/SMIN/
+// UMAX/UMIN, BIC/ORN/BSL/BIT/BIF) at one or two lane widths each.
+// The remaining gaps in the §C2 spec table are:
+//   - ADD/SUB/CMEQ: no dedicated vector tests at any width — add B/H/S/D.
+//     (CMEQ.2D now JITs via PCMPEQQ when host_platform::kHasSSE4_1 is set;
+//     CmeqVec2D below pins that path. The handler still bails via
+//     Undefined() on hosts without SSE4.1, matching the CMGT.2D/SSE4.2
+//     gate above it.)
+//   - AND/ORR/EOR: size-agnostic logical ops — add one each at the
+//     16B canonical shape, matching the BIC/ORN/BSL/BIT/BIF pattern.
+//   - MUL/MLA: B and H widths already pinned (MulVec16B, MulVec8H,
+//     MlaVec8H, MlaVec8BUpperZero); add the .4S width (PMULLD path).
+// Reuses SimdThreeSame() from the preceding region. Encodings per
+// ARM DDI 0487 §C7.2: ADD U=0/opcode=10000, SUB U=1/opcode=10000,
+// CMEQ U=1/opcode=10001, AND/ORR/EOR via the U×size logic-group table
+// at opcode=00011 (AND U=0 size=00, ORR U=0 size=10, EOR U=1 size=00),
+// MUL U=0/opcode=10011, MLA U=0/opcode=10010.
+
+TEST_F(Arm64LiteTranslateRegionTest, AddVec16B) {
+  uint8_t n[16], m[16];
+  for (int i = 0; i < 16; i++) {
+    n[i] = static_cast<uint8_t>(0x10u + i);
+    m[i] = static_cast<uint8_t>(0xF0u - i);
+  }
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xAA, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] + m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddVec8H) {
+  int16_t n_lanes[8] = {1, -1, 32767, -32768, 100, -100, 0x1234, -0x4321};
+  int16_t m_lanes[8] = {2,  3, 1,     -1,     1,    -1,   0x0001, 0x0001};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xAA, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    int16_t expected = static_cast<int16_t>(
+        static_cast<int32_t>(n_lanes[i]) + static_cast<int32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddVec4S) {
+  StoreVec4SInt(state_.cpu, 1, 1, -1, INT32_MIN, INT32_MAX);
+  StoreVec4SInt(state_.cpu, 2, 2,  3, -1,        1);
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 3);
+  EXPECT_EQ(r[1], 2);
+  EXPECT_EQ(r[2], INT32_MAX);      // INT32_MIN + -1 wraps to INT32_MAX
+  EXPECT_EQ(r[3], INT32_MIN);      // INT32_MAX + 1  wraps to INT32_MIN
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddVec2D) {
+  uint64_t n_lanes[2] = {0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL};
+  uint64_t m_lanes[2] = {0x00000000FFFFFFFFULL, 0x0000000000000001ULL};
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xCC, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b11,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0x0000000100000000ULL);
+  EXPECT_EQ(r[1], 0x0000000000000000ULL);  // FFFF…FFFF + 1 wraps
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SubVec16B) {
+  uint8_t n[16], m[16];
+  for (int i = 0; i < 16; i++) {
+    n[i] = static_cast<uint8_t>(0x80u + i);
+    m[i] = static_cast<uint8_t>(0x01u + i);
+  }
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xAA, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] - m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SubVec8H) {
+  int16_t n_lanes[8] = {100, 0, INT16_MIN, INT16_MAX, 1, -1, 0x1234, 0x4321};
+  int16_t m_lanes[8] = {50,  1, 1,         -1,        2,  1, 0x0001, 0x0001};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xAA, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    int16_t expected = static_cast<int16_t>(
+        static_cast<int32_t>(n_lanes[i]) - static_cast<int32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SubVec4S) {
+  StoreVec4SInt(state_.cpu, 1, 5, INT32_MIN, INT32_MAX, 0);
+  StoreVec4SInt(state_.cpu, 2, 3, 1,         -1,        INT32_MIN);
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 2);
+  EXPECT_EQ(r[1], INT32_MAX);                       // INT32_MIN - 1 wraps to MAX
+  EXPECT_EQ(r[2], INT32_MIN);                       // INT32_MAX - -1 wraps to MIN
+  EXPECT_EQ(r[3], INT32_MIN);                       // 0 - INT32_MIN wraps to MIN
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SubVec2D) {
+  uint64_t n_lanes[2] = {0x0000000000000000ULL, 0x8000000000000000ULL};
+  uint64_t m_lanes[2] = {0x0000000000000001ULL, 0x0000000000000001ULL};
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xCC, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b11,
+                    /*opcode=*/0b10000, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);            // 0 - 1 wraps
+  EXPECT_EQ(r[1], 0x7FFFFFFFFFFFFFFFULL);            // INT64_MIN - 1 wraps to MAX
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AndVec16B) {
+  uint8_t n[16], m[16];
+  for (int i = 0; i < 16; i++) {
+    n[i] = static_cast<uint8_t>(0xF0u | (i & 0x0Fu));
+    m[i] = static_cast<uint8_t>(0x0Fu | ((i & 0x0Fu) << 4));
+  }
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0x55, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b00011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] & m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, OrrVec16B) {
+  uint8_t n[16], m[16];
+  for (int i = 0; i < 16; i++) {
+    n[i] = static_cast<uint8_t>(0x0Fu & (i + 1));
+    m[i] = static_cast<uint8_t>(0xF0u & ((i + 1) << 4));
+  }
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0x33, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b00011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] | m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, EorVec16B) {
+  uint8_t n[16], m[16];
+  for (int i = 0; i < 16; i++) {
+    n[i] = static_cast<uint8_t>(0xA5u ^ (i * 7u));
+    m[i] = static_cast<uint8_t>(0x5Au ^ (i * 11u));
+  }
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xCC, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b00011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(n[i] ^ m[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqVec16B) {
+  // .16B: lane-wise equality; verify boundary equals and a mix of unequal.
+  int8_t n_signed[16] = {0, 1, -1, -128, 127, 50, -50, 99,
+                         -99, 0,  0,  5,    5,  6,  -3,  -3};
+  int8_t m_signed[16] = {0, 1, -1, -128, 127, 49, -50, 100,
+                         -100, 1, -1, 5,    6,  5,  -3,  -2};
+  uint8_t n[16], m[16];
+  std::memcpy(n, n_signed, 16);
+  std::memcpy(m, m_signed, 16);
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xAA, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    uint8_t expected = (n_signed[i] == m_signed[i]) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqVec8H) {
+  int16_t n_lanes[8] = {0, 1, -1, INT16_MAX, INT16_MIN, 100, 100, 0};
+  int16_t m_lanes[8] = {0, 1, -2, INT16_MAX, INT16_MAX, 100, 101, 1};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xAA, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    uint16_t expected = (n_lanes[i] == m_lanes[i]) ? 0xFFFFu : 0x0000u;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqVec4S) {
+  StoreVec4SInt(state_.cpu, 1, 5, -1, INT32_MIN, INT32_MAX);
+  StoreVec4SInt(state_.cpu, 2, 5,  0, INT32_MIN, INT32_MAX - 1);
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);                          // 5 == 5
+  EXPECT_EQ(r[1], 0u);                                    // -1 != 0
+  EXPECT_EQ(r[2], 0xFFFFFFFFu);                          // MIN == MIN
+  EXPECT_EQ(r[3], 0u);                                    // MAX != MAX-1
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqVec2D) {
+  // .2D: 64-bit lane equality via PCMPEQQ (SSE4.1). Modern x86_64 hosts
+  // have SSE4.1, so the JIT path is exercised; on hypothetical hosts
+  // without it the handler returns Undefined() and Run() would fail.
+  if (!host_platform::kHasSSE4_1) {
+    GTEST_SKIP() << "PCMPEQQ requires SSE4.1";
+  }
+  int64_t n_lanes[2] = {INT64_MIN, 0x123456789ABCDEF0LL};
+  int64_t m_lanes[2] = {INT64_MIN, 0x123456789ABCDEF1LL};
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memset(&state_.cpu.v[0], 0xAA, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b11,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFull);  // INT64_MIN == INT64_MIN
+  EXPECT_EQ(r[1], 0ull);                    // differ in low nibble
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MulVec4S) {
+  // .4S, Q=1: 32-bit lane MUL via PMULLD. Covers the spec-table S width
+  // gap left after MulVec8H (H), MulVec4HUpperZero (H/.4H), MulVec16B (B).
+  StoreVec4SInt(state_.cpu, 1, 3,  -7, INT32_MAX, 0x10000);
+  StoreVec4SInt(state_.cpu, 2, 5,   2, 2,         0x10000);
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 15);
+  EXPECT_EQ(r[1], -14);
+  // INT32_MAX * 2 = 0xFFFFFFFE truncated to int32 -> -2
+  EXPECT_EQ(r[2], -2);
+  // 0x10000 * 0x10000 = 0x100000000 truncated to int32 -> 0
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MlaVec4S) {
+  // .4S, Q=1: 32-bit lane MLA via PMULLD+PADDD. Vd is read-modify.
+  StoreVec4SInt(state_.cpu, 1, 3,  -7, 2,         0x10000);
+  StoreVec4SInt(state_.cpu, 2, 5,   2, INT32_MAX, 0x10000);
+  StoreVec4SInt(state_.cpu, 0, 100, 50, 1,         INT32_MAX);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 100 + 15);                              // 100 + 3*5
+  EXPECT_EQ(r[1], 50 + (-14));                            // 50 + -7*2
+  // 1 + (2 * INT32_MAX) = 1 + 0xFFFFFFFE = 0xFFFFFFFF = -1
+  EXPECT_EQ(r[2], -1);
+  // INT32_MAX + (0x10000 * 0x10000) = INT32_MAX + 0 (mul truncates) = INT32_MAX
+  EXPECT_EQ(r[3], INT32_MAX);
 }
 // endregion
 

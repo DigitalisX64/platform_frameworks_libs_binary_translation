@@ -3817,16 +3817,42 @@ class LiteTranslator {
 
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kMul: {
-        // region digitalis - MUL .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
-        // .16B/.8B (size=00) has no SSE single-op equivalent; .2D / scalar 64-bit
-        // is reserved by the ARM ARM. Both fall back to the interpreter.
-        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
+        // region digitalis - MUL .16B/.8B via PMOVZXBW + PMULLW + PACKUSWB (SSE4.1);
+        // .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
+        // .2D / scalar 64-bit is reserved by the ARM ARM and falls back to the interpreter.
+        if (args.size == 0b11) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        if (args.size == 0b01) {
+        if (args.size == 0b00) {
+          // Byte multiply: x86 has no PMULLB. Widen each 8 bytes to 16-bit
+          // words (low + high half separately), PMULLW, mask each result
+          // word to its low byte (so PACKUSWB doesn't saturate), then pack.
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmovzxbw(xn_hi, xn_hi);
+          as_.Pmovzxbw(xm_hi, xm_hi);
+          as_.Pmullw(xn, xm);
+          as_.Pmullw(xn_hi, xm_hi);
+          // Reuse xm as the 0x00FF×8 mask: PCMPEQB writes all-ones, PSRLW 8
+          // clears the high byte of each 16-bit lane.
+          as_.Pcmpeqb(xm, xm);
+          as_.Psrlw(xm, int8_t{8});
+          as_.Pand(xn, xm);
+          as_.Pand(xn_hi, xm);
+          as_.Packuswb(xn, xn_hi);
+        } else if (args.size == 0b01) {
           as_.Pmullw(xn, xm);
         } else {
           as_.Pmulld(xn, xm);
@@ -3837,10 +3863,10 @@ class LiteTranslator {
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
-        // region digitalis - MLA .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
-        // .16B/.8B (size=00) has no SSE single-op multiply equivalent; .2D / scalar 64-bit
-        // is reserved by the ARM ARM. Both fall back to the interpreter.
-        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
+        // region digitalis - MLA .16B/.8B via PMOVZXBW+PMULLW+PACKUSWB+PADDB (SSE4.1);
+        // .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
+        // .2D / scalar 64-bit is reserved by the ARM ARM and falls back to the interpreter.
+        if (args.size == 0b11) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         SimdRegister xd = AllocTempSimdReg();
@@ -3850,7 +3876,32 @@ class LiteTranslator {
         load_full(xn, vn_off);
         load_full(xm, vm_off);
         load_full(xd, vd_off);
-        if (args.size == 0b01) {
+        if (args.size == 0b00) {
+          // Byte MLA: same byte-multiply recipe as kMul (size=00) above,
+          // then PADDB into Vd. Adding at byte width gives the correct
+          // low-8-bit-truncated accumulate.
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmovzxbw(xn_hi, xn_hi);
+          as_.Pmovzxbw(xm_hi, xm_hi);
+          as_.Pmullw(xn, xm);
+          as_.Pmullw(xn_hi, xm_hi);
+          as_.Pcmpeqb(xm, xm);
+          as_.Psrlw(xm, int8_t{8});
+          as_.Pand(xn, xm);
+          as_.Pand(xn_hi, xm);
+          as_.Packuswb(xn, xn_hi);
+          as_.Paddb(xd, xn);
+        } else if (args.size == 0b01) {
           as_.Pmullw(xn, xm);
           as_.Paddw(xd, xn);
         } else {
@@ -3931,6 +3982,10 @@ class LiteTranslator {
       }
       case Decoder::AdvSimdThreeSameOpcode::kCmeq: {
         // CMEQ Vd, Vn, Vm — lane-wise equality (-1 if equal, 0 otherwise).
+        // 64-bit lanes need SSE4.1 (PCMPEQQ); other widths are SSE2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_1) {
+          Undefined(); return;
+        }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
@@ -3940,7 +3995,8 @@ class LiteTranslator {
           case 0b00: as_.Pcmpeqb(xn, xm); break;
           case 0b01: as_.Pcmpeqw(xn, xm); break;
           case 0b10: as_.Pcmpeqd(xn, xm); break;
-          default: Undefined(); return;  // 64-bit Pcmpeqq is SSE4_1 — skip for now
+          case 0b11: as_.Pcmpeqq(xn, xm); break;
+          default: Undefined(); return;
         }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
@@ -4259,12 +4315,42 @@ class LiteTranslator {
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
       case Decoder::AdvSimdThreeSameOpcode::kFdivV: {
-        // FP16 vector FADD/FSUB/FMUL/FDIV via F16C round-trip: widen each
-        // operand half to FP32, run the binary op at FP32, narrow back to
-        // FP16. The round-trip is bit-exact for any single FP16-input
-        // FADD/FSUB/FMUL/FDIV because FP32's 24-bit mantissa strictly
-        // contains FP16's 11. FP32/FP64 forms still bail to the interpreter.
-        if (!args.is_fp16) { Undefined(); return; }
+        // FP16 vector FADD/FSUB/FMUL/FDIV via F16C round-trip (below).
+        // FP32 (.2S/.4S) and FP64 (.2D) lower directly to SSE2 packed FP
+        // arithmetic: ADDPS/PD, SUBPS/PD, MULPS/PD, DIVPS/PD.  args.size=0
+        // selects FP32 (4-byte lanes); args.size=1 selects FP64 (8-byte
+        // lanes; the decoder already rejects sz=1 with Q=0).
+        if (!args.is_fp16) {
+          const bool is_double = (args.size & 1);
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          if (is_double) {
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV: as_.Addpd(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV: as_.Subpd(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV: as_.Mulpd(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV: as_.Divpd(xn, xm); break;
+              default: success_ = false; return;
+            }
+          } else {
+            switch (args.opcode) {
+              case Decoder::AdvSimdThreeSameOpcode::kFaddV: as_.Addps(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFsubV: as_.Subps(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmulV: as_.Mulps(xn, xm); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFdivV: as_.Divps(xn, xm); break;
+              default: success_ = false; return;
+            }
+          }
+          // .2S (q=0, FP32 only) zeroes the upper 64 bits of the destination.
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
         if (!host_platform::kHasF16C) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
@@ -4494,7 +4580,7 @@ class LiteTranslator {
       case Decoder::AdvSimdThreeSameOpcode::kFminV:
       case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
       case Decoder::AdvSimdThreeSameOpcode::kFminnmV: {
-        // FP16 vector FMAX / FMIN / FMAXNM / FMINNM via F16C round-trip.
+        // FP vector FMAX / FMIN / FMAXNM / FMINNM.
         //
         // ARM and x86 disagree on NaN handling for MAX/MIN:
         //   - ARM FMAX/FMIN  (IEEE 754-2008): if either input is NaN, result is NaN.
@@ -4518,18 +4604,78 @@ class LiteTranslator {
         //     - neither          -> a' = a, b' = b -> MAXPS = max(a, b). ✓
         // FMINNM analogous with MINPS.
         //
-        // Round-trip is bit-exact for the non-NaN path because FP32's mantissa
-        // strictly contains FP16's. NaN-result bit patterns may differ from a
-        // canonical FP16 qNaN (0x7E00), but are still valid NaNs per ARM ARM
-        // default-NaN propagation rules.
-        //
-        // FP32 / FP64 forms (size = 00 / 01) still bail to the interpreter.
-        if (!args.is_fp16) { Undefined(); return; }
-        if (!host_platform::kHasF16C) { Undefined(); return; }
+        // FP16 round-trip is bit-exact for the non-NaN path because FP32's
+        // mantissa strictly contains FP16's. NaN-result bit patterns may
+        // differ from a canonical FP16 qNaN (0x7E00), but are still valid
+        // NaNs per ARM ARM default-NaN propagation rules.
         const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV);
         const bool is_nm  = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV);
+        if (!args.is_fp16) {
+          // FP32 (.2S/.4S, args.size=0) and FP64 (.2D, args.size=1).  The
+          // decoder filters sz=1 && !Q (the reserved .1D shape) to Undefined,
+          // so the JIT only sees .2S, .4S, and .2D here.  Both halves of
+          // each lowering match the FP16 path above structurally; differs
+          // only by op width (PS vs PD) and skips the F16C round-trip.
+          const bool is_double = (args.size & 1);
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          auto cmpunord = [&](SimdRegister dst, SimdRegister src) {
+            if (is_double) as_.Cmpunordpd(dst, src); else as_.Cmpunordps(dst, src);
+          };
+          auto minmax = [&](SimdRegister dst, SimdRegister src) {
+            if (is_double) {
+              if (is_max) as_.Maxpd(dst, src); else as_.Minpd(dst, src);
+            } else {
+              if (is_max) as_.Maxps(dst, src); else as_.Minps(dst, src);
+            }
+          };
+          if (!is_nm) {
+            // FMAX / FMIN — NaN-propagating: maxab|maxba|OR.
+            SimdRegister tmp = AllocTempSimdReg();
+            if (tmp == no_simd_register) { success_ = false; return; }
+            as_.Movdqa(tmp, xm);
+            minmax(tmp, xn);
+            minmax(xn, xm);
+            as_.Por(xn, tmp);
+          } else {
+            // FMAXNM / FMINNM — substitute NaN-lanes with the other operand,
+            // then min/max.
+            SimdRegister t_mask_a = AllocTempSimdReg();
+            SimdRegister t_mask_b = AllocTempSimdReg();
+            SimdRegister t_an_sub = AllocTempSimdReg();
+            SimdRegister t_bn_sub = AllocTempSimdReg();
+            if (t_mask_a == no_simd_register || t_mask_b == no_simd_register ||
+                t_an_sub == no_simd_register || t_bn_sub == no_simd_register) {
+              success_ = false; return;
+            }
+            as_.Movdqa(t_mask_a, xn);
+            cmpunord(t_mask_a, t_mask_a);   // 1s where a is NaN
+            as_.Movdqa(t_mask_b, xm);
+            cmpunord(t_mask_b, t_mask_b);   // 1s where b is NaN
+            as_.Movdqa(t_an_sub, t_mask_a);
+            as_.Pand(t_an_sub, xm);          // mask_a & b
+            as_.Movdqa(t_bn_sub, t_mask_b);
+            as_.Pand(t_bn_sub, xn);          // mask_b & a
+            as_.Pandn(t_mask_a, xn);         // ~mask_a & a
+            as_.Pandn(t_mask_b, xm);         // ~mask_b & b
+            as_.Por(t_mask_a, t_an_sub);     // a' in t_mask_a
+            as_.Por(t_mask_b, t_bn_sub);     // b' in t_mask_b
+            minmax(t_mask_a, t_mask_b);
+            as_.Movdqa(xn, t_mask_a);
+          }
+          // .2S (q=0, FP32 only) zeroes upper 64 bits of the destination.
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
         auto minmax_op = [&](SimdRegister dst, SimdRegister src) {
           if (is_max) {
             as_.Maxps(dst, src);
