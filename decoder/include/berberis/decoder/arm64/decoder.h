@@ -1467,6 +1467,66 @@ class Decoder {
               // Reciprocal sqrt step: (3.0 - a*b)/2 with (0*inf) -> +1.5
               // saturation. FP16 scalar variant: a=1, U=0, opcode_3=111.
     // endregion
+    // region digitalis - scalar saturating add/sub (B/H/S/D).
+    //   size=00 -> B,  01 -> H,  10 -> S,  11 -> D.
+    //   Unlike the rest of the integer scalar three-same family which is
+    //   D-form only, opcodes 00001 (SQADD/UQADD) and 00011 (SQSUB/UQSUB)
+    //   carry args.size = {00, 01, 10, 11}; the interpreter expands esize
+    //   accordingly and applies the per-width saturating bounds.  Encoding
+    //   reference (ARM ARM C7.2.282 / .284 / .317 / .319):
+    //     SQADD <V>d, <V>n, <V>m  = 01 0 11110 size 1 Rm 0 0001 1 Rn Rd
+    //     UQADD <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 0 0001 1 Rn Rd
+    //     SQSUB <V>d, <V>n, <V>m  = 01 0 11110 size 1 Rm 0 0011 1 Rn Rd
+    //     UQSUB <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 0 0011 1 Rn Rd
+    kSqaddScalar,
+    kUqaddScalar,
+    kSqsubScalar,
+    kUqsubScalar,
+    // endregion
+    // region digitalis - scalar saturating shift left (B/H/S/D).
+    //   size = 00 -> B, 01 -> H, 10 -> S, 11 -> D.
+    //   Shift amount is the low 8 bits of Vm (signed); negative shifts
+    //   are arithmetic right (signed forms) or logical right (unsigned).
+    //   The "R" variants round (add `1 << (rshift-1)` before the right
+    //   shift) and the "S/U-Q" forms saturate the left-shift result to
+    //   the per-width signed/unsigned range.  See ARM ARM C7.2.302 /
+    //   .306 / .310 / .313 (SQSHL / SQRSHL / UQSHL / UQRSHL).
+    //   Encoding (scalar):
+    //     SQSHL  <V>d, <V>n, <V>m = 01 0 11110 size 1 Rm 0 1001 1 Rn Rd
+    //     UQSHL  <V>d, <V>n, <V>m = 01 1 11110 size 1 Rm 0 1001 1 Rn Rd
+    //     SQRSHL <V>d, <V>n, <V>m = 01 0 11110 size 1 Rm 0 1011 1 Rn Rd
+    //     UQRSHL <V>d, <V>n, <V>m = 01 1 11110 size 1 Rm 0 1011 1 Rn Rd
+    kSqshlScalar,
+    kUqshlScalar,
+    kSqrshlScalar,
+    kUqrshlScalar,
+    // endregion
+    // region digitalis - scalar rounding shift left (D only, non-saturating).
+    //   size = 11 -> D (only valid lane width).
+    //   Shift amount is the low 8 bits of Vm (signed); negative shifts
+    //   are arithmetic right (signed) or logical right (unsigned), with
+    //   the standard rounding term `1 << (rshift-1)` added before the
+    //   right shift.  No saturation — bits beyond D are discarded.
+    //   See ARM ARM C7.2.270 / .335 (SRSHL / URSHL).
+    //   Encoding (scalar):
+    //     SRSHL  d, d, d  = 01 0 11110 11 1 Rm 0 1010 1 Rn Rd
+    //     URSHL  d, d, d  = 01 1 11110 11 1 Rm 0 1010 1 Rn Rd
+    kSrshlScalar,
+    kUrshlScalar,
+    // endregion
+    // region digitalis - scalar saturating doubling multiply high (H/S only).
+    //   size = 01 -> H, 10 -> S.  Lane widths B and D are unallocated for
+    //   this opcode; the decoder rejects them as Undefined.
+    //   Computes `Vd = sat_signed((2 * sext(Vn) * sext(Vm) + round) >>
+    //   bits_local)`, with `bits_local = 16` for H and `32` for S, and
+    //   `round = 1 << (bits_local - 1)` for SQRDMULH or `0` for SQDMULH.
+    //   See ARM ARM C7.2.301 / .305 (SQDMULH / SQRDMULH).
+    //   Encoding (scalar):
+    //     SQDMULH  <V>d, <V>n, <V>m  = 01 0 11110 size 1 Rm 1 0110 1 Rn Rd
+    //     SQRDMULH <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 1 0110 1 Rn Rd
+    kSqdmulhScalar,
+    kSqrdmulhScalar,
+    // endregion
   };
 
   struct AdvSimdScalarThreeSameArgs {
@@ -1491,8 +1551,16 @@ class Decoder {
   // a single scalar in Vd.
   enum class AdvSimdScalarPairwiseOpcode : uint8_t {
     kAddp,    // ADDP (scalar): U=0, size=11, opcode=11011 -> d-form
-    // (FMAXNMP/FMAXP/FMINNMP/FMINP scalar variants live here too, but only
-    //  ADDP scalar is needed at present.)
+    // region digitalis
+    // FP scalar pairwise variants.  U=1 in the dispatch encoding.
+    //   size[0] (bit 22) selects S (0) or D (1).
+    //   size[1] (bit 23) selects max- vs min- variants for FMAX*/FMIN*.
+    kFaddpScalar,    // FADDP scalar:    U=1, opcode=01101, size=0x
+    kFmaxnmpScalar,  // FMAXNMP scalar:  U=1, opcode=01100, size=0x
+    kFminnmpScalar,  // FMINNMP scalar:  U=1, opcode=01100, size=1x
+    kFmaxpScalar,    // FMAXP scalar:    U=1, opcode=01111, size=0x
+    kFminpScalar,    // FMINP scalar:    U=1, opcode=01111, size=1x
+    // endregion
   };
 
   struct AdvSimdScalarPairwiseArgs {
@@ -5127,10 +5195,67 @@ class Decoder {
       }
       out_size = sz;
     } else {
-      // Integer scalar three same — D-form only.
-      if (size != 0b11) { Undefined(); return; }
+      // Integer scalar three same.
+      //
+      // Most integer scalar three-same opcodes are D-form only.  The
+      // saturating add/sub family (opcodes 00001 and 00011) supports
+      // all four lane widths (B/H/S/D) — they're commonly used as
+      // single-lane fast paths for DSP saturation.  See ARM ARM
+      // C7.2.282 / .284 (SQADD / SQSUB) and C7.2.317 / .319 (UQADD /
+      // UQSUB).
+      // region digitalis: opcodes 00001 / 00011 / 01001 / 01011 are B/H/S/D-capable;
+      // opcode 10110 (SQDMULH / SQRDMULH) is H/S-only (the per-arm guard
+      // below rejects B and D for it).  All other integer scalar-three-same
+      // opcodes accept D only.
+      const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00011) ||
+                             (opcode == 0b01001) || (opcode == 0b01011);
+      const bool hs_only = (opcode == 0b10110);
+      if (!all_sizes && !hs_only && size != 0b11) { Undefined(); return; }
+      // endregion
 
       switch (opcode) {
+        // region digitalis: SQADD / UQADD scalar (B/H/S/D).
+        case 0b00001:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqaddScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqaddScalar;
+          break;
+        // endregion
+        // region digitalis: SQSUB / UQSUB scalar (B/H/S/D).
+        case 0b00011:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqsubScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqsubScalar;
+          break;
+        // endregion
+        // region digitalis: SQSHL / UQSHL scalar (B/H/S/D).
+        case 0b01001:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqshlScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqshlScalar;
+          break;
+        // endregion
+        // region digitalis: SQRSHL / UQRSHL scalar (B/H/S/D).
+        case 0b01011:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqrshlScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqrshlScalar;
+          break;
+        // endregion
+        // region digitalis: SRSHL / URSHL scalar (D only, non-saturating).
+        //   size=11 is the only valid lane width for this scalar form
+        //   (the all_sizes whitelist intentionally excludes 01010 so
+        //   the `size != 0b11` guard above already rejects B/H/S).
+        case 0b01010:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUrshlScalar
+                 : AdvSimdScalarThreeSameOpcode::kSrshlScalar;
+          break;
+        // endregion
+        // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+        //   Per ARM ARM C7.2.301 / .305: only size=01 (H) and size=10 (S)
+        //   are allocated for this opcode; B and D are unallocated.
+        case 0b10110:
+          if (size != 0b01 && size != 0b10) { Undefined(); return; }
+          op = u ? AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqdmulhScalar;
+          break;
+        // endregion
         case 0b00110:
           op = u ? AdvSimdScalarThreeSameOpcode::kCmhi
                  : AdvSimdScalarThreeSameOpcode::kCmgt;
@@ -5173,7 +5298,10 @@ class Decoder {
   //
   // AdvSIMD scalar pairwise.
   // Encoding: 01 U 11110 size 11000 opcode 10 Rn Rd
-  // For now only ADDP scalar (U=0, size=11, opcode=11011) is supported.
+  // Integer leg (U=0): ADDP scalar (size=11, opcode=11011).
+  // FP leg (U=1): FADDP / FMAXNMP / FMINNMP / FMAXP / FMINP scalar.
+  //   For the FP leg, size[1] (bit 23) discriminates max- vs min- variants
+  //   and size[0] (bit 22) picks S (0) vs D (1).
   //
   void DecodeAdvSimdScalarPairwise() {
     bool u = GetBits<29, 1>();
@@ -5182,13 +5310,48 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    if (u || opcode != 0b11011 || size != 0b11) {
+    AdvSimdScalarPairwiseOpcode op;
+    bool ok = false;
+
+    if (!u) {
+      // Integer leg: ADDP scalar (D-form) only.
+      if (opcode == 0b11011 && size == 0b11) {
+        op = AdvSimdScalarPairwiseOpcode::kAddp;
+        ok = true;
+      }
+    } else {
+      // FP leg.  size[1] selects min- (1) vs max- (0); size[0] selects S/D.
+      bool size_hi = ((size >> 1) & 1) != 0;
+      switch (opcode) {
+        case 0b01100:
+          op = size_hi ? AdvSimdScalarPairwiseOpcode::kFminnmpScalar
+                       : AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar;
+          ok = true;
+          break;
+        case 0b01101:
+          // FADDP scalar only allocated at size[1]=0 (size=0x).
+          if (!size_hi) {
+            op = AdvSimdScalarPairwiseOpcode::kFaddpScalar;
+            ok = true;
+          }
+          break;
+        case 0b01111:
+          op = size_hi ? AdvSimdScalarPairwiseOpcode::kFminpScalar
+                       : AdvSimdScalarPairwiseOpcode::kFmaxpScalar;
+          ok = true;
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (!ok) {
       Undefined();
       return;
     }
 
     const AdvSimdScalarPairwiseArgs args = {
-        .opcode = AdvSimdScalarPairwiseOpcode::kAddp,
+        .opcode = op,
         .rd = rd,
         .rn = rn,
         .size = size,

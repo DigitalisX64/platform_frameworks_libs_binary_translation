@@ -5664,6 +5664,281 @@ class Interpreter {
         break;
     }
 
+    // region digitalis: scalar saturating add/sub (B/H/S/D).
+    //
+    // SQADD / UQADD / SQSUB / UQSUB scalar operate on a single lane of
+    // width 8 / 16 / 32 / 64 bits selected by args.size, not just D-form.
+    // ARM ARM C7.2.282 / .284 / .317 / .319.  The output is the saturated
+    // result placed in the low `esize` bytes of Vd; upper bits are zero
+    // (matches the routine's `result = 0` initialization pattern used by
+    // the surrounding FP path).
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqaddScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqaddScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 1, 2, 4, 8
+        const uint8_t bits_local = esize * 8;
+        const uint64_t mask =
+            (bits_local == 64) ? ~uint64_t{0}
+                               : ((uint64_t{1} << bits_local) - 1);
+        uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]) & mask;
+        uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]) & mask;
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqaddScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar);
+        const bool is_sub =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar);
+        uint64_t r;
+        if (is_signed) {
+          // Sign-extend a and b from `bits_local` bits to 64 bits.
+          const int shift = 64 - bits_local;
+          int64_t sa = static_cast<int64_t>(a << shift) >> shift;
+          int64_t sb = static_cast<int64_t>(b << shift) >> shift;
+          const int64_t smax = (bits_local == 64)
+                                   ? INT64_MAX
+                                   : ((int64_t{1} << (bits_local - 1)) - 1);
+          const int64_t smin = (bits_local == 64)
+                                   ? INT64_MIN
+                                   : -(int64_t{1} << (bits_local - 1));
+          int64_t res;
+          if (!is_sub) {
+            // SQADD.  Mirrors the vector path's lambda (lines 4330-4345)
+            // — the int64 overflow checks at bits_local=64 still hold
+            // because two signed adds can only overflow toward INT64_MIN
+            // or INT64_MAX, both of which the smax/smin clamps catch.
+            int64_t sum = static_cast<int64_t>(
+                static_cast<uint64_t>(sa) + static_cast<uint64_t>(sb));
+            if (sb > 0 && sum < sa) res = smax;
+            else if (sb < 0 && sum > sa) res = smin;
+            else if (sum > smax) res = smax;
+            else if (sum < smin) res = smin;
+            else res = sum;
+          } else {
+            // SQSUB.  Same logic as the vector path's lambda (lines
+            // 4355-4370): sa - sb saturates to the per-width signed range.
+            int64_t diff = static_cast<int64_t>(
+                static_cast<uint64_t>(sa) - static_cast<uint64_t>(sb));
+            if (sb > 0 && diff > sa) res = smin;
+            else if (sb < 0 && diff < sa) res = smax;
+            else if (diff > smax) res = smax;
+            else if (diff < smin) res = smin;
+            else res = diff;
+          }
+          r = static_cast<uint64_t>(res) & mask;
+        } else {
+          // Unsigned: UQADD (sum > mask -> mask) / UQSUB (a < b -> 0).
+          if (!is_sub) {
+            uint64_t sum = a + b;
+            r = (sum > mask || sum < a) ? mask : sum;
+          } else {
+            r = (a > b) ? (a - b) : 0;
+          }
+        }
+        // Write low `bits_local` bits, zero the upper 128 - bits_local bits.
+        state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+        return;
+      }
+      default:
+        break;
+    }
+    // endregion
+
+    // region digitalis: scalar saturating shift left (B/H/S/D).
+    // Covers four new opcodes: SQSHL, UQSHL, SQRSHL, UQRSHL.  The shift
+    // amount comes from the low 8 bits of Vm interpreted as int8_t —
+    // positive shifts left (saturating on the per-width range), negative
+    // shifts right (arithmetic for the signed forms, logical for unsigned).
+    // The "R" variants round half-up by adding `1 << (rshift-1)` before
+    // the right shift.  See ARM ARM C7.2.302 / .306 / .310 / .313.
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqrshlScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 1, 2, 4, 8
+        const uint8_t bits_local = esize * 8;
+        const uint64_t mask =
+            (bits_local == 64) ? ~uint64_t{0}
+                               : ((uint64_t{1} << bits_local) - 1);
+        const uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]) & mask;
+        // Shift amount is the low 8 bits of Vm.D[0], signed.
+        const uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]);
+        const int sh = static_cast<int8_t>(b & 0xFF);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar);
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kUqrshlScalar);
+        uint64_t r;
+        if (is_signed) {
+          const int shift_to_64 = 64 - bits_local;
+          int64_t sa = static_cast<int64_t>(a << shift_to_64) >> shift_to_64;
+          const int64_t smax = (bits_local == 64)
+                                   ? INT64_MAX
+                                   : ((int64_t{1} << (bits_local - 1)) - 1);
+          const int64_t smin = (bits_local == 64)
+                                   ? INT64_MIN
+                                   : -(int64_t{1} << (bits_local - 1));
+          int64_t res;
+          if (sh > 0) {
+            // Left shift, saturate if any bit beyond the sign bit gets set.
+            if (sh >= bits_local) {
+              res = (sa > 0) ? smax : ((sa < 0) ? smin : int64_t{0});
+            } else {
+              __int128 shifted = static_cast<__int128>(sa) << sh;
+              if (shifted > smax) res = smax;
+              else if (shifted < smin) res = smin;
+              else res = static_cast<int64_t>(shifted);
+            }
+          } else if (sh == 0) {
+            res = sa;
+          } else {
+            // Negative shift => arithmetic right shift (optionally rounding).
+            const int rshift = -sh;
+            if (is_rounding) {
+              if (rshift > 64) {
+                res = 0;
+              } else {
+                __int128 sum = static_cast<__int128>(sa) +
+                               (static_cast<__int128>(1) << (rshift - 1));
+                res = static_cast<int64_t>(sum >> rshift);
+              }
+            } else {
+              if (rshift >= bits_local) {
+                res = (sa < 0) ? int64_t{-1} : int64_t{0};
+              } else {
+                res = sa >> rshift;
+              }
+            }
+          }
+          // Right shifts can't grow beyond [smin, smax], but rounding can
+          // bump a positive value across smax (e.g. esize=1, sa=127, rshift=
+          // very-large rounding edge cases); clamp defensively.
+          if (res > smax) res = smax;
+          if (res < smin) res = smin;
+          r = static_cast<uint64_t>(res) & mask;
+        } else {
+          const uint64_t ua = a;
+          uint64_t res;
+          if (sh > 0) {
+            if (sh >= bits_local) {
+              res = (ua != 0) ? mask : 0;
+            } else {
+              __uint128_t shifted = static_cast<__uint128_t>(ua) << sh;
+              if (shifted > static_cast<__uint128_t>(mask)) res = mask;
+              else res = static_cast<uint64_t>(shifted);
+            }
+          } else if (sh == 0) {
+            res = ua;
+          } else {
+            const int rshift = -sh;
+            if (is_rounding) {
+              if (rshift > 64) {
+                res = 0;
+              } else {
+                __uint128_t sum = static_cast<__uint128_t>(ua) +
+                                  (static_cast<__uint128_t>(1) << (rshift - 1));
+                res = static_cast<uint64_t>(sum >> rshift);
+                if (res > mask) res = mask;
+              }
+            } else {
+              if (rshift >= bits_local) {
+                res = 0;
+              } else {
+                res = ua >> rshift;
+              }
+            }
+          }
+          r = res;
+        }
+        state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+        return;
+      }
+      // region digitalis: SRSHL / URSHL scalar (D only, non-saturating).
+      // Like SSHL / USHL but with rounding when shifting right.  Per ARM
+      // ARM C7.2.270 / .335, the rounding term `1 << (rshift-1)` is added
+      // before the right shift; left shifts behave identically to SSHL /
+      // USHL (no saturation — upper bits are discarded by the D-form mask
+      // on writeback).
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUrshlScalar: {
+        const uint64_t ua = static_cast<uint64_t>(state_->cpu.v[args.rn]);
+        const int sh = static_cast<int8_t>(
+            static_cast<uint64_t>(state_->cpu.v[args.rm]) & 0xFF);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar);
+        uint64_t r;
+        if (sh > 0) {
+          // Left shift, no saturation — discard upper bits.
+          r = (sh >= 64) ? uint64_t{0} : (ua << sh);
+        } else if (sh == 0) {
+          r = ua;
+        } else {
+          const int rshift = -sh;
+          if (rshift > 64) {
+            // Rounding right shift with rshift > 64 always rounds to 0
+            // for any 64-bit operand (the rounding term 2^(rshift-1)
+            // dominates and the quotient truncates to 0).
+            r = 0;
+          } else if (is_signed) {
+            const int64_t sa = static_cast<int64_t>(ua);
+            __int128 sum = static_cast<__int128>(sa) +
+                           (static_cast<__int128>(1) << (rshift - 1));
+            r = static_cast<uint64_t>(static_cast<int64_t>(sum >> rshift));
+          } else {
+            __uint128_t sum = static_cast<__uint128_t>(ua) +
+                              (static_cast<__uint128_t>(1) << (rshift - 1));
+            r = static_cast<uint64_t>(sum >> rshift);
+          }
+        }
+        state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+        return;
+      }
+      // endregion
+      // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+      // Per ARM ARM C7.2.301 / .305:
+      //   Vd = sat_signed((2 * sext(Vn) * sext(Vm) + round) >> bits_local)
+      // with bits_local = 16 (size=01, H) or 32 (size=10, S), and
+      // round = 1 << (bits_local - 1) for SQRDMULH or 0 for SQDMULH.
+      // The doubled product for size=S reaches 2 * INT32_MIN * INT32_MIN =
+      // 2^63, which overflows int64_t by one — so the multiply is done
+      // in __int128 before the right shift and the saturation clamp.
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqdmulhScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 2 or 4
+        const uint8_t bits_local = esize * 8;           // 16 or 32
+        const int shift_to_64 = 64 - bits_local;
+        const int64_t sa =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rn])
+                                 << shift_to_64) >> shift_to_64;
+        const int64_t sb =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rm])
+                                 << shift_to_64) >> shift_to_64;
+        const __int128 round =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar)
+                ? (static_cast<__int128>(1) << (bits_local - 1))
+                : __int128{0};
+        const __int128 product =
+            (static_cast<__int128>(2) * sa * sb) + round;
+        int64_t res = static_cast<int64_t>(product >> bits_local);
+        const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+        const int64_t smin = -(int64_t{1} << (bits_local - 1));
+        if (res > smax) res = smax;
+        else if (res < smin) res = smin;
+        const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+        state_->cpu.v[args.rd] =
+            static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+        return;
+      }
+      // endregion
+      default:
+        break;
+    }
+    // endregion
+
     // D-form integer ops below.
     uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]);
     uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]);
@@ -5726,6 +6001,9 @@ class Interpreter {
   //
   // AdvSIMD scalar pairwise.
   // ADDP scalar (D-form): Vd[0] = Vn.D[0] + Vn.D[1].
+  // FP variants (FADDP / FMAXNMP / FMINNMP / FMAXP / FMINP scalar):
+  //   reduce Vn.S[0] op Vn.S[1] (size=00) or Vn.D[0] op Vn.D[1] (size=01)
+  //   into the bottom lane of Vd; upper bits zero.
   //
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
     CHECK(!exception_raised_);
@@ -5740,6 +6018,80 @@ class Interpreter {
         // D-form only.
         r = lo + hi;
         break;
+      // region digitalis: FP scalar pairwise.  size[0] picks S (0) vs D (1).
+      // FMAX/FMIN: NaN-propagating (any-NaN -> NaN).
+      // FMAXNM/FMINNM: NaN-quiet (single-NaN -> other operand).
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar: {
+        bool is_double = ((args.size & 1) != 0);
+        if (is_double) {
+          double a, b, d;
+          memcpy(&a, &lo, 8);
+          memcpy(&b, &hi, 8);
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+              d = a + b;
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+              d = (std::isnan(a) || std::isnan(b)) ? std::nan("")
+                                                    : (a > b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
+              d = (std::isnan(a) || std::isnan(b)) ? std::nan("")
+                                                    : (a < b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+              d = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a > b ? a : b));
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+              d = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a < b ? a : b));
+              break;
+            default:
+              __builtin_unreachable();
+          }
+          memcpy(&r, &d, 8);
+        } else {
+          // S form: read Vn.S[0] (bits[31:0] of lo) and Vn.S[1] (bits[63:32]).
+          uint32_t a_bits = static_cast<uint32_t>(lo);
+          uint32_t b_bits = static_cast<uint32_t>(lo >> 32);
+          float a, b, f;
+          memcpy(&a, &a_bits, 4);
+          memcpy(&b, &b_bits, 4);
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+              f = a + b;
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+              f = (std::isnan(a) || std::isnan(b)) ? std::nanf("")
+                                                    : (a > b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
+              f = (std::isnan(a) || std::isnan(b)) ? std::nanf("")
+                                                    : (a < b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+              f = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a > b ? a : b));
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+              f = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a < b ? a : b));
+              break;
+            default:
+              __builtin_unreachable();
+          }
+          uint32_t f_bits;
+          memcpy(&f_bits, &f, 4);
+          r = f_bits;  // upper 32 bits of the bottom 64-bit lane are zero
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;
