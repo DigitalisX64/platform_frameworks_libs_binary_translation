@@ -6049,17 +6049,21 @@ class Decoder {
   //   00110  | SRSRA    | URSRA     | scalar D only
   //   01000  | —        | SRI       | scalar D only
   //   01010  | SHL      | SLI       | scalar D only
-  //   01100  | —        | SQSHLU    | scalar B/H/S/D (this cycle: D only)
-  //   01110  | SQSHL    | UQSHL     | scalar B/H/S/D (this cycle: D only)
+  //   01100  | —        | SQSHLU    | scalar B/H/S/D (all dispatched)
+  //   01110  | SQSHL    | UQSHL     | scalar B/H/S/D (all dispatched)
+  //   10000  | —        | SQSHRUN   | scalar B/H/S
+  //   10001  | —        | SQRSHRUN  | scalar B/H/S
+  //   10010  | SQSHRN   | UQSHRN    | scalar B/H/S
+  //   10011  | SQRSHRN  | UQRSHRN   | scalar B/H/S
   //
-  // The non-saturating ops are spec'd by ARM ARM as scalar D-only; the
-  // saturating ops accept all four sizes but only the D variant maps
-  // cleanly onto the existing vector interpreter via num_elements=1
-  // (esize=8, vec_len=8).  Non-D saturating shifts and the narrow
-  // (opcode 10xxx) / fixed-point conversion (opcode 11xxx) variants
-  // fall through to Undefined() until follow-up cycles add their own
-  // single-lane interpreter arms — see the carried "what should be
-  // done next" list.
+  // The non-saturating ops (rows 00000..01010) are spec'd by ARM ARM as
+  // scalar D-only; the saturating shifts (rows 01100/01110) accept all
+  // four sizes; the narrow shifts (rows 10000..10011) accept B/H/S
+  // destination (source is 2*dest_esize bits) — immh=1xxx is unallocated
+  // for them because there is no scalar narrow-to-D form. Fixed-point
+  // conversion (opcode 11xxx) still falls through to Undefined() until a
+  // follow-up cycle adds its single-lane interpreter arm — see the
+  // carried "what should be done next" list.
   //
   void DecodeAdvSimdScalarShiftByImm() {
     bool u = GetBits<29, 1>();
@@ -6125,6 +6129,44 @@ class Decoder {
       case 0b01110:
         // SQSHL/UQSHL: scalar B/H/S/D — accept any non-zero immh.
         op = u ? AdvSimdShiftImmOpcode::kUqshl : AdvSimdShiftImmOpcode::kSqshl;
+        break;
+      // Scalar narrow-shift dispatch (ARM ARM C4.1.6.10, opcodes 10000..10011).
+      // Source is 2*esize bits, destination is esize bits, with saturation
+      // (and optional rounding for the "R" variants). Maps:
+      //   opcode | U=0       | U=1
+      //   -------+-----------+-----------
+      //   10000  | —         | SQSHRUN
+      //   10001  | —         | SQRSHRUN
+      //   10010  | SQSHRN    | UQSHRN
+      //   10011  | SQRSHRN   | UQRSHRN
+      // Per ARM ARM these accept B/H/S destination (immh = 0001 / 001x /
+      // 01xx); immh = 1xxx is unallocated (would need a D destination,
+      // but ARM has no scalar narrow-to-D form). The U=0 variants of
+      // opcode 10000/10001 are also unallocated (no SHRN / RSHRN
+      // scalar — those are vector-only).
+      case 0b10000:
+        if (immh & 0b1000) { Undefined(); return; }
+        if (u) {
+          op = AdvSimdShiftImmOpcode::kSqshrun;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b10001:
+        if (immh & 0b1000) { Undefined(); return; }
+        if (u) {
+          op = AdvSimdShiftImmOpcode::kSqrshrun;
+        } else {
+          Undefined(); return;
+        }
+        break;
+      case 0b10010:
+        if (immh & 0b1000) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kUqshrn : AdvSimdShiftImmOpcode::kSqshrn;
+        break;
+      case 0b10011:
+        if (immh & 0b1000) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kUqrshrn : AdvSimdShiftImmOpcode::kSqrshrn;
         break;
       default:
         Undefined();

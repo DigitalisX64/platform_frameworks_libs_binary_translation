@@ -7646,7 +7646,15 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;  // always from full 128-bit source
+        // region digitalis
+        // Scalar narrow-shift dispatch (DecodeAdvSimdScalarShiftByImm)
+        // sets args.scalar=true (and q=false) to mean: read exactly one
+        // source element of src_esize bits and write Vd[esize-1:0],
+        // leaving Vd[127:esize] = 0. The dst_offset / result-init
+        // expressions already produce dst_offset=0 and result=0 when
+        // q=false, so only src_count needs the per-scalar override.
+        // endregion
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         // Q=0: write lower half, Q=1: write upper half (SHRN2).
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
@@ -7848,7 +7856,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7876,7 +7886,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7904,7 +7916,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7938,7 +7952,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7967,7 +7983,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -7993,7 +8011,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -8020,7 +8040,9 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        uint8_t src_count = 16 / src_esize;
+        // region digitalis: see kShrn above for the scalar override rationale.
+        uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
+        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
