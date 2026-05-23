@@ -1316,6 +1316,92 @@ class Interpreter {
   // endregion
 
   // region digitalis
+  // Narrow one FP64 to FP32 with the ARMv8 "Round to Odd" mode (used only by
+  // FCVTXN / FCVTXN2). RtO is double-rounding-safe: take the
+  // round-toward-zero result, then if any source bits were discarded force
+  // the LSB of the result mantissa to 1. NaN propagates as a quiet FP32 NaN;
+  // ±Inf passes through; ±0 passes through. The overflow case returns
+  // ±FP32_MAX (round-toward-zero clamps the magnitude); the LSB of FP32_MAX
+  // is already 1, so RtO leaves it alone. Implemented with manual bit
+  // manipulation because there is no softfloat library in-tree and the C++
+  // compiler does not expose round-to-odd.
+  static uint32_t FpDoubleToFloatRtO(double d) {
+    uint64_t bits;
+    memcpy(&bits, &d, 8);
+    uint32_t sign = static_cast<uint32_t>((bits >> 63) & 1) << 31;
+    uint32_t exp_d = static_cast<uint32_t>((bits >> 52) & 0x7FF);
+    uint64_t mant_d = bits & ((1ULL << 52) - 1);
+
+    // NaN or ±Inf.
+    if (exp_d == 0x7FF) {
+      if (mant_d == 0) {
+        return sign | 0x7F800000u;
+      }
+      // Quiet NaN: keep top of payload, force quiet bit.
+      return sign | 0x7FC00000u | static_cast<uint32_t>(mant_d >> 29);
+    }
+
+    // ±0.
+    if (exp_d == 0 && mant_d == 0) {
+      return sign;
+    }
+
+    int32_t unbiased_exp;
+    uint64_t mant_full;
+    if (exp_d == 0) {
+      // FP64 subnormal: value = mant_d * 2^-1074. Treat as having
+      // unbiased exponent -1074 with no leading implicit bit. Any FP64
+      // subnormal is far below FP32 range so the result will be ±smallest
+      // FP32 denormal via the round-to-odd LSB fixup below.
+      unbiased_exp = -1074;
+      mant_full = mant_d;
+    } else {
+      unbiased_exp = static_cast<int32_t>(exp_d) - 1023;
+      mant_full = mant_d | (1ULL << 52);  // implicit 1 + 52 fraction bits
+    }
+
+    int32_t exp_f = unbiased_exp + 127;
+
+    // Overflow: round-toward-zero clamps to FP32_MAX = 0x7F7FFFFF, whose
+    // LSB is already 1 → odd, so RtO leaves it.
+    if (exp_f >= 0xFF) {
+      return sign | 0x7F7FFFFFu;
+    }
+
+    uint32_t mant_f;
+    bool any_discarded;
+    if (exp_f >= 1) {
+      // Normal FP32: top 23 bits of the 53-bit normalized mantissa.
+      mant_f = static_cast<uint32_t>((mant_full >> 29) & 0x7FFFFFu);
+      any_discarded = (mant_full & ((1ULL << 29) - 1)) != 0;
+      mant_f |= static_cast<uint32_t>(exp_f) << 23;
+    } else {
+      // Subnormal FP32 (or underflow to 0): shift mant_full right by
+      // (30 - exp_f) so the result lands in the FP32 denormal mantissa.
+      // For exp_f = 0, shift = 30; for exp_f <= -23, the mantissa zeros
+      // out and RtO forces the LSB to 1 → smallest denormal.
+      int32_t shift = 30 - exp_f;
+      if (shift >= 64) {
+        mant_f = 0;
+        any_discarded = (mant_full != 0);
+      } else {
+        mant_f = static_cast<uint32_t>(mant_full >> shift);
+        uint64_t mask = (shift == 0) ? 0 : ((1ULL << shift) - 1);
+        any_discarded = (mant_full & mask) != 0;
+      }
+    }
+
+    // RtO: if any low bits were discarded, force LSB to 1. (No-op if
+    // already 1.)
+    if (any_discarded) {
+      mant_f |= 1;
+    }
+
+    return sign | mant_f;
+  }
+  // endregion
+
+  // region digitalis
   // Advanced SIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT (vec),
   // BFMMLA, BFMLALB/T (vec), BFDOT (idx), BFMLALB/T (idx).
   //
@@ -6647,6 +6733,25 @@ class Interpreter {
           memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
           uint16_t bf = FloatToBf16(f);
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 2, &bf, 2);
+        }
+        break;
+      }
+      // endregion
+      // region digitalis FCVTXN / FCVTXN2 (vector narrow FP64->FP32, RtO).
+      // Decoder pins size=01 (FP64 source). Q=0 writes 2 narrow FP32 lanes
+      // into Vd.s[0..1] (upper 64 bits zeroed); Q=1 writes Vd.s[2..3]
+      // (lower 64 bits preserved). Round-to-odd is computed by
+      // FpDoubleToFloatRtO from the FP64 bits — manual implementation
+      // because the host compiler does not expose RtO.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtxn: {
+        if (args.size != 0b01) { Undefined(); return; }
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_off = args.q ? 8 : 0;
+        for (uint8_t i = 0; i < 2; i++) {
+          double d;
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+          uint32_t f_bits = FpDoubleToFloatRtO(d);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 4, &f_bits, 4);
         }
         break;
       }

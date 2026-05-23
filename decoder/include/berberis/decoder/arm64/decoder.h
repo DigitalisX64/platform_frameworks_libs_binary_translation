@@ -1331,6 +1331,20 @@ class Decoder {
     // (upper zeroed); Q=1 writes upper 64 bits and preserves lower.
     kSqxtun,    // SQXTUN/SQXTUN2: U=1, opcode=10011
     // endregion
+    // region digitalis - FCVTXN / FCVTXN2 (vector narrow FP64->FP32, round-to-odd).
+    // Encoding: 0 Q 1 01110 0 sz 10000 10110 10 Rn Rd  with sz=1 (size=01).
+    // U=1 distinguishes this from FCVTN (U=0, opcode=10110) and from BFCVTN
+    // (U=0, opcode=10110, size=10). Only FP64 (size=01) source is encoded; the
+    // destination is FP32. Q=0 writes 2 narrow lanes into low 64 bits of Vd
+    // (upper zeroed); Q=1 writes 2 narrow lanes into upper 64 bits and
+    // preserves lower.
+    //   fcvtxn  v0.2s, v1.2d  = 0x2e616820  (Q=0, U=1, size=01)
+    //   fcvtxn2 v0.4s, v1.2d  = 0x6e616820  (Q=1, U=1, size=01)
+    // Round-to-odd rule (used to avoid double-rounding when chaining narrow
+    // conversions): take the round-toward-zero result; if any bits were
+    // discarded, force the LSB of the result mantissa to 1.
+    kFcvtxn,    // FCVTXN/FCVTXN2: U=1, opcode=10110, size=01
+    // endregion
     // endregion
   };
 
@@ -4768,11 +4782,17 @@ class Decoder {
         }
         break;
       case 0b10110:
-        if (u) { Undefined(); return; }
-        // region digitalis BFCVTN/BFCVTN2 share opcode=10110
-        // with FCVTN; distinguished by size=10 (vs FCVTN's size=00/01).
-        // bit30 (q) selects BFCVTN (low half write) vs BFCVTN2 (high half).
-        if (size == 0b10) {
+        // region digitalis - opcode=10110 splits on U:
+        //   U=0 + size=10 -> BFCVTN/BFCVTN2 (FP32->BF16).
+        //   U=0 + size=00/01 -> FCVTN/FCVTN2 (FP16->? / FP64->FP32). Only
+        //     size=01 is currently implemented; size=00 is undefined here.
+        //   U=1 + size=01 -> FCVTXN/FCVTXN2 (FP64->FP32, round-to-odd).
+        //   U=1 + size!=01 -> unallocated.
+        // bit30 (q) selects low-half write (Q=0) vs high-half write (Q=1).
+        if (u) {
+          if (size != 0b01) { Undefined(); return; }
+          op = AdvSimdTwoRegMiscOpcode::kFcvtxn;
+        } else if (size == 0b10) {
           op = AdvSimdTwoRegMiscOpcode::kBfcvtn;
         } else {
           op = AdvSimdTwoRegMiscOpcode::kFcvtn;
