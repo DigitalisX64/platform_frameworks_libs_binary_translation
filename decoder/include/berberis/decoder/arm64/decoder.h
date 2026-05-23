@@ -1383,17 +1383,28 @@ class Decoder {
   // AdvSIMD scalar two-reg misc opcodes.
   //
   enum class AdvSimdScalarTwoRegMiscOpcode : uint8_t {
-    kScvtf,   // SCVTF (scalar): signed int → float
-    kUcvtf,   // UCVTF (scalar): unsigned int → float
-    kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero
-    kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero
+    kScvtf,   // SCVTF  (scalar): signed int → float                       (opcode=11101, U=0; size ∈ {S,D})
+    kUcvtf,   // UCVTF  (scalar): unsigned int → float                     (opcode=11101, U=1; size ∈ {S,D})
+    kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero    (opcode=11011, U=0; size ∈ {S,D})
+    kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero  (opcode=11011, U=1; size ∈ {S,D})
+    // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
+    kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
+    kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
+    kSqxtun,  // SQXTUN (scalar): signed→unsigned saturating extract narrow (opcode=10010, U=1; size ∈ {B,H,S})
+    kFcvtxn,  // FCVTXN (scalar): FP64→FP32 round-to-odd narrow             (opcode=10110, U=1; size=01)
+    // endregion
   };
 
   struct AdvSimdScalarTwoRegMiscArgs {
     AdvSimdScalarTwoRegMiscOpcode opcode;
     uint8_t rd;
     uint8_t rn;
-    uint8_t size;   // 0=single, 1=double
+    // Raw 2-bit size field from the encoding.
+    //   For FP ops (SCVTF/UCVTF/FCVTZS/FCVTZU/FCVTXN), size matches the
+    //   ARM ARM "sz" bit conventions: 0 = single (FP32), 1 = double (FP64).
+    //   For integer ops (SQABS/SQNEG/SQXTUN), size selects the lane width
+    //   in bytes via `1 << size`: 0=B, 1=H, 2=S, 3=D.
+    uint8_t size;
   };
   // endregion
 
@@ -4945,6 +4956,39 @@ class Decoder {
         op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtzu
                : AdvSimdScalarTwoRegMiscOpcode::kFcvtzs;
         break;
+      // region digitalis - scalar SQABS / SQNEG / SQXTUN / FCVTXN.
+      // Scalar twins of the vector ops at the same opcode bits (00111,
+      // 10010, 10110); each is the one-lane collapse of the vector form.
+      // llvm-mc-21 encoding checks:
+      //   sqabs   b0, b1   → 0x5e207820  (U=0, opcode=00111, size=00)
+      //   sqabs   d0, d1   → 0x5ee07820  (U=0, opcode=00111, size=11)
+      //   sqneg   b0, b1   → 0x7e207820  (U=1, opcode=00111, size=00)
+      //   sqxtun  b0, h1   → 0x7e212820  (U=1, opcode=10010, size=00)
+      //   sqxtun  s0, d1   → 0x7ea12820  (U=1, opcode=10010, size=10)
+      //   fcvtxn  s0, d1   → 0x7e616820  (U=1, opcode=10110, size=01)
+      case 0b00111:
+        // SQABS (U=0) / SQNEG (U=1): single signed-saturating abs/neg.
+        // All four lane widths (B/H/S/D) are encoded.
+        op = u ? AdvSimdScalarTwoRegMiscOpcode::kSqneg
+               : AdvSimdScalarTwoRegMiscOpcode::kSqabs;
+        break;
+      case 0b10010:
+        // SQXTUN (U=1): single-lane signed→unsigned saturating narrow.
+        // size=00→B from H, 01→H from S, 10→S from D. size=11 unallocated.
+        // U=0 at this opcode is SQXTN; not implemented here (vector form
+        // also not shipped yet) — falls through to Undefined.
+        if (!u || size == 0b11) { Undefined(); return; }
+        op = AdvSimdScalarTwoRegMiscOpcode::kSqxtun;
+        break;
+      case 0b10110:
+        // FCVTXN (U=1, size=01): scalar FP64→FP32 round-to-odd.
+        // U=0 at this opcode bit pattern is reserved at the scalar level
+        // (BFCVTN/FCVTN are vector-only — no scalar BFCVTN scalar form
+        // exists), so reject anything else.
+        if (!u || size != 0b01) { Undefined(); return; }
+        op = AdvSimdScalarTwoRegMiscOpcode::kFcvtxn;
+        break;
+      // endregion
       default:
         Undefined();
         return;
@@ -4954,7 +4998,10 @@ class Decoder {
         .opcode = op,
         .rd = rd,
         .rn = rn,
-        .size = static_cast<uint8_t>(size & 1),  // 0=single, 1=double
+        // Raw 2-bit size. The pre-existing FP ops use only size ∈ {0,1};
+        // the new SQABS/SQNEG/SQXTUN family uses size ∈ {0..3}. See the
+        // struct doc-comment above.
+        .size = size,
     };
     insn_consumer_->AdvSimdScalarTwoRegMisc(args);
   }

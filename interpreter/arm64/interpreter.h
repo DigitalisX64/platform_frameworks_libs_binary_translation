@@ -5421,6 +5421,71 @@ class Interpreter {
         }
         break;
       }
+      // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
+      // Each is the single-lane collapse of the corresponding vector op
+      // implemented in AdvSimdTwoRegMisc above; the result is the lane
+      // value zero-extended to the full 128-bit Vd register.
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqabs:
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg: {
+        // Lane width derived from raw 2-bit size: 0=B, 1=H, 2=S, 3=D.
+        uint8_t esize = static_cast<uint8_t>(1U << args.size);
+        uint8_t bits = static_cast<uint8_t>(esize * 8);
+        int64_t int_min = (esize == 8) ? INT64_MIN : -(int64_t{1} << (bits - 1));
+        int64_t int_max = (esize == 8) ? INT64_MAX : ((int64_t{1} << (bits - 1)) - 1);
+        uint64_t emask =
+            (esize == 8) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+        uint64_t elem = 0;
+        memcpy(&elem, &src, esize);
+        int64_t signed_val =
+            static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+        bool is_neg =
+            (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg);
+        int64_t out;
+        if (signed_val == int_min) {
+          out = int_max;  // saturate (single saturating input per ARM ARM)
+        } else if (is_neg) {
+          out = -signed_val;
+        } else {
+          out = (signed_val < 0) ? -signed_val : signed_val;
+        }
+        uint64_t out_u = static_cast<uint64_t>(out) & emask;
+        memcpy(&result, &out_u, esize);
+        break;
+      }
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun: {
+        // size=00→8-bit dst from 16-bit src, 01→16/32, 10→32/64; size=11
+        // is rejected in the decoder.
+        uint8_t dst_esize = static_cast<uint8_t>(1U << args.size);
+        uint8_t src_esize = static_cast<uint8_t>(dst_esize * 2);
+        uint64_t raw = 0;
+        memcpy(&raw, &src, src_esize);
+        int64_t s = static_cast<int64_t>(raw << (64 - src_esize * 8)) >>
+                    (64 - src_esize * 8);
+        uint64_t dst_umax = (dst_esize == 8)
+                                ? ~uint64_t{0}
+                                : ((uint64_t{1} << (dst_esize * 8)) - 1);
+        uint64_t out;
+        if (s < 0) {
+          out = 0;
+        } else if (static_cast<uint64_t>(s) > dst_umax) {
+          out = dst_umax;
+        } else {
+          out = static_cast<uint64_t>(s);
+        }
+        memcpy(&result, &out, dst_esize);
+        break;
+      }
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtxn: {
+        // FCVTXN Sd, Dn — single-lane FP64→FP32 round-to-odd.
+        // Decoder pins args.size == 0b01 (FP64 source). Reuses the
+        // FpDoubleToFloatRtO helper shipped for vector FCVTXN.
+        double d;
+        memcpy(&d, &src, sizeof(d));
+        uint32_t f_bits = FpDoubleToFloatRtO(d);
+        memcpy(&result, &f_bits, sizeof(f_bits));
+        break;
+      }
+      // endregion
     }
 
     state_->cpu.v[args.rd] = result;
