@@ -12495,6 +12495,261 @@ TEST_F(Arm64LiteTranslateRegionTest, Uminp4S) {
 }
 // endregion
 
+// region digitalis: SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
+//
+// Opcode bits (15-11) and U bit per decoder.h:5375-5403:
+//   SSRA opcode=00010 U=0  USRA opcode=00010 U=1
+//   SRI  opcode=01000 U=1  SLI  opcode=01010 U=1
+//
+// SLI shift = immh:immb - bits, range [0, bits-1].
+// SSRA/USRA/SRI shift = 2*bits - immh:immb, range [1, bits].
+constexpr uint32_t kSsraVec8H_3   = 0x4f1d1420;  // ssra v0.8h, v1.8h, #3  (immh:immb=0011101=29 → 32-29=3)
+constexpr uint32_t kSsraVec4H_3   = 0x0f1d1420;  // ssra v0.4h, v1.4h, #3  Q=0
+constexpr uint32_t kSsraVec4S_5   = 0x4f3b1420;  // ssra v0.4s, v1.4s, #5  (immh:immb=0111011=59 → 64-59=5)
+constexpr uint32_t kUsraVec8H_3   = 0x6f1d1420;  // usra v0.8h, v1.8h, #3
+constexpr uint32_t kUsraVec4S_5   = 0x6f3b1420;  // usra v0.4s, v1.4s, #5
+constexpr uint32_t kUsraVec2D_11  = 0x6f751420;  // usra v0.2d, v1.2d, #11 (immh:immb=1110101=117 → 128-117=11)
+constexpr uint32_t kSliVec8H_3    = 0x6f135420;  // sli  v0.8h, v1.8h, #3  (immh:immb=0010011=19 → 19-16=3)
+constexpr uint32_t kSliVec8H_0    = 0x6f105420;  // sli  v0.8h, v1.8h, #0  boundary: copy Vn
+constexpr uint32_t kSliVec2SUp    = 0x2f255420;  // sli  v0.2s, v1.2s, #5  Q=0
+constexpr uint32_t kSliVec2D_11   = 0x6f4b5420;  // sli  v0.2d, v1.2d, #11
+constexpr uint32_t kSriVec8H_3    = 0x6f1d4420;  // sri  v0.8h, v1.8h, #3  (immh:immb=0011101=29 → 32-29=3)
+constexpr uint32_t kSriVec8H_16   = 0x6f104420;  // sri  v0.8h, v1.8h, #16 boundary: preserve Vd
+constexpr uint32_t kSriVec2SUp    = 0x2f3b4420;  // sri  v0.2s, v1.2s, #5  Q=0
+constexpr uint32_t kSriVec2D_11   = 0x6f754420;  // sri  v0.2d, v1.2d, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8H) {
+  int16_t in_n[8] = {0, -1, 8, INT16_MIN, 0x1234, static_cast<int16_t>(0xABCD), 0xFF, -16};
+  int16_t in_d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSsraVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t want = static_cast<int16_t>(in_d[i] + (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << in_n[i] << " in_d=" << in_d[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec4HUpperZero) {
+  int16_t in_n[8] = {-128, 256, INT16_MIN, INT16_MAX, 99, -99, 1, -1};
+  int16_t in_d[8] = {10, 20, 30, 40, 1234, -1234, 0x7000, static_cast<int16_t>(0x8000)};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSsraVec4H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int16_t want = static_cast<int16_t>(in_d[i] + (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec4S) {
+  int32_t in_n[4] = {0, -1, INT32_MIN, 0x12345678};
+  int32_t in_d[4] = {100, 200, 300, 400};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSsraVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int32_t want = in_d[i] + (in_n[i] >> 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8H) {
+  uint16_t in_n[8] = {0x0000, 0xFFFF, 0x0008, 0x8000, 0x1234, 0xABCD, 0x00FF, 0x0F0F};
+  uint16_t in_d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUsraVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>(in_d[i] + (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec4S) {
+  uint32_t in_n[4] = {0x00000000u, 0xFFFFFFFFu, 0x12345678u, 0x80000001u};
+  uint32_t in_d[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUsraVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint32_t want = in_d[i] + (in_n[i] >> 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec2D) {
+  uint64_t in_n[2] = {0x123456789abcdef0ull, 0x8000000000000001ull};
+  uint64_t in_d[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUsraVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint64_t want = in_d[i] + (in_n[i] >> 11);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec8H) {
+  // SLI .8H shift=3: each lane = (Vd & 0x0007) | (Vn << 3).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x0007, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAA5, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0x4321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>((in_d[i] & 0x0007u) | (in_n[i] << 3));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << std::hex << in_n[i]
+                          << " in_d=" << in_d[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec8HShiftZero) {
+  // Boundary: SLI shift=0 → Vd_out = Vn (low-mask is empty).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x0007, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAA5, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0x4321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec8H_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], in_n[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec2SUpperZero) {
+  // SLI .2S shift=5: each lane = (Vd & 0x1F) | (Vn << 5); upper 64 bits zero.
+  uint32_t in_n[4] = {0x12345678u, 0x80000001u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t in_d[4] = {0xAAAAAAAAu, 0x5555555Fu, 0x11111111u, 0x22222222u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec2SUp};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = (in_d[i] & 0x1Fu) | (in_n[i] << 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec2D) {
+  // SLI .2D shift=11: each lane = (Vd & ((1<<11)-1)) | (Vn << 11).
+  uint64_t in_n[2] = {0x0123456789ABCDEFull, 0xFEDCBA9876543210ull};
+  uint64_t in_d[2] = {0xAAAAAAAAAAAAA7FFull, 0x55555555555555AAull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint64_t want = (in_d[i] & ((1ULL << 11) - 1)) | (in_n[i] << 11);
+    EXPECT_EQ(r[i], want) << "lane " << i << std::hex
+                          << " want=" << want << " got=" << r[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec8H) {
+  // SRI .8H shift=3: each lane = (Vd & 0xE000) | (Vn >> 3).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x7000, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAAA, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0xE321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>((in_d[i] & 0xE000u) | (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << std::hex << in_n[i]
+                          << " in_d=" << in_d[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec8HShiftEsize) {
+  // Boundary: SRI shift=16 → Vd_out = Vd (every bit of Vd preserved).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x7000, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAAA, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0xE321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec8H_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], in_d[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec2SUpperZero) {
+  // SRI .2S shift=5: each lane = (Vd & 0xF8000000) | (Vn >> 5); upper 64 bits zero.
+  uint32_t in_n[4] = {0x12345678u, 0x80000001u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t in_d[4] = {0xAAAAAAAAu, 0x5555555Fu, 0x11111111u, 0x22222222u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec2SUp};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = (in_d[i] & 0xF8000000u) | (in_n[i] >> 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec2D) {
+  // SRI .2D shift=11: each lane = (Vd & high_11_bits) | (Vn >> 11).
+  uint64_t in_n[2] = {0x0123456789ABCDEFull, 0xFEDCBA9876543210ull};
+  uint64_t in_d[2] = {0xAAAAAAAAAAAAAAAAull, 0x5555555555555555ull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    // high 11 bits set: mask = ~((1ULL << (64-11)) - 1) = 0xFFE0_0000_0000_0000
+    uint64_t mask = ~((1ULL << (64 - 11)) - 1);
+    uint64_t want = (in_d[i] & mask) | (in_n[i] >> 11);
+    EXPECT_EQ(r[i], want) << "lane " << i << std::hex
+                          << " want=" << want << " got=" << r[i];
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

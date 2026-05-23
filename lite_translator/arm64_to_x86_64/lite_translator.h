@@ -10797,6 +10797,141 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
+      //
+      //   SSRA  Vd<i> = Vd<i> + (Vn<i> >> shift)        (arithmetic right shift, accumulate)
+      //   USRA  Vd<i> = Vd<i> + (Vn<i> >> shift)        (logical right shift, accumulate)
+      //   SLI   Vd<i> = (Vd<i> & low_mask)  | (Vn<i> << shift)   shift ∈ [0, esize-1]
+      //   SRI   Vd<i> = (Vd<i> & high_mask) | (Vn<i> >> shift)   shift ∈ [1, esize]
+      //
+      //   low_mask  has the low  `shift`        bits per lane set (for SLI).
+      //   high_mask has the high `shift`        bits per lane set (for SRI).
+      //
+      // For SLI/SRI the mask-and-OR is expressed via a two-shift bracket on Vd:
+      //
+      //   SLI:  PSLL(Vd, esize-shift); PSRL(Vd, esize-shift) — keeps low  `shift` bits.
+      //   SRI:  PSRL(Vd, esize-shift); PSLL(Vd, esize-shift) — keeps high `shift` bits.
+      //
+      // x86 saturation matches ARM at the boundary in every case:
+      //   - SLI shift==0: PSLL(Vd, esize) → 0 (count ≥ esize zeros the dest),
+      //     then PSRL(0, esize) → 0, then POR(0, PSLL(Vn,0)=Vn) → Vn. Correct.
+      //   - SRI shift==esize: PSRL(Vd, 0) → Vd, PSLL(Vd, 0) → Vd,
+      //     POR(Vd, PSRL(Vn, esize)=0) → Vd. Correct (every bit preserved).
+      //   - SSRA/USRA shift==esize: PSRA at count ≥ esize sign-fills (matches arch);
+      //     PSRL at count ≥ esize zeros (matches arch).
+      //
+      // Bail cases:
+      //   - byte (immh=0001): no PSLLB / PSRLB / PSRAB in SSE; interpreter handles.
+      //   - SSRA at .2D (size=11): needs PSRAQ which is AVX-512F-VL only.
+      case Decoder::AdvSimdShiftImmOpcode::kSsra:
+      case Decoder::AdvSimdShiftImmOpcode::kUsra:
+      case Decoder::AdvSimdShiftImmOpcode::kSli:
+      case Decoder::AdvSimdShiftImmOpcode::kSri: {
+        const uint8_t immh = args.immh;
+        if (immh == 0) { success_ = false; return; }
+        const bool is_byte = (immh == 0b0001);  // esize = 1 (8 bits)
+        if (is_byte) { success_ = false; return; }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else /* immh & 0b0010 */ {
+          esize_bits = 16;
+        }
+        const bool is_sli = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSli);
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        uint8_t shift_count;
+        if (is_sli) {
+          // SLI shift = immh:immb - bits, range [0, bits-1].
+          shift_count = static_cast<uint8_t>(immh_immb - esize_bits);
+        } else {
+          // SSRA/USRA/SRI shift = 2*bits - immh:immb, range [1, bits].
+          shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        }
+        // SSRA .2D needs PSRAQ — bail (AVX-512F-VL only).
+        if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSsra &&
+            esize_bits == 64) {
+          success_ = false; return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xd == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        const int8_t inv = static_cast<int8_t>(esize_bits - shift_count);
+        switch (args.opcode) {
+          case Decoder::AdvSimdShiftImmOpcode::kSsra:
+            // Vd += SSHR(Vn, shift). PSRA{W,D} only.
+            switch (esize_bits) {
+              case 16: as_.Psraw(xn, cnt); as_.Paddw(xd, xn); break;
+              case 32: as_.Psrad(xn, cnt); as_.Paddd(xd, xn); break;
+            }
+            break;
+          case Decoder::AdvSimdShiftImmOpcode::kUsra:
+            // Vd += USHR(Vn, shift). PSRL{W,D,Q}.
+            switch (esize_bits) {
+              case 16: as_.Psrlw(xn, cnt); as_.Paddw(xd, xn); break;
+              case 32: as_.Psrld(xn, cnt); as_.Paddd(xd, xn); break;
+              case 64: as_.Psrlq(xn, cnt); as_.Paddq(xd, xn); break;
+            }
+            break;
+          case Decoder::AdvSimdShiftImmOpcode::kSli:
+            // Vd = (Vd & low_mask) | (Vn << shift).
+            switch (esize_bits) {
+              case 16:
+                as_.Psllw(xd, inv); as_.Psrlw(xd, inv);
+                as_.Psllw(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 32:
+                as_.Pslld(xd, inv); as_.Psrld(xd, inv);
+                as_.Pslld(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 64:
+                as_.Psllq(xd, inv); as_.Psrlq(xd, inv);
+                as_.Psllq(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+            }
+            break;
+          case Decoder::AdvSimdShiftImmOpcode::kSri:
+            // Vd = (Vd & high_mask) | USHR(Vn, shift).
+            switch (esize_bits) {
+              case 16:
+                as_.Psrlw(xd, inv); as_.Psllw(xd, inv);
+                as_.Psrlw(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 32:
+                as_.Psrld(xd, inv); as_.Pslld(xd, inv);
+                as_.Psrld(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 64:
+                as_.Psrlq(xd, inv); as_.Psllq(xd, inv);
+                as_.Psrlq(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+            }
+            break;
+          default:
+            // Unreachable — outer switch limits opcode to the four cases above.
+            success_ = false; return;
+        }
+        if (!args.q) {
+          // Zero upper 64 bits of Vd (D-register semantics).
+          as_.Pslldq(xd, int8_t{8});
+          as_.Psrldq(xd, int8_t{8});
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
