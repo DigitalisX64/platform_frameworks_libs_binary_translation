@@ -7744,6 +7744,102 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec8H) {
 }
 // endregion
 
+// region digitalis - AdvSimdThreeSame JIT for CMGE/CMHS (PCMPGT + invert)
+// Closes the last open compare-flavor entries on the §C2 NEON three-same
+// table: CMGT/CMHI already JITed via PCMPGT (with unsigned sign-flip);
+// CMGE = NOT(PCMPGT(Vm, Vn)), CMHS = same with pre-sign-flip. Reuses
+// SimdThreeSame(). CMGE encoding: U=0, opcode=0b00111. CMHS: U=1, opcode=0b00111.
+TEST_F(Arm64LiteTranslateRegionTest, CmgeVec16BSigned) {
+  // Verify boundary equality cases (== returns all-ones), strict ordering
+  // both directions, and the full int8 sign range across byte lanes.
+  int8_t n_signed[16] = {0, 1, -1, -128, 127, -2, 50, -50,
+                         100, -100, 0, 0, 5, 5, 6, -3};
+  int8_t m_signed[16] = {0, 0, 0, -127, 126, -3, 50, 50,
+                         99, -101, 1, -1, 6, 5, 5, -3};
+  uint8_t n[16], m[16];
+  std::memcpy(n, n_signed, 16);
+  std::memcpy(m, m_signed, 16);
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xAA, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(1, /*u=*/0, /*size=*/0b00, /*opcode=*/0b00111, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  LoadVec16B(state_.cpu, 0, r);
+  for (int i = 0; i < 16; i++) {
+    uint8_t expected = (n_signed[i] >= m_signed[i]) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgeVec4SSigned) {
+  // .4S, Q=1: 32-bit lanes, INT32_MIN/MAX boundaries plus equality.
+  StoreVec4SInt(state_.cpu, 1, 5, -1, INT32_MIN, INT32_MAX);
+  StoreVec4SInt(state_.cpu, 2, 5,  0, -1,        INT32_MAX);
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {
+      SimdThreeSame(1, /*u=*/0, /*size=*/0b10, /*opcode=*/0b00111, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], static_cast<int32_t>(0xFFFFFFFF));  // 5 >= 5 (equal)
+  EXPECT_EQ(r[1], 0);                                  // -1 >= 0 false
+  EXPECT_EQ(r[2], 0);                                  // INT32_MIN >= -1 false
+  EXPECT_EQ(r[3], static_cast<int32_t>(0xFFFFFFFF));  // INT32_MAX >= MAX (equal)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmhsVec4SUnsigned) {
+  // .4S, Q=1: 32-bit unsigned ordering across the signed boundary.
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  uint32_t n_lanes[4] = {0xFFFFFFFFu, 0x80000000u, 1u, 0x7FFFFFFFu};
+  uint32_t m_lanes[4] = {0x7FFFFFFFu, 0x80000000u, 2u, 0x80000000u};
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {
+      SimdThreeSame(1, /*u=*/1, /*size=*/0b10, /*opcode=*/0b00111, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);  // 0xFFFFFFFF >=u 0x7FFFFFFF
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);  // 0x80000000 >=u 0x80000000 (equal)
+  EXPECT_EQ(r[2], 0u);            // 1 !>=u 2
+  EXPECT_EQ(r[3], 0u);            // 0x7FFFFFFF !>=u 0x80000000 (unsigned!)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgeVec4HUpperZero) {
+  // .4H, Q=0: low 4 halfwords are the compare result, upper 8 bytes zeroed.
+  int16_t n_lanes[8] = {0, 100, -1, 32767, 0x1111, 0x2222, 0x3333, 0x4444};
+  int16_t m_lanes[8] = {0, 99,  -2, 32767, 0x5555, 0x6666, 0x7777, 0x0000};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  uint8_t d_init[16];
+  std::memset(d_init, 0xCC, 16);
+  std::memcpy(&state_.cpu.v[0], d_init, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b00111, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFu);  // 0 >= 0
+  EXPECT_EQ(r[1], 0xFFFFu);  // 100 >= 99
+  EXPECT_EQ(r[2], 0xFFFFu);  // -1 >= -2
+  EXPECT_EQ(r[3], 0xFFFFu);  // 32767 >= 32767
+  uint8_t r_bytes[16];
+  std::memcpy(r_bytes, &state_.cpu.v[0], 16);
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

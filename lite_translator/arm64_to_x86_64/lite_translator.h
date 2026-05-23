@@ -4100,6 +4100,85 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
+      // region digitalis - CMGE/CMHS vector via PCMPGT + invert (sign-flip for CMHS)
+      case Decoder::AdvSimdThreeSameOpcode::kCmge: {
+        // CMGE Vd, Vn, Vm: lane-wise signed greater-than-or-equal.
+        // x86 has no PCMPGE; compute NOT(Vm > Vn) instead, since
+        //   (Vn >= Vm)  ==  !(Vm > Vn)  for total signed orderings.
+        // 64-bit lanes still need SSE4.2 (PCMPGTQ); other widths are SSE2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister ones = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            ones == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        // PCMPGT(xm, xn) -> xm > xn per lane.  Then XOR with all-ones to
+        // invert into (xn >= xm).
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xm, xn); break;
+          case 0b01: as_.Pcmpgtw(xm, xn); break;
+          case 0b10: as_.Pcmpgtd(xm, xn); break;
+          case 0b11: as_.Pcmpgtq(xm, xn); break;
+          default: Undefined(); return;
+        }
+        as_.Pcmpeqd(ones, ones);  // 0xFFFFFFFF per dword (== all-ones).
+        as_.Pxor(xm, ones);
+        if (!args.q) mask_low64(xm);
+        store_full(vd_off, xm);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmhs: {
+        // CMHS Vd, Vn, Vm: lane-wise unsigned greater-than-or-equal.
+        // Same shape as CMGE, but flip per-lane sign bits on both operands
+        // first to map unsigned ordering onto the signed PCMPGT*.
+        // 64-bit lanes need SSE4.2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister sign = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            sign == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pcmpeqd(sign, sign);  // 0xFFFFFFFF per dword; specialized below.
+        switch (args.size) {
+          case 0b00: {
+            // Need 0x80 in every byte (no PSLLB on x86).
+            Register tmp = AllocTempReg();
+            if (tmp == Assembler::no_register) { Undefined(); return; }
+            as_.Movq(tmp, int64_t{static_cast<int64_t>(0x8080808080808080ULL)});
+            as_.Movq(sign, tmp);
+            as_.Punpcklqdq(sign, sign);
+            break;
+          }
+          case 0b01: as_.Psllw(sign, int8_t{15}); break;
+          case 0b10: as_.Pslld(sign, int8_t{31}); break;
+          case 0b11: as_.Psllq(sign, int8_t{63}); break;
+          default: Undefined(); return;
+        }
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        // Reuse `sign` as the all-ones invert mask after this point.
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xm, xn); break;
+          case 0b01: as_.Pcmpgtw(xm, xn); break;
+          case 0b10: as_.Pcmpgtd(xm, xn); break;
+          case 0b11: as_.Pcmpgtq(xm, xn); break;
+          default: Undefined(); return;
+        }
+        as_.Pcmpeqd(sign, sign);  // 0xFFFFFFFF per dword.
+        as_.Pxor(xm, sign);
+        if (!args.q) mask_low64(xm);
+        store_full(vd_off, xm);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
