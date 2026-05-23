@@ -4105,56 +4105,155 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // region digitalis - SQADD/UQADD/SQSUB/UQSUB vector for 8/16-bit lanes.
+      // region digitalis - SQADD/UQADD/SQSUB/UQSUB vector for 8/16/32-bit lanes.
       // x86 SSE2 has direct saturating add/sub for byte (PADD{S,US}B /
       // PSUB{S,US}B) and halfword (PADD{S,US}W / PSUB{S,US}W) lanes, which
       // match ARM's per-lane signed/unsigned saturation semantics exactly.
-      // 32/64-bit lanes have no direct SSE equivalent (would need CMP+BLEND
-      // saturate) and fall through to the interpreter via Undefined().
+      // 32-bit (.4S/.2S) lanes have no direct SSE saturating add/sub; emulate
+      // via wrap-add/sub + PMAXUD/PMINUD-based overflow detect (unsigned) or
+      // sign-bit / XOR-blend (signed). 64-bit lanes need AVX-512 PMAXUQ etc.
+      // and bail to the interpreter.
       case Decoder::AdvSimdThreeSameOpcode::kSqadd: {
-        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        if (args.size == 0b11) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        if (args.size == 0b00) as_.Paddsb(xn, xm); else as_.Paddsw(xn, xm);
+        if (args.size == 0b00) {
+          as_.Paddsb(xn, xm);
+        } else if (args.size == 0b01) {
+          as_.Paddsw(xn, xm);
+        } else {
+          // 32-bit signed saturating add: emulate via wrap-add + sign-bit
+          // overflow detect (~(a^b) & (a^sum) has MSB set iff overflow).
+          // sat = (a < 0) ? INT_MIN : INT_MAX = (a >> 31 signed) ^ 0x7FFFFFFF.
+          // result = sum ^ ((sum ^ sat) & ovf_mask).
+          SimdRegister t_sum = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_sum == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) { Undefined(); return; }
+          as_.Movdqa(t_sum, xn);
+          as_.Paddd(t_sum, xm);                       // t_sum = a + b (mod 2^32).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                        // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_sum);                     // t_sat = a ^ sum.
+          as_.Pcmpeqd(xm, xm);                        // xm = -1 (reuse: b not needed).
+          as_.Pxor(t_ovf, xm);                        // t_ovf = ~(a ^ b).
+          as_.Pand(t_ovf, t_sat);                     // t_ovf = ~(a^b) & (a^sum).
+          as_.Psrad(t_ovf, int8_t{31});               // t_ovf = overflow mask.
+          as_.Psrad(xn, int8_t{31});                  // xn = -1 if a<0, 0 else.
+          as_.Psrld(xm, int8_t{1});                   // xm = 0x7FFFFFFF lane.
+          as_.Pxor(xn, xm);                           // xn = (a<0)?INT_MIN:INT_MAX = sat.
+          as_.Pxor(xn, t_sum);                        // xn = sat ^ sum.
+          as_.Pand(xn, t_ovf);                        // xn = (sat ^ sum) & ovf_mask.
+          as_.Pxor(xn, t_sum);                        // xn = sum ^ ((sat^sum) & ovf_mask).
+        }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kUqadd: {
-        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        if (args.size == 0b11) { Undefined(); return; }
+        if (args.size == 0b10 && !host_platform::kHasSSE4_1) {
+          Undefined(); return;                        // PMAXUD is SSE4.1.
+        }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        if (args.size == 0b00) as_.Paddusb(xn, xm); else as_.Paddusw(xn, xm);
+        if (args.size == 0b00) {
+          as_.Paddusb(xn, xm);
+        } else if (args.size == 0b01) {
+          as_.Paddusw(xn, xm);
+        } else {
+          // 32-bit unsigned saturating add. sum = a + b (wrap). Overflow iff
+          // sum < a (unsigned), detected via PMAXUD: max(a, sum) == sum iff no
+          // overflow. Saturate overflowed lanes to UINT32_MAX.
+          SimdRegister t_save_a = AllocTempSimdReg();
+          SimdRegister t_ones = AllocTempSimdReg();
+          if (t_save_a == no_simd_register || t_ones == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(t_save_a, xn);                   // Preserve a before sum overwrites xn.
+          as_.Paddd(xn, xm);                          // xn = sum = a + b.
+          as_.Pmaxud(t_save_a, xn);                   // t_save_a = max(a, sum).
+          as_.Pcmpeqd(t_save_a, xn);                  // -1 where sum == max, i.e. no overflow.
+          as_.Pcmpeqd(t_ones, t_ones);                // t_ones = -1.
+          as_.Pxor(t_save_a, t_ones);                 // invert: -1 where overflow.
+          as_.Por(xn, t_save_a);                      // saturate overflowed lanes to UINT32_MAX.
+        }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kSqsub: {
-        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        if (args.size == 0b11) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        if (args.size == 0b00) as_.Psubsb(xn, xm); else as_.Psubsw(xn, xm);
+        if (args.size == 0b00) {
+          as_.Psubsb(xn, xm);
+        } else if (args.size == 0b01) {
+          as_.Psubsw(xn, xm);
+        } else {
+          // 32-bit signed saturating sub. Overflow iff (a^b) & (a^diff) has
+          // MSB set; sat = (a < 0) ? INT_MIN : INT_MAX (same as SQADD).
+          SimdRegister t_diff = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_diff == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) { Undefined(); return; }
+          as_.Movdqa(t_diff, xn);
+          as_.Psubd(t_diff, xm);                      // t_diff = a - b (mod 2^32).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                        // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_diff);                    // t_sat = a ^ diff.
+          as_.Pand(t_ovf, t_sat);                     // t_ovf = (a^b) & (a^diff).
+          as_.Psrad(t_ovf, int8_t{31});               // overflow mask.
+          as_.Psrad(xn, int8_t{31});                  // xn = -1 if a<0, 0 else.
+          as_.Pcmpeqd(xm, xm);                        // xm = -1.
+          as_.Psrld(xm, int8_t{1});                   // xm = 0x7FFFFFFF.
+          as_.Pxor(xn, xm);                           // xn = sat = (a<0)?INT_MIN:INT_MAX.
+          as_.Pxor(xn, t_diff);                       // xn = sat ^ diff.
+          as_.Pand(xn, t_ovf);                        // xn = (sat ^ diff) & ovf_mask.
+          as_.Pxor(xn, t_diff);                       // xn = diff ^ ((sat^diff) & ovf_mask).
+        }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kUqsub: {
-        if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+        if (args.size == 0b11) { Undefined(); return; }
+        if (args.size == 0b10 && !host_platform::kHasSSE4_1) {
+          Undefined(); return;                        // PMINUD is SSE4.1.
+        }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        if (args.size == 0b00) as_.Psubusb(xn, xm); else as_.Psubusw(xn, xm);
+        if (args.size == 0b00) {
+          as_.Psubusb(xn, xm);
+        } else if (args.size == 0b01) {
+          as_.Psubusw(xn, xm);
+        } else {
+          // 32-bit unsigned saturating sub. result = (a >= b) ? a - b : 0.
+          // Mask: PMINUD(a, b) == b iff a >= b.
+          SimdRegister t_mask = AllocTempSimdReg();
+          if (t_mask == no_simd_register) { Undefined(); return; }
+          as_.Movdqa(t_mask, xn);
+          as_.Pminud(t_mask, xm);                     // t_mask = min(a, b).
+          as_.Pcmpeqd(t_mask, xm);                    // -1 where min == b, i.e. a >= b.
+          as_.Psubd(xn, xm);                          // xn = a - b (wrap).
+          as_.Pand(xn, t_mask);                       // zero out underflow lanes.
+        }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
         return;
