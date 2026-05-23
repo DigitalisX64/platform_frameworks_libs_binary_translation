@@ -8815,6 +8815,165 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec4S) {
 }
 // endregion
 
+// region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
+//
+// Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",
+// cross-checked against aarch64-linux-gnu-as output):
+//   abs v0.16b, v1.16b = 0x4E20B820 (Q=1, U=0, size=00, opcode=01011)
+//   abs v0.8h,  v1.8h  = 0x4E60B820 (Q=1, U=0, size=01)
+//   abs v0.4s,  v1.4s  = 0x4EA0B820 (Q=1, U=0, size=10)
+//   abs v0.2s,  v1.2s  = 0x0EA0B820 (Q=0, U=0, size=10)
+//   neg v0.16b, v1.16b = 0x6E20B820 (Q=1, U=1, size=00, opcode=01011)
+//   neg v0.4s,  v1.4s  = 0x6EA0B820 (Q=1, U=1, size=10)
+//   neg v0.2d,  v1.2d  = 0x6EE0B820 (Q=1, U=1, size=11)
+//   neg v0.2s,  v1.2s  = 0x2EA0B820 (Q=0, U=1, size=10)
+//   mvn v0.16b, v1.16b = 0x6E205820 (Q=1, U=1, size=00, opcode=00101) -- NOT
+//   mvn v0.8b,  v1.8b  = 0x2E205820 (Q=0, U=1, size=00, opcode=00101) -- NOT
+constexpr uint32_t kAbsVec16B = 0x4E20B820;
+constexpr uint32_t kAbsVec8H  = 0x4E60B820;
+constexpr uint32_t kAbsVec4S  = 0x4EA0B820;
+constexpr uint32_t kAbsVec2S  = 0x0EA0B820;
+constexpr uint32_t kNegVec16B = 0x6E20B820;
+constexpr uint32_t kNegVec4S  = 0x6EA0B820;
+constexpr uint32_t kNegVec2D  = 0x6EE0B820;
+constexpr uint32_t kNegVec2S  = 0x2EA0B820;
+constexpr uint32_t kNotVec16B = 0x6E205820;
+constexpr uint32_t kNotVec8B  = 0x2E205820;
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec16B) {
+  int8_t in[16] = {0, 1, -1, 127, -128, -64, 64, -100, 100, -7, 7, 0, 23, -23, -1, INT8_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // ARM ABS leaves INT8_MIN as INT8_MIN (no saturation in ABS).
+  int8_t want[16] = {0, 1, 1, 127, INT8_MIN, 64, 64, 100, 100, 7, 7, 0, 23, 23, 1, INT8_MAX};
+  for (int i = 0; i < 16; ++i) EXPECT_EQ(r[i], want[i]) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec8H) {
+  int16_t in[8] = {0, -1, 32767, -32768, 1234, -1234, -7, 7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  int16_t want[8] = {0, 1, 32767, INT16_MIN, 1234, 1234, 7, 7};
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], want[i]) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec4S) {
+  int32_t in[4] = {-1, INT32_MIN, INT32_MAX, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 1);
+  EXPECT_EQ(r[1], INT32_MIN);  // INT_MIN stays INT_MIN
+  EXPECT_EQ(r[2], INT32_MAX);
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AbsVec2SUpperZero) {
+  int32_t in[4] = {-9, 9, 0x12345678, 0x55AA55AA};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kAbsVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 9);
+  EXPECT_EQ(r[1], 9);
+  EXPECT_EQ(r[2], 0);  // upper half zeroed
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec16B) {
+  int8_t in[16] = {0, 1, -1, 127, -128, 50, -50, 99, -99, 7, -7, 33, -33, 1, 0, INT8_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    // ARM NEG wraps: -INT_MIN = INT_MIN (same as x86 PSUBB from zero).
+    int8_t want = static_cast<int8_t>(-static_cast<int32_t>(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec4S) {
+  int32_t in[4] = {1, -1, INT32_MIN, INT32_MAX};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], -1);
+  EXPECT_EQ(r[1], 1);
+  EXPECT_EQ(r[2], INT32_MIN);  // wraps
+  EXPECT_EQ(r[3], -INT32_MAX);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec2D) {
+  int64_t in[2] = {INT64_MIN, 0x1122334455667788LL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec2D};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT64_MIN);  // wraps
+  EXPECT_EQ(r[1], -0x1122334455667788LL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NegVec2SUpperZero) {
+  int32_t in[4] = {-3, 4, 0x7FFFFFFF, static_cast<int32_t>(0x80000000)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNegVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 3);
+  EXPECT_EQ(r[1], -4);
+  EXPECT_EQ(r[2], 0);
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NotVec16B) {
+  uint8_t in[16] = {0x00, 0xFF, 0xA5, 0x5A, 0x12, 0xED, 0x80, 0x7F,
+                    0x33, 0xCC, 0xAB, 0x54, 0x01, 0xFE, 0xDE, 0xAD};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNotVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) EXPECT_EQ(r[i], static_cast<uint8_t>(~in[i])) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, NotVec8BUpperZero) {
+  uint8_t in[16] = {0x00, 0xFF, 0xA5, 0x5A, 0x12, 0xED, 0x80, 0x7F,
+                    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kNotVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], static_cast<uint8_t>(~in[i])) << "lane " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper-half lane " << i;
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

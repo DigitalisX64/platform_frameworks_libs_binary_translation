@@ -7654,6 +7654,79 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // ABS V.<T>, V.<T> -- per-lane integer absolute value.
+      //   size=00 .8B/.16B  -> mask = PCMPGTB(0, Vn); Vd = PSUBB(PXOR(Vn, mask), mask)
+      //   size=01 .4H/.8H   -> same with PCMPGTW/PSUBW
+      //   size=10 .2S/.4S   -> same with PCMPGTD/PSUBD
+      //   size=11 .2D       -> needs PCMPGTQ (SSE4.2); JIT-bail to interp via success_=false.
+      // Identity: (Vn ^ sign_mask) - sign_mask  where sign_mask = -1 if Vn<0 else 0.
+      //   Vn>=0: (Vn ^ 0) - 0 = Vn
+      //   Vn<0 : (Vn ^ -1) - (-1) = (~Vn) + 1 = -Vn
+      // Avoids depending on SSSE3 PABSB/W/D (not currently in the assembler defs).
+      // INT_MIN stays INT_MIN (matches ARM ABS semantics for the most-negative lane).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
+        if (args.size == 0b11) { success_ = false; return; }  // .2D needs PCMPGTQ — bail to interp
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister mask = AllocTempSimdReg();
+        if (xn == no_simd_register || mask == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(mask, mask);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(mask, xn); break;
+          case 0b01: as_.Pcmpgtw(mask, xn); break;
+          case 0b10: as_.Pcmpgtd(mask, xn); break;
+          default: success_ = false; return;
+        }
+        as_.Pxor(xn, mask);
+        switch (args.size) {
+          case 0b00: as_.Psubb(xn, mask); break;
+          case 0b01: as_.Psubw(xn, mask); break;
+          case 0b10: as_.Psubd(xn, mask); break;
+          default: success_ = false; return;
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // NEG V.<T>, V.<T> -- per-lane integer negation: Vd = 0 - Vn.
+      //   size=00 -> PSUBB; size=01 -> PSUBW; size=10 -> PSUBD; size=11 -> PSUBQ.
+      // All four widths are SSE2-direct. size=11 with Q=0 (.1D) is reserved and
+      // bails to Undefined to mirror the decoder's general size/Q reservation
+      // pattern; the interpreter never sees that encoding either.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNeg: {
+        if (args.size == 0b11 && !args.q) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        switch (args.size) {
+          case 0b00: as_.Psubb(xz, xn); break;
+          case 0b01: as_.Psubw(xz, xn); break;
+          case 0b10: as_.Psubd(xz, xn); break;
+          case 0b11: as_.Psubq(xz, xn); break;
+          default: success_ = false; return;
+        }
+        if (!args.q) mask_low64(xz);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xz);
+        return;
+      }
+      // NOT V.16B / V.8B  -- per-lane bitwise NOT: Vd = ~Vn.
+      // The decoder routes opcode=00101+U=1 to kNot for both size=00 (NOT) and
+      // size=01 (RBIT); only NOT (size=00) has a trivial x86 lowering.  RBIT
+      // needs a nibble-table PSHUFB pair, deferred — JIT-bail via success_=false.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNot: {
+        if (args.size != 0b00) { success_ = false; return; }  // RBIT bails to interp
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister allones = AllocTempSimdReg();
+        if (xn == no_simd_register || allones == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pcmpeqd(allones, allones);
+        as_.Pxor(xn, allones);
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
       //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
       //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
