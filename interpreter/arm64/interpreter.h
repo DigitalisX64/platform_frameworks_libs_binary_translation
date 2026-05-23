@@ -6001,6 +6001,9 @@ class Interpreter {
   //
   // AdvSIMD scalar pairwise.
   // ADDP scalar (D-form): Vd[0] = Vn.D[0] + Vn.D[1].
+  // FP variants (FADDP / FMAXNMP / FMINNMP / FMAXP / FMINP scalar):
+  //   reduce Vn.S[0] op Vn.S[1] (size=00) or Vn.D[0] op Vn.D[1] (size=01)
+  //   into the bottom lane of Vd; upper bits zero.
   //
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
     CHECK(!exception_raised_);
@@ -6015,6 +6018,80 @@ class Interpreter {
         // D-form only.
         r = lo + hi;
         break;
+      // region digitalis: FP scalar pairwise.  size[0] picks S (0) vs D (1).
+      // FMAX/FMIN: NaN-propagating (any-NaN -> NaN).
+      // FMAXNM/FMINNM: NaN-quiet (single-NaN -> other operand).
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+      case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar: {
+        bool is_double = ((args.size & 1) != 0);
+        if (is_double) {
+          double a, b, d;
+          memcpy(&a, &lo, 8);
+          memcpy(&b, &hi, 8);
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+              d = a + b;
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+              d = (std::isnan(a) || std::isnan(b)) ? std::nan("")
+                                                    : (a > b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
+              d = (std::isnan(a) || std::isnan(b)) ? std::nan("")
+                                                    : (a < b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+              d = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a > b ? a : b));
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+              d = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a < b ? a : b));
+              break;
+            default:
+              __builtin_unreachable();
+          }
+          memcpy(&r, &d, 8);
+        } else {
+          // S form: read Vn.S[0] (bits[31:0] of lo) and Vn.S[1] (bits[63:32]).
+          uint32_t a_bits = static_cast<uint32_t>(lo);
+          uint32_t b_bits = static_cast<uint32_t>(lo >> 32);
+          float a, b, f;
+          memcpy(&a, &a_bits, 4);
+          memcpy(&b, &b_bits, 4);
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+              f = a + b;
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+              f = (std::isnan(a) || std::isnan(b)) ? std::nanf("")
+                                                    : (a > b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
+              f = (std::isnan(a) || std::isnan(b)) ? std::nanf("")
+                                                    : (a < b ? a : b);
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+              f = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a > b ? a : b));
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+              f = std::isnan(a) ? b
+                                 : (std::isnan(b) ? a : (a < b ? a : b));
+              break;
+            default:
+              __builtin_unreachable();
+          }
+          uint32_t f_bits;
+          memcpy(&f_bits, &f, 4);
+          r = f_bits;  // upper 32 bits of the bottom 64-bit lane are zero
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;

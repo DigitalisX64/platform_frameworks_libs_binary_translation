@@ -1551,8 +1551,16 @@ class Decoder {
   // a single scalar in Vd.
   enum class AdvSimdScalarPairwiseOpcode : uint8_t {
     kAddp,    // ADDP (scalar): U=0, size=11, opcode=11011 -> d-form
-    // (FMAXNMP/FMAXP/FMINNMP/FMINP scalar variants live here too, but only
-    //  ADDP scalar is needed at present.)
+    // region digitalis
+    // FP scalar pairwise variants.  U=1 in the dispatch encoding.
+    //   size[0] (bit 22) selects S (0) or D (1).
+    //   size[1] (bit 23) selects max- vs min- variants for FMAX*/FMIN*.
+    kFaddpScalar,    // FADDP scalar:    U=1, opcode=01101, size=0x
+    kFmaxnmpScalar,  // FMAXNMP scalar:  U=1, opcode=01100, size=0x
+    kFminnmpScalar,  // FMINNMP scalar:  U=1, opcode=01100, size=1x
+    kFmaxpScalar,    // FMAXP scalar:    U=1, opcode=01111, size=0x
+    kFminpScalar,    // FMINP scalar:    U=1, opcode=01111, size=1x
+    // endregion
   };
 
   struct AdvSimdScalarPairwiseArgs {
@@ -5290,7 +5298,10 @@ class Decoder {
   //
   // AdvSIMD scalar pairwise.
   // Encoding: 01 U 11110 size 11000 opcode 10 Rn Rd
-  // For now only ADDP scalar (U=0, size=11, opcode=11011) is supported.
+  // Integer leg (U=0): ADDP scalar (size=11, opcode=11011).
+  // FP leg (U=1): FADDP / FMAXNMP / FMINNMP / FMAXP / FMINP scalar.
+  //   For the FP leg, size[1] (bit 23) discriminates max- vs min- variants
+  //   and size[0] (bit 22) picks S (0) vs D (1).
   //
   void DecodeAdvSimdScalarPairwise() {
     bool u = GetBits<29, 1>();
@@ -5299,13 +5310,48 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    if (u || opcode != 0b11011 || size != 0b11) {
+    AdvSimdScalarPairwiseOpcode op;
+    bool ok = false;
+
+    if (!u) {
+      // Integer leg: ADDP scalar (D-form) only.
+      if (opcode == 0b11011 && size == 0b11) {
+        op = AdvSimdScalarPairwiseOpcode::kAddp;
+        ok = true;
+      }
+    } else {
+      // FP leg.  size[1] selects min- (1) vs max- (0); size[0] selects S/D.
+      bool size_hi = ((size >> 1) & 1) != 0;
+      switch (opcode) {
+        case 0b01100:
+          op = size_hi ? AdvSimdScalarPairwiseOpcode::kFminnmpScalar
+                       : AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar;
+          ok = true;
+          break;
+        case 0b01101:
+          // FADDP scalar only allocated at size[1]=0 (size=0x).
+          if (!size_hi) {
+            op = AdvSimdScalarPairwiseOpcode::kFaddpScalar;
+            ok = true;
+          }
+          break;
+        case 0b01111:
+          op = size_hi ? AdvSimdScalarPairwiseOpcode::kFminpScalar
+                       : AdvSimdScalarPairwiseOpcode::kFmaxpScalar;
+          ok = true;
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (!ok) {
       Undefined();
       return;
     }
 
     const AdvSimdScalarPairwiseArgs args = {
-        .opcode = AdvSimdScalarPairwiseOpcode::kAddp,
+        .opcode = op,
         .rd = rd,
         .rn = rn,
         .size = size,
