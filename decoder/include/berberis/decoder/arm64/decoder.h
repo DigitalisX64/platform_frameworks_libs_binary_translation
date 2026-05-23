@@ -916,6 +916,14 @@ class Decoder {
     kSabd,      // SABD (vector): U=0, opcode=01110
     kUabd,      // UABD (vector): U=1, opcode=01110
     // endregion
+    // region digitalis - SABA/UABA: absolute-difference-and-accumulate at
+    // .8b/.16b/.4h/.8h/.2s/.4s.  size=11 reserved.  Vd[i] += |Vn[i] - Vm[i]|.
+    // Verified with llvm-mc:
+    //   saba v0.8b,v1.8b,v2.8b = 0x0e227c20 (opcode=01111, U=0);
+    //   uaba v0.8b,v1.8b,v2.8b = 0x2e227c20 (opcode=01111, U=1).
+    kSaba,      // SABA (vector): U=0, opcode=01111
+    kUaba,      // UABA (vector): U=1, opcode=01111
+    // endregion
     // endregion
   };
 
@@ -4220,6 +4228,10 @@ class Decoder {
       // SABD/UABD: absolute-difference vector. size=11 reserved.
       if (size == 0b11) { Undefined(); return; }
       op = u ? AdvSimdThreeSameOpcode::kUabd : AdvSimdThreeSameOpcode::kSabd;
+    } else if (opcode == 0b01111) {
+      // SABA/UABA: absolute-difference-and-accumulate vector. size=11 reserved.
+      if (size == 0b11) { Undefined(); return; }
+      op = u ? AdvSimdThreeSameOpcode::kUaba : AdvSimdThreeSameOpcode::kSaba;
     } else if ((opcode & 0b11000) == 0b11000) {
       // FP three-same (vector). bits[23] = op_high, bits[22] = sz.
       // The 'size' field as read above is {op_high, sz} for this encoding;

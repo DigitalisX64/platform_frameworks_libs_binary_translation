@@ -3947,6 +3947,44 @@ class Interpreter {
         break;
       // endregion
 
+      // region digitalis - SABA/UABA: absolute-difference-and-accumulate.
+      // Vd[i] = Vd[i] + |Vn[i] - Vm[i]|.  Read-modify-write Vd, so the loop
+      // is structured like kMla/kMls (loads `d` from `dst` per lane).
+      // size=11 is rejected at the decoder; esize <= 4 here, so the signed
+      // difference fits in int64_t after sign-extension and the absolute
+      // value is computed without overflow.
+      case Decoder::AdvSimdThreeSameOpcode::kSaba: {
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0, b = 0, d = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+          int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+          int64_t diff = sa - sb;
+          uint64_t abs_diff = static_cast<uint64_t>(diff < 0 ? -diff : diff);
+          uint64_t r = (d + abs_diff) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUaba: {
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0, b = 0, d = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t abs_diff = a > b ? (a - b) : (b - a);
+          uint64_t r = (d + abs_diff) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+      // endregion
+
       // --- Halving add/sub ---
       case Decoder::AdvSimdThreeSameOpcode::kShadd:
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
