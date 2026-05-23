@@ -10932,6 +10932,149 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: SRSHR / URSHR / SRSRA / URSRA vector
+      // shift-by-immediate JIT (rounding right-shift family).
+      //
+      // Per-lane semantics:
+      //   SRSHR  Vd<i> = floor((Vn<i> + 2^(shift-1)) / 2^shift)  signed
+      //   URSHR  Vd<i> = floor((Vn<i> + 2^(shift-1)) / 2^shift)  unsigned
+      //   SRSRA  Vd<i> = Vd<i> + SRSHR(Vn<i>, shift)
+      //   URSRA  Vd<i> = Vd<i> + URSHR(Vn<i>, shift)
+      //
+      // shift ∈ [1, esize], esize ∈ {16, 32, 64} (byte form bails).
+      //
+      // The architectural addition `(x + roundbit)` is computed at infinite
+      // precision; doing it in lane-narrow arithmetic would overflow near
+      // INT_MAX (e.g. SRSHR INT16_MAX by 1).  To avoid this, we compute the
+      // shifted value and the round bit separately, both in lane-narrow
+      // arithmetic where neither overflows, and recombine with PADD:
+      //
+      //   shifted    = PSR{A,L}(Vn, shift)              arith for SRSHR/SRSRA,
+      //                                                 logical for URSHR/URSRA
+      //   round_bit  = PSRL(Vn, shift-1)                bit (shift-1) of Vn -> bit 0
+      //   round_bit  = PSLL(round_bit, esize-1)         two-shift bracket: keep
+      //   round_bit  = PSRL(round_bit, esize-1)         only bit 0 per lane
+      //   result     = PADD(shifted, round_bit)         result == SRSHR/URSHR
+      //
+      // This identity is exact because in infinite precision:
+      //   floor((x + 2^(n-1)) / 2^n) = floor(x / 2^n) + ((x >> (n-1)) & 1)
+      // (the round bit decides whether to round up to the next quotient).
+      //
+      // x86 saturation matches ARM at every boundary:
+      //   - URSHR / URSRA at shift==esize:
+      //       PSRL(Vn, esize) → 0; round_bit = MSB(Vn).
+      //       Architectural URSHR(x, esize) = MSB(x).  ✓
+      //   - SRSHR / SRSRA at shift==esize:
+      //       PSRA(Vn, esize) → sign-fill (0 if MSB=0, -1 if MSB=1);
+      //       round_bit = MSB(Vn).
+      //       Architectural SRSHR(x, esize): if MSB=0 → 0; if MSB=1 → -1+1 = 0.
+      //       Always 0 — matches.  ✓
+      //   - shift==1 (cnt_minus_1=0): PSRL(xr, 0) is a no-op; two-shift
+      //       bracket then isolates bit 0 of Vn = the round bit at shift=1. ✓
+      //
+      // Bail cases:
+      //   - byte (immh=0001): no PSR{A,L}B / PSLLB in SSE.
+      //   - SRSHR / SRSRA at .2D (esize=64): needs PSRAQ, AVX-512F-VL only.
+      //     URSHR / URSRA at .2D are fine — PSRLQ exists in SSE2.
+      case Decoder::AdvSimdShiftImmOpcode::kSrshr:
+      case Decoder::AdvSimdShiftImmOpcode::kUrshr:
+      case Decoder::AdvSimdShiftImmOpcode::kSrsra:
+      case Decoder::AdvSimdShiftImmOpcode::kUrsra: {
+        const uint8_t immh = args.immh;
+        if (immh == 0) { success_ = false; return; }
+        const bool is_byte = (immh == 0b0001);  // esize = 8
+        if (is_byte) { success_ = false; return; }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else /* immh & 0b0010 */ {
+          esize_bits = 16;
+        }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrshr ||
+             args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra);
+        const bool is_accumulate =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra ||
+             args.opcode == Decoder::AdvSimdShiftImmOpcode::kUrsra);
+        // Signed .2D bails — PSRAQ is AVX-512F-VL only.
+        if (is_signed && esize_bits == 64) {
+          success_ = false; return;
+        }
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        const uint8_t shift_count =
+            static_cast<uint8_t>(2 * esize_bits - immh_immb);  // [1, esize]
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xr = AllocTempSimdReg();
+        SimdRegister xd = no_simd_register;
+        if (is_accumulate) {
+          xd = AllocTempSimdReg();
+        }
+        if (xn == no_simd_register || xr == no_simd_register ||
+            (is_accumulate && xd == no_simd_register)) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqu(xr, {.base = Assembler::rbp, .disp = vn_off});
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        const int8_t cnt_minus_1 = static_cast<int8_t>(shift_count - 1);
+        const int8_t esize_minus_1 = static_cast<int8_t>(esize_bits - 1);
+        // Main shifted value in xn.
+        switch (esize_bits) {
+          case 16:
+            if (is_signed) as_.Psraw(xn, cnt); else as_.Psrlw(xn, cnt);
+            break;
+          case 32:
+            if (is_signed) as_.Psrad(xn, cnt); else as_.Psrld(xn, cnt);
+            break;
+          case 64:
+            // Signed bailed above for .2D.
+            as_.Psrlq(xn, cnt);
+            break;
+        }
+        // Round bit in xr: isolate bit (shift-1) of Vn into bit 0 per lane.
+        switch (esize_bits) {
+          case 16:
+            as_.Psrlw(xr, cnt_minus_1);
+            as_.Psllw(xr, esize_minus_1);
+            as_.Psrlw(xr, esize_minus_1);
+            break;
+          case 32:
+            as_.Psrld(xr, cnt_minus_1);
+            as_.Pslld(xr, esize_minus_1);
+            as_.Psrld(xr, esize_minus_1);
+            break;
+          case 64:
+            as_.Psrlq(xr, cnt_minus_1);
+            as_.Psllq(xr, esize_minus_1);
+            as_.Psrlq(xr, esize_minus_1);
+            break;
+        }
+        // Combine shifted + round_bit into xn.
+        switch (esize_bits) {
+          case 16: as_.Paddw(xn, xr); break;
+          case 32: as_.Paddd(xn, xr); break;
+          case 64: as_.Paddq(xn, xr); break;
+        }
+        if (is_accumulate) {
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          switch (esize_bits) {
+            case 16: as_.Paddw(xd, xn); break;
+            case 32: as_.Paddd(xd, xn); break;
+            case 64: as_.Paddq(xd, xn); break;
+          }
+        }
+        SimdRegister result = is_accumulate ? xd : xn;
+        if (!args.q) {
+          // Zero upper 64 bits of Vd (D-register semantics).
+          as_.Pslldq(result, int8_t{8});
+          as_.Psrldq(result, int8_t{8});
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, result);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
