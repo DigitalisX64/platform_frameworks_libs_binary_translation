@@ -4179,6 +4179,82 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SMAX/SMIN/UMAX/UMIN vector via PMAXS*/PMINS*/PMAXU*/PMINU*
+      case Decoder::AdvSimdThreeSameOpcode::kSmax:
+      case Decoder::AdvSimdThreeSameOpcode::kSmin:
+      case Decoder::AdvSimdThreeSameOpcode::kUmax:
+      case Decoder::AdvSimdThreeSameOpcode::kUmin: {
+        // S{MAX,MIN} / U{MAX,MIN} Vd.<T>, Vn.<T>, Vm.<T>: lane-wise signed
+        // or unsigned min/max.  x86 has direct lane-width-matched
+        // PMAXS/PMINS/PMAXU/PMINU instructions for all four arithmetic
+        // widths (8/16/32/64), except the .2D (64-bit) lane which has no
+        // SSE-era instruction (PMAXSQ/PMINSQ/PMAXUQ/PMINUQ only land with
+        // AVX-512F-VL).  Bail .2D to the interpreter; bail any size 0b00/0b01
+        // /0b10 case that needs SSE4.1 when SSE4.1 isn't available.
+        //
+        // Per-size SSE feature gate (table from Intel SDM Vol 2):
+        //   PMAXSB/PMINSB/PMAXSD/PMINSD/PMAXUW/PMINUW/PMAXUD/PMINUD -> SSE4.1.
+        //   PMAXSW/PMINSW/PMAXUB/PMINUB                              -> SSE2.
+        if (args.size == 0b11) {
+          // No SSE/AVX-2 instruction for 64-bit lanes.  Bail.
+          success_ = false;
+          return;
+        }
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+             args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmax);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+             args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmin);
+        // Need SSE4.1 for: signed-byte (PMAXSB/PMINSB), signed-dword
+        // (PMAXSD/PMINSD), unsigned-word (PMAXUW/PMINUW), unsigned-dword
+        // (PMAXUD/PMINUD).  SSE2 covers signed-word and unsigned-byte.
+        const bool needs_sse4_1 =
+            (is_signed && args.size == 0b00) ||
+            (is_signed && args.size == 0b10) ||
+            (!is_signed && args.size == 0b01) ||
+            (!is_signed && args.size == 0b10);
+        if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+          success_ = false;
+          return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        // xn := op(xn, xm) lane-wise.
+        switch (args.size) {
+          case 0b00:  // .16B / .8B
+            if (is_signed) {
+              if (is_max) as_.Pmaxsb(xn, xm); else as_.Pminsb(xn, xm);
+            } else {
+              if (is_max) as_.Pmaxub(xn, xm); else as_.Pminub(xn, xm);
+            }
+            break;
+          case 0b01:  // .8H / .4H
+            if (is_signed) {
+              if (is_max) as_.Pmaxsw(xn, xm); else as_.Pminsw(xn, xm);
+            } else {
+              if (is_max) as_.Pmaxuw(xn, xm); else as_.Pminuw(xn, xm);
+            }
+            break;
+          case 0b10:  // .4S / .2S
+            if (is_signed) {
+              if (is_max) as_.Pmaxsd(xn, xm); else as_.Pminsd(xn, xm);
+            } else {
+              if (is_max) as_.Pmaxud(xn, xm); else as_.Pminud(xn, xm);
+            }
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
