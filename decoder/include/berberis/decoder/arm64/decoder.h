@@ -1298,6 +1298,22 @@ class Decoder {
     kFrintzV,   // FRINTZ  (toward zero):           a=1, U=0, opcode=11001
     kFrintiV,   // FRINTI  (use current rounding):  a=1, U=1, opcode=11001
     // endregion
+    // region digitalis - SQABS / SQNEG (signed saturating abs / negate).
+    // Encoding: 0 Q U 01110 size 10000 00111 10 Rn Rd
+    //   sqabs v0.8b, v1.8b   = 0x0e207820  (Q=0, U=0, size=00)
+    //   sqabs v0.16b, v1.16b = 0x4e207820  (Q=1, U=0, size=00)
+    //   sqabs v0.4h, v1.4h   = 0x0e607820  (Q=0, U=0, size=01)
+    //   sqabs v0.8h, v1.8h   = 0x4e607820  (Q=1, U=0, size=01)
+    //   sqabs v0.2s, v1.2s   = 0x0ea07820  (Q=0, U=0, size=10)
+    //   sqabs v0.4s, v1.4s   = 0x4ea07820  (Q=1, U=0, size=10)
+    //   sqabs v0.2d, v1.2d   = 0x4ee07820  (Q=1, U=0, size=11)
+    //   sqneg ... = same with U=1.
+    // The only saturating input is INT_MIN_in: |INT_MIN| and -INT_MIN
+    // both overflow the signed range and clamp to INT_MAX. .1d (size=11,
+    // Q=0) is not encoded for either op.
+    kSqabs,     // SQABS: U=0, opcode=00111
+    kSqneg,     // SQNEG: U=1, opcode=00111
+    // endregion
     // endregion
   };
 
@@ -4664,6 +4680,14 @@ class Decoder {
       case 0b00110:
         op = u ? AdvSimdTwoRegMiscOpcode::kUadalp : AdvSimdTwoRegMiscOpcode::kSadalp;
         break;
+      // region digitalis - SQABS (U=0) / SQNEG (U=1) at opcode 00111.
+      // All four sizes are valid; size=11 (.2d) is Q=1-only — the .1d form
+      // (size=11, Q=0) is unallocated.
+      case 0b00111:
+        if (size == 0b11 && !q) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kSqneg : AdvSimdTwoRegMiscOpcode::kSqabs;
+        break;
+      // endregion
       case 0b01000:
         op = u ? AdvSimdTwoRegMiscOpcode::kCmgeZero : AdvSimdTwoRegMiscOpcode::kCmgtZero;
         break;

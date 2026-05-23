@@ -5747,6 +5747,40 @@ class Interpreter {
         break;
       }
 
+      // region digitalis - SQABS / SQNEG (signed saturating abs / negate).
+      // For each lane the source is sign-extended to int64_t. The only
+      // input that saturates is INT_MIN_for_this_size: both |INT_MIN| and
+      // -INT_MIN overflow the signed range, so they clamp to INT_MAX.
+      // All other inputs map to ordinary |x| (SQABS) or -x (SQNEG).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqabs:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqneg: {
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        // Compute INT_MIN/INT_MAX for this signed element width.
+        // For esize==8 use the int64 limits directly; otherwise the
+        // shift fits in a signed-defined range.
+        int64_t int_min = (esize == 8) ? INT64_MIN : -(1LL << (bits - 1));
+        int64_t int_max = (esize == 8) ? INT64_MAX : ((1LL << (bits - 1)) - 1);
+        bool is_neg = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSqneg);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t out;
+          if (signed_val == int_min) {
+            out = int_max;  // saturate (single saturating input per ARM ARM)
+          } else if (is_neg) {
+            out = -signed_val;
+          } else {
+            out = (signed_val < 0) ? -signed_val : signed_val;
+          }
+          uint64_t out_u = static_cast<uint64_t>(out) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &out_u, esize);
+        }
+        break;
+      }
+      // endregion
+
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero:
