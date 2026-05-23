@@ -4660,25 +4660,13 @@ class Interpreter {
                 break;
               }
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
-                rh = (std::isnan(a) || std::isnan(b))
-                         ? FpSingleToHalf(std::nanf(""))
-                         : FpSingleToHalf(a > b ? a : b);
-                break;
+                rh = FpSingleToHalf(FmaxScalar<float>(a, b)); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminV:
-                rh = (std::isnan(a) || std::isnan(b))
-                         ? FpSingleToHalf(std::nanf(""))
-                         : FpSingleToHalf(a < b ? a : b);
-                break;
+                rh = FpSingleToHalf(FminScalar<float>(a, b)); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
-                rh = std::isnan(a) ? FpSingleToHalf(b)
-                                   : std::isnan(b) ? FpSingleToHalf(a)
-                                                   : FpSingleToHalf(a > b ? a : b);
-                break;
+                rh = FpSingleToHalf(FmaxnmScalar<float>(a, b)); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
-                rh = std::isnan(a) ? FpSingleToHalf(b)
-                                   : std::isnan(b) ? FpSingleToHalf(a)
-                                                   : FpSingleToHalf(a < b ? a : b);
-                break;
+                rh = FpSingleToHalf(FminnmScalar<float>(a, b)); break;
               case Decoder::AdvSimdThreeSameOpcode::kFcmeqV:
                 rh = (a == b) ? uint16_t{0xFFFF} : uint16_t{0};
                 break;
@@ -4728,20 +4716,16 @@ class Interpreter {
               // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
-              // FMAX/FMIN: IEEE 754-2008 max/min — if either is NaN, result is NaN.
+              // FMAX/FMIN/FMAXNM/FMINNM: see FmaxScalar/FminScalar helpers for
+              // NaN propagation and +0/-0 sign disambiguation.
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
-                r = (std::isnan(a) || std::isnan(b)) ? std::nan("") : (a > b ? a : b);
-                break;
+                r = FmaxScalar<double>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminV:
-                r = (std::isnan(a) || std::isnan(b)) ? std::nan("") : (a < b ? a : b);
-                break;
-              // FMAXNM/FMINNM: max/min number — if exactly one is NaN, return the other.
+                r = FminScalar<double>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
-                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a > b ? a : b));
-                break;
+                r = FmaxnmScalar<double>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
-                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a < b ? a : b));
-                break;
+                r = FminnmScalar<double>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFdivV: r = a / b; break;
               // FP compare: result is all-ones (bit pattern) on TRUE, zero on FALSE.
               case Decoder::AdvSimdThreeSameOpcode::kFcmeqV: {
@@ -4791,17 +4775,13 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
-                r = (std::isnan(a) || std::isnan(b)) ? std::nanf("") : (a > b ? a : b);
-                break;
+                r = FmaxScalar<float>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminV:
-                r = (std::isnan(a) || std::isnan(b)) ? std::nanf("") : (a < b ? a : b);
-                break;
+                r = FminScalar<float>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxnmV:
-                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a > b ? a : b));
-                break;
+                r = FmaxnmScalar<float>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminnmV:
-                r = std::isnan(a) ? b : (std::isnan(b) ? a : (a < b ? a : b));
-                break;
+                r = FminnmScalar<float>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFdivV: r = a / b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFcmeqV: {
                 uint32_t bits = (a == b) ? 0xFFFFFFFFu : 0;
@@ -5105,10 +5085,14 @@ class Interpreter {
         case 0b0001: result = src_n / src_m; break;       // FDIV
         case 0b0010: result = src_n + src_m; break;       // FADD
         case 0b0011: result = src_n - src_m; break;       // FSUB
-        case 0b0100: result = std::fmax(src_n, src_m); break;  // FMAX
-        case 0b0101: result = std::fmin(src_n, src_m); break;  // FMIN
-        case 0b0110: result = std::fmax(src_n, src_m); break;  // FMAXNM (same as FMAX for non-NaN)
-        case 0b0111: result = std::fmin(src_n, src_m); break;  // FMINNM (same as FMIN for non-NaN)
+        // region digitalis: ARM FMAX differs from libm fmax in NaN handling
+        // (any-NaN -> default NaN, not other-operand) and in +0/-0
+        // disambiguation. See FmaxScalar/FminScalar/etc.
+        case 0b0100: result = FmaxScalar<float>(src_n, src_m); break;    // FMAX
+        case 0b0101: result = FminScalar<float>(src_n, src_m); break;    // FMIN
+        case 0b0110: result = FmaxnmScalar<float>(src_n, src_m); break;  // FMAXNM
+        case 0b0111: result = FminnmScalar<float>(src_n, src_m); break;  // FMINNM
+        // endregion
         case 0b1000: result = -(src_n * src_m); break;    // FNMUL
         default: Undefined(); return;
       }
@@ -5127,10 +5111,12 @@ class Interpreter {
         case 0b0001: result = src_n / src_m; break;       // FDIV
         case 0b0010: result = src_n + src_m; break;       // FADD
         case 0b0011: result = src_n - src_m; break;       // FSUB
-        case 0b0100: result = std::fmax(src_n, src_m); break;  // FMAX
-        case 0b0101: result = std::fmin(src_n, src_m); break;  // FMIN
-        case 0b0110: result = std::fmax(src_n, src_m); break;  // FMAXNM
-        case 0b0111: result = std::fmin(src_n, src_m); break;  // FMINNM
+        // region digitalis: see comment above (single-precision arm).
+        case 0b0100: result = FmaxScalar<double>(src_n, src_m); break;    // FMAX
+        case 0b0101: result = FminScalar<double>(src_n, src_m); break;    // FMIN
+        case 0b0110: result = FmaxnmScalar<double>(src_n, src_m); break;  // FMAXNM
+        case 0b0111: result = FminnmScalar<double>(src_n, src_m); break;  // FMINNM
+        // endregion
         case 0b1000: result = -(src_n * src_m); break;    // FNMUL
         default: Undefined(); return;
       }
@@ -5154,10 +5140,11 @@ class Interpreter {
         case 0b0001: result = src_n / src_m; break;       // FDIV
         case 0b0010: result = src_n + src_m; break;       // FADD
         case 0b0011: result = src_n - src_m; break;       // FSUB
-        case 0b0100: result = std::fmax(src_n, src_m); break;  // FMAX
-        case 0b0101: result = std::fmin(src_n, src_m); break;  // FMIN
-        case 0b0110: result = std::fmax(src_n, src_m); break;  // FMAXNM
-        case 0b0111: result = std::fmin(src_n, src_m); break;  // FMINNM
+        // FP16 round-trip through float; helpers handle NaN + +0/-0 corner.
+        case 0b0100: result = FmaxScalar<float>(src_n, src_m); break;    // FMAX
+        case 0b0101: result = FminScalar<float>(src_n, src_m); break;    // FMIN
+        case 0b0110: result = FmaxnmScalar<float>(src_n, src_m); break;  // FMAXNM
+        case 0b0111: result = FminnmScalar<float>(src_n, src_m); break;  // FMINNM
         case 0b1000: result = -(src_n * src_m); break;    // FNMUL
         default: Undefined(); return;
       }
@@ -6036,21 +6023,13 @@ class Interpreter {
               d = a + b;
               break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
-              d = (std::isnan(a) || std::isnan(b)) ? std::nan("")
-                                                    : (a > b ? a : b);
-              break;
+              d = FmaxScalar<double>(a, b); break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
-              d = (std::isnan(a) || std::isnan(b)) ? std::nan("")
-                                                    : (a < b ? a : b);
-              break;
+              d = FminScalar<double>(a, b); break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
-              d = std::isnan(a) ? b
-                                 : (std::isnan(b) ? a : (a > b ? a : b));
-              break;
+              d = FmaxnmScalar<double>(a, b); break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
-              d = std::isnan(a) ? b
-                                 : (std::isnan(b) ? a : (a < b ? a : b));
-              break;
+              d = FminnmScalar<double>(a, b); break;
             default:
               __builtin_unreachable();
           }
@@ -6067,21 +6046,13 @@ class Interpreter {
               f = a + b;
               break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
-              f = (std::isnan(a) || std::isnan(b)) ? std::nanf("")
-                                                    : (a > b ? a : b);
-              break;
+              f = FmaxScalar<float>(a, b); break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
-              f = (std::isnan(a) || std::isnan(b)) ? std::nanf("")
-                                                    : (a < b ? a : b);
-              break;
+              f = FminScalar<float>(a, b); break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
-              f = std::isnan(a) ? b
-                                 : (std::isnan(b) ? a : (a > b ? a : b));
-              break;
+              f = FmaxnmScalar<float>(a, b); break;
             case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
-              f = std::isnan(a) ? b
-                                 : (std::isnan(b) ? a : (a < b ? a : b));
-              break;
+              f = FminnmScalar<float>(a, b); break;
             default:
               __builtin_unreachable();
           }
@@ -6472,16 +6443,11 @@ class Interpreter {
           float a;
           memcpy(&a, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
           float b = acc;
+          // FmaxScalar/etc. handle NaN propagation and +0/-0 sign disambiguation.
           if (is_nm) {
-            acc = std::isnan(a)
-                      ? b
-                      : (std::isnan(b)
-                             ? a
-                             : (is_max ? (a > b ? a : b) : (a < b ? a : b)));
+            acc = is_max ? FmaxnmScalar<float>(a, b) : FminnmScalar<float>(a, b);
           } else {
-            acc = (std::isnan(a) || std::isnan(b))
-                      ? std::nanf("")
-                      : (is_max ? (a > b ? a : b) : (a < b ? a : b));
+            acc = is_max ? FmaxScalar<float>(a, b) : FminScalar<float>(a, b);
           }
         }
         uint32_t out_bits;
@@ -8704,6 +8670,70 @@ class Interpreter {
       return FpType{1.5};
     }
     return std::fma(-a, b, FpType{3}) / FpType{2};
+  }
+
+  // FMAX / FMIN / FMAXNM / FMINNM scalar semantics, parameterized by FP type.
+  // Per ARM ARM C7.2.130 FMAX, C7.2.134 FMIN, C7.2.131 FMAXNM, C7.2.135 FMINNM.
+  //
+  // The +0/-0 corner is the reason these helpers exist: C/C++ `a > b ? a : b`
+  // returns whichever operand happens to come second when both are zero,
+  // because `+0.0 == -0.0` is true and `+0.0 > -0.0` is false. ARM specifies a
+  // definite sign for the zero result — FMAX(+0,-0) = +0, FMIN(+0,-0) = -0,
+  // independent of operand order — so we disambiguate explicitly via signbit.
+  //
+  // Difference between FMAX/FMIN and FMAXNM/FMINNM is only NaN handling:
+  //   - FMAX/FMIN: any NaN input -> default NaN output.
+  //   - FMAXNM/FMINNM: single NaN input -> the other (non-NaN) operand;
+  //                    both-NaN input -> default NaN.
+  // The +0/-0 disambiguation is the same in both families.
+  template <typename FpType>
+  static FpType FmaxScalar(FpType a, FpType b) {
+    if (std::isnan(a) || std::isnan(b)) {
+      return std::numeric_limits<FpType>::quiet_NaN();
+    }
+    if (a == FpType{0} && b == FpType{0}) {
+      return std::signbit(a) ? b : a;
+    }
+    return a > b ? a : b;
+  }
+
+  template <typename FpType>
+  static FpType FminScalar(FpType a, FpType b) {
+    if (std::isnan(a) || std::isnan(b)) {
+      return std::numeric_limits<FpType>::quiet_NaN();
+    }
+    if (a == FpType{0} && b == FpType{0}) {
+      return std::signbit(a) ? a : b;
+    }
+    return a < b ? a : b;
+  }
+
+  template <typename FpType>
+  static FpType FmaxnmScalar(FpType a, FpType b) {
+    if (std::isnan(a)) {
+      return std::isnan(b) ? std::numeric_limits<FpType>::quiet_NaN() : b;
+    }
+    if (std::isnan(b)) {
+      return a;
+    }
+    if (a == FpType{0} && b == FpType{0}) {
+      return std::signbit(a) ? b : a;
+    }
+    return a > b ? a : b;
+  }
+
+  template <typename FpType>
+  static FpType FminnmScalar(FpType a, FpType b) {
+    if (std::isnan(a)) {
+      return std::isnan(b) ? std::numeric_limits<FpType>::quiet_NaN() : b;
+    }
+    if (std::isnan(b)) {
+      return a;
+    }
+    if (a == FpType{0} && b == FpType{0}) {
+      return std::signbit(a) ? a : b;
+    }
+    return a < b ? a : b;
   }
   // endregion
 
