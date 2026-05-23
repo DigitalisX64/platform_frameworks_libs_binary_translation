@@ -1413,6 +1413,8 @@ class Decoder {
     kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
     kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
     kSqxtun,  // SQXTUN (scalar): signed→unsigned saturating extract narrow (opcode=10010, U=1; size ∈ {B,H,S})
+    kSqxtn,   // SQXTN  (scalar): signed saturating extract narrow         (opcode=10100, U=0; size ∈ {B,H,S})
+    kUqxtn,   // UQXTN  (scalar): unsigned saturating extract narrow       (opcode=10100, U=1; size ∈ {B,H,S})
     kFcvtxn,  // FCVTXN (scalar): FP64→FP32 round-to-odd narrow             (opcode=10110, U=1; size=01)
     // endregion
   };
@@ -5133,10 +5135,24 @@ class Decoder {
       case 0b10010:
         // SQXTUN (U=1): single-lane signed→unsigned saturating narrow.
         // size=00→B from H, 01→H from S, 10→S from D. size=11 unallocated.
-        // U=0 at this opcode is SQXTN; not implemented here (vector form
-        // also not shipped yet) — falls through to Undefined.
+        // U=0 at this opcode is XTN (vector-only, no scalar form).
         if (!u || size == 0b11) { Undefined(); return; }
         op = AdvSimdScalarTwoRegMiscOpcode::kSqxtun;
+        break;
+      case 0b10100:
+        // SQXTN (U=0) / UQXTN (U=1): single-lane signed/unsigned saturating
+        // narrow. size=00→B from H, 01→H from S, 10→S from D. size=11
+        // unallocated (no narrow form from a 128-bit source element).
+        // llvm-mc-21 encoding checks:
+        //   sqxtn   b0, h1   → 0x5e214820  (U=0, opcode=10100, size=00)
+        //   sqxtn   h0, s1   → 0x5e614820  (U=0, opcode=10100, size=01)
+        //   sqxtn   s0, d1   → 0x5ea14820  (U=0, opcode=10100, size=10)
+        //   uqxtn   b0, h1   → 0x7e214820  (U=1, opcode=10100, size=00)
+        //   uqxtn   h0, s1   → 0x7e614820  (U=1, opcode=10100, size=01)
+        //   uqxtn   s0, d1   → 0x7ea14820  (U=1, opcode=10100, size=10)
+        if (size == 0b11) { Undefined(); return; }
+        op = u ? AdvSimdScalarTwoRegMiscOpcode::kUqxtn
+               : AdvSimdScalarTwoRegMiscOpcode::kSqxtn;
         break;
       case 0b10110:
         // FCVTXN (U=1, size=01): scalar FP64→FP32 round-to-odd.

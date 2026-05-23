@@ -5464,6 +5464,36 @@ class Interpreter {
         memcpy(&result, &out, dst_esize);
         break;
       }
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtn:
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kUqxtn: {
+        // Single-lane saturating narrow.  size=00→8-bit dst from 16-bit src,
+        // 01→16/32, 10→32/64; size=11 is rejected in the decoder.
+        // SQXTN: signed source, clamp to [INT_min(dst), INT_max(dst)].
+        // UQXTN: unsigned source, clamp to [0, UMAX(dst)].
+        bool is_signed = (args.opcode ==
+                          Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtn);
+        uint8_t dst_esize = static_cast<uint8_t>(1U << args.size);
+        uint8_t src_esize = static_cast<uint8_t>(dst_esize * 2);
+        uint64_t raw = 0;
+        memcpy(&raw, &src, src_esize);
+        uint64_t dst_emask = (dst_esize == 8)
+                                 ? ~uint64_t{0}
+                                 : ((uint64_t{1} << (dst_esize * 8)) - 1);
+        uint64_t out;
+        if (is_signed) {
+          int64_t s = static_cast<int64_t>(raw << (64 - src_esize * 8)) >>
+                      (64 - src_esize * 8);
+          int64_t smax = static_cast<int64_t>(dst_emask >> 1);
+          int64_t smin = -smax - 1;
+          if (s > smax) s = smax;
+          if (s < smin) s = smin;
+          out = static_cast<uint64_t>(s) & dst_emask;
+        } else {
+          out = (raw > dst_emask) ? dst_emask : raw;
+        }
+        memcpy(&result, &out, dst_esize);
+        break;
+      }
       case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtxn: {
         // FCVTXN Sd, Dn — single-lane FP64→FP32 round-to-odd.
         // Decoder pins args.size == 0b01 (FP64 source). Reuses the
