@@ -7904,6 +7904,67 @@ class LiteTranslator {
         success_ = false;
         return;
       }
+      // CLZ V.<T>, V.<T> -- per-lane count leading zeros.
+      //   size=00 .8B/.16B  -> 8-bit lane CLZ (result 0..8)
+      //   size=01 .4H/.8H   -> 16-bit lane CLZ (result 0..16)
+      //   size=10 .2S/.4S   -> 32-bit lane CLZ (result 0..32)
+      //   size=11           -> reserved per ARM ARM; decoder never routes here,
+      //                        but bail defensively via success_=false.
+      // Per-lane lowering: PEXTR{B,W,D} → scalar CLZ via BSR (with zero-input
+      // branch to lane_bits) → XOR with lane_bits-1 → PINSR{B,W,D}.  The
+      // BSR+XOR trick matches the scalar CLZ lowering already used in this
+      // file at the integer scalar dispatch (BSR returns the MSB position
+      // 0..lane_bits-1; XOR with lane_bits-1 (= 2^k - 1, all-ones in low k
+      // bits) flips to (lane_bits - 1) - BSR with no borrow).  The zero-input
+      // case takes the forward branch and stores lane_bits unchanged.
+      //
+      // BSR is undefined on zero on Intel CPUs (AMD sets dst to operand size,
+      // but we don't rely on that), so the TEST+JZ guard is necessary.
+      //
+      // Per-lane round-trip is acceptable for CLZ — rarely on the hot path.
+      // An AVX-512-CD VPLZCNTD/Q gate is possible (size=10 only) but not
+      // implemented here; the lowering is uniform across sizes and the
+      // BSR-based scalar path is portable to any x86_64 host.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kClz: {
+        if (args.size == 0b11) { success_ = false; return; }
+        const uint8_t lane_bits = static_cast<uint8_t>(8u << args.size);
+        const uint8_t bytes_per_lane = static_cast<uint8_t>(1u << args.size);
+        const int lanes_per_vec = (args.q ? 16 : 8) / bytes_per_lane;
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xd == no_simd_register) {
+          success_ = false; return;
+        }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xd, xd);
+        for (int i = 0; i < lanes_per_vec; ++i) {
+          switch (args.size) {
+            case 0b00: as_.Pextrb(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pextrw(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pextrd(r1, xn, static_cast<int8_t>(i)); break;
+          }
+          auto* nonzero = as_.MakeLabel();
+          auto* done = as_.MakeLabel();
+          as_.Testl(r1, r1);
+          as_.Jcc(Condition::kNotZero, *nonzero);
+          as_.Movl(r1, static_cast<int32_t>(lane_bits));
+          as_.Jmp(*done);
+          as_.Bind(nonzero);
+          as_.Bsrl(r1, r1);
+          as_.Xorl(r1, static_cast<int8_t>(lane_bits - 1));
+          as_.Bind(done);
+          switch (args.size) {
+            case 0b00: as_.Pinsrb(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pinsrw(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pinsrd(xd, r1, static_cast<int8_t>(i)); break;
+          }
+        }
+        if (!args.q) mask_low64(xd);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
       //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
       //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).

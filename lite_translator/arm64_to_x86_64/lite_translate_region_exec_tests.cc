@@ -9252,6 +9252,138 @@ TEST_F(Arm64LiteTranslateRegionTest, RbitVec8BUpperZero) {
 }
 // endregion
 
+// region digitalis: CLZ vector two-reg-misc JIT (per-lane PEXTR + BSR + XOR + PINSR)
+constexpr uint32_t kClzVec16B = 0x6E204820;  // clz v0.16b, v1.16b
+constexpr uint32_t kClzVec8B  = 0x2E204820;  // clz v0.8b,  v1.8b
+constexpr uint32_t kClzVec8H  = 0x6E604820;  // clz v0.8h,  v1.8h
+constexpr uint32_t kClzVec4H  = 0x2E604820;  // clz v0.4h,  v1.4h
+constexpr uint32_t kClzVec4S  = 0x6EA04820;  // clz v0.4s,  v1.4s
+constexpr uint32_t kClzVec2S  = 0x2EA04820;  // clz v0.2s,  v1.2s
+
+namespace {
+inline uint32_t Clz8(uint8_t v) {
+  if (v == 0) return 8;
+  uint32_t n = 0;
+  while ((v & 0x80) == 0) { ++n; v = static_cast<uint8_t>(v << 1); }
+  return n;
+}
+inline uint32_t Clz16(uint16_t v) {
+  if (v == 0) return 16;
+  uint32_t n = 0;
+  while ((v & 0x8000u) == 0) { ++n; v = static_cast<uint16_t>(v << 1); }
+  return n;
+}
+inline uint32_t Clz32(uint32_t v) {
+  if (v == 0) return 32;
+  uint32_t n = 0;
+  while ((v & 0x80000000u) == 0) { ++n; v <<= 1; }
+  return n;
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec16B) {
+  // Cover zero, all-ones, single-bit (boundary positions), and mid-range
+  // values so each lane exercises a distinct CLZ result in 0..8.
+  uint8_t in[16] = {0x00, 0xFF, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04,
+                    0x02, 0x01, 0x7F, 0x55, 0xAA, 0xC3, 0x3C, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = static_cast<uint8_t>(Clz8(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec8BUpperZero) {
+  // Q=0 form must zero the upper 64 bits of Vd; pattern in bytes 8..15
+  // of Vn confirms that low lanes are computed and high lanes are zeroed.
+  uint8_t in[16] = {0x00, 0xFF, 0x80, 0x01, 0x40, 0x02, 0x20, 0x04,
+                    0x33, 0xCC, 0xF0, 0x0F, 0xAA, 0x55, 0xFF, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint8_t want = static_cast<uint8_t>(Clz8(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec8H) {
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8000, 0x4000, 0x0001, 0x00FF, 0x7FFF, 0x1234};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>(Clz16(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec4HUpperZero) {
+  // Q=0 form must zero upper 64 bits.
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8000, 0x0001,
+                    0x1111, 0x2222, 0x3333, 0x4444};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec4H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint16_t want = static_cast<uint16_t>(Clz16(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec4S) {
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0x80000000u, 0x00000001u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint32_t want = Clz32(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClzVec2SUpperZero) {
+  uint32_t in[4] = {0x00000000u, 0x00ABCDEFu, 0xDEADBEEFu, 0x12345678u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClzVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = Clz32(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
