@@ -11649,6 +11649,229 @@ TEST_F(Arm64LiteTranslateRegionTest, AddvVec4SDoubleWrap) {
 }
 // endregion
 
+// region digitalis: SADDLV / UADDLV (across-lanes long integer sum) vector
+// JIT — all 5 encoded lane forms × {signed, unsigned}.
+//
+// Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+//   0 Q U 01110 size 11000 00011 10 Rn Rd
+// SADDLV opcode = 0b00011 with U=0; UADDLV opcode = 0b00011 with U=1.
+// Each source lane is widened to 2*esize before summing; the 2*esize result
+// lives in the lowest lane of Vd with all other bytes zeroed.
+//
+// Lane forms covered:
+//   size=00 Q=0: V.8B  → H result  (8b lanes  → 16b sum)
+//   size=00 Q=1: V.16B → H result
+//   size=01 Q=0: V.4H  → S result  (16b lanes → 32b sum)
+//   size=01 Q=1: V.8H  → S result
+//   size=10 Q=1: V.4S  → D result  (32b lanes → 64b sum)
+//
+// `uaddlv h0, v0.8b` (insn 0x2E303800) traced in WhatsApp libar-bundle3.so.
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv8B) {
+  // UADDLV H, V.8B (Q=0, size=00, U=1).
+  // Sum low 8 bytes including 255+255=510 wrap-of-byte; upper 8 are
+  // don't-care.  Sum = 255+255+1+2+3+4+5+6 = 531.  Result is 16-bit, so
+  // 531 < 2^16 — no halfword wrap.  Upper 14 bytes of Vd asserted zero.
+  uint8_t n[16] = {255, 255,   1,   2,   3,   4,   5,   6,
+                   0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 531u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv16B) {
+  // UADDLV H, V.16B (Q=1, size=00, U=1).
+  // Sum all 16 bytes; max possible = 16*255 = 4080 fits in 16 bits.
+  // Inputs: 8 copies of 200 followed by 0..7 → sum = 1628.
+  uint8_t n[16] = {200, 200, 200, 200, 200, 200, 200, 200,
+                     0,   1,   2,   3,   4,   5,   6,   7};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  unsigned expected = 0;
+  for (int i = 0; i < 16; i++) expected += n[i];
+  EXPECT_EQ(r[0], static_cast<uint16_t>(expected));  // 1628
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv8B) {
+  // SADDLV H, V.8B (Q=0, size=00, U=0).
+  // Signed bytes: each 0xFF = -1, 0x80 = -128.
+  // Inputs (low 8): -1, -1, -128, -128, 1, 2, 3, 4.
+  // Sum = -1 + -1 + -128 + -128 + 1 + 2 + 3 + 4 = -248 → 0xFF08 (16-bit).
+  uint8_t n[16] = {0xFF, 0xFF, 0x80, 0x80,   1,   2,   3,   4,
+                   0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint16_t>(-248));  // 0xFF08
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv16B) {
+  // SADDLV H, V.16B (Q=1, size=00, U=0).
+  // All 16 bytes summed as signed: mix of negative and positive.
+  // Inputs: 8 × -100 (0x9C) + 8 × +100 → sum = 0.
+  int8_t n_s[16] = {-100, -100, -100, -100, -100, -100, -100, -100,
+                     100,  100,  100,  100,  100,  100,  100,  100};
+  uint8_t n[16];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv4H) {
+  // UADDLV S, V.4H (Q=0, size=01, U=1).
+  // Sum low 4 unsigned halfwords; result is 32-bit.  Includes 0xFFFF wrap.
+  // Inputs: 0xFFFF, 0xFFFF, 1, 2.  Sum = 131073 = 0x20001.
+  uint16_t n[8] = {0xFFFF, 0xFFFF,      1,      2,
+                   0xDEAD, 0xDEAD, 0xDEAD, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x20001u);  // 131073
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv8H) {
+  // UADDLV S, V.8H (Q=1, size=01, U=1).
+  // Sum all 8 unsigned halfwords; max = 8*65535 = 524280 fits in 32 bits.
+  uint16_t n[8] = {0xFFFF, 0xFFFF, 0x8000, 0x8000,
+                       1,      2,      3,      4};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint32_t expected = 0;
+  for (int i = 0; i < 8; i++) expected += n[i];
+  EXPECT_EQ(r[0], expected);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv4H) {
+  // SADDLV S, V.4H (Q=0, size=01, U=0).
+  // Signed halfwords: 0xFFFF = -1, 0x8000 = -32768.
+  // Inputs (low 4): -1, -1, -32768, +100.  Sum = -32670 → 0xFFFF80A2.
+  uint16_t n[8] = {0xFFFF, 0xFFFF, 0x8000,    100,
+                   0xDEAD, 0xDEAD, 0xDEAD, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint32_t>(-32670));  // 0xFFFF80A2
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv8H) {
+  // SADDLV S, V.8H (Q=1, size=01, U=0).
+  // Half the inputs negative, half positive — sum = 0.
+  int16_t n_s[8] = {-30000, -30000, -30000, -30000,
+                     30000,  30000,  30000,  30000};
+  uint16_t n[8];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv4S) {
+  // UADDLV D, V.4S (Q=1, size=10, U=1).
+  // Sum 4 unsigned dwords into a 64-bit result.  Includes upper-bit
+  // dwords whose 32-bit sum would wrap but 64-bit sum does not.
+  // Inputs: 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF.
+  // Sum = 4 * (2^32 - 1) = 0x3FFFFFFFC.  Result is 64-bit so no wrap.
+  uint32_t n[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(4) * 0xFFFFFFFFull);  // 0x3FFFFFFFC
+  EXPECT_EQ(r[1], 0ull);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv4S) {
+  // SADDLV D, V.4S (Q=1, size=10, U=0).
+  // Signed dwords summed to 64-bit result with sign-extension required.
+  // Inputs: -1, -1, -1, -1 → sum = -4 → 0xFFFFFFFFFFFFFFFC.
+  uint32_t n[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(-4));  // 0xFFFFFFFFFFFFFFFC
+  EXPECT_EQ(r[1], 0ull);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

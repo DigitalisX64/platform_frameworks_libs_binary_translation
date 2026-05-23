@@ -9903,6 +9903,148 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SADDLV / UADDLV (across-lanes long integer sum).
+      // Each source element is widened to 2*esize before being summed; the
+      // single 2*esize-wide result is written to the lowest lane of Vd with
+      // all other bytes zeroed.
+      //
+      // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+      //   0 Q U 01110 size 11000 00011 10 Rn Rd
+      // U=0 → SADDLV (signed), U=1 → UADDLV (unsigned).  Valid lane forms:
+      //   size=00 Q=0: V.8B   → H result (8b lanes  → 16b sum)
+      //   size=00 Q=1: V.16B  → H result
+      //   size=01 Q=0: V.4H   → S result (16b lanes → 32b sum)
+      //   size=01 Q=1: V.8H   → S result
+      //   size=10 Q=1: V.4S   → D result (32b lanes → 64b sum)
+      //   (size=10 Q=0 and size=11 are reserved; decoder rejects size=11.)
+      //
+      // Observed `uaddlv h0, v0.8b` (insn 0x2E303800) in WhatsApp's
+      // libar-bundle3.so JNI_OnLoad path (was previously interpreter-only).
+      //
+      // For UADDLV at .8B/.16B, PSADBW against zero already produces a
+      // 16-bit sum of bytes per qword lane (max 16*255 = 4080 << 2^16), so
+      // the unsigned byte paths reuse the ADDV PSADBW idiom.  For SADDLV
+      // and for halfword/dword inputs, PMOVxxBW / PMOVxxWD / PMOVxxDQ widen
+      // each source lane to the result width first; the widened lanes are
+      // then summed via PADDW / PADDD / PADDQ + PHADDW / PHADDD cascades.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlv: {
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv);
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {
+            // Bytes → 16-bit sum.
+            if (!is_signed) {
+              // UADDLV: PSADBW with zero gives 16-bit unsigned byte sum
+              // per qword (max 8*255 = 2040 ≤ 2^16).
+              SimdRegister xz = AllocTempSimdReg();
+              if (xz == no_simd_register) { Undefined(); return; }
+              as_.Pxor(xz, xz);
+              as_.Psadbw(xn, xz);
+              if (args.q) {
+                // .16B: fold high-qword sum into low qword.
+                SimdRegister xt = AllocTempSimdReg();
+                if (xt == no_simd_register) { Undefined(); return; }
+                as_.Pshufd(xt, xn, static_cast<int8_t>(0xEE));
+                as_.Paddq(xn, xt);
+              }
+            } else {
+              // SADDLV: sign-extend bytes → halfwords, then horizontal
+              // reduce via PHADDW.  Max signed sum 16*127 = 2032, fits.
+              if (args.q) {
+                // .16B: widen low 8 bytes and high 8 bytes separately,
+                // then lane-wise sum (8 partial halfword sums) → 3 PHADDW.
+                SimdRegister xt = AllocTempSimdReg();
+                if (xt == no_simd_register) { Undefined(); return; }
+                as_.Pmovsxbw(xt, xn);          // low  8b → 8 halfwords
+                as_.Psrldq(xn, int8_t{8});
+                as_.Pmovsxbw(xn, xn);          // high 8b → 8 halfwords
+                as_.Paddw(xn, xt);             // 8 partial-sum halfwords
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+              } else {
+                // .8B: only widen low 8 bytes; 3 PHADDW cascades collapse.
+                as_.Pmovsxbw(xn, xn);          // low 8b → 8 halfwords
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+              }
+            }
+            // Keep only the low halfword (2 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{14});
+            as_.Psrldq(xn, int8_t{14});
+            break;
+          }
+          case 0b01: {
+            // Halfwords → 32-bit sum.
+            if (args.q) {
+              // .8H: widen low 4 halfwords and high 4 halfwords separately,
+              // then lane-wise sum (4 partial dword sums) → 2 PHADDD.
+              SimdRegister xt = AllocTempSimdReg();
+              if (xt == no_simd_register) { Undefined(); return; }
+              if (is_signed) {
+                as_.Pmovsxwd(xt, xn);          // low 4 hw → 4 dwords
+                as_.Psrldq(xn, int8_t{8});
+                as_.Pmovsxwd(xn, xn);          // high 4 hw → 4 dwords
+              } else {
+                as_.Pmovzxwd(xt, xn);
+                as_.Psrldq(xn, int8_t{8});
+                as_.Pmovzxwd(xn, xn);
+              }
+              as_.Paddd(xn, xt);               // 4 partial-sum dwords
+              as_.Phaddd(xn, xn);
+              as_.Phaddd(xn, xn);
+            } else {
+              // .4H: only widen low 4 halfwords; 2 PHADDD cascades collapse.
+              if (is_signed) {
+                as_.Pmovsxwd(xn, xn);
+              } else {
+                as_.Pmovzxwd(xn, xn);
+              }
+              as_.Phaddd(xn, xn);
+              as_.Phaddd(xn, xn);
+            }
+            // Keep only the low dword (4 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{12});
+            as_.Psrldq(xn, int8_t{12});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) { Undefined(); return; }  // .2S reserved.
+            // .4S → 64-bit sum.  Widen 4 dwords → 4 qwords across two
+            // registers, sum lane-wise (2 partial qword sums), then fold
+            // hi-qword to lo-qword and add.
+            SimdRegister xt = AllocTempSimdReg();
+            if (xt == no_simd_register) { Undefined(); return; }
+            if (is_signed) {
+              as_.Pmovsxdq(xt, xn);            // low 2 dw → 2 qwords
+              as_.Psrldq(xn, int8_t{8});
+              as_.Pmovsxdq(xn, xn);            // high 2 dw → 2 qwords
+            } else {
+              as_.Pmovzxdq(xt, xn);
+              as_.Psrldq(xn, int8_t{8});
+              as_.Pmovzxdq(xn, xn);
+            }
+            as_.Paddq(xn, xt);                 // 2 partial-sum qwords
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0xEE));
+            as_.Paddq(xn, xt);
+            // Keep only the low qword (8 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{8});
+            as_.Psrldq(xn, int8_t{8});
+            break;
+          }
+          default:
+            Undefined();
+            return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
