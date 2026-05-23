@@ -6037,7 +6037,8 @@ class Interpreter {
         // D-form only.
         r = lo + hi;
         break;
-      // region digitalis: FP scalar pairwise.  size[0] picks S (0) vs D (1).
+      // region digitalis: FP scalar pairwise.  size[0] picks S (0) vs D (1)
+      // for the FP32/FP64 forms; args.is_fp16 selects the Armv8.2-FP16 form.
       // FMAX/FMIN: NaN-propagating (any-NaN -> NaN).
       // FMAXNM/FMINNM: NaN-quiet (single-NaN -> other operand).
       case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
@@ -6045,6 +6046,34 @@ class Interpreter {
       case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
       case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
       case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar: {
+        if (args.is_fp16) {
+          // H form: read Vn.H[0] and Vn.H[1], promote each to FP32 for the
+          // reduction (FP16 -> FP32 is exact and preserves NaN), then narrow
+          // the result back to FP16.
+          uint16_t a_h = static_cast<uint16_t>(lo);
+          uint16_t b_h = static_cast<uint16_t>(lo >> 16);
+          float a = FpHalfToSingle(a_h);
+          float b = FpHalfToSingle(b_h);
+          float f;
+          switch (args.opcode) {
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFaddpScalar:
+              f = a + b;
+              break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxpScalar:
+              f = FmaxScalar<float>(a, b); break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminpScalar:
+              f = FminScalar<float>(a, b); break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar:
+              f = FmaxnmScalar<float>(a, b); break;
+            case Decoder::AdvSimdScalarPairwiseOpcode::kFminnmpScalar:
+              f = FminnmScalar<float>(a, b); break;
+            default:
+              __builtin_unreachable();
+          }
+          uint16_t out_h = FpSingleToHalf(f);
+          r = out_h;  // upper 48 bits of the bottom 64-bit lane are zero
+          break;
+        }
         bool is_double = ((args.size & 1) != 0);
         if (is_double) {
           double a, b, d;

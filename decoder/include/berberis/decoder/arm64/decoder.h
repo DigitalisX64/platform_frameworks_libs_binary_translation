@@ -1554,14 +1554,16 @@ class Decoder {
   enum class AdvSimdScalarPairwiseOpcode : uint8_t {
     kAddp,    // ADDP (scalar): U=0, size=11, opcode=11011 -> d-form
     // region digitalis
-    // FP scalar pairwise variants.  U=1 in the dispatch encoding.
-    //   size[0] (bit 22) selects S (0) or D (1).
+    // FP scalar pairwise variants.  U=1 in the dispatch encoding selects the
+    // FP32/FP64 forms (size[0] picks S vs D); U=0 with bit22=0 selects the
+    // Armv8.2-FP16 forms (carried on AdvSimdScalarPairwiseArgs.is_fp16).
+    //   size[0] (bit 22) selects S (0) or D (1) for the U=1 forms.
     //   size[1] (bit 23) selects max- vs min- variants for FMAX*/FMIN*.
-    kFaddpScalar,    // FADDP scalar:    U=1, opcode=01101, size=0x
-    kFmaxnmpScalar,  // FMAXNMP scalar:  U=1, opcode=01100, size=0x
-    kFminnmpScalar,  // FMINNMP scalar:  U=1, opcode=01100, size=1x
-    kFmaxpScalar,    // FMAXP scalar:    U=1, opcode=01111, size=0x
-    kFminpScalar,    // FMINP scalar:    U=1, opcode=01111, size=1x
+    kFaddpScalar,    // FADDP scalar:    opcode=01101, bit23=0
+    kFmaxnmpScalar,  // FMAXNMP scalar:  opcode=01100, bit23=0
+    kFminnmpScalar,  // FMINNMP scalar:  opcode=01100, bit23=1
+    kFmaxpScalar,    // FMAXP scalar:    opcode=01111, bit23=0
+    kFminpScalar,    // FMINP scalar:    opcode=01111, bit23=1
     // endregion
   };
 
@@ -1570,6 +1572,9 @@ class Decoder {
     uint8_t rd;
     uint8_t rn;
     uint8_t size;
+    // region digitalis
+    bool is_fp16;
+    // endregion
   };
   // endregion
 
@@ -5384,6 +5389,9 @@ class Decoder {
 
     AdvSimdScalarPairwiseOpcode op;
     bool ok = false;
+    // region digitalis
+    bool is_fp16 = false;
+    // endregion
 
     if (!u) {
       // Integer leg: ADDP scalar (D-form) only.
@@ -5391,6 +5399,38 @@ class Decoder {
         op = AdvSimdScalarPairwiseOpcode::kAddp;
         ok = true;
       }
+      // region digitalis
+      // Armv8.2-FP16 scalar pairwise (ARM ARM C7.2 "Advanced SIMD scalar
+      // pairwise (FP16)"): U=0, bit22 (size[0]) must be 0; bit23 (size[1])
+      // selects max- vs min- for FMAX*/FMIN*. FADDP is only allocated at
+      // bit23=0.
+      else if ((size & 1) == 0) {
+        bool size_hi = ((size >> 1) & 1) != 0;
+        switch (opcode) {
+          case 0b01100:
+            op = size_hi ? AdvSimdScalarPairwiseOpcode::kFminnmpScalar
+                         : AdvSimdScalarPairwiseOpcode::kFmaxnmpScalar;
+            ok = true;
+            is_fp16 = true;
+            break;
+          case 0b01101:
+            if (!size_hi) {
+              op = AdvSimdScalarPairwiseOpcode::kFaddpScalar;
+              ok = true;
+              is_fp16 = true;
+            }
+            break;
+          case 0b01111:
+            op = size_hi ? AdvSimdScalarPairwiseOpcode::kFminpScalar
+                         : AdvSimdScalarPairwiseOpcode::kFmaxpScalar;
+            ok = true;
+            is_fp16 = true;
+            break;
+          default:
+            break;
+        }
+      }
+      // endregion
     } else {
       // FP leg.  size[1] selects min- (1) vs max- (0); size[0] selects S/D.
       bool size_hi = ((size >> 1) & 1) != 0;
@@ -5427,6 +5467,9 @@ class Decoder {
         .rd = rd,
         .rn = rn,
         .size = size,
+        // region digitalis
+        .is_fp16 = is_fp16,
+        // endregion
     };
     insn_consumer_->AdvSimdScalarPairwise(args);
   }
