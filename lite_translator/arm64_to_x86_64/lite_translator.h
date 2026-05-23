@@ -11828,6 +11828,372 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis: SHRN / SHRN2 / RSHRN / RSHRN2 / UQSHRN / UQSHRN2
+      // vector shift-right-narrow JIT.
+      //
+      //   immh=0001 → src 16-bit (.8H), dst 8-bit  (.8B / .16B for Q=1)
+      //   immh=001x → src 32-bit (.4S), dst 16-bit (.4H / .8H  for Q=1)
+      //   immh=01xx → src 64-bit (.2D), dst 32-bit (.2S / .4S  for Q=1)
+      //   immh=1xxx → undefined (src would be 128-bit) — bail to interp.
+      //
+      //   narrow_rshift = src_bits - (immh:immb)  ∈ [1, src_bits/2]
+      //
+      // x86 lowering: PSRL{W,D,Q} src by narrow_rshift, then PSHUFB to
+      // gather the low half of each src lane into the low 64 bits of the
+      // dst (upper 64 bits zeroed by 0x80 selectors).  PSRL count ≥ esize
+      // produces 0 per lane — matches the ARM `narrow_rshift >= src_bits`
+      // branch in the interpreter.
+      //
+      // RSHRN adds the rounding constant (1 << (narrow_rshift - 1)) into
+      // every source lane via PADDW/PADDD/PADDQ before the right shift.
+      // The integer add wraps modulo lane width on x86 but the wrap is
+      // benign: the subsequent right shift drops at least narrow_rshift
+      // bits and PSHUFB then narrow-masks to dst_bits, so the high carry
+      // bit that the interpreter's 128-bit wide-add captures is always
+      // discarded.  narrow_rshift ∈ [1, src_bits/2] by the encoding
+      // constraints, so (narrow_rshift - 1) ≥ 0 and the rounding
+      // constant always fits in a single source lane.
+      //
+      // UQSHRN unsigned-saturates the post-shift value to dst_bits before
+      // narrowing.  After PSRL{W,D,Q}, each src lane is in [0, 2^(src_bits
+      // - narrow_rshift) - 1] (top bit is zero because the shift count is
+      // ≥ 1, so the value is non-negative when interpreted as signed).
+      // Clamp via:
+      //   src 16-bit: PMINUW vs 0x00FF... pattern (SSE4.1)
+      //   src 32-bit: PMINUD vs 0x0000FFFF... pattern (SSE4.1)
+      //   src 64-bit: manual — no PMINUQ in baseline SSE.  Extract hi32
+      //               of each qword via PSRLQ-by-32; compare to zero with
+      //               PCMPEQD; broadcast the per-qword "hi==0" mask via
+      //               PSHUFD; XOR with the xsat pattern (which has
+      //               0xFFFFFFFF in the lo32-of-each-qword lanes) to
+      //               invert into "saturate" polarity; POR into xn so
+      //               saturating lanes' lo32 become 0xFFFFFFFF.
+      // The subsequent PSHUFB gathers the saturated lo half of each lane.
+      //
+      // UQRSHRN combines RSHRN's rounding pre-shift add with UQSHRN's
+      // post-shift unsigned saturating clamp.  Because the subsequent
+      // saturate observes the WIDE (pre-shift) value, the rounding add
+      // must NOT lose its carry-out — the plain PADDW/PADDD that RSHRN
+      // uses wraps mod 2^src_bits and silently zeros the saturated
+      // result.  Saturating-add variants:
+      //   src 16-bit: PADDUSW (single instruction, saturates to 0xFFFF).
+      //   src 32-bit: no PADDUSD in baseline SSE; pre-clamp via
+      //               PMINUD(xn, 0xFFFFFFFF - round_lane) before PADDD.
+      //               Clamped lanes land at 0xFFFFFFFF after the add,
+      //               which PSRLD-then-PMINUD correctly drives to the
+      //               saturated 0xFFFF (because 0xFFFFFFFF >> narrow_rshift
+      //               ≥ 0xFFFF for narrow_rshift ∈ [1, 16]).
+      //   src 64-bit: PADDQ wraps, and emulating PADDUSQ on baseline SSE
+      //               needs PCMPGTQ + blend + a separate temp.  Bail to
+      //               interpreter (`success_ = false`).
+      //
+      // SQSHRN signed-saturates the post-shift value to dst_bits before
+      // narrowing.  The pre-shift is PSRA{W,D} (arithmetic right shift,
+      // sign-preserving).  After shift, clamp each src-element-wide lane
+      // to the signed dst-width range:
+      //   dst 8:   [-128, 127]   i.e. [0xFF80, 0x007F] as signed 16-bit
+      //            → PMAXSW+PMINSW (both SSE2).
+      //   dst 16:  [-32768, 32767] i.e. [0xFFFF8000, 0x00007FFF] as
+      //            signed 32-bit → PMAXSD+PMINSD (both SSE4.1).
+      //   dst 32:  src=64, no PSRAQ in baseline SSE — bail.
+      // PSHUFB then gathers the low byte (src 16-bit) or low halfword
+      // (src 32-bit) of each lane.  After signed clamp those bottom
+      // bytes/halfwords ARE the correct signed narrow result.
+      //
+      // SQRSHRN adds the rounding pre-shift add.  The pre-shift saturate
+      // observes the WIDE value, so the rounding add must signed-
+      // saturate too (the round constant is always positive
+      // `1 << (rshift - 1)`):
+      //   src 16-bit: PADDSW (signed saturating word add, SSE2).
+      //   src 32-bit: no PADDSD-integer in baseline SSE; pre-clamp via
+      //               PMINSD(xn, INT32_MAX - round_lane).  Lanes clamped
+      //               there yield exactly INT32_MAX after the plain PADDD,
+      //               which the post-shift PMINSD-vs-signed-max saturates
+      //               correctly.  Adding a positive round constant cannot
+      //               under-flow a signed value, so no lower pre-clamp.
+      //   src 64-bit: bail (no PSRAQ for the shift anyway).
+      //
+      // Q=0:        store narrowed-in-low | zero-upper.
+      // Q=1 ("2"):  preserve Vd[63:0], OR narrowed result into Vd[127:64].
+      case Decoder::AdvSimdShiftImmOpcode::kShrn:
+      case Decoder::AdvSimdShiftImmOpcode::kRshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn: {
+        const uint8_t immh = args.immh;
+        if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
+        uint8_t src_bits;
+        if (immh & 0b0100) {
+          src_bits = 64;
+        } else if (immh & 0b0010) {
+          src_bits = 32;
+        } else /* immh == 0b0001 */ {
+          src_bits = 16;
+        }
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
+        const bool is_saturating_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
+        const bool is_saturating_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
+        if (is_rounding && is_saturating_unsigned && src_bits == 64) {
+          // UQRSHRN src=64 needs a saturating PADDQ that baseline SSE
+          // can't express cheaply.  Fall back to the interpreter.
+          success_ = false; return;
+        }
+        if (is_saturating_signed && src_bits == 64) {
+          // SQSHRN / SQRSHRN src=64 needs PSRAQ which baseline SSE
+          // doesn't have.  Fall back to the interpreter.
+          success_ = false; return;
+        }
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xmask = AllocTempSimdReg();
+        Register r1 = AllocTempReg();
+        if (xn == no_simd_register || xmask == no_simd_register ||
+            r1 == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_rounding) {
+          // Broadcast the per-lane rounding constant (1 << (rshift - 1))
+          // across all SIMD lanes, then add.  The 64-bit pattern packs
+          // the constant into every lane of the source element width.
+          // Plain RSHRN uses PADDW/PADDD/PADDQ (wrap-on-overflow is
+          // benign — the subsequent PSHUFB narrow-mask drops the carry).
+          // UQRSHRN must preserve the carry; see the comment block above
+          // for the saturating-add variants.
+          const uint64_t round_lane = uint64_t{1} << (narrow_rshift - 1);
+          uint64_t round_pattern;
+          switch (src_bits) {
+            case 16:
+              round_pattern = round_lane * uint64_t{0x0001000100010001ULL};
+              break;
+            case 32:
+              round_pattern = round_lane * uint64_t{0x0000000100000001ULL};
+              break;
+            case 64:
+              round_pattern = round_lane;
+              break;
+            default: success_ = false; return;
+          }
+          SimdRegister xround = AllocTempSimdReg();
+          if (xround == no_simd_register) { success_ = false; return; }
+          as_.Movq(r1, static_cast<int64_t>(round_pattern));
+          as_.Movq(xround, r1);
+          as_.Pinsrq(xround, r1, int8_t{1});
+          if (is_saturating_unsigned) {
+            switch (src_bits) {
+              case 16:
+                as_.Paddusw(xn, xround);
+                break;
+              case 32: {
+                const uint32_t clamp_lane =
+                    0xFFFFFFFFu - static_cast<uint32_t>(round_lane);
+                const uint64_t clamp_pattern =
+                    (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+                SimdRegister xclamp = AllocTempSimdReg();
+                if (xclamp == no_simd_register) { success_ = false; return; }
+                as_.Movq(r1, static_cast<int64_t>(clamp_pattern));
+                as_.Movq(xclamp, r1);
+                as_.Pinsrq(xclamp, r1, int8_t{1});
+                as_.Pminud(xn, xclamp);
+                as_.Paddd(xn, xround);
+                break;
+              }
+              // src_bits == 64 already bailed above.
+            }
+          } else if (is_saturating_signed) {
+            switch (src_bits) {
+              case 16:
+                // PADDSW is signed-saturating word add (SSE2).
+                as_.Paddsw(xn, xround);
+                break;
+              case 32: {
+                // No integer PADDSD in baseline SSE; pre-clamp xn so the
+                // plain PADDD cannot overflow positively.  The round
+                // constant is positive (`1 << (rshift - 1)`), so adding
+                // it cannot cause negative underflow — no lower
+                // pre-clamp needed.  Lanes that hit the upper clamp
+                // settle at exactly INT32_MAX after the add, which the
+                // post-shift PMINSD-vs-signed-max drives to the
+                // saturated dst value.
+                const uint32_t clamp_lane =
+                    0x7FFFFFFFu - static_cast<uint32_t>(round_lane);
+                const uint64_t clamp_pattern =
+                    (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+                SimdRegister xclamp = AllocTempSimdReg();
+                if (xclamp == no_simd_register) { success_ = false; return; }
+                as_.Movq(r1, static_cast<int64_t>(clamp_pattern));
+                as_.Movq(xclamp, r1);
+                as_.Pinsrq(xclamp, r1, int8_t{1});
+                as_.Pminsd(xn, xclamp);
+                as_.Paddd(xn, xround);
+                break;
+              }
+              // src_bits == 64 already bailed above.
+            }
+          } else {
+            switch (src_bits) {
+              case 16: as_.Paddw(xn, xround); break;
+              case 32: as_.Paddd(xn, xround); break;
+              case 64: as_.Paddq(xn, xround); break;
+            }
+          }
+        }
+        const int8_t cnt = static_cast<int8_t>(narrow_rshift);
+        if (is_saturating_signed) {
+          // PSRAW/PSRAD: sign-preserving arithmetic right shift.  src=64
+          // already bailed (no PSRAQ in baseline SSE).
+          switch (src_bits) {
+            case 16: as_.Psraw(xn, cnt); break;
+            case 32: as_.Psrad(xn, cnt); break;
+          }
+        } else {
+          switch (src_bits) {
+            case 16: as_.Psrlw(xn, cnt); break;
+            case 32: as_.Psrld(xn, cnt); break;
+            case 64: as_.Psrlq(xn, cnt); break;
+          }
+        }
+        if (is_saturating_signed) {
+          // Clamp each src-element-wide lane to the signed dst range:
+          //   dst 8:  [-128, 127] as signed 16-bit = [0xFF80, 0x007F].
+          //   dst 16: [-32768, 32767] as signed 32-bit
+          //           = [0xFFFF8000, 0x00007FFF].
+          // PSHUFB later gathers byte 0 (src=16) or halfword 0 (src=32)
+          // of each lane — those low bytes/halfwords already encode the
+          // correct signed narrow value once the lane is clamped.
+          uint64_t sat_max_pattern;
+          uint64_t sat_min_pattern;
+          switch (src_bits) {
+            case 16:
+              sat_max_pattern = 0x007F007F007F007FULL;
+              sat_min_pattern = 0xFF80FF80FF80FF80ULL;
+              break;
+            case 32:
+              sat_max_pattern = 0x00007FFF00007FFFULL;
+              sat_min_pattern = 0xFFFF8000FFFF8000ULL;
+              break;
+            default: success_ = false; return;
+          }
+          SimdRegister xsatmax = AllocTempSimdReg();
+          SimdRegister xsatmin = AllocTempSimdReg();
+          if (xsatmax == no_simd_register || xsatmin == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movq(r1, static_cast<int64_t>(sat_max_pattern));
+          as_.Movq(xsatmax, r1);
+          as_.Pinsrq(xsatmax, r1, int8_t{1});
+          as_.Movq(r1, static_cast<int64_t>(sat_min_pattern));
+          as_.Movq(xsatmin, r1);
+          as_.Pinsrq(xsatmin, r1, int8_t{1});
+          switch (src_bits) {
+            case 16:
+              as_.Pminsw(xn, xsatmax);
+              as_.Pmaxsw(xn, xsatmin);
+              break;
+            case 32:
+              as_.Pminsd(xn, xsatmax);
+              as_.Pmaxsd(xn, xsatmin);
+              break;
+          }
+        }
+        if (is_saturating_unsigned) {
+          // Clamp each src-lane value to (1 << dst_bits) - 1 before the
+          // PSHUFB narrow.  Pattern packs the per-lane unsigned max into
+          // every src-element-wide slot of a 64-bit word, then broadcast
+          // across both qwords of an xmm via Movq+Pinsrq.  PMINUW/PMINUD
+          // are SSE4.1; the 64→32 case has no PMINUQ in baseline SSE so
+          // it does a manual hi32-nonzero -> lo32=all-ones rewrite.
+          uint64_t sat_pattern;
+          switch (src_bits) {
+            case 16: sat_pattern = 0x00FF00FF00FF00FFULL; break;
+            case 32: sat_pattern = 0x0000FFFF0000FFFFULL; break;
+            case 64: sat_pattern = 0x00000000FFFFFFFFULL; break;
+            default: success_ = false; return;
+          }
+          SimdRegister xsat = AllocTempSimdReg();
+          if (xsat == no_simd_register) { success_ = false; return; }
+          as_.Movq(r1, static_cast<int64_t>(sat_pattern));
+          as_.Movq(xsat, r1);
+          as_.Pinsrq(xsat, r1, int8_t{1});
+          switch (src_bits) {
+            case 16: as_.Pminuw(xn, xsat); break;
+            case 32: as_.Pminud(xn, xsat); break;
+            case 64: {
+              SimdRegister xhi = AllocTempSimdReg();
+              SimdRegister xzero = AllocTempSimdReg();
+              if (xhi == no_simd_register || xzero == no_simd_register) {
+                success_ = false; return;
+              }
+              as_.Movdqa(xhi, xn);
+              as_.Psrlq(xhi, int8_t{32});
+              as_.Pxor(xzero, xzero);
+              // PCMPEQD: 0xFFFFFFFF per 32-bit lane where lane==0.  For
+              // xhi-after-PSRLQ-32, 32-bit lanes 1 and 3 are always
+              // zero (those were the upper halves of each qword cleared
+              // by the shift), so PCMPEQD lights them up unconditionally
+              // — but PSHUFD-0xA0 then overwrites lanes 1,3 with the
+              // lane 0,2 values, so the spurious matches don't leak.
+              as_.Pcmpeqd(xhi, xzero);
+              as_.Pshufd(xhi, xhi, int8_t{static_cast<int8_t>(0xA0)});
+              // XOR with xsat (which is 0xFFFFFFFF in 32-bit lanes 0,2
+              // and 0 in 32-bit lanes 1,3) inverts polarity in the lo32
+              // slots: post-XOR, lanes 0 and 2 are 0xFFFFFFFF iff the
+              // qword's hi32 was nonzero (i.e., needs saturate).  Lanes
+              // 1,3 are don't-cares — PSHUFB drops them.
+              as_.Pxor(xhi, xsat);
+              as_.Por(xn, xhi);
+              break;
+            }
+          }
+        }
+        // PSHUFB selectors: 0x80 in the upper 8 entries zeros the upper
+        // 64 bits of the result; the lower 8 entries gather the bytes
+        // that form the narrowed value of each source lane.
+        //   src 16-bit → low byte of each .8H lane = bytes 0,2,4,...,14.
+        //   src 32-bit → low half of each .4S lane = bytes 0,1,4,5,8,9,12,13.
+        //   src 64-bit → low word of each .2D lane = bytes 0,1,2,3,8,9,10,11.
+        int64_t mask_lo;
+        const int64_t mask_hi = static_cast<int64_t>(0x8080808080808080ULL);
+        switch (src_bits) {
+          case 16:
+            mask_lo = static_cast<int64_t>(0x0E0C0A0806040200LL);
+            break;
+          case 32:
+            mask_lo = static_cast<int64_t>(0x0D0C090805040100LL);
+            break;
+          case 64:
+            mask_lo = static_cast<int64_t>(0x0B0A090803020100LL);
+            break;
+          default: success_ = false; return;
+        }
+        as_.Movq(r1, mask_lo);
+        as_.Movq(xmask, r1);
+        as_.Movq(r1, mask_hi);
+        as_.Pinsrq(xmask, r1, int8_t{1});
+        as_.Pshufb(xn, xmask);
+        if (args.q) {
+          // SHRN2: preserve Vd[63:0]; place narrowed lanes in Vd[127:64].
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movq(xd, {.base = Assembler::rbp, .disp = vd_off});
+          as_.Pslldq(xn, int8_t{8});
+          as_.Por(xd, xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        } else {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
