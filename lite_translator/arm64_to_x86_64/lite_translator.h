@@ -9527,6 +9527,91 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // region digitalis: SHL / USHR / SSHR vector shift-by-immediate JIT.
+      //
+      //   esize from immh:  bit3→8 (.2D), bit2→4 (.4S/.2S), bit1→2 (.8H/.4H),
+      //                     bit0→1 (.16B/.8B — byte shift, no x86 equivalent,
+      //                     bail).
+      //   SHL  shift count = (immh:immb) - bits   ∈ [0, bits-1]
+      //   USHR / SSHR rshift count = 2*bits - (immh:immb) ∈ [1, bits]
+      //
+      // x86 mapping:
+      //   SHL  .8H/.4H → PSLLW   .4S/.2S → PSLLD   .2D → PSLLQ
+      //   USHR .8H/.4H → PSRLW   .4S/.2S → PSRLD   .2D → PSRLQ
+      //   SSHR .8H/.4H → PSRAW   .4S/.2S → PSRAD   .2D → bail (no PSRAQ pre AVX-512)
+      //
+      // Saturation semantics match ARM at the upper bound:
+      //   PSLL{W,D,Q} with count ≥ bits → 0           (matches SHL spec
+      //     boundary, but the encoding never gets there: SHL shift ≤ bits-1)
+      //   PSRL{W,D,Q} with count ≥ bits → 0           (matches USHR at
+      //     rshift==bits, which produces 0)
+      //   PSRA{W,D}   with count ≥ bits → sign-fill   (matches SSHR at
+      //     rshift==bits, which produces (signed)>>bits-1 i.e. sign-fill)
+      //
+      // !Q forms read the low 64 bits semantically; the source is read
+      // as a 128-bit value but only the low half participates, and the
+      // upper half of Vd is zeroed at the store.
+      case Decoder::AdvSimdShiftImmOpcode::kShl:
+      case Decoder::AdvSimdShiftImmOpcode::kUshr:
+      case Decoder::AdvSimdShiftImmOpcode::kSshr: {
+        const uint8_t immh = args.immh;
+        if (immh == 0) { success_ = false; return; }
+        const bool is_byte = (immh == 0b0001);  // esize = 1
+        if (is_byte) { success_ = false; return; }
+        const bool is_left = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
+        uint8_t esize_bits;
+        uint8_t shift_count;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else /* immh & 0b0010 */ {
+          esize_bits = 16;
+        }
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        if (is_left) {
+          shift_count = static_cast<uint8_t>(immh_immb - esize_bits);  // 0..bits-1
+        } else {
+          shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);  // 1..bits
+        }
+        // SSHR .2D needs PSRAQ which only exists in AVX-512F — bail.
+        if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr &&
+            esize_bits == 64) {
+          success_ = false; return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        if (cnt != 0) {
+          if (is_left) {
+            switch (esize_bits) {
+              case 16: as_.Psllw(xn, cnt); break;
+              case 32: as_.Pslld(xn, cnt); break;
+              case 64: as_.Psllq(xn, cnt); break;
+            }
+          } else if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUshr) {
+            switch (esize_bits) {
+              case 16: as_.Psrlw(xn, cnt); break;
+              case 32: as_.Psrld(xn, cnt); break;
+              case 64: as_.Psrlq(xn, cnt); break;
+            }
+          } else /* kSshr */ {
+            switch (esize_bits) {
+              case 16: as_.Psraw(xn, cnt); break;
+              case 32: as_.Psrad(xn, cnt); break;
+            }
+          }
+        }
+        if (!args.q) {
+          // Zero upper 64 bits of Vd (D-register semantics).
+          as_.Pslldq(xn, int8_t{8});
+          as_.Psrldq(xn, int8_t{8});
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
