@@ -7766,6 +7766,248 @@ TEST_F(Arm64LiteTranslateRegionTest, BfdotIdxQ1Accumulates) {
   EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x40A00000u);  // 5.0
   EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x40C00000u);  // 6.0
 }
+
+// BFMLALB / BFMLALT (vector + indexed) — §H2 JIT closure.
+//
+// Semantics (interpreter at `interpreter.h:1515` and 1542):
+//   off = (T ? 1 : 0)
+//   Vector: for i in [0..4):
+//     Vd.s[i] += Bf16ToFloat(Vn.h[2i + off]) * Bf16ToFloat(Vm.h[2i + off])
+//   Indexed: m = Bf16ToFloat(Vm.h[idx])      ; single BF16, not a pair
+//     for i in [0..4):
+//       Vd.s[i] += Bf16ToFloat(Vn.h[2i + off]) * m
+//   Q implicit 1 for BFMLAL (dest always .4s).
+//
+// Encodings (llvm-mc + decoder cross-check, decoder.h:5615..5621):
+//   bfmlalb v0.4s, v1.8h, v2.8h     = 0x2EC2FC20  (vec, B, bit30=0)
+//   bfmlalt v0.4s, v1.8h, v2.8h     = 0x6EC2FC20  (vec, T, bit30=1)
+//   bfmlalb v0.4s, v1.8h, v2.h[0]   = 0x0FC2F020  (idx, B, idx=0)
+//   bfmlalt v0.4s, v1.8h, v2.h[7]   = 0x4FF2F820  (idx, T, idx=7)
+constexpr uint32_t BfmlalVec(uint8_t rd, uint8_t rn, uint8_t rm, bool t) {
+  return 0x2EC0FC00u
+       | (static_cast<uint32_t>(t ? 1 : 0) << 30)
+       | (static_cast<uint32_t>(rm) << 16)
+       | (static_cast<uint32_t>(rn) << 5)
+       | static_cast<uint32_t>(rd);
+}
+// BFMLAL indexed: index = H:L:M (3 bits, 0..7).  Vm is only 4 bits
+// (Rm[3:0]) — V0..V15.
+constexpr uint32_t BfmlalIdx(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t idx,
+                             bool t) {
+  return 0x0FC0F000u
+       | (static_cast<uint32_t>(t ? 1 : 0) << 30)
+       | (static_cast<uint32_t>((idx >> 2) & 1) << 11)   // H
+       | (static_cast<uint32_t>((idx >> 1) & 1) << 21)   // L
+       | (static_cast<uint32_t>(idx & 1) << 20)          // M
+       | (static_cast<uint32_t>(rm & 0xF) << 16)         // Rm[3:0]
+       | (static_cast<uint32_t>(rn) << 5)
+       | static_cast<uint32_t>(rd);
+}
+
+// BFMLALB vector: B picks the EVEN BF16 lanes (h[0], h[2], h[4], h[6]).
+// Pollute the ODD lanes of Vn and Vm with qNaN to prove only the evens
+// are read.
+TEST_F(Arm64LiteTranslateRegionTest, BfmlalbVecBasic) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  // Vn even lanes: 1.0, 2.0, 3.0, 4.0; odd lanes: qNaN.
+  StoreBf16Lane(state_.cpu, 1, 0, 0x3F80);  // 1.0
+  StoreBf16Lane(state_.cpu, 1, 2, 0x4000);  // 2.0
+  StoreBf16Lane(state_.cpu, 1, 4, 0x4040);  // 3.0
+  StoreBf16Lane(state_.cpu, 1, 6, 0x4080);  // 4.0
+  StoreBf16Lane(state_.cpu, 1, 1, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 3, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 5, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 7, 0x7FC0);
+  // Vm even lanes: 5.0, 6.0, 7.0, 8.0; odd lanes: qNaN.
+  StoreBf16Lane(state_.cpu, 2, 0, 0x40A0);  // 5.0
+  StoreBf16Lane(state_.cpu, 2, 2, 0x40C0);  // 6.0
+  StoreBf16Lane(state_.cpu, 2, 4, 0x40E0);  // 7.0
+  StoreBf16Lane(state_.cpu, 2, 6, 0x4100);  // 8.0
+  StoreBf16Lane(state_.cpu, 2, 1, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 3, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 5, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 7, 0x7FC0);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = { BfmlalVec(0, 1, 2, /*t=*/false) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // lane0 = 0 + 1*5 = 5.0   -> 0x40A00000
+  // lane1 = 0 + 2*6 = 12.0  -> 0x41400000
+  // lane2 = 0 + 3*7 = 21.0  -> 0x41A80000
+  // lane3 = 0 + 4*8 = 32.0  -> 0x42000000
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x40A00000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 1), 0x41400000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x41A80000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x42000000u);
+}
+
+// BFMLALT vector: T picks the ODD BF16 lanes (h[1], h[3], h[5], h[7]).
+// Mirror of BfmlalbVecBasic: data sits in odd lanes, evens are qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, BfmlaltVecBasic) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  // Vn: even lanes qNaN, odd lanes 1.0, 2.0, 3.0, 4.0.
+  StoreBf16Lane(state_.cpu, 1, 0, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 2, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 4, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 6, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 1, 0x3F80);  // 1.0
+  StoreBf16Lane(state_.cpu, 1, 3, 0x4000);  // 2.0
+  StoreBf16Lane(state_.cpu, 1, 5, 0x4040);  // 3.0
+  StoreBf16Lane(state_.cpu, 1, 7, 0x4080);  // 4.0
+  // Vm: even lanes qNaN, odd lanes 5.0, 6.0, 7.0, 8.0.
+  StoreBf16Lane(state_.cpu, 2, 0, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 2, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 4, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 6, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 1, 0x40A0);  // 5.0
+  StoreBf16Lane(state_.cpu, 2, 3, 0x40C0);  // 6.0
+  StoreBf16Lane(state_.cpu, 2, 5, 0x40E0);  // 7.0
+  StoreBf16Lane(state_.cpu, 2, 7, 0x4100);  // 8.0
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = { BfmlalVec(0, 1, 2, /*t=*/true) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Same products as BfmlalbVecBasic — proves T picks the right lanes.
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x40A00000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 1), 0x41400000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x41A80000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x42000000u);
+}
+
+// BFMLALB vector accumulates (read-modify-write) into Vd.
+TEST_F(Arm64LiteTranslateRegionTest, BfmlalbVecAccumulates) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  // All BF16 lanes = 1.0; T NaN pollution proves B path doesn't read them.
+  for (uint8_t i = 0; i < 4; i++) {
+    StoreBf16Lane(state_.cpu, 1, 2 * i, 0x3F80);
+    StoreBf16Lane(state_.cpu, 2, 2 * i, 0x3F80);
+    StoreBf16Lane(state_.cpu, 1, 2 * i + 1, 0x7FC0);
+    StoreBf16Lane(state_.cpu, 2, 2 * i + 1, 0x7FC0);
+  }
+  state_.cpu.v[0] = 0;
+  StoreFp32LaneBits(state_.cpu, 0, 0, 0x41200000);  // 10.0
+  StoreFp32LaneBits(state_.cpu, 0, 1, 0x41A00000);  // 20.0
+  StoreFp32LaneBits(state_.cpu, 0, 2, 0x41F00000);  // 30.0
+  StoreFp32LaneBits(state_.cpu, 0, 3, 0x42200000);  // 40.0
+  static const uint32_t code[] = { BfmlalVec(0, 1, 2, /*t=*/false) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Each lane: Vd + 1*1 = Vd + 1.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x41300000u);  // 11.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 1), 0x41A80000u);  // 21.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x41F80000u);  // 31.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x42240000u);  // 41.0
+}
+
+// BFMLALT vector NaN: an odd-lane NaN in Vm must propagate to the
+// corresponding output lane via MULPS, while other lanes stay finite.
+// Exercises the T-path widen (PSRLD $16; PSLLD $16) preserving the NaN
+// bit pattern.
+TEST_F(Arm64LiteTranslateRegionTest, BfmlaltVecNan) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  // Vn all 1.0 in odd lanes (T-active), even pollution.
+  for (uint8_t i = 0; i < 4; i++) {
+    StoreBf16Lane(state_.cpu, 1, 2 * i, 0x7FC0);
+    StoreBf16Lane(state_.cpu, 1, 2 * i + 1, 0x3F80);  // 1.0
+    StoreBf16Lane(state_.cpu, 2, 2 * i, 0x7FC0);
+    StoreBf16Lane(state_.cpu, 2, 2 * i + 1, 0x3F80);  // 1.0
+  }
+  // Inject qNaN into Vm.h[3] — this feeds output lane 1 (i=1, 2*1+1=3).
+  StoreBf16Lane(state_.cpu, 2, 3, 0x7FC0);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = { BfmlalVec(0, 1, 2, /*t=*/true) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // lane0: 1*1 = 1.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x3F800000u);
+  // lane1: NaN (exp=0xFF, mantissa != 0)
+  uint32_t bits1 = LoadFp32LaneBits(state_.cpu, 0, 1);
+  EXPECT_EQ(bits1 & 0x7F800000u, 0x7F800000u);
+  EXPECT_NE(bits1 & 0x007FFFFFu, 0u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x3F800000u);
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x3F800000u);
+}
+
+// BFMLALB indexed: single Vm.h[0] broadcast across all 4 lanes.
+// Other Vm lanes filled with qNaN to prove the broadcast picks the
+// right BF16 (and the Pinsrw + Pshufd path doesn't leak adjacent bits).
+TEST_F(Arm64LiteTranslateRegionTest, BfmlalbIdxBasic) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  // Vn even lanes carry data; odd lanes qNaN.
+  StoreBf16Lane(state_.cpu, 1, 0, 0x4000);  // 2.0
+  StoreBf16Lane(state_.cpu, 1, 2, 0x4040);  // 3.0
+  StoreBf16Lane(state_.cpu, 1, 4, 0x4080);  // 4.0
+  StoreBf16Lane(state_.cpu, 1, 6, 0x40A0);  // 5.0
+  StoreBf16Lane(state_.cpu, 1, 1, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 3, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 5, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 7, 0x7FC0);
+  // Vm.h[0] = 10.0; other lanes pollute.
+  StoreBf16Lane(state_.cpu, 2, 0, 0x4120);  // 10.0
+  for (uint8_t i = 1; i < 8; i++) StoreBf16Lane(state_.cpu, 2, i, 0x7FC0);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = { BfmlalIdx(0, 1, 2, /*idx=*/0, /*t=*/false) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // lane i = Vn.h[2i+0] * 10 = (2*10, 3*10, 4*10, 5*10) = (20, 30, 40, 50)
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x41A00000u);  // 20.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 1), 0x41F00000u);  // 30.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x42200000u);  // 40.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x42480000u);  // 50.0
+}
+
+// BFMLALT indexed with idx=7 (the maximum 3-bit index value) — exercises
+// the boundary of the H:L:M index field and the T-path Vn widen.  Vm.h[7]
+// is the single broadcasted BF16; all other Vm lanes are qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, BfmlaltIdxMaxIndex) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  // Vn odd lanes (T-active) carry 1.0, 2.0, 3.0, 4.0; evens pollute.
+  StoreBf16Lane(state_.cpu, 1, 1, 0x3F80);  // 1.0
+  StoreBf16Lane(state_.cpu, 1, 3, 0x4000);  // 2.0
+  StoreBf16Lane(state_.cpu, 1, 5, 0x4040);  // 3.0
+  StoreBf16Lane(state_.cpu, 1, 7, 0x4080);  // 4.0
+  StoreBf16Lane(state_.cpu, 1, 0, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 2, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 4, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 1, 6, 0x7FC0);
+  for (uint8_t i = 0; i < 7; i++) StoreBf16Lane(state_.cpu, 2, i, 0x7FC0);
+  StoreBf16Lane(state_.cpu, 2, 7, 0x4080);  // 4.0 (the broadcast m)
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = { BfmlalIdx(0, 1, 2, /*idx=*/7, /*t=*/true) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // lane i = Vn.h[2i+1] * 4 = (1*4, 2*4, 3*4, 4*4) = (4, 8, 12, 16)
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x40800000u);  // 4.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 1), 0x41000000u);  // 8.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x41400000u);  // 12.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x41800000u);  // 16.0
+}
+
+// BFMLALB indexed accumulates into Vd (read-modify-write).
+TEST_F(Arm64LiteTranslateRegionTest, BfmlalbIdxAccumulates) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = 0;
+  for (uint8_t i = 0; i < 4; i++) {
+    StoreBf16Lane(state_.cpu, 1, 2 * i, 0x4000);     // 2.0 even
+    StoreBf16Lane(state_.cpu, 1, 2 * i + 1, 0x7FC0); // qNaN odd
+  }
+  StoreBf16Lane(state_.cpu, 2, 1, 0x4040);  // Vm.h[1] = 3.0 (broadcast)
+  for (uint8_t i = 0; i < 8; i++) {
+    if (i != 1) StoreBf16Lane(state_.cpu, 2, i, 0x7FC0);
+  }
+  state_.cpu.v[0] = 0;
+  StoreFp32LaneBits(state_.cpu, 0, 0, 0x41200000);  // 10.0
+  StoreFp32LaneBits(state_.cpu, 0, 1, 0x41A00000);  // 20.0
+  StoreFp32LaneBits(state_.cpu, 0, 2, 0x41F00000);  // 30.0
+  StoreFp32LaneBits(state_.cpu, 0, 3, 0x42200000);  // 40.0
+  static const uint32_t code[] = { BfmlalIdx(0, 1, 2, /*idx=*/1, /*t=*/false) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Every lane += 2*3 = +6.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 0), 0x41800000u);  // 16.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 1), 0x41D00000u);  // 26.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x42100000u);  // 36.0
+  EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x42380000u);  // 46.0
+}
 // endregion
 
 // region digitalis - FP scalar unary

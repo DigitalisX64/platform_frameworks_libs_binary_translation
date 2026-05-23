@@ -2046,11 +2046,40 @@ class LiteTranslator {
   // (BFMLALB/BFMLALT).  Per-lane BF16-pair multiply-and-accumulate into
   // FP32 destination lanes.
   //
-  // JIT covers BFDOT vector + indexed (the two highest-frequency members
-  // of the family).  BFMMLA and BFMLAL{B,T} stay on the interpreter
-  // (`success_ = false`) until a follow-on cycle — their per-lane shapes
-  // are different enough that bundling them in one commit would inflate
-  // the diff past the per-cycle commit budget.
+  // JIT covers BFDOT (vector + indexed) and BFMLAL{B,T} (vector +
+  // indexed).  BFMMLA stays on the interpreter (`success_ = false`) — its
+  // 2x2 matrix-mul shape (each output lane sums 4 BF16-pair products from
+  // interleaved rows/columns) is enough larger that the per-cycle commit
+  // budget keeps it as a follow-on.
+  //
+  // BFMLAL{B,T} semantics (interpreter at `interpreter.h:1515`,1542):
+  //   off = (T ? 1 : 0)                         // B=even, T=odd
+  //   Vector: for i in [0..4):
+  //     Vd.s[i] += Bf16ToFloat(Vn.h[2i + off]) * Bf16ToFloat(Vm.h[2i + off])
+  //   Indexed: m = Bf16ToFloat(Vm.h[idx])  (single BF16, broadcast),
+  //     for i in [0..4):
+  //       Vd.s[i] += Bf16ToFloat(Vn.h[2i + off]) * m
+  //   Q is implicit 1 for BFMLAL (dest always .4s).
+  //
+  // BFMLAL{B,T} lowering: the BF16 we want lives at either the LOW half
+  // (B, off=0) or the HIGH half (T, off=1) of each FP32 lane of the source
+  // vector.  Bf16ToFloat(x) == (uint32_t(x) << 16) reinterpreted as FP32,
+  // so the lane's FP32 representation is "BF16 in the high 16 bits, zero
+  // in the low 16 bits".  Hence:
+  //   B: PSLLD $16        — lifts the low BF16 to the high half of each
+  //                          FP32 lane; low half becomes zero.
+  //   T: PSRLD $16 then PSLLD $16
+  //                      — equivalent to ANDing with 0xFFFF0000 per
+  //                          dword: zeros the low half while keeping the
+  //                          high BF16 in its existing high-half position.
+  // After the widen pass, MULPS pairs lanes and ADDPS accumulates into Vd.
+  // Indexed form broadcasts a single BF16 across all 4 lanes via
+  // PXOR + PINSRW (memory operand) + PSHUFD — the PINSRW into word slot 1
+  // places the BF16 directly in the high 16 bits of FP32 lane 0 (which
+  // already has zero in the low half from the PXOR), so no shift is
+  // needed before PSHUFD broadcasts that lane.  No B/T discriminator
+  // path is taken for indexed M because the index field already picks
+  // the exact BF16; off only affects the Vn widen.
   //
   // BFDOT semantics (interpreter at `interpreter.h:1487`):
   //   For each FP32 output lane i:
@@ -2095,16 +2124,78 @@ class LiteTranslator {
   void AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameArgs& args) {
     const bool is_bfdot = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdot ||
                            args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdotIdx);
-    if (!is_bfdot) {
-      // BFMMLA, BFMLALB/T vec+idx — interpreter fallback for now.
+    const bool is_bfmlal =
+        (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbVec ||
+         args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltVec ||
+         args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbIdx ||
+         args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
+    if (!is_bfdot && !is_bfmlal) {
+      // BFMMLA — interpreter fallback for now.
       success_ = false;
       return;
     }
-    const bool is_indexed = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdotIdx);
 
     const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (is_bfmlal) {
+      const bool is_bft =
+          (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltVec ||
+           args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
+      const bool is_indexed_mlal =
+          (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbIdx ||
+           args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      if (xmm_n == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_m = AllocTempSimdReg();
+      if (xmm_m == no_simd_register) { success_ = false; return; }
+
+      // Stage 1: widen Vn to FP32 across all 4 lanes.  For BFMLALB
+      // (off=0) the wanted BF16 sits in the LOW 16 of each FP32 lane —
+      // PSLLD $16 lifts it to the high half (zeroing the low).  For
+      // BFMLALT (off=1) the wanted BF16 is already in the HIGH 16 — we
+      // just need to clear the LOW 16, which is PSRLD $16 then PSLLD $16
+      // (effective AND with 0xFFFF0000 per dword).
+      as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+      if (is_bft) {
+        as_.Psrld(xmm_n, static_cast<int8_t>(16));
+      }
+      as_.Pslld(xmm_n, static_cast<int8_t>(16));
+
+      // Stage 2: prepare widened/broadcasted Vm operand.
+      if (is_indexed_mlal) {
+        // Indexed: load the single BF16 at Vm.h[idx] (byte offset 2*idx),
+        // place it directly into the high 16 of FP32 lane 0 via PINSRW
+        // (word slot 1).  Lane 0 then holds [0:16]=0, [16:32]=bf16 —
+        // exactly the FP32 representation of Bf16ToFloat(bf16).  PSHUFD
+        // imm=0 broadcasts that lane to all 4 lanes.
+        as_.Pxor(xmm_m, xmm_m);
+        as_.Pinsrw(xmm_m,
+                   {.base = Assembler::rbp, .disp = vm_off + 2 * args.index},
+                   int8_t{1});
+        as_.Pshufd(xmm_m, xmm_m, static_cast<int8_t>(0x00));
+      } else {
+        // Vector: mirror the Vn widen.
+        as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+        if (is_bft) {
+          as_.Psrld(xmm_m, static_cast<int8_t>(16));
+        }
+        as_.Pslld(xmm_m, static_cast<int8_t>(16));
+      }
+
+      // Stage 3: multiply lane-by-lane.
+      as_.Mulps(xmm_n, xmm_m);
+
+      // Stage 4: accumulate into Vd (Q implicit 1, always 4 FP32 lanes)
+      // and store 16 bytes.
+      as_.Addps(xmm_n, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n);
+      return;
+    }
+
+    const bool is_indexed = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdotIdx);
 
     SimdRegister xmm_n_lo = AllocTempSimdReg();
     if (xmm_n_lo == no_simd_register) { success_ = false; return; }
