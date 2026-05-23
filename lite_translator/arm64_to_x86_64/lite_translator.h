@@ -2040,15 +2040,328 @@ class LiteTranslator {
   // endregion
 
   // region digitalis
-  // AdvSIMD BFloat16 three-same-extra (BFDOT / BFMMLA): bail to the
-  // interpreter for now.  The host x86_64 baseline doesn't include
-  // AVX-512-BF16, so without runtime feature detection the JIT lowering
-  // would need its own BF16 widening sequence (SLLI $16 over a PSHUFD
-  // mask) — feasible but the interpreter path is the right starting
-  // point for correctness, and these instructions are rare per JIT
-  // region in the current sample suite.  JIT path is parked under
-  // "Implement" row 2.
-  void AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameArgs&) { success_ = false; }
+  // AdvSIMD BFloat16 three-same-extra (BFDOT / BFMMLA / BFMLAL{B,T}).
+  //
+  // Reference: ARM ARM C7.2.40 (BFDOT), C7.2.42 (BFMMLA), C7.2.39
+  // (BFMLALB/BFMLALT).  Per-lane BF16-pair multiply-and-accumulate into
+  // FP32 destination lanes.
+  //
+  // JIT covers BFDOT (vector + indexed) and BFMLAL{B,T} (vector +
+  // indexed).  BFMMLA stays on the interpreter (`success_ = false`) — its
+  // 2x2 matrix-mul shape (each output lane sums 4 BF16-pair products from
+  // interleaved rows/columns) is enough larger that the per-cycle commit
+  // budget keeps it as a follow-on.
+  //
+  // BFMLAL{B,T} semantics (interpreter at `interpreter.h:1515`,1542):
+  //   off = (T ? 1 : 0)                         // B=even, T=odd
+  //   Vector: for i in [0..4):
+  //     Vd.s[i] += Bf16ToFloat(Vn.h[2i + off]) * Bf16ToFloat(Vm.h[2i + off])
+  //   Indexed: m = Bf16ToFloat(Vm.h[idx])  (single BF16, broadcast),
+  //     for i in [0..4):
+  //       Vd.s[i] += Bf16ToFloat(Vn.h[2i + off]) * m
+  //   Q is implicit 1 for BFMLAL (dest always .4s).
+  //
+  // BFMLAL{B,T} lowering: the BF16 we want lives at either the LOW half
+  // (B, off=0) or the HIGH half (T, off=1) of each FP32 lane of the source
+  // vector.  Bf16ToFloat(x) == (uint32_t(x) << 16) reinterpreted as FP32,
+  // so the lane's FP32 representation is "BF16 in the high 16 bits, zero
+  // in the low 16 bits".  Hence:
+  //   B: PSLLD $16        — lifts the low BF16 to the high half of each
+  //                          FP32 lane; low half becomes zero.
+  //   T: PSRLD $16 then PSLLD $16
+  //                      — equivalent to ANDing with 0xFFFF0000 per
+  //                          dword: zeros the low half while keeping the
+  //                          high BF16 in its existing high-half position.
+  // After the widen pass, MULPS pairs lanes and ADDPS accumulates into Vd.
+  // Indexed form broadcasts a single BF16 across all 4 lanes via
+  // PXOR + PINSRW (memory operand) + PSHUFD — the PINSRW into word slot 1
+  // places the BF16 directly in the high 16 bits of FP32 lane 0 (which
+  // already has zero in the low half from the PXOR), so no shift is
+  // needed before PSHUFD broadcasts that lane.  No B/T discriminator
+  // path is taken for indexed M because the index field already picks
+  // the exact BF16; off only affects the Vn widen.
+  //
+  // BFDOT semantics (interpreter at `interpreter.h:1487`):
+  //   For each FP32 output lane i:
+  //     Vd.s[i] = Vd.s[i] + Bf16ToFloat(Vn.h[2i])   * Bf16ToFloat(Vm.h[2i])
+  //                       + Bf16ToFloat(Vn.h[2i+1]) * Bf16ToFloat(Vm.h[2i+1])
+  //   Q=0: 2 output lanes, upper 64 bits of Vd zeroed.
+  //   Q=1: 4 output lanes.
+  //   Indexed form (kBfdotIdx): Vm reads a single BF16 pair at index
+  //   args.index (0..3) and broadcasts it across all output lanes —
+  //   the m operand for every lane is (Vm.h[2*idx], Vm.h[2*idx+1]).
+  //
+  // SSE3/SSE4.1 lowering (no AVX-512-BF16 — host baseline lacks it):
+  //
+  //   1.  Widen BF16 to FP32 in-register.  Bf16ToFloat(x) is just
+  //       (uint32_t(x) << 16) reinterpreted as float, so the widen is
+  //       PMOVZXWD (4 BF16 -> 4 zero-extended dwords) followed by
+  //       PSLLD $16 (lifts the 16-bit value into the high half of each
+  //       dword = the FP32 representation of Bf16ToFloat).  Bit-exact
+  //       across normals, subnormals, zeros, infinities, and NaNs (the
+  //       BF16 NaN encoding maps 1:1 to an FP32 NaN with the same
+  //       quiet/signalling bit pattern in the high 16 bits).
+  //
+  //   2.  MULPS pairs the widened lanes: 4 FP32 products per half.
+  //
+  //   3.  HADDPS sums adjacent pairs.  For Q=1: HADDPS xmm_n_lo,
+  //       xmm_n_hi produces [p0+p1, p2+p3, p4+p5, p6+p7] — exactly the
+  //       4 output lanes.  For Q=0: HADDPS xmm_n_lo, zero produces
+  //       [p0+p1, p2+p3, 0, 0] — 2 valid lanes in the low 64.
+  //
+  //   4.  Accumulate into Vd via ADDPS.  Q=1 reads Vd as memory operand
+  //       and stores 16 bytes.  Q=0 reads only the low 8 bytes via MOVQ
+  //       (zero-extending the upper 64) so the 16-byte MOVDQU store
+  //       naturally zeros Vd's upper half per ARM AArch64 Q=0 layout.
+  //
+  // Indexed form: load a 32-bit dword from Vm at byte offset 4*idx
+  // (containing the BF16 pair Vm.h[2*idx] | Vm.h[2*idx+1]<<16); PSHUFD
+  // imm=0x00 broadcasts that dword across all 4 lanes; PMOVZXWD then
+  // sees [Vm.h[2*idx], Vm.h[2*idx+1], Vm.h[2*idx], Vm.h[2*idx+1]] as
+  // 4 BF16 lanes in the low 64; the widen produces the broadcasted
+  // m operand for every output lane.  Q=1 reuses the same xmm against
+  // both Vn halves.
+  void AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameArgs& args) {
+    const bool is_bfdot = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdot ||
+                           args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdotIdx);
+    const bool is_bfmlal =
+        (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbVec ||
+         args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltVec ||
+         args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbIdx ||
+         args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
+    const bool is_bfmmla =
+        (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmmla);
+    if (!is_bfdot && !is_bfmlal && !is_bfmmla) {
+      success_ = false;
+      return;
+    }
+
+    const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (is_bfmmla) {
+      // BFMMLA: 2x2 FP32 output matrix from 2x4 BF16 row inputs.
+      // Per ARM ARM C7.2.55 (and interpreter.h:1501):
+      //   for i, j in [0..2):
+      //     Vd.s[i*2 + j] += Σ_{k∈[0..4)} Bf16ToFloat(Vn.h[i*4 + k]) *
+      //                                   Bf16ToFloat(Vm.h[j*4 + k])
+      // Q is always 1 (decoder rejects Q=0).
+      //
+      // Output lane layout in Vd:
+      //   lane0 = (0,0) = Vn_row0 · Vm_row0   (h[0..3] · h[0..3])
+      //   lane1 = (0,1) = Vn_row0 · Vm_row1   (h[0..3] · h[4..7])
+      //   lane2 = (1,0) = Vn_row1 · Vm_row0   (h[4..7] · h[0..3])
+      //   lane3 = (1,1) = Vn_row1 · Vm_row1   (h[4..7] · h[4..7])
+      //
+      // SSE3 lowering (no AVX-512-BF16 dependency):
+      //   1. Widen each row to 4 FP32 via PMOVZXWD + PSLLD $16 — 4 temps.
+      //   2. Per row, compute two 4-FP32 product vectors via MULPS, then
+      //      collapse each to a scalar dot via two HADDPS rounds:
+      //        HADDPS prod_a, prod_b  -> [pair0_a, pair1_a, pair0_b, pair1_b]
+      //        HADDPS that, itself   -> [dot_a, dot_b, dot_a, dot_b]
+      //      The low 64 bits then hold (dot_a, dot_b).
+      //   3. MOVLHPS packs the row-1 low-64 (dot_10, dot_11) into the
+      //      high-64 of the row-0 register that already holds (dot_00,
+      //      dot_01), yielding [dot_00, dot_01, dot_10, dot_11] — the
+      //      exact Vd lane order required by the ARM ARM matrix layout.
+      //   4. ADDPS against Vd, MOVDQU store.
+      //
+      // Temp register budget: 5 SimdRegisters
+      //   (xmm_n0, xmm_n1, xmm_m0, xmm_m1, xmm_tmp).  AllocTempSimdReg
+      //   failure routes through success_=false (region-aware spill
+      //   fallback to interpreter).
+      SimdRegister xmm_n0 = AllocTempSimdReg();
+      if (xmm_n0 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_n1 = AllocTempSimdReg();
+      if (xmm_n1 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_m0 = AllocTempSimdReg();
+      if (xmm_m0 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_m1 = AllocTempSimdReg();
+      if (xmm_m1 == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_tmp = AllocTempSimdReg();
+      if (xmm_tmp == no_simd_register) { success_ = false; return; }
+
+      // Widen Vn into row 0 / row 1 FP32 vectors.
+      as_.Pmovzxwd(xmm_n0, {.base = Assembler::rbp, .disp = vn_off + 0});
+      as_.Pslld(xmm_n0, static_cast<int8_t>(16));
+      as_.Pmovzxwd(xmm_n1, {.base = Assembler::rbp, .disp = vn_off + 8});
+      as_.Pslld(xmm_n1, static_cast<int8_t>(16));
+
+      // Widen Vm into row 0 / row 1 FP32 vectors.
+      as_.Pmovzxwd(xmm_m0, {.base = Assembler::rbp, .disp = vm_off + 0});
+      as_.Pslld(xmm_m0, static_cast<int8_t>(16));
+      as_.Pmovzxwd(xmm_m1, {.base = Assembler::rbp, .disp = vm_off + 8});
+      as_.Pslld(xmm_m1, static_cast<int8_t>(16));
+
+      // Row 0 dot products: (0,0) and (0,1).
+      // xmm_tmp = xmm_n0 * xmm_m0 (preserving xmm_n0 for the (0,1) product).
+      as_.Movdqa(xmm_tmp, xmm_n0);
+      as_.Mulps(xmm_tmp, xmm_m0);
+      // xmm_n0 = xmm_n0 * xmm_m1 (xmm_n0 source no longer needed after this).
+      as_.Mulps(xmm_n0, xmm_m1);
+      // HADDPS xmm_tmp, xmm_n0 -> [pair0_00, pair1_00, pair0_01, pair1_01].
+      as_.Haddps(xmm_tmp, xmm_n0);
+      // HADDPS xmm_tmp, xmm_tmp -> [dot_00, dot_01, dot_00, dot_01].
+      as_.Haddps(xmm_tmp, xmm_tmp);
+      // Now xmm_tmp[63:0] = (dot_00, dot_01).
+
+      // Row 1 dot products: (1,0) and (1,1).  Reuse the now-free xmm_n0
+      // as scratch.
+      as_.Movdqa(xmm_n0, xmm_n1);
+      as_.Mulps(xmm_n0, xmm_m0);
+      as_.Mulps(xmm_n1, xmm_m1);
+      as_.Haddps(xmm_n0, xmm_n1);
+      as_.Haddps(xmm_n0, xmm_n0);
+      // Now xmm_n0[63:0] = (dot_10, dot_11).
+
+      // Pack the two row halves into one xmm: MOVLHPS xmm_tmp, xmm_n0
+      // copies xmm_n0[63:0] (= (dot_10, dot_11)) into xmm_tmp[127:64]
+      // while leaving xmm_tmp[63:0] (= (dot_00, dot_01)) untouched.
+      // Result: xmm_tmp = [dot_00, dot_01, dot_10, dot_11].
+      as_.Movlhps(xmm_tmp, xmm_n0);
+
+      // Accumulate into Vd and store all 16 bytes.
+      as_.Addps(xmm_tmp, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_tmp);
+      return;
+    }
+
+    if (is_bfmlal) {
+      const bool is_bft =
+          (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltVec ||
+           args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
+      const bool is_indexed_mlal =
+          (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlalbIdx ||
+           args.opcode == Decoder::Bf16ThreeSameOpcode::kBfmlaltIdx);
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      if (xmm_n == no_simd_register) { success_ = false; return; }
+      SimdRegister xmm_m = AllocTempSimdReg();
+      if (xmm_m == no_simd_register) { success_ = false; return; }
+
+      // Stage 1: widen Vn to FP32 across all 4 lanes.  For BFMLALB
+      // (off=0) the wanted BF16 sits in the LOW 16 of each FP32 lane —
+      // PSLLD $16 lifts it to the high half (zeroing the low).  For
+      // BFMLALT (off=1) the wanted BF16 is already in the HIGH 16 — we
+      // just need to clear the LOW 16, which is PSRLD $16 then PSLLD $16
+      // (effective AND with 0xFFFF0000 per dword).
+      as_.Movdqu(xmm_n, {.base = Assembler::rbp, .disp = vn_off});
+      if (is_bft) {
+        as_.Psrld(xmm_n, static_cast<int8_t>(16));
+      }
+      as_.Pslld(xmm_n, static_cast<int8_t>(16));
+
+      // Stage 2: prepare widened/broadcasted Vm operand.
+      if (is_indexed_mlal) {
+        // Indexed: load the single BF16 at Vm.h[idx] (byte offset 2*idx),
+        // place it directly into the high 16 of FP32 lane 0 via PINSRW
+        // (word slot 1).  Lane 0 then holds [0:16]=0, [16:32]=bf16 —
+        // exactly the FP32 representation of Bf16ToFloat(bf16).  PSHUFD
+        // imm=0 broadcasts that lane to all 4 lanes.
+        as_.Pxor(xmm_m, xmm_m);
+        as_.Pinsrw(xmm_m,
+                   {.base = Assembler::rbp, .disp = vm_off + 2 * args.index},
+                   int8_t{1});
+        as_.Pshufd(xmm_m, xmm_m, static_cast<int8_t>(0x00));
+      } else {
+        // Vector: mirror the Vn widen.
+        as_.Movdqu(xmm_m, {.base = Assembler::rbp, .disp = vm_off});
+        if (is_bft) {
+          as_.Psrld(xmm_m, static_cast<int8_t>(16));
+        }
+        as_.Pslld(xmm_m, static_cast<int8_t>(16));
+      }
+
+      // Stage 3: multiply lane-by-lane.
+      as_.Mulps(xmm_n, xmm_m);
+
+      // Stage 4: accumulate into Vd (Q implicit 1, always 4 FP32 lanes)
+      // and store 16 bytes.
+      as_.Addps(xmm_n, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n);
+      return;
+    }
+
+    const bool is_indexed = (args.opcode == Decoder::Bf16ThreeSameOpcode::kBfdotIdx);
+
+    SimdRegister xmm_n_lo = AllocTempSimdReg();
+    if (xmm_n_lo == no_simd_register) { success_ = false; return; }
+    SimdRegister xmm_m_lo = AllocTempSimdReg();
+    if (xmm_m_lo == no_simd_register) { success_ = false; return; }
+
+    SimdRegister xmm_n_hi = no_simd_register;
+    SimdRegister xmm_m_hi = no_simd_register;
+    if (args.q) {
+      xmm_n_hi = AllocTempSimdReg();
+      if (xmm_n_hi == no_simd_register) { success_ = false; return; }
+      if (!is_indexed) {
+        xmm_m_hi = AllocTempSimdReg();
+        if (xmm_m_hi == no_simd_register) { success_ = false; return; }
+      }
+    }
+
+    // Stage 1: widen Vm to FP32.
+    if (is_indexed) {
+      // Load the 32-bit BF16 pair at byte offset 4*idx; broadcast it
+      // across all 4 dword lanes; widen low 4 BF16 words to FP32.
+      as_.Movd(xmm_m_lo, {.base = Assembler::rbp,
+                          .disp = vm_off + 4 * args.index});
+      as_.Pshufd(xmm_m_lo, xmm_m_lo, static_cast<int8_t>(0x00));
+      as_.Pmovzxwd(xmm_m_lo, xmm_m_lo);
+      as_.Pslld(xmm_m_lo, static_cast<int8_t>(16));
+    } else {
+      // Vector form: widen low 4 BF16 of Vm.
+      as_.Pmovzxwd(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
+      as_.Pslld(xmm_m_lo, static_cast<int8_t>(16));
+      if (args.q) {
+        as_.Pmovzxwd(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
+        as_.Pslld(xmm_m_hi, static_cast<int8_t>(16));
+      }
+    }
+
+    // Stage 2: widen Vn to FP32.
+    as_.Pmovzxwd(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
+    as_.Pslld(xmm_n_lo, static_cast<int8_t>(16));
+    if (args.q) {
+      as_.Pmovzxwd(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+      as_.Pslld(xmm_n_hi, static_cast<int8_t>(16));
+    }
+
+    // Stage 3: pair multiply.
+    as_.Mulps(xmm_n_lo, xmm_m_lo);
+    if (args.q) {
+      // Vector form pairs with xmm_m_hi; indexed reuses xmm_m_lo
+      // (broadcasted m pair is identical for both Vn halves).
+      as_.Mulps(xmm_n_hi, is_indexed ? xmm_m_lo : xmm_m_hi);
+    }
+
+    // Stage 4: horizontal-add adjacent FP32 pairs into output lanes.
+    if (args.q) {
+      // [p0+p1, p2+p3, p4+p5, p6+p7] — the 4 BFDOT output lanes.
+      as_.Haddps(xmm_n_lo, xmm_n_hi);
+    } else {
+      // Q=0: only 2 output lanes; HADDPS against zero clears the
+      // upper 64 bits of the result so the MOVQ-then-MOVDQU path
+      // below naturally writes zero into Vd's upper half.
+      as_.Pxor(xmm_m_lo, xmm_m_lo);
+      as_.Haddps(xmm_n_lo, xmm_m_lo);
+    }
+
+    // Stage 5: accumulate into Vd and store 16 bytes.
+    if (args.q) {
+      as_.Addps(xmm_n_lo, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n_lo);
+    } else {
+      // Read Vd's low 8 bytes (low 2 FP32 lanes) zero-extended into
+      // xmm_m_lo, ADDPS in place (upper 64 of xmm_n_lo is already 0
+      // from HADDPS-vs-zero), MOVDQU 16 bytes so Vd's upper half lands
+      // as zero per ARM AArch64 Q=0 layout.
+      as_.Movq(xmm_m_lo, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Addps(xmm_n_lo, xmm_m_lo);
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n_lo);
+    }
+  }
   // endregion
 
   // region digitalis SDOT/UDOT JIT (handoff-71)
@@ -7998,6 +8311,72 @@ class LiteTranslator {
       return;
     }
 
+    // region digitalis - BFCVT Hd, Sn (single -> BF16) (§H2).
+    //
+    // Encoding: ftype=01 (D-form discriminant), opcode=0b000110.  The
+    // source register is read as FP32 (Sn) despite ftype=01 — the
+    // discriminant is purely an opcode-namespace selector, not a "source
+    // is double" hint.  Mirrors interpreter handling at
+    // `interpreter.h:4934` and the FloatToBf16 helper at
+    // `interpreter.h:1330`.
+    //
+    // Algorithm:
+    //   bits = src as uint32_t                  ; raw FP32 bits
+    //   if (exp == 0xFF && mant != 0):
+    //     out = (bits >> 16) | 0x0040           ; quiet NaN with payload top
+    //   else:
+    //     lsb = (bits >> 16) & 1                ; tie-to-even bias
+    //     out = (bits + 0x7FFF + lsb) >> 16     ; RTNE narrow
+    //   Vd = 0; low 16 bits of Vd = out
+    //
+    // ±Inf and ±0 pass through structurally identical (RTNE on Inf:
+    // exp=0xFF mant=0, the +0x7FFF+lsb doesn't carry into the exponent;
+    // top-16 still encodes the same Inf).  No AVX-512-BF16 dependency.
+    if (args.opcode == 0b000110 && is_double) {
+      SimdRegister xmm_zero = AllocTempSimdReg();
+      if (xmm_zero == no_simd_register) { Undefined(); return; }
+      Register bits = AllocTempReg();
+      Register tmp = AllocTempReg();
+      Register lsb = AllocTempReg();
+
+      as_.Movl(bits, {.base = Assembler::rbp, .disp = src_offset});
+
+      Assembler::Label* nan_label = as_.MakeLabel();
+      Assembler::Label* done_label = as_.MakeLabel();
+      Assembler::Label* rtne_label = as_.MakeLabel();
+
+      // NaN check: exponent == 0xFF AND mantissa != 0.
+      as_.Movl(tmp, bits);
+      as_.Andl(tmp, int32_t{0x7F800000});
+      as_.Cmpl(tmp, int32_t{0x7F800000});
+      as_.Jcc(Assembler::Condition::kNotEqual, *rtne_label);
+      as_.Movl(tmp, bits);
+      as_.Andl(tmp, int32_t{0x007FFFFF});
+      as_.Jcc(Assembler::Condition::kNotZero, *nan_label);
+
+      // Fall through (±Inf): treat as RTNE.  Top 16 bits are the BF16.
+      as_.Bind(rtne_label);
+      as_.Movl(lsb, bits);
+      as_.Shrl(lsb, int8_t{16});
+      as_.Andl(lsb, int32_t{1});
+      as_.Addl(lsb, int32_t{0x7FFF});
+      as_.Addl(bits, lsb);
+      as_.Shrl(bits, int8_t{16});
+      as_.Jmp(*done_label);
+
+      // NaN fixup: quiet by setting top bit of BF16 mantissa.
+      as_.Bind(nan_label);
+      as_.Shrl(bits, int8_t{16});
+      as_.Orl(bits, int32_t{0x0040});
+
+      as_.Bind(done_label);
+      as_.Pxor(xmm_zero, xmm_zero);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+      as_.Movw({.base = Assembler::rbp, .disp = dst_offset}, bits);
+      return;
+    }
+    // endregion
+
     // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
     int8_t round_imm = 0;
     bool is_sqrt = false;
@@ -10477,6 +10856,108 @@ class LiteTranslator {
             return;
         }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
+      // region digitalis - BFCVTN / BFCVTN2 (vector narrow FP32 -> BF16) (§H2).
+      //
+      // Q=0 BFCVTN  v.4h, v.4s:  writes 4 BF16 lanes into Vd.h[0..3], upper 64 bits zeroed.
+      // Q=1 BFCVTN2 v.8h, v.4s:  writes 4 BF16 lanes into Vd.h[4..7], lower 64 bits preserved.
+      // Decoder pins size=10 (FP32 source).  Matches interpreter at
+      // `interpreter.h:7240` and the FloatToBf16 helper at `interpreter.h:1330`.
+      //
+      // Per-lane algorithm (4 FP32 lanes in parallel via SSE):
+      //   bits = src as uint32_t
+      //   if (exp == 0xFF && mant != 0):
+      //     out = (bits >> 16) | 0x0040           ; quieted NaN
+      //   else:
+      //     lsb = (bits >> 16) & 1                ; RTNE tie bias
+      //     out = (bits + 0x7FFF + lsb) >> 16     ; round-to-nearest-even narrow
+      // ±0 and ±Inf pass through the RTNE path unchanged (the +0x7FFF+lsb cannot
+      // carry from mantissa into exponent when mantissa is 0).
+      //
+      // Constants are synthesized via PCMPEQD + shifts (no rodata).
+      // No AVX-512-BF16 dependency.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kBfcvtn: {
+        if (args.size != 0b10) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xnan_val = AllocTempSimdReg();
+        SimdRegister xtmp = AllocTempSimdReg();
+        SimdRegister xconst = AllocTempSimdReg();
+        SimdRegister xexp = AllocTempSimdReg();
+        if (xn == no_simd_register || xnan_val == no_simd_register ||
+            xtmp == no_simd_register || xconst == no_simd_register ||
+            xexp == no_simd_register) {
+          success_ = false;
+          return;
+        }
+
+        // Load 4 FP32 lanes.
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+
+        // xnan_val = (n >> 16) | 0x0040 per lane.
+        as_.Movdqa(xnan_val, xn);
+        as_.Psrld(xnan_val, int8_t{16});
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{31});            // 0x00000001 per lane (kept for reuse).
+        as_.Movdqa(xtmp, xconst);
+        as_.Pslld(xtmp, int8_t{6});               // 0x00000040 per lane.
+        as_.Por(xnan_val, xtmp);
+
+        // xtmp = ((n >> 16) & 1) + 0x7FFF per lane (the RTNE bias).
+        as_.Movdqa(xtmp, xn);
+        as_.Psrld(xtmp, int8_t{16});
+        as_.Pand(xtmp, xconst);                   // lsb = (n >> 16) & 1.
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{17});            // 0x00007FFF per lane.
+        as_.Paddd(xtmp, xconst);                  // lsb + 0x7FFF.
+
+        // xn = (n + bias) >> 16 = rounded BF16 in low 16 bits of each lane.
+        as_.Paddd(xn, xtmp);
+        as_.Psrld(xn, int8_t{16});
+
+        // xexp = nan_mask = (exp == 0xFF) & (mant != 0).
+        // Reload original n into xtmp (we mutated xn into rounded).
+        as_.Movdqu(xtmp, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{24});            // 0x000000FF per lane.
+        as_.Pslld(xconst, int8_t{23});            // 0x7F800000 per lane.
+        as_.Movdqa(xexp, xtmp);
+        as_.Pand(xexp, xconst);                   // n & 0x7F800000.
+        as_.Pcmpeqd(xexp, xconst);                // exp == 0xFF per lane (mask).
+        // mant != 0 -> ones per lane in xtmp.
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{9});             // 0x007FFFFF per lane.
+        as_.Pand(xtmp, xconst);                   // mant.
+        as_.Pxor(xconst, xconst);
+        as_.Pcmpeqd(xtmp, xconst);                // mant == 0 mask.
+        as_.Pcmpeqd(xconst, xconst);              // all-ones.
+        as_.Pxor(xtmp, xconst);                   // mant != 0.
+        as_.Pand(xexp, xtmp);                     // nan_mask = exp_max & mant_nz.
+
+        // Blend: out = (nan_mask & nan_val) | (~nan_mask & rounded).
+        as_.Pand(xnan_val, xexp);                 // nan_val & nan_mask.
+        as_.Movdqa(xtmp, xexp);
+        as_.Pandn(xtmp, xn);                      // ~nan_mask & rounded.
+        as_.Por(xnan_val, xtmp);                  // final 4 dwords (low 16 of each).
+
+        // Narrow 4 dwords -> 4 words: PACKUSDW duplicates result to high 64.
+        as_.Packusdw(xnan_val, xnan_val);
+
+        if (!args.q) {
+          // BFCVTN: zero the upper 64 bits before writing Vd.
+          as_.Pslldq(xnan_val, int8_t{8});
+          as_.Psrldq(xnan_val, int8_t{8});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xnan_val);
+        } else {
+          // BFCVTN2: write packed result into upper 64 of Vd, preserving lower 64.
+          as_.Movdqu(xtmp, {.base = Assembler::rbp, .disp = vd_off});
+          as_.Pslldq(xtmp, int8_t{8});
+          as_.Psrldq(xtmp, int8_t{8});            // keep low 64 of Vd, zero high 64.
+          as_.Pslldq(xnan_val, int8_t{8});        // move packed bytes to high 64.
+          as_.Por(xnan_val, xtmp);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xnan_val);
+        }
         return;
       }
       // endregion
