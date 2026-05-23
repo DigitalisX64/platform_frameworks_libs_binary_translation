@@ -7534,7 +7534,14 @@ class Interpreter {
     uint8_t rshift = (2 * bits) - ((immh << 3) | args.immb);  // for right shifts: shift = 2*esize*8 - (immh:immb)
 
     uint8_t vec_len = args.q ? 16 : 8;
-    uint8_t num_elements = vec_len / esize;
+    // region digitalis
+    // Scalar shift-by-immediate (DecodeAdvSimdScalarShiftByImm) sets
+    // args.scalar=true to force single-lane semantics regardless of
+    // esize.  For B/H/S esize this overrides the vector lane count
+    // (16/8/4/2/1) → 1, so only the lowest element is read/written;
+    // the zero-initialised result keeps Vd[127:esize] = 0 per ARM ARM.
+    // endregion
+    uint8_t num_elements = args.scalar ? 1 : (vec_len / esize);
     uint64_t emask = ElementMask(esize);
 
     switch (args.opcode) {

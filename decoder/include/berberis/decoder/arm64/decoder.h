@@ -1617,6 +1617,13 @@ class Decoder {
     uint8_t immb;     // immb field (bits[18:16])
     bool q;           // Q bit
     bool u;           // U bit
+    // region digitalis
+    // Scalar shift-by-immediate dispatch sets this; vector dispatch leaves
+    // it false.  When set, the consumer must process exactly one element
+    // regardless of esize (overrides num_elements = vec_len / esize), and
+    // must zero the upper 64 bits of Vd to match ARM ARM scalar semantics.
+    // endregion
+    bool scalar = false;
   };
   // endregion
 
@@ -6067,29 +6074,36 @@ class Decoder {
     // defensive double-check.
     if (immh == 0) { Undefined(); return; }
 
-    // All currently dispatched scalar shift-by-imm ops are D-form
-    // (immh=1xxx).  Reject non-D immh values up front so SIGILL fires
-    // for the unimplemented B/H/S saturating-shift, narrow-shift, and
-    // fixed-point-conversion scalar variants rather than silently
-    // producing wrong-lane-count results from the vector interpreter.
-    if (!(immh & 0b1000)) { Undefined(); return; }
-
     AdvSimdShiftImmOpcode op;
 
+    // Per ARM ARM C4.1.6.10 the "simple" shifts (SSHR / USHR / SSRA /
+    // USRA / SRSHR / URSHR / SRSRA / URSRA / SHL / SLI / SRI) are
+    // spec'd as scalar D-only — their B/H/S encodings are unallocated.
+    // Reject non-D immh for these to fire SIGILL on bogus encodings
+    // rather than silently producing wrong results.
+    //
+    // The saturating shifts (SQSHL / UQSHL / SQSHLU) accept B/H/S/D
+    // scalar — gate them on immh!=0 (any element size) so all four
+    // widths dispatch.
     switch (opcode) {
       case 0b00000:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUshr : AdvSimdShiftImmOpcode::kSshr;
         break;
       case 0b00010:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUsra : AdvSimdShiftImmOpcode::kSsra;
         break;
       case 0b00100:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUrshr : AdvSimdShiftImmOpcode::kSrshr;
         break;
       case 0b00110:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kUrsra : AdvSimdShiftImmOpcode::kSrsra;
         break;
       case 0b01000:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         if (u) {
           op = AdvSimdShiftImmOpcode::kSri;
         } else {
@@ -6097,9 +6111,11 @@ class Decoder {
         }
         break;
       case 0b01010:
+        if (!(immh & 0b1000)) { Undefined(); return; }
         op = u ? AdvSimdShiftImmOpcode::kSli : AdvSimdShiftImmOpcode::kShl;
         break;
       case 0b01100:
+        // SQSHLU: scalar B/H/S/D — accept any non-zero immh.
         if (u) {
           op = AdvSimdShiftImmOpcode::kSqshlu;
         } else {
@@ -6107,6 +6123,7 @@ class Decoder {
         }
         break;
       case 0b01110:
+        // SQSHL/UQSHL: scalar B/H/S/D — accept any non-zero immh.
         op = u ? AdvSimdShiftImmOpcode::kUqshl : AdvSimdShiftImmOpcode::kSqshl;
         break;
       default:
@@ -6114,11 +6131,12 @@ class Decoder {
         return;
     }
 
-    // q=false ⇒ vec_len=8 ⇒ num_elements = 8/8 = 1 for D-form ⇒ the
-    // existing AdvSimdShiftByImm interpreter executes a single-lane
-    // shift, exactly matching the ARM ARM scalar semantics.  The
-    // upper 64 bits of Vd are zeroed by the consumer's full-128-bit
-    // writeback because `result` is initialised to 0 before the loop.
+    // scalar=true forces the consumer to process exactly one element
+    // regardless of esize, matching ARM ARM scalar semantics:
+    //   Vd[esize-1:0] = op(Vn[esize-1:0]); Vd[127:esize] = 0.
+    // q=false is preserved for downstream code that hasn't yet been
+    // updated to honour the scalar flag; setting both keeps lane
+    // counts conservative (≤2 lanes for the legacy code paths).
     const AdvSimdShiftImmArgs args = {
         .opcode = op,
         .rd = rd,
@@ -6127,6 +6145,7 @@ class Decoder {
         .immb = immb,
         .q = false,
         .u = u,
+        .scalar = true,
     };
     insn_consumer_->AdvSimdShiftByImm(args);
   }
