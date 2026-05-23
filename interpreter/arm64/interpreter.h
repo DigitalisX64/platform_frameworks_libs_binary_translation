@@ -1998,6 +1998,68 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - signed saturating doubling multiply-subtract
+      // long: Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2*sn*sm)).
+      // Same two-stage saturation as SQDMLAL with sign flipped on the
+      // second-stage accumulate. Stage 1 is identical to SQDMULL/SQDMLAL;
+      // since the SQDMULL output range is [INT_MIN_out+1, INT_MAX_out]
+      // (never reaches INT_MIN_out exactly), negating `addend` is safe
+      // without a separate clamp.
+      // For out_esize=4 (in=16), int64_t has 32-bit headroom for both
+      // operands and the difference, so a plain int64_t subtract +
+      // compare suffices. For out_esize=8 (in=32), the difference can
+      // overflow int64_t; use unsigned wrap + signed-overflow detection
+      // (different-sign operands, result sign matches the subtrahend).
+      case Decoder::AdvSimdThreeDiffOpcode::kSqdmlsl: {
+        int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+        int64_t int_max_out =
+            (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+        int64_t int_min_out =
+            (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
+        for (uint8_t i = 0; i < num_elements; i++) {
+          int64_t sn = get_signed(src_n, i);
+          int64_t sm = get_signed(src_m, i);
+          int64_t addend;
+          if (sn == int_min_in && sm == int_min_in) {
+            addend = int_max_out;
+          } else {
+            addend = 2 * sn * sm;
+          }
+          // Sign-extend the existing accumulator lane to int64_t.
+          uint64_t acc_raw = get_accum(i);
+          int64_t acc;
+          if (out_esize == 8) {
+            acc = static_cast<int64_t>(acc_raw);
+          } else {
+            uint8_t shift = (8 - out_esize) * 8;
+            acc = static_cast<int64_t>(acc_raw << shift) >> shift;
+          }
+          int64_t diff;
+          if (out_esize == 8) {
+            uint64_t udiff = static_cast<uint64_t>(acc) - static_cast<uint64_t>(addend);
+            diff = static_cast<int64_t>(udiff);
+            // Signed subtraction overflows when the operands have
+            // different signs and the result's sign matches the
+            // subtrahend's sign.
+            bool a_neg = acc < 0;
+            bool b_neg = addend < 0;
+            bool d_neg = diff < 0;
+            if (a_neg != b_neg && d_neg == b_neg) {
+              diff = a_neg ? int_min_out : int_max_out;
+            }
+          } else {
+            diff = acc - addend;
+            if (diff > int_max_out) {
+              diff = int_max_out;
+            } else if (diff < int_min_out) {
+              diff = int_min_out;
+            }
+          }
+          set_result(i, static_cast<uint64_t>(diff));
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;
