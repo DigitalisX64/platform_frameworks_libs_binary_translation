@@ -5401,16 +5401,24 @@ class Decoder {
           op = AdvSimdShiftImmOpcode::kShl;
         }
         break;
+      // region digitalis: AdvSIMD saturating shift left (immediate) — verified
+      // against llvm-mc output for `sqshl`, `uqshl`, and `sqshlu` (the prior
+      // dispatch swapped 0b01100 and 0b01110, sending real-world UQSHL to
+      // the SQSHLU handler and SQSHLU to the UQSHL handler). The ARMv8 ARM
+      // assigns opcode 0b01110 to SQSHL (U=0) / UQSHL (U=1), and 0b01100 to
+      // SQSHLU (U=1; U=0 is reserved).
       case 0b01110:
+        op = u ? AdvSimdShiftImmOpcode::kUqshl : AdvSimdShiftImmOpcode::kSqshl;
+        break;
+      case 0b01100:
         if (u) {
           op = AdvSimdShiftImmOpcode::kSqshlu;
         } else {
-          op = AdvSimdShiftImmOpcode::kSqshl;
+          Undefined();
+          return;
         }
         break;
-      case 0b01100:
-        op = u ? AdvSimdShiftImmOpcode::kUqshl : AdvSimdShiftImmOpcode::kSqshl;
-        break;
+      // endregion
       case 0b10000:
         if (!u) {
           op = AdvSimdShiftImmOpcode::kShrn;
