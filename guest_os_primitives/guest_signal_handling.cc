@@ -270,21 +270,49 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
       // Translated code should be arranged to continue till
       // the next pending signals check unless it's fatal.
       if (IsPendingSignalWithoutRecoveryCodeFatal(info)) {
-        // region digitalis - log nested no-recovery fatals
-        if (depth > 1 && thread) {
+        // region digitalis - log fatal no-recovery host signals to logcat.
+        // Promoted from TRACE-only (visible only when berberis.tracing is set)
+        // to __android_log_print so the diagnostic is captured unconditionally.
+        // The FB Katana / breakpad-style second-SEGV path enters this branch
+        // when the inner host fault has no Berberis recovery entry. Without
+        // the guest CPU dump here, the second-fault's host PC + guest state
+        // remain unknown — exactly the gap the handoff-235 forensics lead
+        // flagged. Fires for both depth==1 (first fatal) and depth>1 (nested).
+        if (thread) {
           auto& cpu = thread->state()->cpu;
-          TRACE(
-              "NESTED host signal NO-RECOVERY: depth=%d sig=%d host_pc=0x%lx "
-              "fault_addr=%p si_code=%d guest_insn_addr=0x%lx guest_sp=0x%lx "
-              "guest_x30=0x%lx",
-              depth,
-              sig,
-              (unsigned long)addr,
-              info->si_addr,
-              info->si_code,
-              (unsigned long)cpu.insn_addr,
-              (unsigned long)cpu.sp,
-              (unsigned long)cpu.x[30]);
+          __android_log_print(ANDROID_LOG_ERROR, "berberis",
+              "FATAL host signal NO-RECOVERY: depth=%d sig=%d host_pc=0x%lx "
+              "fault_addr=%p si_code=%d guest_insn_addr=0x%lx",
+              depth, sig, (unsigned long)addr,
+              info->si_addr, info->si_code,
+              (unsigned long)cpu.insn_addr);
+          __android_log_print(ANDROID_LOG_ERROR, "berberis",
+              "  x0=0x%lx x1=0x%lx x2=0x%lx x3=0x%lx x4=0x%lx x5=0x%lx "
+              "x6=0x%lx x7=0x%lx",
+              (unsigned long)cpu.x[0], (unsigned long)cpu.x[1],
+              (unsigned long)cpu.x[2], (unsigned long)cpu.x[3],
+              (unsigned long)cpu.x[4], (unsigned long)cpu.x[5],
+              (unsigned long)cpu.x[6], (unsigned long)cpu.x[7]);
+          __android_log_print(ANDROID_LOG_ERROR, "berberis",
+              "  x16=0x%lx x17=0x%lx x18=0x%lx x19=0x%lx x20=0x%lx x21=0x%lx "
+              "x22=0x%lx x23=0x%lx",
+              (unsigned long)cpu.x[16], (unsigned long)cpu.x[17],
+              (unsigned long)cpu.x[18], (unsigned long)cpu.x[19],
+              (unsigned long)cpu.x[20], (unsigned long)cpu.x[21],
+              (unsigned long)cpu.x[22], (unsigned long)cpu.x[23]);
+          __android_log_print(ANDROID_LOG_ERROR, "berberis",
+              "  x24=0x%lx x25=0x%lx x26=0x%lx x27=0x%lx x28=0x%lx "
+              "x29(fp)=0x%lx x30(lr)=0x%lx sp=0x%lx",
+              (unsigned long)cpu.x[24], (unsigned long)cpu.x[25],
+              (unsigned long)cpu.x[26], (unsigned long)cpu.x[27],
+              (unsigned long)cpu.x[28], (unsigned long)cpu.x[29],
+              (unsigned long)cpu.x[30], (unsigned long)cpu.sp);
+        } else {
+          __android_log_print(ANDROID_LOG_ERROR, "berberis",
+              "FATAL host signal NO-RECOVERY (no guest thread): depth=%d "
+              "sig=%d host_pc=0x%lx fault_addr=%p si_code=%d",
+              depth, sig, (unsigned long)addr,
+              info->si_addr, info->si_code);
         }
         // endregion
         HandleFatalSignal(sig, info, context);

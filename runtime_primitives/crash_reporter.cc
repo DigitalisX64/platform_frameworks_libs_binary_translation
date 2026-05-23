@@ -21,6 +21,13 @@
 
 #include <csignal>
 
+// region digitalis - logcat dump on entry to HandleFatalSignal
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <ucontext.h>
+#endif
+// endregion
+
 #include "berberis/base/gettid.h"
 #include "berberis/base/tracing.h"
 #include "berberis/instrument/crash.h"
@@ -35,6 +42,31 @@ struct sigaction g_orig_action[NSIG];
 
 void HandleFatalSignal(int sig, siginfo_t* info, void* context) {
   TRACE("Fatal signal %d", sig);
+
+  // region digitalis - unconditional logcat dump of host signal frame so the
+  // FB Katana / breakpad-style second-SEGV path produces a visible diagnostic
+  // even when berberis.tracing is not enabled. The guest CPU dump (cpu.x[]
+  // / cpu.insn_addr) lives in guest_signal_handling.cc since runtime_primitives
+  // sits below guest_os_primitives in the link layering. Here we emit only
+  // what is available from siginfo_t + ucontext_t (host signal frame).
+#if defined(__ANDROID__)
+  {
+    auto* uc = static_cast<ucontext_t*>(context);
+    unsigned long host_rip =
+        uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RIP]) : 0;
+    unsigned long host_rsp =
+        uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RSP]) : 0;
+    unsigned long host_rbp =
+        uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RBP]) : 0;
+    __android_log_print(
+        ANDROID_LOG_ERROR, "berberis",
+        "HandleFatalSignal: sig=%d si_addr=%p si_code=%d host_rip=0x%lx "
+        "host_rsp=0x%lx host_rbp=0x%lx",
+        sig, info ? info->si_addr : nullptr, info ? info->si_code : 0,
+        host_rip, host_rsp, host_rbp);
+  }
+#endif
+  // endregion
 
   OnCrash(sig, info, context);
 
