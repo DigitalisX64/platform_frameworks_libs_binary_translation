@@ -1467,6 +1467,22 @@ class Decoder {
               // Reciprocal sqrt step: (3.0 - a*b)/2 with (0*inf) -> +1.5
               // saturation. FP16 scalar variant: a=1, U=0, opcode_3=111.
     // endregion
+    // region digitalis - scalar saturating add/sub (B/H/S/D).
+    //   size=00 -> B,  01 -> H,  10 -> S,  11 -> D.
+    //   Unlike the rest of the integer scalar three-same family which is
+    //   D-form only, opcodes 00001 (SQADD/UQADD) and 00011 (SQSUB/UQSUB)
+    //   carry args.size = {00, 01, 10, 11}; the interpreter expands esize
+    //   accordingly and applies the per-width saturating bounds.  Encoding
+    //   reference (ARM ARM C7.2.282 / .284 / .317 / .319):
+    //     SQADD <V>d, <V>n, <V>m  = 01 0 11110 size 1 Rm 0 0001 1 Rn Rd
+    //     UQADD <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 0 0001 1 Rn Rd
+    //     SQSUB <V>d, <V>n, <V>m  = 01 0 11110 size 1 Rm 0 0011 1 Rn Rd
+    //     UQSUB <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 0 0011 1 Rn Rd
+    kSqaddScalar,
+    kUqaddScalar,
+    kSqsubScalar,
+    kUqsubScalar,
+    // endregion
   };
 
   struct AdvSimdScalarThreeSameArgs {
@@ -5127,10 +5143,32 @@ class Decoder {
       }
       out_size = sz;
     } else {
-      // Integer scalar three same — D-form only.
-      if (size != 0b11) { Undefined(); return; }
+      // Integer scalar three same.
+      //
+      // Most integer scalar three-same opcodes are D-form only.  The
+      // saturating add/sub family (opcodes 00001 and 00011) supports
+      // all four lane widths (B/H/S/D) — they're commonly used as
+      // single-lane fast paths for DSP saturation.  See ARM ARM
+      // C7.2.282 / .284 (SQADD / SQSUB) and C7.2.317 / .319 (UQADD /
+      // UQSUB).
+      // region digitalis: opcodes 00001 / 00011 are B/H/S/D-capable.
+      const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00011);
+      if (!all_sizes && size != 0b11) { Undefined(); return; }
+      // endregion
 
       switch (opcode) {
+        // region digitalis: SQADD / UQADD scalar (B/H/S/D).
+        case 0b00001:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqaddScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqaddScalar;
+          break;
+        // endregion
+        // region digitalis: SQSUB / UQSUB scalar (B/H/S/D).
+        case 0b00011:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqsubScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqsubScalar;
+          break;
+        // endregion
         case 0b00110:
           op = u ? AdvSimdScalarThreeSameOpcode::kCmhi
                  : AdvSimdScalarThreeSameOpcode::kCmgt;

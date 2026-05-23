@@ -5664,6 +5664,87 @@ class Interpreter {
         break;
     }
 
+    // region digitalis: scalar saturating add/sub (B/H/S/D).
+    //
+    // SQADD / UQADD / SQSUB / UQSUB scalar operate on a single lane of
+    // width 8 / 16 / 32 / 64 bits selected by args.size, not just D-form.
+    // ARM ARM C7.2.282 / .284 / .317 / .319.  The output is the saturated
+    // result placed in the low `esize` bytes of Vd; upper bits are zero
+    // (matches the routine's `result = 0` initialization pattern used by
+    // the surrounding FP path).
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqaddScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqaddScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 1, 2, 4, 8
+        const uint8_t bits_local = esize * 8;
+        const uint64_t mask =
+            (bits_local == 64) ? ~uint64_t{0}
+                               : ((uint64_t{1} << bits_local) - 1);
+        uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]) & mask;
+        uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]) & mask;
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqaddScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar);
+        const bool is_sub =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar);
+        uint64_t r;
+        if (is_signed) {
+          // Sign-extend a and b from `bits_local` bits to 64 bits.
+          const int shift = 64 - bits_local;
+          int64_t sa = static_cast<int64_t>(a << shift) >> shift;
+          int64_t sb = static_cast<int64_t>(b << shift) >> shift;
+          const int64_t smax = (bits_local == 64)
+                                   ? INT64_MAX
+                                   : ((int64_t{1} << (bits_local - 1)) - 1);
+          const int64_t smin = (bits_local == 64)
+                                   ? INT64_MIN
+                                   : -(int64_t{1} << (bits_local - 1));
+          int64_t res;
+          if (!is_sub) {
+            // SQADD.  Mirrors the vector path's lambda (lines 4330-4345)
+            // — the int64 overflow checks at bits_local=64 still hold
+            // because two signed adds can only overflow toward INT64_MIN
+            // or INT64_MAX, both of which the smax/smin clamps catch.
+            int64_t sum = static_cast<int64_t>(
+                static_cast<uint64_t>(sa) + static_cast<uint64_t>(sb));
+            if (sb > 0 && sum < sa) res = smax;
+            else if (sb < 0 && sum > sa) res = smin;
+            else if (sum > smax) res = smax;
+            else if (sum < smin) res = smin;
+            else res = sum;
+          } else {
+            // SQSUB.  Same logic as the vector path's lambda (lines
+            // 4355-4370): sa - sb saturates to the per-width signed range.
+            int64_t diff = static_cast<int64_t>(
+                static_cast<uint64_t>(sa) - static_cast<uint64_t>(sb));
+            if (sb > 0 && diff > sa) res = smin;
+            else if (sb < 0 && diff < sa) res = smax;
+            else if (diff > smax) res = smax;
+            else if (diff < smin) res = smin;
+            else res = diff;
+          }
+          r = static_cast<uint64_t>(res) & mask;
+        } else {
+          // Unsigned: UQADD (sum > mask -> mask) / UQSUB (a < b -> 0).
+          if (!is_sub) {
+            uint64_t sum = a + b;
+            r = (sum > mask || sum < a) ? mask : sum;
+          } else {
+            r = (a > b) ? (a - b) : 0;
+          }
+        }
+        // Write low `bits_local` bits, zero the upper 128 - bits_local bits.
+        state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+        return;
+      }
+      default:
+        break;
+    }
+    // endregion
+
     // D-form integer ops below.
     uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]);
     uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]);
