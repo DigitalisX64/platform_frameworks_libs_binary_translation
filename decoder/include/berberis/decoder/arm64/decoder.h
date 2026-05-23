@@ -909,6 +909,43 @@ class Decoder {
                 // -> +1.5 saturation, used as Newton-Raphson refinement after
                 // FRSQRTE.  Interpreter-only.
     // endregion
+    // region digitalis - SABD/UABD: vector absolute difference at .8b/.16b/
+    // .4h/.8h/.2s/.4s. size=11 (64-bit lane) is reserved.  Verified with
+    // llvm-mc:  sabd v0.8b,v1.8b,v2.8b = 0x0e227420 (opcode=01110, U=0);
+    //           uabd v0.8b,v1.8b,v2.8b = 0x2e227420 (opcode=01110, U=1).
+    kSabd,      // SABD (vector): U=0, opcode=01110
+    kUabd,      // UABD (vector): U=1, opcode=01110
+    // endregion
+    // region digitalis - SABA/UABA: absolute-difference-and-accumulate at
+    // .8b/.16b/.4h/.8h/.2s/.4s.  size=11 reserved.  Vd[i] += |Vn[i] - Vm[i]|.
+    // Verified with llvm-mc:
+    //   saba v0.8b,v1.8b,v2.8b = 0x0e227c20 (opcode=01111, U=0);
+    //   uaba v0.8b,v1.8b,v2.8b = 0x2e227c20 (opcode=01111, U=1).
+    kSaba,      // SABA (vector): U=0, opcode=01111
+    kUaba,      // UABA (vector): U=1, opcode=01111
+    // endregion
+    // region digitalis - PMUL polynomial multiply (byte-lane GF(2) multiply).
+    // .8b/.16b only; size=01/10/11 reserved per ARM ARM.
+    // Verified with llvm-mc:
+    //   pmul v0.8b,v1.8b,v2.8b   = 0x2e229c20 (opcode=10011, U=1, size=00, Q=0)
+    //   pmul v0.16b,v1.16b,v2.16b = 0x6e229c20 (opcode=10011, U=1, size=00, Q=1)
+    //   pmul v0.4h / v0.4s        invalid (size=01/10 reserved)
+    kPmul,      // PMUL (vector): U=1, opcode=10011, size=00
+    // endregion
+    // region digitalis - SQDMULH / SQRDMULH saturating doubling multiply high.
+    // .4h/.8h/.2s/.4s; size=00 and size=11 reserved per ARM ARM.
+    // Semantics (per lane): high half of (2 * signed(Vn[i]) * signed(Vm[i]) +
+    // round), saturated to the destination element's signed range. SQRDMULH
+    // adds round = 1 << (esize_bits - 1); SQDMULH uses round = 0.
+    // Verified with llvm-mc:
+    //   sqdmulh  v0.4h,v1.4h,v2.4h = 0x0e62b420 (opcode=10110, U=0, size=01)
+    //   sqdmulh  v0.4s,v1.4s,v2.4s = 0x4ea2b420 (Q=1, size=10)
+    //   sqrdmulh v0.4h,v1.4h,v2.4h = 0x2e62b420 (opcode=10110, U=1, size=01)
+    //   sqrdmulh v0.4s,v1.4s,v2.4s = 0x6ea2b420 (Q=1, U=1, size=10)
+    //   sqdmulh v0.8b / v0.2d      invalid (size=00/11 reserved)
+    kSqdmulh,   // SQDMULH (vector):  U=0, opcode=10110
+    kSqrdmulh,  // SQRDMULH (vector): U=1, opcode=10110
+    // endregion
     // endregion
   };
 
@@ -1319,6 +1356,18 @@ class Decoder {
     kRshrn,
     kSqshrn,
     kUqshrn,
+    // region digitalis: AdvSIMD shift-by-immediate narrow family — the
+    // prior enum was missing SQSHRUN / SQRSHRUN / SQRSHRN / UQRSHRN.
+    // Without these, opcodes 0b10010 / 0b10011 (both U-values) silently
+    // fell through to the dispatch default and the U=1 variants of
+    // 0b10000 / 0b10001 (real SQSHRUN / SQRSHRUN) were mis-dispatched
+    // to SQSHRN / UQSHRN handlers.  See dispatch table at
+    // DecodeAdvSimdShiftByImm for the corrected (opcode, U) → enum map.
+    kSqshrun,
+    kSqrshrun,
+    kSqrshrn,
+    kUqrshrn,
+    // endregion
     kSshll,
     kUshll,
   };
@@ -4188,15 +4237,36 @@ class Decoder {
       if (u) { Undefined(); return; }
       op = AdvSimdThreeSameOpcode::kAddp;
     } else if (opcode == 0b10011) {
-      if (u) { Undefined(); return; }
-      op = AdvSimdThreeSameOpcode::kMul;
+      // region digitalis: U=1 -> PMUL polynomial multiply (size=00 only).
+      // Previously U=1 routed to Undefined(); now dispatched to kPmul.
+      if (u) {
+        if (size != 0b00) { Undefined(); return; }
+        op = AdvSimdThreeSameOpcode::kPmul;
+      } else {
+        op = AdvSimdThreeSameOpcode::kMul;
+      }
+      // endregion
     } else if (opcode == 0b10010) {
       op = u ? AdvSimdThreeSameOpcode::kMls : AdvSimdThreeSameOpcode::kMla;
+    // region digitalis: SQDMULH (U=0) / SQRDMULH (U=1) saturating doubling
+    // multiply high. size=00 and size=11 are reserved per ARM ARM.
+    } else if (opcode == 0b10110) {
+      if (size == 0b00 || size == 0b11) { Undefined(); return; }
+      op = u ? AdvSimdThreeSameOpcode::kSqrdmulh : AdvSimdThreeSameOpcode::kSqdmulh;
+    // endregion
     // region digitalis
     } else if (opcode == 0b10100) {
       op = u ? AdvSimdThreeSameOpcode::kUmaxp : AdvSimdThreeSameOpcode::kSmaxp;
     } else if (opcode == 0b10101) {
       op = u ? AdvSimdThreeSameOpcode::kUminp : AdvSimdThreeSameOpcode::kSminp;
+    } else if (opcode == 0b01110) {
+      // SABD/UABD: absolute-difference vector. size=11 reserved.
+      if (size == 0b11) { Undefined(); return; }
+      op = u ? AdvSimdThreeSameOpcode::kUabd : AdvSimdThreeSameOpcode::kSabd;
+    } else if (opcode == 0b01111) {
+      // SABA/UABA: absolute-difference-and-accumulate vector. size=11 reserved.
+      if (size == 0b11) { Undefined(); return; }
+      op = u ? AdvSimdThreeSameOpcode::kUaba : AdvSimdThreeSameOpcode::kSaba;
     } else if ((opcode & 0b11000) == 0b11000) {
       // FP three-same (vector). bits[23] = op_high, bits[22] = sz.
       // The 'size' field as read above is {op_high, sz} for this encoding;
@@ -5419,20 +5489,37 @@ class Decoder {
         }
         break;
       // endregion
+      // region digitalis: AdvSIMD narrow-shift dispatch — verified against
+      // llvm-mc output for shrn / rshrn / sqshrn / uqshrn / sqshrun /
+      // sqrshrn / sqrshrun / uqrshrn (and the *2 upper-half forms, which
+      // differ only in Q).
+      //
+      //   opcode | U=0       | U=1
+      //   -------+-----------+----------
+      //   10000  | SHRN      | SQSHRUN
+      //   10001  | RSHRN     | SQRSHRUN
+      //   10010  | SQSHRN    | UQSHRN
+      //   10011  | SQRSHRN   | UQRSHRN
+      //
+      // Prior dispatch had three independent bugs in this block:
+      //   1. opcode 0b10000 U=1 routed to kSqshrn (wrong: SQSHRUN).
+      //   2. opcode 0b10001 U=1 routed to kUqshrn (wrong: SQRSHRUN).
+      //   3. opcodes 0b10010 / 0b10011 (both U-values) silently fell to
+      //      Undefined(), making real SQSHRN / UQSHRN / SQRSHRN / UQRSHRN
+      //      raise SIGILL on any sample that touched them.
       case 0b10000:
-        if (!u) {
-          op = AdvSimdShiftImmOpcode::kShrn;
-        } else {
-          op = AdvSimdShiftImmOpcode::kSqshrn;
-        }
+        op = u ? AdvSimdShiftImmOpcode::kSqshrun : AdvSimdShiftImmOpcode::kShrn;
         break;
       case 0b10001:
-        if (!u) {
-          op = AdvSimdShiftImmOpcode::kRshrn;
-        } else {
-          op = AdvSimdShiftImmOpcode::kUqshrn;
-        }
+        op = u ? AdvSimdShiftImmOpcode::kSqrshrun : AdvSimdShiftImmOpcode::kRshrn;
         break;
+      case 0b10010:
+        op = u ? AdvSimdShiftImmOpcode::kUqshrn : AdvSimdShiftImmOpcode::kSqshrn;
+        break;
+      case 0b10011:
+        op = u ? AdvSimdShiftImmOpcode::kUqrshrn : AdvSimdShiftImmOpcode::kSqrshrn;
+        break;
+      // endregion
       case 0b10100:
         op = u ? AdvSimdShiftImmOpcode::kUshll : AdvSimdShiftImmOpcode::kSshll;
         break;

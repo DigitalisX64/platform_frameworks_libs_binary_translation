@@ -3928,6 +3928,63 @@ class Interpreter {
             });
         break;
 
+      // region digitalis - SABD/UABD: absolute-difference vector.
+      // Signed: |a - b| computed via the sign of the difference; for
+      // INT_MIN inputs the difference fits in int64_t after sign-extension
+      // because esize is at most 4 (32-bit lanes).
+      case Decoder::AdvSimdThreeSameOpcode::kSabd:
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [](int64_t a, int64_t b) -> int64_t {
+              int64_t d = a - b;
+              return d < 0 ? -d : d;
+            });
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kUabd:
+        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
+            [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t {
+              return a > b ? (a - b) : (b - a);
+            });
+        break;
+      // endregion
+
+      // region digitalis - SABA/UABA: absolute-difference-and-accumulate.
+      // Vd[i] = Vd[i] + |Vn[i] - Vm[i]|.  Read-modify-write Vd, so the loop
+      // is structured like kMla/kMls (loads `d` from `dst` per lane).
+      // size=11 is rejected at the decoder; esize <= 4 here, so the signed
+      // difference fits in int64_t after sign-extension and the absolute
+      // value is computed without overflow.
+      case Decoder::AdvSimdThreeSameOpcode::kSaba: {
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0, b = 0, d = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+          int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+          int64_t diff = sa - sb;
+          uint64_t abs_diff = static_cast<uint64_t>(diff < 0 ? -diff : diff);
+          uint64_t r = (d + abs_diff) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUaba: {
+        uint64_t emask = ElementMask(esize);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0, b = 0, d = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
+          memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
+          uint64_t abs_diff = a > b ? (a - b) : (b - a);
+          uint64_t r = (d + abs_diff) & emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+        }
+        break;
+      }
+      // endregion
+
       // --- Halving add/sub ---
       case Decoder::AdvSimdThreeSameOpcode::kShadd:
         AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
@@ -4149,6 +4206,54 @@ class Interpreter {
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t { return a * b; });
         break;
+      // region digitalis - PMUL polynomial multiply (byte lanes).
+      // For each byte lane: multiply two 8-bit polynomials over GF(2),
+      // keeping only the low 8 bits of the product. The decoder restricts
+      // PMUL to size=00, so esize is always 1 byte here.
+      case Decoder::AdvSimdThreeSameOpcode::kPmul: {
+        auto poly_mul_low8 = [](uint8_t a, uint8_t b) -> uint8_t {
+          uint16_t res = 0;
+          for (unsigned i = 0; i < 8; ++i) {
+            if ((b >> i) & 1u) {
+              res ^= (static_cast<uint16_t>(a) << i);
+            }
+          }
+          return static_cast<uint8_t>(res);
+        };
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint8_t a = reinterpret_cast<const uint8_t*>(&src_n)[i];
+          uint8_t b = reinterpret_cast<const uint8_t*>(&src_m)[i];
+          reinterpret_cast<uint8_t*>(&result)[i] = poly_mul_low8(a, b);
+        }
+        break;
+      }
+      // endregion
+      // region digitalis - SQDMULH / SQRDMULH saturating doubling multiply high.
+      // For each lane: signed multiply two same-width source elements, double
+      // (shift left by 1), saturate to the per-element signed range, and
+      // return the high half. SQRDMULH adds a rounding constant of
+      // 1 << (esize_bits - 1) before the shift; SQDMULH uses 0. The decoder
+      // restricts both to size=01 (16-bit) and size=10 (32-bit), so esize is
+      // either 2 or 4 and the product 2*sa*sb fits comfortably in int64_t.
+      case Decoder::AdvSimdThreeSameOpcode::kSqdmulh:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmulh: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (1LL << (bits_local - 1)) - 1;
+        int64_t smin = -(1LL << (bits_local - 1));
+        int64_t round = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh)
+                          ? (1LL << (bits_local - 1))
+                          : 0;
+        AdvSimdThreeSameElementWiseSigned(src_n, src_m, esize, num_elements, &result,
+            [smax, smin, round, bits_local](int64_t a, int64_t b) -> int64_t {
+              int64_t product = (2 * a * b) + round;
+              int64_t high = product >> bits_local;
+              if (high > smax) return smax;
+              if (high < smin) return smin;
+              return high;
+            });
+        break;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
         // MLA: Vd[i] = Vd[i] + Vn[i] * Vm[i]
         uint64_t emask = ElementMask(esize);
@@ -6944,6 +7049,123 @@ class Interpreter {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
           uint64_t shifted = (narrow_rshift >= src_bits) ? 0 : (elem >> narrow_rshift);
+          if (shifted > sat_max) shifted = sat_max;
+          uint64_t r = shifted & sat_max;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+      // endregion
+
+      // region digitalis: AdvSIMD narrow-shift family (saturating, rounding,
+      // and signed-saturating-unsigned variants). The non-rounding non-unsigned
+      // variants live above (kShrn / kRshrn / kSqshrn / kUqshrn); these are
+      // the four that were previously missing from the decoder and thus had
+      // no interpreter case either. Each computes
+      //   shifted_i = (signed_or_unsigned)src_i >> rshift     (with rounding for
+      //                                                        the "R" forms)
+      //   sat       = clamp(shifted_i, dst_min, dst_max)
+      //   write     = sat narrowed to esize
+      // and writes lower-half (Q=0) / upper-half (Q=1) of Vd.
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrun: {
+        // SQSHRUN: signed saturating shift right unsigned narrow.
+        // Source is signed at 2*esize bits, result is unsigned at esize bits,
+        // negative shifted values saturate to 0.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t sat_max = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t shifted = (narrow_rshift >= src_bits)
+                                ? (signed_val >> (src_bits - 1))
+                                : (signed_val >> narrow_rshift);
+          uint64_t clamped;
+          if (shifted < 0) clamped = 0;
+          else if (static_cast<uint64_t>(shifted) > sat_max) clamped = sat_max;
+          else clamped = static_cast<uint64_t>(shifted);
+          uint64_t r = clamped & sat_max;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrun: {
+        // SQRSHRUN: signed saturating rounding shift right unsigned narrow.
+        // narrow_rshift is always in [1, esize] for valid encodings, so the
+        // simple signed-rounding path below is safe (no overflow in int128).
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t sat_max = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          __int128_t wide = static_cast<__int128_t>(signed_val) + (__int128_t{1} << (narrow_rshift - 1));
+          int64_t shifted = static_cast<int64_t>(wide >> narrow_rshift);
+          uint64_t clamped;
+          if (shifted < 0) clamped = 0;
+          else if (static_cast<uint64_t>(shifted) > sat_max) clamped = sat_max;
+          else clamped = static_cast<uint64_t>(shifted);
+          uint64_t r = clamped & sat_max;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn: {
+        // SQRSHRN: signed saturating rounding shift right narrow.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint8_t dst_bits = esize * 8;
+        int64_t sat_max = (1LL << (dst_bits - 1)) - 1;
+        int64_t sat_min = -(1LL << (dst_bits - 1));
+        uint64_t narrow_mask = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          __int128_t wide = static_cast<__int128_t>(signed_val) + (__int128_t{1} << (narrow_rshift - 1));
+          int64_t shifted = static_cast<int64_t>(wide >> narrow_rshift);
+          if (shifted > sat_max) shifted = sat_max;
+          else if (shifted < sat_min) shifted = sat_min;
+          uint64_t r = static_cast<uint64_t>(shifted) & narrow_mask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn: {
+        // UQRSHRN: unsigned saturating rounding shift right narrow.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t sat_max = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          __uint128_t wide = static_cast<__uint128_t>(elem) + (__uint128_t{1} << (narrow_rshift - 1));
+          uint64_t shifted = static_cast<uint64_t>(wide >> narrow_rshift);
           if (shifted > sat_max) shifted = sat_max;
           uint64_t r = shifted & sat_max;
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
