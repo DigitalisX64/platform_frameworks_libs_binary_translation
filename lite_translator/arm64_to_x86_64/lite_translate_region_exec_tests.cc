@@ -11503,6 +11503,1253 @@ TEST_F(Arm64LiteTranslateRegionTest, AddpVec2D) {
 }
 // endregion
 
+// region digitalis: ADDV (across-lanes integer sum) vector JIT —
+// all 5 encoded lane forms.
+//
+// Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+//   0 Q U 01110 size 11000 opcode 10 Rn Rd
+// ADDV opcode = 0b11011, U = 0.  Valid lane forms:
+//   size=00, Q∈{0,1}: ADDV B, V.{8B,16B}
+//   size=01, Q∈{0,1}: ADDV H, V.{4H,8H}
+//   size=10, Q=1:     ADDV S, V.4S    (Q=0 reserved)
+//   size=11:          reserved
+//
+// Base bits: bits[28:24]=01110 (0x0E000000), bits[21:17]=11000
+// (0x00300000), bits[11:10]=10 (0x00000800).  Verified against
+// `uaddlv h0, v0.8b` = 0x2E303800 (U=1, opcode=00011, size=00, Q=0).
+constexpr uint32_t SimdAcrossLanes(uint8_t q, uint8_t u, uint8_t size,
+                                   uint8_t opcode, uint8_t rd, uint8_t rn) {
+  return 0x0E300800u |
+         (uint32_t{static_cast<uint8_t>(q & 1u)} << 30) |
+         (uint32_t{static_cast<uint8_t>(u & 1u)} << 29) |
+         (uint32_t{static_cast<uint8_t>(size & 3u)} << 22) |
+         (uint32_t{static_cast<uint8_t>(opcode & 0x1fu)} << 12) |
+         (uint32_t{static_cast<uint8_t>(rn & 0x1fu)} << 5) |
+         uint32_t{static_cast<uint8_t>(rd & 0x1fu)};
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec16B) {
+  // ADDV B, V.16B (Q=1, size=00): sum all 16 bytes → low 8 bits of Vd.
+  // Sum = 1+2+...+16 + (255+255) = 136 + 510 = 646; 646 mod 256 = 134.
+  uint8_t n[16] = {  1,   2,   3,   4,   5,   6,   7,   8,
+                     9,  10,  11,  12,  13,  14, 255, 255};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);  // pre-seed Vd to detect upper-zero
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  unsigned expected_full = 0;
+  for (int i = 0; i < 16; i++) expected_full += n[i];
+  EXPECT_EQ(r[0], static_cast<uint8_t>(expected_full));  // sum mod 256
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec8B) {
+  // ADDV B, V.8B (Q=0, size=00): sum low 8 bytes only; upper bytes of source
+  // are don't-care.  Sum = 1+2+...+8 = 36.
+  uint8_t n[16] = { 1,   2,   3,   4,   5,   6,   7,   8,
+                    0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x77, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 36u);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec8H) {
+  // ADDV H, V.8H (Q=1, size=01): sum all 8 halfwords → low 16 bits.
+  // Includes 16-bit wrap: 32768 + 32768 + 1 = 65537 mod 65536 = 1; full sum
+  // also includes 1000+2000+3000+4000+5000+6000 = 21000, so total =
+  // 1 + 21000 = 21001 (no overall wrap).
+  uint16_t n[8] = {32768, 32768,   1, 1000, 2000, 3000, 4000, 5000};
+  // sum = 32768+32768+1+1000+2000+3000+4000+5000 = 71537; mod 65536 = 6001.
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint32_t expected = 0;
+  for (int i = 0; i < 8; i++) expected += n[i];
+  EXPECT_EQ(r[0], static_cast<uint16_t>(expected));  // 6001
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec4H) {
+  // ADDV H, V.4H (Q=0, size=01): sum low 4 halfwords; upper 4 are don't-care.
+  uint16_t n[8] = {  100,   200,  1000,  2000,
+                   0xDEAD,0xDEAD,0xDEAD,0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 3300u);  // 100 + 200 + 1000 + 2000
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec4S) {
+  // ADDV S, V.4S (Q=1, size=10): sum all 4 dwords → low 32 bits, with the
+  // upper 96 bits of Vd zeroed.  Inputs pin 32-bit wrap: 0xFFFFFFFE + 5 =
+  // 0x1_00000003; +100 +200 = 0x1_0000012F; mod 2^32 = 0x12F = 303.
+  uint32_t n[4] = {0xFFFFFFFEu, 5u, 100u, 200u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 303u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AddvVec4SDoubleWrap) {
+  // ADDV S, V.4S (Q=1, size=10): pair-wrap pin.  Each pair sums to 2^32:
+  // (0xFFFFFFFF + 1) and (0x80000000 + 0x80000000); each pair wraps to 0;
+  // total = 0.  Verifies that the JIT correctly handles intermediate
+  // wrap-around without sign-extension drift.
+  uint32_t n[4] = {0xFFFFFFFFu, 0x00000001u, 0x80000000u, 0x80000000u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b11011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+// endregion
+
+// region digitalis: SADDLV / UADDLV (across-lanes long integer sum) vector
+// JIT — all 5 encoded lane forms × {signed, unsigned}.
+//
+// Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+//   0 Q U 01110 size 11000 00011 10 Rn Rd
+// SADDLV opcode = 0b00011 with U=0; UADDLV opcode = 0b00011 with U=1.
+// Each source lane is widened to 2*esize before summing; the 2*esize result
+// lives in the lowest lane of Vd with all other bytes zeroed.
+//
+// Lane forms covered:
+//   size=00 Q=0: V.8B  → H result  (8b lanes  → 16b sum)
+//   size=00 Q=1: V.16B → H result
+//   size=01 Q=0: V.4H  → S result  (16b lanes → 32b sum)
+//   size=01 Q=1: V.8H  → S result
+//   size=10 Q=1: V.4S  → D result  (32b lanes → 64b sum)
+//
+// `uaddlv h0, v0.8b` (insn 0x2E303800) traced in WhatsApp libar-bundle3.so.
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv8B) {
+  // UADDLV H, V.8B (Q=0, size=00, U=1).
+  // Sum low 8 bytes including 255+255=510 wrap-of-byte; upper 8 are
+  // don't-care.  Sum = 255+255+1+2+3+4+5+6 = 531.  Result is 16-bit, so
+  // 531 < 2^16 — no halfword wrap.  Upper 14 bytes of Vd asserted zero.
+  uint8_t n[16] = {255, 255,   1,   2,   3,   4,   5,   6,
+                   0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 531u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv16B) {
+  // UADDLV H, V.16B (Q=1, size=00, U=1).
+  // Sum all 16 bytes; max possible = 16*255 = 4080 fits in 16 bits.
+  // Inputs: 8 copies of 200 followed by 0..7 → sum = 1628.
+  uint8_t n[16] = {200, 200, 200, 200, 200, 200, 200, 200,
+                     0,   1,   2,   3,   4,   5,   6,   7};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  unsigned expected = 0;
+  for (int i = 0; i < 16; i++) expected += n[i];
+  EXPECT_EQ(r[0], static_cast<uint16_t>(expected));  // 1628
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv8B) {
+  // SADDLV H, V.8B (Q=0, size=00, U=0).
+  // Signed bytes: each 0xFF = -1, 0x80 = -128.
+  // Inputs (low 8): -1, -1, -128, -128, 1, 2, 3, 4.
+  // Sum = -1 + -1 + -128 + -128 + 1 + 2 + 3 + 4 = -248 → 0xFF08 (16-bit).
+  uint8_t n[16] = {0xFF, 0xFF, 0x80, 0x80,   1,   2,   3,   4,
+                   0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint16_t>(-248));  // 0xFF08
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv16B) {
+  // SADDLV H, V.16B (Q=1, size=00, U=0).
+  // All 16 bytes summed as signed: mix of negative and positive.
+  // Inputs: 8 × -100 (0x9C) + 8 × +100 → sum = 0.
+  int8_t n_s[16] = {-100, -100, -100, -100, -100, -100, -100, -100,
+                     100,  100,  100,  100,  100,  100,  100,  100};
+  uint8_t n[16];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv4H) {
+  // UADDLV S, V.4H (Q=0, size=01, U=1).
+  // Sum low 4 unsigned halfwords; result is 32-bit.  Includes 0xFFFF wrap.
+  // Inputs: 0xFFFF, 0xFFFF, 1, 2.  Sum = 131073 = 0x20001.
+  uint16_t n[8] = {0xFFFF, 0xFFFF,      1,      2,
+                   0xDEAD, 0xDEAD, 0xDEAD, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x20001u);  // 131073
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv8H) {
+  // UADDLV S, V.8H (Q=1, size=01, U=1).
+  // Sum all 8 unsigned halfwords; max = 8*65535 = 524280 fits in 32 bits.
+  uint16_t n[8] = {0xFFFF, 0xFFFF, 0x8000, 0x8000,
+                       1,      2,      3,      4};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  uint32_t expected = 0;
+  for (int i = 0; i < 8; i++) expected += n[i];
+  EXPECT_EQ(r[0], expected);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv4H) {
+  // SADDLV S, V.4H (Q=0, size=01, U=0).
+  // Signed halfwords: 0xFFFF = -1, 0x8000 = -32768.
+  // Inputs (low 4): -1, -1, -32768, +100.  Sum = -32670 → 0xFFFF80A2.
+  uint16_t n[8] = {0xFFFF, 0xFFFF, 0x8000,    100,
+                   0xDEAD, 0xDEAD, 0xDEAD, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint32_t>(-32670));  // 0xFFFF80A2
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv8H) {
+  // SADDLV S, V.8H (Q=1, size=01, U=0).
+  // Half the inputs negative, half positive — sum = 0.
+  int16_t n_s[8] = {-30000, -30000, -30000, -30000,
+                     30000,  30000,  30000,  30000};
+  uint16_t n[8];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uaddlv4S) {
+  // UADDLV D, V.4S (Q=1, size=10, U=1).
+  // Sum 4 unsigned dwords into a 64-bit result.  Includes upper-bit
+  // dwords whose 32-bit sum would wrap but 64-bit sum does not.
+  // Inputs: 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF.
+  // Sum = 4 * (2^32 - 1) = 0x3FFFFFFFC.  Result is 64-bit so no wrap.
+  uint32_t n[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(4) * 0xFFFFFFFFull);  // 0x3FFFFFFFC
+  EXPECT_EQ(r[1], 0ull);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Saddlv4S) {
+  // SADDLV D, V.4S (Q=1, size=10, U=0).
+  // Signed dwords summed to 64-bit result with sign-extension required.
+  // Inputs: -1, -1, -1, -1 → sum = -4 → 0xFFFFFFFFFFFFFFFC.
+  uint32_t n[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b00011, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(-4));  // 0xFFFFFFFFFFFFFFFC
+  EXPECT_EQ(r[1], 0ull);
+}
+// endregion
+
+// region digitalis: SMAXV / SMINV / UMAXV / UMINV (across-lanes integer
+// max/min reduce) vector JIT — all 5 encoded lane forms × {SMAXV, UMAXV}
+// plus byte/halfword/dword forms for SMINV and UMINV.
+//
+// Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+//   0 Q U 01110 size 11000 opcode 10 Rn Rd
+// SMAXV: opcode=0b01010, U=0.  UMAXV: opcode=0b01010, U=1.
+// SMINV: opcode=0b11010, U=0.  UMINV: opcode=0b11010, U=1.
+// Result width == esize (unlike SADDLV/UADDLV which widens to 2*esize).
+//
+// Lane forms covered:
+//   size=00 Q=0: V.8B   size=00 Q=1: V.16B
+//   size=01 Q=0: V.4H   size=01 Q=1: V.8H
+//   size=10 Q=1: V.4S
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxv8B) {
+  // SMAXV B, V.8B (Q=0, size=00, U=0, opcode=01010).
+  // Signed bytes including 0x80 = -128 (would be max if treated unsigned).
+  // Inputs (low 8): -128, -1, 1, 5, 100, -50, 0, 42.  Max(signed) = 100.
+  uint8_t n[16] = {0x80, 0xFF,    1,    5,  100, 0xCE,    0,   42,
+                   0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 100u);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxv16B) {
+  // SMAXV B, V.16B (Q=1, size=00, U=0).
+  // 16 signed bytes; 0x7F=127 is the max.  Mixed positive/negative.
+  int8_t n_s[16] = {-100,   50,  -1,   0,    1,   25,  127,    7,
+                     -50,   42, -42,  10,  -10,   77,   88,   99};
+  uint8_t n[16];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 127u);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxv4H) {
+  // SMAXV H, V.4H (Q=0, size=01, U=0).
+  // Signed halfwords; 0x8000 = -32768.  Inputs (low 4): -32768, -1, 1, 12345.
+  // Max(signed) = 12345.  Upper 4 halfwords are don't-care.
+  uint16_t n[8] = {0x8000, 0xFFFF,      1,  12345,
+                   0xDEAD, 0xDEAD, 0xDEAD, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 12345u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxv8H) {
+  // SMAXV H, V.8H (Q=1, size=01, U=0).
+  // Signed halfwords; 0x7FFF = 32767 is max.  Mixed positive/negative.
+  int16_t n_s[8] = {-30000,   100, -1, 32767,
+                       50, -32768, 16384, 0};
+  uint16_t n[8];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 32767u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxv4S) {
+  // SMAXV S, V.4S (Q=1, size=10, U=0).
+  // Signed dwords; max = 0x7FFFFFFF.  Includes 0x80000000 = INT32_MIN.
+  uint32_t n[4] = {0x80000000u, 0xFFFFFFFFu, 0x7FFFFFFFu, 12345u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x7FFFFFFFu);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxv8B) {
+  // UMAXV B, V.8B (Q=0, size=00, U=1, opcode=01010).
+  // Unsigned bytes; 0xFF = 255 is max.  Upper 8 don't-care.
+  uint8_t n[16] = {  0,    1,    2,    3,    4, 0xFF,    6,    7,
+                   0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFu);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxv16B) {
+  // UMAXV B, V.16B (Q=1, size=00, U=1).
+  // Unsigned bytes; 0xFE is max.  Pin: distinguishes signed (would pick 1)
+  // from unsigned (picks 0xFE).
+  uint8_t n[16] = {0xFE, 0x80, 0x90, 0xA0, 0xB0, 0xC0,    1,    2,
+                      3,    4,    5,    6,    7,    8,    9,   10};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFEu);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxv4H) {
+  // UMAXV H, V.4H (Q=0, size=01, U=1).
+  // Unsigned halfwords; 0xFFFF is max.  Upper 4 are don't-care.
+  uint16_t n[8] = {0xFFFF,  100,  1000, 0x8000,
+                   0xDEAD, 0xDEAD, 0xDEAD, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0x55, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/0, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFu);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxv8H) {
+  // UMAXV H, V.8H (Q=1, size=01, U=1).
+  // Unsigned halfwords; 0xFFFE is max.  Pin: distinguishes signed
+  // (would pick 100, since 0xFFFE = -2 signed) from unsigned.
+  uint16_t n[8] = {0xFFFE, 0xFFFD, 0x8000, 0x9000,
+                       1,      2,      3,    100};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFEu);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxv4S) {
+  // UMAXV S, V.4S (Q=1, size=10, U=1).
+  // Unsigned dwords; 0xFFFFFFFE is max.  Pin: distinguishes signed
+  // (would pick 100, since 0xFFFFFFFE = -2 signed) from unsigned.
+  uint32_t n[4] = {0xFFFFFFFEu, 0x80000000u, 0xFFFFFFFDu, 100u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                      /*opcode=*/0b01010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFEu);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sminv16B) {
+  // SMINV B, V.16B (Q=1, size=00, U=0, opcode=11010).
+  // Signed bytes; 0x80 = -128 is min.  Mixed pos/neg.
+  int8_t n_s[16] = {100,   50,   25,    0,
+                     -1,  -50, -100, -128,
+                      7,    6,    5,    4,
+                     42,   77,   88,   99};
+  uint8_t n[16];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                      /*opcode=*/0b11010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x80u);  // -128
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sminv8H) {
+  // SMINV H, V.8H (Q=1, size=01, U=0).
+  // Signed halfwords; -32768 = 0x8000 is min.
+  int16_t n_s[8] = {1000,   200, -16000, 100,
+                       0, -32768,  16384, -50};
+  uint16_t n[8];
+  std::memcpy(n, n_s, 16);
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                      /*opcode=*/0b11010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x8000u);  // -32768
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sminv4S) {
+  // SMINV S, V.4S (Q=1, size=10, U=0).
+  // Signed dwords; INT32_MIN = 0x80000000 is min.
+  uint32_t n[4] = {12345u, 0x80000000u, 0xFFFFFFFFu, 50u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                      /*opcode=*/0b11010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x80000000u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uminv16B) {
+  // UMINV B, V.16B (Q=1, size=00, U=1, opcode=11010).
+  // Unsigned bytes; 0 is min.  Pin: distinguishes from signed
+  // (signed would pick 0x80 = -128).
+  uint8_t n[16] = {0xFF, 0xFE, 0x80,   1,
+                      0,    5,   10,  20,
+                     30,   40,   50,  60,
+                     70,   80,   90, 100};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                      /*opcode=*/0b11010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0u);
+  for (int i = 1; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uminv8H) {
+  // UMINV H, V.8H (Q=1, size=01, U=1).
+  // Unsigned halfwords; 1 is min.  Pin: distinguishes signed (picks 0x8000)
+  // from unsigned (picks 1).
+  uint16_t n[8] = {0xFFFF, 0xFFFE, 0x8000, 0x9000,
+                       1,    100,    200,   300};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                      /*opcode=*/0b11010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 1u);
+  for (int i = 1; i < 8; i++) {
+    EXPECT_EQ(r[i], 0u) << "halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uminv4S) {
+  // UMINV S, V.4S (Q=1, size=10, U=1).
+  // Unsigned dwords; 100 is min.  Pin: distinguishes signed (picks
+  // 0x80000000 = INT32_MIN) from unsigned (picks 100).
+  uint32_t n[4] = {0xFFFFFFFFu, 0x80000000u, 0xFFFFFFFEu, 100u};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdAcrossLanes(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                      /*opcode=*/0b11010, /*rd=*/0, /*rn=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 100u);
+  for (int i = 1; i < 4; i++) {
+    EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
+  }
+}
+// endregion
+
+// region digitalis: SMAXP / SMINP / UMAXP / UMINP (pairwise integer max/min) vector JIT
+// AdvSimdThreeSame encoding (DDI 0487 §C7.2):
+//   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
+// SMAXP: U=0, opcode=10100.  UMAXP: U=1, opcode=10100.
+// SMINP: U=0, opcode=10101.  UMINP: U=1, opcode=10101.
+// Sizes 0b00/0b01/0b10 are JITed; 0b11 (.2D / .1D) bails to the interpreter
+// (no PMAXSQ/PMINSQ etc. before AVX-512F-VL).
+//
+// Layout per ARM:  Vd[0..N-1]  = pair(Vn)  with pair(X)[i] = op(X[2i], X[2i+1])
+//                   Vd[N..2N-1] = pair(Vm)
+// where N = lanes/2.
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxp16B) {
+  // SMAXP .16B Q=1 U=0 — signed byte pairwise max, full 16-byte form.
+  // Includes INT8_MIN/MAX boundaries and an equal pair (lane 10/11).
+  int8_t n_signed[16] = {  5,   3,  -1,  INT8_MIN, INT8_MAX, -50,  50,  49,
+                         100, -100,  -3,  -3,        7,    8,  -9, -10};
+  int8_t m_signed[16] = {  0,   1, -50,    -49,       2,   3,  -1,   1,
+                          -1,    0, -128,  127,       4,    5,  -6,  -7};
+  uint8_t n[16], m[16];
+  std::memcpy(n, n_signed, 16);
+  std::memcpy(m, m_signed, 16);
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xAA, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10100, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // First 8 lanes: pair(Vn).
+  for (int i = 0; i < 8; i++) {
+    int8_t expected = (n_signed[2 * i] > n_signed[2 * i + 1])
+                          ? n_signed[2 * i] : n_signed[2 * i + 1];
+    EXPECT_EQ(r[i], expected) << "n-pair lane " << i;
+  }
+  // Last 8 lanes: pair(Vm).
+  for (int i = 0; i < 8; i++) {
+    int8_t expected = (m_signed[2 * i] > m_signed[2 * i + 1])
+                          ? m_signed[2 * i] : m_signed[2 * i + 1];
+    EXPECT_EQ(r[8 + i], expected) << "m-pair lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sminp8BUpperZero) {
+  // SMINP .8B Q=0 U=0 — signed byte pairwise min, 8-byte form; upper 8 zero.
+  int8_t n_signed[16] = {1, 2, -1, INT8_MIN, INT8_MAX, -3, 0, -5,
+                         /*upper don't care*/ 9, 9, 9, 9, 9, 9, 9, 9};
+  int8_t m_signed[16] = {-2, 5, 4, INT8_MIN, 0, INT8_MAX, -100, -101,
+                         9, 9, 9, 9, 9, 9, 9, 9};
+  uint8_t n[16], m[16];
+  std::memcpy(n, n_signed, 16);
+  std::memcpy(m, m_signed, 16);
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  uint8_t d_init[16];
+  std::memset(d_init, 0xCC, 16);
+  StoreVec16B(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10101, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // First 4 lanes: pair(Vn) min.
+  for (int i = 0; i < 4; i++) {
+    int8_t expected = (n_signed[2 * i] < n_signed[2 * i + 1])
+                          ? n_signed[2 * i] : n_signed[2 * i + 1];
+    EXPECT_EQ(r[i], expected) << "n-pair lane " << i;
+  }
+  // Next 4 lanes: pair(Vm) min.
+  for (int i = 0; i < 4; i++) {
+    int8_t expected = (m_signed[2 * i] < m_signed[2 * i + 1])
+                          ? m_signed[2 * i] : m_signed[2 * i + 1];
+    EXPECT_EQ(r[4 + i], expected) << "m-pair lane " << i;
+  }
+  // Upper 8 bytes zeroed.
+  uint8_t r_bytes[16];
+  std::memcpy(r_bytes, &state_.cpu.v[0], 16);
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxp16B) {
+  // UMAXP .16B Q=1 U=1 — unsigned byte pairwise max.  Lane 0/1 uses 0x80 +
+  // 1 — UMAXP picks 0x80 (correct unsigned) whereas SMAXP would pick 1.
+  uint8_t n[16] = {0x80, 0x01, 0xFF, 0x7F, 0x10, 0x10, 0x00, 0xFE,
+                   0x20, 0xA0, 0x30, 0x40, 0x99, 0x66, 0x55, 0xAA};
+  uint8_t m[16] = {0x02, 0x00, 0x80, 0x81, 0x11, 0x12, 0x01, 0x00,
+                   0xFF, 0x00, 0x40, 0x40, 0x88, 0x77, 0x55, 0x55};
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10100, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; i++) {
+    uint8_t expected = (n[2 * i] > n[2 * i + 1]) ? n[2 * i] : n[2 * i + 1];
+    EXPECT_EQ(r[i], expected) << "n-pair lane " << i;
+  }
+  for (int i = 0; i < 8; i++) {
+    uint8_t expected = (m[2 * i] > m[2 * i + 1]) ? m[2 * i] : m[2 * i + 1];
+    EXPECT_EQ(r[8 + i], expected) << "m-pair lane " << i;
+  }
+  // Distinguish unsigned from signed at the first lane pair:
+  EXPECT_EQ(r[0], 0x80u);  // UMAXP picks 0x80; SMAXP would pick 1.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uminp16B) {
+  // UMINP .16B Q=1 U=1 — unsigned byte pairwise min.
+  uint8_t n[16] = {0x80, 0x01, 0xFF, 0x7F, 0x10, 0x10, 0x00, 0xFE,
+                   0x20, 0xA0, 0x30, 0x40, 0x99, 0x66, 0x55, 0xAA};
+  uint8_t m[16] = {0x02, 0x00, 0x80, 0x81, 0x11, 0x12, 0x01, 0x00,
+                   0xFF, 0x00, 0x40, 0x40, 0x88, 0x77, 0x55, 0x55};
+  StoreVec16B(state_.cpu, 1, n);
+  StoreVec16B(state_.cpu, 2, m);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10101, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; i++) {
+    uint8_t expected = (n[2 * i] < n[2 * i + 1]) ? n[2 * i] : n[2 * i + 1];
+    EXPECT_EQ(r[i], expected) << "n-pair lane " << i;
+  }
+  for (int i = 0; i < 8; i++) {
+    uint8_t expected = (m[2 * i] < m[2 * i + 1]) ? m[2 * i] : m[2 * i + 1];
+    EXPECT_EQ(r[8 + i], expected) << "m-pair lane " << i;
+  }
+  // Distinguish unsigned from signed: lane 0 of pair(Vn) is min(0x80, 0x01).
+  // UMINP picks 0x01 (1 < 128 unsigned); SMINP would pick 0x80 (-128 signed
+  // < 1).
+  EXPECT_EQ(r[0], 0x01u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxp8H) {
+  // SMAXP .8H Q=1 U=0 — signed halfword pairwise max.
+  int16_t n_signed[8] = {0, 1, -1, INT16_MIN, INT16_MAX, -1000,
+                         1234, -1234};
+  int16_t m_signed[8] = {2, 0, INT16_MIN, INT16_MIN, INT16_MAX, INT16_MAX,
+                         -32, 32};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_signed, sizeof(n_signed));
+  std::memcpy(&state_.cpu.v[2], m_signed, sizeof(m_signed));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b10100, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 4; i++) {
+    int16_t expected = (n_signed[2 * i] > n_signed[2 * i + 1])
+                           ? n_signed[2 * i] : n_signed[2 * i + 1];
+    EXPECT_EQ(r[i], expected) << "n-pair lane " << i;
+  }
+  for (int i = 0; i < 4; i++) {
+    int16_t expected = (m_signed[2 * i] > m_signed[2 * i + 1])
+                           ? m_signed[2 * i] : m_signed[2 * i + 1];
+    EXPECT_EQ(r[4 + i], expected) << "m-pair lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uminp4HUpperZero) {
+  // UMINP .4H Q=0 U=1 — unsigned halfword pairwise min, 4 lanes; upper zero.
+  uint16_t n[8] = {0x8000, 0x0001, 0xFFFF, 0x7FFF,
+                   /*upper don't care*/ 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD};
+  uint16_t m[8] = {0x0002, 0x0000, 0x8000, 0x8001,
+                   0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n, sizeof(n));
+  std::memcpy(&state_.cpu.v[2], m, sizeof(m));
+  uint8_t d_init[16];
+  std::memset(d_init, 0xCC, 16);
+  std::memcpy(&state_.cpu.v[0], d_init, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b10101, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  // First 2 lanes: pair(Vn) min — first valid 4 lanes of n.
+  EXPECT_EQ(r[0], 0x0001u);  // umin(0x8000, 0x0001)
+  EXPECT_EQ(r[1], 0x7FFFu);  // umin(0xFFFF, 0x7FFF)
+  // Next 2 lanes: pair(Vm) min.
+  EXPECT_EQ(r[2], 0x0000u);  // umin(0x0002, 0x0000)
+  EXPECT_EQ(r[3], 0x8000u);  // umin(0x8000, 0x8001)
+  // Upper 8 bytes zeroed.
+  uint8_t r_bytes[16];
+  std::memcpy(r_bytes, &state_.cpu.v[0], 16);
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smaxp4S) {
+  // SMAXP .4S Q=1 U=0 — signed dword pairwise max.
+  StoreVec4SInt(state_.cpu, 1, 0, INT32_MIN, INT32_MAX, -1);
+  StoreVec4SInt(state_.cpu, 2, 5, 100, INT32_MIN, INT32_MAX);
+  std::memset(&state_.cpu.v[0], 0, sizeof(state_.cpu.v[0]));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10100, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0);           // max(0, INT32_MIN)
+  EXPECT_EQ(r[1], INT32_MAX);   // max(INT32_MAX, -1)
+  EXPECT_EQ(r[2], 100);         // max(5, 100)
+  EXPECT_EQ(r[3], INT32_MAX);   // max(INT32_MIN, INT32_MAX)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sminp2SUpperZero) {
+  // SMINP .2S Q=0 U=0 — signed dword pairwise min; upper qword zero.
+  StoreVec4SInt(state_.cpu, 1, INT32_MIN, INT32_MAX,
+                /*upper don't care*/ 999, 999);
+  StoreVec4SInt(state_.cpu, 2, -1, 1,
+                999, 999);
+  uint8_t d_init[16];
+  std::memset(d_init, 0x88, 16);
+  std::memcpy(&state_.cpu.v[0], d_init, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10101, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MIN);  // min(INT32_MIN, INT32_MAX)
+  EXPECT_EQ(r[1], -1);         // min(-1, 1)
+  EXPECT_EQ(r[2], 0);          // upper zero
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umaxp4S) {
+  // UMAXP .4S Q=1 U=1 — unsigned dword pairwise max; distinguishes unsigned
+  // from signed via the 0x80000000 / 0x7FFFFFFF boundary.
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  uint32_t n[4] = {0x80000000u, 0x7FFFFFFFu, 1u, 2u};
+  uint32_t m[4] = {0xFFFFFFFFu, 0x00000001u, 0x80000000u, 0x00000001u};
+  std::memcpy(&state_.cpu.v[1], n, sizeof(n));
+  std::memcpy(&state_.cpu.v[2], m, sizeof(m));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10100, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // pair(Vn): umax(0x80000000, 0x7FFFFFFF) = 0x80000000; umax(1, 2) = 2.
+  EXPECT_EQ(r[0], 0x80000000u);
+  EXPECT_EQ(r[1], 2u);
+  // pair(Vm): umax(0xFFFFFFFF, 1) = 0xFFFFFFFF; umax(0x80000000, 1) = 0x80000000.
+  EXPECT_EQ(r[2], 0xFFFFFFFFu);
+  EXPECT_EQ(r[3], 0x80000000u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uminp4S) {
+  // UMINP .4S Q=1 U=1 — unsigned dword pairwise min.
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  uint32_t n[4] = {0x80000000u, 0x7FFFFFFFu, 100u, 0u};
+  uint32_t m[4] = {0xFFFFFFFFu, 0x00000001u, 0x80000000u, 0x80000000u};
+  std::memcpy(&state_.cpu.v[1], n, sizeof(n));
+  std::memcpy(&state_.cpu.v[2], m, sizeof(m));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10101, /*rd=*/0, /*rn=*/1, /*rm=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // pair(Vn): umin(0x80000000, 0x7FFFFFFF) = 0x7FFFFFFF; umin(100, 0) = 0.
+  EXPECT_EQ(r[0], 0x7FFFFFFFu);
+  EXPECT_EQ(r[1], 0u);
+  // pair(Vm): umin(0xFFFFFFFF, 1) = 1; umin(0x80000000, 0x80000000) = 0x80000000.
+  EXPECT_EQ(r[2], 1u);
+  EXPECT_EQ(r[3], 0x80000000u);
+}
+// endregion
+
+// region digitalis: SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
+//
+// Opcode bits (15-11) and U bit per decoder.h:5375-5403:
+//   SSRA opcode=00010 U=0  USRA opcode=00010 U=1
+//   SRI  opcode=01000 U=1  SLI  opcode=01010 U=1
+//
+// SLI shift = immh:immb - bits, range [0, bits-1].
+// SSRA/USRA/SRI shift = 2*bits - immh:immb, range [1, bits].
+constexpr uint32_t kSsraVec8H_3   = 0x4f1d1420;  // ssra v0.8h, v1.8h, #3  (immh:immb=0011101=29 → 32-29=3)
+constexpr uint32_t kSsraVec4H_3   = 0x0f1d1420;  // ssra v0.4h, v1.4h, #3  Q=0
+constexpr uint32_t kSsraVec4S_5   = 0x4f3b1420;  // ssra v0.4s, v1.4s, #5  (immh:immb=0111011=59 → 64-59=5)
+constexpr uint32_t kUsraVec8H_3   = 0x6f1d1420;  // usra v0.8h, v1.8h, #3
+constexpr uint32_t kUsraVec4S_5   = 0x6f3b1420;  // usra v0.4s, v1.4s, #5
+constexpr uint32_t kUsraVec2D_11  = 0x6f751420;  // usra v0.2d, v1.2d, #11 (immh:immb=1110101=117 → 128-117=11)
+constexpr uint32_t kSliVec8H_3    = 0x6f135420;  // sli  v0.8h, v1.8h, #3  (immh:immb=0010011=19 → 19-16=3)
+constexpr uint32_t kSliVec8H_0    = 0x6f105420;  // sli  v0.8h, v1.8h, #0  boundary: copy Vn
+constexpr uint32_t kSliVec2SUp    = 0x2f255420;  // sli  v0.2s, v1.2s, #5  Q=0
+constexpr uint32_t kSliVec2D_11   = 0x6f4b5420;  // sli  v0.2d, v1.2d, #11
+constexpr uint32_t kSriVec8H_3    = 0x6f1d4420;  // sri  v0.8h, v1.8h, #3  (immh:immb=0011101=29 → 32-29=3)
+constexpr uint32_t kSriVec8H_16   = 0x6f104420;  // sri  v0.8h, v1.8h, #16 boundary: preserve Vd
+constexpr uint32_t kSriVec2SUp    = 0x2f3b4420;  // sri  v0.2s, v1.2s, #5  Q=0
+constexpr uint32_t kSriVec2D_11   = 0x6f754420;  // sri  v0.2d, v1.2d, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8H) {
+  int16_t in_n[8] = {0, -1, 8, INT16_MIN, 0x1234, static_cast<int16_t>(0xABCD), 0xFF, -16};
+  int16_t in_d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSsraVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t want = static_cast<int16_t>(in_d[i] + (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << in_n[i] << " in_d=" << in_d[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec4HUpperZero) {
+  int16_t in_n[8] = {-128, 256, INT16_MIN, INT16_MAX, 99, -99, 1, -1};
+  int16_t in_d[8] = {10, 20, 30, 40, 1234, -1234, 0x7000, static_cast<int16_t>(0x8000)};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSsraVec4H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int16_t want = static_cast<int16_t>(in_d[i] + (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec4S) {
+  int32_t in_n[4] = {0, -1, INT32_MIN, 0x12345678};
+  int32_t in_d[4] = {100, 200, 300, 400};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSsraVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int32_t want = in_d[i] + (in_n[i] >> 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8H) {
+  uint16_t in_n[8] = {0x0000, 0xFFFF, 0x0008, 0x8000, 0x1234, 0xABCD, 0x00FF, 0x0F0F};
+  uint16_t in_d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUsraVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>(in_d[i] + (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec4S) {
+  uint32_t in_n[4] = {0x00000000u, 0xFFFFFFFFu, 0x12345678u, 0x80000001u};
+  uint32_t in_d[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUsraVec4S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint32_t want = in_d[i] + (in_n[i] >> 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec2D) {
+  uint64_t in_n[2] = {0x123456789abcdef0ull, 0x8000000000000001ull};
+  uint64_t in_d[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kUsraVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint64_t want = in_d[i] + (in_n[i] >> 11);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec8H) {
+  // SLI .8H shift=3: each lane = (Vd & 0x0007) | (Vn << 3).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x0007, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAA5, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0x4321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>((in_d[i] & 0x0007u) | (in_n[i] << 3));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << std::hex << in_n[i]
+                          << " in_d=" << in_d[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec8HShiftZero) {
+  // Boundary: SLI shift=0 → Vd_out = Vn (low-mask is empty).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x0007, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAA5, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0x4321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec8H_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], in_n[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec2SUpperZero) {
+  // SLI .2S shift=5: each lane = (Vd & 0x1F) | (Vn << 5); upper 64 bits zero.
+  uint32_t in_n[4] = {0x12345678u, 0x80000001u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t in_d[4] = {0xAAAAAAAAu, 0x5555555Fu, 0x11111111u, 0x22222222u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec2SUp};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = (in_d[i] & 0x1Fu) | (in_n[i] << 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliVec2D) {
+  // SLI .2D shift=11: each lane = (Vd & ((1<<11)-1)) | (Vn << 11).
+  uint64_t in_n[2] = {0x0123456789ABCDEFull, 0xFEDCBA9876543210ull};
+  uint64_t in_d[2] = {0xAAAAAAAAAAAAA7FFull, 0x55555555555555AAull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSliVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint64_t want = (in_d[i] & ((1ULL << 11) - 1)) | (in_n[i] << 11);
+    EXPECT_EQ(r[i], want) << "lane " << i << std::hex
+                          << " want=" << want << " got=" << r[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec8H) {
+  // SRI .8H shift=3: each lane = (Vd & 0xE000) | (Vn >> 3).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x7000, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAAA, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0xE321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec8H_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>((in_d[i] & 0xE000u) | (in_n[i] >> 3));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in_n=" << std::hex << in_n[i]
+                          << " in_d=" << in_d[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec8HShiftEsize) {
+  // Boundary: SRI shift=16 → Vd_out = Vd (every bit of Vd preserved).
+  uint16_t in_n[8] = {0x1234, 0xABCD, 0xFFFF, 0x8001, 0x0000, 0x7000, 0xCAFE, 0xBABE};
+  uint16_t in_d[8] = {0xAAAA, 0x5555, 0xF0F0, 0x0F0F, 0xFFFF, 0xFFF8, 0x1234, 0xE321};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec8H_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], in_d[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec2SUpperZero) {
+  // SRI .2S shift=5: each lane = (Vd & 0xF8000000) | (Vn >> 5); upper 64 bits zero.
+  uint32_t in_n[4] = {0x12345678u, 0x80000001u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t in_d[4] = {0xAAAAAAAAu, 0x5555555Fu, 0x11111111u, 0x22222222u};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec2SUp};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = (in_d[i] & 0xF8000000u) | (in_n[i] >> 5);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriVec2D) {
+  // SRI .2D shift=11: each lane = (Vd & high_11_bits) | (Vn >> 11).
+  uint64_t in_n[2] = {0x0123456789ABCDEFull, 0xFEDCBA9876543210ull};
+  uint64_t in_d[2] = {0xAAAAAAAAAAAAAAAAull, 0x5555555555555555ull};
+  std::memcpy(&state_.cpu.v[1], in_n, 16);
+  std::memcpy(&state_.cpu.v[0], in_d, 16);
+  static const uint32_t code[] = {kSriVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    // high 11 bits set: mask = ~((1ULL << (64-11)) - 1) = 0xFFE0_0000_0000_0000
+    uint64_t mask = ~((1ULL << (64 - 11)) - 1);
+    uint64_t want = (in_d[i] & mask) | (in_n[i] >> 11);
+    EXPECT_EQ(r[i], want) << "lane " << i << std::hex
+                          << " want=" << want << " got=" << r[i];
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

@@ -4619,6 +4619,215 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SMAXP/SMINP/UMAXP/UMINP vector (pairwise)
+      case Decoder::AdvSimdThreeSameOpcode::kSmaxp:
+      case Decoder::AdvSimdThreeSameOpcode::kSminp:
+      case Decoder::AdvSimdThreeSameOpcode::kUmaxp:
+      case Decoder::AdvSimdThreeSameOpcode::kUminp: {
+        // S{MAX,MIN}P / U{MAX,MIN}P Vd.<T>, Vn.<T>, Vm.<T>: pairwise lane-wise
+        // signed or unsigned max/min.  Vd = pair(Vn) || pair(Vm), where
+        //   pair(X)[i] = op(X[2i], X[2i+1]).
+        // No SSE/AVX2 horizontal-pairwise max/min instruction exists (PHADDW/D
+        // is the additive analog); emulate via PSHUFB-based even/odd gather
+        // (byte/halfword lanes) or PSHUFD-based even/odd lift (dword lanes),
+        // then lane-wise PMAX/PMIN, then concatenate the Vn and Vm partial
+        // results.
+        //
+        // Size 0b11 (.2D / .1D): no PMAXSQ/PMINSQ/PMAXUQ/PMINUQ before
+        // AVX-512F-VL; bail to the interpreter.  size=0b11 Q=0 (.1D) is
+        // ARM-reserved and the interpreter rejects it too.
+        if (args.size == 0b11) {
+          success_ = false;
+          return;
+        }
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmaxp ||
+             args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmaxp);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmaxp ||
+             args.opcode == Decoder::AdvSimdThreeSameOpcode::kSminp);
+        // SSE-feature gate matches the three-same SMAX/SMIN/UMAX/UMIN gate:
+        //   PMAXSB/PMINSB/PMAXSD/PMINSD/PMAXUW/PMINUW/PMAXUD/PMINUD -> SSE4.1.
+        //   PMAXSW/PMINSW/PMAXUB/PMINUB                              -> SSE2.
+        const bool needs_sse4_1 =
+            (is_signed && args.size == 0b00) ||
+            (is_signed && args.size == 0b10) ||
+            (!is_signed && args.size == 0b01) ||
+            (!is_signed && args.size == 0b10);
+        if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+          success_ = false;
+          return;
+        }
+        // Byte/halfword lanes need PSHUFB (SSSE3).  Dword lanes use only PSHUFD
+        // (SSE2).
+        const bool needs_ssse3 = (args.size == 0b00 || args.size == 0b01);
+        if (needs_ssse3 && !host_platform::kHasSSSE3) {
+          success_ = false;
+          return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        // Selector lambda: applies lane-wise PMAX/PMIN of {is_signed, is_max} ×
+        // width to (dst, src) operands.
+        auto pmax_pmin = [&](SimdRegister dst, SimdRegister src) {
+          switch (args.size) {
+            case 0b00:
+              if (is_signed) {
+                if (is_max) as_.Pmaxsb(dst, src); else as_.Pminsb(dst, src);
+              } else {
+                if (is_max) as_.Pmaxub(dst, src); else as_.Pminub(dst, src);
+              }
+              break;
+            case 0b01:
+              if (is_signed) {
+                if (is_max) as_.Pmaxsw(dst, src); else as_.Pminsw(dst, src);
+              } else {
+                if (is_max) as_.Pmaxuw(dst, src); else as_.Pminuw(dst, src);
+              }
+              break;
+            case 0b10:
+              if (is_signed) {
+                if (is_max) as_.Pmaxsd(dst, src); else as_.Pminsd(dst, src);
+              } else {
+                if (is_max) as_.Pmaxud(dst, src); else as_.Pminud(dst, src);
+              }
+              break;
+          }
+        };
+        switch (args.size) {
+          case 0b00:    // .16B (Q=1) / .8B (Q=0)
+          case 0b01: {  // .8H (Q=1) / .4H (Q=0)
+            // Build PSHUFB even-mask and odd-mask in xmm registers via two
+            // Pinsrq's from a temp GP register.  Even-mask gathers the
+            // even-indexed lanes of the source into the low 8 bytes of the
+            // mask result; odd-mask gathers the odd-indexed lanes.  Mask
+            // upper qword = 0x8080...80 so PSHUFB writes 0 into the upper
+            // half (don't-care for our pairwise result).
+            //
+            // size=00 byte: even = {0,2,4,6,8,10,12,14}; odd = {1,3,...,15}.
+            // size=01 word: even = {h0,h2,h4,h6}; odd = {h1,h3,h5,h7}.
+            //   Byte indices for the word form:
+            //     even = {0,1, 4,5, 8,9, 12,13};
+            //     odd  = {2,3, 6,7, 10,11, 14,15}.
+            SimdRegister even_mask = AllocTempSimdReg();
+            SimdRegister odd_mask = AllocTempSimdReg();
+            SimdRegister evens_n = AllocTempSimdReg();
+            SimdRegister odds_n = AllocTempSimdReg();
+            SimdRegister evens_m = AllocTempSimdReg();
+            SimdRegister odds_m = AllocTempSimdReg();
+            Register r1 = AllocTempReg();
+            if (even_mask == no_simd_register || odd_mask == no_simd_register ||
+                evens_n == no_simd_register || odds_n == no_simd_register ||
+                evens_m == no_simd_register || odds_m == no_simd_register ||
+                r1 == no_register) {
+              success_ = false; return;
+            }
+            int64_t even_lo, even_hi, odd_lo, odd_hi;
+            if (args.size == 0b00) {
+              // Byte: {0,2,4,6,8,10,12,14, 0x80*8} and {1,3,5,7,9,11,13,15, 0x80*8}.
+              even_lo = static_cast<int64_t>(0x0E0C0A0806040200LL);
+              even_hi = static_cast<int64_t>(0x8080808080808080ULL);
+              odd_lo  = static_cast<int64_t>(0x0F0D0B0907050301LL);
+              odd_hi  = static_cast<int64_t>(0x8080808080808080ULL);
+            } else {
+              // Halfword: {0,1,4,5,8,9,12,13, 0x80*8} and {2,3,6,7,10,11,14,15, 0x80*8}.
+              even_lo = static_cast<int64_t>(0x0D0C090805040100LL);
+              even_hi = static_cast<int64_t>(0x8080808080808080ULL);
+              odd_lo  = static_cast<int64_t>(0x0F0E0B0A07060302LL);
+              odd_hi  = static_cast<int64_t>(0x8080808080808080ULL);
+            }
+            as_.Movq(r1, even_lo);
+            as_.Movq(even_mask, r1);
+            as_.Movq(r1, even_hi);
+            as_.Pinsrq(even_mask, r1, int8_t{1});
+            as_.Movq(r1, odd_lo);
+            as_.Movq(odd_mask, r1);
+            as_.Movq(r1, odd_hi);
+            as_.Pinsrq(odd_mask, r1, int8_t{1});
+
+            // pair_n into low 8 bytes of xn:
+            as_.Movdqa(evens_n, xn);
+            as_.Pshufb(evens_n, even_mask);
+            as_.Movdqa(odds_n, xn);
+            as_.Pshufb(odds_n, odd_mask);
+            pmax_pmin(evens_n, odds_n);  // low 8 bytes hold pair(Vn)
+
+            // pair_m into low 8 bytes of xm:
+            as_.Movdqa(evens_m, xm);
+            as_.Pshufb(evens_m, even_mask);
+            as_.Movdqa(odds_m, xm);
+            as_.Pshufb(odds_m, odd_mask);
+            pmax_pmin(evens_m, odds_m);  // low 8 bytes hold pair(Vm)
+
+            // Concatenate the two 8-byte partials.  For Q=1 (.16B / .8H),
+            // both partials are full 8 bytes wide and PUNPCKLQDQ gives the
+            // full 16-byte result.  For Q=0 (.8B / .4H), only the low 4
+            // bytes of each partial are meaningful; PUNPCKLDQ packs those
+            // four-byte halves end-to-end and the mask_low64 tail below
+            // zeroes the don't-care upper 64 bits.
+            if (args.q) {
+              as_.Punpcklqdq(evens_n, evens_m);
+            } else {
+              as_.Punpckldq(evens_n, evens_m);
+            }
+            as_.Movdqa(xn, evens_n);
+            break;
+          }
+          case 0b10: {  // .4S (Q=1) / .2S (Q=0)
+            // Dword pairwise: PSHUFD imm 0x88 picks even-indexed dwords of
+            // a source into both halves of the destination ({d0,d2,d0,d2});
+            // imm 0xDD picks odd-indexed dwords ({d1,d3,d1,d3}).  Lane-wise
+            // PMAX/PMIN of the two halves yields pair(X) replicated in both
+            // halves; PUNPCKLQDQ then concatenates the low qwords of pair_n
+            // and pair_m into [pair_n[0], pair_n[1], pair_m[0], pair_m[1]]
+            // — exactly the .4S pairwise result.
+            //
+            // For Q=0 (.2S), the upper qword of Vn / Vm is don't-care; after
+            // PSHUFD 0x88 / 0xDD the dwords at positions 1,3 of the result
+            // are junk, but the PMAX/PMIN at position 0 still gives the
+            // correct max(n0, n1) / max(m0, m1).  After PUNPCKLQDQ the
+            // result is [max(n0,n1), junk, max(m0,m1), junk]; a final
+            // PSHUFD 0x08 packs positions 0 and 2 into 0 and 1, and the
+            // mask_low64 tail zeroes the don't-care upper 64 bits.
+            SimdRegister evens_n = AllocTempSimdReg();
+            SimdRegister odds_n = AllocTempSimdReg();
+            SimdRegister evens_m = AllocTempSimdReg();
+            SimdRegister odds_m = AllocTempSimdReg();
+            if (evens_n == no_simd_register || odds_n == no_simd_register ||
+                evens_m == no_simd_register || odds_m == no_simd_register) {
+              success_ = false; return;
+            }
+            as_.Pshufd(evens_n, xn, static_cast<int8_t>(0x88));
+            as_.Pshufd(odds_n, xn, static_cast<int8_t>(0xDD));
+            pmax_pmin(evens_n, odds_n);  // pair(Vn) replicated in both halves
+            as_.Pshufd(evens_m, xm, static_cast<int8_t>(0x88));
+            as_.Pshufd(odds_m, xm, static_cast<int8_t>(0xDD));
+            pmax_pmin(evens_m, odds_m);  // pair(Vm) replicated in both halves
+            if (args.q) {
+              as_.Punpcklqdq(evens_n, evens_m);
+            } else {
+              // Q=0: low qword of evens_n holds {max(n0,n1), junk}; low qword
+              // of evens_m holds {max(m0,m1), junk}.  PUNPCKLQDQ gives
+              // [max(n0,n1), junk, max(m0,m1), junk]; PSHUFD 0x08 packs
+              // dwords 0 and 2 into positions 0 and 1.
+              as_.Punpcklqdq(evens_n, evens_m);
+              as_.Pshufd(evens_n, evens_n, static_cast<int8_t>(0x08));
+            }
+            as_.Movdqa(xn, evens_n);
+            break;
+          }
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
@@ -9834,6 +10043,336 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // region digitalis - ADDV (across-lanes integer sum). Result is a single
+      // scalar in the lowest lane of Vd with all other bytes zeroed.
+      //
+      // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+      //   0 Q U 01110 size 11000 11011 10 Rn Rd, with U=0.
+      // Valid lane forms:
+      //   size=00 Q=0: ADDV B, V.8B    (sum 8 bytes  → 8-bit lane)
+      //   size=00 Q=1: ADDV B, V.16B   (sum 16 bytes → 8-bit lane)
+      //   size=01 Q=0: ADDV H, V.4H    (sum 4 hw     → 16-bit lane)
+      //   size=01 Q=1: ADDV H, V.8H    (sum 8 hw     → 16-bit lane)
+      //   size=10 Q=1: ADDV S, V.4S    (sum 4 dw     → 32-bit lane)
+      //   (size=10 Q=0 and size=11 are reserved; rejected here.)
+      //
+      // Byte path uses PSADBW (sum-of-absolute-differences vs 0), which
+      // produces 16-bit byte sums in qword-lane positions; halfword/dword
+      // paths use cascading PHADDW / PHADDD to collapse the vector.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAddv: {
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {
+            SimdRegister xz = AllocTempSimdReg();
+            if (xz == no_simd_register) { Undefined(); return; }
+            as_.Pxor(xz, xz);
+            // xn := [sum(bytes 0..7), 0..., sum(bytes 8..15), 0...] as
+            // 16-bit values in qword-lane positions.
+            as_.Psadbw(xn, xz);
+            if (args.q) {
+              // .16B: also fold in the high-qword sum.
+              SimdRegister xt = AllocTempSimdReg();
+              if (xt == no_simd_register) { Undefined(); return; }
+              as_.Pshufd(xt, xn, static_cast<int8_t>(0xEE));  // hi qword → lo qword
+              as_.Paddq(xn, xt);
+            }
+            // Keep only the low byte; zero the rest of Vd.
+            as_.Pslldq(xn, int8_t{15});
+            as_.Psrldq(xn, int8_t{15});
+            break;
+          }
+          case 0b01: {
+            // .4H: 2 cascading PHADDW collapses 4 halfwords → 1.
+            // .8H: 3 cascading PHADDW collapses 8 halfwords → 1.
+            as_.Phaddw(xn, xn);
+            as_.Phaddw(xn, xn);
+            if (args.q) as_.Phaddw(xn, xn);
+            // Keep only the low halfword (2 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{14});
+            as_.Psrldq(xn, int8_t{14});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) { Undefined(); return; }  // .2S reserved for ADDV.
+            // .4S: 2 cascading PHADDD collapses 4 dwords → 1.
+            as_.Phaddd(xn, xn);
+            as_.Phaddd(xn, xn);
+            // Keep only the low dword (4 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{12});
+            as_.Psrldq(xn, int8_t{12});
+            break;
+          }
+          default:
+            Undefined();
+            return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
+      // region digitalis - SADDLV / UADDLV (across-lanes long integer sum).
+      // Each source element is widened to 2*esize before being summed; the
+      // single 2*esize-wide result is written to the lowest lane of Vd with
+      // all other bytes zeroed.
+      //
+      // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+      //   0 Q U 01110 size 11000 00011 10 Rn Rd
+      // U=0 → SADDLV (signed), U=1 → UADDLV (unsigned).  Valid lane forms:
+      //   size=00 Q=0: V.8B   → H result (8b lanes  → 16b sum)
+      //   size=00 Q=1: V.16B  → H result
+      //   size=01 Q=0: V.4H   → S result (16b lanes → 32b sum)
+      //   size=01 Q=1: V.8H   → S result
+      //   size=10 Q=1: V.4S   → D result (32b lanes → 64b sum)
+      //   (size=10 Q=0 and size=11 are reserved; decoder rejects size=11.)
+      //
+      // Observed `uaddlv h0, v0.8b` (insn 0x2E303800) in WhatsApp's
+      // libar-bundle3.so JNI_OnLoad path (was previously interpreter-only).
+      //
+      // For UADDLV at .8B/.16B, PSADBW against zero already produces a
+      // 16-bit sum of bytes per qword lane (max 16*255 = 4080 << 2^16), so
+      // the unsigned byte paths reuse the ADDV PSADBW idiom.  For SADDLV
+      // and for halfword/dword inputs, PMOVxxBW / PMOVxxWD / PMOVxxDQ widen
+      // each source lane to the result width first; the widened lanes are
+      // then summed via PADDW / PADDD / PADDQ + PHADDW / PHADDD cascades.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlv: {
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv);
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {
+            // Bytes → 16-bit sum.
+            if (!is_signed) {
+              // UADDLV: PSADBW with zero gives 16-bit unsigned byte sum
+              // per qword (max 8*255 = 2040 ≤ 2^16).
+              SimdRegister xz = AllocTempSimdReg();
+              if (xz == no_simd_register) { Undefined(); return; }
+              as_.Pxor(xz, xz);
+              as_.Psadbw(xn, xz);
+              if (args.q) {
+                // .16B: fold high-qword sum into low qword.
+                SimdRegister xt = AllocTempSimdReg();
+                if (xt == no_simd_register) { Undefined(); return; }
+                as_.Pshufd(xt, xn, static_cast<int8_t>(0xEE));
+                as_.Paddq(xn, xt);
+              }
+            } else {
+              // SADDLV: sign-extend bytes → halfwords, then horizontal
+              // reduce via PHADDW.  Max signed sum 16*127 = 2032, fits.
+              if (args.q) {
+                // .16B: widen low 8 bytes and high 8 bytes separately,
+                // then lane-wise sum (8 partial halfword sums) → 3 PHADDW.
+                SimdRegister xt = AllocTempSimdReg();
+                if (xt == no_simd_register) { Undefined(); return; }
+                as_.Pmovsxbw(xt, xn);          // low  8b → 8 halfwords
+                as_.Psrldq(xn, int8_t{8});
+                as_.Pmovsxbw(xn, xn);          // high 8b → 8 halfwords
+                as_.Paddw(xn, xt);             // 8 partial-sum halfwords
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+              } else {
+                // .8B: only widen low 8 bytes; 3 PHADDW cascades collapse.
+                as_.Pmovsxbw(xn, xn);          // low 8b → 8 halfwords
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+                as_.Phaddw(xn, xn);
+              }
+            }
+            // Keep only the low halfword (2 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{14});
+            as_.Psrldq(xn, int8_t{14});
+            break;
+          }
+          case 0b01: {
+            // Halfwords → 32-bit sum.
+            if (args.q) {
+              // .8H: widen low 4 halfwords and high 4 halfwords separately,
+              // then lane-wise sum (4 partial dword sums) → 2 PHADDD.
+              SimdRegister xt = AllocTempSimdReg();
+              if (xt == no_simd_register) { Undefined(); return; }
+              if (is_signed) {
+                as_.Pmovsxwd(xt, xn);          // low 4 hw → 4 dwords
+                as_.Psrldq(xn, int8_t{8});
+                as_.Pmovsxwd(xn, xn);          // high 4 hw → 4 dwords
+              } else {
+                as_.Pmovzxwd(xt, xn);
+                as_.Psrldq(xn, int8_t{8});
+                as_.Pmovzxwd(xn, xn);
+              }
+              as_.Paddd(xn, xt);               // 4 partial-sum dwords
+              as_.Phaddd(xn, xn);
+              as_.Phaddd(xn, xn);
+            } else {
+              // .4H: only widen low 4 halfwords; 2 PHADDD cascades collapse.
+              if (is_signed) {
+                as_.Pmovsxwd(xn, xn);
+              } else {
+                as_.Pmovzxwd(xn, xn);
+              }
+              as_.Phaddd(xn, xn);
+              as_.Phaddd(xn, xn);
+            }
+            // Keep only the low dword (4 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{12});
+            as_.Psrldq(xn, int8_t{12});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) { Undefined(); return; }  // .2S reserved.
+            // .4S → 64-bit sum.  Widen 4 dwords → 4 qwords across two
+            // registers, sum lane-wise (2 partial qword sums), then fold
+            // hi-qword to lo-qword and add.
+            SimdRegister xt = AllocTempSimdReg();
+            if (xt == no_simd_register) { Undefined(); return; }
+            if (is_signed) {
+              as_.Pmovsxdq(xt, xn);            // low 2 dw → 2 qwords
+              as_.Psrldq(xn, int8_t{8});
+              as_.Pmovsxdq(xn, xn);            // high 2 dw → 2 qwords
+            } else {
+              as_.Pmovzxdq(xt, xn);
+              as_.Psrldq(xn, int8_t{8});
+              as_.Pmovzxdq(xn, xn);
+            }
+            as_.Paddq(xn, xt);                 // 2 partial-sum qwords
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0xEE));
+            as_.Paddq(xn, xt);
+            // Keep only the low qword (8 bytes); zero the rest.
+            as_.Pslldq(xn, int8_t{8});
+            as_.Psrldq(xn, int8_t{8});
+            break;
+          }
+          default:
+            Undefined();
+            return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
+      // region digitalis - SMAXV / SMINV / UMAXV / UMINV (across-lanes
+      // integer max/min reduce).  Scan all source lanes; write the single
+      // scalar max/min to the lowest lane of Vd with all other bytes of Vd
+      // zeroed.  Result width equals esize (unlike SADDLV/UADDLV which
+      // widens to 2*esize).
+      //
+      // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
+      //   0 Q U 01110 size 11000 opcode 10 Rn Rd
+      // SMAXV: opcode=01010, U=0.  UMAXV: opcode=01010, U=1.
+      // SMINV: opcode=11010, U=0.  UMINV: opcode=11010, U=1.
+      // Valid lane forms (decoder rejects size=11; JIT rejects size=10 Q=0):
+      //   size=00 Q=0: V.8B   size=00 Q=1: V.16B
+      //   size=01 Q=0: V.4H   size=01 Q=1: V.8H
+      //   size=10 Q=1: V.4S
+      //
+      // Strategy: load Vn into xn.  For Q=0, replicate the low qword across
+      // both halves (Pshufd 0x44) so the don't-care upper half can't poison
+      // the reduction — max(x, x) = x so duplicated lanes are idempotent.
+      // Then cascading PMAX/PMIN against a shuffle-of-xn collapses the
+      // vector by halving the surviving lane count each step.  Final shuttle
+      // (Pslldq N; Psrldq N) keeps only the low result lane.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUminv: {
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSminv);
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { Undefined(); return; }
+        SimdRegister xt = AllocTempSimdReg();
+        if (xt == no_simd_register) { Undefined(); return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (!args.q) {
+          // Replicate low qword to high qword: { dw0, dw1, dw0, dw1 } via
+          // _MM_SHUFFLE(1,0,1,0) = 0x44.  Neutralizes the don't-care upper
+          // half of Vn so it can't corrupt the PMAX/PMIN cascade.
+          as_.Pshufd(xn, xn, static_cast<int8_t>(0x44));
+        }
+        auto EmitPmaxPmin = [&](unsigned width_bits) {
+          switch (width_bits) {
+            case 8:
+              if (is_signed) {
+                if (is_max) as_.Pmaxsb(xn, xt); else as_.Pminsb(xn, xt);
+              } else {
+                if (is_max) as_.Pmaxub(xn, xt); else as_.Pminub(xn, xt);
+              }
+              break;
+            case 16:
+              if (is_signed) {
+                if (is_max) as_.Pmaxsw(xn, xt); else as_.Pminsw(xn, xt);
+              } else {
+                if (is_max) as_.Pmaxuw(xn, xt); else as_.Pminuw(xn, xt);
+              }
+              break;
+            case 32:
+              if (is_signed) {
+                if (is_max) as_.Pmaxsd(xn, xt); else as_.Pminsd(xn, xt);
+              } else {
+                if (is_max) as_.Pmaxud(xn, xt); else as_.Pminud(xn, xt);
+              }
+              break;
+          }
+        };
+        switch (args.size) {
+          case 0b00: {
+            // Bytes: 16 → 8 → 4 → 2 → 1 surviving lanes per step.
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0x4E));  // swap qwords
+            EmitPmaxPmin(8);
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0xB1));  // swap dwords within qwords
+            EmitPmaxPmin(8);
+            as_.Movdqa(xt, xn);
+            as_.Psrldq(xt, int8_t{2});  // bring xn bytes 2..3 to xt bytes 0..1
+            EmitPmaxPmin(8);
+            as_.Movdqa(xt, xn);
+            as_.Psrldq(xt, int8_t{1});  // bring xn byte 1 to xt byte 0
+            EmitPmaxPmin(8);
+            // Keep low byte; zero rest.
+            as_.Pslldq(xn, int8_t{15});
+            as_.Psrldq(xn, int8_t{15});
+            break;
+          }
+          case 0b01: {
+            // Halfwords: 8 → 4 → 2 → 1 surviving lanes per step.
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0x4E));  // swap qwords
+            EmitPmaxPmin(16);
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0xB1));  // swap dwords within qwords
+            EmitPmaxPmin(16);
+            as_.Movdqa(xt, xn);
+            as_.Psrldq(xt, int8_t{2});  // bring xn halfword 1 to xt halfword 0
+            EmitPmaxPmin(16);
+            // Keep low halfword; zero rest.
+            as_.Pslldq(xn, int8_t{14});
+            as_.Psrldq(xn, int8_t{14});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) { Undefined(); return; }  // .2S reserved.
+            // Dwords: 4 → 2 → 1 surviving lanes per step.
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0x4E));  // swap qwords
+            EmitPmaxPmin(32);
+            as_.Pshufd(xt, xn, static_cast<int8_t>(0xB1));  // swap dwords within qwords
+            EmitPmaxPmin(32);
+            // Keep low dword; zero rest.
+            as_.Pslldq(xn, int8_t{12});
+            as_.Psrldq(xn, int8_t{12});
+            break;
+          }
+          default:
+            Undefined();
+            return;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
@@ -10255,6 +10794,141 @@ class LiteTranslator {
           as_.Psrldq(xn, int8_t{8});
         }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
+      // region digitalis: SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
+      //
+      //   SSRA  Vd<i> = Vd<i> + (Vn<i> >> shift)        (arithmetic right shift, accumulate)
+      //   USRA  Vd<i> = Vd<i> + (Vn<i> >> shift)        (logical right shift, accumulate)
+      //   SLI   Vd<i> = (Vd<i> & low_mask)  | (Vn<i> << shift)   shift ∈ [0, esize-1]
+      //   SRI   Vd<i> = (Vd<i> & high_mask) | (Vn<i> >> shift)   shift ∈ [1, esize]
+      //
+      //   low_mask  has the low  `shift`        bits per lane set (for SLI).
+      //   high_mask has the high `shift`        bits per lane set (for SRI).
+      //
+      // For SLI/SRI the mask-and-OR is expressed via a two-shift bracket on Vd:
+      //
+      //   SLI:  PSLL(Vd, esize-shift); PSRL(Vd, esize-shift) — keeps low  `shift` bits.
+      //   SRI:  PSRL(Vd, esize-shift); PSLL(Vd, esize-shift) — keeps high `shift` bits.
+      //
+      // x86 saturation matches ARM at the boundary in every case:
+      //   - SLI shift==0: PSLL(Vd, esize) → 0 (count ≥ esize zeros the dest),
+      //     then PSRL(0, esize) → 0, then POR(0, PSLL(Vn,0)=Vn) → Vn. Correct.
+      //   - SRI shift==esize: PSRL(Vd, 0) → Vd, PSLL(Vd, 0) → Vd,
+      //     POR(Vd, PSRL(Vn, esize)=0) → Vd. Correct (every bit preserved).
+      //   - SSRA/USRA shift==esize: PSRA at count ≥ esize sign-fills (matches arch);
+      //     PSRL at count ≥ esize zeros (matches arch).
+      //
+      // Bail cases:
+      //   - byte (immh=0001): no PSLLB / PSRLB / PSRAB in SSE; interpreter handles.
+      //   - SSRA at .2D (size=11): needs PSRAQ which is AVX-512F-VL only.
+      case Decoder::AdvSimdShiftImmOpcode::kSsra:
+      case Decoder::AdvSimdShiftImmOpcode::kUsra:
+      case Decoder::AdvSimdShiftImmOpcode::kSli:
+      case Decoder::AdvSimdShiftImmOpcode::kSri: {
+        const uint8_t immh = args.immh;
+        if (immh == 0) { success_ = false; return; }
+        const bool is_byte = (immh == 0b0001);  // esize = 1 (8 bits)
+        if (is_byte) { success_ = false; return; }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else /* immh & 0b0010 */ {
+          esize_bits = 16;
+        }
+        const bool is_sli = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSli);
+        const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+        uint8_t shift_count;
+        if (is_sli) {
+          // SLI shift = immh:immb - bits, range [0, bits-1].
+          shift_count = static_cast<uint8_t>(immh_immb - esize_bits);
+        } else {
+          // SSRA/USRA/SRI shift = 2*bits - immh:immb, range [1, bits].
+          shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        }
+        // SSRA .2D needs PSRAQ — bail (AVX-512F-VL only).
+        if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSsra &&
+            esize_bits == 64) {
+          success_ = false; return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xd == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        const int8_t inv = static_cast<int8_t>(esize_bits - shift_count);
+        switch (args.opcode) {
+          case Decoder::AdvSimdShiftImmOpcode::kSsra:
+            // Vd += SSHR(Vn, shift). PSRA{W,D} only.
+            switch (esize_bits) {
+              case 16: as_.Psraw(xn, cnt); as_.Paddw(xd, xn); break;
+              case 32: as_.Psrad(xn, cnt); as_.Paddd(xd, xn); break;
+            }
+            break;
+          case Decoder::AdvSimdShiftImmOpcode::kUsra:
+            // Vd += USHR(Vn, shift). PSRL{W,D,Q}.
+            switch (esize_bits) {
+              case 16: as_.Psrlw(xn, cnt); as_.Paddw(xd, xn); break;
+              case 32: as_.Psrld(xn, cnt); as_.Paddd(xd, xn); break;
+              case 64: as_.Psrlq(xn, cnt); as_.Paddq(xd, xn); break;
+            }
+            break;
+          case Decoder::AdvSimdShiftImmOpcode::kSli:
+            // Vd = (Vd & low_mask) | (Vn << shift).
+            switch (esize_bits) {
+              case 16:
+                as_.Psllw(xd, inv); as_.Psrlw(xd, inv);
+                as_.Psllw(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 32:
+                as_.Pslld(xd, inv); as_.Psrld(xd, inv);
+                as_.Pslld(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 64:
+                as_.Psllq(xd, inv); as_.Psrlq(xd, inv);
+                as_.Psllq(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+            }
+            break;
+          case Decoder::AdvSimdShiftImmOpcode::kSri:
+            // Vd = (Vd & high_mask) | USHR(Vn, shift).
+            switch (esize_bits) {
+              case 16:
+                as_.Psrlw(xd, inv); as_.Psllw(xd, inv);
+                as_.Psrlw(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 32:
+                as_.Psrld(xd, inv); as_.Pslld(xd, inv);
+                as_.Psrld(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+              case 64:
+                as_.Psrlq(xd, inv); as_.Psllq(xd, inv);
+                as_.Psrlq(xn, cnt);
+                as_.Por(xd, xn);
+                break;
+            }
+            break;
+          default:
+            // Unreachable — outer switch limits opcode to the four cases above.
+            success_ = false; return;
+        }
+        if (!args.q) {
+          // Zero upper 64 bits of Vd (D-register semantics).
+          as_.Pslldq(xd, int8_t{8});
+          as_.Psrldq(xd, int8_t{8});
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
       // endregion
