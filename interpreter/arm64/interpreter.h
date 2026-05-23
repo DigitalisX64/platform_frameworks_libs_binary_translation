@@ -6446,18 +6446,22 @@ class Interpreter {
       // endregion
 
       // region digitalis - across-lanes FP reductions FMAXV / FMINV /
-      // FMAXNMV / FMINNMV. Reduce a 4-lane FP32 vector (.4S, Q=1)
-      // to a single FP32 scalar lane.
+      // FMAXNMV / FMINNMV. Reduce all lanes of an FP vector (.4S for
+      // FP32, .8H for FP16; Q=1 pinned by the decoder) to a single
+      // scalar FP element.
       //   FMAXV/FMINV: IEEE 754-2008 max/min — any NaN in input
       //     propagates to a NaN result.
       //   FMAXNMV/FMINNMV: max-number/min-number — a NaN is skipped
       //     when the other operand is non-NaN; if both are NaN, NaN
       //     propagates.
-      // Decoder pins Q=1 (.4S) and FP32 (size[0]=0); FP16 routes via
-      // the FP16 dispatcher. The args.size field for these ops carries
-      // "o sz" (bit23=o, bit22=sz), so the routine's normal
-      // size->esize mapping does not apply — the lane width is fixed
-      // at 4 bytes (FP32) regardless of args.size value.
+      // The args.size field for these ops carries "o sz" (bit23=o,
+      // bit22=sz), so the routine's normal size->esize mapping does
+      // not apply — the lane width is determined by args.is_fp16
+      // (FP16=2 bytes, otherwise FP32=4 bytes). FP16 promotes each
+      // lane to FP32 via FpHalfToSingle, reduces in FP32 (same NaN
+      // and signed-zero semantics), then narrows the result back via
+      // FpSingleToHalf — the same round-trip used elsewhere for FP16
+      // max/min (e.g. the FP16 three-same FMAX/FMIN arm).
       // Reduction order is unspecified by ARM; FP max/min is
       // associative across the non-NaN/NaN axis, so a linear sweep
       // produces the architecturally-required result.
@@ -6469,6 +6473,30 @@ class Interpreter {
                        args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv);
         bool is_nm = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv ||
                       args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
+        if (args.is_fp16) {
+          // .8H form: reduce 8 lanes of half. Promote to FP32 for the
+          // reduction (FP16 -> FP32 is exact and preserves NaN); narrow
+          // the final accumulator back to FP16.
+          uint16_t acc_h;
+          memcpy(&acc_h, reinterpret_cast<const uint8_t*>(&src), 2);
+          float acc = FpHalfToSingle(acc_h);
+          for (uint8_t i = 1; i < 8; i++) {
+            uint16_t a_h;
+            memcpy(&a_h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
+            float a = FpHalfToSingle(a_h);
+            float b = acc;
+            if (is_nm) {
+              acc = is_max ? FmaxnmScalar<float>(a, b) : FminnmScalar<float>(a, b);
+            } else {
+              acc = is_max ? FmaxScalar<float>(a, b) : FminScalar<float>(a, b);
+            }
+          }
+          uint16_t out_h = FpSingleToHalf(acc);
+          result = 0;
+          memcpy(reinterpret_cast<uint8_t*>(&result), &out_h, 2);
+          break;
+        }
+        // .4S form.
         float acc;
         memcpy(&acc, reinterpret_cast<const uint8_t*>(&src), 4);
         for (uint8_t i = 1; i < 4; i++) {

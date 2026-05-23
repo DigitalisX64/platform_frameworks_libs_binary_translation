@@ -4816,6 +4816,13 @@ class Decoder {
     uint8_t rd = GetBits<0, 5>();
 
     AdvSimdTwoRegMiscOpcode op;
+    // region digitalis - Armv8.2-FP16 across-lanes (FMAXV/FMINV/FMAXNMV/FMINNMV
+    // on .8H) shares the across-lanes dispatch path with FP32 (.4S) and is
+    // distinguished by U=0 vs FP32's U=1. The relevant cases below set this
+    // flag; it is otherwise false. The interpreter reads args.is_fp16 inside
+    // each across-lanes arm to dispatch the half-precision element path.
+    bool is_fp16 = false;
+    // endregion
 
     switch (opcode) {
       case 0b00000:
@@ -4950,13 +4957,14 @@ class Decoder {
         break;
       // region digitalis - bit20 splits opcode=01111 between
       // FABS/FNEG (bit20=0, two-reg-misc) and across-lanes
-      // FMAXV/FMINV (bit20=1, U=1 mandatory). Without this split the
-      // FMAXV/FMINV (U=1) encoding silently misrouted to kFneg.
-      // bit23 picks max (0) vs min (1); size[0] (=bit22) picks
-      // FP32 (0) vs FP16 (1) — FP16 left to the FP16 dispatcher.
+      // FMAXV/FMINV (bit20=1). bit23 picks max (0) vs min (1).
+      // U=1 selects the FP32 (.4S) form; U=0 selects the FP16 (.8H) form
+      // (interpreter dispatches on args.is_fp16). For both U values bit22
+      // (size[0], "sz") must be 0 — FP64 is unallocated for these encodings.
       case 0b01111:
         if (GetBits<20, 1>()) {
-          if (!u || (size & 1) || !q) { Undefined(); return; }
+          if ((size & 1) || !q) { Undefined(); return; }
+          is_fp16 = !u;
           op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminv
                                 : AdvSimdTwoRegMiscOpcode::kFmaxv;
         } else {
@@ -4965,15 +4973,16 @@ class Decoder {
         break;
       // endregion
       // region digitalis - across-lanes FMAXNMV / FMINNMV
-      // (opcode=01100, bit20=1, U=1 mandatory). Two-reg-misc has no
-      // op at opcode=01100, so the entire case is across-lanes;
-      // pre-Digitalis decoder fell through to default Undefined()
-      // and these encodings would have raised SIGILL. bit23 picks
-      // max-number (0) vs min-number (1); size[0] picks FP precision
-      // (FP32 only here — FP16 left to the FP16 dispatcher).
+      // (opcode=01100, bit20=1). Two-reg-misc has no op at opcode=01100,
+      // so the entire case is across-lanes; pre-Digitalis decoder fell
+      // through to default Undefined() and these encodings would have
+      // raised SIGILL. bit23 picks max-number (0) vs min-number (1);
+      // U=1 selects FP32 (.4S), U=0 selects FP16 (.8H) (interpreter
+      // dispatches on args.is_fp16). bit22 (sz) must be 0.
       case 0b01100:
-        if (!u || !GetBits<20, 1>()) { Undefined(); return; }
+        if (!GetBits<20, 1>()) { Undefined(); return; }
         if ((size & 1) || !q) { Undefined(); return; }
+        is_fp16 = !u;
         op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminnmv
                               : AdvSimdTwoRegMiscOpcode::kFmaxnmv;
         break;
@@ -5085,6 +5094,11 @@ class Decoder {
         .size = size,
         .q = q,
         .u = u,
+        // region digitalis - across-lanes FP16 (FMAXV/FMINV/FMAXNMV/FMINNMV
+        // on .8H) is selected by U=0 in the across-lanes cases above; for
+        // every other dispatch path is_fp16 stays false.
+        .is_fp16 = is_fp16,
+        // endregion
     };
     insn_consumer_->AdvSimdTwoRegMisc(args);
   }
