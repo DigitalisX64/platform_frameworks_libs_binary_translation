@@ -7817,20 +7817,91 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xtable_lo);
         return;
       }
-      // NOT V.16B / V.8B  -- per-lane bitwise NOT: Vd = ~Vn.
-      // The decoder routes opcode=00101+U=1 to kNot for both size=00 (NOT) and
-      // size=01 (RBIT); only NOT (size=00) has a trivial x86 lowering.  RBIT
-      // needs a nibble-table PSHUFB pair, deferred — JIT-bail via success_=false.
+      // NOT V.16B / V.8B (size=00) -- per-lane bitwise NOT: Vd = ~Vn.
+      // RBIT V.16B / V.8B (size=01) -- per-byte bit reversal.
+      // The decoder routes opcode=00101+U=1 to kNot for both encodings,
+      // discriminated by size: size=00 → NOT, size=01 → RBIT.
+      //
+      // RBIT lowering: two-PSHUFB nibble-LUT.  For input byte b = (H<<4) | L:
+      //   reverse_bits(b) = (reverse_4(L) << 4) | reverse_4(H)
+      // where reverse_4 is the 4-bit bit-reverse.  Two lookup tables:
+      //   low_table[i]  = reverse_4(i)              -- lookup result occupies low nibble
+      //   high_table[i] = reverse_4(i) << 4         -- lookup result occupies high nibble
+      // Then:
+      //   t_lo = Vn & 0x0F       (low nibbles)
+      //   t_hi = (Vn >> 4) & 0x0F (high nibbles, via 16-bit PSRLW + PAND)
+      //   Vd   = PSHUFB(high_table, t_lo) | PSHUFB(low_table, t_hi)
+      // The two PSHUFB results have disjoint nibble positions, so POR or
+      // PADDB combine equivalently; we use POR to match the read-as-bits
+      // shape of the operation.
       case Decoder::AdvSimdTwoRegMiscOpcode::kNot: {
-        if (args.size != 0b00) { success_ = false; return; }  // RBIT bails to interp
-        SimdRegister xn = AllocTempSimdReg();
-        SimdRegister allones = AllocTempSimdReg();
-        if (xn == no_simd_register || allones == no_simd_register) { success_ = false; return; }
-        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
-        as_.Pcmpeqd(allones, allones);
-        as_.Pxor(xn, allones);
-        if (!args.q) mask_low64(xn);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        if (args.size == 0b00) {
+          // NOT: trivial bitwise complement.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister allones = AllocTempSimdReg();
+          if (xn == no_simd_register || allones == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Pcmpeqd(allones, allones);
+          as_.Pxor(xn, allones);
+          if (!args.q) mask_low64(xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        if (args.size == 0b01) {
+          // RBIT: two-PSHUFB nibble-LUT bit reversal.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xlow_table = AllocTempSimdReg();
+          SimdRegister xhigh_table = AllocTempSimdReg();
+          SimdRegister xmask = AllocTempSimdReg();
+          if (xn == no_simd_register || xn_hi == no_simd_register ||
+              xlow_table == no_simd_register || xhigh_table == no_simd_register ||
+              xmask == no_simd_register) {
+            success_ = false; return;
+          }
+          Register r1 = AllocTempReg();
+          if (r1 == no_register) { success_ = false; return; }
+          // Build low_table = {0,8,4,12,2,10,6,14, 1,9,5,13,3,11,7,15}.
+          //   bytes  0..7 → 0x0E060A020C040800
+          //   bytes 8..15 → 0x0F070B030D050901
+          as_.Movq(r1, static_cast<int64_t>(0x0E060A020C040800LL));
+          as_.Movq(xlow_table, r1);
+          as_.Movq(r1, static_cast<int64_t>(0x0F070B030D050901LL));
+          as_.Pinsrq(xlow_table, r1, int8_t{1});
+          // Build high_table = {0,0x80,0x40,0xC0,0x20,0xA0,0x60,0xE0,
+          //                     0x10,0x90,0x50,0xD0,0x30,0xB0,0x70,0xF0}.
+          //   bytes  0..7 → 0xE060A020C0408000
+          //   bytes 8..15 → 0xF070B030D0509010
+          as_.Movq(r1, static_cast<int64_t>(0xE060A020C0408000ULL));
+          as_.Movq(xhigh_table, r1);
+          as_.Movq(r1, static_cast<int64_t>(0xF070B030D0509010ULL));
+          as_.Pinsrq(xhigh_table, r1, int8_t{1});
+          // Build 0x0F broadcast mask.
+          as_.Movq(r1, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+          as_.Movq(xmask, r1);
+          as_.Punpcklqdq(xmask, xmask);
+          // Load Vn; split into low and high nibbles.
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqa(xn_hi, xn);
+          as_.Psrlw(xn_hi, int8_t{4});  // 16-bit-lane shift; bits leak between
+                                        // adjacent bytes but PAND below filters
+                                        // each byte's high nibble cleanly.
+          as_.Pand(xn_hi, xmask);
+          as_.Pand(xn, xmask);
+          // Dual PSHUFB: high_table looked up by low nibbles → high-nibble of
+          // result; low_table looked up by high nibbles → low-nibble of result.
+          // PSHUFB is destructive in its first operand; tables consumed here.
+          as_.Pshufb(xhigh_table, xn);
+          as_.Pshufb(xlow_table, xn_hi);
+          as_.Por(xhigh_table, xlow_table);
+          if (!args.q) mask_low64(xhigh_table);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xhigh_table);
+          return;
+        }
+        // size=10 / size=11 are reserved for this opcode group.
+        success_ = false;
         return;
       }
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).

@@ -9201,6 +9201,57 @@ TEST_F(Arm64LiteTranslateRegionTest, CntVec8BUpperZero) {
 }
 // endregion
 
+// region digitalis: RBIT vector two-reg-misc JIT (bit-reverse nibble-LUT via PSHUFB pair)
+constexpr uint32_t kRbitVec16B = 0x6E605820;  // rbit v0.16b, v1.16b
+constexpr uint32_t kRbitVec8B  = 0x2E605820;  // rbit v0.8b,  v1.8b
+
+namespace {
+inline uint8_t ReverseBits8(uint8_t b) {
+  uint8_t r = 0;
+  for (int i = 0; i < 8; ++i) r |= ((b >> i) & 1u) << (7 - i);
+  return r;
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, RbitVec16B) {
+  // Cover bit patterns that exercise both nibble lookups: 0, all-ones,
+  // alternating, single-bit (boundary positions), nibble-aligned values.
+  uint8_t in[16] = {0x00, 0xFF, 0x01, 0x80, 0x55, 0xAA, 0x7F, 0x0F,
+                    0xF0, 0x11, 0x22, 0x44, 0x88, 0xC3, 0x3C, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRbitVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = ReverseBits8(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, RbitVec8BUpperZero) {
+  // Q=0 form must zero the upper 64 bits of Vd.  Non-zero pattern in
+  // bytes 8..15 of Vn confirms those don't leak into Vd.
+  uint8_t in[16] = {0x00, 0xFF, 0x55, 0xAA, 0x01, 0x80, 0x7F, 0x0F,
+                    0x33, 0xCC, 0xF0, 0x0F, 0xAA, 0x55, 0xFF, 0xE7};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kRbitVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint8_t want = ReverseBits8(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
