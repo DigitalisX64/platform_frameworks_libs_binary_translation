@@ -1483,6 +1483,24 @@ class Decoder {
     kSqsubScalar,
     kUqsubScalar,
     // endregion
+    // region digitalis - scalar saturating shift left (B/H/S/D).
+    //   size = 00 -> B, 01 -> H, 10 -> S, 11 -> D.
+    //   Shift amount is the low 8 bits of Vm (signed); negative shifts
+    //   are arithmetic right (signed forms) or logical right (unsigned).
+    //   The "R" variants round (add `1 << (rshift-1)` before the right
+    //   shift) and the "S/U-Q" forms saturate the left-shift result to
+    //   the per-width signed/unsigned range.  See ARM ARM C7.2.302 /
+    //   .306 / .310 / .313 (SQSHL / SQRSHL / UQSHL / UQRSHL).
+    //   Encoding (scalar):
+    //     SQSHL  <V>d, <V>n, <V>m = 01 0 11110 size 1 Rm 0 1001 1 Rn Rd
+    //     UQSHL  <V>d, <V>n, <V>m = 01 1 11110 size 1 Rm 0 1001 1 Rn Rd
+    //     SQRSHL <V>d, <V>n, <V>m = 01 0 11110 size 1 Rm 0 1011 1 Rn Rd
+    //     UQRSHL <V>d, <V>n, <V>m = 01 1 11110 size 1 Rm 0 1011 1 Rn Rd
+    kSqshlScalar,
+    kUqshlScalar,
+    kSqrshlScalar,
+    kUqrshlScalar,
+    // endregion
   };
 
   struct AdvSimdScalarThreeSameArgs {
@@ -5151,8 +5169,9 @@ class Decoder {
       // single-lane fast paths for DSP saturation.  See ARM ARM
       // C7.2.282 / .284 (SQADD / SQSUB) and C7.2.317 / .319 (UQADD /
       // UQSUB).
-      // region digitalis: opcodes 00001 / 00011 are B/H/S/D-capable.
-      const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00011);
+      // region digitalis: opcodes 00001 / 00011 / 01001 / 01011 are B/H/S/D-capable.
+      const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00011) ||
+                             (opcode == 0b01001) || (opcode == 0b01011);
       if (!all_sizes && size != 0b11) { Undefined(); return; }
       // endregion
 
@@ -5167,6 +5186,18 @@ class Decoder {
         case 0b00011:
           op = u ? AdvSimdScalarThreeSameOpcode::kUqsubScalar
                  : AdvSimdScalarThreeSameOpcode::kSqsubScalar;
+          break;
+        // endregion
+        // region digitalis: SQSHL / UQSHL scalar (B/H/S/D).
+        case 0b01001:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqshlScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqshlScalar;
+          break;
+        // endregion
+        // region digitalis: SQRSHL / UQRSHL scalar (B/H/S/D).
+        case 0b01011:
+          op = u ? AdvSimdScalarThreeSameOpcode::kUqrshlScalar
+                 : AdvSimdScalarThreeSameOpcode::kSqrshlScalar;
           break;
         // endregion
         case 0b00110:

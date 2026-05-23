@@ -5745,6 +5745,123 @@ class Interpreter {
     }
     // endregion
 
+    // region digitalis: scalar saturating shift left (B/H/S/D).
+    // Covers four new opcodes: SQSHL, UQSHL, SQRSHL, UQRSHL.  The shift
+    // amount comes from the low 8 bits of Vm interpreted as int8_t —
+    // positive shifts left (saturating on the per-width range), negative
+    // shifts right (arithmetic for the signed forms, logical for unsigned).
+    // The "R" variants round half-up by adding `1 << (rshift-1)` before
+    // the right shift.  See ARM ARM C7.2.302 / .306 / .310 / .313.
+    switch (args.opcode) {
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kUqrshlScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 1, 2, 4, 8
+        const uint8_t bits_local = esize * 8;
+        const uint64_t mask =
+            (bits_local == 64) ? ~uint64_t{0}
+                               : ((uint64_t{1} << bits_local) - 1);
+        const uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]) & mask;
+        // Shift amount is the low 8 bits of Vm.D[0], signed.
+        const uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]);
+        const int sh = static_cast<int8_t>(b & 0xFF);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar);
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar) ||
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kUqrshlScalar);
+        uint64_t r;
+        if (is_signed) {
+          const int shift_to_64 = 64 - bits_local;
+          int64_t sa = static_cast<int64_t>(a << shift_to_64) >> shift_to_64;
+          const int64_t smax = (bits_local == 64)
+                                   ? INT64_MAX
+                                   : ((int64_t{1} << (bits_local - 1)) - 1);
+          const int64_t smin = (bits_local == 64)
+                                   ? INT64_MIN
+                                   : -(int64_t{1} << (bits_local - 1));
+          int64_t res;
+          if (sh > 0) {
+            // Left shift, saturate if any bit beyond the sign bit gets set.
+            if (sh >= bits_local) {
+              res = (sa > 0) ? smax : ((sa < 0) ? smin : int64_t{0});
+            } else {
+              __int128 shifted = static_cast<__int128>(sa) << sh;
+              if (shifted > smax) res = smax;
+              else if (shifted < smin) res = smin;
+              else res = static_cast<int64_t>(shifted);
+            }
+          } else if (sh == 0) {
+            res = sa;
+          } else {
+            // Negative shift => arithmetic right shift (optionally rounding).
+            const int rshift = -sh;
+            if (is_rounding) {
+              if (rshift > 64) {
+                res = 0;
+              } else {
+                __int128 sum = static_cast<__int128>(sa) +
+                               (static_cast<__int128>(1) << (rshift - 1));
+                res = static_cast<int64_t>(sum >> rshift);
+              }
+            } else {
+              if (rshift >= bits_local) {
+                res = (sa < 0) ? int64_t{-1} : int64_t{0};
+              } else {
+                res = sa >> rshift;
+              }
+            }
+          }
+          // Right shifts can't grow beyond [smin, smax], but rounding can
+          // bump a positive value across smax (e.g. esize=1, sa=127, rshift=
+          // very-large rounding edge cases); clamp defensively.
+          if (res > smax) res = smax;
+          if (res < smin) res = smin;
+          r = static_cast<uint64_t>(res) & mask;
+        } else {
+          const uint64_t ua = a;
+          uint64_t res;
+          if (sh > 0) {
+            if (sh >= bits_local) {
+              res = (ua != 0) ? mask : 0;
+            } else {
+              __uint128_t shifted = static_cast<__uint128_t>(ua) << sh;
+              if (shifted > static_cast<__uint128_t>(mask)) res = mask;
+              else res = static_cast<uint64_t>(shifted);
+            }
+          } else if (sh == 0) {
+            res = ua;
+          } else {
+            const int rshift = -sh;
+            if (is_rounding) {
+              if (rshift > 64) {
+                res = 0;
+              } else {
+                __uint128_t sum = static_cast<__uint128_t>(ua) +
+                                  (static_cast<__uint128_t>(1) << (rshift - 1));
+                res = static_cast<uint64_t>(sum >> rshift);
+                if (res > mask) res = mask;
+              }
+            } else {
+              if (rshift >= bits_local) {
+                res = 0;
+              } else {
+                res = ua >> rshift;
+              }
+            }
+          }
+          r = res;
+        }
+        state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
+        return;
+      }
+      default:
+        break;
+    }
+    // endregion
+
     // D-form integer ops below.
     uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]);
     uint64_t b = static_cast<uint64_t>(state_->cpu.v[args.rm]);
