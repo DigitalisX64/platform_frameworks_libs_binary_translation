@@ -5705,7 +5705,7 @@ class LiteTranslator {
   // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
-    // region digitalis: ZIP / UZP vector permute JIT
+    // region digitalis: ZIP / UZP / TRN vector permute JIT
     //
     // opcode encoding (3 bits, from Decoder::DecodeAdvSimd at decoder.h:2808):
     //   001=UZP1, 010=TRN1, 011=ZIP1, 101=UZP2, 110=TRN2, 111=ZIP2
@@ -5720,7 +5720,7 @@ class LiteTranslator {
     // so PUNPCKL picks up the originally-upper-half elements; the Q=0
     // upper-zero tail masks any garbage beyond byte 7 of the result.
     //
-    // UZP1/UZP2 (this cycle): take EVEN (UZP1) or ODD (UZP2) elements
+    // UZP1/UZP2 (-175): take EVEN (UZP1) or ODD (UZP2) elements
     // from each source.  Lowering varies per element width:
     //   .16B/.8B  (PACKUSWB): mask high byte of each halfword via
     //     PSLLW(8)+PSRLW(8) for UZP1, or PSRLW(8) for UZP2, then
@@ -5734,18 +5734,41 @@ class LiteTranslator {
     //   .2D       (PUNPCKL/HQDQ): coincides with ZIP1.2D / ZIP2.2D
     //     because 2-lane uzip and zip are the same permutation.
     //
-    // Q=0 forms: PUNPCKLQDQ(xn, xm) first combines the lower 8 bytes
+    // Q=0 UZP forms: PUNPCKLQDQ(xn, xm) first combines the lower 8 bytes
     // of vn and vm into a single 16-byte register, after which the
     // Q=1-shaped lowering (now using xn as both PACKUS / SHUFPS
     // sources) produces 16/8 bytes of result with the wanted 8 bytes
     // duplicated in the low and high halves.  The Q=0 upper-zero tail
     // discards the duplicate.
     //
-    // TRN1/TRN2 remain on the interpreter pending later cycles; bail
-    // via success_=false here.
+    // TRN1/TRN2 (this cycle): interleave EVEN-indexed (TRN1) or
+    // ODD-indexed (TRN2) elements alternately from each source:
+    //   TRN1: Vd[2i]=Vn[2i],   Vd[2i+1]=Vm[2i]
+    //   TRN2: Vd[2i]=Vn[2i+1], Vd[2i+1]=Vm[2i+1]
+    // Lowering varies per element width:
+    //   .16B/.8B  (PSHUFB + POR): precomputed mask_n picks the wanted
+    //     bytes of Vn into the even positions of the result and zeros
+    //     the rest (0x80 mask byte → 0 in PSHUFB); mask_m mirrors for
+    //     Vm into odd positions; POR combines.  Masks are built at
+    //     JIT time via the same Movq+Pinsrq idiom as the §C8 CNT
+    //     lookup table (lite_translator.h:7967-7979).
+    //   .8H /.4H  (PSHUFB + POR): same shape with halfword indices.
+    //   .4S /.2S  (PSHUFD + PUNPCKLDQ): PSHUFD imm 0x88 collapses
+    //     dwords {0,2} of each source into both halves; PUNPCKLDQ
+    //     then interleaves them into [s1[0], s2[0], s1[2], s2[2]] =
+    //     TRN1.4S.  TRN2.4S uses imm 0xDD to collapse {1,3}.
+    //   .2D       (PUNPCKL/HQDQ): coincides with ZIP1.2D / ZIP2.2D
+    //     for the same 2-lane reason as UZP.
+    //   .2S Q=0   (PUNPCKLDQ): TRN1.2S = [s1[0], s2[0]] coincides with
+    //     ZIP1.2S; TRN2.2S = [s1[1], s2[1]] coincides with ZIP2.2S,
+    //     reached via the same PSRLDQ-4 prelude.
+    //
+    // No SSE4.1 dependency for TRN: PSHUFB is SSSE3 (universally
+    // available on the emulator host), PSHUFD/PUNPCK are SSE2.
     const bool is_zip = (opcode == 0b011 || opcode == 0b111);
     const bool is_uzp = (opcode == 0b001 || opcode == 0b101);
-    if (!is_zip && !is_uzp) {
+    const bool is_trn = (opcode == 0b010 || opcode == 0b110);
+    if (!is_zip && !is_uzp && !is_trn) {
       UNUSED(rd, rn, rm, size);
       success_ = false;
       return;
@@ -5802,7 +5825,7 @@ class LiteTranslator {
           case 0b11: as_.Punpcklqdq(xn, xm); break;  // ZIP1 .2D       (Q=0 forbidden by ARM)
         }
       }
-    } else {  // is_uzp
+    } else if (is_uzp) {
       const bool is_uzp2 = (opcode == 0b101);
 
       if (!q) {
@@ -5867,6 +5890,119 @@ class LiteTranslator {
         case 0b11: {  // .2D (q=1 only; q=0 caught above).
           // UZP1.2D == ZIP1.2D, UZP2.2D == ZIP2.2D (2-lane coincidence).
           if (is_uzp2) {
+            as_.Punpckhqdq(xn, xm);
+          } else {
+            as_.Punpcklqdq(xn, xm);
+          }
+          break;
+        }
+      }
+    } else {  // is_trn
+      const bool is_trn2 = (opcode == 0b110);
+
+      switch (size) {
+        case 0b00:
+        case 0b01: {
+          // .16B / .8B (size=00) and .8H / .4H (size=01) use PSHUFB +
+          // POR with precomputed per-byte masks.  mask_n selects the
+          // wanted bytes of Vn into even output lane positions (rest =
+          // 0x80, which PSHUFB renders as 0); mask_m selects Vm bytes
+          // into the odd positions; POR combines.  Q=0 forms reuse the
+          // Q=1 masks — bytes 8..15 of the result are either zeroed by
+          // PSHUFB (mask 0x80) or filled with garbage from the source's
+          // unspecified upper half, both of which get cleared by the
+          // shared Q=0 upper-zero tail.
+          SimdRegister mask_n = AllocTempSimdReg();
+          SimdRegister mask_m = AllocTempSimdReg();
+          if (mask_n == no_simd_register || mask_m == no_simd_register) {
+            success_ = false;
+            return;
+          }
+          Register r1 = AllocTempReg();
+          if (r1 == no_register) {
+            success_ = false;
+            return;
+          }
+
+          int64_t mask_n_lo, mask_n_hi, mask_m_lo, mask_m_hi;
+          if (size == 0b00) {
+            if (is_trn2) {
+              // TRN2 .16B: bytes {1,_,3,_,5,_,7,_,  9,_,11,_,13,_,15,_}
+              // for Vn (where _ = 0x80, replaced by Vm via POR).
+              mask_n_lo = static_cast<int64_t>(0x8007800580038001LL);
+              mask_n_hi = static_cast<int64_t>(0x800F800D800B8009LL);
+              mask_m_lo = static_cast<int64_t>(0x0780058003800180LL);
+              mask_m_hi = static_cast<int64_t>(0x0F800D800B800980LL);
+            } else {
+              // TRN1 .16B: bytes {0,_,2,_,4,_,6,_,  8,_,10,_,12,_,14,_}
+              mask_n_lo = static_cast<int64_t>(0x8006800480028000LL);
+              mask_n_hi = static_cast<int64_t>(0x800E800C800A8008LL);
+              mask_m_lo = static_cast<int64_t>(0x0680048002800080LL);
+              mask_m_hi = static_cast<int64_t>(0x0E800C800A800880LL);
+            }
+          } else {  // size == 0b01: halfword granularity.
+            if (is_trn2) {
+              // TRN2 .8H: halfwords {1,_,3,_, 5,_,7,_}  -> byte pairs
+              //   {(2,3),_,_,(6,7),_,_, (10,11),_,_,(14,15),_,_}
+              mask_n_lo = static_cast<int64_t>(0x8080070680800302LL);
+              mask_n_hi = static_cast<int64_t>(0x80800F0E80800B0ALL);
+              mask_m_lo = static_cast<int64_t>(0x0706808003028080LL);
+              mask_m_hi = static_cast<int64_t>(0x0F0E80800B0A8080LL);
+            } else {
+              // TRN1 .8H: halfwords {0,_,2,_, 4,_,6,_}  -> byte pairs
+              //   {(0,1),_,_,(4,5),_,_, (8,9),_,_,(12,13),_,_}
+              mask_n_lo = static_cast<int64_t>(0x8080050480800100LL);
+              mask_n_hi = static_cast<int64_t>(0x80800D0C80800908LL);
+              mask_m_lo = static_cast<int64_t>(0x0504808001008080LL);
+              mask_m_hi = static_cast<int64_t>(0x0D0C808009088080LL);
+            }
+          }
+
+          as_.Movq(r1, mask_n_lo);
+          as_.Movq(mask_n, r1);
+          as_.Movq(r1, mask_n_hi);
+          as_.Pinsrq(mask_n, r1, int8_t{1});
+
+          as_.Movq(r1, mask_m_lo);
+          as_.Movq(mask_m, r1);
+          as_.Movq(r1, mask_m_hi);
+          as_.Pinsrq(mask_m, r1, int8_t{1});
+
+          as_.Pshufb(xn, mask_n);
+          as_.Pshufb(xm, mask_m);
+          as_.Por(xn, xm);
+          break;
+        }
+        case 0b10: {  // .4S (q=1) or .2S (q=0).
+          if (!q) {
+            // .2S has only 2 lanes per source: TRN1.2S = [s1[0], s2[0]]
+            // == ZIP1.2S; TRN2.2S = [s1[1], s2[1]] == ZIP2.2S.  Both
+            // reuse the ZIP .2S lowering — PUNPCKLDQ, with a PSRLDQ-4
+            // prelude for TRN2 to pull s1[1]/s2[1] down to position 0.
+            if (is_trn2) {
+              as_.Psrldq(xn, int8_t{4});
+              as_.Psrldq(xm, int8_t{4});
+            }
+            as_.Punpckldq(xn, xm);
+          } else {
+            // .4S: PSHUFD imm 0x88 collapses each source's even-indexed
+            // dwords (or 0xDD for odd) into both halves of the register,
+            // then PUNPCKLDQ interleaves the low halves:
+            //   xn' = [s1[0], s1[2], s1[0], s1[2]]   (after PSHUFD 0x88)
+            //   xm' = [s2[0], s2[2], s2[0], s2[2]]
+            //   res = PUNPCKLDQ(xn', xm') = [s1[0], s2[0], s1[2], s2[2]]
+            //       = TRN1.4S  (and similarly 0xDD -> TRN2.4S).
+            const int8_t imm = is_trn2 ? static_cast<int8_t>(0xDD)
+                                       : static_cast<int8_t>(0x88);
+            as_.Pshufd(xn, xn, imm);
+            as_.Pshufd(xm, xm, imm);
+            as_.Punpckldq(xn, xm);
+          }
+          break;
+        }
+        case 0b11: {  // .2D (q=1 only; q=0 caught above).
+          // TRN1.2D == ZIP1.2D, TRN2.2D == ZIP2.2D (2-lane coincidence).
+          if (is_trn2) {
             as_.Punpckhqdq(xn, xm);
           } else {
             as_.Punpcklqdq(xn, xm);
