@@ -1878,6 +1878,39 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - narrowing high subtract: Vd(narrow) =
+      //   ((Vn - Vm) [+ round]) >> narrow_bits.
+      // SUBHN: round=0. RSUBHN: round=1<<(narrow_bits-1). Q semantics and
+      // source/dest shapes are identical to ADDHN/RADDHN. Two's-complement
+      // wrap of `a - b` modulo 2^(out_esize*8) is implicit via the uint64_t
+      // subtract + mask: the high-half bits we shift out are the wide-width
+      // result regardless of borrow.
+      case Decoder::AdvSimdThreeDiffOpcode::kSubhn:
+      case Decoder::AdvSimdThreeDiffOpcode::kRsubhn: {
+        uint8_t narrow_bits = in_esize * 8;
+        uint64_t round = (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kRsubhn)
+                             ? (1ULL << (narrow_bits - 1))
+                             : 0;
+        uint8_t narrow_lanes[8] = {0};
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a = 0;
+          uint64_t b = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * out_esize, out_esize);
+          memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * out_esize, out_esize);
+          uint64_t diff = a - b + round;
+          if (out_esize < 8) {
+            diff &= (1ULL << (out_esize * 8)) - 1;
+          }
+          uint64_t high = diff >> narrow_bits;
+          memcpy(narrow_lanes + i * in_esize, &high, in_esize);
+        }
+        if (args.q) {
+          result = dst;
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + (args.q ? 8 : 0), narrow_lanes, 8);
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return;
