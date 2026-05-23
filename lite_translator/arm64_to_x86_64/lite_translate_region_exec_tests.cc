@@ -7712,6 +7712,38 @@ TEST_F(Arm64LiteTranslateRegionTest, MulVec4HUpperZero) {
 }
 // endregion
 
+// region digitalis - AdvSimdThreeSame JIT for MLA .8H (PMULLW+PADDW)
+// Direct sibling of the MUL .8H/.4H region above: the JIT already handled
+// MLA .4S/.2S via PMULLD+PADDD; this region adds size=01 (16-bit lanes) via
+// SSE2 PMULLW+PADDW. Reuses SimdThreeSame(). MLA (vector) encoding: U=0,
+// opcode=0b10010.
+TEST_F(Arm64LiteTranslateRegionTest, MlaVec8H) {
+  // .8H, Q=1, full 128-bit. Verify per-lane Vd += Vn * Vm with low-16-bit
+  // truncation across boundary values.
+  int16_t n_lanes[8] = {1, -1, 2, 32767, -32768, 100, 0, 1234};
+  int16_t m_lanes[8] = {3, 7, -4, 2,     2,      -3,  9, 5};
+  int16_t d_lanes[8] = {10, -20, 30, 1, 1, 7, 5, -1000};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memset(&state_.cpu.v[0], 0, sizeof(state_.cpu.v[0]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memcpy(&state_.cpu.v[0], d_lanes, sizeof(d_lanes));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    int16_t expected = static_cast<int16_t>(
+        static_cast<int32_t>(d_lanes[i]) +
+        static_cast<int32_t>(n_lanes[i]) * static_cast<int32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

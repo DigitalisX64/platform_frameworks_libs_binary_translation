@@ -3837,7 +3837,10 @@ class LiteTranslator {
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
-        if (args.size != 0b10) { Undefined(); return; }   // only 32-bit lanes here
+        // region digitalis - MLA .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
+        // .16B/.8B (size=00) has no SSE single-op multiply equivalent; .2D / scalar 64-bit
+        // is reserved by the ARM ARM. Both fall back to the interpreter.
+        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         SimdRegister xd = AllocTempSimdReg();
@@ -3847,10 +3850,16 @@ class LiteTranslator {
         load_full(xn, vn_off);
         load_full(xm, vm_off);
         load_full(xd, vd_off);
-        as_.Pmulld(xn, xm);
-        as_.Paddd(xd, xn);
+        if (args.size == 0b01) {
+          as_.Pmullw(xn, xm);
+          as_.Paddw(xd, xn);
+        } else {
+          as_.Pmulld(xn, xm);
+          as_.Paddd(xd, xn);
+        }
         if (!args.q) mask_low64(xd);
         store_full(vd_off, xd);
+        // endregion
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
