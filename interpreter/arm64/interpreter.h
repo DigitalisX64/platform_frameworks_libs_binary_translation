@@ -6090,6 +6090,56 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis - across-lanes FP reductions FMAXV / FMINV /
+      // FMAXNMV / FMINNMV. Reduce a 4-lane FP32 vector (.4S, Q=1)
+      // to a single FP32 scalar lane.
+      //   FMAXV/FMINV: IEEE 754-2008 max/min — any NaN in input
+      //     propagates to a NaN result.
+      //   FMAXNMV/FMINNMV: max-number/min-number — a NaN is skipped
+      //     when the other operand is non-NaN; if both are NaN, NaN
+      //     propagates.
+      // Decoder pins Q=1 (.4S) and FP32 (size[0]=0); FP16 routes via
+      // the FP16 dispatcher. The args.size field for these ops carries
+      // "o sz" (bit23=o, bit22=sz), so the routine's normal
+      // size->esize mapping does not apply — the lane width is fixed
+      // at 4 bytes (FP32) regardless of args.size value.
+      // Reduction order is unspecified by ARM; FP max/min is
+      // associative across the non-NaN/NaN axis, so a linear sweep
+      // produces the architecturally-required result.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv: {
+        bool is_max = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv ||
+                       args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv);
+        bool is_nm = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv ||
+                      args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
+        float acc;
+        memcpy(&acc, reinterpret_cast<const uint8_t*>(&src), 4);
+        for (uint8_t i = 1; i < 4; i++) {
+          float a;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+          float b = acc;
+          if (is_nm) {
+            acc = std::isnan(a)
+                      ? b
+                      : (std::isnan(b)
+                             ? a
+                             : (is_max ? (a > b ? a : b) : (a < b ? a : b)));
+          } else {
+            acc = (std::isnan(a) || std::isnan(b))
+                      ? std::nanf("")
+                      : (is_max ? (a > b ? a : b) : (a < b ? a : b));
+          }
+        }
+        uint32_t out_bits;
+        memcpy(&out_bits, &acc, 4);
+        result = 0;
+        memcpy(reinterpret_cast<uint8_t*>(&result), &out_bits, 4);
+        break;
+      }
+      // endregion
+
       // region digitalis - across-lanes max/min reductions
       // SMAXV/UMAXV/SMINV/UMINV: reduce a vector to a single scalar lane holding
       // the signed/unsigned max or min across all input lanes. The scalar result

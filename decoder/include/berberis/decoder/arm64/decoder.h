@@ -1345,6 +1345,28 @@ class Decoder {
     // discarded, force the LSB of the result mantissa to 1.
     kFcvtxn,    // FCVTXN/FCVTXN2: U=1, opcode=10110, size=01
     // endregion
+    // region digitalis - across-lanes FP reductions FMAXV / FMINV /
+    // FMAXNMV / FMINNMV. These share AdvSIMD two-reg-misc dispatch path
+    // but live in the across-lanes group (bit20=1) with U=1 mandatory.
+    // The `size` field carries "o sz" (bit23=o picks max=0 / min=1;
+    // bit22=sz picks FP32=0 / FP16=1). The decoder splits max/min via
+    // bit23 into separate enum values so the interpreter only needs to
+    // know which of the four ops it is. FP16 is left to the FP16
+    // half-precision dispatcher; this enum covers the FP32 .4S form
+    // (Q=1 mandatory).
+    //   fmaxv   s0, v1.4s  = 0x6e30f820  (U=1, Q=1, size=00, opcode=01111)
+    //   fminv   s0, v1.4s  = 0x6eb0f820  (U=1, Q=1, size=10, opcode=01111)
+    //   fmaxnmv s0, v1.4s  = 0x6e30c820  (U=1, Q=1, size=00, opcode=01100)
+    //   fminnmv s0, v1.4s  = 0x6eb0c820  (U=1, Q=1, size=10, opcode=01100)
+    // Semantics: FMAXV/FMINV use IEEE 754-2008 max/min (any NaN -> NaN);
+    // FMAXNMV/FMINNMV use max-number/min-number (NaN excluded when other
+    // input is non-NaN). Result is a scalar lane in bottom 4 bytes of Vd
+    // (upper 96 bits zeroed by the routine's `result=0` init).
+    kFmaxv,     // FMAXV   (across .4S): opcode=01111, bit23=0
+    kFminv,     // FMINV   (across .4S): opcode=01111, bit23=1
+    kFmaxnmv,   // FMAXNMV (across .4S): opcode=01100, bit23=0
+    kFminnmv,   // FMINNMV (across .4S): opcode=01100, bit23=1
+    // endregion
     // endregion
   };
 
@@ -4814,9 +4836,36 @@ class Decoder {
         if (u) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kFcvtl;
         break;
+      // region digitalis - bit20 splits opcode=01111 between
+      // FABS/FNEG (bit20=0, two-reg-misc) and across-lanes
+      // FMAXV/FMINV (bit20=1, U=1 mandatory). Without this split the
+      // FMAXV/FMINV (U=1) encoding silently misrouted to kFneg.
+      // bit23 picks max (0) vs min (1); size[0] (=bit22) picks
+      // FP32 (0) vs FP16 (1) — FP16 left to the FP16 dispatcher.
       case 0b01111:
-        op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
+        if (GetBits<20, 1>()) {
+          if (!u || (size & 1) || !q) { Undefined(); return; }
+          op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminv
+                                : AdvSimdTwoRegMiscOpcode::kFmaxv;
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
+        }
         break;
+      // endregion
+      // region digitalis - across-lanes FMAXNMV / FMINNMV
+      // (opcode=01100, bit20=1, U=1 mandatory). Two-reg-misc has no
+      // op at opcode=01100, so the entire case is across-lanes;
+      // pre-Digitalis decoder fell through to default Undefined()
+      // and these encodings would have raised SIGILL. bit23 picks
+      // max-number (0) vs min-number (1); size[0] picks FP precision
+      // (FP32 only here — FP16 left to the FP16 dispatcher).
+      case 0b01100:
+        if (!u || !GetBits<20, 1>()) { Undefined(); return; }
+        if ((size & 1) || !q) { Undefined(); return; }
+        op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminnmv
+                              : AdvSimdTwoRegMiscOpcode::kFmaxnmv;
+        break;
+      // endregion
       // region digitalis - opcode=11101 splits on bit23:
       //   bit23=0: SCVTF (U=0) / UCVTF (U=1) — vector int→FP.
       //   bit23=1: FRECPE (U=0) / FRSQRTE (U=1) — vector FP reciprocal estimate.
