@@ -1314,6 +1314,23 @@ class Decoder {
     kSqabs,     // SQABS: U=0, opcode=00111
     kSqneg,     // SQNEG: U=1, opcode=00111
     // endregion
+    // region digitalis - SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
+    // Encoding: 0 Q 1 01110 size 10000 10011 10 Rn Rd  (U=1 required;
+    // U=0 with opcode=10011 is unallocated). Sizes 00/01/10 only —
+    // size=11 is unallocated for the narrow group (the .1d / .2d
+    // destination form does not exist).
+    //   sqxtun  v0.8b,  v1.8h  = 0x2e212820  (Q=0, size=00, src=.8h  -> dst=.8b)
+    //   sqxtun2 v0.16b, v1.8h  = 0x6e212820  (Q=1, size=00, src=.8h  -> dst=.16b)
+    //   sqxtun  v0.4h,  v1.4s  = 0x2e612820  (Q=0, size=01, src=.4s  -> dst=.4h)
+    //   sqxtun2 v0.8h,  v1.4s  = 0x6e612820  (Q=1, size=01, src=.4s  -> dst=.8h)
+    //   sqxtun  v0.2s,  v1.2d  = 0x2ea12820  (Q=0, size=10, src=.2d  -> dst=.2s)
+    //   sqxtun2 v0.4s,  v1.2d  = 0x6ea12820  (Q=1, size=10, src=.2d  -> dst=.4s)
+    // Saturation rule: read each signed source lane, clamp to
+    // [0, UMAX_dst]: input<0 -> 0; input>UMAX_dst -> UMAX_dst;
+    // else cast to unsigned narrow. Q=0 writes low 64 bits of Vd
+    // (upper zeroed); Q=1 writes upper 64 bits and preserves lower.
+    kSqxtun,    // SQXTUN/SQXTUN2: U=1, opcode=10011
+    // endregion
     // endregion
   };
 
@@ -4734,6 +4751,15 @@ class Decoder {
         if (u) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kXtn;
         break;
+      // region digitalis - SQXTUN/SQXTUN2 at opcode 10011 (U=1 only).
+      // Sizes 00/01/10 are valid; size=11 has no encoded narrow form.
+      // U=0 with opcode=10011 is unallocated.
+      case 0b10011:
+        if (!u) { Undefined(); return; }
+        if (size == 0b11) { Undefined(); return; }
+        op = AdvSimdTwoRegMiscOpcode::kSqxtun;
+        break;
+      // endregion
       case 0b10100:
         if (u) {
           op = AdvSimdTwoRegMiscOpcode::kUqxtn;

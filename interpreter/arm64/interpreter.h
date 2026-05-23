@@ -6568,6 +6568,38 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis - SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
+      // Read each lane as a signed value of width 2*esize, clamp to the
+      // unsigned destination range [0, UMAX_dst], and write as an unsigned
+      // value of width esize. Q=0 writes low 64 bits of Vd (upper zeroed);
+      // Q=1 writes upper 64 bits and preserves lower (SQXTUN2 form).
+      // Decoder rejects size=11 (no narrow form), so src_esize is at most 8.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_count = 16 / src_esize;
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t dst_umax = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t raw = 0;
+          memcpy(&raw, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          // Sign-extend the source to int64_t.
+          int64_t s = static_cast<int64_t>(raw << (64 - src_esize * 8)) >> (64 - src_esize * 8);
+          uint64_t out;
+          if (s < 0) {
+            out = 0;
+          } else if (static_cast<uint64_t>(s) > dst_umax) {
+            out = dst_umax;
+          } else {
+            out = static_cast<uint64_t>(s);
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &out, esize);
+        }
+        break;
+      }
+      // endregion
+
       // region digitalis - floating-point convert long / narrow.
       // FCVTL: widen narrow FP source to wide FP destination.
       //   size=01 (sz=0): f32 -> f64, narrow lane count=2, wide count=2.
