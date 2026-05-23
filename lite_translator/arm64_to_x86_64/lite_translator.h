@@ -3817,15 +3817,23 @@ class LiteTranslator {
 
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kMul: {
-        if (args.size != 0b10) { Undefined(); return; }   // only 32-bit lanes here
+        // region digitalis - MUL .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
+        // .16B/.8B (size=00) has no SSE single-op equivalent; .2D / scalar 64-bit
+        // is reserved by the ARM ARM. Both fall back to the interpreter.
+        if (args.size != 0b01 && args.size != 0b10) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
         load_full(xn, vn_off);
         load_full(xm, vm_off);
-        as_.Pmulld(xn, xm);
+        if (args.size == 0b01) {
+          as_.Pmullw(xn, xm);
+        } else {
+          as_.Pmulld(xn, xm);
+        }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
+        // endregion
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
