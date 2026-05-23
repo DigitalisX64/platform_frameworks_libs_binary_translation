@@ -3929,6 +3929,160 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
+      case Decoder::AdvSimdThreeSameOpcode::kBic: {
+        // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
+        // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pandn(xm, xn);
+        if (!args.q) mask_low64(xm);
+        store_full(vd_off, xm);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kOrn: {
+        // ORN Vd, Vn, Vm: Vd = Vn OR NOT Vm.  Materialize ones via PCMPEQD self,
+        // XOR into xm to invert, then OR with xn.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister ones = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            ones == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pcmpeqd(ones, ones);
+        as_.Pxor(xm, ones);
+        as_.Por(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kBsl: {
+        // BSL Vd, Vn, Vm: Vd = (Vd AND Vn) | (NOT Vd AND Vm).
+        // Bitwise identity: ((Vn XOR Vm) AND Vd) XOR Vm equals the BSL result.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pxor(xn, xm);
+        as_.Pand(xn, xd);
+        as_.Pxor(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kBit: {
+        // BIT Vd, Vn, Vm: Vd = (Vm AND Vn) | (NOT Vm AND Vd) — "insert if true".
+        // Bitwise identity: ((Vd XOR Vn) AND Vm) XOR Vd.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pxor(xn, xd);
+        as_.Pand(xn, xm);
+        as_.Pxor(xn, xd);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kBif: {
+        // BIF Vd, Vn, Vm: Vd = (Vm AND Vd) | (NOT Vm AND Vn) — "insert if false".
+        // Bitwise identity: ((Vd XOR Vn) AND NOT Vm) XOR Vd.  Lower as a single
+        // PANDN to fold the NOT into the AND.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Pxor(xn, xd);
+        as_.Pandn(xm, xn);
+        as_.Pxor(xd, xm);
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt: {
+        // CMGT Vd, Vn, Vm: lane-wise signed greater-than; result lane is
+        // all-ones if Vn > Vm.  64-bit lanes need SSE4.2 (PCMPGTQ); other
+        // widths are SSE2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xn, xm); break;
+          case 0b01: as_.Pcmpgtw(xn, xm); break;
+          case 0b10: as_.Pcmpgtd(xn, xm); break;
+          case 0b11: as_.Pcmpgtq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kCmhi: {
+        // CMHI Vd, Vn, Vm: lane-wise unsigned greater-than.  x86 has no
+        // unsigned vector compare, so flip the per-lane sign bit in both
+        // operands (XOR with 0x80…) and then use the signed PCMPGT*: this
+        // converts the unsigned ordering into the signed ordering that
+        // PCMPGT* implements.  64-bit lanes need SSE4.2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister sign = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            sign == no_simd_register) { Undefined(); return; }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pcmpeqd(sign, sign);  // 0xFFFFFFFF per dword.
+        switch (args.size) {
+          case 0b00: {
+            // Need 0x80 in every byte.  Build via a GPR broadcast since
+            // there's no PSLLB shift on x86.
+            Register tmp = AllocTempReg();
+            if (tmp == Assembler::no_register) { Undefined(); return; }
+            as_.Movq(tmp, int64_t{static_cast<int64_t>(0x8080808080808080ULL)});
+            as_.Movq(sign, tmp);
+            as_.Punpcklqdq(sign, sign);
+            break;
+          }
+          case 0b01: as_.Psllw(sign, int8_t{15}); break;
+          case 0b10: as_.Pslld(sign, int8_t{31}); break;
+          case 0b11: as_.Psllq(sign, int8_t{63}); break;
+          default: Undefined(); return;
+        }
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xn, xm); break;
+          case 0b01: as_.Pcmpgtw(xn, xm); break;
+          case 0b10: as_.Pcmpgtd(xn, xm); break;
+          case 0b11: as_.Pcmpgtq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
