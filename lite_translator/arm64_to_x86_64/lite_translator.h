@@ -10546,6 +10546,108 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - BFCVTN / BFCVTN2 (vector narrow FP32 -> BF16) (§H2).
+      //
+      // Q=0 BFCVTN  v.4h, v.4s:  writes 4 BF16 lanes into Vd.h[0..3], upper 64 bits zeroed.
+      // Q=1 BFCVTN2 v.8h, v.4s:  writes 4 BF16 lanes into Vd.h[4..7], lower 64 bits preserved.
+      // Decoder pins size=10 (FP32 source).  Matches interpreter at
+      // `interpreter.h:7240` and the FloatToBf16 helper at `interpreter.h:1330`.
+      //
+      // Per-lane algorithm (4 FP32 lanes in parallel via SSE):
+      //   bits = src as uint32_t
+      //   if (exp == 0xFF && mant != 0):
+      //     out = (bits >> 16) | 0x0040           ; quieted NaN
+      //   else:
+      //     lsb = (bits >> 16) & 1                ; RTNE tie bias
+      //     out = (bits + 0x7FFF + lsb) >> 16     ; round-to-nearest-even narrow
+      // ±0 and ±Inf pass through the RTNE path unchanged (the +0x7FFF+lsb cannot
+      // carry from mantissa into exponent when mantissa is 0).
+      //
+      // Constants are synthesized via PCMPEQD + shifts (no rodata).
+      // No AVX-512-BF16 dependency.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kBfcvtn: {
+        if (args.size != 0b10) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xnan_val = AllocTempSimdReg();
+        SimdRegister xtmp = AllocTempSimdReg();
+        SimdRegister xconst = AllocTempSimdReg();
+        SimdRegister xexp = AllocTempSimdReg();
+        if (xn == no_simd_register || xnan_val == no_simd_register ||
+            xtmp == no_simd_register || xconst == no_simd_register ||
+            xexp == no_simd_register) {
+          success_ = false;
+          return;
+        }
+
+        // Load 4 FP32 lanes.
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+
+        // xnan_val = (n >> 16) | 0x0040 per lane.
+        as_.Movdqa(xnan_val, xn);
+        as_.Psrld(xnan_val, int8_t{16});
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{31});            // 0x00000001 per lane (kept for reuse).
+        as_.Movdqa(xtmp, xconst);
+        as_.Pslld(xtmp, int8_t{6});               // 0x00000040 per lane.
+        as_.Por(xnan_val, xtmp);
+
+        // xtmp = ((n >> 16) & 1) + 0x7FFF per lane (the RTNE bias).
+        as_.Movdqa(xtmp, xn);
+        as_.Psrld(xtmp, int8_t{16});
+        as_.Pand(xtmp, xconst);                   // lsb = (n >> 16) & 1.
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{17});            // 0x00007FFF per lane.
+        as_.Paddd(xtmp, xconst);                  // lsb + 0x7FFF.
+
+        // xn = (n + bias) >> 16 = rounded BF16 in low 16 bits of each lane.
+        as_.Paddd(xn, xtmp);
+        as_.Psrld(xn, int8_t{16});
+
+        // xexp = nan_mask = (exp == 0xFF) & (mant != 0).
+        // Reload original n into xtmp (we mutated xn into rounded).
+        as_.Movdqu(xtmp, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{24});            // 0x000000FF per lane.
+        as_.Pslld(xconst, int8_t{23});            // 0x7F800000 per lane.
+        as_.Movdqa(xexp, xtmp);
+        as_.Pand(xexp, xconst);                   // n & 0x7F800000.
+        as_.Pcmpeqd(xexp, xconst);                // exp == 0xFF per lane (mask).
+        // mant != 0 -> ones per lane in xtmp.
+        as_.Pcmpeqd(xconst, xconst);
+        as_.Psrld(xconst, int8_t{9});             // 0x007FFFFF per lane.
+        as_.Pand(xtmp, xconst);                   // mant.
+        as_.Pxor(xconst, xconst);
+        as_.Pcmpeqd(xtmp, xconst);                // mant == 0 mask.
+        as_.Pcmpeqd(xconst, xconst);              // all-ones.
+        as_.Pxor(xtmp, xconst);                   // mant != 0.
+        as_.Pand(xexp, xtmp);                     // nan_mask = exp_max & mant_nz.
+
+        // Blend: out = (nan_mask & nan_val) | (~nan_mask & rounded).
+        as_.Pand(xnan_val, xexp);                 // nan_val & nan_mask.
+        as_.Movdqa(xtmp, xexp);
+        as_.Pandn(xtmp, xn);                      // ~nan_mask & rounded.
+        as_.Por(xnan_val, xtmp);                  // final 4 dwords (low 16 of each).
+
+        // Narrow 4 dwords -> 4 words: PACKUSDW duplicates result to high 64.
+        as_.Packusdw(xnan_val, xnan_val);
+
+        if (!args.q) {
+          // BFCVTN: zero the upper 64 bits before writing Vd.
+          as_.Pslldq(xnan_val, int8_t{8});
+          as_.Psrldq(xnan_val, int8_t{8});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xnan_val);
+        } else {
+          // BFCVTN2: write packed result into upper 64 of Vd, preserving lower 64.
+          as_.Movdqu(xtmp, {.base = Assembler::rbp, .disp = vd_off});
+          as_.Pslldq(xtmp, int8_t{8});
+          as_.Psrldq(xtmp, int8_t{8});            // keep low 64 of Vd, zero high 64.
+          as_.Pslldq(xnan_val, int8_t{8});        // move packed bytes to high 64.
+          as_.Por(xnan_val, xtmp);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xnan_val);
+        }
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;

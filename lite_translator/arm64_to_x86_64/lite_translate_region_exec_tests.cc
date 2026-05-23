@@ -7438,6 +7438,104 @@ TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarSignallingNanQuieted) {
 }
 // endregion
 
+// region digitalis - BFCVTN / BFCVTN2 vector (§H2)
+//
+// BFCVTN  v.4h, v.4s:  4 FP32 (Vn) -> 4 BF16 (Vd low 64), upper 64 zeroed.
+// BFCVTN2 v.8h, v.4s:  4 FP32 (Vn) -> 4 BF16 (Vd high 64), lower 64 preserved.
+//
+// Encoding (AdvSimdTwoRegMisc U=0, size=10, opcode=10110):
+//   bfcvtn  v0.4h, v1.4s   = 0x0EA16820
+//   bfcvtn2 v0.8h, v1.4s   = 0x4EA16820
+//
+// JIT lowering in `lite_translator.h` AdvSimdTwoRegMisc kBfcvtn case applies
+// the same RTNE primitive as scalar BFCVT (handoff-228) vectorized over 4
+// FP32 lanes via PCMPEQD/PSRLD/PSLLD/PADDD/PANDN/PACKUSDW.  Constants are
+// synthesized from PCMPEQD all-ones via shifts (no rodata, no AVX-512-BF16).
+constexpr uint32_t BfcvtnVec(uint8_t rd, uint8_t rn) {
+  return 0x0EA16800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Bfcvtn2Vec(uint8_t rd, uint8_t rn) {
+  return 0x4EA16800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+inline void StoreFp32LaneBits(CPUState& cpu, uint8_t v, uint8_t lane, uint32_t bits) {
+  std::memcpy(reinterpret_cast<uint8_t*>(&cpu.v[v]) + lane * 4, &bits, 4);
+}
+inline uint16_t LoadBf16Lane(const CPUState& cpu, uint8_t v, uint8_t lane) {
+  uint16_t bits;
+  std::memcpy(&bits, reinterpret_cast<const uint8_t*>(&cpu.v[v]) + lane * 2, 2);
+  return bits;
+}
+
+// BFCVTN basic: 4 FP32 inputs -> 4 BF16 outputs in low 64; upper 64 bits of
+// Vd must be zeroed (AArch64 vector layout for Q=0 narrowing ops).
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtnVecBasic) {
+  state_.cpu.v[1] = 0;
+  StoreFp32LaneBits(state_.cpu, 1, 0, 0x3F800000);  // 1.0           -> 0x3F80
+  StoreFp32LaneBits(state_.cpu, 1, 1, 0x3F808000);  // RTNE tie down -> 0x3F80
+  StoreFp32LaneBits(state_.cpu, 1, 2, 0x3F818000);  // RTNE tie up   -> 0x3F82
+  StoreFp32LaneBits(state_.cpu, 1, 3, 0x80000000);  // -0.0          -> 0x8000
+  // Pre-pollute Vd (including upper 64) so the zero-fill is observable.
+  state_.cpu.v[0] = ~static_cast<__uint128_t>(0);
+  static const uint32_t code[] = { BfcvtnVec(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 0), uint16_t{0x3F80});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 1), uint16_t{0x3F80});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 2), uint16_t{0x3F82});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 3), uint16_t{0x8000});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// BFCVTN NaN handling: signalling NaN must be quieted by OR-ing 0x0040;
+// ±Inf passes through the RTNE path unchanged (mantissa = 0 so the bias add
+// cannot carry into the exponent).
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtnVecNaNAndInfinity) {
+  state_.cpu.v[1] = 0;
+  StoreFp32LaneBits(state_.cpu, 1, 0, 0x7F800000);  // +Inf -> 0x7F80
+  StoreFp32LaneBits(state_.cpu, 1, 1, 0xFF800000);  // -Inf -> 0xFF80
+  StoreFp32LaneBits(state_.cpu, 1, 2, 0x7F800001);  // sNaN -> 0x7FC0 (quieted)
+  StoreFp32LaneBits(state_.cpu, 1, 3, 0x7FC00000);  // qNaN -> 0x7FC0
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = { BfcvtnVec(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 0), uint16_t{0x7F80});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 1), uint16_t{0xFF80});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 2), uint16_t{0x7FC0});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 3), uint16_t{0x7FC0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// BFCVTN2: writes 4 BF16 into Vd lanes 4..7 (upper 64); the lower 64 of Vd
+// must be preserved bit-for-bit (this is the BFCVTN2 "second-half merge"
+// semantics, distinct from BFCVTN which zero-fills the upper half).
+TEST_F(Arm64LiteTranslateRegionTest, Bfcvtn2VecPreservesLowerHalf) {
+  state_.cpu.v[1] = 0;
+  StoreFp32LaneBits(state_.cpu, 1, 0, 0x3F800000);  // 1.0 -> 0x3F80
+  StoreFp32LaneBits(state_.cpu, 1, 1, 0x40000000);  // 2.0 -> 0x4000
+  StoreFp32LaneBits(state_.cpu, 1, 2, 0x40400000);  // 3.0 -> 0x4040
+  StoreFp32LaneBits(state_.cpu, 1, 3, 0x40800000);  // 4.0 -> 0x4080
+  // Pre-pollute Vd: distinctive lower 64 that must survive; upper 64 will
+  // be overwritten.
+  state_.cpu.v[0] = ~static_cast<__uint128_t>(0);
+  StoreFp32LaneBits(state_.cpu, 0, 0, 0xDEADBEEFu);
+  StoreFp32LaneBits(state_.cpu, 0, 1, 0xCAFEF00Du);
+  static const uint32_t code[] = { Bfcvtn2Vec(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Lower 64 bits preserved.
+  uint32_t lower_dw0;
+  uint32_t lower_dw1;
+  std::memcpy(&lower_dw0, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 0, 4);
+  std::memcpy(&lower_dw1, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 4);
+  EXPECT_EQ(lower_dw0, 0xDEADBEEFu);
+  EXPECT_EQ(lower_dw1, 0xCAFEF00Du);
+  // Upper 64 = 4 new BF16 lanes (Vd.h[4..7]).
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 4), uint16_t{0x3F80});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 5), uint16_t{0x4000});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 6), uint16_t{0x4040});
+  EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 7), uint16_t{0x4080});
+}
+// endregion
+
 // region digitalis - FP scalar unary
 //
 // Scalar FP one-source ops (FpDataProc1 family).  These pin the
