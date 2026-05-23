@@ -9909,6 +9909,292 @@ TEST_F(Arm64LiteTranslateRegionTest, Zip2Vec2S) {
 }
 // endregion
 
+// region digitalis: UZP1 / UZP2 vector permute JIT
+//
+// UZP1 Vd.<T>, Vn.<T>, Vm.<T>  -> pick EVEN-indexed elements of Vn || Vm
+// UZP2 Vd.<T>, Vn.<T>, Vm.<T>  -> pick ODD-indexed  elements of Vn || Vm
+// Lowering: PSLLW/PSRLW + PACKUSWB (.16B/.8B), PSLLD/PSRLD + PACKUSDW
+// (.8H/.4H; SSE4.1), SHUFPS (.4S/.2S), PUNPCKL/HQDQ (.2D).
+// Q=0 forms first PUNPCKLQDQ the two sources to share a single
+// PACKUS/SHUFPS source and let the Q=0 upper-zero tail discard the
+// resulting duplicate.
+constexpr uint32_t kUzp1Vec16B = 0x4e021820;  // uzp1 v0.16b, v1.16b, v2.16b
+constexpr uint32_t kUzp2Vec16B = 0x4e025820;  // uzp2 v0.16b, v1.16b, v2.16b
+constexpr uint32_t kUzp1Vec8H  = 0x4e421820;  // uzp1 v0.8h,  v1.8h,  v2.8h
+constexpr uint32_t kUzp2Vec8H  = 0x4e425820;  // uzp2 v0.8h,  v1.8h,  v2.8h
+constexpr uint32_t kUzp1Vec4S  = 0x4e821820;  // uzp1 v0.4s,  v1.4s,  v2.4s
+constexpr uint32_t kUzp2Vec4S  = 0x4e825820;  // uzp2 v0.4s,  v1.4s,  v2.4s
+constexpr uint32_t kUzp1Vec2D  = 0x4ec21820;  // uzp1 v0.2d,  v1.2d,  v2.2d
+constexpr uint32_t kUzp2Vec2D  = 0x4ec25820;  // uzp2 v0.2d,  v1.2d,  v2.2d
+constexpr uint32_t kUzp1Vec8B  = 0x0e021820;  // uzp1 v0.8b,  v1.8b,  v2.8b
+constexpr uint32_t kUzp2Vec8B  = 0x0e025820;  // uzp2 v0.8b,  v1.8b,  v2.8b
+constexpr uint32_t kUzp1Vec4H  = 0x0e421820;  // uzp1 v0.4h,  v1.4h,  v2.4h
+constexpr uint32_t kUzp2Vec4H  = 0x0e425820;  // uzp2 v0.4h,  v1.4h,  v2.4h
+constexpr uint32_t kUzp1Vec2S  = 0x0e821820;  // uzp1 v0.2s,  v1.2s,  v2.2s
+constexpr uint32_t kUzp2Vec2S  = 0x0e825820;  // uzp2 v0.2s,  v1.2s,  v2.2s
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP1 .16B: bytes 0..7 = even bytes of vn; bytes 8..15 = even bytes of vm.
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i],     vn[2 * i]) << "vn byte " << i;
+    EXPECT_EQ(r[8 + i], vm[2 * i]) << "vm byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP2 .16B: bytes 0..7 = odd bytes of vn; bytes 8..15 = odd bytes of vm.
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i],     vn[2 * i + 1]) << "vn byte " << i;
+    EXPECT_EQ(r[8 + i], vm[2 * i + 1]) << "vm byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec8H) {
+  // Use high-bit values to pin PACKUSDW saturation behavior: each masked
+  // dword sits in 0..0xFFFF so saturation must be a no-op.
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP1 .8H: halfwords 0..3 = even halfwords of vn; 4..7 = even of vm.
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i],     vn[2 * i]) << "vn halfword " << i;
+    EXPECT_EQ(r[4 + i], vm[2 * i]) << "vm halfword " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i],     vn[2 * i + 1]) << "vn halfword " << i;
+    EXPECT_EQ(r[4 + i], vm[2 * i + 1]) << "vm halfword " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP1 .4S: [vn[0], vn[2], vm[0], vm[2]]
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vm[0]);
+  EXPECT_EQ(r[3], vm[2]);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP2 .4S: [vn[1], vn[3], vm[1], vm[3]]
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vn[3]);
+  EXPECT_EQ(r[2], vm[1]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec2D) {
+  uint64_t vn[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+  uint64_t vm[2] = {0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec2D};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP1 .2D == ZIP1 .2D == [vn[0], vm[0]]
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec2D) {
+  uint64_t vn[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+  uint64_t vm[2] = {0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec2D};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP2 .2D == ZIP2 .2D == [vn[1], vm[1]]
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vm[1]);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec8B) {
+  // Upper 8 bytes of vn/vm are garbage and MUST NOT leak into the result.
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP1 .8B: bytes 0..3 = even bytes of vn[0..7]; bytes 4..7 = even of vm[0..7].
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vn[4]);
+  EXPECT_EQ(r[3], vn[6]);
+  EXPECT_EQ(r[4], vm[0]);
+  EXPECT_EQ(r[5], vm[2]);
+  EXPECT_EQ(r[6], vm[4]);
+  EXPECT_EQ(r[7], vm[6]);
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vn[3]);
+  EXPECT_EQ(r[2], vn[5]);
+  EXPECT_EQ(r[3], vn[7]);
+  EXPECT_EQ(r[4], vm[1]);
+  EXPECT_EQ(r[5], vm[3]);
+  EXPECT_EQ(r[6], vm[5]);
+  EXPECT_EQ(r[7], vm[7]);
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec4H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706, 0xFFFF,0xEEEE,0xDDDD,0xCCCC};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716, 0x9999,0x8888,0x7777,0x6666};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec4H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vm[0]);
+  EXPECT_EQ(r[3], vm[2]);
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec4H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706, 0xFFFF,0xEEEE,0xDDDD,0xCCCC};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716, 0x9999,0x8888,0x7777,0x6666};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec4H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vn[3]);
+  EXPECT_EQ(r[2], vm[1]);
+  EXPECT_EQ(r[3], vm[3]);
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp1Vec2S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0x12345678u, 0x9ABCDEF0u};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP1 .2S: [vn[0], vm[0]] in lower 8 bytes.
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec2S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0x12345678u, 0x9ABCDEF0u};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // UZP2 .2S: [vn[1], vm[1]] in lower 8 bytes.
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vm[1]);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

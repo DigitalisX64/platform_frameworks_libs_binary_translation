@@ -5705,37 +5705,47 @@ class LiteTranslator {
   // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
-    // region digitalis: ZIP1 / ZIP2 vector permute JIT
+    // region digitalis: ZIP / UZP vector permute JIT
     //
     // opcode encoding (3 bits, from Decoder::DecodeAdvSimd at decoder.h:2808):
     //   001=UZP1, 010=TRN1, 011=ZIP1, 101=UZP2, 110=TRN2, 111=ZIP2
     //
-    // This cycle implements ZIP1 / ZIP2 (opcode 0b011 / 0b111) for all
-    // element sizes.  ZIP1 interleaves the LOWER half of each source;
-    // ZIP2 interleaves the UPPER half.  Both map directly to x86's
-    // PUNPCK family which has byte/word/dword/qword variants:
+    // ZIP1/ZIP2 (-174): interleave the LOWER/UPPER half of each source.
+    // Maps directly to x86's PUNPCK family:
+    //   ZIP1 .16B/.8B -> PUNPCKLBW    ZIP2 .16B -> PUNPCKHBW
+    //   ZIP1 .8H /.4H -> PUNPCKLWD    ZIP2 .8H  -> PUNPCKHWD
+    //   ZIP1 .4S /.2S -> PUNPCKLDQ    ZIP2 .4S  -> PUNPCKHDQ
+    //   ZIP1 .2D      -> PUNPCKLQDQ   ZIP2 .2D  -> PUNPCKHQDQ
+    // Q=0 ZIP2: PSRLDQ-4 prelude lands bytes 4..7 at positions 0..3
+    // so PUNPCKL picks up the originally-upper-half elements; the Q=0
+    // upper-zero tail masks any garbage beyond byte 7 of the result.
     //
-    //   ZIP1 .16B / .8B  -> PUNPCKLBW xn, xm
-    //   ZIP2 .16B        -> PUNPCKHBW xn, xm
-    //   ZIP1 .8H  / .4H  -> PUNPCKLWD xn, xm
-    //   ZIP2 .8H         -> PUNPCKHWD xn, xm
-    //   ZIP1 .4S  / .2S  -> PUNPCKLDQ xn, xm
-    //   ZIP2 .4S         -> PUNPCKHDQ xn, xm
-    //   ZIP1 .2D         -> PUNPCKLQDQ xn, xm
-    //   ZIP2 .2D         -> PUNPCKHQDQ xn, xm
+    // UZP1/UZP2 (this cycle): take EVEN (UZP1) or ODD (UZP2) elements
+    // from each source.  Lowering varies per element width:
+    //   .16B/.8B  (PACKUSWB): mask high byte of each halfword via
+    //     PSLLW(8)+PSRLW(8) for UZP1, or PSRLW(8) for UZP2, then
+    //     PACKUSWB(xn, xm).  Each masked halfword is 0..255 so PACKUS
+    //     saturation is a no-op.
+    //   .8H /.4H  (PACKUSDW; SSE4.1): same idea with PSLLD/PSRLD by 16
+    //     to mask the high halfword of each dword.  Bails to interp
+    //     when host lacks SSE4.1.
+    //   .4S /.2S  (SHUFPS): UZP1 imm 0x88 = [src1[0],src1[2],src2[0],
+    //     src2[2]]; UZP2 imm 0xDD = [src1[1],src1[3],src2[1],src2[3]].
+    //   .2D       (PUNPCKL/HQDQ): coincides with ZIP1.2D / ZIP2.2D
+    //     because 2-lane uzip and zip are the same permutation.
     //
-    // Q=0 ZIP2 quirk: for .8B/.4H/.2S, ZIP2 interleaves the upper-half
-    // of each 8-byte source (bytes 4..7 of Vn with bytes 4..7 of Vm,
-    // etc.).  PUNPCKH uses bytes 8..15 of the 16-byte register, which
-    // are unspecified for .8B/.4H/.2S inputs — so we instead shift each
-    // source right by 4 bytes (PSRLDQ-4) and then PUNPCKL, which puts
-    // the (originally upper-half) bytes 4..7 at positions 0..3 of the
-    // shifted register where PUNPCKL picks them up.  The upper 8 bytes
-    // of the result are masked to zero per the Q=0 D-register rule.
+    // Q=0 forms: PUNPCKLQDQ(xn, xm) first combines the lower 8 bytes
+    // of vn and vm into a single 16-byte register, after which the
+    // Q=1-shaped lowering (now using xn as both PACKUS / SHUFPS
+    // sources) produces 16/8 bytes of result with the wanted 8 bytes
+    // duplicated in the low and high halves.  The Q=0 upper-zero tail
+    // discards the duplicate.
     //
-    // UZP1/UZP2 and TRN1/TRN2 remain on the interpreter pending later
-    // cycles; bail via success_=false here.
-    if (opcode != 0b011 && opcode != 0b111) {
+    // TRN1/TRN2 remain on the interpreter pending later cycles; bail
+    // via success_=false here.
+    const bool is_zip = (opcode == 0b011 || opcode == 0b111);
+    const bool is_uzp = (opcode == 0b001 || opcode == 0b101);
+    if (!is_zip && !is_uzp) {
       UNUSED(rd, rn, rm, size);
       success_ = false;
       return;
@@ -5744,9 +5754,13 @@ class LiteTranslator {
       success_ = false;
       return;
     }
-    const bool is_zip2 = (opcode == 0b111);
     // Q=0 .2D is reserved by the ARM ARM (encoding restricted).
     if (!q && size == 0b11) {
+      success_ = false;
+      return;
+    }
+    // UZP .8H/.4H lowering uses PACKUSDW which is SSE4.1.
+    if (is_uzp && size == 0b01 && !host_platform::kHasSSE4_1) {
       success_ = false;
       return;
     }
@@ -5763,29 +5777,102 @@ class LiteTranslator {
     as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
     as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
 
-    if (!q && is_zip2) {
-      // Shift each source right by 4 bytes so the (originally upper-half)
-      // bytes 4..7 land at positions 0..3; PUNPCKL will then pick them up.
-      // Bytes that were at 8..15 are now at 4..11 and may be garbage for
-      // the .8B/.4H/.2S forms, but the Q=0 upper-zero mask below discards
-      // anything beyond the first 8 bytes of the result.
-      as_.Psrldq(xn, int8_t{4});
-      as_.Psrldq(xm, int8_t{4});
-    }
+    if (is_zip) {
+      const bool is_zip2 = (opcode == 0b111);
 
-    if (q && is_zip2) {
-      switch (size) {
-        case 0b00: as_.Punpckhbw(xn, xm); break;   // ZIP2 .16B
-        case 0b01: as_.Punpckhwd(xn, xm); break;   // ZIP2 .8H
-        case 0b10: as_.Punpckhdq(xn, xm); break;   // ZIP2 .4S
-        case 0b11: as_.Punpckhqdq(xn, xm); break;  // ZIP2 .2D
+      if (!q && is_zip2) {
+        // Shift each source right by 4 bytes so the (originally upper-half)
+        // bytes 4..7 land at positions 0..3; PUNPCKL will then pick them up.
+        as_.Psrldq(xn, int8_t{4});
+        as_.Psrldq(xm, int8_t{4});
       }
-    } else {
+
+      if (q && is_zip2) {
+        switch (size) {
+          case 0b00: as_.Punpckhbw(xn, xm); break;   // ZIP2 .16B
+          case 0b01: as_.Punpckhwd(xn, xm); break;   // ZIP2 .8H
+          case 0b10: as_.Punpckhdq(xn, xm); break;   // ZIP2 .4S
+          case 0b11: as_.Punpckhqdq(xn, xm); break;  // ZIP2 .2D
+        }
+      } else {
+        switch (size) {
+          case 0b00: as_.Punpcklbw(xn, xm); break;   // ZIP1 .16B/.8B, ZIP2 .8B (after shift)
+          case 0b01: as_.Punpcklwd(xn, xm); break;   // ZIP1 .8H/.4H,  ZIP2 .4H (after shift)
+          case 0b10: as_.Punpckldq(xn, xm); break;   // ZIP1 .4S/.2S,  ZIP2 .2S (after shift)
+          case 0b11: as_.Punpcklqdq(xn, xm); break;  // ZIP1 .2D       (Q=0 forbidden by ARM)
+        }
+      }
+    } else {  // is_uzp
+      const bool is_uzp2 = (opcode == 0b101);
+
+      if (!q) {
+        // Combine the lower 8 bytes of vn and vm into xn so subsequent
+        // PACKUS / SHUFPS only has to consume a single source.  After
+        // this, xn = [vn_lo (bytes 0..7) | vm_lo (bytes 0..7)].
+        as_.Punpcklqdq(xn, xm);
+      }
+
       switch (size) {
-        case 0b00: as_.Punpcklbw(xn, xm); break;   // ZIP1 .16B/.8B, ZIP2 .8B (after shift)
-        case 0b01: as_.Punpcklwd(xn, xm); break;   // ZIP1 .8H/.4H,  ZIP2 .4H (after shift)
-        case 0b10: as_.Punpckldq(xn, xm); break;   // ZIP1 .4S/.2S,  ZIP2 .2S (after shift)
-        case 0b11: as_.Punpcklqdq(xn, xm); break;  // ZIP1 .2D       (Q=0 forbidden by ARM)
+        case 0b00: {  // .16B (q=1) or .8B (q=0).  PACKUSWB.
+          if (is_uzp2) {
+            as_.Psrlw(xn, int8_t{8});
+          } else {
+            as_.Psllw(xn, int8_t{8});
+            as_.Psrlw(xn, int8_t{8});
+          }
+          if (q) {
+            if (is_uzp2) {
+              as_.Psrlw(xm, int8_t{8});
+            } else {
+              as_.Psllw(xm, int8_t{8});
+              as_.Psrlw(xm, int8_t{8});
+            }
+            as_.Packuswb(xn, xm);
+          } else {
+            as_.Packuswb(xn, xn);
+          }
+          break;
+        }
+        case 0b01: {  // .8H (q=1) or .4H (q=0).  PACKUSDW (SSE4.1).
+          if (is_uzp2) {
+            as_.Psrld(xn, int8_t{16});
+          } else {
+            as_.Pslld(xn, int8_t{16});
+            as_.Psrld(xn, int8_t{16});
+          }
+          if (q) {
+            if (is_uzp2) {
+              as_.Psrld(xm, int8_t{16});
+            } else {
+              as_.Pslld(xm, int8_t{16});
+              as_.Psrld(xm, int8_t{16});
+            }
+            as_.Packusdw(xn, xm);
+          } else {
+            as_.Packusdw(xn, xn);
+          }
+          break;
+        }
+        case 0b10: {  // .4S (q=1) or .2S (q=0).  SHUFPS.
+          const int8_t imm =
+              is_uzp2 ? static_cast<int8_t>(0xDD) : static_cast<int8_t>(0x88);
+          if (q) {
+            as_.Shufps(xn, xm, imm);
+          } else {
+            // xn already holds [vn_lo | vm_lo] from Punpcklqdq above.
+            as_.Shufps(xn, xn, imm);
+          }
+          break;
+        }
+        case 0b11: {  // .2D (q=1 only; q=0 caught above).
+          // UZP1.2D == ZIP1.2D, UZP2.2D == ZIP2.2D (2-lane coincidence).
+          if (is_uzp2) {
+            as_.Punpckhqdq(xn, xm);
+          } else {
+            as_.Punpcklqdq(xn, xm);
+          }
+          break;
+        }
       }
     }
 
