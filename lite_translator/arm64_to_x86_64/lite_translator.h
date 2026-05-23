@@ -7998,6 +7998,72 @@ class LiteTranslator {
       return;
     }
 
+    // region digitalis - BFCVT Hd, Sn (single -> BF16) (§H2).
+    //
+    // Encoding: ftype=01 (D-form discriminant), opcode=0b000110.  The
+    // source register is read as FP32 (Sn) despite ftype=01 — the
+    // discriminant is purely an opcode-namespace selector, not a "source
+    // is double" hint.  Mirrors interpreter handling at
+    // `interpreter.h:4934` and the FloatToBf16 helper at
+    // `interpreter.h:1330`.
+    //
+    // Algorithm:
+    //   bits = src as uint32_t                  ; raw FP32 bits
+    //   if (exp == 0xFF && mant != 0):
+    //     out = (bits >> 16) | 0x0040           ; quiet NaN with payload top
+    //   else:
+    //     lsb = (bits >> 16) & 1                ; tie-to-even bias
+    //     out = (bits + 0x7FFF + lsb) >> 16     ; RTNE narrow
+    //   Vd = 0; low 16 bits of Vd = out
+    //
+    // ±Inf and ±0 pass through structurally identical (RTNE on Inf:
+    // exp=0xFF mant=0, the +0x7FFF+lsb doesn't carry into the exponent;
+    // top-16 still encodes the same Inf).  No AVX-512-BF16 dependency.
+    if (args.opcode == 0b000110 && is_double) {
+      SimdRegister xmm_zero = AllocTempSimdReg();
+      if (xmm_zero == no_simd_register) { Undefined(); return; }
+      Register bits = AllocTempReg();
+      Register tmp = AllocTempReg();
+      Register lsb = AllocTempReg();
+
+      as_.Movl(bits, {.base = Assembler::rbp, .disp = src_offset});
+
+      Assembler::Label* nan_label = as_.MakeLabel();
+      Assembler::Label* done_label = as_.MakeLabel();
+      Assembler::Label* rtne_label = as_.MakeLabel();
+
+      // NaN check: exponent == 0xFF AND mantissa != 0.
+      as_.Movl(tmp, bits);
+      as_.Andl(tmp, int32_t{0x7F800000});
+      as_.Cmpl(tmp, int32_t{0x7F800000});
+      as_.Jcc(Assembler::Condition::kNotEqual, *rtne_label);
+      as_.Movl(tmp, bits);
+      as_.Andl(tmp, int32_t{0x007FFFFF});
+      as_.Jcc(Assembler::Condition::kNotZero, *nan_label);
+
+      // Fall through (±Inf): treat as RTNE.  Top 16 bits are the BF16.
+      as_.Bind(rtne_label);
+      as_.Movl(lsb, bits);
+      as_.Shrl(lsb, int8_t{16});
+      as_.Andl(lsb, int32_t{1});
+      as_.Addl(lsb, int32_t{0x7FFF});
+      as_.Addl(bits, lsb);
+      as_.Shrl(bits, int8_t{16});
+      as_.Jmp(*done_label);
+
+      // NaN fixup: quiet by setting top bit of BF16 mantissa.
+      as_.Bind(nan_label);
+      as_.Shrl(bits, int8_t{16});
+      as_.Orl(bits, int32_t{0x0040});
+
+      as_.Bind(done_label);
+      as_.Pxor(xmm_zero, xmm_zero);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_offset}, xmm_zero);
+      as_.Movw({.base = Assembler::rbp, .disp = dst_offset}, bits);
+      return;
+    }
+    // endregion
+
     // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
     int8_t round_imm = 0;
     bool is_sqrt = false;

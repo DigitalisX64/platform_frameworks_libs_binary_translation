@@ -7352,6 +7352,92 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmpHUnordered) {
 }
 // endregion
 
+// region digitalis - BFCVT scalar (§H2 JIT bullet)
+//
+// BFCVT <Hd>, <Sn>: narrow one FP32 to BF16 with round-to-nearest-even,
+// quiet-NaN payload preserved.  Encoding uses ftype=01 (D-form
+// discriminant) even though the source is FP32; the discriminant is
+// purely an opcode-namespace selector per ARM ARM C7.2.51.
+//
+//   Encoding: 0 0 0 11110 01 1 000110 10000 Rn Rd
+//   Base BFCVT Hd, Sn: 0x1E634000
+//
+// llvm-mc-verified: `bfcvt h0, s1` = 0x1e634020.
+//
+// The JIT lowering at lite_translator.h FpDataProc1 (just before the
+// FSQRT/FRINT switch) mirrors the interpreter's FloatToBf16 helper at
+// interpreter.h:1330 — RTNE bias with quiet-NaN forcing — and emits
+// pure GP ops + one PXOR + one MOVDQU + one MOVW (no AVX-512-BF16
+// dependency).
+constexpr uint32_t BfcvtHS(uint8_t rd, uint8_t rn) {
+  return 0x1E634000 | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// 1.0f -> 0x3F80 (low 16 bits of 0x3F800000, no rounding needed since
+// low-16 mantissa bits are zero).
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarOne) {
+  StoreFp32(state_.cpu, 1, 1.0f);
+  static const uint32_t code[] = { BfcvtHS(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x3F80});
+  // Upper 112 bits must be zero (AArch64 scalar layout).
+  EXPECT_EQ(state_.cpu.v[0] >> 16, 0u);
+}
+
+// RTNE ties-to-even: FP32 bit pattern 0x3F808000 (low 16 = exact half)
+// with even target (0x3F80) -> stays 0x3F80.
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarTieToEvenDown) {
+  StoreFp32(state_.cpu, 1, 0.0f);
+  uint32_t bits = 0x3F808000;
+  std::memcpy(&state_.cpu.v[1], &bits, sizeof(bits));
+  static const uint32_t code[] = { BfcvtHS(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x3F80});
+}
+
+// RTNE ties-to-even: FP32 bit pattern 0x3F818000 (low 16 = exact half)
+// with odd target (0x3F81) -> rounds up to even 0x3F82.
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarTieToEvenUp) {
+  StoreFp32(state_.cpu, 1, 0.0f);
+  uint32_t bits = 0x3F818000;
+  std::memcpy(&state_.cpu.v[1], &bits, sizeof(bits));
+  static const uint32_t code[] = { BfcvtHS(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x3F82});
+}
+
+// Negative zero must preserve the sign bit (no rounding bias added).
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarNegativeZero) {
+  StoreFp32(state_.cpu, 1, -0.0f);
+  static const uint32_t code[] = { BfcvtHS(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x8000});
+}
+
+// +Infinity (0x7F800000) -> 0x7F80 (RTNE path: mantissa=0 -> non-NaN,
+// add-bias doesn't carry into exponent).
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarPosInfinity) {
+  uint32_t inf_bits = 0x7F800000;
+  state_.cpu.v[1] = 0;
+  std::memcpy(&state_.cpu.v[1], &inf_bits, sizeof(inf_bits));
+  static const uint32_t code[] = { BfcvtHS(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x7F80});
+}
+
+// Signalling NaN (exp=0xFF, mantissa nonzero with MSB clear) must be
+// quieted in BF16 via OR with 0x0040 (top mantissa bit set).
+TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarSignallingNanQuieted) {
+  uint32_t snan_bits = 0x7F800001;
+  state_.cpu.v[1] = 0;
+  std::memcpy(&state_.cpu.v[1], &snan_bits, sizeof(snan_bits));
+  static const uint32_t code[] = { BfcvtHS(0, 1) };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Expected: (0x7F800001 >> 16) | 0x0040 = 0x7F80 | 0x0040 = 0x7FC0.
+  EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x7FC0});
+}
+// endregion
+
 // region digitalis - FP scalar unary
 //
 // Scalar FP one-source ops (FpDataProc1 family).  These pin the
