@@ -534,6 +534,22 @@ class Interpreter {
       }
       case Decoder::SystemReg::kFpcr:
         state_->cpu.cached_fpcr = static_cast<uint32_t>(value);
+        // region digitalis
+        // Mirror the ARM FPCR rounding-mode and flush-to-zero bits into the
+        // host x86 MXCSR so subsequent interpreted FP ops observe the guest-
+        // requested rounding mode and denormal behaviour. ARM RMode at
+        // FPCR[23:22] maps to MXCSR[14:13] (RC) with a bit-swap because ARM
+        // encodes RP/RM = 01/10 while x86 encodes RD/RU = 01/10 (round-toward-
+        // positive on ARM is the same direction as round-up on x86, but the
+        // 2-bit field encoding is the inverse). ARM FZ at FPCR[24] flushes
+        // both input and output denormals, so it maps to BOTH MXCSR FTZ
+        // (bit 15, output flush) and MXCSR DAZ (bit 6, input flush). Other
+        // FPCR fields (DN, AHP, exception enables, FZ16) have no clean x86
+        // analog; exception enables are intentionally left masked so host FP
+        // never raises SIGFPE. This is the foundation for §L1 — per-op
+        // MXCSR->FPSR cumulative-flag mirroring is a follow-up.
+        ProgramHostMxcsrFromFpcr(static_cast<uint32_t>(value));
+        // endregion
         break;
       case Decoder::SystemReg::kFpsr:
         state_->cpu.emulated_fpsr = static_cast<uint32_t>(value);
@@ -8244,6 +8260,44 @@ class Interpreter {
 
  private:
   // region digitalis
+  // Program host x86 MXCSR rounding mode + FTZ/DAZ from an ARM FPCR value.
+  // Plan §L1 (FP exception flags) infrastructure: writing FPCR via MSR must
+  // program MXCSR rounding mode + DAZ/FTZ. Called from the kFpcr MSR case.
+  //
+  //   ARM FPCR[23:22] RMode: 00=RNE, 01=RP(+inf), 10=RM(-inf), 11=RZ
+  //   x86 MXCSR[14:13] RC:   00=RNE, 01=RD(-inf), 10=RU(+inf), 11=RZ
+  //
+  // The middle two encodings are swapped, so a 4-entry lookup table is the
+  // clearest mapping. FZ -> FTZ+DAZ because ARM FZ flushes both inputs and
+  // outputs, while x86 splits the two into separate bits. Exception masks
+  // (MXCSR bits 7-12) are forced to 1 so host FP never raises SIGFPE; we
+  // emulate exception flag reporting via emulated_fpsr instead. Other FPCR
+  // fields (DN, AHP, IDE/IXE/.../IOE, FZ16) have no clean x86 analog.
+  static void ProgramHostMxcsrFromFpcr(uint32_t fpcr) {
+#if defined(__x86_64__)
+    uint32_t mxcsr;
+    asm volatile("stmxcsr %0" : "=m"(mxcsr));
+    // Clear RC (bits 13-14), FTZ (bit 15), DAZ (bit 6).
+    mxcsr &= ~((0b11u << 13) | (1u << 15) | (1u << 6));
+    // Force all exception masks set (bits 7-12) so host FP doesn't trap.
+    mxcsr |= (0b111111u << 7);
+    static constexpr uint8_t kArmRmodeToX86Rc[4] = {
+        0b00,  // ARM RNE  -> x86 RNE
+        0b10,  // ARM RP   -> x86 RU
+        0b01,  // ARM RM   -> x86 RD
+        0b11,  // ARM RZ   -> x86 RZ
+    };
+    uint32_t arm_rmode = (fpcr >> 22) & 0b11;
+    mxcsr |= static_cast<uint32_t>(kArmRmodeToX86Rc[arm_rmode]) << 13;
+    if (fpcr & (1u << 24)) {  // FPCR.FZ
+      mxcsr |= (1u << 15) | (1u << 6);
+    }
+    asm volatile("ldmxcsr %0" : : "m"(mxcsr));
+#else
+    (void)fpcr;
+#endif
+  }
+
   // Compute element mask: all-ones for element of esize bytes.
   // Avoids UB from (1ULL << 64) when esize == 8.
   static uint64_t ElementMask(uint8_t esize) {
