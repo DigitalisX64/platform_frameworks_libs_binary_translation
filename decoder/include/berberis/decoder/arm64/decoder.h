@@ -1319,6 +1319,18 @@ class Decoder {
     kRshrn,
     kSqshrn,
     kUqshrn,
+    // region digitalis: AdvSIMD shift-by-immediate narrow family — the
+    // prior enum was missing SQSHRUN / SQRSHRUN / SQRSHRN / UQRSHRN.
+    // Without these, opcodes 0b10010 / 0b10011 (both U-values) silently
+    // fell through to the dispatch default and the U=1 variants of
+    // 0b10000 / 0b10001 (real SQSHRUN / SQRSHRUN) were mis-dispatched
+    // to SQSHRN / UQSHRN handlers.  See dispatch table at
+    // DecodeAdvSimdShiftByImm for the corrected (opcode, U) → enum map.
+    kSqshrun,
+    kSqrshrun,
+    kSqrshrn,
+    kUqrshrn,
+    // endregion
     kSshll,
     kUshll,
   };
@@ -5419,20 +5431,37 @@ class Decoder {
         }
         break;
       // endregion
+      // region digitalis: AdvSIMD narrow-shift dispatch — verified against
+      // llvm-mc output for shrn / rshrn / sqshrn / uqshrn / sqshrun /
+      // sqrshrn / sqrshrun / uqrshrn (and the *2 upper-half forms, which
+      // differ only in Q).
+      //
+      //   opcode | U=0       | U=1
+      //   -------+-----------+----------
+      //   10000  | SHRN      | SQSHRUN
+      //   10001  | RSHRN     | SQRSHRUN
+      //   10010  | SQSHRN    | UQSHRN
+      //   10011  | SQRSHRN   | UQRSHRN
+      //
+      // Prior dispatch had three independent bugs in this block:
+      //   1. opcode 0b10000 U=1 routed to kSqshrn (wrong: SQSHRUN).
+      //   2. opcode 0b10001 U=1 routed to kUqshrn (wrong: SQRSHRUN).
+      //   3. opcodes 0b10010 / 0b10011 (both U-values) silently fell to
+      //      Undefined(), making real SQSHRN / UQSHRN / SQRSHRN / UQRSHRN
+      //      raise SIGILL on any sample that touched them.
       case 0b10000:
-        if (!u) {
-          op = AdvSimdShiftImmOpcode::kShrn;
-        } else {
-          op = AdvSimdShiftImmOpcode::kSqshrn;
-        }
+        op = u ? AdvSimdShiftImmOpcode::kSqshrun : AdvSimdShiftImmOpcode::kShrn;
         break;
       case 0b10001:
-        if (!u) {
-          op = AdvSimdShiftImmOpcode::kRshrn;
-        } else {
-          op = AdvSimdShiftImmOpcode::kUqshrn;
-        }
+        op = u ? AdvSimdShiftImmOpcode::kSqrshrun : AdvSimdShiftImmOpcode::kRshrn;
         break;
+      case 0b10010:
+        op = u ? AdvSimdShiftImmOpcode::kUqshrn : AdvSimdShiftImmOpcode::kSqshrn;
+        break;
+      case 0b10011:
+        op = u ? AdvSimdShiftImmOpcode::kUqrshrn : AdvSimdShiftImmOpcode::kSqrshrn;
+        break;
+      // endregion
       case 0b10100:
         op = u ? AdvSimdShiftImmOpcode::kUshll : AdvSimdShiftImmOpcode::kSshll;
         break;

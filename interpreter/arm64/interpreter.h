@@ -6952,6 +6952,123 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis: AdvSIMD narrow-shift family (saturating, rounding,
+      // and signed-saturating-unsigned variants). The non-rounding non-unsigned
+      // variants live above (kShrn / kRshrn / kSqshrn / kUqshrn); these are
+      // the four that were previously missing from the decoder and thus had
+      // no interpreter case either. Each computes
+      //   shifted_i = (signed_or_unsigned)src_i >> rshift     (with rounding for
+      //                                                        the "R" forms)
+      //   sat       = clamp(shifted_i, dst_min, dst_max)
+      //   write     = sat narrowed to esize
+      // and writes lower-half (Q=0) / upper-half (Q=1) of Vd.
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrun: {
+        // SQSHRUN: signed saturating shift right unsigned narrow.
+        // Source is signed at 2*esize bits, result is unsigned at esize bits,
+        // negative shifted values saturate to 0.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t sat_max = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t shifted = (narrow_rshift >= src_bits)
+                                ? (signed_val >> (src_bits - 1))
+                                : (signed_val >> narrow_rshift);
+          uint64_t clamped;
+          if (shifted < 0) clamped = 0;
+          else if (static_cast<uint64_t>(shifted) > sat_max) clamped = sat_max;
+          else clamped = static_cast<uint64_t>(shifted);
+          uint64_t r = clamped & sat_max;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrun: {
+        // SQRSHRUN: signed saturating rounding shift right unsigned narrow.
+        // narrow_rshift is always in [1, esize] for valid encodings, so the
+        // simple signed-rounding path below is safe (no overflow in int128).
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t sat_max = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          __int128_t wide = static_cast<__int128_t>(signed_val) + (__int128_t{1} << (narrow_rshift - 1));
+          int64_t shifted = static_cast<int64_t>(wide >> narrow_rshift);
+          uint64_t clamped;
+          if (shifted < 0) clamped = 0;
+          else if (static_cast<uint64_t>(shifted) > sat_max) clamped = sat_max;
+          else clamped = static_cast<uint64_t>(shifted);
+          uint64_t r = clamped & sat_max;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn: {
+        // SQRSHRN: signed saturating rounding shift right narrow.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint8_t dst_bits = esize * 8;
+        int64_t sat_max = (1LL << (dst_bits - 1)) - 1;
+        int64_t sat_min = -(1LL << (dst_bits - 1));
+        uint64_t narrow_mask = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          __int128_t wide = static_cast<__int128_t>(signed_val) + (__int128_t{1} << (narrow_rshift - 1));
+          int64_t shifted = static_cast<int64_t>(wide >> narrow_rshift);
+          if (shifted > sat_max) shifted = sat_max;
+          else if (shifted < sat_min) shifted = sat_min;
+          uint64_t r = static_cast<uint64_t>(shifted) & narrow_mask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn: {
+        // UQRSHRN: unsigned saturating rounding shift right narrow.
+        uint8_t src_esize = esize * 2;
+        if (src_esize > 8) { Undefined(); return; }
+        uint8_t src_bits = src_esize * 8;
+        uint8_t src_count = 16 / src_esize;
+        uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
+        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+        uint8_t dst_offset = args.q ? 8 : 0;
+        uint64_t sat_max = ElementMask(esize);
+        for (uint8_t i = 0; i < src_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
+          __uint128_t wide = static_cast<__uint128_t>(elem) + (__uint128_t{1} << (narrow_rshift - 1));
+          uint64_t shifted = static_cast<uint64_t>(wide >> narrow_rshift);
+          if (shifted > sat_max) shifted = sat_max;
+          uint64_t r = shifted & sat_max;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
+        }
+        break;
+      }
+      // endregion
+
       default:
         Undefined();
         return;
