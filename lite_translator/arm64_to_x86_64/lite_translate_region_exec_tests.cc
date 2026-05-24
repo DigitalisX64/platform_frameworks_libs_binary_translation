@@ -12014,6 +12014,202 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8H_FromW7_HighBitsIgnored) {
 }
 // endregion
 
+// region digitalis: __memset_aarch64 1024-byte zero-fill reproduction.
+//
+// Reproduces the path Bionic's linker takes when scrubbing a freshly
+// re-allocated 1024-byte chunk from BionicSmallObjectAllocator.  That chunk
+// backs the ZIP central-directory hash table (calloc-allocated, with the
+// linker's calloc proxying directly to BionicAllocator::alloc — see
+// __dl_calloc at linker64+0x99f44 — without an extra memset; the small-
+// object allocator's own per-block memset is the only zeroing pass).
+//
+// Handoff-257 traced the VkCapsViewer splash hang to that table containing
+// non-zero garbage after allocation: every probed bucket showed leftover
+// heap content with `top12bits == 0` and a non-zero lower 20 bits, which
+// AddToMap can never produce for a real ZIP entry.  That signature is what
+// you get when the 1024-byte zero pass over the chunk silently drops a
+// scattering of writes.
+//
+// The instruction sequence below is taken verbatim from
+// __dl___memset_aarch64+0xa4..+0x118 (the big-size, non-DC-ZVA fallback at
+// linker64+0x49d60 onward, joined to the 0x49db8 entry that Berberis
+// reaches because the DCZID_EL0 ZVA check fails).  Pre-fills the buffer
+// with 0xdeadbeef so any missed store leaks the sentinel.
+TEST_F(Arm64LiteTranslateRegionTest, MemsetAarch64_1024ByteZeroFill_Unrolled) {
+  // Unrolled variant: replaces the b.hi loop with 15 inline iterations so the
+  // test runs end-to-end in one JIT region (the framework's allow_dispatch=
+  // false setting otherwise stops after the first backward-branch exit).
+  // If every individual STR Q / STP Q / DUP V translation is correct, the
+  // buffer is fully zeroed; any silently-dropped store leaks the 0xdeadbeef
+  // sentinel byte-by-byte.  This is what __memset_aarch64 ends up doing on
+  // a 1024-byte zero fill: 2 head STRs, 15 main-loop iterations each writing
+  // 64 bytes via 2 paired-Q STPs, then 2 tail STPs.
+  static constexpr size_t kSize = 1024;
+  alignas(16) static uint8_t buffer[kSize];
+  for (size_t i = 0; i < kSize / 4; ++i) {
+    reinterpret_cast<uint32_t*>(buffer)[i] = 0xdeadbeefU;
+  }
+
+  // stp q0, q0, [x3, #0x20]:  0xAD010060
+  // stp q0, q0, [x3, #0x40]:  0xAD020060
+  // add x3, x3, #0x40:        0x91010063
+  // stp q0, q0, [x4, #-0x40]: 0xAD3E0080
+  // stp q0, q0, [x4, #-0x20]: 0xAD3F0080
+  static const uint32_t code[] = {
+      0x4e010c20,  // dup v0.16b, w1
+      0x8b020004,  // add x4, x0, x2
+      0x927cec03,  // and x3, x0, #~0xf
+      0x3d800000,  // str q0, [x0]
+      0x3d800460,  // str q0, [x3, #0x10]
+      // iter 0
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 1
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 2
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 3
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 4
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 5
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 6
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 7
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 8
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 9
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 10
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 11
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 12
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 13
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 14
+      0xad010060, 0xad020060, 0x91010063,
+      0xad3e0080,  // stp q0, q0, [x4, #-0x40]
+      0xad3f0080,  // stp q0, q0, [x4, #-0x20]
+  };
+
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = kSize;
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  size_t first_nonzero = kSize;
+  for (size_t i = 0; i < kSize; ++i) {
+    if (buffer[i] != 0u) {
+      first_nonzero = i;
+      break;
+    }
+  }
+  EXPECT_EQ(first_nonzero, kSize)
+      << "first non-zero byte at offset " << first_nonzero
+      << " (value 0x" << std::hex
+      << static_cast<unsigned>(buffer[first_nonzero == kSize ? 0 : first_nonzero])
+      << "); buffer must be fully zeroed";
+}
+// endregion
+
+// region digitalis: BFM (BFI / BFXIL) JIT
+// BFM merges bits of src into a destination register, leaving the other
+// destination bits alone.  Two ARM ARM aliases that share this encoding
+// are exercised here:
+//   BFI Wd, Wn, #lsb, #width  -> BFM Wd, Wn, #(-lsb mod 32), #(width-1)
+//   BFXIL Wd, Wn, #lsb, #width -> BFM Wd, Wn, #lsb, #(lsb+width-1)
+// These pin the JIT's BFM path on the exact pattern Bionic's AddToMap
+// uses to encode CdEntryMapZip32 buckets:  the bucket stores
+// (name_length << 20) | (name_offset & 0xfffff); the second store does
+// `bfi w9, w19, #20, #12` to write the 12-bit length at bit 20.
+// If BFM's JIT (or its interpreter fallback) silently drops STORE 2,
+// the bucket ends up with top12bits == 0 — exactly the wedged-VkCaps
+// signature handoffs 256–258 chased.
+//
+// Encodings cross-checked with the ARM ARM C6.2.34 / C6.2.35 / C6.2.36.
+//   BFI w9, w19, #20, #12   = 0x330C2E69  (sf=0, opc=01, immr=12, imms=11)
+//   BFI x9, x19, #20, #12   = 0xB36C2E69  (sf=1, N=1, immr=44, imms=11)
+//   BFXIL w0, w1, #4, #8    = 0x33042C20  (sf=0, immr=4,  imms=11)
+//   BFXIL x0, x1, #16, #32  = 0xB350BC20  (sf=1, immr=16, imms=47)
+//   BFC w0, #8, #16         = 0x33183FE0  (BFI Wd, WZR, ...)
+TEST_F(Arm64LiteTranslateRegionTest, BfiW_AddToMapInsertPattern) {
+  // bfi w9, w19, #20, #12:  bucket = (length << 20) | (bucket & 0x000fffff)
+  // Pre-load w9 with name_offset (already OR'd from STORE 1).
+  // Pre-load w19 with name_length (12-bit value; high bits must be ignored).
+  state_.cpu.x[9]  = 0x00007a64ULL;            // STORE 1 result: only low 20 set.
+  state_.cpu.x[19] = 0x12345AAAULL;            // length=0xAAA (high bits noise).
+  static const uint32_t code[] = {
+      0x330C2E69,  // bfi w9, w19, #20, #12
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Expected: w9 = (0xAAA << 20) | 0x7a64 = 0xAAA07A64; upper 32 bits zero.
+  EXPECT_EQ(state_.cpu.x[9], 0xAAA07A64ULL);
+  EXPECT_EQ(state_.cpu.x[19], 0x12345AAAULL) << "src register must be preserved";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, BfiW_PreservesOtherBitsAndZeroesUpper) {
+  // bfi w9, w19, #4, #8: write low 8 bits of w19 to bits[11:4] of w9.
+  state_.cpu.x[9]  = 0xFFFFFFFFFFFFFFFFULL;    // all ones; upper 32 must become 0.
+  state_.cpu.x[19] = 0x000000A5ULL;
+  // Encoding: BFM w9, w19, #(-4 mod 32 = 28), #(8-1 = 7)
+  static const uint32_t code[] = {
+      0x331C1E69,  // bfi w9, w19, #4, #8
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // bits [11:4] -> 0xA5; other low-32 bits unchanged; upper 32 -> 0.
+  EXPECT_EQ(state_.cpu.x[9], 0x00000000FFFFFA5FULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, BfiX_64BitInsert) {
+  // bfi x9, x19, #20, #12: 64-bit form.
+  state_.cpu.x[9]  = 0xDEADBEEF00007A64ULL;
+  state_.cpu.x[19] = 0x12345AAAULL;
+  static const uint32_t code[] = {
+      0xB36C2E69,  // bfi x9, x19, #20, #12
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Expected: bits[31:20] of x9 become 0xAAA; everything else unchanged.
+  EXPECT_EQ(state_.cpu.x[9], 0xDEADBEEFAAA07A64ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, BfxilW_ExtractAndDeposit) {
+  // bfxil w0, w1, #4, #8: copy bits[11:4] of w1 to bits[7:0] of w0.
+  state_.cpu.x[0] = 0xFFFFFFFFFFFFFF00ULL;
+  state_.cpu.x[1] = 0x00000A50ULL;             // bits[11:4] = 0xA5.
+  static const uint32_t code[] = {
+      0x33042C20,  // bfxil w0, w1, #4, #8
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // bits[7:0] of w0 become 0xA5; other low-32 bits unchanged; upper 32 -> 0.
+  EXPECT_EQ(state_.cpu.x[0], 0x00000000FFFFFFA5ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, BfxilX_FullWidth) {
+  // bfxil x0, x1, #16, #32: copy bits[47:16] of x1 to bits[31:0] of x0.
+  state_.cpu.x[0] = 0xAAAAAAAABBBBBBBBULL;
+  state_.cpu.x[1] = 0x1234567890ABCDEFULL;     // bits[47:16] = 0x567890AB.
+  static const uint32_t code[] = {
+      0xB350BC20,  // bfxil x0, x1, #16, #32
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0xAAAAAAAA567890ABULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, BfcW_ClearBitfield) {
+  // bfc w0, #8, #16: clear bits[23:8] of w0 (BFI with src=WZR).
+  state_.cpu.x[0] = 0xFFFFFFFFFFFFFFFFULL;
+  static const uint32_t code[] = {
+      0x33183FE0,  // bfc w0, #8, #16
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x00000000FF0000FFULL);
+}
+// endregion
+
 // region digitalis: INS (element) JIT
 // INS Vd.<T>[dst_idx], Vn.<T>[src_idx] — copy one esize-byte lane from Vn
 // to one lane of Vd, leaving every other lane of Vd unchanged.  These

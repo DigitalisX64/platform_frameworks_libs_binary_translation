@@ -447,7 +447,75 @@ class LiteTranslator {
       }
     }
 
-    // For BFM and other complex bitfield operations, fall back to the interpreter.
+    // region digitalis - general BFM (BFI / BFXIL / BFC).
+    // BFM merges bits from src into dst_val, leaving the other dst_val
+    // bits unchanged. Two cases by immr/imms relationship:
+    //   imms >= immr (BFXIL): take bits[imms:immr] of src and write them
+    //     to bits[width-1:0] of dst, keeping the rest of dst.
+    //   imms <  immr (BFI):   take bits[imms:0] of src and write them at
+    //     bit position (reg_size - immr), keeping the rest of dst.
+    // In both cases: result = (dst_val & ~mask) | (shifted_src & mask).
+    // The semantics_player passes the live dst register as dst_val for kBfm.
+    if (opcode == Decoder::BitfieldOpcode::kBfm) {
+      Register res = AllocTempReg();
+      Register mask_reg = AllocTempReg();
+      uint64_t mask;
+      if (imms >= immr) {
+        // BFXIL: extract width = imms-immr+1 bits, deposit at bit 0.
+        unsigned width = imms - immr + 1;
+        mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        if (is_64bit) {
+          as_.Movq(res, src);
+          if (immr != 0) as_.Shrq(res, static_cast<int8_t>(immr));
+          as_.Movq(mask_reg, static_cast<int64_t>(mask));
+          as_.Andq(res, mask_reg);
+        } else {
+          as_.Movl(res, src);
+          if (immr != 0) as_.Shrl(res, static_cast<int8_t>(immr));
+          // 32-bit AND with immediate (sign-extended to 64); mask fits in 32.
+          as_.Movl(mask_reg, static_cast<int32_t>(mask & 0xFFFFFFFFULL));
+          as_.Andl(res, mask_reg);
+        }
+      } else {
+        // BFI / BFC: extract low width = imms+1 bits, deposit at pos.
+        unsigned width = imms + 1;
+        unsigned pos = reg_size - immr;
+        uint64_t field_mask =
+            (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        mask = (pos >= 64) ? 0 : (field_mask << pos);
+        if (is_64bit) {
+          as_.Movq(res, src);
+          as_.Movq(mask_reg, static_cast<int64_t>(field_mask));
+          as_.Andq(res, mask_reg);
+          if (pos != 0) as_.Shlq(res, static_cast<int8_t>(pos));
+        } else {
+          as_.Movl(res, src);
+          as_.Movl(mask_reg, static_cast<int32_t>(field_mask & 0xFFFFFFFFULL));
+          as_.Andl(res, mask_reg);
+          if (pos != 0) as_.Shll(res, static_cast<int8_t>(pos));
+        }
+      }
+      // Merge: res = (dst_val & ~mask) | res.
+      // We must not mutate dst_val: copy it into a fresh temp first.
+      Register keep = AllocTempReg();
+      if (is_64bit) {
+        as_.Movq(keep, dst_val);
+        as_.Movq(mask_reg, static_cast<int64_t>(~mask));
+        as_.Andq(keep, mask_reg);
+        as_.Orq(res, keep);
+      } else {
+        as_.Movl(keep, dst_val);
+        as_.Movl(mask_reg, static_cast<int32_t>((~mask) & 0xFFFFFFFFULL));
+        as_.Andl(keep, mask_reg);
+        as_.Orl(res, keep);
+        // ARM64 W-register writes zero the upper 32 bits of the X register;
+        // the 32-bit Orl above already zero-extends res to 64 on x86_64.
+      }
+      return res;
+    }
+    // endregion
+
+    // For other complex bitfield operations not yet handled, fall back.
     Undefined();
     return no_register;
   }
