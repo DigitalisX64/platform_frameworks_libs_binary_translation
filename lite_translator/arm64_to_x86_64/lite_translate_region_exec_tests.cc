@@ -14967,6 +14967,204 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec2SShift1) {
 }
 // endregion
 
+// region digitalis: UQRSHRN / UQRSHRN2 vector unsigned-saturating-rounding-
+// shift-right-narrow exec tests.  Pin the JIT lowering at
+// lite_translator.h's AdvSimdShiftByImm kUqrshrn case — same shared body
+// as kShrn/kRshrn/kUqshrn, with both is_rounding AND
+// is_saturating_unsigned set.  Carry-preserving rounding-add:
+// PADDUSW (src=16) or PMINUD-preclamp+PADDD (src=32).  src=64 bails JIT
+// → interpreter.  Encodings verified with aarch64-linux-gnu-as
+// -march=armv8-a.
+
+// uqrshrn  v0.8b,  v1.8h, #5  — wide-add round=16 then >>5 then sat.
+constexpr uint32_t kUqrshrnVec8B_5    = 0x2F0B9C20;
+// uqrshrn2 v0.16b, v1.8h, #5  — Q=1 form.
+constexpr uint32_t kUqrshrn2Vec16B_5  = 0x6F0B9C20;
+// uqrshrn  v0.4h,  v1.4s, #5  — 32→16 PMINUD pre-clamp path.
+constexpr uint32_t kUqrshrnVec4H_5    = 0x2F1B9C20;
+// uqrshrn2 v0.8h,  v1.4s, #5  — Q=1 form of the 32→16 path.
+constexpr uint32_t kUqrshrn2Vec8H_5   = 0x6F1B9C20;
+// uqrshrn  v0.8b,  v1.8h, #1  — minimum rshift; PADDUSW carry test.
+constexpr uint32_t kUqrshrnVec8B_1    = 0x2F0F9C20;
+// uqrshrn  v0.8b,  v1.8h, #8  — maximum rshift; round_const = 128.
+constexpr uint32_t kUqrshrnVec8B_8    = 0x2F089C20;
+// uqrshrn  v0.4h,  v1.4s, #16 — maximum rshift for 32→16; round = 0x8000.
+constexpr uint32_t kUqrshrnVec4H_16   = 0x2F109C20;
+// uqrshrn  v0.2s,  v1.2d, #1  — 64-bit src; expected JIT bail.
+constexpr uint32_t kUqrshrnVec2S_1    = 0x2F3F9C20;
+
+static inline uint8_t  UqrshrnRefU8 (uint16_t e, uint8_t k) {
+  uint32_t wide = static_cast<uint32_t>(e) + (uint32_t{1} << (k - 1));
+  uint32_t shifted = wide >> k;
+  if (shifted > 0xFFu) shifted = 0xFFu;
+  return static_cast<uint8_t>(shifted);
+}
+static inline uint16_t UqrshrnRefU16(uint32_t e, uint8_t k) {
+  uint64_t wide = static_cast<uint64_t>(e) + (uint64_t{1} << (k - 1));
+  uint64_t shifted = wide >> k;
+  if (shifted > 0xFFFFu) shifted = 0xFFFFu;
+  return static_cast<uint16_t>(shifted);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec8BShift5) {
+  // shift=5, round=16.  Mix of saturating, exact-max, and non-saturating.
+  //   0xFFFF + 16 = 0x1000F → >> 5 = 0x800 → sat to 0xFF.
+  //   0x1FEF + 16 = 0x1FFF → >> 5 = 0xFF → exactly the max (no overflow).
+  //   0x0FFF + 16 = 0x100F → >> 5 = 0x80 → no saturation.
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8001, 0x4321, 0x1FEF, 0x0FFF, 0x00FF, 0xCAFE};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqrshrnVec8B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], UqrshrnRefU8(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uqrshrn2Vec16BShift5) {
+  uint16_t in[8]  = {0x0000, 0xFFFF, 0x8001, 0x4321, 0x1FEF, 0x0FFF, 0x00FF, 0xCAFE};
+  uint8_t  vd[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                     0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10, 0x20};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kUqrshrn2Vec16B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low byte " << i << " was clobbered";
+  }
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i + 8], UqrshrnRefU8(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec8BShift1) {
+  // shift=1, round=1.  Heavy PADDUSW carry exercise — without saturating
+  // add, 0xFFFF + 1 wraps to 0 and gives the wrong answer.
+  //   0xFFFF + 1 = 0x10000 → PADDUSW saturates to 0xFFFF → >> 1 = 0x7FFF
+  //     → PMINUW vs 0xFF clamps to 0xFF.  Interpreter computes 0x8000
+  //     >> 0 = 0x8000 → sat 0xFF.  Match.
+  //   0xFFFE + 1 = 0xFFFF → no overflow → >> 1 = 0x7FFF → sat 0xFF.
+  //   0x01FE + 1 = 0x01FF → >> 1 = 0xFF → exactly the max.
+  //   0x00FE + 1 = 0x00FF → >> 1 = 0x7F → no saturation.
+  uint16_t in[8] = {0x0001, 0x0002, 0x0003, 0x000F, 0xFFFE, 0xFFFF, 0x01FE, 0x00FE};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqrshrnVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], UqrshrnRefU8(in[i], 1))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec8BShift8) {
+  // shift=8, round=128.  Carry test at maximum rshift for 16→8.
+  //   0xFFFF + 128 = 0x1007F → PADDUSW saturates to 0xFFFF → >> 8 = 0xFF
+  //     → sat 0xFF.  Match.
+  //   0xFF7F + 128 = 0xFFFF → >> 8 = 0xFF → exactly the max.
+  //   0xFF00 + 128 = 0xFF80 → >> 8 = 0xFF → exactly the max.
+  //   0x0080 + 128 = 0x0100 → >> 8 = 1 → no saturation.
+  uint16_t in[8] = {0x0000, 0xFFFF, 0xFF7F, 0xFF00, 0xFFFE, 0x80FF, 0x0080, 0x007F};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqrshrnVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], UqrshrnRefU8(in[i], 8))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec4HShift5) {
+  // 32→16 path: PMINUD(xn, 0xFFFFFFEF) pre-clamp, then PADDD.  shift=5,
+  // round=16.
+  //   0xFFFFFFFF: clamped to 0xFFFFFFEF + 16 = 0xFFFFFFFF → >> 5 =
+  //     0x7FFFFFF → sat to 0xFFFF.  Interp: (2^32-1) + 16 = 2^32+15 →
+  //     >>5 = 0x7FFFFFF → sat 0xFFFF.  Match.
+  //   0x001FFFFF + 16 = 0x00200002 → wait, 0x001FFFFF clamped vs
+  //     0xFFFFFFEF stays as 0x001FFFFF (no clamp).  + 16 = 0x00200002 →
+  //     wait, 0x001FFFFF + 16 = 0x00200002... ugh actually 0x001FFFFF +
+  //     0x10 = 0x002000F.  >> 5 = 0x10000 → sat 0xFFFF.  But hmm —
+  //     does PADDD here exactly match? 0x001FFFFF + 16 = 0x002000F →
+  //     >> 5 = 0x10000 → sat 0xFFFF.  Reference value via helper.
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0x001FFFFFu, 0x0000FFFFu};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqrshrnVec4H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], UqrshrnRefU16(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uqrshrn2Vec8HShift5) {
+  uint32_t in[4]  = {0x12345678u, 0xFFFFFFFFu, 0x001FFFFFu, 0x0000FFFFu};
+  uint16_t vd[8]  = {0xAAA0, 0xBBB1, 0xCCC2, 0xDDD3, 0x1000, 0x2000, 0x3000, 0x4000};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kUqrshrn2Vec8H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low halfword " << i << " clobbered";
+  }
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i + 4], UqrshrnRefU16(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec4HShift16) {
+  // 32→16 at maximum rshift: round = 0x8000, clamp_max = 0xFFFF7FFF.
+  //   0xFFFFFFFF: clamped to 0xFFFF7FFF + 0x8000 = 0xFFFFFFFF → >> 16 =
+  //     0xFFFF → sat 0xFFFF.  Interp: (2^32-1) + 0x8000 = 2^32+0x7FFF
+  //     → >>16 = 0x10000 → sat 0xFFFF.  Match.
+  //   0xFFFF7FFE + 0x8000 = 0xFFFFFFFE → >> 16 = 0xFFFF.  No clamp (≤
+  //     0xFFFF7FFF).  Match.
+  //   0x00010000 + 0x8000 = 0x00018000 → >> 16 = 1 → no saturation.
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0xFFFF7FFEu, 0x00010000u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqrshrnVec4H_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], UqrshrnRefU16(in[i], 16))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec2SShift1JitBail) {
+  // 64-bit src UQRSHRN: JIT bails (no cheap baseline-SSE PADDUSQ); Run()
+  // returns false because TryLiteTranslateRegion sets success=false.
+  // Confirms the bail mechanism is wired correctly.
+  static const uint32_t code[] = {kUqrshrnVec2S_1};
+  EXPECT_FALSE(Run(code, ToGuestAddr(code) + sizeof(code)));
+}
+// endregion
+
 
 // region digitalis: SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
 //

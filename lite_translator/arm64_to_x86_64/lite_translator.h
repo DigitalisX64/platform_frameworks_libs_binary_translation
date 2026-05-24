@@ -11870,11 +11870,29 @@ class LiteTranslator {
       //               saturating lanes' lo32 become 0xFFFFFFFF.
       // The subsequent PSHUFB gathers the saturated lo half of each lane.
       //
+      // UQRSHRN combines RSHRN's rounding pre-shift add with UQSHRN's
+      // post-shift unsigned saturating clamp.  Because the subsequent
+      // saturate observes the WIDE (pre-shift) value, the rounding add
+      // must NOT lose its carry-out — the plain PADDW/PADDD that RSHRN
+      // uses wraps mod 2^src_bits and silently zeros the saturated
+      // result.  Saturating-add variants:
+      //   src 16-bit: PADDUSW (single instruction, saturates to 0xFFFF).
+      //   src 32-bit: no PADDUSD in baseline SSE; pre-clamp via
+      //               PMINUD(xn, 0xFFFFFFFF - round_lane) before PADDD.
+      //               Clamped lanes land at 0xFFFFFFFF after the add,
+      //               which PSRLD-then-PMINUD correctly drives to the
+      //               saturated 0xFFFF (because 0xFFFFFFFF >> narrow_rshift
+      //               ≥ 0xFFFF for narrow_rshift ∈ [1, 16]).
+      //   src 64-bit: PADDQ wraps, and emulating PADDUSQ on baseline SSE
+      //               needs PCMPGTQ + blend + a separate temp.  Bail to
+      //               interpreter (`success_ = false`).
+      //
       // Q=0:        store narrowed-in-low | zero-upper.
       // Q=1 ("2"):  preserve Vd[63:0], OR narrowed result into Vd[127:64].
       case Decoder::AdvSimdShiftImmOpcode::kShrn:
       case Decoder::AdvSimdShiftImmOpcode::kRshrn:
-      case Decoder::AdvSimdShiftImmOpcode::kUqshrn: {
+      case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn: {
         const uint8_t immh = args.immh;
         if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
         uint8_t src_bits;
@@ -11886,9 +11904,16 @@ class LiteTranslator {
           src_bits = 16;
         }
         const bool is_rounding =
-            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn);
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
         const bool is_saturating_unsigned =
-            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn);
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
+        if (is_rounding && is_saturating_unsigned && src_bits == 64) {
+          // UQRSHRN src=64 needs a saturating PADDQ that baseline SSE
+          // can't express cheaply.  Fall back to the interpreter.
+          success_ = false; return;
+        }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
         const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
         SimdRegister xn = AllocTempSimdReg();
@@ -11901,9 +11926,12 @@ class LiteTranslator {
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
         if (is_rounding) {
           // Broadcast the per-lane rounding constant (1 << (rshift - 1))
-          // across all SIMD lanes, then PADDW/PADDD/PADDQ.  The 64-bit
-          // pattern packs the constant into every lane of the source
-          // element width.
+          // across all SIMD lanes, then add.  The 64-bit pattern packs
+          // the constant into every lane of the source element width.
+          // Plain RSHRN uses PADDW/PADDD/PADDQ (wrap-on-overflow is
+          // benign — the subsequent PSHUFB narrow-mask drops the carry).
+          // UQRSHRN must preserve the carry; see the comment block above
+          // for the saturating-add variants.
           const uint64_t round_lane = uint64_t{1} << (narrow_rshift - 1);
           uint64_t round_pattern;
           switch (src_bits) {
@@ -11923,10 +11951,33 @@ class LiteTranslator {
           as_.Movq(r1, static_cast<int64_t>(round_pattern));
           as_.Movq(xround, r1);
           as_.Pinsrq(xround, r1, int8_t{1});
-          switch (src_bits) {
-            case 16: as_.Paddw(xn, xround); break;
-            case 32: as_.Paddd(xn, xround); break;
-            case 64: as_.Paddq(xn, xround); break;
+          if (is_saturating_unsigned) {
+            switch (src_bits) {
+              case 16:
+                as_.Paddusw(xn, xround);
+                break;
+              case 32: {
+                const uint32_t clamp_lane =
+                    0xFFFFFFFFu - static_cast<uint32_t>(round_lane);
+                const uint64_t clamp_pattern =
+                    (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+                SimdRegister xclamp = AllocTempSimdReg();
+                if (xclamp == no_simd_register) { success_ = false; return; }
+                as_.Movq(r1, static_cast<int64_t>(clamp_pattern));
+                as_.Movq(xclamp, r1);
+                as_.Pinsrq(xclamp, r1, int8_t{1});
+                as_.Pminud(xn, xclamp);
+                as_.Paddd(xn, xround);
+                break;
+              }
+              // src_bits == 64 already bailed above.
+            }
+          } else {
+            switch (src_bits) {
+              case 16: as_.Paddw(xn, xround); break;
+              case 32: as_.Paddd(xn, xround); break;
+              case 64: as_.Paddq(xn, xround); break;
+            }
           }
         }
         const int8_t cnt = static_cast<int8_t>(narrow_rshift);
