@@ -72,6 +72,7 @@ void UpdateGuestProt(int guest_prot, void* addr, size_t length) {
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 static uint64_t g_mmap_count = 0;
 static uint64_t g_mmap_fail_count = 0;
+static uint64_t g_mprotect_count = 0;
 #endif
 // endregion
 
@@ -210,6 +211,13 @@ int MunmapForGuest(void* addr, size_t length) {
 }
 
 int MprotectForGuest(void* addr, size_t length, int prot) {
+  // region digitalis - log mprotect calls to characterize CFIShadowWriter spam
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  uint64_t n = ++g_mprotect_count;
+  TRACE("mprotect#%llu addr=%p len=%zu prot=0x%x",
+        static_cast<unsigned long long>(n), addr, length, prot);
+#endif
+  // endregion
   // In b/218772975 the app is scanning "/proc/self/maps" and tries to mprotect
   // mappings for some libraries found there (for unknown reason) effectively removing
   // execution permission. GuestMapShadow is pre-populated with such mappings, so we
