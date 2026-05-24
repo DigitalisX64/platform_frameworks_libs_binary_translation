@@ -13463,6 +13463,121 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
 }
 // endregion
 
+// region digitalis: Hypothesis G.1 — JIT `adds Wd, Wn, #imm` (W-form)
+// must set ARM C=1 when the 32-bit unsigned sum wraps, so that a following
+// `b.hs target` (HS = C==1) takes the branch.
+//
+// Production AddToMap inner loop at linker64 offsets 0x9cc48-0x9cc4c emits:
+//     adds  w8, w24, #0x1
+//     b.hs  0x9cccc           ; -> ubsan_handle_add_overflow_minimal_abort
+// simpleperf + /proc/PID/mem dump shows VkCapsViewer's qtMainLoopThread
+// spends 84% of CPU in the JIT translation of this code range.  If the JIT
+// for `adds w8, w24, #1` fails to set C correctly when w24 wraps from
+// 0xFFFFFFFF, `b.hs` falls through and the loop never exits via overflow.
+//
+// The existing FullyPopulatedSpins multi-region test verifies the watchdog
+// fires (loop spins on a fully populated table) but does NOT exercise the
+// w24 == 0xFFFFFFFF boundary case where b.hs should TAKE.  This test pins
+// that boundary directly: it sets w24 = 0xFFFFFFFF, runs adds + b.hs, and
+// verifies the branch target is reached.
+TEST_F(Arm64LiteTranslateRegionTest, AddsW32OverflowSetsCarryBhsFires) {
+  // Encodings cross-checked with the ARM ARM C6.2.4 (ADDS imm) and C6.2.27
+  // (B.cond): adds w8, w24, #1 == 0x31000708; b.hs +0x10 == 0x54000082.
+  // MOVZ w24, #0xFFFF == 0x529FFFF8; MOVK w24, #0xFFFF, lsl #16 == 0x72BFFFF8.
+  static const uint32_t code[] = {
+      0x529FFFF8,                 // [0]   MOVZ w24, #0xFFFF
+      0x72BFFFF8,                 // [4]   MOVK w24, #0xFFFF, lsl #16
+                                  //       -> w24 = 0xFFFFFFFF
+      0x31000708,                 // [8]   ADDS w8, w24, #1
+                                  //       -> w8 = 0 (32-bit wrap), C=1, Z=1
+      Bcond(kCondCS, 0x10),       // [12]  B.HS +0x10  -> code + 0x1c
+      MovzX(0, 0xDEAD),           // [16]  fall-through (BUG path)
+      kNop,                       // [20]
+      kNop,                       // [24]
+      MovzX(0, 0xC0DE),           // [28]  b.hs target (not translated)
+  };
+  state_.cpu.x[0] = 0xBAADF00DULL;
+  state_.cpu.x[8] = 0xBAADF00DULL;
+
+  // Expected: b.hs takes, JIT region exits at code + 0x1c.
+  GuestAddr expected_branch_target = ToGuestAddr(code) + 0x1c;
+  EXPECT_TRUE(Run(code, expected_branch_target));
+
+  EXPECT_EQ(state_.cpu.insn_addr, expected_branch_target)
+      << "HYPOTHESIS G.1 OUTCOME: b.hs did NOT fire after `adds w8, "
+         "w24=0xFFFFFFFF, #1`.  ARM ARM requires C=1 on 32-bit unsigned "
+         "overflow; if insn_addr=0x" << std::hex << (ToGuestAddr(code) + 0x10)
+      << ", the JIT's W-form ADDS carry-flag emission is buggy.";
+
+  EXPECT_EQ(state_.cpu.x[24], 0xFFFFFFFFULL)
+      << "Setup invariant: w24 must hold 0xFFFFFFFF after MOVZ+MOVK.";
+
+  EXPECT_EQ(state_.cpu.x[8], 0ULL)
+      << "ARM ARM: ADDS w8, w24=0xFFFFFFFF, #1 must produce w8 = 0 "
+         "(32-bit wrap, upper 32 bits zero from W-form zero-extend).  "
+         "Got 0x" << std::hex << state_.cpu.x[8];
+
+  EXPECT_EQ(state_.cpu.x[0], 0xBAADF00DULL)
+      << "Fall-through `MOVZ x0, #0xDEAD` must NOT have executed.";
+}
+
+// Negative companion: `adds w8, w24=0x7FFFFFFE, #1` -> w8 = 0x7FFFFFFF,
+// C=0, b.hs must NOT fire.  Pins the no-overflow path so we can detect
+// either polarity error (b.hs spuriously firing OR failing).
+TEST_F(Arm64LiteTranslateRegionTest, AddsW32NoOverflowBhsFallsThrough) {
+  // MOVZ w24, #0xFFFE       = 0x529FFFD8
+  // MOVK w24, #0x7FFF, lsl #16 = 0x72AFFFF8  -> w24 = 0x7FFFFFFE
+  static const uint32_t code[] = {
+      0x529FFFD8,                 // [0]   MOVZ w24, #0xFFFE
+      0x72AFFFF8,                 // [4]   MOVK w24, #0x7FFF, lsl #16
+      0x31000708,                 // [8]   ADDS w8, w24, #1
+                                  //       -> w8 = 0x7FFFFFFF, C=0
+      Bcond(kCondCS, 0x10),       // [12]  B.HS  (must NOT fire)
+  };
+  state_.cpu.x[8] = 0xBAADF00DULL;
+
+  // b.hs falls through; JIT region ends at fall-through PC (code + 16).
+  GuestAddr fall_through = ToGuestAddr(code) + sizeof(code);
+  EXPECT_TRUE(Run(code, fall_through));
+
+  EXPECT_EQ(state_.cpu.insn_addr, fall_through)
+      << "b.hs spuriously fired on a non-overflowing adds.  C must be 0 "
+         "when w24=0x7FFFFFFE + 1 = 0x7FFFFFFF (no unsigned wrap).";
+  EXPECT_EQ(state_.cpu.x[24], 0x7FFFFFFEULL) << "Setup invariant";
+  EXPECT_EQ(state_.cpu.x[8], 0x7FFFFFFFULL)
+      << "ARM ARM: adds w8, 0x7FFFFFFE, #1 -> 0x7FFFFFFF.  Got 0x"
+      << std::hex << state_.cpu.x[8];
+}
+
+// G.1 boundary completeness: full pre-mask state w24=0xFFFFFFFE.
+// adds w8, 0xFFFFFFFE, #1 -> w8 = 0xFFFFFFFF, C=0 (no wrap), b.hs must NOT fire.
+// This is the immediate predecessor of the wrap case above; if the JIT
+// computes C from the 64-bit sum instead of the 32-bit sum, it would
+// already show a difference here.
+TEST_F(Arm64LiteTranslateRegionTest, AddsW32JustBelowOverflowBhsFallsThrough) {
+  // MOVZ w24, #0xFFFE         = 0x529FFFD8
+  // MOVK w24, #0xFFFF, lsl #16 = 0x72BFFFF8  -> w24 = 0xFFFFFFFE
+  static const uint32_t code[] = {
+      0x529FFFD8,                 // [0]   MOVZ w24, #0xFFFE
+      0x72BFFFF8,                 // [4]   MOVK w24, #0xFFFF, lsl #16
+      0x31000708,                 // [8]   ADDS w8, w24, #1
+                                  //       -> w8 = 0xFFFFFFFF, C=0
+      Bcond(kCondCS, 0x10),       // [12]  B.HS  (must NOT fire)
+  };
+  state_.cpu.x[8] = 0xBAADF00DULL;
+
+  GuestAddr fall_through = ToGuestAddr(code) + sizeof(code);
+  EXPECT_TRUE(Run(code, fall_through));
+
+  EXPECT_EQ(state_.cpu.insn_addr, fall_through)
+      << "b.hs spuriously fired on adds w8, 0xFFFFFFFE, #1 = 0xFFFFFFFF.  "
+         "Result max-uint32 but no carry — JIT may be misreading C from "
+         "high-bit of result instead of the actual overflow bit.";
+  EXPECT_EQ(state_.cpu.x[24], 0xFFFFFFFEULL) << "Setup invariant";
+  EXPECT_EQ(state_.cpu.x[8], 0xFFFFFFFFULL);
+}
+// endregion
+
 // region digitalis: BFM (BFI / BFXIL) JIT
 // BFM merges bits of src into a destination register, leaving the other
 // destination bits alone.  Two ARM ARM aliases that share this encoding
