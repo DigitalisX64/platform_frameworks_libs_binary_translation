@@ -11913,6 +11913,28 @@ class LiteTranslator {
       //               under-flow a signed value, so no lower pre-clamp.
       //   src 64-bit: bail (no PSRAQ for the shift anyway).
       //
+      // SQSHRUN reads the source as signed, clamps the post-shift value
+      // to the UNSIGNED dst range `[0, 2^dst_bits - 1]`, then narrows.
+      // Negative results saturate to 0, results above the dst-max
+      // saturate to dst-max.  Pre-shift is PSRA{W,D} (sign-preserving,
+      // same as SQSHRN — the source is signed).  Post-shift clamp:
+      //   src 16-bit (dst 8):  PMAXSW vs zero, then PMINSW vs 0x00FF
+      //                        (after PMAXSW the lane is non-negative,
+      //                        so signed-min against the positive 0xFF
+      //                        cap is equivalent to unsigned-min).
+      //   src 32-bit (dst 16): PMAXSD vs zero, then PMINSD vs 0xFFFF
+      //                        (both SSE4.1; same non-negative argument).
+      //   src 64-bit: bail (no PSRAQ).
+      //
+      // SQRSHRUN adds the rounding pre-shift add.  Like SQRSHRN the wide
+      // add must signed-saturate (round constant is positive; saturating
+      // at INT*_MAX leaves the post-clamp at dst-max which is what the
+      // architectural infinite-precision result would deliver too):
+      //   src 16-bit: PADDSW.
+      //   src 32-bit: PMINSD-preclamp + plain PADDD (same trick as
+      //               SQRSHRN — the round constant is positive).
+      //   src 64-bit: bail.
+      //
       // Q=0:        store narrowed-in-low | zero-upper.
       // Q=1 ("2"):  preserve Vd[63:0], OR narrowed result into Vd[127:64].
       case Decoder::AdvSimdShiftImmOpcode::kShrn:
@@ -11920,7 +11942,9 @@ class LiteTranslator {
       case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
       case Decoder::AdvSimdShiftImmOpcode::kUqrshrn:
       case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
-      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn: {
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrun:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrun: {
         const uint8_t immh = args.immh;
         if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
         uint8_t src_bits;
@@ -11934,21 +11958,32 @@ class LiteTranslator {
         const bool is_rounding =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn) ||
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn) ||
-            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrun);
         const bool is_saturating_unsigned =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn) ||
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
         const bool is_saturating_signed =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn) ||
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
+        const bool is_saturating_signed_to_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrun) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrun);
+        // PSRAW/PSRAD (sign-preserving arithmetic right shift) is required
+        // whenever the source is interpreted as signed.  PADDSW / PMINSD-
+        // preclamp+PADDD (signed-saturating add) is required whenever the
+        // wide rounding add must preserve signed saturation.
+        const bool uses_signed_shift =
+            is_saturating_signed || is_saturating_signed_to_unsigned;
         if (is_rounding && is_saturating_unsigned && src_bits == 64) {
           // UQRSHRN src=64 needs a saturating PADDQ that baseline SSE
           // can't express cheaply.  Fall back to the interpreter.
           success_ = false; return;
         }
-        if (is_saturating_signed && src_bits == 64) {
-          // SQSHRN / SQRSHRN src=64 needs PSRAQ which baseline SSE
-          // doesn't have.  Fall back to the interpreter.
+        if (uses_signed_shift && src_bits == 64) {
+          // SQSHRN / SQRSHRN / SQSHRUN / SQRSHRUN src=64 needs PSRAQ
+          // which baseline SSE doesn't have.  Fall back to the
+          // interpreter.
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
@@ -12009,7 +12044,11 @@ class LiteTranslator {
               }
               // src_bits == 64 already bailed above.
             }
-          } else if (is_saturating_signed) {
+          } else if (uses_signed_shift) {
+            // SQRSHRN and SQRSHRUN both need a signed-saturating wide add.
+            // The downstream clamp (signed-to-signed for SQRSHRN; signed-
+            // to-unsigned for SQRSHRUN) drives the saturated INT*_MAX
+            // value to the correct dst-max value in either case.
             switch (src_bits) {
               case 16:
                 // PADDSW is signed-saturating word add (SSE2).
@@ -12022,8 +12061,8 @@ class LiteTranslator {
                 // it cannot cause negative underflow — no lower
                 // pre-clamp needed.  Lanes that hit the upper clamp
                 // settle at exactly INT32_MAX after the add, which the
-                // post-shift PMINSD-vs-signed-max drives to the
-                // saturated dst value.
+                // post-shift PMINSD-vs-signed-max (SQRSHRN) or PMINSD-
+                // vs-0xFFFF (SQRSHRUN) drives to the saturated dst value.
                 const uint32_t clamp_lane =
                     0x7FFFFFFFu - static_cast<uint32_t>(round_lane);
                 const uint64_t clamp_pattern =
@@ -12048,7 +12087,7 @@ class LiteTranslator {
           }
         }
         const int8_t cnt = static_cast<int8_t>(narrow_rshift);
-        if (is_saturating_signed) {
+        if (uses_signed_shift) {
           // PSRAW/PSRAD: sign-preserving arithmetic right shift.  src=64
           // already bailed (no PSRAQ in baseline SSE).
           switch (src_bits) {
@@ -12102,6 +12141,48 @@ class LiteTranslator {
             case 32:
               as_.Pminsd(xn, xsatmax);
               as_.Pmaxsd(xn, xsatmin);
+              break;
+          }
+        }
+        if (is_saturating_signed_to_unsigned) {
+          // Clamp the post-shift signed value to the unsigned dst range
+          // `[0, 2^dst_bits - 1]`:
+          //   PMAXS{W,D} vs zero pins negative lanes at 0.
+          //   PMINS{W,D} vs the (positive) dst-max value caps positives.
+          // After PMAX-with-zero every lane is non-negative, so signed-
+          // min against the positive cap is equivalent to unsigned-min
+          // (avoids the SSE4.1-only PMINUW; PMINUD does exist in SSE4.1
+          // but the signed form is just as good here).  PSHUFB then
+          // gathers byte 0 (src=16) or halfword 0 (src=32) of each lane;
+          // for a non-negative ≤ dst-max value, that bottom slice IS the
+          // unsigned narrow representation.
+          uint64_t sat_max_pattern;
+          switch (src_bits) {
+            case 16:
+              sat_max_pattern = 0x00FF00FF00FF00FFULL;  // dst 8: 0xFF.
+              break;
+            case 32:
+              sat_max_pattern = 0x0000FFFF0000FFFFULL;  // dst 16: 0xFFFF.
+              break;
+            default: success_ = false; return;
+          }
+          SimdRegister xsatmax = AllocTempSimdReg();
+          SimdRegister xzero = AllocTempSimdReg();
+          if (xsatmax == no_simd_register || xzero == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movq(r1, static_cast<int64_t>(sat_max_pattern));
+          as_.Movq(xsatmax, r1);
+          as_.Pinsrq(xsatmax, r1, int8_t{1});
+          as_.Pxor(xzero, xzero);
+          switch (src_bits) {
+            case 16:
+              as_.Pmaxsw(xn, xzero);    // negatives → 0.
+              as_.Pminsw(xn, xsatmax);  // positives capped at 0xFF.
+              break;
+            case 32:
+              as_.Pmaxsd(xn, xzero);    // SSE4.1.
+              as_.Pminsd(xn, xsatmax);  // SSE4.1, cap at 0xFFFF.
               break;
           }
         }
