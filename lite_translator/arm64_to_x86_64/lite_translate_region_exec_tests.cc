@@ -29,6 +29,7 @@
 #include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/runtime_primitives/platform.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
 
 namespace berberis {
@@ -12113,6 +12114,130 @@ TEST_F(Arm64LiteTranslateRegionTest, MemsetAarch64_1024ByteZeroFill_Unrolled) {
       << " (value 0x" << std::hex
       << static_cast<unsigned>(buffer[first_nonzero == kSize ? 0 : first_nonzero])
       << "); buffer must be fully zeroed";
+}
+// endregion
+
+// region digitalis: dispatch-enabled b.hi memset loop (VkCaps regression)
+//
+// Companion to MemsetAarch64_1024ByteZeroFill_Unrolled above.  That test
+// inlines the loop body 15 times so the whole memset runs in a single JIT
+// region with the framework's default allow_dispatch=false.  Production sets
+// allow_dispatch=true (runtime/arm64/translator_x86_64.cc), so the backward
+// b.hi at __memset_aarch64+0x10c becomes a region exit + EmitDirectDispatch
+// per iteration: each iteration's tail spills mapped guest regs via
+// StoreMappedRegs(), mirrors MXCSR->FPSR (gated on fp_dirty_), Movq's the
+// target guest PC into rax, and re-enters the dispatcher; the dispatcher's
+// TranslationCache lookup for the loop-body PC finds the cached region and
+// jumps right back in.  If anything that path drops — a stale q0/x3/x2
+// mapping, a CodePool collision, a wrong NZCV save/restore around the
+// dispatcher's signal check, etc. — a fraction of the 64-byte stores per
+// iteration are lost.  That matches the bucket-corruption signature
+// (top12==0, low20!=0) observed in handoffs 256-260: a freshly calloc'd
+// 1024-byte ZipStringOffset20 bucket table comes out partially zeroed.
+//
+// This test installs the loop body as a real TranslationCache entry so
+// EmitDirectDispatch's lookup for the b.hi target hits the same region and
+// the loop iterates via the production dispatch path, not by inlining.
+class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
+ public:
+  template <typename T>
+  bool RunWithDispatch(const T& code, GuestAddr expected_stop_addr) {
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    GuestAddr code_start = ToGuestAddr(code);
+    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    MachineCode machine_code;
+    auto [success, stop_pc] = TryLiteTranslateRegion(state_.cpu.insn_addr,
+                                                     &machine_code,
+                                                     LiteTranslateParams{
+                                                         .end_pc = code_end,
+                                                         .allow_dispatch = true,
+                                                     });
+    if (!success || (stop_pc > code_end)) {
+      return false;
+    }
+
+    auto* cache = TranslationCache::GetInstance();
+    GuestCodeEntry* entry = cache->AddAndLockForTranslation(code_start, 0);
+    if (!entry) {
+      return false;
+    }
+    HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+    size_t region_size = stop_pc - code_start;
+    cache->SetTranslatedAndUnlock(code_start,
+                                  entry,
+                                  static_cast<uint32_t>(region_size),
+                                  GuestCodeEntry::Kind::kLiteTranslated,
+                                  {host_code, machine_code.install_size()});
+
+    TestingRunGeneratedCode(&state_, AsHostCode(host_code), expected_stop_addr);
+    EXPECT_EQ(state_.cpu.insn_addr, expected_stop_addr);
+
+    // Drop the cache entry so subsequent tests at the same PC start fresh
+    // and aren't subject to stale state from a previous test run.
+    cache->InvalidateGuestRange(code_start, code_end);
+    return true;
+  }
+
+ protected:
+  ThreadState state_{};
+};
+
+TEST_F(Arm64LiteTranslateRegionDispatchTest, MemsetAarch64_1024ByteZeroFill_BhiLoop) {
+  // Loop body only — start PC == b.hi target PC, so EmitDirectDispatch's
+  // TranslationCache lookup at the backward branch hits the same region.
+  // 16 iterations × 64 bytes = 1024 bytes written, starting at +0x20 from
+  // the initial x3.
+  static const uint32_t code[] = {
+      0xad010060,  // [0]  stp q0, q0, [x3, #0x20]
+      0xad020060,  // [4]  stp q0, q0, [x3, #0x40]
+      0x91010063,  // [8]  add x3, x3, #0x40
+      0xf1010042,  // [12] subs x2, x2, #0x40
+      0x54ffff88,  // [16] b.hi -16  -> back to [0]
+  };
+
+  // Buffer is sized to cover the loop's write range with leading and trailing
+  // sentinel guards.  Each iteration writes [x3+0x20, x3+0x60); after 16
+  // iterations x3 has advanced by 16*0x40 = 1024 bytes, so the union of
+  // written addresses is [buffer+0x20, buffer+0x20+1024) = [32, 1056).
+  constexpr size_t kBufferSize = 1088;
+  alignas(16) static uint8_t buffer[kBufferSize];
+  for (size_t i = 0; i < kBufferSize / sizeof(uint32_t); ++i) {
+    reinterpret_cast<uint32_t*>(buffer)[i] = 0xdeadbeefU;
+  }
+
+  state_.cpu.x[3] = ToGuestAddr(buffer);
+  state_.cpu.x[2] = 1024;
+  std::memset(&state_.cpu.v[0], 0, 16);  // v0 = 0 (the value to splat).
+
+  EXPECT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)));
+
+  // x2 should be 0 (16 iterations of -0x40), x3 should be buffer + 1024.
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop counter must reach zero";
+  EXPECT_EQ(state_.cpu.x[3], ToGuestAddr(buffer) + 1024)
+      << "x3 must have advanced by 16 * 0x40 bytes";
+
+  // Bytes [32, 1056) must be fully zeroed.  Any non-zero byte means a STP
+  // store was dropped — likely because a mapped-register spill or restore
+  // around the dispatcher misbehaved between iterations.
+  size_t first_nonzero = 1056;
+  for (size_t i = 32; i < 1056; ++i) {
+    if (buffer[i] != 0u) {
+      first_nonzero = i;
+      break;
+    }
+  }
+  EXPECT_EQ(first_nonzero, 1056u)
+      << "first non-zero byte at offset " << first_nonzero
+      << " (iteration " << ((first_nonzero - 32) / 64) << ", value 0x" << std::hex
+      << static_cast<unsigned>(buffer[first_nonzero == 1056 ? 32 : first_nonzero])
+      << "); the b.hi loop must zero every byte in [32, 1056)";
+
+  // Sentinel sanity: the guard ranges outside the loop's write window must
+  // still hold the sentinel.  If these fire, the loop wrote out of bounds.
+  EXPECT_EQ(reinterpret_cast<uint32_t*>(buffer)[0], 0xdeadbeefU)
+      << "leading sentinel clobbered — loop wrote below x3+0x20";
+  EXPECT_EQ(reinterpret_cast<uint32_t*>(buffer)[1056 / sizeof(uint32_t)], 0xdeadbeefU)
+      << "trailing sentinel clobbered — loop wrote past x3+0x20+1024";
 }
 // endregion
 
