@@ -5346,7 +5346,10 @@ class Interpreter {
         break;
       }
       case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu: {
-        if (args.size == 0) {
+        // Real FCVTZS/FCVTZU encoding has bit23=1 (size ∈ {10, 11}); the
+        // legacy bit23=0 path is still routed here (see decoder).  Either
+        // way only the sz bit (size & 1) chooses single vs double.
+        if ((args.size & 1) == 0) {
           // FCVTZU Sd, Sn: float32 → uint32, round toward zero
           float fval;
           memcpy(&fval, &src, sizeof(fval));
@@ -5376,7 +5379,8 @@ class Interpreter {
         break;
       }
       case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs: {
-        if (args.size == 0) {
+        // See FCVTZU note above: only the sz bit (size & 1) is load-bearing.
+        if ((args.size & 1) == 0) {
           // FCVTZS Sd, Sn: float32 → int32, round toward zero
           float fval;
           memcpy(&fval, &src, sizeof(fval));

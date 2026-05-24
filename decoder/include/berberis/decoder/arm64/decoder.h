@@ -5201,8 +5201,17 @@ class Decoder {
                : AdvSimdScalarTwoRegMiscOpcode::kScvtf;
         break;
       case 0b11011:
-        // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero
-        if (size >= 2) { Undefined(); return; }
+        // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero.
+        // Per ARM ARM "AdvSIMD scalar two-register miscellaneous (FP)" table,
+        // the real FCVTZS/FCVTZU encoding uses a=bit23=1 (size ∈ {10, 11}
+        // where sz=bit22 selects single vs double).  bit23=0 is the
+        // unimplemented FCVTMS/FCVTMU (round toward -inf) — accept both
+        // bit23 values to preserve pre-existing dispatch surface (the legacy
+        // bit23=0 path silently produced truncate-toward-zero semantics; we
+        // keep that to avoid disturbing any test that hit it), and route
+        // both to kFcvtzs/kFcvtzu.  The interpreter handler reads only the
+        // sz bit (size & 1) to choose single (0) vs double (1).
+        // llvm-mc-21 check: fcvtzs s1, s0 → 0x5ea1b801 (bit23=1, sz=0).
         op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtzu
                : AdvSimdScalarTwoRegMiscOpcode::kFcvtzs;
         break;
