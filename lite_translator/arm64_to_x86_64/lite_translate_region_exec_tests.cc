@@ -29,6 +29,7 @@
 #include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/runtime_primitives/platform.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
 
 namespace berberis {
@@ -12113,6 +12114,388 @@ TEST_F(Arm64LiteTranslateRegionTest, MemsetAarch64_1024ByteZeroFill_Unrolled) {
       << " (value 0x" << std::hex
       << static_cast<unsigned>(buffer[first_nonzero == kSize ? 0 : first_nonzero])
       << "); buffer must be fully zeroed";
+}
+// endregion
+
+// region digitalis: dispatch-enabled b.hi memset loop (VkCaps regression)
+//
+// Companion to MemsetAarch64_1024ByteZeroFill_Unrolled above.  That test
+// inlines the loop body 15 times so the whole memset runs in a single JIT
+// region with the framework's default allow_dispatch=false.  Production sets
+// allow_dispatch=true (runtime/arm64/translator_x86_64.cc), so the backward
+// b.hi at __memset_aarch64+0x10c becomes a region exit + EmitDirectDispatch
+// per iteration: each iteration's tail spills mapped guest regs via
+// StoreMappedRegs(), mirrors MXCSR->FPSR (gated on fp_dirty_), Movq's the
+// target guest PC into rax, and re-enters the dispatcher; the dispatcher's
+// TranslationCache lookup for the loop-body PC finds the cached region and
+// jumps right back in.  If anything that path drops — a stale q0/x3/x2
+// mapping, a CodePool collision, a wrong NZCV save/restore around the
+// dispatcher's signal check, etc. — a fraction of the 64-byte stores per
+// iteration are lost.  That matches the bucket-corruption signature
+// (top12==0, low20!=0) observed in handoffs 256-260: a freshly calloc'd
+// 1024-byte ZipStringOffset20 bucket table comes out partially zeroed.
+//
+// This test installs the loop body as a real TranslationCache entry so
+// EmitDirectDispatch's lookup for the b.hi target hits the same region and
+// the loop iterates via the production dispatch path, not by inlining.
+class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
+ public:
+  template <typename T>
+  bool RunWithDispatch(const T& code, GuestAddr expected_stop_addr) {
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    GuestAddr code_start = ToGuestAddr(code);
+    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    MachineCode machine_code;
+    auto [success, stop_pc] = TryLiteTranslateRegion(state_.cpu.insn_addr,
+                                                     &machine_code,
+                                                     LiteTranslateParams{
+                                                         .end_pc = code_end,
+                                                         .allow_dispatch = true,
+                                                     });
+    if (!success || (stop_pc > code_end)) {
+      return false;
+    }
+
+    auto* cache = TranslationCache::GetInstance();
+    GuestCodeEntry* entry = cache->AddAndLockForTranslation(code_start, 0);
+    if (!entry) {
+      return false;
+    }
+    HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+    size_t region_size = stop_pc - code_start;
+    cache->SetTranslatedAndUnlock(code_start,
+                                  entry,
+                                  static_cast<uint32_t>(region_size),
+                                  GuestCodeEntry::Kind::kLiteTranslated,
+                                  {host_code, machine_code.install_size()});
+
+    TestingRunGeneratedCode(&state_, AsHostCode(host_code), expected_stop_addr);
+    EXPECT_EQ(state_.cpu.insn_addr, expected_stop_addr);
+
+    // Drop the cache entry so subsequent tests at the same PC start fresh
+    // and aren't subject to stale state from a previous test run.
+    cache->InvalidateGuestRange(code_start, code_end);
+    return true;
+  }
+
+ protected:
+  ThreadState state_{};
+};
+
+TEST_F(Arm64LiteTranslateRegionDispatchTest, MemsetAarch64_1024ByteZeroFill_BhiLoop) {
+  // Loop body only — start PC == b.hi target PC, so EmitDirectDispatch's
+  // TranslationCache lookup at the backward branch hits the same region.
+  // 16 iterations × 64 bytes = 1024 bytes written, starting at +0x20 from
+  // the initial x3.
+  static const uint32_t code[] = {
+      0xad010060,  // [0]  stp q0, q0, [x3, #0x20]
+      0xad020060,  // [4]  stp q0, q0, [x3, #0x40]
+      0x91010063,  // [8]  add x3, x3, #0x40
+      0xf1010042,  // [12] subs x2, x2, #0x40
+      0x54ffff88,  // [16] b.hi -16  -> back to [0]
+  };
+
+  // Buffer is sized to cover the loop's write range with leading and trailing
+  // sentinel guards.  Each iteration writes [x3+0x20, x3+0x60); after 16
+  // iterations x3 has advanced by 16*0x40 = 1024 bytes, so the union of
+  // written addresses is [buffer+0x20, buffer+0x20+1024) = [32, 1056).
+  constexpr size_t kBufferSize = 1088;
+  alignas(16) static uint8_t buffer[kBufferSize];
+  for (size_t i = 0; i < kBufferSize / sizeof(uint32_t); ++i) {
+    reinterpret_cast<uint32_t*>(buffer)[i] = 0xdeadbeefU;
+  }
+
+  state_.cpu.x[3] = ToGuestAddr(buffer);
+  state_.cpu.x[2] = 1024;
+  std::memset(&state_.cpu.v[0], 0, 16);  // v0 = 0 (the value to splat).
+
+  EXPECT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)));
+
+  // x2 should be 0 (16 iterations of -0x40), x3 should be buffer + 1024.
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop counter must reach zero";
+  EXPECT_EQ(state_.cpu.x[3], ToGuestAddr(buffer) + 1024)
+      << "x3 must have advanced by 16 * 0x40 bytes";
+
+  // Bytes [32, 1056) must be fully zeroed.  Any non-zero byte means a STP
+  // store was dropped — likely because a mapped-register spill or restore
+  // around the dispatcher misbehaved between iterations.
+  size_t first_nonzero = 1056;
+  for (size_t i = 32; i < 1056; ++i) {
+    if (buffer[i] != 0u) {
+      first_nonzero = i;
+      break;
+    }
+  }
+  EXPECT_EQ(first_nonzero, 1056u)
+      << "first non-zero byte at offset " << first_nonzero
+      << " (iteration " << ((first_nonzero - 32) / 64) << ", value 0x" << std::hex
+      << static_cast<unsigned>(buffer[first_nonzero == 1056 ? 32 : first_nonzero])
+      << "); the b.hi loop must zero every byte in [32, 1056)";
+
+  // Sentinel sanity: the guard ranges outside the loop's write window must
+  // still hold the sentinel.  If these fire, the loop wrote out of bounds.
+  EXPECT_EQ(reinterpret_cast<uint32_t*>(buffer)[0], 0xdeadbeefU)
+      << "leading sentinel clobbered — loop wrote below x3+0x20";
+  EXPECT_EQ(reinterpret_cast<uint32_t*>(buffer)[1056 / sizeof(uint32_t)], 0xdeadbeefU)
+      << "trailing sentinel clobbered — loop wrote past x3+0x20+1024";
+}
+
+// Bionic's AddToMap (CdEntryMapZip32::AddToMap) writes each ZIP central-
+// directory bucket with a read-modify-write that BFI-splices a 12-bit
+// name_length into bits[31:20] of the 20-bit name_offset already stored
+// there.  The hot sequence at linker offsets 0x9ccc8..0x9ccd8 is:
+//
+//   ldr w9, [x8, x24, lsl #2]   ; bucket value = name_offset (low 20 bits)
+//   bfi w9, w19, #20, #12       ; splice in name_length at bits[31:20]
+//   str w9, [x8, x24, lsl #2]   ; commit back
+//
+// The bucket-corruption signature observed in VkCaps' wedge (top12 == 0,
+// low20 != 0) is consistent with the second STR being silently dropped
+// after BFI: the first half of the RMW happened (low20 written), but the
+// second store didn't commit.  Handoff-261 ruled out the b.hi-loop
+// region-transition theory; this test probes the next-most-likely
+// suspect: STR (register, 32-bit) with shifted-register offset under a
+// dispatch-enabled backward branch.
+//
+// The loop body's entry PC is the b.hi target, so EmitDirectDispatch
+// reaches the cached region via TranslationCache lookup — same path as
+// production.  256 iterations with a unique x24 per iteration mean every
+// slot of the bucket table participates exactly once.
+TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketRmwUnderDispatch) {
+  // Encodings cross-checked with aarch64-linux-gnu-as round-trip.
+  static const uint32_t code[] = {
+      0xb8787909,  // [0]  ldr w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [4]  bfi w9, w19, #20, #12
+      0xb8387909,  // [8]  str w9, [x8, x24, lsl #2]
+      0x91000718,  // [12] add x24, x24, #1
+      0xf1000442,  // [16] subs x2, x2, #1
+      0x54ffff68,  // [20] b.hi -20  -> back to [0]
+  };
+
+  // 256-entry bucket table, each entry pre-filled with a recognizable
+  // sentinel.  After the loop every slot must be (0xAAA << 20) | (0x45678) =
+  // 0xAAA45678.  Any slot left at 0x12345678 means the STR didn't commit
+  // (or was clobbered, or BFI's destination spilled stale).
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];  // +2 = guard slots
+  buckets[0] = 0xfeedface;  // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0x12345678U;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeef;  // trailing guard
+
+  state_.cpu.x[8] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  // Pre-load x9 with a poison value so a silently-skipped LDR is caught.
+  state_.cpu.x[9] = 0xbaadf00dULL;
+
+  EXPECT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)));
+
+  // SUBS x2, x2, #1 with b.hi exits when x2 transitions to 0 (HI is C && !Z).
+  // 256 iterations -> x2 ends at 0.
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop counter must reach zero";
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must have advanced by N";
+
+  // Every slot must be 0xAAA45678.  Find the first mis-stored slot for a
+  // clean diagnostic.
+  size_t first_bad = kNumSlots;
+  uint32_t first_bad_value = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    if (buckets[i + 1] != 0xAAA45678U) {
+      first_bad = i;
+      first_bad_value = buckets[i + 1];
+      break;
+    }
+  }
+  EXPECT_EQ(first_bad, kNumSlots)
+      << "first mis-stored slot at index " << first_bad
+      << " (value 0x" << std::hex << first_bad_value
+      << "); expected 0xAAA45678 in every slot — a slot left at the "
+         "0x12345678 sentinel means the STR didn't commit under dispatch";
+
+  // Guard slots must not have been touched — a wrong base or wrong shift
+  // would smear writes outside the table.
+  EXPECT_EQ(buckets[0], 0xfeedfaceU)
+      << "leading guard clobbered — STR base/shift bug";
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU)
+      << "trailing guard clobbered — STR base/shift bug";
+}
+
+// Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
+// CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
+// shifted-register addressing form (option=010, S=1), which is a DIFFERENT
+// JIT code path from the UXTX/LSL form (option=011) covered by
+// AddToMapBucketRmwUnderDispatch above.  Live debugging of a wedged
+// VkCapsViewer this cycle showed:
+//   - bucket array (256 × uint32_t at x25) is all zero
+//   - x24 = 75 (probe index), x26 = 0xff (mask)
+//   - thread spins forever in this loop
+//   - the bucket array is empty, so b.eq must take on iteration 0 yet
+//     the loop never exits
+// This pins the wedge on the UXTW LDR path.  The test runs an all-zero
+// 256-entry bucket array and asserts the loop exits on iteration 0.
+// Minimal pin-test for the production AddToMap bucket-FIND load:
+//   ldr w8, [x25, w24, uxtw #2]   (encoding 0xb8785b28, option=010 UXTW, S=1)
+// All existing host tests use option=011 (LSL/UXTX, encoding 0xb8787909).
+// Direct memory dump of a wedged VkCapsViewer this cycle showed the 256-entry
+// bucket array at x25 is fully zero, yet the linker's bucket-find loop
+// (CdEntryMapZip32<ZipStringOffset20>::AddToMap) does not exit via its
+// b.eq empty-bucket branch.  This pins the JIT's UXTW load path on a
+// minimal-no-branch sequence so we can rule it in or out cleanly.
+TEST_F(Arm64LiteTranslateRegionTest, LdrW_UXTW_ShiftedReg_ReadsZeroFromZeroBucket) {
+  // bucket[75] = 0, all guard bytes recognizable.
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0u;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);  // bucket array base
+  state_.cpu.x[24] = 75;                         // probe index (matches debuggerd snapshot)
+  state_.cpu.x[8] = 0xbaadf00dULL;               // poison so a skipped LDR is caught
+  state_.cpu.x[0] = 0xbaadf00dULL;
+
+  // Two instructions: the LDR, plus a MOV that copies x8 to x0 (so even if
+  // x8 is mapped/spilled differently, the result is observable via x0).
+  static const uint32_t code[] = {
+      0xb8785b28,  // ldr w8, [x25, w24, uxtw #2]
+      0xaa0803e0,  // mov x0, x8
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // The JIT must read 0 from bucket[75] and write that into x8 (and via
+  // the mov, into x0).  Both must be 0.  Any non-zero result is the JIT
+  // bug: the UXTW address computation read from somewhere other than
+  // &buckets[1+75], OR the 32-bit load did not zero-extend correctly.
+  EXPECT_EQ(state_.cpu.x[8], 0ULL)
+      << "LDR-UXTW read 0x" << std::hex << state_.cpu.x[8]
+      << " from bucket[75] (which is verifiably zero in memory at "
+      << ToGuestAddr(&buckets[1 + 75]) << ").  Address computed by JIT was wrong.";
+  EXPECT_EQ(state_.cpu.x[0], 0ULL)
+      << "mov x0, x8 propagated x8=0x" << std::hex << state_.cpu.x[0]
+      << " — confirms x8 was set to non-zero by the LDR.";
+
+  // Guards untouched.
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+
+// Same shape, but with a non-zero bucket value, to verify the LDR DOES
+// read the correct address (i.e., this test must PASS regardless of the
+// JIT-UXTW bug — it just confirms the addressing math is reachable).
+TEST_F(Arm64LiteTranslateRegionTest, LdrW_UXTW_ShiftedReg_ReadsNonZeroFromBucket75) {
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  for (size_t i = 0; i < kNumSlots + 2; ++i) {
+    buckets[i] = 0xcafebabeU;  // recognizable sentinel everywhere
+  }
+  buckets[1 + 75] = 0x12345678U;  // distinct value at the indexed slot
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 75;
+  state_.cpu.x[8] = 0xbaadf00dULL;
+  state_.cpu.x[0] = 0xbaadf00dULL;
+
+  static const uint32_t code[] = {
+      0xb8785b28,  // ldr w8, [x25, w24, uxtw #2]
+      0xaa0803e0,  // mov x0, x8
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_EQ(state_.cpu.x[8], 0x12345678ULL);
+  EXPECT_EQ(state_.cpu.x[0], 0x12345678ULL);
+}
+
+// Production AddToMap bucket-FIND loop, dispatch-enabled.  This mirrors
+// the 8-instruction guest loop at linker offset 0x9cc80..0x9ccb4 inside
+// CdEntryMapZip32<ZipStringOffset20>::AddToMap, with a 2-instruction
+// SUBS/B.LS watchdog appended so the test fails cleanly instead of
+// hanging if the b.eq empty-bucket exit fails to fire.
+//
+// Bucket layout: 256 × uint32_t, all zero.  x24=0 (probe index),
+// x26=0xff (mask), x25=bucket base, x19=10 (search-key length).
+// Iteration 0: LDR reads bucket[0]=0; ANDS x9,x8,#0xfffff sets Z;
+// b.eq must take and exit to exit_success.  If b.eq is broken, the
+// loop continues into the advance section, x24 increments, and after
+// 1000 watchdog iterations exits to exit_fail.
+//
+// This is the dispatch-enabled multi-region counterpart to the
+// LdrW_UXTW_ShiftedReg_ReadsZeroFromZeroBucket pin-test that PASSES
+// in isolation but the production loop wedges on.  If this test
+// PASSES, the wedge is elsewhere (a different region transition, a
+// different operand shape, or interpreter fallback that re-enters
+// after some other instruction).  If it FAILS, the bug is in the
+// ANDS-imm flag setting, the b.eq read of Z, or the dispatch
+// round-trip across the b.eq forward branch.
+TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketFindUnderDispatch_UXTW) {
+  // Encodings cross-checked with aarch64-linux-gnu-as round-trip.
+  // loop_top (0x00..0x14), advance (0x18..0x2c), done_found (0x30),
+  // exit_fail (0x34), exit_success (0x38).
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1  (watchdog)
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;  // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0u;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;  // trailing guard
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;        // probe index
+  state_.cpu.x[26] = 0xff;     // mask (N-1 for N=256 buckets)
+  state_.cpu.x[19] = 10;       // search-key length (irrelevant since b.eq fires first)
+  state_.cpu.x[2]  = 1000;     // watchdog
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  // Expected exit: b.eq fires on iter 0 -> exit_success at offset 0x38.
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+
+  EXPECT_TRUE(RunWithDispatch(code, exit_success_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, exit_success_addr)
+      << "Expected exit to exit_success (b.eq empty-bucket).  insn_addr=0x"
+      << std::hex << state_.cpu.insn_addr
+      << ".  If 0x" << (ToGuestAddr(code) + 0x18) << ", b.eq did NOT fire — "
+         "advance section reached on iter 0.  If 0x"
+      << (ToGuestAddr(code) + 0x34) << ", watchdog exhausted (loop spun); "
+         "b.eq never fired across many iterations.";
+
+  EXPECT_EQ(state_.cpu.x[24], 0ULL)
+      << "x24 must stay at 0 (b.eq exits on iter 0).  Got x24=0x"
+      << std::hex << state_.cpu.x[24]
+      << " — loop advanced even though bucket[0]=0 and ANDS should have set Z.";
+
+  EXPECT_EQ(state_.cpu.x[2], 1000ULL)
+      << "Watchdog must not have decremented (loop must not iterate).  x2=0x"
+      << std::hex << state_.cpu.x[2];
+
+  EXPECT_EQ(state_.cpu.x[8], 0ULL) << "LDR must have read bucket[0]=0";
+  EXPECT_EQ(state_.cpu.x[9], 0ULL) << "ANDS x9,x8,#0xfffff with x8=0 must yield 0";
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
 }
 // endregion
 
