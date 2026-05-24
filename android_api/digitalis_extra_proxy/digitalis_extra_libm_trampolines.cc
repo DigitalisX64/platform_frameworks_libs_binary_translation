@@ -17,7 +17,7 @@
 // Digitalis-side fast-path trampolines for libm symbols that the upstream
 // proxy_libm covers minimally (only expf and powf are in the upstream table).
 //
-// Background: the audit in handoff-253 enumerated 34 libm symbols present in
+// Background: a prior audit enumerated 34 libm symbols present in
 // the arm64 guest libm.so but absent from the proxy trampoline table. Two
 // further wrinkles distinguish libm from libc:
 //

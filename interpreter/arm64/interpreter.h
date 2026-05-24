@@ -1029,7 +1029,7 @@ class Interpreter {
 
     uint8_t vec_len = args.q ? 16 : 8;  // bytes in result vector
 
-    // region digitalis FP16 SIMD FCMA (handoff-61)
+    // region digitalis FP16 SIMD FCMA
     if (args.size == 0b01) {
       // Half-precision: 2 bytes per lane; pairs are 4 bytes each.
       // .4H (Q=0) has 2 pairs (lanes 0..3); .8H (Q=1) has 4 pairs (0..7).
@@ -1177,7 +1177,7 @@ class Interpreter {
 
     uint8_t vec_len = args.q ? 16 : 8;  // bytes in result vector.
 
-    // region digitalis FP16 SIMD FCMA indexed (handoff-61)
+    // region digitalis FP16 SIMD FCMA indexed
     if (args.size == 0b01) {
       // Half-precision: 2 bytes per lane; pairs are 4 bytes each.
       // Read the single broadcast complex pair from Vm[index].
@@ -7426,7 +7426,7 @@ class Interpreter {
     __uint128_t src_m = state_->cpu.v[args.rm];
     __uint128_t result = state_->cpu.v[args.rd];
 
-    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL (handoff-62)
+    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
     if (args.size == 0b00) {
       // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,
       // Q=1 (.8h) → 8 output lanes.  Index selects one lane (0..7) from
@@ -8780,7 +8780,7 @@ class Interpreter {
   // Emit LOCK CMPXCHG16B via inline asm so we don't take a libatomic dependency
   // (the bare `__atomic_compare_exchange_n` on `__uint128_t` may lower to a
   // libcall without -mcx16).  The Digitalis host is x86_64; the upstream ARM64
-  // build does not link this file (interpreter.h is host-only — see handoff-33).
+  // build does not link this file (interpreter.h is host-only).
   __uint128_t AtomicCASVal128(void* addr, __uint128_t expected, __uint128_t desired) {
     uint64_t exp_lo = static_cast<uint64_t>(expected);
     uint64_t exp_hi = static_cast<uint64_t>(expected >> 64);
