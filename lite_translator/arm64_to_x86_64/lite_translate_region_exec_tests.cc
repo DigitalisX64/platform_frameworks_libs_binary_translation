@@ -12409,6 +12409,94 @@ TEST_F(Arm64LiteTranslateRegionTest, LdrW_UXTW_ShiftedReg_ReadsNonZeroFromBucket
   EXPECT_EQ(state_.cpu.x[8], 0x12345678ULL);
   EXPECT_EQ(state_.cpu.x[0], 0x12345678ULL);
 }
+
+// Production AddToMap bucket-FIND loop, dispatch-enabled.  This mirrors
+// the 8-instruction guest loop at linker offset 0x9cc80..0x9ccb4 inside
+// CdEntryMapZip32<ZipStringOffset20>::AddToMap, with a 2-instruction
+// SUBS/B.LS watchdog appended so the test fails cleanly instead of
+// hanging if the b.eq empty-bucket exit fails to fire.
+//
+// Bucket layout: 256 × uint32_t, all zero.  x24=0 (probe index),
+// x26=0xff (mask), x25=bucket base, x19=10 (search-key length).
+// Iteration 0: LDR reads bucket[0]=0; ANDS x9,x8,#0xfffff sets Z;
+// b.eq must take and exit to exit_success.  If b.eq is broken, the
+// loop continues into the advance section, x24 increments, and after
+// 1000 watchdog iterations exits to exit_fail.
+//
+// This is the dispatch-enabled multi-region counterpart to the
+// LdrW_UXTW_ShiftedReg_ReadsZeroFromZeroBucket pin-test that PASSES
+// in isolation but the production loop wedges on.  If this test
+// PASSES, the wedge is elsewhere (a different region transition, a
+// different operand shape, or interpreter fallback that re-enters
+// after some other instruction).  If it FAILS, the bug is in the
+// ANDS-imm flag setting, the b.eq read of Z, or the dispatch
+// round-trip across the b.eq forward branch.
+TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketFindUnderDispatch_UXTW) {
+  // Encodings cross-checked with aarch64-linux-gnu-as round-trip.
+  // loop_top (0x00..0x14), advance (0x18..0x2c), done_found (0x30),
+  // exit_fail (0x34), exit_success (0x38).
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1  (watchdog)
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;  // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0u;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;  // trailing guard
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;        // probe index
+  state_.cpu.x[26] = 0xff;     // mask (N-1 for N=256 buckets)
+  state_.cpu.x[19] = 10;       // search-key length (irrelevant since b.eq fires first)
+  state_.cpu.x[2]  = 1000;     // watchdog
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  // Expected exit: b.eq fires on iter 0 -> exit_success at offset 0x38.
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+
+  EXPECT_TRUE(RunWithDispatch(code, exit_success_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, exit_success_addr)
+      << "Expected exit to exit_success (b.eq empty-bucket).  insn_addr=0x"
+      << std::hex << state_.cpu.insn_addr
+      << ".  If 0x" << (ToGuestAddr(code) + 0x18) << ", b.eq did NOT fire — "
+         "advance section reached on iter 0.  If 0x"
+      << (ToGuestAddr(code) + 0x34) << ", watchdog exhausted (loop spun); "
+         "b.eq never fired across many iterations.";
+
+  EXPECT_EQ(state_.cpu.x[24], 0ULL)
+      << "x24 must stay at 0 (b.eq exits on iter 0).  Got x24=0x"
+      << std::hex << state_.cpu.x[24]
+      << " — loop advanced even though bucket[0]=0 and ANDS should have set Z.";
+
+  EXPECT_EQ(state_.cpu.x[2], 1000ULL)
+      << "Watchdog must not have decremented (loop must not iterate).  x2=0x"
+      << std::hex << state_.cpu.x[2];
+
+  EXPECT_EQ(state_.cpu.x[8], 0ULL) << "LDR must have read bucket[0]=0";
+  EXPECT_EQ(state_.cpu.x[9], 0ULL) << "ANDS x9,x8,#0xfffff with x8=0 must yield 0";
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
 // endregion
 
 // region digitalis: BFM (BFI / BFXIL) JIT
