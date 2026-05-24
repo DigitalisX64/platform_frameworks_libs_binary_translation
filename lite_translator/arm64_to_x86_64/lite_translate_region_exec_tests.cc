@@ -14777,6 +14777,196 @@ TEST_F(Arm64LiteTranslateRegionTest, RshrnVec8BShift8) {
 }
 // endregion
 
+// region digitalis: UQSHRN / UQSHRN2 vector unsigned-saturating-shift-
+// right-narrow exec tests.  Pin the JIT lowering at lite_translator.h's
+// AdvSimdShiftByImm kUqshrn case (PSRL{W,D,Q} + PMINUW / PMINUD /
+// manual-64bit-clamp + PSHUFB).  Encodings verified with
+// aarch64-linux-gnu-as -march=armv8-a.
+
+// uqshrn  v0.8b,  v1.8h, #5  → saturate any post-shift value >0xFF to 0xFF.
+constexpr uint32_t kUqshrnVec8B_5    = 0x2F0B9420;
+// uqshrn2 v0.16b, v1.8h, #5
+constexpr uint32_t kUqshrn2Vec16B_5  = 0x6F0B9420;
+// uqshrn  v0.4h,  v1.4s, #5  → saturate any post-shift value >0xFFFF.
+constexpr uint32_t kUqshrnVec4H_5    = 0x2F1B9420;
+// uqshrn2 v0.8h,  v1.4s, #5
+constexpr uint32_t kUqshrn2Vec8H_5   = 0x6F1B9420;
+// uqshrn  v0.2s,  v1.2d, #11 → saturate any post-shift value >0xFFFFFFFF.
+constexpr uint32_t kUqshrnVec2S_11   = 0x2F359420;
+// uqshrn2 v0.4s,  v1.2d, #11
+constexpr uint32_t kUqshrn2Vec4S_11  = 0x6F359420;
+// uqshrn  v0.8b,  v1.8h, #1  — minimum rshift; saturation almost always.
+constexpr uint32_t kUqshrnVec8B_1    = 0x2F0F9420;
+// uqshrn  v0.2s,  v1.2d, #1  — exercises 64→32 manual saturate path.
+constexpr uint32_t kUqshrnVec2S_1    = 0x2F3F9420;
+
+static inline uint8_t  UqshrnRefU8 (uint16_t e, uint8_t k) {
+  uint32_t shifted = static_cast<uint32_t>(e) >> k;
+  if (shifted > 0xFFu) shifted = 0xFFu;
+  return static_cast<uint8_t>(shifted);
+}
+static inline uint16_t UqshrnRefU16(uint32_t e, uint8_t k) {
+  uint64_t shifted = static_cast<uint64_t>(e) >> k;
+  if (shifted > 0xFFFFu) shifted = 0xFFFFu;
+  return static_cast<uint16_t>(shifted);
+}
+static inline uint32_t UqshrnRefU32(uint64_t e, uint8_t k) {
+  uint64_t shifted = e >> k;
+  if (shifted > 0xFFFFFFFFu) shifted = 0xFFFFFFFFu;
+  return static_cast<uint32_t>(shifted);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec8BShift5) {
+  // shift=5: 0xFFFF >> 5 = 0x07FF → saturate to 0xFF.
+  //          0x1FFF >> 5 = 0x00FF → exactly the max.
+  //          0x0FFF >> 5 = 0x007F → no saturation.
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x8001, 0x4321, 0x1FFF, 0x0FFF, 0x00FF, 0xCAFE};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshrnVec8B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], UqshrnRefU8(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uqshrn2Vec16BShift5) {
+  uint16_t in[8]  = {0x0000, 0xFFFF, 0x8001, 0x4321, 0x1FFF, 0x0FFF, 0x00FF, 0xCAFE};
+  uint8_t  vd[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                     0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10, 0x20};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kUqshrn2Vec16B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low byte " << i << " was clobbered";
+  }
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i + 8], UqshrnRefU8(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec4HShift5) {
+  // shift=5: 0xFFFFFFFF >> 5 = 0x07FFFFFF → saturate to 0xFFFF.
+  //          0x001FFFFF >> 5 = 0xFFFF → exactly the max.
+  //          0x0000FFFF >> 5 = 0x07FF → no saturation.
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0x001FFFFFu, 0x0000FFFFu};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshrnVec4H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], UqshrnRefU16(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uqshrn2Vec8HShift5) {
+  uint32_t in[4]  = {0x12345678u, 0xFFFFFFFFu, 0x001FFFFFu, 0x0000FFFFu};
+  uint16_t vd[8]  = {0xAAA0, 0xBBB1, 0xCCC2, 0xDDD3, 0x1000, 0x2000, 0x3000, 0x4000};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kUqshrn2Vec8H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low halfword " << i << " clobbered";
+  }
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i + 4], UqshrnRefU16(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec2SShift11) {
+  // shift=11: 0x123456789ABCDEF0 >> 11 = 0x2468ACF1357 → 0x6ACF1357 truncated to 32 bits...
+  //   but full value is 0x2468ACF1357 > 0xFFFFFFFF → saturate to 0xFFFFFFFF.
+  uint64_t in[2] = {0x123456789ABCDEF0ULL, 0x0000000000123456ULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshrnVec2S_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], UqshrnRefU32(in[i], 11))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper word " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Uqshrn2Vec4SShift11) {
+  uint64_t in[2] = {0xFEDCBA9876543210ULL, 0x0000000000FFFFFFULL};
+  uint32_t vd[4] = {0x11111111u, 0x22222222u, 0xDEAD0000u, 0xBEEF0000u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kUqshrn2Vec4S_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low word " << i << " clobbered";
+  }
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i + 2], UqshrnRefU32(in[i], 11)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec8BShift1) {
+  // shift=1: 0xFFFF >> 1 = 0x7FFF → saturate to 0xFF.
+  //          0x01FF >> 1 = 0x00FF → exactly the max.
+  //          0x00FE >> 1 = 0x007F → no saturation.
+  uint16_t in[8] = {0x0001, 0x0002, 0x0003, 0x000F, 0xFFFE, 0xFFFF, 0x01FF, 0x00FE};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshrnVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], UqshrnRefU8(in[i], 1))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec2SShift1) {
+  // shift=1: exercises the 64→32 manual saturate path heavily.  After
+  // PSRLQ-1, hi32 of any input >= 0x2_00000000 is nonzero → saturate.
+  // 0xFFFFFFFFFFFFFFFF >> 1 = 0x7FFFFFFFFFFFFFFF → saturate to 0xFFFFFFFF.
+  // 0x00000001FFFFFFFE >> 1 = 0x00000000FFFFFFFF → exactly the max.
+  // 0x00000000FFFFFFFE >> 1 = 0x000000007FFFFFFF → no saturate.
+  uint64_t in[2] = {0xFFFFFFFFFFFFFFFFULL, 0x00000001FFFFFFFEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshrnVec2S_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], UqshrnRefU32(in[i], 1))
+        << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper word " << i << " not zeroed";
+  }
+}
+// endregion
+
 
 // region digitalis: SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
 //

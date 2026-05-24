@@ -11828,8 +11828,8 @@ class LiteTranslator {
         return;
       }
       // endregion
-      // region digitalis: SHRN / SHRN2 / RSHRN / RSHRN2 vector
-      // shift-right-narrow JIT.
+      // region digitalis: SHRN / SHRN2 / RSHRN / RSHRN2 / UQSHRN / UQSHRN2
+      // vector shift-right-narrow JIT.
       //
       //   immh=0001 → src 16-bit (.8H), dst 8-bit  (.8B / .16B for Q=1)
       //   immh=001x → src 32-bit (.4S), dst 16-bit (.4H / .8H  for Q=1)
@@ -11854,10 +11854,27 @@ class LiteTranslator {
       // constraints, so (narrow_rshift - 1) ≥ 0 and the rounding
       // constant always fits in a single source lane.
       //
+      // UQSHRN unsigned-saturates the post-shift value to dst_bits before
+      // narrowing.  After PSRL{W,D,Q}, each src lane is in [0, 2^(src_bits
+      // - narrow_rshift) - 1] (top bit is zero because the shift count is
+      // ≥ 1, so the value is non-negative when interpreted as signed).
+      // Clamp via:
+      //   src 16-bit: PMINUW vs 0x00FF... pattern (SSE4.1)
+      //   src 32-bit: PMINUD vs 0x0000FFFF... pattern (SSE4.1)
+      //   src 64-bit: manual — no PMINUQ in baseline SSE.  Extract hi32
+      //               of each qword via PSRLQ-by-32; compare to zero with
+      //               PCMPEQD; broadcast the per-qword "hi==0" mask via
+      //               PSHUFD; XOR with the xsat pattern (which has
+      //               0xFFFFFFFF in the lo32-of-each-qword lanes) to
+      //               invert into "saturate" polarity; POR into xn so
+      //               saturating lanes' lo32 become 0xFFFFFFFF.
+      // The subsequent PSHUFB gathers the saturated lo half of each lane.
+      //
       // Q=0:        store narrowed-in-low | zero-upper.
       // Q=1 ("2"):  preserve Vd[63:0], OR narrowed result into Vd[127:64].
       case Decoder::AdvSimdShiftImmOpcode::kShrn:
-      case Decoder::AdvSimdShiftImmOpcode::kRshrn: {
+      case Decoder::AdvSimdShiftImmOpcode::kRshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshrn: {
         const uint8_t immh = args.immh;
         if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
         uint8_t src_bits;
@@ -11870,6 +11887,8 @@ class LiteTranslator {
         }
         const bool is_rounding =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn);
+        const bool is_saturating_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn);
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
         const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
         SimdRegister xn = AllocTempSimdReg();
@@ -11915,6 +11934,56 @@ class LiteTranslator {
           case 16: as_.Psrlw(xn, cnt); break;
           case 32: as_.Psrld(xn, cnt); break;
           case 64: as_.Psrlq(xn, cnt); break;
+        }
+        if (is_saturating_unsigned) {
+          // Clamp each src-lane value to (1 << dst_bits) - 1 before the
+          // PSHUFB narrow.  Pattern packs the per-lane unsigned max into
+          // every src-element-wide slot of a 64-bit word, then broadcast
+          // across both qwords of an xmm via Movq+Pinsrq.  PMINUW/PMINUD
+          // are SSE4.1; the 64→32 case has no PMINUQ in baseline SSE so
+          // it does a manual hi32-nonzero -> lo32=all-ones rewrite.
+          uint64_t sat_pattern;
+          switch (src_bits) {
+            case 16: sat_pattern = 0x00FF00FF00FF00FFULL; break;
+            case 32: sat_pattern = 0x0000FFFF0000FFFFULL; break;
+            case 64: sat_pattern = 0x00000000FFFFFFFFULL; break;
+            default: success_ = false; return;
+          }
+          SimdRegister xsat = AllocTempSimdReg();
+          if (xsat == no_simd_register) { success_ = false; return; }
+          as_.Movq(r1, static_cast<int64_t>(sat_pattern));
+          as_.Movq(xsat, r1);
+          as_.Pinsrq(xsat, r1, int8_t{1});
+          switch (src_bits) {
+            case 16: as_.Pminuw(xn, xsat); break;
+            case 32: as_.Pminud(xn, xsat); break;
+            case 64: {
+              SimdRegister xhi = AllocTempSimdReg();
+              SimdRegister xzero = AllocTempSimdReg();
+              if (xhi == no_simd_register || xzero == no_simd_register) {
+                success_ = false; return;
+              }
+              as_.Movdqa(xhi, xn);
+              as_.Psrlq(xhi, int8_t{32});
+              as_.Pxor(xzero, xzero);
+              // PCMPEQD: 0xFFFFFFFF per 32-bit lane where lane==0.  For
+              // xhi-after-PSRLQ-32, 32-bit lanes 1 and 3 are always
+              // zero (those were the upper halves of each qword cleared
+              // by the shift), so PCMPEQD lights them up unconditionally
+              // — but PSHUFD-0xA0 then overwrites lanes 1,3 with the
+              // lane 0,2 values, so the spurious matches don't leak.
+              as_.Pcmpeqd(xhi, xzero);
+              as_.Pshufd(xhi, xhi, int8_t{static_cast<int8_t>(0xA0)});
+              // XOR with xsat (which is 0xFFFFFFFF in 32-bit lanes 0,2
+              // and 0 in 32-bit lanes 1,3) inverts polarity in the lo32
+              // slots: post-XOR, lanes 0 and 2 are 0xFFFFFFFF iff the
+              // qword's hi32 was nonzero (i.e., needs saturate).  Lanes
+              // 1,3 are don't-cares — PSHUFB drops them.
+              as_.Pxor(xhi, xsat);
+              as_.Por(xn, xhi);
+              break;
+            }
+          }
         }
         // PSHUFB selectors: 0x80 in the upper 8 entries zeros the upper
         // 64 bits of the result; the lower 8 entries gather the bytes
