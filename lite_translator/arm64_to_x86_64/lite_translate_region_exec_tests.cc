@@ -15166,6 +15166,366 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec2SShift1JitBail) {
 // endregion
 
 
+// region digitalis: SQSHRN / SQSHRN2 / SQRSHRN / SQRSHRN2 vector signed-
+// saturating-shift-right-narrow exec tests.  Pin the JIT lowering at
+// lite_translator.h's AdvSimdShiftByImm kSqshrn/kSqrshrn cases — same
+// shared body as kShrn/kRshrn/kUqshrn/kUqrshrn, with is_saturating_signed
+// set (plus is_rounding for SQRSHRN).  Signed pre-shift via PSRA{W,D},
+// signed post-shift clamp via PMINSW/PMAXSW (src=16) or PMINSD/PMAXSD
+// (src=32).  src=64 bails JIT → interpreter (no PSRAQ in baseline SSE).
+// Encodings verified with aarch64-linux-gnu-as -march=armv8-a.
+
+// sqshrn  v0.8b,  v1.8h, #5  — 16→8 PSRAW+PMINSW+PMAXSW path.
+constexpr uint32_t kSqshrnVec8B_5    = 0x0F0B9420;
+// sqshrn2 v0.16b, v1.8h, #5  — Q=1 form.
+constexpr uint32_t kSqshrn2Vec16B_5  = 0x4F0B9420;
+// sqshrn  v0.4h,  v1.4s, #5  — 32→16 PSRAD+PMINSD+PMAXSD path.
+constexpr uint32_t kSqshrnVec4H_5    = 0x0F1B9420;
+// sqshrn2 v0.8h,  v1.4s, #5  — Q=1 form of the 32→16 path.
+constexpr uint32_t kSqshrn2Vec8H_5   = 0x4F1B9420;
+// sqshrn  v0.8b,  v1.8h, #1  — minimum rshift.
+constexpr uint32_t kSqshrnVec8B_1    = 0x0F0F9420;
+// sqshrn  v0.8b,  v1.8h, #8  — maximum rshift for 16→8.
+constexpr uint32_t kSqshrnVec8B_8    = 0x0F089420;
+// sqshrn  v0.4h,  v1.4s, #16 — maximum rshift for 32→16.
+constexpr uint32_t kSqshrnVec4H_16   = 0x0F109420;
+// sqshrn  v0.2s,  v1.2d, #11 — 64-bit src; expected JIT bail.
+constexpr uint32_t kSqshrnVec2S_11   = 0x0F359420;
+
+// sqrshrn  v0.8b,  v1.8h, #5  — 16→8 with rounding (PADDSW + PSRAW).
+constexpr uint32_t kSqrshrnVec8B_5    = 0x0F0B9C20;
+// sqrshrn2 v0.16b, v1.8h, #5  — Q=1 form.
+constexpr uint32_t kSqrshrn2Vec16B_5  = 0x4F0B9C20;
+// sqrshrn  v0.4h,  v1.4s, #5  — 32→16 PMINSD-preclamp + PADDD + PSRAD.
+constexpr uint32_t kSqrshrnVec4H_5    = 0x0F1B9C20;
+// sqrshrn2 v0.8h,  v1.4s, #5  — Q=1 form of the 32→16 rounding path.
+constexpr uint32_t kSqrshrn2Vec8H_5   = 0x4F1B9C20;
+// sqrshrn  v0.8b,  v1.8h, #1  — heavy PADDSW carry exercise.
+constexpr uint32_t kSqrshrnVec8B_1    = 0x0F0F9C20;
+
+static inline int8_t SqshrnRefS8(int16_t e, uint8_t k) {
+  // Arithmetic shift right by k, then signed-saturate to [-128, 127].
+  int32_t shifted = static_cast<int32_t>(e) >> k;
+  if (shifted > 127) shifted = 127;
+  if (shifted < -128) shifted = -128;
+  return static_cast<int8_t>(shifted);
+}
+static inline int16_t SqshrnRefS16(int32_t e, uint8_t k) {
+  int64_t shifted = static_cast<int64_t>(e) >> k;
+  if (shifted > 32767) shifted = 32767;
+  if (shifted < -32768) shifted = -32768;
+  return static_cast<int16_t>(shifted);
+}
+static inline int8_t SqrshrnRefS8(int16_t e, uint8_t k) {
+  // Add the rounding constant (1 << (k - 1)) into the wide value, shift
+  // arithmetically by k, then signed-saturate.  Architecturally the
+  // rounding add never overflows the wide accumulator (it widens first).
+  int32_t wide = static_cast<int32_t>(e) + (int32_t{1} << (k - 1));
+  int32_t shifted = wide >> k;
+  if (shifted > 127) shifted = 127;
+  if (shifted < -128) shifted = -128;
+  return static_cast<int8_t>(shifted);
+}
+static inline int16_t SqrshrnRefS16(int32_t e, uint8_t k) {
+  int64_t wide = static_cast<int64_t>(e) + (int64_t{1} << (k - 1));
+  int64_t shifted = wide >> k;
+  if (shifted > 32767) shifted = 32767;
+  if (shifted < -32768) shifted = -32768;
+  return static_cast<int16_t>(shifted);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnVec8BShift5) {
+  // shift=5.  Mix positive-saturate, negative-saturate, exact-max,
+  // exact-min, in-range positive, in-range negative.
+  //   0x7FFF >> 5 = 0x3FF → sat to 127.
+  //   0x8000 >> 5 (signed) = 0xFC00 (-1024) → sat to -128.
+  //   0x0FE0 >> 5 = 0x7F → exactly +127, no sat.
+  //   0xF010 >> 5 (signed) = 0xFF80 (-128) → exactly -128.
+  //   0x0100 >> 5 = 8 → no sat.
+  //   0xFF00 >> 5 (signed) = 0xFFF8 (-8) → no sat.
+  int16_t in[8] = {0x0000, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x0FE0, static_cast<int16_t>(0xF010), 0x0100,
+                   static_cast<int16_t>(0xFF00), 0x0010};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshrnVec8B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqshrnRefS8(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint16_t>(in[i]);
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqshrn2Vec16BShift5) {
+  int16_t in[8] = {0x0000, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x0FE0, static_cast<int16_t>(0xF010), 0x0100,
+                   static_cast<int16_t>(0xFF00), 0x0010};
+  int8_t vd[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x78,
+                   0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x7F};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSqshrn2Vec16B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low byte " << i << " was clobbered";
+  }
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i + 8], SqshrnRefS8(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnVec8BShift1) {
+  // shift=1, no rounding.  Tightest test of arithmetic shift + clamp.
+  //   0x7FFF >> 1 = 0x3FFF → sat 127.
+  //   0x8000 >> 1 (signed) = 0xC000 (-16384) → sat -128.
+  //   0x00FE >> 1 = 0x7F → exactly 127.
+  //   0xFF02 >> 1 (signed) = 0xFF81 (-127) → no sat.
+  int16_t in[8] = {0x0000, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x00FE, static_cast<int16_t>(0xFF02), 0x0001,
+                   static_cast<int16_t>(0xFFFE), 0x00FF};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshrnVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqshrnRefS8(in[i], 1))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint16_t>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnVec8BShift8) {
+  // shift=8, maximum for 16→8.  After PSRAW, every byte fits in
+  // [-128, 127] already, so the clamp is a no-op.
+  int16_t in[8] = {0x0000, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x0100, static_cast<int16_t>(0xFF00), 0x4000,
+                   static_cast<int16_t>(0xC000), 0x7F00};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshrnVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqshrnRefS8(in[i], 8))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint16_t>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnVec4HShift5) {
+  // 32→16 path: PSRAD + PMINSD/PMAXSD clamp.
+  //   0x7FFFFFFF >> 5 = 0x03FFFFFF → sat to 32767.
+  //   0x80000000 >> 5 (signed) = 0xFC000000 (-67108864) → sat to -32768.
+  //   0x000FFFE0 >> 5 = 0x7FFF → exactly 32767.
+  //   0xFFF00020 >> 5 (signed) = 0xFFFF8001 (-32767) → no sat.
+  int32_t in[4] = {0x00000000, 0x7FFFFFFF,
+                   static_cast<int32_t>(0x80000000),
+                   0x000FFFE0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshrnVec4H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqshrnRefS16(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint32_t>(in[i]);
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqshrn2Vec8HShift5) {
+  int32_t in[4]  = {0x12345678, static_cast<int32_t>(0xEDCBA987),
+                    0x7FFFFFFF, static_cast<int32_t>(0x80000000)};
+  int16_t vd[8]  = {static_cast<int16_t>(0xAAA0), static_cast<int16_t>(0xBBB1),
+                    static_cast<int16_t>(0xCCC2), static_cast<int16_t>(0xDDD3),
+                    0x1000, 0x2000, 0x3000, 0x4000};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSqshrn2Vec8H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low halfword " << i << " clobbered";
+  }
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i + 4], SqshrnRefS16(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnVec4HShift16) {
+  // 32→16 at maximum rshift.  After PSRAD-by-16 every lane fits in
+  // [-32768, 32767], so the clamp is again a no-op.
+  int32_t in[4] = {0x7FFFFFFF, static_cast<int32_t>(0x80000000),
+                   0x00010000, static_cast<int32_t>(0xFFFF0000)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshrnVec4H_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqshrnRefS16(in[i], 16))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint32_t>(in[i]);
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnVec2SShift11JitBail) {
+  // 64-bit src SQSHRN: no PSRAQ in baseline SSE; JIT bails.
+  static const uint32_t code[] = {kSqshrnVec2S_11};
+  EXPECT_FALSE(Run(code, ToGuestAddr(code) + sizeof(code)));
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnVec8BShift5) {
+  // shift=5, round=16.  Verify the rounding-add saturates SIGNED, not
+  // unsigned: e.g. 0x7FFF + 16 = 0x800F would wrap negative under plain
+  // PADDW; PADDSW pins it at 0x7FFF (INT16_MAX), then PSRAW >>5 gives
+  // 0x3FF → sat 127.  Reference helper widens to int32 first so the
+  // architectural wide-add never overflows.
+  //   0x7FFF +rnd 16 → wide 0x800F >> 5 = 0x400 → sat 127.
+  //   0x8000 (-32768) +rnd 16 → wide -32752 >> 5 = -1024 → sat -128.
+  //   0x0FF0 +rnd 16 → wide 0x1000 >> 5 = 0x80 → sat 127.
+  //   0xFFFF (-1) +rnd 16 → wide 15 >> 5 = 0.
+  int16_t in[8] = {0x0000, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x0FF0, static_cast<int16_t>(0xFFFF),
+                   static_cast<int16_t>(0xFFF0),
+                   0x0FEF, static_cast<int16_t>(0x8001)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqrshrnVec8B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqrshrnRefS8(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint16_t>(in[i]);
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper byte " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqrshrn2Vec16BShift5) {
+  int16_t in[8] = {0x0000, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x0FF0, static_cast<int16_t>(0xFFFF),
+                   static_cast<int16_t>(0xFFF0),
+                   0x0FEF, static_cast<int16_t>(0x8001)};
+  int8_t vd[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x78,
+                   0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x7F};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSqrshrn2Vec16B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low byte " << i << " was clobbered";
+  }
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i + 8], SqrshrnRefS8(in[i], 5)) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnVec8BShift1) {
+  // shift=1, round=1.  PADDSW pins 0x7FFF + 1 at 0x7FFF (no negative
+  // wrap); reference widens, so 0x7FFF + 1 = 0x8000 >>1 = 0x4000 →
+  // sat 127.  Both paths agree on the saturated value.
+  //   0x7FFF (32767) → wide 32768 → >>1 = 16384 → sat 127.
+  //   0x8000 (-32768) → wide -32767 → >>1 = -16384 (arith) → sat -128.
+  //   0x00FE → wide 0xFF >>1 = 0x7F → exactly 127.
+  //   0xFF02 (-254) → wide -253 → >>1 = -127 → no sat.
+  int16_t in[8] = {0x0001, 0x0002, 0x0003, 0x000F,
+                   static_cast<int16_t>(0xFFFE), 0x7FFF, 0x00FE,
+                   static_cast<int16_t>(0xFF02)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqrshrnVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqrshrnRefS8(in[i], 1))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint16_t>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnVec4HShift5) {
+  // 32→16 rounding path: PMINSD(xn, 0x7FFFFFEF)-preclamp + PADDD + PSRAD.
+  //   0x7FFFFFFF: pre-clamped to 0x7FFFFFEF, +16 = 0x7FFFFFFF, >>5 =
+  //     0x3FFFFFF → sat 32767.
+  //   0x80000000 (-2^31): no pre-clamp (negative), + 16 = 0x80000010 →
+  //     >>5 (arith) = 0xFC000000... wait, that needs PSRAD on the signed
+  //     value.  Helper widens to int64 first, so it does
+  //     (-2147483648 + 16) >>5 = -67108863 → sat -32768.  JIT does the
+  //     same: pre-clamp is PMINSD which leaves negative values alone;
+  //     PADDD of (-2147483648 + 16) wraps positively only if the input
+  //     is between INT_MAX-16+1 and INT_MAX (handled by the pre-clamp);
+  //     -2147483648 + 16 = -2147483632, fits, PSRAD then PMINSD/PMAXSD
+  //     gives the right sat.
+  //   0x000FFFE0: not pre-clamped, +16 = 0x10000, >>5 = 0x800 → no sat.
+  int32_t in[4] = {0x00000000, 0x7FFFFFFF,
+                   static_cast<int32_t>(0x80000000),
+                   0x000FFFE0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqrshrnVec4H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqrshrnRefS16(in[i], 5))
+        << "lane " << i << " in=0x" << std::hex
+        << static_cast<uint32_t>(in[i]);
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0) << "upper halfword " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqrshrn2Vec8HShift5) {
+  int32_t in[4]  = {0x12345678, 0x7FFFFFFF,
+                    static_cast<int32_t>(0x80000000),
+                    static_cast<int32_t>(0xFFFFFFE0)};
+  int16_t vd[8]  = {static_cast<int16_t>(0xAAA0), static_cast<int16_t>(0xBBB1),
+                    static_cast<int16_t>(0xCCC2), static_cast<int16_t>(0xDDD3),
+                    0x1000, 0x2000, 0x3000, 0x4000};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSqrshrn2Vec8H_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vd[i]) << "low halfword " << i << " clobbered";
+  }
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i + 4], SqrshrnRefS16(in[i], 5)) << "upper lane " << i;
+  }
+}
+// endregion
+
+
 // region digitalis: SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
 //
 // Vector encoding (DDI 0487 §C7.2.397 / §C7.2.398):

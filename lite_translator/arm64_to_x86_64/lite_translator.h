@@ -11887,12 +11887,40 @@ class LiteTranslator {
       //               needs PCMPGTQ + blend + a separate temp.  Bail to
       //               interpreter (`success_ = false`).
       //
+      // SQSHRN signed-saturates the post-shift value to dst_bits before
+      // narrowing.  The pre-shift is PSRA{W,D} (arithmetic right shift,
+      // sign-preserving).  After shift, clamp each src-element-wide lane
+      // to the signed dst-width range:
+      //   dst 8:   [-128, 127]   i.e. [0xFF80, 0x007F] as signed 16-bit
+      //            → PMAXSW+PMINSW (both SSE2).
+      //   dst 16:  [-32768, 32767] i.e. [0xFFFF8000, 0x00007FFF] as
+      //            signed 32-bit → PMAXSD+PMINSD (both SSE4.1).
+      //   dst 32:  src=64, no PSRAQ in baseline SSE — bail.
+      // PSHUFB then gathers the low byte (src 16-bit) or low halfword
+      // (src 32-bit) of each lane.  After signed clamp those bottom
+      // bytes/halfwords ARE the correct signed narrow result.
+      //
+      // SQRSHRN adds the rounding pre-shift add.  The pre-shift saturate
+      // observes the WIDE value, so the rounding add must signed-
+      // saturate too (the round constant is always positive
+      // `1 << (rshift - 1)`):
+      //   src 16-bit: PADDSW (signed saturating word add, SSE2).
+      //   src 32-bit: no PADDSD-integer in baseline SSE; pre-clamp via
+      //               PMINSD(xn, INT32_MAX - round_lane).  Lanes clamped
+      //               there yield exactly INT32_MAX after the plain PADDD,
+      //               which the post-shift PMINSD-vs-signed-max saturates
+      //               correctly.  Adding a positive round constant cannot
+      //               under-flow a signed value, so no lower pre-clamp.
+      //   src 64-bit: bail (no PSRAQ for the shift anyway).
+      //
       // Q=0:        store narrowed-in-low | zero-upper.
       // Q=1 ("2"):  preserve Vd[63:0], OR narrowed result into Vd[127:64].
       case Decoder::AdvSimdShiftImmOpcode::kShrn:
       case Decoder::AdvSimdShiftImmOpcode::kRshrn:
       case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
-      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn: {
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn: {
         const uint8_t immh = args.immh;
         if (immh == 0 || (immh & 0b1000)) { success_ = false; return; }
         uint8_t src_bits;
@@ -11905,13 +11933,22 @@ class LiteTranslator {
         }
         const bool is_rounding =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn) ||
-            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
         const bool is_saturating_unsigned =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn) ||
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
+        const bool is_saturating_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
         if (is_rounding && is_saturating_unsigned && src_bits == 64) {
           // UQRSHRN src=64 needs a saturating PADDQ that baseline SSE
           // can't express cheaply.  Fall back to the interpreter.
+          success_ = false; return;
+        }
+        if (is_saturating_signed && src_bits == 64) {
+          // SQSHRN / SQRSHRN src=64 needs PSRAQ which baseline SSE
+          // doesn't have.  Fall back to the interpreter.
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
@@ -11972,6 +12009,36 @@ class LiteTranslator {
               }
               // src_bits == 64 already bailed above.
             }
+          } else if (is_saturating_signed) {
+            switch (src_bits) {
+              case 16:
+                // PADDSW is signed-saturating word add (SSE2).
+                as_.Paddsw(xn, xround);
+                break;
+              case 32: {
+                // No integer PADDSD in baseline SSE; pre-clamp xn so the
+                // plain PADDD cannot overflow positively.  The round
+                // constant is positive (`1 << (rshift - 1)`), so adding
+                // it cannot cause negative underflow — no lower
+                // pre-clamp needed.  Lanes that hit the upper clamp
+                // settle at exactly INT32_MAX after the add, which the
+                // post-shift PMINSD-vs-signed-max drives to the
+                // saturated dst value.
+                const uint32_t clamp_lane =
+                    0x7FFFFFFFu - static_cast<uint32_t>(round_lane);
+                const uint64_t clamp_pattern =
+                    (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+                SimdRegister xclamp = AllocTempSimdReg();
+                if (xclamp == no_simd_register) { success_ = false; return; }
+                as_.Movq(r1, static_cast<int64_t>(clamp_pattern));
+                as_.Movq(xclamp, r1);
+                as_.Pinsrq(xclamp, r1, int8_t{1});
+                as_.Pminsd(xn, xclamp);
+                as_.Paddd(xn, xround);
+                break;
+              }
+              // src_bits == 64 already bailed above.
+            }
           } else {
             switch (src_bits) {
               case 16: as_.Paddw(xn, xround); break;
@@ -11981,10 +12048,62 @@ class LiteTranslator {
           }
         }
         const int8_t cnt = static_cast<int8_t>(narrow_rshift);
-        switch (src_bits) {
-          case 16: as_.Psrlw(xn, cnt); break;
-          case 32: as_.Psrld(xn, cnt); break;
-          case 64: as_.Psrlq(xn, cnt); break;
+        if (is_saturating_signed) {
+          // PSRAW/PSRAD: sign-preserving arithmetic right shift.  src=64
+          // already bailed (no PSRAQ in baseline SSE).
+          switch (src_bits) {
+            case 16: as_.Psraw(xn, cnt); break;
+            case 32: as_.Psrad(xn, cnt); break;
+          }
+        } else {
+          switch (src_bits) {
+            case 16: as_.Psrlw(xn, cnt); break;
+            case 32: as_.Psrld(xn, cnt); break;
+            case 64: as_.Psrlq(xn, cnt); break;
+          }
+        }
+        if (is_saturating_signed) {
+          // Clamp each src-element-wide lane to the signed dst range:
+          //   dst 8:  [-128, 127] as signed 16-bit = [0xFF80, 0x007F].
+          //   dst 16: [-32768, 32767] as signed 32-bit
+          //           = [0xFFFF8000, 0x00007FFF].
+          // PSHUFB later gathers byte 0 (src=16) or halfword 0 (src=32)
+          // of each lane — those low bytes/halfwords already encode the
+          // correct signed narrow value once the lane is clamped.
+          uint64_t sat_max_pattern;
+          uint64_t sat_min_pattern;
+          switch (src_bits) {
+            case 16:
+              sat_max_pattern = 0x007F007F007F007FULL;
+              sat_min_pattern = 0xFF80FF80FF80FF80ULL;
+              break;
+            case 32:
+              sat_max_pattern = 0x00007FFF00007FFFULL;
+              sat_min_pattern = 0xFFFF8000FFFF8000ULL;
+              break;
+            default: success_ = false; return;
+          }
+          SimdRegister xsatmax = AllocTempSimdReg();
+          SimdRegister xsatmin = AllocTempSimdReg();
+          if (xsatmax == no_simd_register || xsatmin == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movq(r1, static_cast<int64_t>(sat_max_pattern));
+          as_.Movq(xsatmax, r1);
+          as_.Pinsrq(xsatmax, r1, int8_t{1});
+          as_.Movq(r1, static_cast<int64_t>(sat_min_pattern));
+          as_.Movq(xsatmin, r1);
+          as_.Pinsrq(xsatmin, r1, int8_t{1});
+          switch (src_bits) {
+            case 16:
+              as_.Pminsw(xn, xsatmax);
+              as_.Pmaxsw(xn, xsatmin);
+              break;
+            case 32:
+              as_.Pminsd(xn, xsatmax);
+              as_.Pmaxsd(xn, xsatmin);
+              break;
+          }
         }
         if (is_saturating_unsigned) {
           // Clamp each src-lane value to (1 << dst_bits) - 1 before the
