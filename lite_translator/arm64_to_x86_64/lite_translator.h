@@ -11266,43 +11266,71 @@ class LiteTranslator {
     // result, matching ARM ARM exactly.
     if (args.scalar) { success_ = false; return; }
     // endregion
-    // region digitalis - JIT for USHLL (unsigned shift-left long) at
-    // 8B→8H / 4H→4S widening, used by calculate_gnu_hash_neon and many
-    // SIMD widening expansions. Other shift-imm opcodes fall back.
+    // region digitalis - JIT for USHLL / SSHLL (unsigned/signed shift-left
+    // long) at 8B→8H / 4H→4S / 2S→2D widening + Q=1 "long2" forms
+    // (USHLL2/SSHLL2 reading the upper half of Vn).  Used by
+    // calculate_gnu_hash_neon and many SIMD widening expansions.  Other
+    // shift-imm opcodes fall back.
     int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
 
     switch (args.opcode) {
-      case Decoder::AdvSimdShiftImmOpcode::kUshll: {
-        // USHLL Vd.<wide>, Vn.<narrow>, #shift.
+      case Decoder::AdvSimdShiftImmOpcode::kUshll:
+      case Decoder::AdvSimdShiftImmOpcode::kSshll: {
+        // USHLL/SSHLL Vd.<wide>, Vn.<narrow>, #shift.
         // ARM encoding: esize = 8 << highest-set-bit(immh).
         // immh=0001 → 8B→8H, shift = (immh:immb) - 8
         // immh=001x → 4H→4S, shift = (immh:immb) - 16
         // immh=01xx → 2S→2D, shift = (immh:immb) - 32
+        // Q=0: read low 64 bits of Vn (offset 0).
+        // Q=1: read upper 64 bits of Vn (offset 8) — "long2" form.
+        // SSHLL sign-extends the narrow lanes via PMOVSX before the
+        // shift; left-shift is bit-identical for signed/unsigned, so
+        // PSLLW/PSLLD/PSLLQ is shared.
         uint8_t immh = args.immh;
         if (immh == 0) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { Undefined(); return; }
-        // Q bit is which half of Vn to read; for the !q (low-half)
-        // form used by the linker, we read the D portion. Q=1 reads
-        // the upper half ("ushll2"): not implemented yet.
-        if (args.q) { Undefined(); return; }
-        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshll);
+        const int32_t load_off = vn_off + (args.q ? 8 : 0);
         uint8_t shift_imm;
+        // immh decode for SSHLL/USHLL (ARM ARM C7-1/C7-2):
+        //   0001    → 8B (Q=0) / 16B (Q=1) source, dst=8H, shift=immh:immb-8
+        //   001x    → 4H (Q=0) /  8H (Q=1) source, dst=4S, shift=immh:immb-16
+        //   01xx    → 2S (Q=0) /  4S (Q=1) source, dst=2D, shift=immh:immb-32
+        //   1xxx    → RESERVED for shift-left-long.
+        // Test the high-set-bit first: priority is bit3 (reserved) → bit2
+        // (2S→2D) → bit1 (4H→4S) → bit0 (8B→8H).
         if (immh & 0b1000) {
+          // RESERVED — bail to undefined.
+          Undefined(); return;
+        } else if (immh & 0b0100) {
           // 2S → 2D
           shift_imm = ((immh << 3) | args.immb) - 32;
-          as_.Pmovzxdq(xn, xn);
+          if (is_signed) {
+            as_.Pmovsxdq(xn, {.base = Assembler::rbp, .disp = load_off});
+          } else {
+            as_.Pmovzxdq(xn, {.base = Assembler::rbp, .disp = load_off});
+          }
           if (shift_imm != 0) as_.Psllq(xn, shift_imm);
-        } else if (immh & 0b0110) {
+        } else if (immh & 0b0010) {
           // 4H → 4S
           shift_imm = ((immh << 3) | args.immb) - 16;
-          as_.Pmovzxwd(xn, xn);
+          if (is_signed) {
+            as_.Pmovsxwd(xn, {.base = Assembler::rbp, .disp = load_off});
+          } else {
+            as_.Pmovzxwd(xn, {.base = Assembler::rbp, .disp = load_off});
+          }
           if (shift_imm != 0) as_.Pslld(xn, shift_imm);
         } else if (immh & 0b0001) {
           // 8B → 8H
           shift_imm = ((immh << 3) | args.immb) - 8;
-          as_.Pmovzxbw(xn, xn);
+          if (is_signed) {
+            as_.Pmovsxbw(xn, {.base = Assembler::rbp, .disp = load_off});
+          } else {
+            as_.Pmovzxbw(xn, {.base = Assembler::rbp, .disp = load_off});
+          }
           if (shift_imm != 0) as_.Psllw(xn, shift_imm);
         } else {
           Undefined(); return;

@@ -16087,6 +16087,205 @@ TEST_F(Arm64LiteTranslateRegionTest, SdotIdxVec2SUpperZero) {
 }
 // endregion
 
+// region digitalis - SSHLL / SSHLL2 / USHLL2 JIT exec tests.
+// SSHLL widens narrow lanes via sign-extension before the left shift.
+// USHLL had Q=0 JIT coverage already; this also adds USHLL2 (Q=1) and
+// every (src,dst) size class for SSHLL.  Encodings verified via
+// aarch64-linux-gnu-as.
+
+// AdvSIMDShiftImm vector encoding:
+//   31  30 29 28 23 22..19 18..16 15..11  10  9..5  4..0
+//    0  Q   U  011110  immh   immb  opcode  1   Rn    Rd
+// SSHLL: U=0, opcode=10100.  USHLL: U=1, opcode=10100.
+constexpr uint32_t kSshllVec8HShift5      = 0x0F0DA420;  // SSHLL v0.8h,  v1.8b,  #5
+constexpr uint32_t kSshll2Vec8HShift5     = 0x4F0DA420;  // SSHLL2 v0.8h, v1.16b, #5
+constexpr uint32_t kUshll2Vec8HShift5     = 0x6F0DA420;  // USHLL2 v0.8h, v1.16b, #5
+constexpr uint32_t kSshllVec4SShift5      = 0x0F15A420;  // SSHLL v0.4s,  v1.4h,  #5
+constexpr uint32_t kSshll2Vec4SShift5     = 0x4F15A420;  // SSHLL2 v0.4s, v1.8h,  #5
+constexpr uint32_t kSshllVec2DShift5      = 0x0F25A420;  // SSHLL v0.2d,  v1.2s,  #5
+constexpr uint32_t kSshll2Vec2DShift5     = 0x4F25A420;  // SSHLL2 v0.2d, v1.4s,  #5
+constexpr uint32_t kSshllVec8HShift1      = 0x0F09A420;  // SSHLL v0.8h,  v1.8b,  #1
+constexpr uint32_t kSshllVec8HShift7      = 0x0F0FA420;  // SSHLL v0.8h,  v1.8b,  #7
+constexpr uint32_t kSshllVec4SShift15     = 0x0F1FA420;  // SSHLL v0.4s,  v1.4h,  #15
+constexpr uint32_t kSshllVec2DShift31     = 0x0F3FA420;  // SSHLL v0.2d,  v1.2s,  #31
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec8HShift5) {
+  // 8B → 8H, shift=5.  Sign-extend narrow byte then PSLLW by 5.
+  int8_t in[16] = {0, 1, -1, 127, -128, 64, -64, 17,
+                   0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec8HShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t expected =
+        static_cast<int16_t>(static_cast<int16_t>(in[i]) << 5);
+    EXPECT_EQ(r[i], expected) << "lane " << i << " in=" << (int)in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sshll2Vec8HShift5) {
+  // SSHLL2 reads the upper 8 bytes of Vn.16b.
+  int8_t in[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x78,
+                   0, 1, -1, 127, -128, 64, -64, 17};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshll2Vec8HShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t expected =
+        static_cast<int16_t>(static_cast<int16_t>(in[i + 8]) << 5);
+    EXPECT_EQ(r[i], expected) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Ushll2Vec8HShift5) {
+  // USHLL2 reads upper 8 bytes of Vn.16b, zero-extends to 16-bit, shifts.
+  uint8_t in[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x78,
+                    0x00, 0x01, 0xFF, 0x7F, 0x80, 0x40, 0xC0, 0x11};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshll2Vec8HShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t expected =
+        static_cast<uint16_t>(static_cast<uint16_t>(in[i + 8]) << 5);
+    EXPECT_EQ(r[i], expected) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec4SShift5) {
+  // 4H → 4S, shift=5.  Sign-extend halfword then PSLLD by 5.
+  int16_t in[8] = {0, 1, -1, 0x7FFF, static_cast<int16_t>(0x8000),
+                   0x4000, static_cast<int16_t>(0xC000), 0x1234};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec4SShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int32_t expected = static_cast<int32_t>(in[i]) << 5;
+    EXPECT_EQ(r[i], expected) << "lane " << i << " in=" << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sshll2Vec4SShift5) {
+  int16_t in[8] = {0x1111, 0x2222, 0x3333, 0x4444,
+                   0, 1, -1, 0x7FFF};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshll2Vec4SShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int32_t expected = static_cast<int32_t>(in[i + 4]) << 5;
+    EXPECT_EQ(r[i], expected) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec2DShift5) {
+  // 2S → 2D, shift=5.  Sign-extend word then PSLLQ by 5.
+  int32_t in[4] = {0, -1, 0x7FFFFFFF, static_cast<int32_t>(0x80000000)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec2DShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    int64_t expected = static_cast<int64_t>(in[i]) << 5;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sshll2Vec2DShift5) {
+  int32_t in[4] = {0x11111111, 0x22222222,
+                   -1, static_cast<int32_t>(0x80000000)};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshll2Vec2DShift5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    int64_t expected = static_cast<int64_t>(in[i + 2]) << 5;
+    EXPECT_EQ(r[i], expected) << "upper lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec8HShift1) {
+  // Minimum shift; sign-bit preservation still required.
+  int8_t in[16] = {-1, -128, -64, -32, -16, -8, -2, 127,
+                   0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec8HShift1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t expected =
+        static_cast<int16_t>(static_cast<int16_t>(in[i]) << 1);
+    EXPECT_EQ(r[i], expected) << "lane " << i << " in=" << (int)in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec8HShift7) {
+  // Maximum shift for 8B → 8H.  Sign-extended -1 << 7 = 0xFF80.
+  int8_t in[16] = {-1, 1, -2, 2, -127, 127, -128, 0,
+                   0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec8HShift7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int16_t expected =
+        static_cast<int16_t>(static_cast<int16_t>(in[i]) << 7);
+    EXPECT_EQ(r[i], expected) << "lane " << i << " in=" << (int)in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec4SShift15) {
+  // 4H → 4S, max-ish shift.
+  int16_t in[8] = {-1, 1, -32768, 32767, 0, -1, 0x1234, -0x1234};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec4SShift15};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    int32_t expected = static_cast<int32_t>(in[i]) << 15;
+    EXPECT_EQ(r[i], expected) << "lane " << i << " in=" << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshllVec2DShift31) {
+  // 2S → 2D, max shift.  -1 << 31 = -0x80000000 (sign-extended to 64).
+  int32_t in[4] = {-1, 0x7FFFFFFF, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSshllVec2DShift31};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    int64_t expected = static_cast<int64_t>(in[i]) << 31;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
