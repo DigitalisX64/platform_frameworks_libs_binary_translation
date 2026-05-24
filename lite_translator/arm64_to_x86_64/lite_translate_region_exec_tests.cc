@@ -12239,6 +12239,89 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, MemsetAarch64_1024ByteZeroFill_BhiL
   EXPECT_EQ(reinterpret_cast<uint32_t*>(buffer)[1056 / sizeof(uint32_t)], 0xdeadbeefU)
       << "trailing sentinel clobbered — loop wrote past x3+0x20+1024";
 }
+
+// Bionic's AddToMap (CdEntryMapZip32::AddToMap) writes each ZIP central-
+// directory bucket with a read-modify-write that BFI-splices a 12-bit
+// name_length into bits[31:20] of the 20-bit name_offset already stored
+// there.  The hot sequence at linker offsets 0x9ccc8..0x9ccd8 is:
+//
+//   ldr w9, [x8, x24, lsl #2]   ; bucket value = name_offset (low 20 bits)
+//   bfi w9, w19, #20, #12       ; splice in name_length at bits[31:20]
+//   str w9, [x8, x24, lsl #2]   ; commit back
+//
+// The bucket-corruption signature observed in VkCaps' wedge (top12 == 0,
+// low20 != 0) is consistent with the second STR being silently dropped
+// after BFI: the first half of the RMW happened (low20 written), but the
+// second store didn't commit.  Handoff-261 ruled out the b.hi-loop
+// region-transition theory; this test probes the next-most-likely
+// suspect: STR (register, 32-bit) with shifted-register offset under a
+// dispatch-enabled backward branch.
+//
+// The loop body's entry PC is the b.hi target, so EmitDirectDispatch
+// reaches the cached region via TranslationCache lookup — same path as
+// production.  256 iterations with a unique x24 per iteration mean every
+// slot of the bucket table participates exactly once.
+TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketRmwUnderDispatch) {
+  // Encodings cross-checked with aarch64-linux-gnu-as round-trip.
+  static const uint32_t code[] = {
+      0xb8787909,  // [0]  ldr w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [4]  bfi w9, w19, #20, #12
+      0xb8387909,  // [8]  str w9, [x8, x24, lsl #2]
+      0x91000718,  // [12] add x24, x24, #1
+      0xf1000442,  // [16] subs x2, x2, #1
+      0x54ffff68,  // [20] b.hi -20  -> back to [0]
+  };
+
+  // 256-entry bucket table, each entry pre-filled with a recognizable
+  // sentinel.  After the loop every slot must be (0xAAA << 20) | (0x45678) =
+  // 0xAAA45678.  Any slot left at 0x12345678 means the STR didn't commit
+  // (or was clobbered, or BFI's destination spilled stale).
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];  // +2 = guard slots
+  buckets[0] = 0xfeedface;  // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0x12345678U;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeef;  // trailing guard
+
+  state_.cpu.x[8] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  // Pre-load x9 with a poison value so a silently-skipped LDR is caught.
+  state_.cpu.x[9] = 0xbaadf00dULL;
+
+  EXPECT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)));
+
+  // SUBS x2, x2, #1 with b.hi exits when x2 transitions to 0 (HI is C && !Z).
+  // 256 iterations -> x2 ends at 0.
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop counter must reach zero";
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must have advanced by N";
+
+  // Every slot must be 0xAAA45678.  Find the first mis-stored slot for a
+  // clean diagnostic.
+  size_t first_bad = kNumSlots;
+  uint32_t first_bad_value = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    if (buckets[i + 1] != 0xAAA45678U) {
+      first_bad = i;
+      first_bad_value = buckets[i + 1];
+      break;
+    }
+  }
+  EXPECT_EQ(first_bad, kNumSlots)
+      << "first mis-stored slot at index " << first_bad
+      << " (value 0x" << std::hex << first_bad_value
+      << "); expected 0xAAA45678 in every slot — a slot left at the "
+         "0x12345678 sentinel means the STR didn't commit under dispatch";
+
+  // Guard slots must not have been touched — a wrong base or wrong shift
+  // would smear writes outside the table.
+  EXPECT_EQ(buckets[0], 0xfeedfaceU)
+      << "leading guard clobbered — STR base/shift bug";
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU)
+      << "trailing guard clobbered — STR base/shift bug";
+}
 // endregion
 
 // region digitalis: BFM (BFI / BFXIL) JIT
