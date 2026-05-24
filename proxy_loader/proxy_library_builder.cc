@@ -40,6 +40,53 @@ void DoBadTrampoline(HostCode callee, ThreadState* state) {
                    ToHostAddr<void>(GetLinkRegister(GetCPUState(*state))));
 }
 
+// region digitalis
+namespace {
+
+struct ExtraRegistry {
+  const char* library_name;
+  const KnownTrampoline* trampolines;
+  size_t count;
+};
+
+constexpr size_t kMaxExtraRegistries = 8;
+ExtraRegistry g_extra_registries[kMaxExtraRegistries];
+size_t g_num_extra_registries = 0;
+
+// Linear search the extra-trampoline registry for a symbol name in a library.
+const KnownTrampoline* FindExtraTrampoline(const char* library_name, const char* name) {
+  for (size_t i = 0; i < g_num_extra_registries; ++i) {
+    const auto& reg = g_extra_registries[i];
+    if (strcmp(reg.library_name, library_name) != 0) {
+      continue;
+    }
+    for (size_t j = 0; j < reg.count; ++j) {
+      if (strcmp(reg.trampolines[j].name, name) == 0) {
+        return &reg.trampolines[j];
+      }
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+void ProxyLibraryBuilder::RegisterExtraTrampolines(const char* library_name,
+                                                   const KnownTrampoline* trampolines,
+                                                   size_t count) {
+  if (g_num_extra_registries >= kMaxExtraRegistries) {
+    TRACE("ProxyLibraryBuilder: extra-trampoline registry full (%zu/%zu); dropping registration "
+          "for \"%s\" (%zu trampolines)",
+          g_num_extra_registries,
+          kMaxExtraRegistries,
+          library_name,
+          count);
+    return;
+  }
+  g_extra_registries[g_num_extra_registries++] = {library_name, trampolines, count};
+}
+// endregion
+
 void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name) {
   CHECK(guest_addr);
 
@@ -65,6 +112,27 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
       return;
     }
   }
+
+  // region digitalis
+  // Search Digitalis-side extra trampolines registered for this library.
+  // Same dispatch shape as the primary loop, factored above to share between
+  // primary and extras.
+  if (const KnownTrampoline* extra = FindExtraTrampoline(library_name_, name); extra != nullptr) {
+    void* thunk = extra->thunk;
+    if (!thunk) {
+      thunk = dlsym(handle_, name);
+    }
+    if (!thunk) {
+      thunk = reinterpret_cast<void*>(DoBadThunk);
+    }
+    if (extra->marshal_and_call == DoBadTrampoline) {
+      MakeTrampolineCallable(guest_addr, false, DoBadTrampoline, name, name);
+    } else {
+      MakeTrampolineCallable(guest_addr, false, extra->marshal_and_call, thunk, name);
+    }
+    return;
+  }
+  // endregion
 
   // TODO(b/287342829): variables_ are sorted, use binary search!
   for (size_t i = 0; i < num_variables_; ++i) {

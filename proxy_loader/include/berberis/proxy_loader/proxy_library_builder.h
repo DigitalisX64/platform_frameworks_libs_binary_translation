@@ -51,6 +51,33 @@ class ProxyLibraryBuilder {
 
   void InterceptSymbol(GuestAddr guest_addr, const char* name);
 
+  // region digitalis
+  // Append additional KnownTrampoline entries for `library_name` that will be
+  // consulted by InterceptSymbol after the primary table search misses.
+  //
+  // The primary table is built once via `Build()` from a single static array
+  // shipped by upstream proxy_libc / proxy_libm. This API exists so that the
+  // Digitalis-side android_api/libc/ and android_api/libm/ source can ship a
+  // *parallel* trampoline array for symbols not covered by the upstream JSON
+  // manifest (e.g. LFS-64 aliases, isnan/isinf family, memrchr, strchrnul,
+  // ldexpf, cospi, sinpi …). The audit in handoff-253 found 121 libc + 34 libm
+  // such symbols; they all resolve correctly today via translation through the
+  // guest libc/libm (LD_DEBUG=symbols shows zero UNRESOLVED warnings), but they
+  // miss the fast-path host-passthrough trampoline and are interpreted instead.
+  //
+  // `trampolines` must remain valid for the lifetime of the proxy process —
+  // typically a static const array in a .cc file with a __constructor that
+  // calls this API at module-load time.
+  //
+  // Thread-safety: callers must serialize via single-thread initialization
+  // ordering (gcc constructor priority). The registry is fixed-size; if more
+  // than kMaxExtraRegistries (8) registrations land for one proxy lib, the
+  // overflow is silently dropped.
+  static void RegisterExtraTrampolines(const char* library_name,
+                                       const KnownTrampoline* trampolines,
+                                       size_t count);
+  // endregion
+
  private:
   const char* library_name_ = nullptr;
   size_t num_functions_ = 0;
