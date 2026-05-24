@@ -12938,6 +12938,119 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   cache->InvalidateGuestRange(code_start, code_end);
 }
 
+// region digitalis: Hypothesis C — surrounding-code interaction.
+//
+// Combines production's bucket-FIND loop body (LDR + ANDS + b.eq) AND the
+// bucket-INSERT 5-instruction sequence in ONE contiguous block, run 256x
+// under multi-region dispatch.  Mirrors the FULL execution path of
+// CdEntryMapZip32<ZipStringOffset20>::AddToMap at linker offsets
+// 0x9cc20..0x9cc78 for the "empty bucket on first probe" path.
+//
+// Each outer iteration:
+//   1. LDR w8 = buckets[x24]   (always 0; pre-fill is calloc-equivalent)
+//   2. ANDS x9, x8, #0xfffff   (Z=1 because bucket is empty)
+//   3. b.eq insert             (taken)
+//   4. INSERT 5-insn sequence: STORE 1 + LDR x8 + LDR w9 + BFI + STORE 2
+//   5. x24++, subs x2,#1, b.hi top  (256 iterations total)
+//
+// Hypothesis A (signal clobber) and B (deep mapped-register state /
+// spill-restore) are DISPROVED in earlier work; do NOT re-test them.
+// Hypothesis C theorizes the bug lives in an instruction OUTSIDE the 5-insn
+// insert sequence pinned by the existing tests — specifically the b.eq
+// cross-region dispatch from FIND to INSERT, or the LDR/ANDS pair preceding
+// it.  In production, the find loop runs 1-3 times per AddToMap call before
+// hitting an empty bucket, then dispatches to the insert.  If b.eq's
+// cross-region dispatch (or its surrounding code) occasionally drops x19
+// (the BFI source = name_length), ~half the buckets end up with length=0 —
+// matching the production signature.
+//
+// If this test FAILS, the bug is reproduced deterministically under host
+// conditions and bisection can localize.
+//
+// If this test PASSES, hypothesis C's "1-step find then insert" form is
+// disproved; the next target is hypothesis D (region invalidation /
+// re-translation race during the live VkCapsViewer run, where trans#N
+// climbed to ~290/sec).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindThenInsertCombinedUnderDispatch_256x) {
+  static const uint32_t code[] = {
+      // --- FIND loop body (always hits empty bucket via b.eq) ---
+      0xb8785b28,  // [ 0] loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [ 4]           ands x9, x8, #0xfffff
+      0x54000080,  // [ 8]           b.eq +0x10 (-> insert at offset 24)
+      0x31000708,  // [12]           adds w8, w24, #1      ; advance (dead)
+      0x0a1a0118,  // [16]           and  w24, w8, w26     ; (dead)
+      0x17fffffb,  // [20]           b    -0x14 (-> loop_top, dead)
+      // --- INSERT 5-insn sequence (production 0x9cc58..0x9cc78) ---
+      0x4b160289,  // [24] insert:   sub  w9, w20, w22     ; w9 = name_offset
+      0x2a1f03e0,  // [28]           mov  w0, wzr
+      0x12004d29,  // [32]           and  w9, w9, #0xfffff
+      0x2a090108,  // [36]           orr  w8, w8, w9       ; w8 = offset (len=0)
+      0xb8387b28,  // [40]           str  w8, [x25, x24, lsl #2]   ; STORE 1
+      0xf94006a8,  // [44]           ldr  x8, [x21, #0x8]  ; reload via x21
+      0xb8787909,  // [48]           ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [52]           bfi  w9, w19, #20, #12 ; splice length
+      0xb8387909,  // [56]           str  w9, [x8, x24, lsl #2]    ; STORE 2
+      0x91000718,  // [60]           add  x24, x24, #1     ; next bucket idx
+      0xf1000442,  // [64]           subs x2,  x2, #1
+      0x54fffde8,  // [68]           b.hi -0x44 (-> loop_top, 256 iters)
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;                       // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;           // trailing guard
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = kNumSlots - 1;               // mask = 0xff
+  state_.cpu.x[2]  = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;                        // BFI source: 12-bit length
+  state_.cpu.x[20] = 0x12345ULL;
+  state_.cpu.x[22] = 0;
+
+  EXPECT_TRUE(RunMultiRegion(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_EQ(state_.cpu.x[2],  0ULL) << "loop must exit (x2 reaches 0)";
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must reach kNumSlots";
+
+  // Production-signature check: every bucket must have length=0xAAA in
+  // bits[31:20].  Any bucket with length=0 reproduces the wedge.
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "HYPOTHESIS C CONFIRMED: " << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (production wedge signature reproduced "
+      << "under combined FIND+INSERT host test); first at i="
+      << first_length_zero << " value=0x" << std::hex << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+// endregion
+
 // Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
 // CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
 // shifted-register addressing form (option=010, S=1), which is a DIFFERENT
