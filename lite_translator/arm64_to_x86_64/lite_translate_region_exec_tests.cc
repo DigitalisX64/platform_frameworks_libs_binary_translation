@@ -12598,6 +12598,346 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   cache->InvalidateGuestRange(code_start, code_end);
 }
 
+// Same 5-instruction insert as AddToMapBucketTwoStepInsert_ExplicitSplit-
+// AtProductionBoundary above, but forces a THREE-region topology that
+// exactly matches the production VkCapsViewer IsGpRegPoolLow split points.
+// In production, the early-termination check fires at BOTH guest PCs
+// `linker_base+0x9cc6c` (just before LDR x8) AND `linker_base+0x9cc7c`
+// (just before ADD x24, one past STORE 2).  The existing test only forces
+// the first split; this test forces both:
+//
+//   Region A: STORE 1                     (offset 0..4   = 0x9cc68..0x9cc6c)
+//   Region B: LDR x8, LDR w9, BFI w9,
+//             STORE 2                     (offset 4..20  = 0x9cc6c..0x9cc7c)
+//   Region C: add x24, subs x2, b.hi      (offset 20..32 = 0x9cc7c..0x9cc88)
+//
+// If this test FAILS while the two-region split test PASSES, the bug is
+// specific to the Region B/C boundary (the split between STORE 2 and the
+// loop tail) — a cross-region effect not exercised by the existing tests.
+// If both pass, the production-only condition is something OTHER than the
+// region-split topology (deeper mapped-register state in Region A, the
+// physical-PC of the dispatch chain, signal interaction, or cache-line
+// alignment of the host-emitted dispatch tail).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_ThreeRegionSplitAtProductionBoundaries) {
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1 — Region A
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; Region B start
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2 (end Region B)
+      0x91000718,  // [20] add  x24, x24, #1             ; Region C start
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  state_.cpu.x[8] = 0x12345ULL;
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);
+  GuestAddr split_1 = code_start + 4;   // After STORE 1 / before LDR x8
+  GuestAddr split_2 = code_start + 20;  // After STORE 2 / before ADD x24
+
+  state_.cpu.insn_addr = code_start;
+  auto* cache = TranslationCache::GetInstance();
+
+  // Region A: STORE 1 only.
+  MachineCode mc_a;
+  auto [success_a, stop_a] = TryLiteTranslateRegion(
+      code_start, &mc_a,
+      LiteTranslateParams{.end_pc = split_1, .allow_dispatch = true});
+  ASSERT_TRUE(success_a);
+  ASSERT_EQ(stop_a, split_1);
+  GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry_a, nullptr);
+  HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
+  cache->SetTranslatedAndUnlock(code_start, entry_a,
+                                static_cast<uint32_t>(stop_a - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_a, mc_a.install_size()});
+
+  // Region B: LDR x8 reload .. STORE 2.
+  MachineCode mc_b;
+  auto [success_b, stop_b] = TryLiteTranslateRegion(
+      split_1, &mc_b,
+      LiteTranslateParams{.end_pc = split_2, .allow_dispatch = true});
+  ASSERT_TRUE(success_b);
+  ASSERT_EQ(stop_b, split_2);
+  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(split_1, 0);
+  ASSERT_NE(entry_b, nullptr);
+  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
+  cache->SetTranslatedAndUnlock(split_1, entry_b,
+                                static_cast<uint32_t>(stop_b - split_1),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_b, mc_b.install_size()});
+
+  // Region C: advance, subs, b.hi (with backward branch into Region A).
+  MachineCode mc_c;
+  auto [success_c, stop_c] = TryLiteTranslateRegion(
+      split_2, &mc_c,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_c);
+  ASSERT_EQ(stop_c, code_end);
+  GuestCodeEntry* entry_c = cache->AddAndLockForTranslation(split_2, 0);
+  ASSERT_NE(entry_c, nullptr);
+  HostCodeAddr host_code_c = GetDefaultCodePoolInstance()->Add(&mc_c);
+  cache->SetTranslatedAndUnlock(split_2, entry_c,
+                                static_cast<uint32_t>(stop_c - split_2),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_c, mc_c.install_size()});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
+
+  EXPECT_EQ(state_.cpu.insn_addr, code_end);
+  EXPECT_EQ(state_.cpu.x[2], 0ULL);
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots);
+
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "THREE-REGION SPLIT reproduces production signature: "
+      << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped); first at i="
+      << first_length_zero << " value=0x" << std::hex << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+
+  cache->InvalidateGuestRange(code_start, code_end);
+}
+
+// Hypothesis B (deeper mapped-register state in Region A).  Same 5-insn
+// AddToMap insert sequence as above, but Region A is preceded by a 7-
+// instruction prelude that touches x4-x7 and x10-x12 (none of which are
+// used by the insert sequence proper), forcing the JIT's permanent-slot
+// allocator to map 7 extra guest regs before STORE 1 even starts decoding.
+// Combined with the production's exact three-region split topology
+// (splits at the LDR x8 reload AND one past STORE 2), this matches the
+// register-pressure profile inferred from VkCapsViewer's IsGpRegPoolLow
+// trace, where the JIT's allocator is near-full at Region A's exit.
+//
+// 7 (not 9) prelude regs because: each prelude insn maps 1 guest reg
+// permanently; STORE 1 maps 3 more (x8/x25/x24), totalling 10 permanent
+// slots; that leaves 3 free slots — enough for STORE 1's 2-temp address
+// computation but tight enough that IsGpRegPoolLow(threshold=4) fires
+// at the LDR x8 boundary (avail=3 < 4) and naturally terminates Region
+// A.  With 9 prelude regs the allocator overflows during STORE 1 itself
+// (AllocTemp returns no_register), making TryLiteTranslateRegion return
+// success=false instead of cleanly splitting the region — that's a JIT
+// limit, not the production bug.
+//
+// Each prelude insn is `add xN, xN, xzr` (encoded by hand below) — it
+// reads xN, writes xN, leaves xN's value unchanged, and does NOT touch
+// NZCV (it's ADD, not ADDS), so the b.hi at the loop tail still reads
+// only the SUBS-set flags.
+//
+// If this test FAILS while the simpler three-region split test PASSES,
+// hypothesis B is CONFIRMED — the bug is in the JIT's handling of the
+// 5-insn insert sequence when Region A entered Region B with most of the
+// permanent-slot pool already exhausted.  Each subsequent bisection of
+// which prelude regs trigger the failure pinpoints the spill/restore or
+// dispatch-state hand-off path that mishandles deep mapped state.
+//
+// If this test PASSES, hypothesis B is disproved at this depth (7 extra
+// mapped guest regs).  Next step would be hypothesis C (translating the
+// FULL surrounding AddToMap function as a single block and running it
+// 256x to see if a non-tested-here opcode propagates corruption into
+// the insert sequence's inputs) or D (cache-line / dispatch-tail effects).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_ThreeRegionSplit_DeepMappedRegState) {
+  static const uint32_t code[] = {
+      // --- Prelude: pre-map x4-x7 and x10-x12 into JIT permanent slots
+      //     (7 regs, each `add xN, xN, xzr` keeps xN's value unchanged) ---
+      0x8B1F0084,  // [ 0] add  x4,  x4,  xzr   ; map x4
+      0x8B1F00A5,  // [ 4] add  x5,  x5,  xzr   ; map x5
+      0x8B1F00C6,  // [ 8] add  x6,  x6,  xzr   ; map x6
+      0x8B1F00E7,  // [12] add  x7,  x7,  xzr   ; map x7
+      0x8B1F014A,  // [16] add  x10, x10, xzr   ; map x10
+      0x8B1F016B,  // [20] add  x11, x11, xzr   ; map x11
+      0x8B1F018C,  // [24] add  x12, x12, xzr   ; map x12
+
+      // --- Production AddToMap 5-insn insert sequence ---
+      0xb8387b28,  // [28] str  w8, [x25, x24, lsl #2]  ; STORE 1 (Region A end)
+      0xf94006a8,  // [32] ldr  x8, [x21, #0x8]          ; Region B start
+      0xb8787909,  // [36] ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [40] bfi  w9, w19, #20, #12
+      0xb8387909,  // [44] str  w9, [x8, x24, lsl #2]  ; STORE 2 (Region B end)
+      0x91000718,  // [48] add  x24, x24, #1            ; Region C start
+      0xf1000442,  // [52] subs x2,  x2, #1
+      0x54fffe48,  // [56] b.hi -56  -> back to prelude start (offset 0 = Region A entry)
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  state_.cpu.x[8] = 0x12345ULL;
+  // Sentinel values for the pre-mapped regs (verified intact after the loop).
+  state_.cpu.x[4]  = 0xdead0004ULL;
+  state_.cpu.x[5]  = 0xdead0005ULL;
+  state_.cpu.x[6]  = 0xdead0006ULL;
+  state_.cpu.x[7]  = 0xdead0007ULL;
+  state_.cpu.x[10] = 0xdead000aULL;
+  state_.cpu.x[11] = 0xdead000bULL;
+  state_.cpu.x[12] = 0xdead000cULL;
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);
+  // Region A naturally ends after STORE 1 due to IsGpRegPoolLow (7 prelude
+  // mapped regs + x8/x25/x24 from STORE 1 = 10 mapped, 3 slots left, < 4).
+  // Pass end_pc = code_end and let IsGpRegPoolLow do the cut; verify
+  // stop_a matches the expected first split.
+  GuestAddr expected_split_1 = code_start + 32;
+  GuestAddr split_2 = code_start + 48;  // Forced split: after STORE 2.
+
+  state_.cpu.insn_addr = code_start;
+  auto* cache = TranslationCache::GetInstance();
+
+  // Region A: prelude + STORE 1 (terminated by IsGpRegPoolLow).
+  MachineCode mc_a;
+  auto [success_a, stop_a] = TryLiteTranslateRegion(
+      code_start, &mc_a,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_a);
+  ASSERT_EQ(stop_a, expected_split_1)
+      << "Region A should stop at offset 32 (LDR x8) due to IsGpRegPoolLow "
+      << "after 7 prelude mappings + 3 STORE 1 mappings; stopped at offset "
+      << (stop_a - code_start);
+  GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry_a, nullptr);
+  HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
+  cache->SetTranslatedAndUnlock(code_start, entry_a,
+                                static_cast<uint32_t>(stop_a - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_a, mc_a.install_size()});
+
+  // Region B: LDR x8 reload .. STORE 2 (forced end at split_2).
+  MachineCode mc_b;
+  auto [success_b, stop_b] = TryLiteTranslateRegion(
+      expected_split_1, &mc_b,
+      LiteTranslateParams{.end_pc = split_2, .allow_dispatch = true});
+  ASSERT_TRUE(success_b);
+  ASSERT_EQ(stop_b, split_2);
+  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(expected_split_1, 0);
+  ASSERT_NE(entry_b, nullptr);
+  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
+  cache->SetTranslatedAndUnlock(expected_split_1, entry_b,
+                                static_cast<uint32_t>(stop_b - expected_split_1),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_b, mc_b.install_size()});
+
+  // Region C: advance, subs, b.hi (back-edge to STORE 1 = expected_split_1
+  // boundary... actually b.hi target is offset 36 = STORE 1, which is the
+  // last insn of Region A.  Dispatch lookup at offset 36 finds Region A's
+  // entry (which starts at offset 0) -- there is NO independent cache
+  // entry at offset 36.  So the back-edge re-enters Region A from the
+  // prelude, re-running the 9 prelude insns on each iteration.  This is
+  // the production-equivalent behavior because production's prelude is
+  // outside the loop, but here we let it re-run; it's idempotent.).
+  MachineCode mc_c;
+  auto [success_c, stop_c] = TryLiteTranslateRegion(
+      split_2, &mc_c,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_c);
+  ASSERT_EQ(stop_c, code_end);
+  GuestCodeEntry* entry_c = cache->AddAndLockForTranslation(split_2, 0);
+  ASSERT_NE(entry_c, nullptr);
+  HostCodeAddr host_code_c = GetDefaultCodePoolInstance()->Add(&mc_c);
+  cache->SetTranslatedAndUnlock(split_2, entry_c,
+                                static_cast<uint32_t>(stop_c - split_2),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_c, mc_c.install_size()});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
+
+  EXPECT_EQ(state_.cpu.insn_addr, code_end);
+  EXPECT_EQ(state_.cpu.x[2], 0ULL);
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots);
+
+  // Sentinel regs must be untouched.
+  EXPECT_EQ(state_.cpu.x[4],  0xdead0004ULL);
+  EXPECT_EQ(state_.cpu.x[5],  0xdead0005ULL);
+  EXPECT_EQ(state_.cpu.x[6],  0xdead0006ULL);
+  EXPECT_EQ(state_.cpu.x[7],  0xdead0007ULL);
+  EXPECT_EQ(state_.cpu.x[10], 0xdead000aULL);
+  EXPECT_EQ(state_.cpu.x[11], 0xdead000bULL);
+  EXPECT_EQ(state_.cpu.x[12], 0xdead000cULL);
+
+  // Bucket-array integrity: every bucket's bits[31:20] (length field) must
+  // equal 0xAAA (the BFI'd value).  If hypothesis B is correct, some
+  // buckets will have length=0 (STORE 2 dropped under deep mapped state).
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "HYPOTHESIS B CONFIRMED: " << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped under deep mapped state); "
+      << "first at i=" << first_length_zero << " value=0x" << std::hex
+      << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+
+  cache->InvalidateGuestRange(code_start, code_end);
+}
+
 // Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
 // CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
 // shifted-register addressing form (option=010, S=1), which is a DIFFERENT
