@@ -459,8 +459,15 @@ class Decoder {
     kFpcr = 0xDA20,       // FPCR: op0=3, op1=3, CRn=4, CRm=4, op2=0
     kFpsr = 0xDA21,       // FPSR: op0=3, op1=3, CRn=4, CRm=4, op2=1
     // region digitalis
-    kCtrEl0 = 0xD807,     // CTR_EL0: op0=3, op1=3, CRn=0, CRm=0, op2=7
-    kDczidEl0 = 0xD80F,   // DCZID_EL0: op0=3, op1=3, CRn=0, CRm=0, op2=7 (alt)
+    // Sysreg encoding (computed by DecodeSystem): (op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2.
+    // ARM ARM C5.2.6: CTR_EL0 is op2=1, DCZID_EL0 is op2=7 (NOT both op2=7).
+    // The prior values (kCtrEl0=0xD807, kDczidEl0=0xD80F) routed mrs DCZID_EL0
+    // to the CTR_EL0 handler, returning 0x8444c004 instead of 0x10 — which
+    // made bionic's __dl___memset_aarch64+0xb8 cmp x5,#0x4 succeed and the
+    // DC-ZVA fallback loop take, leaving most of any large memset's buffer
+    // unzeroed.  Symptom: VkCapsViewer bucket-array corruption (handoff-284).
+    kCtrEl0 = 0xD801,     // CTR_EL0:   op0=3, op1=3, CRn=0, CRm=0, op2=1
+    kDczidEl0 = 0xD807,   // DCZID_EL0: op0=3, op1=3, CRn=0, CRm=0, op2=7
     // MIDR_EL1: op0=3, op1=0, CRn=0, CRm=0, op2=0
     //   sysreg = (3<<14)|(0<<11)|(0<<7)|(0<<3)|0 = 0xC000
     // Read by code that decides whether to use vectorised fast paths;
