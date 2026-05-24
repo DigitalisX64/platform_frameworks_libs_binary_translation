@@ -69,7 +69,7 @@ class ProxyLibraryBuilder {
   // Digitalis-side android_api/libc/ and android_api/libm/ source can ship a
   // *parallel* trampoline array for symbols not covered by the upstream JSON
   // manifest (e.g. LFS-64 aliases, isnan/isinf family, memrchr, strchrnul,
-  // ldexpf, cospi, sinpi …). The audit in handoff-253 found 121 libc + 34 libm
+  // ldexpf, cospi, sinpi …). A prior audit found 121 libc + 34 libm
   // such symbols; they all resolve correctly today via translation through the
   // guest libc/libm (LD_DEBUG=symbols shows zero UNRESOLVED warnings), but they
   // miss the fast-path host-passthrough trampoline and are interpreted instead.

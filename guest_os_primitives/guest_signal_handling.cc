@@ -207,7 +207,7 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
       // truncated or bogus pointer. Dump caller PC (x30), arg regs
       // (x0..x7), and callee-saved + iterator regs (x16..x29) — the
       // latter group commonly holds loop pointers (x21 was the buggy
-      // value in FB libcoldstart Yoga layout per handoff-18). The
+      // value in FB libcoldstart Yoga layout). The
       // "Imprecise context" warning still applies for JIT execution —
       // for interpreter execution state is precise.
       if (thread &&
@@ -276,8 +276,8 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
         // The FB Katana / breakpad-style second-SEGV path enters this branch
         // when the inner host fault has no Berberis recovery entry. Without
         // the guest CPU dump here, the second-fault's host PC + guest state
-        // remain unknown — exactly the gap the handoff-235 forensics lead
-        // flagged. Fires for both depth==1 (first fatal) and depth>1 (nested).
+        // remain unknown — exactly the gap earlier forensics flagged.
+        // Fires for both depth==1 (first fatal) and depth>1 (nested).
         if (thread) {
           auto& cpu = thread->state()->cpu;
           __android_log_print(ANDROID_LOG_ERROR, "berberis",

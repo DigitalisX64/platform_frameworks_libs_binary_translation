@@ -256,7 +256,7 @@ class Decoder {
   //
   // FCADD has no by-element form; only FCMLA has an indexed encoding.
   //
-  // Encoding (ARM ARM C7.2.86, verified via llvm-mc — handoff-58):
+  // Encoding (ARM ARM C7.2.86, verified via llvm-mc):
   //   bit31=0, bit30=Q, bit29=1 (U), bits[28:24]=01111,
   //   bits[23:22]=size, bit21=L, bit20=M, bits[19:16]=Rm[3:0],
   //   bit15=0, bits[14:13]=rot, bit12=1, bit11=H, bit10=0,
@@ -280,7 +280,7 @@ class Decoder {
   // while rot=1 (0011) and rot=3 (0111) fall through to the default
   // Undefined.  None of those four paths surface to the consumer.
   //
-  // llvm-mc-verified encodings (handoff-58):
+  // llvm-mc-verified encodings:
   //   fcmla v0.4s, v1.4s, v2.s[0], #0   = 0x6F821020
   //   fcmla v0.4s, v1.4s, v2.s[1], #0   = 0x6F821820  (H=1)
   //   fcmla v0.4s, v1.4s, v2.s[0], #90  = 0x6F823020  (rot=01)
@@ -291,9 +291,9 @@ class Decoder {
   //   fcmla v0.4s, v1.4s, v2.s[1], #270 = 0x6F827820
   //   fcmla v0.4s, v1.4s, v17.s[0], #0  = 0x6F911020  (Vm=10001)
   //
-  // FP16-indexed FCMLA is parked alongside non-indexed FP16 (handoff-49
-  // rejects size==FP16 as "no Digitalis FP16-SIMD FCMA yet").  Even
-  // though handoff-57 added FP16 vector three-same support (), the
+  // FP16-indexed FCMLA is parked alongside non-indexed FP16 (the
+  // non-indexed FP16 path rejects size==FP16 as "no Digitalis FP16-SIMD
+  // FCMA yet").  Even though FP16 vector three-same support exists, the
   // family hasn't been extended yet; doing both at once would bundle two
   // task blocks.  Future work: lift the FP16 reject in both indexed and
   // non-indexed paths together.
@@ -337,7 +337,7 @@ class Decoder {
   // viewed as 2x4 BF16 matrices; computes Vd += Vn * Vm^T per the
   // ARM ARM C7.2.55 pseudo-code.  Always 128-bit (Q=1).
   //
-  // Handoff-51 follow-ups (Armv8.6-BF16 surface closeout):
+  // Follow-ups (Armv8.6-BF16 surface closeout):
   //   - kBfmlalbVec / kBfmlaltVec — BFMLALB/BFMLALT (vector).
   //     Per-FP32-lane widening MAC; B=even (h[2i]), T=odd (h[2i+1]).
   //     Encoding: bits[28:24]=01110, bits[23:22]=11, bit21=0,
@@ -2219,7 +2219,7 @@ class Decoder {
         //   CSDB  = CRm=0010, op2=100  (HINT #20, Armv8.0-PRED)
         //   PAC/AUT-1716, BTI, etc. also live here at higher hint
         //   numbers.  All are correctly NOPed for binary translation.
-        // explicit BTI audit (handoff-45): BTI guards live in
+        // explicit BTI audit: BTI guards live in
         // the HINT space with CRm=0100; the four variants are
         //   BTI    = CRm=0100, op2=000  (HINT #32 = 0x20)
         //   BTI c  = CRm=0100, op2=010  (HINT #34 = 0x22)
@@ -2318,8 +2318,8 @@ class Decoder {
     // Rn=11111 (XZR) which would otherwise be misrouted.  BRAA/BRAB
     // (opc=1000) and BLRAA/BLRAB (opc=1001) currently bail to Undefined.
     // PAC modifier in op4/Rm is ignored: Digitalis never inserts PAC bits
-    // into pointers (see handoff-30), so Rn already holds the clean
-    // target — no masking is needed.
+    // into pointers, so Rn already holds the clean target — no masking
+    // is needed.
     uint8_t op3 = GetBits<10, 6>();
     bool is_pac = (op3 == 0b000010 || op3 == 0b000011);
     // endregion
@@ -4012,9 +4012,9 @@ class Decoder {
       // pointer and the destination (Xn is just the modifier salt).  For a
       // PAC-blind translator the identity is Xd' = Xd — so the source we
       // hand to the existing DataProc1Src callback must be Xd, not Xn.
-      // Passing rn here (as the pre-handoff-41 code did) caused PACIA/AUTIA
-      // and the rest of the on-register PAC family to overwrite Xd with the
-      // value of Xn, silently miscompiling any PAuth probe / verifier.
+      // Passing rn here (as earlier code did) caused PACIA/AUTIA and the
+      // rest of the on-register PAC family to overwrite Xd with the value
+      // of Xn, silently miscompiling any PAuth probe / verifier.
       // Z-variants (PACIZA et al.) encode Rn=11111 (XZR) and XPACI/XPACD
       // similarly use XZR as Rn — passing rd uniformly is still correct
       // because the architectural input register is always Xd.
@@ -4178,7 +4178,7 @@ class Decoder {
   //   - FCADD with bit11 != 0 (unallocated).
   //
   // size == 01 (FP16): both Q=0 (.4h, 2 pairs) and Q=1 (.8h, 4 pairs) are
-  // accepted (handoff-61, FP16 SIMD FCMA). Interpreter promotes
+  // accepted (FP16 SIMD FCMA). Interpreter promotes
   // each half-precision lane to binary32 via FpHalfToSingle, applies the
   // FCMA rotation table, and narrows back via FpSingleToHalf — same
   // round-trip pattern as FP16 vector three-same / two-reg-misc.
@@ -4260,7 +4260,7 @@ class Decoder {
   //   bit30 = T (B/T discriminator).  Q is implicit 1 (BFMLAL is always .4s).
   //   bit12 must be 1 (bits[15:10]=111111).  bit30=0 -> BFMLALB; bit30=1 -> BFMLALT.
   //
-  // llvm-mc-verified encodings (handoff-51):
+  // llvm-mc-verified encodings:
   //   bfmlalb v0.4s, v1.8h, v2.8h   = 0x2ec2fc20  (bit30=0, T=B)
   //   bfmlalt v0.4s, v1.8h, v2.8h   = 0x6ec2fc20  (bit30=1, T=T)
   void DecodeAdvSimdBf16ThreeSame() {
@@ -4504,7 +4504,7 @@ class Decoder {
   // Opcodes that aren't implemented yet (FRINT* / FCVT* round-mode /
   // SCVTF/UCVTF/FRECPE/FRSQRTE in FP16 form) route to Undefined() until
   // the interpreter grows the handlers; this matches the three-same
-  // pairwise-reject pattern (handoff-57).
+  // pairwise-reject pattern.
   void DecodeAdvSimdFp16TwoRegMisc() {
     bool q = GetBits<30, 1>();
     bool u = GetBits<29, 1>();
@@ -5789,7 +5789,7 @@ class Decoder {
     // and size=11 falls into the existing FP MLA/MLS/MUL switch (which
     // would reject opcode=1111 as default Undefined).
     //
-    // Encoding cross-checks (llvm-mc, handoff-51):
+    // Encoding cross-checks (llvm-mc):
     //   bfdot   v0.4s,v1.8h,v17.2h[0] = 0x4f51f020   (Vm=17 via M:Rm)
     //   bfdot   v0.4s,v1.8h,v2.2h[3]  = 0x4f62f820   (index=3 via H:L)
     //   bfmlalb v0.4s,v1.8h,v15.h[0]  = 0x0fcff020   (Vm=15 via Rm[3:0])
@@ -5882,10 +5882,10 @@ class Decoder {
     //   bit22=1 (raw bits[23:22] = 0b11) -> this is the FMLA-FP64 slot;
     //     FCMLA does NOT use it.
     //   bit23=0,bit22=1 (raw bits[23:22] = 0b01) -> FP16.  Parked
-    // alongside non-indexed FP16 (handoff-49 rejects FP16-SIMD
-    //     FCMA until the family is implemented end-to-end).
+    // alongside non-indexed FP16 (the non-indexed FP16-SIMD FCMA path
+    //     rejects until the family is implemented end-to-end).
     //
-    // llvm-mc-verified FP32 encodings (handoff-58 derivation):
+    // llvm-mc-verified FP32 encodings:
     //   fcmla v0.4s, v1.4s, v2.s[0], #0   = 0x6F821020
     //   fcmla v0.4s, v1.4s, v2.s[1], #0   = 0x6F821820  (H=1)
     //   fcmla v0.4s, v1.4s, v2.s[0], #90  = 0x6F823020  (rot=01)
@@ -5920,7 +5920,7 @@ class Decoder {
         return;
       }
       if (size == 0b01) {
-        // FP16 (handoff-61, FP16 SIMD FCMA indexed):
+        // FP16 (FP16 SIMD FCMA indexed):
         //   Q=1 (.8h): index = H:L (2 bits, 0..3) — Vm.8H has 4 pairs.
         //   Q=0 (.4h): index = L only (1 bit, 0..1); H must be 0.
         if (!q && H) { Undefined(); return; }
@@ -5955,7 +5955,7 @@ class Decoder {
       // 64-bit: Vm = M:Rm, index = H
       rm = (M << 4) | Rm4;
       index = H;
-    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL (handoff-62)
+    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
     //
     // FP16 by-element FMLA/FMLS/FMUL — Armv8.2-FP16.  Encoding pattern:
     //   0 Q 0 01111 00 L M Rm[3:0] opcode H 0 Rn Rd
@@ -5971,7 +5971,7 @@ class Decoder {
     // is reserved by the architecture (8-bit indexed MLA does not exist),
     // so this carve-out only fires for FP opcodes (and only U=0).  Integer
     // MLA-idx with size=01 (.4h/.8h elements) is a separate path still
-    // routed to Undefined below — out of scope for handoff-62.
+    // routed to Undefined below — out of scope here.
     } else if (size == 0b00) {
       if (u || (opcode != 0b0001 && opcode != 0b0101 && opcode != 0b1001)) {
         Undefined();
@@ -5980,12 +5980,12 @@ class Decoder {
       rm = Rm4;
       index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
     // endregion
-    // region digitalis - Plan §H-followup: integer MLA/MLS/MUL-idx halfword (handoff-64)
+    // region digitalis integer MLA/MLS/MUL-idx halfword
     //
     // Integer MUL/MLA/MLS by-element with halfword elements (.4h/.8h) —
     // Armv8-A baseline (not an extension; just a previously deferred
-    // decoder gap, see handoff-63 standing item "Integer MLA/MLS/MUL-idx
-    // with size=0b01").  Encoding pattern (per ARM ARM C7.2):
+    // decoder gap for "Integer MLA/MLS/MUL-idx with size=0b01").
+    // Encoding pattern (per ARM ARM C7.2):
     //   0 Q U 01111 01 L M Rm[3:0] opcode H 0 Rn Rd
     // Vm restricted to V0..V15 — the bit-20 M slot is consumed by the
     // index field rather than as Vm's high bit, identical to the
@@ -6002,7 +6002,7 @@ class Decoder {
     // else-branch in AdvSimdVecXIndexedElement (esize = 2), so no
     // interpreter change is needed.
     //
-    // llvm-mc-verified encodings (handoff-64):
+    // llvm-mc-verified encodings:
     //   mul  v0.4h, v1.4h, v2.h[0] = 0x0f428020
     //   mul  v0.8h, v1.8h, v2.h[7] = 0x4f728820
     //   mla  v0.4h, v1.4h, v2.h[0] = 0x2f420020
@@ -6048,13 +6048,13 @@ class Decoder {
         break;
         // endregion
       case 0b1000:
-        // region digitalis follow-up (handoff-67): reject reserved
+        // region digitalis follow-up: reject reserved
         // opcode=1000 with U=1.  Per ARM ARM C7.2 AdvSIMD-vector-x-indexed-element:
         //   U=0, opcode=1000 -> MUL (by element) — kept as kMul.
         //   U=1, opcode=1000 -> RESERVED — there is no instruction at this slot.
         //     MLA-by-element is encoded at opcode=0000 with U=1 (handled by the
         //     `case 0b0000` arm below); SQRDMLAH-by-element (Armv8.1-RDM) is at
-        //     opcode=1101 (not implemented anywhere here yet).
+        //     opcode=1101 (not implemented here yet).
         // The previous code silently mapped this reserved slot to kMla, which
         // produced wrong results without any SIGILL — a textbook silent decoder
         // mis-route.  We now route reserved encodings to Undefined so a guest
@@ -6625,9 +6625,9 @@ class Decoder {
       // than both, so routing to kLdar (which the interpreter and JIT
       // already implement as a plain x86 load) is correctness-preserving.
       // Encoding ref: ARM ARM DDI 0487 C7.2.156 (LDAPR).
-      // Handoff-31 picked case 0b1111 here, which never fired -- the bug
-      // surfaced when hello-lrcpc (handoff-42) issued the explicit
-      // instruction via inline asm and SIGILL'd on the first probe.
+      // An earlier revision picked case 0b1111 here, which never fired --
+      // the bug surfaced when hello-lrcpc issued the explicit instruction
+      // via inline asm and SIGILL'd on the first probe.
       case 0b1100: {
         if (rs != 0b11111) {
           Undefined();

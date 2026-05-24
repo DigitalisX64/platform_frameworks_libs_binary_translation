@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-// Follow-up to handoff-155's SIGUSR1 stress test: lock down the dual-ABI
+// Follow-up to an earlier SIGUSR1 stress test: lock down the dual-ABI
 // signal-handler dispatch path through GuestSignalAction::Change() for the
 // arm64 guest. The hello-jni stress test observed that sa_handler-style
 // guest actions (sa_flags=0) appeared not to deliver signals, while

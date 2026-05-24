@@ -23,7 +23,7 @@
 // in the arm64 guest libc.so. The other ~1340 symbols still resolve correctly
 // — they just go through full instruction-by-instruction translation of the
 // guest libc.so code instead of dispatching directly to the host x86_64 libc.
-// The audit in handoff-253 enumerated 121 specific symbols (e.g. memrchr,
+// A prior audit enumerated 121 specific symbols (e.g. memrchr,
 // strchrnul, the LFS-64 aliases, the isnan/isinf family) where adding a
 // host-passthrough fast-path is a strict speedup with no correctness change.
 //

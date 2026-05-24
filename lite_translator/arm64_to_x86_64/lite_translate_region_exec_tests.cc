@@ -1643,7 +1643,7 @@ constexpr uint32_t StpXPostIndex(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t im
 
 // LDP X3, X4, [X5, #0x10]!  (pre-index)
 // Verifies (a) the load reads from base+offset, not base, and (b) the base
-// register is updated to base+offset.  Pre-handoff-39 the decoder mis-routed
+// register is updated to base+offset.  An earlier decoder revision mis-routed
 // this as signed-offset, so the load was correct but the base writeback was
 // missing — LLVM-emitted prologues that use [sp,#-N]! to allocate frame would
 // then leave sp unmodified and corrupt the stack on the matching epilogue.
@@ -1744,8 +1744,8 @@ TEST_F(Arm64LiteTranslateRegionTest, StpPostIndexAliasRn) {
 // endregion
 
 // region digitalis atomic-op JIT exec-tests.
-// The interpreter path was verified by hello-lse (handoff-37) and hello-barriers
-// (handoff-38) at the integration level, but until now the JIT path for LSE
+// The interpreter path was verified by hello-lse and hello-barriers
+// at the integration level, but until now the JIT path for LSE
 // atomics had zero unit-test coverage.  A hot-loop regression would slip past
 // the integration probe because hello-lse runs each op a small fixed number of
 // times — a CMPXCHG-loop drop-out (e.g. wrong size of cmpxchg, wrong reg into
@@ -2129,7 +2129,7 @@ TEST_F(Arm64LiteTranslateRegionTest, BarriersDoNotBreakRegion) {
 // endregion
 
 // region digitalis - FCVT*S/U scalar saturation diagnostic tests.
-// Used to debug the unsigned sf=1 +Inf saturation path (handoff-99).
+// Used to debug the unsigned sf=1 +Inf saturation path.
 constexpr uint32_t kFcvtnuXd0 = 0x9E610000;  // FCVTNU X0, D0
 constexpr uint32_t kFcvtpuXs0 = 0x9E290000;  // FCVTPU X0, S0
 constexpr uint32_t kFcvtmsXs0 = 0x9E300000;  // FCVTMS X0, S0
@@ -2189,7 +2189,7 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtnuXdFromMemoryPosInfSaturates) {
 // DISABLED diagnostic: shows that when 13 prior MOVZ map all 13 GP slots,
 // IsGpRegPoolLow terminates the JIT region before reaching the FCVTNU.
 // This is the on-device scenario where the interpreter ARM-saturation fix
-// in interpreter.h (handoff-99) catches the FCVTNU instead.  The Run()
+// in interpreter.h catches the FCVTNU instead.  The Run()
 // framework only translates one region and does not invoke the interpreter
 // fallback, so this test cannot pass without separate interpreter coverage.
 TEST_F(Arm64LiteTranslateRegionTest, DISABLED_FcvtnuXdPosInfWithRegPressure) {
@@ -7449,7 +7449,7 @@ TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarSignallingNanQuieted) {
 //   bfcvtn2 v0.8h, v1.4s   = 0x4EA16820
 //
 // JIT lowering in `lite_translator.h` AdvSimdTwoRegMisc kBfcvtn case applies
-// the same RTNE primitive as scalar BFCVT (handoff-228) vectorized over 4
+// the same RTNE primitive as scalar BFCVT vectorized over 4
 // FP32 lanes via PCMPEQD/PSRLD/PSLLD/PADDD/PANDN/PACKUSDW.  Constants are
 // synthesized from PCMPEQD all-ones via shifts (no rodata, no AVX-512-BF16).
 constexpr uint32_t BfcvtnVec(uint8_t rd, uint8_t rn) {
@@ -12024,7 +12024,7 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8H_FromW7_HighBitsIgnored) {
 // __dl_calloc at linker64+0x99f44 — without an extra memset; the small-
 // object allocator's own per-block memset is the only zeroing pass).
 //
-// Handoff-257 traced the VkCapsViewer splash hang to that table containing
+// Earlier debugging traced the VkCapsViewer splash hang to that table containing
 // non-zero garbage after allocation: every probed bucket showed leftover
 // heap content with `top12bits == 0` and a non-zero lower 20 bits, which
 // AddToMap can never produce for a real ZIP entry.  That signature is what
@@ -12132,7 +12132,7 @@ TEST_F(Arm64LiteTranslateRegionTest, MemsetAarch64_1024ByteZeroFill_Unrolled) {
 // mapping, a CodePool collision, a wrong NZCV save/restore around the
 // dispatcher's signal check, etc. — a fraction of the 64-byte stores per
 // iteration are lost.  That matches the bucket-corruption signature
-// (top12==0, low20!=0) observed in handoffs 256-260: a freshly calloc'd
+// (top12==0, low20!=0) observed in earlier debugging: a freshly calloc'd
 // 1024-byte ZipStringOffset20 bucket table comes out partially zeroed.
 //
 // This test installs the loop body as a real TranslationCache entry so
@@ -12252,7 +12252,7 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, MemsetAarch64_1024ByteZeroFill_BhiL
 // The bucket-corruption signature observed in VkCaps' wedge (top12 == 0,
 // low20 != 0) is consistent with the second STR being silently dropped
 // after BFI: the first half of the RMW happened (low20 written), but the
-// second store didn't commit.  Handoff-261 ruled out the b.hi-loop
+// second store didn't commit.  Earlier debugging ruled out the b.hi-loop
 // region-transition theory; this test probes the next-most-likely
 // suspect: STR (register, 32-bit) with shifted-register offset under a
 // dispatch-enabled backward branch.
@@ -12511,7 +12511,7 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketFindUnderDispatch_UXT
 // `bfi w9, w19, #20, #12` to write the 12-bit length at bit 20.
 // If BFM's JIT (or its interpreter fallback) silently drops STORE 2,
 // the bucket ends up with top12bits == 0 — exactly the wedged-VkCaps
-// signature handoffs 256–258 chased.
+// signature earlier debugging chased.
 //
 // Encodings cross-checked with the ARM ARM C6.2.34 / C6.2.35 / C6.2.36.
 //   BFI w9, w19, #20, #12   = 0x330C2E69  (sf=0, opc=01, immr=12, imms=11)
@@ -16468,7 +16468,7 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqrshrun2Vec8HShift5) {
 // SDOT: U=0 (signed byte products).  UDOT: U=1 (unsigned).
 // Q=0 reads only the low 8 bytes of Vn (and Vm for vector form), writes
 // 2 lanes of Vd, and zero-clears the upper 64 bits.
-// JIT lowering implemented at lite_translator.h:2093 (handoff-71) via
+// JIT lowering implemented at lite_translator.h:2093 via
 // PMOVSXBW/PMOVZXBW + PMADDWD + PHADDD + PADDD (SSE4.1 + SSSE3).
 
 constexpr uint32_t DotProdVec(uint8_t q, uint8_t u,

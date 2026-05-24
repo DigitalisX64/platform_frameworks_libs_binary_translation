@@ -1535,7 +1535,7 @@ class LiteTranslator {
   void MteLoadStore(const Decoder::MteLoadStoreArgs&) { success_ = false; }
   // endregion
 
-  // region digitalis FCADD/FCMLA JIT (handoff-69)
+  // region digitalis FCADD/FCMLA JIT
   //
   // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32
   // and FP64.  The interpreter (interpreter.h::AdvSimdFcma) is the
@@ -1573,7 +1573,7 @@ class LiteTranslator {
   // VCVTPH2PS round-trip; that's a follow-up perf row.
   void AdvSimdFcma(const Decoder::FcmaArgs& args) {
     if (args.size == 0b01) {
-      // region digitalis FP16 vector FCMA JIT (handoff-91)
+      // region digitalis FP16 vector FCMA JIT
       //
       // Lower FP16 FCADD/FCMLA via F16C round-trip: widen each operand
       // half (4 FP16 lanes = 2 complex pairs) to FP32, run the FP32
@@ -1922,7 +1922,7 @@ class LiteTranslator {
   // round-trip follow-up as the FP16 FCMA-vector row.
   void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
     if (args.size == 0b01) {
-      // region digitalis FP16 indexed FCMLA JIT (handoff-91)
+      // region digitalis FP16 indexed FCMLA JIT
       //
       // Lower FP16-indexed FCMLA via F16C round-trip on each half: read
       // the indexed complex pair Vm[2*index : 2*index+1] (2 FP16) into
@@ -2455,7 +2455,7 @@ class LiteTranslator {
   }
   // endregion
 
-  // region digitalis SDOT/UDOT JIT (handoff-71)
+  // region digitalis SDOT/UDOT JIT
   //
   // AdvSIMD integer dot product: SDOT/UDOT (vector and indexed-by-element).
   // Reference: ARM ARM C7.2.397 (SDOT), C7.2.398 (UDOT).
@@ -4084,7 +4084,7 @@ class LiteTranslator {
     // interpreter for non-canonical pairs rather than guess.
     //
     // Doubleword variant (UMOV Xd, Vn.D[i]) must use a 64-bit memory load
-    // (movq, REX.W) — handoff-19's DUP fix flagged 32-bit-MOVD-vs-64-bit-MOVQ
+    // (movq, REX.W) — an earlier DUP fix flagged 32-bit-MOVD-vs-64-bit-MOVQ
     // as a load-bearing class of bug; the switch below is explicit about
     // which mov-width belongs at each esize.
     if (args.opcode == Decoder::AdvSimdCopyOpcode::kUmov && esize != 0) {
@@ -4315,7 +4315,7 @@ class LiteTranslator {
       // into the XMM register; using 32-bit MOVD here silently truncates the
       // upper half and the subsequent PSHUFD(0x44) then duplicates the low
       // 32-bit value into both D-lanes. That was the FB libcoldstart Yoga
-      // layout x21 truncation bug (handoff-18): DUP V0.2D, X21 produced
+      // layout x21 truncation bug: DUP V0.2D, X21 produced
       // V0 = {lo32(x21), lo32(x21)} instead of {x21, x21}, so when the
       // surrounding INS/UMOV spill cycle later reloaded X21 from V0.D[1]
       // it got the 32-bit-truncated pointer and the next post-indexed STR
@@ -9503,7 +9503,7 @@ class LiteTranslator {
         }
         if (args.is_fp16) {
           // .4H (Q=0) and .8H (Q=1) — F16C round-trip with ROUNDPS imm.
-          // Per standing rule (handoff-82): F16C round-trip is exact for
+          // Per standing rule: F16C round-trip is exact for
           // FP16 unary FRINT*. Pattern identical to FSQRT FP16 but with
           // ROUNDPS instead of SQRTPS.
           if (!host_platform::kHasF16C) { success_ = false; return; }
@@ -9560,7 +9560,7 @@ class LiteTranslator {
       // nearest, ties away".
       // x86 ROUNDPS/PD has no ties-away mode, so use the identity
       //     FRINTA(x) = trunc(x + copysign(0.5, x))
-      // already used by the scalar FRINTA JIT path (handoff-81).  Per-lane:
+      // already used by the scalar FRINTA JIT path.  Per-lane:
       // build (x AND sign_mask) OR half_pattern  ->  +/-0.5, add to x, ROUND
       // imm=3.  Bit-exact against ARM for all finite/NaN/Inf inputs (the
       // +0.5 nudge is a no-op when |x| >= 2^p; signed zeros preserved by
@@ -10245,7 +10245,7 @@ class LiteTranslator {
       //     FCVTA*(x) = trunc(x + addend)
       // where p is the FP mantissa precision (23 for FP32, 52 for FP64).
       // The magnitude gate is required to avoid the ties-to-even bump on
-      // odd-mantissa integers >= 2^p (handoff-79): for |x| >= 2^p, x is
+      // odd-mantissa integers >= 2^p: for |x| >= 2^p, x is
       // already integer in its FP type, so the addend must be zero.
       //
       // After the FRINTA add-and-trunc step, xn holds the round-to-nearest-
@@ -12558,9 +12558,9 @@ class LiteTranslator {
     // binary64 (std::fma((double)a, (double)b, (double)d)) and
     // narrows once to FP16, so we promote the widened FP32 lanes to
     // FP64 and use VFMADD231PD / VFNMADD231PD — the same FP64
-    // round-trip shape as the three-same FP16 FMLA/FMLS path
-    // implemented in handoff-129.  An FP32-only round-trip would
-    // double-round and diverge from the interpreter for some inputs.
+    // round-trip shape as the existing three-same FP16 FMLA/FMLS path.
+    // An FP32-only round-trip would double-round and diverge from the
+    // interpreter for some inputs.
     if (args.size == 0b00) {
       if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
           args.opcode != Op::kFmul) {
