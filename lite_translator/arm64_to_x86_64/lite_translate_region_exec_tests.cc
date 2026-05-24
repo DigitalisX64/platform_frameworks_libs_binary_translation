@@ -12322,6 +12322,93 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketRmwUnderDispatch) {
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU)
       << "trailing guard clobbered — STR base/shift bug";
 }
+
+// Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
+// CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
+// shifted-register addressing form (option=010, S=1), which is a DIFFERENT
+// JIT code path from the UXTX/LSL form (option=011) covered by
+// AddToMapBucketRmwUnderDispatch above.  Live debugging of a wedged
+// VkCapsViewer this cycle showed:
+//   - bucket array (256 × uint32_t at x25) is all zero
+//   - x24 = 75 (probe index), x26 = 0xff (mask)
+//   - thread spins forever in this loop
+//   - the bucket array is empty, so b.eq must take on iteration 0 yet
+//     the loop never exits
+// This pins the wedge on the UXTW LDR path.  The test runs an all-zero
+// 256-entry bucket array and asserts the loop exits on iteration 0.
+// Minimal pin-test for the production AddToMap bucket-FIND load:
+//   ldr w8, [x25, w24, uxtw #2]   (encoding 0xb8785b28, option=010 UXTW, S=1)
+// All existing host tests use option=011 (LSL/UXTX, encoding 0xb8787909).
+// Direct memory dump of a wedged VkCapsViewer this cycle showed the 256-entry
+// bucket array at x25 is fully zero, yet the linker's bucket-find loop
+// (CdEntryMapZip32<ZipStringOffset20>::AddToMap) does not exit via its
+// b.eq empty-bucket branch.  This pins the JIT's UXTW load path on a
+// minimal-no-branch sequence so we can rule it in or out cleanly.
+TEST_F(Arm64LiteTranslateRegionTest, LdrW_UXTW_ShiftedReg_ReadsZeroFromZeroBucket) {
+  // bucket[75] = 0, all guard bytes recognizable.
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0u;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);  // bucket array base
+  state_.cpu.x[24] = 75;                         // probe index (matches debuggerd snapshot)
+  state_.cpu.x[8] = 0xbaadf00dULL;               // poison so a skipped LDR is caught
+  state_.cpu.x[0] = 0xbaadf00dULL;
+
+  // Two instructions: the LDR, plus a MOV that copies x8 to x0 (so even if
+  // x8 is mapped/spilled differently, the result is observable via x0).
+  static const uint32_t code[] = {
+      0xb8785b28,  // ldr w8, [x25, w24, uxtw #2]
+      0xaa0803e0,  // mov x0, x8
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  // The JIT must read 0 from bucket[75] and write that into x8 (and via
+  // the mov, into x0).  Both must be 0.  Any non-zero result is the JIT
+  // bug: the UXTW address computation read from somewhere other than
+  // &buckets[1+75], OR the 32-bit load did not zero-extend correctly.
+  EXPECT_EQ(state_.cpu.x[8], 0ULL)
+      << "LDR-UXTW read 0x" << std::hex << state_.cpu.x[8]
+      << " from bucket[75] (which is verifiably zero in memory at "
+      << ToGuestAddr(&buckets[1 + 75]) << ").  Address computed by JIT was wrong.";
+  EXPECT_EQ(state_.cpu.x[0], 0ULL)
+      << "mov x0, x8 propagated x8=0x" << std::hex << state_.cpu.x[0]
+      << " — confirms x8 was set to non-zero by the LDR.";
+
+  // Guards untouched.
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+
+// Same shape, but with a non-zero bucket value, to verify the LDR DOES
+// read the correct address (i.e., this test must PASS regardless of the
+// JIT-UXTW bug — it just confirms the addressing math is reachable).
+TEST_F(Arm64LiteTranslateRegionTest, LdrW_UXTW_ShiftedReg_ReadsNonZeroFromBucket75) {
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  for (size_t i = 0; i < kNumSlots + 2; ++i) {
+    buckets[i] = 0xcafebabeU;  // recognizable sentinel everywhere
+  }
+  buckets[1 + 75] = 0x12345678U;  // distinct value at the indexed slot
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 75;
+  state_.cpu.x[8] = 0xbaadf00dULL;
+  state_.cpu.x[0] = 0xbaadf00dULL;
+
+  static const uint32_t code[] = {
+      0xb8785b28,  // ldr w8, [x25, w24, uxtw #2]
+      0xaa0803e0,  // mov x0, x8
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_EQ(state_.cpu.x[8], 0x12345678ULL);
+  EXPECT_EQ(state_.cpu.x[0], 0x12345678ULL);
+}
 // endregion
 
 // region digitalis: BFM (BFI / BFXIL) JIT
