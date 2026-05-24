@@ -12938,6 +12938,117 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   cache->InvalidateGuestRange(code_start, code_end);
 }
 
+// Hypothesis G.2c.1 — w9 pre-BFI contents trigger a JIT RMW mis-translation.
+//
+// Handoff-279's peek dump showed 118/256 buckets in the wedged VkCapsViewer
+// have bits[31:20]=0 (length field zeroed) and bits[19:0]!=0 (offset
+// preserved).  Determinism across cold starts rules out signal-clobber.  The
+// existing 5-insn-under-dispatch tests with default w9 patterns PASS, so the
+// hypothesis is that some specific bit pattern of w9 at the moment BFI runs
+// causes the JIT's BFI lowering to emit a no-op or wrong-mask for that value.
+//
+// This test sweeps w9's pre-BFI contents across representative non-zero
+// patterns.  For each pattern: pre-seed buckets[0] = w9_pattern, drive a
+// single-iteration insert (kNumSlots=1) through the SAME 5-insn-under-
+// dispatch path used by AddToMapBucketTwoStepInsertUnderDispatch_Full5Insn,
+// and verify the bucket ends up with bits[31:20] = 0xAAA (the BFI'd length).
+//
+// We seed via x[8] (which STORE 1 writes into buckets[0], and which LDR w9
+// then reloads — so the value w9 holds at BFI is precisely the low-32 of
+// x[8]).  If ANY pattern produces a bucket with length=0, G.2c.1 is
+// reproduced in isolation and we have a unit-level repro to drive a fix.
+// If all patterns PASS, G.2c.1 is disproved at this depth; the next move is
+// G.2c.2 (decoder mis-dispatch of the specific BFI encoding variant).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_W9PatternSweep) {
+  // Same 5-insn insert + loop tail as AddToMapBucketTwoStepInsertUnderDispatch
+  // _Full5Insn, but parameterized over kNumSlots and a per-run w8 pattern.
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; reload x8 = base
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]    ; w9 = bucket value
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12        ; splice length
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2
+      0x91000718,  // [20] add  x24, x24, #1
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28  -> back to [0]
+  };
+
+  // Patterns chosen to span: all-zero (baseline), all-ones, the length-field
+  // already all-ones (0xfff00000), offset-only (low 20), high-byte-only,
+  // single-bit-in-length-field, and a few arbitrary 32-bit values.  If the
+  // JIT's BFI lowering has a value-dependent miscompile, one of these should
+  // trigger length=0 in the STORE 2 result.
+  static const uint32_t kW8Patterns[] = {
+      0x00000000U,  // all zero (control — already tested elsewhere, passes)
+      0xFFFFFFFFU,  // all ones (BFI must clear bits[31:20] before OR'ing 0xAAA)
+      0xFFF00000U,  // length field already full of 1s
+      0x00012345U,  // offset-only pattern (default test uses this)
+      0x000FFFFFU,  // max-offset-only (low 20 bits set, high 12 clear)
+      0xFFF12345U,  // length=0xFFF + non-zero offset
+      0x00100000U,  // single bit at length[0]
+      0x80000000U,  // sign bit only
+      0x7FFFFFFFU,  // all bits except sign
+      0xAAAAAAAAU,  // alternating bits
+      0x55555555U,  // alternating bits (complement)
+      0xDEADBEEFU,  // arbitrary
+      0xCAFEBABEU,  // arbitrary
+      0x12345678U,  // arbitrary
+      0x00000FFFU,  // low 12 bits set (might collide with the field mask
+                    // computed in the JIT — important to test)
+      0xFFF80000U,  // length=0xFFF + bit at offset[19]
+  };
+
+  for (uint32_t w8_pattern : kW8Patterns) {
+    constexpr size_t kNumSlots = 1;
+    alignas(16) static uint32_t buckets[kNumSlots + 2];
+    buckets[0] = 0xfeedfaceU;
+    buckets[1] = 0;  // calloc-equivalent pre-fill — STORE 1 will overwrite.
+    buckets[2] = 0xdeadbeefU;
+
+    alignas(8) static uint64_t map_struct[4];
+    map_struct[0] = 0;
+    map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+    map_struct[2] = 0;
+    map_struct[3] = 0;
+
+    std::memset(&state_.cpu, 0, sizeof(state_.cpu));
+    state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+    state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+    state_.cpu.x[24] = 0;
+    state_.cpu.x[2] = kNumSlots;
+    state_.cpu.x[19] = 0xAAA;
+    state_.cpu.x[8] = static_cast<uint64_t>(w8_pattern);
+
+    ASSERT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)))
+        << "RunWithDispatch failed for pattern 0x" << std::hex << w8_pattern;
+
+    EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop must exit (x2 reaches 0) for pattern 0x"
+                                     << std::hex << w8_pattern;
+    EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must reach kNumSlots for pattern 0x"
+                                           << std::hex << w8_pattern;
+
+    const uint32_t bucket = buckets[1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    EXPECT_EQ(length, 0xAAAU)
+        << "G.2c.1 REPRODUCED for pattern 0x" << std::hex << w8_pattern
+        << ": bucket=0x" << bucket << " (length=0x" << length
+        << ", expected 0xAAA — STORE 2's BFI was dropped)";
+
+    // Sanity: the offset half must equal the pattern's low 20 bits (what
+    // STORE 1 wrote and was preserved through BFI).
+    const uint32_t offset = bucket & 0xfffffU;
+    EXPECT_EQ(offset, w8_pattern & 0xfffffU)
+        << "STORE 1's offset half corrupted for pattern 0x" << std::hex
+        << w8_pattern << ": got 0x" << offset;
+
+    EXPECT_EQ(buckets[0], 0xfeedfaceU)
+        << "leading guard clobbered for pattern 0x" << std::hex << w8_pattern;
+    EXPECT_EQ(buckets[2], 0xdeadbeefU)
+        << "trailing guard clobbered for pattern 0x" << std::hex << w8_pattern;
+  }
+}
+
 // region digitalis: Hypothesis C — surrounding-code interaction.
 //
 // Combines production's bucket-FIND loop body (LDR + ANDS + b.eq) AND the
