@@ -5429,6 +5429,78 @@ class Interpreter {
         }
         break;
       }
+      // region digitalis - scalar FCVTAS / FCVTAU.
+      // Single-lane collapse of vector kFcvtasV/kFcvtauV. std::round() is
+      // round-to-nearest with ties-away-from-zero, which matches the ARM ARM
+      // FCVTAS/FCVTAU semantics. NaN → 0 (signed) / 0 (unsigned). Out-of-range
+      // saturates to INT_MAX/MIN or UINT_MAX. sz=args.size&1 chooses single
+      // (0) vs double (1); the decoder pins bit23=0 so args.size ∈ {0, 1}.
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtas:
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtau: {
+        bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtau);
+        if ((args.size & 1) == 0) {
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          float r = std::isnan(fval) ? fval : std::round(fval);
+          if (is_unsigned) {
+            uint32_t ival;
+            if (std::isnan(fval) || r < 0.0f) {
+              ival = 0;
+            } else if (r >= static_cast<float>(UINT32_MAX)) {
+              ival = UINT32_MAX;
+            } else {
+              ival = static_cast<uint32_t>(r);
+            }
+            memcpy(&result, &ival, sizeof(ival));
+          } else {
+            int32_t ival;
+            if (std::isnan(fval)) {
+              ival = 0;
+            } else if (r >= static_cast<float>(INT32_MAX)) {
+              ival = INT32_MAX;
+            } else if (r <= static_cast<float>(INT32_MIN)) {
+              ival = INT32_MIN;
+            } else {
+              ival = static_cast<int32_t>(r);
+            }
+            uint32_t uval;
+            memcpy(&uval, &ival, sizeof(uval));
+            memcpy(&result, &uval, sizeof(uval));
+          }
+        } else {
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double r = std::isnan(fval) ? fval : std::round(fval);
+          if (is_unsigned) {
+            uint64_t ival;
+            if (std::isnan(fval) || r < 0.0) {
+              ival = 0;
+            } else if (r >= static_cast<double>(UINT64_MAX)) {
+              ival = UINT64_MAX;
+            } else {
+              ival = static_cast<uint64_t>(r);
+            }
+            memcpy(&result, &ival, sizeof(ival));
+          } else {
+            int64_t ival;
+            if (std::isnan(fval)) {
+              ival = 0;
+            } else if (r >= static_cast<double>(INT64_MAX)) {
+              ival = INT64_MAX;
+            } else if (r <= static_cast<double>(INT64_MIN)) {
+              ival = INT64_MIN;
+            } else {
+              ival = static_cast<int64_t>(r);
+            }
+            uint64_t uval;
+            memcpy(&uval, &ival, sizeof(uval));
+            memcpy(&result, &uval, sizeof(uval));
+          }
+        }
+        break;
+      }
+      // endregion
       // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
       // Each is the single-lane collapse of the corresponding vector op
       // implemented in AdvSimdTwoRegMisc above; the result is the lane

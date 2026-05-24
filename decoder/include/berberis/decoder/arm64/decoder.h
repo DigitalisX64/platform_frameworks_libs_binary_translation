@@ -1436,6 +1436,10 @@ class Decoder {
     kFrecpe,  // FRECPE  (scalar): FP reciprocal estimate                  (opcode=11101, U=0; size ∈ {10, 11})
     kFrsqrte, // FRSQRTE (scalar): FP reciprocal square-root estimate      (opcode=11101, U=1; size ∈ {10, 11})
     // endregion
+    // region digitalis - scalar FCVTAS / FCVTAU.
+    kFcvtas,  // FCVTAS (scalar): float → signed int, round-to-nearest ties-away (opcode=11100, U=0; size ∈ {00, 01})
+    kFcvtau,  // FCVTAU (scalar): float → unsigned int, round-to-nearest ties-away (opcode=11100, U=1; size ∈ {00, 01})
+    // endregion
     // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
     kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
     kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
@@ -5277,6 +5281,24 @@ class Decoder {
           // endregion
         }
         break;
+      // region digitalis - scalar FCVTAS / FCVTAU.
+      // opcode=11100 splits on bit23 of the `size` field per the ARM ARM
+      // "AdvSIMD scalar two-register miscellaneous (FP)" table:
+      //   bit23=0 (size ∈ {00, 01}): FCVTAS (U=0) / FCVTAU (U=1) —
+      //     FP → int, round-to-nearest ties-away-from-zero; sz=size&1
+      //     selects single (0) vs double (1).
+      //   bit23=1: no scalar form (vector URECPE/URSQRTE only).
+      // llvm-mc-21 encoding checks:
+      //   fcvtas s0, s1 → 0x5e21c820  (U=0, opcode=11100, size=00)
+      //   fcvtas d0, d1 → 0x5e61c820  (U=0, opcode=11100, size=01)
+      //   fcvtau s0, s1 → 0x7e21c820  (U=1, opcode=11100, size=00)
+      //   fcvtau d0, d1 → 0x7e61c820  (U=1, opcode=11100, size=01)
+      case 0b11100:
+        if ((size & 0b10) != 0) { Undefined(); return; }
+        op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtau
+               : AdvSimdScalarTwoRegMiscOpcode::kFcvtas;
+        break;
+      // endregion
       case 0b11011:
         // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero.
         // Per ARM ARM "AdvSIMD scalar two-register miscellaneous (FP)" table,
