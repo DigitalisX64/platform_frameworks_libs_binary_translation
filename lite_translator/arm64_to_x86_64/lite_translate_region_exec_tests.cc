@@ -12373,6 +12373,231 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketRmwUnderDispatch) {
       << "trailing guard clobbered — STR base/shift bug";
 }
 
+// Production AddToMap two-step insert (FULL 5-instruction sequence at linker
+// offsets 0x9cc68..0x9cc78 of CdEntryMapZip32<ZipStringOffset20>::AddToMap):
+//
+//   str  w8,  [x25, x24, lsl #2]    ; STORE 1: bucket = name_offset (low 20)
+//   ldr  x8,  [x21, #0x8]            ; reload x8 from map's bucket-pointer
+//                                    ;   (after the reload, x8 == x25)
+//   ldr  w9,  [x8,  x24, lsl #2]    ; reload the just-stored bucket value
+//   bfi  w9,  w19, #20, #12         ; splice 12-bit name_length at bits[31:20]
+//   str  w9,  [x8,  x24, lsl #2]   ; STORE 2: bucket = (length << 20) | offset
+//
+// The peek-tool live capture in the wedged VkCapsViewer showed 118/256 buckets
+// with length=0 and offset!=0 — exactly the signature of STORE 2 being
+// effectively dropped after STORE 1 committed.  This test runs the FULL 5-
+// instruction production sequence under dispatch with a backward-branch loop
+// (so the dispatch path with EmitDirectDispatch is exercised), driven over
+// 256 iterations, with the bucket array initially all zero (matching the
+// linker's calloc'd allocation).  After the loop, every bucket must have its
+// length field populated; any bucket with length=0 means STORE 2 didn't
+// commit for that iteration.
+//
+// Differences from AddToMapBucketRmwUnderDispatch above:
+//   * Includes STORE 1 (via x25), not just STORE 2 (via x8 after reload).
+//   * Includes the LDR x8 reload from a memory slot that aliases x25 — same
+//     bucket array reached via two different base registers.  The JIT must
+//     correctly serialize STORE 1's effect through the address-aliased LDR.
+//   * Pre-fills buckets to ZERO (matching calloc), not 0x12345678.  A length=0
+//     after the loop means STORE 2 didn't commit; with the all-zero pre-fill
+//     it's unambiguous (no risk of a sentinel value still being there).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsertUnderDispatch_Full5Insn) {
+  // Encodings round-tripped through aarch64-linux-gnu-as.
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; reload x8 = bucket base
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]    ; reload bucket
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12        ; splice length
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2
+      0x91000718,  // [20] add  x24, x24, #1
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28  -> back to [0]
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];  // +2 guards
+  buckets[0] = 0xfeedfaceU;                            // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;  // calloc-equivalent pre-fill (production's case)
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;                // trailing guard
+
+  // Pointer-alias slot: a uint64_t at [x21 + 0x8] that holds &buckets[1].
+  // Production has the CdEntryMapZip32 object at x21 with the hash_table_
+  // bucket-pointer field at offset +0x8; we replicate that layout here so
+  // `ldr x8, [x21, #0x8]` materializes the bucket array base.
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;                                   // would be other fields
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);  // [x21+0x8]
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  // x8 initially holds the "name_offset" for this hypothetical insert —
+  // a non-zero unique value so STORE 1 has something distinct to write.
+  state_.cpu.x[8] = 0x12345ULL;
+
+  EXPECT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop must exit (x2 reaches 0)";
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must reach kNumSlots";
+
+  // Each bucket must have length=0xAAA in bits[31:20] (the BFI'd value).
+  // Whether the offset bits[19:0] is the original 0x12345 (iter 0) or the
+  // low 20 bits of &buckets[1] (subsequent iters, because the LDR x8 reload
+  // overwrites x8 = bucket-array base, and STORE 1 in the NEXT iter writes
+  // that address back) doesn't matter — the test only checks the length
+  // half, which is what 118/256 production buckets are missing.
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "production-signature bug: " << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped); first at i=" << first_length_zero
+      << " value=0x" << std::hex << first_bad_bucket;
+
+  // Guards intact.
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+
+// Same 5-instruction insert sequence as the previous test, but with an
+// explicit region split forced at the production boundary observed via the
+// REGION_END_LOW diagnostic in lite_translate_region.cc:
+//
+//   Region A: contains only the STORE 1 (str w8, [x25, x24, lsl #2])
+//   Region B: contains the LDR x8 reload, LDR w9, BFI w9, STORE 2, advance,
+//             subs, b.hi (back-edge to Region A)
+//
+// In production VkCapsViewer the IsGpRegPoolLow early-termination fires at
+// guest PCs `linker_base+0x9cc6c` (= LDR x8 reload, immediately after STORE 1)
+// and `linker_base+0x9cc7c` (= one past STORE 2).  This test pins whether the
+// 5-instruction sequence remains correct under the SAME region-split topology.
+//
+// If this test FAILS while the no-split variant above PASSES, that proves the
+// production wedge's bucket-corruption signature (length=0, offset!=0) is a
+// JIT bug specific to the region-boundary state between STORE 1 and STORE 2 —
+// either cross-region register live-state tracking, signal-check interaction,
+// or some other inter-region effect.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_ExplicitSplitAtProductionBoundary) {
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1 — Region A
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; Region B start
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2
+      0x91000718,  // [20] add  x24, x24, #1
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  state_.cpu.x[8] = 0x12345ULL;
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);
+  GuestAddr split_pc = code_start + 4;  // Right after STORE 1
+
+  state_.cpu.insn_addr = code_start;
+  auto* cache = TranslationCache::GetInstance();
+
+  // Region A: STORE 1 only (end_pc forces termination after one instruction).
+  MachineCode mc_a;
+  auto [success_a, stop_a] = TryLiteTranslateRegion(
+      code_start, &mc_a,
+      LiteTranslateParams{.end_pc = split_pc, .allow_dispatch = true});
+  ASSERT_TRUE(success_a);
+  ASSERT_EQ(stop_a, split_pc);
+  GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry_a, nullptr);
+  HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
+  cache->SetTranslatedAndUnlock(code_start, entry_a,
+                                static_cast<uint32_t>(stop_a - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_a, mc_a.install_size()});
+
+  // Region B: LDR x8 reload through b.hi.
+  MachineCode mc_b;
+  auto [success_b, stop_b] = TryLiteTranslateRegion(
+      split_pc, &mc_b,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_b);
+  ASSERT_EQ(stop_b, code_end);
+  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(split_pc, 0);
+  ASSERT_NE(entry_b, nullptr);
+  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
+  cache->SetTranslatedAndUnlock(split_pc, entry_b,
+                                static_cast<uint32_t>(stop_b - split_pc),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_b, mc_b.install_size()});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
+
+  EXPECT_EQ(state_.cpu.insn_addr, code_end);
+  EXPECT_EQ(state_.cpu.x[2], 0ULL);
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots);
+
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "FORCED-SPLIT bug reproduces production signature: "
+      << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped); first at i="
+      << first_length_zero << " value=0x" << std::hex << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+
+  cache->InvalidateGuestRange(code_start, code_end);
+}
+
 // Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
 // CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
 // shifted-register addressing form (option=010, S=1), which is a DIFFERENT
