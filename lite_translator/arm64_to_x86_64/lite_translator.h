@@ -291,6 +291,20 @@ class LiteTranslator {
     return res;
   }
 
+  // region digitalis
+  // LDR/LDRSW (literal): load from `[insn_addr + offset]`. The address
+  // is constant at JIT time, so we materialize it via movabs and reuse
+  // the standard Load() helper (which applies TBI, sets the recovery
+  // point, and emits the size-appropriate movzx/movsx).
+  Register LoadLiteral(Decoder::LoadStoreSize size, bool is_signed, int64_t offset) {
+    GuestAddr target = GetInsnAddr() + offset;
+    Register addr = AllocTempReg();
+    as_.Movq(addr, target);
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    return Load(size, is_signed, is_64bit_target, addr, 0);
+  }
+  // endregion
+
   Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
                     Register dst_val, Register src, uint8_t immr, uint8_t imms) {
     UNUSED(dst_val);
@@ -2524,6 +2538,24 @@ class LiteTranslator {
     // endregion
     Undefined();
   }
+
+  // region digitalis
+  // LDR (literal) SIMD/FP: load 32/64/128 bits from [insn_addr + offset]
+  // into V[rt]. The address is constant at JIT time, so we materialize
+  // it via movabs into a temp register and reuse the standard SIMD
+  // immediate-offset load path (rn=0, offset=0; the materialized addr is
+  // passed as the base). The integer LDR (literal) JIT follows the same
+  // pattern.
+  void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
+    GuestAddr target = GetInsnAddr() + args.offset;
+    Register addr = AllocTempReg();
+    if (addr == no_register) { Undefined(); return; }
+    as_.Movq(addr, target);
+    SimdLoadStoreImm(
+        {.rt = args.rt, .rn = 0, .offset = 0, .size = args.size, .is_store = false},
+        addr);
+  }
+  // endregion
 
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
     // region digitalis - apply TBI mask before using base as memory operand.

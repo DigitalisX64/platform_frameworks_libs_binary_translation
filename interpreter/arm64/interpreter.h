@@ -183,6 +183,18 @@ class Interpreter {
     return pc + offset;
   }
 
+  // region digitalis
+  // LDR/LDRSW (literal): load from `[insn_addr + offset]`. The Load()
+  // helper handles the FaultyLoad guard, sign/zero extension, and the
+  // (is_64bit_target=true for LDRSW) widening for sign-extended loads.
+  Register LoadLiteral(Decoder::LoadStoreSize size, bool is_signed, int64_t offset) {
+    CHECK(!exception_raised_);
+    Register target = state_->cpu.insn_addr + offset;
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    return Load(size, is_signed, is_64bit_target, target, 0);
+  }
+  // endregion
+
   Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
                     Register dst_val, Register src, uint8_t immr, uint8_t imms) {
     CHECK(!exception_raised_);
@@ -3040,6 +3052,18 @@ class Interpreter {
     }
   }
 
+  // region digitalis
+  // LDR (literal) SIMD/FP: load 32/64/128 bits from [insn_addr + offset]
+  // into V[rt]. SimdLoadFromMemory zero-extends the upper bits and uses
+  // FaultyLoad for fault recovery.
+  void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
+    CHECK(!exception_raised_);
+    uint64_t addr = state_->cpu.insn_addr + args.offset;
+    void* host_addr = ToHostAddr<void>(addr);
+    SimdLoadFromMemory(host_addr, args.rt, args.size);
+  }
+  // endregion
+
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register base) {
     CHECK(!exception_raised_);
     uint8_t element_size;
@@ -5334,7 +5358,10 @@ class Interpreter {
         break;
       }
       case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu: {
-        if (args.size == 0) {
+        // Real FCVTZS/FCVTZU encoding has bit23=1 (size ∈ {10, 11}); the
+        // legacy bit23=0 path is still routed here (see decoder).  Either
+        // way only the sz bit (size & 1) chooses single vs double.
+        if ((args.size & 1) == 0) {
           // FCVTZU Sd, Sn: float32 → uint32, round toward zero
           float fval;
           memcpy(&fval, &src, sizeof(fval));
@@ -5364,7 +5391,8 @@ class Interpreter {
         break;
       }
       case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs: {
-        if (args.size == 0) {
+        // See FCVTZU note above: only the sz bit (size & 1) is load-bearing.
+        if ((args.size & 1) == 0) {
           // FCVTZS Sd, Sn: float32 → int32, round toward zero
           float fval;
           memcpy(&fval, &src, sizeof(fval));
@@ -5401,6 +5429,78 @@ class Interpreter {
         }
         break;
       }
+      // region digitalis - scalar FCVTAS / FCVTAU.
+      // Single-lane collapse of vector kFcvtasV/kFcvtauV. std::round() is
+      // round-to-nearest with ties-away-from-zero, which matches the ARM ARM
+      // FCVTAS/FCVTAU semantics. NaN → 0 (signed) / 0 (unsigned). Out-of-range
+      // saturates to INT_MAX/MIN or UINT_MAX. sz=args.size&1 chooses single
+      // (0) vs double (1); the decoder pins bit23=0 so args.size ∈ {0, 1}.
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtas:
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtau: {
+        bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtau);
+        if ((args.size & 1) == 0) {
+          float fval;
+          memcpy(&fval, &src, sizeof(fval));
+          float r = std::isnan(fval) ? fval : std::round(fval);
+          if (is_unsigned) {
+            uint32_t ival;
+            if (std::isnan(fval) || r < 0.0f) {
+              ival = 0;
+            } else if (r >= static_cast<float>(UINT32_MAX)) {
+              ival = UINT32_MAX;
+            } else {
+              ival = static_cast<uint32_t>(r);
+            }
+            memcpy(&result, &ival, sizeof(ival));
+          } else {
+            int32_t ival;
+            if (std::isnan(fval)) {
+              ival = 0;
+            } else if (r >= static_cast<float>(INT32_MAX)) {
+              ival = INT32_MAX;
+            } else if (r <= static_cast<float>(INT32_MIN)) {
+              ival = INT32_MIN;
+            } else {
+              ival = static_cast<int32_t>(r);
+            }
+            uint32_t uval;
+            memcpy(&uval, &ival, sizeof(uval));
+            memcpy(&result, &uval, sizeof(uval));
+          }
+        } else {
+          double fval;
+          memcpy(&fval, &src, sizeof(fval));
+          double r = std::isnan(fval) ? fval : std::round(fval);
+          if (is_unsigned) {
+            uint64_t ival;
+            if (std::isnan(fval) || r < 0.0) {
+              ival = 0;
+            } else if (r >= static_cast<double>(UINT64_MAX)) {
+              ival = UINT64_MAX;
+            } else {
+              ival = static_cast<uint64_t>(r);
+            }
+            memcpy(&result, &ival, sizeof(ival));
+          } else {
+            int64_t ival;
+            if (std::isnan(fval)) {
+              ival = 0;
+            } else if (r >= static_cast<double>(INT64_MAX)) {
+              ival = INT64_MAX;
+            } else if (r <= static_cast<double>(INT64_MIN)) {
+              ival = INT64_MIN;
+            } else {
+              ival = static_cast<int64_t>(r);
+            }
+            uint64_t uval;
+            memcpy(&uval, &ival, sizeof(uval));
+            memcpy(&result, &uval, sizeof(uval));
+          }
+        }
+        break;
+      }
+      // endregion
       // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
       // Each is the single-lane collapse of the corresponding vector op
       // implemented in AdvSimdTwoRegMisc above; the result is the lane
@@ -5493,6 +5593,41 @@ class Interpreter {
         memcpy(&d, &src, sizeof(d));
         uint32_t f_bits = FpDoubleToFloatRtO(d);
         memcpy(&result, &f_bits, sizeof(f_bits));
+        break;
+      }
+      // endregion
+      // region digitalis - scalar FRECPE / FRSQRTE.
+      // ARM spec only requires ~8 bits of mantissa precision; computing the
+      // exact 1/x or 1/sqrt(x) is well within bound. Mirrors the vector
+      // kFrecpeV/kFrsqrteV implementation. args.size bit 1 is pinned to 1
+      // by the decoder; sz=args.size&1 selects single (0) vs double (1).
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFrecpe:
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFrsqrte: {
+        bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFrsqrte);
+        if ((args.size & 1) == 0) {
+          float f;
+          memcpy(&f, &src, sizeof(f));
+          float r;
+          if (is_rsqrt) {
+            r = (f <= 0.0f || f != f) ? __builtin_nanf("")
+                                      : 1.0f / __builtin_sqrtf(f);
+          } else {
+            r = (f == 0.0f) ? __builtin_inff() * (1.0f / f) : 1.0f / f;
+          }
+          memcpy(&result, &r, sizeof(r));
+        } else {
+          double d;
+          memcpy(&d, &src, sizeof(d));
+          double r;
+          if (is_rsqrt) {
+            r = (d <= 0.0 || d != d) ? __builtin_nan("")
+                                     : 1.0 / __builtin_sqrt(d);
+          } else {
+            r = (d == 0.0) ? __builtin_inf() * (1.0 / d) : 1.0 / d;
+          }
+          memcpy(&result, &r, sizeof(r));
+        }
         break;
       }
       // endregion

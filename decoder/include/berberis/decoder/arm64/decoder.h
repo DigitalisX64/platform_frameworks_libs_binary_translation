@@ -557,6 +557,18 @@ class Decoder {
     bool is_64bit_target;  // For signed loads: extend to 64-bit
   };
 
+  // region digitalis
+  // LDR/LDRSW (literal) — PC-relative integer load. The decoder routes
+  // PRFM (literal) to Nop() (no-op prefetch). bit[29]=0 (V=0) identifies
+  // the integer form; SIMD/FP literal loads are decoded separately.
+  struct LoadLiteralArgs {
+    uint8_t rt;        // Destination register (31 = XZR/WZR, write discarded)
+    int64_t offset;    // PC-relative byte offset (imm19 * 4, sign-extended)
+    LoadStoreSize size;  // k32bit (LDR Wt / LDRSW Xt) or k64bit (LDR Xt)
+    bool is_signed;    // True for LDRSW (sign-extend 32→64)
+  };
+  // endregion
+
   struct LoadStorePairArgs {
     uint8_t rt1;       // First register
     uint8_t rt2;       // Second register
@@ -722,6 +734,17 @@ class Decoder {
     SimdLoadStoreSize size;
     bool is_store;
   };
+
+  // region digitalis
+  // LDR (literal) — SIMD/FP form (V=1). Load 32/64/128 bits from the
+  // PC-relative literal pool into V[rt]. The integer form is decoded
+  // separately as LoadLiteral (V=0).
+  struct SimdLoadLiteralArgs {
+    uint8_t rt;
+    int64_t offset;          // PC-relative byte offset (imm19 * 4, sign-extended)
+    SimdLoadStoreSize size;  // k32bit (S), k64bit (D), k128bit (Q)
+  };
+  // endregion
 
   struct FpIntConvArgs {
     uint8_t rd;
@@ -1409,6 +1432,14 @@ class Decoder {
     kUcvtf,   // UCVTF  (scalar): unsigned int → float                     (opcode=11101, U=1; size ∈ {S,D})
     kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero    (opcode=11011, U=0; size ∈ {S,D})
     kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero  (opcode=11011, U=1; size ∈ {S,D})
+    // region digitalis - scalar FRECPE / FRSQRTE.
+    kFrecpe,  // FRECPE  (scalar): FP reciprocal estimate                  (opcode=11101, U=0; size ∈ {10, 11})
+    kFrsqrte, // FRSQRTE (scalar): FP reciprocal square-root estimate      (opcode=11101, U=1; size ∈ {10, 11})
+    // endregion
+    // region digitalis - scalar FCVTAS / FCVTAU.
+    kFcvtas,  // FCVTAS (scalar): float → signed int, round-to-nearest ties-away (opcode=11100, U=0; size ∈ {00, 01})
+    kFcvtau,  // FCVTAU (scalar): float → unsigned int, round-to-nearest ties-away (opcode=11100, U=1; size ∈ {00, 01})
+    // endregion
     // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
     kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
     kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
@@ -2421,6 +2452,22 @@ class Decoder {
     // region digitalis
     // SIMD/FP load/store register (various): bits[29:27] = x11, bit[26]=1
     if (op_28_27 == 0b11 && op_26 == 1) {
+      // region digitalis
+      // LDR (literal) — SIMD/FP form: opc(2) 011100 imm19 Rt with
+      // bit[29]=0, bit[26]=1. Mirrors the integer LDR (literal) V-bit
+      // fix in the bit[26]=0 branch below: without this check, the
+      // dispatcher falls through to the SIMD register-with-immediate
+      // handlers (which require bit[29]=1) and interprets bits[9:5]
+      // of imm19 as Rn, silently corrupting whichever register Rn
+      // happens to land on. Encoding examples:
+      //   `ldr s0, =literal` = 0x1C000000 | (imm19<<5) | rt   (opc=00)
+      //   `ldr d0, =literal` = 0x5C000000 | (imm19<<5) | rt   (opc=01)
+      //   `ldr q0, =literal` = 0x9C000000 | (imm19<<5) | rt   (opc=10)
+      if (op_29 == 0) {
+        DecodeSimdLoadLiteral();
+        return;
+      }
+      // endregion
       if (op_24) {
         DecodeSimdLoadStoreUnsignedImm();
         return;
@@ -2449,6 +2496,22 @@ class Decoder {
     // Encoding: size[31:30] 111 0 00xx ... (unscaled/pre/post)
     //           size[31:30] 111 0 01xx ... (unsigned offset)
     if (op_28_27 == 0b11 && op_26 == 0) {
+      // region digitalis
+      // LDR/LDRSW/PRFM (literal) — opc(2) 011000 imm19 Rt with bit[29]=0
+      // (V=0). Encoding e.g. `ldr x16, =literal` = 0x58007c50. Without
+      // this branch, dispatch falls through to LDR (immediate)
+      // pre/post/reg/unscaled handlers, which interpret bits[9:5] as Rn
+      // and bits[20:12] as imm9 — treating the literal-offset bits as a
+      // base register index + offset, silently corrupting whichever
+      // register Rn happens to land on (e.g. x2 for 0x58007c50).
+      // Observed in libcoldstart.so sha256_block_data_order prologue
+      // where bits[11:10] of imm19 = 0b11 routed the LDR literal to
+      // DecodeLoadStoreImmPostPreIndex(true) → STR x16, [x2, #7]!.
+      if (op_29 == 0) {
+        DecodeLoadLiteral();
+        return;
+      }
+      // endregion
       if (op_24) {
         // region digitalis
         // MTE load/store memory tags (LDG/STG/ST2G/STZG/STZ2G):
@@ -2535,6 +2598,48 @@ class Decoder {
         .imm = imm,
         .op2 = op2,
     });
+  }
+  // endregion
+
+  // region digitalis
+  // LDR/LDRSW/PRFM (literal): opc(2) 011000 imm19 Rt, bit[29]=0.
+  //   opc=00 → LDR Wt (32-bit, zero-extend)
+  //   opc=01 → LDR Xt (64-bit)
+  //   opc=10 → LDRSW Xt (32-bit, sign-extend to 64-bit)
+  //   opc=11 → PRFM (literal) — treat as NOP
+  void DecodeLoadLiteral() {
+    uint8_t opc = GetBits<30, 2>();
+    int64_t offset = static_cast<int64_t>(SignExtend<19>(GetBits<5, 19>())) * 4;
+    uint8_t rt = GetBits<0, 5>();
+
+    LoadStoreSize size;
+    bool is_signed;
+    switch (opc) {
+      case 0b00:
+        size = LoadStoreSize::k32bit;
+        is_signed = false;
+        break;
+      case 0b01:
+        size = LoadStoreSize::k64bit;
+        is_signed = false;
+        break;
+      case 0b10:
+        size = LoadStoreSize::k32bit;
+        is_signed = true;
+        break;
+      case 0b11:
+      default:
+        insn_consumer_->Nop();
+        return;
+    }
+
+    const LoadLiteralArgs args = {
+        .rt = rt,
+        .offset = offset,
+        .size = size,
+        .is_signed = is_signed,
+    };
+    insn_consumer_->LoadLiteral(args);
   }
   // endregion
 
@@ -3328,6 +3433,37 @@ class Decoder {
   //
   // SIMD/FP load/store (unsigned immediate) - bit[26]=1 variant.
   //
+  // region digitalis
+  // LDR (literal) SIMD/FP: opc(2) 011100 imm19 Rt, bit[29]=0, bit[26]=1.
+  //   opc=00 → LDR St (32-bit, S register)
+  //   opc=01 → LDR Dt (64-bit, D register)
+  //   opc=10 → LDR Qt (128-bit, Q register)
+  //   opc=11 → unallocated (UNDEFINED)
+  void DecodeSimdLoadLiteral() {
+    uint8_t opc = GetBits<30, 2>();
+    int64_t offset = static_cast<int64_t>(SignExtend<19>(GetBits<5, 19>())) * 4;
+    uint8_t rt = GetBits<0, 5>();
+
+    SimdLoadStoreSize size;
+    switch (opc) {
+      case 0b00:
+        size = SimdLoadStoreSize::k32bit;
+        break;
+      case 0b01:
+        size = SimdLoadStoreSize::k64bit;
+        break;
+      case 0b10:
+        size = SimdLoadStoreSize::k128bit;
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
+    insn_consumer_->SimdLoadLiteral({.rt = rt, .offset = offset, .size = size});
+  }
+  // endregion
+
   void DecodeSimdLoadStoreUnsignedImm() {
     uint8_t size = GetBits<30, 2>();
     uint8_t opc = GetBits<22, 2>();
@@ -5124,15 +5260,57 @@ class Decoder {
 
     switch (opcode) {
       case 0b11101:
-        // SCVTF (U=0) / UCVTF (U=1): integer → float, scalar
-        // size: 0=single, 1=double
-        if (size >= 2) { Undefined(); return; }
-        op = u ? AdvSimdScalarTwoRegMiscOpcode::kUcvtf
-               : AdvSimdScalarTwoRegMiscOpcode::kScvtf;
+        // opcode=11101 splits on bit23 of the `size` field:
+        //   bit23=0 (size ∈ {00, 01}): SCVTF (U=0) / UCVTF (U=1) —
+        //     integer → float, scalar; sz=size&1 chooses S vs D.
+        //   bit23=1 (size ∈ {10, 11}): FRECPE (U=0) / FRSQRTE (U=1) —
+        //     FP reciprocal / reciprocal-sqrt estimate, scalar.
+        // llvm-mc-21 encoding checks:
+        //   scvtf   s0, s1   → 0x5e21d820  (U=0, opcode=11101, size=00)
+        //   scvtf   d0, d1   → 0x5e61d820  (U=0, opcode=11101, size=01)
+        //   frecpe  s0, s1   → 0x5ea1d820  (U=0, opcode=11101, size=10)
+        //   frecpe  d0, d1   → 0x5ee1d820  (U=0, opcode=11101, size=11)
+        //   frsqrte s0, s1   → 0x7ea1d820  (U=1, opcode=11101, size=10)
+        if ((size & 0b10) == 0) {
+          op = u ? AdvSimdScalarTwoRegMiscOpcode::kUcvtf
+                 : AdvSimdScalarTwoRegMiscOpcode::kScvtf;
+        } else {
+          // region digitalis
+          op = u ? AdvSimdScalarTwoRegMiscOpcode::kFrsqrte
+                 : AdvSimdScalarTwoRegMiscOpcode::kFrecpe;
+          // endregion
+        }
         break;
+      // region digitalis - scalar FCVTAS / FCVTAU.
+      // opcode=11100 splits on bit23 of the `size` field per the ARM ARM
+      // "AdvSIMD scalar two-register miscellaneous (FP)" table:
+      //   bit23=0 (size ∈ {00, 01}): FCVTAS (U=0) / FCVTAU (U=1) —
+      //     FP → int, round-to-nearest ties-away-from-zero; sz=size&1
+      //     selects single (0) vs double (1).
+      //   bit23=1: no scalar form (vector URECPE/URSQRTE only).
+      // llvm-mc-21 encoding checks:
+      //   fcvtas s0, s1 → 0x5e21c820  (U=0, opcode=11100, size=00)
+      //   fcvtas d0, d1 → 0x5e61c820  (U=0, opcode=11100, size=01)
+      //   fcvtau s0, s1 → 0x7e21c820  (U=1, opcode=11100, size=00)
+      //   fcvtau d0, d1 → 0x7e61c820  (U=1, opcode=11100, size=01)
+      case 0b11100:
+        if ((size & 0b10) != 0) { Undefined(); return; }
+        op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtau
+               : AdvSimdScalarTwoRegMiscOpcode::kFcvtas;
+        break;
+      // endregion
       case 0b11011:
-        // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero
-        if (size >= 2) { Undefined(); return; }
+        // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero.
+        // Per ARM ARM "AdvSIMD scalar two-register miscellaneous (FP)" table,
+        // the real FCVTZS/FCVTZU encoding uses a=bit23=1 (size ∈ {10, 11}
+        // where sz=bit22 selects single vs double).  bit23=0 is the
+        // unimplemented FCVTMS/FCVTMU (round toward -inf) — accept both
+        // bit23 values to preserve pre-existing dispatch surface (the legacy
+        // bit23=0 path silently produced truncate-toward-zero semantics; we
+        // keep that to avoid disturbing any test that hit it), and route
+        // both to kFcvtzs/kFcvtzu.  The interpreter handler reads only the
+        // sz bit (size & 1) to choose single (0) vs double (1).
+        // llvm-mc-21 check: fcvtzs s1, s0 → 0x5ea1b801 (bit23=1, sz=0).
         op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtzu
                : AdvSimdScalarTwoRegMiscOpcode::kFcvtzs;
         break;
