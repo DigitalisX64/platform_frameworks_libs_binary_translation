@@ -183,6 +183,18 @@ class Interpreter {
     return pc + offset;
   }
 
+  // region digitalis
+  // LDR/LDRSW (literal): load from `[insn_addr + offset]`. The Load()
+  // helper handles the FaultyLoad guard, sign/zero extension, and the
+  // (is_64bit_target=true for LDRSW) widening for sign-extended loads.
+  Register LoadLiteral(Decoder::LoadStoreSize size, bool is_signed, int64_t offset) {
+    CHECK(!exception_raised_);
+    Register target = state_->cpu.insn_addr + offset;
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    return Load(size, is_signed, is_64bit_target, target, 0);
+  }
+  // endregion
+
   Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
                     Register dst_val, Register src, uint8_t immr, uint8_t imms) {
     CHECK(!exception_raised_);

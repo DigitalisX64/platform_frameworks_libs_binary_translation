@@ -77,6 +77,17 @@ class SemanticsPlayer {
     SetRegOrIgnore(args.dst, result);
   }
 
+  // region digitalis
+  // LDR/LDRSW (literal) — PC-relative integer load. The listener
+  // computes the target address from `(insn_addr + offset)` and reads
+  // `size` bytes; LDRSW sign-extends 32→64. PRFM literal is decoded as
+  // Nop() upstream, so this handler is reached only for the load forms.
+  void LoadLiteral(const typename Decoder::LoadLiteralArgs& args) {
+    Register result = listener_->LoadLiteral(args.size, args.is_signed, args.offset);
+    SetRegOrIgnore(args.rt, result);
+  }
+  // endregion
+
   void Bitfield(const typename Decoder::BitfieldArgs& args) {
     Register src = GetRegOrZero(args.src);
     Register dst_val = (args.opcode == Decoder::BitfieldOpcode::kBfm)

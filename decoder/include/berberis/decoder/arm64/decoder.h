@@ -557,6 +557,18 @@ class Decoder {
     bool is_64bit_target;  // For signed loads: extend to 64-bit
   };
 
+  // region digitalis
+  // LDR/LDRSW (literal) — PC-relative integer load. The decoder routes
+  // PRFM (literal) to Nop() (no-op prefetch). bit[29]=0 (V=0) identifies
+  // the integer form; SIMD/FP literal loads are decoded separately.
+  struct LoadLiteralArgs {
+    uint8_t rt;        // Destination register (31 = XZR/WZR, write discarded)
+    int64_t offset;    // PC-relative byte offset (imm19 * 4, sign-extended)
+    LoadStoreSize size;  // k32bit (LDR Wt / LDRSW Xt) or k64bit (LDR Xt)
+    bool is_signed;    // True for LDRSW (sign-extend 32→64)
+  };
+  // endregion
+
   struct LoadStorePairArgs {
     uint8_t rt1;       // First register
     uint8_t rt2;       // Second register
@@ -2449,6 +2461,22 @@ class Decoder {
     // Encoding: size[31:30] 111 0 00xx ... (unscaled/pre/post)
     //           size[31:30] 111 0 01xx ... (unsigned offset)
     if (op_28_27 == 0b11 && op_26 == 0) {
+      // region digitalis
+      // LDR/LDRSW/PRFM (literal) — opc(2) 011000 imm19 Rt with bit[29]=0
+      // (V=0). Encoding e.g. `ldr x16, =literal` = 0x58007c50. Without
+      // this branch, dispatch falls through to LDR (immediate)
+      // pre/post/reg/unscaled handlers, which interpret bits[9:5] as Rn
+      // and bits[20:12] as imm9 — treating the literal-offset bits as a
+      // base register index + offset, silently corrupting whichever
+      // register Rn happens to land on (e.g. x2 for 0x58007c50).
+      // Observed in libcoldstart.so sha256_block_data_order prologue
+      // where bits[11:10] of imm19 = 0b11 routed the LDR literal to
+      // DecodeLoadStoreImmPostPreIndex(true) → STR x16, [x2, #7]!.
+      if (op_29 == 0) {
+        DecodeLoadLiteral();
+        return;
+      }
+      // endregion
       if (op_24) {
         // region digitalis
         // MTE load/store memory tags (LDG/STG/ST2G/STZG/STZ2G):
@@ -2535,6 +2563,48 @@ class Decoder {
         .imm = imm,
         .op2 = op2,
     });
+  }
+  // endregion
+
+  // region digitalis
+  // LDR/LDRSW/PRFM (literal): opc(2) 011000 imm19 Rt, bit[29]=0.
+  //   opc=00 → LDR Wt (32-bit, zero-extend)
+  //   opc=01 → LDR Xt (64-bit)
+  //   opc=10 → LDRSW Xt (32-bit, sign-extend to 64-bit)
+  //   opc=11 → PRFM (literal) — treat as NOP
+  void DecodeLoadLiteral() {
+    uint8_t opc = GetBits<30, 2>();
+    int64_t offset = static_cast<int64_t>(SignExtend<19>(GetBits<5, 19>())) * 4;
+    uint8_t rt = GetBits<0, 5>();
+
+    LoadStoreSize size;
+    bool is_signed;
+    switch (opc) {
+      case 0b00:
+        size = LoadStoreSize::k32bit;
+        is_signed = false;
+        break;
+      case 0b01:
+        size = LoadStoreSize::k64bit;
+        is_signed = false;
+        break;
+      case 0b10:
+        size = LoadStoreSize::k32bit;
+        is_signed = true;
+        break;
+      case 0b11:
+      default:
+        insn_consumer_->Nop();
+        return;
+    }
+
+    const LoadLiteralArgs args = {
+        .rt = rt,
+        .offset = offset,
+        .size = size,
+        .is_signed = is_signed,
+    };
+    insn_consumer_->LoadLiteral(args);
   }
   // endregion
 

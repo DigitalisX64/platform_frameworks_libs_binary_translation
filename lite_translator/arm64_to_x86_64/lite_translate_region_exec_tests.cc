@@ -16286,6 +16286,106 @@ TEST_F(Arm64LiteTranslateRegionTest, SshllVec2DShift31) {
 }
 // endregion
 
+// region digitalis
+// LDR (literal) — regression tests. The decoder used to misroute
+// `ldr Xt, =literal` to the LDR (immediate) pre/post/reg/unscaled
+// handlers because the V=0 form shares op_28_27=11/op_26=0 with them.
+// Symptom in the wild: libcoldstart.so sha256_block_data_order prologue
+// at offset 0x62de00 starts with `ldr x16, =literal` (0x58007c50). The
+// imm19 bits[6:5]=0b11 mapped to instruction bits[11:10]=0b11, which
+// routed to pre-indexed STR x16, [x2, #7]! and silently corrupted x2.
+constexpr uint32_t LdrLitX(uint8_t rt, int32_t offset_bytes) {
+  uint32_t imm19 = static_cast<uint32_t>(offset_bytes / 4) & 0x7FFFF;
+  return 0x58000000u | (imm19 << 5) | rt;
+}
+
+constexpr uint32_t LdrLitW(uint8_t rt, int32_t offset_bytes) {
+  uint32_t imm19 = static_cast<uint32_t>(offset_bytes / 4) & 0x7FFFF;
+  return 0x18000000u | (imm19 << 5) | rt;
+}
+
+constexpr uint32_t LdrswLit(uint8_t rt, int32_t offset_bytes) {
+  uint32_t imm19 = static_cast<uint32_t>(offset_bytes / 4) & 0x7FFFF;
+  return 0x98000000u | (imm19 << 5) | rt;
+}
+
+constexpr uint32_t BImmU(int32_t offset_bytes) {
+  uint32_t imm26 = static_cast<uint32_t>(offset_bytes / 4) & 0x3FFFFFF;
+  return 0x14000000u | imm26;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralX) {
+  // LDR X0, +12 loads 8 bytes from code[3..4]; B +16 skips past the
+  // literal pool to code[5]. The region ends at B.
+  static const uint32_t code[] = {
+      LdrLitX(0, 12),    // [0] LDR X0, +12
+      BImmU(16),         // [1] B +16 (region end → code[5])
+      kNop,              // [2] (not translated)
+      0x89ABCDEFu,       // [3] literal lo
+      0x01234567u,       // [4] literal hi
+      kNop,              // [5] branch target
+  };
+  GuestAddr branch_target = ToGuestAddr(code) + 20;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[0], 0x0123456789ABCDEFULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralW) {
+  // LDR W0 zero-extends 32→64.
+  static const uint32_t code[] = {
+      LdrLitW(0, 12),    // [0] LDR W0, +12
+      BImmU(12),         // [1] B +12 (region end → code[4])
+      kNop,              // [2] (not translated)
+      0x89ABCDEFu,       // [3] literal
+      kNop,              // [4] branch target
+  };
+  GuestAddr branch_target = ToGuestAddr(code) + 16;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[0], 0x89ABCDEFULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrswLiteral) {
+  // LDRSW X0 sign-extends 32→64. Literal 0x89ABCDEF (MSB set) becomes
+  // 0xFFFFFFFF89ABCDEF in x0.
+  static const uint32_t code[] = {
+      LdrswLit(0, 12),   // [0] LDRSW X0, +12
+      BImmU(12),         // [1] B +12 (region end → code[4])
+      kNop,              // [2] (not translated)
+      0x89ABCDEFu,       // [3] literal
+      kNop,              // [4] branch target
+  };
+  GuestAddr branch_target = ToGuestAddr(code) + 16;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[0], 0xFFFFFFFF89ABCDEFULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralX_DoesNotClobberOtherRegs) {
+  // The original misroute interpreted bits[9:5]=Rn as a base-register
+  // index and corrupted it via the pre/post-indexed writeback path.
+  // Verify that after a correct LDR (literal) into x0, x1..x4 are
+  // untouched. We seed them via MOVZ before the LDR.
+  static const uint32_t code[] = {
+      MovzX(1, 0x1111),  // [0] MOVZ X1, #0x1111
+      MovzX(2, 0x2222),  // [1] MOVZ X2, #0x2222
+      MovzX(3, 0x3333),  // [2] MOVZ X3, #0x3333
+      MovzX(4, 0x4444),  // [3] MOVZ X4, #0x4444
+      LdrLitX(0, 12),    // [4] LDR X0, +12 → code[7..8]
+      BImmU(16),         // [5] B +16 (region end → code[9])
+      kNop,              // [6] (not translated)
+      0x89ABCDEFu,       // [7] literal lo
+      0x01234567u,       // [8] literal hi
+      kNop,              // [9] branch target
+  };
+  GuestAddr branch_target = ToGuestAddr(code) + 36;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[0], 0x0123456789ABCDEFULL);
+  EXPECT_EQ(state_.cpu.x[1], 0x1111ULL);
+  EXPECT_EQ(state_.cpu.x[2], 0x2222ULL);
+  EXPECT_EQ(state_.cpu.x[3], 0x3333ULL);
+  EXPECT_EQ(state_.cpu.x[4], 0x4444ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

@@ -291,6 +291,20 @@ class LiteTranslator {
     return res;
   }
 
+  // region digitalis
+  // LDR/LDRSW (literal): load from `[insn_addr + offset]`. The address
+  // is constant at JIT time, so we materialize it via movabs and reuse
+  // the standard Load() helper (which applies TBI, sets the recovery
+  // point, and emits the size-appropriate movzx/movsx).
+  Register LoadLiteral(Decoder::LoadStoreSize size, bool is_signed, int64_t offset) {
+    GuestAddr target = GetInsnAddr() + offset;
+    Register addr = AllocTempReg();
+    as_.Movq(addr, target);
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    return Load(size, is_signed, is_64bit_target, addr, 0);
+  }
+  // endregion
+
   Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
                     Register dst_val, Register src, uint8_t immr, uint8_t imms) {
     UNUSED(dst_val);
