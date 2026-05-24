@@ -41,6 +41,7 @@ void DoBadTrampoline(HostCode callee, ThreadState* state) {
 }
 
 // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 namespace {
 
 struct ExtraRegistry {
@@ -85,6 +86,7 @@ void ProxyLibraryBuilder::RegisterExtraTrampolines(const char* library_name,
   }
   g_extra_registries[g_num_extra_registries++] = {library_name, trampolines, count};
 }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
 // endregion
 
 void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name) {
@@ -114,9 +116,12 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
   }
 
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   // Search Digitalis-side extra trampolines registered for this library.
   // Same dispatch shape as the primary loop, factored above to share between
-  // primary and extras.
+  // primary and extras. Only present in the arm64-translation build of the
+  // proxy loader (libberberis_proxy_loader_arm64); the upstream guest-agnostic
+  // libberberis_proxy_loader omits this block entirely.
   if (const KnownTrampoline* extra = FindExtraTrampoline(library_name_, name); extra != nullptr) {
     void* thunk = extra->thunk;
     if (!thunk) {
@@ -132,6 +137,7 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
     }
     return;
   }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
   // endregion
 
   // TODO(b/287342829): variables_ are sorted, use binary search!

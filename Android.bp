@@ -636,10 +636,17 @@ cc_library_shared {
         "libberberis_tinyloader",
     ],
     whole_static_libs: [
-        "libberberis_proxy_loader",
+        // region digitalis: arm64-translation variant of proxy_loader, defines
+        // -DNATIVE_BRIDGE_GUEST_ARCH_ARM64 so the Digitalis fast-path extras
+        // (RegisterExtraTrampolines + InterceptSymbol extras-search block)
+        // compile in. Upstream libberberis_proxy_loader stays in use by other
+        // (riscv64) translation builds — see proxy_loader/Android.bp for the
+        // shared-source rationale.
+        "libberberis_proxy_loader_arm64",
+        // endregion
     ],
     export_static_lib_headers: [
-        "libberberis_proxy_loader",
+        "libberberis_proxy_loader_arm64",
     ],
     shared_libs: [
         "liblog",

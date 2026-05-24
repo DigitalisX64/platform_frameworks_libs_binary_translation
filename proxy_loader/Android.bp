@@ -51,3 +51,32 @@ cc_library_static {
     ],
     export_header_lib_headers: ["libberberis_proxy_loader_headers"],
 }
+
+// region digitalis - arm64-translation variant of the proxy loader.
+// Same sources as libberberis_proxy_loader above, but built with the
+// berberis_arm64_defaults flavor (which sets -DNATIVE_BRIDGE_GUEST_ARCH_ARM64).
+// That macro gates the additional RegisterExtraTrampolines API and the
+// associated InterceptSymbol search-extras block, so this library carries the
+// Digitalis fast-path-extras machinery while the upstream
+// libberberis_proxy_loader stays unchanged.
+//
+// libberberis_arm64.so links this variant via whole_static_libs; the upstream
+// libberberis_riscv64 (and any future guest-arch lib) continues to link
+// libberberis_proxy_loader and never sees the arm64-specific code path.
+cc_library_static {
+    name: "libberberis_proxy_loader_arm64",
+    defaults: ["berberis_arm64_defaults"],
+    host_supported: true,
+    srcs: [
+        "proxy_loader.cc",
+        "proxy_library_builder.cc",
+    ],
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_guest_state_headers",
+        "libberberis_runtime_primitives_headers",
+        "libberberis_proxy_loader_headers",
+    ],
+    export_header_lib_headers: ["libberberis_proxy_loader_headers"],
+}
+// endregion
