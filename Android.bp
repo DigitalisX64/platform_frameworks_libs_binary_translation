@@ -674,6 +674,13 @@ cc_library_shared {
                 "libberberis_jni_arm64",
                 "libberberis_native_activity_arm64",
                 "libberberis_native_bridge_arm64",
+                // region digitalis: companion static library carrying Digitalis-side
+                // fast-path trampolines (libc + libm) for symbols not covered by the
+                // upstream libberberis_proxy_libc / libberberis_proxy_libm. Pulled
+                // in whole so its __attribute__((constructor)) registers extras with
+                // ProxyLibraryBuilder at load time. Upstream proxy libs are untouched.
+                "libberberis_digitalis_extra_proxy_arm64",
+                // endregion
             ],
             static_libs: [
                 // region digitalis: APK extract fallback uses libziparchive in native_bridge_arm64.
