@@ -56,7 +56,16 @@ class LiteTranslator {
         success_(true),
         pc_(pc),
         params_(params),
-        is_region_end_reached_(false) {}
+        is_region_end_reached_(false),
+        // region digitalis - track whether any SIMD/FP register was allocated.
+        // If not, this region can't have dirtied MXCSR exception bits, so the
+        // MXCSR -> FPSR mirror at region exit can be elided. Integer-only hot
+        // loops (e.g. bionic linker CdEntryMapZip32::AddToMap hash probe) hit
+        // 9+ region exits per iteration; eliding the 12-x86-insn mirror saves
+        // ~100 host insns per iteration there.
+        fp_dirty_(false)
+        // endregion
+        {}
 
   //
   // Guest state getters/setters.
@@ -13101,12 +13110,23 @@ class LiteTranslator {
   }
 
   SimdRegister AllocTempSimdReg() {
+    // region digitalis - any SIMD/FP work in the region marks MXCSR as
+    // possibly-dirty so the mirror at region exit isn't elided.
+    fp_dirty_ = true;
+    // endregion
     if (auto reg_option = simd_allocator_.AllocTemp()) {
       return reg_option.value();
     }
     success_ = false;
     return Assembler::no_xmm_register;
   }
+
+  // region digitalis - explicit marker for FP-affecting paths that don't go
+  // through AllocTempSimdReg (e.g. a future scalar FP path that directly uses
+  // a fixed XMM register). Currently unused; kept for forward use.
+  void MarkFpDirty() { fp_dirty_ = true; }
+  bool fp_dirty() const { return fp_dirty_; }
+  // endregion
 
  private:
   // Helper: extract ARM64 NZCV flags from x86_64 EFLAGS after ADD/SUB.
@@ -13221,6 +13241,9 @@ class LiteTranslator {
   Allocator<SimdRegister> simd_allocator_;
   const LiteTranslateParams params_;
   bool is_region_end_reached_;
+  // region digitalis - see constructor comment.
+  bool fp_dirty_;
+  // endregion
   // region digitalis - guest PC label map for backward branch inlining
   std::unordered_map<GuestAddr, Assembler::Label*> guest_pc_labels_;
   // endregion

@@ -59,6 +59,19 @@ using Condition = LiteTranslator::Condition;
 // kFrameSizeAtTranslatedCode-byte frame (already reserved by
 // berberis_RunGeneratedCode).
 void LiteTranslator::EmitMxcsrToFpsrMirror() {
+  // region digitalis - skip mirror entirely if no SIMD/FP op was emitted in
+  // the region: MXCSR cannot have been dirtied by this region, so the mirror
+  // would only OR in already-stale bits (which are no-ops) at significant
+  // host cost. Integer-only hot loops like CdEntryMapZip32::AddToMap probe
+  // hit 9+ region exits per iteration; this elides the ~12-insn mirror per
+  // exit. Correctness: any earlier region's MXCSR bits were already mirrored
+  // into emulated_fpsr at *its* exit, and the dispatch-loop C++ between
+  // regions can only clear MXCSR exception bits (caller-saved per SysV
+  // x86_64 ABI 3.2.1), not set them.
+  if (!fp_dirty_) {
+    return;
+  }
+  // endregion
   // stmxcsr [rsp]
   as_.Stmxcsr({.base = as_.rsp, .disp = 0});
   // eax = MXCSR & 0x3F  (isolate exception bits 0-5)
@@ -102,16 +115,26 @@ void LiteTranslator::ExitRegion(GuestAddr target) {
 
 void LiteTranslator::ExitRegionIndirect(Register target) {
   StoreMappedRegs();
-  // Spill target across the mirror because EmitMxcsrToFpsrMirror clobbers
-  // rax/rcx/rdx, and target may live in rcx or rdx (both in the allocator
-  // pool). Allocate an extra 16-byte slot below rsp: lower 4 bytes for the
-  // mirror's stmxcsr scratch (referenced via [rsp+0]), upper 8 bytes for the
-  // spilled target. Restore rax with target's value, then restore rsp.
-  as_.Subq(as_.rsp, int32_t{16});
-  as_.Movq({.base = as_.rsp, .disp = 8}, target);
-  EmitMxcsrToFpsrMirror();
-  as_.Movq(as_.rax, {.base = as_.rsp, .disp = 8});
-  as_.Addq(as_.rsp, int32_t{16});
+  // region digitalis - skip the mirror-spill scaffolding entirely when no
+  // FP/SIMD work happened in this region (see EmitMxcsrToFpsrMirror comment).
+  if (!fp_dirty_) {
+    // Move target to rax directly; no spill needed.
+    if (target != as_.rax) {
+      as_.Movq(as_.rax, target);
+    }
+  } else {
+    // Spill target across the mirror because EmitMxcsrToFpsrMirror clobbers
+    // rax/rcx/rdx, and target may live in rcx or rdx (both in the allocator
+    // pool). Allocate an extra 16-byte slot below rsp: lower 4 bytes for the
+    // mirror's stmxcsr scratch (referenced via [rsp+0]), upper 8 bytes for
+    // the spilled target. Restore rax with target's value, then restore rsp.
+    as_.Subq(as_.rsp, int32_t{16});
+    as_.Movq({.base = as_.rsp, .disp = 8}, target);
+    EmitMxcsrToFpsrMirror();
+    as_.Movq(as_.rax, {.base = as_.rsp, .disp = 8});
+    as_.Addq(as_.rsp, int32_t{16});
+  }
+  // endregion
   if (params_.allow_dispatch) {
     EmitIndirectDispatch(&as_, as_.rax);
   } else {
