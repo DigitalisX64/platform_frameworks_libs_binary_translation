@@ -16309,6 +16309,25 @@ constexpr uint32_t LdrswLit(uint8_t rt, int32_t offset_bytes) {
   return 0x98000000u | (imm19 << 5) | rt;
 }
 
+// SIMD/FP LDR (literal): opc(2) 011100 imm19 Rt with bit[26]=1.
+//   opc=00 → LDR St (S, 32-bit) — base 0x1C000000
+//   opc=01 → LDR Dt (D, 64-bit) — base 0x5C000000
+//   opc=10 → LDR Qt (Q, 128-bit) — base 0x9C000000
+constexpr uint32_t LdrLitS(uint8_t rt, int32_t offset_bytes) {
+  uint32_t imm19 = static_cast<uint32_t>(offset_bytes / 4) & 0x7FFFF;
+  return 0x1C000000u | (imm19 << 5) | rt;
+}
+
+constexpr uint32_t LdrLitD(uint8_t rt, int32_t offset_bytes) {
+  uint32_t imm19 = static_cast<uint32_t>(offset_bytes / 4) & 0x7FFFF;
+  return 0x5C000000u | (imm19 << 5) | rt;
+}
+
+constexpr uint32_t LdrLitQ(uint8_t rt, int32_t offset_bytes) {
+  uint32_t imm19 = static_cast<uint32_t>(offset_bytes / 4) & 0x7FFFF;
+  return 0x9C000000u | (imm19 << 5) | rt;
+}
+
 constexpr uint32_t BImmU(int32_t offset_bytes) {
   uint32_t imm26 = static_cast<uint32_t>(offset_bytes / 4) & 0x3FFFFFF;
   return 0x14000000u | imm26;
@@ -16383,6 +16402,109 @@ TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralX_DoesNotClobberOtherRegs) {
   EXPECT_EQ(state_.cpu.x[2], 0x2222ULL);
   EXPECT_EQ(state_.cpu.x[3], 0x3333ULL);
   EXPECT_EQ(state_.cpu.x[4], 0x4444ULL);
+}
+
+// SIMD/FP LDR (literal) — V=1 form. Mirrors the integer regression
+// tests above. The decoder used to misroute these to the SIMD register
+// load/store handlers (DecodeSimdLoadStoreUnscaled/RegOffset/PrePost),
+// which all require bit[29]=1; with bit[29]=0 they interpreted imm19
+// bits[9:5] as Rn and silently corrupted whichever register Rn landed
+// on. Each test reads from a literal pool placed after a B that
+// terminates the region.
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralS) {
+  // LDR S0, +12: 32-bit (single-precision) literal into V0 lower 32 bits;
+  // upper 96 bits zero-extended.
+  static const uint32_t code[] = {
+      LdrLitS(0, 12),    // [0] LDR S0, +12
+      BImmU(12),         // [1] B +12 (region end → code[4])
+      kNop,              // [2] (not translated)
+      0x40490FDBu,       // [3] literal = float(pi) bit pattern
+      kNop,              // [4] branch target
+  };
+  memset(&state_.cpu.v[0], 0x77, 16);  // sentinel for upper zero-extend
+  GuestAddr branch_target = ToGuestAddr(code) + 16;
+  EXPECT_TRUE(Run(code, branch_target));
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(v0), 0x40490FDBu);
+  for (int i = 4; i < 16; ++i) {
+    EXPECT_EQ(v0[i], 0x00) << "upper byte " << i << " (must be zero-extended)";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralD) {
+  // LDR D0, +12: 64-bit (double-precision) literal into V0 lower 64 bits;
+  // upper 64 bits zero-extended.
+  static const uint32_t code[] = {
+      LdrLitD(0, 12),    // [0] LDR D0, +12
+      BImmU(16),         // [1] B +16 (region end → code[5])
+      kNop,              // [2] (not translated)
+      0x54442D18u,       // [3] literal lo = double(pi) bit pattern lo
+      0x400921FBu,       // [4] literal hi = double(pi) bit pattern hi
+      kNop,              // [5] branch target
+  };
+  memset(&state_.cpu.v[0], 0xCC, 16);  // sentinel for upper zero-extend
+  GuestAddr branch_target = ToGuestAddr(code) + 20;
+  EXPECT_TRUE(Run(code, branch_target));
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(v0), 0x400921FB54442D18ULL);
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(v0[i], 0x00) << "upper byte " << i << " (must be zero-extended)";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralQ) {
+  // LDR Q0, +12: 128-bit literal into V0 (full register).
+  static const uint32_t code[] = {
+      LdrLitQ(0, 12),    // [0] LDR Q0, +12
+      BImmU(24),         // [1] B +24 (region end → code[7])
+      kNop,              // [2] (not translated)
+      0x03020100u,       // [3] literal[0..3]
+      0x07060504u,       // [4] literal[4..7]
+      0x0B0A0908u,       // [5] literal[8..11]
+      0x0F0E0D0Cu,       // [6] literal[12..15]
+      kNop,              // [7] branch target
+  };
+  memset(&state_.cpu.v[0], 0xAA, 16);
+  GuestAddr branch_target = ToGuestAddr(code) + 28;
+  EXPECT_TRUE(Run(code, branch_target));
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v0[i], static_cast<uint8_t>(i)) << "byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralQ_DoesNotClobberOtherRegs) {
+  // SIMD analogue of LdrLiteralX_DoesNotClobberOtherRegs: the previous
+  // misroute would interpret imm19 bits[9:5] as Rn and clobber whichever
+  // GP register Rn landed on via the SIMD reg-offset / pre/post handlers.
+  // Verify that after a correct LDR Q0, x1..x4 are untouched.
+  static const uint32_t code[] = {
+      MovzX(1, 0x1111),  // [0]
+      MovzX(2, 0x2222),  // [1]
+      MovzX(3, 0x3333),  // [2]
+      MovzX(4, 0x4444),  // [3]
+      LdrLitQ(0, 12),    // [4] LDR Q0, +12 → code[7..10]
+      BImmU(24),         // [5] B +24 (region end → code[11])
+      kNop,              // [6]
+      0xDEADBEEFu,       // [7]
+      0xCAFEBABEu,       // [8]
+      0x12345678u,       // [9]
+      0x9ABCDEF0u,       // [10]
+      kNop,              // [11] branch target
+  };
+  memset(&state_.cpu.v[0], 0x00, 16);
+  GuestAddr branch_target = ToGuestAddr(code) + 44;
+  EXPECT_TRUE(Run(code, branch_target));
+  EXPECT_EQ(state_.cpu.x[1], 0x1111ULL);
+  EXPECT_EQ(state_.cpu.x[2], 0x2222ULL);
+  EXPECT_EQ(state_.cpu.x[3], 0x3333ULL);
+  EXPECT_EQ(state_.cpu.x[4], 0x4444ULL);
+  // Sanity: V0 actually got the literal.
+  uint32_t* v0 = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  EXPECT_EQ(v0[0], 0xDEADBEEFu);
+  EXPECT_EQ(v0[1], 0xCAFEBABEu);
+  EXPECT_EQ(v0[2], 0x12345678u);
+  EXPECT_EQ(v0[3], 0x9ABCDEF0u);
 }
 // endregion
 

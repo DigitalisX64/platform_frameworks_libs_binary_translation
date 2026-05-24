@@ -2539,6 +2539,24 @@ class LiteTranslator {
     Undefined();
   }
 
+  // region digitalis
+  // LDR (literal) SIMD/FP: load 32/64/128 bits from [insn_addr + offset]
+  // into V[rt]. The address is constant at JIT time, so we materialize
+  // it via movabs into a temp register and reuse the standard SIMD
+  // immediate-offset load path (rn=0, offset=0; the materialized addr is
+  // passed as the base). The integer LDR (literal) JIT follows the same
+  // pattern.
+  void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
+    GuestAddr target = GetInsnAddr() + args.offset;
+    Register addr = AllocTempReg();
+    if (addr == no_register) { Undefined(); return; }
+    as_.Movq(addr, target);
+    SimdLoadStoreImm(
+        {.rt = args.rt, .rn = 0, .offset = 0, .size = args.size, .is_store = false},
+        addr);
+  }
+  // endregion
+
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
     // region digitalis - apply TBI mask before using base as memory operand.
     base = ApplyTbi(base);

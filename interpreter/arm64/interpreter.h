@@ -3052,6 +3052,18 @@ class Interpreter {
     }
   }
 
+  // region digitalis
+  // LDR (literal) SIMD/FP: load 32/64/128 bits from [insn_addr + offset]
+  // into V[rt]. SimdLoadFromMemory zero-extends the upper bits and uses
+  // FaultyLoad for fault recovery.
+  void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
+    CHECK(!exception_raised_);
+    uint64_t addr = state_->cpu.insn_addr + args.offset;
+    void* host_addr = ToHostAddr<void>(addr);
+    SimdLoadFromMemory(host_addr, args.rt, args.size);
+  }
+  // endregion
+
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register base) {
     CHECK(!exception_raised_);
     uint8_t element_size;

@@ -390,6 +390,15 @@ class SemanticsPlayer {
     listener_->SimdLoadStoreImm(args, base);
   }
 
+  // region digitalis
+  // LDR (literal) — SIMD/FP form. The listener computes the address
+  // from (insn_addr + offset) and loads `size` bytes into V[rt]
+  // (32-bit S / 64-bit D / 128-bit Q), zero-extending the upper bits.
+  void SimdLoadLiteral(const typename Decoder::SimdLoadLiteralArgs& args) {
+    listener_->SimdLoadLiteral(args);
+  }
+  // endregion
+
   void SimdLoadStoreImmPreIndex(const typename Decoder::SimdLoadStoreImmArgs& args) {
     Register base = GetRegOrSp(args.rn);
     Register new_base = listener_->AddImm(base, args.offset);

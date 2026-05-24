@@ -735,6 +735,17 @@ class Decoder {
     bool is_store;
   };
 
+  // region digitalis
+  // LDR (literal) — SIMD/FP form (V=1). Load 32/64/128 bits from the
+  // PC-relative literal pool into V[rt]. The integer form is decoded
+  // separately as LoadLiteral (V=0).
+  struct SimdLoadLiteralArgs {
+    uint8_t rt;
+    int64_t offset;          // PC-relative byte offset (imm19 * 4, sign-extended)
+    SimdLoadStoreSize size;  // k32bit (S), k64bit (D), k128bit (Q)
+  };
+  // endregion
+
   struct FpIntConvArgs {
     uint8_t rd;
     uint8_t rn;
@@ -2433,6 +2444,22 @@ class Decoder {
     // region digitalis
     // SIMD/FP load/store register (various): bits[29:27] = x11, bit[26]=1
     if (op_28_27 == 0b11 && op_26 == 1) {
+      // region digitalis
+      // LDR (literal) — SIMD/FP form: opc(2) 011100 imm19 Rt with
+      // bit[29]=0, bit[26]=1. Mirrors the integer LDR (literal) V-bit
+      // fix in the bit[26]=0 branch below: without this check, the
+      // dispatcher falls through to the SIMD register-with-immediate
+      // handlers (which require bit[29]=1) and interprets bits[9:5]
+      // of imm19 as Rn, silently corrupting whichever register Rn
+      // happens to land on. Encoding examples:
+      //   `ldr s0, =literal` = 0x1C000000 | (imm19<<5) | rt   (opc=00)
+      //   `ldr d0, =literal` = 0x5C000000 | (imm19<<5) | rt   (opc=01)
+      //   `ldr q0, =literal` = 0x9C000000 | (imm19<<5) | rt   (opc=10)
+      if (op_29 == 0) {
+        DecodeSimdLoadLiteral();
+        return;
+      }
+      // endregion
       if (op_24) {
         DecodeSimdLoadStoreUnsignedImm();
         return;
@@ -3398,6 +3425,37 @@ class Decoder {
   //
   // SIMD/FP load/store (unsigned immediate) - bit[26]=1 variant.
   //
+  // region digitalis
+  // LDR (literal) SIMD/FP: opc(2) 011100 imm19 Rt, bit[29]=0, bit[26]=1.
+  //   opc=00 → LDR St (32-bit, S register)
+  //   opc=01 → LDR Dt (64-bit, D register)
+  //   opc=10 → LDR Qt (128-bit, Q register)
+  //   opc=11 → unallocated (UNDEFINED)
+  void DecodeSimdLoadLiteral() {
+    uint8_t opc = GetBits<30, 2>();
+    int64_t offset = static_cast<int64_t>(SignExtend<19>(GetBits<5, 19>())) * 4;
+    uint8_t rt = GetBits<0, 5>();
+
+    SimdLoadStoreSize size;
+    switch (opc) {
+      case 0b00:
+        size = SimdLoadStoreSize::k32bit;
+        break;
+      case 0b01:
+        size = SimdLoadStoreSize::k64bit;
+        break;
+      case 0b10:
+        size = SimdLoadStoreSize::k128bit;
+        break;
+      default:
+        Undefined();
+        return;
+    }
+
+    insn_consumer_->SimdLoadLiteral({.rt = rt, .offset = offset, .size = size});
+  }
+  // endregion
+
   void DecodeSimdLoadStoreUnsignedImm() {
     uint8_t size = GetBits<30, 2>();
     uint8_t opc = GetBits<22, 2>();
