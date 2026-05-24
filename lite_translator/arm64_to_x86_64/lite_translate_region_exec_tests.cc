@@ -12178,6 +12178,56 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
     return true;
   }
 
+  // region digitalis: translate every region inside [code, code+sizeof(code))
+  // by walking forward from code[0] and re-translating from each region's
+  // stop_pc until end-of-code is reached.  Dispatch back-edges between
+  // regions then resolve via TranslationCache lookups, letting the loop
+  // iterate to natural termination.
+  template <typename T>
+  bool RunMultiRegion(const T& code, GuestAddr expected_stop_addr) {
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    GuestAddr code_start = ToGuestAddr(code);
+    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    auto* cache = TranslationCache::GetInstance();
+
+    HostCodeAddr first_host_code = 0;
+    GuestAddr cur = code_start;
+    while (cur < code_end) {
+      MachineCode machine_code;
+      auto [success, stop_pc] = TryLiteTranslateRegion(cur,
+                                                       &machine_code,
+                                                       LiteTranslateParams{
+                                                           .end_pc = code_end,
+                                                           .allow_dispatch = true,
+                                                       });
+      if (!success || (stop_pc > code_end) || stop_pc == cur) {
+        return false;
+      }
+      GuestCodeEntry* entry = cache->AddAndLockForTranslation(cur, 0);
+      if (!entry) {
+        return false;
+      }
+      HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+      size_t region_size = stop_pc - cur;
+      cache->SetTranslatedAndUnlock(cur,
+                                    entry,
+                                    static_cast<uint32_t>(region_size),
+                                    GuestCodeEntry::Kind::kLiteTranslated,
+                                    {host_code, machine_code.install_size()});
+      if (cur == code_start) {
+        first_host_code = host_code;
+      }
+      cur = stop_pc;
+    }
+
+    TestingRunGeneratedCode(&state_, AsHostCode(first_host_code), expected_stop_addr);
+    EXPECT_EQ(state_.cpu.insn_addr, expected_stop_addr);
+
+    cache->InvalidateGuestRange(code_start, code_end);
+    return true;
+  }
+  // endregion
+
  protected:
   ThreadState state_{};
 };
@@ -12496,6 +12546,242 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketFindUnderDispatch_UXT
 
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+// endregion
+
+// region digitalis: production AddToMap bucket-FIND loop, single-region pin
+// for the no-match (b.ne) path.  The existing UXTW dispatch test only
+// exercises the iter-0 b.eq fast path (bucket[0] empty).  This test fills
+// bucket[0] with a non-matching hash (top12 != x19) and exact non-zero
+// offset bits, then verifies the JIT:
+//   1. loads bucket[0] correctly via UXTW shifted-register addressing,
+//   2. computes ANDS with #0xfffff producing a non-zero result (Z=0),
+//   3. correctly does NOT take the b.eq forward branch,
+//   4. computes CMP x19, x8, lsr #20 with non-zero LSR result,
+//   5. correctly TAKES the b.ne forward branch dispatching to advance_addr.
+//
+// RunWithDispatch translates a single region starting at code[0]; the
+// dispatch out to advance_addr returns to the runtime (no second region
+// is pre-translated).  insn_addr at exit therefore equals advance_addr if
+// the JIT got step 5 right.  This pins all five steps in a single region
+// — the inner instructions of the production AddToMap loop body — without
+// requiring multi-region cache wiring.  If the JIT mis-evaluated b.ne
+// (e.g. taking it as b.eq), insn_addr would land at done_found instead.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindUnderDispatch_UXTW_NonMatchTakesBNe) {
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  // bucket[0] = (0xAAA << 20) | 0x100 = non-empty, hash field = 0xAAA.
+  // x19 = 0xBBB so cmp mismatches, b.ne must fire.
+  constexpr uint32_t kStoredHash = 0xAAA;
+  constexpr uint32_t kStoredOffset = 0x100;
+  constexpr uint64_t kSearchHash = 0xBBB;
+  alignas(16) static uint32_t buckets[3];
+  buckets[0] = 0xfeedfaceU;  // leading guard
+  buckets[1] = (kStoredHash << 20) | kStoredOffset;
+  buckets[2] = 0xdeadbeefU;  // trailing guard
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = 0;          // mask irrelevant (one slot)
+  state_.cpu.x[19] = kSearchHash;
+  state_.cpu.x[2]  = 1000;
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  GuestAddr advance_addr = ToGuestAddr(code) + 0x18;
+  GuestAddr done_found_addr = ToGuestAddr(code) + 0x30;
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+
+  // The framework translates only the first region; b.ne dispatches to
+  // advance_addr which has no cached region, so execution stops there.
+  // EXPECT_TRUE fails its internal insn_addr assertion when the actual
+  // stop != expected — we pass advance_addr so the assertion is happy.
+  EXPECT_TRUE(RunWithDispatch(code, advance_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, advance_addr)
+      << "Expected JIT to dispatch via b.ne to advance_addr=0x" << std::hex
+      << advance_addr << ".  Got insn_addr=0x" << state_.cpu.insn_addr
+      << ".  If 0x" << done_found_addr
+      << ", b.ne FAILED to fire — fall-through executed the unconditional "
+         "branch.  If 0x" << exit_success_addr
+      << ", b.eq spuriously fired despite non-empty bucket.";
+
+  // x24 must still be 0 (advance block did not execute).
+  EXPECT_EQ(state_.cpu.x[24], 0ULL) << "x24 should not have advanced yet";
+  EXPECT_EQ(state_.cpu.x[2], 1000ULL) << "watchdog must not have decremented";
+
+  // x8 must hold the loaded bucket value; x9 = bucket & 0xfffff.
+  EXPECT_EQ(state_.cpu.x[8], buckets[1])
+      << "LDR with UXTW#2 must read bucket[0]=0x" << std::hex << buckets[1];
+  EXPECT_EQ(state_.cpu.x[9], static_cast<uint64_t>(kStoredOffset))
+      << "ANDS x9, x8, #0xfffff must produce offset bits = 0x"
+      << std::hex << kStoredOffset;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[2], 0xdeadbeefU);
+}
+// endregion
+
+// region digitalis: production AddToMap bucket-FIND loop, multi-region,
+// PARTIALLY POPULATED bucket array.  Pre-translates every region within
+// the code array so cross-region dispatches resolve via TranslationCache.
+//
+// This is the test the VkCapsViewer wedge needs: it exercises the FULL
+// iteration cycle that the cached-JIT spin walks through in production —
+// loop-top region (ldr/ands/b.eq/cmp/b.ne) -> advance region (adds/b.hs/
+// and/subs/b.ls/b) -> back-edge dispatch to loop top.  K iterations of
+// "non-matching, non-empty bucket" before b.eq fires on the empty slot.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindMultiRegion_PartiallyPopulated) {
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  constexpr size_t kNumSlots = 16;
+  constexpr size_t kEmptyIdx = 3;
+  constexpr uint32_t kStoredHash = 0xAAA;
+  constexpr uint64_t kSearchHash = 0xBBB;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    if (i == kEmptyIdx) {
+      buckets[i + 1] = 0u;
+    } else {
+      buckets[i + 1] = (kStoredHash << 20) | (0x100 + static_cast<uint32_t>(i));
+    }
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = kNumSlots - 1;
+  state_.cpu.x[19] = kSearchHash;
+  state_.cpu.x[2]  = 1000;
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+  GuestAddr exit_fail_addr = ToGuestAddr(code) + 0x34;
+  GuestAddr done_found_addr = ToGuestAddr(code) + 0x30;
+
+  EXPECT_TRUE(RunMultiRegion(code, exit_success_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, exit_success_addr)
+      << "Expected b.eq to fire on bucket[" << kEmptyIdx << "].  Got 0x"
+      << std::hex << state_.cpu.insn_addr << ".  If 0x" << done_found_addr
+      << ": cmp+b.ne wrong direction (spurious match path).  If 0x"
+      << exit_fail_addr << ": watchdog exhausted — loop spun forever, the "
+         "production VkCaps wedge signature reproduced under host test.";
+
+  EXPECT_EQ(state_.cpu.x[24], static_cast<uint64_t>(kEmptyIdx))
+      << "x24 must equal " << kEmptyIdx << " (empty bucket idx).";
+  EXPECT_EQ(state_.cpu.x[8], 0ULL) << "last LDR must read bucket[empty]=0";
+  EXPECT_EQ(state_.cpu.x[9], 0ULL) << "ANDS with x8=0 yields 0";
+  EXPECT_EQ(state_.cpu.x[2], 1000ULL - kEmptyIdx)
+      << "watchdog should have decremented exactly " << kEmptyIdx << " times";
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+// endregion
+
+// region digitalis: production AddToMap bucket-FIND loop, multi-region,
+// FULLY POPULATED bucket array with non-matching hashes.  Equivalent to
+// the genuine pathological-data hypothesis (-266 hypothesis B): every
+// bucket is non-empty AND no hash matches.  The ARM ARM-defined loop
+// SHOULD spin forever in this case (until the b.hs overflow at iter
+// 0xFFFFFFFF, far beyond any real bucket count).
+//
+// We verify this with a watchdog: after 50 iterations the b.ls fires
+// and we exit_fail.  If the loop terminates EARLIER (insn_addr ==
+// exit_success_addr), the JIT spuriously took b.eq when no bucket was
+// empty — i.e. ANDS with non-zero result set Z=1.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindMultiRegion_FullyPopulatedSpins) {
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  constexpr size_t kNumSlots = 16;
+  constexpr uint32_t kStoredHash = 0xAAA;
+  constexpr uint64_t kSearchHash = 0xBBB;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    // Every bucket non-empty (lower 20 bits != 0), hash != kSearchHash.
+    buckets[i + 1] = (kStoredHash << 20) | (0x100 + static_cast<uint32_t>(i));
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = kNumSlots - 1;
+  state_.cpu.x[19] = kSearchHash;
+  state_.cpu.x[2]  = 50;
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+  GuestAddr exit_fail_addr = ToGuestAddr(code) + 0x34;
+
+  EXPECT_TRUE(RunMultiRegion(code, exit_fail_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, exit_fail_addr)
+      << "Expected watchdog to fire (loop spins on fully-populated, no-"
+         "match table).  Got 0x" << std::hex << state_.cpu.insn_addr
+      << ".  If 0x" << exit_success_addr
+      << ": ANDS spuriously set Z=1 on a non-empty bucket.";
+
+  // After 50 iterations of the watchdog (subs x2,x2,#1 with b.ls), the
+  // loop exits.  x2 should be 0 (b.ls takes when C=0 or Z=1; subs with
+  // x2 going 50->...->1 keeps C=1 (no borrow) until x2=1->0 which sets
+  // Z=1 and C=1, so b.ls=(C==0 OR Z==1) fires at x2=0).
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "watchdog should reach 0";
 }
 // endregion
 
