@@ -5524,6 +5524,41 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - scalar FRECPE / FRSQRTE.
+      // ARM spec only requires ~8 bits of mantissa precision; computing the
+      // exact 1/x or 1/sqrt(x) is well within bound. Mirrors the vector
+      // kFrecpeV/kFrsqrteV implementation. args.size bit 1 is pinned to 1
+      // by the decoder; sz=args.size&1 selects single (0) vs double (1).
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFrecpe:
+      case Decoder::AdvSimdScalarTwoRegMiscOpcode::kFrsqrte: {
+        bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFrsqrte);
+        if ((args.size & 1) == 0) {
+          float f;
+          memcpy(&f, &src, sizeof(f));
+          float r;
+          if (is_rsqrt) {
+            r = (f <= 0.0f || f != f) ? __builtin_nanf("")
+                                      : 1.0f / __builtin_sqrtf(f);
+          } else {
+            r = (f == 0.0f) ? __builtin_inff() * (1.0f / f) : 1.0f / f;
+          }
+          memcpy(&result, &r, sizeof(r));
+        } else {
+          double d;
+          memcpy(&d, &src, sizeof(d));
+          double r;
+          if (is_rsqrt) {
+            r = (d <= 0.0 || d != d) ? __builtin_nan("")
+                                     : 1.0 / __builtin_sqrt(d);
+          } else {
+            r = (d == 0.0) ? __builtin_inf() * (1.0 / d) : 1.0 / d;
+          }
+          memcpy(&result, &r, sizeof(r));
+        }
+        break;
+      }
+      // endregion
     }
 
     state_->cpu.v[args.rd] = result;

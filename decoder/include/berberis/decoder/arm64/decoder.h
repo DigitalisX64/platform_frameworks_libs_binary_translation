@@ -1432,6 +1432,10 @@ class Decoder {
     kUcvtf,   // UCVTF  (scalar): unsigned int → float                     (opcode=11101, U=1; size ∈ {S,D})
     kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero    (opcode=11011, U=0; size ∈ {S,D})
     kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero  (opcode=11011, U=1; size ∈ {S,D})
+    // region digitalis - scalar FRECPE / FRSQRTE.
+    kFrecpe,  // FRECPE  (scalar): FP reciprocal estimate                  (opcode=11101, U=0; size ∈ {10, 11})
+    kFrsqrte, // FRSQRTE (scalar): FP reciprocal square-root estimate      (opcode=11101, U=1; size ∈ {10, 11})
+    // endregion
     // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
     kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
     kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
@@ -5252,11 +5256,26 @@ class Decoder {
 
     switch (opcode) {
       case 0b11101:
-        // SCVTF (U=0) / UCVTF (U=1): integer → float, scalar
-        // size: 0=single, 1=double
-        if (size >= 2) { Undefined(); return; }
-        op = u ? AdvSimdScalarTwoRegMiscOpcode::kUcvtf
-               : AdvSimdScalarTwoRegMiscOpcode::kScvtf;
+        // opcode=11101 splits on bit23 of the `size` field:
+        //   bit23=0 (size ∈ {00, 01}): SCVTF (U=0) / UCVTF (U=1) —
+        //     integer → float, scalar; sz=size&1 chooses S vs D.
+        //   bit23=1 (size ∈ {10, 11}): FRECPE (U=0) / FRSQRTE (U=1) —
+        //     FP reciprocal / reciprocal-sqrt estimate, scalar.
+        // llvm-mc-21 encoding checks:
+        //   scvtf   s0, s1   → 0x5e21d820  (U=0, opcode=11101, size=00)
+        //   scvtf   d0, d1   → 0x5e61d820  (U=0, opcode=11101, size=01)
+        //   frecpe  s0, s1   → 0x5ea1d820  (U=0, opcode=11101, size=10)
+        //   frecpe  d0, d1   → 0x5ee1d820  (U=0, opcode=11101, size=11)
+        //   frsqrte s0, s1   → 0x7ea1d820  (U=1, opcode=11101, size=10)
+        if ((size & 0b10) == 0) {
+          op = u ? AdvSimdScalarTwoRegMiscOpcode::kUcvtf
+                 : AdvSimdScalarTwoRegMiscOpcode::kScvtf;
+        } else {
+          // region digitalis
+          op = u ? AdvSimdScalarTwoRegMiscOpcode::kFrsqrte
+                 : AdvSimdScalarTwoRegMiscOpcode::kFrecpe;
+          // endregion
+        }
         break;
       case 0b11011:
         // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero.
