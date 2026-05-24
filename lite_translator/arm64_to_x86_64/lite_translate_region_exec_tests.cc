@@ -12014,6 +12014,108 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8H_FromW7_HighBitsIgnored) {
 }
 // endregion
 
+// region digitalis: __memset_aarch64 1024-byte zero-fill reproduction.
+//
+// Reproduces the path Bionic's linker takes when scrubbing a freshly
+// re-allocated 1024-byte chunk from BionicSmallObjectAllocator.  That chunk
+// backs the ZIP central-directory hash table (calloc-allocated, with the
+// linker's calloc proxying directly to BionicAllocator::alloc — see
+// __dl_calloc at linker64+0x99f44 — without an extra memset; the small-
+// object allocator's own per-block memset is the only zeroing pass).
+//
+// Handoff-257 traced the VkCapsViewer splash hang to that table containing
+// non-zero garbage after allocation: every probed bucket showed leftover
+// heap content with `top12bits == 0` and a non-zero lower 20 bits, which
+// AddToMap can never produce for a real ZIP entry.  That signature is what
+// you get when the 1024-byte zero pass over the chunk silently drops a
+// scattering of writes.
+//
+// The instruction sequence below is taken verbatim from
+// __dl___memset_aarch64+0xa4..+0x118 (the big-size, non-DC-ZVA fallback at
+// linker64+0x49d60 onward, joined to the 0x49db8 entry that Berberis
+// reaches because the DCZID_EL0 ZVA check fails).  Pre-fills the buffer
+// with 0xdeadbeef so any missed store leaks the sentinel.
+TEST_F(Arm64LiteTranslateRegionTest, MemsetAarch64_1024ByteZeroFill_Unrolled) {
+  // Unrolled variant: replaces the b.hi loop with 15 inline iterations so the
+  // test runs end-to-end in one JIT region (the framework's allow_dispatch=
+  // false setting otherwise stops after the first backward-branch exit).
+  // If every individual STR Q / STP Q / DUP V translation is correct, the
+  // buffer is fully zeroed; any silently-dropped store leaks the 0xdeadbeef
+  // sentinel byte-by-byte.  This is what __memset_aarch64 ends up doing on
+  // a 1024-byte zero fill: 2 head STRs, 15 main-loop iterations each writing
+  // 64 bytes via 2 paired-Q STPs, then 2 tail STPs.
+  static constexpr size_t kSize = 1024;
+  alignas(16) static uint8_t buffer[kSize];
+  for (size_t i = 0; i < kSize / 4; ++i) {
+    reinterpret_cast<uint32_t*>(buffer)[i] = 0xdeadbeefU;
+  }
+
+  // stp q0, q0, [x3, #0x20]:  0xAD010060
+  // stp q0, q0, [x3, #0x40]:  0xAD020060
+  // add x3, x3, #0x40:        0x91010063
+  // stp q0, q0, [x4, #-0x40]: 0xAD3E0080
+  // stp q0, q0, [x4, #-0x20]: 0xAD3F0080
+  static const uint32_t code[] = {
+      0x4e010c20,  // dup v0.16b, w1
+      0x8b020004,  // add x4, x0, x2
+      0x927cec03,  // and x3, x0, #~0xf
+      0x3d800000,  // str q0, [x0]
+      0x3d800460,  // str q0, [x3, #0x10]
+      // iter 0
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 1
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 2
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 3
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 4
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 5
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 6
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 7
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 8
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 9
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 10
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 11
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 12
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 13
+      0xad010060, 0xad020060, 0x91010063,
+      // iter 14
+      0xad010060, 0xad020060, 0x91010063,
+      0xad3e0080,  // stp q0, q0, [x4, #-0x40]
+      0xad3f0080,  // stp q0, q0, [x4, #-0x20]
+  };
+
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = kSize;
+
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  size_t first_nonzero = kSize;
+  for (size_t i = 0; i < kSize; ++i) {
+    if (buffer[i] != 0u) {
+      first_nonzero = i;
+      break;
+    }
+  }
+  EXPECT_EQ(first_nonzero, kSize)
+      << "first non-zero byte at offset " << first_nonzero
+      << " (value 0x" << std::hex
+      << static_cast<unsigned>(buffer[first_nonzero == kSize ? 0 : first_nonzero])
+      << "); buffer must be fully zeroed";
+}
+// endregion
+
 // region digitalis: INS (element) JIT
 // INS Vd.<T>[dst_idx], Vn.<T>[src_idx] — copy one esize-byte lane from Vn
 // to one lane of Vd, leaving every other lane of Vd unchanged.  These
