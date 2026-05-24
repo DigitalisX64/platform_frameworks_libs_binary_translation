@@ -52,8 +52,17 @@ class ProxyLibraryBuilder {
   void InterceptSymbol(GuestAddr guest_addr, const char* name);
 
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   // Append additional KnownTrampoline entries for `library_name` that will be
   // consulted by InterceptSymbol after the primary table search misses.
+  //
+  // Built only for the arm64-to-x86_64 translation configuration. The proxy
+  // loader is otherwise guest-arch-agnostic, but the extras-registry is a
+  // Digitalis-specific addition and is gated to its target build to avoid
+  // bloating libberberis_riscv64 (or any future guest-arch lib) with code it
+  // never exercises. The arm64 build of the proxy loader is shipped as the
+  // separate cc_library_static `libberberis_proxy_loader_arm64`; the original
+  // upstream `libberberis_proxy_loader` is unchanged.
   //
   // The primary table is built once via `Build()` from a single static array
   // shipped by upstream proxy_libc / proxy_libm. This API exists so that the
@@ -76,6 +85,7 @@ class ProxyLibraryBuilder {
   static void RegisterExtraTrampolines(const char* library_name,
                                        const KnownTrampoline* trampolines,
                                        size_t count);
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
   // endregion
 
  private:
