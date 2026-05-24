@@ -12178,6 +12178,56 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
     return true;
   }
 
+  // region digitalis: translate every region inside [code, code+sizeof(code))
+  // by walking forward from code[0] and re-translating from each region's
+  // stop_pc until end-of-code is reached.  Dispatch back-edges between
+  // regions then resolve via TranslationCache lookups, letting the loop
+  // iterate to natural termination.
+  template <typename T>
+  bool RunMultiRegion(const T& code, GuestAddr expected_stop_addr) {
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    GuestAddr code_start = ToGuestAddr(code);
+    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    auto* cache = TranslationCache::GetInstance();
+
+    HostCodeAddr first_host_code = 0;
+    GuestAddr cur = code_start;
+    while (cur < code_end) {
+      MachineCode machine_code;
+      auto [success, stop_pc] = TryLiteTranslateRegion(cur,
+                                                       &machine_code,
+                                                       LiteTranslateParams{
+                                                           .end_pc = code_end,
+                                                           .allow_dispatch = true,
+                                                       });
+      if (!success || (stop_pc > code_end) || stop_pc == cur) {
+        return false;
+      }
+      GuestCodeEntry* entry = cache->AddAndLockForTranslation(cur, 0);
+      if (!entry) {
+        return false;
+      }
+      HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+      size_t region_size = stop_pc - cur;
+      cache->SetTranslatedAndUnlock(cur,
+                                    entry,
+                                    static_cast<uint32_t>(region_size),
+                                    GuestCodeEntry::Kind::kLiteTranslated,
+                                    {host_code, machine_code.install_size()});
+      if (cur == code_start) {
+        first_host_code = host_code;
+      }
+      cur = stop_pc;
+    }
+
+    TestingRunGeneratedCode(&state_, AsHostCode(first_host_code), expected_stop_addr);
+    EXPECT_EQ(state_.cpu.insn_addr, expected_stop_addr);
+
+    cache->InvalidateGuestRange(code_start, code_end);
+    return true;
+  }
+  // endregion
+
  protected:
   ThreadState state_{};
 };
@@ -12322,6 +12372,684 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketRmwUnderDispatch) {
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU)
       << "trailing guard clobbered — STR base/shift bug";
 }
+
+// Production AddToMap two-step insert (FULL 5-instruction sequence at linker
+// offsets 0x9cc68..0x9cc78 of CdEntryMapZip32<ZipStringOffset20>::AddToMap):
+//
+//   str  w8,  [x25, x24, lsl #2]    ; STORE 1: bucket = name_offset (low 20)
+//   ldr  x8,  [x21, #0x8]            ; reload x8 from map's bucket-pointer
+//                                    ;   (after the reload, x8 == x25)
+//   ldr  w9,  [x8,  x24, lsl #2]    ; reload the just-stored bucket value
+//   bfi  w9,  w19, #20, #12         ; splice 12-bit name_length at bits[31:20]
+//   str  w9,  [x8,  x24, lsl #2]   ; STORE 2: bucket = (length << 20) | offset
+//
+// The peek-tool live capture in the wedged VkCapsViewer showed 118/256 buckets
+// with length=0 and offset!=0 — exactly the signature of STORE 2 being
+// effectively dropped after STORE 1 committed.  This test runs the FULL 5-
+// instruction production sequence under dispatch with a backward-branch loop
+// (so the dispatch path with EmitDirectDispatch is exercised), driven over
+// 256 iterations, with the bucket array initially all zero (matching the
+// linker's calloc'd allocation).  After the loop, every bucket must have its
+// length field populated; any bucket with length=0 means STORE 2 didn't
+// commit for that iteration.
+//
+// Differences from AddToMapBucketRmwUnderDispatch above:
+//   * Includes STORE 1 (via x25), not just STORE 2 (via x8 after reload).
+//   * Includes the LDR x8 reload from a memory slot that aliases x25 — same
+//     bucket array reached via two different base registers.  The JIT must
+//     correctly serialize STORE 1's effect through the address-aliased LDR.
+//   * Pre-fills buckets to ZERO (matching calloc), not 0x12345678.  A length=0
+//     after the loop means STORE 2 didn't commit; with the all-zero pre-fill
+//     it's unambiguous (no risk of a sentinel value still being there).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsertUnderDispatch_Full5Insn) {
+  // Encodings round-tripped through aarch64-linux-gnu-as.
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; reload x8 = bucket base
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]    ; reload bucket
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12        ; splice length
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2
+      0x91000718,  // [20] add  x24, x24, #1
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28  -> back to [0]
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];  // +2 guards
+  buckets[0] = 0xfeedfaceU;                            // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;  // calloc-equivalent pre-fill (production's case)
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;                // trailing guard
+
+  // Pointer-alias slot: a uint64_t at [x21 + 0x8] that holds &buckets[1].
+  // Production has the CdEntryMapZip32 object at x21 with the hash_table_
+  // bucket-pointer field at offset +0x8; we replicate that layout here so
+  // `ldr x8, [x21, #0x8]` materializes the bucket array base.
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;                                   // would be other fields
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);  // [x21+0x8]
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  // x8 initially holds the "name_offset" for this hypothetical insert —
+  // a non-zero unique value so STORE 1 has something distinct to write.
+  state_.cpu.x[8] = 0x12345ULL;
+
+  EXPECT_TRUE(RunWithDispatch(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "loop must exit (x2 reaches 0)";
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must reach kNumSlots";
+
+  // Each bucket must have length=0xAAA in bits[31:20] (the BFI'd value).
+  // Whether the offset bits[19:0] is the original 0x12345 (iter 0) or the
+  // low 20 bits of &buckets[1] (subsequent iters, because the LDR x8 reload
+  // overwrites x8 = bucket-array base, and STORE 1 in the NEXT iter writes
+  // that address back) doesn't matter — the test only checks the length
+  // half, which is what 118/256 production buckets are missing.
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "production-signature bug: " << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped); first at i=" << first_length_zero
+      << " value=0x" << std::hex << first_bad_bucket;
+
+  // Guards intact.
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+
+// Same 5-instruction insert sequence as the previous test, but with an
+// explicit region split forced at the production boundary observed via the
+// REGION_END_LOW diagnostic in lite_translate_region.cc:
+//
+//   Region A: contains only the STORE 1 (str w8, [x25, x24, lsl #2])
+//   Region B: contains the LDR x8 reload, LDR w9, BFI w9, STORE 2, advance,
+//             subs, b.hi (back-edge to Region A)
+//
+// In production VkCapsViewer the IsGpRegPoolLow early-termination fires at
+// guest PCs `linker_base+0x9cc6c` (= LDR x8 reload, immediately after STORE 1)
+// and `linker_base+0x9cc7c` (= one past STORE 2).  This test pins whether the
+// 5-instruction sequence remains correct under the SAME region-split topology.
+//
+// If this test FAILS while the no-split variant above PASSES, that proves the
+// production wedge's bucket-corruption signature (length=0, offset!=0) is a
+// JIT bug specific to the region-boundary state between STORE 1 and STORE 2 —
+// either cross-region register live-state tracking, signal-check interaction,
+// or some other inter-region effect.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_ExplicitSplitAtProductionBoundary) {
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1 — Region A
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; Region B start
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2
+      0x91000718,  // [20] add  x24, x24, #1
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  state_.cpu.x[8] = 0x12345ULL;
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);
+  GuestAddr split_pc = code_start + 4;  // Right after STORE 1
+
+  state_.cpu.insn_addr = code_start;
+  auto* cache = TranslationCache::GetInstance();
+
+  // Region A: STORE 1 only (end_pc forces termination after one instruction).
+  MachineCode mc_a;
+  auto [success_a, stop_a] = TryLiteTranslateRegion(
+      code_start, &mc_a,
+      LiteTranslateParams{.end_pc = split_pc, .allow_dispatch = true});
+  ASSERT_TRUE(success_a);
+  ASSERT_EQ(stop_a, split_pc);
+  GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry_a, nullptr);
+  HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
+  cache->SetTranslatedAndUnlock(code_start, entry_a,
+                                static_cast<uint32_t>(stop_a - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_a, mc_a.install_size()});
+
+  // Region B: LDR x8 reload through b.hi.
+  MachineCode mc_b;
+  auto [success_b, stop_b] = TryLiteTranslateRegion(
+      split_pc, &mc_b,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_b);
+  ASSERT_EQ(stop_b, code_end);
+  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(split_pc, 0);
+  ASSERT_NE(entry_b, nullptr);
+  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
+  cache->SetTranslatedAndUnlock(split_pc, entry_b,
+                                static_cast<uint32_t>(stop_b - split_pc),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_b, mc_b.install_size()});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
+
+  EXPECT_EQ(state_.cpu.insn_addr, code_end);
+  EXPECT_EQ(state_.cpu.x[2], 0ULL);
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots);
+
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "FORCED-SPLIT bug reproduces production signature: "
+      << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped); first at i="
+      << first_length_zero << " value=0x" << std::hex << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+
+  cache->InvalidateGuestRange(code_start, code_end);
+}
+
+// Same 5-instruction insert as AddToMapBucketTwoStepInsert_ExplicitSplit-
+// AtProductionBoundary above, but forces a THREE-region topology that
+// exactly matches the production VkCapsViewer IsGpRegPoolLow split points.
+// In production, the early-termination check fires at BOTH guest PCs
+// `linker_base+0x9cc6c` (just before LDR x8) AND `linker_base+0x9cc7c`
+// (just before ADD x24, one past STORE 2).  The existing test only forces
+// the first split; this test forces both:
+//
+//   Region A: STORE 1                     (offset 0..4   = 0x9cc68..0x9cc6c)
+//   Region B: LDR x8, LDR w9, BFI w9,
+//             STORE 2                     (offset 4..20  = 0x9cc6c..0x9cc7c)
+//   Region C: add x24, subs x2, b.hi      (offset 20..32 = 0x9cc7c..0x9cc88)
+//
+// If this test FAILS while the two-region split test PASSES, the bug is
+// specific to the Region B/C boundary (the split between STORE 2 and the
+// loop tail) — a cross-region effect not exercised by the existing tests.
+// If both pass, the production-only condition is something OTHER than the
+// region-split topology (deeper mapped-register state in Region A, the
+// physical-PC of the dispatch chain, signal interaction, or cache-line
+// alignment of the host-emitted dispatch tail).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_ThreeRegionSplitAtProductionBoundaries) {
+  static const uint32_t code[] = {
+      0xb8387b28,  // [ 0] str  w8, [x25, x24, lsl #2]   ; STORE 1 — Region A
+      0xf94006a8,  // [ 4] ldr  x8, [x21, #0x8]           ; Region B start
+      0xb8787909,  // [ 8] ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [12] bfi  w9, w19, #20, #12
+      0xb8387909,  // [16] str  w9, [x8, x24, lsl #2]   ; STORE 2 (end Region B)
+      0x91000718,  // [20] add  x24, x24, #1             ; Region C start
+      0xf1000442,  // [24] subs x2,  x2, #1
+      0x54ffff28,  // [28] b.hi -28
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  state_.cpu.x[8] = 0x12345ULL;
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);
+  GuestAddr split_1 = code_start + 4;   // After STORE 1 / before LDR x8
+  GuestAddr split_2 = code_start + 20;  // After STORE 2 / before ADD x24
+
+  state_.cpu.insn_addr = code_start;
+  auto* cache = TranslationCache::GetInstance();
+
+  // Region A: STORE 1 only.
+  MachineCode mc_a;
+  auto [success_a, stop_a] = TryLiteTranslateRegion(
+      code_start, &mc_a,
+      LiteTranslateParams{.end_pc = split_1, .allow_dispatch = true});
+  ASSERT_TRUE(success_a);
+  ASSERT_EQ(stop_a, split_1);
+  GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry_a, nullptr);
+  HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
+  cache->SetTranslatedAndUnlock(code_start, entry_a,
+                                static_cast<uint32_t>(stop_a - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_a, mc_a.install_size()});
+
+  // Region B: LDR x8 reload .. STORE 2.
+  MachineCode mc_b;
+  auto [success_b, stop_b] = TryLiteTranslateRegion(
+      split_1, &mc_b,
+      LiteTranslateParams{.end_pc = split_2, .allow_dispatch = true});
+  ASSERT_TRUE(success_b);
+  ASSERT_EQ(stop_b, split_2);
+  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(split_1, 0);
+  ASSERT_NE(entry_b, nullptr);
+  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
+  cache->SetTranslatedAndUnlock(split_1, entry_b,
+                                static_cast<uint32_t>(stop_b - split_1),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_b, mc_b.install_size()});
+
+  // Region C: advance, subs, b.hi (with backward branch into Region A).
+  MachineCode mc_c;
+  auto [success_c, stop_c] = TryLiteTranslateRegion(
+      split_2, &mc_c,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_c);
+  ASSERT_EQ(stop_c, code_end);
+  GuestCodeEntry* entry_c = cache->AddAndLockForTranslation(split_2, 0);
+  ASSERT_NE(entry_c, nullptr);
+  HostCodeAddr host_code_c = GetDefaultCodePoolInstance()->Add(&mc_c);
+  cache->SetTranslatedAndUnlock(split_2, entry_c,
+                                static_cast<uint32_t>(stop_c - split_2),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_c, mc_c.install_size()});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
+
+  EXPECT_EQ(state_.cpu.insn_addr, code_end);
+  EXPECT_EQ(state_.cpu.x[2], 0ULL);
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots);
+
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "THREE-REGION SPLIT reproduces production signature: "
+      << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped); first at i="
+      << first_length_zero << " value=0x" << std::hex << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+
+  cache->InvalidateGuestRange(code_start, code_end);
+}
+
+// Hypothesis B (deeper mapped-register state in Region A).  Same 5-insn
+// AddToMap insert sequence as above, but Region A is preceded by a 7-
+// instruction prelude that touches x4-x7 and x10-x12 (none of which are
+// used by the insert sequence proper), forcing the JIT's permanent-slot
+// allocator to map 7 extra guest regs before STORE 1 even starts decoding.
+// Combined with the production's exact three-region split topology
+// (splits at the LDR x8 reload AND one past STORE 2), this matches the
+// register-pressure profile inferred from VkCapsViewer's IsGpRegPoolLow
+// trace, where the JIT's allocator is near-full at Region A's exit.
+//
+// 7 (not 9) prelude regs because: each prelude insn maps 1 guest reg
+// permanently; STORE 1 maps 3 more (x8/x25/x24), totalling 10 permanent
+// slots; that leaves 3 free slots — enough for STORE 1's 2-temp address
+// computation but tight enough that IsGpRegPoolLow(threshold=4) fires
+// at the LDR x8 boundary (avail=3 < 4) and naturally terminates Region
+// A.  With 9 prelude regs the allocator overflows during STORE 1 itself
+// (AllocTemp returns no_register), making TryLiteTranslateRegion return
+// success=false instead of cleanly splitting the region — that's a JIT
+// limit, not the production bug.
+//
+// Each prelude insn is `add xN, xN, xzr` (encoded by hand below) — it
+// reads xN, writes xN, leaves xN's value unchanged, and does NOT touch
+// NZCV (it's ADD, not ADDS), so the b.hi at the loop tail still reads
+// only the SUBS-set flags.
+//
+// If this test FAILS while the simpler three-region split test PASSES,
+// hypothesis B is CONFIRMED — the bug is in the JIT's handling of the
+// 5-insn insert sequence when Region A entered Region B with most of the
+// permanent-slot pool already exhausted.  Each subsequent bisection of
+// which prelude regs trigger the failure pinpoints the spill/restore or
+// dispatch-state hand-off path that mishandles deep mapped state.
+//
+// If this test PASSES, hypothesis B is disproved at this depth (7 extra
+// mapped guest regs).  Next step would be hypothesis C (translating the
+// FULL surrounding AddToMap function as a single block and running it
+// 256x to see if a non-tested-here opcode propagates corruption into
+// the insert sequence's inputs) or D (cache-line / dispatch-tail effects).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketTwoStepInsert_ThreeRegionSplit_DeepMappedRegState) {
+  static const uint32_t code[] = {
+      // --- Prelude: pre-map x4-x7 and x10-x12 into JIT permanent slots
+      //     (7 regs, each `add xN, xN, xzr` keeps xN's value unchanged) ---
+      0x8B1F0084,  // [ 0] add  x4,  x4,  xzr   ; map x4
+      0x8B1F00A5,  // [ 4] add  x5,  x5,  xzr   ; map x5
+      0x8B1F00C6,  // [ 8] add  x6,  x6,  xzr   ; map x6
+      0x8B1F00E7,  // [12] add  x7,  x7,  xzr   ; map x7
+      0x8B1F014A,  // [16] add  x10, x10, xzr   ; map x10
+      0x8B1F016B,  // [20] add  x11, x11, xzr   ; map x11
+      0x8B1F018C,  // [24] add  x12, x12, xzr   ; map x12
+
+      // --- Production AddToMap 5-insn insert sequence ---
+      0xb8387b28,  // [28] str  w8, [x25, x24, lsl #2]  ; STORE 1 (Region A end)
+      0xf94006a8,  // [32] ldr  x8, [x21, #0x8]          ; Region B start
+      0xb8787909,  // [36] ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [40] bfi  w9, w19, #20, #12
+      0xb8387909,  // [44] str  w9, [x8, x24, lsl #2]  ; STORE 2 (Region B end)
+      0x91000718,  // [48] add  x24, x24, #1            ; Region C start
+      0xf1000442,  // [52] subs x2,  x2, #1
+      0x54fffe48,  // [56] b.hi -56  -> back to prelude start (offset 0 = Region A entry)
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[2] = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;
+  state_.cpu.x[8] = 0x12345ULL;
+  // Sentinel values for the pre-mapped regs (verified intact after the loop).
+  state_.cpu.x[4]  = 0xdead0004ULL;
+  state_.cpu.x[5]  = 0xdead0005ULL;
+  state_.cpu.x[6]  = 0xdead0006ULL;
+  state_.cpu.x[7]  = 0xdead0007ULL;
+  state_.cpu.x[10] = 0xdead000aULL;
+  state_.cpu.x[11] = 0xdead000bULL;
+  state_.cpu.x[12] = 0xdead000cULL;
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);
+  // Region A naturally ends after STORE 1 due to IsGpRegPoolLow (7 prelude
+  // mapped regs + x8/x25/x24 from STORE 1 = 10 mapped, 3 slots left, < 4).
+  // Pass end_pc = code_end and let IsGpRegPoolLow do the cut; verify
+  // stop_a matches the expected first split.
+  GuestAddr expected_split_1 = code_start + 32;
+  GuestAddr split_2 = code_start + 48;  // Forced split: after STORE 2.
+
+  state_.cpu.insn_addr = code_start;
+  auto* cache = TranslationCache::GetInstance();
+
+  // Region A: prelude + STORE 1 (terminated by IsGpRegPoolLow).
+  MachineCode mc_a;
+  auto [success_a, stop_a] = TryLiteTranslateRegion(
+      code_start, &mc_a,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_a);
+  ASSERT_EQ(stop_a, expected_split_1)
+      << "Region A should stop at offset 32 (LDR x8) due to IsGpRegPoolLow "
+      << "after 7 prelude mappings + 3 STORE 1 mappings; stopped at offset "
+      << (stop_a - code_start);
+  GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry_a, nullptr);
+  HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
+  cache->SetTranslatedAndUnlock(code_start, entry_a,
+                                static_cast<uint32_t>(stop_a - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_a, mc_a.install_size()});
+
+  // Region B: LDR x8 reload .. STORE 2 (forced end at split_2).
+  MachineCode mc_b;
+  auto [success_b, stop_b] = TryLiteTranslateRegion(
+      expected_split_1, &mc_b,
+      LiteTranslateParams{.end_pc = split_2, .allow_dispatch = true});
+  ASSERT_TRUE(success_b);
+  ASSERT_EQ(stop_b, split_2);
+  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(expected_split_1, 0);
+  ASSERT_NE(entry_b, nullptr);
+  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
+  cache->SetTranslatedAndUnlock(expected_split_1, entry_b,
+                                static_cast<uint32_t>(stop_b - expected_split_1),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_b, mc_b.install_size()});
+
+  // Region C: advance, subs, b.hi (back-edge to STORE 1 = expected_split_1
+  // boundary... actually b.hi target is offset 36 = STORE 1, which is the
+  // last insn of Region A.  Dispatch lookup at offset 36 finds Region A's
+  // entry (which starts at offset 0) -- there is NO independent cache
+  // entry at offset 36.  So the back-edge re-enters Region A from the
+  // prelude, re-running the 9 prelude insns on each iteration.  This is
+  // the production-equivalent behavior because production's prelude is
+  // outside the loop, but here we let it re-run; it's idempotent.).
+  MachineCode mc_c;
+  auto [success_c, stop_c] = TryLiteTranslateRegion(
+      split_2, &mc_c,
+      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success_c);
+  ASSERT_EQ(stop_c, code_end);
+  GuestCodeEntry* entry_c = cache->AddAndLockForTranslation(split_2, 0);
+  ASSERT_NE(entry_c, nullptr);
+  HostCodeAddr host_code_c = GetDefaultCodePoolInstance()->Add(&mc_c);
+  cache->SetTranslatedAndUnlock(split_2, entry_c,
+                                static_cast<uint32_t>(stop_c - split_2),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code_c, mc_c.install_size()});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
+
+  EXPECT_EQ(state_.cpu.insn_addr, code_end);
+  EXPECT_EQ(state_.cpu.x[2], 0ULL);
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots);
+
+  // Sentinel regs must be untouched.
+  EXPECT_EQ(state_.cpu.x[4],  0xdead0004ULL);
+  EXPECT_EQ(state_.cpu.x[5],  0xdead0005ULL);
+  EXPECT_EQ(state_.cpu.x[6],  0xdead0006ULL);
+  EXPECT_EQ(state_.cpu.x[7],  0xdead0007ULL);
+  EXPECT_EQ(state_.cpu.x[10], 0xdead000aULL);
+  EXPECT_EQ(state_.cpu.x[11], 0xdead000bULL);
+  EXPECT_EQ(state_.cpu.x[12], 0xdead000cULL);
+
+  // Bucket-array integrity: every bucket's bits[31:20] (length field) must
+  // equal 0xAAA (the BFI'd value).  If hypothesis B is correct, some
+  // buckets will have length=0 (STORE 2 dropped under deep mapped state).
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "HYPOTHESIS B CONFIRMED: " << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (STORE 2 dropped under deep mapped state); "
+      << "first at i=" << first_length_zero << " value=0x" << std::hex
+      << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+
+  cache->InvalidateGuestRange(code_start, code_end);
+}
+
+// region digitalis: Hypothesis C — surrounding-code interaction.
+//
+// Combines production's bucket-FIND loop body (LDR + ANDS + b.eq) AND the
+// bucket-INSERT 5-instruction sequence in ONE contiguous block, run 256x
+// under multi-region dispatch.  Mirrors the FULL execution path of
+// CdEntryMapZip32<ZipStringOffset20>::AddToMap at linker offsets
+// 0x9cc20..0x9cc78 for the "empty bucket on first probe" path.
+//
+// Each outer iteration:
+//   1. LDR w8 = buckets[x24]   (always 0; pre-fill is calloc-equivalent)
+//   2. ANDS x9, x8, #0xfffff   (Z=1 because bucket is empty)
+//   3. b.eq insert             (taken)
+//   4. INSERT 5-insn sequence: STORE 1 + LDR x8 + LDR w9 + BFI + STORE 2
+//   5. x24++, subs x2,#1, b.hi top  (256 iterations total)
+//
+// Hypothesis A (signal clobber) and B (deep mapped-register state /
+// spill-restore) are DISPROVED in earlier work; do NOT re-test them.
+// Hypothesis C theorizes the bug lives in an instruction OUTSIDE the 5-insn
+// insert sequence pinned by the existing tests — specifically the b.eq
+// cross-region dispatch from FIND to INSERT, or the LDR/ANDS pair preceding
+// it.  In production, the find loop runs 1-3 times per AddToMap call before
+// hitting an empty bucket, then dispatches to the insert.  If b.eq's
+// cross-region dispatch (or its surrounding code) occasionally drops x19
+// (the BFI source = name_length), ~half the buckets end up with length=0 —
+// matching the production signature.
+//
+// If this test FAILS, the bug is reproduced deterministically under host
+// conditions and bisection can localize.
+//
+// If this test PASSES, hypothesis C's "1-step find then insert" form is
+// disproved; the next target is hypothesis D (region invalidation /
+// re-translation race during the live VkCapsViewer run, where trans#N
+// climbed to ~290/sec).
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindThenInsertCombinedUnderDispatch_256x) {
+  static const uint32_t code[] = {
+      // --- FIND loop body (always hits empty bucket via b.eq) ---
+      0xb8785b28,  // [ 0] loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [ 4]           ands x9, x8, #0xfffff
+      0x54000080,  // [ 8]           b.eq +0x10 (-> insert at offset 24)
+      0x31000708,  // [12]           adds w8, w24, #1      ; advance (dead)
+      0x0a1a0118,  // [16]           and  w24, w8, w26     ; (dead)
+      0x17fffffb,  // [20]           b    -0x14 (-> loop_top, dead)
+      // --- INSERT 5-insn sequence (production 0x9cc58..0x9cc78) ---
+      0x4b160289,  // [24] insert:   sub  w9, w20, w22     ; w9 = name_offset
+      0x2a1f03e0,  // [28]           mov  w0, wzr
+      0x12004d29,  // [32]           and  w9, w9, #0xfffff
+      0x2a090108,  // [36]           orr  w8, w8, w9       ; w8 = offset (len=0)
+      0xb8387b28,  // [40]           str  w8, [x25, x24, lsl #2]   ; STORE 1
+      0xf94006a8,  // [44]           ldr  x8, [x21, #0x8]  ; reload via x21
+      0xb8787909,  // [48]           ldr  w9, [x8, x24, lsl #2]
+      0x330c2e69,  // [52]           bfi  w9, w19, #20, #12 ; splice length
+      0xb8387909,  // [56]           str  w9, [x8, x24, lsl #2]    ; STORE 2
+      0x91000718,  // [60]           add  x24, x24, #1     ; next bucket idx
+      0xf1000442,  // [64]           subs x2,  x2, #1
+      0x54fffde8,  // [68]           b.hi -0x44 (-> loop_top, 256 iters)
+  };
+
+  constexpr size_t kNumSlots = 256;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;                       // leading guard
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    buckets[i + 1] = 0;
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;           // trailing guard
+
+  alignas(8) static uint64_t map_struct[4];
+  map_struct[0] = 0;
+  map_struct[1] = reinterpret_cast<uint64_t>(&buckets[1]);
+  map_struct[2] = 0;
+  map_struct[3] = 0;
+
+  state_.cpu.x[21] = ToGuestAddr(&map_struct[0]);
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = kNumSlots - 1;               // mask = 0xff
+  state_.cpu.x[2]  = kNumSlots;
+  state_.cpu.x[19] = 0xAAA;                        // BFI source: 12-bit length
+  state_.cpu.x[20] = 0x12345ULL;
+  state_.cpu.x[22] = 0;
+
+  EXPECT_TRUE(RunMultiRegion(code, ToGuestAddr(code) + sizeof(code)));
+
+  EXPECT_EQ(state_.cpu.x[2],  0ULL) << "loop must exit (x2 reaches 0)";
+  EXPECT_EQ(state_.cpu.x[24], kNumSlots) << "x24 must reach kNumSlots";
+
+  // Production-signature check: every bucket must have length=0xAAA in
+  // bits[31:20].  Any bucket with length=0 reproduces the wedge.
+  size_t first_length_zero = kNumSlots;
+  uint32_t first_bad_bucket = 0;
+  size_t count_length_zero = 0;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    const uint32_t bucket = buckets[i + 1];
+    const uint32_t length = (bucket >> 20) & 0xfff;
+    if (length == 0) {
+      if (first_length_zero == kNumSlots) {
+        first_length_zero = i;
+        first_bad_bucket = bucket;
+      }
+      ++count_length_zero;
+    }
+  }
+  EXPECT_EQ(first_length_zero, kNumSlots)
+      << "HYPOTHESIS C CONFIRMED: " << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0 (production wedge signature reproduced "
+      << "under combined FIND+INSERT host test); first at i="
+      << first_length_zero << " value=0x" << std::hex << first_bad_bucket;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+// endregion
 
 // Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
 // CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
@@ -12496,6 +13224,357 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketFindUnderDispatch_UXT
 
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+// endregion
+
+// region digitalis: production AddToMap bucket-FIND loop, single-region pin
+// for the no-match (b.ne) path.  The existing UXTW dispatch test only
+// exercises the iter-0 b.eq fast path (bucket[0] empty).  This test fills
+// bucket[0] with a non-matching hash (top12 != x19) and exact non-zero
+// offset bits, then verifies the JIT:
+//   1. loads bucket[0] correctly via UXTW shifted-register addressing,
+//   2. computes ANDS with #0xfffff producing a non-zero result (Z=0),
+//   3. correctly does NOT take the b.eq forward branch,
+//   4. computes CMP x19, x8, lsr #20 with non-zero LSR result,
+//   5. correctly TAKES the b.ne forward branch dispatching to advance_addr.
+//
+// RunWithDispatch translates a single region starting at code[0]; the
+// dispatch out to advance_addr returns to the runtime (no second region
+// is pre-translated).  insn_addr at exit therefore equals advance_addr if
+// the JIT got step 5 right.  This pins all five steps in a single region
+// — the inner instructions of the production AddToMap loop body — without
+// requiring multi-region cache wiring.  If the JIT mis-evaluated b.ne
+// (e.g. taking it as b.eq), insn_addr would land at done_found instead.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindUnderDispatch_UXTW_NonMatchTakesBNe) {
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  // bucket[0] = (0xAAA << 20) | 0x100 = non-empty, hash field = 0xAAA.
+  // x19 = 0xBBB so cmp mismatches, b.ne must fire.
+  constexpr uint32_t kStoredHash = 0xAAA;
+  constexpr uint32_t kStoredOffset = 0x100;
+  constexpr uint64_t kSearchHash = 0xBBB;
+  alignas(16) static uint32_t buckets[3];
+  buckets[0] = 0xfeedfaceU;  // leading guard
+  buckets[1] = (kStoredHash << 20) | kStoredOffset;
+  buckets[2] = 0xdeadbeefU;  // trailing guard
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = 0;          // mask irrelevant (one slot)
+  state_.cpu.x[19] = kSearchHash;
+  state_.cpu.x[2]  = 1000;
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  GuestAddr advance_addr = ToGuestAddr(code) + 0x18;
+  GuestAddr done_found_addr = ToGuestAddr(code) + 0x30;
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+
+  // The framework translates only the first region; b.ne dispatches to
+  // advance_addr which has no cached region, so execution stops there.
+  // EXPECT_TRUE fails its internal insn_addr assertion when the actual
+  // stop != expected — we pass advance_addr so the assertion is happy.
+  EXPECT_TRUE(RunWithDispatch(code, advance_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, advance_addr)
+      << "Expected JIT to dispatch via b.ne to advance_addr=0x" << std::hex
+      << advance_addr << ".  Got insn_addr=0x" << state_.cpu.insn_addr
+      << ".  If 0x" << done_found_addr
+      << ", b.ne FAILED to fire — fall-through executed the unconditional "
+         "branch.  If 0x" << exit_success_addr
+      << ", b.eq spuriously fired despite non-empty bucket.";
+
+  // x24 must still be 0 (advance block did not execute).
+  EXPECT_EQ(state_.cpu.x[24], 0ULL) << "x24 should not have advanced yet";
+  EXPECT_EQ(state_.cpu.x[2], 1000ULL) << "watchdog must not have decremented";
+
+  // x8 must hold the loaded bucket value; x9 = bucket & 0xfffff.
+  EXPECT_EQ(state_.cpu.x[8], buckets[1])
+      << "LDR with UXTW#2 must read bucket[0]=0x" << std::hex << buckets[1];
+  EXPECT_EQ(state_.cpu.x[9], static_cast<uint64_t>(kStoredOffset))
+      << "ANDS x9, x8, #0xfffff must produce offset bits = 0x"
+      << std::hex << kStoredOffset;
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[2], 0xdeadbeefU);
+}
+// endregion
+
+// region digitalis: production AddToMap bucket-FIND loop, multi-region,
+// PARTIALLY POPULATED bucket array.  Pre-translates every region within
+// the code array so cross-region dispatches resolve via TranslationCache.
+//
+// This is the test the VkCapsViewer wedge needs: it exercises the FULL
+// iteration cycle that the cached-JIT spin walks through in production —
+// loop-top region (ldr/ands/b.eq/cmp/b.ne) -> advance region (adds/b.hs/
+// and/subs/b.ls/b) -> back-edge dispatch to loop top.  K iterations of
+// "non-matching, non-empty bucket" before b.eq fires on the empty slot.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindMultiRegion_PartiallyPopulated) {
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  constexpr size_t kNumSlots = 16;
+  constexpr size_t kEmptyIdx = 3;
+  constexpr uint32_t kStoredHash = 0xAAA;
+  constexpr uint64_t kSearchHash = 0xBBB;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    if (i == kEmptyIdx) {
+      buckets[i + 1] = 0u;
+    } else {
+      buckets[i + 1] = (kStoredHash << 20) | (0x100 + static_cast<uint32_t>(i));
+    }
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = kNumSlots - 1;
+  state_.cpu.x[19] = kSearchHash;
+  state_.cpu.x[2]  = 1000;
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+  GuestAddr exit_fail_addr = ToGuestAddr(code) + 0x34;
+  GuestAddr done_found_addr = ToGuestAddr(code) + 0x30;
+
+  EXPECT_TRUE(RunMultiRegion(code, exit_success_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, exit_success_addr)
+      << "Expected b.eq to fire on bucket[" << kEmptyIdx << "].  Got 0x"
+      << std::hex << state_.cpu.insn_addr << ".  If 0x" << done_found_addr
+      << ": cmp+b.ne wrong direction (spurious match path).  If 0x"
+      << exit_fail_addr << ": watchdog exhausted — loop spun forever, the "
+         "production VkCaps wedge signature reproduced under host test.";
+
+  EXPECT_EQ(state_.cpu.x[24], static_cast<uint64_t>(kEmptyIdx))
+      << "x24 must equal " << kEmptyIdx << " (empty bucket idx).";
+  EXPECT_EQ(state_.cpu.x[8], 0ULL) << "last LDR must read bucket[empty]=0";
+  EXPECT_EQ(state_.cpu.x[9], 0ULL) << "ANDS with x8=0 yields 0";
+  EXPECT_EQ(state_.cpu.x[2], 1000ULL - kEmptyIdx)
+      << "watchdog should have decremented exactly " << kEmptyIdx << " times";
+
+  EXPECT_EQ(buckets[0], 0xfeedfaceU);
+  EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
+}
+// endregion
+
+// region digitalis: production AddToMap bucket-FIND loop, multi-region,
+// FULLY POPULATED bucket array with non-matching hashes.  Equivalent to
+// the genuine pathological-data hypothesis (-266 hypothesis B): every
+// bucket is non-empty AND no hash matches.  The ARM ARM-defined loop
+// SHOULD spin forever in this case (until the b.hs overflow at iter
+// 0xFFFFFFFF, far beyond any real bucket count).
+//
+// We verify this with a watchdog: after 50 iterations the b.ls fires
+// and we exit_fail.  If the loop terminates EARLIER (insn_addr ==
+// exit_success_addr), the JIT spuriously took b.eq when no bucket was
+// empty — i.e. ANDS with non-zero result set Z=1.
+TEST_F(Arm64LiteTranslateRegionDispatchTest,
+       AddToMapBucketFindMultiRegion_FullyPopulatedSpins) {
+  static const uint32_t code[] = {
+      0xb8785b28,  // [0]  loop_top: ldr w8, [x25, w24, uxtw #2]
+      0xf2404d09,  // [4]            ands x9, x8, #0xfffff
+      0x54000180,  // [8]            b.eq exit_success (+0x30)
+      0xeb48527f,  // [12]           cmp x19, x8, lsr #20
+      0x54000041,  // [16]           b.ne advance (+0x08)
+      0x14000007,  // [20]           b done_found (+0x1c)
+      0x31000708,  // [24] advance:  adds w8, w24, #0x1
+      0x540000c2,  // [28]           b.hs exit_fail (+0x18)
+      0x0a1a0118,  // [32]           and w24, w8, w26
+      0xf1000442,  // [36]           subs x2, x2, #0x1
+      0x54000069,  // [40]           b.ls exit_fail (+0x0c)
+      0x17fffff5,  // [44]           b loop_top (-0x2c)
+      0xd503201f,  // [48] done_found: nop
+      0xd503201f,  // [52] exit_fail: nop
+      0xd503201f,  // [56] exit_success: nop
+  };
+
+  constexpr size_t kNumSlots = 16;
+  constexpr uint32_t kStoredHash = 0xAAA;
+  constexpr uint64_t kSearchHash = 0xBBB;
+  alignas(16) static uint32_t buckets[kNumSlots + 2];
+  buckets[0] = 0xfeedfaceU;
+  for (size_t i = 0; i < kNumSlots; ++i) {
+    // Every bucket non-empty (lower 20 bits != 0), hash != kSearchHash.
+    buckets[i + 1] = (kStoredHash << 20) | (0x100 + static_cast<uint32_t>(i));
+  }
+  buckets[kNumSlots + 1] = 0xdeadbeefU;
+
+  state_.cpu.x[25] = ToGuestAddr(&buckets[1]);
+  state_.cpu.x[24] = 0;
+  state_.cpu.x[26] = kNumSlots - 1;
+  state_.cpu.x[19] = kSearchHash;
+  state_.cpu.x[2]  = 50;
+  state_.cpu.x[8]  = 0xbaadf00dULL;
+  state_.cpu.x[9]  = 0xbaadf00dULL;
+
+  GuestAddr exit_success_addr = ToGuestAddr(code) + 0x38;
+  GuestAddr exit_fail_addr = ToGuestAddr(code) + 0x34;
+
+  EXPECT_TRUE(RunMultiRegion(code, exit_fail_addr));
+
+  EXPECT_EQ(state_.cpu.insn_addr, exit_fail_addr)
+      << "Expected watchdog to fire (loop spins on fully-populated, no-"
+         "match table).  Got 0x" << std::hex << state_.cpu.insn_addr
+      << ".  If 0x" << exit_success_addr
+      << ": ANDS spuriously set Z=1 on a non-empty bucket.";
+
+  // After 50 iterations of the watchdog (subs x2,x2,#1 with b.ls), the
+  // loop exits.  x2 should be 0 (b.ls takes when C=0 or Z=1; subs with
+  // x2 going 50->...->1 keeps C=1 (no borrow) until x2=1->0 which sets
+  // Z=1 and C=1, so b.ls=(C==0 OR Z==1) fires at x2=0).
+  EXPECT_EQ(state_.cpu.x[2], 0ULL) << "watchdog should reach 0";
+}
+// endregion
+
+// region digitalis: Hypothesis G.1 — JIT `adds Wd, Wn, #imm` (W-form)
+// must set ARM C=1 when the 32-bit unsigned sum wraps, so that a following
+// `b.hs target` (HS = C==1) takes the branch.
+//
+// Production AddToMap inner loop at linker64 offsets 0x9cc48-0x9cc4c emits:
+//     adds  w8, w24, #0x1
+//     b.hs  0x9cccc           ; -> ubsan_handle_add_overflow_minimal_abort
+// simpleperf + /proc/PID/mem dump shows VkCapsViewer's qtMainLoopThread
+// spends 84% of CPU in the JIT translation of this code range.  If the JIT
+// for `adds w8, w24, #1` fails to set C correctly when w24 wraps from
+// 0xFFFFFFFF, `b.hs` falls through and the loop never exits via overflow.
+//
+// The existing FullyPopulatedSpins multi-region test verifies the watchdog
+// fires (loop spins on a fully populated table) but does NOT exercise the
+// w24 == 0xFFFFFFFF boundary case where b.hs should TAKE.  This test pins
+// that boundary directly: it sets w24 = 0xFFFFFFFF, runs adds + b.hs, and
+// verifies the branch target is reached.
+TEST_F(Arm64LiteTranslateRegionTest, AddsW32OverflowSetsCarryBhsFires) {
+  // Encodings cross-checked with the ARM ARM C6.2.4 (ADDS imm) and C6.2.27
+  // (B.cond): adds w8, w24, #1 == 0x31000708; b.hs +0x10 == 0x54000082.
+  // MOVZ w24, #0xFFFF == 0x529FFFF8; MOVK w24, #0xFFFF, lsl #16 == 0x72BFFFF8.
+  static const uint32_t code[] = {
+      0x529FFFF8,                 // [0]   MOVZ w24, #0xFFFF
+      0x72BFFFF8,                 // [4]   MOVK w24, #0xFFFF, lsl #16
+                                  //       -> w24 = 0xFFFFFFFF
+      0x31000708,                 // [8]   ADDS w8, w24, #1
+                                  //       -> w8 = 0 (32-bit wrap), C=1, Z=1
+      Bcond(kCondCS, 0x10),       // [12]  B.HS +0x10  -> code + 0x1c
+      MovzX(0, 0xDEAD),           // [16]  fall-through (BUG path)
+      kNop,                       // [20]
+      kNop,                       // [24]
+      MovzX(0, 0xC0DE),           // [28]  b.hs target (not translated)
+  };
+  state_.cpu.x[0] = 0xBAADF00DULL;
+  state_.cpu.x[8] = 0xBAADF00DULL;
+
+  // Expected: b.hs takes, JIT region exits at code + 0x1c.
+  GuestAddr expected_branch_target = ToGuestAddr(code) + 0x1c;
+  EXPECT_TRUE(Run(code, expected_branch_target));
+
+  EXPECT_EQ(state_.cpu.insn_addr, expected_branch_target)
+      << "HYPOTHESIS G.1 OUTCOME: b.hs did NOT fire after `adds w8, "
+         "w24=0xFFFFFFFF, #1`.  ARM ARM requires C=1 on 32-bit unsigned "
+         "overflow; if insn_addr=0x" << std::hex << (ToGuestAddr(code) + 0x10)
+      << ", the JIT's W-form ADDS carry-flag emission is buggy.";
+
+  EXPECT_EQ(state_.cpu.x[24], 0xFFFFFFFFULL)
+      << "Setup invariant: w24 must hold 0xFFFFFFFF after MOVZ+MOVK.";
+
+  EXPECT_EQ(state_.cpu.x[8], 0ULL)
+      << "ARM ARM: ADDS w8, w24=0xFFFFFFFF, #1 must produce w8 = 0 "
+         "(32-bit wrap, upper 32 bits zero from W-form zero-extend).  "
+         "Got 0x" << std::hex << state_.cpu.x[8];
+
+  EXPECT_EQ(state_.cpu.x[0], 0xBAADF00DULL)
+      << "Fall-through `MOVZ x0, #0xDEAD` must NOT have executed.";
+}
+
+// Negative companion: `adds w8, w24=0x7FFFFFFE, #1` -> w8 = 0x7FFFFFFF,
+// C=0, b.hs must NOT fire.  Pins the no-overflow path so we can detect
+// either polarity error (b.hs spuriously firing OR failing).
+TEST_F(Arm64LiteTranslateRegionTest, AddsW32NoOverflowBhsFallsThrough) {
+  // MOVZ w24, #0xFFFE       = 0x529FFFD8
+  // MOVK w24, #0x7FFF, lsl #16 = 0x72AFFFF8  -> w24 = 0x7FFFFFFE
+  static const uint32_t code[] = {
+      0x529FFFD8,                 // [0]   MOVZ w24, #0xFFFE
+      0x72AFFFF8,                 // [4]   MOVK w24, #0x7FFF, lsl #16
+      0x31000708,                 // [8]   ADDS w8, w24, #1
+                                  //       -> w8 = 0x7FFFFFFF, C=0
+      Bcond(kCondCS, 0x10),       // [12]  B.HS  (must NOT fire)
+  };
+  state_.cpu.x[8] = 0xBAADF00DULL;
+
+  // b.hs falls through; JIT region ends at fall-through PC (code + 16).
+  GuestAddr fall_through = ToGuestAddr(code) + sizeof(code);
+  EXPECT_TRUE(Run(code, fall_through));
+
+  EXPECT_EQ(state_.cpu.insn_addr, fall_through)
+      << "b.hs spuriously fired on a non-overflowing adds.  C must be 0 "
+         "when w24=0x7FFFFFFE + 1 = 0x7FFFFFFF (no unsigned wrap).";
+  EXPECT_EQ(state_.cpu.x[24], 0x7FFFFFFEULL) << "Setup invariant";
+  EXPECT_EQ(state_.cpu.x[8], 0x7FFFFFFFULL)
+      << "ARM ARM: adds w8, 0x7FFFFFFE, #1 -> 0x7FFFFFFF.  Got 0x"
+      << std::hex << state_.cpu.x[8];
+}
+
+// G.1 boundary completeness: full pre-mask state w24=0xFFFFFFFE.
+// adds w8, 0xFFFFFFFE, #1 -> w8 = 0xFFFFFFFF, C=0 (no wrap), b.hs must NOT fire.
+// This is the immediate predecessor of the wrap case above; if the JIT
+// computes C from the 64-bit sum instead of the 32-bit sum, it would
+// already show a difference here.
+TEST_F(Arm64LiteTranslateRegionTest, AddsW32JustBelowOverflowBhsFallsThrough) {
+  // MOVZ w24, #0xFFFE         = 0x529FFFD8
+  // MOVK w24, #0xFFFF, lsl #16 = 0x72BFFFF8  -> w24 = 0xFFFFFFFE
+  static const uint32_t code[] = {
+      0x529FFFD8,                 // [0]   MOVZ w24, #0xFFFE
+      0x72BFFFF8,                 // [4]   MOVK w24, #0xFFFF, lsl #16
+      0x31000708,                 // [8]   ADDS w8, w24, #1
+                                  //       -> w8 = 0xFFFFFFFF, C=0
+      Bcond(kCondCS, 0x10),       // [12]  B.HS  (must NOT fire)
+  };
+  state_.cpu.x[8] = 0xBAADF00DULL;
+
+  GuestAddr fall_through = ToGuestAddr(code) + sizeof(code);
+  EXPECT_TRUE(Run(code, fall_through));
+
+  EXPECT_EQ(state_.cpu.insn_addr, fall_through)
+      << "b.hs spuriously fired on adds w8, 0xFFFFFFFE, #1 = 0xFFFFFFFF.  "
+         "Result max-uint32 but no carry — JIT may be misreading C from "
+         "high-bit of result instead of the actual overflow bit.";
+  EXPECT_EQ(state_.cpu.x[24], 0xFFFFFFFEULL) << "Setup invariant";
+  EXPECT_EQ(state_.cpu.x[8], 0xFFFFFFFFULL);
 }
 // endregion
 
