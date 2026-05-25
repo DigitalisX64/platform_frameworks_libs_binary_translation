@@ -1356,8 +1356,8 @@ class Decoder {
     kSqneg,     // SQNEG: U=1, opcode=00111
     // endregion
     // region digitalis - SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
-    // Encoding: 0 Q 1 01110 size 10000 10011 10 Rn Rd  (U=1 required;
-    // U=0 with opcode=10011 is unallocated). Sizes 00/01/10 only —
+    // Encoding: 0 Q 1 01110 size 10000 10010 10 Rn Rd  (U=1 required;
+    // U=0 with opcode=10010 is XTN). Sizes 00/01/10 only —
     // size=11 is unallocated for the narrow group (the .1d / .2d
     // destination form does not exist).
     //   sqxtun  v0.8b,  v1.8h  = 0x2e212820  (Q=0, size=00, src=.8h  -> dst=.8b)
@@ -1370,7 +1370,26 @@ class Decoder {
     // [0, UMAX_dst]: input<0 -> 0; input>UMAX_dst -> UMAX_dst;
     // else cast to unsigned narrow. Q=0 writes low 64 bits of Vd
     // (upper zeroed); Q=1 writes upper 64 bits and preserves lower.
-    kSqxtun,    // SQXTUN/SQXTUN2: U=1, opcode=10011
+    kSqxtun,    // SQXTUN/SQXTUN2: U=1, opcode=10010
+    // endregion
+    // region digitalis - SHLL / SHLL2 (shift left long, by element size).
+    // Encoding: 0 Q 1 01110 size 10000 10011 10 Rn Rd  (U=1 required;
+    // U=0 with opcode=10011 is unallocated). Sizes 00/01/10 only —
+    // size=11 (source .1d / .2d) is unallocated (no wider destination).
+    // Source element width: esize_src = 8 << size (8/16/32).
+    // Destination element width: 2 * esize_src (16/32/64).
+    // Shift amount is implicit: always esize_src (i.e., bottom half of
+    // each widened destination lane is zero; top half is the source element).
+    //   shll  v0.8h, v1.8b,  #8  = 0x2e213820  (Q=0, size=00, src .8b  -> .8h)
+    //   shll2 v0.8h, v1.16b, #8  = 0x6e213820  (Q=1, size=00, src .16b -> .8h)
+    //   shll  v0.4s, v1.4h,  #16 = 0x2e613820  (Q=0, size=01, src .4h  -> .4s)
+    //   shll2 v0.4s, v1.8h,  #16 = 0x6e613820  (Q=1, size=01, src .8h  -> .4s)
+    //   shll  v0.2d, v1.2s,  #32 = 0x2ea13820  (Q=0, size=10, src .2s  -> .2d)
+    //   shll2 v0.2d, v1.4s,  #32 = 0x6ea13820  (Q=1, size=10, src .4s  -> .2d)
+    // Q=0 reads source from low 64 bits of Vn (SHLL); Q=1 reads from upper
+    // 64 bits (SHLL2). Both write all 128 bits of Vd. Functionally
+    // equivalent to USHLL/USHLL2 with shift = esize_src.
+    kShll,      // SHLL/SHLL2: U=1, opcode=10011
     // endregion
     // region digitalis - FCVTXN / FCVTXN2 (vector narrow FP64->FP32, round-to-odd).
     // Encoding: 0 Q 1 01110 0 sz 10000 10110 10 Rn Rd  with sz=1 (size=01).
@@ -5083,6 +5102,14 @@ class Decoder {
         } else {
           op = AdvSimdTwoRegMiscOpcode::kXtn;
         }
+        break;
+        // endregion
+      // region digitalis - opcode=10011 is SHLL/SHLL2 (U=1 required).
+      // size=11 is unallocated (no destination element wider than 64-bit).
+      case 0b10011:
+        if (!u) { Undefined(); return; }
+        if (size == 0b11) { Undefined(); return; }
+        op = AdvSimdTwoRegMiscOpcode::kShll;
         break;
         // endregion
       case 0b10100:
