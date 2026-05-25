@@ -25,6 +25,7 @@
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
+#include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
@@ -1114,6 +1115,154 @@ TEST_F(Arm64LiteTranslateRegionTest, SimdLoadRegOffset128Bit) {
   for (int i = 0; i < 16; ++i) {
     EXPECT_EQ(v0[i], buffer[16 + i]) << "byte " << i;
   }
+}
+
+// region digitalis - AdvSIMD multi-register contiguous LD1/ST1 JIT
+// (LD2/LD3/LD4 with de-interleaving remain interpreter-only).
+
+// Encoding helper for AdvSIMD multi-structure LD1/ST1:
+//   bits[31]=0, [30]=Q, [29:24]=001100, [23]=postindex, [22]=is_load,
+//   [21]=0, [20:16]=Rm (11111 for imm post), [15:12]=opcode
+//   (1 reg=0111, 2 regs=1010, 3 regs=0110, 4 regs=0010), [11:10]=size,
+//   [9:5]=Rn, [4:0]=Rt.
+constexpr uint32_t AdvSimdMultiEnc(bool q, bool postindex, bool is_load,
+                                    uint8_t rm, uint8_t opcode, uint8_t size,
+                                    uint8_t rn, uint8_t rt) {
+  uint32_t enc = 0x0C000000u;
+  if (q) enc |= 0x40000000u;
+  if (postindex) enc |= 0x00800000u;
+  if (is_load) enc |= 0x00400000u;
+  enc |= (static_cast<uint32_t>(rm) & 0x1F) << 16;
+  enc |= (static_cast<uint32_t>(opcode) & 0xF) << 12;
+  enc |= (static_cast<uint32_t>(size) & 0x3) << 10;
+  enc |= (static_cast<uint32_t>(rn) & 0x1F) << 5;
+  enc |= (static_cast<uint32_t>(rt) & 0x1F);
+  return enc;
+}
+
+// LD1 {Vt.16B, Vt+1.16B}, [Xn], #32 — the dynamic linker's strchr loop.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_2x16B_PostIndexImm) {
+  alignas(16) static uint8_t buffer[32];
+  for (int i = 0; i < 32; ++i) buffer[i] = static_cast<uint8_t>(0x30 + i);
+
+  static const uint32_t code[] = {
+      // LD1 {V1.16B, V2.16B}, [X2], #32  → opcode=1010, q=1, postindex=1,
+      // is_load=1, rm=11111, size=00, rn=2, rt=1.
+      AdvSimdMultiEnc(true, true, true, 0x1F, 0b1010, 0, 2, 1),
+  };
+  memset(&state_.cpu.v[1], 0x5A, 16);
+  memset(&state_.cpu.v[2], 0x6B, 16);
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v1 = reinterpret_cast<uint8_t*>(&state_.cpu.v[1]);
+  uint8_t* v2 = reinterpret_cast<uint8_t*>(&state_.cpu.v[2]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v1[i], buffer[i]) << "v1 byte " << i;
+    EXPECT_EQ(v2[i], buffer[16 + i]) << "v2 byte " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[2], ToGuestAddr(buffer) + 32u);
+}
+
+// LD1 {V0.16B}, [X1] — no post-index, 1 register.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_1x16B_NoPostIndex) {
+  alignas(16) static uint8_t buffer[16];
+  for (int i = 0; i < 16; ++i) buffer[i] = static_cast<uint8_t>(0xA0 + i);
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, false, true, 0x00, 0b0111, 0, 1, 0),
+  };
+  memset(&state_.cpu.v[0], 0xCC, 16);
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v0[i], buffer[i]) << "byte " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(buffer));  // not modified
+}
+
+// LD1 {V0.8B}, [X1] — Q=0, 8-byte stride, must zero the upper 64.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_1x8B_ZeroExtends) {
+  alignas(16) static uint8_t buffer[8] =
+      {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, true, 0x00, 0b0111, 0, 1, 0),
+  };
+  memset(&state_.cpu.v[0], 0xFF, 16);  // upper-half poison
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(v0[i], buffer[i]) << "lo " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(v0[i], 0x00) << "hi " << i;
+}
+
+// LD1 {V0.16B, V1.16B, V2.16B, V3.16B}, [X4], X5 — register post-index, 4 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_4x16B_PostIndexReg) {
+  alignas(16) static uint8_t buffer[64];
+  for (int i = 0; i < 64; ++i) buffer[i] = static_cast<uint8_t>(i);
+
+  static const uint32_t code[] = {
+      // 4 regs: opcode=0010. Q=1, postindex=1, is_load=1, rm=5.
+      AdvSimdMultiEnc(true, true, true, 5, 0b0010, 0, 4, 0),
+  };
+  for (int r = 0; r < 4; ++r) memset(&state_.cpu.v[r], 0xEE, 16);
+  state_.cpu.x[4] = ToGuestAddr(buffer);
+  state_.cpu.x[5] = 0x100;  // arbitrary post-index step
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int r = 0; r < 4; ++r) {
+    uint8_t* v = reinterpret_cast<uint8_t*>(&state_.cpu.v[r]);
+    for (int i = 0; i < 16; ++i) {
+      EXPECT_EQ(v[i], buffer[r * 16 + i]) << "v" << r << " byte " << i;
+    }
+  }
+  EXPECT_EQ(state_.cpu.x[4], ToGuestAddr(buffer) + 0x100);
+}
+
+// ST1 {V0.16B, V1.16B}, [X2], #32 — store path, post-index immediate.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_2x16B_PostIndexImm) {
+  alignas(16) static uint8_t buffer[32];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, true, false, 0x1F, 0b1010, 0, 2, 0),
+  };
+  for (int i = 0; i < 16; ++i) {
+    reinterpret_cast<uint8_t*>(&state_.cpu.v[0])[i] = static_cast<uint8_t>(0x10 + i);
+    reinterpret_cast<uint8_t*>(&state_.cpu.v[1])[i] = static_cast<uint8_t>(0x40 + i);
+  }
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(buffer[i], static_cast<uint8_t>(0x10 + i)) << "lo " << i;
+    EXPECT_EQ(buffer[16 + i], static_cast<uint8_t>(0x40 + i)) << "hi " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[2], ToGuestAddr(buffer) + 32u);
+}
+
+// ST1 {V0.8B}, [X1] — Q=0 store path writes only 8 bytes, leaves tail untouched.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_1x8B_DoesNotTouchUpper) {
+  alignas(16) static uint8_t buffer[16];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, false, 0x00, 0b0111, 0, 1, 0),
+  };
+  for (int i = 0; i < 16; ++i) {
+    reinterpret_cast<uint8_t*>(&state_.cpu.v[0])[i] = static_cast<uint8_t>(0x70 + i);
+  }
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(buffer[i], static_cast<uint8_t>(0x70 + i)) << "lo " << i;
+  }
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(buffer[i], 0xCC) << "hi " << i;
 }
 // endregion
 
@@ -18487,6 +18636,232 @@ TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralQ_DoesNotClobberOtherRegs) {
   EXPECT_EQ(v0[1], 0xCAFEBABEu);
   EXPECT_EQ(v0[2], 0x12345678u);
   EXPECT_EQ(v0[3], 0x9ABCDEF0u);
+}
+// endregion
+
+// region digitalis - Interpreter-direct tests for SIMD pair load/store with
+// pre-/post-index.  The JIT currently lowers only 128-bit (Q-register) SIMD
+// pair stores; 64-bit (D-register) pair stores bail to Undefined() and run
+// in the interpreter at production runtime.  Function prologues that save
+// callee-saved D-registers --- e.g. `stp d11, d10, [sp, #-0x60]!` at
+// libcoldstart.so:YGNodeStyleSetWidth+0 in FB's Yoga layout engine --- hit
+// this interpreter path on every call.  These tests pin the interpreter
+// handler's correctness independently of the JIT by calling InterpretInsn
+// directly on a single guest instruction.
+//
+// Encodings (ARM ARM C7 "Advanced SIMD load/store pair, signed offset"):
+//   bits[31:30] = opc          (00=S/32-bit, 01=D/64-bit, 10=Q/128-bit)
+//   bits[29:27] = 101
+//   bit  [26]   = V=1
+//   bits[25:23] = type         (001=post-index, 010=signed-offset, 011=pre-index)
+//   bit  [22]   = L            (1=load, 0=store)
+//   bits[21:15] = signed imm7  (scaled by data size)
+//   bits[14:10] = Rt2
+//   bits [9:5]  = Rn
+//   bits [4:0]  = Rt1
+
+// STP D<rt1>, D<rt2>, [Xn, #imm]!  (pre-index, signed imm7 scaled by 8)
+constexpr uint32_t StpDPreIndex(uint8_t rt1, uint8_t rt2, uint8_t rn,
+                                int8_t imm_div8) {
+  uint32_t imm7 = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0x6D800000 | (imm7 << 15) | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+
+// LDP D<rt1>, D<rt2>, [Xn], #imm   (post-index, signed imm7 scaled by 8)
+constexpr uint32_t LdpDPostIndex(uint8_t rt1, uint8_t rt2, uint8_t rn,
+                                 int8_t imm_div8) {
+  uint32_t imm7 = static_cast<uint32_t>(imm_div8) & 0x7F;
+  return 0x6CC00000 | (imm7 << 15) | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+
+TEST(Arm64InterpreterSimdPair, StpD_PreIndex_NegativeOffset_YogaPrologue) {
+  // The exact instruction seen at libcoldstart.so:YGNodeStyleSetWidth+0:
+  //   stp d11, d10, [sp, #-0x60]!
+  // Verify: (a) the saved-FP-register pair is written bit-for-bit to the
+  // pre-decremented stack slots, (b) SP is updated to sp - 0x60, (c) the
+  // source v[11]/v[10] registers are unchanged by the store, (d) bytes
+  // outside the 16-byte destination window are not modified.
+  alignas(16) static uint8_t stack[256];
+  std::memset(stack, 0xCC, sizeof(stack));
+
+  ThreadState state{};
+  GuestAddr orig_sp = ToGuestAddr(stack + 0xA0);
+  state.cpu.sp = orig_sp;
+
+  const uint64_t v11_lo = 0x0102030405060708ULL;
+  const uint64_t v10_lo = 0xCAFEBABEDEADBEEFULL;
+  // High 64 bits are a distinct sentinel: STP D pair stores only the
+  // low 64 bits per source register, so these must remain in v[] but
+  // must not appear in the destination memory.
+  const uint64_t v11_hi = 0x1111111111111111ULL;
+  const uint64_t v10_hi = 0x2222222222222222ULL;
+  state.cpu.v[11] = (static_cast<__uint128_t>(v11_hi) << 64) | v11_lo;
+  state.cpu.v[10] = (static_cast<__uint128_t>(v10_hi) << 64) | v10_lo;
+
+  static const uint32_t insn = StpDPreIndex(11, 10, 31, -12);  // -0x60/8
+  // Sanity: encoding matches the ARM ARM C7 layout above.
+  ASSERT_EQ(insn, 0x6DBA2BEBu);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(state.cpu.sp, orig_sp - 0x60);
+
+  uint64_t at_sp0; std::memcpy(&at_sp0, stack + 0x40, 8);
+  uint64_t at_sp8; std::memcpy(&at_sp8, stack + 0x48, 8);
+  EXPECT_EQ(at_sp0, v11_lo);
+  EXPECT_EQ(at_sp8, v10_lo);
+
+  for (size_t i = 0; i < sizeof(stack); ++i) {
+    if (i >= 0x40 && i < 0x50) continue;
+    EXPECT_EQ(stack[i], 0xCCu) << "byte " << i << " unexpectedly modified";
+  }
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[11]), v11_lo);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[11] >> 64), v11_hi);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10]), v10_lo);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10] >> 64), v10_hi);
+
+  EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
+}
+
+TEST(Arm64InterpreterSimdPair, StpD_PreIndex_LdpD_PostIndex_Roundtrip) {
+  // Save then restore: the prologue STP + epilogue LDP must round-trip
+  // d11/d10 bit-for-bit.  Between the two we scrub v[11]/v[10] so the
+  // only way LDP can recover the saved values is by reading from the
+  // memory the STP just wrote.  This pins the symmetry the Yoga layout
+  // engine relies on across every node operation.
+  alignas(16) static uint8_t stack[256];
+  std::memset(stack, 0xCC, sizeof(stack));
+
+  ThreadState state{};
+  GuestAddr orig_sp = ToGuestAddr(stack + 0xA0);
+  state.cpu.sp = orig_sp;
+
+  const uint64_t v11_save = 0xAABBCCDDEEFF0011ULL;
+  const uint64_t v10_save = 0x5566778899AABBCCULL;
+  // Set high 64 bits to non-zero to confirm LDP D zero-extends the
+  // destination V register's upper half (per ARM ARM "ZeroExtend(...)").
+  state.cpu.v[11] = (static_cast<__uint128_t>(0x3333333333333333ULL) << 64) | v11_save;
+  state.cpu.v[10] = (static_cast<__uint128_t>(0x4444444444444444ULL) << 64) | v10_save;
+
+  static const uint32_t prologue = StpDPreIndex(11, 10, 31, -12);  // -0x60
+  static const uint32_t epilogue = LdpDPostIndex(11, 10, 31, 12);  // +0x60
+
+  state.cpu.insn_addr = ToGuestAddr(&prologue);
+  InterpretInsn(&state);
+  ASSERT_EQ(state.cpu.sp, orig_sp - 0x60);
+
+  // Scrub v[11] and v[10] so only memory can hold the saved values.
+  state.cpu.v[11] = static_cast<__uint128_t>(0xDEADDEADDEADDEADULL);
+  state.cpu.v[10] = static_cast<__uint128_t>(0xBEEFBEEFBEEFBEEFULL);
+
+  state.cpu.insn_addr = ToGuestAddr(&epilogue);
+  InterpretInsn(&state);
+
+  EXPECT_EQ(state.cpu.sp, orig_sp);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[11]), v11_save);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10]), v10_save);
+  // ARM ARM: V[t] = ZeroExtend(MemData, 128) — upper half must be 0.
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[11] >> 64), 0ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10] >> 64), 0ULL);
+}
+// endregion
+
+// region digitalis - Interpreter-direct tests for AdvSIMD modified-immediate
+// MOVI with the scalar 64-bit form (`MOVI <Dd>, #imm`). Traces of FB Katana's
+// libcoldstart.so show `movi d9, #0` firing at the second of three unique JIT
+// bailout PCs (libcoldstart.so + 0x8BB424). These tests pin the interpreter's
+// ExpandSimdModifiedImm + SimdModifiedImm path for that form independently of
+// the JIT.
+//
+// ARM ARM C7 "Advanced SIMD modified immediate" — scalar 64-bit element form
+// (cmode=1110, op=1, Q=0). Each bit of the 8-bit immediate (split across abc
+// and defgh) expands to a whole byte of the 64-bit destination. The
+// destination is a D register so the upper 64 bits of the underlying V
+// register must be zero-extended.
+//
+//   bits[31]    = 0
+//   bits[30]    = Q       (0=scalar D form, 1=2D vector form)
+//   bit  [29]   = op = 1
+//   bits[28:19] = 0111100000
+//   bits[18:16] = abc     (high 3 bits of imm8)
+//   bits[15:12] = cmode = 1110
+//   bits[11:10] = 01
+//   bits[9:5]   = defgh   (low 5 bits of imm8)
+//   bits[4:0]   = Rd
+constexpr uint32_t MoviD(uint8_t rd, uint8_t imm8) {
+  uint32_t abc = (imm8 >> 5) & 0b111;
+  uint32_t defgh = imm8 & 0b11111;
+  return 0x2F00E400 | (abc << 16) | (defgh << 5) | rd;
+}
+
+TEST(Arm64InterpreterSimdModifiedImm, MoviD_Zero_YogaSecondBailout) {
+  // The exact instruction observed at libcoldstart.so + 0x8BB424:
+  //   movi d9, #0
+  // Verify: v[9] is zeroed in both halves; v[8] and v[10] (neighbors) are
+  // untouched; insn_addr advances by 4.
+  ThreadState state{};
+  state.cpu.v[8] = (static_cast<__uint128_t>(0xAAAAAAAAAAAAAAAAULL) << 64) |
+                   0xBBBBBBBBBBBBBBBBULL;
+  state.cpu.v[9] = (static_cast<__uint128_t>(0xDEADBEEFDEADBEEFULL) << 64) |
+                   0xCAFEBABECAFEBABEULL;
+  state.cpu.v[10] = (static_cast<__uint128_t>(0xCCCCCCCCCCCCCCCCULL) << 64) |
+                    0xDDDDDDDDDDDDDDDDULL;
+
+  static const uint32_t insn = MoviD(9, 0);
+  // Sanity: encoding matches the ARM ARM C7 layout above.
+  ASSERT_EQ(insn, 0x2F00E409u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[8]), 0xBBBBBBBBBBBBBBBBULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[8] >> 64), 0xAAAAAAAAAAAAAAAAULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10]), 0xDDDDDDDDDDDDDDDDULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10] >> 64), 0xCCCCCCCCCCCCCCCCULL);
+  EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
+}
+
+TEST(Arm64InterpreterSimdModifiedImm, MoviD_AllOnes_ZeroExtendsUpperHalf) {
+  // movi d9, #0xFF — every bit of imm8 set ⇒ imm64 = 0xFFFFFFFFFFFFFFFF.
+  // Confirm: low 64 bits hold the expansion; upper 64 bits of v[9] are
+  // zero-extended (Q=0 / D-register form), even though pre-state had
+  // garbage there.
+  ThreadState state{};
+  state.cpu.v[9] = (static_cast<__uint128_t>(0x7777777777777777ULL) << 64) |
+                   0x8888888888888888ULL;
+
+  static const uint32_t insn = MoviD(9, 0xFF);
+  ASSERT_EQ(insn, 0x2F07E7E9u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
+}
+
+TEST(Arm64InterpreterSimdModifiedImm, MoviD_Pattern_BitToByteExpansion) {
+  // movi d9, #0xAA — imm8 = 0b10101010. Bits 1,3,5,7 set ⇒ bytes 1,3,5,7
+  // of imm64 are 0xFF. Pin the bit-to-byte expansion against a single
+  // non-trivial pattern so any future regression in ExpandSimdModifiedImm
+  // surfaces immediately.
+  ThreadState state{};
+  state.cpu.v[9] = ~static_cast<__uint128_t>(0);
+
+  static const uint32_t insn = MoviD(9, 0xAA);
+  ASSERT_EQ(insn, 0x2F05E549u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0xFF00FF00FF00FF00ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
 }
 // endregion
 
