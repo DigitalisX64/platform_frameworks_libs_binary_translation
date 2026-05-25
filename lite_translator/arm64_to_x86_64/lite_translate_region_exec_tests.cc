@@ -18622,6 +18622,101 @@ TEST(Arm64InterpreterSimdPair, StpD_PreIndex_LdpD_PostIndex_Roundtrip) {
 }
 // endregion
 
+// region digitalis - Interpreter-direct tests for AdvSIMD modified-immediate
+// MOVI with the scalar 64-bit form (`MOVI <Dd>, #imm`). Traces of FB Katana's
+// libcoldstart.so show `movi d9, #0` firing at the second of three unique JIT
+// bailout PCs (libcoldstart.so + 0x8BB424). These tests pin the interpreter's
+// ExpandSimdModifiedImm + SimdModifiedImm path for that form independently of
+// the JIT.
+//
+// ARM ARM C7 "Advanced SIMD modified immediate" — scalar 64-bit element form
+// (cmode=1110, op=1, Q=0). Each bit of the 8-bit immediate (split across abc
+// and defgh) expands to a whole byte of the 64-bit destination. The
+// destination is a D register so the upper 64 bits of the underlying V
+// register must be zero-extended.
+//
+//   bits[31]    = 0
+//   bits[30]    = Q       (0=scalar D form, 1=2D vector form)
+//   bit  [29]   = op = 1
+//   bits[28:19] = 0111100000
+//   bits[18:16] = abc     (high 3 bits of imm8)
+//   bits[15:12] = cmode = 1110
+//   bits[11:10] = 01
+//   bits[9:5]   = defgh   (low 5 bits of imm8)
+//   bits[4:0]   = Rd
+constexpr uint32_t MoviD(uint8_t rd, uint8_t imm8) {
+  uint32_t abc = (imm8 >> 5) & 0b111;
+  uint32_t defgh = imm8 & 0b11111;
+  return 0x2F00E400 | (abc << 16) | (defgh << 5) | rd;
+}
+
+TEST(Arm64InterpreterSimdModifiedImm, MoviD_Zero_YogaSecondBailout) {
+  // The exact instruction observed at libcoldstart.so + 0x8BB424:
+  //   movi d9, #0
+  // Verify: v[9] is zeroed in both halves; v[8] and v[10] (neighbors) are
+  // untouched; insn_addr advances by 4.
+  ThreadState state{};
+  state.cpu.v[8] = (static_cast<__uint128_t>(0xAAAAAAAAAAAAAAAAULL) << 64) |
+                   0xBBBBBBBBBBBBBBBBULL;
+  state.cpu.v[9] = (static_cast<__uint128_t>(0xDEADBEEFDEADBEEFULL) << 64) |
+                   0xCAFEBABECAFEBABEULL;
+  state.cpu.v[10] = (static_cast<__uint128_t>(0xCCCCCCCCCCCCCCCCULL) << 64) |
+                    0xDDDDDDDDDDDDDDDDULL;
+
+  static const uint32_t insn = MoviD(9, 0);
+  // Sanity: encoding matches the ARM ARM C7 layout above.
+  ASSERT_EQ(insn, 0x2F00E409u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[8]), 0xBBBBBBBBBBBBBBBBULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[8] >> 64), 0xAAAAAAAAAAAAAAAAULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10]), 0xDDDDDDDDDDDDDDDDULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10] >> 64), 0xCCCCCCCCCCCCCCCCULL);
+  EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
+}
+
+TEST(Arm64InterpreterSimdModifiedImm, MoviD_AllOnes_ZeroExtendsUpperHalf) {
+  // movi d9, #0xFF — every bit of imm8 set ⇒ imm64 = 0xFFFFFFFFFFFFFFFF.
+  // Confirm: low 64 bits hold the expansion; upper 64 bits of v[9] are
+  // zero-extended (Q=0 / D-register form), even though pre-state had
+  // garbage there.
+  ThreadState state{};
+  state.cpu.v[9] = (static_cast<__uint128_t>(0x7777777777777777ULL) << 64) |
+                   0x8888888888888888ULL;
+
+  static const uint32_t insn = MoviD(9, 0xFF);
+  ASSERT_EQ(insn, 0x2F07E7E9u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
+}
+
+TEST(Arm64InterpreterSimdModifiedImm, MoviD_Pattern_BitToByteExpansion) {
+  // movi d9, #0xAA — imm8 = 0b10101010. Bits 1,3,5,7 set ⇒ bytes 1,3,5,7
+  // of imm64 are 0xFF. Pin the bit-to-byte expansion against a single
+  // non-trivial pattern so any future regression in ExpandSimdModifiedImm
+  // surfaces immediately.
+  ThreadState state{};
+  state.cpu.v[9] = ~static_cast<__uint128_t>(0);
+
+  static const uint32_t insn = MoviD(9, 0xAA);
+  ASSERT_EQ(insn, 0x2F05E549u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0xFF00FF00FF00FF00ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
