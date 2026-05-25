@@ -1958,6 +1958,33 @@ constexpr uint32_t SwpX(uint8_t rs, uint8_t rt, uint8_t rn) {
          (static_cast<uint32_t>(rn) << 5) | rt;
 }
 
+// region digitalis
+// W-form (size=10 → base 0xB8200000), H-form (size=01 → base 0x78200000),
+// and B-form (size=00 → base 0x38200000) variants of selected LSE LD<op>
+// opcodes.  The opc[14:12] field is identical across all four sizes:
+//   1=LDCLR, 2=LDEOR, 3=LDSET, 4=LDSMAX, 5=LDSMIN, 6=LDUMAX, 7=LDUMIN.
+constexpr uint32_t LdclrW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8201000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdsetH(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x78203000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdsmaxW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8204000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdsminW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8205000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdumaxB(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x38206000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+// endregion
+
 // CASP / CASPX (compare-and-swap pair, Armv8.1 LSE — ):
 //   bit[31]=0, bit[30]=sz (0 W-pair, 1 X-pair), bits[29:23]=0010000, bit[22]=L,
 //   bit[21]=1, bits[20:16]=Rs (must be even), bit[15]=o0, bits[14:10]=11111,
@@ -2166,6 +2193,128 @@ TEST_F(Arm64LiteTranslateRegionTest, LduminPicksSmallerUnsignedX) {
   EXPECT_EQ(target, 7u);
   EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFFFFFFFFF00ULL);
 }
+
+// region digitalis
+// LSE W/B/H/XZR edge-case pinning suite.  These convert the source-only audit
+// of the kLdsmax/kLdumax/kLdset/kLdclr CAS-loop construction (handoff-308)
+// into runtime evidence.  Each test targets one specific invariant:
+//
+//   * LdsmaxWSignedNegativeVsPositive / LdsminWSignedNegativeVsPositive —
+//     verifies the signed compare uses Movsxlq at W-form, so that the
+//     32-bit value 0xFFFFFFFF is treated as -1 (not 4_294_967_295).
+//   * LdumaxBZeroExtendsOldByte — verifies the B-form returns the old byte
+//     zero-extended to 64 bits (top 56 bits zero).
+//   * LdsetHZeroExtendsOldHalfword — same for H-form (top 48 bits zero).
+//   * LdclrWRsXzrLeavesMemoryUnchanged — Rs==XZR encodes mask=0, so
+//     mem &= ~0 == mem.  Verifies the Rs-is-zero special case.
+//   * LdsetXRtXzrDiscardsResult — Rt==XZR encoding must skip SetReg(31)
+//     (cpu.x has only 31 entries; an unguarded SetReg would CHECK-fail
+//     or write OOB).  The RMW on memory still must happen.
+
+// LDSMAX W-form: old = -1 (0xFFFFFFFF as signed int32), Rs = +1.  Signed max
+// is +1 → memory becomes 1.  Old returned = 0xFFFFFFFF zero-extended to
+// 0x00000000_FFFFFFFF.  A missing Movsxlq before the Cmpq would treat
+// 0xFFFFFFFF as unsigned 4_294_967_295 and incorrectly leave memory
+// unchanged.
+TEST_F(Arm64LiteTranslateRegionTest, LdsmaxWSignedNegativeVsPositive) {
+  alignas(16) static uint32_t target = 0xFFFFFFFFu;
+  target = 0xFFFFFFFFu;
+  state_.cpu.x[0] = 0x00000001ULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdsmaxW(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0x00000001u);
+  EXPECT_EQ(state_.cpu.x[1], 0x00000000FFFFFFFFULL);
+}
+
+// LDSMIN W-form: symmetric to the above.  Signed min(-1, +1) = -1 → memory
+// keeps 0xFFFFFFFF.  Old returned still zero-extended to 0x...FFFFFFFF.
+TEST_F(Arm64LiteTranslateRegionTest, LdsminWSignedNegativeVsPositive) {
+  alignas(16) static uint32_t target = 0xFFFFFFFFu;
+  target = 0xFFFFFFFFu;
+  state_.cpu.x[0] = 0x00000001ULL;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdsminW(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0xFFFFFFFFu);
+  EXPECT_EQ(state_.cpu.x[1], 0x00000000FFFFFFFFULL);
+}
+
+// LDUMAX B-form: old byte = 0xFF, Rs = 0x10.  Unsigned max(0xFF, 0x10) = 0xFF
+// → memory keeps 0xFF.  Rt receives the old byte zero-extended to 64 bits;
+// a missing post-loop mask would leave garbage in the upper 56 bits.
+TEST_F(Arm64LiteTranslateRegionTest, LdumaxBZeroExtendsOldByte) {
+  alignas(16) static uint8_t target_buf[16];
+  target_buf[0] = 0xFFu;
+  // Pre-stamp Rt with a sentinel non-zero so a no-op write would leak.
+  state_.cpu.x[1] = 0xDEADBEEFDEADBEEFULL;
+  state_.cpu.x[0] = 0x10ULL;
+  state_.cpu.x[2] = ToGuestAddr(&target_buf[0]);
+  static const uint32_t code[] = {
+      LdumaxB(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target_buf[0], 0xFFu);
+  EXPECT_EQ(state_.cpu.x[1], 0x00000000000000FFULL);
+}
+
+// LDSET H-form: old halfword = 0xFFFF, Rs = 0x00FF.  0xFFFF | 0x00FF = 0xFFFF
+// → memory unchanged.  Rt = 0xFFFF zero-extended to 64 bits.
+TEST_F(Arm64LiteTranslateRegionTest, LdsetHZeroExtendsOldHalfword) {
+  alignas(16) static uint16_t target_buf[8];
+  target_buf[0] = 0xFFFFu;
+  state_.cpu.x[1] = 0xDEADBEEFDEADBEEFULL;
+  state_.cpu.x[0] = 0x00FFULL;
+  state_.cpu.x[2] = ToGuestAddr(&target_buf[0]);
+  static const uint32_t code[] = {
+      LdsetH(/*rs=*/0, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target_buf[0], 0xFFFFu);
+  EXPECT_EQ(state_.cpu.x[1], 0x000000000000FFFFULL);
+}
+
+// LDCLR W-form with Rs==XZR.  Encoded Rs=31 means the mask is 0; the JIT
+// must materialize this as Xorl(operand, operand), giving ~mask = all-1s
+// and memory &= all-1s = memory (unchanged).  Rt receives the old value
+// zero-extended.
+TEST_F(Arm64LiteTranslateRegionTest, LdclrWRsXzrLeavesMemoryUnchanged) {
+  alignas(16) static uint32_t target = 0xDEADBEEFu;
+  target = 0xDEADBEEFu;
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdclrW(/*rs=*/31, /*rt=*/1, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0xDEADBEEFu);
+  EXPECT_EQ(state_.cpu.x[1], 0x00000000DEADBEEFULL);
+}
+
+// LDSET X-form with Rt==XZR.  Encoded Rt=31 means "discard the return".
+// Memory must still get the RMW (0x1234 | 0xFF = 0x12FF), but the JIT must
+// gate the SetReg(rt) write — cpu.x has only 31 entries and SetReg(31)
+// would CHECK-fail.
+TEST_F(Arm64LiteTranslateRegionTest, LdsetXRtXzrDiscardsResult) {
+  alignas(16) static uint64_t target = 0x0000000000001234ULL;
+  target = 0x0000000000001234ULL;
+  state_.cpu.x[0] = 0xFFULL;                          // Rs (set bits)
+  state_.cpu.x[2] = ToGuestAddr(&target);             // Rn (address)
+  // Pre-stamp x[0] / x[2] sentinels for the post-condition check below.
+  const uint64_t expected_x0_after = 0xFFULL;
+  const uint64_t expected_x2_after = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      LdsetX(/*rs=*/0, /*rt=*/31, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target, 0x00000000000012FFULL);
+  EXPECT_EQ(state_.cpu.x[0], expected_x0_after);
+  EXPECT_EQ(state_.cpu.x[2], expected_x2_after);
+}
+// endregion
 
 // CASP 32-bit pair: equal expected → swap performed; Rs:Rs+1 receive the
 // (matching) old pair zero-extended (verify checkbox).
