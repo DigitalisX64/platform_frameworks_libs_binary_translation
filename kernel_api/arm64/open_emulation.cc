@@ -66,32 +66,66 @@ static_assert(O_LARGEFILE == 00100000);
 
 namespace {
 
+// ARM64 (arch/arm64/include/uapi/asm/fcntl.h) overrides a handful of the
+// asm-generic flag bits to the legacy ARM/Alpha layout, swapping O_DIRECTORY
+// with O_DIRECT and O_NOFOLLOW with O_LARGEFILE relative to the asm-generic
+// (x86_64) values. Translating these is mandatory: passing a guest
+// O_DIRECTORY (0o40000) to the host kernel verbatim looks like O_DIRECT,
+// which the host rejects with EINVAL when applied to a directory --
+// silently breaking opendir / QDirListing / any directory-iteration code.
+constexpr int kGuestODirectory = 040000;    // 0x4000  (host O_DIRECT bit position)
+constexpr int kGuestONofollow  = 0100000;   // 0x8000  (host O_LARGEFILE bit position)
+constexpr int kGuestODirect    = 0200000;   // 0x10000 (host O_DIRECTORY bit position)
+constexpr int kGuestOLargefile = 0400000;   // 0x20000 (host O_NOFOLLOW bit position)
+
+static_assert(O_DIRECTORY == 0200000);
+static_assert(O_NOFOLLOW  == 0400000);
+static_assert(O_DIRECT    == 040000);
+static_assert(O_LARGEFILE == 0100000);
+
+constexpr int kArchSpecificMask =
+    kGuestODirectory | kGuestONofollow | kGuestODirect | kGuestOLargefile;
+
+// Flags whose values match between guest (arm64) and host (x86_64). The
+// arch-specific bits are excluded; they are handled by the explicit swap below.
 const int kCompatibleOpenFlags =
     O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND | O_NONBLOCK | O_DSYNC | FASYNC |
-    O_NOATIME | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_DIRECT | __O_SYNC | O_PATH | O_LARGEFILE;
+    O_NOATIME | O_CLOEXEC | __O_SYNC | O_PATH;
+
+// The swap pairs (O_DIRECTORY <-> O_DIRECT, O_NOFOLLOW <-> O_LARGEFILE) occupy
+// exactly the same four bit positions on both arches; swapping is self-inverse,
+// so the same helper translates in either direction.
+int SwapArchSpecificBits(int flags) {
+  int out = flags & ~kArchSpecificMask;
+  if (flags & kGuestODirectory) out |= O_DIRECTORY;   // 0x4000  -> 0x10000
+  if (flags & kGuestODirect)    out |= O_DIRECT;      // 0x10000 -> 0x4000
+  if (flags & kGuestONofollow)  out |= O_NOFOLLOW;    // 0x8000  -> 0x20000
+  if (flags & kGuestOLargefile) out |= O_LARGEFILE;   // 0x20000 -> 0x8000
+  return out;
+}
 
 }  // namespace
 
 const char* kGuestCpuinfoPath = "/system/etc/cpuinfo.arm64.txt";
 
 int ToHostOpenFlags(int guest_flags) {
-  int unknown_guest_flags = guest_flags & ~kCompatibleOpenFlags;
+  int unknown_guest_flags = guest_flags & ~(kCompatibleOpenFlags | kArchSpecificMask);
   if (unknown_guest_flags) {
     TRACE("Unrecognized guest open flags: original=0x%x unsupported=0x%x. Passing to host as is.",
           guest_flags,
           unknown_guest_flags);
   }
-  return guest_flags;
+  return SwapArchSpecificBits(guest_flags);
 }
 
 int ToGuestOpenFlags(int host_flags) {
-  int unknown_host_flags = host_flags & ~kCompatibleOpenFlags;
+  int unknown_host_flags = host_flags & ~(kCompatibleOpenFlags | kArchSpecificMask);
   if (unknown_host_flags) {
     TRACE("Unrecognized host open flags: original=0x%x unsupported=0x%x. Passing to guest as is.",
           host_flags,
           unknown_host_flags);
   }
-  return host_flags;
+  return SwapArchSpecificBits(host_flags);
 }
 
 }  // namespace berberis
