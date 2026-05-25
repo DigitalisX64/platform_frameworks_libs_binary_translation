@@ -35,6 +35,14 @@
 #include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_state/guest_addr.h"
+// region digitalis - access guest CPU state to log mprotect caller
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include <sys/syscall.h>
+#include "berberis/guest_os_primitives/guest_thread.h"
+#include "berberis/guest_os_primitives/guest_thread_manager.h"
+#include "berberis/guest_state/guest_state.h"
+#endif
+// endregion
 
 namespace berberis {
 
@@ -189,15 +197,27 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
   }
 #endif
   // endregion
-  // region digitalis - log failures
+  // region digitalis - log failures with guest caller pin (LR/FP/TID)
+  // FB Katana logcat shows a periodic mmap-EINVAL storm with flags=0 and
+  // doubling lengths. To pin the guest caller, log x30 (guest LR = return
+  // address) and x29 (guest FP, whose first qword is the caller's frame).
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   if (result == MAP_FAILED) {
     int saved_errno = errno;
     ++g_mmap_fail_count;
+    uint64_t lr = 0, fp = 0;
+    GuestThread* gt = GetCurrentGuestThread();
+    if (gt != nullptr && gt->state() != nullptr) {
+      lr = gt->state()->cpu.x[30];
+      fp = gt->state()->cpu.x[29];
+    }
+    pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
     __android_log_print(ANDROID_LOG_ERROR, "berberis",
-        "mmap FAILED #%lu errno=%d addr=%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx (total_fail=%lu)",
+        "mmap FAILED #%lu errno=%d addr=%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx lr=0x%llx fp=0x%llx tid=%d (total_fail=%lu)",
         (unsigned long)n, saved_errno, addr, (unsigned long)length, prot, flags, fd,
-        (unsigned long)offset, (unsigned long)g_mmap_fail_count);
+        (unsigned long)offset,
+        (unsigned long long)lr, (unsigned long long)fp, tid,
+        (unsigned long)g_mmap_fail_count);
     errno = saved_errno;
   }
 #endif
@@ -211,11 +231,26 @@ int MunmapForGuest(void* addr, size_t length) {
 }
 
 int MprotectForGuest(void* addr, size_t length, int prot) {
-  // region digitalis - log mprotect calls to characterize CFIShadowWriter spam
+  // region digitalis - log mprotect calls + identify caller for atexit-page spin
+  // Bionic's AtexitArray::set_writable() issues a mprotect pair (PROT_READ ↔
+  // PROT_READ|PROT_WRITE) on every __cxa_atexit call. On FB Katana, a tight
+  // loop saturates a CPU with this pattern. To pin the guest caller, we log
+  // x30 (guest LR = return address into the caller) and x29 (guest FP, so
+  // its first qword is the caller's saved x29 / x30 frame chain).
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   uint64_t n = ++g_mprotect_count;
-  TRACE("mprotect#%llu addr=%p len=%zu prot=0x%x",
-        static_cast<unsigned long long>(n), addr, length, prot);
+  uint64_t lr = 0, fp = 0;
+  GuestThread* gt = GetCurrentGuestThread();
+  if (gt != nullptr && gt->state() != nullptr) {
+    lr = gt->state()->cpu.x[30];
+    fp = gt->state()->cpu.x[29];
+  }
+  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  TRACE("mprotect#%llu addr=%p len=%zu prot=0x%x lr=0x%llx fp=0x%llx tid=%d",
+        static_cast<unsigned long long>(n), addr, length, prot,
+        static_cast<unsigned long long>(lr),
+        static_cast<unsigned long long>(fp),
+        tid);
 #endif
   // endregion
   // In b/218772975 the app is scanning "/proc/self/maps" and tries to mprotect
