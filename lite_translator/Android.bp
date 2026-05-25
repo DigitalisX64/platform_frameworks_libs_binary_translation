@@ -85,6 +85,7 @@ cc_test_library {
         "libberberis_base_headers",
         "libberberis_decoder_arm64_headers",
         "libberberis_guest_state_arm64_headers",
+        "libberberis_interpreter_arm64_headers",
         "libberberis_lite_translator_headers",
         "berberis_test_utils_headers",
     ],
