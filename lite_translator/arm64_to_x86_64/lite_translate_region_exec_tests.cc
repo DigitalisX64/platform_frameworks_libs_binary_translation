@@ -19014,6 +19014,130 @@ TEST(Arm64InterpreterSimdModifiedImm, MoviD_Pattern_BitToByteExpansion) {
 }
 // endregion
 
+// region digitalis - SHLL / SHLL2 (shift left long by element size).
+// AdvSimdTwoRegMisc opcode=10011, U=1, size in {00,01,10}. Source from low
+// (Q=0) or high (Q=1) 64 bits of Vn, widened to 2*esize and shifted left
+// by esize bits (placed in upper half of the widened lane; lower half zero).
+// Encoding: 0 Q 1 01110 size 10000 10011 10 Rn Rd.
+
+static constexpr uint32_t Shll(uint8_t rd, uint8_t rn, uint8_t size) {
+  return 0x2E213800u | (static_cast<uint32_t>(size) << 22) |
+         (static_cast<uint32_t>(rn & 0x1F) << 5) | (rd & 0x1F);
+}
+static constexpr uint32_t Shll2(uint8_t rd, uint8_t rn, uint8_t size) {
+  return 0x6E213800u | (static_cast<uint32_t>(size) << 22) |
+         (static_cast<uint32_t>(rn & 0x1F) << 5) | (rd & 0x1F);
+}
+
+TEST(Arm64InterpreterSimdTwoRegMisc, ShllByteToHalfWidensAndShifts) {
+  // shll v0.8h, v1.8b, #8 — each source byte placed in upper byte of a
+  // 16-bit destination lane; lower byte zeroed. Q=0 reads source from
+  // low 64 bits of Vn; upper 64 bits of result fill all 128 bits of Vd.
+  ThreadState state{};
+  state.cpu.v[1] = (static_cast<__uint128_t>(0xCAFEBABEDEADBEEFULL) << 64) |
+                   static_cast<__uint128_t>(0x0102030405060708ULL);
+  state.cpu.v[0] = ~static_cast<__uint128_t>(0);  // sentinel
+
+  static const uint32_t insn = Shll(0, 1, 0b00);
+  ASSERT_EQ(insn, 0x2E213820u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  // Expected halfwords (little-endian): from source bytes 08,07,06,05,04,03,02,01
+  // each shifted by 8 → 0x0800, 0x0700, ..., 0x0100.
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0]),
+            0x0500060007000800ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0] >> 64),
+            0x0100020003000400ULL);
+}
+
+TEST(Arm64InterpreterSimdTwoRegMisc, Shll2ByteToHalfReadsUpperHalf) {
+  // shll2 v0.8h, v1.16b, #8 — Q=1 form: reads upper 8 bytes of Vn.
+  ThreadState state{};
+  state.cpu.v[1] = (static_cast<__uint128_t>(0xCAFEBABEDEADBEEFULL) << 64) |
+                   static_cast<__uint128_t>(0x0102030405060708ULL);
+  state.cpu.v[0] = ~static_cast<__uint128_t>(0);
+
+  static const uint32_t insn = Shll2(0, 1, 0b00);
+  ASSERT_EQ(insn, 0x6E213820u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  // Source bytes (upper half, little-endian): EF, BE, AD, DE, BE, BA, FE, CA
+  // each shifted by 8 → 0xEF00, 0xBE00, 0xAD00, 0xDE00, 0xBE00, 0xBA00, 0xFE00, 0xCA00.
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0]),
+            0xDE00AD00BE00EF00ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0] >> 64),
+            0xCA00FE00BA00BE00ULL);
+}
+
+TEST(Arm64InterpreterSimdTwoRegMisc, ShllHalfToWordWidensAndShifts) {
+  // shll v0.4s, v1.4h, #16 — each source halfword shifted left by 16 into
+  // upper half of 32-bit destination lane.
+  ThreadState state{};
+  state.cpu.v[1] = (static_cast<__uint128_t>(0xDEADBEEFCAFEBABEULL) << 64) |
+                   static_cast<__uint128_t>(0x0001000200030004ULL);
+  state.cpu.v[0] = ~static_cast<__uint128_t>(0);
+
+  static const uint32_t insn = Shll(0, 1, 0b01);
+  ASSERT_EQ(insn, 0x2E613820u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  // Source halfwords (LE): 0x0004, 0x0003, 0x0002, 0x0001
+  // → 0x00040000, 0x00030000, 0x00020000, 0x00010000.
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0]),
+            0x0003000000040000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0] >> 64),
+            0x0001000000020000ULL);
+}
+
+TEST(Arm64InterpreterSimdTwoRegMisc, ShllWordToDoubleShiftsBy32) {
+  // shll v0.2d, v1.2s, #32 — boundary: 32-bit shift on 64-bit accumulator.
+  ThreadState state{};
+  state.cpu.v[1] = (static_cast<__uint128_t>(0xDEADBEEFCAFEBABEULL) << 64) |
+                   static_cast<__uint128_t>(0xFFFFFFFF80000001ULL);
+  state.cpu.v[0] = ~static_cast<__uint128_t>(0);
+
+  static const uint32_t insn = Shll(0, 1, 0b10);
+  ASSERT_EQ(insn, 0x2EA13820u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  // Source words (LE): 0x80000001, 0xFFFFFFFF
+  // → 0x8000000100000000, 0xFFFFFFFF00000000.
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0]),
+            0x8000000100000000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0] >> 64),
+            0xFFFFFFFF00000000ULL);
+}
+
+TEST(Arm64InterpreterSimdTwoRegMisc, Shll2WordToDoubleReadsUpperHalf) {
+  // shll2 v0.2d, v1.4s, #32 — Q=1 form for word-to-double.
+  ThreadState state{};
+  state.cpu.v[1] = (static_cast<__uint128_t>(0xDEADBEEFCAFEBABEULL) << 64) |
+                   static_cast<__uint128_t>(0xFFFFFFFF80000001ULL);
+  state.cpu.v[0] = ~static_cast<__uint128_t>(0);
+
+  static const uint32_t insn = Shll2(0, 1, 0b10);
+  ASSERT_EQ(insn, 0x6EA13820u);
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+
+  InterpretInsn(&state);
+
+  // Upper-half source words (LE): 0xCAFEBABE, 0xDEADBEEF
+  // → 0xCAFEBABE00000000, 0xDEADBEEF00000000.
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0]),
+            0xCAFEBABE00000000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0] >> 64),
+            0xDEADBEEF00000000ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

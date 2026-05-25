@@ -6559,6 +6559,30 @@ class Interpreter {
         break;
       }
 
+      // region digitalis - SHLL / SHLL2 (shift left long by element size).
+      // Source element width: esize (8/16/32 bits). Destination element width:
+      // 2*esize (16/32/64 bits). Implicit shift amount = source element bits.
+      // Each source element ends up in the upper half of the widened destination
+      // lane; lower half is zero. Q=0 reads source from low 64 bits of Vn
+      // (SHLL); Q=1 reads source from upper 64 bits (SHLL2). Result fills all
+      // 128 bits of Vd in both cases (no preserve-lower-half semantics).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kShll: {
+        uint8_t src_esize = esize;        // 1, 2, or 4 bytes
+        uint8_t dst_esize = esize * 2;    // 2, 4, or 8 bytes
+        if (dst_esize > 8) { Undefined(); return; }
+        uint8_t src_off = args.q ? 8 : 0;
+        uint8_t dst_count = 8 / src_esize;  // 8 lanes for B->H, 4 for H->S, 2 for S->D
+        result = static_cast<__uint128_t>(0);
+        for (uint8_t i = 0; i < dst_count; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + src_off + i * src_esize, src_esize);
+          uint64_t shifted = elem << (src_esize * 8);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * dst_esize, &shifted, dst_esize);
+        }
+        break;
+      }
+      // endregion
+
       case Decoder::AdvSimdTwoRegMiscOpcode::kFabs: {
         // FABS (vector): floating-point absolute value per element.
         // region digitalis: Armv8.2-FP16 vector FABS.
