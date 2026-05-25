@@ -7123,11 +7123,81 @@ class LiteTranslator {
   // endregion
 
   // region digitalis
+  // JIT for LD1 / ST1 multi-register contiguous AdvSIMD load/store
+  // (`ld1 {Vt.T, ...}, [Xn]{, post}` / `st1 ...`). Promoted out of the
+  // interpreter because `__dl___strchr_aarch64` in the dynamic linker
+  // uses `ld1 {v1.16b, v2.16b}, [x2], #32` in its hot byte-scan loop —
+  // every dlopen / symbol resolve bailed to the interpreter on this
+  // instruction. De-interleaving variants (LD2/LD3/LD4 / ST2/ST3/ST4)
+  // still fall back to the interpreter (lane shuffling is non-trivial
+  // and was not surfaced as hot by tracing).
   void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t size,
                           bool q, bool is_store, bool postindex, uint8_t rm,
                           bool is_interleaved) {
-    UNUSED(rt, rn, num_regs, size, q, is_store, postindex, rm, is_interleaved);
-    Undefined();
+    UNUSED(size);  // For LD1/ST1 contiguous, the element size only matters
+                   // for post-index immediate math, and that is encoded by Q
+                   // (16- or 8-byte stride per register) — the transfer is
+                   // bulk-vector regardless.
+    if (is_interleaved) { Undefined(); return; }
+    if (num_regs < 1 || num_regs > 4) { Undefined(); return; }
+
+    const int32_t vec_bytes = q ? 16 : 8;
+
+    Register base_orig = (rn == 31) ? GetSp() : GetReg(rn);
+    if (base_orig == no_register) { Undefined(); return; }
+    Register base = ApplyTbi(base_orig);
+    if (base == no_register) { Undefined(); return; }
+
+    SimdRegister xmm = AllocTempSimdReg();
+    if (xmm == no_simd_register) { Undefined(); return; }
+
+    for (uint8_t r = 0; r < num_regs; r++) {
+      const uint8_t vreg = (rt + r) & 31;
+      const int32_t vt_off = offsetof(ThreadState, cpu.v[0]) + vreg * 16;
+      const int32_t mem_off = static_cast<int32_t>(r) * vec_bytes;
+      Assembler::Operand mem{.base = base, .disp = mem_off};
+
+      if (is_store) {
+        if (q) {
+          as_.Movdqu(xmm, {.base = Assembler::rbp, .disp = vt_off});
+          as_.Movdqu(mem, xmm);
+        } else {
+          // Q=0: store low 64 bits of v[vreg].
+          as_.Movq(xmm, {.base = Assembler::rbp, .disp = vt_off});
+          as_.Movq(mem, xmm);
+        }
+      } else {
+        if (q) {
+          as_.Movdqu(xmm, mem);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vt_off}, xmm);
+        } else {
+          // Q=0: load 8 bytes and zero-extend the upper 64 of v[vreg].
+          as_.Pxor(xmm, xmm);
+          as_.Movq(xmm, mem);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vt_off}, xmm);
+        }
+      }
+    }
+
+    if (postindex) {
+      Register new_base = AllocTempReg();
+      if (new_base == no_register) { Undefined(); return; }
+      Register reread_base = (rn == 31) ? GetSp() : GetReg(rn);
+      as_.Movq(new_base, reread_base);
+      if (rm == 31) {
+        // Immediate post-index: total bytes accessed = num_regs * vec_bytes.
+        as_.Addq(new_base, static_cast<int32_t>(num_regs) * vec_bytes);
+      } else {
+        Register rm_val = GetReg(rm);
+        if (rm_val == no_register) { Undefined(); return; }
+        as_.Addq(new_base, rm_val);
+      }
+      if (rn == 31) {
+        SetSp(new_base);
+      } else {
+        SetReg(rn, new_base);
+      }
+    }
   }
 
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {

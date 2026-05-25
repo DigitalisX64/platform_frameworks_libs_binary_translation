@@ -1116,6 +1116,154 @@ TEST_F(Arm64LiteTranslateRegionTest, SimdLoadRegOffset128Bit) {
     EXPECT_EQ(v0[i], buffer[16 + i]) << "byte " << i;
   }
 }
+
+// region digitalis - AdvSIMD multi-register contiguous LD1/ST1 JIT
+// (LD2/LD3/LD4 with de-interleaving remain interpreter-only).
+
+// Encoding helper for AdvSIMD multi-structure LD1/ST1:
+//   bits[31]=0, [30]=Q, [29:24]=001100, [23]=postindex, [22]=is_load,
+//   [21]=0, [20:16]=Rm (11111 for imm post), [15:12]=opcode
+//   (1 reg=0111, 2 regs=1010, 3 regs=0110, 4 regs=0010), [11:10]=size,
+//   [9:5]=Rn, [4:0]=Rt.
+constexpr uint32_t AdvSimdMultiEnc(bool q, bool postindex, bool is_load,
+                                    uint8_t rm, uint8_t opcode, uint8_t size,
+                                    uint8_t rn, uint8_t rt) {
+  uint32_t enc = 0x0C000000u;
+  if (q) enc |= 0x40000000u;
+  if (postindex) enc |= 0x00800000u;
+  if (is_load) enc |= 0x00400000u;
+  enc |= (static_cast<uint32_t>(rm) & 0x1F) << 16;
+  enc |= (static_cast<uint32_t>(opcode) & 0xF) << 12;
+  enc |= (static_cast<uint32_t>(size) & 0x3) << 10;
+  enc |= (static_cast<uint32_t>(rn) & 0x1F) << 5;
+  enc |= (static_cast<uint32_t>(rt) & 0x1F);
+  return enc;
+}
+
+// LD1 {Vt.16B, Vt+1.16B}, [Xn], #32 — the dynamic linker's strchr loop.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_2x16B_PostIndexImm) {
+  alignas(16) static uint8_t buffer[32];
+  for (int i = 0; i < 32; ++i) buffer[i] = static_cast<uint8_t>(0x30 + i);
+
+  static const uint32_t code[] = {
+      // LD1 {V1.16B, V2.16B}, [X2], #32  → opcode=1010, q=1, postindex=1,
+      // is_load=1, rm=11111, size=00, rn=2, rt=1.
+      AdvSimdMultiEnc(true, true, true, 0x1F, 0b1010, 0, 2, 1),
+  };
+  memset(&state_.cpu.v[1], 0x5A, 16);
+  memset(&state_.cpu.v[2], 0x6B, 16);
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v1 = reinterpret_cast<uint8_t*>(&state_.cpu.v[1]);
+  uint8_t* v2 = reinterpret_cast<uint8_t*>(&state_.cpu.v[2]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v1[i], buffer[i]) << "v1 byte " << i;
+    EXPECT_EQ(v2[i], buffer[16 + i]) << "v2 byte " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[2], ToGuestAddr(buffer) + 32u);
+}
+
+// LD1 {V0.16B}, [X1] — no post-index, 1 register.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_1x16B_NoPostIndex) {
+  alignas(16) static uint8_t buffer[16];
+  for (int i = 0; i < 16; ++i) buffer[i] = static_cast<uint8_t>(0xA0 + i);
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, false, true, 0x00, 0b0111, 0, 1, 0),
+  };
+  memset(&state_.cpu.v[0], 0xCC, 16);
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(v0[i], buffer[i]) << "byte " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(buffer));  // not modified
+}
+
+// LD1 {V0.8B}, [X1] — Q=0, 8-byte stride, must zero the upper 64.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_1x8B_ZeroExtends) {
+  alignas(16) static uint8_t buffer[8] =
+      {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, true, 0x00, 0b0111, 0, 1, 0),
+  };
+  memset(&state_.cpu.v[0], 0xFF, 16);  // upper-half poison
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  uint8_t* v0 = reinterpret_cast<uint8_t*>(&state_.cpu.v[0]);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(v0[i], buffer[i]) << "lo " << i;
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(v0[i], 0x00) << "hi " << i;
+}
+
+// LD1 {V0.16B, V1.16B, V2.16B, V3.16B}, [X4], X5 — register post-index, 4 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld1_4x16B_PostIndexReg) {
+  alignas(16) static uint8_t buffer[64];
+  for (int i = 0; i < 64; ++i) buffer[i] = static_cast<uint8_t>(i);
+
+  static const uint32_t code[] = {
+      // 4 regs: opcode=0010. Q=1, postindex=1, is_load=1, rm=5.
+      AdvSimdMultiEnc(true, true, true, 5, 0b0010, 0, 4, 0),
+  };
+  for (int r = 0; r < 4; ++r) memset(&state_.cpu.v[r], 0xEE, 16);
+  state_.cpu.x[4] = ToGuestAddr(buffer);
+  state_.cpu.x[5] = 0x100;  // arbitrary post-index step
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int r = 0; r < 4; ++r) {
+    uint8_t* v = reinterpret_cast<uint8_t*>(&state_.cpu.v[r]);
+    for (int i = 0; i < 16; ++i) {
+      EXPECT_EQ(v[i], buffer[r * 16 + i]) << "v" << r << " byte " << i;
+    }
+  }
+  EXPECT_EQ(state_.cpu.x[4], ToGuestAddr(buffer) + 0x100);
+}
+
+// ST1 {V0.16B, V1.16B}, [X2], #32 — store path, post-index immediate.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_2x16B_PostIndexImm) {
+  alignas(16) static uint8_t buffer[32];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, true, false, 0x1F, 0b1010, 0, 2, 0),
+  };
+  for (int i = 0; i < 16; ++i) {
+    reinterpret_cast<uint8_t*>(&state_.cpu.v[0])[i] = static_cast<uint8_t>(0x10 + i);
+    reinterpret_cast<uint8_t*>(&state_.cpu.v[1])[i] = static_cast<uint8_t>(0x40 + i);
+  }
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(buffer[i], static_cast<uint8_t>(0x10 + i)) << "lo " << i;
+    EXPECT_EQ(buffer[16 + i], static_cast<uint8_t>(0x40 + i)) << "hi " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[2], ToGuestAddr(buffer) + 32u);
+}
+
+// ST1 {V0.8B}, [X1] — Q=0 store path writes only 8 bytes, leaves tail untouched.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_1x8B_DoesNotTouchUpper) {
+  alignas(16) static uint8_t buffer[16];
+  memset(buffer, 0xCC, sizeof(buffer));
+
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, false, 0x00, 0b0111, 0, 1, 0),
+  };
+  for (int i = 0; i < 16; ++i) {
+    reinterpret_cast<uint8_t*>(&state_.cpu.v[0])[i] = static_cast<uint8_t>(0x70 + i);
+  }
+  state_.cpu.x[1] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(buffer[i], static_cast<uint8_t>(0x70 + i)) << "lo " << i;
+  }
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(buffer[i], 0xCC) << "hi " << i;
+}
 // endregion
 
 // Test: single FMUL s0, s0, s1 (in-place multiply)
