@@ -1276,6 +1276,17 @@ class Decoder {
     kFcvtl,
     kFabs,
     kFneg,
+    // region digitalis - FP FCMxxZero (FP32/FP64). The integer kCmxxZero
+    // and Armv8.2-FP16 paths reuse the same kCmxxZero enum values disambiguated
+    // by args.is_fp16; the FP32/FP64 form lives at a different opcode column
+    // (01100/01101/01110 with bits[21:17]=10000, bit23=1), so it carries its
+    // own enum values rather than overloading.
+    kFcmgtZero,  // FCMGT zero: U=0, opcode=01100
+    kFcmgeZero,  // FCMGE zero: U=1, opcode=01100
+    kFcmeqZero,  // FCMEQ zero: U=0, opcode=01101
+    kFcmleZero,  // FCMLE zero: U=1, opcode=01101
+    kFcmltZero,  // FCMLT zero: U=0, opcode=01110 (U=1 unallocated)
+    // endregion
     // region digitalis
     // Across-lanes reductions share the two-reg-misc dispatch path but are
     // distinguished by bit20=1 (across-lanes group) vs bit20=0 (two-reg-misc).
@@ -5120,19 +5131,44 @@ class Decoder {
         }
         break;
       // endregion
-      // region digitalis - across-lanes FMAXNMV / FMINNMV
-      // (opcode=01100, bit20=1). Two-reg-misc has no op at opcode=01100,
-      // so the entire case is across-lanes; pre-Digitalis decoder fell
-      // through to default Undefined() and these encodings would have
-      // raised SIGILL. bit23 picks max-number (0) vs min-number (1);
-      // U=1 selects FP32 (.4S), U=0 selects FP16 (.8H) (interpreter
-      // dispatches on args.is_fp16). bit22 (sz) must be 0.
+      // region digitalis - opcode=01100 covers two distinct encodings:
+      //   bit20=1: across-lanes FMAXNMV (bit23=0) / FMINNMV (bit23=1).
+      //     bit22 (sz) must be 0; U=1 selects FP32 (.4S), U=0 selects
+      //     FP16 (.8H) — interpreter dispatches on args.is_fp16.
+      //   bit20=0: FP two-reg-misc FCMGT (zero, U=0) / FCMGE (zero, U=1).
+      //     bit23=1 is required (FP form). bit22 (sz) picks FP32 (0) or
+      //     FP64 (1); FP64 requires Q=1.
+      // Pre-Digitalis these all routed to Undefined() (fell through to default).
       case 0b01100:
-        if (!GetBits<20, 1>()) { Undefined(); return; }
-        if ((size & 1) || !q) { Undefined(); return; }
-        is_fp16 = !u;
-        op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminnmv
-                              : AdvSimdTwoRegMiscOpcode::kFmaxnmv;
+        if (GetBits<20, 1>()) {
+          if ((size & 1) || !q) { Undefined(); return; }
+          is_fp16 = !u;
+          op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminnmv
+                                : AdvSimdTwoRegMiscOpcode::kFmaxnmv;
+        } else {
+          if (!GetBits<23, 1>()) { Undefined(); return; }  // bit23=0 unallocated
+          if (size == 0b11 && !q) { Undefined(); return; }  // FP64 needs Q=1
+          op = u ? AdvSimdTwoRegMiscOpcode::kFcmgeZero
+                 : AdvSimdTwoRegMiscOpcode::kFcmgtZero;
+        }
+        break;
+      // FP two-reg-misc FCMEQ (zero, U=0) / FCMLE (zero, U=1).
+      // Encoding: opcode=01101, bit20=0, bit23=1 required.
+      case 0b01101:
+        if (GetBits<20, 1>()) { Undefined(); return; }
+        if (!GetBits<23, 1>()) { Undefined(); return; }
+        if (size == 0b11 && !q) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kFcmleZero
+               : AdvSimdTwoRegMiscOpcode::kFcmeqZero;
+        break;
+      // FP two-reg-misc FCMLT zero. U=1 unallocated.
+      // Encoding: opcode=01110, bit20=0, bit23=1, U=0.
+      case 0b01110:
+        if (u) { Undefined(); return; }
+        if (GetBits<20, 1>()) { Undefined(); return; }
+        if (!GetBits<23, 1>()) { Undefined(); return; }
+        if (size == 0b11 && !q) { Undefined(); return; }
+        op = AdvSimdTwoRegMiscOpcode::kFcmltZero;
         break;
       // endregion
       // region digitalis - opcode=11101 splits on bit23:
@@ -6286,6 +6322,30 @@ class Decoder {
       case 0b10100:
         op = u ? AdvSimdShiftImmOpcode::kUshll : AdvSimdShiftImmOpcode::kSshll;
         break;
+      // region digitalis - Vector fixed-point conversion (ARM ARM C7.2
+      // "Advanced SIMD shift by immediate"):
+      //   opcode | U=0     | U=1
+      //   -------+---------+---------
+      //   11100  | SCVTF   | UCVTF   (integer fixed-point -> FP per lane)
+      //   11111  | FCVTZS  | FCVTZU  (FP -> integer fixed-point per lane)
+      // immh selects element width: immh=01xx -> .2s/.4s (FP32 / S32),
+      // immh=1xxx -> .2d (FP64 / S64, Q=1 only).  immh=001x (FP16) is
+      // deferred (reject so SIGILL fires rather than wrong-result), and
+      // immh=0001/0000 are unallocated for these opcodes (top-level
+      // dispatch already gates immh!=0).
+      case 0b11100:
+        if (!(immh & 0b1100)) { Undefined(); return; }
+        if ((immh & 0b1000) && !q) { Undefined(); return; }  // .2d requires Q=1
+        op = u ? AdvSimdShiftImmOpcode::kUcvtfFixed
+               : AdvSimdShiftImmOpcode::kScvtfFixed;
+        break;
+      case 0b11111:
+        if (!(immh & 0b1100)) { Undefined(); return; }
+        if ((immh & 0b1000) && !q) { Undefined(); return; }
+        op = u ? AdvSimdShiftImmOpcode::kFcvtzuFixed
+               : AdvSimdShiftImmOpcode::kFcvtzsFixed;
+        break;
+      // endregion
       default:
         Undefined();
         return;
