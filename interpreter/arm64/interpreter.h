@@ -7498,6 +7498,70 @@ class Interpreter {
     __uint128_t src_m = state_->cpu.v[args.rm];
     __uint128_t result = state_->cpu.v[args.rd];
 
+    // region digitalis integer MUL/MLA/MLS by-element (.4h/.8h size=01,
+    // .2s/.4s size=10).  Integer word-element ops share the FP32-sized
+    // size=10 encoding slot with FMLA/FMLS/FMUL/FMULX, so we cannot
+    // dispatch by size alone — opcode wins.  The decoder already filters
+    // size and (U, opcode) tuples; only valid integer encodings reach
+    // here.
+    if (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kMul ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kMla ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kMls) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      uint8_t esize = (args.size == 0b01) ? 2 : 4;
+      uint8_t num_elements = (args.q ? 16 : 8) / esize;
+      uint64_t emask = ElementMask(esize);
+
+      uint64_t indexed = 0;
+      memcpy(&indexed,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * esize,
+             esize);
+
+      for (uint8_t i = 0; i < num_elements; i++) {
+        uint64_t src = 0;
+        memcpy(&src,
+               reinterpret_cast<const uint8_t*>(&src_n) + i * esize,
+               esize);
+        uint64_t r;
+        switch (args.opcode) {
+          case Decoder::AdvSimdVecXIdxOpcode::kMul:
+            r = (src * indexed) & emask;
+            break;
+          case Decoder::AdvSimdVecXIdxOpcode::kMla: {
+            uint64_t dst = 0;
+            memcpy(&dst,
+                   reinterpret_cast<uint8_t*>(&result) + i * esize,
+                   esize);
+            r = (dst + src * indexed) & emask;
+            break;
+          }
+          case Decoder::AdvSimdVecXIdxOpcode::kMls: {
+            uint64_t dst = 0;
+            memcpy(&dst,
+                   reinterpret_cast<uint8_t*>(&result) + i * esize,
+                   esize);
+            r = (dst - src * indexed) & emask;
+            break;
+          }
+          default:
+            __builtin_unreachable();
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
+      }
+
+      // For Q=0, the architecture zeroes the upper 64 bits of Vd
+      // (D-register semantics) — matches the JIT lite_translator path.
+      if (!args.q) {
+        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+      }
+      state_->cpu.v[args.rd] = result;
+      return;
+    }
+    // endregion
+
     // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
     if (args.size == 0b00) {
       // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,
@@ -7637,43 +7701,11 @@ class Interpreter {
         }
       }
     } else {
-      // Integer element sizes for MUL/MLA/MLS.
-      uint8_t esize = (args.size == 0b01) ? 2 : 4;
-      uint8_t num_elements = (args.q ? 16 : 8) / esize;
-      uint64_t emask = ElementMask(esize);
-
-      uint64_t indexed = 0;
-      memcpy(&indexed, reinterpret_cast<const uint8_t*>(&src_m) + args.index * esize, esize);
-
-      for (uint8_t i = 0; i < num_elements; i++) {
-        uint64_t src = 0;
-        memcpy(&src, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
-
-        switch (args.opcode) {
-          case Decoder::AdvSimdVecXIdxOpcode::kMul: {
-            uint64_t r = (src * indexed) & emask;
-            memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-            break;
-          }
-          case Decoder::AdvSimdVecXIdxOpcode::kMla: {
-            uint64_t dst = 0;
-            memcpy(&dst, reinterpret_cast<uint8_t*>(&result) + i * esize, esize);
-            uint64_t r = (dst + src * indexed) & emask;
-            memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-            break;
-          }
-          case Decoder::AdvSimdVecXIdxOpcode::kMls: {
-            uint64_t dst = 0;
-            memcpy(&dst, reinterpret_cast<uint8_t*>(&result) + i * esize, esize);
-            uint64_t r = (dst - src * indexed) & emask;
-            memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
-            break;
-          }
-          default:
-            Undefined();
-            return;
-        }
-      }
+      // size=01 with non-integer opcodes: decoder already filters this,
+      // but be defensive — integer kMul/kMla/kMls were handled at the
+      // top of the function; anything else with size=01 is reserved.
+      Undefined();
+      return;
     }
 
     state_->cpu.v[args.rd] = result;
