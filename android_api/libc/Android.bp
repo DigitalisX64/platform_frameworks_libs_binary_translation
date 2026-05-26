@@ -39,5 +39,11 @@ cc_library_shared {
         "berberis_proxy_library_defaults",
         "//frameworks/libs/native_bridge_support/android_api/libc:native_bridge_proxy_libc_defaults",
     ],
+    arch: {
+        x86_64: {
+            srcs: ["realloc_probe.cc"],
+            ldflags: ["-Wl,--wrap=realloc"],
+        },
+    },
 }
 // endregion
