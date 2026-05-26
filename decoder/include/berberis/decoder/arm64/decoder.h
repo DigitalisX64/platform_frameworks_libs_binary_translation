@@ -129,6 +129,13 @@ class Decoder {
     kLsrv = 0b001001,
     kAsrv = 0b001010,
     kRorv = 0b001011,
+    // region digitalis - PACGA (Armv8.3-PAuth generic PAC compute)
+    // PACGA Xd, Xn, Xm|SP: 64-bit only (sf=1, S=0, opcode=001100).
+    // ARM ARM C7.2.179: produces a 32-bit PAC in Rd[63:32], zeros Rd[31:0].
+    // Digitalis is PAC-blind (never inserts authentication codes), so the
+    // PAC value is 0 and Rd = 0.  Interpreter handles this; JIT bails.
+    kPacga = 0b001100,
+    // endregion
     // region digitalis - CRC32 opcodes
     kCrc32b = 0b010000,
     kCrc32h = 0b010001,
