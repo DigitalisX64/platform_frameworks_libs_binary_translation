@@ -19212,6 +19212,57 @@ TEST(Arm64InterpreterSimdTwoRegMisc, Shll2WordToDoubleReadsUpperHalf) {
 }
 // endregion
 
+// region digitalis - PACGA (Armv8.3-PAuth generic PAC compute)
+// ARM ARM C7.2.179: PACGA Xd, Xn, Xm|SP computes a 32-bit PAC keyed by
+// APGAKey_EL1 over Xn modified by Xm, places it in Rd[63:32], and zeros
+// Rd[31:0].  Digitalis is PAC-blind: no PAC is ever inserted, so the
+// architectural PAC value is 0, giving Rd = 0 regardless of inputs.
+// Encoding: 1 0 0 11010110 Rm 001100 Rn Rd
+//   sf=1, S=0, fixed bits[28:21]=11010110, opcode (bits[15:10])=001100.
+//   pacga x0, x1, x2 = 0x9AC23020  (Rm=2, Rn=1, Rd=0)
+//   pacga x5, x6, sp = 0x9ADF30C5  (Rm=31 means SP, Rn=6, Rd=5)
+// Derived from the existing MTE comment in decoder.h
+// (subp x0,x1,x2 = 0x9AC20020, opc=000000) plus the +0x3000 contribution
+// from setting bits[15:10] to 001100.
+TEST(Arm64InterpreterDataProc2Src, PacgaReturnsZero_AnyInputs) {
+  // pacga x0, x1, x2 = 0x9AC23020
+  ThreadState state{};
+  state.cpu.x[0] = 0xDEADBEEFCAFEBABEULL;  // pre-write sentinel, must be clobbered.
+  state.cpu.x[1] = 0xFEDCBA9876543210ULL;  // pointer to authenticate.
+  state.cpu.x[2] = 0x0F0E0D0C0B0A0908ULL;  // modifier salt.
+
+  static const uint32_t insn = 0x9AC23020u;
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+  InterpretInsn(&state);
+
+  EXPECT_EQ(state.cpu.x[0], 0ULL);
+  // Source registers must be unchanged.
+  EXPECT_EQ(state.cpu.x[1], 0xFEDCBA9876543210ULL);
+  EXPECT_EQ(state.cpu.x[2], 0x0F0E0D0C0B0A0908ULL);
+  EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
+}
+
+TEST(Arm64InterpreterDataProc2Src, PacgaSpModifierReturnsZero) {
+  // pacga x5, x6, sp = 0x9ADF30C5 — Rm=31 means SP, not XZR.  Architecturally
+  // PACGA with Rm=SP reads SP as the modifier, but since the result is 0
+  // regardless of modifier in a PAC-blind translator, we just verify the
+  // dispatch path doesn't SIGILL on the Rm=31 encoding.
+  ThreadState state{};
+  state.cpu.sp = 0x7000000000ULL;
+  state.cpu.x[5] = 0xAAAAAAAAAAAAAAAAULL;  // pre-write sentinel.
+  state.cpu.x[6] = 0x1234567812345678ULL;
+
+  static const uint32_t insn = 0x9ADF30C5u;
+  state.cpu.insn_addr = ToGuestAddr(&insn);
+  InterpretInsn(&state);
+
+  EXPECT_EQ(state.cpu.x[5], 0ULL);
+  EXPECT_EQ(state.cpu.x[6], 0x1234567812345678ULL);
+  EXPECT_EQ(state.cpu.sp, 0x7000000000ULL);
+  EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

@@ -844,6 +844,19 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - PACGA (Armv8.3-PAuth generic PAC compute)
+      // ARM ARM C7.2.179: PACGA computes a 32-bit PAC for the value in
+      // src1 keyed by src2 (or SP for Rm=31), places it in Rd[63:32], and
+      // zeros Rd[31:0].  Digitalis is PAC-blind: no authentication codes
+      // are ever inserted by PACIA/PACIB/PACDA/PACDB, so the corresponding
+      // generic PAC here is 0, and the architectural definition zeros the
+      // low 32 bits, giving Rd = 0.  PACGA is X-form only (sf=1); the
+      // decoder routes 32-bit attempts to Undefined() via the opcode
+      // mismatch path, so we don't need an is_64bit guard here.
+      case Decoder::DataProc2SrcOpcode::kPacga:
+        result = 0;
+        break;
+      // endregion
       default:
         Undefined();
         return 0;
