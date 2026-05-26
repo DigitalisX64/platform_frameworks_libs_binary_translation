@@ -41,8 +41,14 @@ cc_library_shared {
     ],
     arch: {
         x86_64: {
-            srcs: ["realloc_probe.cc"],
-            ldflags: ["-Wl,--wrap=realloc"],
+            srcs: [
+                "realloc_probe.cc",
+                "free_probe.cc",
+            ],
+            ldflags: [
+                "-Wl,--wrap=realloc",
+                "-Wl,--wrap=free",
+            ],
         },
     },
 }

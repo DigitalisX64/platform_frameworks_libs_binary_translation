@@ -14,23 +14,30 @@
  * limitations under the License.
  */
 
-// Diagnostic wrapper for host realloc. VkCaps (Vulkan caps viewer) aborts
-// inside scudo_realloc / scudo_free with "chunk header is zero", which means
-// a guest caller is passing a pointer whose Scudo chunk header has been
-// zeroed (uninitialized chunk, double-free, or pointer not actually returned
-// from malloc).  To pin the guest caller, intercept realloc via --wrap=realloc
-// and log a window of bytes around the chunk header plus the guest LR/FP/TID
-// just before forwarding to the host realloc that may trip the Scudo check.
+// Diagnostic + safety wrapper for host realloc. VkCaps (Vulkan caps viewer)
+// aborts inside scudo_realloc / scudo_free with "chunk header is zero",
+// which means a guest caller is passing a pointer whose Scudo chunk header
+// has been zeroed (Qt's static "shared-null" QArrayData pattern: a .bss
+// const that doubles as a default-constructed value and gets put on the
+// same realloc/free path as real heap allocations).
 //
 // In bionic's Scudo (Standalone, AndroidNormalConfig), the packed header is
-// 8 bytes immediately preceding the user pointer.  The 8 bytes before that
-// hold the chunk's tagged origin metadata.  We log both windows so that a
-// zero-or-non-zero comparison across multiple calls disambiguates which
-// region Scudo's "chunk header" check is actually reading.
+// 8 bytes immediately preceding the user pointer; the 8 bytes before that
+// hold tagged origin metadata.  A real Scudo chunk has a non-zero packed
+// header at [-8..-1] (or non-zero origin at [-16..-9]); an all-zero
+// 16-byte window means the pointer was never returned from malloc.
+//
+// Approach: peek the 16-byte window before ptr.  If both qwords are zero,
+// treat the input as a non-heap pointer (e.g., Qt shared null) — do a
+// fresh zero-initialised allocation of the requested size and return it
+// without touching the original storage.  The shared-null instance lives
+// in static storage and needs no deallocation; the caller's bookkeeping
+// will pick up the new (heap-managed) pointer like any normal realloc.
 
 #include <malloc.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
@@ -86,23 +93,30 @@ void LogReallocCall(uint64_t n, void* ptr, size_t size) {
 
 extern "C" void* __wrap_realloc(void* ptr, size_t size) {
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-  // First 4 calls log unconditionally so the diagnostic is visible at startup
-  // even in healthy runs.  Beyond that, only log if the 16-byte chunk-header
-  // window [-16..-1] is all-zero — that's the Scudo "chunk header is zero"
-  // condition.  Keeps log volume bounded in production while loudly catching
-  // the abort symptom.
   uint64_t n = g_realloc_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  bool log = (n <= 4);
-  if (!log && ptr != nullptr) {
+  bool non_heap = false;
+  if (ptr != nullptr) {
     const uint8_t* p = static_cast<const uint8_t*>(ptr);
     uint64_t hdr8 = 0;
     uint64_t hdr16 = 0;
     memcpy(&hdr8, p - 8, sizeof(hdr8));
     memcpy(&hdr16, p - 16, sizeof(hdr16));
-    log = (hdr8 == 0 && hdr16 == 0);
+    non_heap = (hdr8 == 0 && hdr16 == 0);
   }
-  if (log) {
+  // Log first 4 calls unconditionally so the diagnostic is visible at
+  // startup.  Beyond that, only log the all-zero-header symptom that
+  // triggers the Scudo abort path.
+  if (n <= 4 || non_heap) {
     LogReallocCall(n, ptr, size);
+  }
+  if (non_heap) {
+    // Qt shared-null / non-heap pointer.  Returning calloc(size, 1) gives
+    // the caller a fresh writable buffer pre-zeroed to the same byte
+    // pattern the shared null had, matching the COW semantics Qt expects.
+    // size == 0 collapses to malloc(0) / free(ptr) — for non-heap ptr the
+    // "free" half is a no-op, so just return NULL.
+    if (size == 0) return nullptr;
+    return calloc(1, size);
   }
 #endif
   return __real_realloc(ptr, size);
