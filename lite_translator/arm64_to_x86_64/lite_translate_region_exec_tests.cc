@@ -2407,6 +2407,80 @@ TEST_F(Arm64LiteTranslateRegionTest, CaspPairUnequalLeavesMemoryX) {
   EXPECT_EQ(state_.cpu.x[5], 0x0123456789ABCDEFULL);
 }
 
+// CASP 32-bit pair where the high source register is XZR (Rs=30 → Rs+1=31).
+// Expected high half reads as 0 (XZR), and the writeback to Rs+1=XZR is
+// discarded.  Memory has its high half cleared so the pair compares equal and
+// the swap is performed.  Pins the rs_hi==31 path through the "Xorl(expected,
+// expected) → no Orq for hi" branch and the "if (rs_hi < 31) SetReg" guard.
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairRsHiIsXzrComparesAndDiscardsWriteW) {
+  alignas(16) static uint64_t target;
+  target = (uint64_t{0x00000000ULL} << 32) | uint64_t{0xDEADBEEFULL};  // hi=0 (XZR matches)
+  state_.cpu.x[30] = 0xDEADBEEFULL;   // Rs   = expected.lo (matches memory.lo)
+  // X31 (XZR) reads as 0; matches memory.hi == 0 — pair compares equal.
+  state_.cpu.x[6]  = 0xAAAAAAAAULL;   // Rt   = new.lo
+  state_.cpu.x[7]  = 0xBBBBBBBBULL;   // Rt+1 = new.hi
+  state_.cpu.x[2]  = ToGuestAddr(&target);
+  static const uint32_t code[] = {
+      CaspW(/*rs=*/30, /*rt=*/6, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target,
+            (uint64_t{0xBBBBBBBBULL} << 32) | uint64_t{0xAAAAAAAAULL});
+  // Rs=30 receives the old memory.lo zero-extended; Rs+1=XZR write is discarded.
+  EXPECT_EQ(state_.cpu.x[30], 0xDEADBEEFULL);
+}
+
+// CASP 64-bit pair where the high source (expected) register is XZR.  The
+// rs_hi==31 path in size=3 lowers to Xorl(exp_hi, exp_hi); pins that branch
+// plus the writeback skip on Rs+1=XZR.  Pair address is 16-byte aligned so
+// CMPXCHG16B doesn't #GP.
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairRsHiIsXzrComparesAndDiscardsWriteX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0xCAFEBABEF00DFEEDULL;
+  pair_mem.hi = 0x0000000000000000ULL;       // XZR == 0 matches
+  state_.cpu.x[30] = 0xCAFEBABEF00DFEEDULL;  // Rs   = expected.lo (matches)
+  // X31 (XZR) reads as 0; matches pair_mem.hi == 0.
+  state_.cpu.x[6]  = 0xFEEDFACECAFEBABEULL;  // Rt   = new.lo
+  state_.cpu.x[7]  = 0xDEADBEEF12345678ULL;  // Rt+1 = new.hi
+  state_.cpu.x[2]  = ToGuestAddr(&pair_mem);
+  static const uint32_t code[] = {
+      CaspX(/*rs=*/30, /*rt=*/6, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(pair_mem.lo, 0xFEEDFACECAFEBABEULL);
+  EXPECT_EQ(pair_mem.hi, 0xDEADBEEF12345678ULL);
+  EXPECT_EQ(state_.cpu.x[30], 0xCAFEBABEF00DFEEDULL);
+}
+
+// CASP 64-bit pair where the high desired (Rt+1) register is XZR — new.hi
+// must be written as 0.  Pins the rt_hi==31 path through the
+// Xorl(des_hi, des_hi) branch and confirms memory.hi ends up zero after the
+// swap.
+TEST_F(Arm64LiteTranslateRegionTest, CaspPairRtHiIsXzrWritesZeroHighX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0x1111111111111111ULL;
+  pair_mem.hi = 0x2222222222222222ULL;
+  state_.cpu.x[4]  = 0x1111111111111111ULL;  // Rs   = expected.lo (matches)
+  state_.cpu.x[5]  = 0x2222222222222222ULL;  // Rs+1 = expected.hi (matches)
+  state_.cpu.x[30] = 0xFEEDFACECAFEBABEULL;  // Rt   = new.lo
+  // X31 (XZR) reads as 0; new.hi = 0 is written via Xorl(des_hi, des_hi).
+  state_.cpu.x[2]  = ToGuestAddr(&pair_mem);
+  static const uint32_t code[] = {
+      CaspX(/*rs=*/4, /*rt=*/30, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(pair_mem.lo, 0xFEEDFACECAFEBABEULL);
+  EXPECT_EQ(pair_mem.hi, 0x0000000000000000ULL);
+  EXPECT_EQ(state_.cpu.x[4], 0x1111111111111111ULL);
+  EXPECT_EQ(state_.cpu.x[5], 0x2222222222222222ULL);
+}
+
 // Barrier instructions in the middle of a JIT region must compile through
 // without breaking up the region or corrupting register values.  Catches a
 // future Nop-handler regression that drops to interpreter (success_ = false)
