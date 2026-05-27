@@ -12901,6 +12901,14 @@ class LiteTranslator {
           // inside the saturating-shift case via the `is_byte` guard
           // because the byte path needs PSLLB workarounds the case lacks.
           break;
+        case Decoder::AdvSimdShiftImmOpcode::kSqshl:
+          // Scalar S/H fall through — vector PSLLW/PSLLD + PSRAW/PSRAD
+          // signed-recover pipeline already lights up.  Scalar B
+          // (immh=0001) bails on `is_byte` inside the case; scalar D
+          // (immh=1xxx) bails on the existing `is_dword && kSqshl`
+          // filter inside the case body (PSRAQ for the signed recover
+          // step is AVX-512F-VL only).
+          break;
         default:
           success_ = false; return;
       }
