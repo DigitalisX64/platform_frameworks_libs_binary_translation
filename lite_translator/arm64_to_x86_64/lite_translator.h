@@ -13192,6 +13192,29 @@ class LiteTranslator {
           // int).  Dedicated case body below handles .S and .D; .H
           // FP16 bails on the immh guard.
           break;
+        case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
+        case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
+        case Decoder::AdvSimdShiftImmOpcode::kSqrshrn:
+        case Decoder::AdvSimdShiftImmOpcode::kUqrshrn:
+        case Decoder::AdvSimdShiftImmOpcode::kSqshrun:
+        case Decoder::AdvSimdShiftImmOpcode::kSqrshrun:
+          // Scalar narrow-shift saturating (ARM ARM C7.2 SQSHRN /
+          // UQSHRN / SQRSHRN / UQRSHRN / SQSHRUN / SQRSHRUN scalar
+          // B/H/S forms).  The shared vector lowering below performs
+          // the lane-wide signed/unsigned arithmetic right shift,
+          // saturation clamp, and PSHUFB narrow-pack on all lanes;
+          // the scalar form differs only in needing the final write
+          // to deliver `Vd[dst_bits-1:0] = narrow(Vn[src_bits-1:0])`
+          // with `Vd[127:dst_bits] = 0`.  That width truncation is
+          // applied at the store path by `Pslldq(16-dst_bytes) +
+          // Psrldq(16-dst_bytes)`, mirroring the byte-granular
+          // upper-zero pattern proven for SQSHL/UQSHL scalar B/H/S
+          // in handoff-334.  Scalar D-source bails are inherited
+          // from the vector-form guards (`uses_signed_shift &&
+          // src_bits == 64` for SQ*/SQSU* scalar S, `is_rounding
+          // && is_saturating_unsigned && src_bits == 64` for UQRSHRN
+          // scalar S).
+          break;
         default:
           success_ = false; return;
       }
@@ -14252,7 +14275,26 @@ class LiteTranslator {
         as_.Movq(r1, mask_hi);
         as_.Pinsrq(xmask, r1, int8_t{1});
         as_.Pshufb(xn, xmask);
-        if (args.q) {
+        if (args.scalar) {
+          // Scalar narrow: keep only the low `dst_bytes` bytes of the
+          // PSHUFB-narrowed result; zero `Vd[127:dst_bits]` per ARM
+          // ARM scalar semantics.  PSHUFB has already laid out the
+          // narrowed-saturated value of every input lane into the low
+          // half of xn, so the low `dst_bytes` bytes already hold the
+          // correct lane-0 narrow result; the higher bytes carry the
+          // narrowed values of upper lanes that the ARM scalar source
+          // (Vn[src_bits-1:0] only) does not address.  Byte-granular
+          // Pslldq + Psrldq with shift = `16 - dst_bytes` keeps just
+          // the low slice and zeros the rest.
+          //   src=16 → dst=B  (dst_bytes=1, shift=15)
+          //   src=32 → dst=H  (dst_bytes=2, shift=14)
+          //   src=64 → dst=S  (dst_bytes=4, shift=12)
+          const int8_t dst_bytes = static_cast<int8_t>(src_bits / 16);
+          const int8_t pack_shift = static_cast<int8_t>(16 - dst_bytes);
+          as_.Pslldq(xn, pack_shift);
+          as_.Psrldq(xn, pack_shift);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else if (args.q) {
           // SHRN2: preserve Vd[63:0]; place narrowed lanes in Vd[127:64].
           SimdRegister xd = AllocTempSimdReg();
           if (xd == no_simd_register) { success_ = false; return; }
