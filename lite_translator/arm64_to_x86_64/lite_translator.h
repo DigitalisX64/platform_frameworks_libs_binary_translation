@@ -12587,7 +12587,6 @@ class LiteTranslator {
   // success_=false — it is a JIT follow-up; the interpreter handles it
   // correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
-    if (args.is_fp16) { success_ = false; return; }
     const auto opc = args.opcode;
     const bool is_fmulx = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFmulx);
     const bool is_frecps = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrecps);
@@ -12598,10 +12597,21 @@ class LiteTranslator {
     const bool is_fcmgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt);
     const bool is_facge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacge);
     const bool is_facgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacgt);
-    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd &&
-        !is_fcmeq && !is_fcmge && !is_fcmgt && !is_facge && !is_facgt) {
+    const bool is_cmp = is_fcmeq || is_fcmge || is_fcmgt || is_facge || is_facgt;
+    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp) {
       success_ = false; return;
     }
+    // region digitalis: FP16 path is JIT-emitted only for the FCMxx / FACxx
+    // family, via an F16C round-trip (each FP16 source lane is lifted to FP32
+    // in xmm lane 0; the existing FP32 compare core runs unchanged; the FP32
+    // mask in lane 0 is packed to a 16-bit mask via Packssdw and stored at
+    // Vd[15:0] with Vd[127:16]=0).  Other FP16 ops (FMULX / FRECPS / FRSQRTS /
+    // FABD scalar H) bail to the interpreter — consistent with the existing
+    // FP16-FCVT / FCMA / FpDataProc3 fallback policy in this file.
+    if (args.is_fp16 && (!is_cmp || !host_platform::kHasF16C)) {
+      success_ = false; return;
+    }
+    // endregion
     if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
       success_ = false; return;
     }
@@ -12651,7 +12661,24 @@ class LiteTranslator {
       if (xmm_a == no_simd_register || xmm_b == no_simd_register) {
         success_ = false; return;
       }
-      if (is_double) {
+      // FP16-via-F16C runs at FP32 width: the FP32 compare core is bit-exact
+      // for the FP16-widened operands because Vcvtph2ps preserves NaN-ness
+      // and ±0 sign, and the FP16 sign bit becomes the FP32 sign bit (the
+      // FACxx fabs mask works at FP32 width).
+      const bool use_single = args.is_fp16 || !is_double;
+      if (args.is_fp16) {
+        // Lift each FP16 source lane to FP32 in xmm lane 0.  Pxor zeroes
+        // bits[127:0]; Pinsrw inserts Vn[15:0] / Vm[15:0] at xmm[15:0]
+        // (other FP16 lanes stay zero); Vcvtph2ps widens 4 FP16 lanes to
+        // 4 FP32 lanes — only lane 0 carries a real value, lanes 1..3 are
+        // FP32 +0.0 by construction.
+        as_.Pxor(xmm_a, xmm_a);
+        as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_a, xmm_a);
+        as_.Pxor(xmm_b, xmm_b);
+        as_.Pinsrw(xmm_b, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_b, xmm_b);
+      } else if (is_double) {
         as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
         as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
       } else {
@@ -12663,8 +12690,8 @@ class LiteTranslator {
         SimdRegister xmm_mask = AllocTempSimdReg();
         if (xmm_mask == no_simd_register) { success_ = false; return; }
         as_.Pcmpeqd(xmm_mask, xmm_mask);
-        if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
-        else as_.Psrld(xmm_mask, int8_t{1});
+        if (use_single) as_.Psrld(xmm_mask, int8_t{1});
+        else as_.Psrlq(xmm_mask, int8_t{1});
         as_.Pand(xmm_a, xmm_mask);
         as_.Pand(xmm_b, xmm_mask);
       }
@@ -12675,27 +12702,41 @@ class LiteTranslator {
       //   FACGE/FACGT — same as FCMGE/FCMGT after both operands are |·|.
       SimdRegister xmm_result = no_simd_register;
       if (is_fcmeq) {
-        if (is_double) as_.Cmpeqsd(xmm_a, xmm_b);
-        else as_.Cmpeqss(xmm_a, xmm_b);
+        if (use_single) as_.Cmpeqss(xmm_a, xmm_b);
+        else as_.Cmpeqsd(xmm_a, xmm_b);
         xmm_result = xmm_a;
       } else if (is_fcmge || is_facge) {
-        if (is_double) as_.Cmplesd(xmm_b, xmm_a);
-        else as_.Cmpless(xmm_b, xmm_a);
+        if (use_single) as_.Cmpless(xmm_b, xmm_a);
+        else as_.Cmplesd(xmm_b, xmm_a);
         xmm_result = xmm_b;
       } else {  // is_fcmgt || is_facgt
-        if (is_double) as_.Cmpltsd(xmm_b, xmm_a);
-        else as_.Cmpltss(xmm_b, xmm_a);
+        if (use_single) as_.Cmpltss(xmm_b, xmm_a);
+        else as_.Cmpltsd(xmm_b, xmm_a);
         xmm_result = xmm_b;
       }
       // Zero Vd above the lane, then write the scalar mask at lane 0.
       // Reuse whichever of xmm_a / xmm_b is not the result as the zero scratch.
       SimdRegister xmm_zero = (xmm_result == xmm_a) ? xmm_b : xmm_a;
       as_.Pxor(xmm_zero, xmm_zero);
-      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_zero);
-      if (is_double) {
-        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+      if (args.is_fp16) {
+        // Pack the FP32 mask (lane 0 dword: 0xFFFFFFFF or 0x00000000) to a
+        // 16-bit mask (lane 0 word: 0xFFFF or 0x0000) via signed-saturating
+        // dword->word pack.  As signed int32: 0xFFFFFFFF == -1 saturates to
+        // -1 == 0xFFFF as int16; 0x00000000 saturates to 0.  Dword lanes
+        // 1..3 of xmm_result are 0 by construction (Vcvtph2ps zero-fill
+        // plus AND/scalar-cmp preserving the upper-zero invariant), so
+        // packing against xmm_zero (=0) leaves word lanes 1..7 == 0.  Full
+        // 128-bit Movdqu then writes Vd[15:0]=mask with Vd[127:16]=0,
+        // matching the AArch64 zero-extend semantic for Hd.
+        as_.Packssdw(xmm_result, xmm_zero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
       } else {
-        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_zero);
+        if (is_double) {
+          as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+        } else {
+          as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+        }
       }
       return;
     }

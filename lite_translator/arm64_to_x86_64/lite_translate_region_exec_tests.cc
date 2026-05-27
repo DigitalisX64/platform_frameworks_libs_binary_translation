@@ -6168,6 +6168,161 @@ TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsEqualZero) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarThreeSame FP16 compare family — FCMEQ /
+// FCMGE / FCMGT / FACGE / FACGT scalar Hd via F16C round-trip.
+// Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)" —
+// bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=a, bit22=1, bit21=0,
+// bits[20:16]=Rm, bits[15:14]=00, bits[13:11]=opcode_3, bit10=1):
+//   FCMEQ Hd, Hn, Hm = 0x5E402400 | (rm<<16) | (rn<<5) | rd  (U=0,a=0,op=100)
+//   FCMGE Hd, Hn, Hm = 0x7E402400 | (rm<<16) | (rn<<5) | rd  (U=1,a=0,op=100)
+//   FCMGT Hd, Hn, Hm = 0x7EC02400 | (rm<<16) | (rn<<5) | rd  (U=1,a=1,op=100)
+//   FACGE Hd, Hn, Hm = 0x7E402C00 | (rm<<16) | (rn<<5) | rd  (U=1,a=0,op=101)
+//   FACGT Hd, Hn, Hm = 0x7EC02C00 | (rm<<16) | (rn<<5) | rd  (U=1,a=1,op=101)
+// Cross-checked against llvm-mc disassembly (Rd=0,Rn=1,Rm=2 -> 0x5E422420,
+// 0x7E422420, 0x7EC22420, 0x7E422C20, 0x7EC22C20).
+// Standard FP16 bit patterns used below: 1.0=0x3C00, 1.25=0x3D00, 1.5=0x3E00,
+// 2.5=0x4100, 3.5=0x4300, -3.5=0xC300, 5.0=0x4500, -5.0=0xC500, +0.0=0x0000,
+// -0.0=0x8000, qNaN=0x7E00.
+constexpr uint32_t FcmeqScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E402400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E402400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EC02400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgeScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E402C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgtScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EC02C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Helper: set Vn[15:0] = h, Vn[127:16] = 0.
+static void StoreScalarH(CPUState& cpu, unsigned idx, uint16_t h) {
+  cpu.v[idx] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&cpu.v[idx])[0] = h;
+}
+
+// FCMEQ Hd: 1.25h == 1.25h -> 0xFFFF in lane 0, upper lanes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarHEqualAllOnes) {
+  StoreScalarH(state_.cpu, 1, 0x3D00u);  // 1.25
+  StoreScalarH(state_.cpu, 2, 0x3D00u);
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {FcmeqScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xFFFFu);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FCMEQ Hd: 1.5h != 2.5h -> 0x0000 in lane 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarHUnequalZero) {
+  StoreScalarH(state_.cpu, 1, 0x3E00u);  // 1.5
+  StoreScalarH(state_.cpu, 2, 0x4100u);  // 2.5
+  static const uint32_t code[] = {FcmeqScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FCMEQ Hd: NaN op anything -> false (CMPEQSS predicate EQ_OQ).
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarHNaNZero) {
+  StoreScalarH(state_.cpu, 1, 0x7E00u);  // qNaN
+  StoreScalarH(state_.cpu, 2, 0x0000u);  // +0
+  static const uint32_t code[] = {FcmeqScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FCMGE Hd: 1.0h >= 1.0h -> 0xFFFF (equal case).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarHEqualAllOnes) {
+  StoreScalarH(state_.cpu, 1, 0x3C00u);  // 1.0
+  StoreScalarH(state_.cpu, 2, 0x3C00u);
+  static const uint32_t code[] = {FcmgeScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xFFFFu);
+}
+
+// FCMGE Hd: -3.5h !>= 3.5h -> 0x0000 (operand-swap correctness).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarHLessZero) {
+  StoreScalarH(state_.cpu, 1, 0xC300u);  // -3.5
+  StoreScalarH(state_.cpu, 2, 0x4300u);  // 3.5
+  static const uint32_t code[] = {FcmgeScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FCMGT Hd: 5.0h > 3.5h -> 0xFFFF.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarHGreaterAllOnes) {
+  StoreScalarH(state_.cpu, 1, 0x4500u);  // 5.0
+  StoreScalarH(state_.cpu, 2, 0x4300u);  // 3.5
+  static const uint32_t code[] = {FcmgtScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xFFFFu);
+}
+
+// FCMGT Hd: 1.0h !> 1.0h (strict) -> 0x0000.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarHEqualZero) {
+  StoreScalarH(state_.cpu, 1, 0x3C00u);
+  StoreScalarH(state_.cpu, 2, 0x3C00u);
+  static const uint32_t code[] = {FcmgtScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FCMGT Hd: NaN op anything -> 0x0000 (unordered compares are false).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarHNaNZero) {
+  StoreScalarH(state_.cpu, 1, 0x7E00u);  // qNaN
+  StoreScalarH(state_.cpu, 2, 0x3C00u);  // 1.0
+  static const uint32_t code[] = {FcmgtScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FACGE Hd: |-5.0h| >= |3.5h| -> 0xFFFF (the fabs mask must be applied
+// at FP32 width to match the lifted Vcvtph2ps representation).
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarHAbsGreaterAllOnes) {
+  StoreScalarH(state_.cpu, 1, 0xC500u);  // -5.0
+  StoreScalarH(state_.cpu, 2, 0x4300u);  // 3.5
+  static const uint32_t code[] = {FacgeScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xFFFFu);
+}
+
+// FACGT Hd: |3.5h| > |-3.5h| -> 0x0000 (abs equal, strict-greater false).
+TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarHAbsEqualZero) {
+  StoreScalarH(state_.cpu, 1, 0x4300u);   // 3.5
+  StoreScalarH(state_.cpu, 2, 0xC300u);   // -3.5
+  static const uint32_t code[] = {FacgtScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FCMEQ Hd in-place (Vd == Vn): must read Vn before zeroing Vd.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarHInPlace) {
+  state_.cpu.v[5] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[0] = 0x3D00u;  // 1.25
+  // Pre-trash upper bytes so the upper-zero step is exercised.
+  for (int i = 1; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[i] = 0xAAAAu;
+  }
+  StoreScalarH(state_.cpu, 2, 0x3D00u);
+  static const uint32_t code[] = {FcmeqScalarH(5, 5, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[0], 0xFFFFu);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
+  }
+}
+// endregion
+
 // region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
 // scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
 // C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
