@@ -12532,9 +12532,72 @@ class LiteTranslator {
   }
   // endregion
 
+  // AdvSimd scalar pairwise JIT (ARM ARM "Advanced SIMD scalar pairwise").
+  // Reads a pair of esize elements from Vn (lane[0] and lane[1] of the low
+  // 64 bits) and combines them into a single scalar in Vd lane[0], with bits
+  // above the lane zero-extended.
+  //
+  // Currently implemented:
+  //   kAddp        — ADDP scalar D-form (Vd.D = Vn.D[0] + Vn.D[1]) via Paddq.
+  //   kFaddpScalar — FADDP scalar S/D (Vd.lane0 = Vn.lane0 + Vn.lane1) via
+  //                  Addss / Addsd against the second-lane load.
+  //
+  // FMAXP / FMINP / FMAXNMP / FMINNMP scalar bail to interpreter — they need
+  // ARM's ±0 sign disambiguation (FMAX(+0,-0)=+0, FMIN(+0,-0)=-0 regardless
+  // of operand order) and FMAX/FMIN-vs-FMAXNM/FMINNM single-NaN handling,
+  // which x86 MAXSS/MAXSD/MINSS/MINSD do NOT honour.  Deferred to a
+  // follow-up JIT-promotion cycle.
+  //
+  // FP16 path (Armv8.2-FP16 forms at U=0 + size[0]=0) also bails to the
+  // interpreter — needs FP16↔FP32 promotion around the reduction.  The
+  // interpreter handles all these paths correctly today.
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
-    UNUSED(args);
-    Undefined();
+    using Op = Decoder::AdvSimdScalarPairwiseOpcode;
+    if (args.is_fp16) { success_ = false; return; }
+    const auto opc = args.opcode;
+    if (opc != Op::kAddp && opc != Op::kFaddpScalar) {
+      success_ = false; return;
+    }
+
+    int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t dst_off   = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    SimdRegister xmm_a = AllocTempSimdReg();
+    SimdRegister xmm_b = AllocTempSimdReg();
+    if (xmm_a == no_simd_register || xmm_b == no_simd_register) {
+      success_ = false; return;
+    }
+
+    if (opc == Op::kAddp) {
+      // ADDP scalar: D-form only.  64-bit integer add of Vn.D[0] + Vn.D[1].
+      as_.Movq(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movq(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
+      as_.Paddq(xmm_a, xmm_b);
+    } else {
+      // FADDP scalar.  args.size LSB picks S (0) vs D (1) for U=1 forms.
+      const bool is_double = ((args.size & 1) != 0);
+      if (is_double) {
+        as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
+        as_.Addsd(xmm_a, xmm_b);
+      } else {
+        as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 4});
+        as_.Addss(xmm_a, xmm_b);
+      }
+    }
+
+    // Zero Vd above the result lane, then write the scalar at lane 0.
+    // S-form writes 32 bits (lanes 1..3 stay zero); D-form and ADDP write
+    // 64 bits (upper 64 bits stay zero).
+    as_.Pxor(xmm_b, xmm_b);
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_b);
+    const bool write_qword = (opc == Op::kAddp) || ((args.size & 1) != 0);
+    if (write_qword) {
+      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    } else {
+      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    }
   }
   // endregion
 

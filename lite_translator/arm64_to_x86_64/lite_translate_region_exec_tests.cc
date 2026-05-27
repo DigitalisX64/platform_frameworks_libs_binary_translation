@@ -6168,6 +6168,149 @@ TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsEqualZero) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
+// scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
+// C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
+//   ADDP  Vd.D, Vn.2D    = 0x5EF1B800 | (rn<<5) | rd  (U=0 size=11 op=11011)
+//   FADDP Sd, Vn.2S      = 0x7E30D800 | (rn<<5) | rd  (U=1 size=00 op=01101)
+//   FADDP Dd, Vn.2D      = 0x7E70D800 | (rn<<5) | rd  (U=1 size=01 op=01101)
+constexpr uint32_t AddpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x5EF1B800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7E30D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7E70D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// ADDP scalar D: Vn.D[0]=10, Vn.D[1]=20 -> Vd.D[0]=30, upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, AddpScalarDPositive) {
+  state_.cpu.v[1] =
+      (static_cast<__uint128_t>(uint64_t{20}) << 64) | uint64_t{10};
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {AddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0, lane1;
+  std::memcpy(&lane0, &state_.cpu.v[0], 8);
+  std::memcpy(&lane1, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(lane0, uint64_t{30});
+  EXPECT_EQ(lane1, uint64_t{0});
+}
+
+// ADDP scalar D: 64-bit wraparound. (2^63 - 1) + 1 = 2^63 (mod 2^64).
+TEST_F(Arm64LiteTranslateRegionTest, AddpScalarDWrap) {
+  state_.cpu.v[1] =
+      (static_cast<__uint128_t>(uint64_t{1}) << 64) |
+      uint64_t{0x7FFFFFFFFFFFFFFFULL};
+  static const uint32_t code[] = {AddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], 8);
+  EXPECT_EQ(lane0, uint64_t{0x8000000000000000ULL});
+}
+
+// ADDP scalar D in-place (Vd == Vn): must still observe Vn's original
+// lanes, not the post-write Vd.  10 + 20 = 30.
+TEST_F(Arm64LiteTranslateRegionTest, AddpScalarDInPlace) {
+  state_.cpu.v[3] =
+      (static_cast<__uint128_t>(uint64_t{20}) << 64) | uint64_t{10};
+  static const uint32_t code[] = {AddpScalarD(3, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0, lane1;
+  std::memcpy(&lane0, &state_.cpu.v[3], 8);
+  std::memcpy(&lane1, reinterpret_cast<const uint8_t*>(&state_.cpu.v[3]) + 8, 8);
+  EXPECT_EQ(lane0, uint64_t{30});
+  EXPECT_EQ(lane1, uint64_t{0});
+}
+
+// FADDP Sd, Vn.2S: 1.5 + 2.5 = 4.0; lanes 1..3 zero.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSPositive) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 1.5f, b = 2.5f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 4.0f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FADDP Sd, Vn.2S with NaN input -> NaN result.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 1.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FaddpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FADDP Dd, Vn.2D: 3.0 + 4.0 = 7.0; upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarDPositive) {
+  double a = 3.0, b = 4.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 7.0);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, uint64_t{0});
+}
+
+// FADDP Dd, Vn.2D with infinity propagation: +inf + 1.0 = +inf.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarDInfFinite) {
+  double a = std::numeric_limits<double>::infinity(), b = 1.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FaddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_EQ(result, std::numeric_limits<double>::infinity());
+}
+
+// FADDP Sd, Vn.2S in-place (Vd == Vn): must read both lanes of Vn before
+// overwriting Vd.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSInPlace) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 0.5f, b = 0.25f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[5], lane_bits, 16);
+  static const uint32_t code[] = {FaddpScalarS(5, 5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[5], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.75f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[5]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+// endregion
+
 // region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
