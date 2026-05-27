@@ -21390,6 +21390,350 @@ TEST(Arm64InterpreterDataProc2Src, PacgaSpModifierReturnsZero) {
 }
 // endregion
 
+// region digitalis: AdvSimdTableLookup JIT — TBL/TBX (8B/16B forms, 1..4
+// table registers).
+//   Encoding: bits[31]=0, bits[30]=Q, bits[29:24]=001110, bits[23:22]=00,
+//   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:13]=len, bit12=op, bits[11:10]=00,
+//   bits[9:5]=Rn, bits[4:0]=Rd.  Q=0 → 8B form, Q=1 → 16B form.
+//   len ∈ {0,1,2,3} → 1..4 table registers; op: 0=TBL, 1=TBX.
+constexpr uint32_t TblTbxEncoding(uint8_t q, uint8_t rd, uint8_t rn, uint8_t rm,
+                                  uint8_t len, uint8_t op) {
+  return (static_cast<uint32_t>(q) << 30) | 0x0E000000u |
+         (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(len) << 13) |
+         (static_cast<uint32_t>(op) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Tbl16B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 0, 0);
+}
+constexpr uint32_t Tbl8B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(0, rd, rn, rm, 0, 0);
+}
+constexpr uint32_t Tbx16B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 0, 1);
+}
+constexpr uint32_t Tbx8B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(0, rd, rn, rm, 0, 1);
+}
+constexpr uint32_t Tbl16B_2Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 1, 0);
+}
+constexpr uint32_t Tbl16B_3Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 2, 0);
+}
+constexpr uint32_t Tbl16B_4Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 3, 0);
+}
+constexpr uint32_t Tbx16B_2Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 1, 1);
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — identity permutation (indices 0..15) selects
+// Vn unchanged.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BIdentity) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xA0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(i);
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — out-of-range index gives 0 (NOT a wrapped
+// lookup).  Test indices in [16..127] which PSHUFB alone would mis-handle as
+// `Vn[idx & 0x0F]`.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BOutOfRangeZeros) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x10 + i);
+  }
+  // Indices 0..15 valid, 16..31 invalid (must yield 0, not wrap).
+  for (int i = 0; i < 8; ++i)  idx_bytes[i] = static_cast<uint8_t>(i);
+  for (int i = 8; i < 16; ++i) idx_bytes[i] = static_cast<uint8_t>(16 + i);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i << " (out-of-range must be 0)";
+  }
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — high-bit indices (128..255) yield 0.  This
+// is the PSHUFB native behaviour (bit 7 set → 0).
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BHighBitIndexZeros) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(0x80 | i);  // 0x80..0x8F — all OOR.
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(&state_.cpu.v[0])[i], 0u)
+        << "byte " << i;
+  }
+}
+
+// TBL Vd.8B (Q=0): only low 8 bytes computed; upper 8 bytes zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl8BUpperZero) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xE0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(i);  // identity
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-fill garbage
+  static const uint32_t code[] = {Tbl8B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i << " (upper must be 0)";
+  }
+}
+
+// TBX Vd.16B, {Vn.16B}, Vm.16B — out-of-range index preserves Vd (the key
+// TBX-vs-TBL difference).
+TEST_F(Arm64LiteTranslateRegionTest, Tbx16BPreservesVdOnOOR) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  uint8_t vd_initial[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x40 + i);
+    vd_initial[i]  = static_cast<uint8_t>(0x90 + i);
+  }
+  // First 8 indices valid; next 8 out of range.
+  for (int i = 0; i < 8; ++i)  idx_bytes[i] = static_cast<uint8_t>(i);
+  for (int i = 8; i < 16; ++i) idx_bytes[i] = static_cast<uint8_t>(16 + i);
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);  // Vd pre-filled
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {Tbx16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], vd_initial[i]) << "byte " << i << " (TBX preserves Vd)";
+  }
+}
+
+// TBX Vd.8B (Q=0): preserved bytes in low 8 honour Vd; upper 8 always 0.
+TEST_F(Arm64LiteTranslateRegionTest, Tbx8BUpperZeroDespiteVd) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  uint8_t vd_initial[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x50 + i);
+    vd_initial[i]  = static_cast<uint8_t>(0xA0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(0xFF);  // every byte out of range.
+  }
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {Tbx8B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  // Q=0 form: low 8 bytes preserved (TBX semantics, all OOR), upper 8 zero.
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], vd_initial[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i;
+  }
+}
+
+// TBL Vd.16B, {Vn.16B, V(n+1).16B}, Vm.16B — two-register table.  Indices
+// 0..15 → Vn, 16..31 → V(n+1).
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16B2RegSpan) {
+  uint8_t t0[16], t1[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i]  = static_cast<uint8_t>(0x20 + i);
+    t1[i]  = static_cast<uint8_t>(0x60 + i);
+    idx[i] = static_cast<uint8_t>(2 * i);  // 0,2,4,...,30 — alternates t0/t1.
+  }
+  std::memcpy(&state_.cpu.v[1], t0,  16);
+  std::memcpy(&state_.cpu.v[2], t1,  16);
+  std::memcpy(&state_.cpu.v[3], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_2Reg(0, 1, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected;
+    int j = 2 * i;
+    expected = (j < 16) ? t0[j] : t1[j - 16];
+    EXPECT_EQ(out[i], expected) << "byte " << i << " idx=" << j;
+  }
+}
+
+// TBL Vd.16B, 3-reg table: indices 0..47 valid.  Test specifically the
+// transitions around register boundaries (15/16, 31/32).
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16B3RegBoundaries) {
+  uint8_t t0[16], t1[16], t2[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i] = static_cast<uint8_t>(0x10 + i);
+    t1[i] = static_cast<uint8_t>(0x50 + i);
+    t2[i] = static_cast<uint8_t>(0x90 + i);
+  }
+  // Indices: 14, 15, 16, 17, 30, 31, 32, 33, then 47, 48 (last valid + OOR), …
+  uint8_t test_idx[16] = {14, 15, 16, 17, 30, 31, 32, 33,
+                          47, 48, 50, 60, 0, 16, 32, 47};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[1], t0,  16);
+  std::memcpy(&state_.cpu.v[2], t1,  16);
+  std::memcpy(&state_.cpu.v[3], t2,  16);
+  std::memcpy(&state_.cpu.v[4], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_3Reg(0, 1, 4)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  auto lookup = [&](int j) -> uint8_t {
+    if (j < 16)      return t0[j];
+    else if (j < 32) return t1[j - 16];
+    else if (j < 48) return t2[j - 32];
+    else             return 0;
+  };
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], lookup(test_idx[i])) << "byte " << i << " idx=" << static_cast<int>(test_idx[i]);
+  }
+}
+
+// TBL Vd.16B, 4-reg table: indices 0..63 valid.  Covers all four registers
+// and the upper-OOR (64..127) zero case.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16B4RegFull) {
+  uint8_t t[4][16], idx[16];
+  for (int r = 0; r < 4; ++r) {
+    for (int i = 0; i < 16; ++i) {
+      t[r][i] = static_cast<uint8_t>((r << 4) | i);  // each byte = byte index!
+    }
+  }
+  // Indices: 0,16,32,48 (first byte of each reg), 15,31,47,63 (last byte), 64
+  // (OOR), 100 (OOR), then a sprinkle.
+  uint8_t test_idx[16] = {0, 16, 32, 48, 15, 31, 47, 63,
+                          64, 100, 1, 17, 33, 49, 60, 70};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[1], t[0], 16);
+  std::memcpy(&state_.cpu.v[2], t[1], 16);
+  std::memcpy(&state_.cpu.v[3], t[2], 16);
+  std::memcpy(&state_.cpu.v[4], t[3], 16);
+  std::memcpy(&state_.cpu.v[5], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_4Reg(0, 1, 5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected = (test_idx[i] < 64) ? test_idx[i] : 0u;
+    EXPECT_EQ(out[i], expected) << "byte " << i;
+  }
+}
+
+// TBX 2-reg: in-range bytes get the lookup; OOR bytes preserve Vd.
+TEST_F(Arm64LiteTranslateRegionTest, Tbx16B2RegMixed) {
+  uint8_t t0[16], t1[16], vd_initial[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i]         = static_cast<uint8_t>(0x30 + i);
+    t1[i]         = static_cast<uint8_t>(0x70 + i);
+    vd_initial[i] = static_cast<uint8_t>(0xB0 + i);
+  }
+  // Mix: half in-range across t0/t1, half OOR.
+  uint8_t test_idx[16] = {0, 1, 16, 17, 32, 200, 33, 100,
+                          15, 31, 14, 30, 64, 0, 50, 31};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], t0, 16);
+  std::memcpy(&state_.cpu.v[2], t1, 16);
+  std::memcpy(&state_.cpu.v[3], idx, 16);
+  static const uint32_t code[] = {Tbx16B_2Reg(0, 1, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  auto lookup = [&](int j, int byte_i) -> uint8_t {
+    if (j < 16)      return t0[j];
+    else if (j < 32) return t1[j - 16];
+    else             return vd_initial[byte_i];  // TBX preserve
+  };
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], lookup(test_idx[i], i)) << "byte " << i;
+  }
+}
+
+// TBL with Vd == Vn (in-place table): the table is read before Vd is written.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BInPlaceVdEqualsVn) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(15 - i);  // reverse permutation.
+  }
+  std::memcpy(&state_.cpu.v[5], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  // Vd == Vn == V5.
+  static const uint32_t code[] = {Tbl16B_1Reg(5, 5, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[5], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[15 - i]) << "byte " << i;
+  }
+}
+
+// TBL with Vd == Vm (in-place index): the index vector is read before Vd is
+// written.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BInPlaceVdEqualsVm) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xD0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>((i * 3) & 0x0F);  // 0,3,6,9,...
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[7], idx_bytes, 16);
+  // Vd == Vm == V7.
+  static const uint32_t code[] = {Tbl16B_1Reg(7, 1, 7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[7], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[idx_bytes[i]]) << "byte " << i;
+  }
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

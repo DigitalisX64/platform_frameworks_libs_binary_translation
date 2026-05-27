@@ -7093,11 +7093,121 @@ class LiteTranslator {
     // endregion
   }
 
+  // region digitalis
+  // JIT for AdvSIMD TBL/TBX (table lookup / table lookup extended).
+  //   TBL Vd.<T>, {Vn.16B [, V(n+1) [, V(n+2) [, V(n+3)]]]}, Vm.<T>
+  //   TBX Vd.<T>, {Vn.16B [, V(n+1) [, V(n+2) [, V(n+3)]]]}, Vm.<T>
+  // T = 8B (q=0) or 16B (q=1).  len ∈ {0,1,2,3} → 1..4 table registers
+  // (consecutive, wrapping (rn+r) mod 32).  op: 0=TBL, 1=TBX.
+  //
+  // Per output byte i (i < 8 or 16):
+  //   idx = Vm.byte[i]
+  //   if idx < table_regs*16: out[i] = table.byte[idx]
+  //   else (TBL): out[i] = 0
+  //   else (TBX): out[i] = Vd.byte[i] (preserved)
+  //
+  // x86 PSHUFB(dst, mask) computes per byte:
+  //   if mask[i][7] = 1: dst[i] = 0
+  //   else              : dst[i] = src.byte[mask[i] & 0x0F]
+  //
+  // Approach: for each table register r in [0, table_regs):
+  //   shifted_idx_r = (Vm.byte[i] - r*16) bytewise wrap
+  //   in_range_r    = 0xFF if shifted_idx_r ∈ [0,15] else 0x00
+  //                  = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0)
+  //   looked_up_r   = PSHUFB(V[(rn+r) % 32], shifted_idx_r)
+  //   looked_up_r &= in_range_r   (zero wrong-register lookups, including
+  //                                 the [16..127] band that PSHUFB doesn't
+  //                                 mask)
+  //   acc          |= looked_up_r
+  //   in_range_all |= in_range_r
+  // For TBX, blend Vd back over bytes not in any register's range:
+  //   result = acc | (Vd & ~in_range_all)
+  // For TBL, result = acc.
+  // For q=0, zero upper 64 bits via the standard PSLLDQ/PSRLDQ pair.
+  //
+  // All table loads happen before any store to Vd, so in-place encodings
+  // (Vd == Vn, Vd == Vm, Vd == V(n+1)..) read the original source bytes.
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
                           uint8_t op, bool q) {
-    UNUSED(rd, rn, rm, len, op, q);
-    Undefined();
+    const uint8_t table_regs = static_cast<uint8_t>(len + 1);  // 1..4
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+
+    SimdRegister xmm_idx        = AllocTempSimdReg();
+    SimdRegister xmm_acc        = AllocTempSimdReg();
+    SimdRegister xmm_in_range   = AllocTempSimdReg();
+    SimdRegister xmm_const15    = AllocTempSimdReg();
+    SimdRegister xmm_zero       = AllocTempSimdReg();
+    SimdRegister xmm_tmp_idx    = AllocTempSimdReg();
+    SimdRegister xmm_tmp_lookup = AllocTempSimdReg();
+    SimdRegister xmm_tmp_mask   = AllocTempSimdReg();
+    if (xmm_idx == no_simd_register || xmm_acc == no_simd_register ||
+        xmm_in_range == no_simd_register || xmm_const15 == no_simd_register ||
+        xmm_zero == no_simd_register || xmm_tmp_idx == no_simd_register ||
+        xmm_tmp_lookup == no_simd_register || xmm_tmp_mask == no_simd_register) {
+      success_ = false; return;
+    }
+
+    Register r_const = AllocTempReg();
+    if (r_const == no_register) { success_ = false; return; }
+
+    // Load the index vector once.  Vm is the per-byte selector.
+    as_.Movdqu(xmm_idx, {.base = Assembler::rbp, .disp = vm_off});
+    // acc = 0, in_range = 0, zero = 0.
+    as_.Pxor(xmm_acc, xmm_acc);
+    as_.Pxor(xmm_in_range, xmm_in_range);
+    as_.Pxor(xmm_zero, xmm_zero);
+    // const15 = byte-broadcast(0x0F).
+    as_.Movq(r_const, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+    as_.Movq(xmm_const15, r_const);
+    as_.Punpcklqdq(xmm_const15, xmm_const15);
+
+    for (uint8_t r = 0; r < table_regs; ++r) {
+      const int32_t vn_off_r =
+          offsetof(ThreadState, cpu.v[0]) + ((rn + r) & 31) * 16;
+
+      // shifted_idx_r = Vm - r*16 (bytewise wrap).  For r=0 this is just Vm.
+      as_.Movdqa(xmm_tmp_idx, xmm_idx);
+      if (r != 0) {
+        const uint64_t broadcast =
+            uint64_t{0x0101010101010101ULL} * static_cast<uint64_t>(r * 16);
+        as_.Movq(r_const, static_cast<int64_t>(broadcast));
+        as_.Movq(xmm_tmp_mask, r_const);
+        as_.Punpcklqdq(xmm_tmp_mask, xmm_tmp_mask);
+        as_.Psubb(xmm_tmp_idx, xmm_tmp_mask);
+      }
+
+      // in_range_r = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0).
+      as_.Movdqa(xmm_tmp_mask, xmm_tmp_idx);
+      as_.Psubusb(xmm_tmp_mask, xmm_const15);
+      as_.Pcmpeqb(xmm_tmp_mask, xmm_zero);
+
+      // looked_up_r = PSHUFB(V[(rn+r)%32], shifted_idx_r), masked by in_range.
+      as_.Movdqu(xmm_tmp_lookup, {.base = Assembler::rbp, .disp = vn_off_r});
+      as_.Pshufb(xmm_tmp_lookup, xmm_tmp_idx);
+      as_.Pand(xmm_tmp_lookup, xmm_tmp_mask);
+
+      as_.Por(xmm_acc, xmm_tmp_lookup);
+      as_.Por(xmm_in_range, xmm_tmp_mask);
+    }
+
+    if (op /* TBX */) {
+      // result = acc | (Vd & ~in_range_all).
+      as_.Movdqu(xmm_tmp_lookup, {.base = Assembler::rbp, .disp = vd_off});
+      // xmm_tmp_mask := ~in_range_all & xmm_tmp_lookup
+      as_.Movdqa(xmm_tmp_mask, xmm_in_range);
+      as_.Pandn(xmm_tmp_mask, xmm_tmp_lookup);
+      as_.Por(xmm_acc, xmm_tmp_mask);
+    }
+
+    if (!q) {
+      // Q=0: zero the upper 64 bits per D-register semantics.
+      as_.Pslldq(xmm_acc, int8_t{8});
+      as_.Psrldq(xmm_acc, int8_t{8});
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_acc);
   }
+  // endregion
 
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     UNUSED(op, rd, rn, rm);
