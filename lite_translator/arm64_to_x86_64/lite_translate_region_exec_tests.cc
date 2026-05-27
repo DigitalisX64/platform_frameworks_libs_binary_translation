@@ -22205,6 +22205,11 @@ constexpr uint32_t kScvtfScalarD_16 = 0x5F70E420;  // scvtf d0, d1, #16
 constexpr uint32_t kUcvtfScalarS_16 = 0x7F30E420;  // ucvtf s0, s1, #16
 constexpr uint32_t kUcvtfScalarD_1  = 0x7F7FE420;  // ucvtf d0, d1, #1
 constexpr uint32_t kUcvtfScalarD_32 = 0x7F60E420;  // ucvtf d0, d1, #32
+// FCVTZS scalar (FP → signed fixed-point int, truncate toward zero).
+// Encoding C7.2.171: 01 0 111110 immh immb 11111 1 Rn Rd
+// (SCVTF base + bits[15:11] 11100 → 11111 changes the opcode field).
+constexpr uint32_t kFcvtzsScalarS_5  = 0x5F3BFC20;  // fcvtzs s0, s1, #5
+constexpr uint32_t kFcvtzsScalarD_16 = 0x5F70FC20;  // fcvtzs d0, d1, #16
 
 TEST_F(Arm64LiteTranslateRegionTest, ScvtfScalarSPositive) {
   // Vn[31:0] = 0x00000100 = 256 (signed int32); fbits=5 → 256/32 = 8.0
@@ -22358,6 +22363,92 @@ TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarDSmall) {
   std::memcpy(r, &state_.cpu.v[0], 16);
   EXPECT_EQ(r[0], 0x3FF0000000000000ULL)
       << "UCVTF .D small: 2^32 / 2^32 = 1.0";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsScalarSPositive) {
+  // Vn[31:0] = FP32(7.5) = 0x40F00000.  fbits=5 → trunc(7.5 * 32) = 240.
+  uint64_t in[2] = {0x40F00000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kFcvtzsScalarS_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0] & 0xFFFFFFFFULL, 240ULL)
+      << "FCVTZS .S: trunc(7.5 * 32) = 240";
+  EXPECT_EQ(r[0] >> 32, 0ULL) << "FCVTZS .S: lane upper-32 zero";
+  EXPECT_EQ(r[1], 0ULL) << "FCVTZS .S: Vd[127:64] zero";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsScalarSNegative) {
+  // Vn[31:0] = FP32(-7.5) = 0xC0F00000.  fbits=5 → trunc(-7.5 * 32) = -240.
+  uint64_t in[2] = {0xC0F00000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kFcvtzsScalarS_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(static_cast<int32_t>(r[0] & 0xFFFFFFFFULL), -240)
+      << "FCVTZS .S: trunc(-7.5 * 32) = -240";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsScalarSNaN) {
+  // Vn[31:0] = qNaN bit pattern.  ARM FCVTZS saturates NaN → 0.
+  uint64_t in[2] = {0x7FC00000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kFcvtzsScalarS_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0ULL) << "FCVTZS .S: NaN → 0";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsScalarSPositiveOverflow) {
+  // Vn[31:0] = FP32(1e30) = 0x7149F2CA.  trunc(1e30 * 32) is well above
+  // INT32_MAX; ARM FCVTZS saturates to INT32_MAX = 0x7FFFFFFF.
+  uint64_t in[2] = {0x7149F2CAULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kFcvtzsScalarS_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0] & 0xFFFFFFFFULL, 0x7FFFFFFFULL)
+      << "FCVTZS .S: positive overflow → INT32_MAX";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsScalarDPositive) {
+  // Vn[63:0] = FP64(0.5) = 0x3FE0000000000000.  fbits=16 → trunc(0.5 *
+  // 65536) = 32768.
+  uint64_t in[2] = {0x3FE0000000000000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kFcvtzsScalarD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 32768ULL) << "FCVTZS .D: trunc(0.5 * 65536) = 32768";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsScalarDPositiveOverflow) {
+  // Vn[63:0] = FP64(2^63) = 0x43E0000000000000.  trunc(2^63 * 2^16) is
+  // far above INT64_MAX; ARM FCVTZS saturates to INT64_MAX.
+  uint64_t in[2] = {0x43E0000000000000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kFcvtzsScalarD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(INT64_MAX))
+      << "FCVTZS .D: positive overflow → INT64_MAX";
   EXPECT_EQ(r[1], 0ULL);
 }
 // endregion
