@@ -5808,6 +5808,130 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSNewtonStepOnOne) {
 }
 // endregion
 
+// region digitalis: FABD scalar three-same JIT lowering (FP32 / FP64).
+// FABD Sd, Sn, Sm = |Sn - Sm| in FP32; same for D form.  Matches the
+// interpreter's std::fabs(a - b) reference semantics.
+// Encoding (ARM ARM C7.2.96 "FABD" scalar and llvm-mc verification):
+//   FABD Sd, Sn, Sm = 0x7EA0D400 | (rm<<16) | (rn<<5) | rd  (size=10, sz=0)
+//   FABD Dd, Dn, Dm = 0x7EE0D400 | (rm<<16) | (rn<<5) | rd  (size=11, sz=1)
+// Verified: fabd s0, s1, s2 -> 0x7EA2D420; fabd d0, d1, d2 -> 0x7EE2D420.
+constexpr uint32_t FabdScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EA0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabdScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EE0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Positive finite result (S): |3.5 - 1.25| = 2.25.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSPositiveResult) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.5f);
+  StoreScalarToV<float>(state_.cpu, 2, 1.25f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.25f);
+  // Lanes 1..3 must be zero (AArch64 scalar zero-extend).
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// Sign clearing on negative subtract (S): |1.0 - 4.0| = 3.0 (not -3.0).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSNegativeSubtract) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 4.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 3.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FP64 form: |10.5 - 0.25| = 10.25, upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarDPositiveResult) {
+  StoreScalarToV<double>(state_.cpu, 1, 10.5);
+  StoreScalarToV<double>(state_.cpu, 2, 0.25);
+  StoreScalarToV<double>(state_.cpu, 0, std::nan(""));
+  static const uint32_t code[] = {FabdScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 10.25);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, 0u);
+}
+
+// FP64 sign-clearing: |0.5 - 1.5| = 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarDNegativeSubtract) {
+  StoreScalarToV<double>(state_.cpu, 1, 0.5);
+  StoreScalarToV<double>(state_.cpu, 2, 1.5);
+  static const uint32_t code[] = {FabdScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 1.0);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// Equal-input zero result (S): |2.0 - 2.0| = +0 (sign cleared).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSEqualInputsPositiveZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 2.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// NaN input must produce NaN with cleared sign bit (S).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSNaNInput) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// Infinity subtraction (S): |+inf - +inf| = NaN, sign cleared.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSInfMinusInfIsNaN) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreScalarToV<float>(state_.cpu, 1, inf);
+  StoreScalarToV<float>(state_.cpu, 2, inf);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// Infinity with finite (S): |+inf - 1.0| = +inf.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSInfMinusFinite) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreScalarToV<float>(state_.cpu, 1, inf);
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_EQ(result, inf);
+  EXPECT_FALSE(std::signbit(result));
+}
+// endregion
+
 // region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0

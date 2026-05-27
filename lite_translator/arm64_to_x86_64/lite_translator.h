@@ -12179,7 +12179,16 @@ class LiteTranslator {
   // be replaced with the default qNaN even though FMA naturally propagates
   // one of the input NaNs — the ARM ARM mandates the default-NaN payload.
   //
-  // Other opcodes in this dispatch class (FABD, FCMxx, FACxx) and the FP16
+  // FABD scalar (FP32/FP64) lowers to SUBSS/SUBSD followed by an AND with
+  // the non-sign-bit mask (clear bit 31 / bit 63 of the result lane).  This
+  // is bit-exact for std::fabs(a - b): finite paths trivially match, and
+  // NaN paths match because the subtract quietens SNaNs and propagates a
+  // NaN payload with whatever sign x86 chose — the AND-mask then clears
+  // the sign bit, giving the same |NaN| the interpreter's std::fabs(NaN)
+  // produces.  Inexact / invalid exceptions flow through MXCSR exactly as
+  // for SUB; the region-exit MXCSR→FPSR mirror picks them up.
+  //
+  // Other opcodes in this dispatch class (FCMxx, FACxx) and the FP16
   // path (is_fp16=true) bail to the interpreter via success_=false — they
   // are JIT follow-ups; the interpreter handles them correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
@@ -12188,7 +12197,8 @@ class LiteTranslator {
     const bool is_fmulx = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFmulx);
     const bool is_frecps = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrecps);
     const bool is_frsqrts = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts);
-    if (!is_fmulx && !is_frecps && !is_frsqrts) {
+    const bool is_fabd = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFabd);
+    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd) {
       success_ = false; return;
     }
     if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
@@ -12199,6 +12209,40 @@ class LiteTranslator {
     int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (is_fabd) {
+      SimdRegister xmm_a = AllocTempSimdReg();
+      SimdRegister xmm_b = AllocTempSimdReg();
+      SimdRegister xmm_mask = AllocTempSimdReg();
+      if (xmm_a == no_simd_register || xmm_b == no_simd_register ||
+          xmm_mask == no_simd_register) {
+        success_ = false; return;
+      }
+      if (is_double) {
+        as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+        as_.Subsd(xmm_a, xmm_b);
+      } else {
+        as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+        as_.Subss(xmm_a, xmm_b);
+      }
+      // Build non-sign-bit mask (all-ones shifted right by 1) and AND it
+      // into the lane to clear the sign bit (== std::fabs).
+      as_.Pcmpeqd(xmm_mask, xmm_mask);
+      if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
+      else as_.Psrld(xmm_mask, int8_t{1});
+      as_.Pand(xmm_a, xmm_mask);
+      // Zero Vd above the lane, then write the scalar result at lane 0.
+      as_.Pxor(xmm_mask, xmm_mask);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_mask);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      }
+      return;
+    }
 
     if (is_frecps || is_frsqrts) {
       // Constants: K_fma (the additive in FMA(-a,b,K)) and K_sat (the
