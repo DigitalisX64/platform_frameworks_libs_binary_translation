@@ -12897,10 +12897,9 @@ class LiteTranslator {
           break;  // D-form-only ops fall through to vector path.
         case Decoder::AdvSimdShiftImmOpcode::kUqshl:
         case Decoder::AdvSimdShiftImmOpcode::kSqshlu:
-          // Only the scalar D form (immh & 0b1000) is JIT-handled;
-          // B/H/S scalar saturating shifts still bail.  The dword check
-          // inside the saturating-shift case below filters esize<64.
-          if (!(args.immh & 0b1000)) { success_ = false; return; }
+          // Scalar D/S/H all fall through.  Scalar B (immh=0001) bails
+          // inside the saturating-shift case via the `is_byte` guard
+          // because the byte path needs PSLLB workarounds the case lacks.
           break;
         default:
           success_ = false; return;
@@ -13514,9 +13513,16 @@ class LiteTranslator {
         as_.Por(xs, xm);                       // xs = blended result
 
         if (!args.q) {
-          // Zero upper 64 bits of Vd (D-register semantics).
-          as_.Pslldq(xs, int8_t{8});
-          as_.Psrldq(xs, int8_t{8});
+          // region digitalis - scalar B/H/S keep only `esize_bits/8` low bytes;
+          // vector .8B/.4H/.2S and scalar .D keep low 8 bytes.  Byte-granular
+          // Pslldq/Psrldq trick zeros everything above the kept bytes.
+          int8_t shift_bytes =
+              (args.scalar && esize_bits < 64)
+                  ? static_cast<int8_t>(16 - (esize_bits / 8))
+                  : int8_t{8};
+          // endregion
+          as_.Pslldq(xs, shift_bytes);
+          as_.Psrldq(xs, shift_bytes);
         }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xs);
         return;
