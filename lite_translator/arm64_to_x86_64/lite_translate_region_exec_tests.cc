@@ -6563,6 +6563,121 @@ TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHInPlace) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarThreeSame FP16 FRECPS scalar Hd via F16C
+// round-trip.  Same lift recipe as FMULX H / FABD H (Pxor + Pinsrw +
+// Vcvtph2ps each FP16 source lane into FP32 xmm lane 0); the existing FP32
+// FRECPS Newton-step core (Vfnmadd231ss of K_fma=+2.0 - a*b, with K_sat=+2.0
+// blend on `(NOT iu) AND mul_unord`, plus default-qNaN blend on iu) runs
+// unchanged on the lifted operands; the FP32 result is narrowed back to FP16
+// via Vcvtps2ph (real-FP value, not a mask).  FMA-gated.
+// Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)" —
+// bit31=0, bit30=1, bit29=U=0, bits[28:24]=11110, bit23=a=0, bit22=1,
+// bit21=0, bits[20:16]=Rm, bits[15:14]=00, bits[13:11]=opcode_3=111,
+// bit10=1):
+//   FRECPS Hd, Hn, Hm = 0x5E403C00 | (rm<<16) | (rn<<5) | rd  (U=0,a=0,op=111)
+// Cross-check against FmulxScalarH base (0x5E401C00, op=011): delta by
+// opcode_3 difference = (111 - 011) << 11 = 100<<11 = 0x2000.  0x5E401C00 +
+// 0x2000 = 0x5E403C00. ✓
+constexpr uint32_t FrecpsScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E403C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FRECPS Hd: regular finite Newton step.  2 - 0.5*3 = 0.5 in FP16.
+// 0.5h=0x3800, 3.0h=0x4200, 0.5h=0x3800.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHRegular) {
+  StoreScalarH(state_.cpu, 1, 0x3800u);  // 0.5
+  StoreScalarH(state_.cpu, 2, 0x4200u);  // 3.0
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x3800u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FRECPS Hd: regular Newton step at the converged fixed point.  2 - 1*1 = 1.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHFixedPoint) {
+  StoreScalarH(state_.cpu, 1, 0x3C00u);  // 1.0
+  StoreScalarH(state_.cpu, 2, 0x3C00u);  // 1.0
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x3C00u);
+}
+
+// FRECPS Hd: saturation case.  +0 * +inf -> +2.0 (unsigned — FRECPS does NOT
+// XOR signs like FMULX).  +2.0h = 0x4000.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHZeroTimesInf) {
+  StoreScalarH(state_.cpu, 1, 0x0000u);  // +0.0
+  StoreScalarH(state_.cpu, 2, 0x7C00u);  // +inf
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+}
+
+// FRECPS Hd: saturation with negative-zero input.  -0 * +inf -> +2.0
+// (NOT -2.0 — FRECPS K_sat is unsigned, no sign XOR).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHNegZeroTimesInf) {
+  StoreScalarH(state_.cpu, 1, 0x8000u);  // -0.0
+  StoreScalarH(state_.cpu, 2, 0x7C00u);  // +inf
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+}
+
+// FRECPS Hd: saturation with -inf input.  -inf * +0 -> +2.0.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHNegInfTimesZero) {
+  StoreScalarH(state_.cpu, 1, 0xFC00u);  // -inf
+  StoreScalarH(state_.cpu, 2, 0x0000u);  // +0.0
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+}
+
+// FRECPS Hd: NaN input -> default qNaN, NOT the input NaN payload.
+// FP16 default qNaN has exp=0x1F, MSB of frac=1, sign=0.  Pattern:
+// 0x7E00 (sign=0, exp=0x1F, frac MSB=1, low frac=0).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHNaNInput) {
+  StoreScalarH(state_.cpu, 1, 0x7E00u);  // qNaN
+  StoreScalarH(state_.cpu, 2, 0x3C00u);  // 1.0
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t result = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  // Default qNaN: sign=0, exp all ones, MSB of frac set.
+  EXPECT_EQ(result & 0xFE00u, 0x7E00u);  // sign=0, exp=0x1F, frac MSB=1
+}
+
+// FRECPS Hd: zero * finite -> FMA(-0, 5, 2) = +2.0 (ordinary FMA, not
+// saturation; saturation only fires on the (0, inf) cross).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHZeroTimesFinite) {
+  StoreScalarH(state_.cpu, 1, 0x0000u);  // +0.0
+  StoreScalarH(state_.cpu, 2, 0x4500u);  // 5.0
+  static const uint32_t code[] = {FrecpsScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+}
+
+// FRECPS Hd in-place (Vd == Vn): the Pinsrw load reads operand bytes before
+// any store to Vd, so an in-place encoding must produce the correct result
+// with upper word lanes of Vd zero post-execution.  0.5 * 3 = 1.5;
+// 2 - 1.5 = 0.5.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHInPlace) {
+  state_.cpu.v[5] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[0] = 0x3800u;  // 0.5
+  for (int i = 1; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[i] = 0xAAAAu;
+  }
+  StoreScalarH(state_.cpu, 2, 0x4200u);  // 3.0
+  static const uint32_t code[] = {FrecpsScalarH(5, 5, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[0], 0x3800u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
+  }
+}
+// endregion
+
 // region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
 // scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
 // C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
