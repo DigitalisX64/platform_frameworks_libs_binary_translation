@@ -11164,6 +11164,7 @@ class LiteTranslator {
   //   FCVTXN Sd, Dn                      FP64 → FP32 narrow, round-to-odd
   //   SQABS  Bd/Hd/Sd/Dd, Bn/Hn/Sn/Dn    signed saturating absolute value
   //   SQNEG  Bd/Hd/Sd/Dd, Bn/Hn/Sn/Dn    signed saturating negate
+  //   SQXTN  Bd, Hn / Hd, Sn / Sd, Dn    signed saturating extract narrow
   //
   // The FP-to-int and int-to-FP single-lane lowerings mirror the per-lane
   // variant of the corresponding vector kFcvtzsV / kFcvtzuV / kFcvtasV /
@@ -11175,11 +11176,14 @@ class LiteTranslator {
   // SQNEG share a GP-register lowering: sign-extend the source, NEG into
   // a paired temp; SQABS picks abs(x) via CMOVS, SQNEG unconditionally
   // uses the negated value; then CMP+CMOVZ saturates INT_MIN → INT_MAX
-  // (the single saturating input case for both ops).
+  // (the single saturating input case for both ops).  SQXTN sign-extends
+  // the 2× lane src to int64 and clamps with two CMOV arms (CMOVG to
+  // INT_MAX_dst, CMOVL to INT_MIN_dst) before storing the dst-width
+  // result at lane 0.
   //
-  // Other constituents of this dispatch class (SQXTN/SQXTUN/UQXTN/
-  // FRECPE/FRSQRTE scalar) bail to the interpreter via success_=false —
-  // they are JIT follow-ups; the interpreter handles them correctly today.
+  // Other constituents of this dispatch class (SQXTUN/UQXTN/FRECPE/
+  // FRSQRTE scalar) bail to the interpreter via success_=false — they are
+  // JIT follow-ups; the interpreter handles them correctly today.
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
     using Opcode = Decoder::AdvSimdScalarTwoRegMiscOpcode;
 
@@ -11768,8 +11772,88 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kSqxtn: {
+        // SQXTN scalar: signed saturating extract narrow, single-lane.
+        // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit
+        // src, 10 → 32-bit dst from 64-bit src; size=11 is rejected by the
+        // decoder.  Per-lane semantics: clamp signed src to
+        // [INT_MIN_dst, INT_MAX_dst] and truncate to dst width.  Result is
+        // written to lane 0 of Vd with the upper bytes zeroed.  See
+        // Interpreter::AdvSimdScalarTwoRegMisc::kSqxtn for the reference
+        // semantics (matched by the host exec tests below).
+        //
+        // Strategy: load src sign-extended to int64 at the 2× lane (src)
+        // width, then clamp with two CMOV arms — CMOVG against INT_MAX_dst
+        // and CMOVL against INT_MIN_dst.  Movq imm64 between the CMP/CMOV
+        // pairs does not touch EFLAGS, so the second comparison sees the
+        // original src vs INT_MIN_dst correctly.  If src exceeds the
+        // positive bound, the CMOVG sets result=INT_MAX_dst and the
+        // subsequent CMOVL is harmless (src > INT_MAX_dst > INT_MIN_dst).
+        const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
+        if (sz == 3) { success_ = false; return; }
+        int64_t int_min;
+        int64_t int_max;
+        switch (sz) {
+          case 0: int_min = INT8_MIN;  int_max = INT8_MAX;  break;
+          case 1: int_min = INT16_MIN; int_max = INT16_MAX; break;
+          default:
+            // sz == 2: dst is S (32-bit), src is D (64-bit).
+            int_min = INT32_MIN; int_max = INT32_MAX; break;
+        }
+        Register src = AllocTempReg();
+        Register result = AllocTempReg();
+        Register bound = AllocTempReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (src == no_register || result == no_register ||
+            bound == no_register || xzero == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load src sign-extended to 64-bit, at the 2× lane src width.
+        switch (sz) {
+          case 0:
+            // src is H (16-bit).
+            as_.Movsxwq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 1:
+            // src is S (32-bit).
+            as_.Movsxlq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          default:
+            // src is D (64-bit); already signed at int64 width.
+            as_.Movq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+        }
+        // result = src (clamping arms may override below).
+        as_.Movq(result, src);
+        // Upper-bound clamp: if src > INT_MAX_dst, result = INT_MAX_dst.
+        as_.Movq(bound, int_max);
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kGreater, result, bound);
+        // Lower-bound clamp: if src < INT_MIN_dst, result = INT_MIN_dst.
+        // Movq imm64 does not affect EFLAGS, so we still have a valid
+        // src-vs-INT_MAX_dst comparison until the next Cmpq sets new flags.
+        as_.Movq(bound, int_min);
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kLess, result, bound);
+        // Zero Vd, then store result at lane 0 at the dst width.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        switch (sz) {
+          case 0:
+            as_.Movb({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 1:
+            as_.Movw({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          default:
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+        }
+        return;
+      }
+
       default:
-        // SQXTN / SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail to the
+        // SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail to the
         // interpreter.  Correctness path is handled by
         // Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT them
         // individually.
