@@ -12601,14 +12601,19 @@ class LiteTranslator {
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp) {
       success_ = false; return;
     }
-    // region digitalis: FP16 path is JIT-emitted only for the FCMxx / FACxx
-    // family, via an F16C round-trip (each FP16 source lane is lifted to FP32
-    // in xmm lane 0; the existing FP32 compare core runs unchanged; the FP32
-    // mask in lane 0 is packed to a 16-bit mask via Packssdw and stored at
-    // Vd[15:0] with Vd[127:16]=0).  Other FP16 ops (FMULX / FRECPS / FRSQRTS /
-    // FABD scalar H) bail to the interpreter — consistent with the existing
-    // FP16-FCVT / FCMA / FpDataProc3 fallback policy in this file.
-    if (args.is_fp16 && (!is_cmp || !host_platform::kHasF16C)) {
+    // region digitalis: FP16 path is JIT-emitted for FCMxx / FACxx (mask out)
+    // and for FMULX (real-FP out), via an F16C round-trip (each FP16 source
+    // lane is lifted to FP32 in xmm lane 0; the existing FP32 core runs
+    // unchanged; result narrowed back to FP16).  Mask-producing ops narrow
+    // with Packssdw (against a zero scratch); real-FP ops narrow with
+    // Vcvtps2ph (which also auto-zeroes the upper 64 bits of the dst xmm).
+    // FRECPS / FRSQRTS / FABD scalar H still bail to the interpreter —
+    // consistent with the existing FP16-FCVT / FCMA / FpDataProc3 fallback
+    // policy in this file.
+    if (args.is_fp16 && !host_platform::kHasF16C) {
+      success_ = false; return;
+    }
+    if (args.is_fp16 && !is_cmp && !is_fmulx) {
       success_ = false; return;
     }
     // endregion
@@ -12875,34 +12880,46 @@ class LiteTranslator {
       success_ = false; return;
     }
 
-    // Load a, b into lane 0.  Upper lanes are don't-care; the final store
-    // overwrites the full Vd slot.
-    if (is_double) {
+    // region digitalis: when args.is_fp16, lift each FP16 source lane to
+    // FP32 in xmm lane 0 (Pxor + Pinsrw + Vcvtph2ps), run the existing FP32
+    // FMULX compute core on the lifted operands, then narrow the FP32 result
+    // back to FP16 via Vcvtps2ph.  Vcvtph2ps puts FP32 +0.0 in lanes 1..3,
+    // which means mul/input cmpunord and ±2.0 bits in lanes 1..3 stay 0
+    // through the blend; Vcvtps2ph on (result, 0, 0, 0) writes word lane 0 =
+    // FP16 result and word lanes 1..3 = 0, and auto-zeroes the upper 64 bits.
+    // Full Movdqu then writes Vd[15:0]=result with Vd[127:16]=0.
+    const bool use_single = args.is_fp16 || !is_double;
+    if (args.is_fp16) {
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+    } else if (is_double) {
       as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
     }
+    // endregion
 
     // mul = a * b
     as_.Movdqa(xmm_mul, xmm_n);
-    if (is_double) {
-      as_.Mulsd(xmm_mul, xmm_m);
-    } else {
-      as_.Mulss(xmm_mul, xmm_m);
-    }
+    if (use_single) as_.Mulss(xmm_mul, xmm_m);
+    else            as_.Mulsd(xmm_mul, xmm_m);
 
     // mul_unord = cmpunord(mul, mul): all-ones iff mul is NaN.
     as_.Movdqa(xmm_mul_unord, xmm_mul);
-    if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
-    else as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+    if (use_single) as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+    else            as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
 
     // input_unord = cmpunord(a, b): all-ones iff either a or b is NaN.
     // CMPUNORDPS/PD sets the lane to all-ones when either operand is NaN.
     as_.Movdqa(xmm_input_unord, xmm_n);
-    if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
-    else as_.Cmpunordps(xmm_input_unord, xmm_m);
+    if (use_single) as_.Cmpunordps(xmm_input_unord, xmm_m);
+    else            as_.Cmpunordpd(xmm_input_unord, xmm_m);
 
     // special_mask = mul_unord AND NOT input_unord.
     // Use PANDN: dst = (NOT dst) AND src.  So xmm_input_unord becomes
@@ -12912,24 +12929,21 @@ class LiteTranslator {
 
     // two_signed = (a XOR b) restricted to sign bit, OR'd with bits of 2.0.
     // Reuse xmm_n as the scratch for (a XOR b); we still have xmm_m intact.
-    if (is_double) {
-      as_.Xorpd(xmm_n, xmm_m);
-    } else {
-      as_.Xorps(xmm_n, xmm_m);
-    }
+    if (use_single) as_.Xorps(xmm_n, xmm_m);
+    else            as_.Xorpd(xmm_n, xmm_m);
     // Build sign-bit mask in xmm_mul_unord (we no longer need mul_unord).
     as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
-    if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
-    else as_.Pslld(xmm_mul_unord, int8_t{31});
+    if (use_single) as_.Pslld(xmm_mul_unord, int8_t{31});
+    else            as_.Psllq(xmm_mul_unord, int8_t{63});
     as_.Pand(xmm_n, xmm_mul_unord);
     // Build ±2.0 by OR'ing in the bits of +2.0.
     Register tmp_gpr = AllocTempReg();
-    if (is_double) {
-      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});  // bits of 2.0 (FP64)
-      as_.Movq(xmm_two, tmp_gpr);
-    } else {
+    if (use_single) {
       as_.Movl(tmp_gpr, int32_t{0x40000000});  // bits of 2.0 (FP32)
       as_.Movd(xmm_two, tmp_gpr);
+    } else {
+      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});  // bits of 2.0 (FP64)
+      as_.Movq(xmm_two, tmp_gpr);
     }
     as_.Por(xmm_n, xmm_two);
     // xmm_n now holds ±2.0 (lane 0), with sign = sign(a) XOR sign(b).
@@ -12943,13 +12957,22 @@ class LiteTranslator {
 
     // Zero Vd, then write the scalar lane 0.  Matches AArch64 scalar
     // semantics: bits above the operand size are zero.
-    as_.Pxor(xmm_two, xmm_two);
-    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_two);
-    if (is_double) {
-      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+    // region digitalis: FP16 narrow path uses Vcvtps2ph (real-FP-valued
+    // result, not an FP-width mask), which auto-zeroes upper 64 bits of dst
+    // xmm; full Movdqu then writes Vd[15:0]=FP16 result, Vd[127:16]=0.
+    if (args.is_fp16) {
+      as_.Vcvtps2ph(xmm_input_unord, xmm_input_unord, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
     } else {
-      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+      as_.Pxor(xmm_two, xmm_two);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_two);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+      }
     }
+    // endregion
   }
   // endregion
 

@@ -6323,6 +6323,130 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarHInPlace) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarThreeSame FP16 FMULX scalar Hd via F16C
+// round-trip.  Same lift recipe as the FP16 compare family (Pxor + Pinsrw +
+// Vcvtph2ps each FP16 source lane into FP32 xmm lane 0); the existing FP32
+// FMULX core (Mulss + cmpunord-blend with ±2.0 on the ±0×±inf special case)
+// runs unchanged on the lifted operands; the FP32 result is narrowed back
+// to FP16 via Vcvtps2ph (real-FP value, not a mask — Vcvtps2ph is the
+// right narrow primitive here, NOT Packssdw).
+// Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)" —
+// bit31=0, bit30=1, bit29=U=0, bits[28:24]=11110, bit23=a=0, bit22=1,
+// bit21=0, bits[20:16]=Rm, bits[15:14]=00, bits[13:11]=011, bit10=1):
+//   FMULX Hd, Hn, Hm = 0x5E401C00 | (rm<<16) | (rn<<5) | rd  (U=0,a=0,op=011)
+// Cross-checked against the existing FcmeqScalarH base (0x5E402400, op=100):
+// only opcode_3 bits[13:11] differ (011 vs 100), so the constant deltas
+// from FcmeqScalarH by the opcode_3 difference = (100 - 011) << 11 = 0x800.
+// 0x5E402400 - 0x800 = 0x5E401C00. ✓
+constexpr uint32_t FmulxScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E401C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMULX Hd: regular finite multiply.  3.0h * 4.0h = 12.0h = 0x4A00.
+// 3.0h = 0x4200; 4.0h = 0x4400; 12.0h = 0x4A00.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHRegular) {
+  StoreScalarH(state_.cpu, 1, 0x4200u);  // 3.0
+  StoreScalarH(state_.cpu, 2, 0x4400u);  // 4.0
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4A00u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FMULX Hd: +0 * +inf -> +2.0 (canonical FMULX saturation).
+// +inf_h = 0x7C00; +2.0h = 0x4000.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHZeroTimesInf) {
+  StoreScalarH(state_.cpu, 1, 0x0000u);  // +0.0
+  StoreScalarH(state_.cpu, 2, 0x7C00u);  // +inf
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+}
+
+// FMULX Hd: -0 * +inf -> -2.0.  Sign = sign(-0) XOR sign(+inf) = 1.
+// -2.0h = 0xC000.  The sign-bit XOR happens at FP32 width; the FP16 sign
+// bit (bit 15) lifts to FP32 sign bit (bit 31) which is the bit Pslld 31
+// isolates.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHNegZeroTimesInf) {
+  StoreScalarH(state_.cpu, 1, 0x8000u);  // -0.0
+  StoreScalarH(state_.cpu, 2, 0x7C00u);  // +inf
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xC000u);
+}
+
+// FMULX Hd: -inf * +0 -> -2.0 (the (0,inf) cross case is symmetric in the
+// operand order; only the XOR'd sign matters).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHNegInfTimesZero) {
+  StoreScalarH(state_.cpu, 1, 0xFC00u);  // -inf
+  StoreScalarH(state_.cpu, 2, 0x0000u);  // +0.0
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xC000u);
+}
+
+// FMULX Hd: -inf * -0 -> +2.0.  Sign = 1 XOR 1 = 0.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHNegInfTimesNegZero) {
+  StoreScalarH(state_.cpu, 1, 0xFC00u);  // -inf
+  StoreScalarH(state_.cpu, 2, 0x8000u);  // -0.0
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+}
+
+// FMULX Hd: NaN input -> NaN output (any NaN bit pattern; not ±2.0).
+// qNaN_h = 0x7E00.  Check via FP16 exponent=0x1F + frac!=0.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHNaNInput) {
+  StoreScalarH(state_.cpu, 1, 0x7E00u);  // qNaN
+  StoreScalarH(state_.cpu, 2, 0x3C00u);  // 1.0
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t result = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(result & 0x7C00u, 0x7C00u);  // exponent all-ones
+  EXPECT_NE(result & 0x03FFu, 0u);       // frac non-zero
+}
+
+// FMULX Hd: 0 * 5 -> +0 (NOT ±2.0; the special case is 0*inf only).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHZeroTimesFinite) {
+  StoreScalarH(state_.cpu, 1, 0x0000u);  // +0.0
+  StoreScalarH(state_.cpu, 2, 0x4500u);  // 5.0
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FMULX Hd: negative * negative -> positive.  -2.5h * -4.0h = +10.0h.
+// -2.5h = 0xC100; -4.0h = 0xC400; +10.0h = 0x4900.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHNegNeg) {
+  StoreScalarH(state_.cpu, 1, 0xC100u);  // -2.5
+  StoreScalarH(state_.cpu, 2, 0xC400u);  // -4.0
+  static const uint32_t code[] = {FmulxScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4900u);
+}
+
+// FMULX Hd in-place (Vd == Vn): must read Vn before any store to Vd.
+// 3.0 * 4.0 = 12.0; upper word lanes of Vd must be zero post-execution.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHInPlace) {
+  state_.cpu.v[5] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[0] = 0x4200u;  // 3.0
+  for (int i = 1; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[i] = 0xAAAAu;
+  }
+  StoreScalarH(state_.cpu, 2, 0x4400u);  // 4.0
+  static const uint32_t code[] = {FmulxScalarH(5, 5, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[0], 0x4A00u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
+  }
+}
+// endregion
+
 // region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
 // scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
 // C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
