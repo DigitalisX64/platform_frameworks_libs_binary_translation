@@ -12042,10 +12042,96 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kFrsqrte: {
+        // FRSQRTE scalar: single-lane FP reciprocal-square-root estimate.
+        // ARM ARM C7.2.155.  Decoder pins bit1 of size (size ∈ {10, 11});
+        // bit0 selects S (0) vs D (1).
+        //
+        // Interpreter reference (interpreter.h kFrsqrte):
+        //   r = (src <= 0 || isNaN(src)) ? default_qNaN : 1.0 / sqrt(src)
+        //
+        // The non-positive-or-NaN replacement uses the default qNaN
+        // payload (0x7FC00000 / 0x7FF8000000000000) rather than the
+        // input NaN — x86 SQRT/DIV would propagate the input NaN, so we
+        // must blend it out explicitly.
+        //
+        // Branchless lowering: compute the normal-path 1.0/sqrt(src),
+        // build the special-case mask (src <= 0 OR isNaN(src)), and blend
+        // the default qNaN under the mask.
+        //   sqrt   = SQRT(src)                  (SQRTSS / SQRTSD)
+        //   recip  = 1.0 / sqrt                 (DIVSS / DIVSD)
+        //   mask   = CMPLE(src, 0) | CMPUNORD(src, src)
+        //   result = (mask & qNaN) | (~mask & recip)
+        // Mantissa-precision requirement is only ~8 bits (same as FRECPE);
+        // the exact 1.0/sqrt(x) computed by SQRT+DIV is well within bound
+        // for every positive-finite input.
+        const bool is_double = ((args.size & 1) != 0);
+        SimdRegister src_xmm = AllocTempSimdReg();
+        SimdRegister sqrt_xmm = AllocTempSimdReg();
+        SimdRegister recip_xmm = AllocTempSimdReg();
+        SimdRegister mask_xmm = AllocTempSimdReg();
+        SimdRegister mask_nan_xmm = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        if (src_xmm == no_simd_register || sqrt_xmm == no_simd_register ||
+            recip_xmm == no_simd_register || mask_xmm == no_simd_register ||
+            mask_nan_xmm == no_simd_register || tmp == no_register) {
+          success_ = false; return;
+        }
+        if (is_double) {
+          // src_xmm = src (memory load zero-extends to 128 bits).
+          as_.Movsd(src_xmm, {.base = Assembler::rbp, .disp = vn_off});
+          // sqrt_xmm = sqrt(src) at lane 0.
+          as_.Sqrtsd(sqrt_xmm, src_xmm);
+          // recip_xmm = 1.0 / sqrt(src).
+          as_.Movq(tmp, int64_t{0x3FF0000000000000LL});  // bits of 1.0d
+          as_.Movq(recip_xmm, tmp);
+          as_.Divsd(recip_xmm, sqrt_xmm);
+          // Build the (src <= 0) mask in mask_xmm.  Reuse sqrt_xmm as
+          // the 0.0 source (its lane 0 contents are no longer needed).
+          as_.Pxor(sqrt_xmm, sqrt_xmm);
+          as_.Movdqa(mask_xmm, src_xmm);
+          as_.Cmplesd(mask_xmm, sqrt_xmm);
+          // Build the isNaN(src) mask in mask_nan_xmm.
+          as_.Movdqa(mask_nan_xmm, src_xmm);
+          as_.Cmpunordsd(mask_nan_xmm, mask_nan_xmm);
+          // mask_xmm = (src <= 0) OR isNaN(src).
+          as_.Por(mask_xmm, mask_nan_xmm);
+          // Default qNaN constant into src_xmm (src is no longer needed).
+          as_.Movq(tmp, int64_t{0x7FF8000000000000LL});
+          as_.Movq(src_xmm, tmp);
+        } else {
+          as_.Movss(src_xmm, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Sqrtss(sqrt_xmm, src_xmm);
+          as_.Movl(tmp, int32_t{0x3F800000});  // bits of 1.0f
+          as_.Movd(recip_xmm, tmp);
+          as_.Divss(recip_xmm, sqrt_xmm);
+          as_.Pxor(sqrt_xmm, sqrt_xmm);
+          as_.Movdqa(mask_xmm, src_xmm);
+          as_.Cmpless(mask_xmm, sqrt_xmm);
+          as_.Movdqa(mask_nan_xmm, src_xmm);
+          as_.Cmpunordss(mask_nan_xmm, mask_nan_xmm);
+          as_.Por(mask_xmm, mask_nan_xmm);
+          as_.Movl(tmp, int32_t{0x7FC00000});  // default qNaN FP32
+          as_.Movd(src_xmm, tmp);
+        }
+        // Blend: result_in_src_xmm = (mask & qNaN) | (~mask & recip).
+        as_.Pand(src_xmm, mask_xmm);
+        as_.Pandn(mask_xmm, recip_xmm);
+        as_.Por(src_xmm, mask_xmm);
+        // Zero Vd, then write the scalar lane 0.
+        as_.Pxor(sqrt_xmm, sqrt_xmm);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, sqrt_xmm);
+        if (is_double) {
+          as_.Movsd({.base = Assembler::rbp, .disp = vd_off}, src_xmm);
+        } else {
+          as_.Movss({.base = Assembler::rbp, .disp = vd_off}, src_xmm);
+        }
+        return;
+      }
+
       default:
-        // FRSQRTE scalar: bails to the interpreter.  Correctness path is
-        // handled by Interpreter::AdvSimdScalarTwoRegMisc; a future cycle
-        // can JIT it (sibling of FRECPE, same dispatch shell).
+        // All AdvSimdScalarTwoRegMisc constituents are JIT-emitted.  Any
+        // remaining unhandled opcode bails to the interpreter for safety.
         success_ = false;
         return;
     }

@@ -3748,6 +3748,147 @@ TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_FourToQuarter) {
 // endregion
 
 // region digitalis
+// FRSQRTE scalar: single-lane FP reciprocal-square-root estimate.  AdvSimd
+// scalar two-reg-misc encoding with U=1, opcode=11101, bits[11:10]=10.
+// Decoder pins size ∈ {10, 11}; bit0 selects S (FP32, size=10) vs
+// D (FP64, size=11).  Encoding bits: 01 1 11110 sz 10000 11101 10 Rn Rd.
+//   FRSQRTE Sd, Sn (size=10): 0x7EA1_D800 for V0,V0.
+//   FRSQRTE Dd, Dn (size=11): 0x7EE1_D800 for V0,V0.
+// Per the interpreter (interpreter.h kFrsqrte), inputs satisfying
+// (src <= 0) OR isNaN(src) yield the default qNaN; all other positive-
+// finite inputs yield 1.0/sqrt(src).
+constexpr uint32_t kFrsqrteSdSnV0 = 0x7EA1D800;
+constexpr uint32_t kFrsqrteDdDnV0 = 0x7EE1D800;
+
+// FRSQRTE Sd, Sn: 4.0f -> 0.5f (sqrt(4)=2, 1/2=0.5; exact).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_FourToHalf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x40800000u;  // 4.0f
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x3F000000u);  // 0.5f
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Sd, Sn: 1.0f -> 1.0f (sqrt(1)=1, 1/1=1; identity).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_OneToOne) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x3F800000u;  // 1.0f
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x3F800000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Sd, Sn: +0.0f -> default qNaN (interpreter rule: src <= 0).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_PosZeroToQNan) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x00000000u;  // +0.0f
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x7FC00000u);  // default qNaN
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Sd, Sn: -0.0f -> default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_NegZeroToQNan) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x80000000u;  // -0.0f
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x7FC00000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Sd, Sn: -2.0f -> default qNaN (negative inputs -> NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_NegativeToQNan) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0xC0000000u;  // -2.0f
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x7FC00000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Sd, Sn: +inf -> +0.0f (sqrt(+inf)=+inf, 1/+inf=+0).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_PosInfToPosZero) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7F800000u;  // +inf
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x00000000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Sd, Sn: qNaN -> default qNaN (NaN inputs map to default-NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteSdSn_QNanToDefaultQNan) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7FC12345u;  // qNaN, non-default payload
+  static const uint32_t code[] = {kFrsqrteSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x7FC00000u);  // default qNaN payload
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Dd, Dn: 4.0d -> 0.5d (exact).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteDdDn_FourToHalf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x4010000000000000ULL;  // 4.0d
+  static const uint32_t code[] = {kFrsqrteDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x3FE0000000000000ULL);  // 0.5d
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Dd, Dn: 16.0d -> 0.25d (sqrt(16)=4, 1/4=0.25; exact).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteDdDn_SixteenToQuarter) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x4030000000000000ULL;  // 16.0d
+  static const uint32_t code[] = {kFrsqrteDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x3FD0000000000000ULL);  // 0.25d
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Dd, Dn: +0.0d -> default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteDdDn_PosZeroToQNan) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x0000000000000000ULL;
+  static const uint32_t code[] = {kFrsqrteDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x7FF8000000000000ULL);  // default qNaN
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Dd, Dn: -1.0d -> default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteDdDn_NegativeToQNan) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0xBFF0000000000000ULL;  // -1.0d
+  static const uint32_t code[] = {kFrsqrteDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x7FF8000000000000ULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRSQRTE Dd, Dn: +inf -> +0.0d.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteDdDn_PosInfToPosZero) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {kFrsqrteDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]), 0ULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+// endregion
+
+// region digitalis
 // FRINTA Sd, Sn / Dd, Dn (round to nearest, ties AWAY from zero).
 // FP data-processing 1-source, opcode=001100:
 //   FRINTA Sd, Sn: 0001_1110_0010_0110_0100_00nn_nnnd_dddd  (ftype=00)
