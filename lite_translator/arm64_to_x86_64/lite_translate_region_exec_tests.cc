@@ -5808,6 +5808,794 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSNewtonStepOnOne) {
 }
 // endregion
 
+// region digitalis: FABD scalar three-same JIT lowering (FP32 / FP64).
+// FABD Sd, Sn, Sm = |Sn - Sm| in FP32; same for D form.  Matches the
+// interpreter's std::fabs(a - b) reference semantics.
+// Encoding (ARM ARM C7.2.96 "FABD" scalar and llvm-mc verification):
+//   FABD Sd, Sn, Sm = 0x7EA0D400 | (rm<<16) | (rn<<5) | rd  (size=10, sz=0)
+//   FABD Dd, Dn, Dm = 0x7EE0D400 | (rm<<16) | (rn<<5) | rd  (size=11, sz=1)
+// Verified: fabd s0, s1, s2 -> 0x7EA2D420; fabd d0, d1, d2 -> 0x7EE2D420.
+constexpr uint32_t FabdScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EA0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabdScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EE0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Positive finite result (S): |3.5 - 1.25| = 2.25.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSPositiveResult) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.5f);
+  StoreScalarToV<float>(state_.cpu, 2, 1.25f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.25f);
+  // Lanes 1..3 must be zero (AArch64 scalar zero-extend).
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// Sign clearing on negative subtract (S): |1.0 - 4.0| = 3.0 (not -3.0).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSNegativeSubtract) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 4.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 3.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// FP64 form: |10.5 - 0.25| = 10.25, upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarDPositiveResult) {
+  StoreScalarToV<double>(state_.cpu, 1, 10.5);
+  StoreScalarToV<double>(state_.cpu, 2, 0.25);
+  StoreScalarToV<double>(state_.cpu, 0, std::nan(""));
+  static const uint32_t code[] = {FabdScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 10.25);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, 0u);
+}
+
+// FP64 sign-clearing: |0.5 - 1.5| = 1.0.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarDNegativeSubtract) {
+  StoreScalarToV<double>(state_.cpu, 1, 0.5);
+  StoreScalarToV<double>(state_.cpu, 2, 1.5);
+  static const uint32_t code[] = {FabdScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 1.0);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// Equal-input zero result (S): |2.0 - 2.0| = +0 (sign cleared).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSEqualInputsPositiveZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 2.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.0f);
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// NaN input must produce NaN with cleared sign bit (S).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSNaNInput) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// Infinity subtraction (S): |+inf - +inf| = NaN, sign cleared.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSInfMinusInfIsNaN) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreScalarToV<float>(state_.cpu, 1, inf);
+  StoreScalarToV<float>(state_.cpu, 2, inf);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+  EXPECT_FALSE(std::signbit(result));
+}
+
+// Infinity with finite (S): |+inf - 1.0| = +inf.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSInfMinusFinite) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreScalarToV<float>(state_.cpu, 1, inf);
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FabdScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_EQ(result, inf);
+  EXPECT_FALSE(std::signbit(result));
+}
+// endregion
+
+// region digitalis: FCMEQ / FCMGE / FCMGT / FACGE / FACGT scalar three-same
+// JIT (FP32/FP64).  Encoding (per ARM ARM C7.2.85 "FCMEQ (scalar)",
+// C7.2.87 "FCMGE (scalar, register)", C7.2.89 "FCMGT (scalar, register)",
+// C7.2.61 "FACGE (scalar)", C7.2.63 "FACGT (scalar)"):
+//
+//   bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=op_high,
+//   bit22=sz, bit21=1, bits[20:16]=Rm, bits[15:11]=opcode_5, bit10=1.
+//
+//   FCMEQ:  U=0, op_high=0, opcode=11100  → 0x5E20E400 (S) / 0x5E60E400 (D)
+//   FCMGE:  U=1, op_high=0, opcode=11100  → 0x7E20E400 (S) / 0x7E60E400 (D)
+//   FCMGT:  U=1, op_high=1, opcode=11100  → 0x7EA0E400 (S) / 0x7EE0E400 (D)
+//   FACGE:  U=1, op_high=0, opcode=11101  → 0x7E20EC00 (S) / 0x7E60EC00 (D)
+//   FACGT:  U=1, op_high=1, opcode=11101  → 0x7EA0EC00 (S) / 0x7EE0EC00 (D)
+constexpr uint32_t FcmeqScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E20E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E60E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E20E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E60E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EA0E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EE0E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgeScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E20EC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgtScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EA0EC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgeScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E60EC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FCMEQ: equal -> 0xFFFFFFFF in lane 0 (S), upper lanes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarSEqualAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.25f);
+  StoreScalarToV<float>(state_.cpu, 2, 1.25f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FcmeqScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FCMEQ: unequal -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarSUnequalZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FcmeqScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMEQ D form: equal -> 0xFFFFFFFFFFFFFFFF, upper 8B zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarDEqualAllOnes) {
+  StoreScalarToV<double>(state_.cpu, 1, -3.14);
+  StoreScalarToV<double>(state_.cpu, 2, -3.14);
+  static const uint32_t code[] = {FcmeqScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, 0u);
+}
+
+// FCMEQ with NaN input -> 0 (C++ a == NaN is false).
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarSNaNZero) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, std::nanf(""));
+  static const uint32_t code[] = {FcmeqScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGE: a >= b on a < b -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarSLessFalse) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FcmgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGE: a >= b on a == b -> all-ones (the boundary case).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarSEqualAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.14f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.14f);
+  static const uint32_t code[] = {FcmgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FCMGE D form: a > b -> all-ones.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarDGreaterAllOnes) {
+  StoreScalarToV<double>(state_.cpu, 1, 5.0);
+  StoreScalarToV<double>(state_.cpu, 2, 1.5);
+  static const uint32_t code[] = {FcmgeScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// FCMGE with NaN -> 0 (C++ NaN >= x is false).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarSNaNZero) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FcmgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGT: a > b on a > b -> all-ones.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarSGreaterAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 7.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.0f);
+  static const uint32_t code[] = {FcmgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FCMGT: a > b on a == b -> 0 (the boundary case; FCMGT is strict).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarSEqualZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 5.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FcmgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGT D form: a > b on negative inputs.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarDNegativeGreater) {
+  StoreScalarToV<double>(state_.cpu, 1, -1.0);
+  StoreScalarToV<double>(state_.cpu, 2, -5.0);
+  static const uint32_t code[] = {FcmgtScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// FACGE: |a| >= |b| where a is negative but larger in magnitude.
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarSAbsGreater) {
+  StoreScalarToV<float>(state_.cpu, 1, -5.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.0f);
+  static const uint32_t code[] = {FacgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FACGE: |a| >= |b| where |a| < |b| -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarSAbsLessZero) {
+  StoreScalarToV<float>(state_.cpu, 1, -2.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FacgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FACGE D form: |a| == |b| -> all-ones (boundary inclusive).
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarDAbsEqualAllOnes) {
+  StoreScalarToV<double>(state_.cpu, 1, -4.5);
+  StoreScalarToV<double>(state_.cpu, 2, 4.5);
+  static const uint32_t code[] = {FacgeScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// FACGT: |a| > |b| where |a| > |b| -> all-ones.
+TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsGreaterAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 6.0f);
+  StoreScalarToV<float>(state_.cpu, 2, -2.0f);
+  static const uint32_t code[] = {FacgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FACGT: |a| > |b| where |a| == |b| -> 0 (strict).
+TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsEqualZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.5f);
+  StoreScalarToV<float>(state_.cpu, 2, -3.5f);
+  static const uint32_t code[] = {FacgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+// endregion
+
+// region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
+// scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
+// C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
+//   ADDP  Vd.D, Vn.2D    = 0x5EF1B800 | (rn<<5) | rd  (U=0 size=11 op=11011)
+//   FADDP Sd, Vn.2S      = 0x7E30D800 | (rn<<5) | rd  (U=1 size=00 op=01101)
+//   FADDP Dd, Vn.2D      = 0x7E70D800 | (rn<<5) | rd  (U=1 size=01 op=01101)
+constexpr uint32_t AddpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x5EF1B800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7E30D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7E70D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// ADDP scalar D: Vn.D[0]=10, Vn.D[1]=20 -> Vd.D[0]=30, upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, AddpScalarDPositive) {
+  state_.cpu.v[1] =
+      (static_cast<__uint128_t>(uint64_t{20}) << 64) | uint64_t{10};
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {AddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0, lane1;
+  std::memcpy(&lane0, &state_.cpu.v[0], 8);
+  std::memcpy(&lane1, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(lane0, uint64_t{30});
+  EXPECT_EQ(lane1, uint64_t{0});
+}
+
+// ADDP scalar D: 64-bit wraparound. (2^63 - 1) + 1 = 2^63 (mod 2^64).
+TEST_F(Arm64LiteTranslateRegionTest, AddpScalarDWrap) {
+  state_.cpu.v[1] =
+      (static_cast<__uint128_t>(uint64_t{1}) << 64) |
+      uint64_t{0x7FFFFFFFFFFFFFFFULL};
+  static const uint32_t code[] = {AddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], 8);
+  EXPECT_EQ(lane0, uint64_t{0x8000000000000000ULL});
+}
+
+// ADDP scalar D in-place (Vd == Vn): must still observe Vn's original
+// lanes, not the post-write Vd.  10 + 20 = 30.
+TEST_F(Arm64LiteTranslateRegionTest, AddpScalarDInPlace) {
+  state_.cpu.v[3] =
+      (static_cast<__uint128_t>(uint64_t{20}) << 64) | uint64_t{10};
+  static const uint32_t code[] = {AddpScalarD(3, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0, lane1;
+  std::memcpy(&lane0, &state_.cpu.v[3], 8);
+  std::memcpy(&lane1, reinterpret_cast<const uint8_t*>(&state_.cpu.v[3]) + 8, 8);
+  EXPECT_EQ(lane0, uint64_t{30});
+  EXPECT_EQ(lane1, uint64_t{0});
+}
+
+// FADDP Sd, Vn.2S: 1.5 + 2.5 = 4.0; lanes 1..3 zero.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSPositive) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 1.5f, b = 2.5f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 4.0f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FADDP Sd, Vn.2S with NaN input -> NaN result.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 1.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FaddpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FADDP Dd, Vn.2D: 3.0 + 4.0 = 7.0; upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarDPositive) {
+  double a = 3.0, b = 4.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 7.0);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, uint64_t{0});
+}
+
+// FADDP Dd, Vn.2D with infinity propagation: +inf + 1.0 = +inf.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarDInfFinite) {
+  double a = std::numeric_limits<double>::infinity(), b = 1.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FaddpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_EQ(result, std::numeric_limits<double>::infinity());
+}
+
+// FADDP Sd, Vn.2S in-place (Vd == Vn): must read both lanes of Vn before
+// overwriting Vd.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSInPlace) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 0.5f, b = 0.25f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[5], lane_bits, 16);
+  static const uint32_t code[] = {FaddpScalarS(5, 5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[5], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 0.75f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[5]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+// endregion
+
+// region digitalis: AdvSimdScalarPairwise JIT — FMAXP / FMINP / FMAXNMP /
+// FMINNMP scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar
+// pairwise", C7.2 — U=1 FP leg, opcode=01111 for max/min, opcode=01100 for
+// maxnm/minnm; size[1] selects min(=1) vs max(=0) family; size[0] selects
+// S(=0) vs D(=1)):
+//   FMAXP   Sd, Vn.2S = 0x7E30F800 | (rn<<5) | rd
+//   FMAXP   Dd, Vn.2D = 0x7E70F800 | (rn<<5) | rd
+//   FMINP   Sd, Vn.2S = 0x7EB0F800 | (rn<<5) | rd
+//   FMINP   Dd, Vn.2D = 0x7EF0F800 | (rn<<5) | rd
+//   FMAXNMP Sd, Vn.2S = 0x7E30C800 | (rn<<5) | rd
+//   FMAXNMP Dd, Vn.2D = 0x7E70C800 | (rn<<5) | rd
+//   FMINNMP Sd, Vn.2S = 0x7EB0C800 | (rn<<5) | rd
+//   FMINNMP Dd, Vn.2D = 0x7EF0C800 | (rn<<5) | rd
+constexpr uint32_t FmaxpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7E30F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7E70F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7EB0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7EF0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7E30C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7E70C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7EB0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7EF0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMAXP Sd: 1.5, 2.5 -> 2.5; lanes 1..3 zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSPositive) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 1.5f, b = 2.5f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmaxpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.5f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FMAXP Dd: -7.0, 3.5 -> 3.5; upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarDPositive) {
+  double a = -7.0, b = 3.5;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmaxpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 3.5);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, uint64_t{0});
+}
+
+// FMAXP Sd ±0 disambiguation: lane0=-0.0, lane1=+0.0 -> +0.0 (ARM mandates
+// the positive zero regardless of operand order; the naive Maxss-then-OR
+// idiom alone would produce -0.0).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSZeroNegZero) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = -0.0f, b = 0.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(result_bits, 0u);  // +0.0 == 0x00000000, not 0x80000000.
+}
+
+// FMAXP Dd ±0 disambiguation, reverse operand order: lane0=+0.0, lane1=-0.0
+// -> +0.0 (must be +0 independent of operand order).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarDZeroPosNeg) {
+  double a = 0.0, b = -0.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 8);
+  EXPECT_EQ(result_bits, uint64_t{0});
+}
+
+// FMAXP Sd NaN propagation: NaN, 1.0 -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 1.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FMINP Sd: 1.5, 2.5 -> 1.5.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarSPositive) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 1.5f, b = 2.5f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.5f);
+}
+
+// FMINP Dd: -7.0, 3.5 -> -7.0.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarDPositive) {
+  double a = -7.0, b = 3.5;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, -7.0);
+}
+
+// FMINP Sd ±0 disambiguation: lane0=+0.0, lane1=-0.0 -> -0.0 (FMIN of two
+// zeros is -0 regardless of operand order).
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarSZeroPosNeg) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 0.0f, b = -0.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(result_bits, 0x80000000u);  // -0.0 bit pattern.
+}
+
+// FMINP Sd NaN propagation: 2.0, NaN -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarSNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 2.0f, b = std::nanf("");
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FMAXNMP Sd: single-NaN suppression — NaN, 1.0 -> 1.0 (returns the
+// non-NaN operand, unlike FMAXP which propagates NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarSSingleNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 1.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.0f);
+}
+
+// FMAXNMP Dd: single-NaN suppression in the other lane — 4.0, NaN -> 4.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarDSingleNaNOther) {
+  double a = 4.0, b = std::nan("");
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 4.0);
+}
+
+// FMAXNMP Sd: both NaN -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarSBothNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = std::nanf("");
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FMAXNMP Sd ±0 disambiguation: -0, +0 -> +0 (sign rule applies to NM
+// family too).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarSZeroNegPos) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = -0.0f, b = 0.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(result_bits, 0u);
+}
+
+// FMINNMP Sd: single-NaN suppression — NaN, 5.0 -> 5.0.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmpScalarSSingleNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 5.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 5.0f);
+}
+
+// FMINNMP Dd: ±0 disambiguation: +0, -0 -> -0.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmpScalarDZeroPosNeg) {
+  double a = 0.0, b = -0.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminnmpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 8);
+  EXPECT_EQ(result_bits, uint64_t{0x8000000000000000ULL});
+}
+
+// FMAXP Sd in-place (Vd == Vn): must read both lanes of Vn before
+// overwriting Vd.  lane0=2.0, lane1=7.0 -> max = 7.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSInPlace) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 2.0f, b = 7.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[6], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarS(6, 6)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[6], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 7.0f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[6]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+// endregion
+
 // region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
@@ -20599,6 +21387,350 @@ TEST(Arm64InterpreterDataProc2Src, PacgaSpModifierReturnsZero) {
   EXPECT_EQ(state.cpu.x[6], 0x1234567812345678ULL);
   EXPECT_EQ(state.cpu.sp, 0x7000000000ULL);
   EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
+}
+// endregion
+
+// region digitalis: AdvSimdTableLookup JIT — TBL/TBX (8B/16B forms, 1..4
+// table registers).
+//   Encoding: bits[31]=0, bits[30]=Q, bits[29:24]=001110, bits[23:22]=00,
+//   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:13]=len, bit12=op, bits[11:10]=00,
+//   bits[9:5]=Rn, bits[4:0]=Rd.  Q=0 → 8B form, Q=1 → 16B form.
+//   len ∈ {0,1,2,3} → 1..4 table registers; op: 0=TBL, 1=TBX.
+constexpr uint32_t TblTbxEncoding(uint8_t q, uint8_t rd, uint8_t rn, uint8_t rm,
+                                  uint8_t len, uint8_t op) {
+  return (static_cast<uint32_t>(q) << 30) | 0x0E000000u |
+         (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(len) << 13) |
+         (static_cast<uint32_t>(op) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Tbl16B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 0, 0);
+}
+constexpr uint32_t Tbl8B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(0, rd, rn, rm, 0, 0);
+}
+constexpr uint32_t Tbx16B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 0, 1);
+}
+constexpr uint32_t Tbx8B_1Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(0, rd, rn, rm, 0, 1);
+}
+constexpr uint32_t Tbl16B_2Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 1, 0);
+}
+constexpr uint32_t Tbl16B_3Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 2, 0);
+}
+constexpr uint32_t Tbl16B_4Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 3, 0);
+}
+constexpr uint32_t Tbx16B_2Reg(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return TblTbxEncoding(1, rd, rn, rm, 1, 1);
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — identity permutation (indices 0..15) selects
+// Vn unchanged.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BIdentity) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xA0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(i);
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — out-of-range index gives 0 (NOT a wrapped
+// lookup).  Test indices in [16..127] which PSHUFB alone would mis-handle as
+// `Vn[idx & 0x0F]`.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BOutOfRangeZeros) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x10 + i);
+  }
+  // Indices 0..15 valid, 16..31 invalid (must yield 0, not wrap).
+  for (int i = 0; i < 8; ++i)  idx_bytes[i] = static_cast<uint8_t>(i);
+  for (int i = 8; i < 16; ++i) idx_bytes[i] = static_cast<uint8_t>(16 + i);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i << " (out-of-range must be 0)";
+  }
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — high-bit indices (128..255) yield 0.  This
+// is the PSHUFB native behaviour (bit 7 set → 0).
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BHighBitIndexZeros) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(0x80 | i);  // 0x80..0x8F — all OOR.
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(&state_.cpu.v[0])[i], 0u)
+        << "byte " << i;
+  }
+}
+
+// TBL Vd.8B (Q=0): only low 8 bytes computed; upper 8 bytes zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl8BUpperZero) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xE0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(i);  // identity
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-fill garbage
+  static const uint32_t code[] = {Tbl8B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i << " (upper must be 0)";
+  }
+}
+
+// TBX Vd.16B, {Vn.16B}, Vm.16B — out-of-range index preserves Vd (the key
+// TBX-vs-TBL difference).
+TEST_F(Arm64LiteTranslateRegionTest, Tbx16BPreservesVdOnOOR) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  uint8_t vd_initial[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x40 + i);
+    vd_initial[i]  = static_cast<uint8_t>(0x90 + i);
+  }
+  // First 8 indices valid; next 8 out of range.
+  for (int i = 0; i < 8; ++i)  idx_bytes[i] = static_cast<uint8_t>(i);
+  for (int i = 8; i < 16; ++i) idx_bytes[i] = static_cast<uint8_t>(16 + i);
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);  // Vd pre-filled
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {Tbx16B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], vd_initial[i]) << "byte " << i << " (TBX preserves Vd)";
+  }
+}
+
+// TBX Vd.8B (Q=0): preserved bytes in low 8 honour Vd; upper 8 always 0.
+TEST_F(Arm64LiteTranslateRegionTest, Tbx8BUpperZeroDespiteVd) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  uint8_t vd_initial[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x50 + i);
+    vd_initial[i]  = static_cast<uint8_t>(0xA0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(0xFF);  // every byte out of range.
+  }
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {Tbx8B_1Reg(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  // Q=0 form: low 8 bytes preserved (TBX semantics, all OOR), upper 8 zero.
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], vd_initial[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i;
+  }
+}
+
+// TBL Vd.16B, {Vn.16B, V(n+1).16B}, Vm.16B — two-register table.  Indices
+// 0..15 → Vn, 16..31 → V(n+1).
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16B2RegSpan) {
+  uint8_t t0[16], t1[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i]  = static_cast<uint8_t>(0x20 + i);
+    t1[i]  = static_cast<uint8_t>(0x60 + i);
+    idx[i] = static_cast<uint8_t>(2 * i);  // 0,2,4,...,30 — alternates t0/t1.
+  }
+  std::memcpy(&state_.cpu.v[1], t0,  16);
+  std::memcpy(&state_.cpu.v[2], t1,  16);
+  std::memcpy(&state_.cpu.v[3], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_2Reg(0, 1, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected;
+    int j = 2 * i;
+    expected = (j < 16) ? t0[j] : t1[j - 16];
+    EXPECT_EQ(out[i], expected) << "byte " << i << " idx=" << j;
+  }
+}
+
+// TBL Vd.16B, 3-reg table: indices 0..47 valid.  Test specifically the
+// transitions around register boundaries (15/16, 31/32).
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16B3RegBoundaries) {
+  uint8_t t0[16], t1[16], t2[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i] = static_cast<uint8_t>(0x10 + i);
+    t1[i] = static_cast<uint8_t>(0x50 + i);
+    t2[i] = static_cast<uint8_t>(0x90 + i);
+  }
+  // Indices: 14, 15, 16, 17, 30, 31, 32, 33, then 47, 48 (last valid + OOR), …
+  uint8_t test_idx[16] = {14, 15, 16, 17, 30, 31, 32, 33,
+                          47, 48, 50, 60, 0, 16, 32, 47};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[1], t0,  16);
+  std::memcpy(&state_.cpu.v[2], t1,  16);
+  std::memcpy(&state_.cpu.v[3], t2,  16);
+  std::memcpy(&state_.cpu.v[4], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_3Reg(0, 1, 4)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  auto lookup = [&](int j) -> uint8_t {
+    if (j < 16)      return t0[j];
+    else if (j < 32) return t1[j - 16];
+    else if (j < 48) return t2[j - 32];
+    else             return 0;
+  };
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], lookup(test_idx[i])) << "byte " << i << " idx=" << static_cast<int>(test_idx[i]);
+  }
+}
+
+// TBL Vd.16B, 4-reg table: indices 0..63 valid.  Covers all four registers
+// and the upper-OOR (64..127) zero case.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16B4RegFull) {
+  uint8_t t[4][16], idx[16];
+  for (int r = 0; r < 4; ++r) {
+    for (int i = 0; i < 16; ++i) {
+      t[r][i] = static_cast<uint8_t>((r << 4) | i);  // each byte = byte index!
+    }
+  }
+  // Indices: 0,16,32,48 (first byte of each reg), 15,31,47,63 (last byte), 64
+  // (OOR), 100 (OOR), then a sprinkle.
+  uint8_t test_idx[16] = {0, 16, 32, 48, 15, 31, 47, 63,
+                          64, 100, 1, 17, 33, 49, 60, 70};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[1], t[0], 16);
+  std::memcpy(&state_.cpu.v[2], t[1], 16);
+  std::memcpy(&state_.cpu.v[3], t[2], 16);
+  std::memcpy(&state_.cpu.v[4], t[3], 16);
+  std::memcpy(&state_.cpu.v[5], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {Tbl16B_4Reg(0, 1, 5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected = (test_idx[i] < 64) ? test_idx[i] : 0u;
+    EXPECT_EQ(out[i], expected) << "byte " << i;
+  }
+}
+
+// TBX 2-reg: in-range bytes get the lookup; OOR bytes preserve Vd.
+TEST_F(Arm64LiteTranslateRegionTest, Tbx16B2RegMixed) {
+  uint8_t t0[16], t1[16], vd_initial[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i]         = static_cast<uint8_t>(0x30 + i);
+    t1[i]         = static_cast<uint8_t>(0x70 + i);
+    vd_initial[i] = static_cast<uint8_t>(0xB0 + i);
+  }
+  // Mix: half in-range across t0/t1, half OOR.
+  uint8_t test_idx[16] = {0, 1, 16, 17, 32, 200, 33, 100,
+                          15, 31, 14, 30, 64, 0, 50, 31};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], t0, 16);
+  std::memcpy(&state_.cpu.v[2], t1, 16);
+  std::memcpy(&state_.cpu.v[3], idx, 16);
+  static const uint32_t code[] = {Tbx16B_2Reg(0, 1, 3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  auto lookup = [&](int j, int byte_i) -> uint8_t {
+    if (j < 16)      return t0[j];
+    else if (j < 32) return t1[j - 16];
+    else             return vd_initial[byte_i];  // TBX preserve
+  };
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], lookup(test_idx[i], i)) << "byte " << i;
+  }
+}
+
+// TBL with Vd == Vn (in-place table): the table is read before Vd is written.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BInPlaceVdEqualsVn) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(15 - i);  // reverse permutation.
+  }
+  std::memcpy(&state_.cpu.v[5], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  // Vd == Vn == V5.
+  static const uint32_t code[] = {Tbl16B_1Reg(5, 5, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[5], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[15 - i]) << "byte " << i;
+  }
+}
+
+// TBL with Vd == Vm (in-place index): the index vector is read before Vd is
+// written.
+TEST_F(Arm64LiteTranslateRegionTest, Tbl16BInPlaceVdEqualsVm) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xD0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>((i * 3) & 0x0F);  // 0,3,6,9,...
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[7], idx_bytes, 16);
+  // Vd == Vm == V7.
+  static const uint32_t code[] = {Tbl16B_1Reg(7, 1, 7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[7], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[idx_bytes[i]]) << "byte " << i;
+  }
 }
 // endregion
 

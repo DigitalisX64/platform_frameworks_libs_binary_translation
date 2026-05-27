@@ -7093,11 +7093,121 @@ class LiteTranslator {
     // endregion
   }
 
+  // region digitalis
+  // JIT for AdvSIMD TBL/TBX (table lookup / table lookup extended).
+  //   TBL Vd.<T>, {Vn.16B [, V(n+1) [, V(n+2) [, V(n+3)]]]}, Vm.<T>
+  //   TBX Vd.<T>, {Vn.16B [, V(n+1) [, V(n+2) [, V(n+3)]]]}, Vm.<T>
+  // T = 8B (q=0) or 16B (q=1).  len ∈ {0,1,2,3} → 1..4 table registers
+  // (consecutive, wrapping (rn+r) mod 32).  op: 0=TBL, 1=TBX.
+  //
+  // Per output byte i (i < 8 or 16):
+  //   idx = Vm.byte[i]
+  //   if idx < table_regs*16: out[i] = table.byte[idx]
+  //   else (TBL): out[i] = 0
+  //   else (TBX): out[i] = Vd.byte[i] (preserved)
+  //
+  // x86 PSHUFB(dst, mask) computes per byte:
+  //   if mask[i][7] = 1: dst[i] = 0
+  //   else              : dst[i] = src.byte[mask[i] & 0x0F]
+  //
+  // Approach: for each table register r in [0, table_regs):
+  //   shifted_idx_r = (Vm.byte[i] - r*16) bytewise wrap
+  //   in_range_r    = 0xFF if shifted_idx_r ∈ [0,15] else 0x00
+  //                  = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0)
+  //   looked_up_r   = PSHUFB(V[(rn+r) % 32], shifted_idx_r)
+  //   looked_up_r &= in_range_r   (zero wrong-register lookups, including
+  //                                 the [16..127] band that PSHUFB doesn't
+  //                                 mask)
+  //   acc          |= looked_up_r
+  //   in_range_all |= in_range_r
+  // For TBX, blend Vd back over bytes not in any register's range:
+  //   result = acc | (Vd & ~in_range_all)
+  // For TBL, result = acc.
+  // For q=0, zero upper 64 bits via the standard PSLLDQ/PSRLDQ pair.
+  //
+  // All table loads happen before any store to Vd, so in-place encodings
+  // (Vd == Vn, Vd == Vm, Vd == V(n+1)..) read the original source bytes.
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
                           uint8_t op, bool q) {
-    UNUSED(rd, rn, rm, len, op, q);
-    Undefined();
+    const uint8_t table_regs = static_cast<uint8_t>(len + 1);  // 1..4
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + rd * 16;
+
+    SimdRegister xmm_idx        = AllocTempSimdReg();
+    SimdRegister xmm_acc        = AllocTempSimdReg();
+    SimdRegister xmm_in_range   = AllocTempSimdReg();
+    SimdRegister xmm_const15    = AllocTempSimdReg();
+    SimdRegister xmm_zero       = AllocTempSimdReg();
+    SimdRegister xmm_tmp_idx    = AllocTempSimdReg();
+    SimdRegister xmm_tmp_lookup = AllocTempSimdReg();
+    SimdRegister xmm_tmp_mask   = AllocTempSimdReg();
+    if (xmm_idx == no_simd_register || xmm_acc == no_simd_register ||
+        xmm_in_range == no_simd_register || xmm_const15 == no_simd_register ||
+        xmm_zero == no_simd_register || xmm_tmp_idx == no_simd_register ||
+        xmm_tmp_lookup == no_simd_register || xmm_tmp_mask == no_simd_register) {
+      success_ = false; return;
+    }
+
+    Register r_const = AllocTempReg();
+    if (r_const == no_register) { success_ = false; return; }
+
+    // Load the index vector once.  Vm is the per-byte selector.
+    as_.Movdqu(xmm_idx, {.base = Assembler::rbp, .disp = vm_off});
+    // acc = 0, in_range = 0, zero = 0.
+    as_.Pxor(xmm_acc, xmm_acc);
+    as_.Pxor(xmm_in_range, xmm_in_range);
+    as_.Pxor(xmm_zero, xmm_zero);
+    // const15 = byte-broadcast(0x0F).
+    as_.Movq(r_const, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+    as_.Movq(xmm_const15, r_const);
+    as_.Punpcklqdq(xmm_const15, xmm_const15);
+
+    for (uint8_t r = 0; r < table_regs; ++r) {
+      const int32_t vn_off_r =
+          offsetof(ThreadState, cpu.v[0]) + ((rn + r) & 31) * 16;
+
+      // shifted_idx_r = Vm - r*16 (bytewise wrap).  For r=0 this is just Vm.
+      as_.Movdqa(xmm_tmp_idx, xmm_idx);
+      if (r != 0) {
+        const uint64_t broadcast =
+            uint64_t{0x0101010101010101ULL} * static_cast<uint64_t>(r * 16);
+        as_.Movq(r_const, static_cast<int64_t>(broadcast));
+        as_.Movq(xmm_tmp_mask, r_const);
+        as_.Punpcklqdq(xmm_tmp_mask, xmm_tmp_mask);
+        as_.Psubb(xmm_tmp_idx, xmm_tmp_mask);
+      }
+
+      // in_range_r = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0).
+      as_.Movdqa(xmm_tmp_mask, xmm_tmp_idx);
+      as_.Psubusb(xmm_tmp_mask, xmm_const15);
+      as_.Pcmpeqb(xmm_tmp_mask, xmm_zero);
+
+      // looked_up_r = PSHUFB(V[(rn+r)%32], shifted_idx_r), masked by in_range.
+      as_.Movdqu(xmm_tmp_lookup, {.base = Assembler::rbp, .disp = vn_off_r});
+      as_.Pshufb(xmm_tmp_lookup, xmm_tmp_idx);
+      as_.Pand(xmm_tmp_lookup, xmm_tmp_mask);
+
+      as_.Por(xmm_acc, xmm_tmp_lookup);
+      as_.Por(xmm_in_range, xmm_tmp_mask);
+    }
+
+    if (op /* TBX */) {
+      // result = acc | (Vd & ~in_range_all).
+      as_.Movdqu(xmm_tmp_lookup, {.base = Assembler::rbp, .disp = vd_off});
+      // xmm_tmp_mask := ~in_range_all & xmm_tmp_lookup
+      as_.Movdqa(xmm_tmp_mask, xmm_in_range);
+      as_.Pandn(xmm_tmp_mask, xmm_tmp_lookup);
+      as_.Por(xmm_acc, xmm_tmp_mask);
+    }
+
+    if (!q) {
+      // Q=0: zero the upper 64 bits per D-register semantics.
+      as_.Pslldq(xmm_acc, int8_t{8});
+      as_.Psrldq(xmm_acc, int8_t{8});
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_acc);
   }
+  // endregion
 
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     UNUSED(op, rd, rn, rm);
@@ -12179,16 +12289,47 @@ class LiteTranslator {
   // be replaced with the default qNaN even though FMA naturally propagates
   // one of the input NaNs — the ARM ARM mandates the default-NaN payload.
   //
-  // Other opcodes in this dispatch class (FABD, FCMxx, FACxx) and the FP16
-  // path (is_fp16=true) bail to the interpreter via success_=false — they
-  // are JIT follow-ups; the interpreter handles them correctly today.
+  // FABD scalar (FP32/FP64) lowers to SUBSS/SUBSD followed by an AND with
+  // the non-sign-bit mask (clear bit 31 / bit 63 of the result lane).  This
+  // is bit-exact for std::fabs(a - b): finite paths trivially match, and
+  // NaN paths match because the subtract quietens SNaNs and propagates a
+  // NaN payload with whatever sign x86 chose — the AND-mask then clears
+  // the sign bit, giving the same |NaN| the interpreter's std::fabs(NaN)
+  // produces.  Inexact / invalid exceptions flow through MXCSR exactly as
+  // for SUB; the region-exit MXCSR→FPSR mirror picks them up.
+  //
+  // FCMEQ / FCMGE / FCMGT (FP32/FP64) scalar lower to CMPEQSS/CMPLESS/
+  // CMPLTSS (or the SD variants) with operand reorder: ARM "a > b" is
+  // x86 "b < a", so we issue Cmpltss/Cmpltsd with the operands swapped
+  // and the destination is the (loaded-into-scratch) Vb register.  The
+  // result is a 32-bit / 64-bit all-ones mask in lane 0 (or zero), with
+  // bits above the lane zeroed by the Pxor+Movdqu+Movss/Movsd dst-write
+  // pattern.  Matches the interpreter's `(a == b) ? 0xFFFF... : 0`
+  // C++-operator semantics exactly for finite, +/-0, +/-inf, and NaN
+  // inputs (C++ FP comparisons return false for any NaN-involved cmp;
+  // x86 CMPSS predicates 0/1/2 return all-zeros for any NaN input).
+  //
+  // FACGE / FACGT (FP32/FP64) scalar are the same as FCMGE / FCMGT but
+  // with abs() applied to both operands first via AND-with-non-sign-mask
+  // — same mask construction as FABD.
+  //
+  // The FP16 path (is_fp16=true) bails to the interpreter via
+  // success_=false — it is a JIT follow-up; the interpreter handles it
+  // correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
     if (args.is_fp16) { success_ = false; return; }
     const auto opc = args.opcode;
     const bool is_fmulx = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFmulx);
     const bool is_frecps = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrecps);
     const bool is_frsqrts = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts);
-    if (!is_fmulx && !is_frecps && !is_frsqrts) {
+    const bool is_fabd = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFabd);
+    const bool is_fcmeq = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq);
+    const bool is_fcmge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmge);
+    const bool is_fcmgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt);
+    const bool is_facge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacge);
+    const bool is_facgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacgt);
+    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd &&
+        !is_fcmeq && !is_fcmge && !is_fcmgt && !is_facge && !is_facgt) {
       success_ = false; return;
     }
     if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
@@ -12199,6 +12340,95 @@ class LiteTranslator {
     int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     int32_t src_m_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
     int32_t dst_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    if (is_fabd) {
+      SimdRegister xmm_a = AllocTempSimdReg();
+      SimdRegister xmm_b = AllocTempSimdReg();
+      SimdRegister xmm_mask = AllocTempSimdReg();
+      if (xmm_a == no_simd_register || xmm_b == no_simd_register ||
+          xmm_mask == no_simd_register) {
+        success_ = false; return;
+      }
+      if (is_double) {
+        as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+        as_.Subsd(xmm_a, xmm_b);
+      } else {
+        as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+        as_.Subss(xmm_a, xmm_b);
+      }
+      // Build non-sign-bit mask (all-ones shifted right by 1) and AND it
+      // into the lane to clear the sign bit (== std::fabs).
+      as_.Pcmpeqd(xmm_mask, xmm_mask);
+      if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
+      else as_.Psrld(xmm_mask, int8_t{1});
+      as_.Pand(xmm_a, xmm_mask);
+      // Zero Vd above the lane, then write the scalar result at lane 0.
+      as_.Pxor(xmm_mask, xmm_mask);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_mask);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      }
+      return;
+    }
+
+    if (is_fcmeq || is_fcmge || is_fcmgt || is_facge || is_facgt) {
+      SimdRegister xmm_a = AllocTempSimdReg();
+      SimdRegister xmm_b = AllocTempSimdReg();
+      if (xmm_a == no_simd_register || xmm_b == no_simd_register) {
+        success_ = false; return;
+      }
+      if (is_double) {
+        as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+      } else {
+        as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+      }
+      // FACGE / FACGT: clear sign bits of both operands (== std::fabs).
+      if (is_facge || is_facgt) {
+        SimdRegister xmm_mask = AllocTempSimdReg();
+        if (xmm_mask == no_simd_register) { success_ = false; return; }
+        as_.Pcmpeqd(xmm_mask, xmm_mask);
+        if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
+        else as_.Psrld(xmm_mask, int8_t{1});
+        as_.Pand(xmm_a, xmm_mask);
+        as_.Pand(xmm_b, xmm_mask);
+      }
+      // Apply comparison.  CMPSS/CMPSD has dst := (dst cmp src):
+      //   FCMEQ a, b: xmm_a := (a == b)     — predicate EQ_OQ.
+      //   FCMGE a, b (a >= b == b <= a):  xmm_b := (b <= a) — LE_OS, swapped.
+      //   FCMGT a, b (a > b == b < a):    xmm_b := (b <  a) — LT_OS, swapped.
+      //   FACGE/FACGT — same as FCMGE/FCMGT after both operands are |·|.
+      SimdRegister xmm_result = no_simd_register;
+      if (is_fcmeq) {
+        if (is_double) as_.Cmpeqsd(xmm_a, xmm_b);
+        else as_.Cmpeqss(xmm_a, xmm_b);
+        xmm_result = xmm_a;
+      } else if (is_fcmge || is_facge) {
+        if (is_double) as_.Cmplesd(xmm_b, xmm_a);
+        else as_.Cmpless(xmm_b, xmm_a);
+        xmm_result = xmm_b;
+      } else {  // is_fcmgt || is_facgt
+        if (is_double) as_.Cmpltsd(xmm_b, xmm_a);
+        else as_.Cmpltss(xmm_b, xmm_a);
+        xmm_result = xmm_b;
+      }
+      // Zero Vd above the lane, then write the scalar mask at lane 0.
+      // Reuse whichever of xmm_a / xmm_b is not the result as the zero scratch.
+      SimdRegister xmm_zero = (xmm_result == xmm_a) ? xmm_b : xmm_a;
+      as_.Pxor(xmm_zero, xmm_zero);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_zero);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+      }
+      return;
+    }
 
     if (is_frecps || is_frsqrts) {
       // Constants: K_fma (the additive in FMA(-a,b,K)) and K_sat (the
@@ -12412,9 +12642,211 @@ class LiteTranslator {
   }
   // endregion
 
+  // AdvSimd scalar pairwise JIT (ARM ARM "Advanced SIMD scalar pairwise").
+  // Reads a pair of esize elements from Vn (lane[0] and lane[1] of the low
+  // 64 bits) and combines them into a single scalar in Vd lane[0], with bits
+  // above the lane zero-extended.
+  //
+  // Currently implemented:
+  //   kAddp           — ADDP scalar D-form (Vd.D = Vn.D[0] + Vn.D[1]) via Paddq.
+  //   kFaddpScalar    — FADDP scalar S/D via Addss / Addsd.
+  //   kFmaxpScalar    — FMAXP scalar S/D via NaN-propagating max idiom
+  //                     (Maxss/Maxsd × 2 + Por) + ±0 sign disambiguation.
+  //   kFminpScalar    — FMINP scalar S/D via NaN-propagating min idiom.
+  //   kFmaxnmpScalar  — FMAXNMP scalar S/D via NaN-suppressing substitution.
+  //   kFminnmpScalar  — FMINNMP scalar S/D via NaN-suppressing substitution.
+  //
+  // FP16 path (Armv8.2-FP16 forms at U=0 + size[0]=0) bails to the
+  // interpreter — needs FP16↔FP32 promotion around the reduction.  The
+  // interpreter handles those paths correctly today.
+  //
+  // FMAX/FMIN-vs-FMAXNM/FMINNM NaN policy (matches the vector lowering at
+  // AdvSimdThreeSame{kFmaxV,kFminV,kFmaxnmV,kFminnmV}):
+  //   - FMAX/FMIN: any NaN input -> NaN result (NaN propagation).
+  //   - FMAXNM/FMINNM: single NaN -> the other operand; both NaN -> NaN.
+  //
+  // ±0 sign disambiguation (ARM ARM C7.2):
+  //   - FMAX(+0,-0)=FMAX(-0,+0)=+0 regardless of operand order;
+  //   - FMIN(+0,-0)=FMIN(-0,+0)=-0 regardless of operand order.
+  // x86 MAXSS/MAXSD/MINSS/MINSD on (0,0) return the source operand bits,
+  // which is order-sensitive, so we apply a corrective blend:
+  // when both inputs are zero we replace the result with AND(a,b) for
+  // FMAX-family (gives +0 if either is +0) or OR(a,b) for FMIN-family
+  // (gives -0 if either is -0).  In the (-0,-0) case AND/OR both produce
+  // -0, which matches ARM's "sign of -0 is preserved" for both families.
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
-    UNUSED(args);
-    Undefined();
+    using Op = Decoder::AdvSimdScalarPairwiseOpcode;
+    if (args.is_fp16) { success_ = false; return; }
+    const auto opc = args.opcode;
+    const bool is_addp        = (opc == Op::kAddp);
+    const bool is_faddp       = (opc == Op::kFaddpScalar);
+    const bool is_fmax_family = (opc == Op::kFmaxpScalar ||
+                                 opc == Op::kFmaxnmpScalar);
+    const bool is_fmin_family = (opc == Op::kFminpScalar ||
+                                 opc == Op::kFminnmpScalar);
+    const bool is_minmax      = is_fmax_family || is_fmin_family;
+    const bool is_nm          = (opc == Op::kFmaxnmpScalar ||
+                                 opc == Op::kFminnmpScalar);
+    if (!is_addp && !is_faddp && !is_minmax) {
+      success_ = false; return;
+    }
+
+    int32_t src_n_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    int32_t dst_off   = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+    // is_double also covers ADDP (D-form, 64-bit) for store-width selection.
+    const bool is_double = is_addp || ((args.size & 1) != 0);
+
+    SimdRegister xmm_a = AllocTempSimdReg();
+    SimdRegister xmm_b = AllocTempSimdReg();
+    if (xmm_a == no_simd_register || xmm_b == no_simd_register) {
+      success_ = false; return;
+    }
+
+    // Load lane 0 (xmm_a) and lane 1 (xmm_b) of Vn.  Movsd/Movss from memory
+    // zero-extend upper 96/64 bits — both source lanes are loaded before any
+    // store to Vd so an in-place encoding (Vd == Vn) reads Vn's original pair.
+    if (is_addp) {
+      as_.Movq(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movq(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
+    } else if (is_double) {
+      as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
+    } else {
+      as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+      as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 4});
+    }
+
+    if (is_addp) {
+      as_.Paddq(xmm_a, xmm_b);
+    } else if (is_faddp) {
+      if (is_double) as_.Addsd(xmm_a, xmm_b);
+      else            as_.Addss(xmm_a, xmm_b);
+    } else {
+      // FMAXP / FMINP / FMAXNMP / FMINNMP scalar.
+      //
+      // Compute the ±0 corrective value and the "both zero" mask from the
+      // original loads BEFORE the min/max op clobbers xmm_a.  After the
+      // min/max we blend the corrective value over the result where the
+      // mask says both inputs were zero.
+      SimdRegister xmm_corr = AllocTempSimdReg();
+      SimdRegister xmm_eq_a = AllocTempSimdReg();
+      SimdRegister xmm_eq_b = AllocTempSimdReg();
+      SimdRegister xmm_zero = AllocTempSimdReg();
+      if (xmm_corr == no_simd_register || xmm_eq_a == no_simd_register ||
+          xmm_eq_b == no_simd_register || xmm_zero == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Corrective value: AND(a,b) for FMAX family, OR(a,b) for FMIN family.
+      as_.Movdqa(xmm_corr, xmm_a);
+      if (is_fmax_family) as_.Pand(xmm_corr, xmm_b);
+      else                as_.Por(xmm_corr, xmm_b);
+
+      // "Both zero" mask in xmm_eq_a (low lane all-ones iff both ==0; IEEE
+      // -0 compares equal to +0, so this catches both sign forms).
+      as_.Pxor(xmm_zero, xmm_zero);
+      as_.Movdqa(xmm_eq_a, xmm_a);
+      if (is_double) as_.Cmpeqsd(xmm_eq_a, xmm_zero);
+      else            as_.Cmpeqss(xmm_eq_a, xmm_zero);
+      as_.Movdqa(xmm_eq_b, xmm_b);
+      if (is_double) as_.Cmpeqsd(xmm_eq_b, xmm_zero);
+      else            as_.Cmpeqss(xmm_eq_b, xmm_zero);
+      as_.Pand(xmm_eq_a, xmm_eq_b);
+
+      if (!is_nm) {
+        // FMAX/FMIN: NaN-propagating idiom (mirrors the vector lowering at
+        // AdvSimdThreeSame kFmaxV/kFminV).
+        //   tmp = b; (Min|Max)ps tmp, a  -> tmp = a if any NaN, else min/max
+        //   (Min|Max)ps a, b              -> a   = b if any NaN, else min/max
+        //   POR a, tmp                    -> bitwise OR keeps all-1 exponent
+        //                                    (NaN) if either was NaN; equals
+        //                                    min/max otherwise.
+        // We use the packed (PS/PD) variants because the assembler does not
+        // expose scalar Maxss/Minss/Maxsd/Minsd; upper lanes hold zero (from
+        // the Movsd/Movss zero-extending memory load) and stay zero through
+        // the packed op since x86 MAX/MIN on (0,0) returns src2 = 0.
+        SimdRegister xmm_tmp = AllocTempSimdReg();
+        if (xmm_tmp == no_simd_register) { success_ = false; return; }
+        as_.Movdqa(xmm_tmp, xmm_b);
+        if (is_fmax_family) {
+          if (is_double) {
+            as_.Maxpd(xmm_tmp, xmm_a);
+            as_.Maxpd(xmm_a, xmm_b);
+          } else {
+            as_.Maxps(xmm_tmp, xmm_a);
+            as_.Maxps(xmm_a, xmm_b);
+          }
+        } else {
+          if (is_double) {
+            as_.Minpd(xmm_tmp, xmm_a);
+            as_.Minpd(xmm_a, xmm_b);
+          } else {
+            as_.Minps(xmm_tmp, xmm_a);
+            as_.Minps(xmm_a, xmm_b);
+          }
+        }
+        as_.Por(xmm_a, xmm_tmp);
+      } else {
+        // FMAXNM/FMINNM: substitute NaN lanes with the other operand, then
+        // take min/max.  After substitution:
+        //   - a NaN, b non-NaN -> a' = b, b' = b -> MAXSS/MINSS = b. ✓
+        //   - b NaN, a non-NaN -> a' = a, b' = a -> MAXSS/MINSS = a. ✓
+        //   - both NaN         -> a' = b (NaN), b' = a (NaN); the result
+        //                          must be NaN per ARM ARM.  MAXSS/MINSS on
+        //                          (NaN, NaN) returns the SRC2 operand bits,
+        //                          which is still a NaN, satisfying ARM.
+        //   - neither NaN      -> a' = a, b' = b -> normal MAXSS/MINSS.
+        SimdRegister xmm_mask_a = AllocTempSimdReg();
+        SimdRegister xmm_mask_b = AllocTempSimdReg();
+        SimdRegister xmm_sub_a  = AllocTempSimdReg();
+        SimdRegister xmm_sub_b  = AllocTempSimdReg();
+        if (xmm_mask_a == no_simd_register || xmm_mask_b == no_simd_register ||
+            xmm_sub_a == no_simd_register || xmm_sub_b == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqa(xmm_mask_a, xmm_a);
+        if (is_double) as_.Cmpunordsd(xmm_mask_a, xmm_mask_a);
+        else            as_.Cmpunordss(xmm_mask_a, xmm_mask_a);
+        as_.Movdqa(xmm_mask_b, xmm_b);
+        if (is_double) as_.Cmpunordsd(xmm_mask_b, xmm_mask_b);
+        else            as_.Cmpunordss(xmm_mask_b, xmm_mask_b);
+        as_.Movdqa(xmm_sub_a, xmm_mask_a);
+        as_.Pand(xmm_sub_a, xmm_b);
+        as_.Movdqa(xmm_sub_b, xmm_mask_b);
+        as_.Pand(xmm_sub_b, xmm_a);
+        as_.Pandn(xmm_mask_a, xmm_a);
+        as_.Pandn(xmm_mask_b, xmm_b);
+        as_.Por(xmm_mask_a, xmm_sub_a);
+        as_.Por(xmm_mask_b, xmm_sub_b);
+        if (is_fmax_family) {
+          if (is_double) as_.Maxpd(xmm_mask_a, xmm_mask_b);
+          else            as_.Maxps(xmm_mask_a, xmm_mask_b);
+        } else {
+          if (is_double) as_.Minpd(xmm_mask_a, xmm_mask_b);
+          else            as_.Minps(xmm_mask_a, xmm_mask_b);
+        }
+        as_.Movdqa(xmm_a, xmm_mask_a);
+      }
+
+      // ±0 disambiguation: blend xmm_corr over xmm_a where both inputs were
+      // zero.  Result: xmm_a := (mask & corr) | (~mask & xmm_a).
+      as_.Pand(xmm_corr, xmm_eq_a);
+      as_.Pandn(xmm_eq_a, xmm_a);
+      as_.Por(xmm_corr, xmm_eq_a);
+      as_.Movdqa(xmm_a, xmm_corr);
+    }
+
+    // Zero Vd above the result lane, then write the scalar at lane 0.
+    // S-form writes 32 bits (lanes 1..3 stay zero); D-form and ADDP write
+    // 64 bits (upper 64 bits stay zero).
+    as_.Pxor(xmm_b, xmm_b);
+    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_b);
+    if (is_double) {
+      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    } else {
+      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    }
   }
   // endregion
 
