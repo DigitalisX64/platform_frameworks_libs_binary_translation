@@ -6447,6 +6447,122 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHInPlace) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarThreeSame FP16 FABD scalar Hd via F16C
+// round-trip.  Same lift recipe as FMULX H (Pxor + Pinsrw + Vcvtph2ps each
+// FP16 source lane into FP32 xmm lane 0); the existing FP32 FABD core
+// (Subss + AND with non-sign-bit mask) runs unchanged on the lifted
+// operands; the FP32 result is narrowed back to FP16 via Vcvtps2ph
+// (real-FP value, not a mask — Vcvtps2ph is the right primitive here).
+// Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)" —
+// a=1, U=1, opcode_3=010):
+//   FABD Hd, Hn, Hm = 0x7EC01400 | (rm<<16) | (rn<<5) | rd
+// Cross-check: FacgtScalarH base (a=1, U=1, opcode_3=101) is 0x7EC02C00;
+// delta to FABD by opcode_3 difference = (010 - 101) << 11 = -0x1800.
+// 0x7EC02C00 - 0x1800 = 0x7EC01400. ✓
+constexpr uint32_t FabdScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EC01400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FABD Hd: positive result (5.0 - 3.5 = 1.5).  5.0h=0x4500, 3.5h=0x4300,
+// 1.5h=0x3E00.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHPositiveResult) {
+  StoreScalarH(state_.cpu, 1, 0x4500u);  // 5.0
+  StoreScalarH(state_.cpu, 2, 0x4300u);  // 3.5
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x3E00u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FABD Hd: negative subtract pinned to positive by fabs (3.5 - 5.0 = -1.5,
+// |...|=1.5).  The Pand against the non-sign-bit mask must clear bit 31 of
+// the FP32 (lifted) representation, which then narrows to FP16 with bit
+// 15 cleared.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHNegativeSubtract) {
+  StoreScalarH(state_.cpu, 1, 0x4300u);  // 3.5
+  StoreScalarH(state_.cpu, 2, 0x4500u);  // 5.0
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x3E00u);
+}
+
+// FABD Hd: equal inputs -> +0 (subtract is exact-zero, AND with mask
+// keeps it +0).  1.5 - 1.5 = +0.0h = 0x0000.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHEqualInputsPositiveZero) {
+  StoreScalarH(state_.cpu, 1, 0x3E00u);  // 1.5
+  StoreScalarH(state_.cpu, 2, 0x3E00u);  // 1.5
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FABD Hd: NaN propagation.  qNaN - finite -> NaN; the AND-with-non-sign
+// mask clears the sign bit but leaves the NaN payload intact (high
+// fraction bits non-zero, exponent all-ones).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHNaNInput) {
+  StoreScalarH(state_.cpu, 1, 0x7E00u);  // qNaN
+  StoreScalarH(state_.cpu, 2, 0x3C00u);  // 1.0
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t result = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(result & 0x7C00u, 0x7C00u);  // exponent all-ones (NaN/inf)
+  EXPECT_NE(result & 0x03FFu, 0u);       // frac non-zero (NaN, not inf)
+  EXPECT_EQ(result & 0x8000u, 0u);       // sign bit cleared by fabs mask
+}
+
+// FABD Hd: inf - inf -> NaN (subtract of equal infinities is the canonical
+// invalid-op case).  AND with non-sign mask preserves NaN-ness.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHInfMinusInf) {
+  StoreScalarH(state_.cpu, 1, 0x7C00u);  // +inf
+  StoreScalarH(state_.cpu, 2, 0x7C00u);  // +inf
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t result = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(result & 0x7C00u, 0x7C00u);
+  EXPECT_NE(result & 0x03FFu, 0u);
+}
+
+// FABD Hd: inf - finite -> +inf.  |+inf| = +inf = 0x7C00.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHInfMinusFinite) {
+  StoreScalarH(state_.cpu, 1, 0x7C00u);  // +inf
+  StoreScalarH(state_.cpu, 2, 0x4500u);  // 5.0
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x7C00u);
+}
+
+// FABD Hd: -inf - +1 -> -inf, fabs -> +inf (sign bit cleared).
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHNegInfMinusOne) {
+  StoreScalarH(state_.cpu, 1, 0xFC00u);  // -inf
+  StoreScalarH(state_.cpu, 2, 0x3C00u);  // 1.0
+  static const uint32_t code[] = {FabdScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x7C00u);
+}
+
+// FABD Hd in-place (Vd == Vn): the Pinsrw load reads operand bytes before
+// any store to Vd, so an in-place encoding must produce the correct result
+// with upper word lanes of Vd zero post-execution.
+TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHInPlace) {
+  state_.cpu.v[5] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[0] = 0x4500u;  // 5.0
+  for (int i = 1; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[i] = 0xAAAAu;
+  }
+  StoreScalarH(state_.cpu, 2, 0x4300u);  // 3.5
+  static const uint32_t code[] = {FabdScalarH(5, 5, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[0], 0x3E00u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
+  }
+}
+// endregion
+
 // region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
 // scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
 // C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
