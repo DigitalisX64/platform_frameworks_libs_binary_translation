@@ -590,6 +590,163 @@ TEST_F(Arm64LiteTranslateRegionTest, StlrWritesToMemory) {
   EXPECT_EQ(state_.cpu.x[2], 42ULL);
 }
 
+// LDAR/STLR all-size JIT coverage.
+// Common constant fields for all LDAR/STLR encodings:
+//   size 001000 1 L 0 11111 1 11111 Rn Rt
+// where bit22 = L (load=1, store=0) and bits[31:30] = size:
+//   00 = B, 01 = H, 10 = W (already covered above), 11 = X.
+// STLR base (L=0): 0x089FFC00 with size in bits[31:30].
+// LDAR base (L=1, bit22=1): 0x08DFFC00 with size in bits[31:30].
+constexpr uint32_t LdarB(uint8_t rt, uint8_t rn) {
+  return 0x08DFFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdarH(uint8_t rt, uint8_t rn) {
+  return 0x48DFFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdarW(uint8_t rt, uint8_t rn) {
+  return 0x88DFFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdarX(uint8_t rt, uint8_t rn) {
+  return 0xC8DFFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t StlrB(uint8_t rt, uint8_t rn) {
+  return 0x089FFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t StlrH(uint8_t rt, uint8_t rn) {
+  return 0x489FFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t StlrX(uint8_t rt, uint8_t rn) {
+  return 0xC89FFC00 | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdarBZeroExtends) {
+  // LDARB W1, [X0]: load one byte and zero-extend into X1.
+  // Source has a high-bit-set value (0xA5) to verify zero-extension over
+  // any stale high bits in the destination GPR.
+  static const uint8_t src = 0xA5;
+  static const uint32_t code[] = {
+      MovzX(1, 0xFFFF),            // pre-pollute X1 (must be overwritten)
+      LdarB(1, 0),                 // LDARB W1, [X0]
+  };
+  state_.cpu.x[0] = ToGuestAddr(&src);
+  state_.cpu.x[1] = 0xDEADBEEFCAFEBABEULL;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xA5ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdarHZeroExtends) {
+  // LDARH W1, [X0]: load 16 bits and zero-extend into X1.
+  static const uint16_t src = 0xA55A;
+  static const uint32_t code[] = {
+      LdarH(1, 0),                 // LDARH W1, [X0]
+  };
+  state_.cpu.x[0] = ToGuestAddr(&src);
+  state_.cpu.x[1] = 0xDEADBEEFCAFEBABEULL;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xA55AULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdarWZeroExtends) {
+  // LDAR W1, [X0]: load 32 bits and zero-extend into X1.
+  static const uint32_t src = 0xDEADBEEF;
+  static const uint32_t code[] = {
+      LdarW(1, 0),                 // LDAR W1, [X0]
+  };
+  state_.cpu.x[0] = ToGuestAddr(&src);
+  state_.cpu.x[1] = 0xCAFEBABECAFEBABEULL;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xDEADBEEFULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdarXLoads64Bit) {
+  // LDAR X1, [X0]: load full 64 bits into X1.
+  static const uint64_t src = 0xCAFEBABEDEADBEEFULL;
+  static const uint32_t code[] = {
+      LdarX(1, 0),                 // LDAR X1, [X0]
+  };
+  state_.cpu.x[0] = ToGuestAddr(&src);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xCAFEBABEDEADBEEFULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StlrBWritesByteOnly) {
+  // STLRB W1, [X0]: store low 8 bits to [X0]; surrounding bytes untouched.
+  static uint8_t buffer[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+  static const uint32_t code[] = {
+      MovzX(1, 0x5A),              // MOVZ X1, #0x5A (low byte of value)
+      StlrB(1, 0),                 // STLRB W1, [X0]
+  };
+  buffer[0] = 0xAA; buffer[1] = 0xAA; buffer[2] = 0xAA; buffer[3] = 0xAA;
+  state_.cpu.x[0] = ToGuestAddr(&buffer[1]);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buffer[0], 0xAA);
+  EXPECT_EQ(buffer[1], 0x5A);
+  EXPECT_EQ(buffer[2], 0xAA);
+  EXPECT_EQ(buffer[3], 0xAA);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StlrBIgnoresHighBits) {
+  // STLRB W1, [X0]: only the low 8 bits of W1 are stored. Verify that
+  // upper bits of the source register are ignored.
+  static uint8_t buffer[2] = {0x00, 0x00};
+  static const uint32_t code[] = {
+      MovzX(1, 0xFF5A),            // MOVZ X1, #0xFF5A
+      StlrB(1, 0),                 // STLRB W1, [X0] (writes 0x5A only)
+  };
+  buffer[0] = 0x00; buffer[1] = 0xCC;
+  state_.cpu.x[0] = ToGuestAddr(&buffer[0]);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buffer[0], 0x5A);
+  EXPECT_EQ(buffer[1], 0xCC);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StlrHWritesHalfwordOnly) {
+  // STLRH W1, [X0]: store low 16 bits to [X0]; surrounding bytes untouched.
+  static uint16_t buffer[2] = {0xAAAA, 0xAAAA};
+  static const uint32_t code[] = {
+      MovzX(1, 0x5AA5),            // MOVZ X1, #0x5AA5
+      StlrH(1, 0),                 // STLRH W1, [X0]
+  };
+  buffer[0] = 0xAAAA; buffer[1] = 0xAAAA;
+  state_.cpu.x[0] = ToGuestAddr(&buffer[0]);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buffer[0], 0x5AA5);
+  EXPECT_EQ(buffer[1], 0xAAAA);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StlrXWrites64Bit) {
+  // STLR X1, [X0]: store all 64 bits to [X0].
+  static uint64_t target_mem = 0;
+  static const uint32_t code[] = {
+      // X1 = 0x000000000000DEAD (only one MOVZ fits an imm16; the goal is
+      // just to put a recognizable non-zero into X1 and verify the full
+      // 64-bit store path).
+      MovzX(1, 0xDEAD),
+      StlrX(1, 0),                 // STLR X1, [X0]
+  };
+  target_mem = 0xCAFEBABECAFEBABEULL;
+  state_.cpu.x[0] = ToGuestAddr(&target_mem);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target_mem, 0xDEADULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdarBStlrBRoundtrip) {
+  // STLRB then LDARB roundtrip: store a byte, load it back, verify both
+  // halves of the JIT path agree on byte width and zero-extension.
+  static uint8_t target_mem = 0;
+  static const uint32_t code[] = {
+      MovzX(1, 0x7E),              // MOVZ X1, #0x7E (source byte)
+      StlrB(1, 0),                 // STLRB W1, [X0]
+      LdarB(2, 0),                 // LDARB W2, [X0]
+  };
+  target_mem = 0;
+  state_.cpu.x[0] = ToGuestAddr(&target_mem);
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(target_mem, 0x7E);
+  EXPECT_EQ(state_.cpu.x[2], 0x7EULL);
+}
+
 // DUP V0.16B, Wn: broadcast byte from GP register to all 16 lanes of V0.
 // Encoding: 0 Q=1 0 01110 000 imm5=00001 0 imm4=0001 1 Rn Rd
 // = 0100 1110 0000 0001 0000 0111 00 Rn Rd
