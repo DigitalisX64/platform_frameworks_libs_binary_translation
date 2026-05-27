@@ -12188,9 +12188,24 @@ class LiteTranslator {
   // produces.  Inexact / invalid exceptions flow through MXCSR exactly as
   // for SUB; the region-exit MXCSR→FPSR mirror picks them up.
   //
-  // Other opcodes in this dispatch class (FCMxx, FACxx) and the FP16
-  // path (is_fp16=true) bail to the interpreter via success_=false — they
-  // are JIT follow-ups; the interpreter handles them correctly today.
+  // FCMEQ / FCMGE / FCMGT (FP32/FP64) scalar lower to CMPEQSS/CMPLESS/
+  // CMPLTSS (or the SD variants) with operand reorder: ARM "a > b" is
+  // x86 "b < a", so we issue Cmpltss/Cmpltsd with the operands swapped
+  // and the destination is the (loaded-into-scratch) Vb register.  The
+  // result is a 32-bit / 64-bit all-ones mask in lane 0 (or zero), with
+  // bits above the lane zeroed by the Pxor+Movdqu+Movss/Movsd dst-write
+  // pattern.  Matches the interpreter's `(a == b) ? 0xFFFF... : 0`
+  // C++-operator semantics exactly for finite, +/-0, +/-inf, and NaN
+  // inputs (C++ FP comparisons return false for any NaN-involved cmp;
+  // x86 CMPSS predicates 0/1/2 return all-zeros for any NaN input).
+  //
+  // FACGE / FACGT (FP32/FP64) scalar are the same as FCMGE / FCMGT but
+  // with abs() applied to both operands first via AND-with-non-sign-mask
+  // — same mask construction as FABD.
+  //
+  // The FP16 path (is_fp16=true) bails to the interpreter via
+  // success_=false — it is a JIT follow-up; the interpreter handles it
+  // correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
     if (args.is_fp16) { success_ = false; return; }
     const auto opc = args.opcode;
@@ -12198,7 +12213,13 @@ class LiteTranslator {
     const bool is_frecps = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrecps);
     const bool is_frsqrts = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts);
     const bool is_fabd = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFabd);
-    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd) {
+    const bool is_fcmeq = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq);
+    const bool is_fcmge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmge);
+    const bool is_fcmgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt);
+    const bool is_facge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacge);
+    const bool is_facgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacgt);
+    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd &&
+        !is_fcmeq && !is_fcmge && !is_fcmgt && !is_facge && !is_facgt) {
       success_ = false; return;
     }
     if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
@@ -12240,6 +12261,61 @@ class LiteTranslator {
         as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
       } else {
         as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      }
+      return;
+    }
+
+    if (is_fcmeq || is_fcmge || is_fcmgt || is_facge || is_facgt) {
+      SimdRegister xmm_a = AllocTempSimdReg();
+      SimdRegister xmm_b = AllocTempSimdReg();
+      if (xmm_a == no_simd_register || xmm_b == no_simd_register) {
+        success_ = false; return;
+      }
+      if (is_double) {
+        as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+      } else {
+        as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
+        as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
+      }
+      // FACGE / FACGT: clear sign bits of both operands (== std::fabs).
+      if (is_facge || is_facgt) {
+        SimdRegister xmm_mask = AllocTempSimdReg();
+        if (xmm_mask == no_simd_register) { success_ = false; return; }
+        as_.Pcmpeqd(xmm_mask, xmm_mask);
+        if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
+        else as_.Psrld(xmm_mask, int8_t{1});
+        as_.Pand(xmm_a, xmm_mask);
+        as_.Pand(xmm_b, xmm_mask);
+      }
+      // Apply comparison.  CMPSS/CMPSD has dst := (dst cmp src):
+      //   FCMEQ a, b: xmm_a := (a == b)     — predicate EQ_OQ.
+      //   FCMGE a, b (a >= b == b <= a):  xmm_b := (b <= a) — LE_OS, swapped.
+      //   FCMGT a, b (a > b == b < a):    xmm_b := (b <  a) — LT_OS, swapped.
+      //   FACGE/FACGT — same as FCMGE/FCMGT after both operands are |·|.
+      SimdRegister xmm_result = no_simd_register;
+      if (is_fcmeq) {
+        if (is_double) as_.Cmpeqsd(xmm_a, xmm_b);
+        else as_.Cmpeqss(xmm_a, xmm_b);
+        xmm_result = xmm_a;
+      } else if (is_fcmge || is_facge) {
+        if (is_double) as_.Cmplesd(xmm_b, xmm_a);
+        else as_.Cmpless(xmm_b, xmm_a);
+        xmm_result = xmm_b;
+      } else {  // is_fcmgt || is_facgt
+        if (is_double) as_.Cmpltsd(xmm_b, xmm_a);
+        else as_.Cmpltss(xmm_b, xmm_a);
+        xmm_result = xmm_b;
+      }
+      // Zero Vd above the lane, then write the scalar mask at lane 0.
+      // Reuse whichever of xmm_a / xmm_b is not the result as the zero scratch.
+      SimdRegister xmm_zero = (xmm_result == xmm_a) ? xmm_b : xmm_a;
+      as_.Pxor(xmm_zero, xmm_zero);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_zero);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
       }
       return;
     }

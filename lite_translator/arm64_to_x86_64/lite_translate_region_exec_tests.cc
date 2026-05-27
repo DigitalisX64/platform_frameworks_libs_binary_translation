@@ -5932,6 +5932,242 @@ TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSInfMinusFinite) {
 }
 // endregion
 
+// region digitalis: FCMEQ / FCMGE / FCMGT / FACGE / FACGT scalar three-same
+// JIT (FP32/FP64).  Encoding (per ARM ARM C7.2.85 "FCMEQ (scalar)",
+// C7.2.87 "FCMGE (scalar, register)", C7.2.89 "FCMGT (scalar, register)",
+// C7.2.61 "FACGE (scalar)", C7.2.63 "FACGT (scalar)"):
+//
+//   bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=op_high,
+//   bit22=sz, bit21=1, bits[20:16]=Rm, bits[15:11]=opcode_5, bit10=1.
+//
+//   FCMEQ:  U=0, op_high=0, opcode=11100  → 0x5E20E400 (S) / 0x5E60E400 (D)
+//   FCMGE:  U=1, op_high=0, opcode=11100  → 0x7E20E400 (S) / 0x7E60E400 (D)
+//   FCMGT:  U=1, op_high=1, opcode=11100  → 0x7EA0E400 (S) / 0x7EE0E400 (D)
+//   FACGE:  U=1, op_high=0, opcode=11101  → 0x7E20EC00 (S) / 0x7E60EC00 (D)
+//   FACGT:  U=1, op_high=1, opcode=11101  → 0x7EA0EC00 (S) / 0x7EE0EC00 (D)
+constexpr uint32_t FcmeqScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E20E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E60E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E20E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E60E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EA0E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EE0E400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgeScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E20EC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgtScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7EA0EC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FacgeScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E60EC00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FCMEQ: equal -> 0xFFFFFFFF in lane 0 (S), upper lanes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarSEqualAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.25f);
+  StoreScalarToV<float>(state_.cpu, 2, 1.25f);
+  StoreScalarToV<float>(state_.cpu, 0, std::nanf(""));  // pre-trash dest
+  static const uint32_t code[] = {FcmeqScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FCMEQ: unequal -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarSUnequalZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FcmeqScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMEQ D form: equal -> 0xFFFFFFFFFFFFFFFF, upper 8B zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarDEqualAllOnes) {
+  StoreScalarToV<double>(state_.cpu, 1, -3.14);
+  StoreScalarToV<double>(state_.cpu, 2, -3.14);
+  static const uint32_t code[] = {FcmeqScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, 0u);
+}
+
+// FCMEQ with NaN input -> 0 (C++ a == NaN is false).
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarSNaNZero) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, std::nanf(""));
+  static const uint32_t code[] = {FcmeqScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGE: a >= b on a < b -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarSLessFalse) {
+  StoreScalarToV<float>(state_.cpu, 1, 1.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 2.0f);
+  static const uint32_t code[] = {FcmgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGE: a >= b on a == b -> all-ones (the boundary case).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarSEqualAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.14f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.14f);
+  static const uint32_t code[] = {FcmgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FCMGE D form: a > b -> all-ones.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarDGreaterAllOnes) {
+  StoreScalarToV<double>(state_.cpu, 1, 5.0);
+  StoreScalarToV<double>(state_.cpu, 2, 1.5);
+  static const uint32_t code[] = {FcmgeScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// FCMGE with NaN -> 0 (C++ NaN >= x is false).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeScalarSNaNZero) {
+  StoreScalarToV<float>(state_.cpu, 1, std::nanf(""));
+  StoreScalarToV<float>(state_.cpu, 2, 1.0f);
+  static const uint32_t code[] = {FcmgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGT: a > b on a > b -> all-ones.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarSGreaterAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 7.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.0f);
+  static const uint32_t code[] = {FcmgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FCMGT: a > b on a == b -> 0 (the boundary case; FCMGT is strict).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarSEqualZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 5.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FcmgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FCMGT D form: a > b on negative inputs.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtScalarDNegativeGreater) {
+  StoreScalarToV<double>(state_.cpu, 1, -1.0);
+  StoreScalarToV<double>(state_.cpu, 2, -5.0);
+  static const uint32_t code[] = {FcmgtScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// FACGE: |a| >= |b| where a is negative but larger in magnitude.
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarSAbsGreater) {
+  StoreScalarToV<float>(state_.cpu, 1, -5.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 3.0f);
+  static const uint32_t code[] = {FacgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FACGE: |a| >= |b| where |a| < |b| -> 0.
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarSAbsLessZero) {
+  StoreScalarToV<float>(state_.cpu, 1, -2.0f);
+  StoreScalarToV<float>(state_.cpu, 2, 5.0f);
+  static const uint32_t code[] = {FacgeScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+
+// FACGE D form: |a| == |b| -> all-ones (boundary inclusive).
+TEST_F(Arm64LiteTranslateRegionTest, FacgeScalarDAbsEqualAllOnes) {
+  StoreScalarToV<double>(state_.cpu, 1, -4.5);
+  StoreScalarToV<double>(state_.cpu, 2, 4.5);
+  static const uint32_t code[] = {FacgeScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint64_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// FACGT: |a| > |b| where |a| > |b| -> all-ones.
+TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsGreaterAllOnes) {
+  StoreScalarToV<float>(state_.cpu, 1, 6.0f);
+  StoreScalarToV<float>(state_.cpu, 2, -2.0f);
+  static const uint32_t code[] = {FacgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0xFFFFFFFFu);
+}
+
+// FACGT: |a| > |b| where |a| == |b| -> 0 (strict).
+TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsEqualZero) {
+  StoreScalarToV<float>(state_.cpu, 1, 3.5f);
+  StoreScalarToV<float>(state_.cpu, 2, -3.5f);
+  static const uint32_t code[] = {FacgtScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t lane0;
+  std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
+  EXPECT_EQ(lane0, 0u);
+}
+// endregion
+
 // region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
