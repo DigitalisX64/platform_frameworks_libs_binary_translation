@@ -22187,6 +22187,121 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHNegativeSaturates) {
 }
 // endregion
 
+// region digitalis: SCVTF / UCVTF scalar fixed-point conversion JIT tests.
+//
+// Encoding (ARM ARM C7.2.301 / C7.2.342, scalar form):
+//   01_U_111110_immh_immb_11100_1_Rn_Rd
+//   U=0 → SCVTF, U=1 → UCVTF
+//   immh=01xx → .S (datasize=32); immh=1xxx → .D (datasize=64)
+//   fbits = 2*datasize - immh:immb, in [1, datasize].
+//
+//   SCVTF S0, S1, #5  : fbits=5, immh:immb=64-5=59=0111011 → 0x5F3BE420
+//   SCVTF D0, D1, #16 : fbits=16, immh:immb=128-16=112=1110000 → 0x5F70E420
+//   UCVTF S0, S1, #16 : fbits=16, immh:immb=64-16=48=0110000 → 0x7F30E420
+constexpr uint32_t kScvtfScalarS_5  = 0x5F3BE420;  // scvtf s0, s1, #5
+constexpr uint32_t kScvtfScalarD_16 = 0x5F70E420;  // scvtf d0, d1, #16
+constexpr uint32_t kUcvtfScalarS_16 = 0x7F30E420;  // ucvtf s0, s1, #16
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfScalarSPositive) {
+  // Vn[31:0] = 0x00000100 = 256 (signed int32); fbits=5 → 256/32 = 8.0
+  // Upper-lane garbage in Vn[127:32] must NOT leak into Vd.
+  uint64_t in[2] = {0xDEADBEEF00000100ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfScalarS_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // FP32(8.0) bit pattern = 0x41000000.
+  EXPECT_EQ(r[0], 0x0000000041000000ULL)
+      << "SCVTF .S positive: 256/32 = 8.0; Vd[63:32] zero";
+  EXPECT_EQ(r[1], 0ULL) << "Vd[127:64] zero";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfScalarSNegative) {
+  // Vn[31:0] = 0xFFFFFE00 = -512 (signed int32); fbits=5 → -512/32 = -16.0
+  uint64_t in[2] = {0x12345678FFFFFE00ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfScalarS_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // FP32(-16.0) bit pattern = 0xC1800000.
+  EXPECT_EQ(r[0], 0x00000000C1800000ULL)
+      << "SCVTF .S negative: -512/32 = -16.0; Vd[63:32] zero";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfScalarDPositive) {
+  // Vn[63:0] = 0x0000000100000000 = 4294967296 (signed int64); fbits=16 →
+  // 4294967296 / 65536 = 65536.0
+  uint64_t in[2] = {0x0000000100000000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfScalarD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // FP64(65536.0) bit pattern = 0x40F0000000000000.
+  EXPECT_EQ(r[0], 0x40F0000000000000ULL)
+      << "SCVTF .D positive: 2^32 / 2^16 = 65536.0";
+  EXPECT_EQ(r[1], 0ULL) << "Vd[127:64] zero";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfScalarDNegative) {
+  // Vn[63:0] = 0xFFFFFFFFFFFFFE00 = -512 (signed int64); fbits=16 →
+  // -512 / 65536 = -0.0078125
+  uint64_t in[2] = {0xFFFFFFFFFFFFFE00ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfScalarD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // FP64(-0.0078125) bit pattern = 0xBF80000000000000.
+  EXPECT_EQ(r[0], 0xBF80000000000000ULL)
+      << "SCVTF .D negative: -512 / 65536 = -0.0078125";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarSHighBitSet) {
+  // Vn[31:0] = 0x80000000 (high bit set) interpreted as uint32 = 2^31;
+  // fbits=16 → 2^31 / 2^16 = 32768.0.  This case would give the wrong
+  // sign under a naive cvtsi2ssl (which treats the input as int32 =
+  // INT32_MIN); the JIT uses Movl+cvtsi2ssq specifically to convert
+  // the zero-extended uint64 value correctly.
+  uint64_t in[2] = {0xDEADBEEF80000000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfScalarS_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // FP32(32768.0) bit pattern = 0x47000000.
+  EXPECT_EQ(r[0], 0x0000000047000000ULL)
+      << "UCVTF .S high-bit-set: 2^31 / 2^16 = 32768.0 (unsigned); "
+         "naive signed cvtsi2ssl would give -32768.0";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarSSmall) {
+  // Vn[31:0] = 0x00100000 = 1048576 (positive uint32); fbits=16 →
+  // 1048576 / 65536 = 16.0.  Verifies the basic path lights up.
+  uint64_t in[2] = {0x12345678001A4000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfScalarS_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // FP32(0x1A4000 / 0x10000) = FP32(0x1A.4) = FP32(26.25). Bit pattern: 0x41D20000.
+  EXPECT_EQ(r[0], 0x0000000041D20000ULL)
+      << "UCVTF .S small: 0x1A4000 / 2^16 = 26.25";
+  EXPECT_EQ(r[1], 0ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis

@@ -12909,6 +12909,13 @@ class LiteTranslator {
           // filter inside the case body (PSRAQ for the signed recover
           // step is AVX-512F-VL only).
           break;
+        case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
+        case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
+          // SCVTF / UCVTF scalar (signed/unsigned fixed-point integer →
+          // FP).  The dedicated case body below handles its own bail
+          // for UCVTF .D's high-bit-set int64 fixup; .S and SCVTF .D
+          // fall through to the JIT.
+          break;
         default:
           success_ = false; return;
       }
@@ -13980,6 +13987,123 @@ class LiteTranslator {
         } else {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         }
+        return;
+      }
+      // endregion
+      // region digitalis: SCVTF / UCVTF scalar fixed-point conversion.
+      //
+      //   Per ARM ARM C7.2.301 / C7.2.342 (scalar form):
+      //     immh=01xx → .S (esize=32, source is 32-bit int)
+      //     immh=1xxx → .D (esize=64, source is 64-bit int)
+      //     fbits = 2*esize - immh:immb, in [1, esize].
+      //   Result Vd[esize-1:0] = FP(src) / 2^fbits; Vd[127:esize] = 0.
+      //
+      // Lowering for SCVTF .S / UCVTF .S / SCVTF .D:
+      //   1. Load the integer source from Vn[esize-1:0] into a GP reg.
+      //      .S: Movl (32-bit load auto-zero-extends to 64).  For SCVTF
+      //          we'll then Cvtsi2ssl which reads the 32-bit subreg as
+      //          signed int32.  For UCVTF we Cvtsi2ssq the 64-bit value
+      //          (zero-extended above), which fits in int64 and converts
+      //          unsigned correctly.
+      //      .D: Movq (64-bit load).  SCVTF then Cvtsi2sdq.
+      //   2. PXOR scratch xmm to zero (carries the upper-zero into the
+      //      final store).
+      //   3. CVTSI2{SS,SD}{L,Q} into the low lane.
+      //   4. Multiply by 2^-fbits via a materialized FP constant
+      //      (Movl/Movq immediate → Movd/Movq into scratch xmm → MULSS/SD).
+      //      The multiply is exact: 2^-fbits is a power of 2, so it just
+      //      adjusts the exponent — no precision loss.  Combined with the
+      //      single-rounded CVTSI2{SS,SD}, the result equals
+      //      round-to-{float,double}(int_val * 2^-fbits), matching the
+      //      ARM ARM spec FixedToFP(int_val, fbits, signed, FPCR).
+      //   5. MOVDQU the full 16-byte xmm to Vd; the PXOR above guarantees
+      //      Vd[127:esize] = 0.
+      //
+      // UCVTF .D (uint64 → double, where bit 63 may be set) needs the
+      // halve / round-to-odd / convert / double-back fixup that the
+      // existing FpFixedPoint SCVTF/UCVTF (FpDataProc1) uses; bailing
+      // to the interpreter for that one variant until we add it.
+      case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
+      case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed: {
+        const uint8_t immh = args.immh;
+        // Decoder gates this; defensive guard for the .H FP16 form
+        // (immh=001x) which we don't JIT here.
+        if (!(immh & 0b1100)) { success_ = false; return; }
+        const bool is_double = (immh & 0b1000) != 0;  // immh=1xxx → .D
+        const uint8_t esize_bits = is_double ? 64 : 32;
+        const uint16_t immh_immb =
+            static_cast<uint16_t>((immh << 3) | args.immb);
+        // fbits = 2*esize - immh:immb.  Valid range: [1, esize_bits].
+        const uint8_t fbits =
+            static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        if (fbits == 0 || fbits > esize_bits) {
+          success_ = false; return;
+        }
+        const bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed);
+        // UCVTF .D needs the uint64→double halve-and-double fixup —
+        // defer to interp until we add it here.
+        if (is_unsigned && is_double) { success_ = false; return; }
+
+        SimdRegister xmm = AllocTempSimdReg();
+        SimdRegister xscale = AllocTempSimdReg();
+        Register gp_int = AllocTempReg();
+        Register gp_scale = AllocTempReg();
+        if (xmm == no_simd_register || xscale == no_simd_register ||
+            gp_int == no_register || gp_scale == no_register) {
+          success_ = false; return;
+        }
+
+        // Load integer source from Vn low half.
+        if (is_double) {
+          as_.Movq(gp_int, {.base = Assembler::rbp, .disp = vn_off});
+        } else {
+          // .S form: Movl loads 32-bit and zero-extends gp_int[63:32]=0.
+          // For SCVTF we'll use Cvtsi2ssl which reads the 32-bit subreg
+          // as int32 (signed).  For UCVTF we'll use Cvtsi2ssq which
+          // treats the zero-extended 64-bit value as int64 (unsigned
+          // source fits in int64's positive range).
+          as_.Movl(gp_int, {.base = Assembler::rbp, .disp = vn_off});
+        }
+
+        // Pre-zero xmm so the final Movdqu zeroes Vd[127:esize].
+        as_.Pxor(xmm, xmm);
+
+        // Integer → FP conversion.
+        if (is_double) {
+          // SCVTF .D: int64 → double.
+          as_.Cvtsi2sdq(xmm, gp_int);
+        } else if (is_unsigned) {
+          // UCVTF .S: uint32 (zero-extended to uint64) → float, via
+          // signed-int64 conversion which is exact for values ≤ 2^32 - 1.
+          as_.Cvtsi2ssq(xmm, gp_int);
+        } else {
+          // SCVTF .S: int32 → float.
+          as_.Cvtsi2ssl(xmm, gp_int);
+        }
+
+        // Scale by 2^-fbits.  Multiplication by a power of 2 is exact
+        // in IEEE-754 (just biases the exponent), so this preserves
+        // the single-rounding semantics of the cvtsi2{ss,sd} step.
+        if (is_double) {
+          // FP64 2^-fbits = sign 0, exp (1023 - fbits), mantissa 0.
+          const uint64_t scale_bits =
+              static_cast<uint64_t>(1023u - fbits) << 52;
+          as_.Movq(gp_scale, static_cast<int64_t>(scale_bits));
+          as_.Movq(xscale, gp_scale);
+          as_.Mulsd(xmm, xscale);
+        } else {
+          // FP32 2^-fbits = sign 0, exp (127 - fbits), mantissa 0.
+          const uint32_t scale_bits =
+              static_cast<uint32_t>(127u - fbits) << 23;
+          as_.Movl(gp_scale, static_cast<int32_t>(scale_bits));
+          as_.Movd(xscale, gp_scale);
+          as_.Mulss(xmm, xscale);
+        }
+
+        // Store the FP result.  PXOR above + Cvtsi2/Mul writing only
+        // the bottom lane gives Vd[127:esize] = 0 for free.
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm);
         return;
       }
       // endregion
