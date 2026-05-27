@@ -6596,6 +6596,154 @@ TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSInPlace) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarPairwise JIT — FP16 forms (FADDP / FMAXP /
+// FMINP / FMAXNMP / FMINNMP scalar Hd).  Encoding (ARM ARM C7.2 "Advanced
+// SIMD scalar pairwise" — U=0 FP16 leg, bit22 (size[0]) = 0, bit23 (size[1])
+// selects max- vs min- for FMAX*/FMIN*; FADDP only allocated at bit23=0):
+//   FADDP   Hd, Vn.2H = 0x5E30D800 | (rn<<5) | rd
+//   FMAXP   Hd, Vn.2H = 0x5E30F800 | (rn<<5) | rd
+//   FMINP   Hd, Vn.2H = 0x5EB0F800 | (rn<<5) | rd
+//   FMAXNMP Hd, Vn.2H = 0x5E30C800 | (rn<<5) | rd
+//   FMINNMP Hd, Vn.2H = 0x5EB0C800 | (rn<<5) | rd
+// Standard FP16 bit patterns used below: 1.5=0x3E00, 2.0=0x4000, 2.5=0x4100,
+// 3.5=0x4300, 4.0=0x4400, 5.0=0x4500, 7.0=0x4700, -7.0=0xC700, +0.0=0x0000,
+// -0.0=0x8000, qNaN=0x7E00.
+constexpr uint32_t FaddpScalarH(uint8_t rd, uint8_t rn) {
+  return 0x5E30D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxpScalarH(uint8_t rd, uint8_t rn) {
+  return 0x5E30F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminpScalarH(uint8_t rd, uint8_t rn) {
+  return 0x5EB0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmpScalarH(uint8_t rd, uint8_t rn) {
+  return 0x5E30C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmpScalarH(uint8_t rd, uint8_t rn) {
+  return 0x5EB0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FADDP Hd: 1.5h + 2.5h = 4.0h; lanes 1..7 (H) zero.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarHPositive) {
+  state_.cpu.v[1] = __uint128_t{0};
+  // lane 0 (low 16 bits) = 1.5h = 0x3E00; lane 1 (next 16 bits) = 2.5h = 0x4100
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x3E00u;
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x4100u;
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4400u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FADDP Hd in-place (Vd == Vn): must read both source FP16 lanes before
+// the upper-zeroing store to Vd.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarHInPlace) {
+  state_.cpu.v[5] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[0] = 0x3E00u;  // 1.5
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[1] = 0x4100u;  // 2.5
+  // Pre-trash upper bytes so the upper-zero step is exercised.
+  for (int i = 2; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[5])[i] = 0xAAAAu;
+  }
+  static const uint32_t code[] = {FaddpScalarH(5, 5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[0], 0x4400u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
+  }
+}
+
+// FMAXP Hd: max(1.5h, 2.5h) = 2.5h.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarHPositive) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x3E00u;  // 1.5
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x4100u;  // 2.5
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmaxpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4100u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FMINP Hd: min(-7.0h, 3.5h) = -7.0h.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarHNegative) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0xC700u;  // -7.0
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x4300u;  // 3.5
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FminpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xC700u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FMAXP Hd ±0 disambiguation: max(-0.0, +0.0) = +0.0 per ARM ARM, regardless
+// of operand order.  The naive Maxss-then-OR idiom in FP32 would yield -0.0;
+// the corrective AND(a,b) blend produces +0.0 = 0x0000 in FP16.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarHZeroNegZero) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x8000u;  // -0.0
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x0000u;  // +0.0
+  static const uint32_t code[] = {FmaxpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x0000u);
+}
+
+// FMINP Hd ±0 disambiguation reversed: min(+0.0, -0.0) = -0.0 = 0x8000.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarHZeroPosNeg) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x0000u;
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x8000u;
+  static const uint32_t code[] = {FminpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x8000u);
+}
+
+// FMAXP Hd NaN propagation: max(qNaN, 1.0) -> NaN (a NaN-encoded FP16 bit
+// pattern, i.e., exponent all-ones and fraction non-zero).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarHNaN) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x7E00u;  // qNaN
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x3C00u;  // 1.0
+  static const uint32_t code[] = {FmaxpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const uint16_t result = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(result & 0x7C00u, 0x7C00u);  // exponent all-ones
+  EXPECT_NE(result & 0x03FFu, 0u);        // fraction non-zero (NaN, not inf)
+}
+
+// FMAXNMP Hd single-NaN suppression: max_nm(qNaN, 5.0) -> 5.0 (NM family
+// returns the non-NaN operand unlike FMAXP which propagates NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarHSingleNaN) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x7E00u;  // qNaN
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x4500u;  // 5.0
+  static const uint32_t code[] = {FmaxnmpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4500u);
+}
+
+// FMINNMP Hd both-NaN: min_nm(qNaN, qNaN) -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmpScalarHBothNaN) {
+  state_.cpu.v[1] = __uint128_t{0};
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[0] = 0x7E00u;
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[1])[1] = 0x7E00u;
+  static const uint32_t code[] = {FminnmpScalarH(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  const uint16_t result = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(result & 0x7C00u, 0x7C00u);
+  EXPECT_NE(result & 0x03FFu, 0u);
+}
+// endregion
+
 // region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0

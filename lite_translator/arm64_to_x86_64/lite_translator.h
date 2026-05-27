@@ -12926,9 +12926,15 @@ class LiteTranslator {
   //   kFmaxnmpScalar  — FMAXNMP scalar S/D via NaN-suppressing substitution.
   //   kFminnmpScalar  — FMINNMP scalar S/D via NaN-suppressing substitution.
   //
-  // FP16 path (Armv8.2-FP16 forms at U=0 + size[0]=0) bails to the
-  // interpreter — needs FP16↔FP32 promotion around the reduction.  The
-  // interpreter handles those paths correctly today.
+  // FP16 path (Armv8.2-FP16 forms at U=0 + size[0]=0): F16C round-trip.
+  // The two FP16 source lanes are lifted to FP32 via Pinsrw + Vcvtph2ps,
+  // the existing FP32 reduction core runs on them unchanged, then the
+  // FP32 result is narrowed back to FP16 via Vcvtps2ph.  Vcvtph2ps
+  // preserves NaN-ness and ±0 sign, and the upper FP32 lanes stay 0
+  // throughout the reduction (the inputs were 16-bit zero-extended and
+  // x86 MAX/MIN/AND/OR on (0,0) returns 0), so Vcvtps2ph's narrowed
+  // upper FP16 lanes are also 0; Movdqu then writes Vd[15:0]=result with
+  // Vd[127:16]=0.  Falls back to interpreter when F16C is absent.
   //
   // FMAX/FMIN-vs-FMAXNM/FMINNM NaN policy (matches the vector lowering at
   // AdvSimdThreeSame{kFmaxV,kFminV,kFmaxnmV,kFminnmV}):
@@ -12946,7 +12952,7 @@ class LiteTranslator {
   // -0, which matches ARM's "sign of -0 is preserved" for both families.
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
     using Op = Decoder::AdvSimdScalarPairwiseOpcode;
-    if (args.is_fp16) { success_ = false; return; }
+    if (args.is_fp16 && !host_platform::kHasF16C) { success_ = false; return; }
     const auto opc = args.opcode;
     const bool is_addp        = (opc == Op::kAddp);
     const bool is_faddp       = (opc == Op::kFaddpScalar);
@@ -12976,12 +12982,24 @@ class LiteTranslator {
     // Load lane 0 (xmm_a) and lane 1 (xmm_b) of Vn.  Movsd/Movss from memory
     // zero-extend upper 96/64 bits — both source lanes are loaded before any
     // store to Vd so an in-place encoding (Vd == Vn) reads Vn's original pair.
+    // FP16 path: each 16-bit source lane is loaded via Pxor + Pinsrw to
+    // isolate it in xmm bits[15:0] with bits[127:16] zeroed, then
+    // Vcvtph2ps widens 4 FP16 lanes to 4 FP32 lanes.  Pinsrw reads
+    // Vn[15:0] and Vn[31:16] before any store to Vd, so an in-place
+    // encoding (Vd == Vn) sees Vn's original pair.
     if (is_addp) {
       as_.Movq(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movq(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
     } else if (is_double) {
       as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
+    } else if (args.is_fp16) {
+      as_.Pxor(xmm_a, xmm_a);
+      as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_a, xmm_a);
+      as_.Pxor(xmm_b, xmm_b);
+      as_.Pinsrw(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 2}, int8_t{0});
+      as_.Vcvtph2ps(xmm_b, xmm_b);
     } else {
       as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 4});
@@ -13109,13 +13127,25 @@ class LiteTranslator {
 
     // Zero Vd above the result lane, then write the scalar at lane 0.
     // S-form writes 32 bits (lanes 1..3 stay zero); D-form and ADDP write
-    // 64 bits (upper 64 bits stay zero).
-    as_.Pxor(xmm_b, xmm_b);
-    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_b);
-    if (is_double) {
-      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    // 64 bits (upper 64 bits stay zero).  FP16 path narrows xmm_a's FP32
+    // lane 0 back to FP16 via Vcvtps2ph — the load lifted each FP16 lane
+    // into an xmm with FP32 lanes 1..3 == 0, the reduction core preserves
+    // those zeros (MAX/MIN/AND/OR on (0,0) returns 0; Addss/Cmpeqss only
+    // touch lane 0), so the narrowed FP16 lanes 1..3 are also 0.  The
+    // Vcvtps2ph instruction itself zeroes the upper 64 bits of the
+    // destination xmm, so a full 128-bit Movdqu store delivers
+    // Vd[15:0]=result and Vd[127:16]=0.
+    if (args.is_fp16) {
+      as_.Vcvtps2ph(xmm_a, xmm_a, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
     } else {
-      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      as_.Pxor(xmm_b, xmm_b);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_b);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      }
     }
   }
   // endregion
