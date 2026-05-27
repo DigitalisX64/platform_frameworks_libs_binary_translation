@@ -14019,10 +14019,12 @@ class LiteTranslator {
       //   5. MOVDQU the full 16-byte xmm to Vd; the PXOR above guarantees
       //      Vd[127:esize] = 0.
       //
-      // UCVTF .D (uint64 → double, where bit 63 may be set) needs the
-      // halve / round-to-odd / convert / double-back fixup that the
-      // existing FpFixedPoint SCVTF/UCVTF (FpDataProc1) uses; bailing
-      // to the interpreter for that one variant until we add it.
+      // UCVTF .D (uint64 → double, where bit 63 may be set) uses the
+      // halve / round-to-odd / convert / double-back fixup mirroring
+      // the existing FpFixedPoint SCVTF/UCVTF (FpDataProc1) path: branch
+      // on the sign bit, take the direct CVTSI2SDQ for values < 2^63,
+      // and for values ≥ 2^63 use the round-to-odd halve + double-back
+      // trick that preserves single-rounding.
       case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
       case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed: {
         const uint8_t immh = args.immh;
@@ -14041,9 +14043,6 @@ class LiteTranslator {
         }
         const bool is_unsigned =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed);
-        // UCVTF .D needs the uint64→double halve-and-double fixup —
-        // defer to interp until we add it here.
-        if (is_unsigned && is_double) { success_ = false; return; }
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
@@ -14070,7 +14069,28 @@ class LiteTranslator {
         as_.Pxor(xmm, xmm);
 
         // Integer → FP conversion.
-        if (is_double) {
+        if (is_double && is_unsigned) {
+          // UCVTF .D: uint64 → double.  Branch on the sign bit: values
+          // < 2^63 convert directly via signed CVTSI2SDQ (exact); values
+          // ≥ 2^63 go through round-to-odd halve / convert / double-back
+          // to preserve single-rounding when bit 63 is set.
+          Register low_bit = AllocTempReg();
+          if (low_bit == no_register) { success_ = false; return; }
+          Assembler::Label* neg_path = as_.MakeLabel();
+          Assembler::Label* done = as_.MakeLabel();
+          as_.Testq(gp_int, gp_int);
+          as_.Jcc(Assembler::Condition::kNegative, *neg_path);
+          as_.Cvtsi2sdq(xmm, gp_int);
+          as_.Jmp(*done);
+          as_.Bind(neg_path);
+          as_.Movq(low_bit, gp_int);
+          as_.Andq(low_bit, static_cast<int32_t>(1));   // captured LSB
+          as_.Shrq(gp_int, static_cast<int8_t>(1));     // logical halve
+          as_.Orq(gp_int, low_bit);                     // round-to-odd
+          as_.Cvtsi2sdq(xmm, gp_int);
+          as_.Addsd(xmm, xmm);                          // double back
+          as_.Bind(done);
+        } else if (is_double) {
           // SCVTF .D: int64 → double.
           as_.Cvtsi2sdq(xmm, gp_int);
         } else if (is_unsigned) {

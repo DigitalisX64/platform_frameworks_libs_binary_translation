@@ -22198,9 +22198,13 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHNegativeSaturates) {
 //   SCVTF S0, S1, #5  : fbits=5, immh:immb=64-5=59=0111011 → 0x5F3BE420
 //   SCVTF D0, D1, #16 : fbits=16, immh:immb=128-16=112=1110000 → 0x5F70E420
 //   UCVTF S0, S1, #16 : fbits=16, immh:immb=64-16=48=0110000 → 0x7F30E420
+//   UCVTF D0, D1, #1  : fbits=1, immh:immb=128-1=127=1111111 → 0x7F7FE420
+//   UCVTF D0, D1, #32 : fbits=32, immh:immb=128-32=96=1100000 → 0x7F60E420
 constexpr uint32_t kScvtfScalarS_5  = 0x5F3BE420;  // scvtf s0, s1, #5
 constexpr uint32_t kScvtfScalarD_16 = 0x5F70E420;  // scvtf d0, d1, #16
 constexpr uint32_t kUcvtfScalarS_16 = 0x7F30E420;  // ucvtf s0, s1, #16
+constexpr uint32_t kUcvtfScalarD_1  = 0x7F7FE420;  // ucvtf d0, d1, #1
+constexpr uint32_t kUcvtfScalarD_32 = 0x7F60E420;  // ucvtf d0, d1, #32
 
 TEST_F(Arm64LiteTranslateRegionTest, ScvtfScalarSPositive) {
   // Vn[31:0] = 0x00000100 = 256 (signed int32); fbits=5 → 256/32 = 8.0
@@ -22298,6 +22302,62 @@ TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarSSmall) {
   // FP32(0x1A4000 / 0x10000) = FP32(0x1A.4) = FP32(26.25). Bit pattern: 0x41D20000.
   EXPECT_EQ(r[0], 0x0000000041D20000ULL)
       << "UCVTF .S small: 0x1A4000 / 2^16 = 26.25";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarDHighBitSet) {
+  // Vn[63:0] = 0x8000000000000000 (uint64 = 2^63, bit 63 set).  fbits=1
+  // → 2^63 / 2 = 2^62 = 4611686018427387904.0.  FP64(2^62) = exponent
+  // 62 + 1023 = 1085 = 0x43D, bit pattern 0x43D0000000000000.  A naive
+  // Cvtsi2sdq on this value would treat the source as int64 = INT64_MIN
+  // and produce -2^63, then multiply by 2^-1 gives -2^62 (wrong sign).
+  // The halve / round-to-odd / convert / double-back fixup recovers
+  // the unsigned interpretation.
+  uint64_t in[2] = {0x8000000000000000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x43D0000000000000ULL)
+      << "UCVTF .D high-bit-set: 2^63 / 2 = 2^62 (unsigned)";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarDAllOnes) {
+  // Vn[63:0] = 0xFFFFFFFFFFFFFFFF (uint64 = 2^64 - 1).  fbits=1 →
+  // (2^64 - 1) / 2 = 2^63 - 0.5.  Rounds to nearest double = 2^63
+  // (exactly representable; 2^63 - 1 is not).  FP64(2^63) bit pattern
+  // = 0x43E0000000000000.  This pins the round-to-odd correctness:
+  // a plain halve without LSB-OR would round 0x7FFFFFFFFFFFFFFE to
+  // 2^63 - 1024 (still not representable; rounds to 2^63 - 2048 or
+  // 2^63 by tie-break), but the round-to-odd ORs the lost LSB into
+  // tmp before convert, preserving the rounding decision.
+  uint64_t in[2] = {0xFFFFFFFFFFFFFFFFULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x43E0000000000000ULL)
+      << "UCVTF .D all-ones: (2^64-1) / 2 rounds to 2^63";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfScalarDSmall) {
+  // Vn[63:0] = 0x0000000100000000 = 2^32 (bit 63 clear, positive path).
+  // fbits=32 → 2^32 / 2^32 = 1.0.  FP64(1.0) = 0x3FF0000000000000.
+  uint64_t in[2] = {0x0000000100000000ULL, 0xCAFEBABEFEEDFACEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfScalarD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x3FF0000000000000ULL)
+      << "UCVTF .D small: 2^32 / 2^32 = 1.0";
   EXPECT_EQ(r[1], 0ULL);
 }
 // endregion
