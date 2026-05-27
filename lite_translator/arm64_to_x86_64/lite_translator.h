@@ -13167,17 +13167,16 @@ class LiteTranslator {
           break;  // D-form-only ops fall through to vector path.
         case Decoder::AdvSimdShiftImmOpcode::kUqshl:
         case Decoder::AdvSimdShiftImmOpcode::kSqshlu:
-          // Scalar D/S/H all fall through.  Scalar B (immh=0001) bails
-          // inside the saturating-shift case via the `is_byte` guard
-          // because the byte path needs PSLLB workarounds the case lacks.
+          // Scalar D/S/H/B all fall through.  Scalar B (immh=0001)
+          // takes a dedicated widen-then-clamp byte path inside the
+          // saturating-shift case (no PSLLB in baseline SSE).
           break;
         case Decoder::AdvSimdShiftImmOpcode::kSqshl:
-          // Scalar S/H fall through — vector PSLLW/PSLLD + PSRAW/PSRAD
-          // signed-recover pipeline already lights up.  Scalar B
-          // (immh=0001) bails on `is_byte` inside the case; scalar D
-          // (immh=1xxx) bails on the existing `is_dword && kSqshl`
-          // filter inside the case body (PSRAQ for the signed recover
-          // step is AVX-512F-VL only).
+          // Scalar S/H/B fall through.  Scalar B uses the widen-via-
+          // PMOVSXBW + PSLLW + signed clamp byte path.  Scalar D
+          // (immh=1xxx) still bails inside the case body on the
+          // existing `is_dword && kSqshl` filter (PSRAQ for the
+          // signed recover step is AVX-512F-VL only).
           break;
         case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
         case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
@@ -13710,7 +13709,87 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);
-        if (is_byte) { success_ = false; return; }
+        if (is_byte) {
+          // region digitalis - scalar byte (esize=8) saturating-shift path.
+          //
+          // No PSLLB/PSRAB/PSRLB in baseline SSE, so we widen Vn[7:0] to
+          // a single 16-bit lane via PMOVSXBW (signed sources: SQSHL /
+          // SQSHLU) or PMOVZXBW (unsigned source: UQSHL), apply PSLLW
+          // (max shift is 7 and the byte source is at most |128|, so the
+          // widened result is always in [-16384, +16256] — fits in i16
+          // without further overflow), then clamp to the dst-byte range:
+          //
+          //   SQSHL  -> [INT8_MIN, INT8_MAX] = [0xFF80, 0x007F] (as i16)
+          //                 Pmaxsw(INT8_MIN) + Pminsw(INT8_MAX)
+          //   UQSHL  -> [0, UINT8_MAX] = [0x0000, 0x00FF]
+          //                 Pminsw(UINT8_MAX)  (source already >= 0)
+          //   SQSHLU -> [0, UINT8_MAX]
+          //                 Pmaxsw(0) + Pminsw(UINT8_MAX)
+          //
+          // Per-lane mask constants are materialized via Pcmpeqw +
+          // Psllw/Psrlw:
+          //   0xFF80 = 0xFFFF << 7   (INT8_MIN signed-extended)
+          //   0x007F = 0xFFFF >> 9   (INT8_MAX)
+          //   0x00FF = 0xFFFF >> 8   (UINT8_MAX)
+          //   0x0000 = Pxor self
+          //
+          // Vector .8B / .16B forms still bail — the vector lowering
+          // needs eight or sixteen byte-saturated parallel shifts and
+          // the widening trick consumes the whole xmm for one lane.
+          if (!args.scalar) {
+            success_ = false; return;
+          }
+          const uint8_t shift_count_b = static_cast<uint8_t>(
+              ((static_cast<uint16_t>(immh) << 3) | args.immb) - 8);
+          const int8_t cnt_b = static_cast<int8_t>(shift_count_b);
+          const bool is_signed_src =
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) ||
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshlu);
+          const bool is_signed_dst =
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl);
+          SimdRegister xn_b = AllocTempSimdReg();
+          SimdRegister xclamp_b = AllocTempSimdReg();
+          if (xn_b == no_simd_register || xclamp_b == no_simd_register) {
+            success_ = false; return;
+          }
+          if (is_signed_src) {
+            as_.Pmovsxbw(xn_b, {.base = Assembler::rbp, .disp = vn_off});
+          } else {
+            as_.Pmovzxbw(xn_b, {.base = Assembler::rbp, .disp = vn_off});
+          }
+          if (cnt_b != 0) {
+            as_.Psllw(xn_b, cnt_b);
+          }
+          if (is_signed_dst) {
+            // SQSHL byte: clamp to [INT8_MIN, INT8_MAX].
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psllw(xclamp_b, int8_t{7});
+            as_.Pmaxsw(xn_b, xclamp_b);
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psrlw(xclamp_b, int8_t{9});
+            as_.Pminsw(xn_b, xclamp_b);
+          } else if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshlu) {
+            // SQSHLU byte: signed source, clamp negative to 0 and
+            // overflow to UINT8_MAX.
+            as_.Pxor(xclamp_b, xclamp_b);
+            as_.Pmaxsw(xn_b, xclamp_b);
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psrlw(xclamp_b, int8_t{8});
+            as_.Pminsw(xn_b, xclamp_b);
+          } else {
+            // UQSHL byte: zero-extended source >= 0, only upper clamp.
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psrlw(xclamp_b, int8_t{8});
+            as_.Pminsw(xn_b, xclamp_b);
+          }
+          // Width-truncate: keep only byte 0 of lane 0; zero Vd[127:8].
+          // Mirrors the byte-granular upper-zero pattern below for H/S.
+          as_.Pslldq(xn_b, int8_t{15});
+          as_.Psrldq(xn_b, int8_t{15});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_b);
+          return;
+          // endregion
+        }
         const bool is_dword = (immh & 0b1000) != 0;
         // region digitalis - dword (esize=64) pipeline lights up only
         // for UQSHL and SQSHLU.  SQSHL .D needs PSRAQ for the signed

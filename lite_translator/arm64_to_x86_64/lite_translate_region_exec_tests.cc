@@ -22187,6 +22187,163 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHNegativeSaturates) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarShiftByImm — scalar B saturating shift left.
+//
+// SQSHL / UQSHL / SQSHLU at scalar B (esize=8) light up through a
+// dedicated widen-then-clamp path in lite_translator.h (no PSLLB in
+// baseline SSE).  Sign- or zero-extend Vn[7:0] to a 16-bit lane, apply
+// PSLLW (shift count in [0,7], result always fits in i16), then clamp
+// the result to the destination byte's range.  Width-truncated store
+// keeps only Vd[7:0]; Vd[127:8] zeroed.
+//
+// Encoding (ARM ARM C7.2 scalar shift-by-imm, immh=0001 for B form):
+//   0 1 U 1 1 1 1 1 0 immh immb opcode 1 Rn Rd
+//   shift = (immh:immb) - 8, in [0, 7]
+//
+//   SQSHL  B0,B1,#3 : U=0, opcode=01110, immh:immb=01011  → 0x5F0B7420
+//   UQSHL  B0,B1,#3 : U=1, opcode=01110, immh:immb=01011  → 0x7F0B7420
+//   SQSHLU B0,B1,#3 : U=1, opcode=01100, immh:immb=01011  → 0x7F0B6420
+//   SQSHLU B0,B1,#0 : U=1, opcode=01100, immh:immb=01000  → 0x7F086420
+constexpr uint32_t kSqshlScalarB_3  = 0x5F0B7420;  // sqshl  b0, b1, #3
+constexpr uint32_t kUqshlScalarB_3  = 0x7F0B7420;  // uqshl  b0, b1, #3
+constexpr uint32_t kSqshluScalarB_3 = 0x7F0B6420;  // sqshlu b0, b1, #3
+constexpr uint32_t kSqshluScalarB_0 = 0x7F086420;  // sqshlu b0, b1, #0
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBNoOverflow) {
+  // Vn[7:0] = 0x08 (signed +8), shift #3 → 0x40 (signed +64; no overflow).
+  uint64_t in[2] = {0xFFFFFFFFFFFFFF08ULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x0000000000000040ULL)
+      << "SQSHL B in-range; result in Vd[7:0], Vd[63:8] zeroed";
+  EXPECT_EQ(r[1], 0ULL) << "Vd[127:64] zeroed";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBPositiveSaturates) {
+  // Vn[7:0] = 0x20 (signed +32), shift #3 → 0x100 > INT8_MAX (+127) →
+  // saturate to 0x7F.
+  uint64_t in[2] = {0xFFFFFFFFFFFFFF20ULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x000000000000007FULL)
+      << "SQSHL B positive overflow saturates to INT8_MAX";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBNegativeSaturates) {
+  // Vn[7:0] = 0xC0 (signed -64), shift #3 → -512 < INT8_MIN (-128) →
+  // saturate to 0x80 (INT8_MIN).
+  uint64_t in[2] = {0x12345678ABCDEFC0ULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x0000000000000080ULL)
+      << "SQSHL B negative overflow saturates to INT8_MIN";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarBNoOverflow) {
+  // Vn[7:0] = 0x05, shift #3 → 0x28 (no overflow).
+  uint64_t in[2] = {0xFFFFFFFFFFFFFF05ULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x0000000000000028ULL)
+      << "UQSHL B in-range; result in Vd[7:0], Vd[63:8] zeroed";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarBSaturates) {
+  // Vn[7:0] = 0x40 (=64), shift #3 → 0x200 > UINT8_MAX → saturate to 0xFF.
+  uint64_t in[2] = {0x1234567890ABCD40ULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x00000000000000FFULL)
+      << "UQSHL B unsigned overflow saturates to UINT8_MAX";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarBNegativeToZero) {
+  // Vn[7:0] = 0x80 (signed -128) — SQSHLU pre-clamps negative input
+  // to 0 even at shift=3.
+  uint64_t in[2] = {0x123456789ABCDE80ULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0ULL) << "SQSHLU B on negative input architecturally yields 0";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarBPositiveSaturates) {
+  // Vn[7:0] = 0x60 (signed +96), shift #3 → 0x300 > UINT8_MAX →
+  // saturate to 0xFF.
+  uint64_t in[2] = {0xAABBCCDDEEFF1160ULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x00000000000000FFULL)
+      << "SQSHLU B positive overflow saturates to UINT8_MAX";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarBZeroShiftNegativeStillClamps) {
+  // Vn[7:0] = 0xFF (signed -1), shift #0 — even with no shift, SQSHLU
+  // clamps negative input to 0.  Exercises the cnt_b==0 (no PSLLW
+  // issued) path.
+  uint64_t in[2] = {0x123456789ABCDEFFULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluScalarB_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0ULL)
+      << "SQSHLU B shift=0 still clamps negative input to 0";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarBUpperLanesIgnored) {
+  // Vn[127:8] = 0xFF (garbage); Vn[7:0] = 0x40, shift #3 → 0x200 →
+  // saturate to 0xFF.  Verifies the Pslldq(15)+Psrldq(15) width
+  // truncation zeros bytes 1..15 regardless of upper-input-lane
+  // garbage that PMOVZXBW lifted into the widened xmm.
+  uint64_t in[2] = {0xFFFFFFFFFFFFFF40ULL, 0xFFFFFFFFFFFFFFFFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlScalarB_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x00000000000000FFULL)
+      << "Result is from lane 0; upper bytes zeroed";
+  EXPECT_EQ(r[1], 0ULL);
+}
+// endregion
+
 // region digitalis: SCVTF / UCVTF scalar fixed-point conversion JIT tests.
 //
 // Encoding (ARM ARM C7.2.301 / C7.2.342, scalar form):
