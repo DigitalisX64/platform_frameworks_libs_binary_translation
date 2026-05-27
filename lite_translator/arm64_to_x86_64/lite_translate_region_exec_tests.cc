@@ -3610,6 +3610,144 @@ TEST_F(Arm64LiteTranslateRegionTest, SqxtunBdHn_ZeroIdentity) {
 // endregion
 
 // region digitalis
+// FRECPE scalar: single-lane FP reciprocal estimate.  AdvSimd scalar
+// two-reg-misc encoding with U=0, opcode=11101, bits[11:10]=10.
+// Decoder pins size ∈ {10, 11}; bit0 selects S (FP32, size=10) vs
+// D (FP64, size=11).  Encoding bits: 01 0 11110 sz 10000 11101 10 Rn Rd.
+//   FRECPE Sd, Sn  (size=10): 0x5EA1_D800 for V0,V0.
+//   FRECPE Dd, Dn  (size=11): 0x5EE1_D800 for V0,V0.
+constexpr uint32_t kFrecpeSdSnV0 = 0x5EA1D800;
+constexpr uint32_t kFrecpeDdDnV0 = 0x5EE1D800;
+
+// FRECPE Sd, Sn: 2.0f -> 0.5f (exact).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_TwoToHalf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x40000000u;  // 2.0f
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x3F000000u);  // 0.5f
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Sd, Sn: 1.0f -> 1.0f (exact identity at unity).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_OneToOne) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x3F800000u;  // 1.0f
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x3F800000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Sd, Sn: +0.0f -> +inf (FRECPE FPSR.DZC case).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_PosZeroToPosInf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x00000000u;  // +0.0f
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x7F800000u);  // +inf
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Sd, Sn: -0.0f -> -inf (sign of zero preserved).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_NegZeroToNegInf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x80000000u;  // -0.0f
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0xFF800000u);  // -inf
+}
+
+// FRECPE Sd, Sn: +inf -> +0.0f.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_PosInfToPosZero) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7F800000u;  // +inf
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x00000000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Sd, Sn: -inf -> -0.0f.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_NegInfToNegZero) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0xFF800000u;  // -inf
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0x80000000u);
+}
+
+// FRECPE Sd, Sn: qNaN -> qNaN (propagates).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeSdSn_QNanPropagates) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x7FC00000u;  // qNaN
+  static const uint32_t code[] = {kFrecpeSdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r = *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  // Any NaN payload is acceptable; the result must be NaN
+  // (exponent=0xFF, mantissa != 0).
+  EXPECT_EQ(r & 0x7F800000u, 0x7F800000u);
+  EXPECT_NE(r & 0x007FFFFFu, 0u);
+}
+
+// FRECPE Dd, Dn: 2.0d -> 0.5d (exact).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_TwoToHalf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x4000000000000000ULL;
+  static const uint32_t code[] = {kFrecpeDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x3FE0000000000000ULL);  // 0.5d
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Dd, Dn: +0.0d -> +inf.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_PosZeroToPosInf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x0000000000000000ULL;
+  static const uint32_t code[] = {kFrecpeDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x7FF0000000000000ULL);  // +inf
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Dd, Dn: -0.0d -> -inf.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_NegZeroToNegInf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x8000000000000000ULL;
+  static const uint32_t code[] = {kFrecpeDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0xFFF0000000000000ULL);  // -inf
+}
+
+// FRECPE Dd, Dn: +inf -> +0.0d.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_PosInfToPosZero) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
+  static const uint32_t code[] = {kFrecpeDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]), 0ULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// FRECPE Dd, Dn: 4.0d -> 0.25d (exact at a power of two).
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_FourToQuarter) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x4010000000000000ULL;
+  static const uint32_t code[] = {kFrecpeDdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]),
+            0x3FD0000000000000ULL);  // 0.25d
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+// endregion
+
+// region digitalis
 // FRINTA Sd, Sn / Dd, Dn (round to nearest, ties AWAY from zero).
 // FP data-processing 1-source, opcode=001100:
 //   FRINTA Sd, Sn: 0001_1110_0010_0110_0100_00nn_nnnd_dddd  (ftype=00)
