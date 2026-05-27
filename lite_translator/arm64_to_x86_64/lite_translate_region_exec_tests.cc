@@ -22561,6 +22561,160 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtzuScalarDPositiveOverflow) {
 }
 // endregion
 
+// region digitalis: FpFixedPointConversion JIT tests (GPR↔FPR family).
+//
+// Encoding (ARM ARM C7.2.298 / C7.2.339 / C7.2.171 / C7.2.181, GPR↔FPR
+// fixed-point form):
+//   sf 0 0 11110 ftype 0 rmode opcode scale Rn Rd
+//   sf:    0 = W (32-bit GP), 1 = X (64-bit GP)
+//   ftype: 00 = S (FP32),     01 = D (FP64)
+//   rmode: 00 (SCVTF/UCVTF) or 11 (FCVTZS/FCVTZU)
+//   opcode: 010 SCVTF, 011 UCVTF, 000 FCVTZS, 001 FCVTZU
+//   scale = 64 - fbits
+//
+// All encodings use Rn=1, Rd=0 (S0/D0/W0/X0 destination from S1/D1/W1/X1).
+//
+//   SCVTF  S0, W1, #5  : sf=0, ftype=00, rmode=00, op=010, scale=59  → 0x1E02EC20
+//   SCVTF  D0, X1, #16 : sf=1, ftype=01, rmode=00, op=010, scale=48  → 0x9E42C020
+//   SCVTF  S0, W1, #5  (negative input, same encoding)               → 0x1E02EC20
+//   UCVTF  S0, W1, #16 : sf=0, ftype=00, rmode=00, op=011, scale=48  → 0x1E03C020
+//   UCVTF  D0, X1, #1  : sf=1, ftype=01, rmode=00, op=011, scale=63  → 0x9E43FC20
+//   FCVTZS W0, S1, #5  : sf=0, ftype=00, rmode=11, op=000, scale=59  → 0x1E18EC20
+//   FCVTZS X0, D1, #16 : sf=1, ftype=01, rmode=11, op=000, scale=48  → 0x9E58C020
+//   FCVTZU W0, S1, #5  : sf=0, ftype=00, rmode=11, op=001, scale=59  → 0x1E19EC20
+//   FCVTZU X0, D1, #1  : sf=1, ftype=01, rmode=11, op=001, scale=63  → 0x9E59FC20
+constexpr uint32_t kScvtfFpFpS_W_5  = 0x1E02EC20;  // scvtf  s0, w1, #5
+constexpr uint32_t kScvtfFpFpD_X_16 = 0x9E42C020;  // scvtf  d0, x1, #16
+constexpr uint32_t kUcvtfFpFpS_W_16 = 0x1E03C020;  // ucvtf  s0, w1, #16
+constexpr uint32_t kUcvtfFpFpD_X_1  = 0x9E43FC20;  // ucvtf  d0, x1, #1
+constexpr uint32_t kFcvtzsFpFpW_S_5  = 0x1E18EC20;  // fcvtzs w0, s1, #5
+constexpr uint32_t kFcvtzsFpFpX_D_16 = 0x9E58C020;  // fcvtzs x0, d1, #16
+constexpr uint32_t kFcvtzuFpFpW_S_5  = 0x1E19EC20;  // fcvtzu w0, s1, #5
+constexpr uint32_t kFcvtzuFpFpX_D_1  = 0x9E59FC20;  // fcvtzu x0, d1, #1
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfFpFpSWPositive) {
+  // SCVTF S0, W1, #5: W1 = 240 (int32) → 240/32 = 7.5 → FP32(7.5).
+  state_.cpu.x[1] = 240ULL;
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfFpFpS_W_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x40F00000ULL) << "FP32(7.5) in V0[31:0], upper zero";
+  EXPECT_EQ(r[1], 0ULL) << "V0[127:64] zeroed";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfFpFpSWNegative) {
+  // SCVTF S0, W1, #5: W1 = (int32_t)-240 = 0xFFFFFF10 → -240/32 = -7.5.
+  state_.cpu.x[1] = 0x00000000FFFFFF10ULL;  // upper 32 bits don't matter for sf=0
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfFpFpS_W_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xC0F00000ULL) << "FP32(-7.5) in V0[31:0]";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ScvtfFpFpDXPositive) {
+  // SCVTF D0, X1, #16: X1 = 65536 → 65536/65536 = 1.0 → FP64(1.0).
+  state_.cpu.x[1] = 65536ULL;
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kScvtfFpFpD_X_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x3FF0000000000000ULL) << "FP64(1.0) in V0[63:0]";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfFpFpSWHighBit) {
+  // UCVTF S0, W1, #16: W1 = UINT32_MAX → uint32(2^32-1)/2^16 ≈ 65536.0.
+  // FP32 mantissa can't represent 65535.999...; rounds up to 65536.
+  state_.cpu.x[1] = 0xFFFFFFFFULL;
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfFpFpS_W_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x47800000ULL) << "FP32(65536.0) rounded from (2^32-1)/2^16";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UcvtfFpFpDXAllOnes) {
+  // UCVTF D0, X1, #1: X1 = UINT64_MAX → (2^64-1)/2 → round-to-odd halve
+  // path; Cvtsi2sdq(0x7FFFFFFFFFFFFFFF) = FP64(2^63 - exact), Addsd
+  // doubles to 2^64; Mulsd by 2^-1 → 2^63.  Exercises the upper-half
+  // uint64 → FP64 fixup.
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUcvtfFpFpD_X_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x43E0000000000000ULL) << "FP64(2^63) from UINT64_MAX/2";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsFpFpWSPositive) {
+  // FCVTZS W0, S1, #5: S1 = FP32(7.5) → 7.5 * 32 = 240 → W0 = 240.
+  StoreFp32(state_.cpu, 1, 7.5f);
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {kFcvtzsFpFpW_S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 240ULL) << "W0 = 240, zero-extended to X0";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsFpFpWSNaN) {
+  // FCVTZS W0, S1, #5: S1 = qNaN → ARM saturation rule → W0 = 0.
+  StoreFp32(state_.cpu, 1, std::numeric_limits<float>::quiet_NaN());
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {kFcvtzsFpFpW_S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL) << "NaN → 0";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzsFpFpXDPositive) {
+  // FCVTZS X0, D1, #16: D1 = FP64(0.5) → 0.5 * 65536 = 32768 → X0 = 32768.
+  StoreFp64(state_.cpu, 1, 0.5);
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {kFcvtzsFpFpX_D_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 32768ULL) << "0.5 * 2^16 = 32768";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuFpFpWSNegative) {
+  // FCVTZU W0, S1, #5: S1 = -7.5 → ARM unsigned saturation: FP<0 → 0.
+  StoreFp32(state_.cpu, 1, -7.5f);
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {kFcvtzuFpFpW_S_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL) << "FP<0 → 0 (unsigned)";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuFpFpXDHighBitRange) {
+  // FCVTZU X0, D1, #1: D1 = FP64(2^62) → scaled = 2^63 — falls into the
+  // [2^63, 2^64) band; subtract-2^63 + Btsq#63 path returns 2^63.
+  StoreFp64(state_.cpu, 1, static_cast<double>(0x1p62));
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {kFcvtzuFpFpX_D_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x8000000000000000ULL)
+      << "2^62 * 2 = 2^63 via subtract-2^63 + Btsq#63";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtzuFpFpXDOverflow) {
+  // FCVTZU X0, D1, #1: D1 = FP64(2^63) → scaled = 2^64 → saturate to
+  // UINT64_MAX.
+  StoreFp64(state_.cpu, 1, static_cast<double>(0x1p63));
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t code[] = {kFcvtzuFpFpX_D_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], UINT64_MAX)
+      << "2^63 * 2 = 2^64 → saturate UINT64_MAX";
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
