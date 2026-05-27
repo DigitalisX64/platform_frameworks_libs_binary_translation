@@ -12852,14 +12852,44 @@ class LiteTranslator {
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
     // region digitalis
-    // Scalar shift-by-immediate (B/H/S/D) bails to interpreter — the
-    // JIT lowerings below use parallel x86 shifts on all lanes within
-    // the lower 64 bits of Vn, which produces wrong values in
-    // Vd[esize:63] for scalar B/H/S semantics (only Vd[esize-1:0]
-    // should be written, with Vd[127:esize] zeroed).  The interpreter
-    // honours args.scalar via num_elements=1 and a zero-initialised
-    // result, matching ARM ARM exactly.
-    if (args.scalar) { success_ = false; return; }
+    // Scalar shift-by-immediate dispatch.  The decoder forces D-form
+    // (immh bit 3 set, esize=64) for the "simple" shift family — SSHR /
+    // USHR / SSRA / USRA / SRSHR / URSHR / SRSRA / URSRA / SHL / SLI /
+    // SRI — and sets args.q=false.  For those opcodes the existing
+    // vector lowering below produces the correct scalar D-form result:
+    //   - esize_bits is decoded as 64 (immh bit 3 set), so PSLLQ / PSRLQ
+    //     are emitted for the low 64 bits of Vn.
+    //   - args.q=false triggers the `Pslldq+Psrldq 8` upper-zero step
+    //     at the store path, which delivers Vd[127:64]=0 — exactly
+    //     ARM ARM scalar Vd[127:esize]=0.
+    //   - SSHR / SSRA / SRSHR / SRSRA at .2D still bail inside their
+    //     case arms (PSRAQ is AVX-512F-VL only); the interpreter picks
+    //     them up.
+    //
+    // Saturating shifts (SQSHL / UQSHL / SQSHLU), narrow shifts
+    // (SQSHRN / UQSHRN / SQRSHRN / UQRSHRN / SQSHRUN / SQRSHRUN), and
+    // fixed-point conversions (SCVTF / UCVTF / FCVTZS / FCVTZU) accept
+    // B/H/S scalar forms whose esize < 64; the vector path's upper-zero
+    // only covers Vd[127:64], not Vd[esize:63], so it would leak wrong
+    // values into Vd's low half.  Bail to interpreter for those.
+    if (args.scalar) {
+      switch (args.opcode) {
+        case Decoder::AdvSimdShiftImmOpcode::kShl:
+        case Decoder::AdvSimdShiftImmOpcode::kSshr:
+        case Decoder::AdvSimdShiftImmOpcode::kUshr:
+        case Decoder::AdvSimdShiftImmOpcode::kSsra:
+        case Decoder::AdvSimdShiftImmOpcode::kUsra:
+        case Decoder::AdvSimdShiftImmOpcode::kSli:
+        case Decoder::AdvSimdShiftImmOpcode::kSri:
+        case Decoder::AdvSimdShiftImmOpcode::kSrshr:
+        case Decoder::AdvSimdShiftImmOpcode::kUrshr:
+        case Decoder::AdvSimdShiftImmOpcode::kSrsra:
+        case Decoder::AdvSimdShiftImmOpcode::kUrsra:
+          break;  // D-form-only ops fall through to vector path.
+        default:
+          success_ = false; return;
+      }
+    }
     // endregion
     // region digitalis - JIT for USHLL / SSHLL (unsigned/signed shift-left
     // long) at 8B→8H / 4H→4S / 2S→2D widening + Q=1 "long2" forms

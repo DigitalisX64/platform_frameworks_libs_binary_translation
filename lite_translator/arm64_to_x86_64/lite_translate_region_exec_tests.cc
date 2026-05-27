@@ -21734,6 +21734,153 @@ TEST_F(Arm64LiteTranslateRegionTest, Tbl16BInPlaceVdEqualsVm) {
 }
 // endregion
 
+// region digitalis
+// Scalar shift-by-immediate D-form JIT exec tests.
+//
+// ARM ARM C4.1.6.10 specifies SSHR / USHR / SSRA / USRA / SRSHR / URSHR /
+// SRSRA / URSRA / SHL / SLI / SRI as scalar D-form only (immh bit 3 set,
+// esize=64).  The JIT promotion reuses the vector path with args.q=false
+// driving the upper-zero step at the store, so the result is exactly
+// scalar D semantics: Vd.D[0] = op(Vn.D[0]); Vd.D[1] = 0.
+//
+// SSHR / SSRA / SRSHR / SRSRA scalar D still bail (PSRAQ is AVX-512F-VL
+// only); they're covered by the existing interpreter path.
+constexpr uint32_t kShlScalarD_11    = 0x5F4B5420;  // shl   d0, d1, #11
+constexpr uint32_t kShlScalarD_InPl  = 0x5F4B5400;  // shl   d0, d0, #11  (Vd==Vn)
+constexpr uint32_t kUshrScalarD_11   = 0x7F750420;  // ushr  d0, d1, #11
+constexpr uint32_t kUshrScalarD_64   = 0x7F400420;  // ushr  d0, d1, #64  (boundary)
+constexpr uint32_t kUsraScalarD_11   = 0x7F751420;  // usra  d0, d1, #11
+constexpr uint32_t kSliScalarD_11    = 0x7F4B5420;  // sli   d0, d1, #11
+constexpr uint32_t kSriScalarD_11    = 0x7F754420;  // sri   d0, d1, #11
+constexpr uint32_t kUrshrScalarD_11  = 0x7F752420;  // urshr d0, d1, #11
+constexpr uint32_t kUrsraScalarD_11  = 0x7F753420;  // ursra d0, d1, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlScalarD) {
+  uint64_t in[2] = {0x0000000000000001ULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);  // Confirms upper-zero step.
+  static const uint32_t code[] = {kShlScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(in[0] << 11));
+  EXPECT_EQ(r[1], 0ULL) << "upper 64 bits must be zero (scalar Vd[127:64]=0)";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlScalarDInPlaceVdEqualsVn) {
+  uint64_t in[2] = {0x0123456789ABCDEFULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kShlScalarD_InPl};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(in[0] << 11)) << "in-place SHL D low";
+  EXPECT_EQ(r[1], 0ULL) << "upper 64 zeroed even with Vd==Vn";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrScalarD) {
+  uint64_t in[2] = {0xFEDCBA9876543210ULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], in[0] >> 11);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrScalarDShift64) {
+  // USHR by esize: ARM-architectural result is 0.  Pins that PSRLQ
+  // saturates count >= esize to 0 (matching arch) and the upper-zero
+  // step doesn't smear the high half into the low half.
+  uint64_t in[2] = {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrScalarD_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraScalarD) {
+  uint64_t in[2]  = {0xFEDCBA9876543210ULL, 0xDEADBEEFCAFEBABEULL};
+  uint64_t acc[2] = {0x0000000000010000ULL, 0xCAFECAFECAFECAFEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], acc, 16);
+  static const uint32_t code[] = {kUsraScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], acc[0] + (in[0] >> 11));
+  EXPECT_EQ(r[1], 0ULL) << "upper 64 zeroed; original acc[1] discarded";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SliScalarD) {
+  // SLI Vd = (Vd & low_mask) | (Vn << shift); low_mask keeps the
+  // bottom `shift` bits of Vd.
+  uint64_t vn[2] = {0x00000000DEADBEEFULL, 0xCAFEBABECAFEBABEULL};
+  uint64_t vd[2] = {0x0000000000000ABCULL, 0x1234567890ABCDEFULL};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSliScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint64_t low_mask = (1ULL << 11) - 1;
+  EXPECT_EQ(r[0], (vd[0] & low_mask) | (vn[0] << 11));
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SriScalarD) {
+  // SRI Vd = (Vd & high_mask) | (Vn >> shift); high_mask keeps the
+  // top `shift` bits of Vd.
+  uint64_t vn[2] = {0xFEDCBA9876543210ULL, 0xCAFEBABECAFEBABEULL};
+  uint64_t vd[2] = {0xAABBCCDDEEFF0011ULL, 0x1234567890ABCDEFULL};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSriScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint64_t high_mask = ~((1ULL << (64 - 11)) - 1);
+  EXPECT_EQ(r[0], (vd[0] & high_mask) | (vn[0] >> 11));
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrScalarD) {
+  // URSHR rounds-to-nearest: floor((x + 2^(shift-1)) / 2^shift).
+  // Pick a value where the round bit is set: low 11 bits = 0x500,
+  // round bit (bit 10) = 1, so result should round up by 1.
+  uint64_t in[2] = {0x12345678ABCDE500ULL, 0xCAFEBABECAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUrshrScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint64_t want = (in[0] >> 11) + ((in[0] >> 10) & 1ULL);
+  EXPECT_EQ(r[0], want) << "URSHR D scalar round-bit accumulation";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrsraScalarD) {
+  uint64_t in[2]  = {0x12345678ABCDE500ULL, 0xCAFEBABECAFEBABEULL};
+  uint64_t acc[2] = {0x0000000000010000ULL, 0x1234567890ABCDEFULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memcpy(&state_.cpu.v[0], acc, 16);
+  static const uint32_t code[] = {kUrsraScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint64_t want = acc[0] + ((in[0] >> 11) + ((in[0] >> 10) & 1ULL));
+  EXPECT_EQ(r[0], want);
+  EXPECT_EQ(r[1], 0ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
