@@ -11163,6 +11163,7 @@ class LiteTranslator {
   //   FCVTAU Sd, Sn / FCVTAU Dd, Dn      FP → unsigned int, round-to-nearest ties-away
   //   FCVTXN Sd, Dn                      FP64 → FP32 narrow, round-to-odd
   //   SQABS  Bd/Hd/Sd/Dd, Bn/Hn/Sn/Dn    signed saturating absolute value
+  //   SQNEG  Bd/Hd/Sd/Dd, Bn/Hn/Sn/Dn    signed saturating negate
   //
   // The FP-to-int and int-to-FP single-lane lowerings mirror the per-lane
   // variant of the corresponding vector kFcvtzsV / kFcvtzuV / kFcvtasV /
@@ -11170,11 +11171,13 @@ class LiteTranslator {
   // that we work on the bottom lane directly (Movsd/Movss) and explicitly
   // zero Vd above the lane before writing the single-precision/double
   // result.  FCVTXN uses a one-shot MXCSR round-toward-zero conversion
-  // plus LSB-OR fix-up to realize the ARM "Round to Odd" mode.  SQABS is a
-  // GP-register lowering: sign-extend the source, NEG into a paired temp,
-  // CMOVS to choose abs(x), then CMP+CMOVZ to saturate INT_MIN → INT_MAX.
+  // plus LSB-OR fix-up to realize the ARM "Round to Odd" mode.  SQABS /
+  // SQNEG share a GP-register lowering: sign-extend the source, NEG into
+  // a paired temp; SQABS picks abs(x) via CMOVS, SQNEG unconditionally
+  // uses the negated value; then CMP+CMOVZ saturates INT_MIN → INT_MAX
+  // (the single saturating input case for both ops).
   //
-  // Other constituents of this dispatch class (SQNEG/SQXTN/SQXTUN/UQXTN/
+  // Other constituents of this dispatch class (SQXTN/SQXTUN/UQXTN/
   // FRECPE/FRSQRTE scalar) bail to the interpreter via success_=false —
   // they are JIT follow-ups; the interpreter handles them correctly today.
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
@@ -11670,22 +11673,26 @@ class LiteTranslator {
         return;
       }
 
-      case Opcode::kSqabs: {
-        // SQABS scalar: saturating signed absolute value.
+      case Opcode::kSqabs:
+      case Opcode::kSqneg: {
+        // SQABS / SQNEG scalar: saturating signed absolute value / negate.
         // size: 00=B (8-bit), 01=H (16-bit), 10=S (32-bit), 11=D (64-bit).
-        // Per-lane semantics:
+        // Per-lane semantics (both share the saturation step):
         //   if src == INT_MIN_for_width -> INT_MAX_for_width (saturation)
-        //   else                         -> |src|
+        //   else if SQNEG               -> -src
+        //   else (SQABS)                -> |src|
         // Result is written to lane 0 of Vd, upper bytes zeroed.  See
-        // Interpreter::AdvSimdScalarTwoRegMisc::kSqabs for the reference
-        // semantics (matched by the four host exec tests below).
+        // Interpreter::AdvSimdScalarTwoRegMisc::{kSqabs,kSqneg} for the
+        // reference semantics (matched by the host exec tests below).
         //
         // Strategy: sign-extend src to int64, compute negated = -src in a
-        // sibling temp, CMOVS picks abs(x); then CMPQ src,INT_MIN_w +
+        // sibling temp.  SQABS picks abs(x) via CMOVS on the sign of src;
+        // SQNEG unconditionally takes negated.  Then CMPQ src,INT_MIN_w +
         // CMOVZ saturates the single saturating input case to INT_MAX_w.
         // The intermediate result fits in int64 even for D-width because
-        // |INT64_MIN| overflows to INT64_MIN (i.e. stays in the "saturate"
-        // bucket selected by the CMP).
+        // |INT64_MIN| (and -INT64_MIN) both overflow to INT64_MIN (i.e.
+        // stays in the "saturate" bucket selected by the CMP).
+        const bool is_neg = (args.opcode == Opcode::kSqneg);
         const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
         int64_t int_min;
         int64_t int_max;
@@ -11726,11 +11733,16 @@ class LiteTranslator {
         // negated = -src.  Negq clobbers EFLAGS.
         as_.Movq(negated, src);
         as_.Negq(negated);
-        // result starts as src; if src < 0, result = -src.  Testq sets
-        // SF from src's sign bit.
-        as_.Movq(result, src);
-        as_.Testq(src, src);
-        as_.Cmovq(Assembler::Condition::kNegative, result, negated);
+        if (is_neg) {
+          // SQNEG: always take the negated value.
+          as_.Movq(result, negated);
+        } else {
+          // SQABS: result starts as src; if src < 0, result = -src.  Testq
+          // sets SF from src's sign bit.
+          as_.Movq(result, src);
+          as_.Testq(src, src);
+          as_.Cmovq(Assembler::Condition::kNegative, result, negated);
+        }
         // Saturation: if src == INT_MIN_for_width, result = INT_MAX_for_width.
         as_.Movq(int_min_reg, int_min);
         as_.Cmpq(src, int_min_reg);
@@ -11757,8 +11769,8 @@ class LiteTranslator {
       }
 
       default:
-        // SQNEG / SQXTN / SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail
-        // to the interpreter.  Correctness path is handled by
+        // SQXTN / SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail to the
+        // interpreter.  Correctness path is handled by
         // Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT them
         // individually.
         success_ = false;
