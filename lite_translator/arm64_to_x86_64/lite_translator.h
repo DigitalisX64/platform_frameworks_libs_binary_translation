@@ -11772,6 +11772,76 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kUqxtn: {
+        // UQXTN scalar: unsigned saturating extract narrow, single-lane.
+        // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit
+        // src, 10 → 32-bit dst from 64-bit src; size=11 is rejected by the
+        // decoder.  Per-lane semantics: clamp unsigned src to [0, UMAX_dst]
+        // and truncate to dst width.  Result is written to lane 0 of Vd with
+        // the upper bytes zeroed.  See
+        // Interpreter::AdvSimdScalarTwoRegMisc::kUqxtn for the reference
+        // semantics (matched by the host exec tests below).
+        //
+        // Strategy: load src zero-extended to uint64 at the 2× lane (src)
+        // width, then clamp with a single CMOV arm — CMOVA (unsigned above)
+        // against UMAX_dst.  Lower bound is implicit (zero-extended load
+        // produces a non-negative value).
+        const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
+        if (sz == 3) { success_ = false; return; }
+        int64_t uint_max;
+        switch (sz) {
+          case 0: uint_max = 0xFF;       break;  // UINT8_MAX
+          case 1: uint_max = 0xFFFF;     break;  // UINT16_MAX
+          default:
+            // sz == 2: dst is S (32-bit), src is D (64-bit).
+            uint_max = 0xFFFFFFFFLL; break;     // UINT32_MAX
+        }
+        Register src = AllocTempReg();
+        Register result = AllocTempReg();
+        Register bound = AllocTempReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (src == no_register || result == no_register ||
+            bound == no_register || xzero == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load src zero-extended to 64-bit, at the 2× lane src width.
+        switch (sz) {
+          case 0:
+            // src is H (16-bit).
+            as_.Movzxwq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 1:
+            // src is S (32-bit).  Movl on a 64-bit dst zero-extends.
+            as_.Movl(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          default:
+            // src is D (64-bit); already zero-extended (full width).
+            as_.Movq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+        }
+        // result = src (CMOV may override below).
+        as_.Movq(result, src);
+        // Upper-bound clamp: if (unsigned) src > UMAX_dst, result = UMAX_dst.
+        as_.Movq(bound, uint_max);
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kAbove, result, bound);
+        // Zero Vd, then store result at lane 0 at the dst width.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        switch (sz) {
+          case 0:
+            as_.Movb({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 1:
+            as_.Movw({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          default:
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+        }
+        return;
+      }
+
       case Opcode::kSqxtn: {
         // SQXTN scalar: signed saturating extract narrow, single-lane.
         // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit
@@ -11853,8 +11923,8 @@ class LiteTranslator {
       }
 
       default:
-        // SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail to the
-        // interpreter.  Correctness path is handled by
+        // SQXTUN / FRECPE / FRSQRTE scalars: bail to the interpreter.
+        // Correctness path is handled by
         // Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT them
         // individually.
         success_ = false;

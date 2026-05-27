@@ -3325,6 +3325,123 @@ TEST_F(Arm64LiteTranslateRegionTest, SqxtnBdHn_ZeroIdentity) {
 // endregion
 
 // region digitalis
+// UQXTN scalar: unsigned saturating extract narrow, single-lane.
+// Encoding: AdvSimd scalar two-reg-misc with U=1, opcode=10100.
+// size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit src,
+//       10 → 32-bit dst from 64-bit src; size=11 unallocated.
+// llvm-mc-21 checks at decoder.h:5425:
+//   uqxtn b0, h0  (size=00) -> 0x7E214800
+//   uqxtn h0, s0  (size=01) -> 0x7E614800
+//   uqxtn s0, d0  (size=10) -> 0x7EA14800
+constexpr uint32_t kUqxtnBdHnV0 = 0x7E214800;
+constexpr uint32_t kUqxtnHdSnV0 = 0x7E614800;
+constexpr uint32_t kUqxtnSdDnV0 = 0x7EA14800;
+
+// UQXTN Bd, Hn: in-range src (H=0xFF → B=0xFF, identity at boundary).
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnBdHn_InRangeBoundary) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint16_t*>(&state_.cpu.v[0]) = 0x00FFu;  // 255 (H)
+  static const uint32_t code[] = {kUqxtnBdHnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint8_t*>(&state_.cpu.v[0]), 0xFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Bd, Hn: src above UINT8_MAX saturates to UINT8_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnBdHn_Saturates) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint16_t*>(&state_.cpu.v[0]) = 0xABCDu;  // 43981 (H)
+  static const uint32_t code[] = {kUqxtnBdHnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint8_t*>(&state_.cpu.v[0]), 0xFFu);  // UINT8_MAX
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Bd, Hn: zero passes through unchanged.
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnBdHn_ZeroIdentity) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint16_t*>(&state_.cpu.v[0]) = 0x0000u;
+  static const uint32_t code[] = {kUqxtnBdHnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0ULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Hd, Sn: in-range src (S=0xFFFF → H=0xFFFF, identity at boundary).
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnHdSn_InRangeBoundary) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x0000FFFFu;  // 65535 (S)
+  static const uint32_t code[] = {kUqxtnHdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint16_t*>(&state_.cpu.v[0]), 0xFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Hd, Sn: src above UINT16_MAX saturates to UINT16_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnHdSn_Saturates) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0x00010000u;  // 65536 (S)
+  static const uint32_t code[] = {kUqxtnHdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint16_t*>(&state_.cpu.v[0]), 0xFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Hd, Sn: high-bit S (interpreted unsigned) saturates.
+// 0xFFFFFFFF as u32 is UINT32_MAX, which is well above UINT16_MAX.  The
+// zero-extending Movl load means this is treated as the large unsigned
+// value 4294967295, NOT as -1, so it correctly saturates to UINT16_MAX
+// (which would not happen if the src were sign-extended).
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnHdSn_HighBitSetSaturates) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint32_t*>(&state_.cpu.v[0]) = 0xFFFFFFFFu;
+  static const uint32_t code[] = {kUqxtnHdSnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint16_t*>(&state_.cpu.v[0]), 0xFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Sd, Dn: in-range src (D=42 → S=42, small unsigned identity).
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnSdDn_InRangeSmall) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 42ULL;
+  static const uint32_t code[] = {kUqxtnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 42u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 42ULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Sd, Dn: src above UINT32_MAX saturates to UINT32_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnSdDn_Saturates) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x0000000100000000ULL;  // +4G
+  static const uint32_t code[] = {kUqxtnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0xFFFFFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFFFFFFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// UQXTN Sd, Dn: full-bits D source saturates (treated as huge unsigned, not
+// as -1).
+TEST_F(Arm64LiteTranslateRegionTest, UqxtnSdDn_AllOnesSaturates) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = ~uint64_t{0};  // UINT64_MAX
+  static const uint32_t code[] = {kUqxtnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]), 0xFFFFFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFFFFFFFULL);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+// endregion
+
+// region digitalis
 // FRINTA Sd, Sn / Dd, Dn (round to nearest, ties AWAY from zero).
 // FP data-processing 1-source, opcode=001100:
 //   FRINTA Sd, Sn: 0001_1110_0010_0110_0100_00nn_nnnd_dddd  (ftype=00)
