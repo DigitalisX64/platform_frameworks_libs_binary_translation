@@ -11772,6 +11772,76 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kUqxtn: {
+        // UQXTN scalar: unsigned saturating extract narrow, single-lane.
+        // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit
+        // src, 10 → 32-bit dst from 64-bit src; size=11 is rejected by the
+        // decoder.  Per-lane semantics: clamp unsigned src to [0, UMAX_dst]
+        // and truncate to dst width.  Result is written to lane 0 of Vd with
+        // the upper bytes zeroed.  See
+        // Interpreter::AdvSimdScalarTwoRegMisc::kUqxtn for the reference
+        // semantics (matched by the host exec tests below).
+        //
+        // Strategy: load src zero-extended to uint64 at the 2× lane (src)
+        // width, then clamp with a single CMOV arm — CMOVA (unsigned above)
+        // against UMAX_dst.  Lower bound is implicit (zero-extended load
+        // produces a non-negative value).
+        const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
+        if (sz == 3) { success_ = false; return; }
+        int64_t uint_max;
+        switch (sz) {
+          case 0: uint_max = 0xFF;       break;  // UINT8_MAX
+          case 1: uint_max = 0xFFFF;     break;  // UINT16_MAX
+          default:
+            // sz == 2: dst is S (32-bit), src is D (64-bit).
+            uint_max = 0xFFFFFFFFLL; break;     // UINT32_MAX
+        }
+        Register src = AllocTempReg();
+        Register result = AllocTempReg();
+        Register bound = AllocTempReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (src == no_register || result == no_register ||
+            bound == no_register || xzero == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load src zero-extended to 64-bit, at the 2× lane src width.
+        switch (sz) {
+          case 0:
+            // src is H (16-bit).
+            as_.Movzxwq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 1:
+            // src is S (32-bit).  Movl on a 64-bit dst zero-extends.
+            as_.Movl(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          default:
+            // src is D (64-bit); already zero-extended (full width).
+            as_.Movq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+        }
+        // result = src (CMOV may override below).
+        as_.Movq(result, src);
+        // Upper-bound clamp: if (unsigned) src > UMAX_dst, result = UMAX_dst.
+        as_.Movq(bound, uint_max);
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kAbove, result, bound);
+        // Zero Vd, then store result at lane 0 at the dst width.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        switch (sz) {
+          case 0:
+            as_.Movb({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 1:
+            as_.Movw({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          default:
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+        }
+        return;
+      }
+
       case Opcode::kSqxtn: {
         // SQXTN scalar: signed saturating extract narrow, single-lane.
         // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit
@@ -11852,11 +11922,216 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kSqxtun: {
+        // SQXTUN scalar: signed-source, unsigned-dst saturating extract
+        // narrow, single-lane.  size: 00 → 8-bit dst from 16-bit src,
+        // 01 → 16-bit dst from 32-bit src, 10 → 32-bit dst from 64-bit src;
+        // size=11 is rejected by the decoder.  Per-lane semantics: treat src
+        // as signed; clamp to [0, UMAX_dst] and truncate to dst width.
+        // Result is written to lane 0 of Vd with the upper bytes zeroed.
+        // See Interpreter::AdvSimdScalarTwoRegMisc::kSqxtun for the
+        // reference semantics (matched by the host exec tests below).
+        //
+        // Strategy: load src sign-extended to int64 at the 2× lane (src)
+        // width, then clamp with two CMOV arms — CMOVL against 0 (signed
+        // less; negative src → 0) and CMOVG against UMAX_dst (signed
+        // greater; src > UMAX_dst → UMAX_dst).  Movq imm64 between the
+        // Cmpq/Cmovq pairs does not touch EFLAGS, so each Cmpq sets fresh
+        // flags for its own arm.
+        const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
+        if (sz == 3) { success_ = false; return; }
+        int64_t uint_max;
+        switch (sz) {
+          case 0: uint_max = 0xFF;       break;  // UINT8_MAX
+          case 1: uint_max = 0xFFFF;     break;  // UINT16_MAX
+          default:
+            // sz == 2: dst is S (32-bit), src is D (64-bit).
+            uint_max = 0xFFFFFFFFLL; break;     // UINT32_MAX
+        }
+        Register src = AllocTempReg();
+        Register result = AllocTempReg();
+        Register bound = AllocTempReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (src == no_register || result == no_register ||
+            bound == no_register || xzero == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load src sign-extended to 64-bit, at the 2× lane src width.
+        switch (sz) {
+          case 0:
+            // src is H (16-bit).
+            as_.Movsxwq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 1:
+            // src is S (32-bit).
+            as_.Movsxlq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          default:
+            // src is D (64-bit); already signed at int64 width.
+            as_.Movq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+        }
+        // result = src (clamping arms may override below).
+        as_.Movq(result, src);
+        // Lower-bound clamp: if src < 0, result = 0.
+        as_.Movq(bound, int64_t{0});
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kLess, result, bound);
+        // Upper-bound clamp: if src > UMAX_dst, result = UMAX_dst.
+        as_.Movq(bound, uint_max);
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kGreater, result, bound);
+        // Zero Vd, then store result at lane 0 at the dst width.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        switch (sz) {
+          case 0:
+            as_.Movb({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 1:
+            as_.Movw({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          default:
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+        }
+        return;
+      }
+
+      case Opcode::kFrecpe: {
+        // FRECPE scalar: single-lane FP reciprocal estimate.  Decoder pins
+        // bit1 of size (size ∈ {10, 11}); bit0 selects S (0) vs D (1).
+        // Per ARM ARM C7.2.150 the result needs only ~8 bits of mantissa
+        // precision; the exact 1.0/x computed by DIVSS / DIVSD is well
+        // within bound.  All special-case inputs fall out of x86 IEEE-754
+        // divide semantics natively:
+        //   ±0   -> ±inf   (matches FRECPE FPSR.DZC behaviour)
+        //   ±inf -> ±0
+        //   NaN  -> NaN    (single-rounded, propagates input)
+        // Matches Interpreter::AdvSimdScalarTwoRegMisc::kFrecpe by-result
+        // for every input class — verified by the host exec tests.
+        const bool is_double = ((args.size & 1) != 0);
+        SimdRegister result_xmm = AllocTempSimdReg();
+        SimdRegister src_xmm = AllocTempSimdReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        if (result_xmm == no_simd_register || src_xmm == no_simd_register ||
+            xzero == no_simd_register || tmp == no_register) {
+          success_ = false; return;
+        }
+        // Build 1.0 in result_xmm; load src lane 0 into src_xmm; divide.
+        if (is_double) {
+          as_.Movq(tmp, int64_t{0x3FF0000000000000LL});  // bits of 1.0 (FP64)
+          as_.Movq(result_xmm, tmp);
+          as_.Movsd(src_xmm, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Divsd(result_xmm, src_xmm);
+        } else {
+          as_.Movl(tmp, int32_t{0x3F800000});  // bits of 1.0f (FP32)
+          as_.Movd(result_xmm, tmp);
+          as_.Movss(src_xmm, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Divss(result_xmm, src_xmm);
+        }
+        // Zero Vd, then write the scalar lane 0.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        if (is_double) {
+          as_.Movsd({.base = Assembler::rbp, .disp = vd_off}, result_xmm);
+        } else {
+          as_.Movss({.base = Assembler::rbp, .disp = vd_off}, result_xmm);
+        }
+        return;
+      }
+
+      case Opcode::kFrsqrte: {
+        // FRSQRTE scalar: single-lane FP reciprocal-square-root estimate.
+        // ARM ARM C7.2.155.  Decoder pins bit1 of size (size ∈ {10, 11});
+        // bit0 selects S (0) vs D (1).
+        //
+        // Interpreter reference (interpreter.h kFrsqrte):
+        //   r = (src <= 0 || isNaN(src)) ? default_qNaN : 1.0 / sqrt(src)
+        //
+        // The non-positive-or-NaN replacement uses the default qNaN
+        // payload (0x7FC00000 / 0x7FF8000000000000) rather than the
+        // input NaN — x86 SQRT/DIV would propagate the input NaN, so we
+        // must blend it out explicitly.
+        //
+        // Branchless lowering: compute the normal-path 1.0/sqrt(src),
+        // build the special-case mask (src <= 0 OR isNaN(src)), and blend
+        // the default qNaN under the mask.
+        //   sqrt   = SQRT(src)                  (SQRTSS / SQRTSD)
+        //   recip  = 1.0 / sqrt                 (DIVSS / DIVSD)
+        //   mask   = CMPLE(src, 0) | CMPUNORD(src, src)
+        //   result = (mask & qNaN) | (~mask & recip)
+        // Mantissa-precision requirement is only ~8 bits (same as FRECPE);
+        // the exact 1.0/sqrt(x) computed by SQRT+DIV is well within bound
+        // for every positive-finite input.
+        const bool is_double = ((args.size & 1) != 0);
+        SimdRegister src_xmm = AllocTempSimdReg();
+        SimdRegister sqrt_xmm = AllocTempSimdReg();
+        SimdRegister recip_xmm = AllocTempSimdReg();
+        SimdRegister mask_xmm = AllocTempSimdReg();
+        SimdRegister mask_nan_xmm = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        if (src_xmm == no_simd_register || sqrt_xmm == no_simd_register ||
+            recip_xmm == no_simd_register || mask_xmm == no_simd_register ||
+            mask_nan_xmm == no_simd_register || tmp == no_register) {
+          success_ = false; return;
+        }
+        if (is_double) {
+          // src_xmm = src (memory load zero-extends to 128 bits).
+          as_.Movsd(src_xmm, {.base = Assembler::rbp, .disp = vn_off});
+          // sqrt_xmm = sqrt(src) at lane 0.
+          as_.Sqrtsd(sqrt_xmm, src_xmm);
+          // recip_xmm = 1.0 / sqrt(src).
+          as_.Movq(tmp, int64_t{0x3FF0000000000000LL});  // bits of 1.0d
+          as_.Movq(recip_xmm, tmp);
+          as_.Divsd(recip_xmm, sqrt_xmm);
+          // Build the (src <= 0) mask in mask_xmm.  Reuse sqrt_xmm as
+          // the 0.0 source (its lane 0 contents are no longer needed).
+          as_.Pxor(sqrt_xmm, sqrt_xmm);
+          as_.Movdqa(mask_xmm, src_xmm);
+          as_.Cmplesd(mask_xmm, sqrt_xmm);
+          // Build the isNaN(src) mask in mask_nan_xmm.
+          as_.Movdqa(mask_nan_xmm, src_xmm);
+          as_.Cmpunordsd(mask_nan_xmm, mask_nan_xmm);
+          // mask_xmm = (src <= 0) OR isNaN(src).
+          as_.Por(mask_xmm, mask_nan_xmm);
+          // Default qNaN constant into src_xmm (src is no longer needed).
+          as_.Movq(tmp, int64_t{0x7FF8000000000000LL});
+          as_.Movq(src_xmm, tmp);
+        } else {
+          as_.Movss(src_xmm, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Sqrtss(sqrt_xmm, src_xmm);
+          as_.Movl(tmp, int32_t{0x3F800000});  // bits of 1.0f
+          as_.Movd(recip_xmm, tmp);
+          as_.Divss(recip_xmm, sqrt_xmm);
+          as_.Pxor(sqrt_xmm, sqrt_xmm);
+          as_.Movdqa(mask_xmm, src_xmm);
+          as_.Cmpless(mask_xmm, sqrt_xmm);
+          as_.Movdqa(mask_nan_xmm, src_xmm);
+          as_.Cmpunordss(mask_nan_xmm, mask_nan_xmm);
+          as_.Por(mask_xmm, mask_nan_xmm);
+          as_.Movl(tmp, int32_t{0x7FC00000});  // default qNaN FP32
+          as_.Movd(src_xmm, tmp);
+        }
+        // Blend: result_in_src_xmm = (mask & qNaN) | (~mask & recip).
+        as_.Pand(src_xmm, mask_xmm);
+        as_.Pandn(mask_xmm, recip_xmm);
+        as_.Por(src_xmm, mask_xmm);
+        // Zero Vd, then write the scalar lane 0.
+        as_.Pxor(sqrt_xmm, sqrt_xmm);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, sqrt_xmm);
+        if (is_double) {
+          as_.Movsd({.base = Assembler::rbp, .disp = vd_off}, src_xmm);
+        } else {
+          as_.Movss({.base = Assembler::rbp, .disp = vd_off}, src_xmm);
+        }
+        return;
+      }
+
       default:
-        // SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail to the
-        // interpreter.  Correctness path is handled by
-        // Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT them
-        // individually.
+        // All AdvSimdScalarTwoRegMisc constituents are JIT-emitted.  Any
+        // remaining unhandled opcode bails to the interpreter for safety.
         success_ = false;
         return;
     }
