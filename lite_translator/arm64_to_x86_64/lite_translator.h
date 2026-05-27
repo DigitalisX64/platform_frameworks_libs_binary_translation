@@ -11922,11 +11922,86 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kSqxtun: {
+        // SQXTUN scalar: signed-source, unsigned-dst saturating extract
+        // narrow, single-lane.  size: 00 → 8-bit dst from 16-bit src,
+        // 01 → 16-bit dst from 32-bit src, 10 → 32-bit dst from 64-bit src;
+        // size=11 is rejected by the decoder.  Per-lane semantics: treat src
+        // as signed; clamp to [0, UMAX_dst] and truncate to dst width.
+        // Result is written to lane 0 of Vd with the upper bytes zeroed.
+        // See Interpreter::AdvSimdScalarTwoRegMisc::kSqxtun for the
+        // reference semantics (matched by the host exec tests below).
+        //
+        // Strategy: load src sign-extended to int64 at the 2× lane (src)
+        // width, then clamp with two CMOV arms — CMOVL against 0 (signed
+        // less; negative src → 0) and CMOVG against UMAX_dst (signed
+        // greater; src > UMAX_dst → UMAX_dst).  Movq imm64 between the
+        // Cmpq/Cmovq pairs does not touch EFLAGS, so each Cmpq sets fresh
+        // flags for its own arm.
+        const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
+        if (sz == 3) { success_ = false; return; }
+        int64_t uint_max;
+        switch (sz) {
+          case 0: uint_max = 0xFF;       break;  // UINT8_MAX
+          case 1: uint_max = 0xFFFF;     break;  // UINT16_MAX
+          default:
+            // sz == 2: dst is S (32-bit), src is D (64-bit).
+            uint_max = 0xFFFFFFFFLL; break;     // UINT32_MAX
+        }
+        Register src = AllocTempReg();
+        Register result = AllocTempReg();
+        Register bound = AllocTempReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (src == no_register || result == no_register ||
+            bound == no_register || xzero == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load src sign-extended to 64-bit, at the 2× lane src width.
+        switch (sz) {
+          case 0:
+            // src is H (16-bit).
+            as_.Movsxwq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 1:
+            // src is S (32-bit).
+            as_.Movsxlq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          default:
+            // src is D (64-bit); already signed at int64 width.
+            as_.Movq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+        }
+        // result = src (clamping arms may override below).
+        as_.Movq(result, src);
+        // Lower-bound clamp: if src < 0, result = 0.
+        as_.Movq(bound, int64_t{0});
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kLess, result, bound);
+        // Upper-bound clamp: if src > UMAX_dst, result = UMAX_dst.
+        as_.Movq(bound, uint_max);
+        as_.Cmpq(src, bound);
+        as_.Cmovq(Assembler::Condition::kGreater, result, bound);
+        // Zero Vd, then store result at lane 0 at the dst width.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        switch (sz) {
+          case 0:
+            as_.Movb({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 1:
+            as_.Movw({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          default:
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+        }
+        return;
+      }
+
       default:
-        // SQXTUN / FRECPE / FRSQRTE scalars: bail to the interpreter.
-        // Correctness path is handled by
-        // Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT them
-        // individually.
+        // FRECPE / FRSQRTE scalars: bail to the interpreter.  Correctness
+        // path is handled by Interpreter::AdvSimdScalarTwoRegMisc; future
+        // cycles can JIT them individually.
         success_ = false;
         return;
     }
