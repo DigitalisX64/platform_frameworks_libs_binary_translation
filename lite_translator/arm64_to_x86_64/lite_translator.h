@@ -12587,7 +12587,6 @@ class LiteTranslator {
   // success_=false — it is a JIT follow-up; the interpreter handles it
   // correctly today.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
-    if (args.is_fp16) { success_ = false; return; }
     const auto opc = args.opcode;
     const bool is_fmulx = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFmulx);
     const bool is_frecps = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFrecps);
@@ -12598,10 +12597,26 @@ class LiteTranslator {
     const bool is_fcmgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFcmgt);
     const bool is_facge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacge);
     const bool is_facgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacgt);
-    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd &&
-        !is_fcmeq && !is_fcmge && !is_fcmgt && !is_facge && !is_facgt) {
+    const bool is_cmp = is_fcmeq || is_fcmge || is_fcmgt || is_facge || is_facgt;
+    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp) {
       success_ = false; return;
     }
+    // region digitalis: FP16 path is JIT-emitted for FCMxx / FACxx (mask out),
+    // FMULX (real-FP out), and FABD (real-FP out) via an F16C round-trip
+    // (each FP16 source lane is lifted to FP32 in xmm lane 0; the existing
+    // FP32 core runs unchanged; result narrowed back to FP16).  Mask-producing
+    // ops narrow with Packssdw (against a zero scratch); real-FP ops narrow
+    // with Vcvtps2ph (which also auto-zeroes the upper 64 bits of the dst
+    // xmm).  FRECPS / FRSQRTS scalar H still bail to the interpreter —
+    // consistent with the existing FP16-FCVT / FCMA / FpDataProc3 fallback
+    // policy in this file.
+    if (args.is_fp16 && !host_platform::kHasF16C) {
+      success_ = false; return;
+    }
+    if (args.is_fp16 && !is_cmp && !is_fmulx && !is_fabd) {
+      success_ = false; return;
+    }
+    // endregion
     if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
       success_ = false; return;
     }
@@ -12619,7 +12634,22 @@ class LiteTranslator {
           xmm_mask == no_simd_register) {
         success_ = false; return;
       }
-      if (is_double) {
+      // region digitalis: FP16 lift via F16C round-trip — Pxor + Pinsrw +
+      // Vcvtph2ps widens each FP16 source lane to FP32 in xmm lane 0.  The
+      // existing FP32 FABD core (Subss + AND with non-sign-bit mask) then
+      // runs unchanged on the lifted operands; lanes 1..3 stay FP32 +0 by
+      // Vcvtph2ps zero-fill, and AND with the (also-FP32) non-sign mask
+      // preserves that upper-zero invariant.
+      const bool use_single = args.is_fp16 || !is_double;
+      if (args.is_fp16) {
+        as_.Pxor(xmm_a, xmm_a);
+        as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_a, xmm_a);
+        as_.Pxor(xmm_b, xmm_b);
+        as_.Pinsrw(xmm_b, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_b, xmm_b);
+        as_.Subss(xmm_a, xmm_b);
+      } else if (is_double) {
         as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
         as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
         as_.Subsd(xmm_a, xmm_b);
@@ -12628,20 +12658,34 @@ class LiteTranslator {
         as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
         as_.Subss(xmm_a, xmm_b);
       }
+      // endregion
       // Build non-sign-bit mask (all-ones shifted right by 1) and AND it
       // into the lane to clear the sign bit (== std::fabs).
       as_.Pcmpeqd(xmm_mask, xmm_mask);
-      if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
-      else as_.Psrld(xmm_mask, int8_t{1});
+      if (use_single) as_.Psrld(xmm_mask, int8_t{1});
+      else as_.Psrlq(xmm_mask, int8_t{1});
       as_.Pand(xmm_a, xmm_mask);
-      // Zero Vd above the lane, then write the scalar result at lane 0.
-      as_.Pxor(xmm_mask, xmm_mask);
-      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_mask);
-      if (is_double) {
-        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      // region digitalis: FP16 narrow via Vcvtps2ph (real-FP output, NOT a
+      // mask — Vcvtps2ph is the right primitive here).  It rounds 4 FP32
+      // lanes to 4 FP16 lanes in the dst xmm's low 64 bits and zero-fills
+      // the upper 64 bits.  Lanes 1..3 are FP32 +0.0 (preserved through
+      // the Subss + Pand pipeline), so narrowed word lanes 1..3 are 0x0000;
+      // word lanes 4..7 are 0 (auto-zero).  Full 128-bit Movdqu then writes
+      // Vd[15:0] = FP16 result with Vd[127:16] = 0.
+      if (args.is_fp16) {
+        as_.Vcvtps2ph(xmm_a, xmm_a, int8_t{0});
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
       } else {
-        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+        // Zero Vd above the lane, then write the scalar result at lane 0.
+        as_.Pxor(xmm_mask, xmm_mask);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_mask);
+        if (is_double) {
+          as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+        } else {
+          as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+        }
       }
+      // endregion
       return;
     }
 
@@ -12651,7 +12695,24 @@ class LiteTranslator {
       if (xmm_a == no_simd_register || xmm_b == no_simd_register) {
         success_ = false; return;
       }
-      if (is_double) {
+      // FP16-via-F16C runs at FP32 width: the FP32 compare core is bit-exact
+      // for the FP16-widened operands because Vcvtph2ps preserves NaN-ness
+      // and ±0 sign, and the FP16 sign bit becomes the FP32 sign bit (the
+      // FACxx fabs mask works at FP32 width).
+      const bool use_single = args.is_fp16 || !is_double;
+      if (args.is_fp16) {
+        // Lift each FP16 source lane to FP32 in xmm lane 0.  Pxor zeroes
+        // bits[127:0]; Pinsrw inserts Vn[15:0] / Vm[15:0] at xmm[15:0]
+        // (other FP16 lanes stay zero); Vcvtph2ps widens 4 FP16 lanes to
+        // 4 FP32 lanes — only lane 0 carries a real value, lanes 1..3 are
+        // FP32 +0.0 by construction.
+        as_.Pxor(xmm_a, xmm_a);
+        as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_a, xmm_a);
+        as_.Pxor(xmm_b, xmm_b);
+        as_.Pinsrw(xmm_b, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_b, xmm_b);
+      } else if (is_double) {
         as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
         as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
       } else {
@@ -12663,8 +12724,8 @@ class LiteTranslator {
         SimdRegister xmm_mask = AllocTempSimdReg();
         if (xmm_mask == no_simd_register) { success_ = false; return; }
         as_.Pcmpeqd(xmm_mask, xmm_mask);
-        if (is_double) as_.Psrlq(xmm_mask, int8_t{1});
-        else as_.Psrld(xmm_mask, int8_t{1});
+        if (use_single) as_.Psrld(xmm_mask, int8_t{1});
+        else as_.Psrlq(xmm_mask, int8_t{1});
         as_.Pand(xmm_a, xmm_mask);
         as_.Pand(xmm_b, xmm_mask);
       }
@@ -12675,27 +12736,41 @@ class LiteTranslator {
       //   FACGE/FACGT — same as FCMGE/FCMGT after both operands are |·|.
       SimdRegister xmm_result = no_simd_register;
       if (is_fcmeq) {
-        if (is_double) as_.Cmpeqsd(xmm_a, xmm_b);
-        else as_.Cmpeqss(xmm_a, xmm_b);
+        if (use_single) as_.Cmpeqss(xmm_a, xmm_b);
+        else as_.Cmpeqsd(xmm_a, xmm_b);
         xmm_result = xmm_a;
       } else if (is_fcmge || is_facge) {
-        if (is_double) as_.Cmplesd(xmm_b, xmm_a);
-        else as_.Cmpless(xmm_b, xmm_a);
+        if (use_single) as_.Cmpless(xmm_b, xmm_a);
+        else as_.Cmplesd(xmm_b, xmm_a);
         xmm_result = xmm_b;
       } else {  // is_fcmgt || is_facgt
-        if (is_double) as_.Cmpltsd(xmm_b, xmm_a);
-        else as_.Cmpltss(xmm_b, xmm_a);
+        if (use_single) as_.Cmpltss(xmm_b, xmm_a);
+        else as_.Cmpltsd(xmm_b, xmm_a);
         xmm_result = xmm_b;
       }
       // Zero Vd above the lane, then write the scalar mask at lane 0.
       // Reuse whichever of xmm_a / xmm_b is not the result as the zero scratch.
       SimdRegister xmm_zero = (xmm_result == xmm_a) ? xmm_b : xmm_a;
       as_.Pxor(xmm_zero, xmm_zero);
-      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_zero);
-      if (is_double) {
-        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+      if (args.is_fp16) {
+        // Pack the FP32 mask (lane 0 dword: 0xFFFFFFFF or 0x00000000) to a
+        // 16-bit mask (lane 0 word: 0xFFFF or 0x0000) via signed-saturating
+        // dword->word pack.  As signed int32: 0xFFFFFFFF == -1 saturates to
+        // -1 == 0xFFFF as int16; 0x00000000 saturates to 0.  Dword lanes
+        // 1..3 of xmm_result are 0 by construction (Vcvtph2ps zero-fill
+        // plus AND/scalar-cmp preserving the upper-zero invariant), so
+        // packing against xmm_zero (=0) leaves word lanes 1..7 == 0.  Full
+        // 128-bit Movdqu then writes Vd[15:0]=mask with Vd[127:16]=0,
+        // matching the AArch64 zero-extend semantic for Hd.
+        as_.Packssdw(xmm_result, xmm_zero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
       } else {
-        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+        as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_zero);
+        if (is_double) {
+          as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+        } else {
+          as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
+        }
       }
       return;
     }
@@ -12834,34 +12909,46 @@ class LiteTranslator {
       success_ = false; return;
     }
 
-    // Load a, b into lane 0.  Upper lanes are don't-care; the final store
-    // overwrites the full Vd slot.
-    if (is_double) {
+    // region digitalis: when args.is_fp16, lift each FP16 source lane to
+    // FP32 in xmm lane 0 (Pxor + Pinsrw + Vcvtph2ps), run the existing FP32
+    // FMULX compute core on the lifted operands, then narrow the FP32 result
+    // back to FP16 via Vcvtps2ph.  Vcvtph2ps puts FP32 +0.0 in lanes 1..3,
+    // which means mul/input cmpunord and ±2.0 bits in lanes 1..3 stay 0
+    // through the blend; Vcvtps2ph on (result, 0, 0, 0) writes word lane 0 =
+    // FP16 result and word lanes 1..3 = 0, and auto-zeroes the upper 64 bits.
+    // Full Movdqu then writes Vd[15:0]=result with Vd[127:16]=0.
+    const bool use_single = args.is_fp16 || !is_double;
+    if (args.is_fp16) {
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+    } else if (is_double) {
       as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
     }
+    // endregion
 
     // mul = a * b
     as_.Movdqa(xmm_mul, xmm_n);
-    if (is_double) {
-      as_.Mulsd(xmm_mul, xmm_m);
-    } else {
-      as_.Mulss(xmm_mul, xmm_m);
-    }
+    if (use_single) as_.Mulss(xmm_mul, xmm_m);
+    else            as_.Mulsd(xmm_mul, xmm_m);
 
     // mul_unord = cmpunord(mul, mul): all-ones iff mul is NaN.
     as_.Movdqa(xmm_mul_unord, xmm_mul);
-    if (is_double) as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
-    else as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+    if (use_single) as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+    else            as_.Cmpunordpd(xmm_mul_unord, xmm_mul_unord);
 
     // input_unord = cmpunord(a, b): all-ones iff either a or b is NaN.
     // CMPUNORDPS/PD sets the lane to all-ones when either operand is NaN.
     as_.Movdqa(xmm_input_unord, xmm_n);
-    if (is_double) as_.Cmpunordpd(xmm_input_unord, xmm_m);
-    else as_.Cmpunordps(xmm_input_unord, xmm_m);
+    if (use_single) as_.Cmpunordps(xmm_input_unord, xmm_m);
+    else            as_.Cmpunordpd(xmm_input_unord, xmm_m);
 
     // special_mask = mul_unord AND NOT input_unord.
     // Use PANDN: dst = (NOT dst) AND src.  So xmm_input_unord becomes
@@ -12871,24 +12958,21 @@ class LiteTranslator {
 
     // two_signed = (a XOR b) restricted to sign bit, OR'd with bits of 2.0.
     // Reuse xmm_n as the scratch for (a XOR b); we still have xmm_m intact.
-    if (is_double) {
-      as_.Xorpd(xmm_n, xmm_m);
-    } else {
-      as_.Xorps(xmm_n, xmm_m);
-    }
+    if (use_single) as_.Xorps(xmm_n, xmm_m);
+    else            as_.Xorpd(xmm_n, xmm_m);
     // Build sign-bit mask in xmm_mul_unord (we no longer need mul_unord).
     as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
-    if (is_double) as_.Psllq(xmm_mul_unord, int8_t{63});
-    else as_.Pslld(xmm_mul_unord, int8_t{31});
+    if (use_single) as_.Pslld(xmm_mul_unord, int8_t{31});
+    else            as_.Psllq(xmm_mul_unord, int8_t{63});
     as_.Pand(xmm_n, xmm_mul_unord);
     // Build ±2.0 by OR'ing in the bits of +2.0.
     Register tmp_gpr = AllocTempReg();
-    if (is_double) {
-      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});  // bits of 2.0 (FP64)
-      as_.Movq(xmm_two, tmp_gpr);
-    } else {
+    if (use_single) {
       as_.Movl(tmp_gpr, int32_t{0x40000000});  // bits of 2.0 (FP32)
       as_.Movd(xmm_two, tmp_gpr);
+    } else {
+      as_.Movq(tmp_gpr, int64_t{0x4000000000000000LL});  // bits of 2.0 (FP64)
+      as_.Movq(xmm_two, tmp_gpr);
     }
     as_.Por(xmm_n, xmm_two);
     // xmm_n now holds ±2.0 (lane 0), with sign = sign(a) XOR sign(b).
@@ -12902,13 +12986,22 @@ class LiteTranslator {
 
     // Zero Vd, then write the scalar lane 0.  Matches AArch64 scalar
     // semantics: bits above the operand size are zero.
-    as_.Pxor(xmm_two, xmm_two);
-    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_two);
-    if (is_double) {
-      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+    // region digitalis: FP16 narrow path uses Vcvtps2ph (real-FP-valued
+    // result, not an FP-width mask), which auto-zeroes upper 64 bits of dst
+    // xmm; full Movdqu then writes Vd[15:0]=FP16 result, Vd[127:16]=0.
+    if (args.is_fp16) {
+      as_.Vcvtps2ph(xmm_input_unord, xmm_input_unord, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
     } else {
-      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+      as_.Pxor(xmm_two, xmm_two);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_two);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
+      }
     }
+    // endregion
   }
   // endregion
 
@@ -12926,9 +13019,15 @@ class LiteTranslator {
   //   kFmaxnmpScalar  — FMAXNMP scalar S/D via NaN-suppressing substitution.
   //   kFminnmpScalar  — FMINNMP scalar S/D via NaN-suppressing substitution.
   //
-  // FP16 path (Armv8.2-FP16 forms at U=0 + size[0]=0) bails to the
-  // interpreter — needs FP16↔FP32 promotion around the reduction.  The
-  // interpreter handles those paths correctly today.
+  // FP16 path (Armv8.2-FP16 forms at U=0 + size[0]=0): F16C round-trip.
+  // The two FP16 source lanes are lifted to FP32 via Pinsrw + Vcvtph2ps,
+  // the existing FP32 reduction core runs on them unchanged, then the
+  // FP32 result is narrowed back to FP16 via Vcvtps2ph.  Vcvtph2ps
+  // preserves NaN-ness and ±0 sign, and the upper FP32 lanes stay 0
+  // throughout the reduction (the inputs were 16-bit zero-extended and
+  // x86 MAX/MIN/AND/OR on (0,0) returns 0), so Vcvtps2ph's narrowed
+  // upper FP16 lanes are also 0; Movdqu then writes Vd[15:0]=result with
+  // Vd[127:16]=0.  Falls back to interpreter when F16C is absent.
   //
   // FMAX/FMIN-vs-FMAXNM/FMINNM NaN policy (matches the vector lowering at
   // AdvSimdThreeSame{kFmaxV,kFminV,kFmaxnmV,kFminnmV}):
@@ -12946,7 +13045,7 @@ class LiteTranslator {
   // -0, which matches ARM's "sign of -0 is preserved" for both families.
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
     using Op = Decoder::AdvSimdScalarPairwiseOpcode;
-    if (args.is_fp16) { success_ = false; return; }
+    if (args.is_fp16 && !host_platform::kHasF16C) { success_ = false; return; }
     const auto opc = args.opcode;
     const bool is_addp        = (opc == Op::kAddp);
     const bool is_faddp       = (opc == Op::kFaddpScalar);
@@ -12976,12 +13075,24 @@ class LiteTranslator {
     // Load lane 0 (xmm_a) and lane 1 (xmm_b) of Vn.  Movsd/Movss from memory
     // zero-extend upper 96/64 bits — both source lanes are loaded before any
     // store to Vd so an in-place encoding (Vd == Vn) reads Vn's original pair.
+    // FP16 path: each 16-bit source lane is loaded via Pxor + Pinsrw to
+    // isolate it in xmm bits[15:0] with bits[127:16] zeroed, then
+    // Vcvtph2ps widens 4 FP16 lanes to 4 FP32 lanes.  Pinsrw reads
+    // Vn[15:0] and Vn[31:16] before any store to Vd, so an in-place
+    // encoding (Vd == Vn) sees Vn's original pair.
     if (is_addp) {
       as_.Movq(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movq(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
     } else if (is_double) {
       as_.Movsd(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 8});
+    } else if (args.is_fp16) {
+      as_.Pxor(xmm_a, xmm_a);
+      as_.Pinsrw(xmm_a, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_a, xmm_a);
+      as_.Pxor(xmm_b, xmm_b);
+      as_.Pinsrw(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 2}, int8_t{0});
+      as_.Vcvtph2ps(xmm_b, xmm_b);
     } else {
       as_.Movss(xmm_a, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_n_off + 4});
@@ -13109,13 +13220,25 @@ class LiteTranslator {
 
     // Zero Vd above the result lane, then write the scalar at lane 0.
     // S-form writes 32 bits (lanes 1..3 stay zero); D-form and ADDP write
-    // 64 bits (upper 64 bits stay zero).
-    as_.Pxor(xmm_b, xmm_b);
-    as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_b);
-    if (is_double) {
-      as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+    // 64 bits (upper 64 bits stay zero).  FP16 path narrows xmm_a's FP32
+    // lane 0 back to FP16 via Vcvtps2ph — the load lifted each FP16 lane
+    // into an xmm with FP32 lanes 1..3 == 0, the reduction core preserves
+    // those zeros (MAX/MIN/AND/OR on (0,0) returns 0; Addss/Cmpeqss only
+    // touch lane 0), so the narrowed FP16 lanes 1..3 are also 0.  The
+    // Vcvtps2ph instruction itself zeroes the upper 64 bits of the
+    // destination xmm, so a full 128-bit Movdqu store delivers
+    // Vd[15:0]=result and Vd[127:16]=0.
+    if (args.is_fp16) {
+      as_.Vcvtps2ph(xmm_a, xmm_a, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
     } else {
-      as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      as_.Pxor(xmm_b, xmm_b);
+      as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_b);
+      if (is_double) {
+        as_.Movsd({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      } else {
+        as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
+      }
     }
   }
   // endregion
@@ -13167,17 +13290,16 @@ class LiteTranslator {
           break;  // D-form-only ops fall through to vector path.
         case Decoder::AdvSimdShiftImmOpcode::kUqshl:
         case Decoder::AdvSimdShiftImmOpcode::kSqshlu:
-          // Scalar D/S/H all fall through.  Scalar B (immh=0001) bails
-          // inside the saturating-shift case via the `is_byte` guard
-          // because the byte path needs PSLLB workarounds the case lacks.
+          // Scalar D/S/H/B all fall through.  Scalar B (immh=0001)
+          // takes a dedicated widen-then-clamp byte path inside the
+          // saturating-shift case (no PSLLB in baseline SSE).
           break;
         case Decoder::AdvSimdShiftImmOpcode::kSqshl:
-          // Scalar S/H fall through — vector PSLLW/PSLLD + PSRAW/PSRAD
-          // signed-recover pipeline already lights up.  Scalar B
-          // (immh=0001) bails on `is_byte` inside the case; scalar D
-          // (immh=1xxx) bails on the existing `is_dword && kSqshl`
-          // filter inside the case body (PSRAQ for the signed recover
-          // step is AVX-512F-VL only).
+          // Scalar S/H/B fall through.  Scalar B uses the widen-via-
+          // PMOVSXBW + PSLLW + signed clamp byte path.  Scalar D
+          // (immh=1xxx) still bails inside the case body on the
+          // existing `is_dword && kSqshl` filter (PSRAQ for the
+          // signed recover step is AVX-512F-VL only).
           break;
         case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
         case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
@@ -13710,7 +13832,87 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);
-        if (is_byte) { success_ = false; return; }
+        if (is_byte) {
+          // region digitalis - scalar byte (esize=8) saturating-shift path.
+          //
+          // No PSLLB/PSRAB/PSRLB in baseline SSE, so we widen Vn[7:0] to
+          // a single 16-bit lane via PMOVSXBW (signed sources: SQSHL /
+          // SQSHLU) or PMOVZXBW (unsigned source: UQSHL), apply PSLLW
+          // (max shift is 7 and the byte source is at most |128|, so the
+          // widened result is always in [-16384, +16256] — fits in i16
+          // without further overflow), then clamp to the dst-byte range:
+          //
+          //   SQSHL  -> [INT8_MIN, INT8_MAX] = [0xFF80, 0x007F] (as i16)
+          //                 Pmaxsw(INT8_MIN) + Pminsw(INT8_MAX)
+          //   UQSHL  -> [0, UINT8_MAX] = [0x0000, 0x00FF]
+          //                 Pminsw(UINT8_MAX)  (source already >= 0)
+          //   SQSHLU -> [0, UINT8_MAX]
+          //                 Pmaxsw(0) + Pminsw(UINT8_MAX)
+          //
+          // Per-lane mask constants are materialized via Pcmpeqw +
+          // Psllw/Psrlw:
+          //   0xFF80 = 0xFFFF << 7   (INT8_MIN signed-extended)
+          //   0x007F = 0xFFFF >> 9   (INT8_MAX)
+          //   0x00FF = 0xFFFF >> 8   (UINT8_MAX)
+          //   0x0000 = Pxor self
+          //
+          // Vector .8B / .16B forms still bail — the vector lowering
+          // needs eight or sixteen byte-saturated parallel shifts and
+          // the widening trick consumes the whole xmm for one lane.
+          if (!args.scalar) {
+            success_ = false; return;
+          }
+          const uint8_t shift_count_b = static_cast<uint8_t>(
+              ((static_cast<uint16_t>(immh) << 3) | args.immb) - 8);
+          const int8_t cnt_b = static_cast<int8_t>(shift_count_b);
+          const bool is_signed_src =
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) ||
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshlu);
+          const bool is_signed_dst =
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl);
+          SimdRegister xn_b = AllocTempSimdReg();
+          SimdRegister xclamp_b = AllocTempSimdReg();
+          if (xn_b == no_simd_register || xclamp_b == no_simd_register) {
+            success_ = false; return;
+          }
+          if (is_signed_src) {
+            as_.Pmovsxbw(xn_b, {.base = Assembler::rbp, .disp = vn_off});
+          } else {
+            as_.Pmovzxbw(xn_b, {.base = Assembler::rbp, .disp = vn_off});
+          }
+          if (cnt_b != 0) {
+            as_.Psllw(xn_b, cnt_b);
+          }
+          if (is_signed_dst) {
+            // SQSHL byte: clamp to [INT8_MIN, INT8_MAX].
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psllw(xclamp_b, int8_t{7});
+            as_.Pmaxsw(xn_b, xclamp_b);
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psrlw(xclamp_b, int8_t{9});
+            as_.Pminsw(xn_b, xclamp_b);
+          } else if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshlu) {
+            // SQSHLU byte: signed source, clamp negative to 0 and
+            // overflow to UINT8_MAX.
+            as_.Pxor(xclamp_b, xclamp_b);
+            as_.Pmaxsw(xn_b, xclamp_b);
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psrlw(xclamp_b, int8_t{8});
+            as_.Pminsw(xn_b, xclamp_b);
+          } else {
+            // UQSHL byte: zero-extended source >= 0, only upper clamp.
+            as_.Pcmpeqw(xclamp_b, xclamp_b);
+            as_.Psrlw(xclamp_b, int8_t{8});
+            as_.Pminsw(xn_b, xclamp_b);
+          }
+          // Width-truncate: keep only byte 0 of lane 0; zero Vd[127:8].
+          // Mirrors the byte-granular upper-zero pattern below for H/S.
+          as_.Pslldq(xn_b, int8_t{15});
+          as_.Psrldq(xn_b, int8_t{15});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_b);
+          return;
+          // endregion
+        }
         const bool is_dword = (immh & 0b1000) != 0;
         // region digitalis - dword (esize=64) pipeline lights up only
         // for UQSHL and SQSHLU.  SQSHL .D needs PSRAQ for the signed
