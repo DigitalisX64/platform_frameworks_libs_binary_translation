@@ -12872,6 +12872,15 @@ class LiteTranslator {
     // B/H/S scalar forms whose esize < 64; the vector path's upper-zero
     // only covers Vd[127:64], not Vd[esize:63], so it would leak wrong
     // values into Vd's low half.  Bail to interpreter for those.
+    //
+    // Exception: UQSHL and SQSHLU at scalar D (immh & 0b1000) light up
+    // through the saturating-shift case below — the .D pipeline only
+    // needs PSLLQ / PSRLQ / PCMPEQQ / PCMPGTQ (all SSE4.x), and the
+    // upper-zero step at the store delivers Vd[127:64]=0 just like the
+    // simple-shift family.  SQSHL .D still needs PSRAQ (AVX-512F-VL),
+    // so it stays on the interpreter path for any size.  B/H/S
+    // saturating scalar shifts also still bail — they need explicit
+    // width-truncated stores that the .D path doesn't cover.
     if (args.scalar) {
       switch (args.opcode) {
         case Decoder::AdvSimdShiftImmOpcode::kShl:
@@ -12886,6 +12895,13 @@ class LiteTranslator {
         case Decoder::AdvSimdShiftImmOpcode::kSrsra:
         case Decoder::AdvSimdShiftImmOpcode::kUrsra:
           break;  // D-form-only ops fall through to vector path.
+        case Decoder::AdvSimdShiftImmOpcode::kUqshl:
+        case Decoder::AdvSimdShiftImmOpcode::kSqshlu:
+          // Only the scalar D form (immh & 0b1000) is JIT-handled;
+          // B/H/S scalar saturating shifts still bail.  The dword check
+          // inside the saturating-shift case below filters esize<64.
+          if (!(args.immh & 0b1000)) { success_ = false; return; }
+          break;
         default:
           success_ = false; return;
       }
@@ -13383,9 +13399,20 @@ class LiteTranslator {
         const bool is_byte = (immh == 0b0001);
         if (is_byte) { success_ = false; return; }
         const bool is_dword = (immh & 0b1000) != 0;
-        if (is_dword) { success_ = false; return; }
+        // region digitalis - dword (esize=64) pipeline lights up only
+        // for UQSHL and SQSHLU.  SQSHL .D needs PSRAQ for the signed
+        // recover step (AVX-512F-VL only) and stays interp-only.  The
+        // 64-bit lane ops are all SSE4.x: PSLLQ/PSRLQ (SSE2),
+        // PCMPEQQ (SSE4.1), PCMPGTQ (SSE4.2).
+        if (is_dword &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) {
+          success_ = false; return;
+        }
+        // endregion
         uint8_t esize_bits;
-        if (immh & 0b0100) {
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
           esize_bits = 32;
         } else /* immh & 0b0010 */ {
           esize_bits = 16;
@@ -13415,8 +13442,12 @@ class LiteTranslator {
           switch (esize_bits) {
             case 16: as_.Pcmpgtw(xt, xn); break;
             case 32: as_.Pcmpgtd(xt, xn); break;
+            // region digitalis
+            case 64: as_.Pcmpgtq(xt, xn); break;  // SSE4.2
+            // endregion
           }
-          // xt = neg_mask (0xFFFF / 0xFFFFFFFF where xn < 0).
+          // xt = neg_mask (0xFFFF / 0xFFFFFFFF / 0xFFFFFFFFFFFFFFFF
+          // where xn < 0).
           as_.Pandn(xt, xn);                   // xt = ~neg_mask & xn = pos_xn
           as_.Movdqa(xn, xt);                  // xn := pos_xn for the rest
         }
@@ -13426,6 +13457,9 @@ class LiteTranslator {
         switch (esize_bits) {
           case 16: as_.Psllw(xs, cnt); break;
           case 32: as_.Pslld(xs, cnt); break;
+          // region digitalis
+          case 64: as_.Psllq(xs, cnt); break;
+          // endregion
         }
         // xm = recover(xs, shift_count) using arith shift (signed) or
         // logical shift (unsigned).
@@ -13434,17 +13468,24 @@ class LiteTranslator {
           switch (esize_bits) {
             case 16: as_.Psraw(xm, cnt); break;
             case 32: as_.Psrad(xm, cnt); break;
+            // esize 64 path filtered above (SQSHL .D bails — no PSRAQ).
           }
         } else {
           switch (esize_bits) {
             case 16: as_.Psrlw(xm, cnt); break;
             case 32: as_.Psrld(xm, cnt); break;
+            // region digitalis
+            case 64: as_.Psrlq(xm, cnt); break;
+            // endregion
           }
         }
         // xm = eq_mask: per-lane all-ones if no overflow, else 0.
         switch (esize_bits) {
           case 16: as_.Pcmpeqw(xm, xn); break;
           case 32: as_.Pcmpeqd(xm, xn); break;
+          // region digitalis
+          case 64: as_.Pcmpeqq(xm, xn); break;  // SSE4.1
+          // endregion
         }
 
         // Build saturation value in xt.

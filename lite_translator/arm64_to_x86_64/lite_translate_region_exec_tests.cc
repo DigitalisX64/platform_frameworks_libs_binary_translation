@@ -21881,6 +21881,103 @@ TEST_F(Arm64LiteTranslateRegionTest, UrsraScalarD) {
 }
 // endregion
 
+// region digitalis
+// AdvSimdScalarShiftByImm — saturating shifts at .D scalar:
+//   UQSHL D scalar, SQSHLU D scalar.  The 64-bit lane pipeline reuses
+//   PSLLQ / PSRLQ / PCMPEQQ (and PCMPGTQ for SQSHLU's negative pre-
+//   zero) — all SSE4.x.  Upper-zero step (args.q=false → Pslldq+Psrldq
+//   8) zeros Vd[127:64].  SQSHL .D scalar still bails because its
+//   signed-recover step needs PSRAQ (AVX-512F-VL only).
+//
+// Encoding (ARM ARM C4.1.6.10): 0 1 U 1 1 1 1 1 0 immh immb opcode 1 Rn Rd
+//   For D scalar shift #11: immh:immb = esize+shift = 64+11 = 75 → immh=1001 immb=011
+//   opcode: 01110 → UQSHL (U=1) / SQSHL (U=0)
+//   opcode: 01100 → SQSHLU (U=1 only)
+constexpr uint32_t kUqshlScalarD_11   = 0x7F4B7420;  // uqshl  d0, d1, #11
+constexpr uint32_t kSqshluScalarD_11  = 0x7F4B6420;  // sqshlu d0, d1, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarDNoOverflow) {
+  // Value with top 11 bits zero — shift left by 11 doesn't overflow.
+  uint64_t in[2] = {0x0000123456789ABCULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);  // Confirms upper-zero step.
+  static const uint32_t code[] = {kUqshlScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(in[0] << 11));
+  EXPECT_EQ(r[1], 0ULL) << "upper 64 zeroed (scalar Vd[127:64]=0)";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarDSaturates) {
+  // Top 11 bits non-zero — shift left by 11 overflows → saturate to UMAX.
+  uint64_t in[2] = {0xFEDCBA9876543210ULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL) << "UQSHL saturates to UMAX on overflow";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarDInPlaceVdEqualsVn) {
+  // Vd == Vn (both d0).  Pins that the vector lowering reads Vn
+  // before the destination store.
+  uint64_t in[2] = {0x0000000FEDCBA987ULL, 0xCAFEBABEDEADBEEFULL};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {0x7F4B7400U};  // uqshl d0, d0, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(in[0] << 11)) << "in-place UQSHL D low";
+  EXPECT_EQ(r[1], 0ULL) << "upper 64 zeroed even with Vd==Vn";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarDNegativeToZero) {
+  // Negative signed source → SQSHLU pre-zero clamps to 0 → result is 0.
+  uint64_t in[2] = {0x8000000000000000ULL, 0xCAFEBABECAFEBABEULL};  // INT64_MIN
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0ULL) << "SQSHLU on negative input architecturally yields 0";
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarDPositiveNoOverflow) {
+  // Positive signed with top 11 bits zero — shift left by 11 doesn't
+  // overflow → result = src << 11.
+  uint64_t in[2] = {0x0000123456789ABCULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], static_cast<uint64_t>(in[0] << 11));
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarDPositiveSaturates) {
+  // Positive signed with top 11 bits non-zero — shift left by 11
+  // overflows in the unsigned destination → saturate to UMAX.
+  uint64_t in[2] = {0x7EDCBA9876543210ULL, 0xDEADBEEFCAFEBABEULL};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL)
+      << "SQSHLU positive overflow saturates to UMAX";
+  EXPECT_EQ(r[1], 0ULL);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
