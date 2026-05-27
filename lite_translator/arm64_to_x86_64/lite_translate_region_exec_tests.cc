@@ -6311,6 +6311,291 @@ TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSInPlace) {
 }
 // endregion
 
+// region digitalis: AdvSimdScalarPairwise JIT — FMAXP / FMINP / FMAXNMP /
+// FMINNMP scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar
+// pairwise", C7.2 — U=1 FP leg, opcode=01111 for max/min, opcode=01100 for
+// maxnm/minnm; size[1] selects min(=1) vs max(=0) family; size[0] selects
+// S(=0) vs D(=1)):
+//   FMAXP   Sd, Vn.2S = 0x7E30F800 | (rn<<5) | rd
+//   FMAXP   Dd, Vn.2D = 0x7E70F800 | (rn<<5) | rd
+//   FMINP   Sd, Vn.2S = 0x7EB0F800 | (rn<<5) | rd
+//   FMINP   Dd, Vn.2D = 0x7EF0F800 | (rn<<5) | rd
+//   FMAXNMP Sd, Vn.2S = 0x7E30C800 | (rn<<5) | rd
+//   FMAXNMP Dd, Vn.2D = 0x7E70C800 | (rn<<5) | rd
+//   FMINNMP Sd, Vn.2S = 0x7EB0C800 | (rn<<5) | rd
+//   FMINNMP Dd, Vn.2D = 0x7EF0C800 | (rn<<5) | rd
+constexpr uint32_t FmaxpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7E30F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7E70F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7EB0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7EF0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7E30C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7E70C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmpScalarS(uint8_t rd, uint8_t rn) {
+  return 0x7EB0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmpScalarD(uint8_t rd, uint8_t rn) {
+  return 0x7EF0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMAXP Sd: 1.5, 2.5 -> 2.5; lanes 1..3 zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSPositive) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 1.5f, b = 2.5f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmaxpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 2.5f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+
+// FMAXP Dd: -7.0, 3.5 -> 3.5; upper 8 bytes zero.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarDPositive) {
+  double a = -7.0, b = 3.5;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmaxpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 3.5);
+  uint64_t upper;
+  std::memcpy(&upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(upper, uint64_t{0});
+}
+
+// FMAXP Sd ±0 disambiguation: lane0=-0.0, lane1=+0.0 -> +0.0 (ARM mandates
+// the positive zero regardless of operand order; the naive Maxss-then-OR
+// idiom alone would produce -0.0).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSZeroNegZero) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = -0.0f, b = 0.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(result_bits, 0u);  // +0.0 == 0x00000000, not 0x80000000.
+}
+
+// FMAXP Dd ±0 disambiguation, reverse operand order: lane0=+0.0, lane1=-0.0
+// -> +0.0 (must be +0 independent of operand order).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarDZeroPosNeg) {
+  double a = 0.0, b = -0.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 8);
+  EXPECT_EQ(result_bits, uint64_t{0});
+}
+
+// FMAXP Sd NaN propagation: NaN, 1.0 -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 1.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FMINP Sd: 1.5, 2.5 -> 1.5.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarSPositive) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 1.5f, b = 2.5f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.5f);
+}
+
+// FMINP Dd: -7.0, 3.5 -> -7.0.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarDPositive) {
+  double a = -7.0, b = 3.5;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, -7.0);
+}
+
+// FMINP Sd ±0 disambiguation: lane0=+0.0, lane1=-0.0 -> -0.0 (FMIN of two
+// zeros is -0 regardless of operand order).
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarSZeroPosNeg) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 0.0f, b = -0.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(result_bits, 0x80000000u);  // -0.0 bit pattern.
+}
+
+// FMINP Sd NaN propagation: 2.0, NaN -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FminpScalarSNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 2.0f, b = std::nanf("");
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FMAXNMP Sd: single-NaN suppression — NaN, 1.0 -> 1.0 (returns the
+// non-NaN operand, unlike FMAXP which propagates NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarSSingleNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 1.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 1.0f);
+}
+
+// FMAXNMP Dd: single-NaN suppression in the other lane — 4.0, NaN -> 4.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarDSingleNaNOther) {
+  double a = 4.0, b = std::nan("");
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(double));
+  EXPECT_DOUBLE_EQ(result, 4.0);
+}
+
+// FMAXNMP Sd: both NaN -> NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarSBothNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = std::nanf("");
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_TRUE(std::isnan(result));
+}
+
+// FMAXNMP Sd ±0 disambiguation: -0, +0 -> +0 (sign rule applies to NM
+// family too).
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpScalarSZeroNegPos) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = -0.0f, b = 0.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FmaxnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(result_bits, 0u);
+}
+
+// FMINNMP Sd: single-NaN suppression — NaN, 5.0 -> 5.0.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmpScalarSSingleNaN) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = std::nanf(""), b = 5.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminnmpScalarS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 5.0f);
+}
+
+// FMINNMP Dd: ±0 disambiguation: +0, -0 -> -0.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmpScalarDZeroPosNeg) {
+  double a = 0.0, b = -0.0;
+  uint64_t lane_bits[2];
+  std::memcpy(&lane_bits[0], &a, 8);
+  std::memcpy(&lane_bits[1], &b, 8);
+  std::memcpy(&state_.cpu.v[1], lane_bits, 16);
+  static const uint32_t code[] = {FminnmpScalarD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t result_bits;
+  std::memcpy(&result_bits, &state_.cpu.v[0], 8);
+  EXPECT_EQ(result_bits, uint64_t{0x8000000000000000ULL});
+}
+
+// FMAXP Sd in-place (Vd == Vn): must read both lanes of Vn before
+// overwriting Vd.  lane0=2.0, lane1=7.0 -> max = 7.0.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSInPlace) {
+  uint32_t lane_bits[4] = {0, 0, 0, 0};
+  float a = 2.0f, b = 7.0f;
+  std::memcpy(&lane_bits[0], &a, 4);
+  std::memcpy(&lane_bits[1], &b, 4);
+  std::memcpy(&state_.cpu.v[6], lane_bits, 16);
+  static const uint32_t code[] = {FmaxpScalarS(6, 6)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float result;
+  std::memcpy(&result, &state_.cpu.v[6], sizeof(float));
+  EXPECT_FLOAT_EQ(result, 7.0f);
+  uint32_t upper[3];
+  std::memcpy(upper, reinterpret_cast<const uint8_t*>(&state_.cpu.v[6]) + 4, 12);
+  EXPECT_EQ(upper[0], 0u);
+  EXPECT_EQ(upper[1], 0u);
+  EXPECT_EQ(upper[2], 0u);
+}
+// endregion
+
 // region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
