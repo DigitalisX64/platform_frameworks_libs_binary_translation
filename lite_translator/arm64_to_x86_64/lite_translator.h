@@ -11161,15 +11161,18 @@ class LiteTranslator {
   //   FCVTZU Sd, Sn / FCVTZU Dd, Dn      FP → unsigned int, round toward zero
   //   FCVTAS Sd, Sn / FCVTAS Dd, Dn      FP → signed   int, round-to-nearest ties-away
   //   FCVTAU Sd, Sn / FCVTAU Dd, Dn      FP → unsigned int, round-to-nearest ties-away
+  //   FCVTXN Sd, Dn                      FP64 → FP32 narrow, round-to-odd
   //
-  // All single-lane lowerings mirror the per-lane variant of the corresponding
-  // vector kFcvtzsV / kFcvtzuV / kFcvtasV / kFcvtauV / kScvtfV / kUcvtfV
-  // emission above; the only differences are that we work on the bottom lane
-  // directly (Movsd/Movss) and explicitly zero Vd above the lane before
-  // writing the single-precision/double result.
+  // The FP-to-int and int-to-FP single-lane lowerings mirror the per-lane
+  // variant of the corresponding vector kFcvtzsV / kFcvtzuV / kFcvtasV /
+  // kFcvtauV / kScvtfV / kUcvtfV emission above; the only differences are
+  // that we work on the bottom lane directly (Movsd/Movss) and explicitly
+  // zero Vd above the lane before writing the single-precision/double
+  // result.  FCVTXN uses a one-shot MXCSR round-toward-zero conversion
+  // plus LSB-OR fix-up to realize the ARM "Round to Odd" mode.
   //
   // Other constituents of this dispatch class (SQABS/SQNEG/SQXTN/SQXTUN/
-  // UQXTN/FCVTXN/FRECPE/FRSQRTE scalar) bail to the interpreter via
+  // UQXTN/FRECPE/FRSQRTE scalar) bail to the interpreter via
   // success_=false — they are JIT follow-ups; the interpreter handles them
   // correctly today.
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
@@ -11588,8 +11591,85 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kFcvtxn: {
+        // FCVTXN Sd, Dn — single-lane FP64 -> FP32 narrow with the ARMv8
+        // "Round to Odd" mode.  Decoder pins args.size == 0b01 (FP64
+        // source).  RtO maps: overflow -> +/-FP32_MAX, NaN -> quiet FP32
+        // NaN, +/-Inf -> +/-Inf, +/-0 -> +/-0; otherwise rounds toward
+        // zero then forces the FP32 LSB to 1 if any FP64 mantissa bits
+        // were discarded.  See Interpreter::FpDoubleToFloatRtO for the
+        // reference semantics.
+        //
+        // Strategy: clear MXCSR's six exception bits and set RC=RTZ,
+        // run CVTSD2SS, then read the new PE bit.  Under RC=RTZ
+        // CVTSD2SS produces the round-toward-zero FP32 (or +/-FP32_MAX
+        // for overflow, since RTZ clamps overflow magnitude to the
+        // largest finite), matching the RtO base value.  If the PE
+        // bit is set the result was inexact -- force the FP32 LSB to
+        // 1 to make it odd.  The overflow saturation +/-FP32_MAX has
+        // LSB=1 already (0x{7F,FF}7FFFFF), so the OR there is a no-op.
+        //
+        // MXCSR cumulative state is preserved across this op: we save
+        // the original MXCSR, run with cleared exceptions + RC=RTZ,
+        // then OR the per-op exception bits back into the saved value
+        // and reload.  MXCSR exception bits are caller-saved per
+        // System V x86_64 ABI 3.2.1 (see CLAUDE.md), so the 4-byte
+        // scratch slot at [rsp+0] used by the region-exit mirror is
+        // safe to use here mid-region.
+        SimdRegister xmm = AllocTempSimdReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        Register mxcsr_save = AllocTempReg();
+        Register mxcsr_after = AllocTempReg();
+        if (xmm == no_simd_register || xzero == no_simd_register ||
+            tmp == no_register || mxcsr_save == no_register ||
+            mxcsr_after == no_register) {
+          success_ = false; return;
+        }
+        as_.Movsd(xmm, {.base = Assembler::rbp, .disp = vn_off});
+        // Save MXCSR.
+        as_.Stmxcsr({.base = Assembler::rsp, .disp = 0});
+        as_.Movl(mxcsr_save, {.base = Assembler::rsp, .disp = 0});
+        // Build modified MXCSR: clear bits 0-5 (exception flags),
+        // set bits 13-14 (RC=11=Round-Toward-Zero).
+        as_.Movl(mxcsr_after, mxcsr_save);
+        as_.Andl(mxcsr_after, int32_t{~int32_t{0x3F}});
+        as_.Orl(mxcsr_after, int32_t{0x6000});
+        as_.Movl({.base = Assembler::rsp, .disp = 0}, mxcsr_after);
+        as_.Ldmxcsr({.base = Assembler::rsp, .disp = 0});
+        // FP64 -> FP32 conversion under RC=RTZ.
+        as_.Cvtsd2ss(xmm, xmm);
+        // Read post-op MXCSR; isolate this op's exception bits.
+        as_.Stmxcsr({.base = Assembler::rsp, .disp = 0});
+        as_.Movl(mxcsr_after, {.base = Assembler::rsp, .disp = 0});
+        as_.Andl(mxcsr_after, int32_t{0x3F});
+        // Restore cumulative MXCSR: saved | per-op exceptions.
+        // This preserves the original RC and ORs the per-op
+        // exception bits into the prior cumulative state, matching
+        // what the region-exit mirror expects.
+        as_.Orl(mxcsr_save, mxcsr_after);
+        as_.Movl({.base = Assembler::rsp, .disp = 0}, mxcsr_save);
+        as_.Ldmxcsr({.base = Assembler::rsp, .disp = 0});
+        // If the per-op PE (bit 5) was set the result was inexact;
+        // OR the FP32 LSB with 1.  (Overflow's FP32_MAX already has
+        // LSB=1, so the OR is a no-op there; NaN/Inf/exact paths
+        // keep PE=0 and skip the fix-up entirely.)
+        Assembler::Label* done = as_.MakeLabel();
+        as_.Testl(mxcsr_after, int32_t{0x20});
+        as_.Jcc(Assembler::Condition::kZero, *done);
+        as_.Movd(tmp, xmm);
+        as_.Orl(tmp, int32_t{1});
+        as_.Movd(xmm, tmp);
+        as_.Bind(done);
+        // Store with upper 96 bits of Vd zeroed.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        as_.Movss({.base = Assembler::rbp, .disp = vd_off}, xmm);
+        return;
+      }
+
       default:
-        // SQABS / SQNEG / SQXTN / SQXTUN / UQXTN / FCVTXN / FRECPE / FRSQRTE
+        // SQABS / SQNEG / SQXTN / SQXTUN / UQXTN / FRECPE / FRSQRTE
         // scalars: bail to the interpreter.  Correctness path is handled
         // by Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT
         // them individually.

@@ -2912,6 +2912,93 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtauDdDn_PosInfSaturates) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]), UINT64_MAX);
 }
+
+// FCVTXN Sd, Dn: single-lane FP64 -> FP32 narrow, ARMv8 round-to-odd.
+// Encoding: AdvSimd scalar two-reg-misc with U=1, size=01, opcode=10110.
+//   bits: 01 1 11110 01 10000 10110 10 Rn Rd  -> 0x7E61_6800 for V0,V0.
+constexpr uint32_t kFcvtxnSdDnV0 = 0x7E616800;
+
+// Exact FP64 -> FP32 (1.0d -> 1.0f).  No discarded bits, no LSB fix-up.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_Exact1p0) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x3FF0000000000000ULL;  // 1.0d
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x3F800000u);  // 1.0f
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// Inexact: 1.1d (0x3FF199999999999A) -> RtZ FP32 0x3F8CCCCC, |1 -> 0x3F8CCCCD.
+// Verifies the round-to-odd LSB fix-up fires when bits are discarded.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_Inexact1p1Rto) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x3FF199999999999AULL;  // 1.1d
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x3F8CCCCDu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// Positive overflow: 1e40d > FP32_MAX (~3.4e38) -> +FP32_MAX = 0x7F7FFFFF.
+// Under RC=RTZ, CVTSD2SS clamps overflow magnitude to the largest finite,
+// and 0x7F7FFFFF's LSB is already 1 so the OR fix-up is a no-op.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_PosOverflowSaturates) {
+  state_.cpu.v[0] = 0;
+  // 1e40d ~= 0x4845_5BE9_6FBF_E94B
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x483D6329F1C35CA5ULL;  // ~1e40d
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x7F7FFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// Negative overflow: -1e40d -> -FP32_MAX = 0xFF7FFFFF.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_NegOverflowSaturates) {
+  state_.cpu.v[0] = 0;
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0xC83D6329F1C35CA5ULL;  // ~-1e40d
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0xFF7FFFFFu);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// +Inf -> +Inf (sign|0x7F800000); exact, no LSB fix-up.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_PosInfPassthrough) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;  // +Inf
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x7F800000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// Canonical qNaN -> canonical qNaN; CVTSD2SS quiets the NaN and PE stays
+// clear (NaN propagation is not "inexact"), so the LSB fix-up is skipped.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_QNaNPassthrough) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF8000000000000ULL;  // qNaN
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x7FC00000u);
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
+
+// -0.0d -> -0.0f; exact, sign preserved.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_NegZeroPassthrough) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x8000000000000000ULL;  // -0.0d
+  static const uint32_t code[] = {kFcvtxnSdDnV0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(*reinterpret_cast<uint32_t*>(&state_.cpu.v[0]),
+            0x80000000u);  // -0.0f
+  EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
+}
 // endregion
 
 // region digitalis
