@@ -12852,14 +12852,74 @@ class LiteTranslator {
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
     // region digitalis
-    // Scalar shift-by-immediate (B/H/S/D) bails to interpreter — the
-    // JIT lowerings below use parallel x86 shifts on all lanes within
-    // the lower 64 bits of Vn, which produces wrong values in
-    // Vd[esize:63] for scalar B/H/S semantics (only Vd[esize-1:0]
-    // should be written, with Vd[127:esize] zeroed).  The interpreter
-    // honours args.scalar via num_elements=1 and a zero-initialised
-    // result, matching ARM ARM exactly.
-    if (args.scalar) { success_ = false; return; }
+    // Scalar shift-by-immediate dispatch.  The decoder forces D-form
+    // (immh bit 3 set, esize=64) for the "simple" shift family — SSHR /
+    // USHR / SSRA / USRA / SRSHR / URSHR / SRSRA / URSRA / SHL / SLI /
+    // SRI — and sets args.q=false.  For those opcodes the existing
+    // vector lowering below produces the correct scalar D-form result:
+    //   - esize_bits is decoded as 64 (immh bit 3 set), so PSLLQ / PSRLQ
+    //     are emitted for the low 64 bits of Vn.
+    //   - args.q=false triggers the `Pslldq+Psrldq 8` upper-zero step
+    //     at the store path, which delivers Vd[127:64]=0 — exactly
+    //     ARM ARM scalar Vd[127:esize]=0.
+    //   - SSHR / SSRA / SRSHR / SRSRA at .2D still bail inside their
+    //     case arms (PSRAQ is AVX-512F-VL only); the interpreter picks
+    //     them up.
+    //
+    // Saturating shifts (SQSHL / UQSHL / SQSHLU), narrow shifts
+    // (SQSHRN / UQSHRN / SQRSHRN / UQRSHRN / SQSHRUN / SQRSHRUN), and
+    // fixed-point conversions (SCVTF / UCVTF / FCVTZS / FCVTZU) accept
+    // B/H/S scalar forms whose esize < 64; the vector path's upper-zero
+    // only covers Vd[127:64], not Vd[esize:63], so it would leak wrong
+    // values into Vd's low half.  Bail to interpreter for those.
+    //
+    // Exception: UQSHL and SQSHLU at scalar D (immh & 0b1000) light up
+    // through the saturating-shift case below — the .D pipeline only
+    // needs PSLLQ / PSRLQ / PCMPEQQ / PCMPGTQ (all SSE4.x), and the
+    // upper-zero step at the store delivers Vd[127:64]=0 just like the
+    // simple-shift family.  SQSHL .D still needs PSRAQ (AVX-512F-VL),
+    // so it stays on the interpreter path for any size.  B/H/S
+    // saturating scalar shifts also still bail — they need explicit
+    // width-truncated stores that the .D path doesn't cover.
+    if (args.scalar) {
+      switch (args.opcode) {
+        case Decoder::AdvSimdShiftImmOpcode::kShl:
+        case Decoder::AdvSimdShiftImmOpcode::kSshr:
+        case Decoder::AdvSimdShiftImmOpcode::kUshr:
+        case Decoder::AdvSimdShiftImmOpcode::kSsra:
+        case Decoder::AdvSimdShiftImmOpcode::kUsra:
+        case Decoder::AdvSimdShiftImmOpcode::kSli:
+        case Decoder::AdvSimdShiftImmOpcode::kSri:
+        case Decoder::AdvSimdShiftImmOpcode::kSrshr:
+        case Decoder::AdvSimdShiftImmOpcode::kUrshr:
+        case Decoder::AdvSimdShiftImmOpcode::kSrsra:
+        case Decoder::AdvSimdShiftImmOpcode::kUrsra:
+          break;  // D-form-only ops fall through to vector path.
+        case Decoder::AdvSimdShiftImmOpcode::kUqshl:
+        case Decoder::AdvSimdShiftImmOpcode::kSqshlu:
+          // Scalar D/S/H all fall through.  Scalar B (immh=0001) bails
+          // inside the saturating-shift case via the `is_byte` guard
+          // because the byte path needs PSLLB workarounds the case lacks.
+          break;
+        case Decoder::AdvSimdShiftImmOpcode::kSqshl:
+          // Scalar S/H fall through — vector PSLLW/PSLLD + PSRAW/PSRAD
+          // signed-recover pipeline already lights up.  Scalar B
+          // (immh=0001) bails on `is_byte` inside the case; scalar D
+          // (immh=1xxx) bails on the existing `is_dword && kSqshl`
+          // filter inside the case body (PSRAQ for the signed recover
+          // step is AVX-512F-VL only).
+          break;
+        case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
+        case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
+          // SCVTF / UCVTF scalar (signed/unsigned fixed-point integer →
+          // FP).  The dedicated case body below handles its own bail
+          // for UCVTF .D's high-bit-set int64 fixup; .S and SCVTF .D
+          // fall through to the JIT.
+          break;
+        default:
+          success_ = false; return;
+      }
+    }
     // endregion
     // region digitalis - JIT for USHLL / SSHLL (unsigned/signed shift-left
     // long) at 8B→8H / 4H→4S / 2S→2D widening + Q=1 "long2" forms
@@ -13353,9 +13413,20 @@ class LiteTranslator {
         const bool is_byte = (immh == 0b0001);
         if (is_byte) { success_ = false; return; }
         const bool is_dword = (immh & 0b1000) != 0;
-        if (is_dword) { success_ = false; return; }
+        // region digitalis - dword (esize=64) pipeline lights up only
+        // for UQSHL and SQSHLU.  SQSHL .D needs PSRAQ for the signed
+        // recover step (AVX-512F-VL only) and stays interp-only.  The
+        // 64-bit lane ops are all SSE4.x: PSLLQ/PSRLQ (SSE2),
+        // PCMPEQQ (SSE4.1), PCMPGTQ (SSE4.2).
+        if (is_dword &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) {
+          success_ = false; return;
+        }
+        // endregion
         uint8_t esize_bits;
-        if (immh & 0b0100) {
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
           esize_bits = 32;
         } else /* immh & 0b0010 */ {
           esize_bits = 16;
@@ -13385,8 +13456,12 @@ class LiteTranslator {
           switch (esize_bits) {
             case 16: as_.Pcmpgtw(xt, xn); break;
             case 32: as_.Pcmpgtd(xt, xn); break;
+            // region digitalis
+            case 64: as_.Pcmpgtq(xt, xn); break;  // SSE4.2
+            // endregion
           }
-          // xt = neg_mask (0xFFFF / 0xFFFFFFFF where xn < 0).
+          // xt = neg_mask (0xFFFF / 0xFFFFFFFF / 0xFFFFFFFFFFFFFFFF
+          // where xn < 0).
           as_.Pandn(xt, xn);                   // xt = ~neg_mask & xn = pos_xn
           as_.Movdqa(xn, xt);                  // xn := pos_xn for the rest
         }
@@ -13396,6 +13471,9 @@ class LiteTranslator {
         switch (esize_bits) {
           case 16: as_.Psllw(xs, cnt); break;
           case 32: as_.Pslld(xs, cnt); break;
+          // region digitalis
+          case 64: as_.Psllq(xs, cnt); break;
+          // endregion
         }
         // xm = recover(xs, shift_count) using arith shift (signed) or
         // logical shift (unsigned).
@@ -13404,17 +13482,24 @@ class LiteTranslator {
           switch (esize_bits) {
             case 16: as_.Psraw(xm, cnt); break;
             case 32: as_.Psrad(xm, cnt); break;
+            // esize 64 path filtered above (SQSHL .D bails — no PSRAQ).
           }
         } else {
           switch (esize_bits) {
             case 16: as_.Psrlw(xm, cnt); break;
             case 32: as_.Psrld(xm, cnt); break;
+            // region digitalis
+            case 64: as_.Psrlq(xm, cnt); break;
+            // endregion
           }
         }
         // xm = eq_mask: per-lane all-ones if no overflow, else 0.
         switch (esize_bits) {
           case 16: as_.Pcmpeqw(xm, xn); break;
           case 32: as_.Pcmpeqd(xm, xn); break;
+          // region digitalis
+          case 64: as_.Pcmpeqq(xm, xn); break;  // SSE4.1
+          // endregion
         }
 
         // Build saturation value in xt.
@@ -13443,9 +13528,16 @@ class LiteTranslator {
         as_.Por(xs, xm);                       // xs = blended result
 
         if (!args.q) {
-          // Zero upper 64 bits of Vd (D-register semantics).
-          as_.Pslldq(xs, int8_t{8});
-          as_.Psrldq(xs, int8_t{8});
+          // region digitalis - scalar B/H/S keep only `esize_bits/8` low bytes;
+          // vector .8B/.4H/.2S and scalar .D keep low 8 bytes.  Byte-granular
+          // Pslldq/Psrldq trick zeros everything above the kept bytes.
+          int8_t shift_bytes =
+              (args.scalar && esize_bits < 64)
+                  ? static_cast<int8_t>(16 - (esize_bits / 8))
+                  : int8_t{8};
+          // endregion
+          as_.Pslldq(xs, shift_bytes);
+          as_.Psrldq(xs, shift_bytes);
         }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xs);
         return;
@@ -13895,6 +13987,123 @@ class LiteTranslator {
         } else {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         }
+        return;
+      }
+      // endregion
+      // region digitalis: SCVTF / UCVTF scalar fixed-point conversion.
+      //
+      //   Per ARM ARM C7.2.301 / C7.2.342 (scalar form):
+      //     immh=01xx → .S (esize=32, source is 32-bit int)
+      //     immh=1xxx → .D (esize=64, source is 64-bit int)
+      //     fbits = 2*esize - immh:immb, in [1, esize].
+      //   Result Vd[esize-1:0] = FP(src) / 2^fbits; Vd[127:esize] = 0.
+      //
+      // Lowering for SCVTF .S / UCVTF .S / SCVTF .D:
+      //   1. Load the integer source from Vn[esize-1:0] into a GP reg.
+      //      .S: Movl (32-bit load auto-zero-extends to 64).  For SCVTF
+      //          we'll then Cvtsi2ssl which reads the 32-bit subreg as
+      //          signed int32.  For UCVTF we Cvtsi2ssq the 64-bit value
+      //          (zero-extended above), which fits in int64 and converts
+      //          unsigned correctly.
+      //      .D: Movq (64-bit load).  SCVTF then Cvtsi2sdq.
+      //   2. PXOR scratch xmm to zero (carries the upper-zero into the
+      //      final store).
+      //   3. CVTSI2{SS,SD}{L,Q} into the low lane.
+      //   4. Multiply by 2^-fbits via a materialized FP constant
+      //      (Movl/Movq immediate → Movd/Movq into scratch xmm → MULSS/SD).
+      //      The multiply is exact: 2^-fbits is a power of 2, so it just
+      //      adjusts the exponent — no precision loss.  Combined with the
+      //      single-rounded CVTSI2{SS,SD}, the result equals
+      //      round-to-{float,double}(int_val * 2^-fbits), matching the
+      //      ARM ARM spec FixedToFP(int_val, fbits, signed, FPCR).
+      //   5. MOVDQU the full 16-byte xmm to Vd; the PXOR above guarantees
+      //      Vd[127:esize] = 0.
+      //
+      // UCVTF .D (uint64 → double, where bit 63 may be set) needs the
+      // halve / round-to-odd / convert / double-back fixup that the
+      // existing FpFixedPoint SCVTF/UCVTF (FpDataProc1) uses; bailing
+      // to the interpreter for that one variant until we add it.
+      case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
+      case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed: {
+        const uint8_t immh = args.immh;
+        // Decoder gates this; defensive guard for the .H FP16 form
+        // (immh=001x) which we don't JIT here.
+        if (!(immh & 0b1100)) { success_ = false; return; }
+        const bool is_double = (immh & 0b1000) != 0;  // immh=1xxx → .D
+        const uint8_t esize_bits = is_double ? 64 : 32;
+        const uint16_t immh_immb =
+            static_cast<uint16_t>((immh << 3) | args.immb);
+        // fbits = 2*esize - immh:immb.  Valid range: [1, esize_bits].
+        const uint8_t fbits =
+            static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        if (fbits == 0 || fbits > esize_bits) {
+          success_ = false; return;
+        }
+        const bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed);
+        // UCVTF .D needs the uint64→double halve-and-double fixup —
+        // defer to interp until we add it here.
+        if (is_unsigned && is_double) { success_ = false; return; }
+
+        SimdRegister xmm = AllocTempSimdReg();
+        SimdRegister xscale = AllocTempSimdReg();
+        Register gp_int = AllocTempReg();
+        Register gp_scale = AllocTempReg();
+        if (xmm == no_simd_register || xscale == no_simd_register ||
+            gp_int == no_register || gp_scale == no_register) {
+          success_ = false; return;
+        }
+
+        // Load integer source from Vn low half.
+        if (is_double) {
+          as_.Movq(gp_int, {.base = Assembler::rbp, .disp = vn_off});
+        } else {
+          // .S form: Movl loads 32-bit and zero-extends gp_int[63:32]=0.
+          // For SCVTF we'll use Cvtsi2ssl which reads the 32-bit subreg
+          // as int32 (signed).  For UCVTF we'll use Cvtsi2ssq which
+          // treats the zero-extended 64-bit value as int64 (unsigned
+          // source fits in int64's positive range).
+          as_.Movl(gp_int, {.base = Assembler::rbp, .disp = vn_off});
+        }
+
+        // Pre-zero xmm so the final Movdqu zeroes Vd[127:esize].
+        as_.Pxor(xmm, xmm);
+
+        // Integer → FP conversion.
+        if (is_double) {
+          // SCVTF .D: int64 → double.
+          as_.Cvtsi2sdq(xmm, gp_int);
+        } else if (is_unsigned) {
+          // UCVTF .S: uint32 (zero-extended to uint64) → float, via
+          // signed-int64 conversion which is exact for values ≤ 2^32 - 1.
+          as_.Cvtsi2ssq(xmm, gp_int);
+        } else {
+          // SCVTF .S: int32 → float.
+          as_.Cvtsi2ssl(xmm, gp_int);
+        }
+
+        // Scale by 2^-fbits.  Multiplication by a power of 2 is exact
+        // in IEEE-754 (just biases the exponent), so this preserves
+        // the single-rounding semantics of the cvtsi2{ss,sd} step.
+        if (is_double) {
+          // FP64 2^-fbits = sign 0, exp (1023 - fbits), mantissa 0.
+          const uint64_t scale_bits =
+              static_cast<uint64_t>(1023u - fbits) << 52;
+          as_.Movq(gp_scale, static_cast<int64_t>(scale_bits));
+          as_.Movq(xscale, gp_scale);
+          as_.Mulsd(xmm, xscale);
+        } else {
+          // FP32 2^-fbits = sign 0, exp (127 - fbits), mantissa 0.
+          const uint32_t scale_bits =
+              static_cast<uint32_t>(127u - fbits) << 23;
+          as_.Movl(gp_scale, static_cast<int32_t>(scale_bits));
+          as_.Movd(xscale, gp_scale);
+          as_.Mulss(xmm, xscale);
+        }
+
+        // Store the FP result.  PXOR above + Cvtsi2/Mul writing only
+        // the bottom lane gives Vd[127:esize] = 0 for free.
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm);
         return;
       }
       // endregion
