@@ -11162,6 +11162,7 @@ class LiteTranslator {
   //   FCVTAS Sd, Sn / FCVTAS Dd, Dn      FP → signed   int, round-to-nearest ties-away
   //   FCVTAU Sd, Sn / FCVTAU Dd, Dn      FP → unsigned int, round-to-nearest ties-away
   //   FCVTXN Sd, Dn                      FP64 → FP32 narrow, round-to-odd
+  //   SQABS  Bd/Hd/Sd/Dd, Bn/Hn/Sn/Dn    signed saturating absolute value
   //
   // The FP-to-int and int-to-FP single-lane lowerings mirror the per-lane
   // variant of the corresponding vector kFcvtzsV / kFcvtzuV / kFcvtasV /
@@ -11169,12 +11170,13 @@ class LiteTranslator {
   // that we work on the bottom lane directly (Movsd/Movss) and explicitly
   // zero Vd above the lane before writing the single-precision/double
   // result.  FCVTXN uses a one-shot MXCSR round-toward-zero conversion
-  // plus LSB-OR fix-up to realize the ARM "Round to Odd" mode.
+  // plus LSB-OR fix-up to realize the ARM "Round to Odd" mode.  SQABS is a
+  // GP-register lowering: sign-extend the source, NEG into a paired temp,
+  // CMOVS to choose abs(x), then CMP+CMOVZ to saturate INT_MIN → INT_MAX.
   //
-  // Other constituents of this dispatch class (SQABS/SQNEG/SQXTN/SQXTUN/
-  // UQXTN/FRECPE/FRSQRTE scalar) bail to the interpreter via
-  // success_=false — they are JIT follow-ups; the interpreter handles them
-  // correctly today.
+  // Other constituents of this dispatch class (SQNEG/SQXTN/SQXTUN/UQXTN/
+  // FRECPE/FRSQRTE scalar) bail to the interpreter via success_=false —
+  // they are JIT follow-ups; the interpreter handles them correctly today.
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
     using Opcode = Decoder::AdvSimdScalarTwoRegMiscOpcode;
 
@@ -11668,11 +11670,97 @@ class LiteTranslator {
         return;
       }
 
+      case Opcode::kSqabs: {
+        // SQABS scalar: saturating signed absolute value.
+        // size: 00=B (8-bit), 01=H (16-bit), 10=S (32-bit), 11=D (64-bit).
+        // Per-lane semantics:
+        //   if src == INT_MIN_for_width -> INT_MAX_for_width (saturation)
+        //   else                         -> |src|
+        // Result is written to lane 0 of Vd, upper bytes zeroed.  See
+        // Interpreter::AdvSimdScalarTwoRegMisc::kSqabs for the reference
+        // semantics (matched by the four host exec tests below).
+        //
+        // Strategy: sign-extend src to int64, compute negated = -src in a
+        // sibling temp, CMOVS picks abs(x); then CMPQ src,INT_MIN_w +
+        // CMOVZ saturates the single saturating input case to INT_MAX_w.
+        // The intermediate result fits in int64 even for D-width because
+        // |INT64_MIN| overflows to INT64_MIN (i.e. stays in the "saturate"
+        // bucket selected by the CMP).
+        const uint8_t sz = static_cast<uint8_t>(args.size & 0x3);
+        int64_t int_min;
+        int64_t int_max;
+        switch (sz) {
+          case 0: int_min = INT8_MIN;  int_max = INT8_MAX;  break;
+          case 1: int_min = INT16_MIN; int_max = INT16_MAX; break;
+          case 2: int_min = INT32_MIN; int_max = INT32_MAX; break;
+          default:
+            // sz == 3 (D-width).
+            int_min = INT64_MIN; int_max = INT64_MAX; break;
+        }
+        Register src = AllocTempReg();
+        Register negated = AllocTempReg();
+        Register result = AllocTempReg();
+        Register int_min_reg = AllocTempReg();
+        Register int_max_reg = AllocTempReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (src == no_register || negated == no_register ||
+            result == no_register || int_min_reg == no_register ||
+            int_max_reg == no_register || xzero == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load src, sign-extended to 64-bit.
+        switch (sz) {
+          case 0:
+            as_.Movsxbq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 1:
+            as_.Movsxwq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          case 2:
+            as_.Movsxlq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+          default:
+            as_.Movq(src, {.base = Assembler::rbp, .disp = vn_off});
+            break;
+        }
+        // negated = -src.  Negq clobbers EFLAGS.
+        as_.Movq(negated, src);
+        as_.Negq(negated);
+        // result starts as src; if src < 0, result = -src.  Testq sets
+        // SF from src's sign bit.
+        as_.Movq(result, src);
+        as_.Testq(src, src);
+        as_.Cmovq(Assembler::Condition::kNegative, result, negated);
+        // Saturation: if src == INT_MIN_for_width, result = INT_MAX_for_width.
+        as_.Movq(int_min_reg, int_min);
+        as_.Cmpq(src, int_min_reg);
+        as_.Movq(int_max_reg, int_max);  // Movq imm does not touch EFLAGS.
+        as_.Cmovq(Assembler::Condition::kZero, result, int_max_reg);
+        // Zero Vd, then store result at lane 0 at the right width.
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        switch (sz) {
+          case 0:
+            as_.Movb({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 1:
+            as_.Movw({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          case 2:
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+          default:
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, result);
+            break;
+        }
+        return;
+      }
+
       default:
-        // SQABS / SQNEG / SQXTN / SQXTUN / UQXTN / FRECPE / FRSQRTE
-        // scalars: bail to the interpreter.  Correctness path is handled
-        // by Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT
-        // them individually.
+        // SQNEG / SQXTN / SQXTUN / UQXTN / FRECPE / FRSQRTE scalars: bail
+        // to the interpreter.  Correctness path is handled by
+        // Interpreter::AdvSimdScalarTwoRegMisc; future cycles can JIT them
+        // individually.
         success_ = false;
         return;
     }
