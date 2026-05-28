@@ -7704,6 +7704,101 @@ class Interpreter {
     }
     // endregion
 
+    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element.
+    // Saturating doubling widening multiply (and accumulate / subtract),
+    // signed only.  Mirrors the SQDMULL/SQDMLAL/SQDMLSL three-different
+    // vector arms at lines ~2074-2163, with Vm.lane[index] broadcast as
+    // the per-lane multiplier.  Two-stage saturation: stage 1 saturates
+    // the doubled product against [INT_MIN_out, INT_MAX_out] (only the
+    // (INT_MIN_in, INT_MIN_in) pair saturates), stage 2 saturates the
+    // wide accumulator add/subtract.  Destination is always 128-bit.
+    if (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmullIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmlalIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmlslIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      bool is_accum = (args.opcode != Decoder::AdvSimdVecXIdxOpcode::kSqdmullIdx);
+      bool is_sub   = (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmlslIdx);
+
+      uint8_t in_esize = (args.size == 0b01) ? 2 : 4;
+      uint8_t out_esize = in_esize * 2;
+      uint8_t num_elements = 16 / out_esize;
+      uint8_t src_offset = args.q ? 8 : 0;
+
+      int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+      int64_t int_max_out =
+          (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+      int64_t int_min_out =
+          (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
+      uint8_t shift = (8 - in_esize) * 8;
+
+      uint64_t indexed_u = 0;
+      memcpy(&indexed_u,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * in_esize,
+             in_esize);
+      int64_t indexed_s = static_cast<int64_t>(indexed_u << shift) >> shift;
+
+      __uint128_t new_result = is_accum ? result : __uint128_t{0};
+      for (uint8_t i = 0; i < num_elements; i++) {
+        uint64_t lane_u = 0;
+        memcpy(&lane_u,
+               reinterpret_cast<const uint8_t*>(&src_n) + src_offset + i * in_esize,
+               in_esize);
+        int64_t sn = static_cast<int64_t>(lane_u << shift) >> shift;
+
+        int64_t doubled;
+        if (sn == int_min_in && indexed_s == int_min_in) {
+          doubled = int_max_out;
+        } else {
+          doubled = 2 * sn * indexed_s;
+        }
+
+        if (is_accum) {
+          int64_t addend = is_sub ? -doubled : doubled;
+          uint64_t acc_raw = 0;
+          memcpy(&acc_raw,
+                 reinterpret_cast<const uint8_t*>(&new_result) + i * out_esize,
+                 out_esize);
+          int64_t acc;
+          if (out_esize == 8) {
+            acc = static_cast<int64_t>(acc_raw);
+          } else {
+            uint8_t s2 = (8 - out_esize) * 8;
+            acc = static_cast<int64_t>(acc_raw << s2) >> s2;
+          }
+          int64_t sum;
+          if (out_esize == 8) {
+            uint64_t usum =
+                static_cast<uint64_t>(acc) + static_cast<uint64_t>(addend);
+            sum = static_cast<int64_t>(usum);
+            bool a_neg = acc < 0;
+            bool b_neg = addend < 0;
+            bool s_neg = sum < 0;
+            if (a_neg == b_neg && a_neg != s_neg) {
+              sum = a_neg ? int_min_out : int_max_out;
+            }
+          } else {
+            sum = acc + addend;
+            if (sum > int_max_out) {
+              sum = int_max_out;
+            } else if (sum < int_min_out) {
+              sum = int_min_out;
+            }
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&new_result) + i * out_esize,
+                 &sum, out_esize);
+        } else {
+          memcpy(reinterpret_cast<uint8_t*>(&new_result) + i * out_esize,
+                 &doubled, out_esize);
+        }
+      }
+      state_->cpu.v[args.rd] = new_result;
+      return;
+    }
+    // endregion
+
     // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
     if (args.size == 0b00) {
       // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,

@@ -1757,6 +1757,14 @@ class Decoder {
                    // Vd lane -= sign_ext(Vn[i]) * sign_ext(Vm[index]).
     kUmlslIdx,     // UMLSL/UMLSL2 (by element): U=1, opcode=0110, size in {01,10}.
                    // Vd lane -= unsigned product.
+    kSqdmullIdx,   // SQDMULL/SQDMULL2 (by element): U=0, opcode=1011, size in {01,10}.
+                   // Saturating doubling widening multiply: dst lane =
+                   // SignedSat(2 * sign_ext(Vn[i]) * sign_ext(Vm[index])).
+                   // Only (INT_MIN_in, INT_MIN_in) saturates; dst always 128-bit.
+    kSqdmlalIdx,   // SQDMLAL/SQDMLAL2 (by element): U=0, opcode=0011, size in {01,10}.
+                   // Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2 * sn * sm)).
+    kSqdmlslIdx,   // SQDMLSL/SQDMLSL2 (by element): U=0, opcode=0111, size in {01,10}.
+                   // Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2 * sn * sm)).
     // endregion
   };
 
@@ -6134,7 +6142,17 @@ class Decoder {
             //   umlsl   v0.4s, v1.4h, v2.h[0] = 0x2F426020   U=1, opcode=0110
             opcode == 0b1010 ||
             opcode == 0b0010 ||
-            opcode == 0b0110
+            opcode == 0b0110 ||
+            // Saturating doubling widening MUL/MAC by element.  U must
+            // be 0; size restricted to {01, 10}.  Vm and index encoding
+            // matches the widening MUL/MAC by element family above.
+            //   sqdmull  v0.4s, v1.4h, v2.h[0]  = 0x0F42B020   opcode=1011
+            //   sqdmull2 v0.4s, v1.8h, v2.h[7]  = 0x4F72B820
+            //   sqdmlal  v0.4s, v1.4h, v2.h[0]  = 0x0F423020   opcode=0011
+            //   sqdmlsl  v0.4s, v1.4h, v2.h[0]  = 0x0F427020   opcode=0111
+            (opcode == 0b1011 && !u) ||
+            (opcode == 0b0011 && !u) ||
+            (opcode == 0b0111 && !u)
             // endregion
             )) {
         Undefined();
@@ -6237,6 +6255,21 @@ class Decoder {
         if (size != 0b01 && size != 0b10) { Undefined(); return; }
         op = u ? AdvSimdVecXIdxOpcode::kUmlslIdx
                : AdvSimdVecXIdxOpcode::kSmlslIdx;
+        break;
+      // Saturating doubling widening MUL/MAC by element (signed only).
+      // Restricted to size ∈ {0b01 (.4h/.8h -> .4s), 0b10 (.2s/.4s -> .2d)}.
+      // U=1 at these opcodes is reserved and routes to Undefined.
+      case 0b1011:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmullIdx;
+        break;
+      case 0b0011:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmlalIdx;
+        break;
+      case 0b0111:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmlslIdx;
         break;
       // endregion
       default:
