@@ -7628,6 +7628,79 @@ class Interpreter {
     }
     // endregion
 
+    // region digitalis: SQRDMLAH / SQRDMLSH by-element (Armv8.1-RDM).
+    //   size=0b01 -> halfword (.4h/.8h, esize=2).
+    //   size=0b10 -> word     (.2s/.4s, esize=4).
+    // Non-widening: destination lane width matches source lane width.
+    // Per-lane semantics (ARM ARM):
+    //   addend = SignedSat((2 * sn * sm + round) >> esize_bits)   // = SQRDMULH(sn,sm)
+    //   SQRDMLAH: Vd[i] = SignedSat(Vd[i] + addend)
+    //   SQRDMLSH: Vd[i] = SignedSat(Vd[i] - addend)
+    // The addend lives in the narrow range [INT_MIN_out, INT_MAX_out] (SQRDMULH
+    // saturates), so accumulator add/sub is done in the next wider signed type
+    // (int32 for halfword, int64 for word) and re-saturated to the narrow range.
+    // SQRDMLSH reuses the SQRDMLAH path with `addend = -addend`; safe because
+    // `addend != INT_MIN_out` is only reachable when SQRDMULH itself rounded the
+    // (INT_MIN_in, INT_MIN_in) corner to INT_MAX_out (no INT_MIN_out output).
+    if (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqrdmlahIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqrdmlshIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      uint8_t esize = (args.size == 0b01) ? 2 : 4;
+      uint8_t num_elements = (args.q ? 16 : 8) / esize;
+      uint8_t bits_local = esize * 8;
+      int64_t smax = (1LL << (bits_local - 1)) - 1;
+      int64_t smin = -(1LL << (bits_local - 1));
+      __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+      bool is_sub = (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqrdmlshIdx);
+
+      uint64_t indexed_u = 0;
+      memcpy(&indexed_u,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * esize,
+             esize);
+      uint8_t shift = (8 - esize) * 8;
+      int64_t indexed_s =
+          static_cast<int64_t>(indexed_u << shift) >> shift;
+
+      for (uint8_t i = 0; i < num_elements; i++) {
+        uint64_t lane_u = 0;
+        memcpy(&lane_u,
+               reinterpret_cast<const uint8_t*>(&src_n) + i * esize,
+               esize);
+        int64_t lane_s =
+            static_cast<int64_t>(lane_u << shift) >> shift;
+
+        // Stage 1: SQRDMULH(lane_s, indexed_s).  The doubled product
+        // 2*lane_s*indexed_s fits int64_t for esize <= 4 (|product| <= 2^62).
+        __int128 product =
+            (static_cast<__int128>(2) * lane_s * indexed_s) + round;
+        int64_t addend = static_cast<int64_t>(product >> bits_local);
+        if (addend > smax) addend = smax;
+        if (addend < smin) addend = smin;
+
+        // Stage 2: signed-saturating add/sub of addend into Vd[i].
+        uint64_t acc_u = 0;
+        memcpy(&acc_u,
+               reinterpret_cast<const uint8_t*>(&result) + i * esize,
+               esize);
+        int64_t acc = static_cast<int64_t>(acc_u << shift) >> shift;
+        int64_t out = is_sub ? acc - addend : acc + addend;
+        if (out > smax) out = smax;
+        if (out < smin) out = smin;
+        uint64_t out_u = static_cast<uint64_t>(out);
+        memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &out_u, esize);
+      }
+
+      if (!args.q) {
+        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+      }
+      state_->cpu.v[args.rd] = result;
+      return;
+    }
+    // endregion
+
     // region digitalis: widening MUL/MAC by element.
     //   size=01 (.4h/.8h sources -> .4s dst, esize 2->4, 4 output lanes).
     //   size=10 (.2s/.4s sources -> .2d dst, esize 4->8, 2 output lanes).
@@ -7699,6 +7772,101 @@ class Interpreter {
 
       // The widening forms write a full 128-bit destination regardless of Q
       // (matches the three-diff vector path's lack of upper-half clearing).
+      state_->cpu.v[args.rd] = new_result;
+      return;
+    }
+    // endregion
+
+    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element.
+    // Saturating doubling widening multiply (and accumulate / subtract),
+    // signed only.  Mirrors the SQDMULL/SQDMLAL/SQDMLSL three-different
+    // vector arms at lines ~2074-2163, with Vm.lane[index] broadcast as
+    // the per-lane multiplier.  Two-stage saturation: stage 1 saturates
+    // the doubled product against [INT_MIN_out, INT_MAX_out] (only the
+    // (INT_MIN_in, INT_MIN_in) pair saturates), stage 2 saturates the
+    // wide accumulator add/subtract.  Destination is always 128-bit.
+    if (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmullIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmlalIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmlslIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      bool is_accum = (args.opcode != Decoder::AdvSimdVecXIdxOpcode::kSqdmullIdx);
+      bool is_sub   = (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmlslIdx);
+
+      uint8_t in_esize = (args.size == 0b01) ? 2 : 4;
+      uint8_t out_esize = in_esize * 2;
+      uint8_t num_elements = 16 / out_esize;
+      uint8_t src_offset = args.q ? 8 : 0;
+
+      int64_t int_min_in = -(1LL << (in_esize * 8 - 1));
+      int64_t int_max_out =
+          (out_esize == 8) ? INT64_MAX : ((1LL << (out_esize * 8 - 1)) - 1);
+      int64_t int_min_out =
+          (out_esize == 8) ? INT64_MIN : -(1LL << (out_esize * 8 - 1));
+      uint8_t shift = (8 - in_esize) * 8;
+
+      uint64_t indexed_u = 0;
+      memcpy(&indexed_u,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * in_esize,
+             in_esize);
+      int64_t indexed_s = static_cast<int64_t>(indexed_u << shift) >> shift;
+
+      __uint128_t new_result = is_accum ? result : __uint128_t{0};
+      for (uint8_t i = 0; i < num_elements; i++) {
+        uint64_t lane_u = 0;
+        memcpy(&lane_u,
+               reinterpret_cast<const uint8_t*>(&src_n) + src_offset + i * in_esize,
+               in_esize);
+        int64_t sn = static_cast<int64_t>(lane_u << shift) >> shift;
+
+        int64_t doubled;
+        if (sn == int_min_in && indexed_s == int_min_in) {
+          doubled = int_max_out;
+        } else {
+          doubled = 2 * sn * indexed_s;
+        }
+
+        if (is_accum) {
+          int64_t addend = is_sub ? -doubled : doubled;
+          uint64_t acc_raw = 0;
+          memcpy(&acc_raw,
+                 reinterpret_cast<const uint8_t*>(&new_result) + i * out_esize,
+                 out_esize);
+          int64_t acc;
+          if (out_esize == 8) {
+            acc = static_cast<int64_t>(acc_raw);
+          } else {
+            uint8_t s2 = (8 - out_esize) * 8;
+            acc = static_cast<int64_t>(acc_raw << s2) >> s2;
+          }
+          int64_t sum;
+          if (out_esize == 8) {
+            uint64_t usum =
+                static_cast<uint64_t>(acc) + static_cast<uint64_t>(addend);
+            sum = static_cast<int64_t>(usum);
+            bool a_neg = acc < 0;
+            bool b_neg = addend < 0;
+            bool s_neg = sum < 0;
+            if (a_neg == b_neg && a_neg != s_neg) {
+              sum = a_neg ? int_min_out : int_max_out;
+            }
+          } else {
+            sum = acc + addend;
+            if (sum > int_max_out) {
+              sum = int_max_out;
+            } else if (sum < int_min_out) {
+              sum = int_min_out;
+            }
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&new_result) + i * out_esize,
+                 &sum, out_esize);
+        } else {
+          memcpy(reinterpret_cast<uint8_t*>(&new_result) + i * out_esize,
+                 &doubled, out_esize);
+        }
+      }
       state_->cpu.v[args.rd] = new_result;
       return;
     }

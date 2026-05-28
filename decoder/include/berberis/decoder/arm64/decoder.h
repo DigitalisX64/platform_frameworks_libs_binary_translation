@@ -1757,6 +1757,23 @@ class Decoder {
                    // Vd lane -= sign_ext(Vn[i]) * sign_ext(Vm[index]).
     kUmlslIdx,     // UMLSL/UMLSL2 (by element): U=1, opcode=0110, size in {01,10}.
                    // Vd lane -= unsigned product.
+    kSqdmullIdx,   // SQDMULL/SQDMULL2 (by element): U=0, opcode=1011, size in {01,10}.
+                   // Saturating doubling widening multiply: dst lane =
+                   // SignedSat(2 * sign_ext(Vn[i]) * sign_ext(Vm[index])).
+                   // Only (INT_MIN_in, INT_MIN_in) saturates; dst always 128-bit.
+    kSqdmlalIdx,   // SQDMLAL/SQDMLAL2 (by element): U=0, opcode=0011, size in {01,10}.
+                   // Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2 * sn * sm)).
+    kSqdmlslIdx,   // SQDMLSL/SQDMLSL2 (by element): U=0, opcode=0111, size in {01,10}.
+                   // Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2 * sn * sm)).
+    kSqrdmlahIdx,  // SQRDMLAH (by element, Armv8.1-RDM): U=1, opcode=1101,
+                   // size in {01,10}.  Non-widening: dst lane width = source
+                   // lane width.  Per-lane: addend = SignedSat(round(2*sn*sm)
+                   // >> esize_bits), then Vd[i] = SignedSat(Vd[i] + addend).
+                   // Reuses the SQRDMULH math for the addend computation.
+    kSqrdmlshIdx,  // SQRDMLSH (by element, Armv8.1-RDM): U=1, opcode=1111,
+                   // size in {01,10}.  Same as kSqrdmlahIdx but subtracts the
+                   // saturated rounded-doubled product: Vd[i] = SignedSat(
+                   // Vd[i] - SignedSat(round(2*sn*sm) >> esize_bits)).
     // endregion
   };
 
@@ -6134,7 +6151,25 @@ class Decoder {
             //   umlsl   v0.4s, v1.4h, v2.h[0] = 0x2F426020   U=1, opcode=0110
             opcode == 0b1010 ||
             opcode == 0b0010 ||
-            opcode == 0b0110
+            opcode == 0b0110 ||
+            // Saturating doubling widening MUL/MAC by element.  U must
+            // be 0; size restricted to {01, 10}.  Vm and index encoding
+            // matches the widening MUL/MAC by element family above.
+            //   sqdmull  v0.4s, v1.4h, v2.h[0]  = 0x0F42B020   opcode=1011
+            //   sqdmull2 v0.4s, v1.8h, v2.h[7]  = 0x4F72B820
+            //   sqdmlal  v0.4s, v1.4h, v2.h[0]  = 0x0F423020   opcode=0011
+            //   sqdmlsl  v0.4s, v1.4h, v2.h[0]  = 0x0F427020   opcode=0111
+            (opcode == 0b1011 && !u) ||
+            (opcode == 0b0011 && !u) ||
+            (opcode == 0b0111 && !u) ||
+            // Armv8.1-RDM saturating-rounding-doubling MAC by element
+            // (non-widening; dst lane size = source lane size).  U must
+            // be 1; size restricted to {01, 10}.  Vm and index encoding
+            // matches the SQDMULH/SQRDMULH by-element shape.
+            //   sqrdmlah v0.4h, v1.4h, v2.h[0] = 0x2F42D020   opcode=1101
+            //   sqrdmlsh v0.4h, v1.4h, v2.h[0] = 0x2F42F020   opcode=1111
+            (opcode == 0b1101 && u) ||
+            (opcode == 0b1111 && u)
             // endregion
             )) {
         Undefined();
@@ -6209,16 +6244,25 @@ class Decoder {
       // region digitalis: SQDMULH / SQRDMULH by element (vector).
       //   U=0, opcode=1100 -> SQDMULH (by element).
       //   U=0, opcode=1101 -> SQRDMULH (by element).
-      // Both restricted to size ∈ {0b01 (.4h/.8h), 0b10 (.2s/.4s)}.
-      //   U=1 at these opcodes is SQRDMLAH / SQRDMLSH (Armv8.1-RDM) —
-      //   intentionally routed to Undefined here until those land.
+      //   U=1, opcode=1101 -> SQRDMLAH (Armv8.1-RDM, by element).
+      //   U=1, opcode=1111 -> SQRDMLSH (Armv8.1-RDM, by element).
+      // All restricted to size ∈ {0b01 (.4h/.8h), 0b10 (.2s/.4s)}.
+      // U=1 at opcode=1100 has no encoding -> Undefined.
       case 0b1100:
         if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
         op = AdvSimdVecXIdxOpcode::kSqdmulhIdx;
         break;
       case 0b1101:
-        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
-        op = AdvSimdVecXIdxOpcode::kSqrdmulhIdx;
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kSqrdmlahIdx
+               : AdvSimdVecXIdxOpcode::kSqrdmulhIdx;
+        break;
+      case 0b1111:
+        // U=0 at opcode=1111 is BFDOT/BFMLAL{B,T} (handled by the
+        // carve-out at the top of DecodeAdvSimdVecXIndexedElement).  Only
+        // U=1 (SQRDMLSH, Armv8.1-RDM) reaches the switch here.
+        if (!u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqrdmlshIdx;
         break;
       // Widening MUL/MAC by element.  Restricted to size ∈ {0b01 (.4h/.8h ->
       // .4s), 0b10 (.2s/.4s -> .2d)}.  size=0b00 has no encoding (8->16
@@ -6237,6 +6281,21 @@ class Decoder {
         if (size != 0b01 && size != 0b10) { Undefined(); return; }
         op = u ? AdvSimdVecXIdxOpcode::kUmlslIdx
                : AdvSimdVecXIdxOpcode::kSmlslIdx;
+        break;
+      // Saturating doubling widening MUL/MAC by element (signed only).
+      // Restricted to size ∈ {0b01 (.4h/.8h -> .4s), 0b10 (.2s/.4s -> .2d)}.
+      // U=1 at these opcodes is reserved and routes to Undefined.
+      case 0b1011:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmullIdx;
+        break;
+      case 0b0011:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmlalIdx;
+        break;
+      case 0b0111:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmlslIdx;
         break;
       // endregion
       default:
