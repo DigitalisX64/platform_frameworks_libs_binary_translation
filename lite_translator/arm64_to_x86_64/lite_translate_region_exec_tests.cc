@@ -9112,6 +9112,125 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec8HTwoPassRegular) {
 }
 // endregion
 
+// region digitalis: FP16 vector FMULX .4H / .8H — F16C round-trip JIT.
+// Encodings derived from the scalar FMULX H base (0x5E401C00, opcode_h=011)
+// by clearing the scalar-form high nibble (bits[31:28]=0101 -> 0000 for Q=0
+// or 0100 for Q=1):
+//   FMULX Vd.4H, Vn.4H, Vm.4H = 0x0E401C00 | (rm<<16) | (rn<<5) | rd
+//   FMULX Vd.8H, Vn.8H, Vm.8H = 0x4E401C00 | (rm<<16) | (rn<<5) | rd
+// Decoder routing: bits[23]=a=0, bits[22]=1 (FP16 marker), bits[21]=0,
+// bits[13:11]=opcode_h=011 -> AdvSimdThreeSameOpcode::kFmulxV with
+// is_fp16=true (decoder.h DecodeAdvSimdFp16ThreeSame, U=0/!a branch).
+constexpr uint32_t FmulxVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E401C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E401C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMULX .4H — regular finite multiplies, lane by lane.  Lanes 4..7 of Vd
+// must be zeroed by the FP16 round-trip path (Q=0 -> upper 64 bits zero).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4HAllLanes) {
+  const uint16_t n_lanes[8] = {kHalf_1_0, kHalf_0_5, kHalf_neg2_0, kHalf_2_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_2_0, kHalf_4_0, kHalf_neg0_5, kHalf_0_5,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN,
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulxVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_2_0);     // 1 * 2 = 2
+  EXPECT_EQ(r[1], kHalf_2_0);     // 0.5 * 4 = 2
+  EXPECT_EQ(r[2], kHalf_1_0);     // -2 * -0.5 = 1
+  EXPECT_EQ(r[3], kHalf_1_0);     // 2 * 0.5 = 1
+  // Lanes 4..7 zeroed by Vcvtps2ph (Q=0 invariant).
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMULX .4H — all four (±0, ±inf) crosses produce ±2.0 with sign = sign(a)
+// XOR sign(b), not the default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4HZeroTimesInfSaturation) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_pos0, kHalf_neg0,
+                                0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_pos_inf, kHalf_pos_inf, kHalf_neg_inf, kHalf_neg_inf,
+                                0, 0, 0, 0};
+  uint16_t d_init[8] = {kHalf_qNaN, kHalf_qNaN, kHalf_qNaN, kHalf_qNaN,
+                        0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulxVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_2_0);     // (+0, +inf) -> +2.0
+  EXPECT_EQ(r[1], kHalf_neg2_0);  // (-0, +inf) -> -2.0
+  EXPECT_EQ(r[2], kHalf_neg2_0);  // (+0, -inf) -> -2.0
+  EXPECT_EQ(r[3], kHalf_2_0);     // (-0, -inf) -> +2.0
+}
+
+// FMULX .4H — NaN input propagates, NOT replaced by ±2.0.  Distinguishes
+// the (±0, ±inf) special-case mask (which only fires when neither input is
+// itself NaN) from generic NaN propagation through the multiply.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec4HNaNInputDoesNotSaturate) {
+  const uint16_t n_lanes[8] = {kHalf_qNaN, kHalf_1_0,  kHalf_pos0,    kHalf_2_0,  0, 0, 0, 0};
+  const uint16_t m_lanes[8] = {kHalf_1_0,  kHalf_qNaN, kHalf_pos_inf, kHalf_3_0,  0, 0, 0, 0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulxVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  // Lane 0/1: NaN input -> NaN out (exponent=11111 AND mantissa nonzero).
+  // FP16 NaN: bits[14:10]=11111 (mask 0x7C00) AND bits[9:0] nonzero (mask 0x03FF).
+  // 0x7C00 alone (mantissa=0) would be ±inf, not NaN.
+  EXPECT_EQ(r[0] & 0x7C00u, 0x7C00u);
+  EXPECT_NE(r[0] & 0x03FFu, 0u);
+  EXPECT_EQ(r[1] & 0x7C00u, 0x7C00u);
+  EXPECT_NE(r[1] & 0x03FFu, 0u);
+  // Lane 2: (+0, +inf) -> +2.0 special case (no NaN input).
+  EXPECT_EQ(r[2], kHalf_2_0);
+  // Lane 3: 2 * 3 = 6.0 (FP16 6.0 = 0x4600).
+  EXPECT_EQ(r[3], 0x4600u);
+}
+
+// FMULX .8H — exercises the 2-pass XMM path (low 4 lanes then high 4).
+// Mix regular finite multiplies (0..3) and saturation lanes (4..7).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxVec8HTwoPassMixed) {
+  const uint16_t n_lanes[8] = {kHalf_1_0,    kHalf_0_5,    kHalf_neg2_0, kHalf_2_0,
+                                kHalf_pos0,   kHalf_neg0,   kHalf_pos0,    kHalf_neg0};
+  const uint16_t m_lanes[8] = {kHalf_2_0,    kHalf_4_0,    kHalf_neg0_5, kHalf_0_5,
+                                kHalf_pos_inf, kHalf_pos_inf, kHalf_neg_inf, kHalf_neg_inf};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmulxVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  // Lanes 0-3 (low pass): regular finite multiplies.
+  EXPECT_EQ(r[0], kHalf_2_0);     // 1 * 2 = 2
+  EXPECT_EQ(r[1], kHalf_2_0);     // 0.5 * 4 = 2
+  EXPECT_EQ(r[2], kHalf_1_0);     // -2 * -0.5 = 1
+  EXPECT_EQ(r[3], kHalf_1_0);     // 2 * 0.5 = 1
+  // Lanes 4-7 (high pass): (±0, ±inf) saturations with sign = sign(a) XOR sign(b).
+  EXPECT_EQ(r[4], kHalf_2_0);     // (+0, +inf) -> +2.0
+  EXPECT_EQ(r[5], kHalf_neg2_0);  // (-0, +inf) -> -2.0
+  EXPECT_EQ(r[6], kHalf_neg2_0);  // (+0, -inf) -> -2.0
+  EXPECT_EQ(r[7], kHalf_2_0);     // (-0, -inf) -> +2.0
+}
+// endregion
+
 // region digitalis: FP16 vector FMLA / FMLS .4H / .8H — FP16 -> FP32 -> FP64
 // round-trip JIT.  Encodings (verified via aarch64-linux-gnu-as -march=
 // armv8.2-a+fp16):

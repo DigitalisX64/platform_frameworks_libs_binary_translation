@@ -6147,9 +6147,119 @@ class LiteTranslator {
       // PUNPCKLQDQ (FP64, broadcast low 64 bits to both 64-bit lanes;
       // SSE2-only so available on every host we target).
       //
-      // FP16 .4H/.8H still bails to the interpreter — args.is_fp16 path.
+      // FP16 .4H/.8H via F16C round-trip — see dedicated branch below.
       case Decoder::AdvSimdThreeSameOpcode::kFmulxV: {
-        if (args.is_fp16) { success_ = false; return; }
+        // region digitalis: FP16 vector FMULX .4H / .8H via F16C round-trip.
+        // The interpreter computes each FP16 lane as
+        // FpSingleToHalf(FmulxScalar<float>(a, b)) — i.e. the whole FMULX
+        // (including the ±0×±∞ → ±2.0 special-case override and sign-of-xor
+        // adjustment) runs in FP32 then narrows to half.  Lift:
+        //   widen FP16 -> FP32 via Vcvtph2ps (4 FP32 lanes in xmm);
+        //   run the FP32 FMULX algorithm — mul = a*b; mul_unord =
+        //     cmpunord(mul,mul); input_unord = cmpunord(a,b);
+        //     special = mul_unord AND NOT input_unord;
+        //     two_signed = ((a XOR b) AND sign_mask) OR bits-of(+2.0);
+        //     result = (mul AND NOT special) OR (two_signed AND special);
+        //   narrow FP32 -> FP16 via Vcvtps2ph.
+        // For .8H process low 4 lanes and high 4 lanes in two passes,
+        // reusing the same temp set, then recombine via Pslldq + Por
+        // (matches the FP16 FRECPS / FRSQRTS vector pattern below).
+        if (args.is_fp16) {
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xmul = AllocTempSimdReg();
+          SimdRegister xmuun = AllocTempSimdReg();
+          SimdRegister xiu = AllocTempSimdReg();
+          SimdRegister xtwo = AllocTempSimdReg();
+          SimdRegister xlo = args.q ? AllocTempSimdReg() : no_simd_register;
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xmul == no_simd_register || xmuun == no_simd_register ||
+              xiu == no_simd_register || xtwo == no_simd_register ||
+              (args.q && xlo == no_simd_register)) {
+            success_ = false; return;
+          }
+          Register tmp_gpr = AllocTempReg();
+          if (tmp_gpr == Assembler::no_register) {
+            success_ = false; return;
+          }
+
+          // Run the FP32 FMULX algorithm on xn/xm (which already hold 4 FP32
+          // lanes lifted from FP16).  Result ends up in xiu.  Destroys
+          // xn/xm/xmul/xmuun/xtwo (all considered scratch within emit_pass).
+          auto emit_pass = [&]() {
+            // mul = a * b
+            as_.Movdqa(xmul, xn);
+            as_.Mulps(xmul, xm);
+            // mul_unord = cmpunord(mul, mul)
+            as_.Movdqa(xmuun, xmul);
+            as_.Cmpunordps(xmuun, xmuun);
+            // input_unord = cmpunord(a, b)
+            as_.Movdqa(xiu, xn);
+            as_.Cmpunordps(xiu, xm);
+            // special_mask = mul_unord AND NOT input_unord.  Pandn writes
+            // dst = (NOT dst) AND src, so the result lands in xiu.
+            as_.Pandn(xiu, xmuun);
+            // two_signed: ((a XOR b) AND sign_mask) OR bits-of(+2.0).
+            // Reuse xn as the XOR scratch; xmuun as the sign mask.
+            as_.Xorps(xn, xm);
+            as_.Pcmpeqd(xmuun, xmuun);
+            as_.Pslld(xmuun, int8_t{31});
+            as_.Pand(xn, xmuun);
+            // Broadcast +2.0 bits into all four FP32 lanes of xtwo.
+            as_.Movl(tmp_gpr, int32_t{0x40000000});
+            as_.Movd(xtwo, tmp_gpr);
+            as_.Pshufd(xtwo, xtwo, int8_t{0});
+            as_.Por(xn, xtwo);
+            // xn now holds ±2.0 per lane (sign = sign(a) XOR sign(b)).
+            // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+            // Reuse xm as masked-±2.0; xiu as result.
+            as_.Movdqa(xm, xn);
+            as_.Pand(xm, xiu);
+            as_.Pandn(xiu, xmul);
+            as_.Por(xiu, xm);
+            // xiu holds the FP32 result (4 lanes).
+          };
+
+          if (!args.q) {
+            // .4H: 4 FP16 lanes in low 64 bits of each operand.
+            as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xn, xn);
+            as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Vcvtph2ps(xm, xm);
+            emit_pass();
+            as_.Vcvtps2ph(xiu, xiu, int8_t{0});
+            // Vcvtps2ph auto-zeroes upper 64 bits.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xiu);
+          } else {
+            // .8H: pass 1 (low 4 lanes), narrow & stash in xlo; pass 2 (high
+            // 4 lanes via Psrldq 8), narrow, recombine via Pslldq + Por.
+            as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Vcvtph2ps(xn, xn);
+            as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Vcvtph2ps(xm, xm);
+            emit_pass();
+            as_.Vcvtps2ph(xlo, xiu, int8_t{0});
+            // xlo holds 4 FP16 lanes in low 64 (lanes 0..3 of result).
+
+            as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Psrldq(xn, int8_t{8});
+            as_.Vcvtph2ps(xn, xn);
+            as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+            as_.Psrldq(xm, int8_t{8});
+            as_.Vcvtph2ps(xm, xm);
+            emit_pass();
+            as_.Vcvtps2ph(xiu, xiu, int8_t{0});
+            // xiu holds 4 FP16 lanes in low 64 (lanes 4..7 of result).
+
+            as_.Pslldq(xiu, int8_t{8});
+            as_.Por(xlo, xiu);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+          }
+          return;
+        }
+        // endregion
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { success_ = false; return; }
 
