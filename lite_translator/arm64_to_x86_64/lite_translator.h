@@ -12895,9 +12895,618 @@ class LiteTranslator {
     const bool is_facge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacge);
     const bool is_facgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacgt);
     const bool is_cmp = is_fcmeq || is_fcmge || is_fcmgt || is_facge || is_facgt;
-    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp) {
+    // region digitalis
+    const bool is_sqrdmlah_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlahScalar);
+    const bool is_sqrdmlsh_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar);
+    const bool is_sqrdm_scalar = is_sqrdmlah_scalar || is_sqrdmlsh_scalar;
+    const bool is_sqdmulh_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqdmulhScalar);
+    const bool is_sqrdmulh_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar);
+    const bool is_sq_d_r_mulh_scalar = is_sqdmulh_scalar || is_sqrdmulh_scalar;
+    const bool is_dform_add =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kAdd);
+    const bool is_dform_sub =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSub);
+    const bool is_dform_cmgt =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmgt);
+    const bool is_dform_cmhi =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmhi);
+    const bool is_dform_cmge =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmge);
+    const bool is_dform_cmhs =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmhs);
+    const bool is_dform_cmtst =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmtst);
+    const bool is_dform_cmeq =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmeq);
+    const bool is_dform_int =
+        is_dform_add || is_dform_sub || is_dform_cmgt || is_dform_cmhi ||
+        is_dform_cmge || is_dform_cmhs || is_dform_cmtst || is_dform_cmeq;
+    const bool is_sqadd_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqaddScalar);
+    const bool is_uqadd_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqaddScalar);
+    const bool is_sqsub_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar);
+    const bool is_uqsub_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar);
+    const bool is_satarith_scalar =
+        is_sqadd_scalar || is_uqadd_scalar || is_sqsub_scalar || is_uqsub_scalar;
+    // B/H/S sizes are JIT-lowered here.  D bails to the interpreter (no
+    // direct SSE primitive for 64-bit saturating add/sub).  B/H route through
+    // the one-instruction saturating SSE ops; S uses the 32-bit recipe ported
+    // single-lane from the vector SQADD/UQADD/SQSUB/UQSUB lowerings.
+    const bool is_satarith_scalar_bhs =
+        is_satarith_scalar &&
+        (args.size == 0b00 || args.size == 0b01 || args.size == 0b10);
+    // endregion
+    if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
+        !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
+        !is_satarith_scalar_bhs) {
       success_ = false; return;
     }
+    // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
+    // Single-lane port of the AdvSimdThreeSame vector lowering:
+    //   size=01 (H): SSSE3 PMULHRSW + (INT16_MIN)² corner fix, then PADDSW /
+    //                PSUBSW for the stage-2 signed-saturating accumulate.
+    //   size=10 (S): SSE4.1 PMULDQ to reconstruct the signed 32×32 → 64
+    //                product in qword 0, PSLLQ 1 to double, PADDQ rounding
+    //                constant 2^31, PSRLQ 32 to extract the upper 32 bits
+    //                into dword 0 (PSRLQ also zero-fills dwords 1..3 because
+    //                qword 1 = 0x80000000 → shifted out), then PCMPEQD-based
+    //                corner XOR, then the wrap-add + overflow-bit-XOR-blend
+    //                signed-saturating 32-bit accumulate.
+    // Vd zero-extends above the lane: Vn/Vm/Vd are loaded with Movd / Pxor +
+    // Pinsrw, so all upper lanes are 0 throughout; the recipe propagates
+    // zeros into the upper lanes of the result; a full 128-bit Movdqu then
+    // writes Vd with Vd[127:bits_local] = 0.
+    if (is_sqrdm_scalar) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        success_ = false; return;
+      }
+      const bool is_sub = is_sqrdmlsh_scalar;
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      if (args.size == 0b01) {
+        if (!host_platform::kHasSSSE3) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        SimdRegister xn_corner = AllocTempSimdReg();
+        SimdRegister xm_corner = AllocTempSimdReg();
+        SimdRegister x_min = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register || xn_corner == no_simd_register ||
+            xm_corner == no_simd_register || x_min == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load Vn.h[0], Vm.h[0], Vd.h[0] with upper-lane zero.
+        as_.Pxor(xn, xn);
+        as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pxor(xm, xm);
+        as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        as_.Pxor(xd, xd);
+        as_.Pinsrw(xd, {.base = Assembler::rbp, .disp = vd_off}, int8_t{0});
+        // x_min = 0x8000 broadcast across 8 halfwords.  Upper lanes of xn/xm
+        // are 0 ≠ 0x8000, so the corner mask collapses to 0 in lanes 1..7.
+        as_.Pcmpeqw(x_min, x_min);
+        as_.Psllw(x_min, int8_t{15});
+        // Stage 1: SQRDMULH via PMULHRSW with corner fix at lane 0.
+        as_.Movdqa(xn_corner, xn);
+        as_.Movdqa(xm_corner, xm);
+        as_.Pmulhrsw(xn, xm);
+        as_.Pcmpeqw(xn_corner, x_min);
+        as_.Pcmpeqw(xm_corner, x_min);
+        as_.Pand(xn_corner, xm_corner);
+        as_.Pxor(xn, xn_corner);
+        // Stage 2: signed-saturating PADDSW / PSUBSW into Vd.h[0].
+        if (is_sub) {
+          as_.Psubsw(xd, xn);
+        } else {
+          as_.Paddsw(xd, xn);
+        }
+        // Lanes 1..7 of xd: 0 ± 0 = 0.  Lane 0 holds the saturated result.
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
+      // size == 0b10 (S form).
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xd = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      SimdRegister xp = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register ||
+          xd == no_simd_register || x_const == no_simd_register ||
+          corner == no_simd_register || xp == no_simd_register) {
+        success_ = false; return;
+      }
+      // Load Vn.s[0], Vm.s[0], Vd.s[0] with upper-lane zero.
+      as_.Movd(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movd(xm, {.base = Assembler::rbp, .disp = vm_off});
+      as_.Movd(xd, {.base = Assembler::rbp, .disp = vd_off});
+      // x_const = INT32_MIN broadcast across 4 dwords.
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Pslld(x_const, int8_t{31});
+      // Corner detection (lane 0 only — lanes 1..3 of xn/xm are 0 ≠
+      // INT32_MIN, so corner mask collapses to 0 there).
+      as_.Movdqa(corner, xn);
+      as_.Pcmpeqd(corner, x_const);
+      as_.Movdqa(xp, xm);
+      as_.Pcmpeqd(xp, x_const);
+      as_.Pand(corner, xp);
+      // Stage 1: PMULDQ → qword 0 = sext(Vn.s[0]) * sext(Vm.s[0]); qword 1 = 0
+      // (since src lanes 2/3 are 0).
+      as_.Movdqa(xp, xn);
+      as_.Pmuldq(xp, xm);
+      // Double via PSLLQ 1.
+      as_.Psllq(xp, int8_t{1});
+      // Rounding constant 2^31 per qword.  Build in x_const.
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Psllq(x_const, int8_t{63});
+      as_.Psrlq(x_const, int8_t{32});
+      as_.Paddq(xp, x_const);
+      // Extract the upper 32 bits of qword 0 into dword 0 via PSRLQ 32.
+      //   qword 0 after shift = (2*product + 0x80000000) >> 32 = high32
+      //   qword 1 after shift = 0x80000000 >> 32 = 0
+      // Resulting layout: dword[0] = high32, dword[1..3] = 0.
+      as_.Psrlq(xp, int8_t{32});
+      // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX at lane 0;
+      // lanes 1..3 of corner are 0 so no perturbation there.
+      as_.Pxor(xp, corner);
+      // Stage 2: 32-bit signed-saturating add/sub via wrap+XOR-blend recipe.
+      SimdRegister t_sum = AllocTempSimdReg();
+      SimdRegister t_ovf = AllocTempSimdReg();
+      SimdRegister t_sat = AllocTempSimdReg();
+      if (t_sum == no_simd_register || t_ovf == no_simd_register ||
+          t_sat == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqa(t_sum, xd);
+      if (is_sub) {
+        as_.Psubd(t_sum, xp);
+      } else {
+        as_.Paddd(t_sum, xp);
+      }
+      as_.Movdqa(t_ovf, xd);
+      as_.Pxor(t_ovf, xp);
+      as_.Movdqa(t_sat, xd);
+      as_.Pxor(t_sat, t_sum);
+      if (!is_sub) {
+        as_.Pcmpeqd(xp, xp);
+        as_.Pxor(t_ovf, xp);
+        as_.Pand(t_ovf, t_sat);
+        as_.Psrld(xp, int8_t{1});
+      } else {
+        as_.Pand(t_ovf, t_sat);
+        as_.Pcmpeqd(xp, xp);
+        as_.Psrld(xp, int8_t{1});
+      }
+      as_.Psrad(t_ovf, int8_t{31});
+      as_.Psrad(xd, int8_t{31});
+      as_.Pxor(xd, xp);
+      as_.Pxor(xd, t_sum);
+      as_.Pand(xd, t_ovf);
+      as_.Pxor(xd, t_sum);
+      // Lane-0 = saturated result.  Lanes 1..3 stay zero because xd started
+      // zero in those lanes and the recipe propagates 0 through PSRAD /
+      // PAND / PXOR with t_sum=0 and t_ovf=0.
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      return;
+    }
+    // endregion
+    // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+    //
+    // Single-lane port of stage 1 of the SQRDMLAH/SQRDMLSH scalar recipe
+    // above (same MOVQ/MOVD load shape, same corner-fix XOR), minus the
+    // stage-2 saturating accumulate.  SQDMULH skips the rounding constant;
+    // SQRDMULH includes it.
+    //
+    // size=01 (H): two paths.
+    //   SQRDMULH .H: SSSE3 PMULHRSW + (INT16_MIN)^2 corner fix at lane 0.
+    //                Lanes 1..7 of operands are 0 by construction (Pinsrw
+    //                following Pxor), so PMULHRSW lanes 1..7 are 0 and the
+    //                corner mask collapses to 0 there.
+    //   SQDMULH  .H: PMULLW + PMULHW + PUNPCKLWD + PSRAD 15 + PACKSSDW
+    //                (signed-saturating pack at 16-bit lane granularity).
+    //                Packing against a zero scratch keeps word lanes 1..7
+    //                clean.
+    //
+    // size=10 (S): single path.
+    //   PMULDQ (sext32→64 of qword-low-32) gives qword 0 = sext(Vn.s[0]) *
+    //   sext(Vm.s[0]) and qword 1 = 0.  PSLLQ 1 doubles.  For SQRDMULH only,
+    //   add rounding constant 2^31 per qword (built via Pcmpeqd + Psllq 63
+    //   + Psrlq 32 = 0x0000...0000_80000000 in both qwords).  PSRLQ 32
+    //   extracts upper 32 bits of qword 0 into dword 0 and zero-fills
+    //   dwords 1..3.  Corner XOR turns the (Vn=Vm=INT32_MIN) wrap-to-
+    //   INT32_MIN into INT32_MAX at lane 0; corner mask is 0 elsewhere.
+    if (is_sq_d_r_mulh_scalar) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        success_ = false; return;
+      }
+      const bool is_rounded = is_sqrdmulh_scalar;
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      if (args.size == 0b01) {
+        if (!host_platform::kHasSSSE3) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load Vn.h[0] / Vm.h[0] with upper-lane zero.
+        as_.Pxor(xn, xn);
+        as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pxor(xm, xm);
+        as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        SimdRegister xmm_result = no_simd_register;
+        if (is_rounded) {
+          SimdRegister xn_corner = AllocTempSimdReg();
+          SimdRegister xm_corner = AllocTempSimdReg();
+          SimdRegister x_min = AllocTempSimdReg();
+          if (xn_corner == no_simd_register || xm_corner == no_simd_register ||
+              x_min == no_simd_register) {
+            success_ = false; return;
+          }
+          // x_min = 0x8000 broadcast across 8 halfwords.
+          as_.Pcmpeqw(x_min, x_min);
+          as_.Psllw(x_min, int8_t{15});
+          as_.Movdqa(xn_corner, xn);
+          as_.Movdqa(xm_corner, xm);
+          as_.Pmulhrsw(xn, xm);
+          as_.Pcmpeqw(xn_corner, x_min);
+          as_.Pcmpeqw(xm_corner, x_min);
+          as_.Pand(xn_corner, xm_corner);
+          as_.Pxor(xn, xn_corner);
+          xmm_result = xn;
+        } else {
+          // SQDMULH .H via 32-bit reconstruction + arithmetic shift +
+          // signed-saturating pack.
+          SimdRegister x_low = AllocTempSimdReg();
+          SimdRegister x_high = AllocTempSimdReg();
+          SimdRegister x_zero = AllocTempSimdReg();
+          if (x_low == no_simd_register || x_high == no_simd_register ||
+              x_zero == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(x_low, xn);
+          as_.Movdqa(x_high, xn);
+          as_.Pmullw(x_low, xm);
+          as_.Pmulhw(x_high, xm);
+          // Interleave (low16, high16) → 32-bit signed product in dword 0;
+          // dwords 1..3 are 0 because operand lanes 1..7 are 0.
+          as_.Punpcklwd(x_low, x_high);
+          as_.Psrad(x_low, int8_t{15});
+          // Signed-saturating pack to 16-bit.  Pack against a zero scratch
+          // so word lanes 1..7 are 0 (PACKSSDW src2's 4 dwords map to dst
+          // words 4..7).
+          as_.Pxor(x_zero, x_zero);
+          as_.Packssdw(x_low, x_zero);
+          xmm_result = x_low;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+        return;
+      }
+      // size == 0b10 (S form).
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      SimdRegister xp = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register ||
+          x_const == no_simd_register || corner == no_simd_register ||
+          xp == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movd(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movd(xm, {.base = Assembler::rbp, .disp = vm_off});
+      // x_const = INT32_MIN broadcast across 4 dwords.
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Pslld(x_const, int8_t{31});
+      // Corner detection: lane 0 only (lanes 1..3 of xn/xm are 0 ≠ INT32_MIN).
+      as_.Movdqa(corner, xn);
+      as_.Pcmpeqd(corner, x_const);
+      as_.Movdqa(xp, xm);
+      as_.Pcmpeqd(xp, x_const);
+      as_.Pand(corner, xp);
+      // Stage 1: PMULDQ → qword 0 = sext(Vn.s[0]) * sext(Vm.s[0]); qword 1 = 0.
+      as_.Movdqa(xp, xn);
+      as_.Pmuldq(xp, xm);
+      // Double via PSLLQ 1.
+      as_.Psllq(xp, int8_t{1});
+      if (is_rounded) {
+        // Rounding constant 2^31 per qword.
+        as_.Pcmpeqd(x_const, x_const);
+        as_.Psllq(x_const, int8_t{63});
+        as_.Psrlq(x_const, int8_t{32});
+        as_.Paddq(xp, x_const);
+      }
+      // Extract upper 32 bits of qword 0 into dword 0; PSRLQ 32 also zero-
+      // fills dwords 1..3 (qword 1's pre-shift value is at most 0x80000000
+      // when is_rounded, which shifts out to 0).
+      as_.Psrlq(xp, int8_t{32});
+      // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX at lane 0;
+      // corner is 0 at lanes 1..3 so no perturbation.
+      as_.Pxor(xp, corner);
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xp);
+      return;
+    }
+    // endregion
+    // region digitalis: SQADD / UQADD / SQSUB / UQSUB scalar (B/H/S sizes).
+    //
+    // ARM ARM C7.2.282 / .284 / .317 / .319: the scalar single-lane forms
+    // saturate at width 8/16/32/64 selected by args.size.  Here we cover
+    // B (size=00), H (size=01), and S (size=10); D (size=11) bails to the
+    // interpreter (no direct SSE primitive for 64-bit saturating add/sub).
+    //
+    // Recipe per (op, size):
+    //   B/H — Pxor + Pinsrb/Pinsrw load Vn / Vm with lane 0 = source byte/
+    //         halfword and lanes 1.. = 0, then apply the matching
+    //         one-instruction saturating SSE op:
+    //
+    //       SQADD B  → PADDSB     (SSE2)
+    //       SQADD H  → PADDSW     (SSE2)
+    //       UQADD B  → PADDUSB    (SSE2)
+    //       UQADD H  → PADDUSW    (SSE2)
+    //       SQSUB B  → PSUBSB     (SSE2)
+    //       SQSUB H  → PSUBSW     (SSE2)
+    //       UQSUB B  → PSUBUSB    (SSE2)
+    //       UQSUB H  → PSUBUSW    (SSE2)
+    //
+    //         Saturating-arith on (0,0) yields 0, so lanes 1.. stay 0.
+    //
+    //   S — Movd loads Vn.s[0] / Vm.s[0] with dwords 1..3 zero-extended,
+    //       then runs the 32-bit signed/unsigned saturating recipe used by
+    //       the vector lowerings at lite_translator.h:4820-4845 (SQADD via
+    //       wrap-add + sign-bit XOR-blend), :4868-4879 (UQADD via PMAXUD +
+    //       PCMPEQD + POR), :4896-4918 (SQSUB via wrap-sub + sign-bit
+    //       XOR-blend), and :4940-4947 (UQSUB via PMINUD + PCMPEQD + PAND).
+    //       Lanes 1..3 are 0 throughout: 0±0=0 (no overflow), the recipes'
+    //       sign/cmp/and steps all produce 0 for zero inputs, so the
+    //       result has dwords 1..3 = 0 automatically.  A full-width Movdqu
+    //       then writes Vd with Vd[127:bits_local] = 0.
+    //
+    // Host features:
+    //   * B form: SSE4.1 (Pinsrb).
+    //   * H form: SSE2 baseline.
+    //   * S signed (SQADD/SQSUB): SSE2 baseline (Movd / Paddd / Psubd /
+    //     Pxor / Pand / Pcmpeqd / Psrad / Psrld).
+    //   * S unsigned (UQADD/UQSUB): SSE4.1 (Pmaxud / Pminud).
+    if (is_satarith_scalar_bhs) {
+      if (args.size == 0b00 && !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      if (args.size == 0b10 && (is_uqadd_scalar || is_uqsub_scalar) &&
+          !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      if (args.size == 0b00) {
+        as_.Pxor(xn, xn);
+        as_.Pxor(xm, xm);
+        as_.Pinsrb(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pinsrb(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        if (is_sqadd_scalar)      as_.Paddsb(xn, xm);
+        else if (is_uqadd_scalar) as_.Paddusb(xn, xm);
+        else if (is_sqsub_scalar) as_.Psubsb(xn, xm);
+        else                      as_.Psubusb(xn, xm);
+      } else if (args.size == 0b01) {
+        as_.Pxor(xn, xn);
+        as_.Pxor(xm, xm);
+        as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        if (is_sqadd_scalar)      as_.Paddsw(xn, xm);
+        else if (is_uqadd_scalar) as_.Paddusw(xn, xm);
+        else if (is_sqsub_scalar) as_.Psubsw(xn, xm);
+        else                      as_.Psubusw(xn, xm);
+      } else {  // args.size == 0b10 (S form)
+        // Movd loads Vn.s[0] / Vm.s[0] into dword 0 and zero-extends dwords
+        // 1..3 — this is the equivalent of the Pxor + Pinsr scrub used for
+        // B/H, but it's a single instruction.
+        as_.Movd(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movd(xm, {.base = Assembler::rbp, .disp = vm_off});
+        if (is_sqadd_scalar) {
+          // 32-bit signed SQADD: wrap-add + sign-bit-XOR-blend.
+          // sat = (a < 0) ? INT_MIN : INT_MAX = (a >> 31 signed) ^ 0x7FFFFFFF.
+          // ovf = ~(a^b) & (a^sum) has MSB set iff signed overflow.
+          // result = sum ^ ((sat ^ sum) & ovf_mask).
+          SimdRegister t_sum = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_sum == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_sum, xn);
+          as_.Paddd(t_sum, xm);                        // t_sum = a + b (mod 2^32).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                         // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_sum);                      // t_sat = a ^ sum.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1 (reuse: b done).
+          as_.Pxor(t_ovf, xm);                         // t_ovf = ~(a ^ b).
+          as_.Pand(t_ovf, t_sat);                      // t_ovf = ~(a^b)&(a^sum).
+          as_.Psrad(t_ovf, int8_t{31});                // t_ovf = overflow mask.
+          as_.Psrad(xn, int8_t{31});                   // xn = -1 if a<0, 0 else.
+          as_.Psrld(xm, int8_t{1});                    // xm = 0x7FFFFFFF.
+          as_.Pxor(xn, xm);                            // xn = sat.
+          as_.Pxor(xn, t_sum);                         // xn = sat ^ sum.
+          as_.Pand(xn, t_ovf);                         // xn = (sat^sum)&ovf.
+          as_.Pxor(xn, t_sum);                         // xn = sum ^ above.
+        } else if (is_uqadd_scalar) {
+          // 32-bit unsigned UQADD: wrap-add + PMAXUD overflow detect.
+          // Overflow iff sum < a (unsigned) ↔ max(a,sum) != sum.
+          SimdRegister t_save_a = AllocTempSimdReg();
+          SimdRegister t_ones = AllocTempSimdReg();
+          if (t_save_a == no_simd_register || t_ones == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_save_a, xn);                    // preserve a.
+          as_.Paddd(xn, xm);                           // xn = sum.
+          as_.Pmaxud(t_save_a, xn);                    // t_save_a = max(a,sum).
+          as_.Pcmpeqd(t_save_a, xn);                   // -1 where no overflow.
+          as_.Pcmpeqd(t_ones, t_ones);                 // t_ones = -1.
+          as_.Pxor(t_save_a, t_ones);                  // invert: -1 where overflow.
+          as_.Por(xn, t_save_a);                       // saturate to UINT32_MAX.
+        } else if (is_sqsub_scalar) {
+          // 32-bit signed SQSUB: wrap-sub + sign-bit XOR-blend.
+          // ovf = (a^b) & (a^diff) has MSB set iff signed overflow.
+          SimdRegister t_diff = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_diff == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_diff, xn);
+          as_.Psubd(t_diff, xm);                       // t_diff = a - b (mod 2^32).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                         // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_diff);                     // t_sat = a ^ diff.
+          as_.Pand(t_ovf, t_sat);                      // t_ovf = (a^b)&(a^diff).
+          as_.Psrad(t_ovf, int8_t{31});                // overflow mask.
+          as_.Psrad(xn, int8_t{31});                   // xn = -1 if a<0, 0 else.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1.
+          as_.Psrld(xm, int8_t{1});                    // xm = 0x7FFFFFFF.
+          as_.Pxor(xn, xm);                            // xn = sat.
+          as_.Pxor(xn, t_diff);                        // xn = sat ^ diff.
+          as_.Pand(xn, t_ovf);                         // xn = (sat^diff)&ovf.
+          as_.Pxor(xn, t_diff);                        // xn = diff ^ above.
+        } else {
+          // 32-bit unsigned UQSUB: result = (a >= b) ? a - b : 0.
+          // Mask: PMINUD(a, b) == b iff a >= b.
+          SimdRegister t_mask = AllocTempSimdReg();
+          if (t_mask == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_mask, xn);
+          as_.Pminud(t_mask, xm);                      // t_mask = min(a,b).
+          as_.Pcmpeqd(t_mask, xm);                     // -1 where a >= b.
+          as_.Psubd(xn, xm);                           // xn = a - b (wrap).
+          as_.Pand(xn, t_mask);                        // zero underflow lanes.
+        }
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      return;
+    }
+    // endregion
+    // region digitalis: D-form scalar integer ops (ADD / SUB / CMGT / CMHI /
+    //   CMGE / CMHS / CMTST / CMEQ scalar).  The ARM ARM restricts these to
+    //   size=11 (D form); Vd[63:0] = scalar op result, Vd[127:64] = 0.
+    //
+    // SSE port mirrors the AdvSimdThreeSame vector lowerings at size=11
+    // earlier in this file (CMGT, CMHI, CMGE, CMHS, CMEQ, ADD, SUB).
+    // Operands are loaded with MOVQ which puts Vn[63:0] in xmm[63:0] and
+    // zeros xmm[127:64], so the lane-1 computation is always between two
+    // zero operands.  We still mask_low64 the result because PCMPEQQ and
+    // the NOT-of-PCMPGTQ produce all-ones in lane 1 (0==0 / !(0>0)).
+    //
+    // SSE requirements:
+    //   * CMEQ scalar D       → PCMPEQQ (SSE4.1)
+    //   * CMTST scalar D      → PAND + PCMPEQQ (SSE4.1)
+    //   * CMGT scalar D       → PCMPGTQ (SSE4.2)
+    //   * CMHI scalar D       → sign-flip + PCMPGTQ (SSE4.2)
+    //   * CMGE scalar D       → PCMPGTQ + NOT (SSE4.2)
+    //   * CMHS scalar D       → sign-flip + PCMPGTQ + NOT (SSE4.2)
+    //   * ADD / SUB scalar D  → PADDQ / PSUBQ (baseline SSE2)
+    if (is_dform_int) {
+      if (args.size != 0b11) { success_ = false; return; }
+      const bool needs_sse4_1 = is_dform_cmeq || is_dform_cmtst;
+      const bool needs_sse4_2 =
+          is_dform_cmgt || is_dform_cmhi || is_dform_cmge || is_dform_cmhs;
+      if (needs_sse4_2 && !host_platform::kHasSSE4_2) {
+        success_ = false; return;
+      }
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      // Load Vn[63:0] / Vm[63:0] with upper-lane zero-extension.
+      as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      if (is_dform_add) {
+        as_.Paddq(xn, xm);
+      } else if (is_dform_sub) {
+        as_.Psubq(xn, xm);
+      } else if (is_dform_cmgt) {
+        as_.Pcmpgtq(xn, xm);
+      } else if (is_dform_cmhi) {
+        // Sign-flip both operands, then signed PCMPGTQ implements unsigned >.
+        SimdRegister sign = AllocTempSimdReg();
+        if (sign == no_simd_register) { success_ = false; return; }
+        as_.Pcmpeqd(sign, sign);
+        as_.Psllq(sign, int8_t{63});
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        as_.Pcmpgtq(xn, xm);
+      } else if (is_dform_cmge) {
+        // CMGE Vn,Vm == !(Vm > Vn).  Reuse xm as the destination of
+        // PCMPGTQ(xm,xn), then XOR with all-ones to invert.
+        SimdRegister ones = AllocTempSimdReg();
+        if (ones == no_simd_register) { success_ = false; return; }
+        as_.Pcmpgtq(xm, xn);
+        as_.Pcmpeqd(ones, ones);
+        as_.Pxor(xm, ones);
+        xn = xm;  // Result lives in xm; rewire xn so the store path is shared.
+      } else if (is_dform_cmhs) {
+        // Sign-flip + !(xm > xn) gives unsigned >=.
+        SimdRegister sign = AllocTempSimdReg();
+        if (sign == no_simd_register) { success_ = false; return; }
+        as_.Pcmpeqd(sign, sign);
+        as_.Psllq(sign, int8_t{63});
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        as_.Pcmpgtq(xm, xn);
+        // Reuse `sign` to build the all-ones invert mask.
+        as_.Pcmpeqd(sign, sign);
+        as_.Pxor(xm, sign);
+        xn = xm;
+      } else if (is_dform_cmtst) {
+        // (Vn & Vm) != 0 ? all-ones : 0.  Compute AND, compare with 0
+        // (PCMPEQQ against a zeroed register), invert.
+        SimdRegister zero = AllocTempSimdReg();
+        if (zero == no_simd_register) { success_ = false; return; }
+        as_.Pand(xn, xm);
+        as_.Pxor(zero, zero);
+        as_.Pcmpeqq(xn, zero);  // xn = (xn & xm) == 0 ? all-ones : 0
+        // Invert: all-ones for nonzero AND, 0 for zero AND.
+        as_.Pcmpeqd(zero, zero);  // Reuse `zero` as the all-ones mask.
+        as_.Pxor(xn, zero);
+      } else if (is_dform_cmeq) {
+        as_.Pcmpeqq(xn, xm);
+      }
+      // Zero the upper 64 bits of the destination — scalar D form writes
+      // Vd[127:64] = 0, but PCMPEQQ and the inverted-PCMPGTQ paths leave
+      // 0xFFFF... in lane 1.
+      as_.Pslldq(xn, int8_t{8});
+      as_.Psrldq(xn, int8_t{8});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      return;
+    }
+    // endregion
     // region digitalis: FP16 path is JIT-emitted for FCMxx / FACxx (mask out),
     // FMULX (real-FP out), FABD (real-FP out), FRECPS (real-FP out), and
     // FRSQRTS (real-FP out) via an F16C round-trip (each FP16 source lane is
@@ -16579,6 +17188,125 @@ class LiteTranslator {
   // (scalar destination semantics).
   void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
     using Op = Decoder::AdvSimdScalarXIdxOpcode;
+    // region digitalis: SQRDMLAH/SQRDMLSH scalar by-element (Armv8.1-RDM).
+    // Same single-lane saturation recipe as the scalar three-same form,
+    // but reads Vm.lane[index] instead of Vm.lane[0].
+    if (args.opcode == Op::kSqrdmlahScalarIdx ||
+        args.opcode == Op::kSqrdmlshScalarIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        success_ = false; return;
+      }
+      const bool is_sub = (args.opcode == Op::kSqrdmlshScalarIdx);
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      if (args.size == 0b01) {
+        if (!host_platform::kHasSSSE3) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        SimdRegister xn_corner = AllocTempSimdReg();
+        SimdRegister xm_corner = AllocTempSimdReg();
+        SimdRegister x_min = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xd == no_simd_register || xn_corner == no_simd_register ||
+            xm_corner == no_simd_register || x_min == no_simd_register) {
+          success_ = false; return;
+        }
+        const int32_t vm_lane_off = vm_off + static_cast<int32_t>(args.index) * 2;
+        as_.Pxor(xn, xn);
+        as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pxor(xm, xm);
+        as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_lane_off}, int8_t{0});
+        as_.Pxor(xd, xd);
+        as_.Pinsrw(xd, {.base = Assembler::rbp, .disp = vd_off}, int8_t{0});
+        as_.Pcmpeqw(x_min, x_min);
+        as_.Psllw(x_min, int8_t{15});
+        as_.Movdqa(xn_corner, xn);
+        as_.Movdqa(xm_corner, xm);
+        as_.Pmulhrsw(xn, xm);
+        as_.Pcmpeqw(xn_corner, x_min);
+        as_.Pcmpeqw(xm_corner, x_min);
+        as_.Pand(xn_corner, xm_corner);
+        as_.Pxor(xn, xn_corner);
+        if (is_sub) {
+          as_.Psubsw(xd, xn);
+        } else {
+          as_.Paddsw(xd, xn);
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
+      // size == 0b10 (S form).
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xd = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      SimdRegister xp = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register ||
+          xd == no_simd_register || x_const == no_simd_register ||
+          corner == no_simd_register || xp == no_simd_register) {
+        success_ = false; return;
+      }
+      const int32_t vm_lane_off = vm_off + static_cast<int32_t>(args.index) * 4;
+      as_.Movd(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movd(xm, {.base = Assembler::rbp, .disp = vm_lane_off});
+      as_.Movd(xd, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Pslld(x_const, int8_t{31});
+      as_.Movdqa(corner, xn);
+      as_.Pcmpeqd(corner, x_const);
+      as_.Movdqa(xp, xm);
+      as_.Pcmpeqd(xp, x_const);
+      as_.Pand(corner, xp);
+      as_.Movdqa(xp, xn);
+      as_.Pmuldq(xp, xm);
+      as_.Psllq(xp, int8_t{1});
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Psllq(x_const, int8_t{63});
+      as_.Psrlq(x_const, int8_t{32});
+      as_.Paddq(xp, x_const);
+      as_.Psrlq(xp, int8_t{32});
+      as_.Pxor(xp, corner);
+      SimdRegister t_sum = AllocTempSimdReg();
+      SimdRegister t_ovf = AllocTempSimdReg();
+      SimdRegister t_sat = AllocTempSimdReg();
+      if (t_sum == no_simd_register || t_ovf == no_simd_register ||
+          t_sat == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqa(t_sum, xd);
+      if (is_sub) {
+        as_.Psubd(t_sum, xp);
+      } else {
+        as_.Paddd(t_sum, xp);
+      }
+      as_.Movdqa(t_ovf, xd);
+      as_.Pxor(t_ovf, xp);
+      as_.Movdqa(t_sat, xd);
+      as_.Pxor(t_sat, t_sum);
+      if (!is_sub) {
+        as_.Pcmpeqd(xp, xp);
+        as_.Pxor(t_ovf, xp);
+        as_.Pand(t_ovf, t_sat);
+        as_.Psrld(xp, int8_t{1});
+      } else {
+        as_.Pand(t_ovf, t_sat);
+        as_.Pcmpeqd(xp, xp);
+        as_.Psrld(xp, int8_t{1});
+      }
+      as_.Psrad(t_ovf, int8_t{31});
+      as_.Psrad(xd, int8_t{31});
+      as_.Pxor(xd, xp);
+      as_.Pxor(xd, t_sum);
+      as_.Pand(xd, t_ovf);
+      as_.Pxor(xd, t_sum);
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      return;
+    }
+    // endregion
     if (args.opcode != Op::kFmulx && args.opcode != Op::kFmul &&
         args.opcode != Op::kFmla && args.opcode != Op::kFmls) {
       success_ = false;
