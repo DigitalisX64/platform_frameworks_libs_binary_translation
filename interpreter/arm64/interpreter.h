@@ -4589,6 +4589,59 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
+      // Decoder restricts size to {01, 10}.  Stage 1 reuses the SQRDMULH
+      // recipe per lane (doubled product + rounding constant, shifted by
+      // bits_local, saturated to the signed narrow range).  Stage 2
+      // signed-saturating-adds (SQRDMLAH) or subtracts (SQRDMLSH) the addend
+      // into the lane's existing Vd value.  Same math as the by-element form
+      // in InsnConsumer::AdvSimdVecXIndexedElement at the kSqrdmlahIdx /
+      // kSqrdmlshIdx arm; only the Vm source changes from a broadcasted
+      // lane to per-lane Vm[i].
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlahVec:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (1LL << (bits_local - 1)) - 1;
+        int64_t smin = -(1LL << (bits_local - 1));
+        __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+        bool is_sub = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec);
+        uint8_t shift = (8 - esize) * 8;
+
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a_u = 0, b_u = 0;
+          memcpy(&a_u,
+                 reinterpret_cast<const uint8_t*>(&src_n) + i * esize,
+                 esize);
+          memcpy(&b_u,
+                 reinterpret_cast<const uint8_t*>(&src_m) + i * esize,
+                 esize);
+          int64_t a = static_cast<int64_t>(a_u << shift) >> shift;
+          int64_t b = static_cast<int64_t>(b_u << shift) >> shift;
+
+          // Stage 1: SQRDMULH(a, b).  2*a*b fits int64_t for esize<=4.
+          __int128 product = (static_cast<__int128>(2) * a * b) + round;
+          int64_t addend = static_cast<int64_t>(product >> bits_local);
+          if (addend > smax) addend = smax;
+          if (addend < smin) addend = smin;
+
+          // Stage 2: signed-saturating add/sub into Vd[i].
+          uint64_t acc_u = 0;
+          memcpy(&acc_u,
+                 reinterpret_cast<const uint8_t*>(&dst) + i * esize,
+                 esize);
+          int64_t acc = static_cast<int64_t>(acc_u << shift) >> shift;
+          int64_t out = is_sub ? acc - addend : acc + addend;
+          if (out > smax) out = smax;
+          if (out < smin) out = smin;
+          uint64_t out_u = static_cast<uint64_t>(out);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &out_u, esize);
+        }
+        if (!args.q) {
+          memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+        }
+        break;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
         // MLA: Vd[i] = Vd[i] + Vn[i] * Vm[i]
         uint64_t emask = ElementMask(esize);

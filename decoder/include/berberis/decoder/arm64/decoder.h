@@ -983,6 +983,26 @@ class Decoder {
     kSqdmulh,   // SQDMULH (vector):  U=0, opcode=10110
     kSqrdmulh,  // SQRDMULH (vector): U=1, opcode=10110
     // endregion
+    // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector
+    // forms (NOT the by-element forms — those live in AdvSimdVecXIdxOpcode
+    // as kSqrdmlahIdx / kSqrdmlshIdx).  These ride the "Advanced SIMD three
+    // same extra" encoding class (bit21=0, bit15=1, bit10=1), which is
+    // disjoint from the standard three-same class (bit21=1) handled by all
+    // entries above.  The decoder routes both encoding classes into this
+    // single enum so the interpreter / JIT only need one dispatch surface.
+    // Encoding (per ARM ARM C7.2.298 / C7.2.300):
+    //   SQRDMLAH <V>d.<T>, <V>n.<T>, <V>m.<T>
+    //     = 0 Q 1 01110 size 0 Rm 1 0000 1 Rn Rd  (U=1, opcode4=0000)
+    //   SQRDMLSH <V>d.<T>, <V>n.<T>, <V>m.<T>
+    //     = 0 Q 1 01110 size 0 Rm 1 0001 1 Rn Rd  (U=1, opcode4=0001)
+    //   size in {01 (.4h/.8h), 10 (.2s/.4s)}; size=00 / size=11 reserved.
+    kSqrdmlahVec,  // SQRDMLAH (vector, three-same): three-same-extra
+                   //   U=1, opcode4=0000, size ∈ {01,10}.
+                   // Vd[i] = sat_signed(Vd[i] + SQRDMULH(Vn[i], Vm[i])).
+    kSqrdmlshVec,  // SQRDMLSH (vector, three-same): three-same-extra
+                   //   U=1, opcode4=0001, size ∈ {01,10}.
+                   // Vd[i] = sat_signed(Vd[i] - SQRDMULH(Vn[i], Vm[i])).
+    // endregion
     // endregion
   };
 
@@ -3294,6 +3314,27 @@ class Decoder {
     }
     // endregion
 
+    // region digitalis
+    // AdvSIMD Armv8.1-RDM three-same vector: SQRDMLAH / SQRDMLSH (NOT the
+    // by-element form — that's already wired through AdvSimdVecXIdxOpcode).
+    //   bit31=0, bits[28:24]=01110, bit21=0, U=bit29=1, bit15=1, bit14=0,
+    //   bit13=0, bit12=0, bit10=1.  bit11 = 0 (SQRDMLAH) / 1 (SQRDMLSH).
+    //   size ∈ {01, 10}; size=00/11 reserved per ARM ARM C7.2.298/.300.
+    //
+    // Disambiguation versus the other three-same-extra arms above:
+    //   FCMA  (bit14=1) — no overlap, FCMA needs bit14=1 here we need bit14=0.
+    //   BF16  (bit13=1, bit11=1) — no overlap, we need bit13=0.
+    //   DotProd (bit12=1, bit11=0) — no overlap, we need bit12=0.
+    // Standard three-same (bit21=1) is mutually exclusive on bit21.  FP16
+    // three-same (bit22=1, bit15=0) is mutually exclusive on bit15.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<21, 1>() &&
+        GetBits<29, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
+        !GetBits<13, 1>() && !GetBits<12, 1>() && GetBits<10, 1>()) {
+      DecodeAdvSimdRdmThreeSame();
+      return;
+    }
+    // endregion
+
     // region digitalis: Armv8.2-FP16 NEON vector three-same.
     // Encoding (per ARM ARM C7.2 "Advanced SIMD three same (FP16)"):
     //   0 Q U 0 1 1 1 0 a 1 0 Rm 0 0 opcode 1 Rn Rd
@@ -4320,6 +4361,52 @@ class Decoder {
         .q = q,
     };
     insn_consumer_->AdvSimdDotProduct(args);
+  }
+  // endregion
+
+  // region digitalis
+  //
+  // AdvSIMD Armv8.1-RDM three-same vector: SQRDMLAH / SQRDMLSH.  These are
+  // the non-indexed siblings of the by-element forms decoded under
+  // AdvSimdVecXIdxOpcode::{kSqrdmlahIdx, kSqrdmlshIdx}.  Both feed back into
+  // the standard AdvSimdThreeSame insn-consumer entry so the interpreter /
+  // JIT can dispatch on a single enum surface.
+  //
+  // Encoding (per ARM ARM C7.2.298 / C7.2.300):
+  //   0 Q 1 01110 size 0 Rm 1 opcode4 1 Rn Rd
+  //   U=1, bit15=1, bit10=1, bit14=0, bit13=0, bit12=0.
+  //   opcode4=0000 (bit11=0) -> SQRDMLAH.
+  //   opcode4=0001 (bit11=1) -> SQRDMLSH.
+  //   size ∈ {01 (.4h/.8h), 10 (.2s/.4s)}; size=00 / size=11 reserved.
+  //
+  // Encodings (bit-level reconstruction from the three-same-extra schema
+  // above; Q=q, size=01 or 10, opcode4=0000 or 0001):
+  //   sqrdmlah v0.4h, v1.4h, v2.4h = 0x2e428420 (Q=0, size=01, opcode4=0000)
+  //   sqrdmlsh v0.8h, v1.8h, v2.8h = 0x6e428c20 (Q=1, size=01, opcode4=0001)
+  //   sqrdmlah v0.4s, v1.4s, v2.4s = 0x6e828420 (Q=1, size=10, opcode4=0000)
+  //   sqrdmlsh v0.2s, v1.2s, v2.2s = 0x2e828c20 (Q=0, size=10, opcode4=0001)
+  void DecodeAdvSimdRdmThreeSame() {
+    bool q = GetBits<30, 1>();
+    uint8_t size = GetBits<22, 2>();
+    uint8_t rm = GetBits<16, 5>();
+    uint8_t rn = GetBits<5, 5>();
+    uint8_t rd = GetBits<0, 5>();
+    bool bit11 = GetBits<11, 1>();
+
+    // size=00 and size=11 are reserved per ARM ARM.
+    if (size != 0b01 && size != 0b10) { Undefined(); return; }
+
+    AdvSimdThreeSameArgs args = {
+        .opcode = bit11 ? AdvSimdThreeSameOpcode::kSqrdmlshVec
+                        : AdvSimdThreeSameOpcode::kSqrdmlahVec,
+        .rd = rd,
+        .rn = rn,
+        .rm = rm,
+        .size = size,
+        .q = q,
+        .is_fp16 = false,
+    };
+    insn_consumer_->AdvSimdThreeSame(args);
   }
   // endregion
 

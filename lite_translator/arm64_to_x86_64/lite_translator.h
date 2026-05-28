@@ -6782,6 +6782,16 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector
+      // bail to the interpreter.  The math mirrors the by-element form's
+      // saturating Newton-step recipe (lite_translator.h's AdvSimdVecXIndexed
+      // Element arm at size=01 and size=10) and could be JIT-lowered in a
+      // follow-up; until then route to the interpreter rather than letting
+      // the default arm flag the instruction as Undefined.
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlahVec:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec:
+        success_ = false; return;
+      // endregion
       default:
         Undefined();
         return;
