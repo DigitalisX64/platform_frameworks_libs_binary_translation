@@ -11363,6 +11363,267 @@ TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec2SAccumulatorNegativeOverflowS
   EXPECT_EQ(lanes_out[1], 500ULL - 0x20000000ULL);
 }
 
+// Armv8.1-RDM SQRDMLAH / SQRDMLSH (by element).  Non-widening: destination
+// lane width equals source lane width.  size=01 (.4h/.8h, Vm restricted to
+// V0..V15, index = H:L:M) and size=10 (.2s/.4s, Vm full 5-bit, index = H:L).
+// U=1 distinguishes from SQRDMULH (U=0, opcode=1101) and from
+// BFDOT/BFMLAL{B,T} (U=0, opcode=1111).
+//
+// Verified encodings (aarch64-linux-gnu-as -march=armv8.1-a):
+//   sqrdmlah v0.4h, v1.4h, v2.h[0]  = 0x2F42D020
+//   sqrdmlah v0.8h, v1.8h, v2.h[7]  = 0x6F72D820
+//   sqrdmlah v0.2s, v1.2s, v2.s[0]  = 0x2F82D020
+//   sqrdmlah v0.4s, v1.4s, v17.s[1] = 0x6FB1D020
+//   sqrdmlsh v0.4h, v1.4h, v2.h[0]  = 0x2F42F020
+//   sqrdmlsh v0.8h, v1.8h, v2.h[7]  = 0x6F72F820
+//   sqrdmlsh v0.2s, v1.2s, v2.s[0]  = 0x2F82F020
+//   sqrdmlsh v0.4s, v1.4s, v2.s[3]  = 0x6FA2F820
+constexpr uint32_t SqrdmlahIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQRDMLAH .4h: Q=0, U=1, size=01, opcode=1101, base 0x2F40D000.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x2F40D000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmlahIdx8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQRDMLAH .8h: Q=1, base 0x6F40D000.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x6F40D000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmlshIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQRDMLSH .4h: Q=0, U=1, size=01, opcode=1111, base 0x2F40F000.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x2F40F000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmlahIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQRDMLAH .2s: Q=0, U=1, size=10, opcode=1101.  Vm 5-bit, index = H:L.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x2F80D000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmlshIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQRDMLSH .2s: Q=0, U=1, size=10, opcode=1111.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x2F80F000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmlshIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQRDMLSH .4s: Q=1, base 0x6F80F000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x6F80F000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// SQRDMLAH/SQRDMLSH by element are interpreter-only — the JIT path bails
+// via the FP opcode whitelist further down.  These tests drive
+// InterpretInsn directly.
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec4HAccumulatesRoundedDoubledHigh) {
+  // SQRDMLAH .4h, .4h, .h[0]: Vd[i] = SignedSat(Vd[i] + SQRDMULH(Vn[i],
+  // Vm.h[0])).  Inputs avoid both stage-1 and stage-2 saturation so every
+  // lane equals Vd_pre + ((2*sn*sm + 0x8000) >> 16).
+  // Vm.h[0] = 0x4000; per lane: addend = (2 * Vn * 0x4000 + 0x8000) >> 16
+  //                                   = (Vn * 0x8000 + 0x8000) >> 16.
+  //   Vn=0x4000: (0x4000*0x8000 + 0x8000)>>16 = (0x20008000)>>16 = 0x2000.
+  //   Vn=0x2000: 0x1000.   Vn=0x1000: 0x0800.   Vn=0x0800: 0x0400.
+  uint16_t n_lanes[8] = {0x4000, 0x2000, 0x1000, 0x0800, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  uint16_t d_pre[8] = {100, 200, 300, 400, 0xBEEF, 0xBEEF, 0xBEEF, 0xBEEF};
+  StoreVec8H(state_.cpu, 0, d_pre);
+  static const uint32_t code[] = {SqrdmlahIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], static_cast<uint16_t>(100u + 0x2000u));
+  EXPECT_EQ(r[1], static_cast<uint16_t>(200u + 0x1000u));
+  EXPECT_EQ(r[2], static_cast<uint16_t>(300u + 0x0800u));
+  EXPECT_EQ(r[3], static_cast<uint16_t>(400u + 0x0400u));
+  // Q=0 -> upper 64 bits of Vd zeroed.
+  EXPECT_EQ(r[4], 0u);
+  EXPECT_EQ(r[5], 0u);
+  EXPECT_EQ(r[6], 0u);
+  EXPECT_EQ(r[7], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec4HStage2PositiveSaturates) {
+  // Stage-2 saturation: addend = 0x2000 (rounded high), Vd_pre near INT16_MAX
+  // so Vd_pre + addend exceeds INT16_MAX and must clamp to INT16_MAX.  Lane 1
+  // accumulator stays inside range as a sanity check.
+  uint16_t n_lanes[8] = {0x4000, 0x4000, 0, 0, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  uint16_t d_pre[8] = {0x7FF0, 0x1000, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 0, d_pre);
+  static const uint32_t code[] = {SqrdmlahIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7FFFu);    // saturated to INT16_MAX.
+  EXPECT_EQ(r[1], 0x3000u);    // 0x1000 + 0x2000, fits.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec8HIntMinSquaredCornerClamps) {
+  // Stage-1 saturation: sn = sm = INT16_MIN.  SQRDMULH would produce 0x8000
+  // pre-saturation; ARM SQRDMULH clamps to INT16_MAX, so addend = 0x7FFF.
+  // Stage-2: Vd_pre = 0 means result = 0 + 0x7FFF = 0x7FFF (no overflow).
+  // Q=1 uses all 8 lanes; lane 7 cross-checks the broadcast.
+  uint16_t n_lanes[8] = {0x8000, 0x8000, 0x8000, 0x8000,
+                         0x8000, 0x8000, 0x8000, 0x8000};
+  // Vm.h[7] = 0x8000 (broadcast index 7 from high half).
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 0x8000};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  uint16_t d_pre[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 0, d_pre);
+  static const uint32_t code[] = {SqrdmlahIdx8H(0, 1, 2, /*k=*/7)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  for (int i = 0; i < 8; i++) {
+    EXPECT_EQ(r[i], 0x7FFFu) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshIdxVec4HSubtractsRoundedAddend) {
+  // SQRDMLSH .4h: Vd[i] = SignedSat(Vd[i] - SQRDMULH(Vn[i], Vm.h[0])).
+  // Same inputs as SqrdmlahIdxVec4HAccumulatesRoundedDoubledHigh except we
+  // subtract; result = Vd_pre - addend.
+  uint16_t n_lanes[8] = {0x4000, 0x2000, 0x1000, 0x0800, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  uint16_t d_pre[8] = {0x4000, 0x3000, 0x2000, 0x1000, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 0, d_pre);
+  static const uint32_t code[] = {SqrdmlshIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], static_cast<uint16_t>(0x4000u - 0x2000u));   // 0x2000
+  EXPECT_EQ(r[1], static_cast<uint16_t>(0x3000u - 0x1000u));   // 0x2000
+  EXPECT_EQ(r[2], static_cast<uint16_t>(0x2000u - 0x0800u));   // 0x1800
+  EXPECT_EQ(r[3], static_cast<uint16_t>(0x1000u - 0x0400u));   // 0x0C00
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshIdxVec4HStage2NegativeSaturates) {
+  // Stage-2 negative saturation: Vd_pre near INT16_MIN; subtracting a positive
+  // addend drives accumulator below INT16_MIN.  Lane 0 saturates; lane 1
+  // fits without saturation.
+  uint16_t n_lanes[8] = {0x4000, 0x4000, 0, 0, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // INT16_MIN + 0x10 = 0x8010 (as uint16_t) - saturating subtract.
+  uint16_t d_pre[8] = {0x8010, 0xF000 /* -0x1000 */, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 0, d_pre);
+  static const uint32_t code[] = {SqrdmlshIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x8000u);    // INT16_MIN after stage-2 saturation.
+  // Lane 1: -0x1000 - 0x2000 = -0x3000 = 0xD000 as uint16_t.
+  EXPECT_EQ(r[1], 0xD000u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec2SAccumulatesRoundedDoubledHigh) {
+  // SQRDMLAH .2s: per-lane addend = ((2*sn*sm) + (1<<31)) >> 32 (= SQRDMULH .2s).
+  // sn = sm = 0x40000000: 2*sn*sm = 0x2000000000000000; +0x80000000 = same
+  // (low half is zeros), >>32 = 0x20000000.  Vd_pre = 0x1000 -> result =
+  // 0x1000 + 0x20000000 = 0x20001000.  Q=0 -> upper 64 bits zero.
+  int32_t n_lanes[4] = {0x40000000, 0x40000000, 0, 0};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  // Pre-fill Vd with a sentinel high half to verify upper-64 zeroing.
+  StoreVec4SInt(state_.cpu, 0, 0x1000, 0x2000, static_cast<int32_t>(0xCAFE0000),
+                static_cast<int32_t>(0xCAFE0000));
+  static const uint32_t code[] = {SqrdmlahIdx2S(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1000 + 0x20000000);
+  EXPECT_EQ(r[1], 0x2000 + 0x20000000);
+  EXPECT_EQ(r[2], 0);   // upper-zero.
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshIdxVec2SUpperZero) {
+  // SQRDMLSH .2s with Q=0 must zero the upper 64 bits of Vd regardless of
+  // the pre-existing upper-half contents.  addend math: sn=sm=0x40000000
+  // -> addend = 0x20000000; Vd_pre = 0x100 -> result = 0x100 - 0x20000000.
+  int32_t n_lanes[4] = {0x40000000, 0x40000000, 0, 0};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  StoreVec4SInt(state_.cpu, 0, 0x100, 0x200, static_cast<int32_t>(0xCAFE0000),
+                static_cast<int32_t>(0xCAFE0000));
+  static const uint32_t code[] = {SqrdmlshIdx2S(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x100 - 0x20000000);
+  EXPECT_EQ(r[1], 0x200 - 0x20000000);
+  EXPECT_EQ(r[2], 0);   // upper-zero.
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshIdxVec4SStage2NegativeSaturates) {
+  // SQRDMLSH .4s, .4s, .s[1]: Vm.s[1] = 0x40000000; addend ≈ 0x20000000.
+  // Lane 0 Vd_pre = INT32_MIN + 100 -> Vd_pre - addend = -0x80000000 + 100 -
+  // 0x20000000 underflows; saturate to INT32_MIN.  Lane 1 fits.
+  int32_t n_lanes[4] = {0x40000000, 0x40000000, 0x40000000, 0x40000000};
+  int32_t m_lanes[4] = {0, 0x40000000, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  StoreVec4SInt(state_.cpu, 0, INT32_MIN + 100, 0x100, 0, 0);
+  static const uint32_t code[] = {SqrdmlshIdx4S(0, 1, 2, /*k=*/1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MIN);                       // negative saturation.
+  EXPECT_EQ(r[1], 0x100 - 0x20000000);              // fits without saturation.
+  // Lanes 2 and 3 had Vd_pre = 0; result = 0 - 0x20000000 = -0x20000000.
+  EXPECT_EQ(r[2], -0x20000000);
+  EXPECT_EQ(r[3], -0x20000000);
+}
+
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
 // interpreter; the tests below drive Run() so the lite_translator lowering
