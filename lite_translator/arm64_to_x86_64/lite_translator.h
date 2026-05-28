@@ -15302,9 +15302,8 @@ class LiteTranslator {
     // directly.  For Vm we broadcast Vm.h[index] across all 8 halfword
     // lanes first (shared shim with MUL/MLA/MLS), then widen the low 4
     // identical lanes.  For SMLAL/UMLAL load Vd and PADDD; for SMLSL/UMLSL
-    // load Vd and PSUBD.  Size=10 (.2s/.4s -> .2d) falls through to the
-    // interpreter — Pmuldq / Pmuludq reconstruction is deferred to a
-    // future cycle.
+    // load Vd and PSUBD.  The size=10 (.2s/.4s -> .2d) sibling arm below
+    // handles word sources via PMOVSXDQ/PMOVZXDQ + PMULDQ/PMULUDQ.
     //
     // Verified encodings (ARM ARM C7.2 / handoff-353):
     //   smull   v0.4s, v1.4h, v2.h[0] = 0x0F42A020
@@ -15377,6 +15376,103 @@ class LiteTranslator {
         as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
         if (is_sub) as_.Psubd(xd, xn);
         else        as_.Paddd(xd, xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      } else {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      }
+      return;
+    }
+    // endregion
+
+    // region digitalis: widening MUL/MAC by-element (size=10: .2s/.4s -> .2d).
+    //
+    // SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL by element with word sources and
+    // doubleword destination — 2 output lanes (.2d).  Q=0 (*MULL/*MLAL/*MLSL)
+    // selects Vn.s[0..1] (low half); Q=1 (*MULL2/*MLAL2/*MLSL2) selects
+    // Vn.s[2..3] (high half).  The destination is always 128-bit regardless
+    // of Q.
+    //
+    // Strategy: PMOVSXDQ (signed) / PMOVZXDQ (unsigned) from memory at
+    // vn_off+(q?8:0) loads the selected pair of source dwords into two
+    // 64-bit lanes — each lane has the source value in its low 32 bits
+    // (which is what PMULDQ/PMULUDQ read; the high 32 bits are ignored).
+    // Broadcast Vm.s[index] across all 4 dword lanes via PSHUFD with
+    // imm = index * 0x55 — this places Vm.s[index] in dword positions 0
+    // and 2 of xm, which is what PMULDQ/PMULUDQ read.  Then PMULDQ
+    // (signed) or PMULUDQ (unsigned) computes two 32x32 → 64 lanes in
+    // a single instruction.  For SMLAL/UMLAL load Vd and PADDQ; for
+    // SMLSL/UMLSL load Vd and PSUBQ.
+    //
+    // Verified encodings (ARM ARM C7.2):
+    //   smull   v0.2d, v1.2s, v2.s[0] = 0x0F82A020
+    //   smull2  v0.2d, v1.4s, v2.s[3] = 0x4FA2A820
+    //   umull   v0.2d, v1.2s, v2.s[0] = 0x2F82A020
+    //   smlal   v0.2d, v1.2s, v2.s[0] = 0x0F822020
+    //   umlal   v0.2d, v1.2s, v2.s[0] = 0x2F822020
+    //   smlsl   v0.2d, v1.2s, v2.s[0] = 0x0F826020
+    //   umlsl   v0.2d, v1.2s, v2.s[0] = 0x2F826020
+    if ((args.opcode == Op::kSmullIdx || args.opcode == Op::kUmullIdx ||
+         args.opcode == Op::kSmlalIdx || args.opcode == Op::kUmlalIdx ||
+         args.opcode == Op::kSmlslIdx || args.opcode == Op::kUmlslIdx) &&
+        args.size == 0b10) {
+      const bool is_signed = (args.opcode == Op::kSmullIdx ||
+                              args.opcode == Op::kSmlalIdx ||
+                              args.opcode == Op::kSmlslIdx);
+      const bool is_accum = (args.opcode == Op::kSmlalIdx ||
+                             args.opcode == Op::kUmlalIdx ||
+                             args.opcode == Op::kSmlslIdx ||
+                             args.opcode == Op::kUmlslIdx);
+      const bool is_sub = (args.opcode == Op::kSmlslIdx ||
+                           args.opcode == Op::kUmlslIdx);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xn = AllocTempSimdReg();
+      if (xm == no_simd_register || xn == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Broadcast Vm.s[index] across all 4 dword lanes of xm.  PMULDQ /
+      // PMULUDQ read from dword positions 0 and 2 of each operand; after
+      // this PSHUFD both of those positions hold Vm.s[index].
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xm, xm, imm);
+      }
+
+      // Widen Vn's selected source half: PMOVSXDQ/PMOVZXDQ reads two
+      // consecutive dwords from memory and places each in its own 64-bit
+      // lane (with sign- or zero-extension into the upper 32 bits of each
+      // lane that PMULDQ/PMULUDQ ignore).  Q=0 reads bytes 0..7; Q=1 reads
+      // bytes 8..15.
+      int32_t vn_src_off = vn_off + (args.q ? 8 : 0);
+      if (is_signed) {
+        as_.Pmovsxdq(xn, {.base = Assembler::rbp, .disp = vn_src_off});
+      } else {
+        as_.Pmovzxdq(xn, {.base = Assembler::rbp, .disp = vn_src_off});
+      }
+
+      // 32x32 → 64 multiply.  PMULDQ is signed; PMULUDQ is unsigned.
+      // Both read dword positions 0 and 2 of each operand and write two
+      // 64-bit product lanes.
+      if (is_signed) {
+        as_.Pmuldq(xn, xm);
+      } else {
+        as_.Pmuludq(xn, xm);
+      }
+
+      if (is_accum) {
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (is_sub) as_.Psubq(xd, xn);
+        else        as_.Paddq(xd, xn);
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
       } else {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);

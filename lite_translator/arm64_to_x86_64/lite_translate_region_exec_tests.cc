@@ -10726,6 +10726,73 @@ constexpr uint32_t UmlslIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
          (static_cast<uint32_t>(rn) << 5) | rd;
 }
 
+// Encoder helpers for size=10 (.2s/.4s -> .2d) widening MUL/MAC by-element.
+// Bit layout differs from size=01: Vm is 5-bit (M:Rm[3:0]) so can reach
+// V0..V31, and the index is only 2 bits (H:L).  M = (rm >> 4) & 1.
+constexpr uint32_t Smull2Idx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SMULL2 .2d, .4s, .s[k]: U=0, Q=1, opcode=1010, base 0x4F80A000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x4F80A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UmullIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // UMULL .2d, .2s, .s[k]: U=1, Q=0, opcode=1010, base 0x2F80A000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x2F80A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Umull2Idx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // UMULL2 .2d, .4s, .s[k]: U=1, Q=1, opcode=1010, base 0x6F80A000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x6F80A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SmlalIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SMLAL .2d, .2s, .s[k]: U=0, Q=0, opcode=0010, base 0x0F802000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x0F802000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UmlalIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // UMLAL .2d, .2s, .s[k]: U=1, Q=0, opcode=0010, base 0x2F802000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x2F802000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SmlslIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SMLSL .2d, .2s, .s[k]: U=0, Q=0, opcode=0110, base 0x0F806000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x0F806000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UmlslIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // UMLSL .2d, .2s, .s[k]: U=1, Q=0, opcode=0110, base 0x2F806000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x2F806000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
 // JIT-driven coverage for the widening MUL/MAC by-element family (size=01:
 // .4h/.8h sources -> .4s destination).  The InterpretInsn-driven tests
 // above keep exercising the interpreter; the tests below drive Run() so
@@ -10898,6 +10965,158 @@ TEST_F(Arm64LiteTranslateRegionTest, UmlslIdxVec4HUnsignedSubtractsJit) {
   EXPECT_EQ(r[1], 0x00400000u - (20u * 0xFFFFu));
   EXPECT_EQ(r[2], 0x00600000u - (30u * 0xFFFFu));
   EXPECT_EQ(r[3], 0x00800000u - (40u * 0xFFFFu));
+}
+
+// JIT-driven coverage for the widening MUL/MAC by-element family at size=10
+// (.2s/.4s sources -> .2d destination).  The InterpretInsn-driven
+// SmullIdxVec2SWordToDouble test above keeps exercising the interpreter; the
+// tests below drive Run() so the lite_translator size=10 lowering is
+// executed.
+TEST_F(Arm64LiteTranslateRegionTest, SmullIdxVec2SWordToDoubleJit) {
+  // SMULL .2d, .2s, .s[0] (size=10): Q=0 uses Vn.s[0..1].
+  // Vn.2s = {-2, 0x7FFFFFFF}; Vm.s[0] = -3.
+  //   -2          * -3 = 6.
+  //   0x7FFFFFFF  * -3 = -6442450941 = 0xFFFFFFFE80000003 (sign-extended).
+  // The upper half of Vn (lanes 2..3) is sentinel and must NOT contribute.
+  int32_t n_lanes[4] = {-2, 0x7FFFFFFF, 0x55555555, 0x66666666};
+  int32_t m_lanes[4] = {-3, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SmullIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), int64_t{6});
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), int64_t{-6442450941});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmullIdxVec2SUnsignedFullRangeJit) {
+  // UMULL .2d, .2s, .s[1] (size=10): 0xFFFFFFFF * 0xFFFFFFFF =
+  // 0xFFFFFFFE00000001 — the full unsigned product fits in 64 bits, and
+  // PMOVZXDQ/PMULUDQ must zero-extend (PMOVSXDQ + PMULDQ would treat
+  // 0xFFFFFFFF as -1 and yield 1, exposing a signedness bug).
+  int32_t n_lanes[4] = {-1, 0x12345678, 0x55555555, 0x66666666};
+  int32_t m_lanes[4] = {0, -1, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {UmullIdx2S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(lanes_out[0], 0xFFFFFFFE00000001ULL);
+  EXPECT_EQ(lanes_out[1], 0x12345677EDCBA988ULL);  // 0x12345678 * 0xFFFFFFFF
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smull2IdxVec4SUsesHighHalfJit) {
+  // SMULL2 .2d, .4s, .s[3]: Q=1 selects Vn high half (lanes 2..3) as the
+  // multiplicand.  Low half (lanes 0..1) is sentinel and must NOT
+  // contribute.  Vm.s[3] = 100.  index=3 exercises the H=L=1 path.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0xDEADBEEF),
+                        static_cast<int32_t>(0xDEADBEEF),
+                        -7, 11};
+  int32_t m_lanes[4] = {0, 0, 0, 100};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {Smull2Idx4S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), int64_t{-700});
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), int64_t{1100});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umull2IdxVec4SUnsignedHighHalfJit) {
+  // UMULL2 .2d, .4s, .s[1]: Q=1 + unsigned corner.  A bug that ignored Q
+  // in the unsigned path would produce zero from the low-half sentinel; a
+  // bug that used PMOVSXDQ on the high half would convert 0xFFFFFFFF to
+  // -1 instead of 4294967295.  Vm.s[1] = 0xFFFFFFFF broadcasts UINT32_MAX
+  // across the multiplier.
+  int32_t n_lanes[4] = {0, 0, -1 /*0xFFFFFFFF*/, static_cast<int32_t>(0x80000000)};
+  int32_t m_lanes[4] = {0, -1 /*0xFFFFFFFF*/, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {Umull2Idx4S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(lanes_out[0], 0xFFFFFFFE00000001ULL);  // 0xFFFFFFFF * 0xFFFFFFFF
+  EXPECT_EQ(lanes_out[1], 0x7FFFFFFF80000000ULL);  // 0x80000000 * 0xFFFFFFFF
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmlalIdxVec2SAccumulatesJit) {
+  // SMLAL .2d, .2s, .s[0]: Vd.2d += sign_ext(Vn.s[i]) * sign_ext(Vm.s[0]).
+  // Vn = {3, -5}, Vm.s[0] = -100, initial Vd = {1000, 2000}.
+  //   r[0] = 1000 + (3 * -100) = 700
+  //   r[1] = 2000 + (-5 * -100) = 2500
+  // Pins the load-modify-store accumulator path with PADDQ on 64-bit lanes.
+  int32_t n_lanes[4] = {3, -5, 0, 0};
+  int32_t m_lanes[4] = {-100, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {1000, 2000};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {SmlalIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), int64_t{700});
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), int64_t{2500});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmlalIdxVec2SUnsignedAccumulateJit) {
+  // UMLAL .2d, .2s, .s[1]: unsigned-extending accumulate.  A signed
+  // mis-routing here would treat 0xFFFFFFFF as -1 and DECREASE the
+  // accumulator instead of increasing it by ~2^64.
+  int32_t n_lanes[4] = {-1 /*0xFFFFFFFF*/, -1 /*0xFFFFFFFF*/, 0, 0};
+  int32_t m_lanes[4] = {0, -1 /*0xFFFFFFFF*/, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {1, 2};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {UmlalIdx2S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(lanes_out[0], 1ULL + 0xFFFFFFFE00000001ULL);
+  EXPECT_EQ(lanes_out[1], 2ULL + 0xFFFFFFFE00000001ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmlslIdxVec2SSubtractsJit) {
+  // SMLSL .2d, .2s, .s[1]: Vd -= signed product.  Vm.s[1] = -10 means the
+  // products are negative; subtracting a negative product moves Vd *up*.
+  // Catches MLAL vs MLSL dispatch confusion on top of sign-of-product.
+  int32_t n_lanes[4] = {3, 7, 0, 0};
+  int32_t m_lanes[4] = {0, -10, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {100, 200};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {SmlslIdx2S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), int64_t{100} - int64_t{3 * -10});
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), int64_t{200} - int64_t{7 * -10});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmlslIdxVec2SUnsignedSubtractsJit) {
+  // UMLSL .2d, .2s, .s[0]: unsigned subtract.  Vd's initial values are
+  // larger than the unsigned products so the differences are positive
+  // 64-bit values, but a signed-vs-unsigned routing bug here would treat
+  // Vm.s[0] = 0xFFFFFFFF as -1, causing -1 * Vn to ADD small positive Vn
+  // values instead of subtracting a ~2^64-sized product.
+  int32_t n_lanes[4] = {10, 20, 0, 0};
+  int32_t m_lanes[4] = {-1 /*0xFFFFFFFF*/, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {0x1000000000ULL, 0x2000000000ULL};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {UmlslIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(lanes_out[0], 0x1000000000ULL - (10ULL * 0xFFFFFFFFULL));
+  EXPECT_EQ(lanes_out[1], 0x2000000000ULL - (20ULL * 0xFFFFFFFFULL));
 }
 
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
