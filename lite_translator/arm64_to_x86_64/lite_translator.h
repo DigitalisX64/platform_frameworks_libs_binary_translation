@@ -15481,6 +15481,170 @@ class LiteTranslator {
     }
     // endregion
 
+    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element
+    // (size=01: .4h/.8h -> .4s).
+    //
+    // Signed saturating doubling widening multiply (and accumulate /
+    // subtract).  Mirrors the interpreter arm in interpreter.h:
+    //
+    //   doubled = SignedSat(2 * sign_ext(Vn[i]) * sign_ext(Vm.h[index])),
+    //             saturated to [INT32_MIN, INT32_MAX]
+    //   SQDMULL :  Vd[i] = doubled
+    //   SQDMLAL :  Vd[i] = SignedSat(Vd[i] + doubled)
+    //   SQDMLSL :  Vd[i] = SignedSat(Vd[i] - doubled)
+    //
+    // The 16x16 signed product fits exactly in int32 (max |INT16_MIN ×
+    // INT16_MIN| = 2^30), so PMOVSXWD + PMULLD reconstructs it without
+    // loss.  Doubling via PADDD self-add overflows only when the product
+    // is exactly 2^30, which corresponds to (Vn[i] = INT16_MIN AND Vm =
+    // INT16_MIN) — the lone architectural saturation corner.  Detect
+    // that corner at 16-bit level (PCMPEQW against 0x8000 broadcast),
+    // sign-extend the mask to 32-bit lanes, and XOR-blend INT32_MAX
+    // over the wrapped doubled value.  The full 128-bit Vd is written
+    // regardless of Q (widening forms — 4 × 32-bit lanes = 128 bits).
+    //
+    // SQDMLAL/SQDMLSL add a stage-2 signed saturating add/sub of
+    // (Vd, addend) against [INT32_MIN, INT32_MAX], reusing the same
+    // wrap-add + overflow-bit-XOR-blend recipe as the SQADD/SQSUB
+    // three-same arm for 32-bit lanes.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+    //   sqdmull  v0.4s, v1.4h, v2.h[0]  = 0x0F42B020
+    //   sqdmull2 v0.4s, v1.8h, v2.h[7]  = 0x4F72B820
+    //   sqdmlal  v0.4s, v1.4h, v2.h[1]  = 0x0F623020
+    //   sqdmlal2 v0.4s, v1.8h, v2.h[6]  = 0x4F623820
+    //   sqdmlsl  v0.4s, v1.4h, v2.h[3]  = 0x0F427820
+    //   sqdmlsl2 v0.4s, v1.8h, v2.h[5]  = 0x4F525820
+    if ((args.opcode == Op::kSqdmullIdx ||
+         args.opcode == Op::kSqdmlalIdx ||
+         args.opcode == Op::kSqdmlslIdx) &&
+        args.size == 0b01) {
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      const bool is_accum = (args.opcode != Op::kSqdmullIdx);
+      const bool is_sub = (args.opcode == Op::kSqdmlslIdx);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xn_full = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      if (xm == no_simd_register || xn_full == no_simd_register ||
+          x_const == no_simd_register || corner == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Broadcast Vm.h[index] across all 8 halfword lanes of xm.
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+      if (args.index >= 4) {
+        as_.Psrldq(xm, int8_t{8});
+      }
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      }
+
+      // x_const = 0x8000 broadcast across 8 halfwords.
+      as_.Pcmpeqw(x_const, x_const);
+      as_.Psllw(x_const, int8_t{15});
+
+      // corner = (Vn lane == 0x8000) AND (Vm broadcast == 0x8000), per
+      // halfword.  x_const is dead after this block.
+      as_.Movdqu(xn_full, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqa(corner, xn_full);
+      as_.Pcmpeqw(corner, x_const);
+      as_.Pcmpeqw(x_const, xm);
+      as_.Pand(corner, x_const);
+
+      // Widen the Vm broadcast's low 4 halfwords to 4 × 32-bit signed.
+      as_.Pmovsxwd(xm, xm);
+
+      // Widen Vn's Q-selected half via memory-operand PMOVSXWD.  Reuse
+      // xn_full's register slot (the full-Vn copy is dead now).
+      int32_t vn_src_off = vn_off + (args.q ? 8 : 0);
+      as_.Pmovsxwd(xn_full, {.base = Assembler::rbp, .disp = vn_src_off});
+
+      // 32-bit signed multiply — PMULLD's low-32 result equals the
+      // architectural product (16x16 product fits in int32).
+      as_.Pmulld(xn_full, xm);
+
+      // Sign-extend the corner mask's Q-selected half to 32-bit lanes.
+      if (args.q) {
+        as_.Psrldq(corner, int8_t{8});
+      }
+      as_.Pmovsxwd(corner, corner);
+
+      // Double via self-add — corner lanes wrap from +2^30 to -2^31.
+      as_.Paddd(xn_full, xn_full);
+
+      // x_const := INT32_MAX broadcast (Pcmpeqd self -> -1, Psrld 1 ->
+      // 0x7FFFFFFF), then XOR-blend over corner lanes:
+      //   xn_full = doubled ^ ((doubled ^ INT32_MAX) & corner_mask).
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Psrld(x_const, int8_t{1});
+      as_.Pxor(x_const, xn_full);
+      as_.Pand(x_const, corner);
+      as_.Pxor(xn_full, x_const);
+
+      if (!is_accum) {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_full);
+        return;
+      }
+
+      // Stage 2: 32-bit signed saturating add/sub of Vd_wide and the
+      // saturated doubled product.  Same overflow-bit-XOR-blend recipe
+      // as the SQADD/SQSUB 32-bit arms at lite_translator.h:4824/4899.
+      //   sum  = a + b      (wrap mod 2^32)
+      //   ovf  = (~(a^b) & (a^sum)) (SQADD) or ((a^b) & (a^diff)) (SQSUB)
+      //   sat  = (a < 0) ? INT_MIN : INT_MAX
+      //   res  = sum ^ ((sum ^ sat) & ovf_mask)
+      SimdRegister xd = AllocTempSimdReg();
+      SimdRegister t_sum = AllocTempSimdReg();
+      SimdRegister t_ovf = AllocTempSimdReg();
+      SimdRegister t_sat = AllocTempSimdReg();
+      if (xd == no_simd_register || t_sum == no_simd_register ||
+          t_ovf == no_simd_register || t_sat == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqa(t_sum, xd);
+      if (is_sub) {
+        as_.Psubd(t_sum, xn_full);
+      } else {
+        as_.Paddd(t_sum, xn_full);
+      }
+      as_.Movdqa(t_ovf, xd);
+      as_.Pxor(t_ovf, xn_full);
+      as_.Movdqa(t_sat, xd);
+      as_.Pxor(t_sat, t_sum);
+      // xn_full holds the addend (still live as 'b').  It becomes dead
+      // after t_ovf and t_sum are computed; reuse it to build INT32_MAX.
+      if (!is_sub) {
+        as_.Pcmpeqd(xn_full, xn_full);
+        as_.Pxor(t_ovf, xn_full);   // ~(a^b).
+        as_.Pand(t_ovf, t_sat);     // ~(a^b) & (a^sum).
+        as_.Psrld(xn_full, int8_t{1});  // xn_full = INT32_MAX broadcast.
+      } else {
+        as_.Pand(t_ovf, t_sat);     // (a^b) & (a^diff).
+        as_.Pcmpeqd(xn_full, xn_full);
+        as_.Psrld(xn_full, int8_t{1});  // INT32_MAX broadcast.
+      }
+      as_.Psrad(t_ovf, int8_t{31});     // overflow mask (all-1s or 0).
+      as_.Psrad(xd, int8_t{31});        // xd = (a<0)?-1:0.
+      as_.Pxor(xd, xn_full);            // xd = sat = (a<0)?INT_MIN:INT_MAX.
+      as_.Pxor(xd, t_sum);              // xd = sat ^ sum (or sat ^ diff).
+      as_.Pand(xd, t_ovf);              // ... & ovf.
+      as_.Pxor(xd, t_sum);              // = sum ^ ((sum^sat) & ovf).
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      return;
+    }
+    // endregion
+
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;

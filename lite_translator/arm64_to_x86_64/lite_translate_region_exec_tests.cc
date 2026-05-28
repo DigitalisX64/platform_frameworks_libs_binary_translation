@@ -11363,6 +11363,173 @@ TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec2SAccumulatorNegativeOverflowS
   EXPECT_EQ(lanes_out[1], 500ULL - 0x20000000ULL);
 }
 
+// JIT-driven SQDMULL/SQDMLAL/SQDMLSL by-element tests for size=01 (.4h/.8h
+// -> .4s).  These call Run() so the JIT lowering path is exercised
+// directly — the InterpretInsn-driven tests above continue to pin the
+// architectural reference.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmullIdxVec4HDoublesSignedProductsJit) {
+  uint16_t n_lanes[8] = {3, static_cast<uint16_t>(-7), 100,
+                         static_cast<uint16_t>(-200), 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {50, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  state_.cpu.v[0] = (__uint128_t{0xDEADBEEFDEADBEEFULL} << 64) |
+                    __uint128_t{0xDEADBEEFDEADBEEFULL};
+  static const uint32_t code[] = {SqdmullIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 2 * 3   * 50);     // 300
+  EXPECT_EQ(r[1], 2 * -7  * 50);     // -700
+  EXPECT_EQ(r[2], 2 * 100 * 50);     // 10000
+  EXPECT_EQ(r[3], 2 * -200 * 50);    // -20000
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmullIdxVec4HSaturatesIntMinSquaredJit) {
+  // (INT16_MIN, INT16_MIN) is the only architectural saturation corner
+  // for stage 1 — pinpoint that JIT corner-detection mask + INT32_MAX
+  // XOR-blend produces INT32_MAX, while neighbouring (INT16_MIN,
+  // INT16_MAX) lanes pass through as the exact doubled product.
+  uint16_t n_lanes[8] = {0x8000, 0x8000, 0x7FFF, 0x8000, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x8000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {SqdmullIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MAX);
+  EXPECT_EQ(r[1], INT32_MAX);
+  EXPECT_EQ(r[2], 2 * 32767 * -32768);   // -2147418112, fits.
+  EXPECT_EQ(r[3], INT32_MAX);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull2IdxVec8HUsesHighHalfJit) {
+  // Q=1 selects Vn high half (lanes 4..7) — a JIT bug routing Q=1 to the
+  // low half (or omitting the +8 from the vn_src memory operand) would
+  // surface as 0xBEEF * -5 products on the output.
+  uint16_t n_lanes[8] = {0xBEEF, 0xBEEF, 0xBEEF, 0xBEEF,
+                         11, static_cast<uint16_t>(-13), 17,
+                         static_cast<uint16_t>(-19)};
+  uint16_t m_lanes[8] = {0, 0, 0, static_cast<uint16_t>(-5), 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {Sqdmull2Idx8H(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 2 * 11  * -5);    // -110
+  EXPECT_EQ(r[1], 2 * -13 * -5);    // 130
+  EXPECT_EQ(r[2], 2 * 17  * -5);    // -170
+  EXPECT_EQ(r[3], 2 * -19 * -5);    // 190
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull2IdxVec8HCornerInHighHalfJit) {
+  // Q=1 with the corner case in the high-half source.  Verifies the
+  // corner-mask Psrldq 8 (selecting the high 4 halfwords for sign-extend
+  // to 32-bit) wires up correctly with Q=1.
+  uint16_t n_lanes[8] = {0, 0, 0, 0,
+                         0x8000, 0x7FFF, 0x8000, 0x8000};
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 0x8000};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {Sqdmull2Idx8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MAX);                          // corner.
+  EXPECT_EQ(r[1], 2 * 32767 * -32768);                 // fits exactly.
+  EXPECT_EQ(r[2], INT32_MAX);                          // corner.
+  EXPECT_EQ(r[3], INT32_MAX);                          // corner.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlalIdxVec4HAccumulatesJit) {
+  // Stage-2 accumulator on top of the doubled product — no saturation
+  // on stage 2 here, so the JIT's SQADD-recipe must produce wrap-sum =
+  // signed-add.
+  uint16_t n_lanes[8] = {static_cast<uint16_t>(-1), 2, 3, 4, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 10, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 1000, 2000, 3000, 4000);
+  static const uint32_t code[] = {SqdmlalIdx4H(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 1000 + 2 * -1 * 10);   // 980
+  EXPECT_EQ(r[1], 2000 + 2 *  2 * 10);   // 2040
+  EXPECT_EQ(r[2], 3000 + 2 *  3 * 10);   // 3060
+  EXPECT_EQ(r[3], 4000 + 2 *  4 * 10);   // 4080
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlalIdxVec4HStage2PositiveOverflowSaturatesJit) {
+  // Vd pre-loaded near INT32_MAX; addend positive → overflow → saturate
+  // to INT32_MAX on the overflowing lanes only.  Pins the JIT's
+  // 32-bit SQADD-style overflow-mask XOR-blend.
+  uint16_t n_lanes[8] = {0x4000, 0x4000, 1, 0, 0, 0, 0, 0};   // 16384, 16384, 1, 0
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};       // index 0 = 16384
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // Vm.h[0] = 16384 broadcasts to all lanes.
+  // Lane 0 addend = 2 * 16384 * 16384 = 0x20000000 (536870912).
+  // Vd lane 0 = INT32_MAX - 100 -> sum overflows -> INT32_MAX.
+  // Lane 1: same addend, Vd = INT32_MIN -> sum = INT32_MIN + 0x20000000,
+  //         no overflow.
+  // Lane 2: Vn=1, addend = 2 * 1 * 16384 = 32768, Vd = 12345 -> 45113.
+  // Lane 3: Vn=0, addend = 0, Vd = 0 -> 0.
+  StoreVec4SInt(state_.cpu, 0, INT32_MAX - 100, INT32_MIN, 12345, 0);
+  static const uint32_t code[] = {SqdmlalIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MAX);                              // saturated.
+  EXPECT_EQ(r[1], INT32_MIN + 0x20000000);                 // -1610612736.
+  EXPECT_EQ(r[2], 12345 + 32768);                          // 45113.
+  EXPECT_EQ(r[3], 0);                                      // 0 + 0.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec4HSubtractsDoubledJit) {
+  // SQDMLSL with Vm[3] = -5 makes addend negative; subtracting a
+  // negative moves Vd up.  Pins the is_sub branch of the JIT's stage-2
+  // SQSUB-style recipe.
+  uint16_t n_lanes[8] = {1, 2, 3, 4, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 0, 0, static_cast<uint16_t>(-5), 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 100, 200, 300, 400);
+  static const uint32_t code[] = {SqdmlslIdx4H(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 100 - (2 *  1 * -5));   // 100 - (-10) = 110
+  EXPECT_EQ(r[1], 200 - (2 *  2 * -5));   // 220
+  EXPECT_EQ(r[2], 300 - (2 *  3 * -5));   // 330
+  EXPECT_EQ(r[3], 400 - (2 *  4 * -5));   // 440
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec4HStage2NegativeOverflowSaturatesJit) {
+  // Vd pre-loaded near INT32_MIN; SQDMLSL subtracts a positive addend
+  // (Vn*Vm positive) → underflow → saturate to INT32_MIN.  Pins the
+  // is_sub overflow branch.
+  uint16_t n_lanes[8] = {0x4000, 1, 0x4000, 0, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // Lane 0: Vd = INT32_MIN + 100; addend = 0x20000000 → diff underflows
+  //         → INT32_MIN.  Lane 1: addend = 0x8000 (small), Vd = 99999 →
+  //         99999 - 0x8000.  Lane 2: addend = 0x20000000, Vd = INT32_MAX →
+  //         INT32_MAX - 0x20000000 (no underflow).
+  StoreVec4SInt(state_.cpu, 0, INT32_MIN + 100, 99999, INT32_MAX, 0);
+  static const uint32_t code[] = {SqdmlslIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MIN);                              // saturated.
+  EXPECT_EQ(r[1], 99999 - 0x8000);                         // 67231.
+  EXPECT_EQ(r[2], INT32_MAX - 0x20000000);                 // 1610612735.
+  EXPECT_EQ(r[3], 0);
+}
+
 // Armv8.1-RDM SQRDMLAH / SQRDMLSH (by element).  Non-widening: destination
 // lane width equals source lane width.  size=01 (.4h/.8h, Vm restricted to
 // V0..V15, index = H:L:M) and size=10 (.2s/.4s, Vm full 5-bit, index = H:L).
