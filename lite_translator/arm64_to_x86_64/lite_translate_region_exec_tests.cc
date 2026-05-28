@@ -10276,6 +10276,230 @@ TEST_F(Arm64LiteTranslateRegionTest, MulVsMlaIdxDispatch) {
 }
 // endregion
 
+// region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
+//
+// The JIT path bails (no x86_64 lowering yet); the runtime falls back to
+// InterpretInsn, which now handles SQDMULH-idx / SQRDMULH-idx via the
+// same per-lane sat-doubling-MUL-high math as the three-same vector form.
+// These tests drive InterpretInsn directly to verify the interpreter +
+// decoder routing for both ops × both element widths × the upper-zero
+// guarantee for Q=0 × saturation × rounding.
+//
+// Verified encodings (aarch64-linux-gnu-as):
+//   sqdmulh  v0.4h, v1.4h, v2.h[0] = 0x0F42C020
+//   sqdmulh  v0.8h, v1.8h, v2.h[3] = 0x4F72C020   (k=3, index = H:L:M = 011)
+//   sqdmulh  v0.2s, v1.2s, v2.s[1] = 0x0FA2C020
+//   sqdmulh  v0.4s, v1.4s, v17.s[1] = 0x4FB1C020  (Vm=M:Rm = 1:0001)
+//   sqrdmulh v0.4h, v1.4h, v2.h[7] = 0x0F72D820
+//   sqrdmulh v0.4s, v1.4s, v2.s[3] = 0x4FA2D820
+constexpr uint32_t SqdmulhIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // Q=0, U=0, size=01, opcode=1100.  Vm restricted to V0..V15 (Rm4).
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x0F40C000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqdmulhIdx8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  return 0x4F40C000u | (((k >> 1) & 1u) << 21) | ((k & 1u) << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (((k >> 2) & 1u) << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqdmulhIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // Q=0, U=0, size=10, opcode=1100.  index = H:L (2 bits, 0..3).
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x0F80C000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqdmulhIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x4F80C000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmulhIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // Q=0, U=0, size=01, opcode=1101.  Same Vm/index encoding as SQDMULH .4h.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x0F40D000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqrdmulhIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x4F80D000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec4HBroadcastsLane) {
+  // Vn.4h = {0x4000, 0x2000, 0x1000, 0x0800}; Vm.h[0] = 0x4000.
+  // Per lane: sqdmulh = sat((2 * a * b) >> 16).
+  //   0x4000 * 0x4000 = 0x10000000 -> *2 = 0x20000000 -> >>16 = 0x2000.
+  //   0x2000 * 0x4000 = 0x08000000 -> *2 = 0x10000000 -> >>16 = 0x1000.
+  //   0x1000 * 0x4000 = 0x04000000 -> *2 = 0x08000000 -> >>16 = 0x0800.
+  //   0x0800 * 0x4000 = 0x02000000 -> *2 = 0x04000000 -> >>16 = 0x0400.
+  uint16_t n_lanes[8] = {0x4000, 0x2000, 0x1000, 0x0800, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  state_.cpu.v[0] = 0xAAAAAAAAAAAAAAAAULL;
+  static const uint32_t code[] = {SqdmulhIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x2000u);
+  EXPECT_EQ(r[1], 0x1000u);
+  EXPECT_EQ(r[2], 0x0800u);
+  EXPECT_EQ(r[3], 0x0400u);
+  // .4h: upper 64 bits must be zero.
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec4HSaturatesIntMinSquared) {
+  // a = b = 0x8000 (INT16_MIN).  (-32768) * (-32768) = 0x40000000.
+  // 2 * 0x40000000 = 0x80000000.  >>16 = 0x8000 = -32768 — but the math
+  // result +32768 doesn't fit in int16, so SQDMULH must saturate to
+  // INT16_MAX = 0x7FFF.
+  uint16_t n_lanes[8] = {0x8000, 0x8000, 0x8000, 0x8000, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x8000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {SqdmulhIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec8HHighLane) {
+  // Vm.h[7] = 0x4000 — exercises the index >= 4 broadcast path.
+  // Q=1, so all 8 destination lanes must be written; no upper-zero clear.
+  uint16_t n_lanes[8] = {0x4000, 0x2000, 0x1000, 0x0800,
+                         0x0400, 0x0200, 0x0100, 0x0080};
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 0x4000};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {SqdmulhIdx8H(0, 1, 2, /*k=*/7)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x2000u);
+  EXPECT_EQ(r[1], 0x1000u);
+  EXPECT_EQ(r[2], 0x0800u);
+  EXPECT_EQ(r[3], 0x0400u);
+  EXPECT_EQ(r[4], 0x0200u);
+  EXPECT_EQ(r[5], 0x0100u);
+  EXPECT_EQ(r[6], 0x0080u);
+  EXPECT_EQ(r[7], 0x0040u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec2SUpperZero) {
+  // .2s — Q=0, must zero upper 64 bits.  Use a=b=0x40000000 lane 0:
+  //   2 * 0x40000000 * 0x40000000 = 0x4000000000000000 -> >>32 = 0x40000000.
+  int32_t n_lanes[4] = {0x40000000, 0x20000000, 0x11111111, 0x22222222};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  state_.cpu.v[0] = 0xFFFFFFFFFFFFFFFFULL;
+  static const uint32_t code[] = {SqdmulhIdx2S(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x20000000);  // (2 * 0x40000000 * 0x40000000) >> 32
+  EXPECT_EQ(r[1], 0x10000000);  // (2 * 0x20000000 * 0x40000000) >> 32
+  // Q=0 -> upper 64 bits zero.
+  EXPECT_EQ(r[2], 0);
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec4SSaturatesIntMinSquared) {
+  // a = b = INT32_MIN (0x80000000).  2 * (-2^31)^2 = 2^63 — overflows
+  // int64, requires __int128 in the interpreter.  Must saturate to
+  // INT32_MAX (0x7FFFFFFF), not wrap to INT32_MIN.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000)};
+  int32_t m_lanes[4] = {static_cast<int32_t>(0x80000000), 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SqdmulhIdx4S(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFFFFF);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec4HRoundingDistinct) {
+  // Pick (a, b) so the rounding constant flips the high half:
+  //   a = 0x4000 (16384), b = 0x4001 (16385).
+  //   2 * 16384 * 16385 = 0x20008000.
+  //   SQDMULH:  0x20008000 >> 16 = 0x2000.
+  //   SQRDMULH: (0x20008000 + 0x8000) >> 16 = 0x20010000 >> 16 = 0x2001.
+  uint16_t n_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4001, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  uint16_t r[8];
+
+  // SQRDMULH first.
+  static const uint32_t code_rd[] = {SqrdmulhIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code_rd);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code_rd) + 4);
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x2001u);
+
+  // SQDMULH baseline (no rounding) — same inputs, different result.
+  static const uint32_t code_no[] = {SqdmulhIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code_no);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code_no) + 4);
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x2000u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec4SSaturatesIntMinSquared) {
+  // SQRDMULH .4s with a=b=INT32_MIN.  Math:
+  //   2 * (-2^31)^2 + 2^31 = 2^63 + 2^31 — high half is 2^31, saturates to
+  //   INT32_MAX (0x7FFFFFFF).
+  int32_t n_lanes[4] = {static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000)};
+  int32_t m_lanes[4] = {static_cast<int32_t>(0x80000000), 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SqrdmulhIdx4S(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFFFFF);
+}
+// endregion
+
 // region digitalis - FCSEL JIT
 //
 // FCSEL Sd|Dd|Hd, Sn, Sm, cond

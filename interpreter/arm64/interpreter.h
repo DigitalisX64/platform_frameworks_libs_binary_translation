@@ -7575,6 +7575,59 @@ class Interpreter {
     }
     // endregion
 
+    // region digitalis: SQDMULH / SQRDMULH by-element (vector).
+    //   size=0b01 -> halfword (.4h/.8h, esize=2, 16-bit lanes).
+    //   size=0b10 -> word     (.2s/.4s, esize=4, 32-bit lanes).
+    // The indexed lane of Vm is broadcast across all destination lanes,
+    // then the per-lane saturating-doubling-multiply-high (with optional
+    // rounding for SQRDMULH) runs identically to the three-same vector
+    // form at lines 4564-4590.  For Q=0 (D-register), upper 64 bits of Vd
+    // are zeroed.
+    if (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqdmulhIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqrdmulhIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      uint8_t esize = (args.size == 0b01) ? 2 : 4;
+      uint8_t num_elements = (args.q ? 16 : 8) / esize;
+      uint8_t bits_local = esize * 8;
+      int64_t smax = (1LL << (bits_local - 1)) - 1;
+      int64_t smin = -(1LL << (bits_local - 1));
+      __int128 round =
+          (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSqrdmulhIdx)
+              ? (static_cast<__int128>(1) << (bits_local - 1))
+              : __int128{0};
+
+      // Broadcast Vm.lane[index] across all 16/esize lanes of a synthetic
+      // vector, then feed it through the existing per-lane signed helper.
+      uint64_t indexed = 0;
+      memcpy(&indexed,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * esize,
+             esize);
+      __uint128_t bcast = 0;
+      for (uint8_t i = 0; i < (16 / esize); i++) {
+        memcpy(reinterpret_cast<uint8_t*>(&bcast) + i * esize, &indexed, esize);
+      }
+
+      AdvSimdThreeSameElementWiseSigned(
+          src_n, bcast, esize, num_elements, &result,
+          [smax, smin, round, bits_local](int64_t a, int64_t b) -> int64_t {
+            __int128 product = (static_cast<__int128>(2) * a * b) + round;
+            int64_t high = static_cast<int64_t>(product >> bits_local);
+            if (high > smax) return smax;
+            if (high < smin) return smin;
+            return high;
+          });
+
+      if (!args.q) {
+        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+      }
+      state_->cpu.v[args.rd] = result;
+      return;
+    }
+    // endregion
+
     // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
     if (args.size == 0b00) {
       // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,

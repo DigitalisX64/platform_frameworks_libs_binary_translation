@@ -1737,6 +1737,13 @@ class Decoder {
     kMul,     // MUL (by element)
     kMla,     // MLA (by element)
     kMls,     // MLS (by element)
+    // region digitalis
+    kSqdmulhIdx,   // SQDMULH (by element): U=0, opcode=1100, size in {01,10}.
+                   // Per-lane saturating doubling multiply high (no rounding).
+    kSqrdmulhIdx,  // SQRDMULH (by element): U=0, opcode=1101, size in {01,10}.
+                   // Same as SQDMULH but with rounding constant 1<<(esize-1)
+                   // added before the right shift.
+    // endregion
   };
 
   struct AdvSimdVecXIdxArgs {
@@ -6086,10 +6093,24 @@ class Decoder {
     //   mla  v0.8h, v1.8h, v2.h[7] = 0x6f720820
     //   mls  v0.4h, v1.4h, v2.h[0] = 0x2f424020
     //   mls  v0.8h, v1.8h, v2.h[7] = 0x6f724820
+    //
+    // SQDMULH / SQRDMULH (by element, halfword) follow the same size=01
+    // shape — Vm is restricted to V0..V15 via Rm4, the bit-20 M slot is
+    // consumed as the index's low bit, and index = H:L:M (3 bits, 0..7).
+    // Verified encodings:
+    //   sqdmulh  v0.4h, v1.4h, v2.h[0] = 0x0f42c020   (U=0, opcode=1100)
+    //   sqdmulh  v0.8h, v1.8h, v2.h[3] = 0x4f72c020
+    //   sqrdmulh v0.4h, v1.4h, v2.h[7] = 0x0f72d820   (U=0, opcode=1101)
+    //   sqrdmulh v0.8h, v1.8h, v2.h[5] = 0x4f52d820
     } else if (size == 0b01) {
       if (!((opcode == 0b1000 && !u) ||
             (opcode == 0b0000 && u) ||
-            (opcode == 0b0100 && u))) {
+            (opcode == 0b0100 && u) ||
+            // region digitalis
+            (opcode == 0b1100 && !u) ||
+            (opcode == 0b1101 && !u)
+            // endregion
+            )) {
         Undefined();
         return;
       }
@@ -6159,6 +6180,21 @@ class Decoder {
           Undefined(); return;
         }
         break;
+      // region digitalis: SQDMULH / SQRDMULH by element (vector).
+      //   U=0, opcode=1100 -> SQDMULH (by element).
+      //   U=0, opcode=1101 -> SQRDMULH (by element).
+      // Both restricted to size ∈ {0b01 (.4h/.8h), 0b10 (.2s/.4s)}.
+      //   U=1 at these opcodes is SQRDMLAH / SQRDMLSH (Armv8.1-RDM) —
+      //   intentionally routed to Undefined here until those land.
+      case 0b1100:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmulhIdx;
+        break;
+      case 0b1101:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqrdmulhIdx;
+        break;
+      // endregion
       default:
         Undefined();
         return;
