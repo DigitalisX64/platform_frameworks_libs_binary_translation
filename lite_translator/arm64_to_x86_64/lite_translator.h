@@ -12925,9 +12925,26 @@ class LiteTranslator {
     const bool is_dform_int =
         is_dform_add || is_dform_sub || is_dform_cmgt || is_dform_cmhi ||
         is_dform_cmge || is_dform_cmhs || is_dform_cmtst || is_dform_cmeq;
+    const bool is_sqadd_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqaddScalar);
+    const bool is_uqadd_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqaddScalar);
+    const bool is_sqsub_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqsubScalar);
+    const bool is_uqsub_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar);
+    const bool is_satarith_scalar =
+        is_sqadd_scalar || is_uqadd_scalar || is_sqsub_scalar || is_uqsub_scalar;
+    // Only B/H sizes are JIT-lowered here.  S/D bail to the interpreter
+    // (S would need the 32-bit signed/unsigned saturating recipe used by
+    // the vector SQADD/UQADD/SQSUB/UQSUB lowerings; D needs a 64-bit
+    // saturating recipe with no direct SSE primitive).
+    const bool is_satarith_scalar_bh =
+        is_satarith_scalar && (args.size == 0b00 || args.size == 0b01);
     // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
-        !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int) {
+        !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
+        !is_satarith_scalar_bh) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13218,6 +13235,65 @@ class LiteTranslator {
       // corner is 0 at lanes 1..3 so no perturbation.
       as_.Pxor(xp, corner);
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xp);
+      return;
+    }
+    // endregion
+    // region digitalis: SQADD / UQADD / SQSUB / UQSUB scalar (B/H sizes only).
+    //
+    // ARM ARM C7.2.282 / .284 / .317 / .319: the scalar single-lane forms
+    // saturate at width 8/16/32/64 selected by args.size.  Here we cover
+    // B (size=00) and H (size=01); S and D bail to the interpreter for
+    // future cycles (S needs the 32-bit sign-bit-XOR-blend recipe from
+    // the vector lowering at lite_translator.h:4820+; D needs a 64-bit
+    // analogue with no direct SSE primitive).
+    //
+    // Recipe per (op, size):
+    //   * Pxor + Pinsrb/Pinsrw load Vn / Vm with lane 0 = source byte/
+    //     halfword and lanes 1.. = 0.
+    //   * Apply the matching one-instruction saturating SSE op:
+    //       SQADD B  → PADDSB     (SSE2)
+    //       SQADD H  → PADDSW     (SSE2)
+    //       UQADD B  → PADDUSB    (SSE2)
+    //       UQADD H  → PADDUSW    (SSE2)
+    //       SQSUB B  → PSUBSB     (SSE2)
+    //       SQSUB H  → PSUBSW     (SSE2)
+    //       UQSUB B  → PSUBUSB    (SSE2)
+    //       UQSUB H  → PSUBUSW    (SSE2)
+    //   * Saturating-arith on (0,0) yields 0, so lanes 1.. stay 0.
+    //   * Full-width Movdqu writes Vd with Vd[127:bits_local] = 0.
+    //
+    // Host features: SSE4.1 only required for the B path (Pinsrb is SSE4.1).
+    // H path is baseline SSE2.
+    if (is_satarith_scalar_bh) {
+      if (args.size == 0b00 && !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Pxor(xn, xn);
+      as_.Pxor(xm, xm);
+      if (args.size == 0b00) {
+        as_.Pinsrb(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pinsrb(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        if (is_sqadd_scalar)      as_.Paddsb(xn, xm);
+        else if (is_uqadd_scalar) as_.Paddusb(xn, xm);
+        else if (is_sqsub_scalar) as_.Psubsb(xn, xm);
+        else                      as_.Psubusb(xn, xm);
+      } else {  // args.size == 0b01
+        as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        if (is_sqadd_scalar)      as_.Paddsw(xn, xm);
+        else if (is_uqadd_scalar) as_.Paddusw(xn, xm);
+        else if (is_sqsub_scalar) as_.Psubsw(xn, xm);
+        else                      as_.Psubusw(xn, xm);
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
       return;
     }
     // endregion

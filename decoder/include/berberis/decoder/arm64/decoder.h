@@ -5760,11 +5760,11 @@ class Decoder {
       // single-lane fast paths for DSP saturation.  See ARM ARM
       // C7.2.282 / .284 (SQADD / SQSUB) and C7.2.317 / .319 (UQADD /
       // UQSUB).
-      // region digitalis: opcodes 00001 / 00011 / 01001 / 01011 are B/H/S/D-capable;
+      // region digitalis: opcodes 00001 / 00101 / 01001 / 01011 are B/H/S/D-capable;
       // opcode 10110 (SQDMULH / SQRDMULH) is H/S-only (the per-arm guard
       // below rejects B and D for it).  All other integer scalar-three-same
       // opcodes accept D only.
-      const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00011) ||
+      const bool all_sizes = (opcode == 0b00001) || (opcode == 0b00101) ||
                              (opcode == 0b01001) || (opcode == 0b01011);
       const bool hs_only = (opcode == 0b10110);
       if (!all_sizes && !hs_only && size != 0b11) { Undefined(); return; }
@@ -5778,7 +5778,12 @@ class Decoder {
           break;
         // endregion
         // region digitalis: SQSUB / UQSUB scalar (B/H/S/D).
-        case 0b00011:
+        // ARM ARM C7.2.317 / C7.2.319: encoding is opcode 0b00101
+        // (NOT 0b00011 — verified against clang --target=aarch64,
+        // e.g. sqsub b0,b1,b2 = 0x5e222c20 whose bits[15:11]=00101).
+        // Opcode 0b00011 is unallocated in the AdvSimdScalarThreeSame
+        // class.
+        case 0b00101:
           op = u ? AdvSimdScalarThreeSameOpcode::kUqsubScalar
                  : AdvSimdScalarThreeSameOpcode::kSqsubScalar;
           break;
