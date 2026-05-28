@@ -15172,11 +15172,21 @@ class LiteTranslator {
     }
     // endregion
 
-    // region digitalis: SQDMULH / SQRDMULH by-element (.4h / .8h, size=01).
+    // region digitalis: SQDMULH / SQRDMULH / SQRDMLAH / SQRDMLSH by-element
+    // (.4h / .8h, size=01).
     //
-    // Per-lane: Vd[i] = SAT16((2 * Vn[i] * Vm[index]) >> 16), with SQRDMULH
-    // adding a rounding constant 1<<15 to the doubled product before the
-    // shift.
+    // Per-lane (SQDMULH/SQRDMULH):
+    //   Vd[i] = SAT16((2 * Vn[i] * Vm[index]) >> 16), with SQRDMULH
+    //   adding a rounding constant 1<<15 to the doubled product before the
+    //   shift.
+    //
+    // Per-lane (SQRDMLAH/SQRDMLSH, Armv8.1-RDM):
+    //   addend = SQRDMULH(Vn[i], Vm[index])
+    //   Vd[i] = SignedSat16(Vd[i] ± addend)
+    // — the stage-1 SQRDMULH lane reuses the PMULHRSW + corner fixup recipe;
+    // stage-2 signed-saturating add/sub against [INT16_MIN, INT16_MAX] is
+    // PADDSW (SQRDMLAH) / PSUBSW (SQRDMLSH), which match the architectural
+    // saturation exactly at 16-bit lane granularity (SSE2).
     //
     // SQRDMULH .8h: SSSE3 PMULHRSW computes ((a*b)>>14 + 1)>>1 = SQRDMULH,
     // except for the single corner case (a=0x8000, b=0x8000) where SQRDMULH
@@ -15191,11 +15201,22 @@ class LiteTranslator {
     // Punpckhwd to reconstruct the 32-bit signed products.
     //
     // .2s/.4s (size=10) and the FP16 / FP32 / FP64 size codes fall through
-    // to the existing FP-only guard below.
+    // to the existing FP-only guard below.  SQRDMLAH/SQRDMLSH at size=10
+    // bail to interpreter (handled by the FP-only guard).
     if ((args.opcode == Op::kSqdmulhIdx ||
-         args.opcode == Op::kSqrdmulhIdx) &&
+         args.opcode == Op::kSqrdmulhIdx ||
+         args.opcode == Op::kSqrdmlahIdx ||
+         args.opcode == Op::kSqrdmlshIdx) &&
         args.size == 0b01) {
       if (!host_platform::kHasSSSE3) { success_ = false; return; }
+      const bool is_rounded =
+          (args.opcode == Op::kSqrdmulhIdx ||
+           args.opcode == Op::kSqrdmlahIdx ||
+           args.opcode == Op::kSqrdmlshIdx);
+      const bool is_accum =
+          (args.opcode == Op::kSqrdmlahIdx ||
+           args.opcode == Op::kSqrdmlshIdx);
+      const bool is_sub = (args.opcode == Op::kSqrdmlshIdx);
 
       int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
       int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
@@ -15223,7 +15244,7 @@ class LiteTranslator {
       }
 
       SimdRegister xmm_result = no_simd_register;
-      if (args.opcode == Op::kSqrdmulhIdx) {
+      if (is_rounded) {
         // SQRDMULH .8h via PMULHRSW + (0x8000, 0x8000) corner fixup.
         SimdRegister xn_save = AllocTempSimdReg();
         SimdRegister xm_save = AllocTempSimdReg();
@@ -15273,6 +15294,21 @@ class LiteTranslator {
 
         as_.Packssdw(x_lo_lanes, x_low);    // signed-saturating pack to 16-bit.
         xmm_result = x_lo_lanes;
+      }
+
+      if (is_accum) {
+        // Stage 2: load Vd and signed-saturating add (SQRDMLAH) or
+        // subtract (SQRDMLSH) the per-lane addend at 16-bit granularity.
+        // PADDSW / PSUBSW saturate to [INT16_MIN, INT16_MAX] natively (SSE2).
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (is_sub) {
+          as_.Psubsw(xd, xmm_result);
+        } else {
+          as_.Paddsw(xd, xmm_result);
+        }
+        xmm_result = xd;
       }
 
       if (!args.q) {
