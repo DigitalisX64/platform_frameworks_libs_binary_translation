@@ -12984,10 +12984,22 @@ class LiteTranslator {
     const bool is_urshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUrshlScalar);
     // endregion
+    // region digitalis: SRSHL scalar (D form only — the size=11 path).
+    // Signed non-saturating rounded variable shift; the signed counterpart of
+    // URSHL.  Left shifts truncate (same as SSHL).  Right shifts use the same
+    // round-bit identity as URSHL but with SAR (signed arithmetic) on the
+    // data shift; the round-bit extraction stays unsigned because we only
+    // want bit value, not arithmetic interpretation.  The |sh|=64 boundary
+    // collapses into the |sh|>=64 zero branch — for any int64 a, the signed
+    // bias (1<<63) sums with a to a non-negative int128 in [0, 2^64-1]
+    // which >>s 64 = 0, so no dedicated |sh|=64 branch is needed.
+    const bool is_srshl_scalar_d =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar);
+    // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
         !is_satarith_scalar_bhsd && !is_shl_scalar_d && !is_uqshl_scalar_d &&
-        !is_sqshl_scalar_d && !is_urshl_scalar_d) {
+        !is_sqshl_scalar_d && !is_urshl_scalar_d && !is_srshl_scalar_d) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13916,6 +13928,84 @@ class LiteTranslator {
       as_.Bind(L_rshift_eq_64);
       // |sh| == 64: result = (a >>u 63) & 1 — i.e. just bit 63.
       as_.Shrq(a, int8_t{63});
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_zero);
+      as_.Xorq(a, a);
+
+      as_.Bind(L_done);
+      // Restore rcx.
+      as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+      as_.Addq(Assembler::rsp, 8);
+
+      // Store result to Vd[63:0] and zero Vd[127:64].
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
+      return;
+    }
+    // endregion
+    // region digitalis: SRSHL scalar D form (signed non-saturating rounded
+    // variable shift, 64-bit lane).  Direct mirror of URSHL D with two
+    // changes: the data shift on the rounding-quadrant arm uses SAR (signed)
+    // instead of SHR, and the |sh|>=64 boundary collapses into a single
+    // zero branch (no dedicated |sh|=64 case).
+    //   * shift in [0, 63]    → a <<u shift.
+    //   * shift >= 64         → 0.
+    //   * shift in [-63, -1]  → (a >>s |sh|) + ((a >>u (|sh|-1)) & 1).
+    //   * shift <= -64        → 0 (for any int64 a, the signed bias 1<<63
+    //                            sums with a to a non-negative int128 in
+    //                            [0, 2^64-1] which >>s 64 = 0; for
+    //                            |sh|>64 the rounding term dominates and
+    //                            quotient is 0 per ARM ARM).
+    if (is_srshl_scalar_d) {
+      if (args.size != 0b11) { success_ = false; return; }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      Register a = AllocTempReg();
+      Register sh = AllocTempReg();
+      Register round_bit = AllocTempReg();
+      if (a == Assembler::no_register || sh == Assembler::no_register ||
+          round_bit == Assembler::no_register) {
+        success_ = false; return;
+      }
+      // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+      as_.Subq(Assembler::rsp, 8);
+      as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+      // Load a from Vn[63:0]; sign-extend Vm[7:0] into sh (int64).
+      as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_off});
+
+      Assembler::Label* L_neg = as_.MakeLabel();
+      Assembler::Label* L_zero = as_.MakeLabel();
+      Assembler::Label* L_done = as_.MakeLabel();
+
+      as_.Testq(sh, sh);
+      as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+      // Positive shift in [0, 127]: sh >= 64 → 0; else a <<u sh.
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+      as_.Movq(Assembler::rcx, sh);
+      as_.ShlqByCl(a);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_neg);
+      // Negative shift: |sh| in [1, 128] after Negq.
+      as_.Negq(sh);
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+      // 1 <= |sh| <= 63: compute round bit then signed quotient.
+      // round_bit = (a >>u (|sh|-1)) & 1.
+      as_.Movq(round_bit, a);
+      as_.Decq(sh);
+      as_.Movq(Assembler::rcx, sh);
+      as_.ShrqByCl(round_bit);
+      as_.Andq(round_bit, int32_t{1});
+      as_.Incq(sh);
+      as_.Movq(Assembler::rcx, sh);
+      as_.SarqByCl(a);
+      as_.Addq(a, round_bit);
       as_.Jmp(*L_done);
 
       as_.Bind(L_zero);
