@@ -12613,13 +12613,13 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarIdxSStage1CornerSubtractsJit)
 //   cmhs d0, d1, d2 = 0x7ee23c20 (U=1, opcode=00111)
 //   cmtst d0, d1, d2 = 0x5ee28c20 (U=0, opcode=10001)
 //   cmeq d0, d1, d2 = 0x7ee28c20 (U=1, opcode=10001)
-constexpr uint32_t ScalarThreeSameD(uint32_t u, uint32_t opcode,
-                                    uint8_t rd, uint8_t rn, uint8_t rm) {
+constexpr uint32_t ScalarThreeSame(uint32_t u, uint32_t size, uint32_t opcode,
+                                   uint8_t rd, uint8_t rn, uint8_t rm) {
   uint32_t insn = 0;
   insn |= uint32_t{0b01} << 30;     // bit31=0, bit30=1 (scalar marker)
   insn |= (u & 0x1u) << 29;
   insn |= uint32_t{0b11110} << 24;
-  insn |= uint32_t{0b11} << 22;     // size = 11 (D form)
+  insn |= (size & 0x3u) << 22;
   insn |= 1u << 21;
   insn |= (rm & 0x1Fu) << 16;
   insn |= (opcode & 0x1Fu) << 11;
@@ -12627,6 +12627,10 @@ constexpr uint32_t ScalarThreeSameD(uint32_t u, uint32_t opcode,
   insn |= (rn & 0x1Fu) << 5;
   insn |= (rd & 0x1Fu);
   return insn;
+}
+constexpr uint32_t ScalarThreeSameD(uint32_t u, uint32_t opcode,
+                                    uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(u, /*size=*/0b11, opcode, rd, rn, rm);
 }
 constexpr uint32_t AddScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
   return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b10000, rd, rn, rm);
@@ -12775,6 +12779,184 @@ TEST_F(Arm64LiteTranslateRegionTest, CmeqScalarDNotEqualJit) {
   static const uint32_t code[] = {CmeqScalarD(0, 1, 2)};
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+// endregion
+
+// region digitalis
+// SQDMULH / SQRDMULH scalar three-same (H/S forms).
+//
+// Encoding (per ARM ARM C7.2.301 / .305): standard
+// AdvSimdScalarThreeSame at opcode 0b10110:
+//   01 U 11110 size 1 Rm 10110 1 Rn Rd
+// where U=0 -> SQDMULH, U=1 -> SQRDMULH; size ∈ {01,10}.
+// Verified encodings (clang --target=aarch64):
+//   sqdmulh  h0, h1, h2 = 0x5e62b420
+//   sqdmulh  s0, s1, s2 = 0x5ea2b420
+//   sqrdmulh h0, h1, h2 = 0x7e62b420
+//   sqrdmulh s0, s1, s2 = 0x7ea2b420
+constexpr uint32_t SqdmulhScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b01, /*opcode=*/0b10110,
+                         rd, rn, rm);
+}
+constexpr uint32_t SqdmulhScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b10, /*opcode=*/0b10110,
+                         rd, rn, rm);
+}
+constexpr uint32_t SqrdmulhScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/1, /*size=*/0b01, /*opcode=*/0b10110,
+                         rd, rn, rm);
+}
+constexpr uint32_t SqrdmulhScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/1, /*size=*/0b10, /*opcode=*/0b10110,
+                         rd, rn, rm);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhSqrdmulhScalarEncodingsMatchLlvmMc) {
+  EXPECT_EQ(SqdmulhScalarH(0, 1, 2),  0x5e62b420u);
+  EXPECT_EQ(SqdmulhScalarS(0, 1, 2),  0x5ea2b420u);
+  EXPECT_EQ(SqrdmulhScalarH(0, 1, 2), 0x7e62b420u);
+  EXPECT_EQ(SqrdmulhScalarS(0, 1, 2), 0x7ea2b420u);
+}
+
+// JIT-driven coverage.  SQDMULH/SQRDMULH have no architectural accumulate;
+// each pins a single doubled-product saturation step.  Vd zero-extends:
+// Vd[127:bits_local] must clear to 0.
+
+// SQDMULH .H ordinary case (no saturation, no rounding):
+// (2 * 0x4000 * 0x4000) >> 16 = 0x80000000 >> 16 = 0x8000... but the
+// product is +0x20000000 as signed (positive), so SAT16(0x2000) = 0x2000.
+// Wait: 2 * 0x4000 * 0x4000 = 0x20000000, >> 16 = 0x2000.  No saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarHMultipliesAndHalvesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x4000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x4000});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL});
+  static const uint32_t code[] = {SqdmulhScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x2000});
+  // Vd[127:16] must zero-extend.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQDMULH .H corner saturation: (INT16_MIN, INT16_MIN) doubled is 2^31
+// which after signed >> 16 wraps to 0x8000 == INT16_MIN, but the
+// architectural saturation clamps to INT16_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarHIntMinSquaredSaturatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x8000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x8000});
+  static const uint32_t code[] = {SqdmulhScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x7FFF});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQRDMULH .H ordinary rounding-distinct case: a=0x4000, b=0x4001.
+// SQDMULH = (2 * 0x4000 * 0x4001) >> 16 = 0x20008000 >> 16 = 0x2000.
+// SQRDMULH = ((2 * 0x4000 * 0x4001) + 0x8000) >> 16 = 0x20010000 >> 16
+//          = 0x2001 — round-half-up.
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmulhScalarHRoundingProducesDistinctValueJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x4000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x4001});
+  static const uint32_t code[] = {SqrdmulhScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x2001});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQRDMULH .H corner saturation: PMULHRSW yields 0x8000 for (0x8000,
+// 0x8000), but SQRDMULH must saturate to 0x7FFF.  Exercises the corner
+// XOR fixup (the same one that ports from the SQRDMLAH stage-1 path).
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmulhScalarHIntMinSquaredSaturatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x8000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x8000});
+  static const uint32_t code[] = {SqrdmulhScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x7FFF});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQDMULH .S ordinary case: a=b=0x40000000 → 2*0x40000000*0x40000000 =
+// 0x2000000000000000, >> 32 = 0x20000000.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarSMultipliesAndHalvesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x40000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x40000000u});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL});
+  static const uint32_t code[] = {SqdmulhScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x20000000u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQDMULH .S corner saturation: (INT32_MIN, INT32_MIN) doubled wraps in
+// int64 to INT64_MIN; upper 32 bits = INT32_MIN.  Architecture saturates
+// to INT32_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarSIntMinSquaredSaturatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x80000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x80000000u});
+  static const uint32_t code[] = {SqdmulhScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x7FFFFFFFu});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQRDMULH .S rounding-distinct case: a=0x40000000, b=0x40000001.
+// SQDMULH product = 2 * 0x40000000 * 0x40000001 = 0x2000000080000000.
+// >> 32 = 0x20000000 (truncate; the low 0x80000000 is dropped).
+// SQRDMULH = (product + 0x80000000) >> 32 = 0x2000000100000000 >> 32
+//          = 0x20000001.
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmulhScalarSRoundingProducesDistinctValueJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x40000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x40000001u});
+  static const uint32_t code[] = {SqrdmulhScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x20000001u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQRDMULH .S corner saturation: (INT32_MIN, INT32_MIN) — same corner
+// as SQDMULH .S; the rounding constant doesn't change the saturation
+// outcome.
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmulhScalarSIntMinSquaredSaturatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x80000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x80000000u});
+  static const uint32_t code[] = {SqrdmulhScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x7FFFFFFFu});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQDMULH .H negative inputs: a=-0x4000 (0xC000), b=0x4000 → 2 * -0x4000
+// * 0x4000 = -0x20000000.  >> 16 = -0x2000 == 0xE000 as uint16.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarHNegativeOperandJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0xC000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x4000});
+  static const uint32_t code[] = {SqdmulhScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0xE000});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+}
+
+// SQDMULH .S zero operand: 2 * 0 * 0x7FFFFFFF = 0.  Result is 0.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarSZeroOperandJit) {
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x7FFFFFFFu});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL});
+  static const uint32_t code[] = {SqdmulhScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
 // endregion

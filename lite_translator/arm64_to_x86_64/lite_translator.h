@@ -12901,6 +12901,11 @@ class LiteTranslator {
     const bool is_sqrdmlsh_scalar =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar);
     const bool is_sqrdm_scalar = is_sqrdmlah_scalar || is_sqrdmlsh_scalar;
+    const bool is_sqdmulh_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqdmulhScalar);
+    const bool is_sqrdmulh_scalar =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar);
+    const bool is_sq_d_r_mulh_scalar = is_sqdmulh_scalar || is_sqrdmulh_scalar;
     const bool is_dform_add =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kAdd);
     const bool is_dform_sub =
@@ -12922,7 +12927,7 @@ class LiteTranslator {
         is_dform_cmge || is_dform_cmhs || is_dform_cmtst || is_dform_cmeq;
     // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
-        !is_sqrdm_scalar && !is_dform_int) {
+        !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13074,6 +13079,145 @@ class LiteTranslator {
       // zero in those lanes and the recipe propagates 0 through PSRAD /
       // PAND / PXOR with t_sum=0 and t_ovf=0.
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      return;
+    }
+    // endregion
+    // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+    //
+    // Single-lane port of stage 1 of the SQRDMLAH/SQRDMLSH scalar recipe
+    // above (same MOVQ/MOVD load shape, same corner-fix XOR), minus the
+    // stage-2 saturating accumulate.  SQDMULH skips the rounding constant;
+    // SQRDMULH includes it.
+    //
+    // size=01 (H): two paths.
+    //   SQRDMULH .H: SSSE3 PMULHRSW + (INT16_MIN)^2 corner fix at lane 0.
+    //                Lanes 1..7 of operands are 0 by construction (Pinsrw
+    //                following Pxor), so PMULHRSW lanes 1..7 are 0 and the
+    //                corner mask collapses to 0 there.
+    //   SQDMULH  .H: PMULLW + PMULHW + PUNPCKLWD + PSRAD 15 + PACKSSDW
+    //                (signed-saturating pack at 16-bit lane granularity).
+    //                Packing against a zero scratch keeps word lanes 1..7
+    //                clean.
+    //
+    // size=10 (S): single path.
+    //   PMULDQ (sext32→64 of qword-low-32) gives qword 0 = sext(Vn.s[0]) *
+    //   sext(Vm.s[0]) and qword 1 = 0.  PSLLQ 1 doubles.  For SQRDMULH only,
+    //   add rounding constant 2^31 per qword (built via Pcmpeqd + Psllq 63
+    //   + Psrlq 32 = 0x0000...0000_80000000 in both qwords).  PSRLQ 32
+    //   extracts upper 32 bits of qword 0 into dword 0 and zero-fills
+    //   dwords 1..3.  Corner XOR turns the (Vn=Vm=INT32_MIN) wrap-to-
+    //   INT32_MIN into INT32_MAX at lane 0; corner mask is 0 elsewhere.
+    if (is_sq_d_r_mulh_scalar) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        success_ = false; return;
+      }
+      const bool is_rounded = is_sqrdmulh_scalar;
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      if (args.size == 0b01) {
+        if (!host_platform::kHasSSSE3) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          success_ = false; return;
+        }
+        // Load Vn.h[0] / Vm.h[0] with upper-lane zero.
+        as_.Pxor(xn, xn);
+        as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+        as_.Pxor(xm, xm);
+        as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
+        SimdRegister xmm_result = no_simd_register;
+        if (is_rounded) {
+          SimdRegister xn_corner = AllocTempSimdReg();
+          SimdRegister xm_corner = AllocTempSimdReg();
+          SimdRegister x_min = AllocTempSimdReg();
+          if (xn_corner == no_simd_register || xm_corner == no_simd_register ||
+              x_min == no_simd_register) {
+            success_ = false; return;
+          }
+          // x_min = 0x8000 broadcast across 8 halfwords.
+          as_.Pcmpeqw(x_min, x_min);
+          as_.Psllw(x_min, int8_t{15});
+          as_.Movdqa(xn_corner, xn);
+          as_.Movdqa(xm_corner, xm);
+          as_.Pmulhrsw(xn, xm);
+          as_.Pcmpeqw(xn_corner, x_min);
+          as_.Pcmpeqw(xm_corner, x_min);
+          as_.Pand(xn_corner, xm_corner);
+          as_.Pxor(xn, xn_corner);
+          xmm_result = xn;
+        } else {
+          // SQDMULH .H via 32-bit reconstruction + arithmetic shift +
+          // signed-saturating pack.
+          SimdRegister x_low = AllocTempSimdReg();
+          SimdRegister x_high = AllocTempSimdReg();
+          SimdRegister x_zero = AllocTempSimdReg();
+          if (x_low == no_simd_register || x_high == no_simd_register ||
+              x_zero == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(x_low, xn);
+          as_.Movdqa(x_high, xn);
+          as_.Pmullw(x_low, xm);
+          as_.Pmulhw(x_high, xm);
+          // Interleave (low16, high16) → 32-bit signed product in dword 0;
+          // dwords 1..3 are 0 because operand lanes 1..7 are 0.
+          as_.Punpcklwd(x_low, x_high);
+          as_.Psrad(x_low, int8_t{15});
+          // Signed-saturating pack to 16-bit.  Pack against a zero scratch
+          // so word lanes 1..7 are 0 (PACKSSDW src2's 4 dwords map to dst
+          // words 4..7).
+          as_.Pxor(x_zero, x_zero);
+          as_.Packssdw(x_low, x_zero);
+          xmm_result = x_low;
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+        return;
+      }
+      // size == 0b10 (S form).
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      SimdRegister xp = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register ||
+          x_const == no_simd_register || corner == no_simd_register ||
+          xp == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movd(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movd(xm, {.base = Assembler::rbp, .disp = vm_off});
+      // x_const = INT32_MIN broadcast across 4 dwords.
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Pslld(x_const, int8_t{31});
+      // Corner detection: lane 0 only (lanes 1..3 of xn/xm are 0 ≠ INT32_MIN).
+      as_.Movdqa(corner, xn);
+      as_.Pcmpeqd(corner, x_const);
+      as_.Movdqa(xp, xm);
+      as_.Pcmpeqd(xp, x_const);
+      as_.Pand(corner, xp);
+      // Stage 1: PMULDQ → qword 0 = sext(Vn.s[0]) * sext(Vm.s[0]); qword 1 = 0.
+      as_.Movdqa(xp, xn);
+      as_.Pmuldq(xp, xm);
+      // Double via PSLLQ 1.
+      as_.Psllq(xp, int8_t{1});
+      if (is_rounded) {
+        // Rounding constant 2^31 per qword.
+        as_.Pcmpeqd(x_const, x_const);
+        as_.Psllq(x_const, int8_t{63});
+        as_.Psrlq(x_const, int8_t{32});
+        as_.Paddq(xp, x_const);
+      }
+      // Extract upper 32 bits of qword 0 into dword 0; PSRLQ 32 also zero-
+      // fills dwords 1..3 (qword 1's pre-shift value is at most 0x80000000
+      // when is_rounded, which shifts out to 0).
+      as_.Psrlq(xp, int8_t{32});
+      // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX at lane 0;
+      // corner is 0 at lanes 1..3 so no perturbation.
+      as_.Pxor(xp, corner);
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xp);
       return;
     }
     // endregion
