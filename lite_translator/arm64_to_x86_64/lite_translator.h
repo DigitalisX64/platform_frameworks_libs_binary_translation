@@ -12964,9 +12964,19 @@ class LiteTranslator {
     const bool is_uqshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqshlScalar);
     // endregion
+    // region digitalis: SQSHL scalar (D form only — the size=11 path).
+    // Signed saturating variable left shift; same scaffolding as UQSHL but
+    // the back-shift uses SAR (arithmetic) and the saturation target depends
+    // on sign(a): positive a → INT64_MAX, negative a → INT64_MIN.  Negative
+    // shifts behave exactly like SSHL (signed arithmetic right shift; no
+    // saturation possible on right shifts).
+    const bool is_sqshl_scalar_d =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar);
+    // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
-        !is_satarith_scalar_bhsd && !is_shl_scalar_d && !is_uqshl_scalar_d) {
+        !is_satarith_scalar_bhsd && !is_shl_scalar_d && !is_uqshl_scalar_d &&
+        !is_sqshl_scalar_d) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13702,6 +13712,110 @@ class LiteTranslator {
       // 0 < |sh| < 64: a >>u |sh|.
       as_.Movq(Assembler::rcx, sh);
       as_.ShrqByCl(a);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_zero);
+      as_.Xorq(a, a);
+
+      as_.Bind(L_done);
+      // Restore rcx.
+      as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+      as_.Addq(Assembler::rsp, 8);
+
+      // Store result to Vd[63:0] and zero Vd[127:64].
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
+      return;
+    }
+    // endregion
+    // region digitalis: SQSHL scalar D form (signed saturating variable left
+    // shift, 64-bit lane).  Mirrors UQSHL scalar D but:
+    //   * The back-shift uses SAR (signed) instead of SHR.  The detector
+    //     `(int64_t)(a << sh) >>s sh == a` correctly identifies signed
+    //     overflow for both positive and negative `a` (e.g. a=1, sh=63 sets
+    //     bit 63 → back via SAR = -1 ≠ 1, overflow; a=-1, sh=63 sets bit 63
+    //     → back via SAR = -1 == a, no overflow because -2^63 fits in
+    //     int64_t).
+    //   * Saturation target depends on sign(a):
+    //       sign(a) = 0 (positive/zero) → INT64_MAX (0x7FFF_FFFF_FFFF_FFFF).
+    //       sign(a) = 1 (negative)      → INT64_MIN (0x8000_0000_0000_0000).
+    //     Computed by Sarq sign-broadcast then XOR with INT64_MAX.
+    //   * Negative shifts use SAR (signed arithmetic right shift) instead of
+    //     SHR, mirroring SSHL.  At |sh| >= 64 the result is the sign
+    //     broadcast (0 or -1), not 0.
+    if (is_sqshl_scalar_d) {
+      if (args.size != 0b11) { success_ = false; return; }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      Register a = AllocTempReg();
+      Register sh = AllocTempReg();
+      Register back = AllocTempReg();
+      if (a == Assembler::no_register || sh == Assembler::no_register ||
+          back == Assembler::no_register) {
+        success_ = false; return;
+      }
+      // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+      as_.Subq(Assembler::rsp, 8);
+      as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+      // Load a from Vn[63:0]; sign-extend Vm[7:0] into sh (int64).
+      as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_off});
+
+      Assembler::Label* L_neg = as_.MakeLabel();
+      Assembler::Label* L_pos_big = as_.MakeLabel();
+      Assembler::Label* L_neg_big = as_.MakeLabel();
+      Assembler::Label* L_zero = as_.MakeLabel();
+      Assembler::Label* L_done = as_.MakeLabel();
+
+      as_.Testq(sh, sh);
+      as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+      // Positive shift in [0, 127]: sh >= 64 falls through to the sign-aware
+      // saturation picker; otherwise the back-shift overflow check.
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+      // 0 <= sh < 64: shift-then-back-shift via SAR overflow check.  Reuse
+      // `sh` as the saved-original holder once cl is loaded.
+      as_.Movq(Assembler::rcx, sh);
+      as_.Movq(sh, a);                 // sh = original a (saved for cmp).
+      as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+      as_.Movq(back, a);
+      as_.SarqByCl(back);              // back = (int64_t)(a << shift) >>s shift.
+      as_.Cmpq(back, sh);              // back == original a ?
+      as_.Jcc(Assembler::Condition::kEqual, *L_done);
+      // Overflow: saturate to INT64_MAX if sign(a)==0 else INT64_MIN.
+      // `sh` still holds the saved original a value.
+      as_.Sarq(sh, int8_t{63});        // sh = sign broadcast (0 or -1).
+      as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});  // a = INT64_MAX.
+      as_.Xorq(a, sh);                 // pos: a = INT64_MAX; neg: a = INT64_MIN.
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_pos_big);
+      // sh >= 64: if a == 0 result is 0, else saturate based on sign(a).
+      as_.Testq(a, a);
+      as_.Jcc(Assembler::Condition::kZero, *L_zero);
+      // sign-broadcast a into back; then build saturation target.
+      as_.Movq(back, a);
+      as_.Sarq(back, int8_t{63});       // back = sign broadcast (0 or -1).
+      as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});
+      as_.Xorq(a, back);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_neg);
+      // Negative shift: |sh| in [1, 128] after Negq.
+      as_.Negq(sh);
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreaterEqual, *L_neg_big);
+      // 0 < |sh| < 64: a = (int64_t)a >>s |sh|.
+      as_.Movq(Assembler::rcx, sh);
+      as_.SarqByCl(a);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_neg_big);
+      // |sh| >= 64: a = sign broadcast across all bits.
+      as_.Sarq(a, int8_t{63});
       as_.Jmp(*L_done);
 
       as_.Bind(L_zero);
