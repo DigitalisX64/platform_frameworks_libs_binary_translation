@@ -12602,17 +12602,17 @@ class LiteTranslator {
       success_ = false; return;
     }
     // region digitalis: FP16 path is JIT-emitted for FCMxx / FACxx (mask out),
-    // FMULX (real-FP out), FABD (real-FP out), and FRECPS (real-FP out) via
-    // an F16C round-trip (each FP16 source lane is lifted to FP32 in xmm lane
-    // 0; the existing FP32 core runs unchanged; result narrowed back to FP16).
-    // Mask-producing ops narrow with Packssdw (against a zero scratch); real-FP
-    // ops narrow with Vcvtps2ph (which also auto-zeroes the upper 64 bits of
-    // the dst xmm).  FRSQRTS scalar H still bails to the interpreter — same
-    // F16C round-trip recipe, just adds a Divss-by-2 step to the FP32 core.
+    // FMULX (real-FP out), FABD (real-FP out), FRECPS (real-FP out), and
+    // FRSQRTS (real-FP out) via an F16C round-trip (each FP16 source lane is
+    // lifted to FP32 in xmm lane 0; the existing FP32 core runs unchanged;
+    // result narrowed back to FP16).  Mask-producing ops narrow with Packssdw
+    // (against a zero scratch); real-FP ops narrow with Vcvtps2ph (which also
+    // auto-zeroes the upper 64 bits of the dst xmm).
     if (args.is_fp16 && !host_platform::kHasF16C) {
       success_ = false; return;
     }
-    if (args.is_fp16 && !is_cmp && !is_fmulx && !is_fabd && !is_frecps) {
+    if (args.is_fp16 && !is_cmp && !is_fmulx && !is_fabd && !is_frecps &&
+        !is_frsqrts) {
       success_ = false; return;
     }
     // endregion
@@ -12803,14 +12803,18 @@ class LiteTranslator {
 
       // region digitalis: FP16 lift via F16C round-trip — Pxor + Pinsrw +
       // Vcvtph2ps widens each FP16 source lane to FP32 in xmm lane 0.  The
-      // existing FP32 FRECPS Newton-step core (Vfnmadd231ss of K_fma - a*b
-      // with K_sat blend on special_mask and qnan blend on input_unord) then
-      // runs unchanged on the lifted operands.  Lanes 1..3 of xmm_n / xmm_m
-      // stay FP32 +0 by Vcvtph2ps zero-fill, and all subsequent FP32-width
-      // primitives in the core preserve that upper-zero invariant (Mulss /
-      // Cmpunordps / Pand / Por / Vfnmadd231ss / Movd-zero-extended-into-xmm
-      // all leave lanes 1..3 == 0).  The narrow at the store path uses
-      // Vcvtps2ph (real-FP output), not Packssdw (mask output).
+      // existing FP32 FRECPS/FRSQRTS Newton-step core (Vfnmadd231ss of
+      // K_fma - a*b, plus a Divss-by-2 step for FRSQRTS, with K_sat blend on
+      // special_mask and qnan blend on input_unord) then runs unchanged on
+      // the lifted operands.  Lanes 1..3 of xmm_n / xmm_m stay FP32 +0 by
+      // Vcvtph2ps zero-fill, and all subsequent FP32-width primitives in the
+      // core preserve that upper-zero invariant (Mulss / Cmpunordps / Pand /
+      // Por / Vfnmadd231ss / Divss / Movd-zero-extended-into-xmm all leave
+      // lanes 1..3 == 0).  Divss of (lane0=fma_result, lanes1..3=+0) by
+      // (lane0=+2, lanes1..3=+0) is undefined per SSE — but Divss only writes
+      // lane 0 and leaves lanes 1..3 of the dst unchanged, so the upper
+      // zeroes survive.  The narrow at the store path uses Vcvtps2ph
+      // (real-FP output), not Packssdw (mask output).
       const bool use_single = args.is_fp16 || !is_double;
       if (args.is_fp16) {
         as_.Pxor(xmm_n, xmm_n);
@@ -12864,14 +12868,14 @@ class LiteTranslator {
       // FRSQRTS: divide by 2 (exact one-exponent decrement).  Reuse xmm_n
       // as scratch — a is no longer needed past this point.
       if (is_frsqrts) {
-        if (is_double) {
-          as_.Movq(tmp_gpr, two_bits_d);
-          as_.Movq(xmm_n, tmp_gpr);
-          as_.Divsd(xmm_mul, xmm_n);
-        } else {
+        if (use_single) {
           as_.Movl(tmp_gpr, two_bits_s);
           as_.Movd(xmm_n, tmp_gpr);
           as_.Divss(xmm_mul, xmm_n);
+        } else {
+          as_.Movq(tmp_gpr, two_bits_d);
+          as_.Movq(xmm_n, tmp_gpr);
+          as_.Divsd(xmm_mul, xmm_n);
         }
       }
       // xmm_mul now holds fma_result.  xmm_n, xmm_m are free as scratch
