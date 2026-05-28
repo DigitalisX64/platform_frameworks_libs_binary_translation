@@ -13009,6 +13009,26 @@ constexpr uint32_t UqsubScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
   return ScalarThreeSame(/*u=*/1, /*size=*/0b01, /*opcode=*/0b00101,
                          rd, rn, rm);
 }
+// S-form (size=10): 32-bit scalar saturating add/sub.  Verified encodings
+// (clang --target=aarch64):
+//   sqadd s0, s1, s2 = 0x5ea20c20    uqadd s0, s1, s2 = 0x7ea20c20
+//   sqsub s0, s1, s2 = 0x5ea22c20    uqsub s0, s1, s2 = 0x7ea22c20
+constexpr uint32_t SqaddScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b10, /*opcode=*/0b00001,
+                         rd, rn, rm);
+}
+constexpr uint32_t UqaddScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/1, /*size=*/0b10, /*opcode=*/0b00001,
+                         rd, rn, rm);
+}
+constexpr uint32_t SqsubScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b10, /*opcode=*/0b00101,
+                         rd, rn, rm);
+}
+constexpr uint32_t UqsubScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/1, /*size=*/0b10, /*opcode=*/0b00101,
+                         rd, rn, rm);
+}
 
 TEST_F(Arm64LiteTranslateRegionTest, SatArithScalarBHEncodingsMatchLlvmMc) {
   EXPECT_EQ(SqaddScalarB(0, 1, 2), 0x5e220c20u);
@@ -13019,6 +13039,13 @@ TEST_F(Arm64LiteTranslateRegionTest, SatArithScalarBHEncodingsMatchLlvmMc) {
   EXPECT_EQ(SqsubScalarH(0, 1, 2), 0x5e622c20u);
   EXPECT_EQ(UqsubScalarB(0, 1, 2), 0x7e222c20u);
   EXPECT_EQ(UqsubScalarH(0, 1, 2), 0x7e622c20u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SatArithScalarSEncodingsMatchLlvmMc) {
+  EXPECT_EQ(SqaddScalarS(0, 1, 2), 0x5ea20c20u);
+  EXPECT_EQ(UqaddScalarS(0, 1, 2), 0x7ea20c20u);
+  EXPECT_EQ(SqsubScalarS(0, 1, 2), 0x5ea22c20u);
+  EXPECT_EQ(UqsubScalarS(0, 1, 2), 0x7ea22c20u);
 }
 
 // JIT-driven semantic coverage.  Each test pins the (Vn, Vm) inputs that
@@ -13170,6 +13197,131 @@ TEST_F(Arm64LiteTranslateRegionTest, SqaddScalarBIgnoresUpperVnVmBytesJit) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(static_cast<uint8_t>(state_.cpu.v[0]), uint8_t{8});  // 3 + 5
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 8, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// S-form (size=10) semantic coverage.  Movd-based load + 32-bit
+// sign-bit-XOR-blend (signed) / PMAXUD-PMINUD (unsigned) recipe.
+
+// SQADD .S ordinary: 1000000 + 2000000 = 3000000, no saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqaddScalarSOrdinaryJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{1000000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{2000000});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL});
+  static const uint32_t code[] = {SqaddScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{3000000});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQADD .S positive saturation: 0x70000000 + 0x20000000 wraps to 0x90000000
+// (-INT32_MIN+...) in two's complement; SQADD must clamp to INT32_MAX = 0x7FFFFFFF.
+TEST_F(Arm64LiteTranslateRegionTest, SqaddScalarSPositiveSaturationJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x70000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x20000000u});
+  static const uint32_t code[] = {SqaddScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x7FFFFFFFu});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQADD .S negative saturation: 0x80000000 + 0x80000000 (both INT32_MIN)
+// wraps to 0; SQADD must clamp to INT32_MIN = 0x80000000.
+TEST_F(Arm64LiteTranslateRegionTest, SqaddScalarSNegativeSaturationJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x80000000u});  // INT32_MIN
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0xFFFFFF00u});  // -256
+  static const uint32_t code[] = {SqaddScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x80000000u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// UQADD .S ordinary: 0x10000000 + 0x20000000 = 0x30000000, no saturation.
+TEST_F(Arm64LiteTranslateRegionTest, UqaddScalarSOrdinaryJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x10000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x20000000u});
+  static const uint32_t code[] = {UqaddScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x30000000u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+}
+
+// UQADD .S saturation: 0xFFFFFFFE + 5 wraps to 3 in uint32; UQADD must clamp
+// to UINT32_MAX = 0xFFFFFFFF.
+TEST_F(Arm64LiteTranslateRegionTest, UqaddScalarSSaturationJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0xFFFFFFFEu});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{5});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL});
+  static const uint32_t code[] = {UqaddScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0xFFFFFFFFu});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQSUB .S positive saturation: 0x70000000 - (-0x70000000) = 0xE0000000
+// (3758096384) > INT32_MAX → clamp to 0x7FFFFFFF.
+TEST_F(Arm64LiteTranslateRegionTest, SqsubScalarSPositiveSaturationJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x70000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x90000000u});  // -0x70000000
+  static const uint32_t code[] = {SqsubScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x7FFFFFFFu});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// SQSUB .S negative saturation: 0x80000000 (INT32_MIN) - 1 wraps to 0x7FFFFFFF
+// in unsigned arithmetic but SQSUB must clamp to INT32_MIN = 0x80000000.
+TEST_F(Arm64LiteTranslateRegionTest, SqsubScalarSNegativeSaturationJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x80000000u});  // INT32_MIN
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{1});
+  static const uint32_t code[] = {SqsubScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x80000000u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+}
+
+// UQSUB .S ordinary: 0x30000000 - 0x10000000 = 0x20000000, no saturation.
+TEST_F(Arm64LiteTranslateRegionTest, UqsubScalarSOrdinaryJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x30000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x10000000u});
+  static const uint32_t code[] = {UqsubScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x20000000u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+}
+
+// UQSUB .S underflow saturates to zero: 5 - 10 in uint32 wraps to 0xFFFFFFFB,
+// but UQSUB must clamp to 0.
+TEST_F(Arm64LiteTranslateRegionTest, UqsubScalarSUnderflowSaturatesToZeroJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{5});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{10});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL});
+  static const uint32_t code[] = {UqsubScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// Upper-bits ignore: Movd only consumes the low dword of Vn/Vm; garbage in
+// Vn[127:32] / Vm[127:32] must not perturb the result, and Vd[127:32] must
+// be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqaddScalarSIgnoresUpperVnVmDwordsJit) {
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFFFFFFF00000003ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBADBULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xAAAAAAAA00000005ULL});
+  static const uint32_t code[] = {SqaddScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{8});  // 3 + 5
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
 // endregion

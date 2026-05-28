@@ -12935,16 +12935,17 @@ class LiteTranslator {
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar);
     const bool is_satarith_scalar =
         is_sqadd_scalar || is_uqadd_scalar || is_sqsub_scalar || is_uqsub_scalar;
-    // Only B/H sizes are JIT-lowered here.  S/D bail to the interpreter
-    // (S would need the 32-bit signed/unsigned saturating recipe used by
-    // the vector SQADD/UQADD/SQSUB/UQSUB lowerings; D needs a 64-bit
-    // saturating recipe with no direct SSE primitive).
-    const bool is_satarith_scalar_bh =
-        is_satarith_scalar && (args.size == 0b00 || args.size == 0b01);
+    // B/H/S sizes are JIT-lowered here.  D bails to the interpreter (no
+    // direct SSE primitive for 64-bit saturating add/sub).  B/H route through
+    // the one-instruction saturating SSE ops; S uses the 32-bit recipe ported
+    // single-lane from the vector SQADD/UQADD/SQSUB/UQSUB lowerings.
+    const bool is_satarith_scalar_bhs =
+        is_satarith_scalar &&
+        (args.size == 0b00 || args.size == 0b01 || args.size == 0b10);
     // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
-        !is_satarith_scalar_bh) {
+        !is_satarith_scalar_bhs) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13238,19 +13239,18 @@ class LiteTranslator {
       return;
     }
     // endregion
-    // region digitalis: SQADD / UQADD / SQSUB / UQSUB scalar (B/H sizes only).
+    // region digitalis: SQADD / UQADD / SQSUB / UQSUB scalar (B/H/S sizes).
     //
     // ARM ARM C7.2.282 / .284 / .317 / .319: the scalar single-lane forms
     // saturate at width 8/16/32/64 selected by args.size.  Here we cover
-    // B (size=00) and H (size=01); S and D bail to the interpreter for
-    // future cycles (S needs the 32-bit sign-bit-XOR-blend recipe from
-    // the vector lowering at lite_translator.h:4820+; D needs a 64-bit
-    // analogue with no direct SSE primitive).
+    // B (size=00), H (size=01), and S (size=10); D (size=11) bails to the
+    // interpreter (no direct SSE primitive for 64-bit saturating add/sub).
     //
     // Recipe per (op, size):
-    //   * Pxor + Pinsrb/Pinsrw load Vn / Vm with lane 0 = source byte/
-    //     halfword and lanes 1.. = 0.
-    //   * Apply the matching one-instruction saturating SSE op:
+    //   B/H — Pxor + Pinsrb/Pinsrw load Vn / Vm with lane 0 = source byte/
+    //         halfword and lanes 1.. = 0, then apply the matching
+    //         one-instruction saturating SSE op:
+    //
     //       SQADD B  → PADDSB     (SSE2)
     //       SQADD H  → PADDSW     (SSE2)
     //       UQADD B  → PADDUSB    (SSE2)
@@ -13259,13 +13259,32 @@ class LiteTranslator {
     //       SQSUB H  → PSUBSW     (SSE2)
     //       UQSUB B  → PSUBUSB    (SSE2)
     //       UQSUB H  → PSUBUSW    (SSE2)
-    //   * Saturating-arith on (0,0) yields 0, so lanes 1.. stay 0.
-    //   * Full-width Movdqu writes Vd with Vd[127:bits_local] = 0.
     //
-    // Host features: SSE4.1 only required for the B path (Pinsrb is SSE4.1).
-    // H path is baseline SSE2.
-    if (is_satarith_scalar_bh) {
+    //         Saturating-arith on (0,0) yields 0, so lanes 1.. stay 0.
+    //
+    //   S — Movd loads Vn.s[0] / Vm.s[0] with dwords 1..3 zero-extended,
+    //       then runs the 32-bit signed/unsigned saturating recipe used by
+    //       the vector lowerings at lite_translator.h:4820-4845 (SQADD via
+    //       wrap-add + sign-bit XOR-blend), :4868-4879 (UQADD via PMAXUD +
+    //       PCMPEQD + POR), :4896-4918 (SQSUB via wrap-sub + sign-bit
+    //       XOR-blend), and :4940-4947 (UQSUB via PMINUD + PCMPEQD + PAND).
+    //       Lanes 1..3 are 0 throughout: 0±0=0 (no overflow), the recipes'
+    //       sign/cmp/and steps all produce 0 for zero inputs, so the
+    //       result has dwords 1..3 = 0 automatically.  A full-width Movdqu
+    //       then writes Vd with Vd[127:bits_local] = 0.
+    //
+    // Host features:
+    //   * B form: SSE4.1 (Pinsrb).
+    //   * H form: SSE2 baseline.
+    //   * S signed (SQADD/SQSUB): SSE2 baseline (Movd / Paddd / Psubd /
+    //     Pxor / Pand / Pcmpeqd / Psrad / Psrld).
+    //   * S unsigned (UQADD/UQSUB): SSE4.1 (Pmaxud / Pminud).
+    if (is_satarith_scalar_bhs) {
       if (args.size == 0b00 && !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      if (args.size == 0b10 && (is_uqadd_scalar || is_uqsub_scalar) &&
+          !host_platform::kHasSSE4_1) {
         success_ = false; return;
       }
       int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
@@ -13276,22 +13295,111 @@ class LiteTranslator {
       if (xn == no_simd_register || xm == no_simd_register) {
         success_ = false; return;
       }
-      as_.Pxor(xn, xn);
-      as_.Pxor(xm, xm);
       if (args.size == 0b00) {
+        as_.Pxor(xn, xn);
+        as_.Pxor(xm, xm);
         as_.Pinsrb(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
         as_.Pinsrb(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
         if (is_sqadd_scalar)      as_.Paddsb(xn, xm);
         else if (is_uqadd_scalar) as_.Paddusb(xn, xm);
         else if (is_sqsub_scalar) as_.Psubsb(xn, xm);
         else                      as_.Psubusb(xn, xm);
-      } else {  // args.size == 0b01
+      } else if (args.size == 0b01) {
+        as_.Pxor(xn, xn);
+        as_.Pxor(xm, xm);
         as_.Pinsrw(xn, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
         as_.Pinsrw(xm, {.base = Assembler::rbp, .disp = vm_off}, int8_t{0});
         if (is_sqadd_scalar)      as_.Paddsw(xn, xm);
         else if (is_uqadd_scalar) as_.Paddusw(xn, xm);
         else if (is_sqsub_scalar) as_.Psubsw(xn, xm);
         else                      as_.Psubusw(xn, xm);
+      } else {  // args.size == 0b10 (S form)
+        // Movd loads Vn.s[0] / Vm.s[0] into dword 0 and zero-extends dwords
+        // 1..3 — this is the equivalent of the Pxor + Pinsr scrub used for
+        // B/H, but it's a single instruction.
+        as_.Movd(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movd(xm, {.base = Assembler::rbp, .disp = vm_off});
+        if (is_sqadd_scalar) {
+          // 32-bit signed SQADD: wrap-add + sign-bit-XOR-blend.
+          // sat = (a < 0) ? INT_MIN : INT_MAX = (a >> 31 signed) ^ 0x7FFFFFFF.
+          // ovf = ~(a^b) & (a^sum) has MSB set iff signed overflow.
+          // result = sum ^ ((sat ^ sum) & ovf_mask).
+          SimdRegister t_sum = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_sum == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_sum, xn);
+          as_.Paddd(t_sum, xm);                        // t_sum = a + b (mod 2^32).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                         // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_sum);                      // t_sat = a ^ sum.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1 (reuse: b done).
+          as_.Pxor(t_ovf, xm);                         // t_ovf = ~(a ^ b).
+          as_.Pand(t_ovf, t_sat);                      // t_ovf = ~(a^b)&(a^sum).
+          as_.Psrad(t_ovf, int8_t{31});                // t_ovf = overflow mask.
+          as_.Psrad(xn, int8_t{31});                   // xn = -1 if a<0, 0 else.
+          as_.Psrld(xm, int8_t{1});                    // xm = 0x7FFFFFFF.
+          as_.Pxor(xn, xm);                            // xn = sat.
+          as_.Pxor(xn, t_sum);                         // xn = sat ^ sum.
+          as_.Pand(xn, t_ovf);                         // xn = (sat^sum)&ovf.
+          as_.Pxor(xn, t_sum);                         // xn = sum ^ above.
+        } else if (is_uqadd_scalar) {
+          // 32-bit unsigned UQADD: wrap-add + PMAXUD overflow detect.
+          // Overflow iff sum < a (unsigned) ↔ max(a,sum) != sum.
+          SimdRegister t_save_a = AllocTempSimdReg();
+          SimdRegister t_ones = AllocTempSimdReg();
+          if (t_save_a == no_simd_register || t_ones == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_save_a, xn);                    // preserve a.
+          as_.Paddd(xn, xm);                           // xn = sum.
+          as_.Pmaxud(t_save_a, xn);                    // t_save_a = max(a,sum).
+          as_.Pcmpeqd(t_save_a, xn);                   // -1 where no overflow.
+          as_.Pcmpeqd(t_ones, t_ones);                 // t_ones = -1.
+          as_.Pxor(t_save_a, t_ones);                  // invert: -1 where overflow.
+          as_.Por(xn, t_save_a);                       // saturate to UINT32_MAX.
+        } else if (is_sqsub_scalar) {
+          // 32-bit signed SQSUB: wrap-sub + sign-bit XOR-blend.
+          // ovf = (a^b) & (a^diff) has MSB set iff signed overflow.
+          SimdRegister t_diff = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_diff == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_diff, xn);
+          as_.Psubd(t_diff, xm);                       // t_diff = a - b (mod 2^32).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                         // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_diff);                     // t_sat = a ^ diff.
+          as_.Pand(t_ovf, t_sat);                      // t_ovf = (a^b)&(a^diff).
+          as_.Psrad(t_ovf, int8_t{31});                // overflow mask.
+          as_.Psrad(xn, int8_t{31});                   // xn = -1 if a<0, 0 else.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1.
+          as_.Psrld(xm, int8_t{1});                    // xm = 0x7FFFFFFF.
+          as_.Pxor(xn, xm);                            // xn = sat.
+          as_.Pxor(xn, t_diff);                        // xn = sat ^ diff.
+          as_.Pand(xn, t_ovf);                         // xn = (sat^diff)&ovf.
+          as_.Pxor(xn, t_diff);                        // xn = diff ^ above.
+        } else {
+          // 32-bit unsigned UQSUB: result = (a >= b) ? a - b : 0.
+          // Mask: PMINUD(a, b) == b iff a >= b.
+          SimdRegister t_mask = AllocTempSimdReg();
+          if (t_mask == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_mask, xn);
+          as_.Pminud(t_mask, xm);                      // t_mask = min(a,b).
+          as_.Pcmpeqd(t_mask, xm);                     // -1 where a >= b.
+          as_.Psubd(xn, xm);                           // xn = a - b (wrap).
+          as_.Pand(xn, t_mask);                        // zero underflow lanes.
+        }
       }
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
       return;
