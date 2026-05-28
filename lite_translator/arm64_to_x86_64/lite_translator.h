@@ -12942,10 +12942,21 @@ class LiteTranslator {
     // + PSHUFD 0xF5 (no PSRAQ in baseline SSE) for signed; PCMPGTQ on
     // sign-flipped operands (SSE4.2) for unsigned.
     const bool is_satarith_scalar_bhsd = is_satarith_scalar;
+    // SSHL / USHL scalar (size=11 D form only — the encoding allocates other
+    // sizes to the vector form, and the decoder above rejects them).  Vd[63:0]
+    // = a shifted by the signed int8 in Vm[7:0]; Vd[127:64] = 0.  Implemented
+    // in GPR scalar with branches because (a) PSRAQ is AVX-512F-VL only and
+    // (b) the shift amount is runtime-variable, so a branched SHL/SHR/SAR
+    // path is simpler than a clamped SSE-shift emulation.
+    const bool is_sshl_scalar_d =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSshl);
+    const bool is_ushl_scalar_d =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUshl);
+    const bool is_shl_scalar_d = is_sshl_scalar_d || is_ushl_scalar_d;
     // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
-        !is_satarith_scalar_bhsd) {
+        !is_satarith_scalar_bhsd && !is_shl_scalar_d) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13525,6 +13536,88 @@ class LiteTranslator {
         }
       }
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      return;
+    }
+    // endregion
+    // region digitalis: SSHL / USHL scalar D form (non-saturating variable
+    // shift).  The shift amount comes from Vm[7:0] sign-extended to int64:
+    //   * shift >= 64        → result = 0  (SSHL and USHL).
+    //   * 0 <= shift < 64    → result = a << shift  (left, same for both).
+    //   * -63 <= shift < 0   → SSHL: a >>s |shift|.  USHL: a >>u |shift|.
+    //   * shift <= -64       → SSHL: sign(a) broadcast (a >>s 63).
+    //                          USHL: 0.
+    // Implemented in GPR scalar with branches: Movq Vn[63:0] → a; sign-extend
+    // Vm[7:0] → shift; test sign + clamped magnitude branches.  RCX is saved
+    // to the stack across the shift-by-cl operations per the existing
+    // DataProc2Src kLslv/kLsrv/kAsrv pattern.
+    if (is_shl_scalar_d) {
+      if (args.size != 0b11) { success_ = false; return; }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      Register a = AllocTempReg();
+      Register sh = AllocTempReg();
+      if (a == Assembler::no_register || sh == Assembler::no_register) {
+        success_ = false; return;
+      }
+      // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+      as_.Subq(Assembler::rsp, 8);
+      as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+      // Load a from Vn[63:0]; sign-extend Vm[7:0] into sh (int64).
+      as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_off});
+
+      Assembler::Label* L_neg = as_.MakeLabel();
+      Assembler::Label* L_zero = as_.MakeLabel();
+      Assembler::Label* L_done = as_.MakeLabel();
+
+      as_.Testq(sh, sh);
+      as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+      // Positive shift in [0, 127]: shift >= 64 → 0; else SHL a, sh.
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+      as_.Movq(Assembler::rcx, sh);
+      as_.ShlqByCl(a);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_neg);
+      // Negative path: sh becomes |shift| in [1, 128] after Negq.  Source was
+      // sign-extension of int8 (range [-128, -1]) so the negation cannot
+      // overflow.
+      as_.Negq(sh);
+      as_.Cmpq(sh, int32_t{64});
+      if (is_sshl_scalar_d) {
+        Assembler::Label* L_arith_max = as_.MakeLabel();
+        as_.Jcc(Assembler::Condition::kGreaterEqual, *L_arith_max);
+        // 0 < |sh| < 64: a = (int64_t)a >> |sh|.
+        as_.Movq(Assembler::rcx, sh);
+        as_.SarqByCl(a);
+        as_.Jmp(*L_done);
+        as_.Bind(L_arith_max);
+        // |sh| >= 64: a = (int64_t)a >> 63 (sign-broadcast across all bits).
+        as_.Sarq(a, int8_t{63});
+        as_.Jmp(*L_done);
+      } else {
+        // USHL negative: |sh| >= 64 → 0; else SHR a, |sh|.
+        as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+        as_.Movq(Assembler::rcx, sh);
+        as_.ShrqByCl(a);
+        as_.Jmp(*L_done);
+      }
+
+      as_.Bind(L_zero);
+      as_.Xorq(a, a);
+
+      as_.Bind(L_done);
+
+      // Restore rcx.
+      as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+      as_.Addq(Assembler::rsp, 8);
+
+      // Store result to Vd[63:0] and zero Vd[127:64].
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
     // endregion
