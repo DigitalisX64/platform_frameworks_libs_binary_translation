@@ -12935,17 +12935,17 @@ class LiteTranslator {
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqsubScalar);
     const bool is_satarith_scalar =
         is_sqadd_scalar || is_uqadd_scalar || is_sqsub_scalar || is_uqsub_scalar;
-    // B/H/S sizes are JIT-lowered here.  D bails to the interpreter (no
-    // direct SSE primitive for 64-bit saturating add/sub).  B/H route through
-    // the one-instruction saturating SSE ops; S uses the 32-bit recipe ported
-    // single-lane from the vector SQADD/UQADD/SQSUB/UQSUB lowerings.
-    const bool is_satarith_scalar_bhs =
-        is_satarith_scalar &&
-        (args.size == 0b00 || args.size == 0b01 || args.size == 0b10);
+    // All four sizes are JIT-lowered.  B/H use the one-instruction saturating
+    // SSE ops (PADDSB/PADDUSB/PSUBSB/PSUBUSB).  S uses the 32-bit recipe ported
+    // single-lane from the vector SQADD/UQADD/SQSUB/UQSUB lowerings.  D uses a
+    // 64-bit recipe: PADDQ/PSUBQ wrap-arith + sign-bit extraction via PSRAD 31
+    // + PSHUFD 0xF5 (no PSRAQ in baseline SSE) for signed; PCMPGTQ on
+    // sign-flipped operands (SSE4.2) for unsigned.
+    const bool is_satarith_scalar_bhsd = is_satarith_scalar;
     // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
-        !is_satarith_scalar_bhs) {
+        !is_satarith_scalar_bhsd) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13279,12 +13279,16 @@ class LiteTranslator {
     //   * S signed (SQADD/SQSUB): SSE2 baseline (Movd / Paddd / Psubd /
     //     Pxor / Pand / Pcmpeqd / Psrad / Psrld).
     //   * S unsigned (UQADD/UQSUB): SSE4.1 (Pmaxud / Pminud).
-    if (is_satarith_scalar_bhs) {
+    if (is_satarith_scalar_bhsd) {
       if (args.size == 0b00 && !host_platform::kHasSSE4_1) {
         success_ = false; return;
       }
       if (args.size == 0b10 && (is_uqadd_scalar || is_uqsub_scalar) &&
           !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      if (args.size == 0b11 && (is_uqadd_scalar || is_uqsub_scalar) &&
+          !host_platform::kHasSSE4_2) {
         success_ = false; return;
       }
       int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
@@ -13313,7 +13317,7 @@ class LiteTranslator {
         else if (is_uqadd_scalar) as_.Paddusw(xn, xm);
         else if (is_sqsub_scalar) as_.Psubsw(xn, xm);
         else                      as_.Psubusw(xn, xm);
-      } else {  // args.size == 0b10 (S form)
+      } else if (args.size == 0b10) {  // S form (32-bit scalar)
         // Movd loads Vn.s[0] / Vm.s[0] into dword 0 and zero-extends dwords
         // 1..3 — this is the equivalent of the Pxor + Pinsr scrub used for
         // B/H, but it's a single instruction.
@@ -13399,6 +13403,125 @@ class LiteTranslator {
           as_.Pcmpeqd(t_mask, xm);                     // -1 where a >= b.
           as_.Psubd(xn, xm);                           // xn = a - b (wrap).
           as_.Pand(xn, t_mask);                        // zero underflow lanes.
+        }
+      } else {  // args.size == 0b11 (D form, 64-bit scalar)
+        // Movq loads Vn[63:0]/Vm[63:0] into qword 0 and zero-extends qword 1.
+        // All 64-bit recipes preserve qword 1 = 0 throughout (every operation
+        // between two zero qwords is zero), so a full-width Movdqu store at
+        // the end zeroes Vd[127:64] naturally.
+        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+        if (is_sqadd_scalar) {
+          // 64-bit signed SQADD: wrap-add + sign-bit XOR-blend.
+          // ovf = ~(a^b) & (a^sum) has MSB (bit 63) set iff signed overflow.
+          // sat = (a < 0) ? INT64_MIN : INT64_MAX = sign_bcast(a) ^ INT64_MAX.
+          // Broadcast bit 63 across the qword via PSRAD 31 + PSHUFD 0xF5
+          // (PSRAQ is AVX-512F-VL only; this two-instruction sequence is
+          // the SSE2-baseline equivalent — PSRAD 31 sign-extends each dword,
+          // then PSHUFD 0xF5 fans dword 1's sign across qword 0 and dword
+          // 3's sign across qword 1).
+          SimdRegister t_sum = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_sum == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_sum, xn);
+          as_.Paddq(t_sum, xm);                        // t_sum = a + b (mod 2^64).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                         // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_sum);                      // t_sat = a ^ sum.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1 (reuse: b done).
+          as_.Pxor(t_ovf, xm);                         // t_ovf = ~(a ^ b).
+          as_.Pand(t_ovf, t_sat);                      // t_ovf = ~(a^b)&(a^sum).
+          as_.Psrad(t_ovf, int8_t{31});                // sign-extend each dword.
+          as_.Pshufd(t_ovf, t_ovf, static_cast<int8_t>(0xF5));
+                                                       // overflow mask broadcast
+                                                       // (qword-wide).
+          as_.Psrad(xn, int8_t{31});                   // sign-extend each dword.
+          as_.Pshufd(xn, xn, static_cast<int8_t>(0xF5));
+                                                       // xn qword = -1 if a<0,
+                                                       // 0 else.
+          as_.Psrlq(xm, int8_t{1});                    // xm = 0x7FFFFFFFFFFFFFFF.
+          as_.Pxor(xn, xm);                            // xn = sat.
+          as_.Pxor(xn, t_sum);                         // xn = sat ^ sum.
+          as_.Pand(xn, t_ovf);                         // xn = (sat^sum)&ovf.
+          as_.Pxor(xn, t_sum);                         // xn = sum ^ above.
+        } else if (is_uqadd_scalar) {
+          // 64-bit unsigned UQADD: wrap-add + PCMPGTQ overflow detect.
+          // Overflow iff sum < a (unsigned) ↔ a > sum (unsigned).
+          // Sign-flip both operands; signed PCMPGTQ on flipped pair implements
+          // unsigned > comparison.  PMAXUQ is AVX-512F-VL only; PCMPGTQ is
+          // SSE4.2 baseline (and gated above).
+          SimdRegister t_save_a = AllocTempSimdReg();
+          if (t_save_a == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_save_a, xn);                    // preserve a.
+          as_.Paddq(xn, xm);                           // xn = sum.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1 (reuse).
+          as_.Psllq(xm, int8_t{63});                   // xm = 0x80...0 sign mask.
+          as_.Pxor(t_save_a, xm);                      // t_save_a = a ^ sign.
+          as_.Pxor(xm, xn);                            // xm = sum ^ sign
+                                                       // (sign mask consumed).
+          as_.Pcmpgtq(t_save_a, xm);                   // -1 where a > sum unsigned
+                                                       // (== overflow).
+          as_.Por(xn, t_save_a);                       // saturate to UINT64_MAX.
+        } else if (is_sqsub_scalar) {
+          // 64-bit signed SQSUB: wrap-sub + sign-bit XOR-blend.
+          // ovf = (a^b) & (a^diff) has bit 63 set iff signed overflow.
+          SimdRegister t_diff = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (t_diff == no_simd_register || t_ovf == no_simd_register ||
+              t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_diff, xn);
+          as_.Psubq(t_diff, xm);                       // t_diff = a - b (mod 2^64).
+          as_.Movdqa(t_ovf, xn);
+          as_.Pxor(t_ovf, xm);                         // t_ovf = a ^ b.
+          as_.Movdqa(t_sat, xn);
+          as_.Pxor(t_sat, t_diff);                     // t_sat = a ^ diff.
+          as_.Pand(t_ovf, t_sat);                      // t_ovf = (a^b)&(a^diff).
+          as_.Psrad(t_ovf, int8_t{31});
+          as_.Pshufd(t_ovf, t_ovf, static_cast<int8_t>(0xF5));
+                                                       // overflow mask broadcast.
+          as_.Psrad(xn, int8_t{31});
+          as_.Pshufd(xn, xn, static_cast<int8_t>(0xF5));
+                                                       // xn = -1 if a<0, 0 else.
+          as_.Pcmpeqd(xm, xm);                         // xm = -1.
+          as_.Psrlq(xm, int8_t{1});                    // xm = 0x7FFFFFFFFFFFFFFF.
+          as_.Pxor(xn, xm);                            // xn = sat.
+          as_.Pxor(xn, t_diff);                        // xn = sat ^ diff.
+          as_.Pand(xn, t_ovf);                         // xn = (sat^diff)&ovf.
+          as_.Pxor(xn, t_diff);                        // xn = diff ^ above.
+        } else {
+          // 64-bit unsigned UQSUB: result = (a >= b) ? a - b : 0.
+          // PMINUQ is AVX-512F-VL only.  Use sign-flip + PCMPGTQ to compare
+          // unsigned 64-bit values.
+          SimdRegister t_diff = AllocTempSimdReg();
+          SimdRegister t_mask = AllocTempSimdReg();
+          if (t_diff == no_simd_register || t_mask == no_simd_register) {
+            success_ = false; return;
+          }
+          as_.Movdqa(t_diff, xn);
+          as_.Psubq(t_diff, xm);                       // t_diff = a - b (mod 2^64).
+          as_.Pcmpeqd(t_mask, t_mask);                 // t_mask = -1.
+          as_.Psllq(t_mask, int8_t{63});               // t_mask = 0x80...0 sign mask.
+          as_.Pxor(xn, t_mask);                        // xn = a ^ sign.
+          as_.Pxor(t_mask, xm);                        // t_mask = b ^ sign
+                                                       // (sign mask consumed).
+          as_.Pcmpgtq(t_mask, xn);                     // -1 where (b^sign) >
+                                                       // (a^sign) signed = b > a
+                                                       // unsigned (underflow).
+          as_.Pcmpeqd(xn, xn);                         // xn = -1 (reuse).
+          as_.Pxor(t_mask, xn);                        // t_mask = -1 where a >= b
+                                                       // (no underflow).
+          as_.Pand(t_diff, t_mask);                    // zero underflow lane.
+          as_.Movdqa(xn, t_diff);                      // xn = result.
         }
       }
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
