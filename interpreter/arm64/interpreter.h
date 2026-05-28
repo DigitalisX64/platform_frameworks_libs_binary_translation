@@ -6145,6 +6145,48 @@ class Interpreter {
         return;
       }
       // endregion
+      // region digitalis: SQRDMLAH / SQRDMLSH scalar (H/S only, Armv8.1-RDM).
+      //   Vd[0:bits_local] = sat_signed(
+      //       Vd[0:bits_local]
+      //       ± sat_signed((2 * sext(Vn) * sext(Vm) + round) >> bits_local))
+      //   where round = 1 << (bits_local - 1); bits_local = 16 (size=01, H)
+      //   or 32 (size=10, S).  SQRDMLAH adds, SQRDMLSH subtracts.  Both
+      //   stages saturate to the signed narrow range, then the result is
+      //   zero-extended into Vd (the top of the 128-bit vector register).
+      //   Sibling of the vector form kSqrdmlahVec / kSqrdmlshVec.
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlahScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 2 or 4
+        const uint8_t bits_local = esize * 8;           // 16 or 32
+        const int shift_to_64 = 64 - bits_local;
+        const int64_t sa =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rn])
+                                 << shift_to_64) >> shift_to_64;
+        const int64_t sb =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rm])
+                                 << shift_to_64) >> shift_to_64;
+        const int64_t sd =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rd])
+                                 << shift_to_64) >> shift_to_64;
+        const __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+        const __int128 product =
+            (static_cast<__int128>(2) * sa * sb) + round;
+        int64_t addend = static_cast<int64_t>(product >> bits_local);
+        const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+        const int64_t smin = -(int64_t{1} << (bits_local - 1));
+        if (addend > smax) addend = smax;
+        else if (addend < smin) addend = smin;
+        const bool is_sub =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar);
+        int64_t res = is_sub ? sd - addend : sd + addend;
+        if (res > smax) res = smax;
+        else if (res < smin) res = smin;
+        const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+        state_->cpu.v[args.rd] =
+            static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+        return;
+      }
+      // endregion
       default:
         break;
     }
@@ -8083,6 +8125,54 @@ class Interpreter {
     CHECK(!exception_raised_);
 
     using Op = typename Decoder::AdvSimdScalarXIdxOpcode;
+
+    // region digitalis: SQRDMLAH / SQRDMLSH scalar by-element (Armv8.1-RDM).
+    //   Vd = sat_signed(
+    //       Vd ± sat_signed((2 * sext(Vn) * sext(Vm[index]) + round) >>
+    //                       bits_local))
+    //   bits_local = 16 (size=01, H) or 32 (size=10, S).  Reads exactly one
+    //   esize-wide lane from Vn and the indexed lane of Vm; saturates to
+    //   the signed narrow range at both stages; zero-extends the result
+    //   into the 128-bit Vd.
+    if (args.opcode == Op::kSqrdmlahScalarIdx ||
+        args.opcode == Op::kSqrdmlshScalarIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      const uint8_t esize_rdm = uint8_t{1} << args.size;  // 2 or 4
+      const uint8_t bits_local = esize_rdm * 8;           // 16 or 32
+      const int shift_to_64 = 64 - bits_local;
+      __uint128_t src_n_rdm = state_->cpu.v[args.rn];
+      __uint128_t src_m_rdm = state_->cpu.v[args.rm];
+      __uint128_t src_d_rdm = state_->cpu.v[args.rd];
+      uint64_t n_u = 0, m_u = 0, d_u = 0;
+      memcpy(&n_u, reinterpret_cast<const uint8_t*>(&src_n_rdm), esize_rdm);
+      memcpy(&m_u,
+             reinterpret_cast<const uint8_t*>(&src_m_rdm) + args.index * esize_rdm,
+             esize_rdm);
+      memcpy(&d_u, reinterpret_cast<const uint8_t*>(&src_d_rdm), esize_rdm);
+      const int64_t sa = static_cast<int64_t>(n_u << shift_to_64) >> shift_to_64;
+      const int64_t sb = static_cast<int64_t>(m_u << shift_to_64) >> shift_to_64;
+      const int64_t sd = static_cast<int64_t>(d_u << shift_to_64) >> shift_to_64;
+      const __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+      const __int128 product = (static_cast<__int128>(2) * sa * sb) + round;
+      int64_t addend = static_cast<int64_t>(product >> bits_local);
+      const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+      const int64_t smin = -(int64_t{1} << (bits_local - 1));
+      if (addend > smax) addend = smax;
+      else if (addend < smin) addend = smin;
+      const bool is_sub = (args.opcode == Op::kSqrdmlshScalarIdx);
+      int64_t res = is_sub ? sd - addend : sd + addend;
+      if (res > smax) res = smax;
+      else if (res < smin) res = smin;
+      const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+      state_->cpu.v[args.rd] =
+          static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+      return;
+    }
+    // endregion
+
     if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       Undefined();
       return;
