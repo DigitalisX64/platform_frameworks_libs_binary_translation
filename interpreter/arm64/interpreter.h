@@ -4589,6 +4589,59 @@ class Interpreter {
         break;
       }
       // endregion
+      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
+      // Decoder restricts size to {01, 10}.  Stage 1 reuses the SQRDMULH
+      // recipe per lane (doubled product + rounding constant, shifted by
+      // bits_local, saturated to the signed narrow range).  Stage 2
+      // signed-saturating-adds (SQRDMLAH) or subtracts (SQRDMLSH) the addend
+      // into the lane's existing Vd value.  Same math as the by-element form
+      // in InsnConsumer::AdvSimdVecXIndexedElement at the kSqrdmlahIdx /
+      // kSqrdmlshIdx arm; only the Vm source changes from a broadcasted
+      // lane to per-lane Vm[i].
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlahVec:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec: {
+        uint8_t bits_local = esize * 8;
+        int64_t smax = (1LL << (bits_local - 1)) - 1;
+        int64_t smin = -(1LL << (bits_local - 1));
+        __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+        bool is_sub = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec);
+        uint8_t shift = (8 - esize) * 8;
+
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t a_u = 0, b_u = 0;
+          memcpy(&a_u,
+                 reinterpret_cast<const uint8_t*>(&src_n) + i * esize,
+                 esize);
+          memcpy(&b_u,
+                 reinterpret_cast<const uint8_t*>(&src_m) + i * esize,
+                 esize);
+          int64_t a = static_cast<int64_t>(a_u << shift) >> shift;
+          int64_t b = static_cast<int64_t>(b_u << shift) >> shift;
+
+          // Stage 1: SQRDMULH(a, b).  2*a*b fits int64_t for esize<=4.
+          __int128 product = (static_cast<__int128>(2) * a * b) + round;
+          int64_t addend = static_cast<int64_t>(product >> bits_local);
+          if (addend > smax) addend = smax;
+          if (addend < smin) addend = smin;
+
+          // Stage 2: signed-saturating add/sub into Vd[i].
+          uint64_t acc_u = 0;
+          memcpy(&acc_u,
+                 reinterpret_cast<const uint8_t*>(&dst) + i * esize,
+                 esize);
+          int64_t acc = static_cast<int64_t>(acc_u << shift) >> shift;
+          int64_t out = is_sub ? acc - addend : acc + addend;
+          if (out > smax) out = smax;
+          if (out < smin) out = smin;
+          uint64_t out_u = static_cast<uint64_t>(out);
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &out_u, esize);
+        }
+        if (!args.q) {
+          memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+        }
+        break;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
         // MLA: Vd[i] = Vd[i] + Vn[i] * Vm[i]
         uint64_t emask = ElementMask(esize);
@@ -6084,6 +6137,48 @@ class Interpreter {
         int64_t res = static_cast<int64_t>(product >> bits_local);
         const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
         const int64_t smin = -(int64_t{1} << (bits_local - 1));
+        if (res > smax) res = smax;
+        else if (res < smin) res = smin;
+        const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+        state_->cpu.v[args.rd] =
+            static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+        return;
+      }
+      // endregion
+      // region digitalis: SQRDMLAH / SQRDMLSH scalar (H/S only, Armv8.1-RDM).
+      //   Vd[0:bits_local] = sat_signed(
+      //       Vd[0:bits_local]
+      //       ± sat_signed((2 * sext(Vn) * sext(Vm) + round) >> bits_local))
+      //   where round = 1 << (bits_local - 1); bits_local = 16 (size=01, H)
+      //   or 32 (size=10, S).  SQRDMLAH adds, SQRDMLSH subtracts.  Both
+      //   stages saturate to the signed narrow range, then the result is
+      //   zero-extended into Vd (the top of the 128-bit vector register).
+      //   Sibling of the vector form kSqrdmlahVec / kSqrdmlshVec.
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlahScalar:
+      case Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar: {
+        const uint8_t esize = uint8_t{1} << args.size;  // 2 or 4
+        const uint8_t bits_local = esize * 8;           // 16 or 32
+        const int shift_to_64 = 64 - bits_local;
+        const int64_t sa =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rn])
+                                 << shift_to_64) >> shift_to_64;
+        const int64_t sb =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rm])
+                                 << shift_to_64) >> shift_to_64;
+        const int64_t sd =
+            static_cast<int64_t>(static_cast<uint64_t>(state_->cpu.v[args.rd])
+                                 << shift_to_64) >> shift_to_64;
+        const __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+        const __int128 product =
+            (static_cast<__int128>(2) * sa * sb) + round;
+        int64_t addend = static_cast<int64_t>(product >> bits_local);
+        const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+        const int64_t smin = -(int64_t{1} << (bits_local - 1));
+        if (addend > smax) addend = smax;
+        else if (addend < smin) addend = smin;
+        const bool is_sub =
+            (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar);
+        int64_t res = is_sub ? sd - addend : sd + addend;
         if (res > smax) res = smax;
         else if (res < smin) res = smin;
         const uint64_t mask = (uint64_t{1} << bits_local) - 1;
@@ -8030,6 +8125,54 @@ class Interpreter {
     CHECK(!exception_raised_);
 
     using Op = typename Decoder::AdvSimdScalarXIdxOpcode;
+
+    // region digitalis: SQRDMLAH / SQRDMLSH scalar by-element (Armv8.1-RDM).
+    //   Vd = sat_signed(
+    //       Vd ± sat_signed((2 * sext(Vn) * sext(Vm[index]) + round) >>
+    //                       bits_local))
+    //   bits_local = 16 (size=01, H) or 32 (size=10, S).  Reads exactly one
+    //   esize-wide lane from Vn and the indexed lane of Vm; saturates to
+    //   the signed narrow range at both stages; zero-extends the result
+    //   into the 128-bit Vd.
+    if (args.opcode == Op::kSqrdmlahScalarIdx ||
+        args.opcode == Op::kSqrdmlshScalarIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      const uint8_t esize_rdm = uint8_t{1} << args.size;  // 2 or 4
+      const uint8_t bits_local = esize_rdm * 8;           // 16 or 32
+      const int shift_to_64 = 64 - bits_local;
+      __uint128_t src_n_rdm = state_->cpu.v[args.rn];
+      __uint128_t src_m_rdm = state_->cpu.v[args.rm];
+      __uint128_t src_d_rdm = state_->cpu.v[args.rd];
+      uint64_t n_u = 0, m_u = 0, d_u = 0;
+      memcpy(&n_u, reinterpret_cast<const uint8_t*>(&src_n_rdm), esize_rdm);
+      memcpy(&m_u,
+             reinterpret_cast<const uint8_t*>(&src_m_rdm) + args.index * esize_rdm,
+             esize_rdm);
+      memcpy(&d_u, reinterpret_cast<const uint8_t*>(&src_d_rdm), esize_rdm);
+      const int64_t sa = static_cast<int64_t>(n_u << shift_to_64) >> shift_to_64;
+      const int64_t sb = static_cast<int64_t>(m_u << shift_to_64) >> shift_to_64;
+      const int64_t sd = static_cast<int64_t>(d_u << shift_to_64) >> shift_to_64;
+      const __int128 round = static_cast<__int128>(1) << (bits_local - 1);
+      const __int128 product = (static_cast<__int128>(2) * sa * sb) + round;
+      int64_t addend = static_cast<int64_t>(product >> bits_local);
+      const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+      const int64_t smin = -(int64_t{1} << (bits_local - 1));
+      if (addend > smax) addend = smax;
+      else if (addend < smin) addend = smin;
+      const bool is_sub = (args.opcode == Op::kSqrdmlshScalarIdx);
+      int64_t res = is_sub ? sd - addend : sd + addend;
+      if (res > smax) res = smax;
+      else if (res < smin) res = smin;
+      const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+      state_->cpu.v[args.rd] =
+          static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+      return;
+    }
+    // endregion
+
     if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       Undefined();
       return;
