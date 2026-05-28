@@ -6782,15 +6782,192 @@ class LiteTranslator {
         return;
       }
       // endregion
-      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector
-      // bail to the interpreter.  The math mirrors the by-element form's
-      // saturating Newton-step recipe (lite_translator.h's AdvSimdVecXIndexed
-      // Element arm at size=01 and size=10) and could be JIT-lowered in a
-      // follow-up; until then route to the interpreter rather than letting
-      // the default arm flag the instruction as Undefined.
+      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
+      //
+      // Decoder restricts size to {01, 10}.  size=01 (.4h/.8h) uses PMULHRSW
+      // (SSSE3) for stage-1 SQRDMULH with corner fixup at (INT16_MIN,
+      // INT16_MIN) lanes, then PADDSW/PSUBSW for stage-2 signed-saturating
+      // accumulate.  size=10 (.2s/.4s) reconstructs 4 signed 32×32 → 64
+      // products via two PMULDQs (SSE4.1), doubles via PSLLQ 1, adds the
+      // rounding constant 2^31 per qword, extracts the upper 32 bits via
+      // PSHUFD 0xDD + PUNPCKLDQ, applies the (INT32_MIN, INT32_MIN) corner
+      // fixup via PCMPEQD + XOR, then signed-saturating accumulates via the
+      // wrap-add + overflow-bit-XOR-blend recipe.
+      //
+      // Same recipe as the by-element form at size=01 and size=10 in
+      // AdvSimdVecXIndexedElement, with two adjustments for three-same:
+      //   * No Vm broadcast: Vm comes from memory as-is.
+      //   * size=10 needs PSRLQ 32 on BOTH xn AND xm for the "high pass"
+      //     (the by-element form's xm has all 4 dwords identical from the
+      //     broadcast, so it can be reused without the extra shift).
       case Decoder::AdvSimdThreeSameOpcode::kSqrdmlahVec:
-      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec: {
+        const bool is_sub =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmlshVec);
+        if (args.size == 0b01) {
+          if (!host_platform::kHasSSSE3) { success_ = false; return; }
+
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xn_corner = AllocTempSimdReg();
+          SimdRegister xm_corner = AllocTempSimdReg();
+          SimdRegister x_min = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xn_corner == no_simd_register || xm_corner == no_simd_register ||
+              x_min == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+
+          // x_min = 0x8000 broadcast across 8 halfwords.
+          as_.Pcmpeqw(x_min, x_min);
+          as_.Psllw(x_min, int8_t{15});
+
+          // Stage 1: SQRDMULH via PMULHRSW + corner fixup.
+          as_.Movdqa(xn_corner, xn);
+          as_.Movdqa(xm_corner, xm);
+          as_.Pmulhrsw(xn, xm);              // SQRDMULH except (INT16_MIN)^2 corner.
+          as_.Pcmpeqw(xn_corner, x_min);     // Vn lanes == 0x8000.
+          as_.Pcmpeqw(xm_corner, x_min);     // Vm lanes == 0x8000.
+          as_.Pand(xn_corner, xm_corner);    // Combined corner mask.
+          as_.Pxor(xn, xn_corner);           // 0x8000 ^ 0xFFFF = 0x7FFF on corner.
+
+          // Stage 2: PADDSW / PSUBSW into Vd (signed-saturating).
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          load_full(xd, vd_off);
+          if (is_sub) {
+            as_.Psubsw(xd, xn);
+          } else {
+            as_.Paddsw(xd, xn);
+          }
+
+          if (!args.q) mask_low64(xd);
+          store_full(vd_off, xd);
+          return;
+        }
+        if (args.size == 0b10) {
+          if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister x_const = AllocTempSimdReg();
+          SimdRegister corner = AllocTempSimdReg();
+          SimdRegister xp_lo = AllocTempSimdReg();
+          SimdRegister xp_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              x_const == no_simd_register || corner == no_simd_register ||
+              xp_lo == no_simd_register || xp_hi == no_simd_register ||
+              xm_hi == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+
+          // x_const = INT32_MIN broadcast across 4 dwords.
+          as_.Pcmpeqd(x_const, x_const);
+          as_.Pslld(x_const, int8_t{31});
+
+          // Corner detection: lanes where Vn.s[i] == INT32_MIN AND
+          // Vm.s[i] == INT32_MIN.  PCMPEQD destroys dst, so preserve xn and
+          // xm in scratch slots first.
+          as_.Movdqa(corner, xn);
+          as_.Pcmpeqd(corner, x_const);
+          as_.Movdqa(xp_lo, xm);
+          as_.Pcmpeqd(xp_lo, x_const);
+          as_.Pand(corner, xp_lo);
+          // xp_lo is dead and about to be repurposed.
+
+          // Stage 1: two PMULDQs reconstruct the 4 signed 32×32 → 64 products.
+          //   xp_lo qword 0 = sext_i64(Vn.s[0]) * sext_i64(Vm.s[0])
+          //   xp_lo qword 1 = sext_i64(Vn.s[2]) * sext_i64(Vm.s[2])
+          //   xp_hi qword 0 = sext_i64(Vn.s[1]) * sext_i64(Vm.s[1])
+          //   xp_hi qword 1 = sext_i64(Vn.s[3]) * sext_i64(Vm.s[3])
+          // Unlike the by-element form (Vm broadcast → all 4 dwords identical),
+          // the three-same Vm has distinct dwords per lane, so the "high pass"
+          // needs PSRLQ 32 on BOTH xn AND xm.
+          as_.Movdqa(xp_lo, xn);
+          as_.Pmuldq(xp_lo, xm);
+          as_.Movdqa(xp_hi, xn);
+          as_.Psrlq(xp_hi, int8_t{32});
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrlq(xm_hi, int8_t{32});
+          as_.Pmuldq(xp_hi, xm_hi);
+          // xn, xm, xm_hi are dead from here; x_const is dead (reused next).
+
+          // Double each 64-bit signed product via PSLLQ 1.
+          as_.Psllq(xp_lo, int8_t{1});
+          as_.Psllq(xp_hi, int8_t{1});
+
+          // Rounding constant 2^31 = 0x80000000 per qword.
+          as_.Pcmpeqd(x_const, x_const);
+          as_.Psllq(x_const, int8_t{63});
+          as_.Psrlq(x_const, int8_t{32});
+          as_.Paddq(xp_lo, x_const);
+          as_.Paddq(xp_hi, x_const);
+
+          // Extract the upper 32 bits of each 64-bit lane.
+          as_.Pshufd(xp_lo, xp_lo, static_cast<int8_t>(0xDD));
+          as_.Pshufd(xp_hi, xp_hi, static_cast<int8_t>(0xDD));
+          as_.Punpckldq(xp_lo, xp_hi);
+
+          // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
+          as_.Pxor(xp_lo, corner);
+
+          SimdRegister xmm_result = xp_lo;
+
+          // Stage 2: 32-bit signed-saturating add/sub of Vd and the stage-1
+          // product, via the wrap-add + overflow-bit-XOR-blend recipe.
+          //   sum  = a ± b              (PADDD/PSUBD wraps mod 2^32)
+          //   ovf  = ~(a^b) & (a^sum)   for ADD
+          //        |  (a^b) & (a^diff)  for SUB
+          //   sat  = (a < 0) ? INT32_MIN : INT32_MAX
+          //   res  = sum ^ ((sum ^ sat) & ovf_mask)
+          SimdRegister xd = AllocTempSimdReg();
+          SimdRegister t_sum = AllocTempSimdReg();
+          SimdRegister t_ovf = AllocTempSimdReg();
+          SimdRegister t_sat = AllocTempSimdReg();
+          if (xd == no_simd_register || t_sum == no_simd_register ||
+              t_ovf == no_simd_register || t_sat == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xd, vd_off);
+          as_.Movdqa(t_sum, xd);
+          if (is_sub) {
+            as_.Psubd(t_sum, xmm_result);
+          } else {
+            as_.Paddd(t_sum, xmm_result);
+          }
+          as_.Movdqa(t_ovf, xd);
+          as_.Pxor(t_ovf, xmm_result);
+          as_.Movdqa(t_sat, xd);
+          as_.Pxor(t_sat, t_sum);
+          if (!is_sub) {
+            as_.Pcmpeqd(xmm_result, xmm_result);
+            as_.Pxor(t_ovf, xmm_result);       // ~(a^b)
+            as_.Pand(t_ovf, t_sat);            // ~(a^b) & (a^sum)
+            as_.Psrld(xmm_result, int8_t{1});  // INT32_MAX broadcast
+          } else {
+            as_.Pand(t_ovf, t_sat);            // (a^b) & (a^diff)
+            as_.Pcmpeqd(xmm_result, xmm_result);
+            as_.Psrld(xmm_result, int8_t{1});  // INT32_MAX broadcast
+          }
+          as_.Psrad(t_ovf, int8_t{31});        // overflow mask (all-1s or 0)
+          as_.Psrad(xd, int8_t{31});           // xd = (a<0) ? -1 : 0
+          as_.Pxor(xd, xmm_result);            // xd = sat = INT_MIN or INT_MAX
+          as_.Pxor(xd, t_sum);                 // xd = sat ^ sum
+          as_.Pand(xd, t_ovf);                 // ... & ovf
+          as_.Pxor(xd, t_sum);                 // = sum ^ ((sum^sat) & ovf)
+
+          if (!args.q) mask_low64(xd);
+          store_full(vd_off, xd);
+          return;
+        }
+        // size=00 / size=11 are reserved by the decoder; bail safely.
         success_ = false; return;
+      }
       // endregion
       default:
         Undefined();
