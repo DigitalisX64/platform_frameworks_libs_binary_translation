@@ -15171,6 +15171,220 @@ class LiteTranslator {
       return;
     }
     // endregion
+
+    // region digitalis: SQDMULH / SQRDMULH by-element (.4h / .8h, size=01).
+    //
+    // Per-lane: Vd[i] = SAT16((2 * Vn[i] * Vm[index]) >> 16), with SQRDMULH
+    // adding a rounding constant 1<<15 to the doubled product before the
+    // shift.
+    //
+    // SQRDMULH .8h: SSSE3 PMULHRSW computes ((a*b)>>14 + 1)>>1 = SQRDMULH,
+    // except for the single corner case (a=0x8000, b=0x8000) where SQRDMULH
+    // saturates to 0x7FFF but PMULHRSW yields 0x8000.  Fixup: build a mask
+    // where both inputs were 0x8000, then XOR the affected lanes
+    // (0x8000 ^ 0xFFFF = 0x7FFF).
+    //
+    // SQDMULH .8h: full 32-bit signed product, arithmetic right-shift by 15,
+    // then signed-saturating pack back to 16-bit lanes (PACKSSDW) handles
+    // the (INT16_MIN)^2 overflow corner.  PMULLW gives the low 16 bits and
+    // PMULHW gives the high 16 bits (signed); interleave via Punpcklwd /
+    // Punpckhwd to reconstruct the 32-bit signed products.
+    //
+    // .2s/.4s (size=10) and the FP16 / FP32 / FP64 size codes fall through
+    // to the existing FP-only guard below.
+    if ((args.opcode == Op::kSqdmulhIdx ||
+         args.opcode == Op::kSqrdmulhIdx) &&
+        args.size == 0b01) {
+      if (!host_platform::kHasSSSE3) { success_ = false; return; }
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Broadcast Vm.h[index] across all 8 halfword lanes (same pattern as
+      // the MUL/MLA/MLS .8h arm above).
+      if (args.index >= 4) {
+        as_.Psrldq(xm, int8_t{8});
+      }
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      }
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kSqrdmulhIdx) {
+        // SQRDMULH .8h via PMULHRSW + (0x8000, 0x8000) corner fixup.
+        SimdRegister xn_save = AllocTempSimdReg();
+        SimdRegister xm_save = AllocTempSimdReg();
+        SimdRegister x_min = AllocTempSimdReg();
+        if (xn_save == no_simd_register || xm_save == no_simd_register ||
+            x_min == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqa(xn_save, xn);
+        as_.Movdqa(xm_save, xm);
+
+        // x_min = 0x8000 broadcast across 8 halfwords (Pcmpeqw self -> all 1s
+        // = 0xFFFF, then Psllw 15 -> 0x8000).
+        as_.Pcmpeqw(x_min, x_min);
+        as_.Psllw(x_min, int8_t{15});
+
+        as_.Pmulhrsw(xn, xm);     // xn = SQRDMULH except (INT16_MIN)^2 corner.
+        as_.Pcmpeqw(xn_save, x_min);   // lanes where Vn was 0x8000 -> 0xFFFF.
+        as_.Pcmpeqw(xm_save, x_min);   // lanes where Vm was 0x8000 -> 0xFFFF.
+        as_.Pand(xn_save, xm_save);    // combined corner mask.
+        as_.Pxor(xn, xn_save);         // 0x8000 ^ 0xFFFF = 0x7FFF on corner.
+        xmm_result = xn;
+      } else {
+        // SQDMULH .8h via 32-bit reconstruction + arithmetic shift + signed
+        // saturating pack.
+        SimdRegister x_low = AllocTempSimdReg();
+        SimdRegister x_high = AllocTempSimdReg();
+        SimdRegister x_lo_lanes = AllocTempSimdReg();
+        if (x_low == no_simd_register || x_high == no_simd_register ||
+            x_lo_lanes == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqa(x_low, xn);
+        as_.Movdqa(x_high, xn);
+        as_.Pmullw(x_low, xm);    // x_low = (a*b) & 0xFFFF per lane.
+        as_.Pmulhw(x_high, xm);   // x_high = (a*b) >> 16, signed, per lane.
+
+        // Interleave (low16, high16) -> 32-bit signed products.
+        // Punpcklwd takes lanes 0-3 of each source.
+        // Punpckhwd takes lanes 4-7 of each source.
+        as_.Movdqa(x_lo_lanes, x_low);
+        as_.Punpcklwd(x_lo_lanes, x_high);  // 4 lanes of full 32-bit products.
+        as_.Punpckhwd(x_low, x_high);       // upper 4 lanes.
+
+        as_.Psrad(x_lo_lanes, int8_t{15});  // (a*b) >> 15 as 32-bit signed.
+        as_.Psrad(x_low, int8_t{15});
+
+        as_.Packssdw(x_lo_lanes, x_low);    // signed-saturating pack to 16-bit.
+        xmm_result = x_lo_lanes;
+      }
+
+      if (!args.q) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
+
+    // region digitalis: widening MUL/MAC by-element (size=01: .4h/.8h -> .4s).
+    //
+    // SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL by element with halfword sources
+    // and word destination — 4 output lanes (.4s).  Q=0 (*MULL/*MLAL/*MLSL)
+    // selects Vn.h[0..3] (low half) as multiplicands; Q=1 (*MULL2/*MLAL2/
+    // *MLSL2) selects Vn.h[4..7] (high half).  Destination is always
+    // 128-bit regardless of Q — widening forms do NOT zero the upper half
+    // (this differs from the same-size MUL/MLA/MLS arm above).
+    //
+    // Strategy: widen each operand's 4 halfword lanes to 32-bit via
+    // PMOVSXWD (signed: SMULL/SMLAL/SMLSL) or PMOVZXWD (unsigned: UMULL/
+    // UMLAL/UMLSL), then PMULLD for the 32-bit product (low 32 of PMULLD's
+    // signed result equals the correct full-width product since both 16x16
+    // signed and 16x16 unsigned products fit in 32 bits).  PMOVSXWD /
+    // PMOVZXWD from memory at vn_off+(q?8:0) picks the correct half
+    // directly.  For Vm we broadcast Vm.h[index] across all 8 halfword
+    // lanes first (shared shim with MUL/MLA/MLS), then widen the low 4
+    // identical lanes.  For SMLAL/UMLAL load Vd and PADDD; for SMLSL/UMLSL
+    // load Vd and PSUBD.  Size=10 (.2s/.4s -> .2d) falls through to the
+    // interpreter — Pmuldq / Pmuludq reconstruction is deferred to a
+    // future cycle.
+    //
+    // Verified encodings (ARM ARM C7.2 / handoff-353):
+    //   smull   v0.4s, v1.4h, v2.h[0] = 0x0F42A020
+    //   smull2  v0.4s, v1.8h, v2.h[7] = 0x4F72A820
+    //   umull   v0.4s, v1.4h, v2.h[0] = 0x2F42A020
+    //   smlal   v0.4s, v1.4h, v2.h[0] = 0x0F422020
+    //   umlal   v0.4s, v1.4h, v2.h[0] = 0x2F422020
+    //   smlsl   v0.4s, v1.4h, v2.h[0] = 0x0F426020
+    //   umlsl   v0.4s, v1.4h, v2.h[0] = 0x2F426020
+    if ((args.opcode == Op::kSmullIdx || args.opcode == Op::kUmullIdx ||
+         args.opcode == Op::kSmlalIdx || args.opcode == Op::kUmlalIdx ||
+         args.opcode == Op::kSmlslIdx || args.opcode == Op::kUmlslIdx) &&
+        args.size == 0b01) {
+      const bool is_signed = (args.opcode == Op::kSmullIdx ||
+                              args.opcode == Op::kSmlalIdx ||
+                              args.opcode == Op::kSmlslIdx);
+      const bool is_accum = (args.opcode == Op::kSmlalIdx ||
+                             args.opcode == Op::kUmlalIdx ||
+                             args.opcode == Op::kSmlslIdx ||
+                             args.opcode == Op::kUmlslIdx);
+      const bool is_sub = (args.opcode == Op::kSmlslIdx ||
+                           args.opcode == Op::kUmlslIdx);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xn = AllocTempSimdReg();
+      if (xm == no_simd_register || xn == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Broadcast Vm.h[index] across all 8 halfword lanes of xm.
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+      if (args.index >= 4) {
+        as_.Psrldq(xm, int8_t{8});
+      }
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      }
+
+      // Widen Vm's low 4 broadcast halfwords to 4 × 32-bit lanes (with the
+      // correct sign-extend / zero-extend semantics for the product).
+      if (is_signed) as_.Pmovsxwd(xm, xm);
+      else           as_.Pmovzxwd(xm, xm);
+
+      // Widen Vn's selected source half to 4 × 32-bit lanes.  Q=0 reads
+      // bytes 0..7 of Vn; Q=1 reads bytes 8..15 — PMOVSXWD/PMOVZXWD with
+      // a memory operand at vn_off+(q?8:0) picks the correct half.
+      int32_t vn_src_off = vn_off + (args.q ? 8 : 0);
+      if (is_signed) {
+        as_.Pmovsxwd(xn, {.base = Assembler::rbp, .disp = vn_src_off});
+      } else {
+        as_.Pmovzxwd(xn, {.base = Assembler::rbp, .disp = vn_src_off});
+      }
+
+      // 32-bit multiply: both signed and unsigned 16x16 products fit in
+      // 32 bits, so PMULLD's signed low-32 result equals the architectural
+      // result for both forms.
+      as_.Pmulld(xn, xm);
+
+      if (is_accum) {
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (is_sub) as_.Psubd(xd, xn);
+        else        as_.Paddd(xd, xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      } else {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      }
+      return;
+    }
+    // endregion
+
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
@@ -15497,7 +15711,7 @@ class LiteTranslator {
       success_ = false;
       return;
     }
-    if (args.size != 0b10 && args.size != 0b11) {
+    if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       success_ = false;
       return;
     }
@@ -15507,6 +15721,139 @@ class LiteTranslator {
       return;
     }
     const bool is_double = (args.size == 0b11);
+
+    // region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+    //
+    // Lift each FP16 source lane to FP32 lane 0 via Pxor + Pinsrw + Vcvtph2ps
+    // (same scalar-lift recipe as AdvSimdScalarThreeSame FP16).  For
+    // FMLA/FMLS, additionally promote to FP64 so the multiply-add uses a
+    // single binary64 rounding (matches the interpreter's FpHalfToSingle ->
+    // std::fma((double)... narrow path).  Result narrows back via Vcvtps2ph
+    // (real-FP output, NOT a mask), which auto-zeroes the upper 64 bits of
+    // the dst xmm; a full 128-bit Movdqu then writes Vd[15:0]=FP16 result
+    // with Vd[127:16]=0, matching the AArch64 scalar Hd zero-extend.
+    //
+    // F16C absence falls back to interpreter (success_ = false).  FMA
+    // absence also falls back (FMA is already required above for FMLA/FMLS
+    // in the FP32/FP64 path).
+    if (args.size == 0b00) {
+      if (!host_platform::kHasF16C) { success_ = false; return; }
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      SimdRegister xmm_m = AllocTempSimdReg();
+      if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+        success_ = false; return;
+      }
+      // Lift Vn.h[0] and Vm.h[index] to FP32 in xmm lane 0.  Pinsrw with a
+      // memory operand reads 16 bits from the offset; the upper bytes of
+      // each XMM are zeroed first.
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m,
+                 {.base = Assembler::rbp,
+                  .disp = vm_off + static_cast<int32_t>(args.index) * 2},
+                 int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kFmul) {
+        as_.Mulss(xmm_n, xmm_m);
+        xmm_result = xmm_n;
+      } else if (args.opcode == Op::kFmulx) {
+        // FMULX FP16 saturation: same shape as FP32 scalar FMULX three-same
+        // FP16.  mul = a*b; if mul is NaN and neither input was NaN
+        // (the (±0,±inf) case), return ±2.0 with sign = sign(a) XOR sign(b).
+        // FP16 ±2.0 = 0x4000 / 0xC000 round-trips exactly through FP32 ±2.0
+        // = 0x40000000 / 0xC0000000 via Vcvtps2ph.
+        SimdRegister xmm_mul = AllocTempSimdReg();
+        SimdRegister xmm_mul_unord = AllocTempSimdReg();
+        SimdRegister xmm_iu = AllocTempSimdReg();
+        SimdRegister xmm_two = AllocTempSimdReg();
+        if (xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+            xmm_iu == no_simd_register || xmm_two == no_simd_register) {
+          success_ = false; return;
+        }
+
+        // mul = a * b
+        as_.Movdqa(xmm_mul, xmm_n);
+        as_.Mulss(xmm_mul, xmm_m);
+
+        // mul_unord = cmpunord(mul, mul)
+        as_.Movdqa(xmm_mul_unord, xmm_mul);
+        as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+        // input_unord = cmpunord(a, b)
+        as_.Movdqa(xmm_iu, xmm_n);
+        as_.Cmpunordps(xmm_iu, xmm_m);
+
+        // special_mask = (NOT input_unord) AND mul_unord, lands in xmm_iu.
+        as_.Pandn(xmm_iu, xmm_mul_unord);
+
+        // two_signed = ((a XOR b) AND sign_mask) OR bits-of(+2.0).
+        as_.Xorps(xmm_n, xmm_m);
+        as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+        as_.Pslld(xmm_mul_unord, int8_t{31});
+        as_.Pand(xmm_n, xmm_mul_unord);
+
+        Register tmp_gpr = AllocTempReg();
+        if (tmp_gpr == Assembler::no_register) { return; }
+        as_.Movl(tmp_gpr, int32_t{0x40000000});
+        as_.Movd(xmm_two, tmp_gpr);
+        as_.Por(xmm_n, xmm_two);
+
+        // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+        as_.Movdqa(xmm_m, xmm_n);
+        as_.Pand(xmm_m, xmm_iu);
+        as_.Pandn(xmm_iu, xmm_mul);
+        as_.Por(xmm_iu, xmm_m);
+        xmm_result = xmm_iu;
+      } else {
+        // FMLA / FMLS: promote to FP64 so the multiply-add rounds once.
+        SimdRegister xmm_n_pd = AllocTempSimdReg();
+        SimdRegister xmm_m_pd = AllocTempSimdReg();
+        SimdRegister xmm_d_pd = AllocTempSimdReg();
+        SimdRegister xmm_d_f32 = AllocTempSimdReg();
+        if (xmm_n_pd == no_simd_register || xmm_m_pd == no_simd_register ||
+            xmm_d_pd == no_simd_register || xmm_d_f32 == no_simd_register) {
+          success_ = false; return;
+        }
+        // Lift Vd.h[0] to FP32 lane 0 via the same Pinsrw + Vcvtph2ps path.
+        as_.Pxor(xmm_d_f32, xmm_d_f32);
+        as_.Pinsrw(xmm_d_f32, {.base = Assembler::rbp, .disp = vd_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_d_f32, xmm_d_f32);
+
+        // Widen lane 0 of each operand to FP64 (Vcvtps2pd reads low 2 FP32
+        // lanes; we only care about lane 0).
+        as_.Vcvtps2pd(xmm_n_pd, xmm_n);
+        as_.Vcvtps2pd(xmm_m_pd, xmm_m);
+        as_.Vcvtps2pd(xmm_d_pd, xmm_d_f32);
+        if (args.opcode == Op::kFmls) {
+          as_.Vfnmadd231sd(xmm_d_pd, xmm_n_pd, xmm_m_pd);
+        } else {
+          as_.Vfmadd231sd(xmm_d_pd, xmm_n_pd, xmm_m_pd);
+        }
+        // Narrow FP64 -> FP32 in lane 0; xmm_n is free as the dst.
+        as_.Vcvtpd2ps(xmm_n, xmm_d_pd);
+        xmm_result = xmm_n;
+      }
+
+      // Narrow FP32 lane 0 to FP16 word lane 0; Vcvtps2ph zero-fills the
+      // upper 64 bits of dst.  Lanes 1..3 of xmm_result were FP32 +0 by
+      // Vcvtph2ps zero-fill (preserved through the scalar primitives, since
+      // FMULX's PSLLD/Pcmpeqd-with-itself/Pand all leave dword lanes 1..3
+      // at zero, and Mulss/Vcvtpd2ps only write lane 0).  Word lanes 1..7
+      // of the narrowed xmm_result are therefore 0.
+      as_.Vcvtps2ph(xmm_result, xmm_result, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
 
     // FMUL / FMLA / FMLS — simpler scalar lowering without the FMULX
     // saturation shape.  Load Vn/Vm into XMM regs, broadcast the indexed

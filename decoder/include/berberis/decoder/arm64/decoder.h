@@ -1737,6 +1737,27 @@ class Decoder {
     kMul,     // MUL (by element)
     kMla,     // MLA (by element)
     kMls,     // MLS (by element)
+    // region digitalis
+    kSqdmulhIdx,   // SQDMULH (by element): U=0, opcode=1100, size in {01,10}.
+                   // Per-lane saturating doubling multiply high (no rounding).
+    kSqrdmulhIdx,  // SQRDMULH (by element): U=0, opcode=1101, size in {01,10}.
+                   // Same as SQDMULH but with rounding constant 1<<(esize-1)
+                   // added before the right shift.
+    kSmullIdx,     // SMULL/SMULL2 (by element): U=0, opcode=1010, size in {01,10}.
+                   // Widening signed multiply: dst lane = sign_ext(Vn[i]) *
+                   // sign_ext(Vm[index]); dst is always 128-bit.  Q selects Vn
+                   // low half (Q=0, SMULL) vs high half (Q=1, SMULL2).
+    kUmullIdx,     // UMULL/UMULL2 (by element): U=1, opcode=1010, size in {01,10}.
+                   // Widening unsigned multiply; same Q semantics as kSmullIdx.
+    kSmlalIdx,     // SMLAL/SMLAL2 (by element): U=0, opcode=0010, size in {01,10}.
+                   // Vd lane += sign_ext(Vn[i]) * sign_ext(Vm[index]).
+    kUmlalIdx,     // UMLAL/UMLAL2 (by element): U=1, opcode=0010, size in {01,10}.
+                   // Vd lane += unsigned product.
+    kSmlslIdx,     // SMLSL/SMLSL2 (by element): U=0, opcode=0110, size in {01,10}.
+                   // Vd lane -= sign_ext(Vn[i]) * sign_ext(Vm[index]).
+    kUmlslIdx,     // UMLSL/UMLSL2 (by element): U=1, opcode=0110, size in {01,10}.
+                   // Vd lane -= unsigned product.
+    // endregion
   };
 
   struct AdvSimdVecXIdxArgs {
@@ -6086,10 +6107,36 @@ class Decoder {
     //   mla  v0.8h, v1.8h, v2.h[7] = 0x6f720820
     //   mls  v0.4h, v1.4h, v2.h[0] = 0x2f424020
     //   mls  v0.8h, v1.8h, v2.h[7] = 0x6f724820
+    //
+    // SQDMULH / SQRDMULH (by element, halfword) follow the same size=01
+    // shape — Vm is restricted to V0..V15 via Rm4, the bit-20 M slot is
+    // consumed as the index's low bit, and index = H:L:M (3 bits, 0..7).
+    // Verified encodings:
+    //   sqdmulh  v0.4h, v1.4h, v2.h[0] = 0x0f42c020   (U=0, opcode=1100)
+    //   sqdmulh  v0.8h, v1.8h, v2.h[3] = 0x4f72c020
+    //   sqrdmulh v0.4h, v1.4h, v2.h[7] = 0x0f72d820   (U=0, opcode=1101)
+    //   sqrdmulh v0.8h, v1.8h, v2.h[5] = 0x4f52d820
     } else if (size == 0b01) {
       if (!((opcode == 0b1000 && !u) ||
             (opcode == 0b0000 && u) ||
-            (opcode == 0b0100 && u))) {
+            (opcode == 0b0100 && u) ||
+            // region digitalis
+            (opcode == 0b1100 && !u) ||
+            (opcode == 0b1101 && !u) ||
+            // Widening MUL/MAC by element accept both U values.
+            // Encoding pattern (ARM ARM C7.2):
+            //   smull   v0.4s, v1.4h, v2.h[0] = 0x0F42A020   U=0, opcode=1010
+            //   smull2  v0.4s, v1.8h, v2.h[7] = 0x4F72A820   Q=1, index=7
+            //   umull   v0.4s, v1.4h, v2.h[0] = 0x2F42A020   U=1, opcode=1010
+            //   smlal   v0.4s, v1.4h, v2.h[0] = 0x0F422020   U=0, opcode=0010
+            //   umlal   v0.4s, v1.4h, v2.h[0] = 0x2F422020   U=1, opcode=0010
+            //   smlsl   v0.4s, v1.4h, v2.h[0] = 0x0F426020   U=0, opcode=0110
+            //   umlsl   v0.4s, v1.4h, v2.h[0] = 0x2F426020   U=1, opcode=0110
+            opcode == 0b1010 ||
+            opcode == 0b0010 ||
+            opcode == 0b0110
+            // endregion
+            )) {
         Undefined();
         return;
       }
@@ -6159,6 +6206,39 @@ class Decoder {
           Undefined(); return;
         }
         break;
+      // region digitalis: SQDMULH / SQRDMULH by element (vector).
+      //   U=0, opcode=1100 -> SQDMULH (by element).
+      //   U=0, opcode=1101 -> SQRDMULH (by element).
+      // Both restricted to size ∈ {0b01 (.4h/.8h), 0b10 (.2s/.4s)}.
+      //   U=1 at these opcodes is SQRDMLAH / SQRDMLSH (Armv8.1-RDM) —
+      //   intentionally routed to Undefined here until those land.
+      case 0b1100:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqdmulhIdx;
+        break;
+      case 0b1101:
+        if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
+        op = AdvSimdVecXIdxOpcode::kSqrdmulhIdx;
+        break;
+      // Widening MUL/MAC by element.  Restricted to size ∈ {0b01 (.4h/.8h ->
+      // .4s), 0b10 (.2s/.4s -> .2d)}.  size=0b00 has no encoding (8->16
+      // widening MUL is not defined), size=0b11 is reserved.
+      case 0b1010:
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kUmullIdx
+               : AdvSimdVecXIdxOpcode::kSmullIdx;
+        break;
+      case 0b0010:
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kUmlalIdx
+               : AdvSimdVecXIdxOpcode::kSmlalIdx;
+        break;
+      case 0b0110:
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kUmlslIdx
+               : AdvSimdVecXIdxOpcode::kSmlslIdx;
+        break;
+      // endregion
       default:
         Undefined();
         return;
@@ -6229,18 +6309,42 @@ class Decoder {
       return;
     }
 
-    uint8_t rm = static_cast<uint8_t>((M << 4) | Rm4);
+    uint8_t rm;
     uint8_t index;
     if (size == 0b10) {
-      // FP32: index = H:L (4 elements in Vm.4S).
+      // FP32: index = H:L (4 elements in Vm.4S).  Vm = M:Rm4 (5 bits).
+      rm = static_cast<uint8_t>((M << 4) | Rm4);
       index = static_cast<uint8_t>((H << 1) | L);
     } else if (size == 0b11) {
-      // FP64: index = H (2 elements in Vm.2D); L must be 0.
+      // FP64: index = H (2 elements in Vm.2D); L must be 0.  Vm = M:Rm4.
       if (L) { Undefined(); return; }
+      rm = static_cast<uint8_t>((M << 4) | Rm4);
       index = H;
+    // region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+    //
+    // Encoding "Advanced SIMD scalar x indexed element (FP16)" per ARM ARM
+    // C7.2 uses size=0b00 (not 0b01 as a stale earlier comment claimed).
+    //   "0 1 U 1 1 1 1 1 0 0 L M Rm[3:0] opcode H 0 Rn Rd"
+    // The bit-20 M slot is consumed as the index's low bit, so Vm is only
+    // 4 bits (Rm4) — the indexed source is restricted to V0..V15.  Index
+    // = H:L:M (3 bits, 0..7) selects one of 8 FP16 lanes of Vm.8H.  Unlike
+    // the *vector* FP16 by-element form (which rejects U=1), scalar FMULX
+    // FP16 by-element DOES exist (ARM ARM C7.2.83), so all four opcodes
+    // {FMLA, FMLS, FMUL, FMULX} are admitted here.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a+fp16):
+    //   fmul  h0, h1, v2.h[0] = 0x5F029020
+    //   fmul  h3, h4, v5.h[7] = 0x5F359883
+    //   fmla  h0, h1, v2.h[0] = 0x5F021020
+    //   fmls  h0, h1, v2.h[7] = 0x5F325820
+    //   fmulx h0, h1, v2.h[0] = 0x7F029020
+    //   fmulx h3, h4, v5.h[7] = 0x7F359883
+    } else if (size == 0b00) {
+      rm = Rm4;
+      index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
+    // endregion
     } else {
-      // FP16 (size=01) is Armv8.2-FP16 scalar-x-indexed — not handled
-      // yet.  size=00 is reserved at this slot.
+      // size=0b01 is reserved at this slot.
       Undefined();
       return;
     }
