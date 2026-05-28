@@ -15320,6 +15320,219 @@ class LiteTranslator {
     }
     // endregion
 
+    // region digitalis: SQDMULH / SQRDMULH / SQRDMLAH / SQRDMLSH by-element
+    // (.2s / .4s, size=10).
+    //
+    // 32-bit-lane sibling of the size=01 arm above.  Stage 1 reconstructs
+    // SQDMULH .4s / SQRDMULH .4s without PSRAQ via PMULDQ at qword
+    // granularity + PSHUFD-to-high-32-bits + PUNPCKLDQ-merge.  Stage 2
+    // (SQRDMLAH / SQRDMLSH only) reuses the 32-bit-lane wrap-add +
+    // overflow-bit-XOR-blend recipe from the SQDMLAL .4s arm below.
+    //
+    // Per-lane (SQDMULH/SQRDMULH .4s):
+    //   product = sext_i64(Vn.s[i]) * sext_i64(Vm.s[index])
+    //   doubled = 2 * product  [+ 0x80000000 for SQRDMULH]
+    //   Vd.s[i] = SAT_INT32(doubled >> 32)
+    // The 32x32 signed product fits in int64 (|INT32_MIN^2| = 2^62), and
+    // doubling overflows int64 only at the lone corner (Vn.s[i] = INT32_MIN
+    // AND Vm.s[index] = INT32_MIN), which wraps to INT64_MIN.  The upper 32
+    // bits of INT64_MIN are 0x80000000 = INT32_MIN, but the architectural
+    // saturated answer is INT32_MAX.  Fixup: detect the corner at 32-bit
+    // lane level (PCMPEQD against INT32_MIN broadcast), then XOR the
+    // affected output lanes (INT32_MIN ^ 0xFFFFFFFF = INT32_MAX).
+    //
+    // Per-lane (SQRDMLAH/SQRDMLSH .4s, Armv8.1-RDM):
+    //   addend = SQRDMULH(Vn.s[i], Vm.s[index])
+    //   Vd.s[i] = SignedSat32(Vd.s[i] ± addend)
+    // Stage 2 is the same wrap-add / wrap-sub + sign-bit / XOR-blend
+    // recipe the size=01 SQDMLAL/SQDMLSL arm uses for its 32-bit-lane
+    // accumulator step.
+    //
+    // PMULDQ uses the low 32 bits of each 64-bit qword.  Vm.s[index] is
+    // broadcast across all 4 dwords of xm, so the same xm serves both the
+    // "lanes 0,2" PMULDQ and the "lanes 1,3" PMULDQ (after PSRLQ 32 of
+    // xn) — Vm's qword-low-32 after PSRLQ 32 equals the unshifted value
+    // because all 4 dwords are identical.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+    //   sqdmulh  v0.2s, v1.2s, v2.s[0]  = 0x0F82C020
+    //   sqdmulh  v0.4s, v1.4s, v2.s[3]  = 0x4FA2C820
+    //   sqrdmulh v0.2s, v1.2s, v2.s[1]  = 0x0FA2D020
+    //   sqrdmulh v0.4s, v1.4s, v2.s[2]  = 0x4F82D820
+    //   sqrdmlah v0.2s, v1.2s, v2.s[0]  = 0x2F82D020
+    //   sqrdmlah v0.4s, v1.4s, v2.s[3]  = 0x6FA2D820
+    //   sqrdmlsh v0.2s, v1.2s, v2.s[1]  = 0x2FA2F020
+    //   sqrdmlsh v0.4s, v1.4s, v2.s[2]  = 0x6F82F820
+    if ((args.opcode == Op::kSqdmulhIdx ||
+         args.opcode == Op::kSqrdmulhIdx ||
+         args.opcode == Op::kSqrdmlahIdx ||
+         args.opcode == Op::kSqrdmlshIdx) &&
+        args.size == 0b10) {
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      const bool is_rounded =
+          (args.opcode == Op::kSqrdmulhIdx ||
+           args.opcode == Op::kSqrdmlahIdx ||
+           args.opcode == Op::kSqrdmlshIdx);
+      const bool is_accum =
+          (args.opcode == Op::kSqrdmlahIdx ||
+           args.opcode == Op::kSqrdmlshIdx);
+      const bool is_sub = (args.opcode == Op::kSqrdmlshIdx);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      SimdRegister xp_lo = AllocTempSimdReg();
+      SimdRegister xp_hi = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register ||
+          x_const == no_simd_register || corner == no_simd_register ||
+          xp_lo == no_simd_register || xp_hi == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Broadcast Vm.s[index] across all 4 dword lanes.
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xm, xm, imm);
+      }
+
+      // x_const = INT32_MIN broadcast across 4 dwords (Pcmpeqd self → -1,
+      // Pslld 31 → 0x80000000 per dword).
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Pslld(x_const, int8_t{31});
+
+      // Corner detection at 32-bit lane level: lanes where Vn.s[i] ==
+      // INT32_MIN AND Vm.s[index] (broadcast) == INT32_MIN.  PCMPEQD
+      // destroys dst; preserve xn and xm via Movdqa-to-temp first.
+      as_.Movdqa(corner, xn);
+      as_.Pcmpeqd(corner, x_const);
+      as_.Movdqa(xp_lo, xm);
+      as_.Pcmpeqd(xp_lo, x_const);
+      as_.Pand(corner, xp_lo);
+      // `corner` now holds the 4-lane int32 corner mask; xp_lo is dead and
+      // about to be repurposed as the lanes-0,2 product slot.
+
+      // Stage 1: two PMULDQs reconstruct the 4 signed 32×32 → 64 products.
+      //   xp_lo qword 0 = sext_i64(Vn.s[0]) * sext_i64(Vm.s[index])
+      //   xp_lo qword 1 = sext_i64(Vn.s[2]) * sext_i64(Vm.s[index])
+      //   xp_hi qword 0 = sext_i64(Vn.s[1]) * sext_i64(Vm.s[index])
+      //   xp_hi qword 1 = sext_i64(Vn.s[3]) * sext_i64(Vm.s[index])
+      // Vm.s[index] broadcast means xm's low-32-bit-of-each-qword equals
+      // the broadcast value before AND after PSRLQ 32 on the multiplicand
+      // side — so xm is reused for both PMULDQs without re-shuffling.
+      as_.Movdqa(xp_lo, xn);
+      as_.Pmuldq(xp_lo, xm);
+      as_.Movdqa(xp_hi, xn);
+      as_.Psrlq(xp_hi, int8_t{32});
+      as_.Pmuldq(xp_hi, xm);
+      // xn and xm are dead from here.  x_const is dead (about to be reused).
+
+      // Double each 64-bit signed product via PSLLQ 1.  Corner lanes wrap
+      // from +2^62 to ±2^63 (= INT64_MIN as signed), which after the
+      // upper-32-bits extraction becomes INT32_MIN — the corner mask
+      // XOR-blend below restores INT32_MAX.
+      as_.Psllq(xp_lo, int8_t{1});
+      as_.Psllq(xp_hi, int8_t{1});
+
+      if (is_rounded) {
+        // Rounding constant 2^31 = 0x80000000 per qword.  Build in
+        // x_const: Pcmpeqd self → -1 per dword; Psllq 63 → 0x8000…0000
+        // per qword (only bit 63 set); Psrlq 32 → 0x0000…0000_80000000.
+        as_.Pcmpeqd(x_const, x_const);
+        as_.Psllq(x_const, int8_t{63});
+        as_.Psrlq(x_const, int8_t{32});
+        as_.Paddq(xp_lo, x_const);
+        as_.Paddq(xp_hi, x_const);
+      }
+
+      // Extract the upper 32 bits of each 64-bit lane: PSHUFD with mask
+      // 0b11_01_11_01 = 0xDD packs dwords [1, 3, 1, 3] → low 64 bits
+      // hold [hi32_qword0, hi32_qword1].
+      as_.Pshufd(xp_lo, xp_lo, static_cast<int8_t>(0xDD));
+      as_.Pshufd(xp_hi, xp_hi, static_cast<int8_t>(0xDD));
+
+      // Interleave to produce the 4 int32 result lanes in order:
+      //   xp_lo low 2 lanes after PSHUFD: [prod_lane0, prod_lane2]
+      //   xp_hi low 2 lanes after PSHUFD: [prod_lane1, prod_lane3]
+      // PUNPCKLDQ interleaves low qwords:
+      //   xp_lo := [xp_lo[0], xp_hi[0], xp_lo[1], xp_hi[1]]
+      //         =  [prod_lane0, prod_lane1, prod_lane2, prod_lane3]
+      as_.Punpckldq(xp_lo, xp_hi);
+
+      // Apply the corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX, so
+      // XORing with `corner` (each lane either 0 or 0xFFFFFFFF) replaces
+      // INT32_MIN with INT32_MAX in corner lanes and leaves the rest
+      // unchanged.
+      as_.Pxor(xp_lo, corner);
+
+      SimdRegister xmm_result = xp_lo;
+
+      if (is_accum) {
+        // Stage 2: 32-bit signed-saturating add/sub of Vd and the
+        // saturated stage-1 product.  Same wrap-add + overflow-bit-XOR-
+        // blend recipe as the SQDMLAL .4s arm (size=01) below.
+        //   sum  = a ± b              (PADDD/PSUBD wraps mod 2^32)
+        //   ovf  = ~(a^b) & (a^sum)   for ADD  (sign bit indicates overflow)
+        //        |  (a^b) & (a^diff)  for SUB
+        //   sat  = (a < 0) ? INT32_MIN : INT32_MAX
+        //   res  = sum ^ ((sum ^ sat) & ovf_mask)
+        SimdRegister xd = AllocTempSimdReg();
+        SimdRegister t_sum = AllocTempSimdReg();
+        SimdRegister t_ovf = AllocTempSimdReg();
+        SimdRegister t_sat = AllocTempSimdReg();
+        if (xd == no_simd_register || t_sum == no_simd_register ||
+            t_ovf == no_simd_register || t_sat == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        as_.Movdqa(t_sum, xd);
+        if (is_sub) {
+          as_.Psubd(t_sum, xmm_result);
+        } else {
+          as_.Paddd(t_sum, xmm_result);
+        }
+        as_.Movdqa(t_ovf, xd);
+        as_.Pxor(t_ovf, xmm_result);
+        as_.Movdqa(t_sat, xd);
+        as_.Pxor(t_sat, t_sum);
+        // xmm_result (the addend 'b') is dead after t_ovf and t_sum are
+        // computed; reuse its slot for the INT32_MAX broadcast.
+        if (!is_sub) {
+          as_.Pcmpeqd(xmm_result, xmm_result);
+          as_.Pxor(t_ovf, xmm_result);   // ~(a^b)
+          as_.Pand(t_ovf, t_sat);        // ~(a^b) & (a^sum)
+          as_.Psrld(xmm_result, int8_t{1});  // INT32_MAX broadcast
+        } else {
+          as_.Pand(t_ovf, t_sat);        // (a^b) & (a^diff)
+          as_.Pcmpeqd(xmm_result, xmm_result);
+          as_.Psrld(xmm_result, int8_t{1});  // INT32_MAX broadcast
+        }
+        as_.Psrad(t_ovf, int8_t{31});    // overflow mask (all-1s or 0)
+        as_.Psrad(xd, int8_t{31});       // xd = (a<0) ? -1 : 0
+        as_.Pxor(xd, xmm_result);        // xd = sat = (a<0) ? INT_MIN : INT_MAX
+        as_.Pxor(xd, t_sum);             // xd = sat ^ sum
+        as_.Pand(xd, t_ovf);             // ... & ovf
+        as_.Pxor(xd, t_sum);             // = sum ^ ((sum^sat) & ovf)
+        xmm_result = xd;
+      }
+
+      if (!args.q) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
+
     // region digitalis: widening MUL/MAC by-element (size=01: .4h/.8h -> .4s).
     //
     // SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL by element with halfword sources

@@ -12245,6 +12245,224 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec4HUpperZeroJit) {
   EXPECT_EQ(r[3], 0xAEAAu);
   for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
 }
+
+// SQRDMLAH .4s encoder: Q=1, U=1, size=10, opcode=1101.  Index = H:L.
+constexpr uint32_t SqrdmlahIdx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x6F80D000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec4SBroadcastsLaneJit) {
+  // Basic SQDMULH .4s (no rounding) via the new size=10 JIT arm.
+  // Vm.s[0] = 0x40000000 broadcast; per lane SQDMULH = (2*a*b) >> 32.
+  //   a=0x40000000 -> (2 * 2^30 * 2^30) >> 32 = 2^29 = 0x20000000.
+  //   a=0x20000000 -> 0x10000000.   a=0x10000000 -> 0x08000000.
+  //   a=0x08000000 -> 0x04000000.
+  int32_t n_lanes[4] = {0x40000000, 0x20000000, 0x10000000, 0x08000000};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  state_.cpu.v[0] = 0xAAAAAAAAAAAAAAAAULL;
+  static const uint32_t code[] = {SqdmulhIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x20000000);
+  EXPECT_EQ(r[1], 0x10000000);
+  EXPECT_EQ(r[2], 0x08000000);
+  EXPECT_EQ(r[3], 0x04000000);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec4SSaturatesIntMinSquaredJit) {
+  // SQDMULH .4s with a = b = INT32_MIN.  Without saturation:
+  //   2 * (-2^31)^2 = 2^63 wraps to INT64_MIN = 0x8000000000000000; high 32
+  //   = 0x80000000 = INT32_MIN.  Architectural answer is INT32_MAX.  The
+  //   corner mask XOR flips INT32_MIN -> INT32_MAX.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000)};
+  int32_t m_lanes[4] = {static_cast<int32_t>(0x80000000), 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SqdmulhIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFFFFF) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec2SUpperZeroJit) {
+  // Q=0 -> upper 64 bits of Vd must be zeroed by the JIT.  Sentinel high
+  // half of Vd_pre verifies the Pslldq+Psrldq epilogue runs.
+  int32_t n_lanes[4] = {0x40000000, 0x20000000,
+                        static_cast<int32_t>(0xCAFE0000),
+                        static_cast<int32_t>(0xCAFE0000)};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  state_.cpu.v[0] = 0xAAAAAAAAAAAAAAAAULL;
+  static const uint32_t code[] = {SqdmulhIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x20000000);
+  EXPECT_EQ(r[1], 0x10000000);
+  EXPECT_EQ(r[2], 0);
+  EXPECT_EQ(r[3], 0);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec4SRoundingDistinctJit) {
+  // SQRDMULH adds 0x80000000 before the >>32 shift; SQDMULH does not.
+  // a = 0x40000000, b = 0x00000001 (Vm.s[index]=1):
+  //   SQDMULH:  (2 * 0x40000000 * 1) >> 32 = 0x80000000 >> 32 = 0.
+  //   SQRDMULH: (0x80000000 + 0x80000000) >> 32 = 0x100000000 >> 32 = 1.
+  // Run both and check distinct outputs.
+  int32_t n_lanes[4] = {0x40000000, 0x40000000, 0x40000000, 0x40000000};
+  int32_t m_lanes[4] = {1, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code_rd[] = {SqrdmulhIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code_rd, ToGuestAddr(code_rd) + sizeof(code_rd)));
+  int32_t r_rd[4];
+  LoadVec4SInt(state_.cpu, 0, r_rd);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r_rd[i], 1) << "lane " << i;
+
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code_no[] = {SqdmulhIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code_no, ToGuestAddr(code_no) + sizeof(code_no)));
+  int32_t r_no[4];
+  LoadVec4SInt(state_.cpu, 0, r_no);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r_no[i], 0) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec4SHighLaneJit) {
+  // Broadcast index 3 -> Vm.s[3].  Confirms the Pshufd-broadcast covers
+  // every legal index (0..3) for the .4s form.
+  int32_t n_lanes[4] = {0x40000000, 0x20000000, 0x10000000, 0x08000000};
+  int32_t m_lanes[4] = {0, 0, 0, 0x40000000};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SqrdmulhIdx4S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  // addend per lane (Vm = 0x40000000):
+  //   ((2*Vn*0x40000000) + 0x80000000) >> 32
+  //   = (Vn*0x80000000 + 0x80000000) >> 32
+  //   = ((Vn+1)*0x80000000) >> 32 = (Vn+1)/2 for the test inputs.
+  // a=0x40000000 -> ((0x40000000+1)*0x80000000) >> 32 = 0x20000000 (low
+  //                  bit of Vn+1 rounds away).
+  EXPECT_EQ(r[0], 0x20000000);
+  EXPECT_EQ(r[1], 0x10000000);
+  EXPECT_EQ(r[2], 0x08000000);
+  EXPECT_EQ(r[3], 0x04000000);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec4SAccumulatesRoundedJit) {
+  // SQRDMLAH .4s: Vd[i] = SignedSat(Vd[i] + SQRDMULH(Vn[i], Vm.s[index])).
+  // Vm.s[0] = 0x40000000 broadcast.  Per-lane addend math matches
+  // SqrdmulhIdxVec4S*.
+  int32_t n_lanes[4] = {0x40000000, 0x20000000, 0x10000000, 0x08000000};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  StoreVec4SInt(state_.cpu, 0, 0x1000, 0x2000, 0x3000, 0x4000);
+  static const uint32_t code[] = {SqrdmlahIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1000 + 0x20000000);
+  EXPECT_EQ(r[1], 0x2000 + 0x10000000);
+  EXPECT_EQ(r[2], 0x3000 + 0x08000000);
+  EXPECT_EQ(r[3], 0x4000 + 0x04000000);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmlahIdxVec4SStage2PositiveOverflowSaturatesJit) {
+  // Stage-2 positive saturation: addend = 0x20000000, Vd_pre near INT32_MAX
+  // so a+b overflows; result must clamp to INT32_MAX.  Lane 1 fits to
+  // sanity-check the non-overflow path runs through the same arm.
+  int32_t n_lanes[4] = {0x40000000, 0x40000000, 0, 0};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  StoreVec4SInt(state_.cpu, 0, 0x7FFFFFF0, 0x1000, 0, 0);
+  static const uint32_t code[] = {SqrdmlahIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7FFFFFFF);            // saturated.
+  EXPECT_EQ(r[1], 0x1000 + 0x20000000);   // fits.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmlshIdxVec4SStage2NegativeOverflowSaturatesJit) {
+  // Stage-2 negative saturation via PSUBD-based wrap path: Vd_pre near
+  // INT32_MIN minus a positive addend underflows; result must clamp to
+  // INT32_MIN.  Lane 1 fits without saturation.
+  int32_t n_lanes[4] = {0x40000000, 0x40000000, 0, 0};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  StoreVec4SInt(state_.cpu, 0, INT32_MIN + 100, 0x100, 0, 0);
+  static const uint32_t code[] = {SqrdmlshIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], INT32_MIN);             // saturated.
+  EXPECT_EQ(r[1], 0x100 - 0x20000000);    // fits.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmlahIdxVec4SStage1CornerSaturatesJit) {
+  // Stage-1 (INT32_MIN, INT32_MIN) corner in every lane: SQRDMULH would
+  // produce 0x80000000 without the corner XOR fixup; the architectural
+  // result is INT32_MAX.  Then stage-2 PADDD(0 + 0x7FFFFFFF) = 0x7FFFFFFF.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000),
+                        static_cast<int32_t>(0x80000000)};
+  int32_t m_lanes[4] = {static_cast<int32_t>(0x80000000), 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  StoreVec4SInt(state_.cpu, 0, 0, 0, 0, 0);
+  static const uint32_t code[] = {SqrdmlahIdx4S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFFFFF) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec2SUpperZeroJit) {
+  // Q=0 (.2s) SQRDMLAH: upper 64 bits must be zeroed regardless of the
+  // sentinel high half of the pre-state.  Pins the Pslldq+Psrldq epilogue
+  // through the accumulator path.
+  int32_t n_lanes[4] = {0x40000000, 0x20000000,
+                        static_cast<int32_t>(0xCAFE0000),
+                        static_cast<int32_t>(0xCAFE0000)};
+  int32_t m_lanes[4] = {0x40000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  state_.cpu.v[0] = 0xAAAAAAAAAAAAAAAAULL;
+  static const uint32_t code[] = {SqrdmlahIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  // Vd_pre low half lanes = 0xAAAAAAAA (signed -0x55555556).
+  // addend per lane: lane0 = 0x20000000, lane1 = 0x10000000.
+  // lane 0: -0x55555556 + 0x20000000 = -0x35555556 = 0xCAAAAAAA.
+  // lane 1: -0x55555556 + 0x10000000 = -0x45555556 = 0xBAAAAAAA.
+  EXPECT_EQ(static_cast<uint32_t>(r[0]), 0xCAAAAAAAu);
+  EXPECT_EQ(static_cast<uint32_t>(r[1]), 0xBAAAAAAAu);
+  EXPECT_EQ(r[2], 0);   // upper-zero.
+  EXPECT_EQ(r[3], 0);
+}
 // endregion
 
 // region digitalis - FCSEL JIT
