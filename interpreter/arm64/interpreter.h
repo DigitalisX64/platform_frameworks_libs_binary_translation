@@ -7628,6 +7628,82 @@ class Interpreter {
     }
     // endregion
 
+    // region digitalis: widening MUL/MAC by element.
+    //   size=01 (.4h/.8h sources -> .4s dst, esize 2->4, 4 output lanes).
+    //   size=10 (.2s/.4s sources -> .2d dst, esize 4->8, 2 output lanes).
+    // Q=0 (SMULL/SMLAL/SMLSL form):  uses Vn low half  (bytes 0..7).
+    // Q=1 (SMULL2/SMLAL2/SMLSL2):    uses Vn high half (bytes 8..15).
+    // Destination is always 128-bit regardless of Q.  Vm.lane[index] is
+    // broadcast as the per-lane multiplier.  Wraparound matches the
+    // three-diff vector form's accumulate semantics.
+    if (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmullIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kUmullIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmlalIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kUmlalIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmlslIdx ||
+        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kUmlslIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      uint8_t in_esize = (args.size == 0b01) ? 2 : 4;
+      uint8_t out_esize = in_esize * 2;
+      uint8_t num_elements = 16 / out_esize;
+      uint8_t src_offset = args.q ? 8 : 0;
+
+      bool is_signed = (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmullIdx ||
+                        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmlalIdx ||
+                        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmlslIdx);
+      bool is_accum  = (args.opcode != Decoder::AdvSimdVecXIdxOpcode::kSmullIdx &&
+                        args.opcode != Decoder::AdvSimdVecXIdxOpcode::kUmullIdx);
+      bool is_sub    = (args.opcode == Decoder::AdvSimdVecXIdxOpcode::kSmlslIdx ||
+                        args.opcode == Decoder::AdvSimdVecXIdxOpcode::kUmlslIdx);
+
+      uint64_t indexed_u = 0;
+      memcpy(&indexed_u,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * in_esize,
+             in_esize);
+      uint8_t shift = (8 - in_esize) * 8;
+      int64_t indexed_s =
+          static_cast<int64_t>(indexed_u << shift) >> shift;
+
+      __uint128_t new_result = is_accum ? result : __uint128_t{0};
+      for (uint8_t i = 0; i < num_elements; i++) {
+        uint64_t lane_u = 0;
+        memcpy(&lane_u,
+               reinterpret_cast<const uint8_t*>(&src_n) + src_offset + i * in_esize,
+               in_esize);
+        uint64_t prod;
+        if (is_signed) {
+          int64_t lane_s =
+              static_cast<int64_t>(lane_u << shift) >> shift;
+          // For in_esize ∈ {2, 4}, |lane_s * indexed_s| ≤ 2^62, so the
+          // signed multiply never overflows int64_t.
+          prod = static_cast<uint64_t>(lane_s * indexed_s);
+        } else {
+          prod = lane_u * indexed_u;
+        }
+        if (is_accum) {
+          uint64_t accum = 0;
+          memcpy(&accum,
+                 reinterpret_cast<const uint8_t*>(&new_result) + i * out_esize,
+                 out_esize);
+          uint64_t new_val = is_sub ? accum - prod : accum + prod;
+          memcpy(reinterpret_cast<uint8_t*>(&new_result) + i * out_esize,
+                 &new_val, out_esize);
+        } else {
+          memcpy(reinterpret_cast<uint8_t*>(&new_result) + i * out_esize,
+                 &prod, out_esize);
+        }
+      }
+
+      // The widening forms write a full 128-bit destination regardless of Q
+      // (matches the three-diff vector path's lack of upper-half clearing).
+      state_->cpu.v[args.rd] = new_result;
+      return;
+    }
+    // endregion
+
     // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
     if (args.size == 0b00) {
       // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,

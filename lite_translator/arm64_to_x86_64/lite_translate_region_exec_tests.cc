@@ -10499,6 +10499,198 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec4SSaturatesIntMinSquared) {
   for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFFFFF);
 }
 
+// Widening MUL/MAC by-element encoders.  Shared shape for all six U×Op
+// combinations of (SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL): bit29 = U,
+// bits[15:12] = opcode (1010/0010/0110).  Halfword form (size=01) has
+// Vm restricted to V0..V15 (Rm4) with index = H:L:M.  Word form (size=10)
+// has Vm = M:Rm[3:0] (5-bit) with index = H:L.  Q selects Vn low half
+// (.4h/.2s) vs Vn high half (.8h/.4s — *MULL2 / *MLAL2 / *MLSL2).
+constexpr uint32_t SmullIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x0F40A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Smull2Idx8H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x4F40A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UmullIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x2F40A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SmlalIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x0F402000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SmlslIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x0F406000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SmullIdx2S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x0F80A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmullIdxVec4HSignedProducts) {
+  // SMULL .4s, .4h, .h[0]: Vn.4h = {-3, 5, -100, 32767}, Vm.h[0] = -200.
+  // Expected per-lane (sign-extended 16x16 -> 32):
+  //   -3   * -200 =     600
+  //    5   * -200 =   -1000
+  //  -100  * -200 =   20000
+  //  32767 * -200 = -6553400
+  uint16_t n_lanes[8] = {
+      static_cast<uint16_t>(-3),  static_cast<uint16_t>(5),
+      static_cast<uint16_t>(-100), 0x7FFF, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {static_cast<uint16_t>(-200), 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // Pre-fill Vd with sentinel — SMULL is non-accumulating, so the result
+  // must overwrite the entire 128-bit destination.
+  state_.cpu.v[0] = (__uint128_t{0xDEADBEEFDEADBEEFULL} << 64) |
+                    __uint128_t{0xDEADBEEFDEADBEEFULL};
+  static const uint32_t code[] = {SmullIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 600);
+  EXPECT_EQ(r[1], -1000);
+  EXPECT_EQ(r[2], 20000);
+  EXPECT_EQ(r[3], -6553400);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmullIdxVec4HUnsignedFullRange) {
+  // UMULL .4s, .4h, .h[2]: Vn.4h = {0xFFFF, 0x1234, 0xABCD, 0x0001},
+  // Vm.h[2] = 0xFFFF.  Unsigned products fit in 32 bits exactly:
+  //   0xFFFF * 0xFFFF = 0xFFFE0001
+  //   0x1234 * 0xFFFF = 0x1233EDCC
+  //   0xABCD * 0xFFFF = 0xABCC5433
+  //   0x0001 * 0xFFFF = 0x0000FFFF
+  uint16_t n_lanes[8] = {0xFFFF, 0x1234, 0xABCD, 0x0001, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 0, 0xFFFF, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {UmullIdx4H(0, 1, 2, /*k=*/2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, reinterpret_cast<int32_t*>(r));
+  EXPECT_EQ(r[0], 0xFFFE0001u);
+  EXPECT_EQ(r[1], 0x1233EDCCu);
+  EXPECT_EQ(r[2], 0xABCC5433u);
+  EXPECT_EQ(r[3], 0x0000FFFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smull2IdxVec8HUsesHighHalf) {
+  // SMULL2 .4s, .8h, .h[7]: Q=1 selects Vn high half (lanes 4..7) as the
+  // multiplicand.  Low half (lanes 0..3) is sentinel and must NOT appear
+  // in the result.  Vm.h[7] = 100.  index=7 exercises the H=L=M=1 path.
+  uint16_t n_lanes[8] = {
+      0xBEEF, 0xBEEF, 0xBEEF, 0xBEEF,                      // low half: ignored
+      static_cast<uint16_t>(-7), 11, static_cast<uint16_t>(-13), 17};
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 100};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {Smull2Idx8H(0, 1, 2, /*k=*/7)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], -700);
+  EXPECT_EQ(r[1],  1100);
+  EXPECT_EQ(r[2], -1300);
+  EXPECT_EQ(r[3],  1700);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmlalIdxVec4HAccumulates) {
+  // SMLAL .4s, .4h, .h[0]: Vd.4s += Vn.4h(sign-ext) * Vm.h[0](sign-ext).
+  // Vd[i] = 1000 + (i+1) * 200; Vn[i] = i+1; Vm.h[0] = 7.
+  //   Result[i] = Vd[i] + (i+1)*7
+  uint16_t n_lanes[8] = {1, 2, 3, 4, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 1200, 1400, 1600, 1800);
+  static const uint32_t code[] = {SmlalIdx4H(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 1207);
+  EXPECT_EQ(r[1], 1414);
+  EXPECT_EQ(r[2], 1621);
+  EXPECT_EQ(r[3], 1828);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmlslIdxVec4HSubtracts) {
+  // SMLSL .4s, .4h, .h[3]: Vd -= sign_ext(Vn) * sign_ext(Vm.h[3]).
+  // Vm.h[3] = -10 ensures (i+1)*(-10) = negative product; subtracting a
+  // negative product is equivalent to adding the absolute value, so the
+  // accumulator must move *up* by |product| — distinct from SMLAL with
+  // a positive multiplier.
+  uint16_t n_lanes[8] = {1, 2, 3, 4, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 0, 0, static_cast<uint16_t>(-10), 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 100, 200, 300, 400);
+  static const uint32_t code[] = {SmlslIdx4H(0, 1, 2, /*k=*/3)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 100 - (1 * -10));   // 110
+  EXPECT_EQ(r[1], 200 - (2 * -10));   // 220
+  EXPECT_EQ(r[2], 300 - (3 * -10));   // 330
+  EXPECT_EQ(r[3], 400 - (4 * -10));   // 440
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmullIdxVec2SWordToDouble) {
+  // SMULL .2d, .2s, .s[0] (size=10): Q=0 uses Vn.s[0..1] (low half).
+  // Vn.2s = {-2, 0x7FFFFFFF}; Vm.s[0] = -3.
+  //   -2          * -3 = 6.
+  //   0x7FFFFFFF  * -3 = -6442450941 = 0xFFFFFFFE80000003 (sign-extended).
+  int32_t n_lanes[4] = {-2, 0x7FFFFFFF, 0x55555555, 0x66666666};
+  int32_t m_lanes[4] = {-3, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SmullIdx2S(0, 1, 2, /*k=*/0)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), int64_t{6});
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), int64_t{-6442450941});
+}
+
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
 // interpreter; the tests below drive Run() so the lite_translator lowering

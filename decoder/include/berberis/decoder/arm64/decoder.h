@@ -1743,6 +1743,20 @@ class Decoder {
     kSqrdmulhIdx,  // SQRDMULH (by element): U=0, opcode=1101, size in {01,10}.
                    // Same as SQDMULH but with rounding constant 1<<(esize-1)
                    // added before the right shift.
+    kSmullIdx,     // SMULL/SMULL2 (by element): U=0, opcode=1010, size in {01,10}.
+                   // Widening signed multiply: dst lane = sign_ext(Vn[i]) *
+                   // sign_ext(Vm[index]); dst is always 128-bit.  Q selects Vn
+                   // low half (Q=0, SMULL) vs high half (Q=1, SMULL2).
+    kUmullIdx,     // UMULL/UMULL2 (by element): U=1, opcode=1010, size in {01,10}.
+                   // Widening unsigned multiply; same Q semantics as kSmullIdx.
+    kSmlalIdx,     // SMLAL/SMLAL2 (by element): U=0, opcode=0010, size in {01,10}.
+                   // Vd lane += sign_ext(Vn[i]) * sign_ext(Vm[index]).
+    kUmlalIdx,     // UMLAL/UMLAL2 (by element): U=1, opcode=0010, size in {01,10}.
+                   // Vd lane += unsigned product.
+    kSmlslIdx,     // SMLSL/SMLSL2 (by element): U=0, opcode=0110, size in {01,10}.
+                   // Vd lane -= sign_ext(Vn[i]) * sign_ext(Vm[index]).
+    kUmlslIdx,     // UMLSL/UMLSL2 (by element): U=1, opcode=0110, size in {01,10}.
+                   // Vd lane -= unsigned product.
     // endregion
   };
 
@@ -6108,7 +6122,19 @@ class Decoder {
             (opcode == 0b0100 && u) ||
             // region digitalis
             (opcode == 0b1100 && !u) ||
-            (opcode == 0b1101 && !u)
+            (opcode == 0b1101 && !u) ||
+            // Widening MUL/MAC by element accept both U values.
+            // Encoding pattern (ARM ARM C7.2):
+            //   smull   v0.4s, v1.4h, v2.h[0] = 0x0F42A020   U=0, opcode=1010
+            //   smull2  v0.4s, v1.8h, v2.h[7] = 0x4F72A820   Q=1, index=7
+            //   umull   v0.4s, v1.4h, v2.h[0] = 0x2F42A020   U=1, opcode=1010
+            //   smlal   v0.4s, v1.4h, v2.h[0] = 0x0F422020   U=0, opcode=0010
+            //   umlal   v0.4s, v1.4h, v2.h[0] = 0x2F422020   U=1, opcode=0010
+            //   smlsl   v0.4s, v1.4h, v2.h[0] = 0x0F426020   U=0, opcode=0110
+            //   umlsl   v0.4s, v1.4h, v2.h[0] = 0x2F426020   U=1, opcode=0110
+            opcode == 0b1010 ||
+            opcode == 0b0010 ||
+            opcode == 0b0110
             // endregion
             )) {
         Undefined();
@@ -6193,6 +6219,24 @@ class Decoder {
       case 0b1101:
         if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
         op = AdvSimdVecXIdxOpcode::kSqrdmulhIdx;
+        break;
+      // Widening MUL/MAC by element.  Restricted to size ∈ {0b01 (.4h/.8h ->
+      // .4s), 0b10 (.2s/.4s -> .2d)}.  size=0b00 has no encoding (8->16
+      // widening MUL is not defined), size=0b11 is reserved.
+      case 0b1010:
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kUmullIdx
+               : AdvSimdVecXIdxOpcode::kSmullIdx;
+        break;
+      case 0b0010:
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kUmlalIdx
+               : AdvSimdVecXIdxOpcode::kSmlalIdx;
+        break;
+      case 0b0110:
+        if (size != 0b01 && size != 0b10) { Undefined(); return; }
+        op = u ? AdvSimdVecXIdxOpcode::kUmlslIdx
+               : AdvSimdVecXIdxOpcode::kSmlslIdx;
         break;
       // endregion
       default:
