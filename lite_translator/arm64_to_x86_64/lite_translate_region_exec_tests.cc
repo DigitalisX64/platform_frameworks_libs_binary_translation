@@ -12508,6 +12508,95 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarIdxSStage1CornerSubtracts) {
 }
 // endregion
 
+// region digitalis
+// JIT-driven coverage for SQRDMLAH/SQRDMLSH scalar three-same and scalar
+// by-element (Armv8.1-RDM).  The InterpretInsn-driven tests above continue
+// to exercise the interpreter handler; the tests below drive Run() so the
+// lite_translator lowering is executed.
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahScalarHAccumulatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x4000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x4000});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint16_t{0x1000});
+  static const uint32_t code[] = {SqrdmlahScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x3000});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahScalarHStage1CornerSaturatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x8000});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x8000});
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {SqrdmlahScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x7FFF});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarHStage2NegativeSaturatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x8000});  // INT16_MIN
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint16_t{0x8000});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint16_t{0x8064});  // INT16_MIN+100
+  static const uint32_t code[] = {SqrdmlshScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x8000});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahScalarSAccumulatesJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x40000000u});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x40000000u});
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint32_t{0x100u});
+  static const uint32_t code[] = {SqrdmlahScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint32_t>(state_.cpu.v[0]), uint32_t{0x20000100u});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarSStage1AndStage2SaturateJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x80000000u});  // INT32_MIN
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint32_t{0x80000000u});
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(static_cast<uint32_t>(INT32_MIN + 100));
+  static const uint32_t code[] = {SqrdmlshScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int32_t>(state_.cpu.v[0]), INT32_MIN);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahScalarIdxHReadsLaneJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint16_t{0x4000});
+  __uint128_t vm = 0;
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0x4000, 0, 0};
+  std::memcpy(&vm, m_lanes, 16);
+  state_.cpu.v[2] = vm;
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint16_t{0x100});
+  static const uint32_t code[] = {SqrdmlxScalarIdxH(/*is_sub=*/false, 0, 1, 2, 5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint16_t>(state_.cpu.v[0]), uint16_t{0x2100});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 16, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarIdxSStage1CornerSubtractsJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint32_t{0x80000000u});
+  __uint128_t vm = 0;
+  uint32_t m_lanes[4] = {0, 0, 0x80000000u, 0};
+  std::memcpy(&vm, m_lanes, 16);
+  state_.cpu.v[2] = vm;
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(static_cast<uint32_t>(INT32_MAX));
+  static const uint32_t code[] = {SqrdmlxScalarIdxS(/*is_sub=*/true, 0, 1, 2, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int32_t>(state_.cpu.v[0]), 0);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+// endregion
+
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
 // interpreter; the tests below drive Run() so the lite_translator lowering
