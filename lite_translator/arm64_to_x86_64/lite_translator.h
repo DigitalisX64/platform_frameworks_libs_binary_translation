@@ -12973,10 +12973,21 @@ class LiteTranslator {
     const bool is_sqshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar);
     // endregion
+    // region digitalis: URSHL scalar (D form only — the size=11 path).
+    // Unsigned non-saturating rounded variable shift; left shifts discard
+    // upper bits (same as USHL); right shifts add a round-half-up bias
+    // 1 << (rshift-1) before the shift.  Implemented via the standard
+    // overflow-avoiding identity
+    //   (a + (1 << (rshift-1))) >>u rshift  ==
+    //   (a >>u rshift) + ((a >>u (rshift-1)) & 1)
+    // so that a near UINT64_MAX doesn't wrap during the bias addition.
+    const bool is_urshl_scalar_d =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUrshlScalar);
+    // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
         !is_satarith_scalar_bhsd && !is_shl_scalar_d && !is_uqshl_scalar_d &&
-        !is_sqshl_scalar_d) {
+        !is_sqshl_scalar_d && !is_urshl_scalar_d) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13816,6 +13827,95 @@ class LiteTranslator {
       as_.Bind(L_neg_big);
       // |sh| >= 64: a = sign broadcast across all bits.
       as_.Sarq(a, int8_t{63});
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_zero);
+      as_.Xorq(a, a);
+
+      as_.Bind(L_done);
+      // Restore rcx.
+      as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+      as_.Addq(Assembler::rsp, 8);
+
+      // Store result to Vd[63:0] and zero Vd[127:64].
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);
+      as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
+      return;
+    }
+    // endregion
+    // region digitalis: URSHL scalar D form (unsigned non-saturating rounded
+    // variable shift, 64-bit lane).  Left shifts truncate (no saturation —
+    // bits past bit 63 are discarded); right shifts add a round-half-up bias
+    // before the shift.  The standard identity
+    //   (a + 2^(rshift-1)) >>u rshift  ==
+    //   (a >>u rshift) + ((a >>u (rshift-1)) & 1)
+    // avoids the bias-addition wraparound near UINT64_MAX.
+    //   * shift in [0, 63]    → a <<u shift.
+    //   * shift >= 64         → 0.
+    //   * shift in [-63, -1]  → (a >>u |sh|) + ((a >>u (|sh|-1)) & 1).
+    //   * shift == -64        → bit 63 of a (the round bit is the only
+    //                            surviving contribution; equivalent to
+    //                            (a >>u 63) & 1).  Handled with Shrq by
+    //                            immediate 63 since (a >>u 64) is the
+    //                            undefined-shift boundary on x86.
+    //   * shift <= -65        → 0 (per ARM ARM semantics; the rounding
+    //                            term dominates and the quotient is 0).
+    if (is_urshl_scalar_d) {
+      if (args.size != 0b11) { success_ = false; return; }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      Register a = AllocTempReg();
+      Register sh = AllocTempReg();
+      Register round_bit = AllocTempReg();
+      if (a == Assembler::no_register || sh == Assembler::no_register ||
+          round_bit == Assembler::no_register) {
+        success_ = false; return;
+      }
+      // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+      as_.Subq(Assembler::rsp, 8);
+      as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+      // Load a from Vn[63:0]; sign-extend Vm[7:0] into sh (int64).
+      as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_off});
+
+      Assembler::Label* L_neg = as_.MakeLabel();
+      Assembler::Label* L_rshift_eq_64 = as_.MakeLabel();
+      Assembler::Label* L_zero = as_.MakeLabel();
+      Assembler::Label* L_done = as_.MakeLabel();
+
+      as_.Testq(sh, sh);
+      as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+      // Positive shift in [0, 127]: sh >= 64 → 0; else a <<u sh.
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+      as_.Movq(Assembler::rcx, sh);
+      as_.ShlqByCl(a);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_neg);
+      // Negative shift: |sh| in [1, 128] after Negq.
+      as_.Negq(sh);
+      as_.Cmpq(sh, int32_t{64});
+      as_.Jcc(Assembler::Condition::kGreater, *L_zero);
+      as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_64);
+      // 1 <= |sh| <= 63: compute round bit then signed quotient.
+      // round_bit = (a >>u (|sh|-1)) & 1.
+      as_.Movq(round_bit, a);
+      as_.Decq(sh);
+      as_.Movq(Assembler::rcx, sh);
+      as_.ShrqByCl(round_bit);
+      as_.Andq(round_bit, int32_t{1});
+      as_.Incq(sh);
+      as_.Movq(Assembler::rcx, sh);
+      as_.ShrqByCl(a);
+      as_.Addq(a, round_bit);
+      as_.Jmp(*L_done);
+
+      as_.Bind(L_rshift_eq_64);
+      // |sh| == 64: result = (a >>u 63) & 1 — i.e. just bit 63.
+      as_.Shrq(a, int8_t{63});
       as_.Jmp(*L_done);
 
       as_.Bind(L_zero);
