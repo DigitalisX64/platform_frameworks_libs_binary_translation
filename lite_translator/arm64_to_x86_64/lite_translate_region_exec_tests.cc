@@ -10691,6 +10691,215 @@ TEST_F(Arm64LiteTranslateRegionTest, SmullIdxVec2SWordToDouble) {
   EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), int64_t{-6442450941});
 }
 
+// Encoder helpers for the remaining widening MUL/MAC by-element forms that
+// the JIT path needs to exercise (the InterpretInsn-driven tests above
+// cover SMULL/UMULL/SMLAL/SMLSL .4h and SMULL .2s).  All share the same
+// bit shape — `0x_F40_000 | (L<<21) | (M<<20) | (Rm4<<16) | (H<<11) |
+// (Rn<<5) | Rd` — with the variant bits being U (bit 29), Q (bit 30),
+// and opcode (bits 15:12: 1010 = MULL, 0010 = MLAL, 0110 = MLSL).
+constexpr uint32_t UmullIdx2Helper8H(uint8_t rd, uint8_t rn, uint8_t rm,
+                                     uint8_t k) {
+  // UMULL2 .4s, .8h, .h[k]: U=1, Q=1, opcode=1010, base 0x6F40A000.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x6F40A000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UmlalIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // UMLAL .4s, .4h, .h[k]: U=1, Q=0, opcode=0010, base 0x2F402000.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x2F402000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UmlslIdx4H(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // UMLSL .4s, .4h, .h[k]: U=1, Q=0, opcode=0110, base 0x2F406000.
+  uint32_t M = k & 1u;
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  return 0x2F406000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// JIT-driven coverage for the widening MUL/MAC by-element family (size=01:
+// .4h/.8h sources -> .4s destination).  The InterpretInsn-driven tests
+// above keep exercising the interpreter; the tests below drive Run() so
+// the lite_translator lowering is executed.
+TEST_F(Arm64LiteTranslateRegionTest, SmullIdxVec4HSignedProductsJit) {
+  // SMULL .4s, .4h, .h[0]: signed sign-extension visible across positive,
+  // negative, and INT16_MAX magnitude lanes.  The widening forms write
+  // the full 128-bit destination — Q=0 must NOT zero the upper half here
+  // (this differs from the same-size MUL/MLA/MLS arm).
+  uint16_t n_lanes[8] = {
+      static_cast<uint16_t>(-3),  static_cast<uint16_t>(5),
+      static_cast<uint16_t>(-100), 0x7FFF, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {static_cast<uint16_t>(-200), 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  state_.cpu.v[0] = (__uint128_t{0xDEADBEEFDEADBEEFULL} << 64) |
+                    __uint128_t{0xDEADBEEFDEADBEEFULL};
+  static const uint32_t code[] = {SmullIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 600);
+  EXPECT_EQ(r[1], -1000);
+  EXPECT_EQ(r[2], 20000);
+  EXPECT_EQ(r[3], -6553400);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmullIdxVec4HUnsignedFullRangeJit) {
+  // UMULL .4s, .4h, .h[2]: 0xFFFF * 0xFFFF = 0xFFFE0001 — the full
+  // unsigned product fits in 32 bits, and PMOVZXWD must zero-extend
+  // (using PMOVSXWD here would treat 0xFFFF as -1 and yield 1, exposing
+  // a signedness bug in the lowering).
+  uint16_t n_lanes[8] = {0xFFFF, 0x1234, 0xABCD, 0x0001, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 0, 0xFFFF, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {UmullIdx4H(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, reinterpret_cast<int32_t*>(r));
+  EXPECT_EQ(r[0], 0xFFFE0001u);
+  EXPECT_EQ(r[1], 0x1233EDCCu);
+  EXPECT_EQ(r[2], 0xABCC5433u);
+  EXPECT_EQ(r[3], 0x0000FFFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Smull2IdxVec8HUsesHighHalfJit) {
+  // SMULL2 .4s, .8h, .h[7]: Q=1 selects Vn high half (lanes 4..7) as the
+  // multiplicand.  Low half (lanes 0..3) is sentinel 0xBEEF and must NOT
+  // contribute.  The lowering reads Vn at byte offset vn_off+8, so a
+  // bug routing Q=1 to the low half would surface as a 0xBEEF*100 product.
+  uint16_t n_lanes[8] = {
+      0xBEEF, 0xBEEF, 0xBEEF, 0xBEEF,
+      static_cast<uint16_t>(-7), 11, static_cast<uint16_t>(-13), 17};
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 100};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {Smull2Idx8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], -700);
+  EXPECT_EQ(r[1],  1100);
+  EXPECT_EQ(r[2], -1300);
+  EXPECT_EQ(r[3],  1700);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Umull2IdxVec8HUnsignedHighHalfJit) {
+  // UMULL2 .4s, .8h, .h[7]: Q=1 + unsigned.  Distinguishes the
+  // (is_signed=false, q=1) corner: a bug that ignored Q in the unsigned
+  // path would produce zero from the low-half sentinel; a bug that used
+  // PMOVSXWD on the high half would convert 0xFFFF to -1 instead of
+  // 65535.  Vm.h[7] = 0xFFFF broadcasts INT16_MAX-as-unsigned across
+  // the multiplier.
+  uint16_t n_lanes[8] = {0, 0, 0, 0,
+                         0xFFFF, 0x8000, 0x0001, 0xC000};
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 0xFFFF};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {UmullIdx2Helper8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, reinterpret_cast<int32_t*>(r));
+  EXPECT_EQ(r[0], 0xFFFE0001u);  // 0xFFFF * 0xFFFF
+  EXPECT_EQ(r[1], 0x7FFF8000u);  // 0x8000 * 0xFFFF
+  EXPECT_EQ(r[2], 0x0000FFFFu);  // 0x0001 * 0xFFFF
+  EXPECT_EQ(r[3], 0xBFFF4000u);  // 0xC000 * 0xFFFF
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmlalIdxVec4HAccumulatesJit) {
+  // SMLAL .4s, .4h, .h[0]: Vd += sign_ext(Vn) * sign_ext(Vm.h[0]).
+  // Verifies the load-modify-store accumulator path and that the full
+  // 128-bit Vd is updated (i.e. no upper-half clearing in the JIT path).
+  uint16_t n_lanes[8] = {1, 2, 3, 4, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // Pre-seed Vd's upper 64 bits with sentinel — widening forms write the
+  // full 128 bits so this must be overwritten as part of the .4s store.
+  // (The architectural result is that Vd[0..3] = base + product; the
+  // upper-half is sentinel because the encoder only writes 4 lanes,
+  // and the JIT's Movdqu of xd preserves the upper bits from Vd's load.)
+  StoreVec4SInt(state_.cpu, 0, 1200, 1400, 1600, 1800);
+  static const uint32_t code[] = {SmlalIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 1207);
+  EXPECT_EQ(r[1], 1414);
+  EXPECT_EQ(r[2], 1621);
+  EXPECT_EQ(r[3], 1828);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmlalIdxVec4HUnsignedAccumulateJit) {
+  // UMLAL .4s, .4h, .h[1]: unsigned-extending accumulate.  A signed
+  // mis-routing here would produce a negative product (treating 0xFFFF
+  // as -1) that incorrectly *decreases* the accumulator instead of
+  // increasing it by 65535.
+  uint16_t n_lanes[8] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 0xFFFF, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 1, 2, 3, 4);
+  static const uint32_t code[] = {UmlalIdx4H(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, reinterpret_cast<int32_t*>(r));
+  EXPECT_EQ(r[0], 1u + 0xFFFE0001u);
+  EXPECT_EQ(r[1], 2u + 0xFFFE0001u);
+  EXPECT_EQ(r[2], 3u + 0xFFFE0001u);
+  EXPECT_EQ(r[3], 4u + 0xFFFE0001u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmlslIdxVec4HSubtractsJit) {
+  // SMLSL .4s, .4h, .h[3]: Vd -= signed product.  Vm.h[3] = -10 means
+  // (i+1)*(-10) = negative; subtracting a negative moves the accumulator
+  // *up*.  Catches a bug that confuses MLAL vs MLSL dispatch on top of
+  // sign-of-product.
+  uint16_t n_lanes[8] = {1, 2, 3, 4, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0, 0, 0, static_cast<uint16_t>(-10), 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 100, 200, 300, 400);
+  static const uint32_t code[] = {SmlslIdx4H(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 100 - (1 * -10));   // 110
+  EXPECT_EQ(r[1], 200 - (2 * -10));   // 220
+  EXPECT_EQ(r[2], 300 - (3 * -10));   // 330
+  EXPECT_EQ(r[3], 400 - (4 * -10));   // 440
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UmlslIdxVec4HUnsignedSubtractsJit) {
+  // UMLSL .4s, .4h, .h[0]: unsigned subtract.  Initial Vd has values
+  // larger than the products so the differences are positive 32-bit
+  // values, but a signed-vs-unsigned routing bug here would produce
+  // very different magnitudes (sign-extending 0xFFFF yields -1, so
+  // -1 * Vn would mean ADDING small positive Vn values).
+  uint16_t n_lanes[8] = {10, 20, 30, 40, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0xFFFF, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec4SInt(state_.cpu, 0, 0x00200000, 0x00400000, 0x00600000, 0x00800000);
+  static const uint32_t code[] = {UmlslIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, reinterpret_cast<int32_t*>(r));
+  EXPECT_EQ(r[0], 0x00200000u - (10u * 0xFFFFu));
+  EXPECT_EQ(r[1], 0x00400000u - (20u * 0xFFFFu));
+  EXPECT_EQ(r[2], 0x00600000u - (30u * 0xFFFFu));
+  EXPECT_EQ(r[3], 0x00800000u - (40u * 0xFFFFu));
+}
+
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
 // interpreter; the tests below drive Run() so the lite_translator lowering

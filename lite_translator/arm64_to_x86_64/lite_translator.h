@@ -15284,6 +15284,107 @@ class LiteTranslator {
     }
     // endregion
 
+    // region digitalis: widening MUL/MAC by-element (size=01: .4h/.8h -> .4s).
+    //
+    // SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL by element with halfword sources
+    // and word destination — 4 output lanes (.4s).  Q=0 (*MULL/*MLAL/*MLSL)
+    // selects Vn.h[0..3] (low half) as multiplicands; Q=1 (*MULL2/*MLAL2/
+    // *MLSL2) selects Vn.h[4..7] (high half).  Destination is always
+    // 128-bit regardless of Q — widening forms do NOT zero the upper half
+    // (this differs from the same-size MUL/MLA/MLS arm above).
+    //
+    // Strategy: widen each operand's 4 halfword lanes to 32-bit via
+    // PMOVSXWD (signed: SMULL/SMLAL/SMLSL) or PMOVZXWD (unsigned: UMULL/
+    // UMLAL/UMLSL), then PMULLD for the 32-bit product (low 32 of PMULLD's
+    // signed result equals the correct full-width product since both 16x16
+    // signed and 16x16 unsigned products fit in 32 bits).  PMOVSXWD /
+    // PMOVZXWD from memory at vn_off+(q?8:0) picks the correct half
+    // directly.  For Vm we broadcast Vm.h[index] across all 8 halfword
+    // lanes first (shared shim with MUL/MLA/MLS), then widen the low 4
+    // identical lanes.  For SMLAL/UMLAL load Vd and PADDD; for SMLSL/UMLSL
+    // load Vd and PSUBD.  Size=10 (.2s/.4s -> .2d) falls through to the
+    // interpreter — Pmuldq / Pmuludq reconstruction is deferred to a
+    // future cycle.
+    //
+    // Verified encodings (ARM ARM C7.2 / handoff-353):
+    //   smull   v0.4s, v1.4h, v2.h[0] = 0x0F42A020
+    //   smull2  v0.4s, v1.8h, v2.h[7] = 0x4F72A820
+    //   umull   v0.4s, v1.4h, v2.h[0] = 0x2F42A020
+    //   smlal   v0.4s, v1.4h, v2.h[0] = 0x0F422020
+    //   umlal   v0.4s, v1.4h, v2.h[0] = 0x2F422020
+    //   smlsl   v0.4s, v1.4h, v2.h[0] = 0x0F426020
+    //   umlsl   v0.4s, v1.4h, v2.h[0] = 0x2F426020
+    if ((args.opcode == Op::kSmullIdx || args.opcode == Op::kUmullIdx ||
+         args.opcode == Op::kSmlalIdx || args.opcode == Op::kUmlalIdx ||
+         args.opcode == Op::kSmlslIdx || args.opcode == Op::kUmlslIdx) &&
+        args.size == 0b01) {
+      const bool is_signed = (args.opcode == Op::kSmullIdx ||
+                              args.opcode == Op::kSmlalIdx ||
+                              args.opcode == Op::kSmlslIdx);
+      const bool is_accum = (args.opcode == Op::kSmlalIdx ||
+                             args.opcode == Op::kUmlalIdx ||
+                             args.opcode == Op::kSmlslIdx ||
+                             args.opcode == Op::kUmlslIdx);
+      const bool is_sub = (args.opcode == Op::kSmlslIdx ||
+                           args.opcode == Op::kUmlslIdx);
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xn = AllocTempSimdReg();
+      if (xm == no_simd_register || xn == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Broadcast Vm.h[index] across all 8 halfword lanes of xm.
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+      if (args.index >= 4) {
+        as_.Psrldq(xm, int8_t{8});
+      }
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      }
+
+      // Widen Vm's low 4 broadcast halfwords to 4 × 32-bit lanes (with the
+      // correct sign-extend / zero-extend semantics for the product).
+      if (is_signed) as_.Pmovsxwd(xm, xm);
+      else           as_.Pmovzxwd(xm, xm);
+
+      // Widen Vn's selected source half to 4 × 32-bit lanes.  Q=0 reads
+      // bytes 0..7 of Vn; Q=1 reads bytes 8..15 — PMOVSXWD/PMOVZXWD with
+      // a memory operand at vn_off+(q?8:0) picks the correct half.
+      int32_t vn_src_off = vn_off + (args.q ? 8 : 0);
+      if (is_signed) {
+        as_.Pmovsxwd(xn, {.base = Assembler::rbp, .disp = vn_src_off});
+      } else {
+        as_.Pmovzxwd(xn, {.base = Assembler::rbp, .disp = vn_src_off});
+      }
+
+      // 32-bit multiply: both signed and unsigned 16x16 products fit in
+      // 32 bits, so PMULLD's signed low-32 result equals the architectural
+      // result for both forms.
+      as_.Pmulld(xn, xm);
+
+      if (is_accum) {
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        if (is_sub) as_.Psubd(xd, xn);
+        else        as_.Paddd(xd, xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      } else {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+      }
+      return;
+    }
+    // endregion
+
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
