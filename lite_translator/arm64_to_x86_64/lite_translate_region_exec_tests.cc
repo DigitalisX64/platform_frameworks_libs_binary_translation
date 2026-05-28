@@ -10498,6 +10498,113 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec4SSaturatesIntMinSquared) {
   LoadVec4SInt(state_.cpu, 0, r);
   for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x7FFFFFFF);
 }
+
+// JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
+// (size=01).  The interpreter-driven tests above continue to exercise the
+// interpreter; the tests below drive Run() so the lite_translator lowering
+// is executed.
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec8HBroadcastsLaneJit) {
+  uint16_t n_lanes[8] = {0x4000, 0x2000, 0x1000, 0x0800,
+                         0x0400, 0x0200, 0x0100, 0x0080};
+  uint16_t m_lanes[8] = {0, 0, 0, 0, 0, 0, 0, 0x4000};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {SqdmulhIdx8H(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x2000u);
+  EXPECT_EQ(r[1], 0x1000u);
+  EXPECT_EQ(r[2], 0x0800u);
+  EXPECT_EQ(r[3], 0x0400u);
+  EXPECT_EQ(r[4], 0x0200u);
+  EXPECT_EQ(r[5], 0x0100u);
+  EXPECT_EQ(r[6], 0x0080u);
+  EXPECT_EQ(r[7], 0x0040u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec8HSaturatesIntMinSquaredJit) {
+  // a = b = 0x8000.  PACKSSDW must saturate the 0x10000 32-bit value down
+  // to 0x7FFF (INT16_MAX), not wrap to 0x8000.
+  uint16_t n_lanes[8] = {0x8000, 0x8000, 0x8000, 0x8000,
+                         0x8000, 0x8000, 0x8000, 0x8000};
+  uint16_t m_lanes[8] = {0x8000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {SqdmulhIdx8H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], 0x7FFFu);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhIdxVec4HUpperZeroJit) {
+  // Q=0 (.4h).  JIT must zero upper 64 bits of Vd.
+  uint16_t n_lanes[8] = {0x4000, 0x2000, 0x1000, 0x0800, 0, 0, 0, 0};
+  uint16_t m_lanes[8] = {0x4000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  state_.cpu.v[0] = 0xAAAAAAAAAAAAAAAAULL;
+  static const uint32_t code[] = {SqdmulhIdx4H(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x2000u);
+  EXPECT_EQ(r[1], 0x1000u);
+  EXPECT_EQ(r[2], 0x0800u);
+  EXPECT_EQ(r[3], 0x0400u);
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhIdxVec8HRoundingDistinctJit) {
+  // a = 0x4000, b = 0x4001.  SQDMULH=0x2000, SQRDMULH=0x2001 — JIT
+  // must produce the rounded value (PMULHRSW), not the truncated one.
+  uint16_t n_lanes[8] = {0x4000, 0x4000, 0x4000, 0x4000,
+                         0x4000, 0x4000, 0x4000, 0x4000};
+  uint16_t m_lanes[8] = {0x4001, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  static const uint32_t code[] = {SqrdmulhIdx4H(0, 1, 2, /*k=*/0)};
+  // SqrdmulhIdx4H encoding has Q=0 — only 4 lanes written + upper zero.
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(r[i], 0x2001u);
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest,
+       SqrdmulhIdxVec8HCornerFixupSaturatesIntMinSquaredJit) {
+  // a = b = 0x8000.  PMULHRSW yields 0x8000 for this pair, but SQRDMULH
+  // must saturate to 0x7FFF.  Exercises the JIT corner-mask Pxor fixup.
+  // Mix in non-corner lanes to verify the fixup only flips the affected
+  // ones (mask AND of two PCMPEQW operands).
+  //
+  // Per-lane SQRDMULH math (= SAT16(((2 * a_signed * b_signed) + 0x8000) >> 16)):
+  //   (0x8000, 0x8000) -> SAT16((2^31 + 2^15) >> 16) = SAT16(0x8000) = 0x7FFF.
+  //   (0x4000, 0x8000) -> SAT16(-16384) = 0xC000.
+  //   (0x2000, 0x8000) -> SAT16(-8192)  = 0xE000.
+  //   (0x1000, 0x8000) -> SAT16(-4096)  = 0xF000.
+  //   (0x0800, 0x8000) -> SAT16(-2048)  = 0xF800.
+  uint16_t n_lanes[8] = {0x8000, 0x4000, 0x8000, 0x2000,
+                         0x8000, 0x1000, 0x8000, 0x0800};
+  uint16_t m_lanes[8] = {0x8000, 0, 0, 0, 0, 0, 0, 0};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  // SqrdmulhIdx8H encoding: Q=1, .8h, broadcast Vm.h[0] (= 0x4F42D020).
+  static const uint32_t code_8h[] = {0x4F42D020u};
+  EXPECT_TRUE(Run(code_8h, ToGuestAddr(code_8h) + sizeof(code_8h)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7FFFu);
+  EXPECT_EQ(r[1], 0xC000u);
+  EXPECT_EQ(r[2], 0x7FFFu);
+  EXPECT_EQ(r[3], 0xE000u);
+  EXPECT_EQ(r[4], 0x7FFFu);
+  EXPECT_EQ(r[5], 0xF000u);
+  EXPECT_EQ(r[6], 0x7FFFu);
+  EXPECT_EQ(r[7], 0xF800u);
+}
 // endregion
 
 // region digitalis - FCSEL JIT

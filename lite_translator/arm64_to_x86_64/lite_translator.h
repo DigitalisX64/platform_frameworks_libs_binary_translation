@@ -15171,6 +15171,119 @@ class LiteTranslator {
       return;
     }
     // endregion
+
+    // region digitalis: SQDMULH / SQRDMULH by-element (.4h / .8h, size=01).
+    //
+    // Per-lane: Vd[i] = SAT16((2 * Vn[i] * Vm[index]) >> 16), with SQRDMULH
+    // adding a rounding constant 1<<15 to the doubled product before the
+    // shift.
+    //
+    // SQRDMULH .8h: SSSE3 PMULHRSW computes ((a*b)>>14 + 1)>>1 = SQRDMULH,
+    // except for the single corner case (a=0x8000, b=0x8000) where SQRDMULH
+    // saturates to 0x7FFF but PMULHRSW yields 0x8000.  Fixup: build a mask
+    // where both inputs were 0x8000, then XOR the affected lanes
+    // (0x8000 ^ 0xFFFF = 0x7FFF).
+    //
+    // SQDMULH .8h: full 32-bit signed product, arithmetic right-shift by 15,
+    // then signed-saturating pack back to 16-bit lanes (PACKSSDW) handles
+    // the (INT16_MIN)^2 overflow corner.  PMULLW gives the low 16 bits and
+    // PMULHW gives the high 16 bits (signed); interleave via Punpcklwd /
+    // Punpckhwd to reconstruct the 32-bit signed products.
+    //
+    // .2s/.4s (size=10) and the FP16 / FP32 / FP64 size codes fall through
+    // to the existing FP-only guard below.
+    if ((args.opcode == Op::kSqdmulhIdx ||
+         args.opcode == Op::kSqrdmulhIdx) &&
+        args.size == 0b01) {
+      if (!host_platform::kHasSSSE3) { success_ = false; return; }
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Broadcast Vm.h[index] across all 8 halfword lanes (same pattern as
+      // the MUL/MLA/MLS .8h arm above).
+      if (args.index >= 4) {
+        as_.Psrldq(xm, int8_t{8});
+      }
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshuflw(xm, xm, imm);
+        as_.Pshufd(xm, xm, int8_t{0x44});
+      }
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kSqrdmulhIdx) {
+        // SQRDMULH .8h via PMULHRSW + (0x8000, 0x8000) corner fixup.
+        SimdRegister xn_save = AllocTempSimdReg();
+        SimdRegister xm_save = AllocTempSimdReg();
+        SimdRegister x_min = AllocTempSimdReg();
+        if (xn_save == no_simd_register || xm_save == no_simd_register ||
+            x_min == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqa(xn_save, xn);
+        as_.Movdqa(xm_save, xm);
+
+        // x_min = 0x8000 broadcast across 8 halfwords (Pcmpeqw self -> all 1s
+        // = 0xFFFF, then Psllw 15 -> 0x8000).
+        as_.Pcmpeqw(x_min, x_min);
+        as_.Psllw(x_min, int8_t{15});
+
+        as_.Pmulhrsw(xn, xm);     // xn = SQRDMULH except (INT16_MIN)^2 corner.
+        as_.Pcmpeqw(xn_save, x_min);   // lanes where Vn was 0x8000 -> 0xFFFF.
+        as_.Pcmpeqw(xm_save, x_min);   // lanes where Vm was 0x8000 -> 0xFFFF.
+        as_.Pand(xn_save, xm_save);    // combined corner mask.
+        as_.Pxor(xn, xn_save);         // 0x8000 ^ 0xFFFF = 0x7FFF on corner.
+        xmm_result = xn;
+      } else {
+        // SQDMULH .8h via 32-bit reconstruction + arithmetic shift + signed
+        // saturating pack.
+        SimdRegister x_low = AllocTempSimdReg();
+        SimdRegister x_high = AllocTempSimdReg();
+        SimdRegister x_lo_lanes = AllocTempSimdReg();
+        if (x_low == no_simd_register || x_high == no_simd_register ||
+            x_lo_lanes == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqa(x_low, xn);
+        as_.Movdqa(x_high, xn);
+        as_.Pmullw(x_low, xm);    // x_low = (a*b) & 0xFFFF per lane.
+        as_.Pmulhw(x_high, xm);   // x_high = (a*b) >> 16, signed, per lane.
+
+        // Interleave (low16, high16) -> 32-bit signed products.
+        // Punpcklwd takes lanes 0-3 of each source.
+        // Punpckhwd takes lanes 4-7 of each source.
+        as_.Movdqa(x_lo_lanes, x_low);
+        as_.Punpcklwd(x_lo_lanes, x_high);  // 4 lanes of full 32-bit products.
+        as_.Punpckhwd(x_low, x_high);       // upper 4 lanes.
+
+        as_.Psrad(x_lo_lanes, int8_t{15});  // (a*b) >> 15 as 32-bit signed.
+        as_.Psrad(x_low, int8_t{15});
+
+        as_.Packssdw(x_lo_lanes, x_low);    // signed-saturating pack to 16-bit.
+        xmm_result = x_lo_lanes;
+      }
+
+      if (!args.q) {
+        as_.Pslldq(xmm_result, int8_t{8});
+        as_.Psrldq(xmm_result, int8_t{8});
+      }
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
+
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
