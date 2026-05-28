@@ -12597,6 +12597,188 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarIdxSStage1CornerSubtractsJit)
 }
 // endregion
 
+// region digitalis
+// D-form scalar integer three-same encoders (ADD / SUB / CMGT / CMHI / CMGE /
+// CMHS / CMTST / CMEQ scalar).
+//
+// Encoding format (ARM ARM C7.2):
+//   01 U 11110 11 1 Rm opcode 1 Rn Rd   (size = 11 for D form)
+//
+// Verified encodings (clang --target=aarch64):
+//   add  d0, d1, d2 = 0x5ee28420 (U=0, opcode=10000)
+//   sub  d0, d1, d2 = 0x7ee28420 (U=1, opcode=10000)
+//   cmgt d0, d1, d2 = 0x5ee23420 (U=0, opcode=00110)
+//   cmhi d0, d1, d2 = 0x7ee23420 (U=1, opcode=00110)
+//   cmge d0, d1, d2 = 0x5ee23c20 (U=0, opcode=00111)
+//   cmhs d0, d1, d2 = 0x7ee23c20 (U=1, opcode=00111)
+//   cmtst d0, d1, d2 = 0x5ee28c20 (U=0, opcode=10001)
+//   cmeq d0, d1, d2 = 0x7ee28c20 (U=1, opcode=10001)
+constexpr uint32_t ScalarThreeSameD(uint32_t u, uint32_t opcode,
+                                    uint8_t rd, uint8_t rn, uint8_t rm) {
+  uint32_t insn = 0;
+  insn |= uint32_t{0b01} << 30;     // bit31=0, bit30=1 (scalar marker)
+  insn |= (u & 0x1u) << 29;
+  insn |= uint32_t{0b11110} << 24;
+  insn |= uint32_t{0b11} << 22;     // size = 11 (D form)
+  insn |= 1u << 21;
+  insn |= (rm & 0x1Fu) << 16;
+  insn |= (opcode & 0x1Fu) << 11;
+  insn |= 1u << 10;
+  insn |= (rn & 0x1Fu) << 5;
+  insn |= (rd & 0x1Fu);
+  return insn;
+}
+constexpr uint32_t AddScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b10000, rd, rn, rm);
+}
+constexpr uint32_t SubScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/1, /*opcode=*/0b10000, rd, rn, rm);
+}
+constexpr uint32_t CmgtScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b00110, rd, rn, rm);
+}
+constexpr uint32_t CmhiScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/1, /*opcode=*/0b00110, rd, rn, rm);
+}
+constexpr uint32_t CmgeScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b00111, rd, rn, rm);
+}
+constexpr uint32_t CmhsScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/1, /*opcode=*/0b00111, rd, rn, rm);
+}
+constexpr uint32_t CmtstScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b10001, rd, rn, rm);
+}
+constexpr uint32_t CmeqScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/1, /*opcode=*/0b10001, rd, rn, rm);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ScalarThreeSameDFormEncodingsMatchLlvmMc) {
+  EXPECT_EQ(AddScalarD(0, 1, 2),   0x5ee28420u);
+  EXPECT_EQ(SubScalarD(0, 1, 2),   0x7ee28420u);
+  EXPECT_EQ(CmgtScalarD(0, 1, 2),  0x5ee23420u);
+  EXPECT_EQ(CmhiScalarD(0, 1, 2),  0x7ee23420u);
+  EXPECT_EQ(CmgeScalarD(0, 1, 2),  0x5ee23c20u);
+  EXPECT_EQ(CmhsScalarD(0, 1, 2),  0x7ee23c20u);
+  EXPECT_EQ(CmtstScalarD(0, 1, 2), 0x5ee28c20u);
+  EXPECT_EQ(CmeqScalarD(0, 1, 2),  0x7ee28c20u);
+}
+
+// JIT-driven coverage for the D-form scalar integer three-same ops landed in
+// AdvSimdScalarThreeSame.  Each test pins lane-0 semantics against the ARM ARM
+// (ADD/SUB modular 64-bit, signed/unsigned ordering compares, bitwise-AND-tst,
+// equality) and verifies Vd[127:64] = 0 (scalar D writes the bottom 64 bits
+// and zero-extends the destination vector register).
+TEST_F(Arm64LiteTranslateRegionTest, AddScalarDWrapsBottom64Jit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFF00ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x0000000000000200ULL});
+  static const uint32_t code[] = {AddScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x100ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SubScalarDWrapsBottom64Jit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x0000000000000100ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x0000000000000200ULL});
+  static const uint32_t code[] = {SubScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFF00ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgtScalarDSignedJit) {
+  // -1 > -2 in signed → all-ones; reverse → 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFEULL});
+  static const uint32_t code[] = {CmgtScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgtScalarDSignedFalseJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFEULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  static const uint32_t code[] = {CmgtScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmhiScalarDUnsignedDistinguishesSignJit) {
+  // CMGT would call 0xFFFFFFFFFFFFFFFF "less than" 0x1; CMHI calls it greater.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x0000000000000001ULL});
+  static const uint32_t code[] = {CmhiScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmgeScalarDSignedEqualsJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x42ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x42ULL});
+  static const uint32_t code[] = {CmgeScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmhsScalarDUnsignedGreaterEqualJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  static const uint32_t code[] = {CmhsScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstScalarDDetectsCommonBitJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x000000000000000FULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x00000000000000F0ULL});
+  static const uint32_t code[] = {CmtstScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // (0x0F & 0xF0) == 0 → CMTST returns 0.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstScalarDOverlapJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x00000000000000FFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x0000000000000080ULL});
+  static const uint32_t code[] = {CmtstScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqScalarDEqualJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL});
+  static const uint32_t code[] = {CmeqScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmeqScalarDNotEqualJit) {
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x2ULL});
+  static const uint32_t code[] = {CmeqScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+// endregion
+
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
 // interpreter; the tests below drive Run() so the lite_translator lowering

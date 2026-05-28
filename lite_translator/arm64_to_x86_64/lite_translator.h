@@ -12901,9 +12901,28 @@ class LiteTranslator {
     const bool is_sqrdmlsh_scalar =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar);
     const bool is_sqrdm_scalar = is_sqrdmlah_scalar || is_sqrdmlsh_scalar;
+    const bool is_dform_add =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kAdd);
+    const bool is_dform_sub =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSub);
+    const bool is_dform_cmgt =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmgt);
+    const bool is_dform_cmhi =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmhi);
+    const bool is_dform_cmge =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmge);
+    const bool is_dform_cmhs =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmhs);
+    const bool is_dform_cmtst =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmtst);
+    const bool is_dform_cmeq =
+        (opc == Decoder::AdvSimdScalarThreeSameOpcode::kCmeq);
+    const bool is_dform_int =
+        is_dform_add || is_dform_sub || is_dform_cmgt || is_dform_cmhi ||
+        is_dform_cmge || is_dform_cmhs || is_dform_cmtst || is_dform_cmeq;
     // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
-        !is_sqrdm_scalar) {
+        !is_sqrdm_scalar && !is_dform_int) {
       success_ = false; return;
     }
     // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
@@ -13055,6 +13074,108 @@ class LiteTranslator {
       // zero in those lanes and the recipe propagates 0 through PSRAD /
       // PAND / PXOR with t_sum=0 and t_ovf=0.
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+      return;
+    }
+    // endregion
+    // region digitalis: D-form scalar integer ops (ADD / SUB / CMGT / CMHI /
+    //   CMGE / CMHS / CMTST / CMEQ scalar).  The ARM ARM restricts these to
+    //   size=11 (D form); Vd[63:0] = scalar op result, Vd[127:64] = 0.
+    //
+    // SSE port mirrors the AdvSimdThreeSame vector lowerings at size=11
+    // earlier in this file (CMGT, CMHI, CMGE, CMHS, CMEQ, ADD, SUB).
+    // Operands are loaded with MOVQ which puts Vn[63:0] in xmm[63:0] and
+    // zeros xmm[127:64], so the lane-1 computation is always between two
+    // zero operands.  We still mask_low64 the result because PCMPEQQ and
+    // the NOT-of-PCMPGTQ produce all-ones in lane 1 (0==0 / !(0>0)).
+    //
+    // SSE requirements:
+    //   * CMEQ scalar D       → PCMPEQQ (SSE4.1)
+    //   * CMTST scalar D      → PAND + PCMPEQQ (SSE4.1)
+    //   * CMGT scalar D       → PCMPGTQ (SSE4.2)
+    //   * CMHI scalar D       → sign-flip + PCMPGTQ (SSE4.2)
+    //   * CMGE scalar D       → PCMPGTQ + NOT (SSE4.2)
+    //   * CMHS scalar D       → sign-flip + PCMPGTQ + NOT (SSE4.2)
+    //   * ADD / SUB scalar D  → PADDQ / PSUBQ (baseline SSE2)
+    if (is_dform_int) {
+      if (args.size != 0b11) { success_ = false; return; }
+      const bool needs_sse4_1 = is_dform_cmeq || is_dform_cmtst;
+      const bool needs_sse4_2 =
+          is_dform_cmgt || is_dform_cmhi || is_dform_cmge || is_dform_cmhs;
+      if (needs_sse4_2 && !host_platform::kHasSSE4_2) {
+        success_ = false; return;
+      }
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        success_ = false; return;
+      }
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register) {
+        success_ = false; return;
+      }
+      // Load Vn[63:0] / Vm[63:0] with upper-lane zero-extension.
+      as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
+
+      if (is_dform_add) {
+        as_.Paddq(xn, xm);
+      } else if (is_dform_sub) {
+        as_.Psubq(xn, xm);
+      } else if (is_dform_cmgt) {
+        as_.Pcmpgtq(xn, xm);
+      } else if (is_dform_cmhi) {
+        // Sign-flip both operands, then signed PCMPGTQ implements unsigned >.
+        SimdRegister sign = AllocTempSimdReg();
+        if (sign == no_simd_register) { success_ = false; return; }
+        as_.Pcmpeqd(sign, sign);
+        as_.Psllq(sign, int8_t{63});
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        as_.Pcmpgtq(xn, xm);
+      } else if (is_dform_cmge) {
+        // CMGE Vn,Vm == !(Vm > Vn).  Reuse xm as the destination of
+        // PCMPGTQ(xm,xn), then XOR with all-ones to invert.
+        SimdRegister ones = AllocTempSimdReg();
+        if (ones == no_simd_register) { success_ = false; return; }
+        as_.Pcmpgtq(xm, xn);
+        as_.Pcmpeqd(ones, ones);
+        as_.Pxor(xm, ones);
+        xn = xm;  // Result lives in xm; rewire xn so the store path is shared.
+      } else if (is_dform_cmhs) {
+        // Sign-flip + !(xm > xn) gives unsigned >=.
+        SimdRegister sign = AllocTempSimdReg();
+        if (sign == no_simd_register) { success_ = false; return; }
+        as_.Pcmpeqd(sign, sign);
+        as_.Psllq(sign, int8_t{63});
+        as_.Pxor(xn, sign);
+        as_.Pxor(xm, sign);
+        as_.Pcmpgtq(xm, xn);
+        // Reuse `sign` to build the all-ones invert mask.
+        as_.Pcmpeqd(sign, sign);
+        as_.Pxor(xm, sign);
+        xn = xm;
+      } else if (is_dform_cmtst) {
+        // (Vn & Vm) != 0 ? all-ones : 0.  Compute AND, compare with 0
+        // (PCMPEQQ against a zeroed register), invert.
+        SimdRegister zero = AllocTempSimdReg();
+        if (zero == no_simd_register) { success_ = false; return; }
+        as_.Pand(xn, xm);
+        as_.Pxor(zero, zero);
+        as_.Pcmpeqq(xn, zero);  // xn = (xn & xm) == 0 ? all-ones : 0
+        // Invert: all-ones for nonzero AND, 0 for zero AND.
+        as_.Pcmpeqd(zero, zero);  // Reuse `zero` as the all-ones mask.
+        as_.Pxor(xn, zero);
+      } else if (is_dform_cmeq) {
+        as_.Pcmpeqq(xn, xm);
+      }
+      // Zero the upper 64 bits of the destination — scalar D form writes
+      // Vd[127:64] = 0, but PCMPEQQ and the inverted-PCMPGTQ paths leave
+      // 0xFFFF... in lane 1.
+      as_.Pslldq(xn, int8_t{8});
+      as_.Psrldq(xn, int8_t{8});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
       return;
     }
     // endregion
