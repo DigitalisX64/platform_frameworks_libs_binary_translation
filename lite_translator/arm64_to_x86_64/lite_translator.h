@@ -15645,6 +15645,183 @@ class LiteTranslator {
     }
     // endregion
 
+    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element
+    // (size=10: .2s/.4s -> .2d).
+    //
+    // 32-bit-source / 64-bit-destination sibling of the size=01 arm
+    // above.  Two output lanes (.2D).  Q=0 selects Vn.s[0..1] (low
+    // half); Q=1 (*MULL2/*MLAL2/*MLSL2) selects Vn.s[2..3] (high half).
+    // The destination is always 128-bit regardless of Q.
+    //
+    // Stage 1 (saturating doubling widening multiply):
+    //   doubled = SignedSat(2 * sign_ext(Vn.s[i]) * sign_ext(Vm.s[index]))
+    //           saturated to [INT64_MIN, INT64_MAX]
+    // The 32x32 signed product fits exactly in int64 (max |INT32_MIN ×
+    // INT32_MIN| = 2^62 < INT64_MAX), so PMULDQ reconstructs it
+    // losslessly.  PADDQ self-add doubles; overflow happens only when
+    // the product is exactly 2^62, which requires (Vn = INT32_MIN AND
+    // Vm = INT32_MIN) — the lone architectural saturation corner.
+    // Detect that corner at 32-bit level (PCMPEQD against 0x80000000
+    // broadcast for both Vn and Vm), AND the two 32-bit masks, then
+    // Q-select via Psrldq 8 and sign-extend to 64-bit lanes via
+    // Pmovsxdq; XOR-blend INT64_MAX over the wrapped doubled lanes.
+    //
+    // Stage 2 (SQDMLAL/SQDMLSL only): 64-bit signed saturating add/sub
+    // of (Vd, doubled).  No PSRAQ in baseline SSE, so the sign-bit
+    // extraction uses PCMPGTQ-against-zero (SSE4.2) — guarded.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+    //   sqdmull  v0.2d, v1.2s, v2.s[0]  = 0x0F82B020
+    //   sqdmull2 v0.2d, v1.4s, v2.s[3]  = 0x4FA2B820
+    //   sqdmlal  v0.2d, v1.2s, v2.s[0]  = 0x0F823020
+    //   sqdmlal2 v0.2d, v1.4s, v2.s[2]  = 0x4F82B820
+    //   sqdmlsl  v0.2d, v1.2s, v2.s[1]  = 0x0FA27020
+    //   sqdmlsl2 v0.2d, v1.4s, v2.s[2]  = 0x4F827820
+    if ((args.opcode == Op::kSqdmullIdx ||
+         args.opcode == Op::kSqdmlalIdx ||
+         args.opcode == Op::kSqdmlslIdx) &&
+        args.size == 0b10) {
+      if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+      const bool is_accum = (args.opcode != Op::kSqdmullIdx);
+      const bool is_sub = (args.opcode == Op::kSqdmlslIdx);
+      // Stage 2 needs PCMPGTQ for 64-bit sign-bit extraction (no PSRAQ
+      // in baseline SSE).  Bail to interpreter on SSE4.1-only hosts.
+      if (is_accum && !host_platform::kHasSSE4_2) {
+        success_ = false; return;
+      }
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xn_full = AllocTempSimdReg();
+      SimdRegister x_const = AllocTempSimdReg();
+      SimdRegister corner = AllocTempSimdReg();
+      if (xm == no_simd_register || xn_full == no_simd_register ||
+          x_const == no_simd_register || corner == no_simd_register) {
+        success_ = false; return;
+      }
+
+      // Broadcast Vm.s[index] across all 4 dword lanes of xm.  PMULDQ
+      // reads dword positions 0 and 2; we fill all four for both the
+      // multiply and the 32-bit-lane PCMPEQD corner check.
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm =
+            static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        as_.Pshufd(xm, xm, imm);
+      }
+
+      // x_const = 0x80000000 broadcast across 4 dwords.
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Pslld(x_const, int8_t{31});
+
+      // corner = (Vn dword == 0x80000000) AND (Vm dword == 0x80000000),
+      // per 32-bit lane.  Compute corner_m in `corner` from the xm
+      // broadcast first, then AND-in corner_n built from the full Vn.
+      // x_const is dead after the second Pcmpeqd consumes it.
+      as_.Movdqa(corner, xm);
+      as_.Pcmpeqd(corner, x_const);
+      as_.Movdqu(xn_full, {.base = Assembler::rbp, .disp = vn_off});
+      as_.Pcmpeqd(xn_full, x_const);
+      as_.Pand(corner, xn_full);
+
+      // Q-select the corner mask's two relevant dwords and sign-extend
+      // them to two 64-bit qword lanes.
+      if (args.q) {
+        as_.Psrldq(corner, int8_t{8});
+      }
+      as_.Pmovsxdq(corner, corner);
+
+      // Widen Vn's Q-selected dword pair to two 64-bit signed lanes
+      // via PMOVSXDQ from memory (vn_off + (q ? 8 : 0)).  This reads
+      // the same 8 bytes used for the corner check, sign-extended into
+      // the upper 32 bits of each 64-bit lane that PMULDQ ignores.
+      int32_t vn_src_off = vn_off + (args.q ? 8 : 0);
+      as_.Pmovsxdq(xn_full, {.base = Assembler::rbp, .disp = vn_src_off});
+
+      // 32x32 → 64 signed multiply (PMULDQ reads dword 0 and 2 of each
+      // operand) and double via self-add — corner lanes wrap to
+      // INT64_MIN, which the XOR-blend below replaces with INT64_MAX.
+      as_.Pmuldq(xn_full, xm);
+      as_.Paddq(xn_full, xn_full);
+
+      // x_const := INT64_MAX broadcast (Pcmpeqd self → -1, Psrlq 1 →
+      // 0x7FFFFFFFFFFFFFFF), then XOR-blend over corner lanes:
+      //   xn_full = doubled ^ ((doubled ^ INT64_MAX) & corner_mask).
+      as_.Pcmpeqd(x_const, x_const);
+      as_.Psrlq(x_const, int8_t{1});
+      as_.Pxor(x_const, xn_full);
+      as_.Pand(x_const, corner);
+      as_.Pxor(xn_full, x_const);
+
+      if (!is_accum) {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_full);
+        return;
+      }
+
+      // Stage 2: 64-bit signed saturating add/sub of Vd and the
+      // saturated doubled product.  Same wrap-add + overflow-bit-XOR-
+      // blend recipe as the 32-bit stage-2 arm above, but at qword
+      // granularity using PCMPGTQ-against-zero for sign extraction
+      // (no PSRAQ in baseline SSE).
+      //   sum  = a ± b              (PADDQ/PSUBQ wraps mod 2^64)
+      //   ovf  = ~(a^b) & (a^sum)   for SQADD (sign bit indicates overflow)
+      //        |  (a^b) & (a^diff)  for SQSUB
+      //   sat  = (a < 0) ? INT64_MIN : INT64_MAX
+      //   res  = sum ^ ((sum ^ sat) & ovf_mask)
+      SimdRegister xd = AllocTempSimdReg();
+      SimdRegister t_sum = AllocTempSimdReg();
+      SimdRegister t_ovf = AllocTempSimdReg();
+      SimdRegister t_sat = AllocTempSimdReg();
+      if (xd == no_simd_register || t_sum == no_simd_register ||
+          t_ovf == no_simd_register || t_sat == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+      as_.Movdqa(t_sum, xd);
+      if (is_sub) {
+        as_.Psubq(t_sum, xn_full);
+      } else {
+        as_.Paddq(t_sum, xn_full);
+      }
+      // t_ovf = a ^ b (for SQADD) or a ^ b (also used for SQSUB).
+      as_.Movdqa(t_ovf, xd);
+      as_.Pxor(t_ovf, xn_full);
+      if (!is_sub) {
+        // ~(a^b): rebuild -1 in x_const (the INT64_MAX broadcast is
+        // dead now), XOR into t_ovf.
+        as_.Pcmpeqd(x_const, x_const);
+        as_.Pxor(t_ovf, x_const);
+      }
+      // t_sat := a ^ sum (or a ^ diff).
+      as_.Movdqa(t_sat, xd);
+      as_.Pxor(t_sat, t_sum);
+      // t_ovf := overflow indicator in sign bit of each qword.
+      as_.Pand(t_ovf, t_sat);
+      // ovf_mask in x_const: x_const = (0 > t_ovf) per qword (SSE4.2).
+      as_.Pxor(x_const, x_const);
+      as_.Pcmpgtq(x_const, t_ovf);
+      // a_sign_mask in t_ovf: t_ovf = (0 > xd) per qword.
+      as_.Pxor(t_ovf, t_ovf);
+      as_.Pcmpgtq(t_ovf, xd);
+      // INT64_MAX broadcast in xn_full (dead after t_sum).
+      as_.Pcmpeqd(xn_full, xn_full);
+      as_.Psrlq(xn_full, int8_t{1});
+      // sat = INT64_MAX XOR a_sign_mask: (a<0)? INT64_MIN : INT64_MAX.
+      as_.Movdqa(t_sat, t_ovf);
+      as_.Pxor(t_sat, xn_full);
+      // res = sum ^ ((sum ^ sat) & ovf_mask).
+      as_.Pxor(t_sat, t_sum);
+      as_.Pand(t_sat, x_const);
+      as_.Pxor(t_sum, t_sat);
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, t_sum);
+      return;
+    }
+    // endregion
+
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;

@@ -11530,6 +11530,192 @@ TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec4HStage2NegativeOverflowSatura
   EXPECT_EQ(r[3], 0);
 }
 
+// JIT-driven SQDMULL/SQDMLAL/SQDMLSL by-element tests for size=10 (.2s/.4s
+// -> .2d).  PMULDQ + PADDQ stage-1 with 64-bit corner detect (INT32_MIN
+// pair) + PCMPGTQ-based 64-bit signed saturating add/sub in stage 2.
+constexpr uint32_t Sqdmull2Idx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQDMULL2 .2d, .4s, .s[k]: Q=1 → base 0x4F80B000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x4F80B000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Sqdmlal2Idx4S(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  // SQDMLAL2 .2d, .4s, .s[k]: Q=1 → base 0x4F803000.
+  uint32_t L = k & 1u;
+  uint32_t H = (k >> 1) & 1u;
+  uint32_t M = (rm >> 4) & 1u;
+  return 0x4F803000u | (L << 21) | (M << 20) |
+         (static_cast<uint32_t>(rm & 0xFu) << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqdmullIdxVec2SDoublesSignedProductsJit) {
+  // Inputs picked so neither lane hits the (INT32_MIN, INT32_MIN)
+  // corner; PMULDQ + PADDQ self-add yields the exact doubled product.
+  int32_t n_lanes[4] = {3, -7, 0, 0};
+  int32_t m_lanes[4] = {50, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  state_.cpu.v[0] = (__uint128_t{0xDEADBEEFDEADBEEFULL} << 64) |
+                    __uint128_t{0xDEADBEEFDEADBEEFULL};
+  static const uint32_t code[] = {SqdmullIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), 2LL *  3 * 50);  // 300
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), 2LL * -7 * 50);  // -700
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmullIdxVec2SSaturatesIntMinSquaredJit) {
+  // (INT32_MIN, INT32_MIN) is the only stage-1 saturation corner.
+  // Pinpoints the 32-bit-level corner detect → Pmovsxdq widening →
+  // INT64_MAX XOR-blend over the wrapped doubled lane.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0x80000000), 0x7FFFFFFF, 0, 0};
+  int32_t m_lanes[4] = {static_cast<int32_t>(0x80000000), 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {SqdmullIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), INT64_MAX);  // corner.
+  // Lane 1: 2 * 0x7FFFFFFF * INT32_MIN = -(2^63 - 2^32) = 0x8000000100000000.
+  EXPECT_EQ(lanes_out[1], 0x8000000100000000ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull2IdxVec4SUsesHighHalfJit) {
+  // Q=1 selects Vn.s[2..3] (high half).  Low half is sentinel and must
+  // NOT contribute — a Q-bit dispatch bug would surface as products of
+  // 0xDEADBEEF instead of 11 / -13.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0xDEADBEEF),
+                        static_cast<int32_t>(0xDEADBEEF), 11, -13};
+  int32_t m_lanes[4] = {0, 0, 0, -5};   // index 3 → Vm.s[3] = -5.
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {Sqdmull2Idx4S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), 2LL *  11 * -5);   // -110
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), 2LL * -13 * -5);   //  130
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull2IdxVec4SCornerInHighHalfJit) {
+  // Q=1 with the corner case in the high-half source: verifies the
+  // corner-mask Psrldq 8 + Pmovsxdq widening picks up the high two
+  // 32-bit lanes correctly.
+  int32_t n_lanes[4] = {0, 0, static_cast<int32_t>(0x80000000),
+                        0x7FFFFFFF};
+  int32_t m_lanes[4] = {0, 0, 0, static_cast<int32_t>(0x80000000)};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  static const uint32_t code[] = {Sqdmull2Idx4S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), INT64_MAX);  // corner.
+  // Lane 1 (Vn = INT32_MAX, Vm = INT32_MIN):
+  //   2 * 0x7FFFFFFF * INT32_MIN = -(2^63 - 2^32) = 0x8000000100000000.
+  EXPECT_EQ(lanes_out[1], 0x8000000100000000ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlalIdxVec2SAccumulatesJit) {
+  // Stage-2 accumulator path on top of the doubled product, no
+  // saturation on the wide add.  Pins the load-modify-store accumulator
+  // path through the 64-bit PCMPGTQ-based stage-2 saturation recipe.
+  int32_t n_lanes[4] = {-1, 2, 0, 0};
+  int32_t m_lanes[4] = {0, 10, 0, 0};   // index 1 → Vm.s[1] = 10.
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {1000ULL, 2000ULL};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {SqdmlalIdx2S(0, 1, 2, /*k=*/1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), 1000 + 2LL * -1 * 10);  // 980
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), 2000 + 2LL *  2 * 10);  // 2040
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlalIdxVec2SStage2PositiveOverflowSaturatesJit) {
+  // Lane 0: Vd preloaded just below INT64_MAX; addend positive →
+  // overflows → must saturate to INT64_MAX.  Lane 1: small addend, no
+  // overflow.  Pins the SQADD recipe's positive-overflow branch at the
+  // 64-bit qword granularity using PCMPGTQ.
+  int32_t n_lanes[4] = {0x10000000, 1, 0, 0};
+  int32_t m_lanes[4] = {0x10000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {static_cast<uint64_t>(INT64_MAX) - 100ULL, 500ULL};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {SqdmlalIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), INT64_MAX);
+  // Lane 1: 500 + 2 * 1 * 0x10000000 = 0x20000000 + 500.
+  EXPECT_EQ(lanes_out[1], 0x20000000ULL + 500ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec2SSubtractsDoubledJit) {
+  // SQDMLSL with Vm.s[index] = -5: addend negative; subtracting a
+  // negative moves Vd up.  Pins the is_sub branch of the stage-2
+  // recipe (PSUBQ + (a^b)&(a^diff) overflow indicator).
+  int32_t n_lanes[4] = {1, 2, 0, 0};
+  int32_t m_lanes[4] = {0, 0, 0, -5};   // index 3.
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {100ULL, 200ULL};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {SqdmlslIdx2S(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), 100 - (2LL * 1 * -5));  // 110
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), 200 - (2LL * 2 * -5));  // 220
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmlslIdxVec2SStage2NegativeOverflowSaturatesJit) {
+  // Lane 0: Vd preloaded just above INT64_MIN; SQDMLSL subtracts a
+  // positive addend → underflows → must saturate to INT64_MIN.  Lane 1:
+  // small addend, no underflow.  Pins the SQSUB recipe's negative-
+  // overflow branch at 64-bit qword granularity.
+  int32_t n_lanes[4] = {0x10000000, 1, 0, 0};
+  int32_t m_lanes[4] = {0x10000000, 0, 0, 0};
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {static_cast<uint64_t>(INT64_MIN) + 100ULL, 500ULL};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {SqdmlslIdx2S(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), INT64_MIN);
+  // Lane 1: 500 - 2 * 1 * 0x10000000 = 500 - 0x20000000 (wraps in uint64).
+  EXPECT_EQ(lanes_out[1], 500ULL - 0x20000000ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlal2IdxVec4SUsesHighHalfJit) {
+  // Q=1 SQDMLAL2 accumulator: source comes from Vn.s[2..3] (high half).
+  // Confirms the Q-selected Pmovsxdq from memory at +8 wires correctly
+  // through the stage-2 accumulator.
+  int32_t n_lanes[4] = {static_cast<int32_t>(0xDEADBEEF),
+                        static_cast<int32_t>(0xDEADBEEF), 3, 4};
+  int32_t m_lanes[4] = {0, 0, 7, 0};   // index 2 → Vm.s[2] = 7.
+  StoreVec4SInt(state_.cpu, 1, n_lanes[0], n_lanes[1], n_lanes[2], n_lanes[3]);
+  StoreVec4SInt(state_.cpu, 2, m_lanes[0], m_lanes[1], m_lanes[2], m_lanes[3]);
+  uint64_t init_vd[2] = {1000ULL, 2000ULL};
+  memcpy(&state_.cpu.v[0], init_vd, sizeof(init_vd));
+  static const uint32_t code[] = {Sqdmlal2Idx4S(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lanes_out[2];
+  memcpy(lanes_out, &state_.cpu.v[0], sizeof(lanes_out));
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[0]), 1000 + 2LL * 3 * 7);  // 1042
+  EXPECT_EQ(static_cast<int64_t>(lanes_out[1]), 2000 + 2LL * 4 * 7);  // 2056
+}
+
 // Armv8.1-RDM SQRDMLAH / SQRDMLSH (by element).  Non-widening: destination
 // lane width equals source lane width.  size=01 (.4h/.8h, Vm restricted to
 // V0..V15, index = H:L:M) and size=10 (.2s/.4s, Vm full 5-bit, index = H:L).
