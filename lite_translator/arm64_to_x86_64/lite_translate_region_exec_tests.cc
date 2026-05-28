@@ -8886,6 +8886,152 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarDRegular) {
   EXPECT_EQ(lane1, 0ULL);
 }
 
+// region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+//
+// Encoding "Advanced SIMD scalar x indexed element (FP16)" per ARM ARM C7.2
+// uses size=0b00 (bits[23:22]).  Vm = Rm4 only (4 bits, V0..V15); the bit-20
+// M slot is consumed as the index's low bit.  Index = H:L:M (3 bits, 0..7)
+// selects one of 8 FP16 lanes of Vm.8H.  All four ops are admitted
+// (FMULX scalar FP16 by-element exists per ARM ARM C7.2.83).
+//
+// Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a+fp16):
+//   fmul  h0, h1, v2.h[0] = 0x5F029020
+//   fmul  h3, h4, v5.h[7] = 0x5F359883
+//   fmla  h0, h1, v2.h[0] = 0x5F021020
+//   fmls  h0, h1, v2.h[7] = 0x5F325820
+//   fmulx h0, h1, v2.h[0] = 0x7F029020
+//   fmulx h3, h4, v5.h[7] = 0x7F359883
+//
+// Encoder layout (k = index in 0..7, k[2]=H, k[1]=L, k[0]=M):
+//   bit31:24 = 0x5F (FMUL/FMLA/FMLS) or 0x7F (FMULX), bit23:22 = 00 (FP16),
+//   bit21 = L, bit20 = M, bit19:16 = Rm4, bit15:12 = opcode,
+//   bit11 = H, bit10 = 0, bit9:5 = rn, bit4:0 = rd.
+constexpr uint32_t FmulIdxScalarH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t M = (k >> 0) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  uint32_t Rm4 = rm & 0xFu;
+  return 0x5F009000u | (L << 21) | (M << 20) | (Rm4 << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlaIdxScalarH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t M = (k >> 0) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  uint32_t Rm4 = rm & 0xFu;
+  return 0x5F001000u | (L << 21) | (M << 20) | (Rm4 << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmlsIdxScalarH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t M = (k >> 0) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  uint32_t Rm4 = rm & 0xFu;
+  return 0x5F005000u | (L << 21) | (M << 20) | (Rm4 << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulxIdxScalarH(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t k) {
+  uint32_t L = (k >> 1) & 1u;
+  uint32_t M = (k >> 0) & 1u;
+  uint32_t H = (k >> 2) & 1u;
+  uint32_t Rm4 = rm & 0xFu;
+  return 0x7F009000u | (L << 21) | (M << 20) | (Rm4 << 16) | (H << 11) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FMUL Hd, Hn, Vm.h[k]: regular finite multiply, k=7 exercises all three
+// index bits (H, L, M).  3.0 * 4.0 = 12.0; 3.0h=0x4200, 4.0h=0x4400,
+// 12.0h=0x4A00.  Upper-lane zero check confirms scalar Hd semantics.
+TEST_F(Arm64LiteTranslateRegionTest, FmulIdxScalarHRegular) {
+  StoreScalarH(state_.cpu, 1, 0x4200u);  // Hn = 3.0
+  for (int i = 0; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[i] = 0xAAAAu;
+  }
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[7] = 0x4400u;  // Vm.h[7] = 4.0
+  state_.cpu.v[0] = ~__uint128_t{0};  // pre-trash dest
+  static const uint32_t code[] = {FmulIdxScalarH(0, 1, 2, /*k=*/7)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4A00u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FMULX Hd by-element: (+0 * +inf) saturation override returns +2.0h = 0x4000.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarHZeroTimesInf) {
+  StoreScalarH(state_.cpu, 1, 0x0000u);  // Hn = +0.0
+  for (int i = 0; i < 8; ++i) {
+    reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[i] = 0x3C00u;  // 1.0 elsewhere
+  }
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[3] = 0x7C00u;  // Vm.h[3] = +inf
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FmulxIdxScalarH(0, 1, 2, /*k=*/3)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0x4000u);
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FMULX Hd by-element: (-0 * +inf) saturation returns -2.0h = 0xC000.
+// Sign = sign(a) XOR sign(b) per the FMULX special-case override.
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarHNegZeroTimesInf) {
+  StoreScalarH(state_.cpu, 1, 0x8000u);  // Hn = -0.0
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[5] = 0x7C00u;  // Vm.h[5] = +inf
+  static const uint32_t code[] = {FmulxIdxScalarH(0, 1, 2, /*k=*/5)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0], 0xC000u);
+}
+
+// FMULX Hd by-element: NaN input propagates as NaN; special-case override
+// fires only when (mul is NaN) AND (neither input is NaN).
+TEST_F(Arm64LiteTranslateRegionTest, FmulxIdxScalarHNaNPropagation) {
+  StoreScalarH(state_.cpu, 1, 0x7E00u);  // Hn = qNaN
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[0] = 0x3C00u;  // Vm.h[0] = 1.0
+  static const uint32_t code[] = {FmulxIdxScalarH(0, 1, 2, /*k=*/0)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  // FP16 NaN: exp=11111 and mantissa != 0.
+  EXPECT_EQ(r & 0x7C00u, 0x7C00u) << "expected FP16 NaN, got 0x" << std::hex << r;
+  EXPECT_NE(r & 0x03FFu, 0u) << "expected FP16 NaN mantissa nonzero, got 0x" << std::hex << r;
+}
+
+// FMLA Hd by-element: Vd = Vd + Vn * Vm[k] under single fused binary64 round.
+// a = 1.0h + 2^-10 = 0x3C01 (= 1.0009765625, exact in FP64).
+//   a*a (in FP64) = 1 + 2^-9 + 2^-20 (exact in FP64).
+//   fma(a, a, -1) (in FP64) = 2^-9 + 2^-20 (exact in FP64).
+//   Narrow FP64 -> FP32 -> FP16:
+//     2^-9 * (1 + 2^-11) — 2^-11 is half of FP16's mantissa LSB, so
+//     round-to-nearest-even keeps mantissa = 0.  Result = 2^-9 = 0x1800.
+// (For these inputs fused-vs-unfused are bit-identical in FP32 too, since
+// the FP16-lifted product fits in FP32's 24-bit mantissa — the test pins
+// correctness, not the fused property per se.)
+TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxScalarHCorrect) {
+  StoreScalarH(state_.cpu, 1, 0x3C01u);
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[2] = 0x3C01u;  // Vm.h[2] = a
+  StoreScalarH(state_.cpu, 0, 0xBC00u);  // -1.0h
+  static const uint32_t code[] = {FmlaIdxScalarH(0, 1, 2, /*k=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(r, 0x1800u) << "expected fma(a,a,-1) -> FP16 0x1800, got 0x" << std::hex << r;
+  for (int i = 1; i < 8; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[i], 0u);
+  }
+}
+
+// FMLS Hd by-element: Vd = Vd - Vn * Vm[k] = fma(-a, a, d).  With same
+// a = 0x3C01 and d = 1.0h: fma(-a, a, 1) = -(2^-9 + 2^-20) -> FP16 0x9800.
+TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarHCorrect) {
+  StoreScalarH(state_.cpu, 1, 0x3C01u);  // Hn = a = 1.0 + 2^-10
+  reinterpret_cast<uint16_t*>(&state_.cpu.v[2])[6] = 0x3C01u;  // Vm.h[6] = a
+  StoreScalarH(state_.cpu, 0, 0x3C00u);  // 1.0h
+  static const uint32_t code[] = {FmlsIdxScalarH(0, 1, 2, /*k=*/6)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
+  EXPECT_EQ(r, 0x9800u) << "expected fma(-a,a,1) -> FP16 0x9800, got 0x" << std::hex << r;
+}
+// endregion
+
 // Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs
 // from (a*b)+d in float, proving the lowering uses VFMADD231PS.
 TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {

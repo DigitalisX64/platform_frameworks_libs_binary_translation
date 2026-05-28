@@ -6229,18 +6229,42 @@ class Decoder {
       return;
     }
 
-    uint8_t rm = static_cast<uint8_t>((M << 4) | Rm4);
+    uint8_t rm;
     uint8_t index;
     if (size == 0b10) {
-      // FP32: index = H:L (4 elements in Vm.4S).
+      // FP32: index = H:L (4 elements in Vm.4S).  Vm = M:Rm4 (5 bits).
+      rm = static_cast<uint8_t>((M << 4) | Rm4);
       index = static_cast<uint8_t>((H << 1) | L);
     } else if (size == 0b11) {
-      // FP64: index = H (2 elements in Vm.2D); L must be 0.
+      // FP64: index = H (2 elements in Vm.2D); L must be 0.  Vm = M:Rm4.
       if (L) { Undefined(); return; }
+      rm = static_cast<uint8_t>((M << 4) | Rm4);
       index = H;
+    // region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+    //
+    // Encoding "Advanced SIMD scalar x indexed element (FP16)" per ARM ARM
+    // C7.2 uses size=0b00 (not 0b01 as a stale earlier comment claimed).
+    //   "0 1 U 1 1 1 1 1 0 0 L M Rm[3:0] opcode H 0 Rn Rd"
+    // The bit-20 M slot is consumed as the index's low bit, so Vm is only
+    // 4 bits (Rm4) — the indexed source is restricted to V0..V15.  Index
+    // = H:L:M (3 bits, 0..7) selects one of 8 FP16 lanes of Vm.8H.  Unlike
+    // the *vector* FP16 by-element form (which rejects U=1), scalar FMULX
+    // FP16 by-element DOES exist (ARM ARM C7.2.83), so all four opcodes
+    // {FMLA, FMLS, FMUL, FMULX} are admitted here.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a+fp16):
+    //   fmul  h0, h1, v2.h[0] = 0x5F029020
+    //   fmul  h3, h4, v5.h[7] = 0x5F359883
+    //   fmla  h0, h1, v2.h[0] = 0x5F021020
+    //   fmls  h0, h1, v2.h[7] = 0x5F325820
+    //   fmulx h0, h1, v2.h[0] = 0x7F029020
+    //   fmulx h3, h4, v5.h[7] = 0x7F359883
+    } else if (size == 0b00) {
+      rm = Rm4;
+      index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
+    // endregion
     } else {
-      // FP16 (size=01) is Armv8.2-FP16 scalar-x-indexed — not handled
-      // yet.  size=00 is reserved at this slot.
+      // size=0b01 is reserved at this slot.
       Undefined();
       return;
     }

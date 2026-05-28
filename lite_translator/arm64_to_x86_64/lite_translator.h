@@ -15497,7 +15497,7 @@ class LiteTranslator {
       success_ = false;
       return;
     }
-    if (args.size != 0b10 && args.size != 0b11) {
+    if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       success_ = false;
       return;
     }
@@ -15507,6 +15507,139 @@ class LiteTranslator {
       return;
     }
     const bool is_double = (args.size == 0b11);
+
+    // region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+    //
+    // Lift each FP16 source lane to FP32 lane 0 via Pxor + Pinsrw + Vcvtph2ps
+    // (same scalar-lift recipe as AdvSimdScalarThreeSame FP16).  For
+    // FMLA/FMLS, additionally promote to FP64 so the multiply-add uses a
+    // single binary64 rounding (matches the interpreter's FpHalfToSingle ->
+    // std::fma((double)... narrow path).  Result narrows back via Vcvtps2ph
+    // (real-FP output, NOT a mask), which auto-zeroes the upper 64 bits of
+    // the dst xmm; a full 128-bit Movdqu then writes Vd[15:0]=FP16 result
+    // with Vd[127:16]=0, matching the AArch64 scalar Hd zero-extend.
+    //
+    // F16C absence falls back to interpreter (success_ = false).  FMA
+    // absence also falls back (FMA is already required above for FMLA/FMLS
+    // in the FP32/FP64 path).
+    if (args.size == 0b00) {
+      if (!host_platform::kHasF16C) { success_ = false; return; }
+
+      int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+
+      SimdRegister xmm_n = AllocTempSimdReg();
+      SimdRegister xmm_m = AllocTempSimdReg();
+      if (xmm_n == no_simd_register || xmm_m == no_simd_register) {
+        success_ = false; return;
+      }
+      // Lift Vn.h[0] and Vm.h[index] to FP32 in xmm lane 0.  Pinsrw with a
+      // memory operand reads 16 bits from the offset; the upper bytes of
+      // each XMM are zeroed first.
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = vn_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m,
+                 {.base = Assembler::rbp,
+                  .disp = vm_off + static_cast<int32_t>(args.index) * 2},
+                 int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+
+      SimdRegister xmm_result = no_simd_register;
+      if (args.opcode == Op::kFmul) {
+        as_.Mulss(xmm_n, xmm_m);
+        xmm_result = xmm_n;
+      } else if (args.opcode == Op::kFmulx) {
+        // FMULX FP16 saturation: same shape as FP32 scalar FMULX three-same
+        // FP16.  mul = a*b; if mul is NaN and neither input was NaN
+        // (the (±0,±inf) case), return ±2.0 with sign = sign(a) XOR sign(b).
+        // FP16 ±2.0 = 0x4000 / 0xC000 round-trips exactly through FP32 ±2.0
+        // = 0x40000000 / 0xC0000000 via Vcvtps2ph.
+        SimdRegister xmm_mul = AllocTempSimdReg();
+        SimdRegister xmm_mul_unord = AllocTempSimdReg();
+        SimdRegister xmm_iu = AllocTempSimdReg();
+        SimdRegister xmm_two = AllocTempSimdReg();
+        if (xmm_mul == no_simd_register || xmm_mul_unord == no_simd_register ||
+            xmm_iu == no_simd_register || xmm_two == no_simd_register) {
+          success_ = false; return;
+        }
+
+        // mul = a * b
+        as_.Movdqa(xmm_mul, xmm_n);
+        as_.Mulss(xmm_mul, xmm_m);
+
+        // mul_unord = cmpunord(mul, mul)
+        as_.Movdqa(xmm_mul_unord, xmm_mul);
+        as_.Cmpunordps(xmm_mul_unord, xmm_mul_unord);
+
+        // input_unord = cmpunord(a, b)
+        as_.Movdqa(xmm_iu, xmm_n);
+        as_.Cmpunordps(xmm_iu, xmm_m);
+
+        // special_mask = (NOT input_unord) AND mul_unord, lands in xmm_iu.
+        as_.Pandn(xmm_iu, xmm_mul_unord);
+
+        // two_signed = ((a XOR b) AND sign_mask) OR bits-of(+2.0).
+        as_.Xorps(xmm_n, xmm_m);
+        as_.Pcmpeqd(xmm_mul_unord, xmm_mul_unord);
+        as_.Pslld(xmm_mul_unord, int8_t{31});
+        as_.Pand(xmm_n, xmm_mul_unord);
+
+        Register tmp_gpr = AllocTempReg();
+        if (tmp_gpr == Assembler::no_register) { return; }
+        as_.Movl(tmp_gpr, int32_t{0x40000000});
+        as_.Movd(xmm_two, tmp_gpr);
+        as_.Por(xmm_n, xmm_two);
+
+        // Blend: result = (mul AND NOT special) OR (±2.0 AND special).
+        as_.Movdqa(xmm_m, xmm_n);
+        as_.Pand(xmm_m, xmm_iu);
+        as_.Pandn(xmm_iu, xmm_mul);
+        as_.Por(xmm_iu, xmm_m);
+        xmm_result = xmm_iu;
+      } else {
+        // FMLA / FMLS: promote to FP64 so the multiply-add rounds once.
+        SimdRegister xmm_n_pd = AllocTempSimdReg();
+        SimdRegister xmm_m_pd = AllocTempSimdReg();
+        SimdRegister xmm_d_pd = AllocTempSimdReg();
+        SimdRegister xmm_d_f32 = AllocTempSimdReg();
+        if (xmm_n_pd == no_simd_register || xmm_m_pd == no_simd_register ||
+            xmm_d_pd == no_simd_register || xmm_d_f32 == no_simd_register) {
+          success_ = false; return;
+        }
+        // Lift Vd.h[0] to FP32 lane 0 via the same Pinsrw + Vcvtph2ps path.
+        as_.Pxor(xmm_d_f32, xmm_d_f32);
+        as_.Pinsrw(xmm_d_f32, {.base = Assembler::rbp, .disp = vd_off}, int8_t{0});
+        as_.Vcvtph2ps(xmm_d_f32, xmm_d_f32);
+
+        // Widen lane 0 of each operand to FP64 (Vcvtps2pd reads low 2 FP32
+        // lanes; we only care about lane 0).
+        as_.Vcvtps2pd(xmm_n_pd, xmm_n);
+        as_.Vcvtps2pd(xmm_m_pd, xmm_m);
+        as_.Vcvtps2pd(xmm_d_pd, xmm_d_f32);
+        if (args.opcode == Op::kFmls) {
+          as_.Vfnmadd231sd(xmm_d_pd, xmm_n_pd, xmm_m_pd);
+        } else {
+          as_.Vfmadd231sd(xmm_d_pd, xmm_n_pd, xmm_m_pd);
+        }
+        // Narrow FP64 -> FP32 in lane 0; xmm_n is free as the dst.
+        as_.Vcvtpd2ps(xmm_n, xmm_d_pd);
+        xmm_result = xmm_n;
+      }
+
+      // Narrow FP32 lane 0 to FP16 word lane 0; Vcvtps2ph zero-fills the
+      // upper 64 bits of dst.  Lanes 1..3 of xmm_result were FP32 +0 by
+      // Vcvtph2ps zero-fill (preserved through the scalar primitives, since
+      // FMULX's PSLLD/Pcmpeqd-with-itself/Pand all leave dword lanes 1..3
+      // at zero, and Mulss/Vcvtpd2ps only write lane 0).  Word lanes 1..7
+      // of the narrowed xmm_result are therefore 0.
+      as_.Vcvtps2ph(xmm_result, xmm_result, int8_t{0});
+      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
+      return;
+    }
+    // endregion
 
     // FMUL / FMLA / FMLS — simpler scalar lowering without the FMULX
     // saturation shape.  Load Vn/Vm into XMM regs, broadcast the indexed

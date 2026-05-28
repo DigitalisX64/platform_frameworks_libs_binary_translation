@@ -7733,18 +7733,69 @@ class Interpreter {
     CHECK(!exception_raised_);
 
     using Op = typename Decoder::AdvSimdScalarXIdxOpcode;
-    if (args.size != 0b10 && args.size != 0b11) {
+    if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       Undefined();
       return;
     }
     const bool is_double = (args.size == 0b11);
-    const uint8_t esize = is_double ? 8 : 4;
+    const bool is_fp16 = (args.size == 0b00);
+    const uint8_t esize = is_double ? 8 : (is_fp16 ? 2 : 4);
     const bool needs_dst = (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
 
     __uint128_t src_n = state_->cpu.v[args.rn];
     __uint128_t src_m = state_->cpu.v[args.rm];
     __uint128_t src_d = needs_dst ? state_->cpu.v[args.rd] : __uint128_t{0};
     __uint128_t result = 0;
+
+    // region digitalis: FP16 scalar by-element FMLA/FMLS/FMUL/FMULX
+    // (Armv8.2-FP16). Lift each FP16 lane to FP32 via FpHalfToSingle, run
+    // the scalar op in FP32 (single rounding for FMUL/FMULX; binary64 for
+    // FMLA/FMLS to mirror the FP32 FMLA path's single-round binary64
+    // accumulate), narrow result back via FpSingleToHalf. Mirrors the
+    // existing AdvSimdScalarThreeSame FP16 interpreter shape.
+    if (is_fp16) {
+      uint16_t hn, hm, hd = 0;
+      memcpy(&hn, reinterpret_cast<const uint8_t*>(&src_n), 2);
+      memcpy(&hm,
+             reinterpret_cast<const uint8_t*>(&src_m) + args.index * 2,
+             2);
+      if (needs_dst) {
+        memcpy(&hd, reinterpret_cast<const uint8_t*>(&src_d), 2);
+      }
+      float a = FpHalfToSingle(hn);
+      float b = FpHalfToSingle(hm);
+      float d = FpHalfToSingle(hd);
+      uint16_t rh;
+      switch (args.opcode) {
+        case Op::kFmulx:
+          rh = FpSingleToHalf(FmulxScalar<float>(a, b));
+          break;
+        case Op::kFmul:
+          rh = FpSingleToHalf(a * b);
+          break;
+        case Op::kFmla: {
+          double r64 = std::fma(static_cast<double>(a),
+                                static_cast<double>(b),
+                                static_cast<double>(d));
+          rh = FpSingleToHalf(static_cast<float>(r64));
+          break;
+        }
+        case Op::kFmls: {
+          double r64 = std::fma(static_cast<double>(-a),
+                                static_cast<double>(b),
+                                static_cast<double>(d));
+          rh = FpSingleToHalf(static_cast<float>(r64));
+          break;
+        }
+        default:
+          Undefined();
+          return;
+      }
+      memcpy(reinterpret_cast<uint8_t*>(&result), &rh, 2);
+      state_->cpu.v[args.rd] = result;
+      return;
+    }
+    // endregion
 
     if (is_double) {
       double n_lane, m_lane, d_lane = 0.0;
