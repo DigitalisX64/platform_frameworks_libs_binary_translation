@@ -20283,10 +20283,73 @@ class LiteTranslator {
           // can't express cheaply.  Fall back to the interpreter.
           success_ = false; return;
         }
+        // region digitalis: SQSHRN scalar D-source GPR fallback.
+        //
+        // The SIMD vector lowering needs PSRAQ for the per-lane signed
+        // arithmetic right shift at src=64, which is AVX-512F-VL only.
+        // For the scalar form (one lane, ARM ARM C7.2.236 form
+        // `SQSHRN Vd<s>, Vn<d>, #shift`), we can sidestep PSRAQ entirely
+        // by routing the single lane through 64-bit GPR ops:
+        //
+        //   1. Movq a, Vn[63:0]                  (signed int64)
+        //   2. Sarq a, cnt                       (cnt in [1, 32])
+        //   3. clamp a to [INT32_MIN, INT32_MAX] via Cmpq + Cmovq
+        //   4. Pxor xzero / Movdqu Vd, xzero     (zero Vd[127:0])
+        //   5. Movl Vd[31:0], a                  (write low 32 bits)
+        //
+        // At cnt==32 (immh:immb=0x20) the SAR result is in [INT32_MIN,
+        // INT32_MAX] already, so the clamp Cmovq pair is a runtime
+        // no-op there.  At cnt<32 saturation can fire when the upper
+        // bits don't agree with the would-be sign bit of int32.
+        //
+        // FPSR.QC is not updated here, mirroring the existing SQSHL .D
+        // scalar GPR fallback at `lite_translator.h:19880` — neither
+        // path sets QC.  This is perf-only and matches the historical
+        // behaviour of the interpreter-bailout path for these forms.
+        if (args.scalar && uses_signed_shift && src_bits == 64 &&
+            !is_rounding && !is_saturating_signed_to_unsigned) {
+          const uint16_t immh_immb_local =
+              static_cast<uint16_t>((immh << 3) | args.immb);
+          const uint8_t narrow_rshift_local =
+              static_cast<uint8_t>(64 - immh_immb_local);
+          const int8_t cnt = static_cast<int8_t>(narrow_rshift_local);
+          Register a = AllocTempReg();
+          Register int32_max_reg = AllocTempReg();
+          Register int32_min_reg = AllocTempReg();
+          SimdRegister xzero = AllocTempSimdReg();
+          if (a == Assembler::no_register ||
+              int32_max_reg == Assembler::no_register ||
+              int32_min_reg == Assembler::no_register ||
+              xzero == no_simd_register) {
+            success_ = false; return;
+          }
+          // Load Vn[63:0] as signed int64.
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+          // Arithmetic right shift by `cnt` (range [1, 32]).
+          as_.Sarq(a, cnt);
+          // Clamp a to [INT32_MIN, INT32_MAX] branchlessly.  Movq imm
+          // does not affect EFLAGS, so the materialization stays clear
+          // of the Cmpq->Cmovq window.
+          as_.Movq(int32_max_reg, int64_t{INT32_MAX});
+          as_.Cmpq(a, int32_max_reg);
+          as_.Cmovq(Assembler::Condition::kGreater, a, int32_max_reg);
+          as_.Movq(int32_min_reg, int64_t{INT32_MIN});
+          as_.Cmpq(a, int32_min_reg);
+          as_.Cmovq(Assembler::Condition::kLess, a, int32_min_reg);
+          // Zero Vd, then overlay the saturated int32 in Vd[31:0].
+          as_.Pxor(xzero, xzero);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+          as_.Movl({.base = Assembler::rbp, .disp = vd_off}, a);
+          return;
+        }
+        // endregion
         if (uses_signed_shift && src_bits == 64) {
-          // SQSHRN / SQRSHRN / SQSHRUN / SQRSHRUN src=64 needs PSRAQ
-          // which baseline SSE doesn't have.  Fall back to the
-          // interpreter.
+          // Remaining signed-source-D paths that still need PSRAQ:
+          //   - SQSHRN  vector .2S (args.scalar=false, src=64)
+          //   - SQRSHRN scalar D-source / vector .2S
+          //   - SQSHRUN scalar D-source / vector .2S
+          //   - SQRSHRUN scalar D-source / vector .2S
+          // Baseline SSE has no PSRAQ; fall back to the interpreter.
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
