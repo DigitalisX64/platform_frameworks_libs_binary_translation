@@ -7352,6 +7352,91 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SRSHL.2D vector form: signed non-saturating rounded
+      // variable shift across two 64-bit lanes.  Mirror of URSHL.2D with two
+      // changes from the unsigned recipe: the data shift on the rounding-
+      // quadrant arm uses SAR (signed) instead of SHR, and the |sh|>=64
+      // boundary collapses into a single zero branch (no dedicated |sh|=64
+      // case — for any int64 a, the signed bias 1<<63 sums with a to a non-
+      // negative int128 in [0, 2^64-1] which >>s 64 = 0).  The round-bit
+      // extract stays unsigned (it is a bit-presence check, not arithmetic).
+      // Quadrants:
+      //   sh in [0, 63]   -> SHL a, sh  (left shifts truncate — same as SSHL)
+      //   sh >= 64        -> 0
+      //   sh in [-63, -1] -> (a >>s |sh|) + ((a >>u (|sh|-1)) & 1)
+      //   sh <= -64       -> 0 (signed-bias sum >>s 64 = 0 per ARM ARM)
+      // Scalar D form (kSrshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kSrshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register round_bit = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            round_bit == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 -> 0; else a <<u sh.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShlqByCl(a);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.  |sh|>=64 -> 0.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          // 1 <= |sh| <= 63: round_bit = (a >>u (|sh|-1)) & 1;
+          //                  a = (a >>s |sh|) + round_bit.
+          as_.Movq(round_bit, a);
+          as_.Decq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(round_bit);
+          as_.Andq(round_bit, int32_t{1});
+          as_.Incq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.SarqByCl(a);
+          as_.Addq(a, round_bit);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
