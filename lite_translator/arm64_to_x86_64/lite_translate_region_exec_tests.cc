@@ -7853,6 +7853,860 @@ TEST_F(Arm64LiteTranslateRegionTest, FacgeVec2D) {
 }
 // endregion
 
+// region digitalis: FCMxxZero vector two-reg-misc JIT (FP32 .2S/.4S, FP64 .2D).
+//
+// FCMxx Vd.<T>, Vn.<T>, #0.0 compares each lane of Vn against +0.0 and writes
+// an all-ones mask on TRUE / zero on FALSE.  All five forms are ordered:
+// NaN in Vn → result is FALSE.
+//
+// Encoding (per ARM ARM C7.2.86/.88/.90/.92/.94):
+//   FCMGT V.4S = 0x4EA0C800 | (rn<<5) | rd     (U=0, opcode=01100)
+//   FCMGT V.2S = 0x0EA0C800
+//   FCMGT V.2D = 0x4EE0C800
+//   FCMGE V.4S = 0x6EA0C800 | (rn<<5) | rd     (U=1, opcode=01100)
+//   FCMGE V.2D = 0x6EE0C800
+//   FCMEQ V.4S = 0x4EA0D800                     (U=0, opcode=01101)
+//   FCMEQ V.2S = 0x0EA0D800
+//   FCMEQ V.2D = 0x4EE0D800
+//   FCMLE V.4S = 0x6EA0D800                     (U=1, opcode=01101)
+//   FCMLE V.2D = 0x6EE0D800
+//   FCMLT V.4S = 0x4EA0E800                     (U=0, opcode=01110; U=1 unalloc)
+//   FCMLT V.2D = 0x4EE0E800
+constexpr uint32_t FcmgtZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtZeroVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x6EE0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqZeroVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmleZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmleZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x6EE0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmltZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA0E800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmltZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE0E800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FCMGT zero .4S: mixed positive/negative/zero/NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtZeroVec4SMixed) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.0f, std::nanf(""));
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+                            std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FcmgtZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 1.0 > 0 -> true
+  EXPECT_EQ(r[1], 0u);             // -2.0 > 0 -> false
+  EXPECT_EQ(r[2], 0u);             // 0.0 > 0 -> false (strict)
+  EXPECT_EQ(r[3], 0u);             // NaN > 0 -> false (ordered)
+}
+
+// FCMGT zero .2S: Q=0 upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtZeroVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 3.0f, -1.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+                            std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FcmgtZeroVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 3.0 > 0 -> true
+  EXPECT_EQ(r[1], 0u);             // -1.0 > 0 -> false
+  EXPECT_EQ(r[2], 0u);             // upper zeroed (Q=0)
+  EXPECT_EQ(r[3], 0u);
+}
+
+// FCMGT zero .2D: FP64; -0.0 > 0 -> false, +0.0 > 0 -> false, NaN -> false.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtZeroVec2DSignedZero) {
+  StoreVec2D(state_.cpu, 1, -0.0, 2.5);
+  static const uint32_t code[] = {FcmgtZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0u);                          // -0 > 0 -> false
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);     // 2.5 > 0 -> true
+}
+
+// FCMGE zero .4S: includes the +0/-0 boundary (both >= 0).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeZeroVec4SZeroBoundary) {
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, -1.0f, std::nanf(""));
+  static const uint32_t code[] = {FcmgeZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // +0 >= 0 -> true
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);   // -0 >= 0 -> true
+  EXPECT_EQ(r[2], 0u);             // -1 >= 0 -> false
+  EXPECT_EQ(r[3], 0u);             // NaN >= 0 -> false
+}
+
+// FCMGE zero .2D: FP64 boundary.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeZeroVec2DBoundary) {
+  StoreVec2D(state_.cpu, 1, 0.0, -2.0);
+  static const uint32_t code[] = {FcmgeZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);     // 0 >= 0 -> true
+  EXPECT_EQ(r[1], 0u);                          // -2 >= 0 -> false
+}
+
+// FCMEQ zero .4S: +0/-0 both equal 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqZeroVec4SPosNegZero) {
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, 1.0f, std::nanf(""));
+  static const uint32_t code[] = {FcmeqZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // +0 == 0 -> true
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);   // -0 == 0 -> true
+  EXPECT_EQ(r[2], 0u);             // 1 == 0 -> false
+  EXPECT_EQ(r[3], 0u);             // NaN == 0 -> false
+}
+
+// FCMEQ zero .2S: Q=0 upper-zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqZeroVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 0.0f, 1.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+                            std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FcmeqZeroVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 0 == 0 -> true
+  EXPECT_EQ(r[1], 0u);             // 1 == 0 -> false
+  EXPECT_EQ(r[2], 0u);             // Q=0 upper zeroed
+  EXPECT_EQ(r[3], 0u);
+}
+
+// FCMEQ zero .2D: FP64 with NaN per lane.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqZeroVec2DNaN) {
+  StoreVec2D(state_.cpu, 1, std::nan(""), 0.0);
+  static const uint32_t code[] = {FcmeqZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0u);                          // NaN == 0 -> false
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);     // 0 == 0 -> true
+}
+
+// FCMLE zero .4S: <= 0 boundary; +0 and -0 both satisfy.
+TEST_F(Arm64LiteTranslateRegionTest, FcmleZeroVec4SBoundary) {
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, 1.0f, -2.0f);
+  static const uint32_t code[] = {FcmleZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 0 <= 0 -> true
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);   // -0 <= 0 -> true
+  EXPECT_EQ(r[2], 0u);             // 1 <= 0 -> false
+  EXPECT_EQ(r[3], 0xFFFFFFFFu);   // -2 <= 0 -> true
+}
+
+// FCMLE zero .2D: FP64 NaN -> false.
+TEST_F(Arm64LiteTranslateRegionTest, FcmleZeroVec2DNaN) {
+  StoreVec2D(state_.cpu, 1, std::nan(""), -3.0);
+  static const uint32_t code[] = {FcmleZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0u);                          // NaN <= 0 -> false
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);     // -3 <= 0 -> true
+}
+
+// FCMLT zero .4S: < 0 strict; +0 and -0 are NOT less than 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmltZeroVec4SStrictZero) {
+  StoreVec4S(state_.cpu, 1, -1.0f, 0.0f, -0.0f, std::nanf(""));
+  static const uint32_t code[] = {FcmltZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // -1 < 0 -> true
+  EXPECT_EQ(r[1], 0u);             // +0 < 0 -> false (strict)
+  EXPECT_EQ(r[2], 0u);             // -0 < 0 -> false
+  EXPECT_EQ(r[3], 0u);             // NaN < 0 -> false
+}
+
+// FCMLT zero .2D: FP64 strict.
+TEST_F(Arm64LiteTranslateRegionTest, FcmltZeroVec2DStrict) {
+  StoreVec2D(state_.cpu, 1, -5.0, 0.0);
+  static const uint32_t code[] = {FcmltZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);     // -5 < 0 -> true
+  EXPECT_EQ(r[1], 0u);                          // 0 < 0 -> false
+}
+// endregion
+
+// region digitalis: FRECPE / FRSQRTE vector JIT (FP32 .2S/.4S, FP64 .2D).
+// Encoding (ARM ARM C7.2.118 / C7.2.131):
+//   FRECPE  V.4S, V.4S  = 0x4EA1D800 | (rn<<5) | rd  (U=0, opc=11101, bit23=1)
+//   FRECPE  V.2S, V.2S  = 0x0EA1D800 | (rn<<5) | rd  (Q=0)
+//   FRECPE  V.2D, V.2D  = 0x4EE1D800 | (rn<<5) | rd  (sz=1)
+//   FRSQRTE V.4S, V.4S  = 0x6EA1D800 | (rn<<5) | rd  (U=1)
+//   FRSQRTE V.2S, V.2S  = 0x2EA1D800 | (rn<<5) | rd
+//   FRSQRTE V.2D, V.2D  = 0x6EE1D800 | (rn<<5) | rd
+constexpr uint32_t FrecpeVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpeVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpeVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrteVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrteVec2S(uint8_t rd, uint8_t rn) {
+  return 0x2EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrteVec2D(uint8_t rd, uint8_t rn) {
+  return 0x6EE1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FRECPE .4S: per-lane 1.0/x including ±0/±inf endpoints.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec4SAllLanes) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 2.0f, 0.0f, -0.0f, inf);
+  static const uint32_t code[] = {FrecpeVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 0.5f);                  // 1/2 = 0.5
+  EXPECT_EQ(r[1], inf);                          // 1/+0 = +inf
+  EXPECT_EQ(r[2], -inf);                         // 1/-0 = -inf
+  EXPECT_FLOAT_EQ(r[3], 0.0f);                  // 1/+inf = +0
+}
+
+// FRECPE .2S: Q=0 upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec2SUpperZero) {
+  // Pre-trash Vd upper 64 bits with a NaN payload.
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+             std::nanf(""), std::nanf(""));
+  StoreVec4S(state_.cpu, 1, 4.0f, 8.0f, 1.0f, 1.0f);
+  static const uint32_t code[] = {FrecpeVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 0.25f);                 // 1/4
+  EXPECT_FLOAT_EQ(r[1], 0.125f);                // 1/8
+  // Upper 64 bits must be zero (Q=0 invariant).
+  EXPECT_EQ(r[2], 0.0f);
+  EXPECT_EQ(r[3], 0.0f);
+}
+
+// FRECPE .2D: FP64 reciprocal.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec2DAllLanes) {
+  const double inf = std::numeric_limits<double>::infinity();
+  StoreVec2D(state_.cpu, 1, 4.0, -0.5);
+  static const uint32_t code[] = {FrecpeVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.25);                 // 1/4
+  EXPECT_DOUBLE_EQ(r[1], -2.0);                 // 1/-0.5
+  (void)inf;
+}
+
+// FRECPE .4S: NaN propagates.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec4SNaNPropagates) {
+  StoreVec4S(state_.cpu, 1, std::nanf(""), 1.0f, 1.0f, 1.0f);
+  static const uint32_t code[] = {FrecpeVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  // NaN propagates: result lane 0 must have NaN bit pattern (exponent
+  // bits all 1, mantissa non-zero).
+  EXPECT_EQ((r[0] >> 23) & 0xFF, 0xFFu);
+  EXPECT_NE(r[0] & 0x7FFFFFu, 0u);
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[1]), 1.0f);
+}
+
+// FRSQRTE .4S: positive lanes -> 1/sqrt; special cases (-x, +0, -0, NaN)
+// -> default qNaN per ARM spec.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec4SMixed) {
+  StoreVec4S(state_.cpu, 1, 4.0f, -1.0f, 0.0f, std::nanf(""));
+  static const uint32_t code[] = {FrsqrteVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[0]), 0.5f);  // 1/sqrt(4)
+  EXPECT_EQ(r[1], 0x7FC00000u);                  // -1 -> default qNaN
+  EXPECT_EQ(r[2], 0x7FC00000u);                  // +0 -> default qNaN
+  EXPECT_EQ(r[3], 0x7FC00000u);                  // NaN -> default qNaN
+}
+
+// FRSQRTE .4S: -0 also returns default qNaN (not -inf).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec4SNegZero) {
+  StoreVec4S(state_.cpu, 1, -0.0f, 16.0f, 0.25f, 1.0f);
+  static const uint32_t code[] = {FrsqrteVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0x7FC00000u);                  // -0 -> default qNaN
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[1]), 0.25f);   // 1/sqrt(16)
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[2]), 2.0f);    // 1/sqrt(0.25)
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[3]), 1.0f);    // 1/sqrt(1)
+}
+
+// FRSQRTE .2S: Q=0 upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+             std::nanf(""), std::nanf(""));
+  StoreVec4S(state_.cpu, 1, 4.0f, 16.0f, 100.0f, 100.0f);
+  static const uint32_t code[] = {FrsqrteVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 0.5f);                  // 1/sqrt(4)
+  EXPECT_FLOAT_EQ(r[1], 0.25f);                 // 1/sqrt(16)
+  EXPECT_EQ(r[2], 0.0f);
+  EXPECT_EQ(r[3], 0.0f);
+}
+
+// FRSQRTE .2D: FP64 mixed positive / negative / NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2DMixed) {
+  StoreVec2D(state_.cpu, 1, 4.0, std::nan(""));
+  static const uint32_t code[] = {FrsqrteVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(&r[0]), 0.5);  // 1/sqrt(4)
+  EXPECT_EQ(r[1], 0x7FF8000000000000ULL);                    // NaN -> qNaN
+}
+
+// FRSQRTE .2D: negative input returns default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2DNegative) {
+  StoreVec2D(state_.cpu, 1, -3.0, 0.0625);
+  static const uint32_t code[] = {FrsqrteVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0x7FF8000000000000ULL);                    // -3 -> qNaN
+  EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(&r[1]), 4.0); // 1/sqrt(0.0625)
+}
+// endregion
+
+// region digitalis: SQABS / SQNEG vector JIT (B/H/S widths, .2D bails).
+// Encoding (ARM ARM C7.2.241 / C7.2.243; AdvSimdTwoRegMisc opcode=00111):
+//   SQABS .8B  = 0x0E207800 | (rn<<5) | rd  (U=0, size=00, Q=0)
+//   SQABS .16B = 0x4E207800 | (rn<<5) | rd  (Q=1)
+//   SQABS .4H  = 0x0E607800 | (rn<<5) | rd  (size=01)
+//   SQABS .8H  = 0x4E607800 | (rn<<5) | rd
+//   SQABS .2S  = 0x0EA07800 | (rn<<5) | rd  (size=10)
+//   SQABS .4S  = 0x4EA07800 | (rn<<5) | rd
+//   SQNEG = SQABS | 0x20000000  (U=1)
+constexpr uint32_t SqabsVec8B(uint8_t rd, uint8_t rn) {
+  return 0x0E207800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E207800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E607800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA07800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA07800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqnegVec16B(uint8_t rd, uint8_t rn) {
+  return SqabsVec16B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t SqnegVec8B(uint8_t rd, uint8_t rn) {
+  return SqabsVec8B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t SqnegVec4S(uint8_t rd, uint8_t rn) {
+  return SqabsVec4S(rd, rn) | 0x20000000u;
+}
+
+// SQABS .16B: includes INT8_MIN (0x80) saturating to INT8_MAX (0x7F).
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec16BSaturates) {
+  const uint8_t n[16] = {
+      0x00, 0x01, 0x7F, 0x80, 0xFF, 0x80, 0x05, 0xFB,
+      0x80, 0xC0, 0x40, 0x81, 0x7F, 0x00, 0x80, 0x7E,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // src=0x00 ->  0; 0x01 -> 1; 0x7F -> 127; 0x80 -> 0x7F (saturate);
+  // 0xFF=-1 -> 1; 0xFB=-5 -> 5; 0xC0=-64 -> 64; 0x81=-127 -> 127; 0x7E -> 126.
+  const uint8_t expected[16] = {
+      0x00, 0x01, 0x7F, 0x7F, 0x01, 0x7F, 0x05, 0x05,
+      0x7F, 0x40, 0x40, 0x7F, 0x7F, 0x00, 0x7F, 0x7E,
+  };
+  for (int i = 0; i < 16; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQABS .8B Q=0: upper 64 bits must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec8BUpperZero) {
+  const uint8_t prev[16] = {
+      0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34,
+      0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+  };
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0x80, 0xFF, 0x01, 0x00, 0x7F, 0x80, 0xC0, 0x40,
+      0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec8B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expected_low[8] = {0x7F, 0x01, 0x01, 0x00, 0x7F, 0x7F, 0x40, 0x40};
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected_low[i]) << "lane " << i;
+  for (int i = 8; i < 16; i++) EXPECT_EQ(r[i], 0x00) << "lane " << i;
+}
+
+// SQNEG .16B: includes INT8_MIN saturating to INT8_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec16BSaturates) {
+  const uint8_t n[16] = {
+      0x00, 0x01, 0x7F, 0x80, 0xFF, 0x05, 0xFB, 0x80,
+      0xC0, 0x40, 0x81, 0x7F, 0x80, 0x00, 0xFE, 0x02,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqnegVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // -0=0; -1=0xFF; -127=0x81; -INT_MIN saturates to 0x7F; -(-1)=1; -5=0xFB;
+  // -(-5)=5; ... matching the per-lane signed two's complement negation
+  // with the single INT_MIN saturating sentinel.
+  const uint8_t expected[16] = {
+      0x00, 0xFF, 0x81, 0x7F, 0x01, 0xFB, 0x05, 0x7F,
+      0x40, 0xC0, 0x7F, 0x81, 0x7F, 0x00, 0x02, 0xFE,
+  };
+  for (int i = 0; i < 16; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQABS .8H: INT16_MIN saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec8HSaturates) {
+  const uint16_t n[8] = {
+      0x0000, 0x0001, 0x7FFF, 0x8000,
+      0xFFFF, 0x8001, 0x4000, 0xC000,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // src=0,1,32767,INT16_MIN -> 0,1,32767,INT16_MAX(=0x7FFF);
+  // src=-1,-32767,16384,-16384 -> 1, 32767, 16384, 16384.
+  const uint16_t expected[8] = {
+      0x0000, 0x0001, 0x7FFF, 0x7FFF,
+      0x0001, 0x7FFF, 0x4000, 0x4000,
+  };
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQNEG .8H: mixed positive / negative / INT16_MIN.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec8HMixed) {
+  const uint16_t n[8] = {
+      0x0001, 0x7FFF, 0x8000, 0x8001,
+      0xFFFF, 0x0000, 0x4000, 0xC000,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec8H(0, 1) | 0x20000000u};  // SQNEG .8H
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // -1=0xFFFF; -32767=0x8001; -INT16_MIN saturates to 0x7FFF;
+  // -(-32767)=32767; -(-1)=1; 0; -16384=0xC000; -(-16384)=16384.
+  const uint16_t expected[8] = {
+      0xFFFF, 0x8001, 0x7FFF, 0x7FFF,
+      0x0001, 0x0000, 0xC000, 0x4000,
+  };
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQABS .4S: INT32_MIN saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec4SSaturates) {
+  const int32_t in[4] = {static_cast<int32_t>(0x80000000u), -1, INT32_MAX, -100};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {SqabsVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT32_MAX);  // INT_MIN -> INT_MAX
+  EXPECT_EQ(r[1], 1);          // -1 -> 1
+  EXPECT_EQ(r[2], INT32_MAX);  // INT_MAX unchanged
+  EXPECT_EQ(r[3], 100);        // -100 -> 100
+}
+
+// SQNEG .4S: INT32_MIN saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec4SSaturates) {
+  const int32_t in[4] = {static_cast<int32_t>(0x80000000u), INT32_MAX, 42, -42};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {SqnegVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT32_MAX);    // INT_MIN -> INT_MAX
+  EXPECT_EQ(r[1], -INT32_MAX);   // INT_MAX -> -INT_MAX
+  EXPECT_EQ(r[2], -42);
+  EXPECT_EQ(r[3], 42);
+}
+
+// SQABS .2S Q=0: upper 64 bits must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec2SUpperZero) {
+  const int32_t prev[4] = {-1, -1, -1, -1};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int32_t in[4] = {static_cast<int32_t>(0x80000000u), -5, 0x55555555, 0x66666666};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {SqabsVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT32_MAX);  // INT_MIN -> INT_MAX
+  EXPECT_EQ(r[1], 5);          // -5 -> 5
+  EXPECT_EQ(r[2], 0);          // Q=0 upper 64 zeroed
+  EXPECT_EQ(r[3], 0);
+}
+
+// SQNEG .8B Q=0: upper 64 bits must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec8BUpperZero) {
+  const uint8_t prev[16] = {
+      0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+      0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+  };
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0x80, 0x01, 0xFF, 0x7F, 0x00, 0x02, 0xFE, 0x80,
+      0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqnegVec8B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expected_low[8] = {0x7F, 0xFF, 0x01, 0x81, 0x00, 0xFE, 0x02, 0x7F};
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected_low[i]) << "lane " << i;
+  for (int i = 8; i < 16; i++) EXPECT_EQ(r[i], 0x00) << "lane " << i;
+}
+// endregion
+
+// region digitalis: SADDLP / UADDLP / SADALP / UADALP vector JIT
+// (size=00 byte->half, size=01 half->word, size=10 word->dword).
+//
+// Encoding (ARM ARM C7.2.225 / C7.2.260 / C7.2.224 / C7.2.259;
+// AdvSimdTwoRegMisc opcode=00010 / 00110):
+//   SADDLP .8B/.4H  = 0x0E202800 | (rn<<5) | rd  (U=0, op=00010, size=00, Q=0)
+//   SADDLP .16B/.8H = 0x4E202800 | ...           (Q=1)
+//   SADDLP .4H/.2S  = 0x0E602800 | ...           (size=01)
+//   SADDLP .8H/.4S  = 0x4E602800 | ...
+//   SADDLP .2S/.1D  = 0x0EA02800 | ...           (size=10)
+//   SADDLP .4S/.2D  = 0x4EA02800 | ...
+//   UADDLP = SADDLP | 0x20000000                  (U=1)
+//   SADALP = SADDLP with op=00110 -> 0x0E206800 etc.
+//   UADALP = SADALP | 0x20000000
+constexpr uint32_t SaddlpVec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E202800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec8B(uint8_t rd, uint8_t rn) {
+  return 0x0E202800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E602800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA02800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA02800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UaddlpVec16B(uint8_t rd, uint8_t rn) {
+  return SaddlpVec16B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t UaddlpVec8H(uint8_t rd, uint8_t rn) {
+  return SaddlpVec8H(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t UaddlpVec4S(uint8_t rd, uint8_t rn) {
+  return SaddlpVec4S(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t SadalpVec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E206800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SadalpVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E606800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UadalpVec16B(uint8_t rd, uint8_t rn) {
+  return SadalpVec16B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t UadalpVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA06800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// SADDLP .16B: signed pairwise add of 16 bytes -> 8 halves.  Validates
+// signed extension via PSLLW/PSRAW (low byte) and PSRAW (high byte).
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec16B) {
+  const int8_t n[16] = {
+       1,  2,
+      -1, -2,
+     127, 127,
+    -128, -128,
+       0, -1,
+      50, -50,
+      -3,  3,
+       100, -100,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Adjacent pair sums treating each byte as signed int8:
+  EXPECT_EQ(r[0], int16_t{1 + 2});
+  EXPECT_EQ(r[1], int16_t{-1 + -2});
+  EXPECT_EQ(r[2], int16_t{127 + 127});      // 254 — needs sign-extension to 16
+  EXPECT_EQ(r[3], int16_t{-128 + -128});    // -256 — INT8_MIN sum needs sign ext
+  EXPECT_EQ(r[4], int16_t{0 + -1});
+  EXPECT_EQ(r[5], int16_t{50 + -50});
+  EXPECT_EQ(r[6], int16_t{-3 + 3});
+  EXPECT_EQ(r[7], int16_t{100 + -100});
+}
+
+// UADDLP .16B: unsigned pairwise add of 16 bytes -> 8 halves.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec16B) {
+  const uint8_t n[16] = {
+       1, 2, 0xFF, 0xFF, 0x80, 0x80, 0x00, 0x00,
+       0xFF, 0x01, 0x10, 0x20, 0xAA, 0xBB, 0xCC, 0xDD,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UaddlpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint16_t{1 + 2});
+  EXPECT_EQ(r[1], uint16_t{0xFF + 0xFF});           // 510 — unsigned, no clip
+  EXPECT_EQ(r[2], uint16_t{0x80 + 0x80});           // 256
+  EXPECT_EQ(r[3], uint16_t{0});
+  EXPECT_EQ(r[4], uint16_t{0xFF + 0x01});           // 256
+  EXPECT_EQ(r[5], uint16_t{0x10 + 0x20});           // 48
+  EXPECT_EQ(r[6], uint16_t{0xAA + 0xBB});
+  EXPECT_EQ(r[7], uint16_t{0xCC + 0xDD});
+}
+
+// UADDLP .8B Q=0: 8-byte source, 4-half result, upper 64 of Vd zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec8BUpperZero) {
+  const uint8_t prev[16] = {
+      0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+  };
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0x80, 0x80, 0xFF, 0x01, 0x10, 0x20, 0x00, 0x00,
+      0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec8B(0, 1) | 0x20000000u};  // UADDLP .8B
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint16_t{0x80 + 0x80});
+  EXPECT_EQ(r[1], uint16_t{0xFF + 0x01});
+  EXPECT_EQ(r[2], uint16_t{0x10 + 0x20});
+  EXPECT_EQ(r[3], uint16_t{0});
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0) << "Q=0 upper lane " << i;
+}
+
+// SADDLP .8H: signed pairwise add of 8 halves -> 4 words via PMADDWD path.
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec8H) {
+  const int16_t n[8] = {
+      30000, 30000,
+      -30000, -30000,
+      static_cast<int16_t>(0x7FFF), -1,
+      1, -1,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int32_t{60000});                // 30000+30000 (needs 17-bit signed)
+  EXPECT_EQ(r[1], int32_t{-60000});               // -30000+-30000
+  EXPECT_EQ(r[2], int32_t{0x7FFF + -1});          // 0x7FFE
+  EXPECT_EQ(r[3], int32_t{0});                    // 1+-1
+}
+
+// UADDLP .8H: unsigned pairwise add of 8 halves -> 4 words.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec8H) {
+  const uint16_t n[8] = {
+      0xFFFF, 0xFFFF,
+      0x8000, 0x8000,
+      0x0001, 0x0002,
+      0x4000, 0x4000,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UaddlpVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint32_t{0xFFFF + 0xFFFFu});   // 0x1FFFE
+  EXPECT_EQ(r[1], uint32_t{0x8000 + 0x8000u});   // 0x10000
+  EXPECT_EQ(r[2], uint32_t{0x0001 + 0x0002u});
+  EXPECT_EQ(r[3], uint32_t{0x4000 + 0x4000u});   // 0x8000
+}
+
+// SADDLP .4S: signed pairwise add of 4 words -> 2 dwords via PMOVSXDQ path.
+// Pins overflow: INT32_MAX + INT32_MAX overflows 32-bit but fits in 64-bit.
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec4S) {
+  const int32_t n[4] = {
+      INT32_MAX, INT32_MAX,
+      INT32_MIN, INT32_MIN,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int64_t{INT32_MAX} + int64_t{INT32_MAX});
+  EXPECT_EQ(r[1], int64_t{INT32_MIN} + int64_t{INT32_MIN});
+}
+
+// UADDLP .4S: unsigned pairwise add of 4 words -> 2 dwords.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec4S) {
+  const uint32_t n[4] = {
+      0xFFFFFFFFu, 0xFFFFFFFFu,
+      0x80000000u, 0x7FFFFFFFu,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UaddlpVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0xFFFFFFFFu} + uint64_t{0xFFFFFFFFu});
+  EXPECT_EQ(r[1], uint64_t{0x80000000u} + uint64_t{0x7FFFFFFFu});
+}
+
+// SADDLP .2S Q=0: 2-word source, 1-dword result, upper 64 zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec2SUpperZero) {
+  const int32_t prev[4] = {-1, -1, -1, -1};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int32_t n[4] = {INT32_MIN, -5, 0x55555555, 0x66666666};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int64_t{INT32_MIN} + int64_t{-5});
+  EXPECT_EQ(r[1], 0);  // Q=0 upper 64 zeroed
+}
+
+// SADALP .16B: accumulate signed pair sums into Vd holding prior .8H values.
+TEST_F(Arm64LiteTranslateRegionTest, SadalpVec16B) {
+  const int16_t prev[8] = {100, -100, 1, -1, 32767, -32768, 50, -50};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int8_t n[16] = {
+      1, 2, 3, 4, 5, 6, 7, 8,
+      -1, -1, 0, 0, 10, 20, -10, 30,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SadalpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int16_t{100 + (1 + 2)});
+  EXPECT_EQ(r[1], int16_t{-100 + (3 + 4)});
+  EXPECT_EQ(r[2], int16_t{1 + (5 + 6)});
+  EXPECT_EQ(r[3], int16_t{-1 + (7 + 8)});
+  EXPECT_EQ(r[4], int16_t{32767 + (-1 + -1)});
+  EXPECT_EQ(r[5], int16_t{-32768 + (0 + 0)});
+  EXPECT_EQ(r[6], int16_t{50 + (10 + 20)});
+  EXPECT_EQ(r[7], int16_t{-50 + (-10 + 30)});
+}
+
+// UADALP .16B: accumulate unsigned pair sums into Vd holding prior .8H values.
+TEST_F(Arm64LiteTranslateRegionTest, UadalpVec16B) {
+  const uint16_t prev[8] = {0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 0x8000};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0xFF, 0xFF, 0x10, 0x20, 0x80, 0x80, 0x00, 0x01,
+      0x55, 0xAA, 0x33, 0x44, 0x11, 0x22, 0x77, 0x88,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UadalpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint16_t{0x1000 + 0xFF + 0xFF});
+  EXPECT_EQ(r[1], uint16_t{0x2000 + 0x10 + 0x20});
+  EXPECT_EQ(r[2], uint16_t{0x3000 + 0x80 + 0x80});
+  EXPECT_EQ(r[3], uint16_t{0x4000 + 0x00 + 0x01});
+  EXPECT_EQ(r[4], uint16_t{0x5000 + 0x55 + 0xAA});
+  EXPECT_EQ(r[5], uint16_t{0x6000 + 0x33 + 0x44});
+  EXPECT_EQ(r[6], uint16_t{0x7000 + 0x11 + 0x22});
+  EXPECT_EQ(r[7], uint16_t{0x8000 + 0x77 + 0x88});
+}
+
+// SADALP .8H: accumulate via PMADDWD path into Vd holding prior .4S values.
+TEST_F(Arm64LiteTranslateRegionTest, SadalpVec8H) {
+  const int32_t prev[4] = {1000, -1000, INT32_MAX - 100, INT32_MIN + 100};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int16_t n[8] = {
+      10, 20,
+      -30, -40,
+      100, 1,
+      0, 0,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SadalpVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int32_t{1000 + (10 + 20)});
+  EXPECT_EQ(r[1], int32_t{-1000 + (-30 + -40)});
+  EXPECT_EQ(r[2], int32_t{(INT32_MAX - 100) + (100 + 1)});
+  EXPECT_EQ(r[3], int32_t{(INT32_MIN + 100) + 0});
+}
+
+// UADALP .4S: accumulate via PMOVSXDQ-free unsigned pair sums (size=10)
+// into Vd holding prior .2D values.
+TEST_F(Arm64LiteTranslateRegionTest, UadalpVec4S) {
+  const uint64_t prev[2] = {0x1111111111111111ull, 0xAAAABBBBCCCCDDDDull};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint32_t n[4] = {
+      0xFFFFFFFFu, 0xFFFFFFFFu,
+      0x80000000u, 0x7FFFFFFFu,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UadalpVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x1111111111111111ull} + uint64_t{0xFFFFFFFFu} + uint64_t{0xFFFFFFFFu});
+  EXPECT_EQ(r[1], uint64_t{0xAAAABBBBCCCCDDDDull} + uint64_t{0x80000000u} + uint64_t{0x7FFFFFFFu});
+}
+// endregion
+
 // region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
 //   FMAX/FMIN  — IEEE: any NaN -> NaN result.
@@ -25257,6 +26111,139 @@ TEST_F(Arm64LiteTranslateRegionTest, ClzVec2SUpperZero) {
   std::memcpy(r, &state_.cpu.v[0], 16);
   for (int i = 0; i < 2; ++i) {
     uint32_t want = Clz32(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 2; i < 4; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+// endregion
+
+// region digitalis: CLS vector two-reg-misc JIT (PCMPGT sign-mask + per-lane
+// PEXTR + BSR + XOR + DEC + PINSR).  Encodings are CLZ with bit 29 (U) flipped
+// from 1 → 0.
+constexpr uint32_t kClsVec16B = 0x4E204820;  // cls v0.16b, v1.16b
+constexpr uint32_t kClsVec8B  = 0x0E204820;  // cls v0.8b,  v1.8b
+constexpr uint32_t kClsVec8H  = 0x4E604820;  // cls v0.8h,  v1.8h
+constexpr uint32_t kClsVec4H  = 0x0E604820;  // cls v0.4h,  v1.4h
+constexpr uint32_t kClsVec4S  = 0x4EA04820;  // cls v0.4s,  v1.4s
+constexpr uint32_t kClsVec2S  = 0x0EA04820;  // cls v0.2s,  v1.2s
+
+namespace {
+inline uint32_t Cls8(uint8_t v) {
+  uint8_t y = (v & 0x80) ? static_cast<uint8_t>(~v) : v;
+  if (y == 0) return 7;
+  return static_cast<uint32_t>(Clz8(y) - 1);
+}
+inline uint32_t Cls16(uint16_t v) {
+  uint16_t y = (v & 0x8000u) ? static_cast<uint16_t>(~v) : v;
+  if (y == 0) return 15;
+  return static_cast<uint32_t>(Clz16(y) - 1);
+}
+inline uint32_t Cls32(uint32_t v) {
+  uint32_t y = (v & 0x80000000u) ? ~v : v;
+  if (y == 0) return 31;
+  return Clz32(y) - 1;
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, ClsVec16B) {
+  // Coverage: 0x00/0xFF (all-same → 7), 0x7F/0x80 (sign-bit-differs → 0),
+  // 0xC0/0x3F (one match then differs → 1), mid-range positive/negative.
+  uint8_t in[16] = {0x00, 0xFF, 0x7F, 0x80, 0xC0, 0x3F, 0x55, 0xAA,
+                    0x01, 0xFE, 0xE7, 0x18, 0x40, 0xBF, 0x10, 0xEF};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClsVec16B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = static_cast<uint8_t>(Cls8(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClsVec8BUpperZero) {
+  // Q=0 form must zero upper 64 bits of Vd; the high 8 bytes of Vn carry
+  // non-trivial sign patterns to confirm they don't bleed through.
+  uint8_t in[16] = {0x00, 0xFF, 0x7F, 0x80, 0x01, 0xFE, 0x33, 0xCC,
+                    0xAA, 0x55, 0xC0, 0x3F, 0x40, 0xBF, 0xE7, 0x18};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClsVec8B};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint8_t want = static_cast<uint8_t>(Cls8(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClsVec8H) {
+  // 0x0000/0xFFFF → 15; 0x7FFF/0x8000 → 0; signed positive/negative spreads.
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x7FFF, 0x8000,
+                    0x0001, 0xFFFE, 0x1234, 0xDEAD};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClsVec8H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t want = static_cast<uint16_t>(Cls16(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClsVec4HUpperZero) {
+  uint16_t in[8] = {0x0000, 0xFFFF, 0x7FFF, 0x8000,
+                    0x1111, 0x2222, 0x3333, 0x4444};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClsVec4H};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint16_t want = static_cast<uint16_t>(Cls16(in[i]));
+    EXPECT_EQ(r[i], want) << "lane " << i;
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClsVec4S) {
+  // 0x00000000/0xFFFFFFFF → 31; 0x7FFFFFFF/0x80000000 → 0.
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0x7FFFFFFFu, 0x80000000u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClsVec4S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    uint32_t want = Cls32(in[i]);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex << in[i];
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ClsVec2SUpperZero) {
+  uint32_t in[4] = {0x00000000u, 0xFFFFFFFFu, 0xDEADBEEFu, 0x12345678u};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kClsVec2S};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    uint32_t want = Cls32(in[i]);
     EXPECT_EQ(r[i], want) << "lane " << i;
   }
   for (int i = 2; i < 4; ++i) {

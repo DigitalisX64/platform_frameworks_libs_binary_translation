@@ -13232,6 +13232,370 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // FCMxx Vd.<T>, Vn.<T>, #0.0 — per-lane FP compare against +0.0.
+      //   FCMGT: Vn >  0  -> Cmplt*p* xz, xn   (xz < Vn  == Vn > 0)
+      //   FCMGE: Vn >= 0  -> Cmple*p* xz, xn   (xz <= Vn == Vn >= 0)
+      //   FCMEQ: Vn == 0  -> Cmpeq*p* xn, xz
+      //   FCMLE: Vn <= 0  -> Cmple*p* xn, xz
+      //   FCMLT: Vn <  0  -> Cmplt*p* xn, xz
+      // SSE legacy Cmp{eq,lt,le}p{s,d} are ordered — they write 0 (FALSE) on
+      // any NaN operand, matching ARM FCMxx zero semantics.  Result lane is
+      // 0xFFFFFFFF (FP32) / 0xFFFF..FFFF (FP64) on TRUE, zero on FALSE.
+      // Decoder gates: bit23=1 required (size & 0b10), .2D (size=0b11) needs
+      // Q=1, .1D (size=0b11 Q=0) is ARM-reserved.  args.is_fp16 is always
+      // false for this encoding column — FP16 FCMxxZero lives in a different
+      // encoding slot (interpreter handles).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmeqZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmleZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmltZero: {
+        if (args.is_fp16) { success_ = false; return; }
+        // size encodes bit23:bit22. FP forms always have bit23=1 → size&0b10.
+        if ((args.size & 0b10) == 0) { Undefined(); return; }
+        const bool is_double = (args.size == 0b11);
+        if (is_double && !args.q) { Undefined(); return; }  // .1D reserved
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) {
+          Undefined(); return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        using Op = Decoder::AdvSimdTwoRegMiscOpcode;
+        switch (args.opcode) {
+          case Op::kFcmeqZero:
+            if (is_double) as_.Cmpeqpd(xn, xz);
+            else           as_.Cmpeqps(xn, xz);
+            break;
+          case Op::kFcmgtZero:
+            // Vn > 0  <=>  0 < Vn ; result lands in xz, move to xn.
+            if (is_double) as_.Cmpltpd(xz, xn);
+            else           as_.Cmpltps(xz, xn);
+            as_.Movdqa(xn, xz);
+            break;
+          case Op::kFcmgeZero:
+            // Vn >= 0  <=>  0 <= Vn
+            if (is_double) as_.Cmplepd(xz, xn);
+            else           as_.Cmpleps(xz, xn);
+            as_.Movdqa(xn, xz);
+            break;
+          case Op::kFcmltZero:
+            if (is_double) as_.Cmpltpd(xn, xz);
+            else           as_.Cmpltps(xn, xz);
+            break;
+          case Op::kFcmleZero:
+            if (is_double) as_.Cmplepd(xn, xz);
+            else           as_.Cmpleps(xn, xz);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // FRECPE Vd.<T>, Vn.<T> — per-lane FP reciprocal estimate.
+      // FRSQRTE Vd.<T>, Vn.<T> — per-lane FP reciprocal-square-root estimate.
+      // Vector form: bit23=1 always; size=0b10 -> FP32, size=0b11 -> FP64.
+      // FP16 form (separate encoding column, args.is_fp16==true) bails to
+      // the interpreter; .1D (size=0b11, Q=0) is ARM-reserved.
+      //
+      // ARM ARM C7.2.118 / C7.2.131 require only ~8-bit mantissa precision;
+      // the exact 1/x via DIVP{s,d} (FRECPE) and 1/sqrt(x) via SQRTP{s,d} +
+      // DIVP{s,d} (FRSQRTE) is well within bound and matches the scalar
+      // FRECPE/FRSQRTE lowering for endpoint consistency.
+      //
+      // FRECPE endpoints fall out of SSE IEEE-754 divide natively:
+      //   ±0 -> ±inf, ±inf -> ±0, NaN -> NaN propagated.
+      // FRSQRTE special case: ARM specifies negative/zero/NaN input returns
+      // default qNaN, but SSE SQRT propagates NaN / writes signed inf for
+      // ±0.  Branchless blend:
+      //   sqrt   = SQRT(src)
+      //   recip  = 1.0 / sqrt
+      //   mask   = CMPLE(src, 0) | CMPUNORD(src, src)
+      //   result = (mask & qNaN) | (~mask & recip)
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if ((args.size & 0b10) == 0) { Undefined(); return; }
+        const bool is_double = (args.size == 0b11);
+        if (is_double && !args.q) { Undefined(); return; }  // .1D reserved
+        const bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV);
+
+        if (is_rsqrt) {
+          // FRSQRTE: needs the (src <= 0 || isNaN(src)) -> qNaN blend.
+          SimdRegister src = AllocTempSimdReg();
+          SimdRegister sqrt_xmm = AllocTempSimdReg();
+          SimdRegister recip = AllocTempSimdReg();
+          SimdRegister mask_xmm = AllocTempSimdReg();
+          SimdRegister mask_nan = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          if (src == no_simd_register || sqrt_xmm == no_simd_register ||
+              recip == no_simd_register || mask_xmm == no_simd_register ||
+              mask_nan == no_simd_register || tmp == no_register) {
+            success_ = false; return;
+          }
+          as_.Movdqu(src, {.base = Assembler::rbp, .disp = vn_off});
+          // sqrt = SQRT(src)
+          if (is_double) as_.Sqrtpd(sqrt_xmm, src);
+          else           as_.Sqrtps(sqrt_xmm, src);
+          // recip = 1.0 / sqrt(src) via broadcasted 1.0 vector.
+          if (is_double) {
+            as_.Movq(tmp, int64_t{0x3FF0000000000000LL});  // 1.0 (FP64)
+            as_.Movq(recip, tmp);
+            as_.Pshufd(recip, recip, static_cast<int8_t>(0x44));
+            as_.Divpd(recip, sqrt_xmm);
+          } else {
+            as_.Movl(tmp, int32_t{0x3F800000});  // 1.0f (FP32)
+            as_.Movd(recip, tmp);
+            as_.Pshufd(recip, recip, static_cast<int8_t>(0x00));
+            as_.Divps(recip, sqrt_xmm);
+          }
+          // sqrt_xmm is dead — reuse it as the all-zero vector for CMPLE.
+          as_.Pxor(sqrt_xmm, sqrt_xmm);
+          as_.Movdqa(mask_xmm, src);
+          if (is_double) as_.Cmplepd(mask_xmm, sqrt_xmm);
+          else           as_.Cmpleps(mask_xmm, sqrt_xmm);
+          // mask_nan = CMPUNORD(src, src) — true lanes where src is NaN.
+          as_.Movdqa(mask_nan, src);
+          if (is_double) as_.Cmpunordpd(mask_nan, mask_nan);
+          else           as_.Cmpunordps(mask_nan, mask_nan);
+          as_.Por(mask_xmm, mask_nan);
+          // mask_nan is dead — reuse for the broadcast qNaN.
+          if (is_double) {
+            as_.Movq(tmp, int64_t{0x7FF8000000000000LL});  // default qNaN
+            as_.Movq(mask_nan, tmp);
+            as_.Pshufd(mask_nan, mask_nan, static_cast<int8_t>(0x44));
+          } else {
+            as_.Movl(tmp, int32_t{0x7FC00000});  // default qNaN (FP32)
+            as_.Movd(mask_nan, tmp);
+            as_.Pshufd(mask_nan, mask_nan, static_cast<int8_t>(0x00));
+          }
+          // result = (mask_xmm & qNaN) | (~mask_xmm & recip)
+          as_.Pand(mask_nan, mask_xmm);
+          as_.Pandn(mask_xmm, recip);
+          as_.Por(mask_nan, mask_xmm);
+          if (!args.q) mask_low64(mask_nan);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, mask_nan);
+          return;
+        }
+        // FRECPE: recip = 1.0 / src per lane. SSE DIV matches ARM endpoints.
+        SimdRegister src = AllocTempSimdReg();
+        SimdRegister recip = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        if (src == no_simd_register || recip == no_simd_register ||
+            tmp == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(src, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_double) {
+          as_.Movq(tmp, int64_t{0x3FF0000000000000LL});
+          as_.Movq(recip, tmp);
+          as_.Pshufd(recip, recip, static_cast<int8_t>(0x44));
+          as_.Divpd(recip, src);
+        } else {
+          as_.Movl(tmp, int32_t{0x3F800000});
+          as_.Movd(recip, tmp);
+          as_.Pshufd(recip, recip, static_cast<int8_t>(0x00));
+          as_.Divps(recip, src);
+        }
+        if (!args.q) mask_low64(recip);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, recip);
+        return;
+      }
+      // SQABS Vd.<T>, Vn.<T> — per-lane saturating signed absolute value.
+      // SQNEG Vd.<T>, Vn.<T> — per-lane saturating signed negate.
+      //   size=00 .8B/.16B  -> byte ops via PCMPGTB / PSUBB / PCMPEQB
+      //   size=01 .4H/.8H   -> word ops
+      //   size=10 .2S/.4S   -> dword ops
+      //   size=11 .2D       -> needs PCMPGTQ (SSE4.2) and PCMPEQQ (SSE4.1);
+      //                        bail to interp (same boundary as kAbs/kNeg).
+      // Per-lane semantics — INT_MIN_w is the only saturating input (|INT_MIN|
+      // and -INT_MIN both overflow the signed range):
+      //   if src == INT_MIN_w -> INT_MAX_w
+      //   else SQABS -> |src|; SQNEG -> -src
+      // Saturation as branchless XOR: after the abs/neg step, lanes whose
+      // source was INT_MIN still hold INT_MIN (0x80..0).  XOR-ing INT_MIN
+      // with all-1s yields INT_MAX (0x7F..F).  Build the saturation mask as
+      // PCMPEQ(src, INT_MIN_bcast) and XOR into the result; non-INT_MIN lanes
+      // XOR with zero and pass through unchanged.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqabs:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqneg: {
+        if (args.size == 0b11) { success_ = false; return; }
+        const bool is_neg =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSqneg);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        SimdRegister xtmp = AllocTempSimdReg();
+        Register gp_min = AllocTempReg();
+        if (xn == no_simd_register || xres == no_simd_register ||
+            xtmp == no_simd_register || gp_min == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_neg) {
+          // SQNEG: res = 0 - xn.
+          as_.Pxor(xres, xres);
+          switch (args.size) {
+            case 0b00: as_.Psubb(xres, xn); break;
+            case 0b01: as_.Psubw(xres, xn); break;
+            default:   as_.Psubd(xres, xn); break;
+          }
+        } else {
+          // SQABS: sign_mask = PCMPGT(0, xn); res = (xn ^ sign_mask) - sign_mask.
+          as_.Pxor(xtmp, xtmp);
+          switch (args.size) {
+            case 0b00: as_.Pcmpgtb(xtmp, xn); break;
+            case 0b01: as_.Pcmpgtw(xtmp, xn); break;
+            default:   as_.Pcmpgtd(xtmp, xn); break;
+          }
+          as_.Movdqa(xres, xn);
+          as_.Pxor(xres, xtmp);
+          switch (args.size) {
+            case 0b00: as_.Psubb(xres, xtmp); break;
+            case 0b01: as_.Psubw(xres, xtmp); break;
+            default:   as_.Psubd(xres, xtmp); break;
+          }
+        }
+        // Build broadcasted INT_MIN_w in xtmp; xtmp is dead at this point
+        // (sign mask consumed for SQABS; never set for SQNEG).  A 32-bit
+        // broadcast pattern (Movd + Pshufd 0x00) covers all three widths
+        // because the INT_MIN bit pattern repeats every 32 bits at
+        // byte/half/word granularity.
+        int32_t int_min_bcast;
+        switch (args.size) {
+          case 0b00: int_min_bcast = static_cast<int32_t>(0x80808080u); break;
+          case 0b01: int_min_bcast = static_cast<int32_t>(0x80008000u); break;
+          default:   int_min_bcast = static_cast<int32_t>(0x80000000u); break;
+        }
+        as_.Movl(gp_min, int_min_bcast);
+        as_.Movd(xtmp, gp_min);
+        as_.Pshufd(xtmp, xtmp, int8_t{0x00});
+        // Saturation mask: 1s in lanes where src == INT_MIN_w.
+        switch (args.size) {
+          case 0b00: as_.Pcmpeqb(xtmp, xn); break;
+          case 0b01: as_.Pcmpeqw(xtmp, xn); break;
+          default:   as_.Pcmpeqd(xtmp, xn); break;
+        }
+        // Apply: lanes where src==INT_MIN flip from 0x80..0 (INT_MIN) to
+        // 0x7F..F (INT_MAX); other lanes XOR with 0 (no-op).
+        as_.Pxor(xres, xtmp);
+        if (!args.q) mask_low64(xres);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        return;
+      }
+      // SADDLP / UADDLP Vd.<Tb>, Vn.<Ta> — add adjacent pairs of elements,
+      // producing a result with elements twice as wide.  S = signed, U = unsigned.
+      // SADALP / UADALP — same shape but accumulate into Vd.
+      //   size=00 src .8B/.16B  -> dst .4H/.8H
+      //   size=01 src .4H/.8H   -> dst .2S/.4S
+      //   size=10 src .2S/.4S   -> dst .1D/.2D
+      //   size=11 reserved (decoder routes UNDEF).
+      //
+      // Idioms per width:
+      //   byte->half  unsigned: lo = (xn & 0x00FF); hi = (xn >> 8); PADDW.
+      //   byte->half  signed:   lo = (xn << 8) >> 8 (arith); hi = (xn >> 8) arith; PADDW.
+      //   half->word  unsigned: lo = (xn & 0x0000FFFF); hi = (xn >> 16); PADDD.
+      //   half->word  signed:   PMADDWD(xn, [0x0001 per half]) — exact signed pair sum.
+      //   word->dword unsigned: lo = (xn & 0xFFFFFFFF per qword); hi = (xn >> 32); PADDQ.
+      //   word->dword signed:   sign-extend each dword to qword via PMOVSXDQ on lo/hi
+      //                         halves, then pair-sum via PUNPCKLQDQ/PUNPCKHQDQ + PADDQ.
+      // Accumulate forms (SADALP/UADALP) PADD into the existing Vd contents.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSadalp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUadalp: {
+        if (args.size == 0b11) { Undefined(); return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp);
+        const bool is_accum =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUadalp);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        SimdRegister xtmp = AllocTempSimdReg();
+        if (xn == no_simd_register || xres == no_simd_register ||
+            xtmp == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {  // byte -> half
+            if (is_signed) {
+              as_.Movdqa(xres, xn);
+              as_.Psllw(xres, int8_t{8});
+              as_.Psraw(xres, int8_t{8});  // low byte sign-extended to 16
+              as_.Movdqa(xtmp, xn);
+              as_.Psraw(xtmp, int8_t{8});  // high byte sign-extended to 16
+              as_.Paddw(xres, xtmp);
+            } else {
+              as_.Pcmpeqw(xtmp, xtmp);
+              as_.Psrlw(xtmp, int8_t{8});  // 0x00FF per half
+              as_.Movdqa(xres, xn);
+              as_.Pand(xres, xtmp);         // low byte zero-extended
+              as_.Movdqa(xtmp, xn);
+              as_.Psrlw(xtmp, int8_t{8});  // high byte zero-extended
+              as_.Paddw(xres, xtmp);
+            }
+            break;
+          }
+          case 0b01: {  // half -> word
+            if (is_signed) {
+              as_.Pcmpeqw(xtmp, xtmp);
+              as_.Psrlw(xtmp, int8_t{15});  // 0x0001 per half
+              as_.Movdqa(xres, xn);
+              as_.Pmaddwd(xres, xtmp);       // signed pair sum -> 32-bit per dword
+            } else {
+              as_.Pcmpeqd(xtmp, xtmp);
+              as_.Psrld(xtmp, int8_t{16});  // 0x0000FFFF per dword
+              as_.Movdqa(xres, xn);
+              as_.Pand(xres, xtmp);
+              as_.Movdqa(xtmp, xn);
+              as_.Psrld(xtmp, int8_t{16});
+              as_.Paddd(xres, xtmp);
+            }
+            break;
+          }
+          case 0b10: {  // word -> dword
+            if (is_signed) {
+              SimdRegister xhi = AllocTempSimdReg();
+              if (xhi == no_simd_register) { success_ = false; return; }
+              as_.Pmovsxdq(xres, xn);            // [sx(xn[0]), sx(xn[1])]
+              as_.Movdqa(xhi, xn);
+              as_.Psrldq(xhi, int8_t{8});         // [xn[2], xn[3], 0, 0]
+              as_.Pmovsxdq(xhi, xhi);             // [sx(xn[2]), sx(xn[3])]
+              as_.Movdqa(xtmp, xres);
+              as_.Punpcklqdq(xtmp, xhi);          // [sx(0), sx(2)]
+              as_.Punpckhqdq(xres, xhi);          // [sx(1), sx(3)]
+              as_.Paddq(xres, xtmp);              // [sx(0)+sx(1), sx(2)+sx(3)]
+            } else {
+              as_.Pcmpeqd(xtmp, xtmp);
+              as_.Psrlq(xtmp, int8_t{32});  // 0x00000000_FFFFFFFF per qword
+              as_.Movdqa(xres, xn);
+              as_.Pand(xres, xtmp);          // low 32 of each qword, zero-extended
+              as_.Movdqa(xtmp, xn);
+              as_.Psrlq(xtmp, int8_t{32});  // high 32 of each qword, zero-extended
+              as_.Paddq(xres, xtmp);
+            }
+            break;
+          }
+        }
+        if (is_accum) {
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          switch (args.size) {
+            case 0b00: as_.Paddw(xres, xd); break;
+            case 0b01: as_.Paddd(xres, xd); break;
+            default:   as_.Paddq(xres, xd); break;
+          }
+        }
+        if (!args.q) mask_low64(xres);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
@@ -13592,6 +13956,85 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
+      // region digitalis
+      // CLS V.<T>, V.<T> -- per-lane count leading sign bits (number of
+      // consecutive bits below the MSB that equal the MSB; range 0..N-1).
+      //   size=00 .8B/.16B  -> 8-bit lane CLS (result 0..7)
+      //   size=01 .4H/.8H   -> 16-bit lane CLS (result 0..15)
+      //   size=10 .2S/.4S   -> 32-bit lane CLS (result 0..31)
+      //   size=11           -> reserved per ARM ARM.
+      // Identity used: y = (x < 0) ? ~x : x (per lane); then
+      //   CLS(x) = CLZ_N(y) - 1, where CLZ_N is N-bit count-leading-zeros.
+      // Per-lane y is built once via a vector XOR with the per-lane sign
+      // mask (PCMPGT{B,W,D}(0, xn) yields all-ones in negative lanes, 0
+      // elsewhere — exactly arithmetic-shift-right-by-(N-1) per lane),
+      // then scalarized through PEXTR{B,W,D} → BSR → XOR with (N-1) → SUB 1
+      // (the BSR+XOR pair gives CLZ_N; the trailing -1 gives CLS).  The
+      // y==0 branch substitutes (N-1) directly — that's CLS of an all-zero
+      // or all-one lane (e.g. 0x00 or 0xFF), where every bit after the MSB
+      // matches.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCls: {
+        if (args.size == 0b11) { success_ = false; return; }
+        const uint8_t lane_bits = static_cast<uint8_t>(8u << args.size);
+        const uint8_t bytes_per_lane = static_cast<uint8_t>(1u << args.size);
+        const int lanes_per_vec = (args.q ? 16 : 8) / bytes_per_lane;
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        SimdRegister xsign = AllocTempSimdReg();
+        if (xn == no_simd_register || xd == no_simd_register ||
+            xsign == no_simd_register) {
+          success_ = false; return;
+        }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xsign, xsign);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xsign, xn); break;
+          case 0b01: as_.Pcmpgtw(xsign, xn); break;
+          case 0b10: as_.Pcmpgtd(xsign, xn); break;
+        }
+        // xsign now has the per-lane sign-extension mask (all-ones in
+        // negative lanes, zero elsewhere).  XOR collapses negative lanes to
+        // (~x) while leaving positive lanes untouched — that's the
+        // CLS-via-CLZ preprocess.
+        as_.Pxor(xn, xsign);
+        as_.Pxor(xd, xd);
+        for (int i = 0; i < lanes_per_vec; ++i) {
+          switch (args.size) {
+            case 0b00: as_.Pextrb(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pextrw(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pextrd(r1, xn, static_cast<int8_t>(i)); break;
+          }
+          auto* nonzero = as_.MakeLabel();
+          auto* done = as_.MakeLabel();
+          as_.Testl(r1, r1);
+          as_.Jcc(Condition::kNotZero, *nonzero);
+          // y == 0  =>  CLS = lane_bits - 1.  (All bits below MSB match.)
+          as_.Movl(r1, static_cast<int32_t>(lane_bits - 1));
+          as_.Jmp(*done);
+          as_.Bind(nonzero);
+          // CLZ_N(y) = (lane_bits - 1) XOR BSR(y).  CLS = CLZ_N(y) - 1.
+          as_.Bsrl(r1, r1);
+          // CLS = CLZ - 1 = (lane_bits - 1) XOR BSR  XOR'd with (lane_bits - 2).
+          // We collapse to a single XOR by noting that for a non-zero
+          // bsr_value in [0..lane_bits-1], CLZ = (lane_bits - 1) - bsr_value,
+          // hence CLS = (lane_bits - 2) - bsr_value.  But the host doesn't
+          // have a "XOR with constant minus 1" — keep it as XOR + DECL.
+          as_.Xorl(r1, static_cast<int8_t>(lane_bits - 1));
+          as_.Decl(r1);
+          as_.Bind(done);
+          switch (args.size) {
+            case 0b00: as_.Pinsrb(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pinsrw(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pinsrd(xd, r1, static_cast<int8_t>(i)); break;
+          }
+        }
+        if (!args.q) mask_low64(xd);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
+      // endregion
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
       //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
       //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
