@@ -7552,6 +7552,129 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SQRSHL.2D vector form: signed saturating rounded
+      // variable shift across two 64-bit lanes.  Per-lane port of the SQRSHL
+      // scalar D recipe — combines the SQSHL.2D positive arm (SAR-based
+      // back-shift overflow detector + sign-broadcast XOR-with-INT64_MAX
+      // saturation picker) with the SRSHL.2D negative arm (overflow-safe
+      // rounding identity with SAR data shift + SHR round-bit extract).
+      // Saturation only on the left-shift quadrant, rounding only on the
+      // right-shift quadrant, so the two scaffoldings compose without
+      // interaction.  `scratch` doubles as the back-shift holder on the
+      // positive arm (SAR variant for sign-aware overflow detection) and
+      // the round_bit holder on the negative arm — the disjoint-arm
+      // 3-temp sharing pattern from the scalar D recipe.  Unlike UQRSHL.2D,
+      // there is NO dedicated |sh|=64 branch on the negative arm: the
+      // signed bias 1<<63 sums with int64 a to a non-negative int128 in
+      // [0, 2^64-1] which >>s 64 = 0, so |sh|>=64 collapses into the
+      // zero branch (matches SRSHL.2D).
+      // Quadrants:
+      //   sh in [0, 63]   -> SHL then SAR back-shift overflow check; on
+      //                       mismatch saturate to INT64_MAX (pos a) or
+      //                       INT64_MIN (neg a) via sign-broadcast XOR.
+      //   sh >= 64        -> a == 0 ? 0 : sign-aware INT64_MAX/INT64_MIN.
+      //   sh in [-63, -1] -> (a >>s |sh|) + ((a >>u (|sh|-1)) & 1).
+      //   sh <= -64       -> 0.
+      // Scalar D form (kSqrshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kSqrshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register scratch = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            scratch == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_pos_big = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 falls through to the sign-
+          // aware saturation picker; otherwise the SAR-back-shift overflow
+          // check.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+          // 0 <= sh < 64: shift-then-back-shift via SAR overflow check.
+          // Reuse `sh` as the saved-original holder once cl is loaded.
+          as_.Movq(Assembler::rcx, sh);
+          as_.Movq(sh, a);                 // sh = original a (saved for cmp).
+          as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+          as_.Movq(scratch, a);
+          as_.SarqByCl(scratch);           // scratch = (int64_t)(a << shift) >>s shift.
+          as_.Cmpq(scratch, sh);           // scratch == original a ?
+          as_.Jcc(Assembler::Condition::kEqual, *L_done);
+          // Overflow: saturate to INT64_MAX if sign(a)==0 else INT64_MIN.
+          // `sh` still holds the saved original a value.
+          as_.Sarq(sh, int8_t{63});        // sh = sign broadcast (0 or -1).
+          as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});  // a = INT64_MAX.
+          as_.Xorq(a, sh);                 // pos: a = INT64_MAX; neg: a = INT64_MIN.
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_pos_big);
+          // sh >= 64: if a == 0 result is 0, else saturate based on sign(a).
+          as_.Testq(a, a);
+          as_.Jcc(Assembler::Condition::kZero, *L_zero);
+          // sign-broadcast a into scratch; then build saturation target.
+          as_.Movq(scratch, a);
+          as_.Sarq(scratch, int8_t{63});   // scratch = sign broadcast (0 or -1).
+          as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(a, scratch);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.  |sh|>=64 -> 0
+          // (no dedicated |sh|=64 case — the signed-bias sum >>s 64 = 0).
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          // 1 <= |sh| <= 63: round_bit = (a >>u (|sh|-1)) & 1;
+          //                  a = (a >>s |sh|) + round_bit.
+          as_.Movq(scratch, a);
+          as_.Decq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(scratch);
+          as_.Andq(scratch, int32_t{1});
+          as_.Incq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.SarqByCl(a);
+          as_.Addq(a, scratch);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;

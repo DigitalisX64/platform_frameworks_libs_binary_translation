@@ -14500,6 +14500,187 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshlVec2DUpperBytesOfShiftIgnoredJit) {
 }
 // endregion
 
+// region digitalis: SQRSHL.2D vector form (per-lane signed saturating
+// rounded variable shift across two 64-bit lanes).  Encoded as
+// AdvSimdThreeSame Q=1, size=11, opcode=01011, U=0.  Combines SQSHL.2D
+// positive arm (SAR-back-shift overflow detector + sign-broadcast
+// XOR-with-INT64_MAX saturation picker) with SRSHL.2D negative arm
+// (overflow-safe rounding identity with SAR data shift + SHR round-bit
+// extract; |sh|>=64 collapses to zero, NO dedicated |sh|=64 branch).
+constexpr uint32_t SqrshlVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4EE05C00u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DEncodingMatchesLlvmMc) {
+  // `sqrshl v0.2d, v1.2d, v2.2d` = 0x4ee25c20.
+  EXPECT_EQ(SqrshlVec2D(0, 1, 2), 0x4ee25c20u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DLeftSmallNoSaturationJit) {
+  // Lane 0: 0x1 << 8 = 0x100 (SAR back-shift recovers 1).
+  // Lane 1: 0x2 << 16 = 0x20000 (SAR back-shift recovers 2).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x2ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{16}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{8});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x100ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x20000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DLeftPositiveSaturatesIntMaxJit) {
+  // Lane 0: a = INT64_MAX, sh = 1.  SHL+SAR back-shift gives 0xFFFF…FFFE
+  // (≠ INT64_MAX); overflow detected; saturates to INT64_MAX (positive a).
+  // Lane 1: a = 1, sh = 63.  SHL+SAR back-shift: a<<63 = 0x8000…0, SAR 63 =
+  // 0xFFFF…FFFF (≠ 1); overflow detected; saturates to INT64_MAX.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x1ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{63}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DLeftNegativeSaturatesIntMinJit) {
+  // Lane 0: a = INT64_MIN, sh = 1.  SHL: a<<1 = 0; SAR 1 = 0 (≠ INT64_MIN);
+  // overflow detected; sign(INT64_MIN)=neg → saturates to INT64_MIN.
+  // Lane 1: a = -1, sh = 63.  a<<63 = INT64_MIN; SAR 63 = -1 (== a); NO
+  // overflow → result is INT64_MIN itself.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{63}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x8000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DLeftBy64MixedZeroNonzeroJit) {
+  // sh = 64 both lanes; L_pos_big branch.
+  // Lane 0: a = 0 → 0 (L_zero branch — Testq+kZero).
+  // Lane 1: a = -3 → INT64_MIN (sign-broadcast XOR saturation picker).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFDULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x0ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{64}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{64});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x8000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DRightRoundedMixedLanesJit) {
+  // Lane 0: a = 31, sh = -1.  round_bit = (31 >>u 0) & 1 = 1;
+  //   a = (31 >>s 1) + 1 = 15 + 1 = 16.
+  // Lane 1: a = -1, sh = -1.  round_bit = ((-1) >>u 0) & 1 = 1;
+  //   a = ((-1) >>s 1) + 1 = -1 + 1 = 0.  This is the SAR-vs-SHR sentinel
+  //   identity from the SRSHL recipe: SAR(-1, 1) is -1 (sign-fill), and the
+  //   round bit adds 1 → 0 (NOT +1 from an incorrect SHR-based recipe,
+  //   which would give SHR(-1, 1) = INT64_MAX, off by half UINT64_MAX).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1FULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xFFULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFULL});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DRightNoOverflowAtIntMaxJit) {
+  // Both lanes a = INT64_MAX, sh = -1.  Naive
+  //   (INT64_MAX + (1<<0)) >>s 1
+  // would push the bias addition into 0x8000_0000_0000_0000 (INT64_MIN),
+  // then SAR 1 yields 0xC000_0000_0000_0000 (wrong).  The overflow-safe
+  // identity used by the recipe gives
+  //   (INT64_MAX >>s 1) + ((INT64_MAX >>u 0) & 1) = 0x3FFF…FF + 1 = 2^62.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xFFULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFULL});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x4000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x4000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DRightBy64CollapsesZeroJit) {
+  // sh = -64 both lanes: SQRSHL has NO dedicated |sh|=64 branch (unlike
+  // UQRSHL.2D / URSHL.2D); |sh|>=64 collapses to 0 per SRSHL.2D semantics.
+  // Lane 0 a bit63=1, Lane 1 a bit63=0 — both yield 0.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xC0ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xC0ULL});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DRightBy65ZeroJit) {
+  // sh = -65 both lanes: |sh|>=65 → 0.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBFULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xBFULL});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DPerLaneIndependentJit) {
+  // Cross-lane independence with distinct quadrants — saturation in one
+  // lane must not bleed into the rounding-arm computation of the other.
+  // Lane 0: a = INT64_MAX, sh = 1 → saturates to INT64_MAX (positive
+  // overflow; sign(a)=0 → INT64_MAX).
+  // Lane 1: a = 0x100, sh = -4 → 0x10 (rounded, no saturation possible).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x100ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xFCULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x10ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DUpperBytesOfShiftIgnoredJit) {
+  // Per-lane shift uses only the LOW byte of Vm[lane*8:lane*8+8]; upper 7
+  // bytes per lane ignored.  Same invariant as URSHL.2D / UQSHL.2D /
+  // SQSHL.2D / SRSHL.2D / UQRSHL.2D variants.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x2ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBA08ULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBA04ULL});
+  static const uint32_t code[] = {SqrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
+}
+// endregion
+
 // region digitalis: UQSHL scalar D form (unsigned saturating variable shift).
 // Encoded with opcode 0b01001, U=1 in the AdvSimdScalarThreeSame class.
 constexpr uint32_t UqshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
