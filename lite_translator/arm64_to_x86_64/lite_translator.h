@@ -6979,13 +6979,13 @@ class LiteTranslator {
       //   sh in [-(W-1), -1]  -> SHR a, |sh|  (USHL); SAR a, |sh|  (SSHL).
       //   sh <= -W            -> 0  (USHL);  SAR a, W-1  (SSHL).
       // Scalar D (kSshl/kUshl scalar) handled separately via
-      // AdvSimdScalarThreeSame.  This cycle adds .2S/.4S (size=10); the
-      // .2D form (size=11) is unchanged from prior cycles.  Other widths
-      // (.8B/.16B/.4H/.8H) still bail to the interpreter; .1D (Q=0,
-      // size=11) is ARM-reserved.
+      // AdvSimdScalarThreeSame.  This cycle adds .4H/.8H (size=01); .2S/.4S
+      // (size=10) and .2D (size=11) are unchanged from prior cycles.  Other
+      // widths (.8B/.16B) still bail to the interpreter; .1D (Q=0, size=11)
+      // is ARM-reserved.
       case Decoder::AdvSimdThreeSameOpcode::kSshl:
       case Decoder::AdvSimdThreeSameOpcode::kUshl: {
-        if (args.size != 0b10 && args.size != 0b11) {
+        if (args.size != 0b01 && args.size != 0b10 && args.size != 0b11) {
           success_ = false; return;
         }
         if (args.size == 0b11 && !args.q) {
@@ -7060,7 +7060,7 @@ class LiteTranslator {
             // Store lane result to Vd.
             as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
           }
-        } else {
+        } else if (args.size == 0b10) {
           // .2S (Q=0) / .4S (Q=1): 2 or 4 lanes of 32-bit.  Per-lane shift
           // count is the signed int8 in the LOW byte of the corresponding
           // Vm S-lane (vm_off + lane*4).  Width-32 thresholds: sh >= 32 ->
@@ -7127,6 +7127,87 @@ class LiteTranslator {
           }
 
           // For Q=0 (.2S), zero the upper 64 bits of Vd.
+          if (!args.q) {
+            as_.Xorq(a, a);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
+          }
+        } else {
+          // .4H (Q=0) / .8H (Q=1): 4 or 8 lanes of 16-bit.  Per-lane shift
+          // count is the signed int8 in the LOW byte of the corresponding
+          // Vm H-lane (vm_off + lane*2).  Width-16 thresholds: sh >= 16 ->
+          // zero (USHL) or arith-max via Sarl 15 (SSHL); -16 < sh < 0 ->
+          // SHR/SAR by |sh|; sh <= -16 -> zero (USHL) or Sarl 15 (SSHL).
+          // SSHL uses Movsxwl so the 32-bit shift primitives propagate the
+          // 16-bit sign correctly across the upper bits; the low 16 of the
+          // result is the correct H-lane value and the Movw store discards
+          // the upper bits.  USHL uses Movzxwl so the value is zero-extended.
+          const int num_lanes = args.q ? 8 : 4;
+          for (int lane = 0; lane < num_lanes; ++lane) {
+            int32_t vn_lane = vn_off + lane * 2;
+            int32_t vm_lane = vm_off + lane * 2;
+            int32_t vd_lane = vd_off + lane * 2;
+
+            if (is_signed) {
+              // Sign-extend 16-bit Vn lane to 32-bit.  Upper 32 of the
+              // 64-bit register is zero-extended by the 32-bit dest.
+              as_.Movsxwl(a, {.base = Assembler::rbp, .disp = vn_lane});
+            } else {
+              // Zero-extend 16-bit Vn lane to 32-bit.
+              as_.Movzxwl(a, {.base = Assembler::rbp, .disp = vn_lane});
+            }
+            as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+            Assembler::Label* L_neg = as_.MakeLabel();
+            Assembler::Label* L_zero = as_.MakeLabel();
+            Assembler::Label* L_done = as_.MakeLabel();
+
+            as_.Testq(sh, sh);
+            as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+            // Positive shift in [0, 127]: shift >= 16 -> 0 (low 16 of
+            // SHL-by-cl on a 32-bit reg is 0 once cl >= 16); else SHL a, sh.
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShllByCl(a);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_neg);
+            // Negative path: sh = |shift| in [1, 128] after Negq.
+            as_.Negq(sh);
+            as_.Cmpq(sh, int32_t{16});
+            if (is_signed) {
+              Assembler::Label* L_arith_max = as_.MakeLabel();
+              as_.Jcc(Assembler::Condition::kGreaterEqual, *L_arith_max);
+              // 0 < |sh| < 16: a = (int32_t)a >> |sh|.  Movsxwl-loaded
+              // SignExt(low_16) gives correct sign propagation across the
+              // 32-bit SAR; low 16 of result = SignExt(low_16) >>s |sh|.
+              as_.Movq(Assembler::rcx, sh);
+              as_.SarlByCl(a);
+              as_.Jmp(*L_done);
+              as_.Bind(L_arith_max);
+              // |sh| >= 16: a = SignExt(low_16) >>s 15 -> sign broadcast.
+              // Low 16 = 0xFFFF (negative) or 0x0000 (non-negative).
+              as_.Sarl(a, int8_t{15});
+              as_.Jmp(*L_done);
+            } else {
+              // USHL negative: |sh| >= 16 -> 0; else SHR a, |sh|.
+              as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+              as_.Movq(Assembler::rcx, sh);
+              as_.ShrlByCl(a);
+              as_.Jmp(*L_done);
+            }
+
+            as_.Bind(L_zero);
+            as_.Xorl(a, a);  // 32-bit zero (x86 zero-extends to upper 32).
+
+            as_.Bind(L_done);
+
+            // 16-bit lane store from the low 16 of `a`.
+            as_.Movw({.base = Assembler::rbp, .disp = vd_lane}, a);
+          }
+
+          // For Q=0 (.4H), zero the upper 64 bits of Vd.
           if (!args.q) {
             as_.Xorq(a, a);
             as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);

@@ -13944,6 +13944,216 @@ TEST_F(Arm64LiteTranslateRegionTest, ShlVec2SUpperBytesOfShiftIgnoredJit) {
 }
 // endregion
 
+// region digitalis: SSHL.4H / SSHL.8H / USHL.4H / USHL.8H vector forms
+// (per-lane signed/unsigned variable shifts across 16-bit H-lanes).
+// Encoded as AdvSimdThreeSame size=01, opcode=01000; Q selects .4H (0) or
+// .8H (1); U selects SSHL (0) or USHL (1).
+constexpr uint32_t SshlVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E604400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SshlVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E604400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UshlVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2E604400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UshlVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E604400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// Helper to pack four 16-bit values into the low 64 bits of a __uint128_t.
+static inline __uint128_t Pack4H(uint16_t l0, uint16_t l1, uint16_t l2,
+                                 uint16_t l3) {
+  return (static_cast<__uint128_t>(l3) << 48) |
+         (static_cast<__uint128_t>(l2) << 32) |
+         (static_cast<__uint128_t>(l1) << 16) |
+         static_cast<__uint128_t>(l0);
+}
+
+// Helper to pack eight 16-bit values into a full __uint128_t.
+static inline __uint128_t Pack8H(uint16_t l0, uint16_t l1, uint16_t l2,
+                                 uint16_t l3, uint16_t l4, uint16_t l5,
+                                 uint16_t l6, uint16_t l7) {
+  return (static_cast<__uint128_t>(l7) << 112) |
+         (static_cast<__uint128_t>(l6) << 96) |
+         (static_cast<__uint128_t>(l5) << 80) |
+         (static_cast<__uint128_t>(l4) << 64) |
+         Pack4H(l0, l1, l2, l3);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec4H8HEncodingsMatchLlvmMc) {
+  // Verified via:
+  //   sshl v0.4h, v1.4h, v2.4h = 0x0e624420
+  //   sshl v0.8h, v1.8h, v2.8h = 0x4e624420
+  //   ushl v0.4h, v1.4h, v2.4h = 0x2e624420
+  //   ushl v0.8h, v1.8h, v2.8h = 0x6e624420
+  EXPECT_EQ(SshlVec4H(0, 1, 2), 0x0e624420u);
+  EXPECT_EQ(SshlVec8H(0, 1, 2), 0x4e624420u);
+  EXPECT_EQ(UshlVec4H(0, 1, 2), 0x2e624420u);
+  EXPECT_EQ(UshlVec8H(0, 1, 2), 0x6e624420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshlVec4HLeftAllLanesJit) {
+  // 4 lanes: a={1, 2, 3, 4}, sh={1, 2, 3, 4}.
+  // Lane 0: 1<<1 = 2; lane 1: 2<<2 = 8; lane 2: 3<<3 = 24; lane 3: 4<<4 = 64.
+  state_.cpu.v[1] = Pack4H(0x0001, 0x0002, 0x0003, 0x0004);
+  state_.cpu.v[2] = Pack4H(0x0001, 0x0002, 0x0003, 0x0004);
+  static const uint32_t code[] = {UshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0x0002, 0x0008, 0x0018, 0x0040)));
+  // Q=0 must zero Vd[127:64].
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshlVec8HLeftAllLanesJit) {
+  // 8 lanes, each a=1, with shifts 1/2/4/8/3/5/7/15 (max non-saturating shift
+  // at width-16 is 15).  Verifies the upper 64 bits of Vd are populated by
+  // lanes 4-7 (no Q=0 zeroing).
+  state_.cpu.v[1] = Pack8H(0x0001, 0x0001, 0x0001, 0x0001,
+                            0x0001, 0x0001, 0x0001, 0x0001);
+  state_.cpu.v[2] = Pack8H(0x0001, 0x0002, 0x0004, 0x0008,
+                            0x0003, 0x0005, 0x0007, 0x000F);
+  static const uint32_t code[] = {UshlVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Low 64 bits = lanes 0-3.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0x0002, 0x0004, 0x0010, 0x0100)));
+  // High 64 bits = lanes 4-7.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            static_cast<uint64_t>(
+                Pack4H(0x0008, 0x0020, 0x0080, 0x8000)));
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshlVec4HRightArithMixedLanesJit) {
+  // SAR-vs-SHR sentinel at .4H width.  Lane 0: a=-8 (0xFFF8) sh=-1 -> -4
+  // (0xFFFC: SAR sign-fills).  Lane 1: a=-16 (0xFFF0) sh=-2 -> -4 (0xFFFC).
+  // A SHR-based recipe would give (uint16_t)-8 >>u 1 = 0x7FFC.  Lane 2:
+  // a=INT16_MIN (0x8000) sh=-1 -> 0xC000 (SAR-fill at the boundary).  Lane 3:
+  // a=-1 (0xFFFF) sh=-1 -> 0xFFFF (SAR keeps all ones).
+  state_.cpu.v[1] = Pack4H(0xFFF8, 0xFFF0, 0x8000, 0xFFFF);
+  // Vm low-byte per-lane shift counts: lane 0=-1 (0xFF), lane 1=-2 (0xFE),
+  // lane 2=-1 (0xFF), lane 3=-1 (0xFF).
+  state_.cpu.v[2] = Pack4H(0x00FF, 0x00FE, 0x00FF, 0x00FF);
+  static const uint32_t code[] = {SshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0xFFFC, 0xFFFC, 0xC000, 0xFFFF)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec4HLeftBy16ZeroesBothArmsJit) {
+  // sh=16 -> 0 for both SSHL and USHL.  Verifies the positive-arm sh>=W
+  // collapse-to-zero at width-16.  Tested via SSHL with a mix of signs to
+  // confirm the path doesn't depend on sign(a).
+  state_.cpu.v[1] = Pack4H(0x8000, 0x7FFF, 0xCAFE, 0xBABE);
+  state_.cpu.v[2] = Pack4H(0x0010, 0x0010, 0x0010, 0x0010);
+  static const uint32_t code[] = {SshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshlVec4HRightBy16MixedSignsJit) {
+  // sh=-16 (0xF0) on all lanes: SSHL produces sign(a) broadcast across the
+  // 16 bits.  Lane 0: a=0x8000 (negative) -> 0xFFFF.  Lane 1: a=0x7FFF
+  // (positive) -> 0.  Lane 2: a=-1 (0xFFFF) -> 0xFFFF.  Lane 3: a=1
+  // (0x0001) -> 0.
+  state_.cpu.v[1] = Pack4H(0x8000, 0x7FFF, 0xFFFF, 0x0001);
+  state_.cpu.v[2] = Pack4H(0x00F0, 0x00F0, 0x00F0, 0x00F0);
+  static const uint32_t code[] = {SshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0xFFFF, 0x0000, 0xFFFF, 0x0000)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshlVec4HRightBy16ZeroesBothJit) {
+  // sh=-16 on all lanes: USHL fills with zeros regardless of sign(a).
+  // Distinguishes USHL from SSHL at the negative-arm |sh|>=W boundary.
+  state_.cpu.v[1] = Pack4H(0x8000, 0xFFFF, 0x7FFF, 0x0001);
+  state_.cpu.v[2] = Pack4H(0x00F0, 0x00F0, 0x00F0, 0x00F0);
+  static const uint32_t code[] = {UshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec4HUpperHalfZeroedJit) {
+  // Q=0 (.4H) must zero Vd[127:64].  Set Vd to all-ones beforehand; after a
+  // no-op SSHL with sh=0, only the low 64 bits should retain Vn's four
+  // 16-bit lanes and the upper 64 bits should be 0.
+  state_.cpu.v[0] = ~static_cast<__uint128_t>(0);
+  state_.cpu.v[1] = Pack4H(0xCAFE, 0xBABE, 0xDEAD, 0xBEEF);
+  state_.cpu.v[2] = 0;  // sh=0 in all lanes (per-lane low byte = 0).
+  static const uint32_t code[] = {SshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0xCAFE, 0xBABE, 0xDEAD, 0xBEEF)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec4HPerLaneIndependentJit) {
+  // Cross-lane independence at .4H: each lane's arm doesn't leak to the next.
+  // Lane 0: 0x0001<<15 = 0x8000 (positive-arm, no overflow for USHL).
+  // Lane 1: 0x0100>>u4 = 0x0010 (negative arm, sh=-4=0xFC).
+  // Lane 2: 0x0001<<8 = 0x0100 (positive arm).
+  // Lane 3: 0xF000>>u8 = 0x00F0 (negative arm, sh=-8=0xF8).
+  state_.cpu.v[1] = Pack4H(0x0001, 0x0100, 0x0001, 0xF000);
+  state_.cpu.v[2] = Pack4H(0x000F, 0x00FC, 0x0008, 0x00F8);
+  static const uint32_t code[] = {UshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0x8000, 0x0010, 0x0100, 0x00F0)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec4HUpperBytesOfShiftIgnoredJit) {
+  // Per-lane shift uses only the LOW byte of Vm[lane*2:lane*2+2]; upper byte
+  // of each H-lane's shift descriptor must be ignored.
+  state_.cpu.v[1] = Pack4H(0x0001, 0x0002, 0x0001, 0x0004);
+  // Per-lane Vm.16 = HighByte:LowByte.  Low byte is the shift; high byte is
+  // arbitrary noise (0xDE, 0xAD, 0xBE, 0xEF) that must NOT affect the result.
+  state_.cpu.v[2] = Pack4H(0xDE04, 0xAD08, 0xBE0F, 0xEFFC);
+  static const uint32_t code[] = {UshlVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Lane 0: 1<<4 = 0x0010. Lane 1: 2<<8 = 0x0200. Lane 2: 1<<15 = 0x8000.
+  // Lane 3: 4>>u4 = 0 (USHL by -4).
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(Pack4H(0x0010, 0x0200, 0x8000, 0x0000)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshlVec8HMixedQuadrantsAllLanesJit) {
+  // .8H end-to-end with mixed quadrants across all 8 lanes.  Verifies Q=1
+  // populates Vd[127:0] (no Q=0 upper-half zeroing).
+  // Lane 0: a=INT16_MAX  (0x7FFF) sh= 1  -> 0xFFFE.        (positive arm, no zeroes)
+  // Lane 1: a=INT16_MIN  (0x8000) sh=-1  -> 0xC000.        (negative arm, SAR-fill)
+  // Lane 2: a=0x0040     sh= 8           -> 0x4000.        (positive arm)
+  // Lane 3: a=0xFFFF     sh=-1           -> 0xFFFF.        (negative arm, -1>>1=-1)
+  // Lane 4: a=0x0001     sh=15           -> 0x8000.        (positive arm, no overflow)
+  // Lane 5: a=0xFFFE     sh=-15          -> 0xFFFF.        (negative arm, sign-fill broadcast)
+  // Lane 6: a=0xCAFE     sh=16           -> 0x0000.        (positive arm at |sh|=W collapse)
+  // Lane 7: a=0xCAFE     sh=-16          -> 0xFFFF.        (negative arm at |sh|=W, SSHL sign broadcast)
+  state_.cpu.v[1] = Pack8H(0x7FFF, 0x8000, 0x0040, 0xFFFF,
+                            0x0001, 0xFFFE, 0xCAFE, 0xCAFE);
+  state_.cpu.v[2] = Pack8H(0x0001, 0x00FF, 0x0008, 0x00FF,
+                            0x000F, 0x00F1, 0x0010, 0x00F0);
+  static const uint32_t code[] = {SshlVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            static_cast<uint64_t>(
+                Pack4H(0xFFFE, 0xC000, 0x4000, 0xFFFF)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            static_cast<uint64_t>(
+                Pack4H(0x8000, 0xFFFF, 0x0000, 0xFFFF)));
+}
+// endregion
+
 // region digitalis: UQSHL.2D vector form (per-lane unsigned saturating variable
 // shift across two 64-bit lanes).  Encoded as AdvSimdThreeSame Q=1, size=11,
 // opcode=01001, U=1.
