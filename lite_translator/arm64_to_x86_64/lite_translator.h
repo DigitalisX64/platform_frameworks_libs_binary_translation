@@ -8370,11 +8370,11 @@ class LiteTranslator {
       //   sh == -W            -> bit (W-1) of a (round bit alone)
       //   sh <= -(W+1)        -> 0
       // Scalar D form (kUqrshlScalar) handled separately via
-      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11) and
-      // .2S/.4S (size=10); other widths (.8B/.16B/.4H/.8H) still bail to
-      // the interpreter.  .1D (Q=0, size=11) is ARM-reserved.
+      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11),
+      // .2S/.4S (size=10), and .4H/.8H (size=01); .8B/.16B (size=00)
+      // still bails to the interpreter.  .1D (Q=0, size=11) is ARM-reserved.
       case Decoder::AdvSimdThreeSameOpcode::kUqrshl: {
-        if (args.size != 0b10 && args.size != 0b11) {
+        if (args.size != 0b01 && args.size != 0b10 && args.size != 0b11) {
           success_ = false; return;
         }
         if (args.size == 0b11 && !args.q) {
@@ -8468,7 +8468,7 @@ class LiteTranslator {
             // Store lane result to Vd.
             as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
           }
-        } else {
+        } else if (args.size == 0b10) {
           // .2S (Q=0) / .4S (Q=1): 2 or 4 lanes of 32-bit.  Movl zero-
           // extends the Vn lane into bits[63:32]; subsequent 32-bit shift /
           // Andl / Xorl chain leaves bits[63:32] of `a` clean, so a 32-bit
@@ -8559,6 +8559,100 @@ class LiteTranslator {
             as_.Xorq(a, a);
             as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
           }
+        } else {
+          // .4H (Q=0) / .8H (Q=1): 4 or 8 lanes of 16-bit (size == 0b01).
+          // Movzxwl zero-extends the 16-bit lane into 32 bits (upper 16 of
+          // result = 0).  Width-16 thresholds: positive sh in [0,15] gets a
+          // width-16 overflow check (Shrl-back-16 + Testl bits[31:16] of the
+          // shifted value — mirrors UQSHL .4H/.8H); sh>=16 picks 0 or
+          // UINT16_MAX (0xFFFF); |sh|=16 extracts bit 15 alone (round-bit
+          // alone); |sh|>16 collapses to 0.  Negative arm reuses the URSHL
+          // .4H/.8H overflow-safe rounding identity with width-16
+          // thresholds.
+          const int num_lanes = args.q ? 8 : 4;
+          for (int lane = 0; lane < num_lanes; ++lane) {
+            int32_t vn_lane = vn_off + lane * 2;
+            int32_t vm_lane = vm_off + lane * 2;
+            int32_t vd_lane = vd_off + lane * 2;
+
+            as_.Movzxwl(a, {.base = Assembler::rbp, .disp = vn_lane});
+            as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+            Assembler::Label* L_neg = as_.MakeLabel();
+            Assembler::Label* L_pos_big = as_.MakeLabel();
+            Assembler::Label* L_rshift_eq_16 = as_.MakeLabel();
+            Assembler::Label* L_zero = as_.MakeLabel();
+            Assembler::Label* L_done = as_.MakeLabel();
+
+            as_.Testq(sh, sh);
+            as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+            // Positive shift in [0, 127]: sh >= 16 -> a-vs-UINT16_MAX picker;
+            // else width-16 back-shift overflow check.
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+            // 0 <= sh < 16: ShllByCl then test bits[31:16] of result.
+            // Since Movzxwl zeroed those bits, any non-zero bit there means
+            // the value overflowed the 16-bit lane.  Same recipe as
+            // UQSHL .4H/.8H positive arm.
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShllByCl(a);
+            as_.Movq(scratch, a);
+            as_.Shrl(scratch, int8_t{16});
+            as_.Testl(scratch, scratch);
+            as_.Jcc(Assembler::Condition::kZero, *L_done);
+            as_.Movl(a, int32_t{0xFFFF});  // saturate to UINT16_MAX (low 16).
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_pos_big);
+            // sh >= 16: if a == 0 result is 0, else UINT16_MAX.
+            as_.Testl(a, a);
+            as_.Jcc(Assembler::Condition::kZero, *L_zero);
+            as_.Movl(a, int32_t{0xFFFF});
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_neg);
+            // Negative shift: |sh| in [1, 128] after Negq.
+            as_.Negq(sh);
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreater, *L_zero);
+            as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_16);
+            // 1 <= |sh| <= 15: round_bit = (a >>u (|sh|-1)) & 1;
+            //                  a = (a >>u |sh|) + round_bit.
+            // Movzxwl-loaded a has upper 16 = 0; ShrlByCl preserves
+            // cleanly across the 32-bit shift.
+            as_.Movl(scratch, a);
+            as_.Decq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrlByCl(scratch);
+            as_.Andl(scratch, int32_t{1});
+            as_.Incq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrlByCl(a);
+            as_.Addl(a, scratch);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_rshift_eq_16);
+            // |sh| == 16: result = (a >>u 15) & 1 — bit 15 (round-bit alone).
+            // For Movzxwl-loaded a, this is bit 15 of the original H lane.
+            as_.Shrl(a, int8_t{15});
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_zero);
+            as_.Xorl(a, a);
+
+            as_.Bind(L_done);
+
+            // Movw-store the 16-bit lane (low 16 of `a`); upper bits ignored.
+            as_.Movw({.base = Assembler::rbp, .disp = vd_lane}, a);
+          }
+
+          // For Q=0 (.4H), zero the upper 64 bits of Vd.
+          if (!args.q) {
+            as_.Xorq(a, a);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
+          }
         }
 
         // Restore rcx.
@@ -8590,11 +8684,11 @@ class LiteTranslator {
       //   sh in [-(W-1), -1]  -> (a >>s |sh|) + ((a >>u (|sh|-1)) & 1).
       //   sh <= -W            -> 0.
       // Scalar D form (kSqrshlScalar) handled separately via
-      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11) and
-      // .2S/.4S (size=10); other widths (.8B/.16B/.4H/.8H) still bail to
-      // the interpreter.  .1D (Q=0, size=11) is ARM-reserved.
+      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11),
+      // .2S/.4S (size=10), and .4H/.8H (size=01); .8B/.16B (size=00)
+      // still bails to the interpreter.  .1D (Q=0, size=11) is ARM-reserved.
       case Decoder::AdvSimdThreeSameOpcode::kSqrshl: {
-        if (args.size != 0b10 && args.size != 0b11) {
+        if (args.size != 0b01 && args.size != 0b10 && args.size != 0b11) {
           success_ = false; return;
         }
         if (args.size == 0b11 && !args.q) {
@@ -8690,7 +8784,7 @@ class LiteTranslator {
             // Store lane result to Vd.
             as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
           }
-        } else {
+        } else if (args.size == 0b10) {
           // .2S (Q=0) / .4S (Q=1): 2 or 4 lanes of 32-bit.  Movl zero-
           // extends the Vn lane into bits[63:32]; subsequent 32-bit SHL /
           // SAR / Andl / Xorl chain leaves bits[63:32] of `a` clean, so a
@@ -8786,6 +8880,109 @@ class LiteTranslator {
           }
 
           // For Q=0 (.2S), zero the upper 64 bits of Vd.
+          if (!args.q) {
+            as_.Xorq(a, a);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
+          }
+        } else {
+          // .4H (Q=0) / .8H (Q=1): 4 or 8 lanes of 16-bit (size == 0b01).
+          // Movsxwl sign-extends the 16-bit lane into 32 bits (upper 16 of
+          // result = sign-extension of bit 15).  Positive arm reuses the
+          // SQSHL .4H/.8H signed-16-bit overflow check: after ShllByCl, the
+          // result fits in signed 16-bit iff sign-extending the low 16
+          // reproduces the full 32-bit value (`Shll back, 16; Sarl back, 16;
+          // Cmpl back, a`).  Saturation pivot is INT16_MAX (0x7FFF) /
+          // INT16_MIN (0x8000) selected via the sign-broadcast XOR pattern
+          // (`Sarl sh, 31; Movl a, 0x7FFF; Xorl a, sh`).  Negative arm
+          // reuses the SRSHL .4H/.8H overflow-safe rounding identity with
+          // SAR data shift + SHR round-bit; |sh|>=16 collapses to 0
+          // (single threshold — no dedicated |sh|=16 case, matching SRSHL).
+          const int num_lanes = args.q ? 8 : 4;
+          for (int lane = 0; lane < num_lanes; ++lane) {
+            int32_t vn_lane = vn_off + lane * 2;
+            int32_t vm_lane = vm_off + lane * 2;
+            int32_t vd_lane = vd_off + lane * 2;
+
+            as_.Movsxwl(a, {.base = Assembler::rbp, .disp = vn_lane});
+            as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+            Assembler::Label* L_neg = as_.MakeLabel();
+            Assembler::Label* L_pos_big = as_.MakeLabel();
+            Assembler::Label* L_zero = as_.MakeLabel();
+            Assembler::Label* L_done = as_.MakeLabel();
+
+            as_.Testq(sh, sh);
+            as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+            // Positive shift in [0, 127]: sh >= 16 -> sign-aware picker;
+            // else signed-16-bit overflow check.
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+            // 0 <= sh < 16: ShllByCl, then check if signed-16 fit.  Reuse
+            // `sh` as the saved-original holder after cl is loaded.  Since
+            // `a` is Movsxwl-loaded (sign in bit 31), Movq(sh, a) preserves
+            // the sign-extended original for the saturation pivot.
+            as_.Movq(Assembler::rcx, sh);
+            as_.Movq(sh, a);
+            as_.ShllByCl(a);
+            as_.Movq(scratch, a);
+            as_.Shll(scratch, int8_t{16});
+            as_.Sarl(scratch, int8_t{16});
+            as_.Cmpl(scratch, a);
+            as_.Jcc(Assembler::Condition::kEqual, *L_done);
+            // Overflow: saturate to INT16_MAX (pos a) or INT16_MIN (neg a).
+            // `sh` holds Movsxwl-loaded saved-original; Sarl 31 broadcasts
+            // sign across low 32; Movl 0x7FFF zero-extends INT16_MAX;
+            // Xorl flips to 0xFFFF8000 (low 16 = INT16_MIN) on negative.
+            as_.Sarl(sh, int8_t{31});
+            as_.Movl(a, int32_t{0x7FFF});
+            as_.Xorl(a, sh);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_pos_big);
+            // sh >= 16: if a == 0 result is 0, else sign-aware saturation.
+            as_.Testq(a, a);
+            as_.Jcc(Assembler::Condition::kZero, *L_zero);
+            as_.Movq(scratch, a);
+            as_.Sarl(scratch, int8_t{31});
+            as_.Movl(a, int32_t{0x7FFF});
+            as_.Xorl(a, scratch);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_neg);
+            // Negative shift: |sh| in [1, 128] after Negq.  |sh|>=16 -> 0
+            // (no dedicated |sh|=16 case — the signed-bias sum >>s 16 = 0;
+            // matches SRSHL.4H/.8H, NOT UQRSHL.4H/.8H).
+            as_.Negq(sh);
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+            // 1 <= |sh| <= 15: round_bit = (a >>u (|sh|-1)) & 1;
+            //                  a = (a >>s |sh|) + round_bit.  Data shift is
+            // SarlByCl (signed); round-bit extract stays ShrlByCl (bit-
+            // presence check, not arithmetic).  Movsxwl-loaded a gives
+            // correct sign propagation across 32-bit SAR.
+            as_.Movl(scratch, a);
+            as_.Decq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrlByCl(scratch);
+            as_.Andl(scratch, int32_t{1});
+            as_.Incq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.SarlByCl(a);
+            as_.Addl(a, scratch);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_zero);
+            as_.Xorl(a, a);
+
+            as_.Bind(L_done);
+
+            // Movw-store the 16-bit lane (low 16 of `a`); upper bits ignored.
+            as_.Movw({.base = Assembler::rbp, .disp = vd_lane}, a);
+          }
+
+          // For Q=0 (.4H), zero the upper 64 bits of Vd.
           if (!args.q) {
             as_.Xorq(a, a);
             as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
