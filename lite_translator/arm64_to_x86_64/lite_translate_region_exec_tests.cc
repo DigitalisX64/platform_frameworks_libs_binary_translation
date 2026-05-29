@@ -14063,6 +14063,141 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVec2DUpperBytesOfShiftIgnoredJit) {
 }
 // endregion
 
+// region digitalis: URSHL.2D vector form (per-lane unsigned non-saturating
+// rounded variable shift across two 64-bit lanes).  Encoded as
+// AdvSimdThreeSame Q=1, size=11, opcode=01010, U=1.
+constexpr uint32_t UrshlVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6EE05400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DEncodingMatchesLlvmMc) {
+  // `urshl v0.2d, v1.2d, v2.2d` = 0x6ee25420.
+  EXPECT_EQ(UrshlVec2D(0, 1, 2), 0x6ee25420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DLeftSmallBothLanesJit) {
+  // Lane 0: 0x1 <<u 8 = 0x100.  Lane 1: 0x2 <<u 16 = 0x20000.  No rounding
+  // applies on the positive arm (left shifts are unbiased).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x2ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{16}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{8});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x100ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x20000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DLeftBy64ZeroesBothJit) {
+  // sh = 64 both lanes: shift >= 64 → 0 (unsigned non-saturating).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{64}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{64});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DRightRoundedMixedLanesJit) {
+  // Lane 0: 0x1F (31) >>u 1 = 0xF (15), round_bit = (31 >>u 0) & 1 = 1 →
+  //         result = 15 + 1 = 16 (0x10).  sh = -1 (0xFF).
+  // Lane 1: 0x100 >>u 4 = 0x10, round_bit = (0x100 >>u 3) & 1 = 0 → 0x10.
+  //         sh = -4 (0xFC).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x100ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1FULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xFCULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFULL});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x10ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DRightNoOverflowAtUintMaxJit) {
+  // The overflow-safe identity (a >>u rshift) + ((a >>u (rshift-1)) & 1)
+  // must NOT add bias to a before shifting — would wrap at UINT64_MAX.
+  // Lane 0: a = UINT64_MAX (0xFFFFFFFFFFFFFFFF), sh = -1.
+  //         a >>u 1 = 0x7FFFFFFFFFFFFFFF; round_bit = (UINT64_MAX >>u 0) & 1 = 1.
+  //         result = 0x8000_0000_0000_0000 (correct round-half-up of
+  //         (2^64-1)/2 = 2^63 - 0.5 → 2^63).
+  // Lane 1: a = UINT64_MAX (0xFFFFFFFFFFFFFFFF), sh = -4.
+  //         a >>u 4 = 0x0FFFFFFFFFFFFFFF; round_bit = (UINT64_MAX >>u 3) & 1 = 1.
+  //         result = 0x1000_0000_0000_0000.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xFCULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFULL});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x1000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DRightBy64RoundBitOnlyJit) {
+  // sh = -64 both lanes: result = (a >>u 63) & 1 — just bit 63 of a.
+  // Lane 0: a = 0x8000_0000_0000_0000 (bit 63 set) → 1.
+  // Lane 1: a = 0x7FFF_FFFF_FFFF_FFFF (bit 63 clear) → 0.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xC0ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xC0ULL});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{1});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DRightBy65ZeroJit) {
+  // sh = -65 both lanes: rounding term dominates per ARM ARM → 0.
+  // sh byte = 0xBF (-65 sign-extended).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBFULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xBFULL});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DPerLaneIndependentJit) {
+  // Cross-lane independence with distinct shift directions.
+  // Lane 0: 0x1 <<u 4 = 0x10.  Lane 1: 0x3 >>u 1 with round_bit =
+  //         (3 >>u 0) & 1 = 1 → 1 + 1 = 2.  sh byte lane 1 = 0xFF (-1).
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x3ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xFFULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x4ULL});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{2});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2DUpperBytesOfShiftIgnoredJit) {
+  // Per-lane shift uses only the LOW byte of Vm[lane*8:lane*8+8]; upper 7
+  // bytes per lane ignored.  Same shape as UQSHL.2D / SQSHL.2D variants.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0x2ULL}) << 64) |
+                     static_cast<__uint128_t>(uint64_t{0x1ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBA08ULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBA04ULL});
+  static const uint32_t code[] = {UrshlVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
+}
+// endregion
+
 // region digitalis: UQSHL scalar D form (unsigned saturating variable shift).
 // Encoded with opcode 0b01001, U=1 in the AdvSimdScalarThreeSame class.
 constexpr uint32_t UqshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
