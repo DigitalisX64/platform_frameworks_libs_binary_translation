@@ -13294,6 +13294,116 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // FRECPE Vd.<T>, Vn.<T> — per-lane FP reciprocal estimate.
+      // FRSQRTE Vd.<T>, Vn.<T> — per-lane FP reciprocal-square-root estimate.
+      // Vector form: bit23=1 always; size=0b10 -> FP32, size=0b11 -> FP64.
+      // FP16 form (separate encoding column, args.is_fp16==true) bails to
+      // the interpreter; .1D (size=0b11, Q=0) is ARM-reserved.
+      //
+      // ARM ARM C7.2.118 / C7.2.131 require only ~8-bit mantissa precision;
+      // the exact 1/x via DIVP{s,d} (FRECPE) and 1/sqrt(x) via SQRTP{s,d} +
+      // DIVP{s,d} (FRSQRTE) is well within bound and matches the scalar
+      // FRECPE/FRSQRTE lowering for endpoint consistency.
+      //
+      // FRECPE endpoints fall out of SSE IEEE-754 divide natively:
+      //   ±0 -> ±inf, ±inf -> ±0, NaN -> NaN propagated.
+      // FRSQRTE special case: ARM specifies negative/zero/NaN input returns
+      // default qNaN, but SSE SQRT propagates NaN / writes signed inf for
+      // ±0.  Branchless blend:
+      //   sqrt   = SQRT(src)
+      //   recip  = 1.0 / sqrt
+      //   mask   = CMPLE(src, 0) | CMPUNORD(src, src)
+      //   result = (mask & qNaN) | (~mask & recip)
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
+        if (args.is_fp16) { success_ = false; return; }
+        if ((args.size & 0b10) == 0) { Undefined(); return; }
+        const bool is_double = (args.size == 0b11);
+        if (is_double && !args.q) { Undefined(); return; }  // .1D reserved
+        const bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV);
+
+        if (is_rsqrt) {
+          // FRSQRTE: needs the (src <= 0 || isNaN(src)) -> qNaN blend.
+          SimdRegister src = AllocTempSimdReg();
+          SimdRegister sqrt_xmm = AllocTempSimdReg();
+          SimdRegister recip = AllocTempSimdReg();
+          SimdRegister mask_xmm = AllocTempSimdReg();
+          SimdRegister mask_nan = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          if (src == no_simd_register || sqrt_xmm == no_simd_register ||
+              recip == no_simd_register || mask_xmm == no_simd_register ||
+              mask_nan == no_simd_register || tmp == no_register) {
+            success_ = false; return;
+          }
+          as_.Movdqu(src, {.base = Assembler::rbp, .disp = vn_off});
+          // sqrt = SQRT(src)
+          if (is_double) as_.Sqrtpd(sqrt_xmm, src);
+          else           as_.Sqrtps(sqrt_xmm, src);
+          // recip = 1.0 / sqrt(src) via broadcasted 1.0 vector.
+          if (is_double) {
+            as_.Movq(tmp, int64_t{0x3FF0000000000000LL});  // 1.0 (FP64)
+            as_.Movq(recip, tmp);
+            as_.Pshufd(recip, recip, static_cast<int8_t>(0x44));
+            as_.Divpd(recip, sqrt_xmm);
+          } else {
+            as_.Movl(tmp, int32_t{0x3F800000});  // 1.0f (FP32)
+            as_.Movd(recip, tmp);
+            as_.Pshufd(recip, recip, static_cast<int8_t>(0x00));
+            as_.Divps(recip, sqrt_xmm);
+          }
+          // sqrt_xmm is dead — reuse it as the all-zero vector for CMPLE.
+          as_.Pxor(sqrt_xmm, sqrt_xmm);
+          as_.Movdqa(mask_xmm, src);
+          if (is_double) as_.Cmplepd(mask_xmm, sqrt_xmm);
+          else           as_.Cmpleps(mask_xmm, sqrt_xmm);
+          // mask_nan = CMPUNORD(src, src) — true lanes where src is NaN.
+          as_.Movdqa(mask_nan, src);
+          if (is_double) as_.Cmpunordpd(mask_nan, mask_nan);
+          else           as_.Cmpunordps(mask_nan, mask_nan);
+          as_.Por(mask_xmm, mask_nan);
+          // mask_nan is dead — reuse for the broadcast qNaN.
+          if (is_double) {
+            as_.Movq(tmp, int64_t{0x7FF8000000000000LL});  // default qNaN
+            as_.Movq(mask_nan, tmp);
+            as_.Pshufd(mask_nan, mask_nan, static_cast<int8_t>(0x44));
+          } else {
+            as_.Movl(tmp, int32_t{0x7FC00000});  // default qNaN (FP32)
+            as_.Movd(mask_nan, tmp);
+            as_.Pshufd(mask_nan, mask_nan, static_cast<int8_t>(0x00));
+          }
+          // result = (mask_xmm & qNaN) | (~mask_xmm & recip)
+          as_.Pand(mask_nan, mask_xmm);
+          as_.Pandn(mask_xmm, recip);
+          as_.Por(mask_nan, mask_xmm);
+          if (!args.q) mask_low64(mask_nan);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, mask_nan);
+          return;
+        }
+        // FRECPE: recip = 1.0 / src per lane. SSE DIV matches ARM endpoints.
+        SimdRegister src = AllocTempSimdReg();
+        SimdRegister recip = AllocTempSimdReg();
+        Register tmp = AllocTempReg();
+        if (src == no_simd_register || recip == no_simd_register ||
+            tmp == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(src, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_double) {
+          as_.Movq(tmp, int64_t{0x3FF0000000000000LL});
+          as_.Movq(recip, tmp);
+          as_.Pshufd(recip, recip, static_cast<int8_t>(0x44));
+          as_.Divpd(recip, src);
+        } else {
+          as_.Movl(tmp, int32_t{0x3F800000});
+          as_.Movd(recip, tmp);
+          as_.Pshufd(recip, recip, static_cast<int8_t>(0x00));
+          as_.Divps(recip, src);
+        }
+        if (!args.q) mask_low64(recip);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, recip);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.

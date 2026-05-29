@@ -8062,6 +8062,156 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmltZeroVec2DStrict) {
 }
 // endregion
 
+// region digitalis: FRECPE / FRSQRTE vector JIT (FP32 .2S/.4S, FP64 .2D).
+// Encoding (ARM ARM C7.2.118 / C7.2.131):
+//   FRECPE  V.4S, V.4S  = 0x4EA1D800 | (rn<<5) | rd  (U=0, opc=11101, bit23=1)
+//   FRECPE  V.2S, V.2S  = 0x0EA1D800 | (rn<<5) | rd  (Q=0)
+//   FRECPE  V.2D, V.2D  = 0x4EE1D800 | (rn<<5) | rd  (sz=1)
+//   FRSQRTE V.4S, V.4S  = 0x6EA1D800 | (rn<<5) | rd  (U=1)
+//   FRSQRTE V.2S, V.2S  = 0x2EA1D800 | (rn<<5) | rd
+//   FRSQRTE V.2D, V.2D  = 0x6EE1D800 | (rn<<5) | rd
+constexpr uint32_t FrecpeVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpeVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrecpeVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrteVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrteVec2S(uint8_t rd, uint8_t rn) {
+  return 0x2EA1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FrsqrteVec2D(uint8_t rd, uint8_t rn) {
+  return 0x6EE1D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FRECPE .4S: per-lane 1.0/x including ±0/±inf endpoints.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec4SAllLanes) {
+  const float inf = std::numeric_limits<float>::infinity();
+  StoreVec4S(state_.cpu, 1, 2.0f, 0.0f, -0.0f, inf);
+  static const uint32_t code[] = {FrecpeVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 0.5f);                  // 1/2 = 0.5
+  EXPECT_EQ(r[1], inf);                          // 1/+0 = +inf
+  EXPECT_EQ(r[2], -inf);                         // 1/-0 = -inf
+  EXPECT_FLOAT_EQ(r[3], 0.0f);                  // 1/+inf = +0
+}
+
+// FRECPE .2S: Q=0 upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec2SUpperZero) {
+  // Pre-trash Vd upper 64 bits with a NaN payload.
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+             std::nanf(""), std::nanf(""));
+  StoreVec4S(state_.cpu, 1, 4.0f, 8.0f, 1.0f, 1.0f);
+  static const uint32_t code[] = {FrecpeVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 0.25f);                 // 1/4
+  EXPECT_FLOAT_EQ(r[1], 0.125f);                // 1/8
+  // Upper 64 bits must be zero (Q=0 invariant).
+  EXPECT_EQ(r[2], 0.0f);
+  EXPECT_EQ(r[3], 0.0f);
+}
+
+// FRECPE .2D: FP64 reciprocal.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec2DAllLanes) {
+  const double inf = std::numeric_limits<double>::infinity();
+  StoreVec2D(state_.cpu, 1, 4.0, -0.5);
+  static const uint32_t code[] = {FrecpeVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 0.25);                 // 1/4
+  EXPECT_DOUBLE_EQ(r[1], -2.0);                 // 1/-0.5
+  (void)inf;
+}
+
+// FRECPE .4S: NaN propagates.
+TEST_F(Arm64LiteTranslateRegionTest, FrecpeVec4SNaNPropagates) {
+  StoreVec4S(state_.cpu, 1, std::nanf(""), 1.0f, 1.0f, 1.0f);
+  static const uint32_t code[] = {FrecpeVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  // NaN propagates: result lane 0 must have NaN bit pattern (exponent
+  // bits all 1, mantissa non-zero).
+  EXPECT_EQ((r[0] >> 23) & 0xFF, 0xFFu);
+  EXPECT_NE(r[0] & 0x7FFFFFu, 0u);
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[1]), 1.0f);
+}
+
+// FRSQRTE .4S: positive lanes -> 1/sqrt; special cases (-x, +0, -0, NaN)
+// -> default qNaN per ARM spec.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec4SMixed) {
+  StoreVec4S(state_.cpu, 1, 4.0f, -1.0f, 0.0f, std::nanf(""));
+  static const uint32_t code[] = {FrsqrteVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[0]), 0.5f);  // 1/sqrt(4)
+  EXPECT_EQ(r[1], 0x7FC00000u);                  // -1 -> default qNaN
+  EXPECT_EQ(r[2], 0x7FC00000u);                  // +0 -> default qNaN
+  EXPECT_EQ(r[3], 0x7FC00000u);                  // NaN -> default qNaN
+}
+
+// FRSQRTE .4S: -0 also returns default qNaN (not -inf).
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec4SNegZero) {
+  StoreVec4S(state_.cpu, 1, -0.0f, 16.0f, 0.25f, 1.0f);
+  static const uint32_t code[] = {FrsqrteVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0x7FC00000u);                  // -0 -> default qNaN
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[1]), 0.25f);   // 1/sqrt(16)
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[2]), 2.0f);    // 1/sqrt(0.25)
+  EXPECT_FLOAT_EQ(*reinterpret_cast<float*>(&r[3]), 1.0f);    // 1/sqrt(1)
+}
+
+// FRSQRTE .2S: Q=0 upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+             std::nanf(""), std::nanf(""));
+  StoreVec4S(state_.cpu, 1, 4.0f, 16.0f, 100.0f, 100.0f);
+  static const uint32_t code[] = {FrsqrteVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 0.5f);                  // 1/sqrt(4)
+  EXPECT_FLOAT_EQ(r[1], 0.25f);                 // 1/sqrt(16)
+  EXPECT_EQ(r[2], 0.0f);
+  EXPECT_EQ(r[3], 0.0f);
+}
+
+// FRSQRTE .2D: FP64 mixed positive / negative / NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2DMixed) {
+  StoreVec2D(state_.cpu, 1, 4.0, std::nan(""));
+  static const uint32_t code[] = {FrsqrteVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(&r[0]), 0.5);  // 1/sqrt(4)
+  EXPECT_EQ(r[1], 0x7FF8000000000000ULL);                    // NaN -> qNaN
+}
+
+// FRSQRTE .2D: negative input returns default qNaN.
+TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2DNegative) {
+  StoreVec2D(state_.cpu, 1, -3.0, 0.0625);
+  static const uint32_t code[] = {FrsqrteVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0x7FF8000000000000ULL);                    // -3 -> qNaN
+  EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(&r[1]), 4.0); // 1/sqrt(0.0625)
+}
+// endregion
+
 // region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
 //   FMAX/FMIN  — IEEE: any NaN -> NaN result.
