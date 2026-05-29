@@ -19383,6 +19383,65 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 1
+        // region digitalis: SSHR .8B / .16B byte form JIT via
+        // PMOVSXBW + PSRAW + PACKSSWB.
+        //
+        // SSHR's per-lane arithmetic right shift on bytes has no SSE
+        // equivalent (no PSRAB). Widen each byte to a sign-extended
+        // 16-bit word with PMOVSXBW, shift via PSRAW, then pack back
+        // via PACKSSWB. The arithmetic-right-shift of an int8 cannot
+        // grow magnitude, so every shifted word is in [-128, 127] —
+        // PACKSSWB does not saturate.
+        //
+        // shift_count for byte form is 8 - immb ∈ [1, 8]. At cnt==8 on
+        // a sign-extended-byte word, PSRAW by 8 shifts the sign byte
+        // into bits[7:0] (byte-wide sign-fill), matching ARM SSHR's
+        // sign-fill at shift==esize.
+        //
+        // .8B (!Q): widen low 8 bytes only, shift, pack with self, zero
+        //   Vd[127:64] (D-register semantics).
+        // .16B (Q): widen low and high halves separately into two SIMD
+        //   temps, shift each, PACKSSWB(lo, hi) places low result in
+        //   low 8 bytes and high result in high 8 bytes — matches ARM
+        //   lane order.
+        //
+        // Scalar B form is not encoded by ARM (scalar SSHR only exists
+        // at D). Defensive bail if args.scalar is set with is_byte.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (xn_lo == no_simd_register) { success_ = false; return; }
+          SimdRegister xn_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) {
+              success_ = false; return;
+            }
+          }
+          as_.Pmovsxbw(xn_lo,
+                       {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovsxbw(xn_hi,
+                         {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          as_.Psraw(xn_lo, cnt);
+          if (args.q) {
+            as_.Psraw(xn_hi, cnt);
+            as_.Packsswb(xn_lo, xn_hi);
+          } else {
+            as_.Packsswb(xn_lo, xn_lo);
+            // Zero upper 64 bits of Vd (D-register semantics).
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
+          return;
+        }
+        // endregion
         if (is_byte) { success_ = false; return; }
         const bool is_left = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
         uint8_t esize_bits;
@@ -19400,11 +19459,69 @@ class LiteTranslator {
         } else {
           shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);  // 1..bits
         }
-        // SSHR .2D needs PSRAQ which only exists in AVX-512F — bail.
+        // region digitalis: SSHR .2D / scalar D GPR fallback.
+        //
+        // SSHR's per-lane arithmetic right shift at .D needs PSRAQ,
+        // which is AVX-512F-VL only.  For the .2D vector form and the
+        // scalar D-source form (both single-or-double 64-bit lanes
+        // operating on the low half of the SIMD register), the lanes
+        // can be shipped through 64-bit GPR ops without PSRAQ:
+        //
+        //   Movq lane_i, Vn[64*i +: 64]        (signed int64)
+        //   Sarq lane_i, cnt                   (cnt in [1, 64])
+        //   Movq Vd[64*i +: 64], lane_i        (write back)
+        //
+        // Load BOTH lanes before storing — Vd may equal Vn.  shift_count
+        // is in [1, 64]; x86 Sarq r64, imm masks the count to 6 bits,
+        // so cnt==64 would hardware-decode as 0 (no shift) — wrong for
+        // ARM's spec'd sign-fill at shift==esize.  Map cnt==64 → 63: a
+        // Sarq r64, 63 replicates the sign bit across the whole lane,
+        // which is the same sign-fill result the ARM spec demands for
+        // SSHR at shift==64.
+        //
+        // Scalar D (args.scalar=true) writes a single lane and zeroes
+        // Vd[127:64].  Vector .2D (args.scalar=false, args.q=true)
+        // writes both lanes.  Vector .1D (args.scalar=false,
+        // args.q=false) is reserved per ARM ARM C7.2.336 — bail so the
+        // interpreter raises SIGILL via the decoder UNDEFINED path.
         if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr &&
             esize_bits == 64) {
-          success_ = false; return;
+          const bool is_two_lane = !args.scalar && args.q;
+          if (!args.scalar && !args.q) {
+            // Vector .1D is reserved.
+            success_ = false; return;
+          }
+          Register lane0 = AllocTempReg();
+          Register lane1 =
+              is_two_lane ? AllocTempReg() : Assembler::no_register;
+          if (lane0 == Assembler::no_register ||
+              (is_two_lane && lane1 == Assembler::no_register)) {
+            success_ = false; return;
+          }
+          as_.Movq(lane0, {.base = Assembler::rbp, .disp = vn_off});
+          if (is_two_lane) {
+            as_.Movq(lane1,
+                     {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          const int8_t sarq_cnt =
+              (shift_count >= 64) ? int8_t{63}
+                                  : static_cast<int8_t>(shift_count);
+          as_.Sarq(lane0, sarq_cnt);
+          if (is_two_lane) {
+            as_.Sarq(lane1, sarq_cnt);
+          }
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, lane0);
+          if (is_two_lane) {
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     lane1);
+          } else {
+            // Scalar D: zero Vd[127:64].
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     int32_t{0});
+          }
+          return;
         }
+        // endregion
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { success_ = false; return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
@@ -19490,11 +19607,82 @@ class LiteTranslator {
           // SSRA/USRA/SRI shift = 2*bits - immh:immb, range [1, bits].
           shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);
         }
-        // SSRA .2D needs PSRAQ — bail (AVX-512F-VL only).
+        // region digitalis: SSRA .2D / scalar D GPR fallback.
+        //
+        // SSRA's per-lane arithmetic right shift at .D needs PSRAQ,
+        // which is AVX-512F-VL only.  Sibling of the SSHR .2D GPR
+        // fallback above: load both Vn lanes into GPRs, Sarq each,
+        // accumulate into the original Vd lane values, then write
+        // back.  SSRA's accumulate step adds one Addq per lane on
+        // top of the SSHR shape — Vd += SSHR(Vn, shift) per lane.
+        //
+        //   Movq vn0,  Vn[63:0]               (signed int64)
+        //   Movq vn1,  Vn[127:64]             (only if two-lane)
+        //   Movq vd0,  Vd[63:0]               (load orig Vd up front
+        //   Movq vd1,  Vd[127:64]              so Vd==Vn stays safe
+        //   Sarq vn0,  cnt                     across the writes)
+        //   Sarq vn1,  cnt                    (only if two-lane)
+        //   Addq vd0,  vn0                    (accumulate SSHR into Vd)
+        //   Addq vd1,  vn1                    (only if two-lane)
+        //   Movq Vd[63:0],   vd0
+        //   Movq Vd[127:64], vd1              (two-lane)
+        //   Movq Vd[127:64], imm32{0}         (scalar D: zero upper)
+        //
+        // cnt==64 maps to Sarq r64, 63 — same sign-fill the ARM
+        // spec demands at shift==esize (see the SSHR fallback rationale
+        // above).  Vector .1D (args.scalar=false, args.q=false) is
+        // reserved per ARM ARM C7.2.337; bail to interpreter so the
+        // decoder UNDEFINED path raises SIGILL.
         if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSsra &&
             esize_bits == 64) {
-          success_ = false; return;
+          const bool is_two_lane = !args.scalar && args.q;
+          if (!args.scalar && !args.q) {
+            // Vector .1D is reserved.
+            success_ = false; return;
+          }
+          Register vn0 = AllocTempReg();
+          Register vn1 =
+              is_two_lane ? AllocTempReg() : Assembler::no_register;
+          Register vd0 = AllocTempReg();
+          Register vd1 =
+              is_two_lane ? AllocTempReg() : Assembler::no_register;
+          if (vn0 == Assembler::no_register ||
+              vd0 == Assembler::no_register ||
+              (is_two_lane &&
+               (vn1 == Assembler::no_register ||
+                vd1 == Assembler::no_register))) {
+            success_ = false; return;
+          }
+          as_.Movq(vn0, {.base = Assembler::rbp, .disp = vn_off});
+          if (is_two_lane) {
+            as_.Movq(vn1, {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          as_.Movq(vd0, {.base = Assembler::rbp, .disp = vd_off});
+          if (is_two_lane) {
+            as_.Movq(vd1, {.base = Assembler::rbp, .disp = vd_off + 8});
+          }
+          const int8_t sarq_cnt =
+              (shift_count >= 64) ? int8_t{63}
+                                  : static_cast<int8_t>(shift_count);
+          as_.Sarq(vn0, sarq_cnt);
+          if (is_two_lane) {
+            as_.Sarq(vn1, sarq_cnt);
+          }
+          as_.Addq(vd0, vn0);
+          if (is_two_lane) {
+            as_.Addq(vd1, vn1);
+          }
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, vd0);
+          if (is_two_lane) {
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, vd1);
+          } else {
+            // Scalar D: zero Vd[127:64].
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     int32_t{0});
+          }
+          return;
         }
+        // endregion
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xd = AllocTempSimdReg();
         if (xn == no_simd_register || xd == no_simd_register) {
@@ -19641,6 +19829,225 @@ class LiteTranslator {
              args.opcode == Decoder::AdvSimdShiftImmOpcode::kUrsra);
         // Signed .2D bails — PSRAQ is AVX-512F-VL only.
         if (is_signed && esize_bits == 64) {
+          // region digitalis: SRSHR .2D / scalar D GPR fallback.
+          //
+          // Per-lane semantics (signed rounding right shift):
+          //   result = floor((Vn + 2^(shift-1)) / 2^shift)
+          //
+          // PSRAQ is AVX-512F-VL only.  Sibling of the SSRA .2D GPR
+          // fallback above: load each Vn lane into a temp GPR, compute
+          // the round bit via Shrq + Andq (bit (cnt-1) of Vn into bit
+          // 0), Sarq the value by cnt, Addq the round bit, write back.
+          //
+          //   Movq    vn_i,    Vn[lane_i]
+          //   Movq    round_i, vn_i
+          //   Shrq    round_i, (cnt-1)        ; bit (cnt-1) into bit 0
+          //   Andq    round_i, int32_t{1}     ; mask to bit 0
+          //   Sarq    vn_i,    cnt            ; arith right shift
+          //   Addq    vn_i,    round_i        ; shifted + round
+          //   Movq    Vd[lane_i], vn_i
+          //
+          // For scalar D the upper 64 bits of Vd are zeroed after the
+          // single-lane write.
+          //
+          // Boundary at cnt==esize (cnt==64): the identity
+          //   floor((x + 2^(esize-1)) / 2^esize)
+          // is always 0 for both MSB=0 (PSRA sign-fills to 0, round bit
+          // is 0) and MSB=1 (PSRA sign-fills to -1, round bit is 1,
+          // sum -1+1=0).  In the GPR path Sarq r64 with count==64
+          // masks to 63 (wrong); special-case cnt==64 by writing 0
+          // directly per lane.
+          //
+          // SRSRA .2D / scalar D (accumulate sibling: result += orig Vd)
+          // is deferred to the next cycle — it needs the SSRA-style
+          // orig-Vd preload + extra Addq per lane.  Vector .1D
+          // (args.scalar=false, args.q=false) is reserved per ARM ARM
+          // C7.2.342; bail to interpreter so the decoder UNDEFINED path
+          // raises SIGILL.
+          if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrshr) {
+            const bool is_two_lane = !args.scalar && args.q;
+            if (!args.scalar && !args.q) {
+              // Vector .1D is reserved.
+              success_ = false; return;
+            }
+            const uint16_t immh_immb_local =
+                static_cast<uint16_t>((immh << 3) | args.immb);
+            const uint8_t shift_count_local =
+                static_cast<uint8_t>(2 * 64 - immh_immb_local);  // [1, 64]
+            if (shift_count_local == 64) {
+              // SRSHR at shift==esize is always 0.
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off},
+                       int32_t{0});
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                       int32_t{0});
+              return;
+            }
+            Register vn0 = AllocTempReg();
+            Register round0 = AllocTempReg();
+            Register vn1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            Register round1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            if (vn0 == Assembler::no_register ||
+                round0 == Assembler::no_register ||
+                (is_two_lane &&
+                 (vn1 == Assembler::no_register ||
+                  round1 == Assembler::no_register))) {
+              success_ = false; return;
+            }
+            const int8_t cnt = static_cast<int8_t>(shift_count_local);
+            const int8_t cnt_minus_1 =
+                static_cast<int8_t>(shift_count_local - 1);
+            as_.Movq(vn0, {.base = Assembler::rbp, .disp = vn_off});
+            if (is_two_lane) {
+              as_.Movq(vn1, {.base = Assembler::rbp, .disp = vn_off + 8});
+            }
+            as_.Movq(round0, vn0);
+            if (is_two_lane) {
+              as_.Movq(round1, vn1);
+            }
+            as_.Shrq(round0, cnt_minus_1);
+            if (is_two_lane) {
+              as_.Shrq(round1, cnt_minus_1);
+            }
+            as_.Andq(round0, int32_t{1});
+            if (is_two_lane) {
+              as_.Andq(round1, int32_t{1});
+            }
+            as_.Sarq(vn0, cnt);
+            if (is_two_lane) {
+              as_.Sarq(vn1, cnt);
+            }
+            as_.Addq(vn0, round0);
+            if (is_two_lane) {
+              as_.Addq(vn1, round1);
+            }
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, vn0);
+            if (is_two_lane) {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, vn1);
+            } else {
+              // Scalar D: zero Vd[127:64].
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                       int32_t{0});
+            }
+            return;
+          }
+          // endregion
+          // region digitalis: SRSRA .2D / scalar D GPR fallback.
+          //
+          // Per-lane semantics (signed rounding right shift, accumulate):
+          //   result = Vd<i> + floor((Vn<i> + 2^(shift-1)) / 2^shift)
+          //
+          // Combines the SRSHR per-lane shape (round bit via
+          // Shrq + Andq, Sarq vn by cnt, Addq round) with the SSRA-style
+          // orig-Vd preload + accumulate Addq.  Load BOTH Vn and orig Vd
+          // up front so Vd==Vn aliasing remains safe across the writes.
+          //
+          //   Movq    vn_i,    Vn[lane_i]
+          //   Movq    vd_i,    Vd[lane_i]    (load orig Vd before any write)
+          //   Movq    round_i, vn_i
+          //   Shrq    round_i, (cnt-1)       ; bit (cnt-1) into bit 0
+          //   Andq    round_i, int32_t{1}    ; mask to bit 0
+          //   Sarq    vn_i,    cnt           ; arith right shift
+          //   Addq    vn_i,    round_i       ; SRSHR(Vn_i, cnt) in vn_i
+          //   Addq    vd_i,    vn_i          ; Vd_i += SRSHR(Vn_i, cnt)
+          //   Movq    Vd[lane_i], vd_i
+          //
+          // Boundary at cnt==esize (cnt==64): SRSHR(Vn, 64) is always 0
+          // (see SRSHR rationale above), so SRSRA at cnt==64 is a no-op
+          // per lane (Vd unchanged).  Vector .2D: nothing to write —
+          // memory already holds the unmodified Vd.  Scalar D: need to
+          // zero Vd[127:64] for D-register semantics (and Vd[63:0] keeps
+          // its original value, which is already in memory).  In the GPR
+          // path Sarq r64 with count==64 masks to 63 (wrong); special-
+          // case cnt==64 directly.
+          if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra) {
+            const bool is_two_lane = !args.scalar && args.q;
+            if (!args.scalar && !args.q) {
+              // Vector .1D is reserved.
+              success_ = false; return;
+            }
+            const uint16_t immh_immb_local =
+                static_cast<uint16_t>((immh << 3) | args.immb);
+            const uint8_t shift_count_local =
+                static_cast<uint8_t>(2 * 64 - immh_immb_local);  // [1, 64]
+            if (shift_count_local == 64) {
+              // SRSRA at shift==esize: no-op per lane (SRSHR yields 0).
+              if (!is_two_lane) {
+                // Scalar D: zero Vd[127:64]; Vd[63:0] preserved as-is.
+                as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                         int32_t{0});
+              }
+              return;
+            }
+            Register vn0 = AllocTempReg();
+            Register vd0 = AllocTempReg();
+            Register round0 = AllocTempReg();
+            Register vn1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            Register vd1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            Register round1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            if (vn0 == Assembler::no_register ||
+                vd0 == Assembler::no_register ||
+                round0 == Assembler::no_register ||
+                (is_two_lane &&
+                 (vn1 == Assembler::no_register ||
+                  vd1 == Assembler::no_register ||
+                  round1 == Assembler::no_register))) {
+              success_ = false; return;
+            }
+            const int8_t cnt = static_cast<int8_t>(shift_count_local);
+            const int8_t cnt_minus_1 =
+                static_cast<int8_t>(shift_count_local - 1);
+            // Load BOTH Vn and orig Vd before any writes (Vd==Vn safety).
+            as_.Movq(vn0, {.base = Assembler::rbp, .disp = vn_off});
+            if (is_two_lane) {
+              as_.Movq(vn1, {.base = Assembler::rbp, .disp = vn_off + 8});
+            }
+            as_.Movq(vd0, {.base = Assembler::rbp, .disp = vd_off});
+            if (is_two_lane) {
+              as_.Movq(vd1, {.base = Assembler::rbp, .disp = vd_off + 8});
+            }
+            // Round bit per lane.
+            as_.Movq(round0, vn0);
+            if (is_two_lane) {
+              as_.Movq(round1, vn1);
+            }
+            as_.Shrq(round0, cnt_minus_1);
+            if (is_two_lane) {
+              as_.Shrq(round1, cnt_minus_1);
+            }
+            as_.Andq(round0, int32_t{1});
+            if (is_two_lane) {
+              as_.Andq(round1, int32_t{1});
+            }
+            // SRSHR result in vn_i.
+            as_.Sarq(vn0, cnt);
+            if (is_two_lane) {
+              as_.Sarq(vn1, cnt);
+            }
+            as_.Addq(vn0, round0);
+            if (is_two_lane) {
+              as_.Addq(vn1, round1);
+            }
+            // Accumulate: Vd_i += SRSHR(Vn_i, cnt).
+            as_.Addq(vd0, vn0);
+            if (is_two_lane) {
+              as_.Addq(vd1, vn1);
+            }
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, vd0);
+            if (is_two_lane) {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, vd1);
+            } else {
+              // Scalar D: zero Vd[127:64].
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                       int32_t{0});
+            }
+            return;
+          }
+          // endregion
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
