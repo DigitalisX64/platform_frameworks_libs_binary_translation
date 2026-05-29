@@ -20283,43 +20283,56 @@ class LiteTranslator {
           // can't express cheaply.  Fall back to the interpreter.
           success_ = false; return;
         }
-        // region digitalis: SQSHRN scalar D-source GPR fallback.
+        // region digitalis: SQSHRN / SQSHRUN scalar D-source GPR fallback.
         //
         // The SIMD vector lowering needs PSRAQ for the per-lane signed
         // arithmetic right shift at src=64, which is AVX-512F-VL only.
-        // For the scalar form (one lane, ARM ARM C7.2.236 form
-        // `SQSHRN Vd<s>, Vn<d>, #shift`), we can sidestep PSRAQ entirely
-        // by routing the single lane through 64-bit GPR ops:
+        // For the scalar form (one lane, ARM ARM C7.2.236 / C7.2.238 forms
+        // `SQSHRN Vd<s>, Vn<d>, #shift` and `SQSHRUN Vd<s>, Vn<d>, #shift`),
+        // we can sidestep PSRAQ entirely by routing the single lane through
+        // 64-bit GPR ops:
         //
         //   1. Movq a, Vn[63:0]                  (signed int64)
         //   2. Sarq a, cnt                       (cnt in [1, 32])
-        //   3. clamp a to [INT32_MIN, INT32_MAX] via Cmpq + Cmovq
+        //   3. clamp a to dst range via Cmpq + Cmovq
+        //        SQSHRN  : [INT32_MIN,  INT32_MAX]
+        //        SQSHRUN : [0,          UINT32_MAX]
         //   4. Pxor xzero / Movdqu Vd, xzero     (zero Vd[127:0])
         //   5. Movl Vd[31:0], a                  (write low 32 bits)
         //
-        // At cnt==32 (immh:immb=0x20) the SAR result is in [INT32_MIN,
-        // INT32_MAX] already, so the clamp Cmovq pair is a runtime
-        // no-op there.  At cnt<32 saturation can fire when the upper
-        // bits don't agree with the would-be sign bit of int32.
+        // Clamp ordering is upper-first then lower-second.  For SQSHRUN,
+        // any negative Sarq result is < UINT32_MAX so the upper Cmovq.g
+        // is a no-op and the lower Cmovq.l fires to deliver 0; any
+        // overflow-positive result first clamps down to UINT32_MAX, and
+        // UINT32_MAX is not < 0 so the lower clamp is then a no-op.  For
+        // SQSHRN at cnt==32 (immh:immb=0x20) the SAR result is already in
+        // [INT32_MIN, INT32_MAX] and both clamps are runtime no-ops.
         //
         // FPSR.QC is not updated here, mirroring the existing SQSHL .D
         // scalar GPR fallback at `lite_translator.h:19880` — neither
         // path sets QC.  This is perf-only and matches the historical
         // behaviour of the interpreter-bailout path for these forms.
         if (args.scalar && uses_signed_shift && src_bits == 64 &&
-            !is_rounding && !is_saturating_signed_to_unsigned) {
+            !is_rounding) {
           const uint16_t immh_immb_local =
               static_cast<uint16_t>((immh << 3) | args.immb);
           const uint8_t narrow_rshift_local =
               static_cast<uint8_t>(64 - immh_immb_local);
           const int8_t cnt = static_cast<int8_t>(narrow_rshift_local);
+          const int64_t clamp_max =
+              is_saturating_signed_to_unsigned
+                  ? int64_t{0xFFFFFFFF}  // UINT32_MAX
+                  : int64_t{INT32_MAX};
+          const int64_t clamp_min =
+              is_saturating_signed_to_unsigned ? int64_t{0}
+                                               : int64_t{INT32_MIN};
           Register a = AllocTempReg();
-          Register int32_max_reg = AllocTempReg();
-          Register int32_min_reg = AllocTempReg();
+          Register max_reg = AllocTempReg();
+          Register min_reg = AllocTempReg();
           SimdRegister xzero = AllocTempSimdReg();
           if (a == Assembler::no_register ||
-              int32_max_reg == Assembler::no_register ||
-              int32_min_reg == Assembler::no_register ||
+              max_reg == Assembler::no_register ||
+              min_reg == Assembler::no_register ||
               xzero == no_simd_register) {
             success_ = false; return;
           }
@@ -20327,15 +20340,19 @@ class LiteTranslator {
           as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
           // Arithmetic right shift by `cnt` (range [1, 32]).
           as_.Sarq(a, cnt);
-          // Clamp a to [INT32_MIN, INT32_MAX] branchlessly.  Movq imm
+          // Clamp a to [clamp_min, clamp_max] branchlessly.  Movq imm
           // does not affect EFLAGS, so the materialization stays clear
-          // of the Cmpq->Cmovq window.
-          as_.Movq(int32_max_reg, int64_t{INT32_MAX});
-          as_.Cmpq(a, int32_max_reg);
-          as_.Cmovq(Assembler::Condition::kGreater, a, int32_max_reg);
-          as_.Movq(int32_min_reg, int64_t{INT32_MIN});
-          as_.Cmpq(a, int32_min_reg);
-          as_.Cmovq(Assembler::Condition::kLess, a, int32_min_reg);
+          // of the Cmpq->Cmovq window.  Signed Cmovq.g / Cmovq.l work
+          // for both SQSHRN and SQSHRUN: clamp_max is non-negative in
+          // both cases (INT32_MAX, UINT32_MAX both fit in int64 positive
+          // range), and clamp_min is non-positive in both cases
+          // (INT32_MIN, 0).
+          as_.Movq(max_reg, clamp_max);
+          as_.Cmpq(a, max_reg);
+          as_.Cmovq(Assembler::Condition::kGreater, a, max_reg);
+          as_.Movq(min_reg, clamp_min);
+          as_.Cmpq(a, min_reg);
+          as_.Cmovq(Assembler::Condition::kLess, a, min_reg);
           // Zero Vd, then overlay the saturated int32 in Vd[31:0].
           as_.Pxor(xzero, xzero);
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
@@ -20347,7 +20364,7 @@ class LiteTranslator {
           // Remaining signed-source-D paths that still need PSRAQ:
           //   - SQSHRN  vector .2S (args.scalar=false, src=64)
           //   - SQRSHRN scalar D-source / vector .2S
-          //   - SQSHRUN scalar D-source / vector .2S
+          //   - SQSHRUN vector .2S (args.scalar=false, src=64)
           //   - SQRSHRUN scalar D-source / vector .2S
           // Baseline SSE has no PSRAQ; fall back to the interpreter.
           success_ = false; return;
