@@ -8212,6 +8212,208 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2DNegative) {
 }
 // endregion
 
+// region digitalis: SQABS / SQNEG vector JIT (B/H/S widths, .2D bails).
+// Encoding (ARM ARM C7.2.241 / C7.2.243; AdvSimdTwoRegMisc opcode=00111):
+//   SQABS .8B  = 0x0E207800 | (rn<<5) | rd  (U=0, size=00, Q=0)
+//   SQABS .16B = 0x4E207800 | (rn<<5) | rd  (Q=1)
+//   SQABS .4H  = 0x0E607800 | (rn<<5) | rd  (size=01)
+//   SQABS .8H  = 0x4E607800 | (rn<<5) | rd
+//   SQABS .2S  = 0x0EA07800 | (rn<<5) | rd  (size=10)
+//   SQABS .4S  = 0x4EA07800 | (rn<<5) | rd
+//   SQNEG = SQABS | 0x20000000  (U=1)
+constexpr uint32_t SqabsVec8B(uint8_t rd, uint8_t rn) {
+  return 0x0E207800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E207800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E607800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA07800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqabsVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA07800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SqnegVec16B(uint8_t rd, uint8_t rn) {
+  return SqabsVec16B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t SqnegVec8B(uint8_t rd, uint8_t rn) {
+  return SqabsVec8B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t SqnegVec4S(uint8_t rd, uint8_t rn) {
+  return SqabsVec4S(rd, rn) | 0x20000000u;
+}
+
+// SQABS .16B: includes INT8_MIN (0x80) saturating to INT8_MAX (0x7F).
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec16BSaturates) {
+  const uint8_t n[16] = {
+      0x00, 0x01, 0x7F, 0x80, 0xFF, 0x80, 0x05, 0xFB,
+      0x80, 0xC0, 0x40, 0x81, 0x7F, 0x00, 0x80, 0x7E,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // src=0x00 ->  0; 0x01 -> 1; 0x7F -> 127; 0x80 -> 0x7F (saturate);
+  // 0xFF=-1 -> 1; 0xFB=-5 -> 5; 0xC0=-64 -> 64; 0x81=-127 -> 127; 0x7E -> 126.
+  const uint8_t expected[16] = {
+      0x00, 0x01, 0x7F, 0x7F, 0x01, 0x7F, 0x05, 0x05,
+      0x7F, 0x40, 0x40, 0x7F, 0x7F, 0x00, 0x7F, 0x7E,
+  };
+  for (int i = 0; i < 16; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQABS .8B Q=0: upper 64 bits must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec8BUpperZero) {
+  const uint8_t prev[16] = {
+      0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34,
+      0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+  };
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0x80, 0xFF, 0x01, 0x00, 0x7F, 0x80, 0xC0, 0x40,
+      0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec8B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expected_low[8] = {0x7F, 0x01, 0x01, 0x00, 0x7F, 0x7F, 0x40, 0x40};
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected_low[i]) << "lane " << i;
+  for (int i = 8; i < 16; i++) EXPECT_EQ(r[i], 0x00) << "lane " << i;
+}
+
+// SQNEG .16B: includes INT8_MIN saturating to INT8_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec16BSaturates) {
+  const uint8_t n[16] = {
+      0x00, 0x01, 0x7F, 0x80, 0xFF, 0x05, 0xFB, 0x80,
+      0xC0, 0x40, 0x81, 0x7F, 0x80, 0x00, 0xFE, 0x02,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqnegVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // -0=0; -1=0xFF; -127=0x81; -INT_MIN saturates to 0x7F; -(-1)=1; -5=0xFB;
+  // -(-5)=5; ... matching the per-lane signed two's complement negation
+  // with the single INT_MIN saturating sentinel.
+  const uint8_t expected[16] = {
+      0x00, 0xFF, 0x81, 0x7F, 0x01, 0xFB, 0x05, 0x7F,
+      0x40, 0xC0, 0x7F, 0x81, 0x7F, 0x00, 0x02, 0xFE,
+  };
+  for (int i = 0; i < 16; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQABS .8H: INT16_MIN saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec8HSaturates) {
+  const uint16_t n[8] = {
+      0x0000, 0x0001, 0x7FFF, 0x8000,
+      0xFFFF, 0x8001, 0x4000, 0xC000,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // src=0,1,32767,INT16_MIN -> 0,1,32767,INT16_MAX(=0x7FFF);
+  // src=-1,-32767,16384,-16384 -> 1, 32767, 16384, 16384.
+  const uint16_t expected[8] = {
+      0x0000, 0x0001, 0x7FFF, 0x7FFF,
+      0x0001, 0x7FFF, 0x4000, 0x4000,
+  };
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQNEG .8H: mixed positive / negative / INT16_MIN.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec8HMixed) {
+  const uint16_t n[8] = {
+      0x0001, 0x7FFF, 0x8000, 0x8001,
+      0xFFFF, 0x0000, 0x4000, 0xC000,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqabsVec8H(0, 1) | 0x20000000u};  // SQNEG .8H
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // -1=0xFFFF; -32767=0x8001; -INT16_MIN saturates to 0x7FFF;
+  // -(-32767)=32767; -(-1)=1; 0; -16384=0xC000; -(-16384)=16384.
+  const uint16_t expected[8] = {
+      0xFFFF, 0x8001, 0x7FFF, 0x7FFF,
+      0x0001, 0x0000, 0xC000, 0x4000,
+  };
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected[i]) << "lane " << i;
+}
+
+// SQABS .4S: INT32_MIN saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec4SSaturates) {
+  const int32_t in[4] = {static_cast<int32_t>(0x80000000u), -1, INT32_MAX, -100};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {SqabsVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT32_MAX);  // INT_MIN -> INT_MAX
+  EXPECT_EQ(r[1], 1);          // -1 -> 1
+  EXPECT_EQ(r[2], INT32_MAX);  // INT_MAX unchanged
+  EXPECT_EQ(r[3], 100);        // -100 -> 100
+}
+
+// SQNEG .4S: INT32_MIN saturation.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec4SSaturates) {
+  const int32_t in[4] = {static_cast<int32_t>(0x80000000u), INT32_MAX, 42, -42};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {SqnegVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT32_MAX);    // INT_MIN -> INT_MAX
+  EXPECT_EQ(r[1], -INT32_MAX);   // INT_MAX -> -INT_MAX
+  EXPECT_EQ(r[2], -42);
+  EXPECT_EQ(r[3], 42);
+}
+
+// SQABS .2S Q=0: upper 64 bits must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqabsVec2SUpperZero) {
+  const int32_t prev[4] = {-1, -1, -1, -1};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int32_t in[4] = {static_cast<int32_t>(0x80000000u), -5, 0x55555555, 0x66666666};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {SqabsVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], INT32_MAX);  // INT_MIN -> INT_MAX
+  EXPECT_EQ(r[1], 5);          // -5 -> 5
+  EXPECT_EQ(r[2], 0);          // Q=0 upper 64 zeroed
+  EXPECT_EQ(r[3], 0);
+}
+
+// SQNEG .8B Q=0: upper 64 bits must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SqnegVec8BUpperZero) {
+  const uint8_t prev[16] = {
+      0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+      0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+  };
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0x80, 0x01, 0xFF, 0x7F, 0x00, 0x02, 0xFE, 0x80,
+      0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SqnegVec8B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expected_low[8] = {0x7F, 0xFF, 0x01, 0x81, 0x00, 0xFE, 0x02, 0x7F};
+  for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected_low[i]) << "lane " << i;
+  for (int i = 8; i < 16; i++) EXPECT_EQ(r[i], 0x00) << "lane " << i;
+}
+// endregion
+
 // region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
 //   FMAX/FMIN  — IEEE: any NaN -> NaN result.

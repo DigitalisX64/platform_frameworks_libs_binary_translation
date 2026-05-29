@@ -13404,6 +13404,87 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, recip);
         return;
       }
+      // SQABS Vd.<T>, Vn.<T> — per-lane saturating signed absolute value.
+      // SQNEG Vd.<T>, Vn.<T> — per-lane saturating signed negate.
+      //   size=00 .8B/.16B  -> byte ops via PCMPGTB / PSUBB / PCMPEQB
+      //   size=01 .4H/.8H   -> word ops
+      //   size=10 .2S/.4S   -> dword ops
+      //   size=11 .2D       -> needs PCMPGTQ (SSE4.2) and PCMPEQQ (SSE4.1);
+      //                        bail to interp (same boundary as kAbs/kNeg).
+      // Per-lane semantics — INT_MIN_w is the only saturating input (|INT_MIN|
+      // and -INT_MIN both overflow the signed range):
+      //   if src == INT_MIN_w -> INT_MAX_w
+      //   else SQABS -> |src|; SQNEG -> -src
+      // Saturation as branchless XOR: after the abs/neg step, lanes whose
+      // source was INT_MIN still hold INT_MIN (0x80..0).  XOR-ing INT_MIN
+      // with all-1s yields INT_MAX (0x7F..F).  Build the saturation mask as
+      // PCMPEQ(src, INT_MIN_bcast) and XOR into the result; non-INT_MIN lanes
+      // XOR with zero and pass through unchanged.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqabs:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqneg: {
+        if (args.size == 0b11) { success_ = false; return; }
+        const bool is_neg =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSqneg);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        SimdRegister xtmp = AllocTempSimdReg();
+        Register gp_min = AllocTempReg();
+        if (xn == no_simd_register || xres == no_simd_register ||
+            xtmp == no_simd_register || gp_min == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (is_neg) {
+          // SQNEG: res = 0 - xn.
+          as_.Pxor(xres, xres);
+          switch (args.size) {
+            case 0b00: as_.Psubb(xres, xn); break;
+            case 0b01: as_.Psubw(xres, xn); break;
+            default:   as_.Psubd(xres, xn); break;
+          }
+        } else {
+          // SQABS: sign_mask = PCMPGT(0, xn); res = (xn ^ sign_mask) - sign_mask.
+          as_.Pxor(xtmp, xtmp);
+          switch (args.size) {
+            case 0b00: as_.Pcmpgtb(xtmp, xn); break;
+            case 0b01: as_.Pcmpgtw(xtmp, xn); break;
+            default:   as_.Pcmpgtd(xtmp, xn); break;
+          }
+          as_.Movdqa(xres, xn);
+          as_.Pxor(xres, xtmp);
+          switch (args.size) {
+            case 0b00: as_.Psubb(xres, xtmp); break;
+            case 0b01: as_.Psubw(xres, xtmp); break;
+            default:   as_.Psubd(xres, xtmp); break;
+          }
+        }
+        // Build broadcasted INT_MIN_w in xtmp; xtmp is dead at this point
+        // (sign mask consumed for SQABS; never set for SQNEG).  A 32-bit
+        // broadcast pattern (Movd + Pshufd 0x00) covers all three widths
+        // because the INT_MIN bit pattern repeats every 32 bits at
+        // byte/half/word granularity.
+        int32_t int_min_bcast;
+        switch (args.size) {
+          case 0b00: int_min_bcast = static_cast<int32_t>(0x80808080u); break;
+          case 0b01: int_min_bcast = static_cast<int32_t>(0x80008000u); break;
+          default:   int_min_bcast = static_cast<int32_t>(0x80000000u); break;
+        }
+        as_.Movl(gp_min, int_min_bcast);
+        as_.Movd(xtmp, gp_min);
+        as_.Pshufd(xtmp, xtmp, int8_t{0x00});
+        // Saturation mask: 1s in lanes where src == INT_MIN_w.
+        switch (args.size) {
+          case 0b00: as_.Pcmpeqb(xtmp, xn); break;
+          case 0b01: as_.Pcmpeqw(xtmp, xn); break;
+          default:   as_.Pcmpeqd(xtmp, xn); break;
+        }
+        // Apply: lanes where src==INT_MIN flip from 0x80..0 (INT_MIN) to
+        // 0x7F..F (INT_MAX); other lanes XOR with 0 (no-op).
+        as_.Pxor(xres, xtmp);
+        if (!args.q) mask_low64(xres);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
