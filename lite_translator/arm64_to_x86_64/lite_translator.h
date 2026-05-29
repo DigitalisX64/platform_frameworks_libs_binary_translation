@@ -4902,6 +4902,94 @@ class LiteTranslator {
         store_full(vd_off, xmax);
         return;
       }
+      case Decoder::AdvSimdThreeSameOpcode::kSaba: {
+        // SABA: Vd[lane] += |signed(Vn[lane]) - signed(Vm[lane])| per lane.
+        // Same per-lane abs-diff recipe as kSabd (PMAXS - PMINS in modular
+        // esize arithmetic gives the truncated-extended absolute difference,
+        // including the INT_MIN-vs-INT_MAX wrap case where the modular
+        // PSUB-then-sign-mask trick fails); then PADDx into Vd.
+        // .2D / scalar 64-bit is reserved by the ARM ARM and falls back.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xmax == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxsb(xmax, xm);  // SSE4.1
+            as_.Pminsb(xn, xm);    // SSE4.1
+            as_.Psubb(xmax, xn);
+            as_.Paddb(xd, xmax);
+            break;
+          case 0b01:
+            as_.Pmaxsw(xmax, xm);  // SSE2
+            as_.Pminsw(xn, xm);    // SSE2
+            as_.Psubw(xmax, xn);
+            as_.Paddw(xd, xmax);
+            break;
+          case 0b10:
+            as_.Pmaxsd(xmax, xm);  // SSE4.1
+            as_.Pminsd(xn, xm);    // SSE4.1
+            as_.Psubd(xmax, xn);
+            as_.Paddd(xd, xmax);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUaba: {
+        // UABA: Vd[lane] += |unsigned(Vn[lane]) - unsigned(Vm[lane])|.
+        // Per-lane PMAXUx - PMINUx for the abs-diff, then PADDx into Vd.
+        // Byte uses PMAXUB/PMINUB (SSE2); halfword uses PMAXUW/PMINUW
+        // (SSE4.1); word uses PMAXUD/PMINUD (SSE4.1).  .2D is reserved.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xmax == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxub(xmax, xm);
+            as_.Pminub(xn, xm);
+            as_.Psubb(xmax, xn);
+            as_.Paddb(xd, xmax);
+            break;
+          case 0b01:
+            as_.Pmaxuw(xmax, xm);
+            as_.Pminuw(xn, xm);
+            as_.Psubw(xmax, xn);
+            as_.Paddw(xd, xmax);
+            break;
+          case 0b10:
+            as_.Pmaxud(xmax, xm);
+            as_.Pminud(xn, xm);
+            as_.Psubd(xmax, xn);
+            as_.Paddd(xd, xmax);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
       // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
         SimdRegister xn = AllocTempSimdReg();
