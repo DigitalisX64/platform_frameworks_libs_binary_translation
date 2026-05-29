@@ -8414,6 +8414,299 @@ TEST_F(Arm64LiteTranslateRegionTest, SqnegVec8BUpperZero) {
 }
 // endregion
 
+// region digitalis: SADDLP / UADDLP / SADALP / UADALP vector JIT
+// (size=00 byte->half, size=01 half->word, size=10 word->dword).
+//
+// Encoding (ARM ARM C7.2.225 / C7.2.260 / C7.2.224 / C7.2.259;
+// AdvSimdTwoRegMisc opcode=00010 / 00110):
+//   SADDLP .8B/.4H  = 0x0E202800 | (rn<<5) | rd  (U=0, op=00010, size=00, Q=0)
+//   SADDLP .16B/.8H = 0x4E202800 | ...           (Q=1)
+//   SADDLP .4H/.2S  = 0x0E602800 | ...           (size=01)
+//   SADDLP .8H/.4S  = 0x4E602800 | ...
+//   SADDLP .2S/.1D  = 0x0EA02800 | ...           (size=10)
+//   SADDLP .4S/.2D  = 0x4EA02800 | ...
+//   UADDLP = SADDLP | 0x20000000                  (U=1)
+//   SADALP = SADDLP with op=00110 -> 0x0E206800 etc.
+//   UADALP = SADALP | 0x20000000
+constexpr uint32_t SaddlpVec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E202800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec8B(uint8_t rd, uint8_t rn) {
+  return 0x0E202800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E602800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA02800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SaddlpVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA02800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UaddlpVec16B(uint8_t rd, uint8_t rn) {
+  return SaddlpVec16B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t UaddlpVec8H(uint8_t rd, uint8_t rn) {
+  return SaddlpVec8H(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t UaddlpVec4S(uint8_t rd, uint8_t rn) {
+  return SaddlpVec4S(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t SadalpVec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E206800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t SadalpVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E606800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t UadalpVec16B(uint8_t rd, uint8_t rn) {
+  return SadalpVec16B(rd, rn) | 0x20000000u;
+}
+constexpr uint32_t UadalpVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA06800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// SADDLP .16B: signed pairwise add of 16 bytes -> 8 halves.  Validates
+// signed extension via PSLLW/PSRAW (low byte) and PSRAW (high byte).
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec16B) {
+  const int8_t n[16] = {
+       1,  2,
+      -1, -2,
+     127, 127,
+    -128, -128,
+       0, -1,
+      50, -50,
+      -3,  3,
+       100, -100,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Adjacent pair sums treating each byte as signed int8:
+  EXPECT_EQ(r[0], int16_t{1 + 2});
+  EXPECT_EQ(r[1], int16_t{-1 + -2});
+  EXPECT_EQ(r[2], int16_t{127 + 127});      // 254 — needs sign-extension to 16
+  EXPECT_EQ(r[3], int16_t{-128 + -128});    // -256 — INT8_MIN sum needs sign ext
+  EXPECT_EQ(r[4], int16_t{0 + -1});
+  EXPECT_EQ(r[5], int16_t{50 + -50});
+  EXPECT_EQ(r[6], int16_t{-3 + 3});
+  EXPECT_EQ(r[7], int16_t{100 + -100});
+}
+
+// UADDLP .16B: unsigned pairwise add of 16 bytes -> 8 halves.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec16B) {
+  const uint8_t n[16] = {
+       1, 2, 0xFF, 0xFF, 0x80, 0x80, 0x00, 0x00,
+       0xFF, 0x01, 0x10, 0x20, 0xAA, 0xBB, 0xCC, 0xDD,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UaddlpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint16_t{1 + 2});
+  EXPECT_EQ(r[1], uint16_t{0xFF + 0xFF});           // 510 — unsigned, no clip
+  EXPECT_EQ(r[2], uint16_t{0x80 + 0x80});           // 256
+  EXPECT_EQ(r[3], uint16_t{0});
+  EXPECT_EQ(r[4], uint16_t{0xFF + 0x01});           // 256
+  EXPECT_EQ(r[5], uint16_t{0x10 + 0x20});           // 48
+  EXPECT_EQ(r[6], uint16_t{0xAA + 0xBB});
+  EXPECT_EQ(r[7], uint16_t{0xCC + 0xDD});
+}
+
+// UADDLP .8B Q=0: 8-byte source, 4-half result, upper 64 of Vd zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec8BUpperZero) {
+  const uint8_t prev[16] = {
+      0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+  };
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0x80, 0x80, 0xFF, 0x01, 0x10, 0x20, 0x00, 0x00,
+      0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec8B(0, 1) | 0x20000000u};  // UADDLP .8B
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint16_t{0x80 + 0x80});
+  EXPECT_EQ(r[1], uint16_t{0xFF + 0x01});
+  EXPECT_EQ(r[2], uint16_t{0x10 + 0x20});
+  EXPECT_EQ(r[3], uint16_t{0});
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0) << "Q=0 upper lane " << i;
+}
+
+// SADDLP .8H: signed pairwise add of 8 halves -> 4 words via PMADDWD path.
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec8H) {
+  const int16_t n[8] = {
+      30000, 30000,
+      -30000, -30000,
+      static_cast<int16_t>(0x7FFF), -1,
+      1, -1,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int32_t{60000});                // 30000+30000 (needs 17-bit signed)
+  EXPECT_EQ(r[1], int32_t{-60000});               // -30000+-30000
+  EXPECT_EQ(r[2], int32_t{0x7FFF + -1});          // 0x7FFE
+  EXPECT_EQ(r[3], int32_t{0});                    // 1+-1
+}
+
+// UADDLP .8H: unsigned pairwise add of 8 halves -> 4 words.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec8H) {
+  const uint16_t n[8] = {
+      0xFFFF, 0xFFFF,
+      0x8000, 0x8000,
+      0x0001, 0x0002,
+      0x4000, 0x4000,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UaddlpVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint32_t{0xFFFF + 0xFFFFu});   // 0x1FFFE
+  EXPECT_EQ(r[1], uint32_t{0x8000 + 0x8000u});   // 0x10000
+  EXPECT_EQ(r[2], uint32_t{0x0001 + 0x0002u});
+  EXPECT_EQ(r[3], uint32_t{0x4000 + 0x4000u});   // 0x8000
+}
+
+// SADDLP .4S: signed pairwise add of 4 words -> 2 dwords via PMOVSXDQ path.
+// Pins overflow: INT32_MAX + INT32_MAX overflows 32-bit but fits in 64-bit.
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec4S) {
+  const int32_t n[4] = {
+      INT32_MAX, INT32_MAX,
+      INT32_MIN, INT32_MIN,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int64_t{INT32_MAX} + int64_t{INT32_MAX});
+  EXPECT_EQ(r[1], int64_t{INT32_MIN} + int64_t{INT32_MIN});
+}
+
+// UADDLP .4S: unsigned pairwise add of 4 words -> 2 dwords.
+TEST_F(Arm64LiteTranslateRegionTest, UaddlpVec4S) {
+  const uint32_t n[4] = {
+      0xFFFFFFFFu, 0xFFFFFFFFu,
+      0x80000000u, 0x7FFFFFFFu,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UaddlpVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0xFFFFFFFFu} + uint64_t{0xFFFFFFFFu});
+  EXPECT_EQ(r[1], uint64_t{0x80000000u} + uint64_t{0x7FFFFFFFu});
+}
+
+// SADDLP .2S Q=0: 2-word source, 1-dword result, upper 64 zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, SaddlpVec2SUpperZero) {
+  const int32_t prev[4] = {-1, -1, -1, -1};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int32_t n[4] = {INT32_MIN, -5, 0x55555555, 0x66666666};
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SaddlpVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int64_t{INT32_MIN} + int64_t{-5});
+  EXPECT_EQ(r[1], 0);  // Q=0 upper 64 zeroed
+}
+
+// SADALP .16B: accumulate signed pair sums into Vd holding prior .8H values.
+TEST_F(Arm64LiteTranslateRegionTest, SadalpVec16B) {
+  const int16_t prev[8] = {100, -100, 1, -1, 32767, -32768, 50, -50};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int8_t n[16] = {
+      1, 2, 3, 4, 5, 6, 7, 8,
+      -1, -1, 0, 0, 10, 20, -10, 30,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SadalpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int16_t{100 + (1 + 2)});
+  EXPECT_EQ(r[1], int16_t{-100 + (3 + 4)});
+  EXPECT_EQ(r[2], int16_t{1 + (5 + 6)});
+  EXPECT_EQ(r[3], int16_t{-1 + (7 + 8)});
+  EXPECT_EQ(r[4], int16_t{32767 + (-1 + -1)});
+  EXPECT_EQ(r[5], int16_t{-32768 + (0 + 0)});
+  EXPECT_EQ(r[6], int16_t{50 + (10 + 20)});
+  EXPECT_EQ(r[7], int16_t{-50 + (-10 + 30)});
+}
+
+// UADALP .16B: accumulate unsigned pair sums into Vd holding prior .8H values.
+TEST_F(Arm64LiteTranslateRegionTest, UadalpVec16B) {
+  const uint16_t prev[8] = {0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 0x8000};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint8_t n[16] = {
+      0xFF, 0xFF, 0x10, 0x20, 0x80, 0x80, 0x00, 0x01,
+      0x55, 0xAA, 0x33, 0x44, 0x11, 0x22, 0x77, 0x88,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UadalpVec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint16_t{0x1000 + 0xFF + 0xFF});
+  EXPECT_EQ(r[1], uint16_t{0x2000 + 0x10 + 0x20});
+  EXPECT_EQ(r[2], uint16_t{0x3000 + 0x80 + 0x80});
+  EXPECT_EQ(r[3], uint16_t{0x4000 + 0x00 + 0x01});
+  EXPECT_EQ(r[4], uint16_t{0x5000 + 0x55 + 0xAA});
+  EXPECT_EQ(r[5], uint16_t{0x6000 + 0x33 + 0x44});
+  EXPECT_EQ(r[6], uint16_t{0x7000 + 0x11 + 0x22});
+  EXPECT_EQ(r[7], uint16_t{0x8000 + 0x77 + 0x88});
+}
+
+// SADALP .8H: accumulate via PMADDWD path into Vd holding prior .4S values.
+TEST_F(Arm64LiteTranslateRegionTest, SadalpVec8H) {
+  const int32_t prev[4] = {1000, -1000, INT32_MAX - 100, INT32_MIN + 100};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const int16_t n[8] = {
+      10, 20,
+      -30, -40,
+      100, 1,
+      0, 0,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {SadalpVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], int32_t{1000 + (10 + 20)});
+  EXPECT_EQ(r[1], int32_t{-1000 + (-30 + -40)});
+  EXPECT_EQ(r[2], int32_t{(INT32_MAX - 100) + (100 + 1)});
+  EXPECT_EQ(r[3], int32_t{(INT32_MIN + 100) + 0});
+}
+
+// UADALP .4S: accumulate via PMOVSXDQ-free unsigned pair sums (size=10)
+// into Vd holding prior .2D values.
+TEST_F(Arm64LiteTranslateRegionTest, UadalpVec4S) {
+  const uint64_t prev[2] = {0x1111111111111111ull, 0xAAAABBBBCCCCDDDDull};
+  std::memcpy(&state_.cpu.v[0], prev, 16);
+  const uint32_t n[4] = {
+      0xFFFFFFFFu, 0xFFFFFFFFu,
+      0x80000000u, 0x7FFFFFFFu,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {UadalpVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x1111111111111111ull} + uint64_t{0xFFFFFFFFu} + uint64_t{0xFFFFFFFFu});
+  EXPECT_EQ(r[1], uint64_t{0xAAAABBBBCCCCDDDDull} + uint64_t{0x80000000u} + uint64_t{0x7FFFFFFFu});
+}
+// endregion
+
 // region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
 //   FMAX/FMIN  — IEEE: any NaN -> NaN result.

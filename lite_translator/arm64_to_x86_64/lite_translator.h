@@ -13485,6 +13485,117 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
         return;
       }
+      // SADDLP / UADDLP Vd.<Tb>, Vn.<Ta> — add adjacent pairs of elements,
+      // producing a result with elements twice as wide.  S = signed, U = unsigned.
+      // SADALP / UADALP — same shape but accumulate into Vd.
+      //   size=00 src .8B/.16B  -> dst .4H/.8H
+      //   size=01 src .4H/.8H   -> dst .2S/.4S
+      //   size=10 src .2S/.4S   -> dst .1D/.2D
+      //   size=11 reserved (decoder routes UNDEF).
+      //
+      // Idioms per width:
+      //   byte->half  unsigned: lo = (xn & 0x00FF); hi = (xn >> 8); PADDW.
+      //   byte->half  signed:   lo = (xn << 8) >> 8 (arith); hi = (xn >> 8) arith; PADDW.
+      //   half->word  unsigned: lo = (xn & 0x0000FFFF); hi = (xn >> 16); PADDD.
+      //   half->word  signed:   PMADDWD(xn, [0x0001 per half]) — exact signed pair sum.
+      //   word->dword unsigned: lo = (xn & 0xFFFFFFFF per qword); hi = (xn >> 32); PADDQ.
+      //   word->dword signed:   sign-extend each dword to qword via PMOVSXDQ on lo/hi
+      //                         halves, then pair-sum via PUNPCKLQDQ/PUNPCKHQDQ + PADDQ.
+      // Accumulate forms (SADALP/UADALP) PADD into the existing Vd contents.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSadalp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUadalp: {
+        if (args.size == 0b11) { Undefined(); return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp);
+        const bool is_accum =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp ||
+             args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUadalp);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        SimdRegister xtmp = AllocTempSimdReg();
+        if (xn == no_simd_register || xres == no_simd_register ||
+            xtmp == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        switch (args.size) {
+          case 0b00: {  // byte -> half
+            if (is_signed) {
+              as_.Movdqa(xres, xn);
+              as_.Psllw(xres, int8_t{8});
+              as_.Psraw(xres, int8_t{8});  // low byte sign-extended to 16
+              as_.Movdqa(xtmp, xn);
+              as_.Psraw(xtmp, int8_t{8});  // high byte sign-extended to 16
+              as_.Paddw(xres, xtmp);
+            } else {
+              as_.Pcmpeqw(xtmp, xtmp);
+              as_.Psrlw(xtmp, int8_t{8});  // 0x00FF per half
+              as_.Movdqa(xres, xn);
+              as_.Pand(xres, xtmp);         // low byte zero-extended
+              as_.Movdqa(xtmp, xn);
+              as_.Psrlw(xtmp, int8_t{8});  // high byte zero-extended
+              as_.Paddw(xres, xtmp);
+            }
+            break;
+          }
+          case 0b01: {  // half -> word
+            if (is_signed) {
+              as_.Pcmpeqw(xtmp, xtmp);
+              as_.Psrlw(xtmp, int8_t{15});  // 0x0001 per half
+              as_.Movdqa(xres, xn);
+              as_.Pmaddwd(xres, xtmp);       // signed pair sum -> 32-bit per dword
+            } else {
+              as_.Pcmpeqd(xtmp, xtmp);
+              as_.Psrld(xtmp, int8_t{16});  // 0x0000FFFF per dword
+              as_.Movdqa(xres, xn);
+              as_.Pand(xres, xtmp);
+              as_.Movdqa(xtmp, xn);
+              as_.Psrld(xtmp, int8_t{16});
+              as_.Paddd(xres, xtmp);
+            }
+            break;
+          }
+          case 0b10: {  // word -> dword
+            if (is_signed) {
+              SimdRegister xhi = AllocTempSimdReg();
+              if (xhi == no_simd_register) { success_ = false; return; }
+              as_.Pmovsxdq(xres, xn);            // [sx(xn[0]), sx(xn[1])]
+              as_.Movdqa(xhi, xn);
+              as_.Psrldq(xhi, int8_t{8});         // [xn[2], xn[3], 0, 0]
+              as_.Pmovsxdq(xhi, xhi);             // [sx(xn[2]), sx(xn[3])]
+              as_.Movdqa(xtmp, xres);
+              as_.Punpcklqdq(xtmp, xhi);          // [sx(0), sx(2)]
+              as_.Punpckhqdq(xres, xhi);          // [sx(1), sx(3)]
+              as_.Paddq(xres, xtmp);              // [sx(0)+sx(1), sx(2)+sx(3)]
+            } else {
+              as_.Pcmpeqd(xtmp, xtmp);
+              as_.Psrlq(xtmp, int8_t{32});  // 0x00000000_FFFFFFFF per qword
+              as_.Movdqa(xres, xn);
+              as_.Pand(xres, xtmp);          // low 32 of each qword, zero-extended
+              as_.Movdqa(xtmp, xn);
+              as_.Psrlq(xtmp, int8_t{32});  // high 32 of each qword, zero-extended
+              as_.Paddq(xres, xtmp);
+            }
+            break;
+          }
+        }
+        if (is_accum) {
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          switch (args.size) {
+            case 0b00: as_.Paddw(xres, xd); break;
+            case 0b01: as_.Paddd(xres, xd); break;
+            default:   as_.Paddq(xres, xd); break;
+          }
+        }
+        if (!args.q) mask_low64(xres);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
