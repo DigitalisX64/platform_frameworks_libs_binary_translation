@@ -36662,6 +36662,200 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmEncodingMatchesLlvmMc) {
 }
 // endregion
 
+// region digitalis
+// AdvSimdShiftByImm — UQSHL .2D vector form (per-lane unsigned saturating
+// left-shift by immediate).  Already JIT-driven via the existing vector
+// pipeline at lite_translator.h ~line 20030 — esize=64 uses Psllq (SSE2) +
+// Psrlq (SSE2) for the back-shift recovery + Pcmpeqq (SSE4.1) for the
+// per-lane equality detector + Pcmpeqd-of-self-for-all-ones sat target.
+// All baseline SSE-x; no AVX-512 dependency (unlike SQSHL .2D which needs
+// PSRAQ for the signed back-shift).
+//
+// Encoding: `0 Q U=1 011110 immh immb 011101 Rn Rd`.  For .2D: Q=1,
+// immh=1xxx (immh bit 3 set, esize=64), shift_count = (immh:immb) - 64.
+constexpr uint32_t kUqshlVecD_0   = 0x6F407420;  // uqshl v0.2d, v1.2d, #0
+constexpr uint32_t kUqshlVecD_1   = 0x6F417420;  // uqshl v0.2d, v1.2d, #1
+constexpr uint32_t kUqshlVecD_11  = 0x6F4B7420;  // uqshl v0.2d, v1.2d, #11
+constexpr uint32_t kUqshlVecD_63  = 0x6F7F7420;  // uqshl v0.2d, v1.2d, #63
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kUqshlVecD_0, 0x6F407420u);
+  EXPECT_EQ(kUqshlVecD_1, 0x6F417420u);
+  EXPECT_EQ(kUqshlVecD_11, 0x6F4B7420u);
+  EXPECT_EQ(kUqshlVecD_63, 0x6F7F7420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShiftZeroPassThroughJit) {
+  // cnt==0 → Psllq(xs, 0) is identity; Psrlq(xm, 0) is identity; Pcmpeqq
+  // is all-ones → result = xn for both lanes.  Pins both lanes pass
+  // through untouched.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShiftOneBothLanesNoSatJit) {
+  // Two values with top bit 0; shift by 1 doesn't lose any high bit.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x3000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x1234567890ABCDEFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x6000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x2468ACF121579BDEULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShiftOneMixedSatNoSatJit) {
+  // Lane 0: top bit 0, no saturation.  Lane 1: top bit 1, shifts off →
+  // saturate to UINT64_MAX.  Pins per-lane independent saturation.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x8000000000000001ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x2000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShift63MixedFitsSaturatesJit) {
+  // Lane 0: value=1, cnt=63 → 1<<63 = 0x8000000000000000 (fits unsigned).
+  // Lane 1: value=3, cnt=63 → 3<<63 overflows u64 → saturate to UINT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1}) |
+                    (static_cast<__uint128_t>(uint64_t{3}) << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmInPlaceVdEqualsVnJit) {
+  // Vd == Vn (both v0).  Vector pipeline reads via Movdqu before the
+  // store, so Vd==Vn is naturally safe — pins that invariant.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000FEDCBA987ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x00000000DEADBEEFULL})
+                     << 64);
+  static const uint32_t code[] = {0x6F4B7400U};  // uqshl v0.2d, v0.2d, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000FEDCBA987ULL} << 11);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x00000000DEADBEEFULL} << 11);
+}
+// endregion
+
+// region digitalis
+// AdvSimdShiftByImm — SQSHLU .2D vector form (per-lane signed-to-unsigned
+// saturating left-shift by immediate).  Already JIT-driven via the
+// existing vector pipeline at lite_translator.h ~line 20040 — esize=64
+// runs Pcmpgtq (SSE4.2) for the neg-detector + Pandn to pre-zero
+// negatives, then the same Psllq/Psrlq/Pcmpeqq UQSHL pipeline.  All
+// baseline SSE-x; no AVX-512 dependency.
+//
+// Encoding: `0 Q U=1 011110 immh immb 011001 Rn Rd`.  Same prefix as
+// UQSHL except bits[15:10] = 011001 (vs UQSHL's 011101).
+constexpr uint32_t kSqshluVecD_0   = 0x6F406420;  // sqshlu v0.2d, v1.2d, #0
+constexpr uint32_t kSqshluVecD_11  = 0x6F4B6420;  // sqshlu v0.2d, v1.2d, #11
+constexpr uint32_t kSqshluVecD_63  = 0x6F7F6420;  // sqshlu v0.2d, v1.2d, #63
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqshluVecD_0, 0x6F406420u);
+  EXPECT_EQ(kSqshluVecD_11, 0x6F4B6420u);
+  EXPECT_EQ(kSqshluVecD_63, 0x6F7F6420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShiftZeroNegPreZeroJit) {
+  // cnt==0 → Psllq identity.  Lane 0 positive passes through; lane 1
+  // negative (top bit set) is pre-zeroed by Pcmpgtq + Pandn before the
+  // shift, then passes through as 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1234567890ABCDEFULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x8000000000000001ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x1234567890ABCDEFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
+      << "negative lane pre-zeroed by Pcmpgtq+Pandn even at cnt=0";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShift11PosNoSatNegZeroJit) {
+  // Lane 0: positive that fits after << 11.  Lane 1: negative → 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x0000123456789ABCULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0091A2B3C4D5E000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShift11PosSaturatesNegZeroJit) {
+  // Lane 0: positive with top 11 bits non-zero → overflow → saturate
+  // to UINT64_MAX.  Lane 1: negative → 0.  Pins that the per-lane
+  // saturate target (UINT64_MAX from Pcmpeqd-of-self) is not clobbered
+  // by lane 1's neg-zero path.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x7EDCBA9876543210ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShift63PosOneFitsNegZeroJit) {
+  // Lane 0: value=1 (positive), cnt=63 → 1<<63 = 0x8000000000000000.
+  // As unsigned, 0x8000000000000000 fits (UINT64_MAX is much larger).
+  // The detector: Psllq(1,63)=0x8000000000000000; Psrlq(...,63)=1;
+  // Pcmpeqq(1, xn==1) → eq → no saturation.
+  // Lane 1: value=-1 (negative) → pre-zeroed → 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmInPlaceVdEqualsVnJit) {
+  // Vd == Vn (both v0).  Vector pipeline reads Vn via Movdqu into xn
+  // before any Vd store, so Vd==Vn is naturally safe.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000FEDCBA987ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x80000000DEADBEEFULL})
+                     << 64);
+  static const uint32_t code[] = {0x6F4B6400U};  // sqshlu v0.2d, v0.2d, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000FEDCBA987ULL} << 11);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
+      << "negative lane pre-zeroed; Vd==Vn safe";
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -
