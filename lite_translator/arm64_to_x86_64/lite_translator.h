@@ -6969,6 +6969,97 @@ class LiteTranslator {
         success_ = false; return;
       }
       // endregion
+      // region digitalis - SSHL.2D / USHL.2D vector form: signed/unsigned
+      // variable shift across two 64-bit lanes.  The per-lane shift count
+      // is the signed int8 in the low byte of the corresponding Vm lane.
+      // Per-lane GPR-branched recipe (twice the scalar D recipe inlined):
+      // load lane, sign-extend shift byte, branch by sign(sh), do the
+      // signed/unsigned arithmetic, store lane.  Quadrants:
+      //   sh in [0, 63]   -> SHL a, sh
+      //   sh >= 64        -> 0 (USHL); positive a: 0 / negative a: -1 (SSHL).
+      //                      Implemented as 'arith max' = SAR a, 63.
+      //   sh in [-63, -1] -> SHR a, |sh|  (USHL); SAR a, |sh|  (SSHL).
+      //   sh <= -64       -> 0  (USHL);  SAR a, 63  (SSHL).
+      // Scalar D (kSshl/kUshl scalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector forms) bail to
+      // the interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kSshl:
+      case Decoder::AdvSimdThreeSameOpcode::kUshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSshl);
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: shift >= 64 -> 0; else SHL a, sh.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShlqByCl(a);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative path: sh = |shift| in [1, 128] after Negq.  Source was
+          // sign-extension of int8 (range [-128, -1]) so the negation cannot
+          // overflow.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          if (is_signed) {
+            Assembler::Label* L_arith_max = as_.MakeLabel();
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_arith_max);
+            // 0 < |sh| < 64: a = (int64_t)a >> |sh|.
+            as_.Movq(Assembler::rcx, sh);
+            as_.SarqByCl(a);
+            as_.Jmp(*L_done);
+            as_.Bind(L_arith_max);
+            // |sh| >= 64: a = (int64_t)a >> 63 (sign-broadcast across bits).
+            as_.Sarq(a, int8_t{63});
+            as_.Jmp(*L_done);
+          } else {
+            // USHL negative: |sh| >= 64 -> 0; else SHR a, |sh|.
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrqByCl(a);
+            as_.Jmp(*L_done);
+          }
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
