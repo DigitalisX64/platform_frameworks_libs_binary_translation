@@ -19236,8 +19236,9 @@ class LiteTranslator {
           // Shlq + Sarq + Cmpq overflow detector inside the case body
           // — the SSE vector path's PSRAQ signed-recover step is
           // AVX-512F-VL only, but the single-lane GPR fallback uses
-          // baseline 64-bit GPR ops.  Vector .2D still bails to
-          // the interpreter.
+          // baseline 64-bit GPR ops.  Vector .2D (args.scalar=false,
+          // immh=1xxx) routes through the same GPR detector applied
+          // twice (once per .2D lane) inside the case body.
           break;
         case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
         case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
@@ -19925,14 +19926,89 @@ class LiteTranslator {
                    int32_t{0});
           return;
         }
-        // Vector .2D SQSHL (Q=1, immh & 0b1000) still needs PSRAQ for the
-        // signed back-shift recovery step (AVX-512F-VL only), so it bails
-        // to the interpreter.  The 64-bit lane ops used by the still-
-        // covered UQSHL .D / SQSHLU .D / SQSHL .D vector paths are all
-        // SSE4.x: PSLLQ/PSRLQ (SSE2), PCMPEQQ (SSE4.1), PCMPGTQ (SSE4.2).
-        if (is_dword &&
+        // Vector .2D SQSHL (args.scalar=false, immh & 0b1000) cannot use
+        // the SSE vector pipeline below — its signed back-shift recovery
+        // step needs PSRAQ (AVX-512F-VL only on x86).  Emit a two-lane
+        // GPR fallback that mirrors the scalar D detector twice, once per
+        // .2D lane.
+        //
+        // Vd==Vn safety: read both Vn[63:0] and Vn[127:64] into GPRs up
+        // front, before writing either Vd lane.
+        //
+        // The unallocated args.q=false / immh=1xxx encoding ("vector .1D"
+        // — reserved per ARM ARM C7.2.243) is handled by mirroring the
+        // existing vector pipeline's `if (!args.q)` upper-zero behavior:
+        // produce lane 0 via the GPR detector and zero Vd[127:64].
+        if (is_dword && !args.scalar &&
             args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) {
-          success_ = false; return;
+          const uint16_t immh_immb =
+              static_cast<uint16_t>((immh << 3) | args.immb);
+          const uint8_t shift_count = static_cast<uint8_t>(immh_immb - 64);
+          const int8_t cnt = static_cast<int8_t>(shift_count);
+          Register a_lo = AllocTempReg();
+          Register a_hi = AllocTempReg();
+          Register candidate = AllocTempReg();
+          Register back = AllocTempReg();
+          Register sat = AllocTempReg();
+          if (a_lo == Assembler::no_register ||
+              a_hi == Assembler::no_register ||
+              candidate == Assembler::no_register ||
+              back == Assembler::no_register ||
+              sat == Assembler::no_register) {
+            success_ = false; return;
+          }
+          // Read both Vn lanes before writing either Vd lane.
+          as_.Movq(a_lo, {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Movq(a_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          if (cnt == 0) {
+            // No shift, no possible overflow; emit pass-through.
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a_lo);
+            if (args.q) {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a_hi);
+            } else {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                       int32_t{0});
+            }
+            return;
+          }
+          // Lane 0: GPR-fallback signed-overflow detector.
+          as_.Movq(sat, a_lo);
+          as_.Sarq(sat, int8_t{63});
+          as_.Movq(back, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(sat, back);
+          as_.Movq(candidate, a_lo);
+          as_.Shlq(candidate, cnt);
+          as_.Movq(back, candidate);
+          as_.Sarq(back, cnt);
+          Assembler::Label* L_lo_overflow = as_.MakeLabel();
+          as_.Cmpq(back, a_lo);
+          as_.Jcc(Assembler::Condition::kNotEqual, *L_lo_overflow);
+          as_.Movq(sat, candidate);
+          as_.Bind(L_lo_overflow);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, sat);
+          if (!args.q) {
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     int32_t{0});
+            return;
+          }
+          // Lane 1: reuse sat / candidate / back GPRs.
+          as_.Movq(sat, a_hi);
+          as_.Sarq(sat, int8_t{63});
+          as_.Movq(back, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(sat, back);
+          as_.Movq(candidate, a_hi);
+          as_.Shlq(candidate, cnt);
+          as_.Movq(back, candidate);
+          as_.Sarq(back, cnt);
+          Assembler::Label* L_hi_overflow = as_.MakeLabel();
+          as_.Cmpq(back, a_hi);
+          as_.Jcc(Assembler::Condition::kNotEqual, *L_hi_overflow);
+          as_.Movq(sat, candidate);
+          as_.Bind(L_hi_overflow);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, sat);
+          return;
         }
         // endregion
         uint8_t esize_bits;
