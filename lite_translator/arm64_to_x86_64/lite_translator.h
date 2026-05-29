@@ -5460,6 +5460,105 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kSrhadd:
+      case Decoder::AdvSimdThreeSameOpcode::kUrhadd: {
+        // SRHADD / URHADD Vd, Vn, Vm — per-lane (a + b + 1) >> 1, signed
+        // (SRHADD) or unsigned (URHADD).  ARM ARM C7.2 reserves .2D.
+        //
+        // Width recipes:
+        //  - URHADD byte (.8B/.16B): single PAVGB.  SSE2 PAVGB computes
+        //    (a + b + 1) >> 1 unsigned per byte — an exact match.
+        //  - URHADD halfword (.4H/.8H): single PAVGW, exact match.
+        //  - SRHADD byte (.8B/.16B): widen-PADDW-add1-PSRAW-PACKSSWB.
+        //    x86 has no PSRAB / PSRLB so byte signed must widen to 16-bit;
+        //    +1 is materialized by PCMPEQW(xm, xm) (all -1 per word) followed
+        //    by PSUBW (subtracting -1 = adding 1).  Lane values stay in
+        //    [-128, 127] after the shift so PACKSSWB never saturates.
+        //  - SRHADD halfword/word and URHADD word: bitwise identity
+        //    (a + b + 1) >> 1 = (a | b) - ((a ^ b) >> 1), proven from
+        //    a + b = (a^b) + 2*(a&b) and (a|b) = (a^b) + (a&b).  Arithmetic
+        //    shift (PSRAW/PSRAD) for signed, logical shift (PSRLW/PSRLD)
+        //    for unsigned.  All SSE2.
+        if (args.size == 0b11) { Undefined(); return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrhadd);
+        if (!is_signed && (args.size == 0b00 || args.size == 0b01)) {
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            Undefined(); return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          if (args.size == 0b00) as_.Pavgb(xn, xm);
+          else as_.Pavgw(xn, xm);
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        if (args.size == 0b00) {
+          // SRHADD byte (signed): widen-PADDW-add1-PSRAW-PACKSSWB.
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovsxbw(xn, xn);
+          as_.Pmovsxbw(xm, xm);
+          as_.Pmovsxbw(xn_hi, xn_hi);
+          as_.Pmovsxbw(xm_hi, xm_hi);
+          as_.Paddw(xn, xm);
+          as_.Paddw(xn_hi, xm_hi);
+          // xm and xm_hi are dead.  Clobber xm to all-ones per word
+          // (PCMPEQW(xm, xm)) so PSUBW(xn, xm) adds 1 to each lane.
+          as_.Pcmpeqw(xm, xm);
+          as_.Psubw(xn, xm);
+          as_.Psubw(xn_hi, xm);
+          as_.Psraw(xn, int8_t{1});
+          as_.Psraw(xn_hi, int8_t{1});
+          as_.Packsswb(xn, xn_hi);
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        // SRHADD halfword/word, URHADD word: bitwise (a|b) - ((a^b) >> 1).
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xxor = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xxor == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xxor, xn);
+        as_.Pxor(xxor, xm);
+        as_.Por(xn, xm);
+        if (args.size == 0b01) {
+          if (is_signed) as_.Psraw(xxor, int8_t{1});
+          else as_.Psrlw(xxor, int8_t{1});
+          as_.Psubw(xn, xxor);
+        } else {
+          // size == 0b10.
+          if (is_signed) as_.Psrad(xxor, int8_t{1});
+          else as_.Psrld(xxor, int8_t{1});
+          as_.Psubd(xn, xxor);
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kBic: {
         // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
         // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
