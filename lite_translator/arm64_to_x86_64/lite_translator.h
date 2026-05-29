@@ -7359,6 +7359,188 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SQDMULH / SQRDMULH three-same vector: saturating
+      // doubling multiply-high, with optional rounding.  Decoder restricts
+      // size to {01, 10}.
+      //
+      // SQDMULH per lane:  result = sat_int<esize>((SInt(a) * SInt(b) * 2) >> esize_bits).
+      // SQRDMULH per lane: same, with (1 << (esize_bits - 1)) added before the shift.
+      //
+      // The only lane that requires the saturation step is (a, b) ==
+      // (INT_MIN, INT_MIN), where 2 * INT_MIN * INT_MIN overflows int(2*esize).
+      // ARM expects INT_MAX for that lane.  All other lanes are exact via
+      // straight-line widen / multiply / double / extract-high.
+      //
+      // size=01 (.4H/.8H):
+      //   SQDMULH:  PMULHW (signed high 16) + PMULLW (low 16); combine by
+      //     (PMULHW << 1) | (PMULLW >> 15) — that is, the high 16 bits of the
+      //     doubled product, ignoring the corner overflow.  3 PMUL + 2 shift
+      //     + 1 OR + corner fixup.
+      //   SQRDMULH: PMULHRSW (SSSE3) computes ((a * b * 2 + 0x8000) >> 16),
+      //     exactly matching SQRDMULH except for the (INT16_MIN)^2 lane.
+      //     1 PMUL + corner fixup.
+      //   Corner fixup at .8H (same as kSqrdmlahVec):
+      //     x_min = 0x8000 broadcast across 8 halfwords.
+      //     corner = (Vn == x_min) PCMPEQW AND (Vm == x_min) PCMPEQW.
+      //     result ^= corner   (0x8000 ^ 0xFFFF = 0x7FFF = INT16_MAX).
+      //
+      // size=10 (.2S/.4S): reuse the kSqrdmlahVec stage-1 recipe.  Two PMULDQs
+      //   (SSE4.1) reconstruct the 4 signed 32×32 → 64 products.  PSLLQ 1
+      //   doubles each.  For SQRDMULH, PADDQ the rounding constant
+      //   0x80000000 per qword.  PSHUFD 0xDD picks the high dword of each
+      //   qword into the low dword; PUNPCKLDQ interleaves the two halves.
+      //   Corner fixup at .4S: x_const = INT32_MIN broadcast; corner =
+      //   (Vn == x_const) AND (Vm == x_const); result ^= corner
+      //   (INT32_MIN ^ 0xFFFFFFFF = INT32_MAX).
+      //
+      // PSLLQ-overflow correctness (size=10): for any (a, b) with a * b
+      // representable as an int64 (i.e., not the (INT_MIN)^2 corner), the
+      // doubled product 2 * a * b fits in int64 with at most a wrap into the
+      // upper bit; PSHUFD then picks bits 32..63 which, interpreted as a
+      // signed int32, equals floor((2 * a * b) / 2^32) = ARM's
+      // ((2 * a * b) >> esize_bits) at size=10.  For the corner, the wrap
+      // produces 0x80000000, which the corner XOR flips to 0x7FFFFFFF.
+      case Decoder::AdvSimdThreeSameOpcode::kSqdmulh:
+      case Decoder::AdvSimdThreeSameOpcode::kSqrdmulh: {
+        const bool is_round =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh);
+        if (args.size == 0b01) {
+          if (is_round) {
+            // SQRDMULH .4H/.8H via PMULHRSW + corner fixup (SSSE3).
+            if (!host_platform::kHasSSSE3) { success_ = false; return; }
+            SimdRegister xn = AllocTempSimdReg();
+            SimdRegister xm = AllocTempSimdReg();
+            SimdRegister xn_corner = AllocTempSimdReg();
+            SimdRegister xm_corner = AllocTempSimdReg();
+            SimdRegister x_min = AllocTempSimdReg();
+            if (xn == no_simd_register || xm == no_simd_register ||
+                xn_corner == no_simd_register || xm_corner == no_simd_register ||
+                x_min == no_simd_register) {
+              success_ = false; return;
+            }
+            load_full(xn, vn_off);
+            load_full(xm, vm_off);
+            as_.Pcmpeqw(x_min, x_min);
+            as_.Psllw(x_min, int8_t{15});
+            as_.Movdqa(xn_corner, xn);
+            as_.Movdqa(xm_corner, xm);
+            as_.Pmulhrsw(xn, xm);
+            as_.Pcmpeqw(xn_corner, x_min);
+            as_.Pcmpeqw(xm_corner, x_min);
+            as_.Pand(xn_corner, xm_corner);
+            as_.Pxor(xn, xn_corner);
+            if (!args.q) mask_low64(xn);
+            store_full(vd_off, xn);
+            return;
+          }
+          // SQDMULH .4H/.8H via PMULHW + PMULLW combine + corner fixup (SSE2).
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xn_lo = AllocTempSimdReg();
+          SimdRegister xn_corner = AllocTempSimdReg();
+          SimdRegister xm_corner = AllocTempSimdReg();
+          SimdRegister x_min = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xn_lo == no_simd_register || xn_corner == no_simd_register ||
+              xm_corner == no_simd_register || x_min == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          as_.Movdqa(xn_corner, xn);
+          as_.Movdqa(xm_corner, xm);
+          as_.Movdqa(xn_lo, xn);
+          as_.Pmullw(xn_lo, xm);              // low 16 of (a * b)
+          as_.Pmulhw(xn, xm);                 // high 16 of signed (a * b)
+          as_.Psllw(xn, int8_t{1});           // (high << 1)
+          as_.Psrlw(xn_lo, int8_t{15});       // top bit of low half
+          as_.Por(xn, xn_lo);                 // high 16 of (2 * a * b), wraps on corner
+          as_.Pcmpeqw(x_min, x_min);
+          as_.Psllw(x_min, int8_t{15});       // INT16_MIN broadcast
+          as_.Pcmpeqw(xn_corner, x_min);
+          as_.Pcmpeqw(xm_corner, x_min);
+          as_.Pand(xn_corner, xm_corner);
+          as_.Pxor(xn, xn_corner);            // INT16_MIN ^ 0xFFFF = INT16_MAX
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        if (args.size == 0b10) {
+          // size=10 .2S/.4S: PMULDQ widen + PSLLQ + (optional round) + corner.
+          if (!host_platform::kHasSSE4_1) { success_ = false; return; }
+
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister x_const = AllocTempSimdReg();
+          SimdRegister corner = AllocTempSimdReg();
+          SimdRegister xp_lo = AllocTempSimdReg();
+          SimdRegister xp_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              x_const == no_simd_register || corner == no_simd_register ||
+              xp_lo == no_simd_register || xp_hi == no_simd_register ||
+              xm_hi == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+
+          // x_const = INT32_MIN broadcast across 4 dwords.
+          as_.Pcmpeqd(x_const, x_const);
+          as_.Pslld(x_const, int8_t{31});
+
+          // Corner detection: lanes where Vn.s[i] == INT32_MIN AND
+          // Vm.s[i] == INT32_MIN.
+          as_.Movdqa(corner, xn);
+          as_.Pcmpeqd(corner, x_const);
+          as_.Movdqa(xp_lo, xm);
+          as_.Pcmpeqd(xp_lo, x_const);
+          as_.Pand(corner, xp_lo);
+          // xp_lo is dead and about to be repurposed.
+
+          // Two PMULDQs reconstruct the 4 signed 32×32 → 64 products.
+          //   xp_lo qword 0 = sext_i64(Vn.s[0]) * sext_i64(Vm.s[0])
+          //   xp_lo qword 1 = sext_i64(Vn.s[2]) * sext_i64(Vm.s[2])
+          //   xp_hi qword 0 = sext_i64(Vn.s[1]) * sext_i64(Vm.s[1])
+          //   xp_hi qword 1 = sext_i64(Vn.s[3]) * sext_i64(Vm.s[3])
+          as_.Movdqa(xp_lo, xn);
+          as_.Pmuldq(xp_lo, xm);
+          as_.Movdqa(xp_hi, xn);
+          as_.Psrlq(xp_hi, int8_t{32});
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrlq(xm_hi, int8_t{32});
+          as_.Pmuldq(xp_hi, xm_hi);
+          // xn, xm, xm_hi dead from here.
+
+          // Double each 64-bit signed product via PSLLQ 1.
+          as_.Psllq(xp_lo, int8_t{1});
+          as_.Psllq(xp_hi, int8_t{1});
+
+          // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
+          if (is_round) {
+            as_.Pcmpeqd(x_const, x_const);
+            as_.Psllq(x_const, int8_t{63});
+            as_.Psrlq(x_const, int8_t{32});
+            as_.Paddq(xp_lo, x_const);
+            as_.Paddq(xp_hi, x_const);
+          }
+
+          // Extract the upper 32 bits of each 64-bit lane.
+          as_.Pshufd(xp_lo, xp_lo, static_cast<int8_t>(0xDD));
+          as_.Pshufd(xp_hi, xp_hi, static_cast<int8_t>(0xDD));
+          as_.Punpckldq(xp_lo, xp_hi);
+
+          // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
+          as_.Pxor(xp_lo, corner);
+
+          if (!args.q) mask_low64(xp_lo);
+          store_full(vd_off, xp_lo);
+          return;
+        }
+        // size=00 and size=11 reserved by the decoder; bail safely.
+        success_ = false; return;
+      }
+      // endregion
       // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
       //
       // Decoder restricts size to {01, 10}.  size=01 (.4h/.8h) uses PMULHRSW

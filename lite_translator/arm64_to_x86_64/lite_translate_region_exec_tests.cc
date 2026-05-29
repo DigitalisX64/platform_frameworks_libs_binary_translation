@@ -24209,6 +24209,203 @@ TEST_F(Arm64LiteTranslateRegionTest, UhsubVec8BUpperZero) {
 }
 // endregion
 
+// region digitalis - SQDMULH / SQRDMULH vector JIT.
+//
+// SQDMULH:  result[i] = sat_intN((SInt(a[i]) * SInt(b[i]) * 2) >> N)
+// SQRDMULH: result[i] = sat_intN((SInt(a[i]) * SInt(b[i]) * 2 + 2^(N-1)) >> N)
+// Defined for size in {01 (.4H/.8H), 10 (.2S/.4S)}.
+// Encoding: AdvSimdThreeSame, opcode=10110, U=0 (SQDMULH) / U=1 (SQRDMULH).
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhSqrdmulhVecEncodingsMatchLlvmMc) {
+  // SQDMULH: U=0, opcode=10110.
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x0E62B420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x4E62B420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b10,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x0EA2B420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x4EA2B420u);
+  // SQRDMULH: U=1, opcode=10110.
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b01,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x2E62B420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x6E62B420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b10,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x2EA2B420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                          /*opcode=*/0b10110, 0, 1, 2), 0x6EA2B420u);
+}
+
+namespace {
+inline int16_t SqdmulhLane16(int16_t a, int16_t b) {
+  int32_t prod = static_cast<int32_t>(a) * static_cast<int32_t>(b);
+  int64_t doubled = static_cast<int64_t>(prod) * 2;
+  int64_t high = doubled >> 16;
+  if (high > INT16_MAX) high = INT16_MAX;
+  if (high < INT16_MIN) high = INT16_MIN;
+  return static_cast<int16_t>(high);
+}
+inline int16_t SqrdmulhLane16(int16_t a, int16_t b) {
+  int32_t prod = static_cast<int32_t>(a) * static_cast<int32_t>(b);
+  int64_t doubled_round = static_cast<int64_t>(prod) * 2 + (1 << 15);
+  int64_t high = doubled_round >> 16;
+  if (high > INT16_MAX) high = INT16_MAX;
+  if (high < INT16_MIN) high = INT16_MIN;
+  return static_cast<int16_t>(high);
+}
+inline int32_t SqdmulhLane32(int32_t a, int32_t b) {
+  __int128 prod = static_cast<__int128>(a) * static_cast<__int128>(b);
+  __int128 doubled = prod * 2;
+  __int128 high = doubled >> 32;
+  if (high > INT32_MAX) high = INT32_MAX;
+  if (high < INT32_MIN) high = INT32_MIN;
+  return static_cast<int32_t>(high);
+}
+inline int32_t SqrdmulhLane32(int32_t a, int32_t b) {
+  __int128 prod = static_cast<__int128>(a) * static_cast<__int128>(b);
+  __int128 doubled_round = prod * 2 + (static_cast<__int128>(1) << 31);
+  __int128 high = doubled_round >> 32;
+  if (high > INT32_MAX) high = INT32_MAX;
+  if (high < INT32_MIN) high = INT32_MIN;
+  return static_cast<int32_t>(high);
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhVec8H) {
+  // .8H Q=1: per-halfword SQDMULH.  Cover (INT16_MIN, INT16_MIN) corner
+  // (saturates to INT16_MAX), (INT16_MAX, INT16_MAX), and mixed-sign pairs.
+  int16_t n_lanes[8] = {INT16_MIN, INT16_MAX, INT16_MIN, INT16_MAX,
+                        0, 1, -1, 0x4000};
+  int16_t m_lanes[8] = {INT16_MIN, INT16_MAX, INT16_MAX, INT16_MIN,
+                        0x1234, -1, 1, -0x4000};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b10110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqdmulhLane16(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  EXPECT_EQ(r[0], INT16_MAX);  // corner: (INT16_MIN)^2 saturates to INT16_MAX
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhVec8H) {
+  // .8H Q=1: per-halfword SQRDMULH.  Same corner (INT16_MIN)^2 → INT16_MAX.
+  // Round bias = 0x8000.
+  int16_t n_lanes[8] = {INT16_MIN, INT16_MAX, INT16_MIN, INT16_MAX,
+                        0, 1, -1, 0x4000};
+  int16_t m_lanes[8] = {INT16_MIN, INT16_MAX, INT16_MAX, INT16_MIN,
+                        0x1234, -1, 1, -0x4000};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b10110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqrdmulhLane16(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  EXPECT_EQ(r[0], INT16_MAX);  // corner: (INT16_MIN)^2 saturates to INT16_MAX
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhVec4S) {
+  // .4S Q=1: per-word SQDMULH.  Cover (INT32_MIN, INT32_MIN) corner,
+  // (INT32_MIN, INT32_MAX) (= -(2^32 - 2) doubled → -(2^33 - 4), >> 32 = -2),
+  // and mid-range mixed-sign pairs.
+  int32_t n_lanes[4] = {INT32_MIN, INT32_MIN, INT32_MAX, 0x40000000};
+  int32_t m_lanes[4] = {INT32_MIN, INT32_MAX, INT32_MAX, -0x40000000};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqdmulhLane32(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  EXPECT_EQ(r[0], INT32_MAX);  // corner: (INT32_MIN)^2 saturates to INT32_MAX
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhVec4S) {
+  // .4S Q=1: per-word SQRDMULH.  Same corner.  Round bias = 0x80000000.
+  int32_t n_lanes[4] = {INT32_MIN, INT32_MIN, INT32_MAX, 0x40000000};
+  int32_t m_lanes[4] = {INT32_MIN, INT32_MAX, INT32_MAX, -0x40000000};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqrdmulhLane32(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  EXPECT_EQ(r[0], INT32_MAX);  // corner: (INT32_MIN)^2 saturates to INT32_MAX
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqdmulhVec4HUpperZero) {
+  // .4H Q=0: low 4 halfword lanes via PMULHW + PMULLW combine path; upper
+  // 8 bytes zeroed by mask_low64.  Pre-fill Vd with sentinel 0xCC.
+  int16_t n_lanes[8] = {INT16_MIN, INT16_MAX, 100, -100,
+                        static_cast<int16_t>(0xAAAA), 0x5555, 0x1234,
+                        static_cast<int16_t>(0xDEAD)};
+  int16_t m_lanes[8] = {INT16_MIN, INT16_MAX, -50, 50,
+                        0x1111, 0x2222, 0x3333, 0x4444};
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b10110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqdmulhLane16(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  uint8_t r_bytes[16];
+  std::memcpy(r_bytes, &state_.cpu.v[0], 16);
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r_bytes[i], 0x00u) << "upper byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhVec2SUpperZero) {
+  // .2S Q=0: low 2 word lanes via PMULDQ path; upper 8 bytes zeroed.
+  int32_t n_lanes[4] = {INT32_MIN, 0x40000000, 0, 0};
+  int32_t m_lanes[4] = {INT32_MIN, -0x40000000, 0, 0};
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r[i], SqrdmulhLane32(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  uint8_t r_bytes[16];
+  std::memcpy(r_bytes, &state_.cpu.v[0], 16);
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r_bytes[i], 0x00u) << "upper byte " << i;
+  }
+}
+// endregion
+
 // region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
 //
 // Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",
