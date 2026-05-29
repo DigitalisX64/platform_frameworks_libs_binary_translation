@@ -7853,6 +7853,215 @@ TEST_F(Arm64LiteTranslateRegionTest, FacgeVec2D) {
 }
 // endregion
 
+// region digitalis: FCMxxZero vector two-reg-misc JIT (FP32 .2S/.4S, FP64 .2D).
+//
+// FCMxx Vd.<T>, Vn.<T>, #0.0 compares each lane of Vn against +0.0 and writes
+// an all-ones mask on TRUE / zero on FALSE.  All five forms are ordered:
+// NaN in Vn → result is FALSE.
+//
+// Encoding (per ARM ARM C7.2.86/.88/.90/.92/.94):
+//   FCMGT V.4S = 0x4EA0C800 | (rn<<5) | rd     (U=0, opcode=01100)
+//   FCMGT V.2S = 0x0EA0C800
+//   FCMGT V.2D = 0x4EE0C800
+//   FCMGE V.4S = 0x6EA0C800 | (rn<<5) | rd     (U=1, opcode=01100)
+//   FCMGE V.2D = 0x6EE0C800
+//   FCMEQ V.4S = 0x4EA0D800                     (U=0, opcode=01101)
+//   FCMEQ V.2S = 0x0EA0D800
+//   FCMEQ V.2D = 0x4EE0D800
+//   FCMLE V.4S = 0x6EA0D800                     (U=1, opcode=01101)
+//   FCMLE V.2D = 0x6EE0D800
+//   FCMLT V.4S = 0x4EA0E800                     (U=0, opcode=01110; U=1 unalloc)
+//   FCMLT V.2D = 0x4EE0E800
+constexpr uint32_t FcmgtZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtZeroVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgtZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmgeZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x6EE0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqZeroVec2S(uint8_t rd, uint8_t rn) {
+  return 0x0EA0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmeqZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmleZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x6EA0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmleZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x6EE0D800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmltZeroVec4S(uint8_t rd, uint8_t rn) {
+  return 0x4EA0E800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcmltZeroVec2D(uint8_t rd, uint8_t rn) {
+  return 0x4EE0E800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// FCMGT zero .4S: mixed positive/negative/zero/NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtZeroVec4SMixed) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 0.0f, std::nanf(""));
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+                            std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FcmgtZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 1.0 > 0 -> true
+  EXPECT_EQ(r[1], 0u);             // -2.0 > 0 -> false
+  EXPECT_EQ(r[2], 0u);             // 0.0 > 0 -> false (strict)
+  EXPECT_EQ(r[3], 0u);             // NaN > 0 -> false (ordered)
+}
+
+// FCMGT zero .2S: Q=0 upper-zero invariant.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtZeroVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 3.0f, -1.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+                            std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FcmgtZeroVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 3.0 > 0 -> true
+  EXPECT_EQ(r[1], 0u);             // -1.0 > 0 -> false
+  EXPECT_EQ(r[2], 0u);             // upper zeroed (Q=0)
+  EXPECT_EQ(r[3], 0u);
+}
+
+// FCMGT zero .2D: FP64; -0.0 > 0 -> false, +0.0 > 0 -> false, NaN -> false.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgtZeroVec2DSignedZero) {
+  StoreVec2D(state_.cpu, 1, -0.0, 2.5);
+  static const uint32_t code[] = {FcmgtZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0u);                          // -0 > 0 -> false
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);     // 2.5 > 0 -> true
+}
+
+// FCMGE zero .4S: includes the +0/-0 boundary (both >= 0).
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeZeroVec4SZeroBoundary) {
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, -1.0f, std::nanf(""));
+  static const uint32_t code[] = {FcmgeZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // +0 >= 0 -> true
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);   // -0 >= 0 -> true
+  EXPECT_EQ(r[2], 0u);             // -1 >= 0 -> false
+  EXPECT_EQ(r[3], 0u);             // NaN >= 0 -> false
+}
+
+// FCMGE zero .2D: FP64 boundary.
+TEST_F(Arm64LiteTranslateRegionTest, FcmgeZeroVec2DBoundary) {
+  StoreVec2D(state_.cpu, 1, 0.0, -2.0);
+  static const uint32_t code[] = {FcmgeZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);     // 0 >= 0 -> true
+  EXPECT_EQ(r[1], 0u);                          // -2 >= 0 -> false
+}
+
+// FCMEQ zero .4S: +0/-0 both equal 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqZeroVec4SPosNegZero) {
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, 1.0f, std::nanf(""));
+  static const uint32_t code[] = {FcmeqZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // +0 == 0 -> true
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);   // -0 == 0 -> true
+  EXPECT_EQ(r[2], 0u);             // 1 == 0 -> false
+  EXPECT_EQ(r[3], 0u);             // NaN == 0 -> false
+}
+
+// FCMEQ zero .2S: Q=0 upper-zero.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqZeroVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 0.0f, 1.0f, 99.0f, 99.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""),
+                            std::nanf(""), std::nanf(""));
+  static const uint32_t code[] = {FcmeqZeroVec2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 0 == 0 -> true
+  EXPECT_EQ(r[1], 0u);             // 1 == 0 -> false
+  EXPECT_EQ(r[2], 0u);             // Q=0 upper zeroed
+  EXPECT_EQ(r[3], 0u);
+}
+
+// FCMEQ zero .2D: FP64 with NaN per lane.
+TEST_F(Arm64LiteTranslateRegionTest, FcmeqZeroVec2DNaN) {
+  StoreVec2D(state_.cpu, 1, std::nan(""), 0.0);
+  static const uint32_t code[] = {FcmeqZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0u);                          // NaN == 0 -> false
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);     // 0 == 0 -> true
+}
+
+// FCMLE zero .4S: <= 0 boundary; +0 and -0 both satisfy.
+TEST_F(Arm64LiteTranslateRegionTest, FcmleZeroVec4SBoundary) {
+  StoreVec4S(state_.cpu, 1, 0.0f, -0.0f, 1.0f, -2.0f);
+  static const uint32_t code[] = {FcmleZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // 0 <= 0 -> true
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);   // -0 <= 0 -> true
+  EXPECT_EQ(r[2], 0u);             // 1 <= 0 -> false
+  EXPECT_EQ(r[3], 0xFFFFFFFFu);   // -2 <= 0 -> true
+}
+
+// FCMLE zero .2D: FP64 NaN -> false.
+TEST_F(Arm64LiteTranslateRegionTest, FcmleZeroVec2DNaN) {
+  StoreVec2D(state_.cpu, 1, std::nan(""), -3.0);
+  static const uint32_t code[] = {FcmleZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0u);                          // NaN <= 0 -> false
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);     // -3 <= 0 -> true
+}
+
+// FCMLT zero .4S: < 0 strict; +0 and -0 are NOT less than 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcmltZeroVec4SStrictZero) {
+  StoreVec4S(state_.cpu, 1, -1.0f, 0.0f, -0.0f, std::nanf(""));
+  static const uint32_t code[] = {FcmltZeroVec4S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);   // -1 < 0 -> true
+  EXPECT_EQ(r[1], 0u);             // +0 < 0 -> false (strict)
+  EXPECT_EQ(r[2], 0u);             // -0 < 0 -> false
+  EXPECT_EQ(r[3], 0u);             // NaN < 0 -> false
+}
+
+// FCMLT zero .2D: FP64 strict.
+TEST_F(Arm64LiteTranslateRegionTest, FcmltZeroVec2DStrict) {
+  StoreVec2D(state_.cpu, 1, -5.0, 0.0);
+  static const uint32_t code[] = {FcmltZeroVec2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);     // -5 < 0 -> true
+  EXPECT_EQ(r[1], 0u);                          // 0 < 0 -> false
+}
+// endregion
+
 // region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
 //   FMAX/FMIN  — IEEE: any NaN -> NaN result.

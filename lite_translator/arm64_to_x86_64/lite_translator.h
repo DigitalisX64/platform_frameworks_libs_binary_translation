@@ -13232,6 +13232,68 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+      // FCMxx Vd.<T>, Vn.<T>, #0.0 — per-lane FP compare against +0.0.
+      //   FCMGT: Vn >  0  -> Cmplt*p* xz, xn   (xz < Vn  == Vn > 0)
+      //   FCMGE: Vn >= 0  -> Cmple*p* xz, xn   (xz <= Vn == Vn >= 0)
+      //   FCMEQ: Vn == 0  -> Cmpeq*p* xn, xz
+      //   FCMLE: Vn <= 0  -> Cmple*p* xn, xz
+      //   FCMLT: Vn <  0  -> Cmplt*p* xn, xz
+      // SSE legacy Cmp{eq,lt,le}p{s,d} are ordered — they write 0 (FALSE) on
+      // any NaN operand, matching ARM FCMxx zero semantics.  Result lane is
+      // 0xFFFFFFFF (FP32) / 0xFFFF..FFFF (FP64) on TRUE, zero on FALSE.
+      // Decoder gates: bit23=1 required (size & 0b10), .2D (size=0b11) needs
+      // Q=1, .1D (size=0b11 Q=0) is ARM-reserved.  args.is_fp16 is always
+      // false for this encoding column — FP16 FCMxxZero lives in a different
+      // encoding slot (interpreter handles).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmeqZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmleZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmltZero: {
+        if (args.is_fp16) { success_ = false; return; }
+        // size encodes bit23:bit22. FP forms always have bit23=1 → size&0b10.
+        if ((args.size & 0b10) == 0) { Undefined(); return; }
+        const bool is_double = (args.size == 0b11);
+        if (is_double && !args.q) { Undefined(); return; }  // .1D reserved
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) {
+          Undefined(); return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        using Op = Decoder::AdvSimdTwoRegMiscOpcode;
+        switch (args.opcode) {
+          case Op::kFcmeqZero:
+            if (is_double) as_.Cmpeqpd(xn, xz);
+            else           as_.Cmpeqps(xn, xz);
+            break;
+          case Op::kFcmgtZero:
+            // Vn > 0  <=>  0 < Vn ; result lands in xz, move to xn.
+            if (is_double) as_.Cmpltpd(xz, xn);
+            else           as_.Cmpltps(xz, xn);
+            as_.Movdqa(xn, xz);
+            break;
+          case Op::kFcmgeZero:
+            // Vn >= 0  <=>  0 <= Vn
+            if (is_double) as_.Cmplepd(xz, xn);
+            else           as_.Cmpleps(xz, xn);
+            as_.Movdqa(xn, xz);
+            break;
+          case Op::kFcmltZero:
+            if (is_double) as_.Cmpltpd(xn, xz);
+            else           as_.Cmpltps(xn, xz);
+            break;
+          case Op::kFcmleZero:
+            if (is_double) as_.Cmplepd(xn, xz);
+            else           as_.Cmpleps(xn, xz);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
       // REV64 Vd.<T>, Vn.<T> — reverse element order within each 64-bit lane.
       // size=00: byte reverse (8B / 16B) — BSWAPQ on each 64-bit half.
       // size=01: halfword reverse (4H / 8H) — PSHUFLW + PSHUFHW imm=0x1B.
