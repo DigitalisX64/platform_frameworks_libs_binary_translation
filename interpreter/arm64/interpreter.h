@@ -6490,6 +6490,35 @@ class Interpreter {
         break;
       }
 
+      // region digitalis
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCls: {
+        // CLS: count leading sign bits per element (number of consecutive
+        // bits following the most-significant bit that equal the MSB; result
+        // range 0..esize*8-1).  Standard identity:
+        //   y = (x < 0) ? ~x : x
+        //   cls(x) = clz_N(y) - 1
+        // where clz_N treats y as an N-bit value (N = esize*8).
+        if (args.size == 0b11) { Undefined(); return; }
+        uint64_t emask = ElementMask(esize);
+        uint8_t bits = esize * 8;
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint64_t elem = 0;
+          memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
+          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          uint64_t y = static_cast<uint64_t>(signed_val < 0 ? ~signed_val : signed_val) & emask;
+          uint64_t cls;
+          if (y == 0) {
+            cls = bits - 1;
+          } else {
+            cls = __builtin_clzll(y) - (64 - bits) - 1;
+          }
+          cls &= emask;
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &cls, esize);
+        }
+        break;
+      }
+      // endregion
+
       case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
         // ABS: absolute value per signed element.
         uint64_t emask = ElementMask(esize);
@@ -7586,7 +7615,6 @@ class Interpreter {
       // endregion
 
       // Less critical ops: leave as undefined for now.
-      case Decoder::AdvSimdTwoRegMiscOpcode::kCls:
       default:
         Undefined();
         return;

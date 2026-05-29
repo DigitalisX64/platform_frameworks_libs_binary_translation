@@ -13956,6 +13956,85 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
+      // region digitalis
+      // CLS V.<T>, V.<T> -- per-lane count leading sign bits (number of
+      // consecutive bits below the MSB that equal the MSB; range 0..N-1).
+      //   size=00 .8B/.16B  -> 8-bit lane CLS (result 0..7)
+      //   size=01 .4H/.8H   -> 16-bit lane CLS (result 0..15)
+      //   size=10 .2S/.4S   -> 32-bit lane CLS (result 0..31)
+      //   size=11           -> reserved per ARM ARM.
+      // Identity used: y = (x < 0) ? ~x : x (per lane); then
+      //   CLS(x) = CLZ_N(y) - 1, where CLZ_N is N-bit count-leading-zeros.
+      // Per-lane y is built once via a vector XOR with the per-lane sign
+      // mask (PCMPGT{B,W,D}(0, xn) yields all-ones in negative lanes, 0
+      // elsewhere — exactly arithmetic-shift-right-by-(N-1) per lane),
+      // then scalarized through PEXTR{B,W,D} → BSR → XOR with (N-1) → SUB 1
+      // (the BSR+XOR pair gives CLZ_N; the trailing -1 gives CLS).  The
+      // y==0 branch substitutes (N-1) directly — that's CLS of an all-zero
+      // or all-one lane (e.g. 0x00 or 0xFF), where every bit after the MSB
+      // matches.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCls: {
+        if (args.size == 0b11) { success_ = false; return; }
+        const uint8_t lane_bits = static_cast<uint8_t>(8u << args.size);
+        const uint8_t bytes_per_lane = static_cast<uint8_t>(1u << args.size);
+        const int lanes_per_vec = (args.q ? 16 : 8) / bytes_per_lane;
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        SimdRegister xsign = AllocTempSimdReg();
+        if (xn == no_simd_register || xd == no_simd_register ||
+            xsign == no_simd_register) {
+          success_ = false; return;
+        }
+        Register r1 = AllocTempReg();
+        if (r1 == no_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xsign, xsign);
+        switch (args.size) {
+          case 0b00: as_.Pcmpgtb(xsign, xn); break;
+          case 0b01: as_.Pcmpgtw(xsign, xn); break;
+          case 0b10: as_.Pcmpgtd(xsign, xn); break;
+        }
+        // xsign now has the per-lane sign-extension mask (all-ones in
+        // negative lanes, zero elsewhere).  XOR collapses negative lanes to
+        // (~x) while leaving positive lanes untouched — that's the
+        // CLS-via-CLZ preprocess.
+        as_.Pxor(xn, xsign);
+        as_.Pxor(xd, xd);
+        for (int i = 0; i < lanes_per_vec; ++i) {
+          switch (args.size) {
+            case 0b00: as_.Pextrb(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pextrw(r1, xn, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pextrd(r1, xn, static_cast<int8_t>(i)); break;
+          }
+          auto* nonzero = as_.MakeLabel();
+          auto* done = as_.MakeLabel();
+          as_.Testl(r1, r1);
+          as_.Jcc(Condition::kNotZero, *nonzero);
+          // y == 0  =>  CLS = lane_bits - 1.  (All bits below MSB match.)
+          as_.Movl(r1, static_cast<int32_t>(lane_bits - 1));
+          as_.Jmp(*done);
+          as_.Bind(nonzero);
+          // CLZ_N(y) = (lane_bits - 1) XOR BSR(y).  CLS = CLZ_N(y) - 1.
+          as_.Bsrl(r1, r1);
+          // CLS = CLZ - 1 = (lane_bits - 1) XOR BSR  XOR'd with (lane_bits - 2).
+          // We collapse to a single XOR by noting that for a non-zero
+          // bsr_value in [0..lane_bits-1], CLZ = (lane_bits - 1) - bsr_value,
+          // hence CLS = (lane_bits - 2) - bsr_value.  But the host doesn't
+          // have a "XOR with constant minus 1" — keep it as XOR + DECL.
+          as_.Xorl(r1, static_cast<int8_t>(lane_bits - 1));
+          as_.Decl(r1);
+          as_.Bind(done);
+          switch (args.size) {
+            case 0b00: as_.Pinsrb(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b01: as_.Pinsrw(xd, r1, static_cast<int8_t>(i)); break;
+            case 0b10: as_.Pinsrd(xd, r1, static_cast<int8_t>(i)); break;
+          }
+        }
+        if (!args.q) mask_low64(xd);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+        return;
+      }
+      // endregion
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
       //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
       //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
