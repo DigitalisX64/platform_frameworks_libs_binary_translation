@@ -16874,14 +16874,16 @@ class LiteTranslator {
     const bool is_srshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar);
     // endregion
-    // region digitalis: UQRSHL scalar (D form only — the size=11 path).
-    // Unsigned saturating rounded variable shift; combines UQSHL D positive
-    // arm (shift-then-back-shift overflow detector + saturation to UINT64_MAX)
-    // with URSHL D negative arm (overflow-safe rounding identity, dedicated
-    // |sh|=64 bit-63 extraction branch).  Saturation and rounding apply in
-    // disjoint quadrants — positive shifts saturate but never round, negative
-    // shifts round but never saturate — so the two scaffoldings compose
-    // without interaction.
+    // region digitalis: UQRSHL scalar (all sizes — unsigned saturating
+    // rounded variable shift, lane width N = 8/16/32/64).  Combines UQSHL
+    // scalar positive arm (shift-then-mask-then-back-shift overflow detector
+    // + saturation to umax_N = (1 << N) - 1) with URSHL D negative arm
+    // (overflow-safe rounding identity, dedicated |sh|=N bit-(N-1) extraction
+    // branch).  Saturation and rounding apply in disjoint quadrants —
+    // positive shifts saturate but never round, negative shifts round but
+    // never saturate — so the two scaffoldings compose without interaction.
+    // The `_d` suffix is historical; the flag detects UQRSHL scalar at any
+    // size.
     const bool is_uqrshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqrshlScalar);
     // endregion
@@ -18054,30 +18056,36 @@ class LiteTranslator {
       return;
     }
     // endregion
-    // region digitalis: UQRSHL scalar D form (unsigned saturating rounded
-    // variable shift, 64-bit lane).  Combines UQSHL D positive arm with
-    // URSHL D negative arm — saturation only on the left-shift quadrant,
-    // rounding only on the right-shift quadrant, so the two scaffoldings
-    // compose without interaction:
-    //   * shift in [0, 63]    → shift-then-back-shift overflow detector;
-    //                            saturate to UINT64_MAX on overflow.
-    //   * shift >= 64         → UINT64_MAX if a != 0 else 0.
-    //   * shift in [-63, -1]  → (a >>u |sh|) + ((a >>u (|sh|-1)) & 1).
-    //   * shift == -64        → bit 63 of a (the round bit is the only
-    //                            surviving contribution; same as URSHL D
-    //                            since (a >>u 64) is the undefined-shift
-    //                            boundary on x86).
-    //   * shift <= -65        → 0 (rounding term dominates per ARM ARM).
+    // region digitalis: UQRSHL scalar (all sizes — unsigned saturating
+    // rounded variable shift, lane width N = 8/16/32/64).  Combines UQSHL
+    // scalar positive arm with URSHL D negative arm — saturation only on
+    // the left-shift quadrant, rounding only on the right-shift quadrant,
+    // so the two scaffoldings compose without interaction:
+    //   * shift in [0, N-1]   → shift-then-mask-then-back-shift overflow
+    //                            detector; saturate to umax_N on overflow.
+    //   * shift >= N          → umax_N if a != 0 else 0.
+    //   * shift in [-(N-1), -1]→ (a >>u |sh|) + ((a >>u (|sh|-1)) & 1).
+    //   * shift == -N         → bit (N-1) of a (the round bit is the only
+    //                            surviving contribution; the data shift
+    //                            by N would land outside the int_N lane
+    //                            and contributes 0).
+    //   * shift <= -(N+1)     → 0 (rounding term dominates per ARM ARM).
+    // `a` is zero-extended from Vn[N-1:0] at load time so bits above
+    // position N-1 are 0; the MaskToN step on the positive arm clears the
+    // candidate's bits above position N-1 so the back-shift detector
+    // compares against the int_N envelope and not the int64 envelope.
+    // For bits_local==64 the MaskToN, LoadUmax, and Shrq-by-(N-1)
+    // operations collapse to no-ops / the existing D-form constants.
     if (is_uqrshl_scalar_d) {
-      if (args.size != 0b11) { success_ = false; return; }
+      const int bits_local = 1 << (3 + args.size);
       int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
       int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
       int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
       Register a = AllocTempReg();
       Register sh = AllocTempReg();
       // `scratch` doubles as the back-shift holder on the positive arm
-      // (UQSHL D recipe) and the round_bit holder on the negative arm
-      // (URSHL D recipe) — these quadrants are disjoint.
+      // (UQSHL recipe) and the round_bit holder on the negative arm
+      // (URSHL recipe) — these quadrants are disjoint.
       Register scratch = AllocTempReg();
       if (a == Assembler::no_register || sh == Assembler::no_register ||
           scratch == Assembler::no_register) {
@@ -18086,52 +18094,90 @@ class LiteTranslator {
       // Save rcx (variable shift uses cl; rcx is in the allocator pool).
       as_.Subq(Assembler::rsp, 8);
       as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
-      // Load a from Vn[63:0]; sign-extend Vm[7:0] into sh (int64).
-      as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+      // Load a from Vn[bits_local-1:0] zero-extended to 64; sign-extend
+      // Vm[7:0] into sh (int64).  The width-specific load reads exactly
+      // the source lane width and zero-extends the upper bits.
+      switch (args.size) {
+        case 0b00:
+          as_.Movzxbq(a, {.base = Assembler::rbp, .disp = vn_off}); break;
+        case 0b01:
+          as_.Movzxwq(a, {.base = Assembler::rbp, .disp = vn_off}); break;
+        case 0b10:
+          // Movl on a 64-bit dst zero-extends to 64 bits.
+          as_.Movl   (a, {.base = Assembler::rbp, .disp = vn_off}); break;
+        case 0b11:
+          as_.Movq   (a, {.base = Assembler::rbp, .disp = vn_off}); break;
+      }
       as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Mask `r` to bits_local bits in-place.  No-op for bits_local==64.
+      auto MaskToN = [&](Register r) {
+        switch (bits_local) {
+          case 8:  as_.Andq(r, int32_t{0xFF}); break;
+          case 16: as_.Andq(r, int32_t{0xFFFF}); break;
+          case 32:
+            // Andq with int32_t{0xFFFFFFFF} = int32_t{-1} sign-extends to
+            // -1 in 64-bit, which clobbers nothing — wrong.  Use the
+            // 64-bit-truncation idiom Shlq 32 / Shrq 32 instead.
+            as_.Shlq(r, int8_t{32});
+            as_.Shrq(r, int8_t{32});
+            break;
+          case 64:
+            break;  // 64-bit GPR ops naturally truncate.
+        }
+      };
+      // Load umax_N = (1 << bits_local) - 1 into `r`.
+      auto LoadUmax = [&](Register r) {
+        if (bits_local == 64) {
+          as_.Movq(r, static_cast<int64_t>(-1));  // UINT64_MAX.
+        } else {
+          as_.Movq(r, static_cast<int64_t>((uint64_t{1} << bits_local) - 1));
+        }
+      };
 
       Assembler::Label* L_neg = as_.MakeLabel();
       Assembler::Label* L_pos_big = as_.MakeLabel();
-      Assembler::Label* L_rshift_eq_64 = as_.MakeLabel();
+      Assembler::Label* L_rshift_eq_N = as_.MakeLabel();
       Assembler::Label* L_zero = as_.MakeLabel();
       Assembler::Label* L_done = as_.MakeLabel();
 
       as_.Testq(sh, sh);
       as_.Jcc(Assembler::Condition::kSign, *L_neg);
 
-      // Positive shift in [0, 127]: sh >= 64 falls through to the
-      // a-vs-UINT64_MAX picker; otherwise the back-shift overflow check.
-      as_.Cmpq(sh, int32_t{64});
+      // Positive shift in [0, 127]: sh >= bits_local falls through to the
+      // a-vs-umax_N picker; otherwise the back-shift overflow check.
+      as_.Cmpq(sh, int32_t{bits_local});
       as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
 
-      // 0 <= sh < 64: shift-then-back-shift overflow check.  Reuse `sh` as
-      // the saved-original holder once cl is loaded.
+      // 0 <= sh < bits_local: shift-then-mask-then-back-shift overflow check.
       as_.Movq(Assembler::rcx, sh);
       as_.Movq(sh, a);                 // sh = original a (saved for cmp).
       as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+      MaskToN(a);
       as_.Movq(scratch, a);
-      as_.ShrqByCl(scratch);           // scratch = (a << shift) >> shift.
+      as_.ShrqByCl(scratch);           // scratch = ((a << sh) & umax_N) >>u sh.
       as_.Cmpq(scratch, sh);           // scratch == original a ?
       as_.Jcc(Assembler::Condition::kEqual, *L_done);
-      // Overflow: bits were lost above the qword; saturate to UINT64_MAX.
-      as_.Movq(a, static_cast<int64_t>(-1));
+      // Overflow: bits were lost above bit (bits_local-1); saturate to umax_N.
+      LoadUmax(a);
       as_.Jmp(*L_done);
 
       as_.Bind(L_pos_big);
-      // sh >= 64: if a == 0 result is 0, else UINT64_MAX.
+      // sh >= bits_local: if a == 0 result is 0, else umax_N.
       as_.Testq(a, a);
       as_.Jcc(Assembler::Condition::kZero, *L_zero);
-      as_.Movq(a, static_cast<int64_t>(-1));
+      LoadUmax(a);
       as_.Jmp(*L_done);
 
       as_.Bind(L_neg);
       // Negative shift: |sh| in [1, 128] after Negq.
       as_.Negq(sh);
-      as_.Cmpq(sh, int32_t{64});
+      as_.Cmpq(sh, int32_t{bits_local});
       as_.Jcc(Assembler::Condition::kGreater, *L_zero);
-      as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_64);
-      // 1 <= |sh| <= 63: overflow-safe rounding identity.
-      // round_bit = (a >>u (|sh|-1)) & 1.
+      as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_N);
+      // 1 <= |sh| < bits_local: overflow-safe rounding identity.
+      // round_bit = (a >>u (|sh|-1)) & 1.  `a` is zero-extended so ShrqByCl
+      // cannot pull garbage in from above bit (bits_local-1).
       as_.Movq(scratch, a);
       as_.Decq(sh);
       as_.Movq(Assembler::rcx, sh);
@@ -18143,9 +18189,12 @@ class LiteTranslator {
       as_.Addq(a, scratch);
       as_.Jmp(*L_done);
 
-      as_.Bind(L_rshift_eq_64);
-      // |sh| == 64: result = (a >>u 63) — just bit 63 (the round bit).
-      as_.Shrq(a, int8_t{63});
+      as_.Bind(L_rshift_eq_N);
+      // |sh| == bits_local: result = (a >>u (bits_local-1)) — just bit
+      // (bits_local-1), the round bit.  Bits above (bits_local-1) of `a`
+      // are guaranteed 0 by the zero-extended load, so this single Shrq
+      // extracts exactly one bit.
+      as_.Shrq(a, static_cast<int8_t>(bits_local - 1));
       as_.Jmp(*L_done);
 
       as_.Bind(L_zero);
@@ -18156,7 +18205,11 @@ class LiteTranslator {
       as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
       as_.Addq(Assembler::rsp, 8);
 
-      // Store result to Vd[63:0] and zero Vd[127:64].
+      // Store result to Vd: low qword holds the (zero-extended) result;
+      // Vd[127:64] is explicitly zeroed.  For bits_local<64 the high bits
+      // of `a` are guaranteed zero by the masking / zero-extended right-
+      // shift, so a full-width Movq into Vd[63:0] naturally puts the
+      // result in Vd[bits_local-1:0] and zero in Vd[63:bits_local].
       as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
