@@ -7892,11 +7892,11 @@ class LiteTranslator {
       //                          (a >>u (W-1)) & 1)
       //   sh <= -(W+1)        -> 0 (rounding term dominates per ARM ARM).
       // Scalar D form (kUrshlScalar) handled separately via
-      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11) and
-      // .2S/.4S (size=10); other widths (.8B/.16B/.4H/.8H) still bail to
+      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11), .2S/.4S
+      // (size=10), and .4H/.8H (size=01); .8B/.16B (size=00) still bails to
       // the interpreter.  .1D (Q=0, size=11) is ARM-reserved.
       case Decoder::AdvSimdThreeSameOpcode::kUrshl: {
-        if (args.size != 0b10 && args.size != 0b11) {
+        if (args.size != 0b01 && args.size != 0b10 && args.size != 0b11) {
           success_ = false; return;
         }
         if (args.size == 0b11 && !args.q) {
@@ -7971,7 +7971,7 @@ class LiteTranslator {
             // Store lane result to Vd.
             as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
           }
-        } else {
+        } else if (args.size == 0b10) {
           // .2S (Q=0) / .4S (Q=1): 2 or 4 lanes of 32-bit.  Movl zero-
           // extends the Vn lane into bits[63:32]; subsequent 32-bit
           // shift / Andl / Xorl chain leaves bits[63:32] of `a` clean,
@@ -8044,6 +8044,80 @@ class LiteTranslator {
             as_.Xorq(a, a);
             as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
           }
+        } else {
+          // .4H (Q=0) / .8H (Q=1): 4 or 8 lanes of 16-bit.  Movzxwl zero-
+          // extends the 16-bit Vn lane into bits[31:16] and the 64-bit
+          // register's upper 32, so subsequent 32-bit SHL/SHR/Andl/Xorl
+          // operations stay clean.  Width-16 thresholds replace width-32
+          // ones: positive sh >= 16 -> 0; |sh| > 16 -> 0; |sh| == 16 ->
+          // bit 15 of a (the round bit alone).  The overflow-safe
+          // rounding identity (a >>u rshift) + ((a >>u (rshift-1)) & 1)
+          // protects against the |a == UINT16_MAX, |sh| == 1| boundary
+          // (Movzxwl a = 0x0000FFFF; round_bit shift gives 1; data shift
+          // gives 0x7FFF; sum = 0x8000 — no wraparound at 16-bit width).
+          const int num_lanes = args.q ? 8 : 4;
+          for (int lane = 0; lane < num_lanes; ++lane) {
+            int32_t vn_lane = vn_off + lane * 2;
+            int32_t vm_lane = vm_off + lane * 2;
+            int32_t vd_lane = vd_off + lane * 2;
+
+            as_.Movzxwl(a, {.base = Assembler::rbp, .disp = vn_lane});
+            as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+            Assembler::Label* L_neg = as_.MakeLabel();
+            Assembler::Label* L_rshift_eq_16 = as_.MakeLabel();
+            Assembler::Label* L_zero = as_.MakeLabel();
+            Assembler::Label* L_done = as_.MakeLabel();
+
+            as_.Testq(sh, sh);
+            as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+            // Positive shift in [0, 127]: sh >= 16 -> 0; else a <<u sh.
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShllByCl(a);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_neg);
+            // Negative shift: |sh| in [1, 128] after Negq.
+            as_.Negq(sh);
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreater, *L_zero);
+            as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_16);
+            // 1 <= |sh| <= 15: round_bit = (a >>u (|sh|-1)) & 1;
+            //                  a = (a >>u |sh|) + round_bit.
+            as_.Movq(round_bit, a);
+            as_.Decq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrlByCl(round_bit);
+            as_.Andl(round_bit, int32_t{1});
+            as_.Incq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrlByCl(a);
+            as_.Addl(a, round_bit);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_rshift_eq_16);
+            // |sh| == 16: result = (a >>u 15) & 1 — just bit 15 (round
+            // bit alone).  Low 16 of a after Shrl 15 = 0 or 1.
+            as_.Shrl(a, int8_t{15});
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_zero);
+            as_.Xorl(a, a);
+
+            as_.Bind(L_done);
+
+            // 16-bit lane store from the low 16 of `a`.
+            as_.Movw({.base = Assembler::rbp, .disp = vd_lane}, a);
+          }
+
+          // For Q=0 (.4H), zero the upper 64 bits of Vd.
+          if (!args.q) {
+            as_.Xorq(a, a);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
+          }
         }
 
         // Restore rcx.
@@ -8066,11 +8140,11 @@ class LiteTranslator {
       //   sh in [-(W-1), -1]  -> (a >>s |sh|) + ((a >>u (|sh|-1)) & 1)
       //   sh <= -W            -> 0 (signed-bias sum >>s W = 0 per ARM ARM)
       // Scalar D form (kSrshlScalar) handled separately via
-      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11) and
-      // .2S/.4S (size=10); other widths (.8B/.16B/.4H/.8H) still bail to
+      // AdvSimdScalarThreeSame.  This case lowers .2D (size=11), .2S/.4S
+      // (size=10), and .4H/.8H (size=01); .8B/.16B (size=00) still bails to
       // the interpreter.  .1D (Q=0, size=11) is ARM-reserved.
       case Decoder::AdvSimdThreeSameOpcode::kSrshl: {
-        if (args.size != 0b10 && args.size != 0b11) {
+        if (args.size != 0b01 && args.size != 0b10 && args.size != 0b11) {
           success_ = false; return;
         }
         if (args.size == 0b11 && !args.q) {
@@ -8138,7 +8212,7 @@ class LiteTranslator {
             // Store lane result to Vd.
             as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
           }
-        } else {
+        } else if (args.size == 0b10) {
           // .2S (Q=0) / .4S (Q=1): 2 or 4 lanes of 32-bit.  Movl zero-
           // extends the Vn lane into bits[63:32]; subsequent 32-bit
           // SAR / SHR / Andl / Addl / Xorl chain leaves bits[63:32] of
@@ -8199,6 +8273,73 @@ class LiteTranslator {
           }
 
           // For Q=0 (.2S), zero the upper 64 bits of Vd.
+          if (!args.q) {
+            as_.Xorq(a, a);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
+          }
+        } else {
+          // .4H (Q=0) / .8H (Q=1): 4 or 8 lanes of 16-bit.  Movsxwl sign-
+          // extends the 16-bit Vn lane into bits[31:16] so the 32-bit
+          // SAR propagates the original sign bit correctly across the
+          // upper bits; the low 16 of the result is the correct H-lane
+          // value and the Movw store discards the upper bits.  Width-16
+          // thresholds replace width-32 ones: positive sh >= 16 -> 0;
+          // |sh| >= 16 -> 0 (single threshold — SRSHL collapses both
+          // |sh|=W and |sh|>W into the zero branch, unlike URSHL which
+          // has a dedicated |sh|=W bit-15-only branch).  Round-bit
+          // extract remains unsigned (Shrl) because it's a bit-presence
+          // check, not arithmetic.
+          const int num_lanes = args.q ? 8 : 4;
+          for (int lane = 0; lane < num_lanes; ++lane) {
+            int32_t vn_lane = vn_off + lane * 2;
+            int32_t vm_lane = vm_off + lane * 2;
+            int32_t vd_lane = vd_off + lane * 2;
+
+            as_.Movsxwl(a, {.base = Assembler::rbp, .disp = vn_lane});
+            as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+            Assembler::Label* L_neg = as_.MakeLabel();
+            Assembler::Label* L_zero = as_.MakeLabel();
+            Assembler::Label* L_done = as_.MakeLabel();
+
+            as_.Testq(sh, sh);
+            as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+            // Positive shift in [0, 127]: sh >= 16 -> 0; else a <<u sh.
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShllByCl(a);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_neg);
+            // Negative shift: |sh| in [1, 128] after Negq.  |sh|>=16 -> 0.
+            as_.Negq(sh);
+            as_.Cmpq(sh, int32_t{16});
+            as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+            // 1 <= |sh| <= 15: round_bit = (a >>u (|sh|-1)) & 1;
+            //                  a = (a >>s |sh|) + round_bit.
+            as_.Movq(round_bit, a);
+            as_.Decq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.ShrlByCl(round_bit);
+            as_.Andl(round_bit, int32_t{1});
+            as_.Incq(sh);
+            as_.Movq(Assembler::rcx, sh);
+            as_.SarlByCl(a);
+            as_.Addl(a, round_bit);
+            as_.Jmp(*L_done);
+
+            as_.Bind(L_zero);
+            as_.Xorl(a, a);
+
+            as_.Bind(L_done);
+
+            // 16-bit lane store from the low 16 of `a`.
+            as_.Movw({.base = Assembler::rbp, .disp = vd_lane}, a);
+          }
+
+          // For Q=0 (.4H), zero the upper 64 bits of Vd.
           if (!args.q) {
             as_.Xorq(a, a);
             as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a);
