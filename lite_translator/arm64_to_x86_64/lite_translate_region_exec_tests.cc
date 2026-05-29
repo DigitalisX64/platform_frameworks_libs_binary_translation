@@ -36509,6 +36509,830 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmEncodingMatchesLlvmMc) {
 }
 // endregion
 
+// region digitalis - AdvSimdShiftByImm SQSHL vector .2D (immh & 0b1000,
+// args.scalar=false, Q=1) two-lane GPR fallback.  Same SSE blocker as
+// scalar D — the vector pipeline needs PSRAQ (AVX-512F-VL only) for the
+// signed back-shift recovery step.  JIT emits the scalar GPR detector
+// twice, once per .2D lane, with both Vn lanes loaded up front for
+// Vd==Vn safety.
+//
+// Encoding (ARM ARM C7.2.243): 0 Q U 011110 immh immb 01110 1 Rn Rd
+//   Vector .2D shift #N (Q=1, U=0, N in [0, 63]):
+//     immh:immb = 64 + N
+//     SQSHL V0.2D, V1.2D, #11 — immh=1001, immb=011 → 0x4F4B7420.
+constexpr uint32_t kSqshlVecD_0   = 0x4F407420;  // sqshl v0.2d, v1.2d, #0
+constexpr uint32_t kSqshlVecD_1   = 0x4F417420;  // sqshl v0.2d, v1.2d, #1
+constexpr uint32_t kSqshlVecD_11  = 0x4F4B7420;  // sqshl v0.2d, v1.2d, #11
+constexpr uint32_t kSqshlVecD_62  = 0x4F7E7420;  // sqshl v0.2d, v1.2d, #62
+constexpr uint32_t kSqshlVecD_63  = 0x4F7F7420;  // sqshl v0.2d, v1.2d, #63
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShiftZeroPassThroughJit) {
+  // shift=0 must be a no-op for any input across both lanes; INT64_MIN
+  // and INT64_MAX pinned together to exercise both signs simultaneously.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShiftOneBothLanesNoSatJit) {
+  // Two positive small magnitudes shifted by 1; neither overflows.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x3000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x1234567890ABCDEFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x6000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x2468ACF121579BDEULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShiftOneBothLanesSaturateJit) {
+  // Lane 0: positive, saturates to INT64_MAX (sign(a)=0 path).
+  // Lane 1: negative, saturates to INT64_MIN (sign(a)<0 path).
+  // Confirms per-lane independence of the saturation target chooser.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x4000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xC000000000000000ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x8000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShiftOneMixedSatNoSatJit) {
+  // Lane 0: positive that fits (no saturation).
+  // Lane 1: positive that overflows after << 1 (saturates to INT64_MAX).
+  // Pins that lane 0 result is not clobbered by lane 1's intermediate
+  // state in the shared sat / candidate / back GPRs.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x4000000000000000ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x2000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShift63BothLanesSaturateJit) {
+  // Boundary shift=63.  Lane 0: a=+1 → candidate=INT64_MIN as signed,
+  // saturates to INT64_MAX.  Lane 1: a=-1 → candidate=INT64_MIN
+  // matches; no saturation (back-SAR -1 = a).
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x8000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShift62NegTwoNoSatBothJit) {
+  // a=-2, shift=62.  candidate=INT64_MIN; back-SAR by 62 = -2 = a, so
+  // no saturation.  Both lanes seeded with the same boundary value to
+  // confirm both lanes' detectors accept the candidate==INT64_MIN
+  // boundary independently.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFEULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFEULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_62};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x8000000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmShift11ArbValuesNoSatJit) {
+  // Both lanes have top-11-bits-zero values, so << 11 fits without
+  // saturation in either lane.  Pins arbitrary-bit no-overflow detector.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x0000123456789ABCULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x000000FEDCBA9876ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlVecD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0091A2B3C4D5E000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x0007F6E5D4C3B000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmInPlaceVdEqualsVnJit) {
+  // Vd == Vn (both v0).  Pins that the GPR path reads BOTH Vn lanes
+  // into a_lo / a_hi GPRs before writing either Vd lane — the upper
+  // 64-bit Movq read must observe the original Vn[127:64], not a
+  // partial Vd update from lane 0.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000FEDCBA987ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x00000000DEADBEEFULL})
+                     << 64);
+  static const uint32_t code[] = {0x4F4B7400U};  // sqshl v0.2d, v0.2d, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000FEDCBA987ULL} << 11);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x00000000DEADBEEFULL} << 11)
+      << "upper lane reads original Vn[127:64], not Vd[63:0] after lane-0 store";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqshlVecD_0, 0x4F407420u);
+  EXPECT_EQ(kSqshlVecD_1, 0x4F417420u);
+  EXPECT_EQ(kSqshlVecD_11, 0x4F4B7420u);
+  EXPECT_EQ(kSqshlVecD_62, 0x4F7E7420u);
+  EXPECT_EQ(kSqshlVecD_63, 0x4F7F7420u);
+}
+// endregion
+
+// region digitalis
+// AdvSimdShiftByImm — UQSHL .2D vector form (per-lane unsigned saturating
+// left-shift by immediate).  Already JIT-driven via the existing vector
+// pipeline at lite_translator.h ~line 20030 — esize=64 uses Psllq (SSE2) +
+// Psrlq (SSE2) for the back-shift recovery + Pcmpeqq (SSE4.1) for the
+// per-lane equality detector + Pcmpeqd-of-self-for-all-ones sat target.
+// All baseline SSE-x; no AVX-512 dependency (unlike SQSHL .2D which needs
+// PSRAQ for the signed back-shift).
+//
+// Encoding: `0 Q U=1 011110 immh immb 011101 Rn Rd`.  For .2D: Q=1,
+// immh=1xxx (immh bit 3 set, esize=64), shift_count = (immh:immb) - 64.
+constexpr uint32_t kUqshlVecD_0   = 0x6F407420;  // uqshl v0.2d, v1.2d, #0
+constexpr uint32_t kUqshlVecD_1   = 0x6F417420;  // uqshl v0.2d, v1.2d, #1
+constexpr uint32_t kUqshlVecD_11  = 0x6F4B7420;  // uqshl v0.2d, v1.2d, #11
+constexpr uint32_t kUqshlVecD_63  = 0x6F7F7420;  // uqshl v0.2d, v1.2d, #63
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kUqshlVecD_0, 0x6F407420u);
+  EXPECT_EQ(kUqshlVecD_1, 0x6F417420u);
+  EXPECT_EQ(kUqshlVecD_11, 0x6F4B7420u);
+  EXPECT_EQ(kUqshlVecD_63, 0x6F7F7420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShiftZeroPassThroughJit) {
+  // cnt==0 → Psllq(xs, 0) is identity; Psrlq(xm, 0) is identity; Pcmpeqq
+  // is all-ones → result = xn for both lanes.  Pins both lanes pass
+  // through untouched.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShiftOneBothLanesNoSatJit) {
+  // Two values with top bit 0; shift by 1 doesn't lose any high bit.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x3000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x1234567890ABCDEFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x6000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x2468ACF121579BDEULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShiftOneMixedSatNoSatJit) {
+  // Lane 0: top bit 0, no saturation.  Lane 1: top bit 1, shifts off →
+  // saturate to UINT64_MAX.  Pins per-lane independent saturation.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1000000000000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x8000000000000001ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x2000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmShift63MixedFitsSaturatesJit) {
+  // Lane 0: value=1, cnt=63 → 1<<63 = 0x8000000000000000 (fits unsigned).
+  // Lane 1: value=3, cnt=63 → 3<<63 overflows u64 → saturate to UINT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1}) |
+                    (static_cast<__uint128_t>(uint64_t{3}) << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUqshlVecD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmInPlaceVdEqualsVnJit) {
+  // Vd == Vn (both v0).  Vector pipeline reads via Movdqu before the
+  // store, so Vd==Vn is naturally safe — pins that invariant.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000FEDCBA987ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x00000000DEADBEEFULL})
+                     << 64);
+  static const uint32_t code[] = {0x6F4B7400U};  // uqshl v0.2d, v0.2d, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000FEDCBA987ULL} << 11);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x00000000DEADBEEFULL} << 11);
+}
+// endregion
+
+// region digitalis
+// AdvSimdShiftByImm — SQSHLU .2D vector form (per-lane signed-to-unsigned
+// saturating left-shift by immediate).  Already JIT-driven via the
+// existing vector pipeline at lite_translator.h ~line 20040 — esize=64
+// runs Pcmpgtq (SSE4.2) for the neg-detector + Pandn to pre-zero
+// negatives, then the same Psllq/Psrlq/Pcmpeqq UQSHL pipeline.  All
+// baseline SSE-x; no AVX-512 dependency.
+//
+// Encoding: `0 Q U=1 011110 immh immb 011001 Rn Rd`.  Same prefix as
+// UQSHL except bits[15:10] = 011001 (vs UQSHL's 011101).
+constexpr uint32_t kSqshluVecD_0   = 0x6F406420;  // sqshlu v0.2d, v1.2d, #0
+constexpr uint32_t kSqshluVecD_11  = 0x6F4B6420;  // sqshlu v0.2d, v1.2d, #11
+constexpr uint32_t kSqshluVecD_63  = 0x6F7F6420;  // sqshlu v0.2d, v1.2d, #63
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqshluVecD_0, 0x6F406420u);
+  EXPECT_EQ(kSqshluVecD_11, 0x6F4B6420u);
+  EXPECT_EQ(kSqshluVecD_63, 0x6F7F6420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShiftZeroNegPreZeroJit) {
+  // cnt==0 → Psllq identity.  Lane 0 positive passes through; lane 1
+  // negative (top bit set) is pre-zeroed by Pcmpgtq + Pandn before the
+  // shift, then passes through as 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1234567890ABCDEFULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x8000000000000001ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x1234567890ABCDEFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
+      << "negative lane pre-zeroed by Pcmpgtq+Pandn even at cnt=0";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShift11PosNoSatNegZeroJit) {
+  // Lane 0: positive that fits after << 11.  Lane 1: negative → 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x0000123456789ABCULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0091A2B3C4D5E000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShift11PosSaturatesNegZeroJit) {
+  // Lane 0: positive with top 11 bits non-zero → overflow → saturate
+  // to UINT64_MAX.  Lane 1: negative → 0.  Pins that the per-lane
+  // saturate target (UINT64_MAX from Pcmpeqd-of-self) is not clobbered
+  // by lane 1's neg-zero path.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x7EDCBA9876543210ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmShift63PosOneFitsNegZeroJit) {
+  // Lane 0: value=1 (positive), cnt=63 → 1<<63 = 0x8000000000000000.
+  // As unsigned, 0x8000000000000000 fits (UINT64_MAX is much larger).
+  // The detector: Psllq(1,63)=0x8000000000000000; Psrlq(...,63)=1;
+  // Pcmpeqq(1, xn==1) → eq → no saturation.
+  // Lane 1: value=-1 (negative) → pre-zeroed → 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1}) |
+                    (static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL})
+                     << 64);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshluVecD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmInPlaceVdEqualsVnJit) {
+  // Vd == Vn (both v0).  Vector pipeline reads Vn via Movdqu into xn
+  // before any Vd store, so Vd==Vn is naturally safe.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000FEDCBA987ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x80000000DEADBEEFULL})
+                     << 64);
+  static const uint32_t code[] = {0x6F4B6400U};  // sqshlu v0.2d, v0.2d, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000FEDCBA987ULL} << 11);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
+      << "negative lane pre-zeroed; Vd==Vn safe";
+}
+// endregion
+
+// region digitalis
+// AdvSimdShiftByImm — SQSHRN scalar D-source: signed-saturating narrow
+// shift, src lane is 64 bits, dst is signed 32-bit S.  ARM ARM
+// C7.2.236.  Encoding: `01 U=0 011111 immh immb 100101 Rn Rd` with
+// immh = 01xx (src=D, dst=S), narrow_rshift = 64 - immh:immb, range
+// [1, 32].  The SIMD pipeline at `lite_translator.h:20243` bails for
+// src=64 because the per-lane signed right shift needs PSRAQ (AVX-
+// 512F-VL only).  This cycle adds a single-lane GPR fallback that
+// loads Vn[63:0] into a 64-bit GPR, runs Sarq + branchless Cmovq
+// clamps to [INT32_MIN, INT32_MAX], zeros Vd via Pxor+Movdqu, and
+// overlays the saturated int32 in Vd[31:0] with Movl.
+constexpr uint32_t kSqshrnScalarSD_1   = 0x5F3F9420;  // sqshrn s0, d1, #1
+constexpr uint32_t kSqshrnScalarSD_11  = 0x5F359420;  // sqshrn s0, d1, #11
+constexpr uint32_t kSqshrnScalarSD_16  = 0x5F309420;  // sqshrn s0, d1, #16
+constexpr uint32_t kSqshrnScalarSD_32  = 0x5F209420;  // sqshrn s0, d1, #32
+constexpr uint32_t kSqshrnScalarSD_VdEqVn_11 = 0x5F359400;  // sqshrn s0, d0, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqshrnScalarSD_1, 0x5F3F9420u);
+  EXPECT_EQ(kSqshrnScalarSD_11, 0x5F359420u);
+  EXPECT_EQ(kSqshrnScalarSD_16, 0x5F309420u);
+  EXPECT_EQ(kSqshrnScalarSD_32, 0x5F209420u);
+  EXPECT_EQ(kSqshrnScalarSD_VdEqVn_11, 0x5F359400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift32MaxInt64FitsJit) {
+  // shift=32 boundary: any int64 input arithmetic-right-shifted by 32
+  // lands in [INT32_MIN, INT32_MAX]; the Cmovq clamps are no-ops here.
+  // INT64_MAX >> 32 = 0x7FFFFFFF = INT32_MAX.
+  uint64_t in[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL}, uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x1111111111111111ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x2222222222222222ULL})
+                     << 64);
+  static const uint32_t code[] = {kSqshrnScalarSD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000007FFFFFFFULL})
+      << "Vd[31:0] = INT32_MAX (fits at boundary); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
+      << "Vd[127:64] = 0 per scalar S semantics";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift32MinInt64FitsJit) {
+  // INT64_MIN >> 32 (arith) = 0xFFFFFFFF80000000 (signed) = INT32_MIN.
+  // No saturation at shift=32 boundary.
+  uint64_t in[2] = {uint64_t{0x8000000000000000ULL}, uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrnScalarSD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000080000000ULL})
+      << "Vd[31:0] = INT32_MIN, Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift1NoSaturateJit) {
+  // Vn[63:0] = 0x000000001FFFFFFE → Sarq 1 = 0x000000000FFFFFFF, fits
+  // in int32, no clamp.  Upper-lane Vn[127:64] garbage must not leak.
+  uint64_t in[2] = {uint64_t{0x000000001FFFFFFEULL}, uint64_t{0xCAFEBABE12345678ULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xBBBBBBBBBBBBBBBBULL})
+                     << 64);
+  static const uint32_t code[] = {kSqshrnScalarSD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000000FFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift11PositiveSaturatesJit) {
+  // Vn[63:0] = 0x0000FFFFFFFFFFFF → Sarq 11 = 0x000000001FFFFFFFFF (oh
+  // wait that's 33 bits); actual value:
+  //   0x0000FFFFFFFFFFFF >>arith 11 = 0x0000001FFFFFFFFF (37 bits),
+  //   exceeds INT32_MAX → clamp to INT32_MAX = 0x7FFFFFFF.
+  uint64_t in[2] = {uint64_t{0x0000FFFFFFFFFFFFULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrnScalarSD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000007FFFFFFFULL})
+      << "Vd[31:0] = INT32_MAX (positive saturation), Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift11NegativeSaturatesJit) {
+  // Vn[63:0] = 0xFFFF000000000000 = -0x1000000000000 (large negative).
+  // Sarq 11 = 0xFFFFFFE000000000 (signed), well below INT32_MIN
+  // → clamp to INT32_MIN = 0x80000000.
+  uint64_t in[2] = {uint64_t{0xFFFF000000000000ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrnScalarSD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000080000000ULL})
+      << "Vd[31:0] = INT32_MIN (negative saturation), Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift16FitsInt32Jit) {
+  // Vn[63:0] = 0x0000000000FFFF00 → Sarq 16 = 0x00000000000000FF (255).
+  // Positive, far below INT32_MAX, no clamp.
+  uint64_t in[2] = {uint64_t{0x0000000000FFFF00ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrnScalarSD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x00000000000000FFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDShift16NegSmallFitsJit) {
+  // Vn[63:0] = 0xFFFFFFFFFFFF0001 = -65535 (signed).  Sarq 16 = -1 =
+  // 0xFFFFFFFFFFFFFFFF (signed) → low 32 = 0xFFFFFFFF, value -1 fits
+  // int32 → no clamp.
+  uint64_t in[2] = {uint64_t{0xFFFFFFFFFFFF0001ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrnScalarSD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x00000000FFFFFFFFULL})
+      << "Vd[31:0] = -1 (signed); Vd[63:32] = 0 (the upper 32 bits of "
+         "the int64 GPR are sign-extension bits which Movl drops)";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDVdEqVnJit) {
+  // Vd == Vn (both v0).  GPR-fallback reads Vn into a temp GPR before
+  // the Pxor zero-broadcast Movdqu, so Vd==Vn is safe.
+  // Vn[63:0] = 0x80000000DEADBEEF (large negative).  Sarq 11 =
+  // 0xFFF00000001BD5B7 (signed), well below INT32_MIN → clamp.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x80000000DEADBEEFULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSqshrnScalarSD_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000080000000ULL})
+      << "Vd[31:0] = INT32_MIN; Vd==Vn safe (Vn read before Vd store)";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
+// region digitalis: SQSHRUN scalar D-source GPR fallback.
+// AdvSimdShiftByImm — SQSHRUN scalar D-source: signed-saturating-
+// unsigned narrow shift, src lane is 64 bits, dst is unsigned 32-bit S.
+// ARM ARM C7.2.238.  Encoding: `01 U=1 011111 immh immb 100001 Rn Rd`
+// with immh = 01xx (src=D, dst=S), narrow_rshift = 64 - immh:immb,
+// range [1, 32].  The SIMD pipeline at `lite_translator.h:20243` bails
+// for src=64 because the per-lane signed right shift needs PSRAQ (AVX-
+// 512F-VL only).  Sibling-promote from SQSHRN scalar D-source: same
+// single-lane GPR fallback, but clamp the Sarq result to [0,
+// UINT32_MAX] instead of [INT32_MIN, INT32_MAX].
+constexpr uint32_t kSqshrunScalarSD_1   = 0x7F3F8420;  // sqshrun s0, d1, #1
+constexpr uint32_t kSqshrunScalarSD_11  = 0x7F358420;  // sqshrun s0, d1, #11
+constexpr uint32_t kSqshrunScalarSD_16  = 0x7F308420;  // sqshrun s0, d1, #16
+constexpr uint32_t kSqshrunScalarSD_32  = 0x7F208420;  // sqshrun s0, d1, #32
+constexpr uint32_t kSqshrunScalarSD_VdEqVn_11 = 0x7F358400;  // sqshrun s0, d0, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqshrunScalarSD_1, 0x7F3F8420u);
+  EXPECT_EQ(kSqshrunScalarSD_11, 0x7F358420u);
+  EXPECT_EQ(kSqshrunScalarSD_16, 0x7F308420u);
+  EXPECT_EQ(kSqshrunScalarSD_32, 0x7F208420u);
+  EXPECT_EQ(kSqshrunScalarSD_VdEqVn_11, 0x7F358400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift32MaxInt64FitsJit) {
+  // shift=32 boundary: INT64_MAX >> 32 = 0x7FFFFFFF (positive, fits in
+  // [0, UINT32_MAX]; below UINT32_MAX so the Cmovq.g upper clamp is a
+  // no-op, and 0x7FFFFFFF >= 0 so the Cmovq.l lower clamp is a no-op).
+  uint64_t in[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL}, uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x1111111111111111ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x2222222222222222ULL})
+                     << 64);
+  static const uint32_t code[] = {kSqshrunScalarSD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000007FFFFFFFULL})
+      << "Vd[31:0] = 0x7FFFFFFF (fits); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
+      << "Vd[127:64] = 0 per scalar S semantics";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift32MinInt64ClampsZeroJit) {
+  // INT64_MIN >> 32 (arith) = 0xFFFFFFFF80000000 (signed = -2^31);
+  // signed-less-than 0 → clamps to 0 (NOT to INT32_MIN — this is the
+  // SQSHRN→SQSHRUN delta).
+  uint64_t in[2] = {uint64_t{0x8000000000000000ULL}, uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrunScalarSD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0ULL)
+      << "Vd[31:0] = 0 (negative input clamps to 0); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift1NoSaturateJit) {
+  // Vn[63:0] = 0x000000001FFFFFFE → Sarq 1 = 0x000000000FFFFFFF (~268M),
+  // positive and well below UINT32_MAX, no clamp.  Upper-lane Vn[127:64]
+  // garbage must not leak.
+  uint64_t in[2] = {uint64_t{0x000000001FFFFFFEULL}, uint64_t{0xCAFEBABE12345678ULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xBBBBBBBBBBBBBBBBULL})
+                     << 64);
+  static const uint32_t code[] = {kSqshrunScalarSD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000000FFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift11PositiveSaturatesJit) {
+  // Vn[63:0] = 0x0000FFFFFFFFFFFF (= 281474976710655) >> 11 (arith) =
+  // 0x0000001FFFFFFFFF (= 137438953471, 37-bit value), exceeds
+  // UINT32_MAX (0xFFFFFFFF = 4294967295) → clamp to UINT32_MAX.
+  uint64_t in[2] = {uint64_t{0x0000FFFFFFFFFFFFULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrunScalarSD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x00000000FFFFFFFFULL})
+      << "Vd[31:0] = UINT32_MAX (positive overflow); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift11NegativeClampsZeroJit) {
+  // Vn[63:0] = 0xFFFF000000000000 (= -0x1000000000000 signed).  Sarq 11
+  // (arith) = 0xFFFFFFE000000000 (signed, still negative); signed
+  // less-than-0 → clamp to 0 (SQSHRUN delta vs SQSHRN's INT32_MIN clamp).
+  uint64_t in[2] = {uint64_t{0xFFFF000000000000ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrunScalarSD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0ULL)
+      << "Vd[31:0] = 0 (negative clamps to 0); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift16FitsInt32Jit) {
+  // Vn[63:0] = 0x0000000000FFFF00 → Sarq 16 = 0x00000000000000FF (255).
+  // Positive, far below UINT32_MAX, no clamp.
+  uint64_t in[2] = {uint64_t{0x0000000000FFFF00ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrunScalarSD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x00000000000000FFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDShift16NegSmallClampsZeroJit) {
+  // Vn[63:0] = 0xFFFFFFFFFFFF0001 = -65535 (signed).  Sarq 16 = -1
+  // (signed) → negative → clamp to 0 for the unsigned destination.
+  // The SQSHRN sibling test pinned -1 as 0xFFFFFFFF (signed fits);
+  // SQSHRUN diverges here because the destination is unsigned.
+  uint64_t in[2] = {uint64_t{0xFFFFFFFFFFFF0001ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqshrunScalarSD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0ULL)
+      << "Vd[31:0] = 0 (negative clamps to 0 for unsigned dst); "
+         "Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDVdEqVnJit) {
+  // Vd == Vn (both v0).  Vn[63:0] = 0x80000000DEADBEEF (large negative
+  // signed).  Sarq 11 (arith) yields a signed-negative value, clamps
+  // to 0.  GPR-fallback reads Vn into a temp GPR before the Pxor zero-
+  // broadcast Movdqu, so Vd==Vn is safe.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x80000000DEADBEEFULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSqshrunScalarSD_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0ULL)
+      << "Vd[31:0] = 0 (negative clamps to 0); Vd==Vn safe";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
+// region digitalis: SQRSHRN scalar D-source GPR fallback.
+// AdvSimdShiftByImm — SQRSHRN scalar D-source: signed-saturating-
+// rounding narrow shift, src lane is 64 bits, dst is signed 32-bit S.
+// ARM ARM C7.2.226.  Encoding: `01 U=0 011111 immh immb 100011 Rn Rd`
+// with immh = 01xx (src=D, dst=S), narrow_rshift = 64 - immh:immb,
+// range [1, 32].  Sibling-promote of SQSHRN scalar D-source: same
+// single-lane GPR fallback with a pre-Sarq saturating-signed add of
+// `(1 << (shift-1))`.  The round constant is always positive, so only
+// positive overflow is possible (a near INT64_MAX); negative-direction
+// underflow can never happen with a positive addend.  Cmovq.o vs
+// INT64_MAX after the Addq drives saturated lanes to INT64_MAX, and
+// the post-Sarq clamp to [INT32_MIN, INT32_MAX] settles them at
+// exactly INT32_MAX (at cnt==32: INT64_MAX >> 32 = INT32_MAX directly;
+// at smaller cnts: > INT32_MAX, then clamps to INT32_MAX).
+constexpr uint32_t kSqrshrnScalarSD_1   = 0x5F3F9C20;  // sqrshrn s0, d1, #1
+constexpr uint32_t kSqrshrnScalarSD_11  = 0x5F359C20;  // sqrshrn s0, d1, #11
+constexpr uint32_t kSqrshrnScalarSD_16  = 0x5F309C20;  // sqrshrn s0, d1, #16
+constexpr uint32_t kSqrshrnScalarSD_32  = 0x5F209C20;  // sqrshrn s0, d1, #32
+constexpr uint32_t kSqrshrnScalarSD_VdEqVn_11 = 0x5F359C00;  // sqrshrn s0, d0, #11
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqrshrnScalarSD_1, 0x5F3F9C20u);
+  EXPECT_EQ(kSqrshrnScalarSD_11, 0x5F359C20u);
+  EXPECT_EQ(kSqrshrnScalarSD_16, 0x5F309C20u);
+  EXPECT_EQ(kSqrshrnScalarSD_32, 0x5F209C20u);
+  EXPECT_EQ(kSqrshrnScalarSD_VdEqVn_11, 0x5F359C00u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift1NoSaturateJit) {
+  // Vn[63:0] = 0x000000001FFFFFFE.  round = 1<<0 = 1, sum =
+  // 0x000000001FFFFFFF (no signed overflow).  Sarq 1 = 0x0FFFFFFF
+  // (~268M), positive and well below INT32_MAX, no clamp.
+  uint64_t in[2] = {uint64_t{0x000000001FFFFFFEULL}, uint64_t{0xCAFEBABE12345678ULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xBBBBBBBBBBBBBBBBULL})
+                     << 64);
+  static const uint32_t code[] = {kSqrshrnScalarSD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000000FFFFFFFULL})
+      << "Vd[31:0] = (0x1FFFFFFE + 1) >> 1 = 0x0FFFFFFF; Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift1RoundsHalfUpJit) {
+  // Vn[63:0] = 0x0000000000000003 (= 3).  round = 1, sum = 4.  Sarq 1
+  // = 2.  Pins the rounding behaviour: 3>>1 truncates to 1, but
+  // SQRSHRN rounds half-up to 2.
+  uint64_t in[2] = {uint64_t{0x0000000000000003ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000000000002ULL})
+      << "round-half-up: (3 + 1) >> 1 = 2 (truncated 3>>1 would be 1)";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift32MaxInt64OFSaturatesJit) {
+  // Vn[63:0] = INT64_MAX = 0x7FFFFFFFFFFFFFFF.  round = 1<<31 =
+  // 0x80000000.  sum = a + round overflows int64 positively (OF set).
+  // Cmovq.o clamps the sum to INT64_MAX.  Sarq INT64_MAX, 32 =
+  // 0x000000007FFFFFFF = INT32_MAX — exactly at the upper clamp,
+  // upper Cmovq.g a no-op.  This pins the OF-saturation path.
+  uint64_t in[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL}, uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000007FFFFFFFULL})
+      << "Vd[31:0] = INT32_MAX (OF-saturated then Sarq 32 lands on the "
+         "upper boundary); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift32MinInt64FitsJit) {
+  // Vn[63:0] = INT64_MIN = 0x8000000000000000.  round = 1<<31
+  // (positive).  sum = INT64_MIN + 0x80000000 = 0x8000000080000000
+  // (still very negative, no signed overflow, OF = 0).  Sarq 32 =
+  // 0xFFFFFFFF80000000 (signed = -2^31), below INT32_MIN's int64
+  // representation -2^31? Actually INT32_MIN as int64 is also
+  // 0xFFFFFFFF80000000 — equal, so signed Cmpq is NOT less-than, lower
+  // clamp is a no-op.  Result: 0x80000000 = INT32_MIN (= -2^31).
+  uint64_t in[2] = {uint64_t{0x8000000000000000ULL}, uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000080000000ULL})
+      << "Vd[31:0] = INT32_MIN (already at lower boundary, no clamp); "
+         "Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift11PositiveSaturatesJit) {
+  // Vn[63:0] = 0x0000FFFFFFFFFFFF (positive, 281474976710655).  round =
+  // 1<<10 = 1024, sum = 0x0001000000000FFF.  Sarq 11 = 0x0000002000001FFE
+  // (signed-positive, ~137G), exceeds INT32_MAX → upper clamp fires
+  // to INT32_MAX.
+  uint64_t in[2] = {uint64_t{0x0000FFFFFFFFFFFFULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000007FFFFFFFULL})
+      << "Vd[31:0] = INT32_MAX (positive overflow); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift11NegativeSaturatesJit) {
+  // Vn[63:0] = 0xFFFF000000000000 (signed = -281474976710656).  round =
+  // 1<<10 = 1024 (positive), sum = 0xFFFF000000000400 (still very
+  // negative, no OF).  Sarq 11 = signed-very-negative, well below
+  // INT32_MIN → lower clamp fires to INT32_MIN.
+  uint64_t in[2] = {uint64_t{0xFFFF000000000000ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000080000000ULL})
+      << "Vd[31:0] = INT32_MIN (negative overflow); Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift16FitsInt32Jit) {
+  // Vn[63:0] = 0x0000000000FFFF00.  round = 1<<15 = 0x8000, sum =
+  // 0x0000000001007F00 — wait, 0x00FFFF00 + 0x8000 = 0x01007F00.
+  // Sarq 16 = 0x100 (= 256), positive and far below INT32_MAX, no
+  // clamp.  Pins a non-rounding-boundary positive case.
+  uint64_t in[2] = {uint64_t{0x0000000000FFFF00ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000000000100ULL})
+      << "Vd[31:0] = (0x00FFFF00 + 0x8000) >> 16 = 0x100; Vd[63:32] = 0";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDShift16NegSmallFitsJit) {
+  // Vn[63:0] = 0xFFFFFFFFFFFF0001 (= -65535 signed).  round = 0x8000,
+  // sum = 0xFFFFFFFFFFFF8001 (= -32767 signed).  Sarq 16 (arith) =
+  // 0xFFFFFFFFFFFFFFFF (= -1 signed), in [INT32_MIN, INT32_MAX], no
+  // clamp.  Movl drops upper 32 sign-extension bits — Vd[31:0] =
+  // 0xFFFFFFFF (-1 as signed int32).
+  uint64_t in[2] = {uint64_t{0xFFFFFFFFFFFF0001ULL}, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSqrshrnScalarSD_16};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x00000000FFFFFFFFULL})
+      << "Vd[31:0] = -1 (signed fits in int32); Vd[63:32] = 0 (Movl "
+         "drops sign-extension upper)";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDVdEqVnJit) {
+  // Vd == Vn (both v0).  Vn[63:0] = 0x80000000DEADBEEF (large
+  // negative).  round = 1<<10 = 1024 (positive), sum still very
+  // negative, no OF.  Sarq 11 (arith) yields very-negative — well
+  // below INT32_MIN → clamps to INT32_MIN.  GPR-fallback reads Vn
+  // into temp GPR before Pxor zero-broadcast, so Vd==Vn is safe.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x80000000DEADBEEFULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSqrshrnScalarSD_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000080000000ULL})
+      << "Vd[31:0] = INT32_MIN (negative saturates); Vd==Vn safe";
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -

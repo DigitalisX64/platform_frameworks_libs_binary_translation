@@ -19236,8 +19236,9 @@ class LiteTranslator {
           // Shlq + Sarq + Cmpq overflow detector inside the case body
           // — the SSE vector path's PSRAQ signed-recover step is
           // AVX-512F-VL only, but the single-lane GPR fallback uses
-          // baseline 64-bit GPR ops.  Vector .2D still bails to
-          // the interpreter.
+          // baseline 64-bit GPR ops.  Vector .2D (args.scalar=false,
+          // immh=1xxx) routes through the same GPR detector applied
+          // twice (once per .2D lane) inside the case body.
           break;
         case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
         case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
@@ -19925,14 +19926,89 @@ class LiteTranslator {
                    int32_t{0});
           return;
         }
-        // Vector .2D SQSHL (Q=1, immh & 0b1000) still needs PSRAQ for the
-        // signed back-shift recovery step (AVX-512F-VL only), so it bails
-        // to the interpreter.  The 64-bit lane ops used by the still-
-        // covered UQSHL .D / SQSHLU .D / SQSHL .D vector paths are all
-        // SSE4.x: PSLLQ/PSRLQ (SSE2), PCMPEQQ (SSE4.1), PCMPGTQ (SSE4.2).
-        if (is_dword &&
+        // Vector .2D SQSHL (args.scalar=false, immh & 0b1000) cannot use
+        // the SSE vector pipeline below — its signed back-shift recovery
+        // step needs PSRAQ (AVX-512F-VL only on x86).  Emit a two-lane
+        // GPR fallback that mirrors the scalar D detector twice, once per
+        // .2D lane.
+        //
+        // Vd==Vn safety: read both Vn[63:0] and Vn[127:64] into GPRs up
+        // front, before writing either Vd lane.
+        //
+        // The unallocated args.q=false / immh=1xxx encoding ("vector .1D"
+        // — reserved per ARM ARM C7.2.243) is handled by mirroring the
+        // existing vector pipeline's `if (!args.q)` upper-zero behavior:
+        // produce lane 0 via the GPR detector and zero Vd[127:64].
+        if (is_dword && !args.scalar &&
             args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) {
-          success_ = false; return;
+          const uint16_t immh_immb =
+              static_cast<uint16_t>((immh << 3) | args.immb);
+          const uint8_t shift_count = static_cast<uint8_t>(immh_immb - 64);
+          const int8_t cnt = static_cast<int8_t>(shift_count);
+          Register a_lo = AllocTempReg();
+          Register a_hi = AllocTempReg();
+          Register candidate = AllocTempReg();
+          Register back = AllocTempReg();
+          Register sat = AllocTempReg();
+          if (a_lo == Assembler::no_register ||
+              a_hi == Assembler::no_register ||
+              candidate == Assembler::no_register ||
+              back == Assembler::no_register ||
+              sat == Assembler::no_register) {
+            success_ = false; return;
+          }
+          // Read both Vn lanes before writing either Vd lane.
+          as_.Movq(a_lo, {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Movq(a_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          if (cnt == 0) {
+            // No shift, no possible overflow; emit pass-through.
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a_lo);
+            if (args.q) {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, a_hi);
+            } else {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                       int32_t{0});
+            }
+            return;
+          }
+          // Lane 0: GPR-fallback signed-overflow detector.
+          as_.Movq(sat, a_lo);
+          as_.Sarq(sat, int8_t{63});
+          as_.Movq(back, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(sat, back);
+          as_.Movq(candidate, a_lo);
+          as_.Shlq(candidate, cnt);
+          as_.Movq(back, candidate);
+          as_.Sarq(back, cnt);
+          Assembler::Label* L_lo_overflow = as_.MakeLabel();
+          as_.Cmpq(back, a_lo);
+          as_.Jcc(Assembler::Condition::kNotEqual, *L_lo_overflow);
+          as_.Movq(sat, candidate);
+          as_.Bind(L_lo_overflow);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, sat);
+          if (!args.q) {
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     int32_t{0});
+            return;
+          }
+          // Lane 1: reuse sat / candidate / back GPRs.
+          as_.Movq(sat, a_hi);
+          as_.Sarq(sat, int8_t{63});
+          as_.Movq(back, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(sat, back);
+          as_.Movq(candidate, a_hi);
+          as_.Shlq(candidate, cnt);
+          as_.Movq(back, candidate);
+          as_.Sarq(back, cnt);
+          Assembler::Label* L_hi_overflow = as_.MakeLabel();
+          as_.Cmpq(back, a_hi);
+          as_.Jcc(Assembler::Condition::kNotEqual, *L_hi_overflow);
+          as_.Movq(sat, candidate);
+          as_.Bind(L_hi_overflow);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, sat);
+          return;
         }
         // endregion
         uint8_t esize_bits;
@@ -20207,10 +20283,119 @@ class LiteTranslator {
           // can't express cheaply.  Fall back to the interpreter.
           success_ = false; return;
         }
+        // region digitalis: SQSHRN / SQSHRUN / SQRSHRN scalar D-source
+        // GPR fallback.
+        //
+        // The SIMD vector lowering needs PSRAQ for the per-lane signed
+        // arithmetic right shift at src=64, which is AVX-512F-VL only.
+        // For the scalar form (one lane, ARM ARM C7.2.226 / C7.2.236 /
+        // C7.2.238 / C7.2.228 forms `SQSHRN Vd<s>, Vn<d>, #shift`,
+        // `SQSHRUN Vd<s>, Vn<d>, #shift`, `SQRSHRN Vd<s>, Vn<d>, #shift`),
+        // we can sidestep PSRAQ entirely by routing the single lane through
+        // 64-bit GPR ops:
+        //
+        //   1. Movq a, Vn[63:0]                  (signed int64)
+        //   2. (rounding only) signed-saturating add of (1<<(cnt-1)).
+        //      Round const is always positive, so only positive
+        //      overflow is possible — clamp to INT64_MAX on OF.
+        //   3. Sarq a, cnt                       (cnt in [1, 32])
+        //   4. clamp a to dst range via Cmpq + Cmovq
+        //        SQSHRN / SQRSHRN : [INT32_MIN,  INT32_MAX]
+        //        SQSHRUN          : [0,          UINT32_MAX]
+        //   5. Pxor xzero / Movdqu Vd, xzero     (zero Vd[127:0])
+        //   6. Movl Vd[31:0], a                  (write low 32 bits)
+        //
+        // Clamp ordering is upper-first then lower-second.  For SQSHRUN,
+        // any negative Sarq result is < UINT32_MAX so the upper Cmovq.g
+        // is a no-op and the lower Cmovq.l fires to deliver 0; any
+        // overflow-positive result first clamps down to UINT32_MAX, and
+        // UINT32_MAX is not < 0 so the lower clamp is then a no-op.  For
+        // SQSHRN at cnt==32 (immh:immb=0x20) the SAR result is already in
+        // [INT32_MIN, INT32_MAX] and both clamps are runtime no-ops.
+        //
+        // For SQRSHRN, the pre-Sarq rounding add (1 << (cnt-1)) is in
+        // [1, 0x80000000].  Because round_const > 0, the add can only
+        // overflow positively (a near INT64_MAX); negative-direction
+        // underflow is impossible.  We use Cmovq.o against INT64_MAX as
+        // the saturation target — after the post-Sarq upper clamp drives
+        // INT64_MAX >> cnt (positive, at least INT32_MAX at cnt==32) to
+        // exactly INT32_MAX, which is the correct signed-saturating
+        // narrow result.
+        //
+        // FPSR.QC is not updated here, mirroring the existing SQSHL .D
+        // scalar GPR fallback at `lite_translator.h:19880` — neither
+        // path sets QC.  This is perf-only and matches the historical
+        // behaviour of the interpreter-bailout path for these forms.
+        if (args.scalar && uses_signed_shift && src_bits == 64 &&
+            !(is_rounding && is_saturating_signed_to_unsigned)) {
+          const uint16_t immh_immb_local =
+              static_cast<uint16_t>((immh << 3) | args.immb);
+          const uint8_t narrow_rshift_local =
+              static_cast<uint8_t>(64 - immh_immb_local);
+          const int8_t cnt = static_cast<int8_t>(narrow_rshift_local);
+          const int64_t clamp_max =
+              is_saturating_signed_to_unsigned
+                  ? int64_t{0xFFFFFFFF}  // UINT32_MAX
+                  : int64_t{INT32_MAX};
+          const int64_t clamp_min =
+              is_saturating_signed_to_unsigned ? int64_t{0}
+                                               : int64_t{INT32_MIN};
+          Register a = AllocTempReg();
+          Register max_reg = AllocTempReg();
+          Register min_reg = AllocTempReg();
+          Register round_reg =
+              is_rounding ? AllocTempReg() : Assembler::no_register;
+          SimdRegister xzero = AllocTempSimdReg();
+          if (a == Assembler::no_register ||
+              max_reg == Assembler::no_register ||
+              min_reg == Assembler::no_register ||
+              (is_rounding && round_reg == Assembler::no_register) ||
+              xzero == no_simd_register) {
+            success_ = false; return;
+          }
+          // Load Vn[63:0] as signed int64.
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+          if (is_rounding) {
+            // Saturating-signed pre-Sarq add of the rounding constant.
+            // round_const = 1 << (cnt - 1), in [1, 0x80000000].
+            const int64_t round_const = int64_t{1} << (cnt - 1);
+            as_.Movq(round_reg, round_const);
+            // Addq sets OF iff signed overflow.  Movq imm doesn't
+            // touch EFLAGS, so the materialization of INT64_MAX into
+            // max_reg between Addq and Cmovq.o keeps OF intact.
+            as_.Addq(a, round_reg);
+            as_.Movq(max_reg, int64_t{INT64_MAX});
+            as_.Cmovq(Assembler::Condition::kOverflow, a, max_reg);
+          }
+          // Arithmetic right shift by `cnt` (range [1, 32]).
+          as_.Sarq(a, cnt);
+          // Clamp a to [clamp_min, clamp_max] branchlessly.  Movq imm
+          // does not affect EFLAGS, so the materialization stays clear
+          // of the Cmpq->Cmovq window.  Signed Cmovq.g / Cmovq.l work
+          // for both SQSHRN/SQRSHRN and SQSHRUN: clamp_max is non-
+          // negative in all cases (INT32_MAX, UINT32_MAX both fit in
+          // int64 positive range), and clamp_min is non-positive in
+          // all cases (INT32_MIN, 0).
+          as_.Movq(max_reg, clamp_max);
+          as_.Cmpq(a, max_reg);
+          as_.Cmovq(Assembler::Condition::kGreater, a, max_reg);
+          as_.Movq(min_reg, clamp_min);
+          as_.Cmpq(a, min_reg);
+          as_.Cmovq(Assembler::Condition::kLess, a, min_reg);
+          // Zero Vd, then overlay the saturated int32 in Vd[31:0].
+          as_.Pxor(xzero, xzero);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+          as_.Movl({.base = Assembler::rbp, .disp = vd_off}, a);
+          return;
+        }
+        // endregion
         if (uses_signed_shift && src_bits == 64) {
-          // SQSHRN / SQRSHRN / SQSHRUN / SQRSHRUN src=64 needs PSRAQ
-          // which baseline SSE doesn't have.  Fall back to the
-          // interpreter.
+          // Remaining signed-source-D paths that still need PSRAQ:
+          //   - SQSHRN  vector .2S (args.scalar=false, src=64)
+          //   - SQRSHRN vector .2S (args.scalar=false, src=64)
+          //   - SQSHRUN vector .2S (args.scalar=false, src=64)
+          //   - SQRSHRUN scalar D-source / vector .2S
+          // Baseline SSE has no PSRAQ; fall back to the interpreter.
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
