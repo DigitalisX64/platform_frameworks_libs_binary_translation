@@ -7154,6 +7154,527 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - SQSHL.2D vector form: signed saturating variable
+      // shift across two 64-bit lanes.  Identical scaffolding to UQSHL.2D
+      // above but with sign-aware saturation:
+      //   sh in [0, 63]   -> SHL then SAR back-shift overflow check.  On
+      //                      mismatch saturate to INT64_MAX (pos a) or
+      //                      INT64_MIN (neg a), picked via
+      //                      `sign(saved_a) ^ INT64_MAX`.
+      //   sh >= 64        -> a == 0 ? 0 : sign-aware saturation target.
+      //   sh in [-63, -1] -> SAR a, |sh|  (signed arithmetic right shift;
+      //                      no saturation possible on right shifts).
+      //   sh <= -64       -> sign broadcast (SAR by 63), not 0 — preserves
+      //                      the sign bit for negative inputs (-1 stays -1).
+      // Scalar D form (kSqshlScalar) handled separately via
+      // AdvSimdScalarThreeSame at lite_translator.h:13979.  Other widths
+      // (B/H/S vector) bail to the interpreter; .1D (Q=0, size=11) is
+      // ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kSqshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register back = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            back == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_pos_big = as_.MakeLabel();
+          Assembler::Label* L_neg_big = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 falls through to the
+          // sign-aware saturation picker; otherwise back-shift overflow check.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+          // 0 <= sh < 64: shift-then-back-shift via SAR overflow check.
+          // Reuse `sh` as the saved-original holder once cl is loaded.
+          as_.Movq(Assembler::rcx, sh);
+          as_.Movq(sh, a);                 // sh = original a (saved for cmp).
+          as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+          as_.Movq(back, a);
+          as_.SarqByCl(back);              // back = (int64_t)(a << shift) >>s shift.
+          as_.Cmpq(back, sh);              // back == original a ?
+          as_.Jcc(Assembler::Condition::kEqual, *L_done);
+          // Overflow: saturate to INT64_MAX if sign(a)==0 else INT64_MIN.
+          // `sh` still holds the saved original a value.
+          as_.Sarq(sh, int8_t{63});        // sh = sign broadcast (0 or -1).
+          as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});  // a = INT64_MAX.
+          as_.Xorq(a, sh);                 // pos: a = INT64_MAX; neg: a = INT64_MIN.
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_pos_big);
+          // sh >= 64: if a == 0 result is 0, else saturate based on sign(a).
+          as_.Testq(a, a);
+          as_.Jcc(Assembler::Condition::kZero, *L_zero);
+          // sign-broadcast a into back; then build saturation target.
+          as_.Movq(back, a);
+          as_.Sarq(back, int8_t{63});       // back = sign broadcast (0 or -1).
+          as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(a, back);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_neg_big);
+          // 0 < |sh| < 64: a = (int64_t)a >>s |sh|.
+          as_.Movq(Assembler::rcx, sh);
+          as_.SarqByCl(a);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg_big);
+          // |sh| >= 64: a = sign broadcast across all bits.
+          as_.Sarq(a, int8_t{63});
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
+      // region digitalis - URSHL.2D vector form: unsigned non-saturating rounded
+      // variable shift across two 64-bit lanes.  Per-lane GPR-branched recipe
+      // (twice the URSHL scalar D recipe inlined).  Left shifts truncate (no
+      // saturation); right shifts add a round-half-up bias via the overflow-safe
+      // identity (a >>u rshift) + ((a >>u (rshift-1)) & 1).  Quadrants:
+      //   sh in [0, 63]   -> SHL a, sh
+      //   sh >= 64        -> 0
+      //   sh in [-63, -1] -> (a >>u |sh|) + ((a >>u (|sh|-1)) & 1)
+      //   sh == -64       -> bit 63 of a (round-bit alone; (a >>u 63) & 1)
+      //   sh <= -65       -> 0 (rounding term dominates per ARM ARM).
+      // Scalar D form (kUrshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kUrshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register round_bit = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            round_bit == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_rshift_eq_64 = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 -> 0; else a <<u sh.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShlqByCl(a);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreater, *L_zero);
+          as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_64);
+          // 1 <= |sh| <= 63: round_bit = (a >>u (|sh|-1)) & 1;
+          //                  a = (a >>u |sh|) + round_bit.
+          as_.Movq(round_bit, a);
+          as_.Decq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(round_bit);
+          as_.Andq(round_bit, int32_t{1});
+          as_.Incq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(a);
+          as_.Addq(a, round_bit);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_rshift_eq_64);
+          // |sh| == 64: result = (a >>u 63) & 1 — just bit 63 (round-bit alone).
+          as_.Shrq(a, int8_t{63});
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
+      // region digitalis - SRSHL.2D vector form: signed non-saturating rounded
+      // variable shift across two 64-bit lanes.  Mirror of URSHL.2D with two
+      // changes from the unsigned recipe: the data shift on the rounding-
+      // quadrant arm uses SAR (signed) instead of SHR, and the |sh|>=64
+      // boundary collapses into a single zero branch (no dedicated |sh|=64
+      // case — for any int64 a, the signed bias 1<<63 sums with a to a non-
+      // negative int128 in [0, 2^64-1] which >>s 64 = 0).  The round-bit
+      // extract stays unsigned (it is a bit-presence check, not arithmetic).
+      // Quadrants:
+      //   sh in [0, 63]   -> SHL a, sh  (left shifts truncate — same as SSHL)
+      //   sh >= 64        -> 0
+      //   sh in [-63, -1] -> (a >>s |sh|) + ((a >>u (|sh|-1)) & 1)
+      //   sh <= -64       -> 0 (signed-bias sum >>s 64 = 0 per ARM ARM)
+      // Scalar D form (kSrshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kSrshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register round_bit = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            round_bit == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 -> 0; else a <<u sh.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShlqByCl(a);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.  |sh|>=64 -> 0.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          // 1 <= |sh| <= 63: round_bit = (a >>u (|sh|-1)) & 1;
+          //                  a = (a >>s |sh|) + round_bit.
+          as_.Movq(round_bit, a);
+          as_.Decq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(round_bit);
+          as_.Andq(round_bit, int32_t{1});
+          as_.Incq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.SarqByCl(a);
+          as_.Addq(a, round_bit);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
+      // region digitalis - UQRSHL.2D vector form: unsigned saturating rounded
+      // variable shift across two 64-bit lanes.  Per-lane port of the UQRSHL
+      // scalar D recipe — combines the UQSHL.2D positive arm (shift-then-
+      // back-shift overflow detector + saturate-to-UINT64_MAX) with the
+      // URSHL.2D negative arm (overflow-safe rounding identity + dedicated
+      // |sh|=64 bit-63-only branch).  Saturation only on the left-shift
+      // quadrant, rounding only on the right-shift quadrant, so the two
+      // scaffoldings compose without interaction.  `scratch` doubles as the
+      // back-shift holder (positive arm) and round_bit holder (negative arm)
+      // — the disjoint-arm 3-temp sharing pattern from the scalar D recipe.
+      // Quadrants:
+      //   sh in [0, 63]   -> SHL then SHR back-shift overflow check; on
+      //                       mismatch saturate to UINT64_MAX
+      //   sh >= 64        -> a == 0 ? 0 : UINT64_MAX
+      //   sh in [-63, -1] -> (a >>u |sh|) + ((a >>u (|sh|-1)) & 1)
+      //   sh == -64       -> bit 63 of a (round bit alone)
+      //   sh <= -65       -> 0
+      // Scalar D form (kUqrshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kUqrshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register scratch = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            scratch == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_pos_big = as_.MakeLabel();
+          Assembler::Label* L_rshift_eq_64 = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 falls through to the
+          // a-vs-UINT64_MAX picker; otherwise back-shift overflow check.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+          // 0 <= sh < 64: shift-then-back-shift overflow check.  Reuse `sh`
+          // as the saved-original holder once cl is loaded.
+          as_.Movq(Assembler::rcx, sh);
+          as_.Movq(sh, a);                 // sh = original a (saved for cmp).
+          as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+          as_.Movq(scratch, a);
+          as_.ShrqByCl(scratch);           // scratch = (a << shift) >> shift.
+          as_.Cmpq(scratch, sh);           // scratch == original a ?
+          as_.Jcc(Assembler::Condition::kEqual, *L_done);
+          // Overflow: bits were lost above the qword; saturate to UINT64_MAX.
+          as_.Movq(a, static_cast<int64_t>(-1));
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_pos_big);
+          // sh >= 64: if a == 0 result is 0, else UINT64_MAX.
+          as_.Testq(a, a);
+          as_.Jcc(Assembler::Condition::kZero, *L_zero);
+          as_.Movq(a, static_cast<int64_t>(-1));
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreater, *L_zero);
+          as_.Jcc(Assembler::Condition::kEqual, *L_rshift_eq_64);
+          // 1 <= |sh| <= 63: round_bit = (a >>u (|sh|-1)) & 1;
+          //                  a = (a >>u |sh|) + round_bit.
+          as_.Movq(scratch, a);
+          as_.Decq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(scratch);
+          as_.Andq(scratch, int32_t{1});
+          as_.Incq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(a);
+          as_.Addq(a, scratch);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_rshift_eq_64);
+          // |sh| == 64: result = (a >>u 63) & 1 — just bit 63 (round-bit alone).
+          as_.Shrq(a, int8_t{63});
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
+      // region digitalis - SQRSHL.2D vector form: signed saturating rounded
+      // variable shift across two 64-bit lanes.  Per-lane port of the SQRSHL
+      // scalar D recipe — combines the SQSHL.2D positive arm (SAR-based
+      // back-shift overflow detector + sign-broadcast XOR-with-INT64_MAX
+      // saturation picker) with the SRSHL.2D negative arm (overflow-safe
+      // rounding identity with SAR data shift + SHR round-bit extract).
+      // Saturation only on the left-shift quadrant, rounding only on the
+      // right-shift quadrant, so the two scaffoldings compose without
+      // interaction.  `scratch` doubles as the back-shift holder on the
+      // positive arm (SAR variant for sign-aware overflow detection) and
+      // the round_bit holder on the negative arm — the disjoint-arm
+      // 3-temp sharing pattern from the scalar D recipe.  Unlike UQRSHL.2D,
+      // there is NO dedicated |sh|=64 branch on the negative arm: the
+      // signed bias 1<<63 sums with int64 a to a non-negative int128 in
+      // [0, 2^64-1] which >>s 64 = 0, so |sh|>=64 collapses into the
+      // zero branch (matches SRSHL.2D).
+      // Quadrants:
+      //   sh in [0, 63]   -> SHL then SAR back-shift overflow check; on
+      //                       mismatch saturate to INT64_MAX (pos a) or
+      //                       INT64_MIN (neg a) via sign-broadcast XOR.
+      //   sh >= 64        -> a == 0 ? 0 : sign-aware INT64_MAX/INT64_MIN.
+      //   sh in [-63, -1] -> (a >>s |sh|) + ((a >>u (|sh|-1)) & 1).
+      //   sh <= -64       -> 0.
+      // Scalar D form (kSqrshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kSqrshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register scratch = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            scratch == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_pos_big = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 falls through to the sign-
+          // aware saturation picker; otherwise the SAR-back-shift overflow
+          // check.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+          // 0 <= sh < 64: shift-then-back-shift via SAR overflow check.
+          // Reuse `sh` as the saved-original holder once cl is loaded.
+          as_.Movq(Assembler::rcx, sh);
+          as_.Movq(sh, a);                 // sh = original a (saved for cmp).
+          as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+          as_.Movq(scratch, a);
+          as_.SarqByCl(scratch);           // scratch = (int64_t)(a << shift) >>s shift.
+          as_.Cmpq(scratch, sh);           // scratch == original a ?
+          as_.Jcc(Assembler::Condition::kEqual, *L_done);
+          // Overflow: saturate to INT64_MAX if sign(a)==0 else INT64_MIN.
+          // `sh` still holds the saved original a value.
+          as_.Sarq(sh, int8_t{63});        // sh = sign broadcast (0 or -1).
+          as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});  // a = INT64_MAX.
+          as_.Xorq(a, sh);                 // pos: a = INT64_MAX; neg: a = INT64_MIN.
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_pos_big);
+          // sh >= 64: if a == 0 result is 0, else saturate based on sign(a).
+          as_.Testq(a, a);
+          as_.Jcc(Assembler::Condition::kZero, *L_zero);
+          // sign-broadcast a into scratch; then build saturation target.
+          as_.Movq(scratch, a);
+          as_.Sarq(scratch, int8_t{63});   // scratch = sign broadcast (0 or -1).
+          as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(a, scratch);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.  |sh|>=64 -> 0
+          // (no dedicated |sh|=64 case — the signed-bias sum >>s 64 = 0).
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          // 1 <= |sh| <= 63: round_bit = (a >>u (|sh|-1)) & 1;
+          //                  a = (a >>s |sh|) + round_bit.
+          as_.Movq(scratch, a);
+          as_.Decq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(scratch);
+          as_.Andq(scratch, int32_t{1});
+          as_.Incq(sh);
+          as_.Movq(Assembler::rcx, sh);
+          as_.SarqByCl(a);
+          as_.Addq(a, scratch);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
