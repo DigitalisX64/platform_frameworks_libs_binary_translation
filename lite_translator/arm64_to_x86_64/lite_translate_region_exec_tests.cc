@@ -14636,6 +14636,253 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshlScalarDIgnoresUpperVnVmJit) {
 }
 // endregion
 
+// region digitalis: SQRSHL scalar D form (signed saturating rounded variable
+// shift).  Encoded with opcode 0b01011, U=0 in the AdvSimdScalarThreeSame
+// class.
+constexpr uint32_t SqrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b01011, rd, rn, rm);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(SqrshlScalarD(0, 1, 2), 0x5ee25c20u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftSmallNoSaturationJit) {
+  // 1 << 4 = 0x10.  Single bit; back-shift recovers original; no saturation.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{4});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy62PosNoSaturationJit) {
+  // 1 << 62 = 0x4000_..._0000; bit 62 is still below the sign bit, so no
+  // signed overflow.  Back-shift via SAR recovers 1.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{62});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x4000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy63PosSaturatesJit) {
+  // 1 << 63 sets the sign bit.  SAR back-shift recovers -1, not 1 →
+  // saturate.  sign(a) = 0 (a was positive) → INT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{63});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy1HighBitPosSaturatesJit) {
+  // INT64_MAX << 1 = 0xFFFF_..._FFFE.  SAR back-shift recovers -1, not
+  // INT64_MAX → saturate.  sign(a)=0 → INT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy1NegSaturatesJit) {
+  // INT64_MIN << 1 = 0.  SAR back-shift recovers 0, not INT64_MIN →
+  // saturate.  sign(a)=-1 (negative a) → INT64_MAX XOR -1 = INT64_MIN.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftByZeroNoOpJit) {
+  // sh = 0 → a unchanged.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xDEADBEEFCAFEBABEULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy64NonZeroPosSaturatesJit) {
+  // sh = 64, a = 1 > 0 → L_pos_big with sign(a)=0 → INT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{64});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy64NonZeroNegSaturatesJit) {
+  // sh = 64, a = -1 (sign bit set) → L_pos_big with sign(a)=-1 → INT64_MIN.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{64});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy64ZeroStaysZeroJit) {
+  // sh = 64, a = 0 → L_zero (not saturation; a was already 0).
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{64});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDLeftBy127PosSaturatesJit) {
+  // sh = 127 (max sign-extended int8) → L_pos_big with sign(a)=0 → INT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{3});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{127});
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy1PosRoundsUpJit) {
+  // a = 3, sh = -1.  ARM: 3 >>s 1 + round_bit(1) = 1 + 1 = 2.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{3});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{2});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy1PosRoundsDownJit) {
+  // a = 2, sh = -1.  ARM: 2 >>s 1 + round_bit(0) = 1 + 0 = 1.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{2});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{1});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy1NegRoundsUpJit) {
+  // a = -1 (0xFF...FF), sh = -1.  ARM: -1 >>s 1 + round_bit(1) = -1 + 1 = 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy1IntMinNoOverflowJit) {
+  // a = INT64_MIN (= -2^63), sh = -1.  ARM signed: -2^63 >>s 1 = -2^62
+  // (0xC000_..._0000); round_bit = bit 0 of a = 0.  Pin the overflow-safe
+  // identity: naive (a + 1<<0) at INT64_MIN doesn't wrap because the bias
+  // is just 1, but the identity must still produce the same result.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xC000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy63NegOneJit) {
+  // a = -1, sh = -63.  ARM: -1 >>s 63 + round_bit = -1 + 1 = 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xC1ULL});  // -63
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy63IntMaxJit) {
+  // a = INT64_MAX, sh = -63.  ARM: INT64_MAX >>s 63 = 0; round_bit =
+  // bit 62 of a = 1.  Sum = 1.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xC1ULL});  // -63
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{1});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy64IntMaxZeroesJit) {
+  // sh = -64; |sh| >= 64 collapses to L_zero per SRSHL semantics.
+  // Pin INT64_MAX → 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xC0ULL});  // -64
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy64IntMinZeroesJit) {
+  // sh = -64 with a = INT64_MIN.  ARM signed: (a + 2^63) >>s 64 =
+  // (INT64_MIN + 2^63) >>s 64 = 0 >>s 64 = 0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xC0ULL});  // -64
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy65ZeroesJit) {
+  // sh = -65 → L_zero (rounding term dominates per ARM ARM).
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xBFULL});  // -65
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDRightBy128ZeroesJit) {
+  // sh = -128 (Vm[7:0] = 0x80, sign-extended to -128).  L_zero.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0x80ULL});  // -128
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDIgnoresUpperVnVmJit) {
+  // Garbage in Vn[127:64] / Vm[127:8] must not perturb lane 0, and
+  // Vd[127:64] must be zeroed on output.  Lane 0: a = 5, sh = -1.  ARM:
+  // 5 >>s 1 + (5 >>u 0 & 1) = 2 + 1 = 3.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{5});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBADBULL})
+                      << 64) |
+                     static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqrshlScalarD(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{3});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+// endregion
+
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
 // interpreter; the tests below drive Run() so the lite_translator lowering
