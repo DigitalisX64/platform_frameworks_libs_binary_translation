@@ -7060,6 +7060,100 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis - UQSHL.2D vector form: unsigned saturating variable
+      // shift across two 64-bit lanes.  The per-lane shift count is the
+      // signed int8 in the low byte of the corresponding Vm lane.  Per-lane
+      // GPR-branched recipe (twice the UQSHL scalar D recipe inlined).
+      // Quadrants:
+      //   sh in [0, 63]   -> shift-then-back-shift overflow check; on lost
+      //                      bits, saturate to UINT64_MAX.
+      //   sh >= 64        -> a == 0 ? 0 : UINT64_MAX.
+      //   sh in [-63, -1] -> SHR a, |sh|  (no saturation; right-shifting an
+      //                      unsigned value cannot overflow).
+      //   sh <= -64       -> 0.
+      // Scalar D form (kUqshlScalar) handled separately via
+      // AdvSimdScalarThreeSame.  Other widths (B/H/S vector) bail to the
+      // interpreter; .1D (Q=0, size=11) is ARM-reserved.
+      case Decoder::AdvSimdThreeSameOpcode::kUqshl: {
+        if (args.size != 0b11) { success_ = false; return; }
+        if (!args.q) { success_ = false; return; }
+        Register a = AllocTempReg();
+        Register sh = AllocTempReg();
+        Register back = AllocTempReg();
+        if (a == Assembler::no_register || sh == Assembler::no_register ||
+            back == Assembler::no_register) {
+          success_ = false; return;
+        }
+        // Save rcx (variable shift uses cl; rcx is in the allocator pool).
+        as_.Subq(Assembler::rsp, 8);
+        as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
+
+        for (int lane = 0; lane < 2; ++lane) {
+          int32_t vn_lane = vn_off + lane * 8;
+          int32_t vm_lane = vm_off + lane * 8;
+          int32_t vd_lane = vd_off + lane * 8;
+
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_lane});
+          as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_lane});
+
+          Assembler::Label* L_neg = as_.MakeLabel();
+          Assembler::Label* L_pos_big = as_.MakeLabel();
+          Assembler::Label* L_zero = as_.MakeLabel();
+          Assembler::Label* L_done = as_.MakeLabel();
+
+          as_.Testq(sh, sh);
+          as_.Jcc(Assembler::Condition::kSign, *L_neg);
+
+          // Positive shift in [0, 127]: sh >= 64 falls to the a-vs-UINT64_MAX
+          // picker; otherwise the back-shift overflow check.
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
+
+          // 0 <= sh < 64: shift-then-back-shift overflow check.  Reuse `sh`
+          // as the saved-original holder once cl is loaded (shift count
+          // already moved to rcx, so the sh register is free).
+          as_.Movq(Assembler::rcx, sh);
+          as_.Movq(sh, a);
+          as_.ShlqByCl(a);
+          as_.Movq(back, a);
+          as_.ShrqByCl(back);
+          as_.Cmpq(back, sh);
+          as_.Jcc(Assembler::Condition::kEqual, *L_done);
+          as_.Movq(a, static_cast<int64_t>(-1));  // saturate to UINT64_MAX.
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_pos_big);
+          // sh >= 64: if a == 0 result is 0, else UINT64_MAX.
+          as_.Testq(a, a);
+          as_.Jcc(Assembler::Condition::kZero, *L_zero);
+          as_.Movq(a, static_cast<int64_t>(-1));
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_neg);
+          // Negative shift: |sh| in [1, 128] after Negq.
+          as_.Negq(sh);
+          as_.Cmpq(sh, int32_t{64});
+          as_.Jcc(Assembler::Condition::kGreaterEqual, *L_zero);
+          // 0 < |sh| < 64: a >>u |sh|.
+          as_.Movq(Assembler::rcx, sh);
+          as_.ShrqByCl(a);
+          as_.Jmp(*L_done);
+
+          as_.Bind(L_zero);
+          as_.Xorq(a, a);
+
+          as_.Bind(L_done);
+
+          // Store lane result to Vd.
+          as_.Movq({.base = Assembler::rbp, .disp = vd_lane}, a);
+        }
+
+        // Restore rcx.
+        as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
+        as_.Addq(Assembler::rsp, 8);
+        return;
+      }
+      // endregion
       default:
         Undefined();
         return;
