@@ -22991,6 +22991,247 @@ TEST_F(Arm64LiteTranslateRegionTest, MlsVec8BUpperZero) {
 }
 // endregion
 
+// region digitalis: SABD/UABD vector JIT
+//
+// Encoding (per ARM ARM C7.2 "SABD/UABD (vector)", cross-checked via
+// llvm-mc):
+//   sabd v0.8b,  v1.8b,  v2.8b  = 0x0E227420 (Q=0, U=0, size=00, opcode=01110)
+//   sabd v0.16b, v1.16b, v2.16b = 0x4E227420 (Q=1, U=0, size=00)
+//   sabd v0.4h,  v1.4h,  v2.4h  = 0x0E627420 (Q=0, U=0, size=01)
+//   sabd v0.8h,  v1.8h,  v2.8h  = 0x4E627420 (Q=1, U=0, size=01)
+//   sabd v0.2s,  v1.2s,  v2.2s  = 0x0EA27420 (Q=0, U=0, size=10)
+//   sabd v0.4s,  v1.4s,  v2.4s  = 0x4EA27420 (Q=1, U=0, size=10)
+//   uabd v0.8b,  v1.8b,  v2.8b  = 0x2E227420 (Q=0, U=1, size=00)
+//   uabd v0.16b, v1.16b, v2.16b = 0x6E227420 (Q=1, U=1, size=00)
+//   uabd v0.4h,  v1.4h,  v2.4h  = 0x2E627420 (Q=0, U=1, size=01)
+//   uabd v0.8h,  v1.8h,  v2.8h  = 0x6E627420 (Q=1, U=1, size=01)
+//   uabd v0.2s,  v1.2s,  v2.2s  = 0x2EA27420 (Q=0, U=1, size=10)
+//   uabd v0.4s,  v1.4s,  v2.4s  = 0x6EA27420 (Q=1, U=1, size=10)
+TEST_F(Arm64LiteTranslateRegionTest, SabdUabdVecEncodingsMatchLlvmMc) {
+  // Pin all 12 vector encodings byte-equality vs llvm-mc.  Confirms the
+  // decoder routes SABD (U=0) and UABD (U=1) on opcode=0b01110.
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x0E227420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x4E227420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b01, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x0E627420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x4E627420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b10, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x0EA27420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x4EA27420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b00, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x2E227420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x6E227420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b01, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x2E627420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x6E627420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b10, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x2EA27420u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10, /*opcode=*/0b01110,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x6EA27420u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SabdVec16B) {
+  // .16B, Q=1: per-byte signed absolute difference.  Covers INT_MIN-to-
+  // positive (truncated abs wraps to 0x80) and the asymmetric pair where
+  // PSUBB-then-(Vn^mask)-mask trick must match arithmetic abs.
+  int8_t n_lanes[16] = {0,    -128, 127, -128,   50, -50,    0,   17,
+                        100,    -1, INT8_MAX, -7, 33,  -33, INT8_MIN, INT8_MAX};
+  int8_t m_lanes[16] = {0,       0,   0,  127,   50,  50,  127, -100,
+                          -100,   1,        0,  7, -33,   33, INT8_MAX, INT8_MIN};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    // ARM SABD pseudocode: result = abs(SInt(a) - SInt(b)); elem = result<7:0>.
+    int32_t d = static_cast<int32_t>(n_lanes[i]) - static_cast<int32_t>(m_lanes[i]);
+    if (d < 0) d = -d;
+    uint8_t expected = static_cast<uint8_t>(d);
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SabdVec8H) {
+  // .8H, Q=1: per-halfword signed absolute difference.
+  int16_t n_lanes[8] = {0, -32768, 32767, -1000, 0, INT16_MAX, INT16_MIN, 100};
+  int16_t m_lanes[8] = {0,      0,     0,   500, -1000, INT16_MIN, INT16_MAX, -100};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int32_t d = static_cast<int32_t>(n_lanes[i]) - static_cast<int32_t>(m_lanes[i]);
+    if (d < 0) d = -d;
+    uint16_t expected = static_cast<uint16_t>(d);
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SabdVec4S) {
+  // .4S, Q=1: per-word signed absolute difference via PMAXSD-PMINSD-PSUBD.
+  // ARM SABD computes the abs in extended (unbounded) precision then
+  // truncates to esize.  For INT32_MIN-vs-INT32_MAX pairs, the extended
+  // difference is +/- 4294967295; truncated abs = 0xFFFFFFFF.
+  int32_t n_lanes[4] = {INT32_MIN, INT32_MAX, -1, 0};
+  int32_t m_lanes[4] = {INT32_MAX, INT32_MIN,  0, 0};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // abs(INT32_MIN - INT32_MAX) extended = 4294967295 = 0xFFFFFFFF; truncated
+  // to 32 bits = 0xFFFFFFFF.
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);
+  EXPECT_EQ(r[2], 1u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SabdVec8BUpperZero) {
+  // .8B, Q=0: low 8 byte lanes are SABD; upper 8 bytes must be zeroed by
+  // mask_low64.  Pre-set Vd[127:64] to a non-zero sentinel.
+  int8_t n_lanes[16] = {10, -10, 50,   0, INT8_MIN, INT8_MAX,  1,  -1,
+                         0,    0,  0,   0, 0, 0, 0, 0};
+  int8_t m_lanes[16] = {  0,  10, 30, 100, INT8_MAX, INT8_MIN, -1,   1,
+                         0,    0,  0,   0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    int32_t d = static_cast<int32_t>(n_lanes[i]) - static_cast<int32_t>(m_lanes[i]);
+    if (d < 0) d = -d;
+    uint8_t expected = static_cast<uint8_t>(d);
+    EXPECT_EQ(r[i], expected) << "low lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UabdVec16B) {
+  // .16B, Q=1: per-byte unsigned absolute difference via PMAXUB-PMINUB-PSUBB.
+  // Cover boundary values 0x00 / 0xFF and the symmetric a/b vs b/a pair.
+  uint8_t n_lanes[16] = {0, 255, 100, 100, 0xFF, 0x80, 1, 200,
+                          50,   0,  17, 240,   0,  128, 99, 11};
+  uint8_t m_lanes[16] = {0,   0,   0, 255,   0, 0x80, 200, 1,
+                          50,  17,   0,  10, 240,    1, 11, 99};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected = n_lanes[i] > m_lanes[i] ? n_lanes[i] - m_lanes[i]
+                                               : m_lanes[i] - n_lanes[i];
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UabdVec8H) {
+  // .8H, Q=1: per-halfword unsigned absolute difference via PMAXUW-PMINUW-PSUBW.
+  // Cover the full unsigned-16 range and the equal-operand case.
+  uint16_t n_lanes[8] = {0, 0xFFFF, 1000,  0xFFFF, 0x8000, 0x7FFF,    0,   5000};
+  uint16_t m_lanes[8] = {0,      0, 1000,  0x0000, 0x7FFF, 0x8000, 0xFFFF, 200};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t expected = n_lanes[i] > m_lanes[i] ? n_lanes[i] - m_lanes[i]
+                                                : m_lanes[i] - n_lanes[i];
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UabdVec4S) {
+  // .4S, Q=1: per-word unsigned absolute difference via PMAXUD-PMINUD-PSUBD.
+  // Cover full unsigned-32 range; ARM's "abs of unsigned difference" semantics
+  // are the obvious max-min — no wrap concerns since the result fits in u32.
+  uint32_t n_lanes[4] = {0,         0xFFFFFFFFu, 0x80000000u, 0};
+  uint32_t m_lanes[4] = {0xFFFFFFFFu, 0,         0x7FFFFFFFu, 0};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFu);
+  EXPECT_EQ(r[1], 0xFFFFFFFFu);
+  EXPECT_EQ(r[2], 1u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UabdVec2SUpperZero) {
+  // .2S, Q=0: low 2 word lanes are UABD; upper 64 bits must be zeroed by
+  // mask_low64.  Pre-set Vd[127:64] to a non-zero sentinel.
+  uint32_t n_lanes[4] = {0x12345678u, 100, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t m_lanes[4] = {0x10000000u, 200, 0xDEADBEEFu, 0xCAFEBABEu};
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b01110, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x12345678u - 0x10000000u);
+  EXPECT_EQ(r[1], 200u - 100u);
+  EXPECT_EQ(r[2], 0u);  // upper 64 bits zeroed
+  EXPECT_EQ(r[3], 0u);
+}
+// endregion
+
 // region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
 //
 // Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",

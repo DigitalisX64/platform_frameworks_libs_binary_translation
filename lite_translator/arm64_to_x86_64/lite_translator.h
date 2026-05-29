@@ -4814,6 +4814,95 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kSabd: {
+        // SABD: Vd[lane] = |signed(Vn[lane]) - signed(Vm[lane])|.
+        // ARM ARM computes the difference in extended (unbounded) signed
+        // precision, then truncates the absolute value to esize.  A naive
+        // PSUBx + sign-mask abs only matches when the difference fits in
+        // esize bits — for INT_MIN-vs-INT_MAX pairs the modular subtraction
+        // wraps and the abs gives the wrong magnitude.
+        //
+        // Recipe: per-lane PMAXS - PMINS gives max(a,b) - min(a,b) on the
+        // SIGNED interpretation, computed in modular esize arithmetic.
+        // The signed max minus the signed min equals the truncated absolute
+        // difference for every input, including the wrap case (INT_MAX -
+        // INT_MIN = -1 mod 2^esize = 0xFF...F, which matches ARM's
+        // abs(INT_MAX-INT_MIN) = 2^esize - 1 truncated).
+        //
+        // Byte/word need SSE4.1 PMAX/PMINSB/D; halfword uses SSE2
+        // PMAXSW/PMINSW.  .2D is reserved by the ARM ARM and falls back.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xmax == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxsb(xmax, xm);  // SSE4.1
+            as_.Pminsb(xn, xm);    // SSE4.1
+            as_.Psubb(xmax, xn);
+            break;
+          case 0b01:
+            as_.Pmaxsw(xmax, xm);  // SSE2
+            as_.Pminsw(xn, xm);    // SSE2
+            as_.Psubw(xmax, xn);
+            break;
+          case 0b10:
+            as_.Pmaxsd(xmax, xm);  // SSE4.1
+            as_.Pminsd(xn, xm);    // SSE4.1
+            as_.Psubd(xmax, xn);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xmax);
+        store_full(vd_off, xmax);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUabd: {
+        // UABD: Vd[lane] = (Vn[lane] > Vm[lane]) ? Vn-Vm : Vm-Vn (unsigned).
+        // Recipe: per-lane max(Vn,Vm) - min(Vn,Vm) via PMAXUx + PMINUx + PSUBx.
+        // Byte uses PMAXUB/PMINUB (SSE2); halfword uses PMAXUW/PMINUW (SSE4.1);
+        // word uses PMAXUD/PMINUD (SSE4.1).  .2D is reserved by the ARM ARM
+        // (no AVX-512 PMAXUQ/PMINUQ dependency to worry about).
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xmax == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxub(xmax, xm);
+            as_.Pminub(xn, xm);
+            as_.Psubb(xmax, xn);
+            break;
+          case 0b01:
+            as_.Pmaxuw(xmax, xm);
+            as_.Pminuw(xn, xm);
+            as_.Psubw(xmax, xn);
+            break;
+          case 0b10:
+            as_.Pmaxud(xmax, xm);
+            as_.Pminud(xn, xm);
+            as_.Psubd(xmax, xn);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xmax);
+        store_full(vd_off, xmax);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
