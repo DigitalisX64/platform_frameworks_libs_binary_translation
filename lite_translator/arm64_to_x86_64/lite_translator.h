@@ -5371,6 +5371,95 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kShadd:
+      case Decoder::AdvSimdThreeSameOpcode::kUhadd: {
+        // SHADD / UHADD Vd, Vn, Vm — per-lane (a + b) >> 1 with no overflow,
+        // signed (SHADD) or unsigned (UHADD).  ARM ARM C7.2 reserves .2D.
+        //
+        // Width recipes:
+        //  - Byte (size=00): widen 8 bytes to 8 words (lo + hi halves
+        //    separately), PADDW (sum fits in 9 bits, no overflow),
+        //    arithmetic / logical shift right by 1, pack with signed /
+        //    unsigned saturation.  Needs SSE4.1 for PMOVZXBW / PMOVSXBW
+        //    (same recipe shape as kMul size=00).
+        //  - Halfword (size=01) / Word (size=10): bitwise identity
+        //    a + b = (a^b) + 2*(a&b), so (a + b) >> 1 = (a&b) + ((a^b) >> 1).
+        //    Modular PADDx is exact here because the identity preserves
+        //    the low esize bits.  Arithmetic shift (PSRAW/PSRAD) for signed,
+        //    logical shift (PSRLW/PSRLD) for unsigned.  All SSE2.
+        if (args.size == 0b11) { Undefined(); return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShadd);
+        if (args.size == 0b00) {
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          if (is_signed) {
+            as_.Pmovsxbw(xn, xn);
+            as_.Pmovsxbw(xm, xm);
+            as_.Pmovsxbw(xn_hi, xn_hi);
+            as_.Pmovsxbw(xm_hi, xm_hi);
+          } else {
+            as_.Pmovzxbw(xn, xn);
+            as_.Pmovzxbw(xm, xm);
+            as_.Pmovzxbw(xn_hi, xn_hi);
+            as_.Pmovzxbw(xm_hi, xm_hi);
+          }
+          as_.Paddw(xn, xm);
+          as_.Paddw(xn_hi, xm_hi);
+          if (is_signed) {
+            as_.Psraw(xn, int8_t{1});
+            as_.Psraw(xn_hi, int8_t{1});
+            as_.Packsswb(xn, xn_hi);
+          } else {
+            as_.Psrlw(xn, int8_t{1});
+            as_.Psrlw(xn_hi, int8_t{1});
+            as_.Packuswb(xn, xn_hi);
+          }
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        // Halfword / word: bitwise (a&b) + ((a^b) >> 1).
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xand = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xand == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xand, xn);
+        as_.Pand(xand, xm);
+        as_.Pxor(xn, xm);
+        if (args.size == 0b01) {
+          if (is_signed) as_.Psraw(xn, int8_t{1});
+          else as_.Psrlw(xn, int8_t{1});
+          as_.Paddw(xn, xand);
+        } else {
+          // size == 0b10.
+          if (is_signed) as_.Psrad(xn, int8_t{1});
+          else as_.Psrld(xn, int8_t{1});
+          as_.Paddd(xn, xand);
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kBic: {
         // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
         // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
