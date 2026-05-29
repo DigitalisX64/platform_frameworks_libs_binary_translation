@@ -16839,12 +16839,15 @@ class LiteTranslator {
     const bool is_uqshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqshlScalar);
     // endregion
-    // region digitalis: SQSHL scalar (D form only — the size=11 path).
+    // region digitalis: SQSHL scalar (all sizes — B, H, S, D).
     // Signed saturating variable left shift; same scaffolding as UQSHL but
     // the back-shift uses SAR (arithmetic) and the saturation target depends
-    // on sign(a): positive a → INT64_MAX, negative a → INT64_MIN.  Negative
+    // on sign(a): positive a → INT_MAX_N, negative a → INT_MIN_N.  Negative
     // shifts behave exactly like SSHL (signed arithmetic right shift; no
-    // saturation possible on right shifts).
+    // saturation possible on right shifts).  Implemented in GPR scalar with
+    // branches, parameterized on `bits_local = 1 << (3 + args.size)`.  The
+    // sign-extend-then-back-shift overflow detector reduces to a no-op
+    // sign-extend step at N=64.
     const bool is_sqshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar);
     // endregion
@@ -17711,23 +17714,30 @@ class LiteTranslator {
       return;
     }
     // endregion
-    // region digitalis: SQSHL scalar D form (signed saturating variable left
-    // shift, 64-bit lane).  Mirrors UQSHL scalar D but:
-    //   * The back-shift uses SAR (signed) instead of SHR.  The detector
-    //     `(int64_t)(a << sh) >>s sh == a` correctly identifies signed
-    //     overflow for both positive and negative `a` (e.g. a=1, sh=63 sets
-    //     bit 63 → back via SAR = -1 ≠ 1, overflow; a=-1, sh=63 sets bit 63
-    //     → back via SAR = -1 == a, no overflow because -2^63 fits in
-    //     int64_t).
+    // region digitalis: SQSHL scalar (all sizes — signed saturating variable
+    // left shift, lane width N = 8/16/32/64).  Mirrors UQSHL scalar but:
+    //   * Operand `a` is sign-extended from Vn[bits_local-1:0] to int64 at
+    //     load time, so bit 63 of `a` carries the sign of the N-bit lane and
+    //     SAR-by-63 produces a width-independent sign broadcast.
+    //   * For 0 <= sh < bits_local, the candidate `a << sh` must fit in
+    //     int_N.  The overflow detector applies SignExtendFromN to the
+    //     candidate (Shl/Sar by 64-N at B/H; Movsxlq at S as the single-
+    //     instruction form; no-op at D) and then SAR-by-sh back to compare
+    //     against the saved `a`.  At N=64 this reduces to the existing
+    //     D-form detector `(int64_t)(a << sh) >>s sh == a`.
     //   * Saturation target depends on sign(a):
-    //       sign(a) = 0 (positive/zero) → INT64_MAX (0x7FFF_FFFF_FFFF_FFFF).
-    //       sign(a) = 1 (negative)      → INT64_MIN (0x8000_0000_0000_0000).
-    //     Computed by Sarq sign-broadcast then XOR with INT64_MAX.
+    //       sign(a) = 0 → INT_MAX_N = (1 << (bits_local - 1)) - 1.
+    //       sign(a) = 1 → INT_MIN_N = -(1 << (bits_local - 1)).
+    //     Computed by Sarq sign-broadcast (by 63 — width-independent because
+    //     `a` was sign-extended at load) then XOR with INT_MAX_N.
     //   * Negative shifts use SAR (signed arithmetic right shift) instead of
-    //     SHR, mirroring SSHL.  At |sh| >= 64 the result is the sign
+    //     SHR, mirroring SSHL.  At |sh| >= bits_local the result is the sign
     //     broadcast (0 or -1), not 0.
+    //   * The store path masks `a` to bits_local before writing to Vd[63:0]
+    //     so the sign-extension bits don't leak into Vd[63:bits_local]
+    //     (no-op at N=64).
     if (is_sqshl_scalar_d) {
-      if (args.size != 0b11) { success_ = false; return; }
+      const int bits_local = 1 << (3 + args.size);
       int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
       int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
       int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
@@ -17741,9 +17751,57 @@ class LiteTranslator {
       // Save rcx (variable shift uses cl; rcx is in the allocator pool).
       as_.Subq(Assembler::rsp, 8);
       as_.Movq({.base = Assembler::rsp}, Assembler::rcx);
-      // Load a from Vn[63:0]; sign-extend Vm[7:0] into sh (int64).
-      as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+      // Load `a` sign-extended from Vn[bits_local-1:0] into int64; sign-
+      // extend Vm[7:0] into sh.  Bit 63 of `a` thus carries the sign of
+      // the N-bit lane, making SAR-by-63 a width-independent sign broadcast.
+      switch (args.size) {
+        case 0b00:
+          as_.Movsxbq(a, {.base = Assembler::rbp, .disp = vn_off}); break;
+        case 0b01:
+          as_.Movsxwq(a, {.base = Assembler::rbp, .disp = vn_off}); break;
+        case 0b10:
+          as_.Movsxlq(a, {.base = Assembler::rbp, .disp = vn_off}); break;
+        case 0b11:
+          as_.Movq   (a, {.base = Assembler::rbp, .disp = vn_off}); break;
+      }
       as_.Movsxbq(sh, {.base = Assembler::rbp, .disp = vm_off});
+
+      // Sign-extend the low bits_local bits of `r` to int64 in-place.  This
+      // re-aligns the N-bit lane to the int64 envelope so the back-shift
+      // via SAR produces a value comparable to the saved (sign-extended)
+      // original.  At N=64 the 64-bit ShlqByCl already produced a value
+      // whose bit 63 is the lane's MSB, so this is a no-op.
+      auto SignExtendFromN = [&](Register r) {
+        switch (bits_local) {
+          case 8:  as_.Shlq(r, int8_t{56}); as_.Sarq(r, int8_t{56}); break;
+          case 16: as_.Shlq(r, int8_t{48}); as_.Sarq(r, int8_t{48}); break;
+          case 32: as_.Movsxlq(r, r); break;
+          case 64: break;
+        }
+      };
+      // Zero-extend low bits_local bits of `r` (mask to N) — used at the
+      // store path to drop the upper sign-extension bits before writing
+      // Vd[63:0].  No-op at N=64.  Andq with int32_t{0xFFFFFFFF} would
+      // sign-extend to -1, so S uses the Shlq/Shrq 32 idiom.
+      auto MaskToN = [&](Register r) {
+        switch (bits_local) {
+          case 8:  as_.Andq(r, int32_t{0xFF}); break;
+          case 16: as_.Andq(r, int32_t{0xFFFF}); break;
+          case 32:
+            as_.Shlq(r, int8_t{32});
+            as_.Shrq(r, int8_t{32});
+            break;
+          case 64: break;
+        }
+      };
+      // Load INT_MAX_N = (1 << (bits_local - 1)) - 1 into `r`.  At N=64 the
+      // constant is INT64_MAX and Movq emits movabsq; at N=32 it is
+      // 0x7FFFFFFF (positive int32) and Movq emits the 7-byte form; at
+      // N=8/16 the constant is small positive and Movq emits the short form.
+      auto LoadIntMaxN = [&](Register r) {
+        as_.Movq(r,
+                 static_cast<int64_t>((uint64_t{1} << (bits_local - 1)) - 1));
+      };
 
       Assembler::Label* L_neg = as_.MakeLabel();
       Assembler::Label* L_pos_big = as_.MakeLabel();
@@ -17754,50 +17812,59 @@ class LiteTranslator {
       as_.Testq(sh, sh);
       as_.Jcc(Assembler::Condition::kSign, *L_neg);
 
-      // Positive shift in [0, 127]: sh >= 64 falls through to the sign-aware
-      // saturation picker; otherwise the back-shift overflow check.
-      as_.Cmpq(sh, int32_t{64});
+      // Positive shift in [0, 127]: sh >= bits_local falls through to the
+      // sign-aware saturation picker; otherwise the sign-extend-then-back-
+      // shift overflow check.
+      as_.Cmpq(sh, int32_t{bits_local});
       as_.Jcc(Assembler::Condition::kGreaterEqual, *L_pos_big);
 
-      // 0 <= sh < 64: shift-then-back-shift via SAR overflow check.  Reuse
-      // `sh` as the saved-original holder once cl is loaded.
+      // 0 <= sh < bits_local: shift, sign-extend low N bits, then back-
+      // shift via SAR.  Reuse `sh` as the saved-original holder once cl is
+      // loaded.  The SignExtendFromN step is essential for bits_local < 64
+      // because ShlqByCl can place bits above position (bits_local-1) that
+      // belong to the int64-envelope but not the int_N lane; without
+      // re-sign-extending from the lane's MSB, the back-SAR would compare
+      // against the wrong value.
       as_.Movq(Assembler::rcx, sh);
       as_.Movq(sh, a);                 // sh = original a (saved for cmp).
       as_.ShlqByCl(a);                 // a = a << shift (candidate result).
+      SignExtendFromN(a);              // a = sign_ext_N(low N of a<<shift).
       as_.Movq(back, a);
-      as_.SarqByCl(back);              // back = (int64_t)(a << shift) >>s shift.
-      as_.Cmpq(back, sh);              // back == original a ?
+      as_.SarqByCl(back);              // back = sign-ext lane SAR shift.
+      as_.Cmpq(back, sh);              // back == saved original ?
       as_.Jcc(Assembler::Condition::kEqual, *L_done);
-      // Overflow: saturate to INT64_MAX if sign(a)==0 else INT64_MIN.
-      // `sh` still holds the saved original a value.
+      // Overflow: saturate to INT_MAX_N if sign(a)==0 else INT_MIN_N.
+      // `sh` still holds the saved original a (sign-extended to int64), so
+      // Sarq by 63 produces the width-independent sign broadcast.
       as_.Sarq(sh, int8_t{63});        // sh = sign broadcast (0 or -1).
-      as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});  // a = INT64_MAX.
-      as_.Xorq(a, sh);                 // pos: a = INT64_MAX; neg: a = INT64_MIN.
+      LoadIntMaxN(a);                  // a = INT_MAX_N.
+      as_.Xorq(a, sh);                 // pos: INT_MAX_N; neg: INT_MIN_N sign-ext.
       as_.Jmp(*L_done);
 
       as_.Bind(L_pos_big);
-      // sh >= 64: if a == 0 result is 0, else saturate based on sign(a).
+      // sh >= bits_local: if a == 0 result is 0, else saturate based on
+      // sign(a).
       as_.Testq(a, a);
       as_.Jcc(Assembler::Condition::kZero, *L_zero);
-      // sign-broadcast a into back; then build saturation target.
       as_.Movq(back, a);
       as_.Sarq(back, int8_t{63});       // back = sign broadcast (0 or -1).
-      as_.Movq(a, int64_t{0x7FFFFFFFFFFFFFFFLL});
+      LoadIntMaxN(a);
       as_.Xorq(a, back);
       as_.Jmp(*L_done);
 
       as_.Bind(L_neg);
       // Negative shift: |sh| in [1, 128] after Negq.
       as_.Negq(sh);
-      as_.Cmpq(sh, int32_t{64});
+      as_.Cmpq(sh, int32_t{bits_local});
       as_.Jcc(Assembler::Condition::kGreaterEqual, *L_neg_big);
-      // 0 < |sh| < 64: a = (int64_t)a >>s |sh|.
+      // 0 < |sh| < bits_local: a = (int64_t)a >>s |sh|.  `a` is sign-
+      // extended at load time so SAR preserves the proper sign-extension.
       as_.Movq(Assembler::rcx, sh);
       as_.SarqByCl(a);
       as_.Jmp(*L_done);
 
       as_.Bind(L_neg_big);
-      // |sh| >= 64: a = sign broadcast across all bits.
+      // |sh| >= bits_local: a = sign broadcast across all bits.
       as_.Sarq(a, int8_t{63});
       as_.Jmp(*L_done);
 
@@ -17808,6 +17875,11 @@ class LiteTranslator {
       // Restore rcx.
       as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
       as_.Addq(Assembler::rsp, 8);
+
+      // Mask `a` to bits_local before storing.  At N=64 this is a no-op;
+      // for bits_local < 64 it drops the sign-extension bits so Vd[63:N]
+      // ends up as 0 instead of all 1s for negative results.
+      MaskToN(a);
 
       // Store result to Vd[63:0] and zero Vd[127:64].
       as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);

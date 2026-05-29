@@ -19644,6 +19644,226 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDIgnoresUpperVnVmJit) {
 }
 // endregion
 
+// region digitalis: SQSHL scalar B / H / S forms (signed saturating
+// variable shift at 8/16/32-bit lane widths).  Same opcode (0b01001, U=0)
+// as SqshlScalarD with size encoded in bits 23:22 of the instruction.
+constexpr uint32_t SqshlScalarB(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b00, /*opcode=*/0b01001, rd, rn, rm);
+}
+constexpr uint32_t SqshlScalarH(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b01, /*opcode=*/0b01001, rd, rn, rm);
+}
+constexpr uint32_t SqshlScalarS(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return ScalarThreeSame(/*u=*/0, /*size=*/0b10, /*opcode=*/0b01001, rd, rn, rm);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBEncodingMatchesLlvmMc) {
+  // sqshl b0, b1, b2.
+  EXPECT_EQ(SqshlScalarB(0, 1, 2), 0x5e224c20u);
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHEncodingMatchesLlvmMc) {
+  // sqshl h0, h1, h2.
+  EXPECT_EQ(SqshlScalarH(0, 1, 2), 0x5e624c20u);
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSEncodingMatchesLlvmMc) {
+  // sqshl s0, s1, s2.
+  EXPECT_EQ(SqshlScalarS(0, 1, 2), 0x5ea24c20u);
+}
+
+// B form (8-bit lane, INT_MAX_N=0x7F, INT_MIN_N=0x80).
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBLeftBy1PosLowNoSatJit) {
+  // a = +32, sh = 1.  +64 fits int8 → no sat → 0x40.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x20ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x40ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBLeftBy1PosHighSaturatesJit) {
+  // a = +64 (0x40), sh = 1.  +128 doesn't fit int8 [-128, 127] → sat to
+  // INT8_MAX = 0x7F.  Exercises the SignExtendFromN-then-SAR detector at
+  // the positive overflow boundary (low 8 of a<<1 = 0x80, sign-extends
+  // to -128 → SAR by 1 = -64 ≠ saved +64).
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x40ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x7FULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBLeftBy1NegHighSaturatesJit) {
+  // a = -65 (0xBF, sign-ext 0xFFFF…FFBF), sh = 1.  -130 doesn't fit int8
+  // → sat to INT8_MIN = 0x80.  Exercises sign-aware saturation at sub-D:
+  // saved-a SAR 63 = -1 → XOR with INT_MAX_N produces INT_MIN_N
+  // sign-ext'd to int64, which the store-path MaskToN truncates to 0x80.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xBFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x80ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBLeftBy1NegBoundaryNoSatJit) {
+  // a = -64 (0xC0), sh = 1.  -128 fits int8 (INT8_MIN), no sat → 0x80.
+  // This is the boundary case: SignExtendFromN(a<<1) = -128, SAR by 1 =
+  // -64 == saved a, no overflow detected.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xC0ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x80ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBRightArithmeticJit) {
+  // a = -2 (0xFE), sh = -1.  Arithmetic right shift preserves sign:
+  // -2 >>s 1 = -1 = 0xFF.  Distinguishes SQSHL from UQSHL (which would
+  // produce a logical 0x7F).
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFEULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0xFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBRightBy8NegSignBcastJit) {
+  // a = INT8_MIN = -128 (0x80), sh = -8.  |sh| == N → sign broadcast.
+  // For negative a, broadcast = -1 = 0xFF (lane).  Exercises the
+  // L_neg_big path and the MaskToN of an all-1s int64.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x80ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xF8ULL});  // -8
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0xFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBLeftBy7NegOneNoSatJit) {
+  // a = -1 (0xFF), sh = 7.  -1 << 7 = -128 = INT8_MIN, fits int8 → no sat
+  // → 0x80.  Critical boundary case: SignExtendFromN(a<<7) = -128, SAR
+  // by 7 = -1 == saved -1 → no overflow, result is the candidate -128.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{7});
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x80ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarBIgnoresUpperVnVmJit) {
+  // High bytes of Vn beyond lane 0 and high bits of Vm beyond [7:0] must
+  // not perturb the result; Vd[127:8] must be zeroed on output.  Lane 0
+  // of Vn is 0x40 (+64), sh = 1 → sat to 0x7F.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64) |
+                    static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBA40ULL});
+  state_.cpu.v[2] = (static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBADBULL})
+                     << 64) |
+                    static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFF01ULL});
+  static const uint32_t code[] = {SqshlScalarB(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x7FULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// H form (16-bit lane, INT_MAX_N=0x7FFF, INT_MIN_N=0x8000).
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHLeftBy1PosSaturatesJit) {
+  // a = 0x4000 (+16384), sh = 1.  +32768 doesn't fit int16 → sat 0x7FFF.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x4000ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x7FFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHLeftBy1NegSaturatesJit) {
+  // a = 0xBFFF (lane = -16385 sign-ext), sh = 1.  -32770 doesn't fit int16
+  // → sat to INT16_MIN = 0x8000.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xBFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x8000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHLeftBy14PosOneNoSatJit) {
+  // a = 1, sh = 14.  +16384 fits int16 → 0x4000.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{14});
+  static const uint32_t code[] = {SqshlScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x4000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHRightArithmeticJit) {
+  // a = 0xFFFF (-1 as int16), sh = -1.  SSHL: -1 >>s 1 = -1 = 0xFFFF.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xFFULL});  // -1
+  static const uint32_t code[] = {SqshlScalarH(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0xFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+// S form (32-bit lane, INT_MAX_N=0x7FFFFFFF, INT_MIN_N=0x80000000).
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSLeftBy1PosSaturatesJit) {
+  // a = 0x40000000 (+2^30), sh = 1.  +2^31 doesn't fit int32 → sat to
+  // INT32_MAX = 0x7FFFFFFF.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x40000000ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x7FFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSLeftBy1NegSaturatesJit) {
+  // a = 0xBFFFFFFF (lane = -0x40000001 as int32 sign-ext), sh = 1.
+  // Result doesn't fit int32 → sat to INT32_MIN = 0x80000000.
+  // Critical test for S-form MaskToN: the result 0xFFFFFFFF80000000 in
+  // int64 must be masked via Shlq 32 / Shrq 32 to produce 0x80000000;
+  // a naive Andq with int32_t{0xFFFFFFFF} would sign-extend to -1.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xBFFFFFFFULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x80000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSLeftBy30PosOneNoSatJit) {
+  // a = 1, sh = 30.  +2^30 fits int32 → 0x40000000.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{1});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{30});
+  static const uint32_t code[] = {SqshlScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x40000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSRightArithmeticNegJit) {
+  // a = 0x80000000 (INT32_MIN), sh = -16.  SSHL: INT32_MIN >>s 16 =
+  // 0xFFFF8000 = -32768 (sign-extended high lane).  Tests that S-form
+  // MaskToN correctly truncates the int64 sign-extended SAR result
+  // (0xFFFFFFFFFFFF8000) down to 0xFFFF8000.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x80000000ULL});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{0xF0ULL});  // -16
+  static const uint32_t code[] = {SqshlScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0xFFFF8000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSIgnoresUpperVnJit) {
+  // Garbage in Vn[127:32] must not affect result; Vd[127:32] must zero on
+  // output.  Lane 0 of Vn is 0x40000000; sh = 1 → sat to 0x7FFFFFFF.
+  state_.cpu.v[1] = (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64) |
+                    (static_cast<__uint128_t>(uint64_t{0xBADBADBADBADBADBULL})
+                     << 32) |
+                    static_cast<__uint128_t>(uint32_t{0x40000000U});
+  state_.cpu.v[2] = static_cast<__uint128_t>(uint64_t{1});
+  static const uint32_t code[] = {SqshlScalarS(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x7FFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+// endregion
+
 // region digitalis: URSHL scalar D form (unsigned non-saturating rounded
 // variable shift).  Encoded with opcode 0b01010, U=1 in the
 // AdvSimdScalarThreeSame class.
