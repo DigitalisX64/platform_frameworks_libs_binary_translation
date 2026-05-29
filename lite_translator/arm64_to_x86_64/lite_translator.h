@@ -20283,22 +20283,27 @@ class LiteTranslator {
           // can't express cheaply.  Fall back to the interpreter.
           success_ = false; return;
         }
-        // region digitalis: SQSHRN / SQSHRUN scalar D-source GPR fallback.
+        // region digitalis: SQSHRN / SQSHRUN / SQRSHRN scalar D-source
+        // GPR fallback.
         //
         // The SIMD vector lowering needs PSRAQ for the per-lane signed
         // arithmetic right shift at src=64, which is AVX-512F-VL only.
-        // For the scalar form (one lane, ARM ARM C7.2.236 / C7.2.238 forms
-        // `SQSHRN Vd<s>, Vn<d>, #shift` and `SQSHRUN Vd<s>, Vn<d>, #shift`),
+        // For the scalar form (one lane, ARM ARM C7.2.226 / C7.2.236 /
+        // C7.2.238 / C7.2.228 forms `SQSHRN Vd<s>, Vn<d>, #shift`,
+        // `SQSHRUN Vd<s>, Vn<d>, #shift`, `SQRSHRN Vd<s>, Vn<d>, #shift`),
         // we can sidestep PSRAQ entirely by routing the single lane through
         // 64-bit GPR ops:
         //
         //   1. Movq a, Vn[63:0]                  (signed int64)
-        //   2. Sarq a, cnt                       (cnt in [1, 32])
-        //   3. clamp a to dst range via Cmpq + Cmovq
-        //        SQSHRN  : [INT32_MIN,  INT32_MAX]
-        //        SQSHRUN : [0,          UINT32_MAX]
-        //   4. Pxor xzero / Movdqu Vd, xzero     (zero Vd[127:0])
-        //   5. Movl Vd[31:0], a                  (write low 32 bits)
+        //   2. (rounding only) signed-saturating add of (1<<(cnt-1)).
+        //      Round const is always positive, so only positive
+        //      overflow is possible — clamp to INT64_MAX on OF.
+        //   3. Sarq a, cnt                       (cnt in [1, 32])
+        //   4. clamp a to dst range via Cmpq + Cmovq
+        //        SQSHRN / SQRSHRN : [INT32_MIN,  INT32_MAX]
+        //        SQSHRUN          : [0,          UINT32_MAX]
+        //   5. Pxor xzero / Movdqu Vd, xzero     (zero Vd[127:0])
+        //   6. Movl Vd[31:0], a                  (write low 32 bits)
         //
         // Clamp ordering is upper-first then lower-second.  For SQSHRUN,
         // any negative Sarq result is < UINT32_MAX so the upper Cmovq.g
@@ -20308,12 +20313,21 @@ class LiteTranslator {
         // SQSHRN at cnt==32 (immh:immb=0x20) the SAR result is already in
         // [INT32_MIN, INT32_MAX] and both clamps are runtime no-ops.
         //
+        // For SQRSHRN, the pre-Sarq rounding add (1 << (cnt-1)) is in
+        // [1, 0x80000000].  Because round_const > 0, the add can only
+        // overflow positively (a near INT64_MAX); negative-direction
+        // underflow is impossible.  We use Cmovq.o against INT64_MAX as
+        // the saturation target — after the post-Sarq upper clamp drives
+        // INT64_MAX >> cnt (positive, at least INT32_MAX at cnt==32) to
+        // exactly INT32_MAX, which is the correct signed-saturating
+        // narrow result.
+        //
         // FPSR.QC is not updated here, mirroring the existing SQSHL .D
         // scalar GPR fallback at `lite_translator.h:19880` — neither
         // path sets QC.  This is perf-only and matches the historical
         // behaviour of the interpreter-bailout path for these forms.
         if (args.scalar && uses_signed_shift && src_bits == 64 &&
-            !is_rounding) {
+            !(is_rounding && is_saturating_signed_to_unsigned)) {
           const uint16_t immh_immb_local =
               static_cast<uint16_t>((immh << 3) | args.immb);
           const uint8_t narrow_rshift_local =
@@ -20329,24 +20343,39 @@ class LiteTranslator {
           Register a = AllocTempReg();
           Register max_reg = AllocTempReg();
           Register min_reg = AllocTempReg();
+          Register round_reg =
+              is_rounding ? AllocTempReg() : Assembler::no_register;
           SimdRegister xzero = AllocTempSimdReg();
           if (a == Assembler::no_register ||
               max_reg == Assembler::no_register ||
               min_reg == Assembler::no_register ||
+              (is_rounding && round_reg == Assembler::no_register) ||
               xzero == no_simd_register) {
             success_ = false; return;
           }
           // Load Vn[63:0] as signed int64.
           as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+          if (is_rounding) {
+            // Saturating-signed pre-Sarq add of the rounding constant.
+            // round_const = 1 << (cnt - 1), in [1, 0x80000000].
+            const int64_t round_const = int64_t{1} << (cnt - 1);
+            as_.Movq(round_reg, round_const);
+            // Addq sets OF iff signed overflow.  Movq imm doesn't
+            // touch EFLAGS, so the materialization of INT64_MAX into
+            // max_reg between Addq and Cmovq.o keeps OF intact.
+            as_.Addq(a, round_reg);
+            as_.Movq(max_reg, int64_t{INT64_MAX});
+            as_.Cmovq(Assembler::Condition::kOverflow, a, max_reg);
+          }
           // Arithmetic right shift by `cnt` (range [1, 32]).
           as_.Sarq(a, cnt);
           // Clamp a to [clamp_min, clamp_max] branchlessly.  Movq imm
           // does not affect EFLAGS, so the materialization stays clear
           // of the Cmpq->Cmovq window.  Signed Cmovq.g / Cmovq.l work
-          // for both SQSHRN and SQSHRUN: clamp_max is non-negative in
-          // both cases (INT32_MAX, UINT32_MAX both fit in int64 positive
-          // range), and clamp_min is non-positive in both cases
-          // (INT32_MIN, 0).
+          // for both SQSHRN/SQRSHRN and SQSHRUN: clamp_max is non-
+          // negative in all cases (INT32_MAX, UINT32_MAX both fit in
+          // int64 positive range), and clamp_min is non-positive in
+          // all cases (INT32_MIN, 0).
           as_.Movq(max_reg, clamp_max);
           as_.Cmpq(a, max_reg);
           as_.Cmovq(Assembler::Condition::kGreater, a, max_reg);
@@ -20363,7 +20392,7 @@ class LiteTranslator {
         if (uses_signed_shift && src_bits == 64) {
           // Remaining signed-source-D paths that still need PSRAQ:
           //   - SQSHRN  vector .2S (args.scalar=false, src=64)
-          //   - SQRSHRN scalar D-source / vector .2S
+          //   - SQRSHRN vector .2S (args.scalar=false, src=64)
           //   - SQSHRUN vector .2S (args.scalar=false, src=64)
           //   - SQRSHRUN scalar D-source / vector .2S
           // Baseline SSE has no PSRAQ; fall back to the interpreter.
