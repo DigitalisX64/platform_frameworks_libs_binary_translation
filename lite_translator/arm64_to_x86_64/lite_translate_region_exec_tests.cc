@@ -36363,6 +36363,152 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshluScalarDPositiveSaturates) {
   EXPECT_EQ(r[1], 0ULL);
 }
 
+// AdvSimdScalarShiftByImm — SQSHL at .D scalar.
+//
+// The SSE vector pipeline below needs PSRAQ for the signed back-shift
+// recovery step (AVX-512F-VL only); the JIT now emits a dedicated
+// GPR-scalar fallback (Shlq + Sarq + Cmpq overflow detector branched
+// against a precomputed INT64_MAX / INT64_MIN saturation target).
+// Vector .2D SQSHL still bails to the interpreter via the
+// `is_dword && kSqshl` filter that follows the new scalar path.
+//
+// Encoding (ARM ARM C7.2.243): 0 1 0 1 1 1 1 1 0 immh immb 01110 1 Rn Rd
+//   D scalar shift #N (N in [0, 63]):
+//     immh:immb = 64 + N
+//     SQSHL D0, D1, #11 — immh=1001, immb=011 → 0x5F4B7420.
+constexpr uint32_t kSqshlScalarD_0   = 0x5F407420;  // sqshl d0, d1, #0
+constexpr uint32_t kSqshlScalarD_1   = 0x5F417420;  // sqshl d0, d1, #1
+constexpr uint32_t kSqshlScalarD_11  = 0x5F4B7420;  // sqshl d0, d1, #11
+constexpr uint32_t kSqshlScalarD_62  = 0x5F7E7420;  // sqshl d0, d1, #62
+constexpr uint32_t kSqshlScalarD_63  = 0x5F7F7420;  // sqshl d0, d1, #63
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShiftZeroPassThroughJit) {
+  // shift=0 must be a no-op for any value, including INT64_MIN (the
+  // cnt==0 fast path must not run the Sarq sign-broadcast + Cmpq overflow
+  // detector — back-shifting by 0 on INT64_MIN compares fine, but exercise
+  // the dedicated early-return path here).
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x8000000000000000ULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);  // confirms upper-zero step.
+  static const uint32_t code[] = {kSqshlScalarD_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShiftOnePositiveNoSatJit) {
+  // a = 0x3000000000000000 (positive), shift = 1.  Result fits int64
+  // as 0x6000000000000000 — no saturation.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x3000000000000000ULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x6000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShiftOnePosSaturatesJit) {
+  // a = 0x4000000000000000 (positive), shift = 1.  Candidate is
+  // 0x8000000000000000 which is INT64_MIN as int64; back-SAR by 1 gives
+  // -0x4000000000000000 ≠ original a → overflow → saturate to INT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x4000000000000000ULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShift63NegOneNoSatJit) {
+  // a = -1, shift = 63.  Candidate = INT64_MIN; back-SAR by 63 = -1 = a
+  // → no overflow.  Confirms that INT64_MIN as candidate is correctly
+  // identified as a non-overflowed signed result when sign(a)<0.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShift63PosOneSaturatesJit) {
+  // a = +1, shift = 63.  Candidate = INT64_MIN as int64 (negative);
+  // back-SAR = -1 ≠ +1 → overflow.  sign(a) = 0 → saturate to INT64_MAX.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x1ULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x7FFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShift62NegTwoSaturatesJit) {
+  // a = -2, shift = 62.  Arithmetic result -2^63 fits int64 as INT64_MIN;
+  // candidate = (-2) << 62 = 0x8000000000000000 = INT64_MIN.  back-SAR by
+  // 62 = -2 = a → no overflow!  Result is INT64_MIN.  Pins the exact
+  // boundary where a negative input saturates *to* INT64_MIN without
+  // routing through the explicit saturation arm.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFEULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_62};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShift11ArbValueNoSatJit) {
+  // a = 0x0000123456789ABC, shift = 11.  Top 11 bits of a are zero, so
+  // the signed left shift fits in int64 without overflow.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x0000123456789ABCULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0091A2B3C4D5E000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmShift11NegArbSaturatesJit) {
+  // a = 0xFEDCBA9876543210 (large negative magnitude), shift = 11.
+  // Candidate overflows int64 (the high 11 bits are not all sign bits);
+  // back-SAR detector mismatches → saturate.  sign(a) = -1 → INT64_MIN.
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0xFEDCBA9876543210ULL});
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSqshlScalarD_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x8000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmInPlaceVdEqualsVnJit) {
+  // Vd == Vn (both d0).  Pins that the GPR-scalar path reads Vn[63:0]
+  // before zeroing Vd[127:64].
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000FEDCBA987ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCAFEBABEDEADBEEFULL})
+                     << 64);
+  static const uint32_t code[] = {0x5F4B7400U};  // sqshl d0, d0, #11
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000FEDCBA987ULL} << 11);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0})
+      << "upper 64 zeroed even with Vd==Vn";
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSqshlScalarD_0, 0x5F407420u);
+  EXPECT_EQ(kSqshlScalarD_1, 0x5F417420u);
+  EXPECT_EQ(kSqshlScalarD_11, 0x5F4B7420u);
+  EXPECT_EQ(kSqshlScalarD_62, 0x5F7E7420u);
+  EXPECT_EQ(kSqshlScalarD_63, 0x5F7F7420u);
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -

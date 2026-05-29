@@ -19232,9 +19232,12 @@ class LiteTranslator {
         case Decoder::AdvSimdShiftImmOpcode::kSqshl:
           // Scalar S/H/B fall through.  Scalar B uses the widen-via-
           // PMOVSXBW + PSLLW + signed clamp byte path.  Scalar D
-          // (immh=1xxx) still bails inside the case body on the
-          // existing `is_dword && kSqshl` filter (PSRAQ for the
-          // signed recover step is AVX-512F-VL only).
+          // (immh=1xxx) routes through a dedicated GPR-scalar
+          // Shlq + Sarq + Cmpq overflow detector inside the case body
+          // — the SSE vector path's PSRAQ signed-recover step is
+          // AVX-512F-VL only, but the single-lane GPR fallback uses
+          // baseline 64-bit GPR ops.  Vector .2D still bails to
+          // the interpreter.
           break;
         case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed:
         case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed:
@@ -19849,11 +19852,84 @@ class LiteTranslator {
           // endregion
         }
         const bool is_dword = (immh & 0b1000) != 0;
-        // region digitalis - dword (esize=64) pipeline lights up only
-        // for UQSHL and SQSHLU.  SQSHL .D needs PSRAQ for the signed
-        // recover step (AVX-512F-VL only) and stays interp-only.  The
-        // 64-bit lane ops are all SSE4.x: PSLLQ/PSRLQ (SSE2),
-        // PCMPEQQ (SSE4.1), PCMPGTQ (SSE4.2).
+        // region digitalis: SQSHL scalar .D GPR fallback path.
+        //
+        // SQSHL (immediate) scalar .D (immh & 0b1000, args.scalar==true)
+        // with shift_count in [0, 63].  The SSE vector .2D pipeline below
+        // needs PSRAQ for the signed back-shift recovery step (AVX-512F-VL
+        // only on x86), so emit a GPR-scalar fallback here using Shlq +
+        // Sarq (both 64-bit GPR ops, baseline x86-64).  Vector .2D SQSHL
+        // still bails to the interpreter via the per-vector filter below
+        // — the GPR scalar path only handles a single 64-bit lane.
+        //
+        // Algorithm (mirrors the AdvSimdScalarThreeSame SQSHL D variable-
+        // shift path at lite_translator.h around line 17744, specialized
+        // for a compile-time shift):
+        //
+        //   a         = (int64_t)Vn[63:0]
+        //   sat       = (a < 0) ? INT64_MIN : INT64_MAX
+        //               (computed branchless as INT64_MAX ^ (a >>s 63))
+        //   candidate = a << cnt
+        //   back      = candidate >>s cnt
+        //   result    = (back == a) ? candidate : sat
+        //   Vd[63:0]  = result;  Vd[127:64] = 0.
+        //
+        // At cnt == 0 the shift is a no-op and no overflow is possible;
+        // emit the pass-through directly to avoid the Cmpq + branch.
+        if (is_dword && args.scalar &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) {
+          const uint16_t immh_immb =
+              static_cast<uint16_t>((immh << 3) | args.immb);
+          const uint8_t shift_count = static_cast<uint8_t>(immh_immb - 64);
+          const int8_t cnt = static_cast<int8_t>(shift_count);
+          Register a = AllocTempReg();
+          Register candidate = AllocTempReg();
+          Register back = AllocTempReg();
+          Register sat = AllocTempReg();
+          if (a == Assembler::no_register ||
+              candidate == Assembler::no_register ||
+              back == Assembler::no_register ||
+              sat == Assembler::no_register) {
+            success_ = false; return;
+          }
+          as_.Movq(a, {.base = Assembler::rbp, .disp = vn_off});
+          if (cnt == 0) {
+            // No shift, no possible overflow; emit pass-through.
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, a);
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     int32_t{0});
+            return;
+          }
+          // sat = sign(a) ? INT64_MIN : INT64_MAX:
+          //   sat_tmp = a >>s 63   (all-zeros for a>=0, all-ones for a<0)
+          //   sat     = INT64_MAX ^ sat_tmp
+          //           → INT64_MAX (a>=0) or INT64_MIN (a<0).
+          as_.Movq(sat, a);
+          as_.Sarq(sat, int8_t{63});
+          as_.Movq(back, int64_t{0x7FFFFFFFFFFFFFFFLL});
+          as_.Xorq(sat, back);
+          // candidate = a << cnt; back = candidate >>s cnt.
+          as_.Movq(candidate, a);
+          as_.Shlq(candidate, cnt);
+          as_.Movq(back, candidate);
+          as_.Sarq(back, cnt);
+          // If back == a: no overflow → result is candidate.
+          // Else: result stays at the precomputed saturation target.
+          Assembler::Label* L_overflow = as_.MakeLabel();
+          as_.Cmpq(back, a);
+          as_.Jcc(Assembler::Condition::kNotEqual, *L_overflow);
+          as_.Movq(sat, candidate);
+          as_.Bind(L_overflow);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, sat);
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                   int32_t{0});
+          return;
+        }
+        // Vector .2D SQSHL (Q=1, immh & 0b1000) still needs PSRAQ for the
+        // signed back-shift recovery step (AVX-512F-VL only), so it bails
+        // to the interpreter.  The 64-bit lane ops used by the still-
+        // covered UQSHL .D / SQSHLU .D / SQSHL .D vector paths are all
+        // SSE4.x: PSLLQ/PSRLQ (SSE2), PCMPEQQ (SSE4.1), PCMPGTQ (SSE4.2).
         if (is_dword &&
             args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl) {
           success_ = false; return;
