@@ -37749,6 +37749,225 @@ TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDVdEqVnJit) {
 }
 // endregion
 
+// region digitalis: SRSHR .2D / scalar D GPR fallback tests.
+//
+// SRSHR is the signed rounding right shift, no accumulate.  Per lane:
+//   result = floor((Vn + 2^(shift-1)) / 2^shift)        [signed]
+//
+// The .2D / scalar D GPR fallback computes the round bit via Shrq +
+// Andq (bit (cnt-1) of Vn into bit 0), Sarq the value by cnt, Addq
+// the round bit.  At cnt==64 (== esize) ARM-spec'd result is 0 for
+// every input; the fallback special-cases this by writing 0 directly.
+//
+// Coverage:
+//   - Vector SRSHR .2D shifts {1, 11, 32, 63, 64}.
+//   - Scalar SRSHR D shifts {1, 32, 63, 64}.
+//   - Vd[127:64] zeroed for scalar D form.
+//   - Vd==Vn alias safe in both forms (SRSHR doesn't accumulate, but
+//     the alias case still exercises the temp-GPR-load-before-write
+//     ordering).
+constexpr uint32_t kSrshrVec2D_1    = 0x4F7F2420;  // srshr v0.2d, v1.2d, #1
+constexpr uint32_t kSrshrVec2D_11   = 0x4F752420;  // srshr v0.2d, v1.2d, #11
+constexpr uint32_t kSrshrVec2D_32   = 0x4F602420;  // srshr v0.2d, v1.2d, #32
+constexpr uint32_t kSrshrVec2D_63   = 0x4F412420;  // srshr v0.2d, v1.2d, #63
+constexpr uint32_t kSrshrVec2D_64   = 0x4F402420;  // srshr v0.2d, v1.2d, #64
+constexpr uint32_t kSrshrVec2D_VdEqVn_11 = 0x4F752400;  // srshr v0.2d, v0.2d, #11
+constexpr uint32_t kSrshrScalarD_1  = 0x5F7F2420;  // srshr d0, d1, #1
+constexpr uint32_t kSrshrScalarD_32 = 0x5F602420;  // srshr d0, d1, #32
+constexpr uint32_t kSrshrScalarD_63 = 0x5F412420;  // srshr d0, d1, #63
+constexpr uint32_t kSrshrScalarD_64 = 0x5F402420;  // srshr d0, d1, #64
+constexpr uint32_t kSrshrScalarD_VdEqVn_1 = 0x5F7F2400;  // srshr d0, d0, #1
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVecScalarDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSrshrVec2D_1, 0x4F7F2420u);
+  EXPECT_EQ(kSrshrVec2D_11, 0x4F752420u);
+  EXPECT_EQ(kSrshrVec2D_32, 0x4F602420u);
+  EXPECT_EQ(kSrshrVec2D_63, 0x4F412420u);
+  EXPECT_EQ(kSrshrVec2D_64, 0x4F402420u);
+  EXPECT_EQ(kSrshrVec2D_VdEqVn_11, 0x4F752400u);
+  EXPECT_EQ(kSrshrScalarD_1, 0x5F7F2420u);
+  EXPECT_EQ(kSrshrScalarD_32, 0x5F602420u);
+  EXPECT_EQ(kSrshrScalarD_63, 0x5F412420u);
+  EXPECT_EQ(kSrshrScalarD_64, 0x5F402420u);
+  EXPECT_EQ(kSrshrScalarD_VdEqVn_1, 0x5F7F2400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec2DShift1Jit) {
+  // Lane 0: floor((7+1)/2) = 4.
+  // Lane 1: floor((-7+1)/2) = floor(-3) = -3 = 0xFFFFFFFFFFFFFFFD.
+  uint64_t vn[2] = {uint64_t{0x0000000000000007ULL},
+                    uint64_t{0xFFFFFFFFFFFFFFF9ULL}};  // -7
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec2D_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000004ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFFDULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec2DShift11Jit) {
+  // Lane 0: SRSHR(INT64_MAX, 11) = floor((2^63 - 1 + 2^10) / 2^11)
+  //                              = 2^52 = 0x0010000000000000.
+  // Lane 1: SRSHR(INT64_MIN, 11) = floor((-2^63 + 2^10) / 2^11)
+  //                              = -2^52 = 0xFFF0000000000000.
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},
+                    uint64_t{0x8000000000000000ULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0010000000000000ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFF0000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec2DShift32Jit) {
+  // Lane 0: SRSHR(0x123456789ABCDEF0, 32)
+  //   Vn + 2^31 = 0x123456791ABCDEF0; /2^32 = 0x12345679.
+  // Lane 1: SRSHR(0xFEDCBA9876543210, 32)
+  //   Signed: Sarq = 0xFFFFFFFFFEDCBA98; round bit 0 = 0 (bit 31 of Vn = 0).
+  //   Sum = 0xFFFFFFFFFEDCBA98.
+  uint64_t vn[2] = {uint64_t{0x123456789ABCDEF0ULL},
+                    uint64_t{0xFEDCBA9876543210ULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec2D_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000012345679ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFEDCBA98ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec2DShift63Jit) {
+  // Lane 0: SRSHR(INT64_MAX, 63) = floor((2^63 - 1 + 2^62) / 2^63)
+  //                              = 1 (round up from 0.5 - tiny).
+  // Lane 1: SRSHR(INT64_MIN, 63) = floor((-2^63 + 2^62) / 2^63)
+  //                              = -1 (floor of -0.5).
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},
+                    uint64_t{0x8000000000000000ULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kSrshrVec2D_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000001ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec2DShift64BoundaryZeroJit) {
+  // shift == esize: ARM-spec'd SRSHR yields 0 for every input (signed).
+  // Both lanes must be 0 regardless of Vn value.
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // INT64_MAX
+                    uint64_t{0x8000000000000000ULL}};  // INT64_MIN
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kSrshrVec2D_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0});
+  EXPECT_EQ(r[1], uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrVec2DVdEqVnJit) {
+  // Vd==Vn (both v0); SRSHR doesn't accumulate, so result is just
+  // SRSHR(Vn, shift) per lane.  Round bit computed before Sarq, so
+  // even with aliasing the temp-GPR ordering is safe.
+  // Lane 0: SRSHR(0x20000, 11) = floor((131072 + 1024) / 2048) = 64.
+  // Lane 1: SRSHR(-65537, 11) = floor((-64513) / 2048) = -32
+  //                           = 0xFFFFFFFFFFFFFFE0.
+  uint64_t in[2] = {uint64_t{0x0000000000020000ULL},
+                    uint64_t{0xFFFFFFFFFFFEFFFFULL}};  // -65537
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSrshrVec2D_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000040ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFE0ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDShift1Jit) {
+  // Scalar D: only Vn[63:0] participates; Vd[127:64] zeroed.
+  // SRSHR(7, 1) = floor(8/2) = 4.
+  uint64_t vn[2] = {uint64_t{0x0000000000000007ULL},
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSrshrScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000000000004ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDShift32Jit) {
+  // SRSHR(0x123456789ABCDEF0, 32) = 0x12345679.
+  uint64_t vn[2] = {uint64_t{0x123456789ABCDEF0ULL},
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64);
+  static const uint32_t code[] = {kSrshrScalarD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000012345679ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDShift63Jit) {
+  // SRSHR(INT64_MIN, 63) = -1 (per Vec2DShift63 trace, lane 1 path).
+  uint64_t vn[2] = {uint64_t{0x8000000000000000ULL},
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64);
+  static const uint32_t code[] = {kSrshrScalarD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDShift64BoundaryZeroJit) {
+  // shift==esize boundary: result is 0 for every input.  Scalar D
+  // form writes 0 to both halves of Vd via the shared cnt==64 store.
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // INT64_MAX
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xAAAAAAAAAAAAAAAAULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSrshrScalarD_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDVdEqVnJit) {
+  // Vd==Vn==v0, scalar D, shift=1.  Vn[63:0]=-5;
+  // SRSHR(-5, 1) = floor(-4/2) = -2 = 0xFFFFFFFFFFFFFFFE.
+  // Vd[127:64] gets zeroed by the scalar D upper-zero step.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFBULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSrshrScalarD_VdEqVn_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFEULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -
