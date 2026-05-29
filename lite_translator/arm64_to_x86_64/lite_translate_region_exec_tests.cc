@@ -23469,6 +23469,171 @@ TEST_F(Arm64LiteTranslateRegionTest, UabaVec2SUpperZero) {
 }
 // endregion
 
+// region digitalis: CMTST (vector) JIT
+//
+// Encoding (per ARM ARM C7.2 "CMTST (vector)", cross-checked against
+// aarch64-linux-gnu-as):
+//   cmtst v0.8b,  v1.8b,  v2.8b  = 0x0E228C20 (Q=0, U=0, size=00, opcode=10001)
+//   cmtst v0.16b, v1.16b, v2.16b = 0x4E228C20 (Q=1, U=0, size=00)
+//   cmtst v0.4h,  v1.4h,  v2.4h  = 0x0E628C20 (Q=0, U=0, size=01)
+//   cmtst v0.8h,  v1.8h,  v2.8h  = 0x4E628C20 (Q=1, U=0, size=01)
+//   cmtst v0.2s,  v1.2s,  v2.2s  = 0x0EA28C20 (Q=0, U=0, size=10)
+//   cmtst v0.4s,  v1.4s,  v2.4s  = 0x4EA28C20 (Q=1, U=0, size=10)
+//   cmtst v0.2d,  v1.2d,  v2.2d  = 0x4EE28C20 (Q=1, U=0, size=11)
+// CMTST differs from CMEQ (vector) at opcode=10001 only by the U bit
+// (CMTST U=0; CMEQ U=1).  .1D is not a defined arrangement for CMTST.
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVecEncodingsMatchLlvmMc) {
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x0E228C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x4E228C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b01,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x0E628C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x4E628C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b10,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x0EA28C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x4EA28C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b11,
+                          /*opcode=*/0b10001, 0, 1, 2), 0x4EE28C20u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVec16B) {
+  // .16B, Q=1: per-byte bitwise AND != 0 mask.  Cover all-zero, all-set,
+  // single-bit overlap, and disjoint-but-nonzero lane combinations.
+  uint8_t n_lanes[16] = {0x00, 0xFF, 0x01, 0x80, 0x55, 0xAA, 0x0F, 0xF0,
+                          0x12, 0x34, 0xC0, 0x03, 0x81, 0x7E, 0x40, 0x20};
+  uint8_t m_lanes[16] = {0x00, 0xFF, 0x01, 0x80, 0xAA, 0x55, 0xF0, 0x0F,
+                          0x21, 0x43, 0x30, 0x0C, 0x18, 0x81, 0x40, 0x20};
+  std::memcpy(&state_.cpu.v[0], "\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA"
+                                  "\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA", 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected = ((n_lanes[i] & m_lanes[i]) != 0) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVec8H) {
+  // .8H, Q=1: per-halfword bitwise AND != 0 mask.
+  uint16_t n_lanes[8] = {0x0000, 0xFFFF, 0x0001, 0x8000,
+                          0x5555, 0x00FF, 0xFF00, 0x4002};
+  uint16_t m_lanes[8] = {0x0000, 0xAAAA, 0x0001, 0x0001,
+                          0xAAAA, 0xFF00, 0x00FF, 0x0002};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b01,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    uint16_t expected =
+        ((static_cast<uint16_t>(n_lanes[i] & m_lanes[i])) != 0) ? 0xFFFFu
+                                                                  : 0x0000u;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVec4S) {
+  // .4S, Q=1: per-word bitwise AND != 0 mask.
+  uint32_t n_lanes[4] = {0u, 0xFFFFFFFFu, 0x80000000u, 0x01020304u};
+  uint32_t m_lanes[4] = {0xFFFFFFFFu, 0u, 0x80000000u, 0x10204080u};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b10,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Expected per lane: (n & m) != 0 ? 0xFFFFFFFF : 0.
+  EXPECT_EQ(r[0], 0u);             // 0 & FFFFFFFF == 0.
+  EXPECT_EQ(r[1], 0u);             // FFFFFFFF & 0 == 0.
+  EXPECT_EQ(r[2], 0xFFFFFFFFu);    // 80000000 & 80000000 == 80000000.
+  EXPECT_EQ(r[3], 0u);             // 01020304 & 10204080 == 0.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVec2D) {
+  // .2D, Q=1: per-doubleword bitwise AND != 0 mask via PCMPEQQ (SSE4.1).
+  if (!host_platform::kHasSSE4_1) {
+    GTEST_SKIP() << "PCMPEQQ requires SSE4.1";
+  }
+  uint64_t n_lanes[2] = {0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL};
+  uint64_t m_lanes[2] = {0xFFFFFFFE00000000ULL, 0x0000000000000000ULL};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b11,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0ULL);                       // 0x1 & 0xFFFFFFFE00000000 == 0.
+  EXPECT_EQ(r[1], 0ULL);                       // FFFF...FF & 0 == 0.
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVec2DBothSet) {
+  // .2D, Q=1: both lanes overlap in at least one bit.
+  if (!host_platform::kHasSSE4_1) {
+    GTEST_SKIP() << "PCMPEQQ requires SSE4.1";
+  }
+  uint64_t n_lanes[2] = {0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL};
+  uint64_t m_lanes[2] = {0x8000000000000001ULL, 0x0000000000000001ULL};
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/0, /*size=*/0b11,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, CmtstVec8BUpperZero) {
+  // .8B, Q=0: low 8 byte lanes are CMTST'd; upper 64 bits zeroed by
+  // mask_low64.  Pre-fill Vd[127:64] with a non-zero sentinel that must
+  // be cleared after the JIT step.
+  uint8_t n_lanes[16] = {0x00, 0xFF, 0x01, 0x80, 0x55, 0xAA, 0x0F, 0xF0,
+                          0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE};
+  uint8_t m_lanes[16] = {0xFF, 0x00, 0x01, 0x80, 0xAA, 0x55, 0xF0, 0x0F,
+                          0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE};
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
+                    /*opcode=*/0b10001, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Low 8 bytes: (n & m) != 0.
+  for (int i = 0; i < 8; ++i) {
+    uint8_t expected = ((n_lanes[i] & m_lanes[i]) != 0) ? 0xFFu : 0x00u;
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+  // Upper 8 bytes: must be zeroed (the 0xCC sentinel is gone).
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
+  }
+}
+// endregion
+
 // region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
 //
 // Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",

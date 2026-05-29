@@ -5337,6 +5337,40 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kCmtst: {
+        // CMTST Vd, Vn, Vm — lane-wise (Vn & Vm) != 0 ? all-ones : 0.
+        // Recipe: PAND(Vn, Vm), then PCMPEQ against zero (all-ones if the
+        // lane is zero), then PXOR with all-ones to invert (so the non-zero
+        // lanes become the set lanes).  .2D needs PCMPEQQ which is SSE4.1.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_1) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pand(xn, xm);
+        as_.Pxor(xm, xm);  // xm = 0.
+        switch (args.size) {
+          case 0b00: as_.Pcmpeqb(xn, xm); break;
+          case 0b01: as_.Pcmpeqw(xn, xm); break;
+          case 0b10: as_.Pcmpeqd(xn, xm); break;
+          case 0b11: as_.Pcmpeqq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        // Materialize all-ones (size-independent) and invert: lanes where
+        // (Vn & Vm) != 0 become all-ones, the rest stay zero.
+        as_.Pcmpeqd(xm, xm);
+        as_.Pxor(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kBic: {
         // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
         // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
