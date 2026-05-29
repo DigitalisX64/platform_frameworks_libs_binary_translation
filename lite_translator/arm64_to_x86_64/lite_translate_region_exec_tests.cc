@@ -37520,6 +37520,235 @@ TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDVdEqVnJit) {
 }
 // endregion
 
+// region digitalis: AdvSimdShiftByImm — SSRA .2D AND scalar D.
+//
+// Sibling-promote of the SSHR .2D / scalar D fallback above.  SSRA's
+// per-lane semantics is Vd<i> = Vd<i> + SSHR(Vn<i>, shift), so the
+// JIT shape is the SSHR shape plus one Addq per lane that accumulates
+// the shifted Vn into the original Vd.  The same PSRAQ AVX-512F-VL
+// blocker applies at esize=64.  Coverage:
+//
+//   - Vector SSRA .2D: two 64-bit lanes each Sarq'd by cnt, then Addq'd
+//     into the matching original Vd lane.
+//   - Scalar SSRA D:   single 64-bit lane, accumulate into Vd[63:0],
+//     Vd[127:64] zeroed.
+//   - cnt boundary at 64 (= esize): cnt==64 maps to Sarq imm 63, same
+//     sign-fill result as the SSHR boundary.
+//   - Vd==Vn safety: both Vn and Vd lane values loaded into temp GPRs
+//     before any write, so Vd==Vn computes Vd += SSHR(Vd, shift)
+//     correctly across the two-lane path.
+constexpr uint32_t kSsraVec2D_1   = 0x4F7F1420;  // ssra v0.2d, v1.2d, #1
+constexpr uint32_t kSsraVec2D_11  = 0x4F751420;  // ssra v0.2d, v1.2d, #11
+constexpr uint32_t kSsraVec2D_32  = 0x4F601420;  // ssra v0.2d, v1.2d, #32
+constexpr uint32_t kSsraVec2D_63  = 0x4F411420;  // ssra v0.2d, v1.2d, #63
+constexpr uint32_t kSsraVec2D_64  = 0x4F401420;  // ssra v0.2d, v1.2d, #64
+constexpr uint32_t kSsraVec2D_VdEqVn_11 = 0x4F751400;  // ssra v0.2d, v0.2d, #11
+constexpr uint32_t kSsraScalarD_1   = 0x5F7F1420;  // ssra d0, d1, #1
+constexpr uint32_t kSsraScalarD_32  = 0x5F601420;  // ssra d0, d1, #32
+constexpr uint32_t kSsraScalarD_63  = 0x5F411420;  // ssra d0, d1, #63
+constexpr uint32_t kSsraScalarD_64  = 0x5F401420;  // ssra d0, d1, #64
+constexpr uint32_t kSsraScalarD_VdEqVn_1 = 0x5F7F1400;  // ssra d0, d0, #1
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVecScalarDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSsraVec2D_1, 0x4F7F1420u);
+  EXPECT_EQ(kSsraVec2D_11, 0x4F751420u);
+  EXPECT_EQ(kSsraVec2D_32, 0x4F601420u);
+  EXPECT_EQ(kSsraVec2D_63, 0x4F411420u);
+  EXPECT_EQ(kSsraVec2D_64, 0x4F401420u);
+  EXPECT_EQ(kSsraVec2D_VdEqVn_11, 0x4F751400u);
+  EXPECT_EQ(kSsraScalarD_1, 0x5F7F1420u);
+  EXPECT_EQ(kSsraScalarD_32, 0x5F601420u);
+  EXPECT_EQ(kSsraScalarD_63, 0x5F411420u);
+  EXPECT_EQ(kSsraScalarD_64, 0x5F401420u);
+  EXPECT_EQ(kSsraScalarD_VdEqVn_1, 0x5F7F1400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec2DShift1Jit) {
+  // Lane 0: 0x10 + (0x7 >> 1) = 0x10 + 0x3 = 0x13.
+  // Lane 1: -0x10 + (-0x7 >> 1) = -0x10 + -0x4 = -0x14 (Sarq toward -inf).
+  uint64_t vn[2] = {uint64_t{0x0000000000000007ULL},
+                    uint64_t{0xFFFFFFFFFFFFFFF9ULL}};  // -7
+  uint64_t vd[2] = {uint64_t{0x0000000000000010ULL},
+                    uint64_t{0xFFFFFFFFFFFFFFF0ULL}};  // -16
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSsraVec2D_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000013ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFECULL});  // -20
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec2DShift11Jit) {
+  // Lane 0: 0x10 + (INT64_MAX >> 11) = 0x10 + 0x000FFFFFFFFFFFFF = 0x000FFFFFFFFFFFFF + 0x10.
+  // Lane 1: 1 + (INT64_MIN >> 11) = 1 + 0xFFF0000000000000 = 0xFFF0000000000001.
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // INT64_MAX
+                    uint64_t{0x8000000000000000ULL}};  // INT64_MIN
+  uint64_t vd[2] = {uint64_t{0x0000000000000010ULL},
+                    uint64_t{0x0000000000000001ULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSsraVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x10ULL} + uint64_t{0x000FFFFFFFFFFFFFULL});
+  EXPECT_EQ(r[1], uint64_t{0x01ULL} + uint64_t{0xFFF0000000000000ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec2DShift32Jit) {
+  // Mixed positive/negative.  Vd accumulator non-zero.
+  // Lane 0: 0x100 + (0x123456789ABCDEF0 >> 32) = 0x100 + 0x12345678 = 0x12345778.
+  // Lane 1: -1 + (0xFEDCBA9876543210 >> 32) = -1 + 0xFFFFFFFFFEDCBA98
+  //       = 0xFFFFFFFFFFFFFFFF + 0xFFFFFFFFFEDCBA98 = 0xFFFFFFFFFEDCBA97 (mod 2^64).
+  uint64_t vn[2] = {uint64_t{0x123456789ABCDEF0ULL},
+                    uint64_t{0xFEDCBA9876543210ULL}};  // negative
+  uint64_t vd[2] = {uint64_t{0x0000000000000100ULL},
+                    uint64_t{0xFFFFFFFFFFFFFFFFULL}};  // -1
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSsraVec2D_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000012345778ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFEDCBA97ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec2DShift63Jit) {
+  // Shift 63 isolates sign bit per lane: positive → 0, negative → -1.
+  // Lane 0 accumulator 0x100 + 0 = 0x100.
+  // Lane 1 accumulator 0x200 + -1 = 0x1FF.
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // sign bit 0
+                    uint64_t{0x8000000000000000ULL}};  // sign bit 1
+  uint64_t vd[2] = {uint64_t{0x0000000000000100ULL},
+                    uint64_t{0x0000000000000200ULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSsraVec2D_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000100ULL});
+  EXPECT_EQ(r[1], uint64_t{0x00000000000001FFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec2DShift64BoundarySignFillJit) {
+  // Shift==esize boundary: ARM SSHR yields sign-fill per lane; JIT maps
+  // cnt==64 to Sarq imm 63 (same sign-fill result).  Then accumulate.
+  // Lane 0: 0x55 + 0 (positive Vn → 0) = 0x55.
+  // Lane 1: 0x77 + -1 (negative Vn → -1) = 0x76.
+  uint64_t vn[2] = {uint64_t{0x0000000000000001ULL},   // positive small
+                    uint64_t{0xFFFFFFFFFFFFFFFFULL}};  // -1
+  uint64_t vd[2] = {uint64_t{0x0000000000000055ULL},
+                    uint64_t{0x0000000000000077ULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  static const uint32_t code[] = {kSsraVec2D_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000055ULL});
+  EXPECT_EQ(r[1], uint64_t{0x0000000000000076ULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec2DVdEqVnJit) {
+  // Vd==Vn (both v0); two-lane GPR fallback loads Vn lanes AND Vd lanes
+  // up front, so Vd==Vn computes Vd += SSHR(Vd, shift) safely.
+  // Lane 0: 0x20000 + (0x20000 >> 11) = 0x20000 + 0x40 = 0x20040.
+  // Lane 1: -65537 + (-65537 >> 11) = -65537 + -33 = -65570 = 0xFFFFFFFFFFFEFFDE.
+  uint64_t in[2] = {uint64_t{0x0000000000020000ULL},
+                    uint64_t{0xFFFFFFFFFFFEFFFFULL}};  // -65537
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSsraVec2D_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000020040ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFEFFDEULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDShift1Jit) {
+  // Scalar D: only Vn[63:0] participates; Vd[127:64] must be zeroed.
+  // -6 >> 1 = -3 (toward -inf); accumulate into Vd[63:0] = 0x10.
+  // Result: 0x10 + -3 = 13 = 0x0D.
+  uint64_t vn[2] = {uint64_t{0xFFFFFFFFFFFFFFFAULL},   // -6
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000000000010ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSsraScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x000000000000000DULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDShift32Jit) {
+  // Scalar D shift=32 mixed bits; accumulate into Vd[63:0] = 0x100.
+  // 0x123456789ABCDEF0 >> 32 = 0x12345678; + 0x100 = 0x12345778.
+  uint64_t vn[2] = {uint64_t{0x123456789ABCDEF0ULL},
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000000000100ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64);
+  static const uint32_t code[] = {kSsraScalarD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000012345778ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDShift63Jit) {
+  // INT64_MIN >> 63 = -1; accumulate into Vd[63:0] = 1.
+  // Result: 1 + -1 = 0.  Vd[127:64] must be zeroed.
+  uint64_t vn[2] = {uint64_t{0x8000000000000000ULL},   // INT64_MIN
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000000000001ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64);
+  static const uint32_t code[] = {kSsraScalarD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000000000000ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDShift64BoundarySignFillJit) {
+  // Scalar D shift==64: sign-fill via cnt==63 mapping.  Positive Vn →
+  // 0; accumulate into Vd[63:0] = 0x42 → result 0x42.  Vd[127:64] zero.
+  uint64_t vn[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // INT64_MAX (positive)
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0x0000000000000042ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSsraScalarD_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000000000042ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDVdEqVnJit) {
+  // Vd==Vn==v0; scalar D form must read Vd before zeroing upper.
+  // Lane 0 in = -4; -4 + (-4 >> 1) = -4 + -2 = -6 = 0xFFFFFFFFFFFFFFFA.
+  // Upper Vd[127:64] must end up zero per scalar D semantics.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFCULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSsraScalarD_VdEqVn_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFAULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -
