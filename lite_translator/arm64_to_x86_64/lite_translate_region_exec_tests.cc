@@ -24406,6 +24406,85 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhVec2SUpperZero) {
 }
 // endregion
 
+// region digitalis - PMUL polynomial multiply (vector, byte lanes) JIT.
+//
+// PMUL .8B / .16B per-lane carry-less multiply over GF(2)[x], keeping the
+// low 8 bits of the polynomial product.  Encoding: AdvSimdThreeSame, U=1,
+// opcode=10011, size=00.  All other sizes reserved.
+TEST_F(Arm64LiteTranslateRegionTest, PmulVecEncodingsMatchLlvmMc) {
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b00,
+                          /*opcode=*/0b10011, 0, 1, 2), 0x2E229C20u);
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                          /*opcode=*/0b10011, 0, 1, 2), 0x6E229C20u);
+}
+
+namespace {
+inline uint8_t PolyMulLow8(uint8_t a, uint8_t b) {
+  uint16_t res = 0;
+  for (unsigned i = 0; i < 8; ++i) {
+    if ((b >> i) & 1u) {
+      res ^= static_cast<uint16_t>(static_cast<uint16_t>(a) << i);
+    }
+  }
+  return static_cast<uint8_t>(res);
+}
+}  // namespace
+
+TEST_F(Arm64LiteTranslateRegionTest, PmulVec16B) {
+  // .16B Q=1: full 16-lane coverage.  Includes boundary bytes (0x00, 0xFF,
+  // 0x01, 0x80), mixed-symmetry pairs, and the (0xFF, 0xFF) lane which is
+  // the hot input for CRC32 / GHASH reductions (PolyMulLow8(0xFF, 0xFF) =
+  // 0x55).
+  uint8_t n_lanes[16] = {
+      0x00, 0xFF, 0x01, 0x80, 0x03, 0x05, 0xAA, 0x55,
+      0xF0, 0x0F, 0x37, 0xC9, 0x10, 0x20, 0x40, 0xDE};
+  uint8_t m_lanes[16] = {
+      0x00, 0xFF, 0xFF, 0x80, 0x05, 0x03, 0x55, 0xAA,
+      0x0F, 0xF0, 0xC9, 0x37, 0x01, 0x80, 0x40, 0xAD};
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Pin the (0xFF, 0xFF) lane explicitly: PolyMulLow8(0xFF, 0xFF) = 0x55.
+  EXPECT_EQ(r[1], 0x55u);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], PolyMulLow8(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, PmulVec8BUpperZero) {
+  // .8B Q=0: low 8 byte lanes via PMUL; upper 8 bytes must be zeroed by
+  // mask_low64.  Vd pre-filled with 0xCC sentinel; the upper-8 source bytes
+  // are non-trivial values to confirm they do not leak into Vd.
+  uint8_t n_lanes[16] = {
+      0x03, 0xFF, 0x10, 0x7F, 0xC3, 0x42, 0x00, 0x80,
+      0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A};
+  uint8_t m_lanes[16] = {
+      0x05, 0xFF, 0x07, 0xFE, 0x42, 0xC3, 0xFF, 0x80,
+      0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED, 0xFA, 0xCE};
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  std::memcpy(&state_.cpu.v[1], n_lanes, 16);
+  std::memcpy(&state_.cpu.v[2], m_lanes, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10011, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], PolyMulLow8(n_lanes[i], m_lanes[i])) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
+  }
+}
+// endregion
+
 // region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
 //
 // Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",

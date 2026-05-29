@@ -7541,6 +7541,98 @@ class LiteTranslator {
         success_ = false; return;
       }
       // endregion
+      // region digitalis - PMUL polynomial multiply (vector, byte lanes).
+      //
+      // ARM ARM C7.2.219: PMUL .8B/.16B performs per-lane carry-less multiply
+      // over GF(2)[x]; the result is the low 8 bits of the polynomial product.
+      // The decoder restricts size to 00 (8-bit lanes); size in {01, 10, 11}
+      // is reserved and routed to Undefined upstream.
+      //
+      // Lowering: per-bit unrolled SSE2 recipe (no PCLMULQDQ dependency).
+      //   acc = 0
+      //   bit_mask = 0x01 (byte-replicated)
+      //   for i in 0..7:
+      //     shift_mask = -bit_mask per byte                  // = (0xFF << i) & 0xFF
+      //     shifted_a  = (a << i) AND shift_mask             // byte-clean
+      //     selector   = ((b AND bit_mask) PCMPEQB bit_mask) // 0xFF if bit set
+      //     acc       ^= shifted_a AND selector
+      //     bit_mask  += bit_mask                             // doubles via PADDB
+      //
+      // Notes:
+      //   * PSLLW shifts whole 16-bit lanes, so the low byte's high bits
+      //     spill into the high byte after the shift; the PAND with
+      //     shift_mask zeros those spilled bits in every byte.  shift_mask
+      //     = -bit_mask (PSUBB(zero, bit_mask)) because for bit_mask = 1<<i,
+      //     `0 - (1<<i) mod 256 = ((0xFF << i) & 0xFF)` is exactly the
+      //     byte mask with bits 0..i-1 cleared and bits i..7 set.
+      //   * PCMPEQB(masked_b, bit_mask) produces 0xFF per byte if bit i was
+      //     set in b (since the masked value equals bit_mask only when the
+      //     lone surviving bit was set), and 0 otherwise.
+      //   * The bit_mask doubles cleanly via PADDB across iterations
+      //     0x01 -> 0x02 -> 0x04 -> ... -> 0x80 (no overflow within 8 iters).
+      case Decoder::AdvSimdThreeSameOpcode::kPmul: {
+        // Decoder enforces size=00; defensive bail for safety.
+        if (args.size != 0b00) { Undefined(); return; }
+
+        SimdRegister xa = AllocTempSimdReg();
+        SimdRegister xb = AllocTempSimdReg();
+        SimdRegister xacc = AllocTempSimdReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        SimdRegister xbit = AllocTempSimdReg();
+        SimdRegister xshift_a = AllocTempSimdReg();
+        SimdRegister xsel = AllocTempSimdReg();
+        if (xa == no_simd_register || xb == no_simd_register ||
+            xacc == no_simd_register || xzero == no_simd_register ||
+            xbit == no_simd_register || xshift_a == no_simd_register ||
+            xsel == no_simd_register) {
+          success_ = false; return;
+        }
+        Register tmp_gpr = AllocTempReg();
+        if (tmp_gpr == Assembler::no_register) {
+          success_ = false; return;
+        }
+
+        load_full(xa, vn_off);
+        load_full(xb, vm_off);
+
+        // xacc = 0, xzero = 0.
+        as_.Pxor(xacc, xacc);
+        as_.Pxor(xzero, xzero);
+
+        // xbit = byte 0x01 replicated across all 16 bytes.
+        as_.Movq(tmp_gpr, int64_t{0x0101010101010101LL});
+        as_.Movq(xbit, tmp_gpr);
+        as_.Punpcklqdq(xbit, xbit);
+
+        // 8 iterations, one per bit position 0..7.
+        for (int i = 0; i < 8; ++i) {
+          // shifted_a = (xa << i) per byte, byte-masked.
+          as_.Movdqa(xshift_a, xa);
+          if (i != 0) {
+            as_.Psllw(xshift_a, static_cast<int8_t>(i));
+            // shift_mask = -xbit per byte = byte (0xFF << i) & 0xFF.
+            as_.Movdqa(xsel, xzero);
+            as_.Psubb(xsel, xbit);
+            as_.Pand(xshift_a, xsel);
+          }
+          // selector = (xb AND xbit) PCMPEQB xbit -> 0xFF per byte where bit i set.
+          as_.Movdqa(xsel, xb);
+          as_.Pand(xsel, xbit);
+          as_.Pcmpeqb(xsel, xbit);
+          // Accumulate: xacc ^= shifted_a AND selector.
+          as_.Pand(xshift_a, xsel);
+          as_.Pxor(xacc, xshift_a);
+          // Double xbit for the next iteration (skip after the last bit).
+          if (i != 7) {
+            as_.Paddb(xbit, xbit);
+          }
+        }
+
+        if (!args.q) mask_low64(xacc);
+        store_full(vd_off, xacc);
+        return;
+      }
+      // endregion
       // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
       //
       // Decoder restricts size to {01, 10}.  size=01 (.4h/.8h) uses PMULHRSW
