@@ -37333,6 +37333,193 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDVdEqVnJit) {
 }
 // endregion
 
+// region digitalis: AdvSimdShiftByImm — SSHR at .2D and scalar D.
+//
+// lite_translator.h's AdvSimdShiftImmOpcode::kSshr case promotes the
+// esize_bits==64 paths through a two-lane GPR fallback (PSRAQ is
+// AVX-512F-VL only).  Coverage:
+//
+//   - Vector SSHR .2D: two 64-bit lanes each Sarq'd by cnt.
+//   - Scalar SSHR D:   single 64-bit lane, Vd[127:64] zeroed.
+//   - cnt boundary at 64 (= esize): ARM spec'd sign-fill; x86 Sarq
+//     r64, imm masks count to 6 bits so cnt==64 maps to cnt==63 in the
+//     JIT (same sign-fill result).
+//   - Vd==Vn safety: both lanes loaded into temp GPRs before any write.
+constexpr uint32_t kSshrVec2D_1   = 0x4F7F0420;  // sshr v0.2d, v1.2d, #1
+constexpr uint32_t kSshrVec2D_11  = 0x4F750420;  // sshr v0.2d, v1.2d, #11
+constexpr uint32_t kSshrVec2D_32  = 0x4F600420;  // sshr v0.2d, v1.2d, #32
+constexpr uint32_t kSshrVec2D_63  = 0x4F410420;  // sshr v0.2d, v1.2d, #63
+constexpr uint32_t kSshrVec2D_64  = 0x4F400420;  // sshr v0.2d, v1.2d, #64
+constexpr uint32_t kSshrVec2D_VdEqVn_11 = 0x4F750400;  // sshr v0.2d, v0.2d, #11
+constexpr uint32_t kSshrScalarD_1   = 0x5F7F0420;  // sshr d0, d1, #1
+constexpr uint32_t kSshrScalarD_32  = 0x5F600420;  // sshr d0, d1, #32
+constexpr uint32_t kSshrScalarD_63  = 0x5F410420;  // sshr d0, d1, #63
+constexpr uint32_t kSshrScalarD_64  = 0x5F400420;  // sshr d0, d1, #64
+constexpr uint32_t kSshrScalarD_VdEqVn_1 = 0x5F7F0400;  // sshr d0, d0, #1
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVecScalarDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSshrVec2D_1, 0x4F7F0420u);
+  EXPECT_EQ(kSshrVec2D_11, 0x4F750420u);
+  EXPECT_EQ(kSshrVec2D_32, 0x4F600420u);
+  EXPECT_EQ(kSshrVec2D_63, 0x4F410420u);
+  EXPECT_EQ(kSshrVec2D_64, 0x4F400420u);
+  EXPECT_EQ(kSshrVec2D_VdEqVn_11, 0x4F750400u);
+  EXPECT_EQ(kSshrScalarD_1, 0x5F7F0420u);
+  EXPECT_EQ(kSshrScalarD_32, 0x5F600420u);
+  EXPECT_EQ(kSshrScalarD_63, 0x5F410420u);
+  EXPECT_EQ(kSshrScalarD_64, 0x5F400420u);
+  EXPECT_EQ(kSshrScalarD_VdEqVn_1, 0x5F7F0400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVec2DShift1Jit) {
+  // Lane 0 positive odd, lane 1 negative odd.  Sarq by 1: positive
+  // halves (rounding toward -inf), negative becomes more negative.
+  uint64_t in[2] = {uint64_t{0x0000000000000007ULL},
+                    uint64_t{0xFFFFFFFFFFFFFFF9ULL}};  // -7
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrVec2D_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000003ULL});  // 7 >> 1 = 3
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFFCULL});  // -7 >> 1 = -4 (Sarq toward -inf)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVec2DShift11Jit) {
+  uint64_t in[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // INT64_MAX
+                    uint64_t{0x8000000000000000ULL}};  // INT64_MIN
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x000FFFFFFFFFFFFFULL});   // INT64_MAX >> 11
+  EXPECT_EQ(r[1], uint64_t{0xFFF0000000000000ULL});   // INT64_MIN >> 11 (sign-extended)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVec2DShift32Jit) {
+  uint64_t in[2] = {uint64_t{0x123456789ABCDEF0ULL},
+                    uint64_t{0xFEDCBA9876543210ULL}};  // negative
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrVec2D_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000012345678ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFEDCBA98ULL});  // sign-extended
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVec2DShift63Jit) {
+  // Shift 63 isolates sign bit per lane: positive → 0, negative → -1.
+  uint64_t in[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // sign bit 0
+                    uint64_t{0x8000000000000000ULL}};  // sign bit 1
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrVec2D_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000000ULL});
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVec2DShift64BoundarySignFillJit) {
+  // Shift==esize boundary: ARM SSHR produces sign-fill per lane.  The
+  // JIT maps cnt==64 to Sarq imm 63 (same sign-fill result).
+  uint64_t in[2] = {uint64_t{0x0000000000000001ULL},   // positive small
+                    uint64_t{0xFFFFFFFFFFFFFFFFULL}};  // -1
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrVec2D_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000000ULL});  // positive → 0
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFFFULL});  // negative → -1
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrVec2DVdEqVnJit) {
+  // Vd==Vn (both v0).  Two-lane GPR fallback loads both lanes into
+  // temp GPRs before writing either lane, so Vd==Vn is naturally safe.
+  uint64_t in[2] = {uint64_t{0x0000000000020000ULL},
+                    uint64_t{0xFFFFFFFFFFFEFFFFULL}};  // negative
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSshrVec2D_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x0000000000000040ULL});  // 0x20000 >> 11 = 0x40
+  EXPECT_EQ(r[1], uint64_t{0xFFFFFFFFFFFFFFDFULL});  // -65537 >> 11 = -33 (toward -inf)
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDShift1Jit) {
+  // Scalar D: only Vn[63:0] participates; Vd[127:64] must be zeroed.
+  uint64_t in[2] = {uint64_t{0xFFFFFFFFFFFFFFFAULL},   // -6
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};  // garbage upper
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSshrScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFDULL});  // -6 >> 1 = -3
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDShift32Jit) {
+  uint64_t in[2] = {uint64_t{0x123456789ABCDEF0ULL},
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrScalarD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000012345678ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDShift63Jit) {
+  uint64_t in[2] = {uint64_t{0x8000000000000000ULL},   // INT64_MIN
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrScalarD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFFULL});  // sign bit replicated
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDShift64BoundarySignFillJit) {
+  // Scalar D shift==64: sign-fill via cnt==63 mapping.
+  uint64_t in[2] = {uint64_t{0x7FFFFFFFFFFFFFFFULL},   // INT64_MAX (positive)
+                    uint64_t{0xDEADBEEFCAFEBABEULL}};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {kSshrScalarD_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0x0000000000000000ULL});  // positive → 0
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDVdEqVnJit) {
+  // Vd==Vn==v0; lane 0 loaded into temp GPR before zero of upper.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{0xFFFFFFFFFFFFFFFCULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  static const uint32_t code[] = {kSshrScalarD_VdEqVn_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFFEULL});  // -4 >> 1 = -2
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -

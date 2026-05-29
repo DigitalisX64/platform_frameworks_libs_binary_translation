@@ -19400,11 +19400,69 @@ class LiteTranslator {
         } else {
           shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);  // 1..bits
         }
-        // SSHR .2D needs PSRAQ which only exists in AVX-512F — bail.
+        // region digitalis: SSHR .2D / scalar D GPR fallback.
+        //
+        // SSHR's per-lane arithmetic right shift at .D needs PSRAQ,
+        // which is AVX-512F-VL only.  For the .2D vector form and the
+        // scalar D-source form (both single-or-double 64-bit lanes
+        // operating on the low half of the SIMD register), the lanes
+        // can be shipped through 64-bit GPR ops without PSRAQ:
+        //
+        //   Movq lane_i, Vn[64*i +: 64]        (signed int64)
+        //   Sarq lane_i, cnt                   (cnt in [1, 64])
+        //   Movq Vd[64*i +: 64], lane_i        (write back)
+        //
+        // Load BOTH lanes before storing — Vd may equal Vn.  shift_count
+        // is in [1, 64]; x86 Sarq r64, imm masks the count to 6 bits,
+        // so cnt==64 would hardware-decode as 0 (no shift) — wrong for
+        // ARM's spec'd sign-fill at shift==esize.  Map cnt==64 → 63: a
+        // Sarq r64, 63 replicates the sign bit across the whole lane,
+        // which is the same sign-fill result the ARM spec demands for
+        // SSHR at shift==64.
+        //
+        // Scalar D (args.scalar=true) writes a single lane and zeroes
+        // Vd[127:64].  Vector .2D (args.scalar=false, args.q=true)
+        // writes both lanes.  Vector .1D (args.scalar=false,
+        // args.q=false) is reserved per ARM ARM C7.2.336 — bail so the
+        // interpreter raises SIGILL via the decoder UNDEFINED path.
         if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr &&
             esize_bits == 64) {
-          success_ = false; return;
+          const bool is_two_lane = !args.scalar && args.q;
+          if (!args.scalar && !args.q) {
+            // Vector .1D is reserved.
+            success_ = false; return;
+          }
+          Register lane0 = AllocTempReg();
+          Register lane1 =
+              is_two_lane ? AllocTempReg() : Assembler::no_register;
+          if (lane0 == Assembler::no_register ||
+              (is_two_lane && lane1 == Assembler::no_register)) {
+            success_ = false; return;
+          }
+          as_.Movq(lane0, {.base = Assembler::rbp, .disp = vn_off});
+          if (is_two_lane) {
+            as_.Movq(lane1,
+                     {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          const int8_t sarq_cnt =
+              (shift_count >= 64) ? int8_t{63}
+                                  : static_cast<int8_t>(shift_count);
+          as_.Sarq(lane0, sarq_cnt);
+          if (is_two_lane) {
+            as_.Sarq(lane1, sarq_cnt);
+          }
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, lane0);
+          if (is_two_lane) {
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     lane1);
+          } else {
+            // Scalar D: zero Vd[127:64].
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                     int32_t{0});
+          }
+          return;
         }
+        // endregion
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { success_ = false; return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
