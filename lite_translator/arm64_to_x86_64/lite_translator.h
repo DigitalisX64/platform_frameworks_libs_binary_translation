@@ -5559,6 +5559,133 @@ class LiteTranslator {
         return;
       }
       // endregion
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kShsub:
+      case Decoder::AdvSimdThreeSameOpcode::kUhsub: {
+        // SHSUB / UHSUB Vd, Vn, Vm — per-lane (a - b) >> 1 with floor-
+        // divide, signed (SHSUB) or unsigned (UHSUB).  ARM ARM C7.2
+        // reserves .2D.
+        //
+        // Width recipes:
+        //  - Byte (size=00): widen 8 bytes per half to 16-bit lanes
+        //    via PMOVSXBW / PMOVZXBW, PSUBW, arithmetic / logical
+        //    shift right by 1, PACKSSWB / PACKUSWB.  Unsigned needs
+        //    a 0x00FF per-word mask before PACKUSWB so the modular
+        //    PSRLW result of `a - b` for a < b (in [0x7F80, 0x7FFF])
+        //    does not saturate up to 0xFF.
+        //  - Halfword (size=01): same shape one width up.  PMOVSXWD /
+        //    PMOVZXWD widen 4 halfwords per half to int32, PSUBD,
+        //    PSRAD / PSRLD by 1, PACKSSDW / PACKUSDW.  Unsigned needs
+        //    0x0000FFFF mask before PACKUSDW for the same reason.
+        //  - Word (size=10): no SSE2 / SSE4.1 PSRAQ and no PACK 64→32
+        //    with saturation, so PMOVSXDQ / PMOVZXDQ widen 2 dwords
+        //    per half to int64, PSUBQ, PSRLQ by 1, then pack via
+        //    PSHUFD (gather low dword of each qword) + PUNPCKLQDQ.
+        //    PSRLQ is logical, but the bit-63 difference vs PSRAQ
+        //    does not survive the mask-to-low-32 step in PSHUFD, so
+        //    this is correct for both signed and unsigned (the
+        //    widening PMOVSXDQ vs PMOVZXDQ is what distinguishes the
+        //    two cases).
+        if (args.size == 0b11) { Undefined(); return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShsub);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xn_hi = AllocTempSimdReg();
+        SimdRegister xm_hi = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xn_hi == no_simd_register || xm_hi == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xn_hi, xn);
+        as_.Movdqa(xm_hi, xm);
+        as_.Psrldq(xn_hi, int8_t{8});
+        as_.Psrldq(xm_hi, int8_t{8});
+        if (args.size == 0b00) {
+          if (is_signed) {
+            as_.Pmovsxbw(xn, xn);
+            as_.Pmovsxbw(xm, xm);
+            as_.Pmovsxbw(xn_hi, xn_hi);
+            as_.Pmovsxbw(xm_hi, xm_hi);
+            as_.Psubw(xn, xm);
+            as_.Psubw(xn_hi, xm_hi);
+            as_.Psraw(xn, int8_t{1});
+            as_.Psraw(xn_hi, int8_t{1});
+            as_.Packsswb(xn, xn_hi);
+          } else {
+            as_.Pmovzxbw(xn, xn);
+            as_.Pmovzxbw(xm, xm);
+            as_.Pmovzxbw(xn_hi, xn_hi);
+            as_.Pmovzxbw(xm_hi, xm_hi);
+            as_.Psubw(xn, xm);
+            as_.Psubw(xn_hi, xm_hi);
+            as_.Psrlw(xn, int8_t{1});
+            as_.Psrlw(xn_hi, int8_t{1});
+            // Clobber xm to 0x00FF per int16 so PACKUSWB only sees the
+            // low byte of each lane (avoids 0x7F80..0x7FFF saturating).
+            as_.Pcmpeqw(xm, xm);
+            as_.Psrlw(xm, int8_t{8});
+            as_.Pand(xn, xm);
+            as_.Pand(xn_hi, xm);
+            as_.Packuswb(xn, xn_hi);
+          }
+        } else if (args.size == 0b01) {
+          if (is_signed) {
+            as_.Pmovsxwd(xn, xn);
+            as_.Pmovsxwd(xm, xm);
+            as_.Pmovsxwd(xn_hi, xn_hi);
+            as_.Pmovsxwd(xm_hi, xm_hi);
+            as_.Psubd(xn, xm);
+            as_.Psubd(xn_hi, xm_hi);
+            as_.Psrad(xn, int8_t{1});
+            as_.Psrad(xn_hi, int8_t{1});
+            as_.Packssdw(xn, xn_hi);
+          } else {
+            as_.Pmovzxwd(xn, xn);
+            as_.Pmovzxwd(xm, xm);
+            as_.Pmovzxwd(xn_hi, xn_hi);
+            as_.Pmovzxwd(xm_hi, xm_hi);
+            as_.Psubd(xn, xm);
+            as_.Psubd(xn_hi, xm_hi);
+            as_.Psrld(xn, int8_t{1});
+            as_.Psrld(xn_hi, int8_t{1});
+            // Clobber xm to 0x0000FFFF per int32 for the same reason.
+            as_.Pcmpeqd(xm, xm);
+            as_.Psrld(xm, int8_t{16});
+            as_.Pand(xn, xm);
+            as_.Pand(xn_hi, xm);
+            as_.Packusdw(xn, xn_hi);
+          }
+        } else {
+          // size == 0b10 (word).
+          if (is_signed) {
+            as_.Pmovsxdq(xn, xn);
+            as_.Pmovsxdq(xm, xm);
+            as_.Pmovsxdq(xn_hi, xn_hi);
+            as_.Pmovsxdq(xm_hi, xm_hi);
+          } else {
+            as_.Pmovzxdq(xn, xn);
+            as_.Pmovzxdq(xm, xm);
+            as_.Pmovzxdq(xn_hi, xn_hi);
+            as_.Pmovzxdq(xm_hi, xm_hi);
+          }
+          as_.Psubq(xn, xm);
+          as_.Psubq(xn_hi, xm_hi);
+          as_.Psrlq(xn, int8_t{1});
+          as_.Psrlq(xn_hi, int8_t{1});
+          // PSHUFD imm 0x88 = dst[0]=src[0], dst[1]=src[2]: gathers the
+          // two low-dword-of-each-int64-lane values into the low qword.
+          as_.Pshufd(xn, xn, static_cast<int8_t>(0x88));
+          as_.Pshufd(xn_hi, xn_hi, static_cast<int8_t>(0x88));
+          as_.Punpcklqdq(xn, xn_hi);
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kBic: {
         // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
         // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
