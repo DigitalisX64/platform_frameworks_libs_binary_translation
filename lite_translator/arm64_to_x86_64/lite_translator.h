@@ -6393,15 +6393,70 @@ class LiteTranslator {
         // (4 16-bit lanes for FP16 lanes 0..3), upper 64 bits hold the packed
         // hi_mask (lanes 4..7). No Pslldq+Por dance needed.
         //
-        // FP32 / FP64 forms (size = 00 / 01) still bail to the interpreter.
-        if (!args.is_fp16) { Undefined(); return; }
-        if (!host_platform::kHasF16C) { Undefined(); return; }
+        // FP16 path uses an F16C round-trip (Vcvtph2ps + 128-bit FP32 compare +
+        // Packssdw narrow).  FP32 / FP64 paths run the 128-bit compare directly
+        // on the loaded operands: same five-mnemonic shape (Cmpeqps/Cmpleps/
+        // Cmpltps for FP32, Cmpeqpd/Cmplepd/Cmpltpd for FP64).  Mask emission
+        // is bit-identical with the FP16 narrow path because PACKSSDW saturates
+        // 0xFFFFFFFF -> 0xFFFF and 0x00000000 -> 0x0000 — the same bit pattern
+        // FP32/FP64 packed compares write per lane (all-ones on TRUE, zero on
+        // FALSE, FALSE for unordered).
         using Op = Decoder::AdvSimdThreeSameOpcode;
         const bool is_eq  = (args.opcode == Op::kFcmeqV);
         const bool is_ge  = (args.opcode == Op::kFcmgeV ||
                              args.opcode == Op::kFacgeV);
         const bool is_abs = (args.opcode == Op::kFacgeV ||
                              args.opcode == Op::kFacgtV);
+        if (!args.is_fp16) {
+          // FP32 (args.size = 0b00) or FP64 (args.size = 0b01).
+          // .1D (Q=0, size=01) is ARM-reserved; the decoder routes it to
+          // Undefined() before reaching here.  Defensive bail keeps the JIT
+          // symmetric with the rest of the FP three-same lane matrix.
+          if (args.size == 0b01 && !args.q) { Undefined(); return; }
+          if (args.size != 0b00 && args.size != 0b01) { Undefined(); return; }
+          const bool is_double = (args.size == 0b01);
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_off});
+          if (is_abs) {
+            // Sign-clear mask: 0x7FFFFFFF per dword (FP32) or
+            // 0x7FFFFFFFFFFFFFFF per qword (FP64).
+            SimdRegister mask = AllocTempSimdReg();
+            if (mask == no_simd_register) { Undefined(); return; }
+            as_.Pcmpeqd(mask, mask);
+            if (is_double) as_.Psrlq(mask, int8_t{1});
+            else           as_.Psrld(mask, int8_t{1});
+            as_.Pand(xn, mask);
+            as_.Pand(xm, mask);
+          }
+          // Compare: result mask lands in xn.
+          //   FCMEQ: Cmpeq*p* xn, xm                    -> xn = (xn == xm)
+          //   FCMGE: Cmple*p* xm, xn ; xn = xm           -> xn = (xm <= xn)
+          //   FCMGT: Cmplt*p* xm, xn ; xn = xm           -> xn = (xm <  xn)
+          // SSE legacy-encoded Cmp{eq,lt,le}p{s,d} are ordered: result lane
+          // is FALSE (zero) when any operand is NaN.  ARM FCMEQ/FCMGE/FCMGT
+          // also return FALSE for unordered compares — identical semantics.
+          if (is_eq) {
+            if (is_double) as_.Cmpeqpd(xn, xm);
+            else           as_.Cmpeqps(xn, xm);
+          } else if (is_ge) {
+            if (is_double) as_.Cmplepd(xm, xn);
+            else           as_.Cmpleps(xm, xn);
+            as_.Movdqa(xn, xm);
+          } else {  // FCMGT / FACGT
+            if (is_double) as_.Cmpltpd(xm, xn);
+            else           as_.Cmpltps(xm, xn);
+            as_.Movdqa(xn, xm);
+          }
+          if (!args.q) mask_low64(xn);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        if (!host_platform::kHasF16C) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         if (xn == no_simd_register || xm == no_simd_register) {
