@@ -4763,6 +4763,234 @@ class LiteTranslator {
         // endregion
         return;
       }
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kMls: {
+        // MLS: Vd[lane] = Vd[lane] - Vn[lane] * Vm[lane].
+        // Same product recipe as kMla / kMul (byte uses widen+PMULLW+
+        // PACKUSWB; halfword uses PMULLW; word uses PMULLD), but PSUB
+        // the product from Vd instead of PADDing it.  .2D / scalar
+        // 64-bit is reserved by the ARM ARM and falls back.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        if (args.size == 0b00) {
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmovzxbw(xn_hi, xn_hi);
+          as_.Pmovzxbw(xm_hi, xm_hi);
+          as_.Pmullw(xn, xm);
+          as_.Pmullw(xn_hi, xm_hi);
+          as_.Pcmpeqb(xm, xm);
+          as_.Psrlw(xm, int8_t{8});
+          as_.Pand(xn, xm);
+          as_.Pand(xn_hi, xm);
+          as_.Packuswb(xn, xn_hi);
+          as_.Psubb(xd, xn);
+        } else if (args.size == 0b01) {
+          as_.Pmullw(xn, xm);
+          as_.Psubw(xd, xn);
+        } else {
+          as_.Pmulld(xn, xm);
+          as_.Psubd(xd, xn);
+        }
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      // endregion
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kSabd: {
+        // SABD: Vd[lane] = |signed(Vn[lane]) - signed(Vm[lane])|.
+        // ARM ARM computes the difference in extended (unbounded) signed
+        // precision, then truncates the absolute value to esize.  A naive
+        // PSUBx + sign-mask abs only matches when the difference fits in
+        // esize bits — for INT_MIN-vs-INT_MAX pairs the modular subtraction
+        // wraps and the abs gives the wrong magnitude.
+        //
+        // Recipe: per-lane PMAXS - PMINS gives max(a,b) - min(a,b) on the
+        // SIGNED interpretation, computed in modular esize arithmetic.
+        // The signed max minus the signed min equals the truncated absolute
+        // difference for every input, including the wrap case (INT_MAX -
+        // INT_MIN = -1 mod 2^esize = 0xFF...F, which matches ARM's
+        // abs(INT_MAX-INT_MIN) = 2^esize - 1 truncated).
+        //
+        // Byte/word need SSE4.1 PMAX/PMINSB/D; halfword uses SSE2
+        // PMAXSW/PMINSW.  .2D is reserved by the ARM ARM and falls back.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xmax == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxsb(xmax, xm);  // SSE4.1
+            as_.Pminsb(xn, xm);    // SSE4.1
+            as_.Psubb(xmax, xn);
+            break;
+          case 0b01:
+            as_.Pmaxsw(xmax, xm);  // SSE2
+            as_.Pminsw(xn, xm);    // SSE2
+            as_.Psubw(xmax, xn);
+            break;
+          case 0b10:
+            as_.Pmaxsd(xmax, xm);  // SSE4.1
+            as_.Pminsd(xn, xm);    // SSE4.1
+            as_.Psubd(xmax, xn);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xmax);
+        store_full(vd_off, xmax);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUabd: {
+        // UABD: Vd[lane] = (Vn[lane] > Vm[lane]) ? Vn-Vm : Vm-Vn (unsigned).
+        // Recipe: per-lane max(Vn,Vm) - min(Vn,Vm) via PMAXUx + PMINUx + PSUBx.
+        // Byte uses PMAXUB/PMINUB (SSE2); halfword uses PMAXUW/PMINUW (SSE4.1);
+        // word uses PMAXUD/PMINUD (SSE4.1).  .2D is reserved by the ARM ARM
+        // (no AVX-512 PMAXUQ/PMINUQ dependency to worry about).
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xmax == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxub(xmax, xm);
+            as_.Pminub(xn, xm);
+            as_.Psubb(xmax, xn);
+            break;
+          case 0b01:
+            as_.Pmaxuw(xmax, xm);
+            as_.Pminuw(xn, xm);
+            as_.Psubw(xmax, xn);
+            break;
+          case 0b10:
+            as_.Pmaxud(xmax, xm);
+            as_.Pminud(xn, xm);
+            as_.Psubd(xmax, xn);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xmax);
+        store_full(vd_off, xmax);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kSaba: {
+        // SABA: Vd[lane] += |signed(Vn[lane]) - signed(Vm[lane])| per lane.
+        // Same per-lane abs-diff recipe as kSabd (PMAXS - PMINS in modular
+        // esize arithmetic gives the truncated-extended absolute difference,
+        // including the INT_MIN-vs-INT_MAX wrap case where the modular
+        // PSUB-then-sign-mask trick fails); then PADDx into Vd.
+        // .2D / scalar 64-bit is reserved by the ARM ARM and falls back.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xmax == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxsb(xmax, xm);  // SSE4.1
+            as_.Pminsb(xn, xm);    // SSE4.1
+            as_.Psubb(xmax, xn);
+            as_.Paddb(xd, xmax);
+            break;
+          case 0b01:
+            as_.Pmaxsw(xmax, xm);  // SSE2
+            as_.Pminsw(xn, xm);    // SSE2
+            as_.Psubw(xmax, xn);
+            as_.Paddw(xd, xmax);
+            break;
+          case 0b10:
+            as_.Pmaxsd(xmax, xm);  // SSE4.1
+            as_.Pminsd(xn, xm);    // SSE4.1
+            as_.Psubd(xmax, xn);
+            as_.Paddd(xd, xmax);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      case Decoder::AdvSimdThreeSameOpcode::kUaba: {
+        // UABA: Vd[lane] += |unsigned(Vn[lane]) - unsigned(Vm[lane])|.
+        // Per-lane PMAXUx - PMINUx for the abs-diff, then PADDx into Vd.
+        // Byte uses PMAXUB/PMINUB (SSE2); halfword uses PMAXUW/PMINUW
+        // (SSE4.1); word uses PMAXUD/PMINUD (SSE4.1).  .2D is reserved.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmax = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xmax == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        as_.Movdqa(xmax, xn);
+        switch (args.size) {
+          case 0b00:
+            as_.Pmaxub(xmax, xm);
+            as_.Pminub(xn, xm);
+            as_.Psubb(xmax, xn);
+            as_.Paddb(xd, xmax);
+            break;
+          case 0b01:
+            as_.Pmaxuw(xmax, xm);
+            as_.Pminuw(xn, xm);
+            as_.Psubw(xmax, xn);
+            as_.Paddw(xd, xmax);
+            break;
+          case 0b10:
+            as_.Pmaxud(xmax, xm);
+            as_.Pminud(xn, xm);
+            as_.Psubd(xmax, xn);
+            as_.Paddd(xd, xmax);
+            break;
+          default: Undefined(); return;
+        }
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
@@ -5109,6 +5337,129 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kCmtst: {
+        // CMTST Vd, Vn, Vm — lane-wise (Vn & Vm) != 0 ? all-ones : 0.
+        // Recipe: PAND(Vn, Vm), then PCMPEQ against zero (all-ones if the
+        // lane is zero), then PXOR with all-ones to invert (so the non-zero
+        // lanes become the set lanes).  .2D needs PCMPEQQ which is SSE4.1.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_1) {
+          Undefined(); return;
+        }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Pand(xn, xm);
+        as_.Pxor(xm, xm);  // xm = 0.
+        switch (args.size) {
+          case 0b00: as_.Pcmpeqb(xn, xm); break;
+          case 0b01: as_.Pcmpeqw(xn, xm); break;
+          case 0b10: as_.Pcmpeqd(xn, xm); break;
+          case 0b11: as_.Pcmpeqq(xn, xm); break;
+          default: Undefined(); return;
+        }
+        // Materialize all-ones (size-independent) and invert: lanes where
+        // (Vn & Vm) != 0 become all-ones, the rest stay zero.
+        as_.Pcmpeqd(xm, xm);
+        as_.Pxor(xn, xm);
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kShadd:
+      case Decoder::AdvSimdThreeSameOpcode::kUhadd: {
+        // SHADD / UHADD Vd, Vn, Vm — per-lane (a + b) >> 1 with no overflow,
+        // signed (SHADD) or unsigned (UHADD).  ARM ARM C7.2 reserves .2D.
+        //
+        // Width recipes:
+        //  - Byte (size=00): widen 8 bytes to 8 words (lo + hi halves
+        //    separately), PADDW (sum fits in 9 bits, no overflow),
+        //    arithmetic / logical shift right by 1, pack with signed /
+        //    unsigned saturation.  Needs SSE4.1 for PMOVZXBW / PMOVSXBW
+        //    (same recipe shape as kMul size=00).
+        //  - Halfword (size=01) / Word (size=10): bitwise identity
+        //    a + b = (a^b) + 2*(a&b), so (a + b) >> 1 = (a&b) + ((a^b) >> 1).
+        //    Modular PADDx is exact here because the identity preserves
+        //    the low esize bits.  Arithmetic shift (PSRAW/PSRAD) for signed,
+        //    logical shift (PSRLW/PSRLD) for unsigned.  All SSE2.
+        if (args.size == 0b11) { Undefined(); return; }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShadd);
+        if (args.size == 0b00) {
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          if (is_signed) {
+            as_.Pmovsxbw(xn, xn);
+            as_.Pmovsxbw(xm, xm);
+            as_.Pmovsxbw(xn_hi, xn_hi);
+            as_.Pmovsxbw(xm_hi, xm_hi);
+          } else {
+            as_.Pmovzxbw(xn, xn);
+            as_.Pmovzxbw(xm, xm);
+            as_.Pmovzxbw(xn_hi, xn_hi);
+            as_.Pmovzxbw(xm_hi, xm_hi);
+          }
+          as_.Paddw(xn, xm);
+          as_.Paddw(xn_hi, xm_hi);
+          if (is_signed) {
+            as_.Psraw(xn, int8_t{1});
+            as_.Psraw(xn_hi, int8_t{1});
+            as_.Packsswb(xn, xn_hi);
+          } else {
+            as_.Psrlw(xn, int8_t{1});
+            as_.Psrlw(xn_hi, int8_t{1});
+            as_.Packuswb(xn, xn_hi);
+          }
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
+        // Halfword / word: bitwise (a&b) + ((a^b) >> 1).
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xand = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xand == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        as_.Movdqa(xand, xn);
+        as_.Pand(xand, xm);
+        as_.Pxor(xn, xm);
+        if (args.size == 0b01) {
+          if (is_signed) as_.Psraw(xn, int8_t{1});
+          else as_.Psrlw(xn, int8_t{1});
+          as_.Paddw(xn, xand);
+        } else {
+          // size == 0b10.
+          if (is_signed) as_.Psrad(xn, int8_t{1});
+          else as_.Psrld(xn, int8_t{1});
+          as_.Paddd(xn, xand);
+        }
+        if (!args.q) mask_low64(xn);
+        store_full(vd_off, xn);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kBic: {
         // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
         // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
