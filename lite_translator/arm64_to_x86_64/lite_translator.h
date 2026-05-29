@@ -4763,6 +4763,57 @@ class LiteTranslator {
         // endregion
         return;
       }
+      // region digitalis
+      case Decoder::AdvSimdThreeSameOpcode::kMls: {
+        // MLS: Vd[lane] = Vd[lane] - Vn[lane] * Vm[lane].
+        // Same product recipe as kMla / kMul (byte uses widen+PMULLW+
+        // PACKUSWB; halfword uses PMULLW; word uses PMULLD), but PSUB
+        // the product from Vd instead of PADDing it.  .2D / scalar
+        // 64-bit is reserved by the ARM ARM and falls back.
+        if (args.size == 0b11) { Undefined(); return; }
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xd = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register || xd == no_simd_register) {
+          Undefined(); return;
+        }
+        load_full(xn, vn_off);
+        load_full(xm, vm_off);
+        load_full(xd, vd_off);
+        if (args.size == 0b00) {
+          SimdRegister xn_hi = AllocTempSimdReg();
+          SimdRegister xm_hi = AllocTempSimdReg();
+          if (xn_hi == no_simd_register || xm_hi == no_simd_register) {
+            Undefined(); return;
+          }
+          as_.Movdqa(xn_hi, xn);
+          as_.Movdqa(xm_hi, xm);
+          as_.Psrldq(xn_hi, int8_t{8});
+          as_.Psrldq(xm_hi, int8_t{8});
+          as_.Pmovzxbw(xn, xn);
+          as_.Pmovzxbw(xm, xm);
+          as_.Pmovzxbw(xn_hi, xn_hi);
+          as_.Pmovzxbw(xm_hi, xm_hi);
+          as_.Pmullw(xn, xm);
+          as_.Pmullw(xn_hi, xm_hi);
+          as_.Pcmpeqb(xm, xm);
+          as_.Psrlw(xm, int8_t{8});
+          as_.Pand(xn, xm);
+          as_.Pand(xn_hi, xm);
+          as_.Packuswb(xn, xn_hi);
+          as_.Psubb(xd, xn);
+        } else if (args.size == 0b01) {
+          as_.Pmullw(xn, xm);
+          as_.Psubw(xd, xn);
+        } else {
+          as_.Pmulld(xn, xm);
+          as_.Psubd(xd, xn);
+        }
+        if (!args.q) mask_low64(xd);
+        store_full(vd_off, xd);
+        return;
+      }
+      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();

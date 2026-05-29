@@ -22850,6 +22850,147 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec4S) {
 }
 // endregion
 
+// region digitalis - AdvSimdThreeSame JIT for MLS vector
+// MLS (vector): Vd[lane] = Vd[lane] - Vn[lane] * Vm[lane].  Uses the same
+// product recipe as kMla / kMul (byte: PMOVZXBW + PMULLW + PACKUSWB;
+// halfword: PMULLW; word: PMULLD) but PSUBs the product from Vd instead of
+// PADDing.  Encoding: U=1, opcode=0b10010 (vs U=0 / 0b10010 for MLA).
+// Sizes 00/01/10 are JIT-lowered; size=11 (.2D) is reserved by the ARM ARM
+// and bails to the interpreter.
+TEST_F(Arm64LiteTranslateRegionTest, MlsVecEncodingsMatchLlvmMc) {
+  // Byte-equal vs `clang --target=aarch64-linux-gnu` for the six MLS vector
+  // encodings.  Pins the encoder + decoder routing (U bit toggles MLA<->MLS;
+  // opcode 0b10010 + size + Q select the lane shape).
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b00, /*opcode=*/0b10010,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x2E229420u);  // mls v0.8b,  v1.8b,  v2.8b
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00, /*opcode=*/0b10010,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x6E229420u);  // mls v0.16b, v1.16b, v2.16b
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b01, /*opcode=*/0b10010,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x2E629420u);  // mls v0.4h,  v1.4h,  v2.4h
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01, /*opcode=*/0b10010,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x6E629420u);  // mls v0.8h,  v1.8h,  v2.8h
+  EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b10, /*opcode=*/0b10010,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x2EA29420u);  // mls v0.2s,  v1.2s,  v2.2s
+  EXPECT_EQ(SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10, /*opcode=*/0b10010,
+                          /*rd=*/0, /*rn=*/1, /*rm=*/2),
+            0x6EA29420u);  // mls v0.4s,  v1.4s,  v2.4s
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MlsVec8H) {
+  // .8H, Q=1: 16-bit lanes, PMULLW + PSUBW.  Cover signed-16 boundaries and
+  // the read-modify-write semantics (Vd is both source and destination).
+  int16_t n_lanes[8] = {1, -1, 2, 32767, -32768, 100, 0, 1234};
+  int16_t m_lanes[8] = {3,  7, -4,    2,      2, -3,  9, 5};
+  int16_t d_lanes[8] = {10, -20, 30, 1, 1, 7, 5, -1000};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memset(&state_.cpu.v[0], 0, sizeof(state_.cpu.v[0]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memcpy(&state_.cpu.v[0], d_lanes, sizeof(d_lanes));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b01,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    int16_t expected = static_cast<int16_t>(
+        static_cast<int32_t>(d_lanes[i]) -
+        static_cast<int32_t>(n_lanes[i]) * static_cast<int32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MlsVec4S) {
+  // .4S, Q=1: 32-bit lanes via PMULLD + PSUBD.
+  StoreVec4SInt(state_.cpu, 1, 3,  -7, 2,         0x10000);
+  StoreVec4SInt(state_.cpu, 2, 5,   2, INT32_MAX, 0x10000);
+  StoreVec4SInt(state_.cpu, 0, 100, 50, 1,         INT32_MAX);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b10,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int32_t r[4];
+  LoadVec4SInt(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 100 - 15);                              // 100 - 3*5
+  EXPECT_EQ(r[1], 50 - (-14));                            // 50 - (-7*2)
+  // 2 * INT32_MAX = 0xFFFFFFFE truncated to int32 = -2; 1 - (-2) = 3.
+  EXPECT_EQ(r[2], 3);
+  // INT32_MAX - (0x10000 * 0x10000 truncated to 0) = INT32_MAX
+  EXPECT_EQ(r[3], INT32_MAX);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MlsVec16B) {
+  // .16B, Q=1: 16 byte lanes via the widen + PMULLW + PACKUSWB + PSUBB
+  // recipe.  Mixed signed boundaries plus asymmetric low/high halves so a
+  // wrong-half-pack regression would be caught.
+  int8_t n_lanes[16] = {1, -1, 2, 127, -128, 100, 0, 12,
+                        3,  5, 7, -16, 64,   33, -1, 99};
+  int8_t m_lanes[16] = {3,  7, -4, 2,    2,  -3, 9, 5,
+                        2,  4, 6, 8,    2,   3,  4, 5};
+  int8_t d_lanes[16] = {10, 20, -30, 0, 100, -50, 7, 5,
+                         1,  -1, 0, 64, -64,  33, 7, -1};
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memset(&state_.cpu.v[0], 0, sizeof(state_.cpu.v[0]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memcpy(&state_.cpu.v[0], d_lanes, sizeof(d_lanes));
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/1, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 16; i++) {
+    int8_t expected = static_cast<int8_t>(
+        static_cast<int32_t>(d_lanes[i]) -
+        static_cast<int32_t>(n_lanes[i]) * static_cast<int32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MlsVec8BUpperZero) {
+  // .8B, Q=0: low 8 byte lanes are Vd -= Vn*Vm; upper 8 bytes must be zeroed
+  // by the Q=0 mask_low64 step.  Pre-set Vd[127:64] to a non-zero sentinel.
+  uint8_t n_lanes[16] = {1, 2,    3, 200, 17, 255, 50, 100,
+                         0, 0xCC, 0,   0,  0,   0,  0,   0};
+  uint8_t m_lanes[16] = {2, 3,    4,   3, 10,   2,  2,   3,
+                         0, 0xDD, 0,   0,  0,   0,  0,   0};
+  uint8_t d_init[16];
+  std::memset(d_init, 0xCC, 16);
+  // Use larger d values so subtraction doesn't always wrap into 0 / negative.
+  d_init[0] = 200; d_init[1] = 100; d_init[2] = 50; d_init[3] = 1;
+  d_init[4] = 250; d_init[5] = 7;   d_init[6] = 99; d_init[7] = 255;
+  std::memset(&state_.cpu.v[1], 0, sizeof(state_.cpu.v[1]));
+  std::memset(&state_.cpu.v[2], 0, sizeof(state_.cpu.v[2]));
+  std::memcpy(&state_.cpu.v[1], n_lanes, sizeof(n_lanes));
+  std::memcpy(&state_.cpu.v[2], m_lanes, sizeof(m_lanes));
+  std::memcpy(&state_.cpu.v[0], d_init, 16);
+  static const uint32_t code[] = {
+      SimdThreeSame(/*q=*/0, /*u=*/1, /*size=*/0b00,
+                    /*opcode=*/0b10010, 0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  for (int i = 0; i < 8; i++) {
+    uint8_t expected = static_cast<uint8_t>(
+        static_cast<uint32_t>(d_init[i]) -
+        static_cast<uint32_t>(n_lanes[i]) * static_cast<uint32_t>(m_lanes[i]));
+    EXPECT_EQ(r[i], expected) << "low lane " << i;
+  }
+  for (int i = 8; i < 16; i++) {
+    EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+  }
+}
+// endregion
+
 // region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
 //
 // Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",
