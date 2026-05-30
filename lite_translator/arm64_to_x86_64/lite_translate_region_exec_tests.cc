@@ -12086,6 +12086,22 @@ TEST_F(Arm64LiteTranslateRegionTest, BrkDeliversSigtrap) {
 }
 // endregion
 
+// region digitalis - RNDR (FEAT_RNG): MRS Xt, RNDR returns entropy and clears
+// NZCV (success). Interpreter-only. Two draws differ; flags end cleared.
+TEST_F(Arm64LiteTranslateRegionTest, RndrReturnsEntropyAndClearsFlags) {
+  static const uint32_t code0[] = {0xD53B2400u};      // mrs x0, RNDR
+  static const uint32_t code1[] = {0xD53B2400u | 1u};  // mrs x1, RNDR
+  state_.cpu.flags = CPUState::kFlagCarry | CPUState::kFlagZero;
+  state_.cpu.insn_addr = ToGuestAddr(code0);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code0) + 4);
+  EXPECT_EQ(state_.cpu.flags, 0u);  // success: NZCV cleared
+  state_.cpu.insn_addr = ToGuestAddr(code1);
+  InterpretInsn(&state_);
+  EXPECT_NE(state_.cpu.x[0], state_.cpu.x[1]);  // independent draws (entropy)
+}
+// endregion
+
 // region digitalis - URECPE / URSQRTE .4S (unsigned integer reciprocal /
 // reciprocal-sqrt estimate) — interpreter (JIT bails). Driven via InterpretInsn.
 constexpr uint32_t Urecpe4s(uint8_t rd, uint8_t rn) {

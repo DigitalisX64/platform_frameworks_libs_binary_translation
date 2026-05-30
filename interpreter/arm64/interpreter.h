@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <type_traits>
 
 #include "../faulty_memory_accesses.h"
@@ -541,6 +542,18 @@ class Interpreter {
         //   Variant 0x0, Architecture 0xF (defined by ID_AA64*_EL1)
         //   PartNum 0xD03 (Cortex-A53), Revision 0x4
         return 0x410FD034ULL;
+      case Decoder::SystemReg::kRndr:
+      case Decoder::SystemReg::kRndrrs: {
+        // RNDR / RNDRRS (FEAT_RNG): return a 64-bit random value and report
+        // success. The architecture has these reads update PSTATE.NZCV — all
+        // clear (0b0000) on success, so a host that always has entropy clears
+        // the flags here (clearing C signals "random available" to the common
+        // `mrs Xt, RNDR; b.cc <retry>` idiom). Entropy comes from the host's
+        // /dev/urandom-backed random_device, seeded once per thread.
+        thread_local std::mt19937_64 rng(std::random_device{}());
+        state_->cpu.flags = 0;  // NZCV = 0b0000 (success)
+        return static_cast<Register>(rng());
+      }
       // endregion
       default:
         Undefined();
