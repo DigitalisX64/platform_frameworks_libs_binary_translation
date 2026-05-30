@@ -669,6 +669,36 @@
       ]
     },
     {
+      "comment": "CRC32C (Castagnoli) — accumulator in r32, data in r/m8.",
+      "encodings": {
+        "Crc32cb": { "feature": "SSE4_2", "opcodes": [ "F2", "0F", "38", "F0" ] }
+      },
+      "args": [
+        { "class": "GeneralReg32", "usage": "use_def" },
+        { "class": "GeneralReg8/Mem8", "usage": "use" }
+      ]
+    },
+    {
+      "comment": "CRC32C — accumulator in r32, data in r/m16.",
+      "encodings": {
+        "Crc32ch": { "feature": "SSE4_2", "opcodes": [ "66", "F2", "0F", "38", "F1" ] }
+      },
+      "args": [
+        { "class": "GeneralReg32", "usage": "use_def" },
+        { "class": "GeneralReg16/Mem16", "usage": "use" }
+      ]
+    },
+    {
+      "comment": "CRC32C — accumulator in r32, data in r/m32.",
+      "encodings": {
+        "Crc32cw": { "feature": "SSE4_2", "opcodes": [ "F2", "0F", "38", "F1" ] }
+      },
+      "args": [
+        { "class": "GeneralReg32", "usage": "use_def" },
+        { "class": "GeneralReg32/Mem32", "usage": "use" }
+      ]
+    },
+    {
       "encodings": {
         "Bsfw": { "opcodes": [ "66", "0F", "BC" ] },
         "Bsrw": { "opcodes": [ "66", "0F", "BD" ] },
