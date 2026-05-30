@@ -12179,6 +12179,97 @@ TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
 }
 // endregion
 
+// region digitalis - SHLL/SHLL2 (shift left long by element size) JIT.
+constexpr uint32_t Shll8h(uint8_t rd, uint8_t rn) { return 0x2E213800u | (rn << 5) | rd; }
+constexpr uint32_t Shll2_8h(uint8_t rd, uint8_t rn) { return 0x6E213800u | (rn << 5) | rd; }
+constexpr uint32_t Shll4s(uint8_t rd, uint8_t rn) { return 0x2E613800u | (rn << 5) | rd; }
+constexpr uint32_t Shll2d(uint8_t rd, uint8_t rn) { return 0x2EA13800u | (rn << 5) | rd; }
+TEST_F(Arm64LiteTranslateRegionTest, ShllVariants) {
+  uint64_t r[2];
+  // SHLL .8H: each of 8 low bytes -> byte<<8.
+  SetV128(state_.cpu, 1, 0x0807060504030201ULL, 0x100F0E0D0C0B0A09ULL);
+  static const uint32_t c0[] = {Shll8h(0, 1)};
+  EXPECT_TRUE(Run(c0, ToGuestAddr(c0) + sizeof(c0)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0400030002000100ULL);
+  EXPECT_EQ(r[1], 0x0800070006000500ULL);
+  // SHLL2 .8H: high 8 bytes.
+  static const uint32_t c1[] = {Shll2_8h(0, 1)};
+  EXPECT_TRUE(Run(c1, ToGuestAddr(c1) + sizeof(c1)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0C000B000A000900ULL);
+  EXPECT_EQ(r[1], 0x10000F000E000D00ULL);
+  // SHLL .4S: each of 4 low halfwords -> hw<<16.
+  SetV128(state_.cpu, 1, 0x0004000300020001ULL, 0ULL);
+  static const uint32_t c2[] = {Shll4s(0, 1)};
+  EXPECT_TRUE(Run(c2, ToGuestAddr(c2) + sizeof(c2)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0002000000010000ULL);
+  EXPECT_EQ(r[1], 0x0004000000030000ULL);
+  // SHLL .2D: each of 2 low words -> word<<32.
+  SetV128(state_.cpu, 1, 0x0000000200000001ULL, 0ULL);
+  static const uint32_t c3[] = {Shll2d(0, 1)};
+  EXPECT_TRUE(Run(c3, ToGuestAddr(c3) + sizeof(c3)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000100000000ULL);
+  EXPECT_EQ(r[1], 0x0000000200000000ULL);
+}
+// endregion
+
+// region digitalis - FCVTXN/FCVTXN2 (FP64->FP32 round-to-odd) JIT. Validate the
+// JIT against the interpreter (the round-to-odd reference) across non-NaN edge
+// cases (exact, inexact, overflow, signed zero), the FCVTXN2 high-half write,
+// and that a NaN lane yields a quiet NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnVectorMatchesInterpreter) {
+  struct Pair { double a; double b; };
+  const Pair cases[] = {
+      {1.0, 2.0}, {1.5, -1.5}, {3.14159265358979, 2.718281828459045},
+      {1e300, -1e300}, {0.0, -0.0}, {1.0000001, 123456.789},
+  };
+  static const uint32_t code[] = {0x2E616820u};  // fcvtxn v0.2s, v1.2d
+  for (const Pair& c : cases) {
+    double in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = 0;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    uint64_t jit_lo;
+    memcpy(&jit_lo, &state_.cpu.v[0], 8);
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = 0;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    uint64_t interp_lo;
+    memcpy(&interp_lo, &state_.cpu.v[0], 8);
+    EXPECT_EQ(jit_lo, interp_lo) << "FCVTXN mismatch a=" << c.a << " b=" << c.b;
+  }
+  // FCVTXN2 v0.4s, v1.2d (Q=1) preserves Vd's low 64 and writes the high 64.
+  double in2[2] = {1.5, 2.5};
+  memcpy(&state_.cpu.v[1], in2, 16);
+  SetV128(state_.cpu, 0, 0xDEADBEEFCAFEBABEULL, 0ULL);
+  static const uint32_t code2[] = {0x6E616820u};  // fcvtxn2 v0.4s, v1.2d
+  EXPECT_TRUE(Run(code2, ToGuestAddr(code2) + sizeof(code2)));
+  uint64_t lo, hi;
+  memcpy(&lo, &state_.cpu.v[0], 8);
+  memcpy(&hi, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(lo, 0xDEADBEEFCAFEBABEULL);  // low half preserved
+  float f0, f1;
+  memcpy(&f0, &hi, 4);
+  memcpy(&f1, reinterpret_cast<const uint8_t*>(&hi) + 4, 4);
+  EXPECT_FLOAT_EQ(f0, 1.5f);
+  EXPECT_FLOAT_EQ(f1, 2.5f);
+  // NaN lane -> a quiet NaN (exp=0xFF, mantissa MSB set).
+  double nan_in[2] = {std::nan(""), 1.0};
+  memcpy(&state_.cpu.v[1], nan_in, 16);
+  state_.cpu.v[0] = 0;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t nan_bits;
+  memcpy(&nan_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(nan_bits & 0x7F800000u, 0x7F800000u);  // exp all ones
+  EXPECT_NE(nan_bits & 0x007FFFFFu, 0u);            // mantissa nonzero (NaN)
+  EXPECT_NE(nan_bits & 0x00400000u, 0u);            // quiet bit set
+}
+// endregion
+
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
 // and outputs are validated against the SM3 round/expansion (the full sequence
 // reproduces the published SM3("abc") digest). Interpreter-only.
@@ -12399,6 +12490,52 @@ TEST_F(Arm64LiteTranslateRegionTest, Ursqrte4sEstimate) {
   GetV128(state_.cpu, 0, r);
   EXPECT_EQ(r[0], 0xB4800000FF800000ULL);
   EXPECT_EQ(r[1], 0xB500000093800000ULL);
+}
+// endregion
+
+// region digitalis - SQDMULL/SQDMLAL/SQDMLSL .2D (.2S->.2D, 64-bit saturation).
+constexpr uint32_t Sqdmull2d(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqdmlal2d(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA09000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqdmlsl2d(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0B000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+// Vn.2S=[3, INT32_MIN], Vm.2S=[5, INT32_MIN]: lane0 2*3*5=30, lane1
+// 2*INT32_MIN^2 = 2^63 -> SAT INT64_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull2dWithSaturation) {
+  SetV128(state_.cpu, 1, 0x8000000000000003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x8000000000000005ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmull2d(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000000000000001EULL);
+  EXPECT_EQ(r[1], 0x7FFFFFFFFFFFFFFFULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlal2dSaturatingAccum) {
+  SetV128(state_.cpu, 0, 0x0000000000000064ULL, 0x0000000000000064ULL);  // acc=100,100
+  SetV128(state_.cpu, 1, 0x8000000000000003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x8000000000000005ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlal2d(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000000000082ULL);          // 100+30
+  EXPECT_EQ(r[1], 0x7FFFFFFFFFFFFFFFULL);           // 100+INT64_MAX -> sat
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlsl2dAccum) {
+  SetV128(state_.cpu, 0, 0x0000000000000064ULL, 0x0000000000000064ULL);
+  SetV128(state_.cpu, 1, 0x8000000000000003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x8000000000000005ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlsl2d(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000000000046ULL);           // 100-30
+  EXPECT_EQ(r[1], 0x8000000000000065ULL);           // 100-INT64_MAX (in range)
 }
 // endregion
 
