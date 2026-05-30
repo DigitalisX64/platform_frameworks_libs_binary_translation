@@ -38406,6 +38406,301 @@ TEST_F(Arm64LiteTranslateRegionTest, SshrVec16BVdEqVnJit) {
 }
 // endregion
 
+// region digitalis: SSRA .8B / .16B byte-form JIT (PMOVSXBW + PSRAW +
+// PACKSSWB + PADDB).
+//
+// Sibling of SSHR byte-form above with an accumulate step.  ARM SSRA
+// is `Vd[i] += SSHR(Vn[i], cnt)` per byte with native mod-256
+// wraparound.  The JIT packs the SSHR result to int8 first (no
+// saturation — arith-shifted bytes stay in [-128, 127]) and PADDB-s
+// into Vd, so any post-add overflow wraps modulo 256 natively at byte
+// width.  Coverage:
+//
+//   - .8B (!Q): low 8 bytes only; Vd[127:64] zeroed.
+//   - .16B (Q): both halves widened separately, PACKSSWB(lo, hi) into
+//     ARM lane order, full 16-byte PADDB into Vd.
+//   - shift==esize (cnt==8): SSHR sign-fill (negative→-1,
+//     non-negative→0), then PADDB into Vd.
+//   - byte mod-256 wraparound: Vd + SSHR result outside [-128, 127]
+//     wraps natively via PADDB.
+//   - Vd==Vn safety: PMOVSXBW reads Vn from memory BEFORE the Movq /
+//     Movdqu loads Vd, and the final Movdqu to vd_off happens last.
+constexpr uint32_t kSsraVec8B_1   = 0x0F0F1420;  // ssra v0.8b, v1.8b, #1
+constexpr uint32_t kSsraVec8B_4   = 0x0F0C1420;  // ssra v0.8b, v1.8b, #4
+constexpr uint32_t kSsraVec8B_7   = 0x0F091420;  // ssra v0.8b, v1.8b, #7
+constexpr uint32_t kSsraVec8B_8   = 0x0F081420;  // ssra v0.8b, v1.8b, #8
+constexpr uint32_t kSsraVec16B_1  = 0x4F0F1420;  // ssra v0.16b, v1.16b, #1
+constexpr uint32_t kSsraVec16B_4  = 0x4F0C1420;  // ssra v0.16b, v1.16b, #4
+constexpr uint32_t kSsraVec16B_7  = 0x4F091420;  // ssra v0.16b, v1.16b, #7
+constexpr uint32_t kSsraVec16B_8  = 0x4F081420;  // ssra v0.16b, v1.16b, #8
+constexpr uint32_t kSsraVec8B_VdEqVn_3  = 0x0F0D1400;  // ssra v0.8b, v0.8b, #3
+constexpr uint32_t kSsraVec16B_VdEqVn_3 = 0x4F0D1400;  // ssra v0.16b, v0.16b, #3
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraByteEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSsraVec8B_1, 0x0F0F1420u);
+  EXPECT_EQ(kSsraVec8B_4, 0x0F0C1420u);
+  EXPECT_EQ(kSsraVec8B_7, 0x0F091420u);
+  EXPECT_EQ(kSsraVec8B_8, 0x0F081420u);
+  EXPECT_EQ(kSsraVec16B_1, 0x4F0F1420u);
+  EXPECT_EQ(kSsraVec16B_4, 0x4F0C1420u);
+  EXPECT_EQ(kSsraVec16B_7, 0x4F091420u);
+  EXPECT_EQ(kSsraVec16B_8, 0x4F081420u);
+  EXPECT_EQ(kSsraVec8B_VdEqVn_3, 0x0F0D1400u);
+  EXPECT_EQ(kSsraVec16B_VdEqVn_3, 0x4F0D1400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift1Jit) {
+  // SSHR(Vn,1) per byte:
+  //   {7,-7,14,-14,127,-128, 0,-1} >>1 = {3,-4, 7,-7,63,-64, 0,-1}
+  // Vd + SSHR (no wrap this case — picked to stay in int8 range):
+  //   {10,20,50,-50,40,-30,70,80} + {3,-4,7,-7,63,-64,0,-1}
+  //   = {13,16,57,-57,103,-94,70,79}
+  // Upper 8 bytes of Vn must be ignored; Vd[127:64] must be zeroed.
+  int8_t in_vn[16] = { 7, -7, 14, -14, 127, -128,  0, -1,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  int8_t in_vd[16] = {10, 20, 50, -50,  40,  -30, 70, 80,
+                       0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {13, 16, 57, -57, 103, -94, 70, 79};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper half zeroed (D-register semantics).
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BWrapAroundJit) {
+  // Mod-256 wraparound at byte width.  shift=1, Vd + SSHR(Vn,1)
+  // outside int8 range wraps natively via PADDB.
+  //   SSHR({100,-100, 90, -90, 127, -128, 50, -50}, 1)
+  //     = { 50, -50, 45, -45,  63,  -64, 25, -25}
+  //   Vd = {100, -90, 90,-90, 90, -90, 110,-110}
+  //   sum mod 256 (int8):
+  //     100+50=150  → 150-256=-106
+  //     -90+(-50)=-140 → -140+256=116
+  //     90+45=135   → 135-256=-121
+  //     -90+(-45)=-135 → -135+256=121
+  //     90+63=153   → 153-256=-103
+  //     -90+(-64)=-154 → -154+256=102
+  //     110+25=135  → 135-256=-121
+  //     -110+(-25)=-135 → -135+256=121
+  int8_t in_vn[16] = {100, -100, 90, -90, 127, -128,  50,  -50,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = {100,  -90, 90, -90,  90,  -90, 110, -110,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {-106, 116, -121, 121, -103, 102, -121, 121};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift4Jit) {
+  // SSHR(Vn,4) per byte:
+  //   {16,-16,100,-100,127,-128, 1,-1} >>4 = {1,-1, 6,-7, 7,-8, 0,-1}
+  // Vd + SSHR (no wrap):
+  //   {0, 0, 10, -10, 20, -20, 1, 100} + {1,-1,6,-7,7,-8,0,-1}
+  //   = {1,-1,16,-17,27,-28,1,99}
+  int8_t in_vn[16] = {16, -16, 100, -100, 127, -128, 1, -1,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = { 0,  0,  10,  -10,  20,  -20, 1, 100,
+                      0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {1, -1, 16, -17, 27, -28, 1, 99};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift7Jit) {
+  // shift==7 isolates sign bit: positive (incl. 0) -> 0; negative -> -1.
+  //   SSHR({1,-1,0,127,-128,64,-64,100}, 7) = {0,-1,0,0,-1,0,-1,0}
+  // Vd + SSHR:
+  //   {10, 20, 30, 40, -50, -60, -70, 80} + {0,-1,0,0,-1,0,-1,0}
+  //   = {10, 19, 30, 40, -51, -60, -71, 80}
+  int8_t in_vn[16] = {1, -1, 0, 127, -128, 64, -64, 100,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = {10, 20, 30, 40, -50, -60, -70, 80,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {10, 19, 30, 40, -51, -60, -71, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift8BoundarySignFillJit) {
+  // cnt==esize=8: SSHR sign-fill per byte (negative->-1, non-neg->0).
+  //   SSHR({1,-1,0,127,-128,64,-64,100}, 8) = {0,-1,0,0,-1,0,-1,0}
+  // Same SSHR result as shift=7; Vd accumulate gives same outcome.
+  int8_t in_vn[16] = {1, -1, 0, 127, -128, 64, -64, 100,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = {10, 20, 30, 40, -50, -60, -70, 80,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {10, 19, 30, 40, -51, -60, -71, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BShift1Jit) {
+  // 16 bytes (.16B Q=1).  Low+high halves of Vn must both appear
+  // in Vd in the same lane order.  Tests upper-half ARM lane
+  // semantics: PACKSSWB(xn_lo, xn_hi) places hi in bits[127:64].
+  //   SSHR(Vn, 1):
+  //     low : { 7,-7,14,-14,127,-128, 0,-1} >>1 = { 3,-4, 7,-7,63,-64, 0,-1}
+  //     high: {31,-31,64,-64,  1, 127, 2,-2} >>1 = {15,-16,32,-32, 0,  63, 1,-1}
+  //   Vd accumulate (no wrap):
+  //     low : {10,20,50,-50,40,-30,70,80}  + above = {13,16,57,-57,103,-94,70,79}
+  //     high: {0,  0, 5, -5,10, 20, 30,40} + above = {15,-16,37,-37,10, 83, 31,39}
+  int8_t in_vn[16] = { 7,  -7, 14, -14, 127, -128, 0, -1,
+                      31, -31, 64, -64,   1,  127, 2, -2};
+  int8_t in_vd[16] = {10, 20, 50, -50, 40, -30, 70, 80,
+                       0,  0,  5,  -5, 10,  20, 30, 40};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec16B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[16] = {13, 16, 57, -57, 103, -94, 70, 79,
+                             15, -16, 37, -37,  10,  83, 31, 39};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BShift4Jit) {
+  // SSHR(Vn,4) per byte across both halves:
+  //   low : {16,-16,100,-100,127,-128,1,-1} >>4 = {1,-1,6,-7,7,-8,0,-1}
+  //   high: {32,-32, 64, -64, 15, -15,7,-7} >>4 = {2,-2,4,-4,0,-1,0,-1}
+  // Vd accumulate (no wrap):
+  //   low : {0, 0, 0,0,10, 5,0, 0}  + above = {1,-1,6,-7,17,-3,0,-1}
+  //   high: {1, 2, 3,4, 5, 6,7,8} + above = {3, 0, 7, 0, 5, 5, 7, 7}
+  int8_t in_vn[16] = {16, -16, 100, -100, 127, -128, 1, -1,
+                      32, -32,  64,  -64,  15,  -15, 7, -7};
+  int8_t in_vd[16] = {0, 0, 0, 0, 10, 5, 0, 0,
+                      1, 2, 3, 4,  5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec16B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[16] = {1, -1, 6, -7, 17, -3, 0, -1,
+                             3,  0, 7,  0,  5,  5, 7,  7};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BShift8BoundarySignFillJit) {
+  // cnt==esize=8: SSHR sign-fill per byte across all 16 lanes.
+  //   low : {1,-1, 0,127,-128,64,-64,100} sign-fill = {0,-1,0,0,-1,0,-1,0}
+  //   high: {-1, 0, 1,-128, 127,-50,50, 2} sign-fill = {-1,0,0,-1,0,-1,0,0}
+  // Vd accumulate:
+  //   low : { 5,10, 20, 30,-40,-50,-60, 70} + above = {5, 9, 20, 30, -41, -50, -61, 70}
+  //   high: {-5,15,-10, -1,  0,  1,  2,  3} + above = {-6, 15,-10,-2, 0, 0, 2, 3}
+  int8_t in_vn[16] = { 1,  -1,   0,  127, -128,  64, -64, 100,
+                      -1,   0,   1, -128,  127, -50,  50,   2};
+  int8_t in_vd[16] = { 5, 10,  20,   30,  -40, -50, -60,  70,
+                      -5, 15, -10,   -1,    0,   1,   2,   3};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec16B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[16] = { 5,  9,  20, 30, -41, -50, -61, 70,
+                             -6, 15, -10, -2,   0,   0,   2,  3};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BVdEqVnJit) {
+  // Vd==Vn==v0, .8B.  Validates PMOVSXBW reads Vn from memory BEFORE
+  // the Movq load of Vd, and the final Movdqu writes Vd LAST.
+  // Bytes are both source (for SSHR) and accumulator (for the add).
+  //   SSHR({24,-25,64,-65,-1, 0,100,-100}, 3) = {3,-4, 8,-9,-1, 0,12,-13}
+  //   Vd_orig (== Vn_orig) = {24,-25,64,-65,-1, 0,100,-100}
+  //   Vd + SSHR =
+  //     {27,-29,72,-74,-2, 0,112,-113}
+  // Upper 8 bytes (originally 0x77..0x00 of Vn) must be zeroed in Vd
+  // post-write.
+  int8_t in[16] = { 24, -25, 64, -65,  -1,  0, 100, -100,
+                   0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSsraVec8B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {27, -29, 72, -74, -2, 0, 112, -113};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper 8 bytes of Vd zeroed (D-register semantics) despite
+  // originally holding nonzero Vn data.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BVdEqVnJit) {
+  // Vd==Vn==v0, .16B.  Both PMOVSXBW loads must complete BEFORE the
+  // Movdqu load of Vd; the result PADDB-s into Vd; final Movdqu
+  // happens last.
+  //   SSHR(Vn, 3) per lane:
+  //     { 8, -9, 16,-17,  1,-1,100,-100} >>3 = { 1, -2, 2, -3, 0,-1, 12,-13}
+  //     {24,-25, 64,-65,127,32,-32,  -1} >>3 = { 3, -4, 8, -9,15, 4, -4, -1}
+  //   Vd_orig = Vn_orig:
+  //     { 8, -9, 16,-17,  1,-1,100,-100, 24,-25, 64,-65,127,32,-32, -1}
+  //   Vd + SSHR (no wrap):
+  //     { 9,-11, 18,-20,  1,-2,112,-113, 27,-29, 72,-74,142→-114, 36,-36, -2}
+  int8_t in[16] = { 8,  -9, 16, -17,   1, -1, 100, -100,
+                   24, -25, 64, -65, 127, 32, -32,   -1};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSsraVec16B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // lane 12: 127 + 15 = 142 → wraps to -114 (142-256).
+  const int8_t expect[16] = { 9, -11, 18, -20,   1, -2, 112, -113,
+                             27, -29, 72, -74, -114, 36, -36,   -2};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -

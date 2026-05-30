@@ -19588,6 +19588,78 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 1 (8 bits)
+        // region digitalis: SSRA .8B / .16B byte form JIT via
+        // PMOVSXBW + PSRAW + PACKSSWB + PADDB.
+        //
+        // Sibling-promote of the SSHR .8B / .16B byte form above.
+        // SSRA's accumulate step is `Vd += SSHR(Vn, cnt)` per byte.
+        // Doing the accumulate at word width (PADDW before PACKSSWB)
+        // would let PACKSSWB saturate the post-add words (e.g. 127 +
+        // 63 = 190 saturates to 127); ARM SSRA wraps modulo 256, not
+        // saturates. So pack first to int8 (arith-shifted bytes stay
+        // in [-128, 127] — PACKSSWB does not saturate them), then
+        // PADDB at byte width for native mod-256 wrap.
+        //
+        // .8B (!Q): widen low 8 bytes, shift, pack with self, zero
+        //   upper half of the packed result, load Vd's low 8 bytes
+        //   via Movq (zeros upper), PADDB, store. The Movq+upper-zero
+        //   sequence guarantees Vd[127:64] is 0 after the store
+        //   (D-register semantics).
+        // .16B (Q): widen both halves of Vn, shift each, PACKSSWB(lo,
+        //   hi) lays the result in ARM lane order, Movdqu full 16 of
+        //   Vd, PADDB, store.
+        //
+        // Vd==Vn safety: PMOVSXBW reads from vn_off before the Movq /
+        // Movdqu loads Vd, and the final Movdqu to vd_off happens
+        // last — so writes to Vd don't disturb the earlier Vn reads.
+        //
+        // Scalar B form is not encoded by ARM (scalar SSRA only
+        // exists at D — ARM ARM C7.2.339). Defensive bail.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSsra) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (xn_lo == no_simd_register) { success_ = false; return; }
+          SimdRegister xn_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) {
+              success_ = false; return;
+            }
+          }
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Pmovsxbw(xn_lo,
+                       {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovsxbw(xn_hi,
+                         {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          as_.Psraw(xn_lo, cnt);
+          if (args.q) {
+            as_.Psraw(xn_hi, cnt);
+            as_.Packsswb(xn_lo, xn_hi);
+            as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          } else {
+            as_.Packsswb(xn_lo, xn_lo);
+            // PACKSSWB(xn, xn) duplicates the 8 result bytes into both
+            // halves of xn_lo. Zero its upper half before PADDB so the
+            // upper 8 result bytes of Vd stay 0 (D-reg semantics).
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+            // Movq m64→xmm loads only the low 8 bytes of Vd and zeros
+            // xd[127:64].
+            as_.Movq(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+          return;
+        }
+        // endregion
         if (is_byte) { success_ = false; return; }
         uint8_t esize_bits;
         if (immh & 0b1000) {
