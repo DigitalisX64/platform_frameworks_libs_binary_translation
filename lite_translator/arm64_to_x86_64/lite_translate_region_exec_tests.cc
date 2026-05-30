@@ -11955,6 +11955,86 @@ TEST_F(Arm64LiteTranslateRegionTest, Addhn2_16bUpper) {
 }
 // endregion
 
+// region digitalis - SQDMULL .4S (signed doubling widening multiply) JIT.
+constexpr uint32_t Sqdmull4s(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E60D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+// Vn.4H = [3, 5, -32768, 7], Vm.4H = [4, 6, -32768, 2].
+//   2*3*4=24, 2*5*6=60, 2*(-32768)^2=2^31 -> SAT 0x7FFFFFFF, 2*7*2=28.
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull4sWithSaturation) {
+  SetV128(state_.cpu, 1, 0x0007800000050003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x0002800000060004ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmull4s(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000003C00000018ULL);  // [24, 60]
+  EXPECT_EQ(r[1], 0x0000001C7FFFFFFFULL);  // [SAT, 28]
+}
+// endregion
+
+// region digitalis - SUQADD / USQADD (saturating accumulate, mixed sign) JIT.
+//   SUQADD = 0x0E203800 | (q<<30) | (size<<22) | (rn<<5) | rd
+//   USQADD = SUQADD | (1<<29)  (U bit)
+constexpr uint32_t Suqadd(uint8_t rd, uint8_t rn, uint8_t size, bool q) {
+  return 0x0E203800u | (uint32_t{q} << 30) | (uint32_t{size} << 22) |
+         (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Usqadd(uint8_t rd, uint8_t rn, uint8_t size, bool q) {
+  return Suqadd(rd, rn, size, q) | (1u << 29);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Suqadd8b) {
+  SetV128(state_.cpu, 0, 0xCE32807F000A9C64ULL, 0ULL);  // Vd signed accumulator
+  SetV128(state_.cpu, 1, 0x1464C80A00051E32ULL, 0ULL);  // Vn unsigned addend
+  static const uint32_t code[] = {Suqadd(0, 1, 0b00, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xe27f487f000fba7fULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Usqadd8b) {
+  SetV128(state_.cpu, 0, 0xCE32807F000A9C64ULL, 0ULL);  // Vd unsigned accumulator
+  SetV128(state_.cpu, 1, 0x1464C80A00051E32ULL, 0ULL);  // Vn signed addend
+  static const uint32_t code[] = {Usqadd(0, 1, 0b00, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xe2964889000fba96ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Suqadd4h) {
+  SetV128(state_.cpu, 0, 0x7FFF8000FF9C0064ULL, 0ULL);
+  SetV128(state_.cpu, 1, 0x000A8000FFFF0032ULL, 0ULL);
+  static const uint32_t code[] = {Suqadd(0, 1, 0b01, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7fff00007fff0096ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Usqadd4h) {
+  SetV128(state_.cpu, 0, 0x7FFF8000FF9C0064ULL, 0ULL);
+  SetV128(state_.cpu, 1, 0x000A8000FFFF0032ULL, 0ULL);
+  static const uint32_t code[] = {Usqadd(0, 1, 0b01, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x80090000ff9b0096ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Suqadd16b) {  // Q=1 exercises the high half
+  SetV128(state_.cpu, 0, 0xCE32807F000A9C64ULL, 0x0102037F80FE0A14ULL);
+  SetV128(state_.cpu, 1, 0x1464C80A00051E32ULL, 0x05FF02018003FE10ULL);
+  static const uint32_t code[] = {Suqadd(0, 1, 0b00, true)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xe27f487f000fba7fULL);
+  EXPECT_EQ(r[1], 0x067f057f00017f24ULL);
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to
