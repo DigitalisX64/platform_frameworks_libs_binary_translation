@@ -2600,20 +2600,70 @@ class LiteTranslator {
   }
   // endregion
 
+  // Mirror of the interpreter's ExpandSimdModifiedImm — pure function of the
+  // (compile-time-known) encoding fields, so the JIT can materialise the full
+  // 128-bit MOVI/MVNI value at translation time and emit a constant load.
+  static __uint128_t ExpandSimdModifiedImmJit(uint8_t op, uint8_t cmode,
+                                              uint8_t abc, uint8_t defgh, bool q) {
+    uint8_t imm8 = (abc << 5) | defgh;
+    uint64_t imm64 = 0;
+    if (op == 0) {
+      switch (cmode >> 1) {
+        case 0b000: imm64 = uint64_t{imm8} | (uint64_t{imm8} << 32); break;
+        case 0b001: imm64 = (uint64_t{imm8} << 8) | (uint64_t{imm8} << 40); break;
+        case 0b010: imm64 = (uint64_t{imm8} << 16) | (uint64_t{imm8} << 48); break;
+        case 0b011: imm64 = (uint64_t{imm8} << 24) | (uint64_t{imm8} << 56); break;
+        case 0b100: for (int i = 0; i < 4; i++) imm64 |= uint64_t{imm8} << (i * 16); break;
+        case 0b101: for (int i = 0; i < 4; i++) imm64 |= uint64_t{imm8} << (i * 16 + 8); break;
+        case 0b110:
+          if (!(cmode & 1)) {
+            uint32_t v = (uint32_t{imm8} << 8) | 0xFF;
+            imm64 = uint64_t{v} | (uint64_t{v} << 32);
+          } else {
+            uint32_t v = (uint32_t{imm8} << 16) | 0xFFFF;
+            imm64 = uint64_t{v} | (uint64_t{v} << 32);
+          }
+          break;
+        case 0b111: for (int i = 0; i < 8; i++) imm64 |= uint64_t{imm8} << (i * 8); break;
+      }
+    } else {
+      if (cmode == 0b1110) {
+        for (int i = 0; i < 8; i++)
+          if (imm8 & (1 << i)) imm64 |= 0xFFULL << (i * 8);
+      } else {
+        return ~ExpandSimdModifiedImmJit(0, cmode, abc, defgh, q);
+      }
+    }
+    __uint128_t result = static_cast<__uint128_t>(imm64);
+    if (q) result |= static_cast<__uint128_t>(imm64) << 64;
+    return result;
+  }
+
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
     // region digitalis
-    if (args.op == 1 && args.cmode == 0b1110 && args.abc == 0 && args.defgh == 0 && args.q) {
-      // MOVI Vd.2D, #0x0 — zero the register.
-      SimdRegister xmm = AllocTempSimdReg();
-      if (xmm == no_simd_register) { Undefined(); return; }
-      as_.Pxor(xmm, xmm);
-      // Store to ThreadState SIMD register.
-      int32_t offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
-      as_.Movdqu({.base = Assembler::rbp, .disp = offset}, xmm);
-      return;
+    // Compute the 128-bit immediate at translation time (matches the
+    // interpreter's expand-and-replace semantics) and emit a constant load.
+    __uint128_t value =
+        ExpandSimdModifiedImmJit(args.op, args.cmode, args.abc, args.defgh, args.q);
+    uint64_t lo = static_cast<uint64_t>(value);
+    uint64_t hi = static_cast<uint64_t>(value >> 64);
+    int32_t off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+    SimdRegister xd = AllocTempSimdReg();
+    if (xd == no_simd_register) { success_ = false; return; }
+    if (lo == 0 && hi == 0) {
+      as_.Pxor(xd, xd);
+    } else {
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      as_.Movq(tmp, static_cast<int64_t>(lo));
+      as_.Movq(xd, tmp);  // zero-extends: upper 64 = 0
+      if (hi != 0) {
+        as_.Movq(tmp, static_cast<int64_t>(hi));
+        as_.Pinsrq(xd, tmp, int8_t{1});
+      }
     }
+    as_.Movdqu({.base = Assembler::rbp, .disp = off}, xd);
     // endregion
-    Undefined();
   }
 
   // region digitalis
@@ -10456,6 +10506,66 @@ class LiteTranslator {
       return;
     }
 
+    // region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half).
+    // Vd(narrow) = ((Vn op Vm) [+ round]) >> narrow_bits, taking the high
+    // half of each wide lane.  R-variants add round = 1<<(narrow_bits-1).
+    // size=00 (.8B<-.8H) and 01 (.4H<-.4S); the .2S<-.2D form (size=10) has
+    // no x86 narrowing pack and bails to the interpreter.  Q=1 ("2" form)
+    // writes the upper 64 bits and preserves Vd's low 64.
+    if (args.opcode == Op::kAddhn || args.opcode == Op::kSubhn ||
+        args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn) {
+      if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+      const bool is_sub = (args.opcode == Op::kSubhn || args.opcode == Op::kRsubhn);
+      const bool is_round = (args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn);
+      const int32_t vn_o = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      const int32_t vm_o = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      const int32_t vd_o = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xz = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register || xz == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_o});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_o});
+      as_.Pxor(xz, xz);
+      auto add_round = [&](int64_t pat) -> bool {
+        SimdRegister xr = AllocTempSimdReg();
+        Register t = AllocTempReg();
+        if (xr == no_simd_register || t == no_register) return false;
+        as_.Movq(t, pat);
+        as_.Movq(xr, t);
+        as_.Punpcklqdq(xr, xr);
+        if (args.size == 0b00) as_.Paddw(xn, xr); else as_.Paddd(xn, xr);
+        return true;
+      };
+      if (args.size == 0b00) {
+        if (is_sub) as_.Psubw(xn, xm); else as_.Paddw(xn, xm);
+        if (is_round && !add_round(int64_t{0x0080008000800080LL})) { success_ = false; return; }
+        as_.Psrlw(xn, int8_t{8});
+        as_.Packuswb(xn, xz);
+      } else {  // size == 01
+        if (is_sub) as_.Psubd(xn, xm); else as_.Paddd(xn, xm);
+        if (is_round && !add_round(int64_t{0x0000800000008000LL})) { success_ = false; return; }
+        as_.Psrld(xn, int8_t{16});
+        as_.Packusdw(xn, xz);
+      }
+      if (!args.q) {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+      } else {
+        as_.Pslldq(xn, int8_t{8});
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+        as_.Pslldq(xd, int8_t{8});  // mask Vd low 64
+        as_.Psrldq(xd, int8_t{8});
+        as_.Por(xn, xd);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+      }
+      return;
+    }
+    // endregion
+
     // Widening add/sub family — same widen-then-binop pattern as the
     // multiply family below:
     //   SADDL/UADDL/SSUBL/USUBL — widen both Vn and Vm, then add/sub
@@ -11511,7 +11621,34 @@ class LiteTranslator {
     }
     // endregion
     switch (opcode2) {
-      case 0b000010:  // REV16 (not commonly needed, skip for now)
+      case 0b000001: {  // REV16: reverse byte order within each 16-bit halfword.
+        // res = ((src & 0x..00FF) << 8) | ((src & 0x..FF00) >> 8).
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return no_register; }
+        if (is_64bit) {
+          Register mask = AllocTempReg();
+          if (mask == no_register) { success_ = false; return no_register; }
+          as_.Movq(res, src);
+          as_.Movq(tmp, src);
+          as_.Movq(mask, int64_t{0x00FF00FF00FF00FFLL});
+          as_.Andq(res, mask);
+          as_.Shlq(res, int8_t{8});
+          as_.Movq(mask, static_cast<int64_t>(0xFF00FF00FF00FF00ULL));
+          as_.Andq(tmp, mask);
+          as_.Shrq(tmp, int8_t{8});
+          as_.Orq(res, tmp);
+        } else {
+          as_.Movl(res, src);
+          as_.Movl(tmp, src);
+          as_.Andl(res, 0x00FF00FF);
+          as_.Shll(res, int8_t{8});
+          as_.Andl(tmp, static_cast<int32_t>(0xFF00FF00));
+          as_.Shrl(tmp, int8_t{8});
+          as_.Orl(res, tmp);
+        }
+        return res;
+      }
+      case 0b000010:  // REV32 (sf=1) / REV W (sf=0) — interpreter-only.
         Undefined();
         return no_register;
       case 0b000011:  // REV (byte reverse) — maps to x86 BSWAP
@@ -13206,6 +13343,155 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+
+      // region digitalis - XTN / XTN2 (truncating extract narrow). args.size
+      // selects the destination element width (00=.8B, 01=.4H, 10=.2S); each
+      // source lane is twice as wide.  Q=0 writes the packed result to the low
+      // 64 bits (upper zeroed); Q=1 (XTN2) writes the upper 64 bits, preserving
+      // Vd's low 64.  Truncation via mask-then-unsigned-pack (the mask makes
+      // PACKUS* saturation a no-op); .2D->.2S gathers the low dwords.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kXtn: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        if (args.size == 0b00 || args.size == 0b01) {
+          SimdRegister xm = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          if (xm == no_simd_register || tmp == no_register) { success_ = false; return; }
+          as_.Movq(tmp, args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                                          : int64_t{0x0000FFFF0000FFFFLL});
+          as_.Movq(xm, tmp);
+          as_.Punpcklqdq(xm, xm);
+          as_.Pand(xn, xm);
+          if (args.size == 0b00) {
+            as_.Packuswb(xn, xz);  // 8 words -> 8 bytes, low 64
+          } else {
+            as_.Packusdw(xn, xz);  // 4 dwords -> 4 words, low 64
+          }
+        } else if (args.size == 0b10) {
+          as_.Pshufd(xn, xn, int8_t{0b00001000});  // [d0, d2, *, *]
+          mask_low64(xn);                           // -> [d0, d2, 0, 0]
+        } else {
+          success_ = false;
+          return;
+        }
+        if (!args.q) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          // XTN2: shift packed result into the upper 64 bits, then merge with
+          // Vd's preserved low 64.
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          mask_low64(xd);
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
+
+      // region digitalis - SQXTN / UQXTN / SQXTUN (saturating extract narrow).
+      // Same dst-width selection and Q=0/Q2 layout as XTN; the pack differs by
+      // saturation flavour:
+      //   SQXTN  signed src -> signed dst   : PACKSSWB / PACKSSDW
+      //   SQXTUN signed src -> unsigned dst : PACKUSWB / PACKUSDW
+      //   UQXTN  unsigned src -> unsigned dst: clamp via PMINUW/PMINUD then
+      //                                        PACKUSWB/PACKUSDW (the clamp
+      //                                        keeps values in the positive
+      //                                        signed range so PACKUS is exact).
+      // .2D->.2S (size=10) has no x86 narrowing pack; bail to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
+        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+        const auto opc = args.opcode;
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn) {
+          SimdRegister xm = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          if (xm == no_simd_register || tmp == no_register) { success_ = false; return; }
+          as_.Movq(tmp, args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                                          : int64_t{0x0000FFFF0000FFFFLL});
+          as_.Movq(xm, tmp);
+          as_.Punpcklqdq(xm, xm);
+          if (args.size == 0b00) {
+            as_.Pminuw(xn, xm);
+            as_.Packuswb(xn, xz);
+          } else {
+            as_.Pminud(xn, xm);
+            as_.Packusdw(xn, xz);
+          }
+        } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
+          if (args.size == 0b00) {
+            as_.Packuswb(xn, xz);
+          } else {
+            as_.Packusdw(xn, xz);
+          }
+        } else {  // kSqxtn
+          if (args.size == 0b00) {
+            as_.Packsswb(xn, xz);
+          } else {
+            as_.Packssdw(xn, xz);
+          }
+        }
+        if (!args.q) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          mask_low64(xd);
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
+
+      // region digitalis - FCVTL / FCVTN (FP32<->FP64, size=01).  FCVTL widens
+      // 2 floats to 2 doubles (CVTPS2PD; Q=1/FCVTL2 takes the upper floats);
+      // FCVTN narrows 2 doubles to 2 floats (CVTPD2PS; Q=0 low+zero-upper,
+      // Q=1/FCVTN2 upper-half merge).  size=00 (FP16) bails to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl: {
+        if (args.size != 0b01) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (args.q) as_.Psrldq(xn, int8_t{8});  // FCVTL2: high 2 floats -> low
+        as_.Cvtps2pd(xn, xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn: {
+        if (args.size != 0b01) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Cvtpd2ps(xn, xn);  // 2 doubles -> 2 floats in low 64, upper zeroed
+        if (!args.q) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          mask_low64(xd);
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
+
       // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 -- per-lane signed compare against 0.
       //   CMGT (Vn > 0)  ->  PCMPGTx(Vn, 0)
       //   CMLT (Vn < 0)  ->  PCMPGTx(0, Vn)
