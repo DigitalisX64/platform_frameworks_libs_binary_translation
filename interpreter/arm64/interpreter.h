@@ -5056,6 +5056,26 @@ class Interpreter {
   //
   // FP data-processing (1 source): FMOV, FABS, FNEG, FSQRT, FCVT, FRINTx.
   //
+  // region digitalis - FRINTTS (FEAT_FRINTTS) shared rounding. Round `src` to
+  // an integral value (toward zero for the Z variants, FPCR rounding mode via
+  // rint for the X variants), then saturate to the signed 32- or 64-bit range.
+  // Out-of-range inputs, NaN and infinities yield the most-negative value and
+  // set FPSR.IOC, matching the ARM ARM FPRoundIntN definition. opcode bit0
+  // selects X(1)/Z(0); bit1 selects 64-bit(1)/32-bit(0).
+  double FrintTs(double src, uint8_t opcode) {
+    const bool toward_zero = (opcode & 0b1u) == 0;
+    const bool is64 = (opcode & 0b10u) != 0;
+    double r = toward_zero ? std::trunc(src) : std::rint(src);
+    const double lo = is64 ? -9223372036854775808.0 : -2147483648.0;
+    const double hi = is64 ? 9223372036854775808.0 : 2147483648.0;
+    if (!(r >= lo && r < hi)) {
+      state_->cpu.emulated_fpsr |= 1u;  // FPSR.IOC (invalid operation)
+      return lo;
+    }
+    return r;
+  }
+  // endregion
+
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
     CHECK(!exception_raised_);
     uint8_t ftype = args.ftype;
@@ -5116,6 +5136,14 @@ class Interpreter {
         case 0b001111:  // FRINTI (round using FPCR rounding mode)
           result = std::rint(src);
           break;
+        // region digitalis - FRINTTS scalar (FP32).
+        case 0b010000:  // FRINT32Z
+        case 0b010001:  // FRINT32X
+        case 0b010010:  // FRINT64Z
+        case 0b010011:  // FRINT64X
+          result = static_cast<float>(FrintTs(static_cast<double>(src), opcode));
+          break;
+        // endregion
         default:
           Undefined();
           return;
@@ -5192,6 +5220,14 @@ class Interpreter {
         case 0b001111:  // FRINTI
           result = std::rint(src);
           break;
+        // region digitalis - FRINTTS scalar (FP64).
+        case 0b010000:  // FRINT32Z
+        case 0b010001:  // FRINT32X
+        case 0b010010:  // FRINT64Z
+        case 0b010011:  // FRINT64X
+          result = FrintTs(src, opcode);
+          break;
+        // endregion
         default:
           Undefined();
           return;
@@ -7454,6 +7490,41 @@ class Interpreter {
         }
         break;
         // endregion
+      }
+      // endregion
+
+      // region digitalis - FRINTTS vector (FRINT32Z/X, FRINT64Z/X). Per lane,
+      // round to a 32/64-bit integral FP value with saturation, reusing the
+      // scalar FrintTs helper. Element width comes from sz (size&1); the int
+      // target width + rounding mode come from the opcode (mapped to the same
+      // 6-bit selector the scalar FpDataProc1 path uses).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32zV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32xV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint64zV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint64xV: {
+        uint8_t scalar_op;
+        switch (args.opcode) {
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32zV: scalar_op = 0b010000; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32xV: scalar_op = 0b010001; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrint64zV: scalar_op = 0b010010; break;
+          default:                                           scalar_op = 0b010011; break;  // kFrint64xV
+        }
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            float r = static_cast<float>(FrintTs(static_cast<double>(f), scalar_op));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            double r = FrintTs(d, scalar_op);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
+          }
+        }
+        break;
       }
       // endregion
 

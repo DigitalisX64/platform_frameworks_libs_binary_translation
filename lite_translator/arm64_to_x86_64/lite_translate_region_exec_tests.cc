@@ -12086,6 +12086,77 @@ TEST_F(Arm64LiteTranslateRegionTest, BrkDeliversSigtrap) {
 }
 // endregion
 
+// region digitalis - FRINTTS (FEAT_FRINTTS) scalar: round to a 32/64-bit
+// integral FP value, saturating out-of-range/NaN to the most-negative value.
+// Interpreter-only (JIT bails); driven via InterpretInsn.
+TEST_F(Arm64LiteTranslateRegionTest, Frint32zScalarSingle) {
+  static const uint32_t code[] = {0x1E284020u};  // frint32z s0, s1
+  float in = 3.7f;
+  memcpy(&state_.cpu.v[1], &in, 4);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  float out;
+  memcpy(&out, &state_.cpu.v[0], 4);
+  EXPECT_FLOAT_EQ(out, 3.0f);  // toward zero
+  float big = 3.0e9f;          // > INT32_MAX -> saturate to INT32_MIN
+  memcpy(&state_.cpu.v[1], &big, 4);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  memcpy(&out, &state_.cpu.v[0], 4);
+  EXPECT_FLOAT_EQ(out, -2147483648.0f);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Frint32xScalarSingleRoundsToEven) {
+  static const uint32_t code[] = {0x1E28C020u};  // frint32x s0, s1
+  float in = 2.5f;
+  memcpy(&state_.cpu.v[1], &in, 4);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  float out;
+  memcpy(&out, &state_.cpu.v[0], 4);
+  EXPECT_FLOAT_EQ(out, 2.0f);  // round-to-nearest-even (default FPCR mode)
+}
+TEST_F(Arm64LiteTranslateRegionTest, Frint64zScalarDouble) {
+  static const uint32_t code[] = {0x1E694020u};  // frint64z d0, d1
+  double in = -5.9;
+  memcpy(&state_.cpu.v[1], &in, 8);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  double out;
+  memcpy(&out, &state_.cpu.v[0], 8);
+  EXPECT_DOUBLE_EQ(out, -5.0);
+  double big = 1.0e20;  // > INT64_MAX -> saturate to INT64_MIN
+  memcpy(&state_.cpu.v[1], &big, 8);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  memcpy(&out, &state_.cpu.v[0], 8);
+  EXPECT_DOUBLE_EQ(out, -9223372036854775808.0);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Frint32zVector4S) {
+  alignas(16) float in[4] = {3.7f, -2.2f, 3.0e9f, -1.5f};
+  memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {0x4E21E820u};  // frint32z v0.4s, v1.4s
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  float out[4];
+  memcpy(out, &state_.cpu.v[0], 16);
+  EXPECT_FLOAT_EQ(out[0], 3.0f);
+  EXPECT_FLOAT_EQ(out[1], -2.0f);
+  EXPECT_FLOAT_EQ(out[2], -2147483648.0f);  // > INT32_MAX -> saturate
+  EXPECT_FLOAT_EQ(out[3], -1.0f);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Frint64zVector2D) {
+  alignas(16) double in[2] = {-5.9, 1.0e20};
+  memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {0x4E61F820u};  // frint64z v0.2d, v1.2d
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  double out[2];
+  memcpy(out, &state_.cpu.v[0], 16);
+  EXPECT_DOUBLE_EQ(out[0], -5.0);
+  EXPECT_DOUBLE_EQ(out[1], -9223372036854775808.0);  // > INT64_MAX -> saturate
+}
+// endregion
+
 // region digitalis - RNDR (FEAT_RNG): MRS Xt, RNDR returns entropy and clears
 // NZCV (success). Interpreter-only. Two draws differ; flags end cleared.
 TEST_F(Arm64LiteTranslateRegionTest, RndrReturnsEntropyAndClearsFlags) {
