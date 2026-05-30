@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <type_traits>
 
 #include "../faulty_memory_accesses.h"
@@ -488,6 +489,18 @@ class Interpreter {
     RunGuestSyscall(state_);
   }
 
+  // region digitalis - BRK #imm: software breakpoint. Deliver a synchronous
+  // SIGTRAP at the current guest PC (the BRK), then stop the interpreter batch
+  // so the host signal handler routes it to the guest's SIGTRAP action. The
+  // guest PC stays at the BRK (insn_addr is not advanced), matching the
+  // architectural behaviour debuggers and sanitizers rely on.
+  void Brk(uint16_t /*imm*/) {
+    CHECK(!exception_raised_);
+    BreakpointInsn(GetInsnAddr());
+    exception_raised_ = true;
+  }
+  // endregion
+
   Register Mrs(Decoder::SystemReg sysreg) {
     CHECK(!exception_raised_);
     switch (sysreg) {
@@ -529,6 +542,18 @@ class Interpreter {
         //   Variant 0x0, Architecture 0xF (defined by ID_AA64*_EL1)
         //   PartNum 0xD03 (Cortex-A53), Revision 0x4
         return 0x410FD034ULL;
+      case Decoder::SystemReg::kRndr:
+      case Decoder::SystemReg::kRndrrs: {
+        // RNDR / RNDRRS (FEAT_RNG): return a 64-bit random value and report
+        // success. The architecture has these reads update PSTATE.NZCV — all
+        // clear (0b0000) on success, so a host that always has entropy clears
+        // the flags here (clearing C signals "random available" to the common
+        // `mrs Xt, RNDR; b.cc <retry>` idiom). Entropy comes from the host's
+        // /dev/urandom-backed random_device, seeded once per thread.
+        thread_local std::mt19937_64 rng(std::random_device{}());
+        state_->cpu.flags = 0;  // NZCV = 0b0000 (success)
+        return static_cast<Register>(rng());
+      }
       // endregion
       default:
         Undefined();

@@ -483,6 +483,13 @@ class Decoder {
     // expected fast paths instead of the SIGILL-handler-driven probe
     // fallbacks that can spin in detection loops.
     kMidrEl1 = 0xC000,
+    // RNDR / RNDRRS (FEAT_RNG): op0=3, op1=3, CRn=2, CRm=4, op2=0/1.
+    //   RNDR   = (3<<14)|(3<<11)|(2<<7)|(4<<3)|0 = 0xD920
+    //   RNDRRS = ... | 1                         = 0xD921
+    // Read by getentropy/ASLR seeding; the interpreter wires these to a host
+    // RNG and reports success (NZCV cleared), rather than faulting.
+    kRndr = 0xD920,
+    kRndrrs = 0xD921,
     // endregion
   };
 
@@ -2328,6 +2335,16 @@ class Decoder {
       insn_consumer_->Svc(args);
       return;
     }
+    // region digitalis - BRK: opc=001, ll=00. Software breakpoint; delivers a
+    // synchronous SIGTRAP to the guest (so debuggers and sanitizers — HWASan,
+    // UBSan trap-on-error — see a breakpoint at the guest PC instead of an
+    // illegal-instruction abort). HLT (opc=010) and DCPS1-3 (opc=101) remain
+    // fatal-with-diagnostic via Undefined() below.
+    if (opc == 0b001 && ll == 0b00) {
+      insn_consumer_->Brk(imm16);
+      return;
+    }
+    // endregion
     // Other exception instructions not implemented yet.
     Undefined();
   }

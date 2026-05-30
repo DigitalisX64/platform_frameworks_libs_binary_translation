@@ -247,6 +247,12 @@ class SemanticsPlayer {
     listener_->Svc(args.imm);
   }
 
+  // region digitalis - BRK breakpoint (delivers SIGTRAP to the guest).
+  void Brk(uint16_t imm) {
+    listener_->Brk(imm);
+  }
+  // endregion
+
   void Mrs(const typename Decoder::MrsArgs& args) {
     Register result = listener_->Mrs(args.sysreg);
     SetRegOrIgnore(args.dst, result);
