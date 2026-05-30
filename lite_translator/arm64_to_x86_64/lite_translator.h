@@ -10506,6 +10506,66 @@ class LiteTranslator {
       return;
     }
 
+    // region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half).
+    // Vd(narrow) = ((Vn op Vm) [+ round]) >> narrow_bits, taking the high
+    // half of each wide lane.  R-variants add round = 1<<(narrow_bits-1).
+    // size=00 (.8B<-.8H) and 01 (.4H<-.4S); the .2S<-.2D form (size=10) has
+    // no x86 narrowing pack and bails to the interpreter.  Q=1 ("2" form)
+    // writes the upper 64 bits and preserves Vd's low 64.
+    if (args.opcode == Op::kAddhn || args.opcode == Op::kSubhn ||
+        args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn) {
+      if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+      const bool is_sub = (args.opcode == Op::kSubhn || args.opcode == Op::kRsubhn);
+      const bool is_round = (args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn);
+      const int32_t vn_o = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      const int32_t vm_o = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      const int32_t vd_o = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      SimdRegister xn = AllocTempSimdReg();
+      SimdRegister xm = AllocTempSimdReg();
+      SimdRegister xz = AllocTempSimdReg();
+      if (xn == no_simd_register || xm == no_simd_register || xz == no_simd_register) {
+        success_ = false; return;
+      }
+      as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_o});
+      as_.Movdqu(xm, {.base = Assembler::rbp, .disp = vm_o});
+      as_.Pxor(xz, xz);
+      auto add_round = [&](int64_t pat) -> bool {
+        SimdRegister xr = AllocTempSimdReg();
+        Register t = AllocTempReg();
+        if (xr == no_simd_register || t == no_register) return false;
+        as_.Movq(t, pat);
+        as_.Movq(xr, t);
+        as_.Punpcklqdq(xr, xr);
+        if (args.size == 0b00) as_.Paddw(xn, xr); else as_.Paddd(xn, xr);
+        return true;
+      };
+      if (args.size == 0b00) {
+        if (is_sub) as_.Psubw(xn, xm); else as_.Paddw(xn, xm);
+        if (is_round && !add_round(int64_t{0x0080008000800080LL})) { success_ = false; return; }
+        as_.Psrlw(xn, int8_t{8});
+        as_.Packuswb(xn, xz);
+      } else {  // size == 01
+        if (is_sub) as_.Psubd(xn, xm); else as_.Paddd(xn, xm);
+        if (is_round && !add_round(int64_t{0x0000800000008000LL})) { success_ = false; return; }
+        as_.Psrld(xn, int8_t{16});
+        as_.Packusdw(xn, xz);
+      }
+      if (!args.q) {
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+      } else {
+        as_.Pslldq(xn, int8_t{8});
+        SimdRegister xd = AllocTempSimdReg();
+        if (xd == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+        as_.Pslldq(xd, int8_t{8});  // mask Vd low 64
+        as_.Psrldq(xd, int8_t{8});
+        as_.Por(xn, xd);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+      }
+      return;
+    }
+    // endregion
+
     // Widening add/sub family — same widen-then-binop pattern as the
     // multiply family below:
     //   SADDL/UADDL/SSUBL/USUBL — widen both Vn and Vm, then add/sub

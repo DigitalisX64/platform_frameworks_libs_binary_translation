@@ -11865,6 +11865,96 @@ TEST_F(Arm64LiteTranslateRegionTest, Movi8h) {
 }
 // endregion
 
+// region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half) JIT.
+constexpr uint32_t Addhn8b(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E204000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Addhn4h(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E604000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Subhn8b(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E206000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Raddhn8b(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2E204000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Raddhn4h(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2E604000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Addhn2_16b(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E204000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+
+// ADDHN .8B: (Vn+Vm)>>8 per halfword. 0x0200+0x0100=0x0300, >>8 = 0x03.
+TEST_F(Arm64LiteTranslateRegionTest, Addhn8b) {
+  SetV128(state_.cpu, 1, 0x0200020002000200ULL, 0x0200020002000200ULL);
+  SetV128(state_.cpu, 2, 0x0100010001000100ULL, 0x0100010001000100ULL);
+  static const uint32_t code[] = {Addhn8b(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0303030303030303ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+// ADDHN .4H: (Vn+Vm)>>16 per dword. 0x00020000+0x00010000=0x00030000, >>16=0x0003.
+TEST_F(Arm64LiteTranslateRegionTest, Addhn4h) {
+  SetV128(state_.cpu, 1, 0x0002000000020000ULL, 0x0002000000020000ULL);
+  SetV128(state_.cpu, 2, 0x0001000000010000ULL, 0x0001000000010000ULL);
+  static const uint32_t code[] = {Addhn4h(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0003000300030003ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+// SUBHN .8B: (Vn-Vm)>>8. 0x0500-0x0100=0x0400, >>8 = 0x04.
+TEST_F(Arm64LiteTranslateRegionTest, Subhn8b) {
+  SetV128(state_.cpu, 1, 0x0500050005000500ULL, 0x0500050005000500ULL);
+  SetV128(state_.cpu, 2, 0x0100010001000100ULL, 0x0100010001000100ULL);
+  static const uint32_t code[] = {Subhn8b(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0404040404040404ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+// RADDHN .8B: (Vn+Vm+0x80)>>8. 0x0200+0x0080=0x0280, +0x80=0x0300, >>8=0x03.
+// (plain ADDHN of the same inputs would give 0x02 — confirms the rounding.)
+TEST_F(Arm64LiteTranslateRegionTest, Raddhn8bRounds) {
+  SetV128(state_.cpu, 1, 0x0200020002000200ULL, 0x0200020002000200ULL);
+  SetV128(state_.cpu, 2, 0x0080008000800080ULL, 0x0080008000800080ULL);
+  static const uint32_t code[] = {Raddhn8b(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0303030303030303ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+// RADDHN .4H: (Vn+Vm+0x8000)>>16. 0x00028000+0x8000=0x00030000, >>16=0x0003.
+TEST_F(Arm64LiteTranslateRegionTest, Raddhn4hRounds) {
+  SetV128(state_.cpu, 1, 0x0002000000020000ULL, 0x0002000000020000ULL);
+  SetV128(state_.cpu, 2, 0x0000800000008000ULL, 0x0000800000008000ULL);
+  static const uint32_t code[] = {Raddhn4h(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0003000300030003ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+// ADDHN2: low 64 of Vd preserved, narrowed bytes to upper 64.
+TEST_F(Arm64LiteTranslateRegionTest, Addhn2_16bUpper) {
+  SetV128(state_.cpu, 0, 0x1122334455667788ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(state_.cpu, 1, 0x0200020002000200ULL, 0x0200020002000200ULL);
+  SetV128(state_.cpu, 2, 0x0100010001000100ULL, 0x0100010001000100ULL);
+  static const uint32_t code[] = {Addhn2_16b(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
+  EXPECT_EQ(r[1], 0x0303030303030303ULL);
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to
