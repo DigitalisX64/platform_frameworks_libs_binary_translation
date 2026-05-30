@@ -12054,6 +12054,40 @@ TEST_F(Arm64LiteTranslateRegionTest, Addhn2_16bUpper) {
 }
 // endregion
 
+// region digitalis - URECPE / URSQRTE .4S (unsigned integer reciprocal /
+// reciprocal-sqrt estimate) — interpreter (JIT bails). Driven via InterpretInsn.
+constexpr uint32_t Urecpe4s(uint8_t rd, uint8_t rn) {
+  return 0x4EA1C800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Ursqrte4s(uint8_t rd, uint8_t rn) {
+  return 0x6EA1C800u | (uint32_t{rn} << 5) | rd;
+}
+// Inputs [0.5, 1.0, 1.5, ~0.5] as Q-format; lane0 has bit31 clear (URECPE
+// saturates to 0xFFFFFFFF), lane3 (0x7FFFFFFF) likewise for URECPE.
+TEST_F(Arm64LiteTranslateRegionTest, Urecpe4sEstimate) {
+  SetV128(state_.cpu, 1, 0x8000000040000000ULL, 0x7FFFFFFFC0000000ULL);
+  static const uint32_t code[] = {Urecpe4s(0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFF800000FFFFFFFFULL);
+  EXPECT_EQ(r[1], 0xFFFFFFFFAA800000ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Ursqrte4sEstimate) {
+  SetV128(state_.cpu, 1, 0x8000000040000000ULL, 0x7FFFFFFFC0000000ULL);
+  static const uint32_t code[] = {Ursqrte4s(0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xB4800000FF800000ULL);
+  EXPECT_EQ(r[1], 0xB500000093800000ULL);
+}
+// endregion
+
 // region digitalis - SQDMULL .4S (signed doubling widening multiply) JIT.
 constexpr uint32_t Sqdmull4s(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x0E60D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
