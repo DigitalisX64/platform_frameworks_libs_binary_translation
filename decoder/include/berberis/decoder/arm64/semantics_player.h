@@ -499,6 +499,20 @@ class SemanticsPlayer {
               uint8_t rm) {
     listener_->Sha512(op, rd, rn, rm);
   }
+
+  // SHA3 (FEAT_SHA3).
+  void Eor3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    listener_->Eor3(rd, rn, rm, ra);
+  }
+  void Bcax(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    listener_->Bcax(rd, rn, rm, ra);
+  }
+  void Rax1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Rax1(rd, rn, rm);
+  }
+  void Xar(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
+    listener_->Xar(rd, rn, rm, imm6);
+  }
   // endregion
 
   // region digitalis

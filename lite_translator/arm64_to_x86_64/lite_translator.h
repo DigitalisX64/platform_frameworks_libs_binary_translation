@@ -11210,6 +11210,24 @@ class LiteTranslator {
     UNUSED(op, rd, rn, rm);
     Undefined();
   }
+
+  // SHA3 (FEAT_SHA3): interpreter-only — bail.
+  void Eor3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    UNUSED(rd, rn, rm, ra);
+    Undefined();
+  }
+  void Bcax(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    UNUSED(rd, rn, rm, ra);
+    Undefined();
+  }
+  void Rax1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
+    Undefined();
+  }
+  void Xar(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
+    UNUSED(rd, rn, rm, imm6);
+    Undefined();
+  }
   // endregion
 
   // region digitalis
