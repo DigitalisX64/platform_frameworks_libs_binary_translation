@@ -4669,6 +4669,75 @@ class Interpreter {
         break;
       }
 
+      // --- FP pairwise three-same: FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP ---
+      // Reduce adjacent element pairs.  The result's low half comes from Vn's
+      // pairs and the high half from Vm's pairs, i.e. result[k] reduces the
+      // pair (cat[2k], cat[2k+1]) of the concatenation cat = Vn:Vm.  All FP
+      // precisions (.4h/.8h via FP16 round-trip; .2s/.4s/.2d).
+      case Decoder::AdvSimdThreeSameOpcode::kFaddpV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmaxpV:
+      case Decoder::AdvSimdThreeSameOpcode::kFminpV:
+      case Decoder::AdvSimdThreeSameOpcode::kFmaxnmpV:
+      case Decoder::AdvSimdThreeSameOpcode::kFminnmpV: {
+        auto reduce_f = [&](float a, float b) -> float {
+          switch (args.opcode) {
+            case Decoder::AdvSimdThreeSameOpcode::kFaddpV:   return a + b;
+            case Decoder::AdvSimdThreeSameOpcode::kFmaxpV:   return FmaxScalar<float>(a, b);
+            case Decoder::AdvSimdThreeSameOpcode::kFminpV:   return FminScalar<float>(a, b);
+            case Decoder::AdvSimdThreeSameOpcode::kFmaxnmpV: return FmaxnmScalar<float>(a, b);
+            default:                                         return FminnmScalar<float>(a, b);
+          }
+        };
+        auto reduce_d = [&](double a, double b) -> double {
+          switch (args.opcode) {
+            case Decoder::AdvSimdThreeSameOpcode::kFaddpV:   return a + b;
+            case Decoder::AdvSimdThreeSameOpcode::kFmaxpV:   return FmaxScalar<double>(a, b);
+            case Decoder::AdvSimdThreeSameOpcode::kFminpV:   return FminScalar<double>(a, b);
+            case Decoder::AdvSimdThreeSameOpcode::kFmaxnmpV: return FmaxnmScalar<double>(a, b);
+            default:                                         return FminnmScalar<double>(a, b);
+          }
+        };
+        if (args.is_fp16) {
+          uint8_t lanes = args.q ? 8 : 4;
+          uint16_t cat[16];
+          for (uint8_t k = 0; k < lanes; k++) {
+            memcpy(&cat[k], reinterpret_cast<const uint8_t*>(&src_n) + k * 2, 2);
+            memcpy(&cat[lanes + k], reinterpret_cast<const uint8_t*>(&src_m) + k * 2, 2);
+          }
+          for (uint8_t k = 0; k < lanes; k++) {
+            float a = FpHalfToSingle(cat[2 * k]);
+            float b = FpHalfToSingle(cat[2 * k + 1]);
+            uint16_t rh = FpSingleToHalf(reduce_f(a, b));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + k * 2, &rh, 2);
+          }
+          break;
+        }
+        if (args.size == 0b01) {  // double (.2d)
+          uint8_t lanes = vec_len / 8;
+          double cat[4];
+          for (uint8_t k = 0; k < lanes; k++) {
+            memcpy(&cat[k], reinterpret_cast<const uint8_t*>(&src_n) + k * 8, 8);
+            memcpy(&cat[lanes + k], reinterpret_cast<const uint8_t*>(&src_m) + k * 8, 8);
+          }
+          for (uint8_t k = 0; k < lanes; k++) {
+            double r = reduce_d(cat[2 * k], cat[2 * k + 1]);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + k * 8, &r, 8);
+          }
+        } else {  // single (.2s / .4s)
+          uint8_t lanes = vec_len / 4;
+          float cat[8];
+          for (uint8_t k = 0; k < lanes; k++) {
+            memcpy(&cat[k], reinterpret_cast<const uint8_t*>(&src_n) + k * 4, 4);
+            memcpy(&cat[lanes + k], reinterpret_cast<const uint8_t*>(&src_m) + k * 4, 4);
+          }
+          for (uint8_t k = 0; k < lanes; k++) {
+            float r = reduce_f(cat[2 * k], cat[2 * k + 1]);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + k * 4, &r, 4);
+          }
+        }
+        break;
+      }
+
       // --- FP three-same vector ops (Digitalis addition) ---
       // For FP cases args.size is sz alone (0 = single 32-bit, 1 = double 64-bit),
       // not the {op_high, sz} pair the raw encoding carries; the decoder

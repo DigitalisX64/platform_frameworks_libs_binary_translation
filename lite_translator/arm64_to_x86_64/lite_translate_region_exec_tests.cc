@@ -7469,6 +7469,150 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
 }
 // endregion
 
+// region digitalis: FP pairwise vector three-same (FADDP/FMAXP/FMINP/
+// FMAXNMP/FMINNMP), interpreter path.  result low half = reduce(Vn pairs),
+// high half = reduce(Vm pairs).  FP32/64 encodings derived from FMULX
+// (U=1 in the FP three-same leg); FP16 from the FRECPS.4H base.
+constexpr uint32_t FaddpVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20D400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FaddpVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2E20D400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FaddpVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E60D400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FmaxpVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20F400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FminpVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6EA0F400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FmaxnmpVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E20C400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FaddpVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2E401400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+
+// FADDP .4S: low half from Vn pairs, high half from Vm pairs.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4SBasic) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 2.0f, 3.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, 6.0f, 7.0f, 8.0f);
+  static const uint32_t code[] = {FaddpVec4S(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);   // 1+2
+  EXPECT_FLOAT_EQ(r[1], 7.0f);   // 3+4
+  EXPECT_FLOAT_EQ(r[2], 11.0f);  // 5+6
+  EXPECT_FLOAT_EQ(r[3], 15.0f);  // 7+8
+}
+
+// FMAXP / FMINP .4S.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxpVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 4.0f, 2.0f, 3.0f);
+  StoreVec4S(state_.cpu, 2, 8.0f, 5.0f, 6.0f, 7.0f);
+  static const uint32_t code[] = {FmaxpVec4S(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 4.0f);   // max(1,4)
+  EXPECT_FLOAT_EQ(r[1], 3.0f);   // max(2,3)
+  EXPECT_FLOAT_EQ(r[2], 8.0f);   // max(8,5)
+  EXPECT_FLOAT_EQ(r[3], 7.0f);   // max(6,7)
+}
+TEST_F(Arm64LiteTranslateRegionTest, FminpVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 4.0f, 2.0f, 3.0f);
+  StoreVec4S(state_.cpu, 2, 8.0f, 5.0f, 6.0f, 7.0f);
+  static const uint32_t code[] = {FminpVec4S(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);
+  EXPECT_FLOAT_EQ(r[1], 2.0f);
+  EXPECT_FLOAT_EQ(r[2], 5.0f);
+  EXPECT_FLOAT_EQ(r[3], 6.0f);
+}
+
+// FMAXNMP .4S: NaN-suppressing — max-number of a (NaN, finite) pair is the
+// finite value.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmpVec4SNaN) {
+  StoreVec4S(state_.cpu, 1, std::nanf(""), 2.0f, 3.0f, 4.0f);
+  StoreVec4S(state_.cpu, 2, 5.0f, 6.0f, 7.0f, 8.0f);
+  static const uint32_t code[] = {FmaxnmpVec4S(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 2.0f);   // maxnm(NaN, 2) = 2
+  EXPECT_FLOAT_EQ(r[1], 4.0f);
+  EXPECT_FLOAT_EQ(r[2], 6.0f);
+  EXPECT_FLOAT_EQ(r[3], 8.0f);
+}
+
+// FADDP .2S (q=0): two result lanes, upper 64 bits zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 1.0f, 2.0f, 9.0f, 9.0f);  // lanes 2,3 ignored
+  StoreVec4S(state_.cpu, 2, 3.0f, 4.0f, 9.0f, 9.0f);
+  StoreVec4S(state_.cpu, 0, std::nanf(""), std::nanf(""), 7.0f, 7.0f);
+  static const uint32_t code[] = {FaddpVec2S(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);   // 1+2
+  EXPECT_FLOAT_EQ(r[1], 7.0f);   // 3+4
+  uint32_t b2, b3;
+  std::memcpy(&b2, &r[2], 4);
+  std::memcpy(&b3, &r[3], 4);
+  EXPECT_EQ(b2, 0u);
+  EXPECT_EQ(b3, 0u);
+}
+
+// FADDP .2D.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5, 2.5);
+  StoreVec2D(state_.cpu, 2, 3.5, 4.5);
+  static const uint32_t code[] = {FaddpVec2D(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 4.0);   // 1.5+2.5
+  EXPECT_DOUBLE_EQ(r[1], 8.0);   // 3.5+4.5
+}
+
+// FADDP .4H (FP16): 1.0h..8.0h pairwise -> 3,7,11,15 (halves).
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4H) {
+  // 1.0h=0x3C00 2.0h=0x4000 3.0h=0x4200 4.0h=0x4400
+  // 5.0h=0x4500 6.0h=0x4600 7.0h=0x4700 8.0h=0x4800
+  uint16_t vn[8] = {0x3C00, 0x4000, 0x4200, 0x4400, 0, 0, 0, 0};
+  uint16_t vm[8] = {0x4500, 0x4600, 0x4700, 0x4800, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  static const uint32_t code[] = {FaddpVec4H(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x4200);  // 1+2=3.0h
+  EXPECT_EQ(r[1], 0x4700);  // 3+4=7.0h
+  EXPECT_EQ(r[2], 0x4980);  // 5+6=11.0h
+  EXPECT_EQ(r[3], 0x4B80);  // 7+8=15.0h
+}
+// endregion
+
 // region digitalis: FADD / FSUB / FMUL / FDIV vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  Direct lowering to ADDPS/PD, SUBPS/PD,
 // MULPS/PD, DIVPS/PD (all SSE2).  Tests pick operand pairs that are

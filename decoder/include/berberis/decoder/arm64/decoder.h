@@ -945,6 +945,15 @@ class Decoder {
                 // Reciprocal square-root step: (3.0 - a*b)/2, with (0 * inf)
                 // -> +1.5 saturation, used as Newton-Raphson refinement after
                 // FRSQRTE.  Interpreter-only.
+    // FP pairwise (vector): reduce adjacent element pairs of Vn into the low
+    // half of Vd and of Vm into the high half.  U=1 in the FP three-same leg.
+    // All FP precisions (.4h/.8h via FP16 encoding; .2s/.4s/.2d).
+    // Interpreter-only.
+    kFaddpV,    // FADDP   (vector): op_high=0, opcode=11010, U=1
+    kFmaxpV,    // FMAXP   (vector): op_high=0, opcode=11110, U=1
+    kFminpV,    // FMINP   (vector): op_high=1, opcode=11110, U=1
+    kFmaxnmpV,  // FMAXNMP (vector): op_high=0, opcode=11000, U=1
+    kFminnmpV,  // FMINNMP (vector): op_high=1, opcode=11000, U=1
     // endregion
     // region digitalis - SABD/UABD: vector absolute difference at .8b/.16b/
     // .4h/.8h/.2s/.4s. size=11 (64-bit lane) is reserved.  Verified with
@@ -4647,18 +4656,23 @@ class Decoder {
     } else {
       if (!a) {
         switch (opcode_3) {
+          case 0b000: op = AdvSimdThreeSameOpcode::kFmaxnmpV; ok = true; break;
+          case 0b010: op = AdvSimdThreeSameOpcode::kFaddpV;  ok = true; break;
           case 0b011: op = AdvSimdThreeSameOpcode::kFmulV;   ok = true; break;
           case 0b100: op = AdvSimdThreeSameOpcode::kFcmgeV;  ok = true; break;
           case 0b101: op = AdvSimdThreeSameOpcode::kFacgeV;  ok = true; break;
+          case 0b110: op = AdvSimdThreeSameOpcode::kFmaxpV;  ok = true; break;
           case 0b111: op = AdvSimdThreeSameOpcode::kFdivV;   ok = true; break;
-          default: break;  // 000 FMAXNMP, 010 FADDP, 110 FMAXP — Undefined.
+          default: break;  // 001 reserved — Undefined.
         }
       } else {
         switch (opcode_3) {
+          case 0b000: op = AdvSimdThreeSameOpcode::kFminnmpV; ok = true; break;
           case 0b010: op = AdvSimdThreeSameOpcode::kFabdV;   ok = true; break;
           case 0b100: op = AdvSimdThreeSameOpcode::kFcmgtV;  ok = true; break;
           case 0b101: op = AdvSimdThreeSameOpcode::kFacgtV;  ok = true; break;
-          default: break;  // 000 FMINNMP, 011 reserved, 110 FMINP, 111 reserved — Undefined.
+          case 0b110: op = AdvSimdThreeSameOpcode::kFminpV;  ok = true; break;
+          default: break;  // 011, 111 reserved — Undefined.
         }
       }
     }
@@ -4970,8 +4984,8 @@ class Decoder {
       if (!op_high) {
         switch (opcode) {
           case 0b11010:
-            if (u) { ok = false; break; }   // FADDP not implemented
-            op = AdvSimdThreeSameOpcode::kFaddV;
+            op = u ? AdvSimdThreeSameOpcode::kFaddpV
+                   : AdvSimdThreeSameOpcode::kFaddV;
             break;
           case 0b11011:
             // region digitalis: U=0 -> FMULX (kFmulxV), U=1 -> FMUL (kFmulV).
@@ -4988,8 +5002,8 @@ class Decoder {
           // region digitalis - FMAXNM/FMAX (op_high=0, U=0); FDIV (U=1);
           // FCMEQ (U=0)/FCMGE (U=1)/FACGE (U=1) at opcode 11100/11101.
           case 0b11000:
-            if (u) { ok = false; break; }   // FMAXNMP — not implemented
-            op = AdvSimdThreeSameOpcode::kFmaxnmV;
+            op = u ? AdvSimdThreeSameOpcode::kFmaxnmpV
+                   : AdvSimdThreeSameOpcode::kFmaxnmV;
             break;
           case 0b11100:
             op = u ? AdvSimdThreeSameOpcode::kFcmgeV : AdvSimdThreeSameOpcode::kFcmeqV;
@@ -5000,8 +5014,8 @@ class Decoder {
             op = AdvSimdThreeSameOpcode::kFacgeV;
             break;
           case 0b11110:
-            if (u) { ok = false; break; }   // FMAXP — not implemented
-            op = AdvSimdThreeSameOpcode::kFmaxV;
+            op = u ? AdvSimdThreeSameOpcode::kFmaxpV
+                   : AdvSimdThreeSameOpcode::kFmaxV;
             break;
           case 0b11111:
             // region digitalis: op_high=0, opcode=11111: FRECPS (U=0) / FDIV (U=1).
@@ -5024,8 +5038,8 @@ class Decoder {
             break;
           // region digitalis - FMINNM/FMIN (op_high=1, U=0); FCMGT (U=1)/FACGT (U=1).
           case 0b11000:
-            if (u) { ok = false; break; }   // FMINNMP — not implemented
-            op = AdvSimdThreeSameOpcode::kFminnmV;
+            op = u ? AdvSimdThreeSameOpcode::kFminnmpV
+                   : AdvSimdThreeSameOpcode::kFminnmV;
             break;
           case 0b11100:
             if (!u) { ok = false; break; }  // op_high=1,U=0 undef at opcode 11100
@@ -5037,8 +5051,8 @@ class Decoder {
             op = AdvSimdThreeSameOpcode::kFacgtV;
             break;
           case 0b11110:
-            if (u) { ok = false; break; }   // FMINP — not implemented
-            op = AdvSimdThreeSameOpcode::kFminV;
+            op = u ? AdvSimdThreeSameOpcode::kFminpV
+                   : AdvSimdThreeSameOpcode::kFminV;
             break;
           case 0b11111:
             // region digitalis: op_high=1, opcode=11111: FRSQRTS (U=0);
