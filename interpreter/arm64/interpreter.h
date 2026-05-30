@@ -5371,6 +5371,23 @@ class Interpreter {
       } else {
         flags = CPUState::kFlagCarry;
       }
+    } else if (args.ftype == 0b11) {
+      // Half-precision (Armv8.2-FP16): widen both operands to FP32 and compare.
+      uint16_t bits_n;
+      uint16_t bits_m;
+      memcpy(&bits_n, &state_->cpu.v[args.rn], 2);
+      memcpy(&bits_m, &state_->cpu.v[args.rm], 2);
+      float src_n = FpHalfToSingle(bits_n);
+      float src_m = FpHalfToSingle(bits_m);
+      if (std::isnan(src_n) || std::isnan(src_m)) {
+        flags = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+      } else if (src_n == src_m) {
+        flags = CPUState::kFlagZero | CPUState::kFlagCarry;
+      } else if (src_n < src_m) {
+        flags = CPUState::kFlagNegative;
+      } else {
+        flags = CPUState::kFlagCarry;
+      }
     } else {
       Undefined();
       return;

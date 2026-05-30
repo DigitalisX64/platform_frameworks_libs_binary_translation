@@ -22270,6 +22270,78 @@ TEST_F(Arm64LiteTranslateRegionTest, FccmpDCompoundLtTrue) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);  // equal -> Z=1,C=1
 }
+
+// FP16 FCCMP (Armv8.2-FP16): ftype=11, base 0x1EE00400. Operands widen to
+// FP32 via F16C, then UCOMISS (same NZCV mapping as S/D).
+//   1.0h=0x3C00  2.0h=0x4000  3.5h=0x4300  9.0h=0x4880  qNaN=0x7E00
+constexpr uint32_t FccmpH(uint8_t rn, uint8_t rm, uint8_t cond, uint8_t nzcv) {
+  return FccmpScalar(0x1EE00400, rn, rm, cond, nzcv);
+}
+
+// FCCMP H — condition TRUE, ordered equal: flags <- 0110 (Z=1, C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueOrderedEqual) {
+  StoreFp16Bits(state_.cpu, 1, 0x4300);  // 3.5h
+  StoreFp16Bits(state_.cpu, 2, 0x4300);  // 3.5h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                   // Z=1 -> EQ true
+      FccmpH(1, 2, kCondEQ, 0b1010),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCCMP H — condition TRUE, ordered less: flags <- 1000 (N=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueOrderedLess) {
+  StoreFp16Bits(state_.cpu, 1, 0x3C00);  // 1.0h
+  StoreFp16Bits(state_.cpu, 2, 0x4000);  // 2.0h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),
+      FccmpH(1, 2, kCondEQ, 0b0101),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);
+}
+
+// FCCMP H — condition TRUE, ordered greater: flags <- 0010 (C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueOrderedGreater) {
+  StoreFp16Bits(state_.cpu, 1, 0x4880);  // 9.0h
+  StoreFp16Bits(state_.cpu, 2, 0x4000);  // 2.0h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),
+      FccmpH(1, 2, kCondEQ, 0b1100),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0010u);
+}
+
+// FCCMP H — condition TRUE, unordered (NaN): flags <- 0011 (C=1, V=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueUnordered) {
+  StoreFp16Bits(state_.cpu, 1, 0x7E00);  // qNaN
+  StoreFp16Bits(state_.cpu, 2, 0x3C00);  // 1.0h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),
+      FccmpH(1, 2, kCondEQ, 0b1000),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCCMP H — condition FALSE: nzcv immediate written to flags (no compare).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondFalseWritesImmediate) {
+  StoreFp16Bits(state_.cpu, 1, 0x3C00);  // 1.0h (would be "equal" if compared)
+  StoreFp16Bits(state_.cpu, 2, 0x3C00);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                  // Z=0, N=1 -> EQ false
+      FccmpH(1, 2, kCondEQ, 0b1011),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1011u);
+}
 // endregion
 
 // region digitalis - FCMP NaN

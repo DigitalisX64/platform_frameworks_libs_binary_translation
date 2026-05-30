@@ -12974,9 +12974,9 @@ class LiteTranslator {
   // x86 EFLAGS -> ARM NZCV via EmitStoreArmFpNZCV (same as FCMP); otherwise
   // write the immediate NZCV field directly to ThreadState::cpu.flags.
   //
-  // The decoder only routes ftype 00 (S) and 01 (D) to this consumer; FP16
-  // FCCMP is not encoded by the ARM ARM (the H-variant uses a separate
-  // FpDataProc1-like family, not handled here).
+  // ftype 00 (S), 01 (D) and 11 (H, Armv8.2-FP16) are all encoded; 10 is
+  // reserved.  FP16 widens both operands to FP32 via F16C (UCOMISS), matching
+  // FpCompare; without host F16C the region bails to the interpreter.
   //
   // Layout mirrors the integer ConditionalSelect / FCSEL NZCV decoder:
   //   1. Read existing flags into flags_reg (Btl source).
@@ -12994,11 +12994,10 @@ class LiteTranslator {
   // SIMD floating-point exception path follows the same trap behaviour as
   // a plain FpCompare.
   void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args) {
-    if (args.ftype != 0b00 && args.ftype != 0b01) {
-      success_ = false;
-      return;
-    }
+    if (args.ftype == 0b10) { Undefined(); return; }
+    if (args.ftype == 0b11 && !host_platform::kHasF16C) { success_ = false; return; }
     const bool is_double = (args.ftype == 0b01);
+    const bool is_half = (args.ftype == 0b11);
 
     SimdRegister xmm_n = AllocTempSimdReg();
     if (xmm_n == no_simd_register) { success_ = false; return; }
@@ -13139,6 +13138,16 @@ class LiteTranslator {
       as_.Movsd(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movsd(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       as_.Ucomisd(xmm_n, xmm_m);
+    } else if (is_half) {
+      // Widen both FP16 operands to FP32 via F16C, then UCOMISS (mirrors
+      // FpCompare's half path).
+      as_.Pxor(xmm_n, xmm_n);
+      as_.Pinsrw(xmm_n, {.base = Assembler::rbp, .disp = src_n_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_n, xmm_n);
+      as_.Pxor(xmm_m, xmm_m);
+      as_.Pinsrw(xmm_m, {.base = Assembler::rbp, .disp = src_m_off}, int8_t{0});
+      as_.Vcvtph2ps(xmm_m, xmm_m);
+      as_.Ucomiss(xmm_n, xmm_m);
     } else {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});

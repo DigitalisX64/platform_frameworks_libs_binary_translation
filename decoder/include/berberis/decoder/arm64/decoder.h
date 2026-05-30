@@ -4328,8 +4328,10 @@ class Decoder {
     bool signal_nans = GetBits<4, 1>();
     uint8_t nzcv = GetBits<0, 4>();
 
-    // Only ftype 00 (single) and 01 (double) supported.
-    if (ftype >= 2) { Undefined(); return; }
+    // region digitalis
+    // ftype: 00=S, 01=D, 11=H (Armv8.2-FP16).  10 is reserved.
+    if (ftype == 0b10) { Undefined(); return; }
+    // endregion
 
     const FpConditionalCompareArgs args = {
         .rn = rn,
