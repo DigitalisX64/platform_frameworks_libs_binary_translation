@@ -11633,6 +11633,103 @@ TEST_F(Arm64LiteTranslateRegionTest, Xtn2_16bUpperHalf) {
 }
 // endregion
 
+// region digitalis - SQXTN / UQXTN / SQXTUN (saturating extract narrow) — JIT.
+// Encodings (clang --target=aarch64):
+//   sqxtn .8b=0x0E214800 .4h=0x0E614800 ; sqxtn2 .16b=0x4E214800
+//   uqxtn .8b=0x2E214800 .4h=0x2E614800
+//   sqxtun .8b=0x2E212800 .4h=0x2E612800
+constexpr uint32_t Sqxtn8b(uint8_t rd, uint8_t rn) {
+  return 0x0E214800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqxtn4h(uint8_t rd, uint8_t rn) {
+  return 0x0E614800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqxtn2_16b(uint8_t rd, uint8_t rn) {
+  return 0x4E214800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Uqxtn8b(uint8_t rd, uint8_t rn) {
+  return 0x2E214800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqxtun8b(uint8_t rd, uint8_t rn) {
+  return 0x2E212800u | (uint32_t{rn} << 5) | rd;
+}
+
+// SQXTN .8B: signed saturate to [-128,127]. 512 -> 0x7F, -512 -> 0x80.
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn8bSaturatesHigh) {
+  SetV128(state_.cpu, 1, 0x0200020002000200ULL, 0x0200020002000200ULL);
+  static const uint32_t code[] = {Sqxtn8b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7F7F7F7F7F7F7F7FULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn8bSaturatesLow) {
+  SetV128(state_.cpu, 1, 0xFE00FE00FE00FE00ULL, 0xFE00FE00FE00FE00ULL);  // -512
+  static const uint32_t code[] = {Sqxtn8b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x8080808080808080ULL);  // -128
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn8bMixed) {
+  // halfwords 100, 200, -100, -200 -> 0x64, 0x7F(sat), 0x9C, 0x80(sat).
+  SetV128(state_.cpu, 1, 0xFF38FF9C00C80064ULL, 0ULL);
+  static const uint32_t code[] = {Sqxtn8b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x00000000809C7F64ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// UQXTN .8B: unsigned saturate to [0,255]. 512 -> 0xFF.
+TEST_F(Arm64LiteTranslateRegionTest, Uqxtn8bSaturates) {
+  SetV128(state_.cpu, 1, 0x0200020002000200ULL, 0x00FF00FF00FF00FFULL);
+  static const uint32_t code[] = {Uqxtn8b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);  // low half all 0xFF (sat + already-FF)
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// SQXTUN .8B: signed src -> unsigned dst. -256 -> 0, 512 -> 255.
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtun8bClampsNegToZero) {
+  SetV128(state_.cpu, 1, 0xFF00FF00FF00FF00ULL, 0x0200020002000200ULL);
+  static const uint32_t code[] = {Sqxtun8b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFFFFFF00000000ULL);  // lanes 0-3 -> 0, lanes 4-7 -> 0xFF
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// SQXTN .4H: signed saturate to [-32768,32767]. 131072 -> 0x7FFF.
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn4hSaturates) {
+  SetV128(state_.cpu, 1, 0x0002000000020000ULL, 0x0002000000020000ULL);
+  static const uint32_t code[] = {Sqxtn4h(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7FFF7FFF7FFF7FFFULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// SQXTN2: low 64 of Vd preserved, saturated bytes to upper 64.
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2_16bUpperHalf) {
+  SetV128(state_.cpu, 0, 0x1122334455667788ULL, 0xCCCCCCCCCCCCCCCCULL);  // Vd
+  SetV128(state_.cpu, 1, 0x0200020002000200ULL, 0x0200020002000200ULL);  // Vn
+  static const uint32_t code[] = {Sqxtn2_16b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
+  EXPECT_EQ(r[1], 0x7F7F7F7F7F7F7F7FULL);  // saturated
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to

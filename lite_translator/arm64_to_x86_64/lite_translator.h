@@ -13257,6 +13257,69 @@ class LiteTranslator {
       }
       // endregion
 
+      // region digitalis - SQXTN / UQXTN / SQXTUN (saturating extract narrow).
+      // Same dst-width selection and Q=0/Q2 layout as XTN; the pack differs by
+      // saturation flavour:
+      //   SQXTN  signed src -> signed dst   : PACKSSWB / PACKSSDW
+      //   SQXTUN signed src -> unsigned dst : PACKUSWB / PACKUSDW
+      //   UQXTN  unsigned src -> unsigned dst: clamp via PMINUW/PMINUD then
+      //                                        PACKUSWB/PACKUSDW (the clamp
+      //                                        keeps values in the positive
+      //                                        signed range so PACKUS is exact).
+      // .2D->.2S (size=10) has no x86 narrowing pack; bail to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
+        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+        const auto opc = args.opcode;
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn) {
+          SimdRegister xm = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          if (xm == no_simd_register || tmp == no_register) { success_ = false; return; }
+          as_.Movq(tmp, args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                                          : int64_t{0x0000FFFF0000FFFFLL});
+          as_.Movq(xm, tmp);
+          as_.Punpcklqdq(xm, xm);
+          if (args.size == 0b00) {
+            as_.Pminuw(xn, xm);
+            as_.Packuswb(xn, xz);
+          } else {
+            as_.Pminud(xn, xm);
+            as_.Packusdw(xn, xz);
+          }
+        } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
+          if (args.size == 0b00) {
+            as_.Packuswb(xn, xz);
+          } else {
+            as_.Packusdw(xn, xz);
+          }
+        } else {  // kSqxtn
+          if (args.size == 0b00) {
+            as_.Packsswb(xn, xz);
+          } else {
+            as_.Packssdw(xn, xz);
+          }
+        }
+        if (!args.q) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          mask_low64(xd);
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
+
       // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 -- per-lane signed compare against 0.
       //   CMGT (Vn > 0)  ->  PCMPGTx(Vn, 0)
       //   CMLT (Vn < 0)  ->  PCMPGTx(0, Vn)
