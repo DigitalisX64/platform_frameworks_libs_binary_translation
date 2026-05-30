@@ -210,6 +210,7 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
       // value in FB libcoldstart Yoga layout). The
       // "Imprecise context" warning still applies for JIT execution —
       // for interpreter execution state is precise.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
       if (thread &&
           (sig == SIGSEGV || sig == SIGBUS) &&
           reinterpret_cast<uintptr_t>(info->si_addr) < 0x100000000ULL) {
@@ -242,11 +243,13 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
             (unsigned long)cpu.x[26], (unsigned long)cpu.x[27],
             (unsigned long)cpu.x[28]);
       }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
       // endregion
       // region digitalis - if this is a NESTED host signal (depth > 1) the
       // first frame is still mid-ProcessGuestSignal (guest handler in flight).
       // Recording the guest CPU here gives forensic data the existing
       // "delivering signal" trace doesn't capture for the inner fault.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
       if (depth > 1 && thread) {
         auto& cpu = thread->state()->cpu;
         TRACE(
@@ -264,6 +267,7 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
             (unsigned long)cpu.x[30],
             (unsigned long)cpu.x[29]);
       }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
       // endregion
     } else {
       // Failed to find recovery code.
@@ -278,6 +282,7 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
         // the guest CPU dump here, the second-fault's host PC + guest state
         // remain unknown — exactly the gap earlier forensics flagged.
         // Fires for both depth==1 (first fatal) and depth>1 (nested).
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
         if (thread) {
           auto& cpu = thread->state()->cpu;
           __android_log_print(ANDROID_LOG_ERROR, "berberis",
@@ -314,6 +319,13 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
               depth, sig, (unsigned long)addr,
               info->si_addr, info->si_code);
         }
+#else
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "FATAL host signal NO-RECOVERY: depth=%d sig=%d host_pc=0x%lx "
+            "fault_addr=%p si_code=%d",
+            depth, sig, (unsigned long)addr,
+            info->si_addr, info->si_code);
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
         // endregion
         HandleFatalSignal(sig, info, context);
         // If the raised signal is blocked we may need to return from the handler to unblock it.
