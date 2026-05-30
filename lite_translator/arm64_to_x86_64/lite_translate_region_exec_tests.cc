@@ -12216,6 +12216,60 @@ TEST_F(Arm64LiteTranslateRegionTest, ShllVariants) {
 }
 // endregion
 
+// region digitalis - FCVTXN/FCVTXN2 (FP64->FP32 round-to-odd) JIT. Validate the
+// JIT against the interpreter (the round-to-odd reference) across non-NaN edge
+// cases (exact, inexact, overflow, signed zero), the FCVTXN2 high-half write,
+// and that a NaN lane yields a quiet NaN.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtxnVectorMatchesInterpreter) {
+  struct Pair { double a; double b; };
+  const Pair cases[] = {
+      {1.0, 2.0}, {1.5, -1.5}, {3.14159265358979, 2.718281828459045},
+      {1e300, -1e300}, {0.0, -0.0}, {1.0000001, 123456.789},
+  };
+  static const uint32_t code[] = {0x2E616820u};  // fcvtxn v0.2s, v1.2d
+  for (const Pair& c : cases) {
+    double in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = 0;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    uint64_t jit_lo;
+    memcpy(&jit_lo, &state_.cpu.v[0], 8);
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = 0;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    uint64_t interp_lo;
+    memcpy(&interp_lo, &state_.cpu.v[0], 8);
+    EXPECT_EQ(jit_lo, interp_lo) << "FCVTXN mismatch a=" << c.a << " b=" << c.b;
+  }
+  // FCVTXN2 v0.4s, v1.2d (Q=1) preserves Vd's low 64 and writes the high 64.
+  double in2[2] = {1.5, 2.5};
+  memcpy(&state_.cpu.v[1], in2, 16);
+  SetV128(state_.cpu, 0, 0xDEADBEEFCAFEBABEULL, 0ULL);
+  static const uint32_t code2[] = {0x6E616820u};  // fcvtxn2 v0.4s, v1.2d
+  EXPECT_TRUE(Run(code2, ToGuestAddr(code2) + sizeof(code2)));
+  uint64_t lo, hi;
+  memcpy(&lo, &state_.cpu.v[0], 8);
+  memcpy(&hi, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 8, 8);
+  EXPECT_EQ(lo, 0xDEADBEEFCAFEBABEULL);  // low half preserved
+  float f0, f1;
+  memcpy(&f0, &hi, 4);
+  memcpy(&f1, reinterpret_cast<const uint8_t*>(&hi) + 4, 4);
+  EXPECT_FLOAT_EQ(f0, 1.5f);
+  EXPECT_FLOAT_EQ(f1, 2.5f);
+  // NaN lane -> a quiet NaN (exp=0xFF, mantissa MSB set).
+  double nan_in[2] = {std::nan(""), 1.0};
+  memcpy(&state_.cpu.v[1], nan_in, 16);
+  state_.cpu.v[0] = 0;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t nan_bits;
+  memcpy(&nan_bits, &state_.cpu.v[0], 4);
+  EXPECT_EQ(nan_bits & 0x7F800000u, 0x7F800000u);  // exp all ones
+  EXPECT_NE(nan_bits & 0x007FFFFFu, 0u);            // mantissa nonzero (NaN)
+  EXPECT_NE(nan_bits & 0x00400000u, 0u);            // quiet bit set
+}
+// endregion
+
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
 // and outputs are validated against the SM3 round/expansion (the full sequence
 // reproduces the published SM3("abc") digest). Interpreter-only.
