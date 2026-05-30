@@ -1233,6 +1233,14 @@ class Decoder {
     kFrinta = 0b001100,
     kFrintx = 0b001110,
     kFrinti = 0b001111,
+    // region digitalis - FRINTTS (FEAT_FRINTTS): round to a 32/64-bit signed
+    // integral FP value, saturating out-of-range / NaN to the most-negative
+    // value. Z = toward zero, X = FPCR rounding mode (signals Inexact).
+    kFrint32z = 0b010000,
+    kFrint32x = 0b010001,
+    kFrint64z = 0b010010,
+    kFrint64x = 0b010011,
+    // endregion
   };
 
   struct FpDataProc1Args {

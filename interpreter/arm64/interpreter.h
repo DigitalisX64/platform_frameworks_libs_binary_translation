@@ -5056,6 +5056,26 @@ class Interpreter {
   //
   // FP data-processing (1 source): FMOV, FABS, FNEG, FSQRT, FCVT, FRINTx.
   //
+  // region digitalis - FRINTTS (FEAT_FRINTTS) shared rounding. Round `src` to
+  // an integral value (toward zero for the Z variants, FPCR rounding mode via
+  // rint for the X variants), then saturate to the signed 32- or 64-bit range.
+  // Out-of-range inputs, NaN and infinities yield the most-negative value and
+  // set FPSR.IOC, matching the ARM ARM FPRoundIntN definition. opcode bit0
+  // selects X(1)/Z(0); bit1 selects 64-bit(1)/32-bit(0).
+  double FrintTs(double src, uint8_t opcode) {
+    const bool toward_zero = (opcode & 0b1u) == 0;
+    const bool is64 = (opcode & 0b10u) != 0;
+    double r = toward_zero ? std::trunc(src) : std::rint(src);
+    const double lo = is64 ? -9223372036854775808.0 : -2147483648.0;
+    const double hi = is64 ? 9223372036854775808.0 : 2147483648.0;
+    if (!(r >= lo && r < hi)) {
+      state_->cpu.emulated_fpsr |= 1u;  // FPSR.IOC (invalid operation)
+      return lo;
+    }
+    return r;
+  }
+  // endregion
+
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
     CHECK(!exception_raised_);
     uint8_t ftype = args.ftype;
@@ -5116,6 +5136,14 @@ class Interpreter {
         case 0b001111:  // FRINTI (round using FPCR rounding mode)
           result = std::rint(src);
           break;
+        // region digitalis - FRINTTS scalar (FP32).
+        case 0b010000:  // FRINT32Z
+        case 0b010001:  // FRINT32X
+        case 0b010010:  // FRINT64Z
+        case 0b010011:  // FRINT64X
+          result = static_cast<float>(FrintTs(static_cast<double>(src), opcode));
+          break;
+        // endregion
         default:
           Undefined();
           return;
@@ -5192,6 +5220,14 @@ class Interpreter {
         case 0b001111:  // FRINTI
           result = std::rint(src);
           break;
+        // region digitalis - FRINTTS scalar (FP64).
+        case 0b010000:  // FRINT32Z
+        case 0b010001:  // FRINT32X
+        case 0b010010:  // FRINT64Z
+        case 0b010011:  // FRINT64X
+          result = FrintTs(src, opcode);
+          break;
+        // endregion
         default:
           Undefined();
           return;
