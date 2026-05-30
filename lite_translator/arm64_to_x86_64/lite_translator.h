@@ -20026,6 +20026,116 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 8
+        // region digitalis: URSHR .8B / .16B byte form JIT via
+        // PMOVZXBW + PSRLW + two-shift bit-isolate + PADDW + PACKUSWB.
+        //
+        // Per-lane URSHR:  Vd<i> = floor((Vn<i> + 2^(cnt-1)) / 2^cnt)
+        // with cnt ∈ [1, 8] for byte form.
+        //
+        // Computed at u16 word width on PMOVZXBW-widened bytes via the
+        // identity URSHR(x, cnt) = (x >> cnt) + ((x >> (cnt-1)) & 1):
+        //
+        //   xn          = PMOVZXBW(Vn_half)       // u8 → u16 word (hi 8 bits = 0)
+        //   round       = MOVDQA(xn)              // separate copy for round derivation
+        //   round       = PSRLW(round, cnt-1)     // bit (cnt-1) of byte → bit 0 of word
+        //   round       = PSLLW(round, 15)        // two-shift bracket: keep only bit 0,
+        //   round       = PSRLW(round, 15)        //   yielding {0, 1} per word
+        //   shifted     = PSRLW(xn, cnt)          // logical right shift, fits in u8
+        //   shifted    += PADDW(shifted, round)   // shifted + round, fits in u8 too
+        //   bytes       = PACKUSWB(shifted, ...)  // word → byte (no actual saturation)
+        //   Vd          = bytes
+        //
+        // PACKUSWB never saturates: PSRLW on a zero-extended-byte word is
+        // ≤ 0x7F for cnt ≥ 1; +round ≤ 1 makes the max 0x80, well below
+        // 0xFF.
+        //
+        // shift==esize (cnt==8) boundary: PSRLW by 8 yields 0; round bit
+        // = (byte >> 7) & 1 = MSB of original byte; result per lane is
+        // MSB.  Matches ARM URSHR at shift==esize: (x + 2^(esize-1)) >>
+        // esize = (x + 128) >> 8 = `x >= 128 ? 1 : 0` = MSB.  No
+        // saturation issue (max result = 1).
+        //
+        // shift==1 boundary: cnt_minus_1 == 0, PSRLW(round, 0) is a
+        // no-op, so the two-shift bracket isolates bit 0 of the original
+        // word = bit 0 of the original byte = correct round bit at
+        // shift=1.
+        //
+        // .8B (!Q): widen low 8 bytes only, compute one word lane, pack
+        //   with self, zero upper duplicate via Pslldq+Psrldq (D-register
+        //   semantics).
+        // .16B (Q): widen both halves of Vn, compute both lanes in
+        //   parallel, PACKUSWB(lo, hi) lays out ARM lane order (low half
+        //   of result in low 8 bytes, high half in high 8 bytes).
+        //
+        // Scalar B form is not encoded by ARM (scalar URSHR only exists
+        // at D — ARM ARM C7.2.358).  Defensive bail.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kUrshr) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (xn_lo == no_simd_register) { success_ = false; return; }
+          SimdRegister round_lo = AllocTempSimdReg();
+          if (round_lo == no_simd_register) { success_ = false; return; }
+          SimdRegister xn_hi = no_simd_register;
+          SimdRegister round_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) { success_ = false; return; }
+            round_hi = AllocTempSimdReg();
+            if (round_hi == no_simd_register) {
+              success_ = false; return;
+            }
+          }
+          as_.Pmovzxbw(xn_lo,
+                       {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovzxbw(xn_hi,
+                         {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          // Copy widened Vn into the round-bit derivation regs.
+          as_.Movdqa(round_lo, xn_lo);
+          if (args.q) {
+            as_.Movdqa(round_hi, xn_hi);
+          }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          const int8_t cnt_minus_1 =
+              static_cast<int8_t>(byte_shift_count - 1);
+          // bit (cnt-1) of each byte → bit 0 of each word.
+          as_.Psrlw(round_lo, cnt_minus_1);
+          if (args.q) {
+            as_.Psrlw(round_hi, cnt_minus_1);
+          }
+          // Two-shift bracket: keep only bit 0 per word ({0, 1}).
+          as_.Psllw(round_lo, int8_t{15});
+          if (args.q) {
+            as_.Psllw(round_hi, int8_t{15});
+          }
+          as_.Psrlw(round_lo, int8_t{15});
+          if (args.q) {
+            as_.Psrlw(round_hi, int8_t{15});
+          }
+          // Logical right shift the widened byte by cnt.
+          as_.Psrlw(xn_lo, cnt);
+          if (args.q) {
+            as_.Psrlw(xn_hi, cnt);
+          }
+          // shifted + round (per-word; fits in u8).
+          as_.Paddw(xn_lo, round_lo);
+          if (args.q) {
+            as_.Paddw(xn_hi, round_hi);
+            as_.Packuswb(xn_lo, xn_hi);
+          } else {
+            as_.Packuswb(xn_lo, xn_lo);
+            // Zero upper 64 bits (D-register semantics).
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
+          return;
+        }
+        // endregion
         if (is_byte) { success_ = false; return; }
         uint8_t esize_bits;
         if (immh & 0b1000) {
