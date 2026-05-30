@@ -1006,6 +1006,13 @@ class Interpreter {
     switch (args.opcode) {
       case Decoder::MteLoadStoreOpcode::kStg:
       case Decoder::MteLoadStoreOpcode::kSt2g:
+      // region digitalis - STGM / STZGM tag-block stores: pure tag stores,
+      // NOP without MTE backing. STZGM's data-zeroing block size is defined by
+      // GMID_EL1 (not emulated here), so it is treated as a tag NOP rather than
+      // zeroing a guessed-size region (over-zeroing would corrupt memory).
+      case Decoder::MteLoadStoreOpcode::kStgm:
+      case Decoder::MteLoadStoreOpcode::kStzgm:
+      // endregion
         // Pure tag store — NOP without MTE backing.
         break;
       case Decoder::MteLoadStoreOpcode::kLdg: {
@@ -1016,6 +1023,15 @@ class Interpreter {
         }
         break;
       }
+      // region digitalis - LDGM: load tag multiple into Rt. Tags are packed as
+      // 4-bit nibbles; with no MTE backing all tags read 0, so Rt = 0.
+      case Decoder::MteLoadStoreOpcode::kLdgm: {
+        if (args.rt != 31) {
+          state_->cpu.x[args.rt] = 0;
+        }
+        break;
+      }
+      // endregion
       case Decoder::MteLoadStoreOpcode::kStzg: {
         // Zero the 16-byte granule containing access_addr.
         uint64_t aligned = access_addr & ~uint64_t{0x0F};

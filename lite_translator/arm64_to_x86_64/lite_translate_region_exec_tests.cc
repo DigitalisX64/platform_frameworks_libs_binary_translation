@@ -12157,6 +12157,28 @@ TEST_F(Arm64LiteTranslateRegionTest, Frint64zVector2D) {
 }
 // endregion
 
+// region digitalis - LDGM/STGM/STZGM (FEAT_MTE tag-block): without MTE
+// backing, LDGM reads tags as zero (Rt=0) and STGM/STZGM are tag NOPs.
+TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
+  alignas(16) static uint8_t buf[64];
+  state_.cpu.x[0] = 0xFFFFFFFFFFFFFFFFULL;
+  state_.cpu.x[1] = ToGuestAddr(buf);
+  static const uint32_t ldgm[] = {0xD9E00020u};  // ldgm x0, [x1]
+  state_.cpu.insn_addr = ToGuestAddr(ldgm);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(ldgm) + 4);
+  EXPECT_EQ(state_.cpu.x[0], 0u);  // all tags read 0
+  static const uint32_t stgm[] = {0xD9A00020u};  // stgm x0, [x1] — NOP
+  state_.cpu.insn_addr = ToGuestAddr(stgm);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(stgm) + 4);
+  static const uint32_t stzgm[] = {0xD9200020u};  // stzgm x0, [x1] — NOP
+  state_.cpu.insn_addr = ToGuestAddr(stzgm);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(stzgm) + 4);
+}
+// endregion
+
 // region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
 // the address and adjust the logical tag in bits[59:56]. Interpreter-only.
 TEST_F(Arm64LiteTranslateRegionTest, AddgSubgTagArithmetic) {

@@ -205,6 +205,12 @@ class Decoder {
     kStzg,   // store tag + zero 16-byte granule
     kSt2g,   // store double tag (32-byte granule) — NOP without MTE backing
     kStz2g,  // store double tag + zero 32-byte granule
+    // region digitalis - tag-block (granule-multiple) forms (op2=00).
+    kLdgm,   // load tag multiple into Rt — without MTE, all tags read 0
+    kStgm,   // store tag multiple — NOP without MTE backing
+    kStzgm,  // store tag multiple + zero block — tag NOP; block size is
+             // GMID_EL1-defined (not emulated), so treated as a tag NOP
+    // endregion
   };
 
   struct MteLoadStoreArgs {
@@ -2707,7 +2713,11 @@ class Decoder {
       // Observed in libcoldstart.so sha256_block_data_order prologue
       // where bits[11:10] of imm19 = 0b11 routed the LDR literal to
       // DecodeLoadStoreImmPostPreIndex(true) → STR x16, [x2, #7]!.
-      if (op_29 == 0) {
+      // LDR/LDRSW/PRFM (literal) all have bit[24]=0; the MTE tag load/store
+      // group (LDG/STG/ST2G/STZG/STZ2G and the LDGM/STGM/STZGM tag-block forms)
+      // shares op_29=0 but has bit[24]=1. Guard the literal gate on op_24==0 so
+      // it does not shadow the MTE encodings decoded below.
+      if (op_29 == 0 && op_24 == 0) {
         DecodeLoadLiteral();
         return;
       }
@@ -2787,6 +2797,14 @@ class Decoder {
       mte_op = MteLoadStoreOpcode::kSt2g;
     } else if (opc == 0b11 && op2 != 0b00) {
       mte_op = MteLoadStoreOpcode::kStz2g;
+    // region digitalis - tag-block (granule-multiple) forms: op2=00, imm9=0.
+    } else if (opc == 0b11 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kLdgm;
+    } else if (opc == 0b10 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kStgm;
+    } else if (opc == 0b00 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kStzgm;
+    // endregion
     } else {
       return Undefined();
     }
