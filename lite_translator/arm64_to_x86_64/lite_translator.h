@@ -19383,6 +19383,65 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 1
+        // region digitalis: SSHR .8B / .16B byte form JIT via
+        // PMOVSXBW + PSRAW + PACKSSWB.
+        //
+        // SSHR's per-lane arithmetic right shift on bytes has no SSE
+        // equivalent (no PSRAB). Widen each byte to a sign-extended
+        // 16-bit word with PMOVSXBW, shift via PSRAW, then pack back
+        // via PACKSSWB. The arithmetic-right-shift of an int8 cannot
+        // grow magnitude, so every shifted word is in [-128, 127] —
+        // PACKSSWB does not saturate.
+        //
+        // shift_count for byte form is 8 - immb ∈ [1, 8]. At cnt==8 on
+        // a sign-extended-byte word, PSRAW by 8 shifts the sign byte
+        // into bits[7:0] (byte-wide sign-fill), matching ARM SSHR's
+        // sign-fill at shift==esize.
+        //
+        // .8B (!Q): widen low 8 bytes only, shift, pack with self, zero
+        //   Vd[127:64] (D-register semantics).
+        // .16B (Q): widen low and high halves separately into two SIMD
+        //   temps, shift each, PACKSSWB(lo, hi) places low result in
+        //   low 8 bytes and high result in high 8 bytes — matches ARM
+        //   lane order.
+        //
+        // Scalar B form is not encoded by ARM (scalar SSHR only exists
+        // at D). Defensive bail if args.scalar is set with is_byte.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (xn_lo == no_simd_register) { success_ = false; return; }
+          SimdRegister xn_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) {
+              success_ = false; return;
+            }
+          }
+          as_.Pmovsxbw(xn_lo,
+                       {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovsxbw(xn_hi,
+                         {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          as_.Psraw(xn_lo, cnt);
+          if (args.q) {
+            as_.Psraw(xn_hi, cnt);
+            as_.Packsswb(xn_lo, xn_hi);
+          } else {
+            as_.Packsswb(xn_lo, xn_lo);
+            // Zero upper 64 bits of Vd (D-register semantics).
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
+          return;
+        }
+        // endregion
         if (is_byte) { success_ = false; return; }
         const bool is_left = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
         uint8_t esize_bits;
