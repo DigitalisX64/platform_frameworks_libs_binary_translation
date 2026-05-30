@@ -11810,6 +11810,61 @@ TEST_F(Arm64LiteTranslateRegionTest, Fcvtn2F64ToF32Upper) {
 }
 // endregion
 
+// region digitalis - SIMD modified-immediate (MOVI/MVNI) JIT.  Encoded words
+// from clang --target=aarch64.  Values match the interpreter's expand-and-
+// replace semantics.
+TEST_F(Arm64LiteTranslateRegionTest, Movi4s) {
+  static const uint32_t code[] = {0x4F000640u};  // movi v0.4s, #0x12
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000001200000012ULL);
+  EXPECT_EQ(r[1], 0x0000001200000012ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Movi4sLsl8) {
+  static const uint32_t code[] = {0x4F002640u};  // movi v0.4s, #0x12, lsl #8
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000120000001200ULL);
+  EXPECT_EQ(r[1], 0x0000120000001200ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Movi8bUpperZero) {
+  static const uint32_t code[] = {0x0F02E6A0u};  // movi v0.8b, #0x55 (Q=0)
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x5555555555555555ULL);
+  EXPECT_EQ(r[1], 0ULL);  // upper 64 zeroed
+}
+TEST_F(Arm64LiteTranslateRegionTest, Mvni4s) {
+  static const uint32_t code[] = {0x6F000640u};  // mvni v0.4s, #0x12
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFFFFEDFFFFFFEDULL);
+  EXPECT_EQ(r[1], 0xFFFFFFEDFFFFFFEDULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Movi2dBitmask) {
+  static const uint32_t code[] = {0x6F05E540u};  // movi v0.2d, #0xff00ff00ff00ff00
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFF00FF00FF00FF00ULL);
+  EXPECT_EQ(r[1], 0xFF00FF00FF00FF00ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Movi8h) {
+  static const uint32_t code[] = {0x4F058560u};  // movi v0.8h, #0xAB
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x00AB00AB00AB00ABULL);
+  EXPECT_EQ(r[1], 0x00AB00AB00AB00ABULL);
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to

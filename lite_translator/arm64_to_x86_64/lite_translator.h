@@ -2600,20 +2600,70 @@ class LiteTranslator {
   }
   // endregion
 
+  // Mirror of the interpreter's ExpandSimdModifiedImm — pure function of the
+  // (compile-time-known) encoding fields, so the JIT can materialise the full
+  // 128-bit MOVI/MVNI value at translation time and emit a constant load.
+  static __uint128_t ExpandSimdModifiedImmJit(uint8_t op, uint8_t cmode,
+                                              uint8_t abc, uint8_t defgh, bool q) {
+    uint8_t imm8 = (abc << 5) | defgh;
+    uint64_t imm64 = 0;
+    if (op == 0) {
+      switch (cmode >> 1) {
+        case 0b000: imm64 = uint64_t{imm8} | (uint64_t{imm8} << 32); break;
+        case 0b001: imm64 = (uint64_t{imm8} << 8) | (uint64_t{imm8} << 40); break;
+        case 0b010: imm64 = (uint64_t{imm8} << 16) | (uint64_t{imm8} << 48); break;
+        case 0b011: imm64 = (uint64_t{imm8} << 24) | (uint64_t{imm8} << 56); break;
+        case 0b100: for (int i = 0; i < 4; i++) imm64 |= uint64_t{imm8} << (i * 16); break;
+        case 0b101: for (int i = 0; i < 4; i++) imm64 |= uint64_t{imm8} << (i * 16 + 8); break;
+        case 0b110:
+          if (!(cmode & 1)) {
+            uint32_t v = (uint32_t{imm8} << 8) | 0xFF;
+            imm64 = uint64_t{v} | (uint64_t{v} << 32);
+          } else {
+            uint32_t v = (uint32_t{imm8} << 16) | 0xFFFF;
+            imm64 = uint64_t{v} | (uint64_t{v} << 32);
+          }
+          break;
+        case 0b111: for (int i = 0; i < 8; i++) imm64 |= uint64_t{imm8} << (i * 8); break;
+      }
+    } else {
+      if (cmode == 0b1110) {
+        for (int i = 0; i < 8; i++)
+          if (imm8 & (1 << i)) imm64 |= 0xFFULL << (i * 8);
+      } else {
+        return ~ExpandSimdModifiedImmJit(0, cmode, abc, defgh, q);
+      }
+    }
+    __uint128_t result = static_cast<__uint128_t>(imm64);
+    if (q) result |= static_cast<__uint128_t>(imm64) << 64;
+    return result;
+  }
+
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
     // region digitalis
-    if (args.op == 1 && args.cmode == 0b1110 && args.abc == 0 && args.defgh == 0 && args.q) {
-      // MOVI Vd.2D, #0x0 — zero the register.
-      SimdRegister xmm = AllocTempSimdReg();
-      if (xmm == no_simd_register) { Undefined(); return; }
-      as_.Pxor(xmm, xmm);
-      // Store to ThreadState SIMD register.
-      int32_t offset = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
-      as_.Movdqu({.base = Assembler::rbp, .disp = offset}, xmm);
-      return;
+    // Compute the 128-bit immediate at translation time (matches the
+    // interpreter's expand-and-replace semantics) and emit a constant load.
+    __uint128_t value =
+        ExpandSimdModifiedImmJit(args.op, args.cmode, args.abc, args.defgh, args.q);
+    uint64_t lo = static_cast<uint64_t>(value);
+    uint64_t hi = static_cast<uint64_t>(value >> 64);
+    int32_t off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+    SimdRegister xd = AllocTempSimdReg();
+    if (xd == no_simd_register) { success_ = false; return; }
+    if (lo == 0 && hi == 0) {
+      as_.Pxor(xd, xd);
+    } else {
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      as_.Movq(tmp, static_cast<int64_t>(lo));
+      as_.Movq(xd, tmp);  // zero-extends: upper 64 = 0
+      if (hi != 0) {
+        as_.Movq(tmp, static_cast<int64_t>(hi));
+        as_.Pinsrq(xd, tmp, int8_t{1});
+      }
     }
+    as_.Movdqu({.base = Assembler::rbp, .disp = off}, xd);
     // endregion
-    Undefined();
   }
 
   // region digitalis
