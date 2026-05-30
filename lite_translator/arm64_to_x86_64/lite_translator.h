@@ -11502,12 +11502,28 @@ class LiteTranslator {
   }
   // endregion
 
-  // region digitalis - SM4 (interpreter only).
+  // region digitalis - SM3/SM4 (interpreter only).
   void Sm4e(uint8_t rd, uint8_t rn) {
     UNUSED(rd, rn);
     Undefined();
   }
   void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
+    Undefined();
+  }
+  void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    UNUSED(rd, rn, rm, ra);
+    Undefined();
+  }
+  void Sm3tt(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm2, uint8_t op) {
+    UNUSED(rd, rn, rm, imm2, op);
+    Undefined();
+  }
+  void Sm3partw1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
+    Undefined();
+  }
+  void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
     UNUSED(rd, rn, rm);
     Undefined();
   }

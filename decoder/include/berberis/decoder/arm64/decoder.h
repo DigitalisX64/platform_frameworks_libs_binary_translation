@@ -3785,12 +3785,45 @@ class Decoder {
     //   SM4E    Vd,Vn    : bits[23:21]=110, Rm=00000, bits[15:10]=100001.
     if (bit31 && GetBits<24, 7>() == 0b1001110) {
       uint8_t sm_b23_21 = GetBits<21, 3>();
-      if (sm_b23_21 == 0b011 && GetBits<12, 4>() == 0b1100 &&
-          GetBits<10, 2>() == 0b10) {
-        insn_consumer_->Sm4ekey(GetBits<0, 5>(),   // rd
-                                GetBits<5, 5>(),    // rn
-                                GetBits<16, 5>());  // rm
+      // SM3SS1 (4-register) / SM3TT1A/1B/2A/2B (3-register, by-lane).
+      //   bits[23:21]=010, bit15=0 -> SM3SS1 (Ra = bits[14:10]).
+      //   bits[23:21]=010, bit15=1 -> SM3TT*, imm2=bits[13:12], op=bits[11:10]
+      //     (00=TT1A, 01=TT1B, 10=TT2A, 11=TT2B).
+      if (sm_b23_21 == 0b010) {
+        if (!GetBits<15, 1>()) {
+          insn_consumer_->Sm3ss1(GetBits<0, 5>(),    // rd
+                                 GetBits<5, 5>(),     // rn
+                                 GetBits<16, 5>(),    // rm
+                                 GetBits<10, 5>());   // ra
+        } else {
+          insn_consumer_->Sm3tt(GetBits<0, 5>(),    // rd
+                                GetBits<5, 5>(),     // rn
+                                GetBits<16, 5>(),    // rm
+                                GetBits<12, 2>(),    // imm2
+                                GetBits<10, 2>());   // op: 00/01/10/11
+        }
         return;
+      }
+      // bits[23:21]=011, bits[15:12]=1100: SM3PARTW1 (bits[11:10]=00),
+      // SM3PARTW2 (01), SM4EKEY (10).
+      if (sm_b23_21 == 0b011 && GetBits<12, 4>() == 0b1100) {
+        uint8_t sub = GetBits<10, 2>();
+        if (sub == 0b00) {
+          insn_consumer_->Sm3partw1(GetBits<0, 5>(), GetBits<5, 5>(),
+                                    GetBits<16, 5>());
+          return;
+        }
+        if (sub == 0b01) {
+          insn_consumer_->Sm3partw2(GetBits<0, 5>(), GetBits<5, 5>(),
+                                    GetBits<16, 5>());
+          return;
+        }
+        if (sub == 0b10) {
+          insn_consumer_->Sm4ekey(GetBits<0, 5>(),   // rd
+                                  GetBits<5, 5>(),    // rn
+                                  GetBits<16, 5>());  // rm
+          return;
+        }
       }
       if (sm_b23_21 == 0b110 && GetBits<16, 5>() == 0 &&
           GetBits<10, 6>() == 0b100001) {

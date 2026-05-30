@@ -546,6 +546,21 @@ class SemanticsPlayer {
   }
   // endregion
 
+  // region digitalis - SM3 (FEAT_SM3).
+  void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    listener_->Sm3ss1(rd, rn, rm, ra);
+  }
+  void Sm3tt(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm2, uint8_t op) {
+    listener_->Sm3tt(rd, rn, rm, imm2, op);
+  }
+  void Sm3partw1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Sm3partw1(rd, rn, rm);
+  }
+  void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Sm3partw2(rd, rn, rm);
+  }
+  // endregion
+
   // region digitalis
   void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
     listener_->CryptoAes(rd, rn, opcode);

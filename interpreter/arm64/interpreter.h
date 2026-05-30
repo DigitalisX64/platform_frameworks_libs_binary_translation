@@ -2445,6 +2445,91 @@ class Interpreter {
   }
   // endregion
 
+  // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/1B/2A/2B, SM3PARTW1/2.
+  // Word i of a vector is bits[32i+31:32i] (word 0 = low). Derived from the
+  // SM3 round/expansion (GB/T 32905); the full sequence reproduces the
+  // published SM3("abc") digest. P0(x)=x^rol(x,9)^rol(x,17),
+  // P1(x)=x^rol(x,15)^rol(x,23).
+  static uint32_t Sm3P0(uint32_t x) { return x ^ Sm4Rol(x, 9) ^ Sm4Rol(x, 17); }
+  static uint32_t Sm3Ror(uint32_t x, int n) { return Sm4Rol(x, 32 - n); }
+  // SM3SS1: Vd[3] = rol(rol(Vn[3],12) + Vm[3] + Va[3], 7); Vd[2:0] = 0.
+  void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    CHECK(!exception_raised_);
+    uint32_t n[4], m[4], a[4];
+    __uint128_t vn = state_->cpu.v[rn], vm = state_->cpu.v[rm], va = state_->cpu.v[ra];
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    memcpy(a, &va, 16);
+    uint32_t out[4] = {0, 0, 0, Sm4Rol(Sm4Rol(n[3], 12) + m[3] + a[3], 7)};
+    __uint128_t vd;
+    memcpy(&vd, out, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // SM3TT: op 00=TT1A, 01=TT1B, 10=TT2A, 11=TT2B. Vd holds the working state
+  // (D,C,B,A) for TT1 / (H,G,F,E) for TT2 in lanes 0..3; Vn[3] is SS2 (TT1) or
+  // SS1 (TT2); Vm[imm2] is W'[j] (TT1) or W[j] (TT2).
+  void Sm3tt(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm2, uint8_t op) {
+    CHECK(!exception_raised_);
+    uint32_t d[4], n[4], m[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(d, &vd, 16);
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    const bool is_tt2 = (op & 0b10);
+    const bool is_b = (op & 0b01);
+    const uint32_t wj = m[imm2 & 3];
+    uint32_t out[4];
+    if (!is_tt2) {
+      uint32_t ff = is_b ? ((d[3] & d[2]) | (d[3] & d[1]) | (d[2] & d[1]))
+                         : (d[3] ^ d[2] ^ d[1]);
+      uint32_t t = ff + d[0] + n[3] + wj;
+      out[0] = d[1];
+      out[1] = Sm3Ror(d[2], 23);
+      out[2] = d[3];
+      out[3] = t;
+    } else {
+      uint32_t gg = is_b ? ((d[3] & d[2]) | (~d[3] & d[1])) : (d[3] ^ d[2] ^ d[1]);
+      uint32_t t = gg + d[0] + n[3] + wj;
+      out[0] = d[1];
+      out[1] = Sm3Ror(d[2], 13);
+      out[2] = d[3];
+      out[3] = Sm3P0(t);
+    }
+    memcpy(&vd, out, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // SM3PARTW1: Vd[i] = P1(Vd[i] ^ Vn[i] ^ rol(Vm[i+1],15)); lane 3 uses the
+  // just-written Vd[0] for the rotate term.
+  void Sm3partw1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint32_t d[4], n[4], m[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(d, &vd, 16);
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    auto p1 = [](uint32_t x) { return x ^ Sm4Rol(x, 15) ^ Sm4Rol(x, 23); };
+    uint32_t t;
+    t = d[0] ^ n[0] ^ Sm4Rol(m[1], 15); d[0] = p1(t);
+    t = d[1] ^ n[1] ^ Sm4Rol(m[2], 15); d[1] = p1(t);
+    t = d[2] ^ n[2] ^ Sm4Rol(m[3], 15); d[2] = p1(t);
+    t = d[3] ^ n[3] ^ Sm4Rol(d[0], 15); d[3] = p1(t);
+    memcpy(&vd, d, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // SM3PARTW2: Vd[i] ^= rol(Vn[i],7) ^ Vm[i].
+  void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint32_t d[4], n[4], m[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(d, &vd, 16);
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    for (int i = 0; i < 4; i++) d[i] ^= Sm4Rol(n[i], 7) ^ m[i];
+    memcpy(&vd, d, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // endregion
+
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     CHECK(!exception_raised_);
     auto ror64 = [](uint64_t x, unsigned n) -> uint64_t {
