@@ -396,6 +396,12 @@ class SemanticsPlayer {
   }
   // endregion
 
+  // region digitalis - I8MM matrix multiply-accumulate (SMMLA/UMMLA/USMMLA).
+  void AdvSimdMatMul(const typename Decoder::MatMulArgs& args) {
+    listener_->AdvSimdMatMul(args);
+  }
+  // endregion
+
   // region digitalis
   void SimdModifiedImm(const typename Decoder::SimdModifiedImmArgs& args) {
     listener_->SimdModifiedImm(args);

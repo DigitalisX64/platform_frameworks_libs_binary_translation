@@ -2515,7 +2515,21 @@ class LiteTranslator {
   // {SDOT,UDOT} — are lowered.  The interpreter (interpreter.h:1237)
   // remains the executable spec; this JIT path produces bit-exact
   // output (32-bit integer arithmetic with defined wraparound).
+  // region digitalis - I8MM matrix multiply-accumulate: interpreter only.
+  void AdvSimdMatMul(const Decoder::MatMulArgs&) { success_ = false; }
+  // endregion
+
   void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
+    // region digitalis - the I8MM mixed-sign dot products (USDOT/SUDOT) need
+    // per-operand signedness; this SDOT/UDOT lowering assumes both operands
+    // share a sign, so bail to the interpreter for the mixed forms.
+    if (args.opcode == Decoder::DotProductOpcode::kUsdot ||
+        args.opcode == Decoder::DotProductOpcode::kUsdotIdx ||
+        args.opcode == Decoder::DotProductOpcode::kSudotIdx) {
+      success_ = false;
+      return;
+    }
+    // endregion
     const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
                             args.opcode == Decoder::DotProductOpcode::kSdotIdx);
     const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||

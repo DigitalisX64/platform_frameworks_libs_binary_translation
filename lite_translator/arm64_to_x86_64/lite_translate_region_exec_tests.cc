@@ -12179,6 +12179,50 @@ TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
 }
 // endregion
 
+// region digitalis - I8MM (FEAT_I8MM): USDOT (mixed-sign dot product) and the
+// integer matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Interpreter-only; the
+// signed/unsigned/mixed forms must give distinct results (Vn byte0=0x80,
+// byte8=0xFF distinguish signed vs unsigned interpretation).
+TEST_F(Arm64LiteTranslateRegionTest, I8mmUsdotAndMatMul) {
+  // Vn (unsigned bytes), Vm (signed bytes) per the reference computation.
+  SetV128(state_.cpu, 1, 0x0807060504030280ULL, 0x01010101020202FFULL);
+  SetV128(state_.cpu, 2, 0xFFFFFFFF01010101ULL, 0xFEFEFEFE02020202ULL);
+  uint64_t r[2];
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t usdot[] = {0x4E829C20u};  // usdot v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(usdot);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xffffffe600000089ULL);
+  EXPECT_EQ(r[1], 0xfffffff80000020aULL);
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t smmla[] = {0x4E82A420u};  // smmla v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(smmla);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xfffffedeffffff6fULL);
+  EXPECT_EQ(r[1], 0x0000000200000001ULL);
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t ummla[] = {0x6E82A420u};  // ummla v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(ummla);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x00001ade00001a6fULL);
+  EXPECT_EQ(r[1], 0x0000060200000501ULL);
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t usmmla[] = {0x4E82AC20u};  // usmmla v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(usmmla);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000000de0000006fULL);
+  EXPECT_EQ(r[1], 0x0000020200000101ULL);
+}
+// endregion
+
 // region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
 // the address and adjust the logical tag in bits[59:56]. Interpreter-only.
 TEST_F(Arm64LiteTranslateRegionTest, AddgSubgTagArithmetic) {

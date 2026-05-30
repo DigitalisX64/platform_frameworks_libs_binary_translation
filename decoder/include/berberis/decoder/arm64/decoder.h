@@ -417,6 +417,11 @@ class Decoder {
     kUdot,      // UDOT vector
     kSdotIdx,   // SDOT by element
     kUdotIdx,   // UDOT by element
+    // region digitalis - I8MM mixed-sign dot products (FEAT_I8MM).
+    kUsdot,     // USDOT vector  (Vn unsigned, Vm signed)
+    kUsdotIdx,  // USDOT by element
+    kSudotIdx,  // SUDOT by element (Vn signed, Vm unsigned; vector form N/A)
+    // endregion
   };
 
   struct DotProductArgs {
@@ -426,6 +431,20 @@ class Decoder {
     uint8_t rm;
     uint8_t index;  // 0..3 for indexed forms; 0 for vector forms.
     bool q;         // True selects .4s form (4 lanes); false selects .2s (2 lanes).
+  };
+  // endregion
+
+  // region digitalis - I8MM 8-bit integer matrix multiply-accumulate.
+  enum class MatMulOpcode : uint8_t {
+    kSmmla,   // signed x signed
+    kUmmla,   // unsigned x unsigned
+    kUsmmla,  // Vn unsigned, Vm signed
+  };
+  struct MatMulArgs {
+    MatMulOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
   };
   // endregion
 
@@ -3457,6 +3476,54 @@ class Decoder {
         GetBits<10, 1>()) {
       DecodeAdvSimdDotProductVec();
       return;
+    }
+    // endregion
+
+    // region digitalis - I8MM (FEAT_I8MM): USDOT (vector) and the integer
+    // matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Same prefix as DotProd
+    // (bits[28:24]=01110, bits[23:22]=10, bit21=0, bit15=1, bit14=0, bit10=1);
+    // bits[13:11] select the op:
+    //   011 -> USDOT vector (U=0; Vn unsigned, Vm signed)
+    //   100 -> SMMLA (U=0) / UMMLA (U=1)
+    //   101 -> USMMLA (U=0; Vn unsigned, Vm signed)
+    // All are .4S (Q=1) only.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0b10 &&
+        !GetBits<21, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
+        GetBits<10, 1>()) {
+      uint8_t b13_11 = GetBits<11, 3>();  // bits[13:11]
+      bool u = GetBits<29, 1>();
+      if (b13_11 == 0b011 && !u) {  // USDOT vector
+        const DotProductArgs args = {
+            .opcode = DotProductOpcode::kUsdot,
+            .rd = GetBits<0, 5>(),
+            .rn = GetBits<5, 5>(),
+            .rm = GetBits<16, 5>(),
+            .index = 0,
+            .q = GetBits<30, 1>(),
+        };
+        insn_consumer_->AdvSimdDotProduct(args);
+        return;
+      }
+      if (b13_11 == 0b100) {  // SMMLA / UMMLA
+        const MatMulArgs args = {
+            .opcode = u ? MatMulOpcode::kUmmla : MatMulOpcode::kSmmla,
+            .rd = GetBits<0, 5>(),
+            .rn = GetBits<5, 5>(),
+            .rm = GetBits<16, 5>(),
+        };
+        insn_consumer_->AdvSimdMatMul(args);
+        return;
+      }
+      if (b13_11 == 0b101 && !u) {  // USMMLA
+        const MatMulArgs args = {
+            .opcode = MatMulOpcode::kUsmmla,
+            .rd = GetBits<0, 5>(),
+            .rn = GetBits<5, 5>(),
+            .rm = GetBits<16, 5>(),
+        };
+        insn_consumer_->AdvSimdMatMul(args);
+        return;
+      }
     }
     // endregion
 

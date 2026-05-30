@@ -1355,10 +1355,15 @@ class Interpreter {
     memcpy(n_b, &src_n, 16);
     memcpy(m_b, &src_m, 16);
 
-    const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
-                            args.opcode == Decoder::DotProductOpcode::kSdotIdx);
-    const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
-                             args.opcode == Decoder::DotProductOpcode::kUdotIdx);
+    // Per-operand signedness covers SDOT/UDOT and the I8MM mixed-sign forms
+    // USDOT (Vn unsigned, Vm signed) and SUDOT (Vn signed, Vm unsigned).
+    using Op = Decoder::DotProductOpcode;
+    const bool n_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kSudotIdx);
+    const bool m_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kUsdot || args.opcode == Op::kUsdotIdx);
+    const bool is_indexed = (args.opcode == Op::kSdotIdx || args.opcode == Op::kUdotIdx ||
+                             args.opcode == Op::kUsdotIdx || args.opcode == Op::kSudotIdx);
 
     __uint128_t result = 0;
     uint8_t lanes = args.q ? 4 : 2;
@@ -1369,10 +1374,10 @@ class Interpreter {
         uint8_t n_byte = n_b[4 * i + k];
         uint8_t m_byte = is_indexed ? m_b[4 * args.index + k]
                                     : m_b[4 * i + k];
-        int32_t n_ext = is_signed ? static_cast<int32_t>(static_cast<int8_t>(n_byte))
-                                  : static_cast<int32_t>(n_byte);
-        int32_t m_ext = is_signed ? static_cast<int32_t>(static_cast<int8_t>(m_byte))
-                                  : static_cast<int32_t>(m_byte);
+        int32_t n_ext = n_signed ? static_cast<int32_t>(static_cast<int8_t>(n_byte))
+                                 : static_cast<int32_t>(n_byte);
+        int32_t m_ext = m_signed ? static_cast<int32_t>(static_cast<int8_t>(m_byte))
+                                 : static_cast<int32_t>(m_byte);
         // Cast through uint32_t to make wraparound well-defined; bit-pattern
         // of the result matches the signed-arithmetic case for both SDOT
         // and UDOT per ARM ARM C7.2.397 / C7.2.398.
@@ -1388,6 +1393,47 @@ class Interpreter {
       memcpy(&lo, &result, 8);
       result = 0;
       memcpy(&result, &lo, 8);
+    }
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  // region digitalis - I8MM SMMLA/UMMLA/USMMLA (FEAT_I8MM). Vn holds a 2x8
+  // int8 matrix (two rows of 8), Vm holds an 8x2 matrix stored row-major as
+  // two rows of 8 (its transpose), Vd is a 2x2 int32 accumulator. The result
+  // is Vd + Vn * Vm^T: lane (2*i + j) accumulates the 8-element dot product of
+  // Vn row i with Vm row j. SMMLA = signed*signed, UMMLA = unsigned*unsigned,
+  // USMMLA = unsigned(Vn)*signed(Vm). Always .4S (full 128-bit result).
+  void AdvSimdMatMul(const Decoder::MatMulArgs& args) {
+    CHECK(!exception_raised_);
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];
+    uint8_t n_b[16], m_b[16];
+    memcpy(n_b, &src_n, 16);
+    memcpy(m_b, &src_m, 16);
+
+    const bool n_signed = (args.opcode == Decoder::MatMulOpcode::kSmmla);
+    const bool m_signed = (args.opcode == Decoder::MatMulOpcode::kSmmla ||
+                           args.opcode == Decoder::MatMulOpcode::kUsmmla);
+
+    __uint128_t result = 0;
+    for (uint8_t i = 0; i < 2; i++) {       // row of Vn
+      for (uint8_t j = 0; j < 2; j++) {     // row of Vm (column of result)
+        int32_t acc;
+        memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + (2 * i + j) * 4, 4);
+        for (uint8_t k = 0; k < 8; k++) {
+          uint8_t nb = n_b[8 * i + k];
+          uint8_t mb = m_b[8 * j + k];
+          int32_t ne = n_signed ? static_cast<int32_t>(static_cast<int8_t>(nb))
+                                 : static_cast<int32_t>(nb);
+          int32_t me = m_signed ? static_cast<int32_t>(static_cast<int8_t>(mb))
+                                 : static_cast<int32_t>(mb);
+          acc = static_cast<int32_t>(static_cast<uint32_t>(acc) +
+                                     static_cast<uint32_t>(ne * me));
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + (2 * i + j) * 4, &acc, 4);
+      }
     }
     state_->cpu.v[args.rd] = result;
   }
