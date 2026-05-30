@@ -12066,6 +12066,35 @@ TEST_F(Arm64LiteTranslateRegionTest, Suqadd16b) {  // Q=1 exercises the high hal
 }
 // endregion
 
+// region digitalis - PMULL / PMULL2 .8H (poly8 widening carryless multiply) JIT.
+constexpr uint32_t Pmull8h(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20E000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Pmull2_8h(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return Pmull8h(rd, rn, rm) | (1u << 30);  // Q=1 -> PMULL2 (high 8 bytes)
+}
+TEST_F(Arm64LiteTranslateRegionTest, Pmull8hPoly8) {
+  SetV128(state_.cpu, 1, 0xAA07108001FFCA53ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x5507108002FF53CAULL, 0ULL);
+  static const uint32_t code[] = {Pmull8h(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000255553F7E3F7EULL);
+  EXPECT_EQ(r[1], 0x2222001501004000ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Pmull2_8hPoly8UsesHighHalf) {
+  SetV128(state_.cpu, 1, 0xDEADBEEFDEADBEEFULL, 0xAA07108001FFCA53ULL);
+  SetV128(state_.cpu, 2, 0xDEADBEEFDEADBEEFULL, 0x5507108002FF53CAULL);
+  static const uint32_t code[] = {Pmull2_8h(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000255553F7E3F7EULL);
+  EXPECT_EQ(r[1], 0x2222001501004000ULL);
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to

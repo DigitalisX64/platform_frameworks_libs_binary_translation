@@ -10478,31 +10478,70 @@ class LiteTranslator {
 
     // PMULL64 (size=11) lowers to a single PCLMULQDQ — the imm-named
     // Pclmullqlqdq for Q=0 (poly_mul64(Vn.D[0], Vm.D[0])) and Pclmulhqhqdq
-    // for Q=1 (PMULL2; poly_mul64(Vn.D[1], Vm.D[1])). PMULL.8H (size=00)
-    // is 8 independent 8-bit polynomial products with no native shape —
-    // continues to bail to the interpreter.
+    // for Q=1 (PMULL2; poly_mul64(Vn.D[1], Vm.D[1])).
+    //
+    // PMULL.8H (size=00) is 8 independent 8-bit polynomial products that
+    // widen to full 16-bit results.  Widen both 8-byte sources to 16-bit
+    // lanes (PMOVZXBW; Q=1/PMULL2 takes bytes 8..15), then run the per-bit
+    // carry-less shift-and-XOR in 16-bit lanes.  Because every lane already
+    // holds a value < 256 and the degree-14 product fits in 16 bits, the
+    // PSLLW shifts never spill across lanes, so no per-lane masking is
+    // needed (unlike the byte-truncated PMUL).  The bit selector for bit i
+    // is built by PSLLW(b, 15-i) then PSRAW 15, broadcasting bit i to the
+    // whole lane.  size in {01,10} is reserved for PMULL and bails.
     if (args.opcode == Op::kPmull) {
-      if (args.size != 0b11) {
-        Undefined();
-        return;
-      }
       const int32_t vn_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
       const int32_t vm_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
       const int32_t vd_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
-      SimdRegister xn_p = AllocTempSimdReg();
-      SimdRegister xm_p = AllocTempSimdReg();
-      if (xn_p == no_simd_register || xm_p == no_simd_register) {
-        success_ = false;
+      if (args.size == 0b11) {
+        SimdRegister xn_p = AllocTempSimdReg();
+        SimdRegister xm_p = AllocTempSimdReg();
+        if (xn_p == no_simd_register || xm_p == no_simd_register) {
+          success_ = false;
+          return;
+        }
+        as_.Movdqu(xn_p, {.base = Assembler::rbp, .disp = vn_off_pmull});
+        as_.Movdqu(xm_p, {.base = Assembler::rbp, .disp = vm_off_pmull});
+        if (args.q) {
+          as_.Pclmulhqhqdq(xn_p, xm_p);
+        } else {
+          as_.Pclmullqlqdq(xn_p, xm_p);
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, xn_p);
         return;
       }
-      as_.Movdqu(xn_p, {.base = Assembler::rbp, .disp = vn_off_pmull});
-      as_.Movdqu(xm_p, {.base = Assembler::rbp, .disp = vm_off_pmull});
-      if (args.q) {
-        as_.Pclmulhqhqdq(xn_p, xm_p);
-      } else {
-        as_.Pclmullqlqdq(xn_p, xm_p);
+      if (args.size == 0b00) {  // PMULL/PMULL2 .8H (poly8 widening)
+        const int32_t extra = args.q ? 8 : 0;
+        SimdRegister za = AllocTempSimdReg();
+        SimdRegister zb = AllocTempSimdReg();
+        SimdRegister acc = AllocTempSimdReg();
+        SimdRegister shifted = AllocTempSimdReg();
+        SimdRegister sel = AllocTempSimdReg();
+        if (za == no_simd_register || zb == no_simd_register ||
+            acc == no_simd_register || shifted == no_simd_register ||
+            sel == no_simd_register) {
+          success_ = false;
+          return;
+        }
+        as_.Movq(za, {.base = Assembler::rbp, .disp = vn_off_pmull + extra});
+        as_.Movq(zb, {.base = Assembler::rbp, .disp = vm_off_pmull + extra});
+        as_.Pmovzxbw(za, za);  // 8 bytes -> 8x16-bit lanes
+        as_.Pmovzxbw(zb, zb);
+        as_.Pxor(acc, acc);
+        for (int i = 0; i < 8; ++i) {
+          as_.Movdqa(shifted, za);
+          if (i != 0) as_.Psllw(shifted, static_cast<int8_t>(i));
+          // sel = 0xFFFF per lane where bit i of zb is set.
+          as_.Movdqa(sel, zb);
+          if (15 - i != 0) as_.Psllw(sel, static_cast<int8_t>(15 - i));
+          as_.Psraw(sel, int8_t{15});
+          as_.Pand(shifted, sel);
+          as_.Pxor(acc, shifted);
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, acc);
+        return;
       }
-      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, xn_p);
+      Undefined();  // size in {01,10} reserved
       return;
     }
 
