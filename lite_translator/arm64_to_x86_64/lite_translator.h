@@ -19720,6 +19720,88 @@ class LiteTranslator {
           return;
         }
         // endregion
+        // region digitalis: USRA .8B / .16B byte form JIT via
+        // PMOVZXBW + PSRLW + PACKUSWB + PADDB.
+        //
+        // Unsigned sibling of the SSRA .8B / .16B byte form above with
+        // three instruction substitutions:
+        //   PMOVSXBW → PMOVZXBW  (zero-extend instead of sign-extend)
+        //   PSRAW    → PSRLW     (logical instead of arithmetic right shift)
+        //   PACKSSWB → PACKUSWB  (unsigned-saturate-narrow)
+        //
+        // USRA's accumulate step is `Vd += USHR(Vn, cnt)` per byte.
+        // PACKUSWB on the PSRLW'd zero-extended-byte words does not
+        // actually saturate — logical right shift on a u16 word whose
+        // high 8 bits are 0 cannot grow the value beyond 0xFF.
+        // PADDB at byte width gives ARM's native mod-256 wrap on the
+        // u8 accumulate (e.g. Vd=200, USHR=100 → 300 wraps to 44).
+        //
+        // .8B (!Q): widen low 8 bytes, shift, pack with self, zero
+        //   upper half of the packed result, load Vd's low 8 bytes via
+        //   Movq (zeros upper), PADDB, store. The Movq+upper-zero
+        //   sequence guarantees Vd[127:64] is 0 after the store
+        //   (D-register semantics).
+        // .16B (Q): widen both halves of Vn, shift each, PACKUSWB(lo,
+        //   hi) lays the result in ARM lane order, Movdqu full 16 of
+        //   Vd, PADDB, store.
+        //
+        // Vd==Vn safety: PMOVZXBW reads from vn_off before the Movq /
+        // Movdqu loads Vd, and the final Movdqu to vd_off happens
+        // last — so writes to Vd don't disturb the earlier Vn reads.
+        //
+        // shift==esize (cnt==8) collapses to a per-lane no-op on Vd:
+        // PSRLW by 8 on a zero-extended byte word produces 0, PACKUSWB
+        // gives all-zero bytes, PADDB(Vd, 0) leaves Vd unchanged.
+        // Matches ARM USRA at shift==esize where the USHR contribution
+        // is zero.
+        //
+        // Scalar B form is not encoded by ARM (scalar USRA only exists
+        // at D — ARM ARM C7.2.367). Defensive bail.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kUsra) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (xn_lo == no_simd_register) { success_ = false; return; }
+          SimdRegister xn_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) {
+              success_ = false; return;
+            }
+          }
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Pmovzxbw(xn_lo,
+                       {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovzxbw(xn_hi,
+                         {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          as_.Psrlw(xn_lo, cnt);
+          if (args.q) {
+            as_.Psrlw(xn_hi, cnt);
+            as_.Packuswb(xn_lo, xn_hi);
+            as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          } else {
+            as_.Packuswb(xn_lo, xn_lo);
+            // PACKUSWB(xn, xn) duplicates the 8 result bytes into both
+            // halves of xn_lo. Zero its upper half before PADDB so the
+            // upper 8 result bytes of Vd stay 0 (D-reg semantics).
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+            // Movq m64→xmm loads only the low 8 bytes of Vd and zeros
+            // xd[127:64].
+            as_.Movq(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+          return;
+        }
+        // endregion
         if (is_byte) { success_ = false; return; }
         uint8_t esize_bits;
         if (immh & 0b1000) {
