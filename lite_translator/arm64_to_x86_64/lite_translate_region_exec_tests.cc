@@ -12493,6 +12493,52 @@ TEST_F(Arm64LiteTranslateRegionTest, Ursqrte4sEstimate) {
 }
 // endregion
 
+// region digitalis - SQDMULL/SQDMLAL/SQDMLSL .2D (.2S->.2D, 64-bit saturation).
+constexpr uint32_t Sqdmull2d(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqdmlal2d(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA09000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqdmlsl2d(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EA0B000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+// Vn.2S=[3, INT32_MIN], Vm.2S=[5, INT32_MIN]: lane0 2*3*5=30, lane1
+// 2*INT32_MIN^2 = 2^63 -> SAT INT64_MAX.
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull2dWithSaturation) {
+  SetV128(state_.cpu, 1, 0x8000000000000003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x8000000000000005ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmull2d(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000000000000001EULL);
+  EXPECT_EQ(r[1], 0x7FFFFFFFFFFFFFFFULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlal2dSaturatingAccum) {
+  SetV128(state_.cpu, 0, 0x0000000000000064ULL, 0x0000000000000064ULL);  // acc=100,100
+  SetV128(state_.cpu, 1, 0x8000000000000003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x8000000000000005ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlal2d(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000000000082ULL);          // 100+30
+  EXPECT_EQ(r[1], 0x7FFFFFFFFFFFFFFFULL);           // 100+INT64_MAX -> sat
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlsl2dAccum) {
+  SetV128(state_.cpu, 0, 0x0000000000000064ULL, 0x0000000000000064ULL);
+  SetV128(state_.cpu, 1, 0x8000000000000003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x8000000000000005ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlsl2d(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000000000046ULL);           // 100-30
+  EXPECT_EQ(r[1], 0x8000000000000065ULL);           // 100-INT64_MAX (in range)
+}
+// endregion
+
 // region digitalis - SQDMULL .4S (signed doubling widening multiply) JIT.
 constexpr uint32_t Sqdmull4s(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x0E60D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;

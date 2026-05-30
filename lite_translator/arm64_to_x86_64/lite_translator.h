@@ -10881,7 +10881,78 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xd);
         return;
       }
-      success_ = false;  // size=10 -> interpreter
+      if (args.size == 0b10) {  // .2D form (.2S->.2D, manual 64-bit saturation)
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmask = AllocTempSimdReg();
+        SimdRegister xsat = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xmask == no_simd_register || xsat == no_simd_register) { success_ = false; return; }
+        Register t = AllocTempReg();
+        if (t == no_register) { success_ = false; return; }
+        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_o + extra});
+        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_o + extra});
+        as_.Pmovsxdq(xn, xn);  // 2 source words -> 2 sign-extended qwords
+        as_.Pmovsxdq(xm, xm);
+        as_.Pmuldq(xn, xm);    // 2 exact signed 64-bit products
+        // The only doubling-overflow case is INT32_MIN^2 == 2^62 -> SMAX.
+        as_.Movq(t, int64_t{0x4000000000000000LL});
+        as_.Movq(xmask, t);
+        as_.Punpcklqdq(xmask, xmask);
+        as_.Pcmpeqq(xmask, xn);  // lanes where product == 2^62
+        as_.Paddq(xn, xn);       // double
+        as_.Movq(t, int64_t{0x7FFFFFFFFFFFFFFFLL});
+        as_.Movq(xsat, t);
+        as_.Punpcklqdq(xsat, xsat);
+        as_.Pand(xsat, xmask);   // INT64_MAX in saturating lanes
+        as_.Pandn(xmask, xn);    // doubled in non-saturating lanes
+        as_.Por(xmask, xsat);    // xmask = doubled saturated product P
+        if (!is_acc) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xmask);
+          return;
+        }
+        // 64-bit signed saturating accumulate: result = SignedSat64(Vd +/- P).
+        SimdRegister xd = xn;    // reuse: accumulator a
+        SimdRegister xres = xm;  // reuse: a +/- P
+        SimdRegister xof = xsat; // reuse: overflow raw value
+        SimdRegister xtmp = AllocTempSimdReg();
+        SimdRegister xzero = AllocTempSimdReg();
+        if (xtmp == no_simd_register || xzero == no_simd_register) { success_ = false; return; }
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+        if (is_sub) {
+          as_.Movdqa(xres, xd);
+          as_.Psubq(xres, xmask);    // diff = a - P
+          as_.Movdqa(xof, xd);
+          as_.Pxor(xof, xmask);      // a ^ P
+          as_.Movdqa(xtmp, xd);
+          as_.Pxor(xtmp, xres);      // a ^ diff
+          as_.Pand(xof, xtmp);       // overflow when (a^P)&(a^diff) sign set
+        } else {
+          as_.Movdqa(xres, xd);
+          as_.Paddq(xres, xmask);    // sum = a + P
+          as_.Movdqa(xof, xd);
+          as_.Pxor(xof, xres);       // a ^ sum
+          as_.Movdqa(xtmp, xmask);
+          as_.Pxor(xtmp, xres);      // P ^ sum
+          as_.Pand(xof, xtmp);       // overflow when (a^sum)&(P^sum) sign set
+        }
+        // overflow_mask (xtmp) = all-ones per qword where xof < 0 (sign set).
+        as_.Movdqa(xtmp, xzero);
+        as_.Pcmpgtq(xtmp, xof);
+        // sat = sign(a) ^ INT64_MAX  (INT64_MIN if a<0, else INT64_MAX).
+        as_.Pcmpgtq(xzero, xd);      // xzero = all-ones where a < 0
+        as_.Movq(t, int64_t{0x7FFFFFFFFFFFFFFFLL});
+        as_.Movq(xmask, t);          // reuse xmask (P consumed) for INT64_MAX
+        as_.Punpcklqdq(xmask, xmask);
+        as_.Pxor(xzero, xmask);      // xzero = sat value
+        as_.Pand(xzero, xtmp);       // sat in overflow lanes
+        as_.Pandn(xtmp, xres);       // result in non-overflow lanes
+        as_.Por(xzero, xtmp);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xzero);
+        return;
+      }
+      success_ = false;  // size=00 -> interpreter (no SQDMULL byte form)
       return;
     }
     // endregion
