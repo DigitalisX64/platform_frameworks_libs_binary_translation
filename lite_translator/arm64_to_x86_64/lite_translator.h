@@ -799,6 +799,15 @@ class LiteTranslator {
     // endregion
   }
 
+  // region digitalis - BRK must be handled by the interpreter (which raises the
+  // synchronous SIGTRAP). End the region before this instruction; the dispatch
+  // loop installs kInterpreted for the BRK address, exactly like SVC.
+  void Brk(uint16_t imm) {
+    UNUSED(imm);
+    success_ = false;
+  }
+  // endregion
+
   Register Mrs(Decoder::SystemReg sysreg) {
     // region digitalis
     if (sysreg == Decoder::SystemReg::kTpidrEl0) {

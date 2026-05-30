@@ -17,6 +17,9 @@
 
 #include "gtest/gtest.h"
 
+#include <csetjmp>
+#include <csignal>
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -12051,6 +12054,35 @@ TEST_F(Arm64LiteTranslateRegionTest, Addhn2_16bUpper) {
   GetV128(state_.cpu, 0, r);
   EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
   EXPECT_EQ(r[1], 0x0303030303030303ULL);
+}
+// endregion
+
+// region digitalis - BRK delivers a synchronous SIGTRAP (not SIGILL). Install a
+// host SIGTRAP handler that siglongjmps out, interpret a BRK, and confirm the
+// trap fired — proving BRK routes to the interpreter's breakpoint path rather
+// than the illegal-instruction (SIGILL) path.
+namespace {
+sigjmp_buf g_brk_jmp;
+volatile sig_atomic_t g_brk_signal = 0;
+void BrkTrapHandler(int sig) {
+  g_brk_signal = sig;
+  siglongjmp(g_brk_jmp, 1);
+}
+}  // namespace
+TEST_F(Arm64LiteTranslateRegionTest, BrkDeliversSigtrap) {
+  struct sigaction sa = {};
+  struct sigaction old_sa = {};
+  sa.sa_handler = BrkTrapHandler;
+  sigemptyset(&sa.sa_mask);
+  ASSERT_EQ(sigaction(SIGTRAP, &sa, &old_sa), 0);
+  static const uint32_t code[] = {0xD4200000u};  // BRK #0
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  g_brk_signal = 0;
+  if (sigsetjmp(g_brk_jmp, 1) == 0) {
+    InterpretInsn(&state_);
+  }
+  sigaction(SIGTRAP, &old_sa, nullptr);
+  EXPECT_EQ(g_brk_signal, SIGTRAP);
 }
 // endregion
 

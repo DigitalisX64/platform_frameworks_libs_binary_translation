@@ -488,6 +488,18 @@ class Interpreter {
     RunGuestSyscall(state_);
   }
 
+  // region digitalis - BRK #imm: software breakpoint. Deliver a synchronous
+  // SIGTRAP at the current guest PC (the BRK), then stop the interpreter batch
+  // so the host signal handler routes it to the guest's SIGTRAP action. The
+  // guest PC stays at the BRK (insn_addr is not advanced), matching the
+  // architectural behaviour debuggers and sanitizers rely on.
+  void Brk(uint16_t /*imm*/) {
+    CHECK(!exception_raised_);
+    BreakpointInsn(GetInsnAddr());
+    exception_raised_ = true;
+  }
+  // endregion
+
   Register Mrs(Decoder::SystemReg sysreg) {
     CHECK(!exception_raised_);
     switch (sysreg) {

@@ -23,6 +23,11 @@ namespace berberis {
 
 void UndefinedInsn(GuestAddr pc);
 
+// region digitalis - BRK #imm software breakpoint: raise a synchronous SIGTRAP
+// so the Berberis host signal handler routes it to the guest's SIGTRAP action.
+void BreakpointInsn(GuestAddr pc);
+// endregion
+
 }  // namespace berberis
 
 #endif  // BERBERIS_RUNTIME_PRIMITIVES_INTERPRET_HELPERS_H_

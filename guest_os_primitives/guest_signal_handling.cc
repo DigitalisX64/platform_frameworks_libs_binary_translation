@@ -383,6 +383,11 @@ void GuestThread::SetSignalFromHost(const siginfo_t& host_info) {
   *guest_info = host_info;
   switch (host_info.si_signo) {
     case SIGILL:
+    // region digitalis - BRK raises a synchronous SIGTRAP; like SIGILL/SIGFPE
+    // its faulting address is the current guest instruction (the BRK), which a
+    // guest breakpoint/sanitizer handler reads to recover the BRK immediate.
+    case SIGTRAP:
+    // endregion
     case SIGFPE: {
       guest_info->si_addr = ToHostAddr<void>(GetInsnAddr(GetCPUState(*state_)));
       break;

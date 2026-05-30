@@ -2328,6 +2328,16 @@ class Decoder {
       insn_consumer_->Svc(args);
       return;
     }
+    // region digitalis - BRK: opc=001, ll=00. Software breakpoint; delivers a
+    // synchronous SIGTRAP to the guest (so debuggers and sanitizers — HWASan,
+    // UBSan trap-on-error — see a breakpoint at the guest PC instead of an
+    // illegal-instruction abort). HLT (opc=010) and DCPS1-3 (opc=101) remain
+    // fatal-with-diagnostic via Undefined() below.
+    if (opc == 0b001 && ll == 0b00) {
+      insn_consumer_->Brk(imm16);
+      return;
+    }
+    // endregion
     // Other exception instructions not implemented yet.
     Undefined();
   }
