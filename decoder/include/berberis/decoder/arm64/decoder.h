@@ -6447,6 +6447,30 @@ class Decoder {
     }
     // endregion
 
+    // region digitalis - I8MM by-element USDOT / SUDOT (FEAT_I8MM).
+    //   U=0, opcode=bits[15:12]=1111, index = H:L; the size field selects the
+    //   mixed-sign flavour: size=10 -> USDOT (Vn unsigned, Vm signed),
+    //   size=00 -> SUDOT (Vn signed, Vm unsigned). Vm = M:Rm[3:0].
+    // Verified (clang -march=armv8.6-a+i8mm):
+    //   usdot v0.4s, v1.16b, v2.4b[0] = 0x4f82f020 (size=10)
+    //   sudot v0.4s, v1.16b, v2.4b[1] = 0x4f22f020 (size=00, L=1)
+    if (!u && opcode == 0b1111 && (size == 0b10 || size == 0b00)) {
+      uint8_t dp_rm = static_cast<uint8_t>((M << 4) | Rm4);
+      uint8_t dp_index = static_cast<uint8_t>((H << 1) | L);
+      const DotProductArgs args = {
+          .opcode = (size == 0b10) ? DotProductOpcode::kUsdotIdx
+                                   : DotProductOpcode::kSudotIdx,
+          .rd = rd,
+          .rn = rn,
+          .rm = dp_rm,
+          .index = dp_index,
+          .q = q,
+      };
+      insn_consumer_->AdvSimdDotProduct(args);
+      return;
+    }
+    // endregion
+
     // region digitalis indexed FCMLA
     // FCMLA (by element) — Armv8.3-FCMA.
     //
