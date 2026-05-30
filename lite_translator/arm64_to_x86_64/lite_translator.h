@@ -19874,7 +19874,121 @@ class LiteTranslator {
             return;
           }
           // endregion
-          // SRSRA .2D still bails (accumulate sibling, next cycle).
+          // region digitalis: SRSRA .2D / scalar D GPR fallback.
+          //
+          // Per-lane semantics (signed rounding right shift, accumulate):
+          //   result = Vd<i> + floor((Vn<i> + 2^(shift-1)) / 2^shift)
+          //
+          // Combines the SRSHR per-lane shape (round bit via
+          // Shrq + Andq, Sarq vn by cnt, Addq round) with the SSRA-style
+          // orig-Vd preload + accumulate Addq.  Load BOTH Vn and orig Vd
+          // up front so Vd==Vn aliasing remains safe across the writes.
+          //
+          //   Movq    vn_i,    Vn[lane_i]
+          //   Movq    vd_i,    Vd[lane_i]    (load orig Vd before any write)
+          //   Movq    round_i, vn_i
+          //   Shrq    round_i, (cnt-1)       ; bit (cnt-1) into bit 0
+          //   Andq    round_i, int32_t{1}    ; mask to bit 0
+          //   Sarq    vn_i,    cnt           ; arith right shift
+          //   Addq    vn_i,    round_i       ; SRSHR(Vn_i, cnt) in vn_i
+          //   Addq    vd_i,    vn_i          ; Vd_i += SRSHR(Vn_i, cnt)
+          //   Movq    Vd[lane_i], vd_i
+          //
+          // Boundary at cnt==esize (cnt==64): SRSHR(Vn, 64) is always 0
+          // (see SRSHR rationale above), so SRSRA at cnt==64 is a no-op
+          // per lane (Vd unchanged).  Vector .2D: nothing to write —
+          // memory already holds the unmodified Vd.  Scalar D: need to
+          // zero Vd[127:64] for D-register semantics (and Vd[63:0] keeps
+          // its original value, which is already in memory).  In the GPR
+          // path Sarq r64 with count==64 masks to 63 (wrong); special-
+          // case cnt==64 directly.
+          if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra) {
+            const bool is_two_lane = !args.scalar && args.q;
+            if (!args.scalar && !args.q) {
+              // Vector .1D is reserved.
+              success_ = false; return;
+            }
+            const uint16_t immh_immb_local =
+                static_cast<uint16_t>((immh << 3) | args.immb);
+            const uint8_t shift_count_local =
+                static_cast<uint8_t>(2 * 64 - immh_immb_local);  // [1, 64]
+            if (shift_count_local == 64) {
+              // SRSRA at shift==esize: no-op per lane (SRSHR yields 0).
+              if (!is_two_lane) {
+                // Scalar D: zero Vd[127:64]; Vd[63:0] preserved as-is.
+                as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                         int32_t{0});
+              }
+              return;
+            }
+            Register vn0 = AllocTempReg();
+            Register vd0 = AllocTempReg();
+            Register round0 = AllocTempReg();
+            Register vn1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            Register vd1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            Register round1 =
+                is_two_lane ? AllocTempReg() : Assembler::no_register;
+            if (vn0 == Assembler::no_register ||
+                vd0 == Assembler::no_register ||
+                round0 == Assembler::no_register ||
+                (is_two_lane &&
+                 (vn1 == Assembler::no_register ||
+                  vd1 == Assembler::no_register ||
+                  round1 == Assembler::no_register))) {
+              success_ = false; return;
+            }
+            const int8_t cnt = static_cast<int8_t>(shift_count_local);
+            const int8_t cnt_minus_1 =
+                static_cast<int8_t>(shift_count_local - 1);
+            // Load BOTH Vn and orig Vd before any writes (Vd==Vn safety).
+            as_.Movq(vn0, {.base = Assembler::rbp, .disp = vn_off});
+            if (is_two_lane) {
+              as_.Movq(vn1, {.base = Assembler::rbp, .disp = vn_off + 8});
+            }
+            as_.Movq(vd0, {.base = Assembler::rbp, .disp = vd_off});
+            if (is_two_lane) {
+              as_.Movq(vd1, {.base = Assembler::rbp, .disp = vd_off + 8});
+            }
+            // Round bit per lane.
+            as_.Movq(round0, vn0);
+            if (is_two_lane) {
+              as_.Movq(round1, vn1);
+            }
+            as_.Shrq(round0, cnt_minus_1);
+            if (is_two_lane) {
+              as_.Shrq(round1, cnt_minus_1);
+            }
+            as_.Andq(round0, int32_t{1});
+            if (is_two_lane) {
+              as_.Andq(round1, int32_t{1});
+            }
+            // SRSHR result in vn_i.
+            as_.Sarq(vn0, cnt);
+            if (is_two_lane) {
+              as_.Sarq(vn1, cnt);
+            }
+            as_.Addq(vn0, round0);
+            if (is_two_lane) {
+              as_.Addq(vn1, round1);
+            }
+            // Accumulate: Vd_i += SRSHR(Vn_i, cnt).
+            as_.Addq(vd0, vn0);
+            if (is_two_lane) {
+              as_.Addq(vd1, vn1);
+            }
+            as_.Movq({.base = Assembler::rbp, .disp = vd_off}, vd0);
+            if (is_two_lane) {
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, vd1);
+            } else {
+              // Scalar D: zero Vd[127:64].
+              as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8},
+                       int32_t{0});
+            }
+            return;
+          }
+          // endregion
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);

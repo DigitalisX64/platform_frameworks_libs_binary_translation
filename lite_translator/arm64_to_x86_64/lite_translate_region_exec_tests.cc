@@ -37968,6 +37968,241 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDVdEqVnJit) {
 }
 // endregion
 
+// region digitalis: SRSRA vector .2D and scalar D JIT.
+//
+// Per-lane semantics (signed rounding right shift, accumulate):
+//   Vd<i> = Vd<i> + floor((Vn<i> + 2^(shift-1)) / 2^shift)
+//
+// PSRAQ is AVX-512F-VL only, so the .2D + scalar D forms ship through a
+// per-lane GPR fallback: load both Vn and orig Vd up front (Vd==Vn
+// safety), compute round bit via Shrq + Andq, Sarq vn by cnt, Addq
+// round bit, Addq into vd, write vd back.  Scalar D zeroes Vd[127:64].
+// cnt==esize (64) is a per-lane no-op (SRSHR yields 0).
+//
+// Encoding:
+//   bits[15:11] opcode = 00110 (SRSRA); bit 12 set distinguishes from
+//   SSRA (00010), bit 12 set vs SRSHR (00100); two-D-width:
+//   srsra v0.2d, v1.2d, #N  → 0x4F(64-N as immh:immb)3420
+//   srsra d0,    d1,    #N  → 0x5F(64-N as immh:immb)3420
+constexpr uint32_t kSrsraVec2D_1    = 0x4F7F3420;  // srsra v0.2d, v1.2d, #1
+constexpr uint32_t kSrsraVec2D_11   = 0x4F753420;  // srsra v0.2d, v1.2d, #11
+constexpr uint32_t kSrsraVec2D_32   = 0x4F603420;  // srsra v0.2d, v1.2d, #32
+constexpr uint32_t kSrsraVec2D_63   = 0x4F413420;  // srsra v0.2d, v1.2d, #63
+constexpr uint32_t kSrsraVec2D_64   = 0x4F403420;  // srsra v0.2d, v1.2d, #64
+constexpr uint32_t kSrsraVec2D_VdEqVn_11 = 0x4F753400;  // srsra v0.2d, v0.2d, #11
+constexpr uint32_t kSrsraScalarD_1  = 0x5F7F3420;  // srsra d0, d1, #1
+constexpr uint32_t kSrsraScalarD_32 = 0x5F603420;  // srsra d0, d1, #32
+constexpr uint32_t kSrsraScalarD_63 = 0x5F413420;  // srsra d0, d1, #63
+constexpr uint32_t kSrsraScalarD_64 = 0x5F403420;  // srsra d0, d1, #64
+constexpr uint32_t kSrsraScalarD_VdEqVn_1 = 0x5F7F3400;  // srsra d0, d0, #1
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVecScalarDEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSrsraVec2D_1, 0x4F7F3420u);
+  EXPECT_EQ(kSrsraVec2D_11, 0x4F753420u);
+  EXPECT_EQ(kSrsraVec2D_32, 0x4F603420u);
+  EXPECT_EQ(kSrsraVec2D_63, 0x4F413420u);
+  EXPECT_EQ(kSrsraVec2D_64, 0x4F403420u);
+  EXPECT_EQ(kSrsraVec2D_VdEqVn_11, 0x4F753400u);
+  EXPECT_EQ(kSrsraScalarD_1, 0x5F7F3420u);
+  EXPECT_EQ(kSrsraScalarD_32, 0x5F603420u);
+  EXPECT_EQ(kSrsraScalarD_63, 0x5F413420u);
+  EXPECT_EQ(kSrsraScalarD_64, 0x5F403420u);
+  EXPECT_EQ(kSrsraScalarD_VdEqVn_1, 0x5F7F3400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec2DShift1Jit) {
+  // shift=1; round bit fires both ways.
+  // Lane 0: Vd=10, Vn=7 → SRSHR(7,1) = floor(8/2) = 4; 10 + 4 = 14.
+  // Lane 1: Vd=20, Vn=-7 → SRSHR(-7,1) = floor(-6/2) = -3; 20 + -3 = 17.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{10}) |
+                    (static_cast<__uint128_t>(uint64_t{20}) << 64);
+  state_.cpu.v[1] =
+      static_cast<__uint128_t>(uint64_t{7}) |
+      (static_cast<__uint128_t>(static_cast<uint64_t>(int64_t{-7})) << 64);
+  static const uint32_t code[] = {kSrsraVec2D_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]), int64_t{14});
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0] >> 64), int64_t{17});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec2DShift11Jit) {
+  // shift=11.
+  // Lane 0: Vd=100, Vn=INT64_MAX
+  //   SRSHR(INT64_MAX, 11) = floor((INT64_MAX + 2^10) / 2^11) = 2^52.
+  //   Vd_new = 100 + 2^52 = 0x10000000000064.
+  // Lane 1: Vd=200, Vn=INT64_MIN
+  //   SRSHR(INT64_MIN, 11) = floor((INT64_MIN + 2^10) / 2^11)
+  //                       = -2^52 (round bit 0).
+  //   Vd_new = 200 + -2^52 = 0xFFF00000000000C8.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{100}) |
+                    (static_cast<__uint128_t>(uint64_t{200}) << 64);
+  state_.cpu.v[1] =
+      static_cast<__uint128_t>(
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) |
+      (static_cast<__uint128_t>(
+           static_cast<uint64_t>(std::numeric_limits<int64_t>::min()))
+       << 64);
+  static const uint32_t code[] = {kSrsraVec2D_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]),
+            int64_t{0x10000000000064});
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0] >> 64),
+            int64_t{static_cast<int64_t>(uint64_t{0xFFF00000000000C8ULL})});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec2DShift32Jit) {
+  // shift=32; mixed signs.
+  // Lane 0: Vd=1000, Vn=0x80000000 (positive, 2^31)
+  //   SRSHR(2^31, 32) = floor((2^31 + 2^31) / 2^32) = 1; 1000 + 1 = 1001.
+  // Lane 1: Vd=-50, Vn=-0x100000000 (-2^32)
+  //   SRSHR(-2^32, 32) = floor((-2^32 + 2^31) / 2^32) = -1; -50 + -1 = -51.
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(uint64_t{1000}) |
+      (static_cast<__uint128_t>(static_cast<uint64_t>(int64_t{-50})) << 64);
+  state_.cpu.v[1] =
+      static_cast<__uint128_t>(uint64_t{0x80000000ULL}) |
+      (static_cast<__uint128_t>(static_cast<uint64_t>(int64_t{-(1LL << 32)}))
+       << 64);
+  static const uint32_t code[] = {kSrsraVec2D_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]), int64_t{1001});
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0] >> 64), int64_t{-51});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec2DShift63Jit) {
+  // shift=63 — isolates sign bit + round bit.
+  // Lane 0: Vd=5, Vn=INT64_MAX → SRSHR = 1 (round up); 5 + 1 = 6.
+  // Lane 1: Vd=5, Vn=INT64_MIN → SRSHR = -1; 5 + -1 = 4.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{5}) |
+                    (static_cast<__uint128_t>(uint64_t{5}) << 64);
+  state_.cpu.v[1] =
+      static_cast<__uint128_t>(
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) |
+      (static_cast<__uint128_t>(
+           static_cast<uint64_t>(std::numeric_limits<int64_t>::min()))
+       << 64);
+  static const uint32_t code[] = {kSrsraVec2D_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]), int64_t{6});
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0] >> 64), int64_t{4});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec2DShift64BoundaryNoOpJit) {
+  // shift=64: SRSHR(Vn, 64) = 0 for every input; SRSRA = Vd + 0 = Vd.
+  // Both lanes unchanged.  Use distinctive Vd / Vn to confirm no
+  // accidental write happened.
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL}) |
+      (static_cast<__uint128_t>(uint64_t{0x0123456789ABCDEFULL}) << 64);
+  state_.cpu.v[1] =
+      static_cast<__uint128_t>(
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) |
+      (static_cast<__uint128_t>(
+           static_cast<uint64_t>(std::numeric_limits<int64_t>::min()))
+       << 64);
+  static const uint32_t code[] = {kSrsraVec2D_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xDEADBEEFCAFEBABEULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0x0123456789ABCDEFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraVec2DVdEqVnJit) {
+  // Vd==Vn==v0, .2D, shift=11.  orig Vd[63:0]=0x20000, orig Vd[127:64]=-65537.
+  //   Lane 0: SRSHR(0x20000, 11) = floor((131072 + 1024) / 2048) = 64.
+  //           result = 0x20000 + 64 = 0x20040.
+  //   Lane 1: SRSHR(-65537, 11) = floor((-65537 + 1024) / 2048) = -32.
+  //           result = -65537 + -32 = -65569 = 0xFFFFFFFFFFFEFFDF.
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(uint64_t{0x20000ULL}) |
+      (static_cast<__uint128_t>(static_cast<uint64_t>(int64_t{-65537})) << 64);
+  static const uint32_t code[] = {kSrsraVec2D_VdEqVn_11};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x20040ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
+            uint64_t{0xFFFFFFFFFFFEFFDFULL});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraScalarDShift1Jit) {
+  // Scalar D, shift=1. Vd[63:0]=10, Vn[63:0]=7;
+  //   SRSHR(7,1)=4; 10+4=14.  Vd[127:64] zeroed.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{10}) |
+                    (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64);
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{7}) |
+                    (static_cast<__uint128_t>(uint64_t{0x1111111111111111ULL})
+                     << 64);
+  static const uint32_t code[] = {kSrsraScalarD_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]), int64_t{14});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraScalarDShift32Jit) {
+  // Scalar D, shift=32. Vd[63:0]=1000, Vn[63:0]=0x80000000.
+  //   SRSHR(2^31, 32) = 1; 1000 + 1 = 1001.  Vd[127:64] zeroed.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{1000}) |
+                    (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL})
+                     << 64);
+  state_.cpu.v[1] = static_cast<__uint128_t>(uint64_t{0x80000000ULL}) |
+                    (static_cast<__uint128_t>(uint64_t{0x9999999999999999ULL})
+                     << 64);
+  static const uint32_t code[] = {kSrsraScalarD_32};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]), int64_t{1001});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraScalarDShift63Jit) {
+  // Scalar D, shift=63 INT64_MIN.  SRSHR(INT64_MIN, 63) = -1.
+  //   Vd[63:0]=100; result = 100 + -1 = 99.  Vd[127:64] zeroed.
+  state_.cpu.v[0] = static_cast<__uint128_t>(uint64_t{100}) |
+                    (static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL})
+                     << 64);
+  state_.cpu.v[1] = static_cast<__uint128_t>(static_cast<uint64_t>(
+                        std::numeric_limits<int64_t>::min())) |
+                    (static_cast<__uint128_t>(uint64_t{0x2222222222222222ULL})
+                     << 64);
+  static const uint32_t code[] = {kSrsraScalarD_63};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.v[0]), int64_t{99});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraScalarDShift64BoundaryNoOpJit) {
+  // Scalar D, shift=64: SRSHR(Vn, 64) = 0, so result = Vd[63:0] + 0 =
+  // Vd[63:0] unchanged.  Vd[127:64] gets zeroed by the scalar D upper-
+  // zero step.
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(uint64_t{0xDEADBEEFCAFEBABEULL}) |
+      (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL}) << 64);
+  state_.cpu.v[1] =
+      static_cast<__uint128_t>(
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::min())) |
+      (static_cast<__uint128_t>(uint64_t{0x3333333333333333ULL}) << 64);
+  static const uint32_t code[] = {kSrsraScalarD_64};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xDEADBEEFCAFEBABEULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SrsraScalarDVdEqVnJit) {
+  // Vd==Vn==v0, scalar D, shift=1.  Vd[63:0]=Vn[63:0]=-5.
+  //   SRSHR(-5, 1) = floor((-5 + 1) / 2) = -2.
+  //   result = -5 + -2 = -7 = 0xFFFFFFFFFFFFFFF9.  Vd[127:64] zeroed.
+  state_.cpu.v[0] =
+      static_cast<__uint128_t>(static_cast<uint64_t>(int64_t{-5})) |
+      (static_cast<__uint128_t>(uint64_t{0xCCCCCCCCCCCCCCCCULL}) << 64);
+  static const uint32_t code[] = {kSrsraScalarD_VdEqVn_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]),
+            uint64_t{0xFFFFFFFFFFFFFFF9ULL});
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
 // truncated upper-zero at the store path (Pslldq+Psrldq by `16 -
