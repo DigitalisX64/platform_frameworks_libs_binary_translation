@@ -11730,6 +11730,86 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2_16bUpperHalf) {
 }
 // endregion
 
+// region digitalis - scalar REV16 + FCVTL/FCVTN (FP32<->FP64) JIT.
+constexpr uint32_t Rev16W(uint8_t rd, uint8_t rn) {
+  return 0x5AC00400u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Rev16X(uint8_t rd, uint8_t rn) {
+  return 0xDAC00400u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t FcvtlD(uint8_t rd, uint8_t rn) {
+  return 0x0E617800u | (uint32_t{rn} << 5) | rd;  // .2d from .2s
+}
+constexpr uint32_t Fcvtl2D(uint8_t rd, uint8_t rn) {
+  return 0x4E617800u | (uint32_t{rn} << 5) | rd;  // .2d from .4s (upper)
+}
+constexpr uint32_t FcvtnS(uint8_t rd, uint8_t rn) {
+  return 0x0E616800u | (uint32_t{rn} << 5) | rd;  // .2s from .2d
+}
+constexpr uint32_t Fcvtn2S(uint8_t rd, uint8_t rn) {
+  return 0x4E616800u | (uint32_t{rn} << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Rev16WScalar) {
+  state_.cpu.x[1] = 0x11223344ULL;
+  static const uint32_t code[] = {Rev16W(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x22114433ULL);  // bytes swapped per halfword, zero-ext
+}
+TEST_F(Arm64LiteTranslateRegionTest, Rev16XScalar) {
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  static const uint32_t code[] = {Rev16X(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x2211443366558877ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, FcvtlF32ToF64) {
+  float in[2] = {1.5f, -2.5f};
+  std::memcpy(&state_.cpu.v[1], in, 8);
+  static const uint32_t code[] = {FcvtlD(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_DOUBLE_EQ(r[0], 1.5);
+  EXPECT_DOUBLE_EQ(r[1], -2.5);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Fcvtl2F32ToF64Upper) {
+  float in[4] = {9.0f, 9.0f, 3.5f, -4.5f};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  static const uint32_t code[] = {Fcvtl2D(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_DOUBLE_EQ(r[0], 3.5);
+  EXPECT_DOUBLE_EQ(r[1], -4.5);
+}
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnF64ToF32) {
+  StoreVec2D(state_.cpu, 1, 1.5, -2.5);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {FcvtnS(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_FLOAT_EQ(r[0], 1.5f);
+  EXPECT_FLOAT_EQ(r[1], -2.5f);
+  uint64_t hi;
+  std::memcpy(&hi, &r[2], 8);
+  EXPECT_EQ(hi, 0ULL);  // upper 64 zeroed (Q=0)
+}
+TEST_F(Arm64LiteTranslateRegionTest, Fcvtn2F64ToF32Upper) {
+  StoreVec2D(state_.cpu, 1, 3.5, -4.5);
+  SetV128(state_.cpu, 0, 0x1122334455667788ULL, 0xCCCCCCCCCCCCCCCCULL);
+  static const uint32_t code[] = {Fcvtn2S(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
+  float hi[2];
+  std::memcpy(hi, &r[1], 8);
+  EXPECT_FLOAT_EQ(hi[0], 3.5f);
+  EXPECT_FLOAT_EQ(hi[1], -4.5f);
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to

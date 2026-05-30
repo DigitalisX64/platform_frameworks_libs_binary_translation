@@ -11511,7 +11511,34 @@ class LiteTranslator {
     }
     // endregion
     switch (opcode2) {
-      case 0b000010:  // REV16 (not commonly needed, skip for now)
+      case 0b000001: {  // REV16: reverse byte order within each 16-bit halfword.
+        // res = ((src & 0x..00FF) << 8) | ((src & 0x..FF00) >> 8).
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) { success_ = false; return no_register; }
+        if (is_64bit) {
+          Register mask = AllocTempReg();
+          if (mask == no_register) { success_ = false; return no_register; }
+          as_.Movq(res, src);
+          as_.Movq(tmp, src);
+          as_.Movq(mask, int64_t{0x00FF00FF00FF00FFLL});
+          as_.Andq(res, mask);
+          as_.Shlq(res, int8_t{8});
+          as_.Movq(mask, static_cast<int64_t>(0xFF00FF00FF00FF00ULL));
+          as_.Andq(tmp, mask);
+          as_.Shrq(tmp, int8_t{8});
+          as_.Orq(res, tmp);
+        } else {
+          as_.Movl(res, src);
+          as_.Movl(tmp, src);
+          as_.Andl(res, 0x00FF00FF);
+          as_.Shll(res, int8_t{8});
+          as_.Andl(tmp, static_cast<int32_t>(0xFF00FF00));
+          as_.Shrl(tmp, int8_t{8});
+          as_.Orl(res, tmp);
+        }
+        return res;
+      }
+      case 0b000010:  // REV32 (sf=1) / REV W (sf=0) — interpreter-only.
         Undefined();
         return no_register;
       case 0b000011:  // REV (byte reverse) — maps to x86 BSWAP
@@ -13305,6 +13332,41 @@ class LiteTranslator {
             as_.Packssdw(xn, xz);
           }
         }
+        if (!args.q) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          mask_low64(xd);
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
+
+      // region digitalis - FCVTL / FCVTN (FP32<->FP64, size=01).  FCVTL widens
+      // 2 floats to 2 doubles (CVTPS2PD; Q=1/FCVTL2 takes the upper floats);
+      // FCVTN narrows 2 doubles to 2 floats (CVTPD2PS; Q=0 low+zero-upper,
+      // Q=1/FCVTN2 upper-half merge).  size=00 (FP16) bails to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl: {
+        if (args.size != 0b01) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (args.q) as_.Psrldq(xn, int8_t{8});  // FCVTL2: high 2 floats -> low
+        as_.Cvtps2pd(xn, xn);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn: {
+        if (args.size != 0b01) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Cvtpd2ps(xn, xn);  // 2 doubles -> 2 floats in low 64, upper zeroed
         if (!args.q) {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         } else {
