@@ -10478,31 +10478,70 @@ class LiteTranslator {
 
     // PMULL64 (size=11) lowers to a single PCLMULQDQ — the imm-named
     // Pclmullqlqdq for Q=0 (poly_mul64(Vn.D[0], Vm.D[0])) and Pclmulhqhqdq
-    // for Q=1 (PMULL2; poly_mul64(Vn.D[1], Vm.D[1])). PMULL.8H (size=00)
-    // is 8 independent 8-bit polynomial products with no native shape —
-    // continues to bail to the interpreter.
+    // for Q=1 (PMULL2; poly_mul64(Vn.D[1], Vm.D[1])).
+    //
+    // PMULL.8H (size=00) is 8 independent 8-bit polynomial products that
+    // widen to full 16-bit results.  Widen both 8-byte sources to 16-bit
+    // lanes (PMOVZXBW; Q=1/PMULL2 takes bytes 8..15), then run the per-bit
+    // carry-less shift-and-XOR in 16-bit lanes.  Because every lane already
+    // holds a value < 256 and the degree-14 product fits in 16 bits, the
+    // PSLLW shifts never spill across lanes, so no per-lane masking is
+    // needed (unlike the byte-truncated PMUL).  The bit selector for bit i
+    // is built by PSLLW(b, 15-i) then PSRAW 15, broadcasting bit i to the
+    // whole lane.  size in {01,10} is reserved for PMULL and bails.
     if (args.opcode == Op::kPmull) {
-      if (args.size != 0b11) {
-        Undefined();
-        return;
-      }
       const int32_t vn_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
       const int32_t vm_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
       const int32_t vd_off_pmull = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
-      SimdRegister xn_p = AllocTempSimdReg();
-      SimdRegister xm_p = AllocTempSimdReg();
-      if (xn_p == no_simd_register || xm_p == no_simd_register) {
-        success_ = false;
+      if (args.size == 0b11) {
+        SimdRegister xn_p = AllocTempSimdReg();
+        SimdRegister xm_p = AllocTempSimdReg();
+        if (xn_p == no_simd_register || xm_p == no_simd_register) {
+          success_ = false;
+          return;
+        }
+        as_.Movdqu(xn_p, {.base = Assembler::rbp, .disp = vn_off_pmull});
+        as_.Movdqu(xm_p, {.base = Assembler::rbp, .disp = vm_off_pmull});
+        if (args.q) {
+          as_.Pclmulhqhqdq(xn_p, xm_p);
+        } else {
+          as_.Pclmullqlqdq(xn_p, xm_p);
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, xn_p);
         return;
       }
-      as_.Movdqu(xn_p, {.base = Assembler::rbp, .disp = vn_off_pmull});
-      as_.Movdqu(xm_p, {.base = Assembler::rbp, .disp = vm_off_pmull});
-      if (args.q) {
-        as_.Pclmulhqhqdq(xn_p, xm_p);
-      } else {
-        as_.Pclmullqlqdq(xn_p, xm_p);
+      if (args.size == 0b00) {  // PMULL/PMULL2 .8H (poly8 widening)
+        const int32_t extra = args.q ? 8 : 0;
+        SimdRegister za = AllocTempSimdReg();
+        SimdRegister zb = AllocTempSimdReg();
+        SimdRegister acc = AllocTempSimdReg();
+        SimdRegister shifted = AllocTempSimdReg();
+        SimdRegister sel = AllocTempSimdReg();
+        if (za == no_simd_register || zb == no_simd_register ||
+            acc == no_simd_register || shifted == no_simd_register ||
+            sel == no_simd_register) {
+          success_ = false;
+          return;
+        }
+        as_.Movq(za, {.base = Assembler::rbp, .disp = vn_off_pmull + extra});
+        as_.Movq(zb, {.base = Assembler::rbp, .disp = vm_off_pmull + extra});
+        as_.Pmovzxbw(za, za);  // 8 bytes -> 8x16-bit lanes
+        as_.Pmovzxbw(zb, zb);
+        as_.Pxor(acc, acc);
+        for (int i = 0; i < 8; ++i) {
+          as_.Movdqa(shifted, za);
+          if (i != 0) as_.Psllw(shifted, static_cast<int8_t>(i));
+          // sel = 0xFFFF per lane where bit i of zb is set.
+          as_.Movdqa(sel, zb);
+          if (15 - i != 0) as_.Psllw(sel, static_cast<int8_t>(15 - i));
+          as_.Psraw(sel, int8_t{15});
+          as_.Pand(shifted, sel);
+          as_.Pxor(acc, shifted);
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, acc);
+        return;
       }
-      as_.Movdqu({.base = Assembler::rbp, .disp = vd_off_pmull}, xn_p);
+      Undefined();  // size in {01,10} reserved
       return;
     }
 
@@ -10723,6 +10762,94 @@ class LiteTranslator {
         return;
       }
     }
+
+    // region digitalis - SQDMULL (signed doubling widening multiply,
+    // saturating): product = SAT(2 * SignedWiden(Vn) * Vm).  Only the
+    // .4H->.4S form (size=01) is JIT-lowered: PMOVSXWD + PMULLD give exact
+    // 32-bit products, and the doubling overflows only at the INT16_MIN^2
+    // case (product == 0x40000000 -> SMAX), handled with a PCMPEQD blend.
+    // SQDMLAL/SQDMLSL add a second 32-bit signed *saturating* accumulate of
+    // that product into Vd; x86 has no 32-bit saturating add, so it is
+    // synthesised from PADDD/PSUBD + overflow detection (the carry into the
+    // sign bit) and a PSRAD-built saturation constant.  The .2S->.2D form
+    // (size=10) bails to the interpreter.
+    if (args.opcode == Op::kSqdmull || args.opcode == Op::kSqdmlal ||
+        args.opcode == Op::kSqdmlsl) {
+      const bool is_acc = (args.opcode != Op::kSqdmull);
+      const bool is_sub = (args.opcode == Op::kSqdmlsl);
+      const int32_t vn_o = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+      const int32_t vm_o = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+      const int32_t vd_o = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+      const int32_t extra = args.q ? 8 : 0;
+      if (args.size == 0b01) {  // .4S form (manual 32-bit saturation)
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        SimdRegister xmask = AllocTempSimdReg();
+        SimdRegister xsat = AllocTempSimdReg();
+        if (xn == no_simd_register || xm == no_simd_register ||
+            xmask == no_simd_register || xsat == no_simd_register) { success_ = false; return; }
+        Register t = AllocTempReg();
+        if (t == no_register) { success_ = false; return; }
+        as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_o + extra});
+        as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_o + extra});
+        as_.Pmovsxwd(xn, xn);
+        as_.Pmovsxwd(xm, xm);
+        as_.Pmulld(xn, xm);  // exact 32-bit products
+        as_.Movq(t, int64_t{0x4000000040000000LL});
+        as_.Movq(xmask, t);
+        as_.Punpcklqdq(xmask, xmask);
+        as_.Pcmpeqd(xmask, xn);  // lanes where product == INT16_MIN^2
+        as_.Paddd(xn, xn);       // double (saturating lanes are wrong here)
+        as_.Movq(t, int64_t{0x7FFFFFFF7FFFFFFFLL});
+        as_.Movq(xsat, t);
+        as_.Punpcklqdq(xsat, xsat);
+        as_.Pand(xsat, xmask);   // SMAX in saturating lanes
+        as_.Pandn(xmask, xn);    // ~mask & doubled (non-saturating lanes)
+        as_.Por(xmask, xsat);    // xmask = doubled saturated product P
+        if (!is_acc) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xmask);
+          return;
+        }
+        // result = SignedSat32(a +/- P) where a = Vd.4S accumulator, P=xmask.
+        SimdRegister xd = xn;    // reuse: a (accumulator)
+        SimdRegister xres = xm;  // reuse: result of the (non-saturating) op
+        SimdRegister xof = xsat; // reuse: overflow sign-bit mask
+        SimdRegister xtmp = AllocTempSimdReg();
+        if (xtmp == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+        if (is_sub) {
+          as_.Movdqa(xres, xd);
+          as_.Psubd(xres, xmask);     // diff = a - P
+          as_.Movdqa(xof, xd);
+          as_.Pxor(xof, xmask);       // a ^ P
+          as_.Movdqa(xtmp, xd);
+          as_.Pxor(xtmp, xres);       // a ^ diff
+          as_.Pand(xof, xtmp);        // overflow when (a^P)&(a^diff) sign set
+        } else {
+          as_.Movdqa(xres, xd);
+          as_.Paddd(xres, xmask);     // sum = a + P
+          as_.Movdqa(xof, xd);
+          as_.Pxor(xof, xres);        // a ^ sum
+          as_.Movdqa(xtmp, xmask);
+          as_.Pxor(xtmp, xres);       // P ^ sum
+          as_.Pand(xof, xtmp);        // overflow when (a^sum)&(P^sum) sign set
+        }
+        as_.Psrad(xof, int8_t{31});   // all-ones lanes where the add overflowed
+        as_.Psrad(xd, int8_t{31});    // a's sign extended (0 or -1)
+        as_.Movq(t, int64_t{0x7FFFFFFF7FFFFFFFLL});
+        as_.Movq(xmask, t);           // reuse xmask (P consumed) for the const
+        as_.Punpcklqdq(xmask, xmask);
+        as_.Pxor(xd, xmask);          // sat = (a>>31) ^ INT32_MAX (MAX or MIN)
+        as_.Pand(xd, xof);            // sat in overflow lanes
+        as_.Pandn(xof, xres);         // result in non-overflow lanes
+        as_.Por(xd, xof);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xd);
+        return;
+      }
+      success_ = false;  // size=10 -> interpreter
+      return;
+    }
+    // endregion
 
     const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
     const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
@@ -11373,10 +11500,88 @@ class LiteTranslator {
                    // for post-index immediate math, and that is encoded by Q
                    // (16- or 8-byte stride per register) — the transfer is
                    // bulk-vector regardless.
-    if (is_interleaved) { Undefined(); return; }
-    if (num_regs < 1 || num_regs > 4) { Undefined(); return; }
-
     const int32_t vec_bytes = q ? 16 : 8;
+
+    // region digitalis - de-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4
+    // (multiple-structure form).  Memory holds num_regs * (vec_bytes/esize)
+    // elements laid out structure-major: element index e in memory belongs to
+    // register (e % num_regs), lane (e / num_regs).  The universal lowering
+    // moves one element per PINSR (load) / PEXTR (store) directly between the
+    // computed memory operand and the destination/source lane — exact for every
+    // (num_regs, element-size, Q) combination, with no interpreter bailout.
+    // Q=0 zeroes the upper 64 bits of each loaded register via the initial
+    // PXOR.  Shuffle-based fast paths could replace the per-lane round-trip for
+    // the hot sizes, but the element-wise form keeps the whole class on the JIT.
+    if (is_interleaved) {
+      if (num_regs < 2 || num_regs > 4) { Undefined(); return; }
+      if (size > 3) { Undefined(); return; }
+      const int esize = 1 << size;
+      const int num_lanes = vec_bytes / esize;
+
+      Register ibase_orig = (rn == 31) ? GetSp() : GetReg(rn);
+      if (ibase_orig == no_register) { Undefined(); return; }
+      Register ibase = ApplyTbi(ibase_orig);
+      if (ibase == no_register) { Undefined(); return; }
+
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { Undefined(); return; }
+
+      for (uint8_t r = 0; r < num_regs; r++) {
+        const uint8_t vreg = (rt + r) & 31;
+        const int32_t vt_off = offsetof(ThreadState, cpu.v[0]) + vreg * 16;
+        if (is_store) {
+          as_.Movdqu(xmm, {.base = Assembler::rbp, .disp = vt_off});
+        } else {
+          as_.Pxor(xmm, xmm);
+        }
+        for (int l = 0; l < num_lanes; l++) {
+          const int32_t mem_off = (l * num_regs + r) * esize;
+          Assembler::Operand mem{.base = ibase, .disp = mem_off};
+          const int8_t lane = static_cast<int8_t>(l);
+          if (is_store) {
+            switch (esize) {
+              case 1: as_.Pextrb(mem, xmm, lane); break;
+              case 2: as_.Pextrw(mem, xmm, lane); break;
+              case 4: as_.Pextrd(mem, xmm, lane); break;
+              default: as_.Pextrq(mem, xmm, lane); break;  // esize == 8
+            }
+          } else {
+            switch (esize) {
+              case 1: as_.Pinsrb(xmm, mem, lane); break;
+              case 2: as_.Pinsrw(xmm, mem, lane); break;
+              case 4: as_.Pinsrd(xmm, mem, lane); break;
+              default: as_.Pinsrq(xmm, mem, lane); break;  // esize == 8
+            }
+          }
+        }
+        if (!is_store) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vt_off}, xmm);
+        }
+      }
+
+      if (postindex) {
+        Register new_base = AllocTempReg();
+        if (new_base == no_register) { Undefined(); return; }
+        Register reread_base = (rn == 31) ? GetSp() : GetReg(rn);
+        as_.Movq(new_base, reread_base);
+        if (rm == 31) {
+          as_.Addq(new_base, static_cast<int32_t>(num_regs) * vec_bytes);
+        } else {
+          Register rm_val = GetReg(rm);
+          if (rm_val == no_register) { Undefined(); return; }
+          as_.Addq(new_base, rm_val);
+        }
+        if (rn == 31) {
+          SetSp(new_base);
+        } else {
+          SetReg(rn, new_base);
+        }
+      }
+      return;
+    }
+    // endregion
+
+    if (num_regs < 1 || num_regs > 4) { Undefined(); return; }
 
     Register base_orig = (rn == 31) ? GetSp() : GetReg(rn);
     if (base_orig == no_register) { Undefined(); return; }
@@ -14208,6 +14413,80 @@ class LiteTranslator {
         success_ = false;
         return;
       }
+
+      // region digitalis - SUQADD / USQADD (per-lane saturating accumulate of
+      // mixed signedness) for byte/halfword lanes.
+      //   SUQADD Vd, Vn: Vd[i] = SignedSat( int(Vd[i]) + uint(Vn[i]) )
+      //   USQADD Vd, Vn: Vd[i] = UnsignedSat( uint(Vd[i]) + int(Vn[i]) )
+      // x86 has no mixed-sign saturating add, but the per-lane sum of an N-bit
+      // signed and an N-bit unsigned value always fits in 2N bits, so widen
+      // both operands (Vd and Vn each with their own signedness), add in the
+      // wider lane, then narrow back with the saturating pack that matches the
+      // destination's signedness: SUQADD -> signed dst -> PACKSS*, USQADD ->
+      // unsigned dst -> PACKUS*.  PACKUS* already clamps negatives to 0 and
+      // over-range to max, which is exactly UnsignedSat.  Q=0 packs the low
+      // half against zero (upper 64 zeroed); Q=1 packs low+high halves.
+      // .2S/.4S (size=10) and .1D/.2D (size=11) would need 64-bit widening with
+      // no narrowing pack on x86; bail to the interpreter.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSuqadd:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd: {
+        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+        const bool usqadd =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd);
+        SimdRegister xd = AllocTempSimdReg();
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister dlo = AllocTempSimdReg();
+        SimdRegister nlo = AllocTempSimdReg();
+        if (xd == no_simd_register || xn == no_simd_register ||
+            dlo == no_simd_register || nlo == no_simd_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // Widen the low 8 bytes of `src` into `dst` with the given signedness.
+        auto widen_lo = [&](SimdRegister dst, bool is_signed) {
+          if (args.size == 0b00) {
+            if (is_signed) as_.Pmovsxbw(dst, dst); else as_.Pmovzxbw(dst, dst);
+          } else {
+            if (is_signed) as_.Pmovsxwd(dst, dst); else as_.Pmovzxwd(dst, dst);
+          }
+        };
+        auto add_wide = [&](SimdRegister a, SimdRegister b) {
+          if (args.size == 0b00) as_.Paddw(a, b); else as_.Paddd(a, b);
+        };
+        // Vd signedness is the destination flavour (SUQADD signed / USQADD
+        // unsigned); Vn carries the opposite signedness.
+        as_.Movdqa(dlo, xd);
+        as_.Movdqa(nlo, xn);
+        widen_lo(dlo, /*is_signed=*/!usqadd);
+        widen_lo(nlo, /*is_signed=*/usqadd);
+        add_wide(dlo, nlo);  // dlo = widened lane sums (low half)
+        SimdRegister hi = AllocTempSimdReg();
+        if (hi == no_simd_register) { success_ = false; return; }
+        if (args.q) {
+          SimdRegister nhi = AllocTempSimdReg();
+          if (nhi == no_simd_register) { success_ = false; return; }
+          as_.Psrldq(xd, int8_t{8});  // bring high 8 bytes into the low lanes
+          as_.Psrldq(xn, int8_t{8});
+          as_.Movdqa(hi, xd);
+          as_.Movdqa(nhi, xn);
+          widen_lo(hi, /*is_signed=*/!usqadd);
+          widen_lo(nhi, /*is_signed=*/usqadd);
+          add_wide(hi, nhi);  // hi = widened lane sums (high half)
+        } else {
+          as_.Pxor(hi, hi);
+        }
+        // Narrow with the destination-signedness saturating pack.
+        if (args.size == 0b00) {
+          if (usqadd) as_.Packuswb(dlo, hi); else as_.Packsswb(dlo, hi);
+        } else {
+          if (usqadd) as_.Packusdw(dlo, hi); else as_.Packssdw(dlo, hi);
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, dlo);
+        return;
+      }
+      // endregion
+
       // CLZ V.<T>, V.<T> -- per-lane count leading zeros.
       //   size=00 .8B/.16B  -> 8-bit lane CLZ (result 0..8)
       //   size=01 .4H/.8H   -> 16-bit lane CLZ (result 0..16)

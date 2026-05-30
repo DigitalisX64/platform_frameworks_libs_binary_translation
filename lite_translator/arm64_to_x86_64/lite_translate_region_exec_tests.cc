@@ -1421,6 +1421,105 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_1x8B_DoesNotTouchUpp
   }
   for (int i = 8; i < 16; ++i) EXPECT_EQ(buffer[i], 0xCC) << "hi " << i;
 }
+
+// region digitalis - de-interleaving LD2/LD3/LD4 and interleaving ST2/ST3/ST4.
+// LD2 {V0.4S, V1.4S}, [X0] — opcode=1000, size=10 (32-bit), Q=1, 2 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld2_4S_Deinterleaves) {
+  alignas(16) static uint32_t buffer[8] = {0x10, 0x20, 0x11, 0x21,
+                                           0x12, 0x22, 0x13, 0x23};
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, false, true, 0x00, 0b1000, 0b10, 0, 0),
+  };
+  memset(&state_.cpu.v[0], 0xEE, 16);
+  memset(&state_.cpu.v[1], 0xEE, 16);
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t* v0 = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  uint32_t* v1 = reinterpret_cast<uint32_t*>(&state_.cpu.v[1]);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(v0[i], 0x10u + i) << "v0 lane " << i;
+    EXPECT_EQ(v1[i], 0x20u + i) << "v1 lane " << i;
+  }
+}
+
+// LD3 {V0.8B, V1.8B, V2.8B}, [X0] — opcode=0100, size=00, Q=0, 3 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld3_8B_Deinterleaves) {
+  alignas(16) static uint8_t buffer[24];
+  for (int i = 0; i < 24; ++i) buffer[i] = static_cast<uint8_t>(i);  // a,b,c,...
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, true, 0x00, 0b0100, 0b00, 0, 0),
+  };
+  for (int r = 0; r < 3; ++r) memset(&state_.cpu.v[r], 0xEE, 16);
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int r = 0; r < 3; ++r) {
+    uint8_t* v = reinterpret_cast<uint8_t*>(&state_.cpu.v[r]);
+    for (int l = 0; l < 8; ++l) {
+      EXPECT_EQ(v[l], buffer[l * 3 + r]) << "v" << r << " lane " << l;
+    }
+    for (int l = 8; l < 16; ++l) EXPECT_EQ(v[l], 0x00) << "v" << r << " hi " << l;
+  }
+}
+
+// LD4 {V0.4H..V3.4H}, [X0] — opcode=0000, size=01 (16-bit), Q=0, 4 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld4_4H_Deinterleaves) {
+  alignas(16) static uint16_t buffer[16];
+  for (int i = 0; i < 16; ++i) buffer[i] = static_cast<uint16_t>(0x100 + i);
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, true, 0x00, 0b0000, 0b01, 0, 0),
+  };
+  for (int r = 0; r < 4; ++r) memset(&state_.cpu.v[r], 0xEE, 16);
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int r = 0; r < 4; ++r) {
+    uint16_t* v = reinterpret_cast<uint16_t*>(&state_.cpu.v[r]);
+    for (int l = 0; l < 4; ++l) {
+      EXPECT_EQ(v[l], buffer[l * 4 + r]) << "v" << r << " lane " << l;
+    }
+  }
+}
+
+// ST2 {V0.4S, V1.4S}, [X0], #32 — interleave on store, post-index immediate.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St2_4S_Interleaves) {
+  alignas(16) static uint32_t buffer[8];
+  memset(buffer, 0xCC, sizeof(buffer));
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, true, false, 0x1F, 0b1000, 0b10, 0, 0),
+  };
+  uint32_t* v0 = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  uint32_t* v1 = reinterpret_cast<uint32_t*>(&state_.cpu.v[1]);
+  for (int i = 0; i < 4; ++i) { v0[i] = 0x10 + i; v1[i] = 0x20 + i; }
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(buffer[i * 2], 0x10u + i) << "even " << i;
+    EXPECT_EQ(buffer[i * 2 + 1], 0x20u + i) << "odd " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[0], ToGuestAddr(buffer) + 32u);
+}
+
+// ST4 {V0.16B..V3.16B}, [X0] — RGBA byte interleave, Q=1, 4 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St4_16B_Interleaves) {
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xCC, sizeof(buffer));
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, false, false, 0x00, 0b0000, 0b00, 0, 0),
+  };
+  for (int r = 0; r < 4; ++r) {
+    uint8_t* v = reinterpret_cast<uint8_t*>(&state_.cpu.v[r]);
+    for (int i = 0; i < 16; ++i) v[i] = static_cast<uint8_t>(r * 0x40 + i);
+  }
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int l = 0; l < 16; ++l) {
+    for (int r = 0; r < 4; ++r) {
+      EXPECT_EQ(buffer[l * 4 + r], static_cast<uint8_t>(r * 0x40 + l))
+          << "lane " << l << " reg " << r;
+    }
+  }
+}
+// endregion
+
 // endregion
 
 // Test: single FMUL s0, s0, s1 (in-place multiply)
@@ -11952,6 +12051,146 @@ TEST_F(Arm64LiteTranslateRegionTest, Addhn2_16bUpper) {
   GetV128(state_.cpu, 0, r);
   EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
   EXPECT_EQ(r[1], 0x0303030303030303ULL);
+}
+// endregion
+
+// region digitalis - SQDMULL .4S (signed doubling widening multiply) JIT.
+constexpr uint32_t Sqdmull4s(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E60D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+// Vn.4H = [3, 5, -32768, 7], Vm.4H = [4, 6, -32768, 2].
+//   2*3*4=24, 2*5*6=60, 2*(-32768)^2=2^31 -> SAT 0x7FFFFFFF, 2*7*2=28.
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmull4sWithSaturation) {
+  SetV128(state_.cpu, 1, 0x0007800000050003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x0002800000060004ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmull4s(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000003C00000018ULL);  // [24, 60]
+  EXPECT_EQ(r[1], 0x0000001C7FFFFFFFULL);  // [SAT, 28]
+}
+// SQDMLAL/SQDMLSL .4S: Vd.4S +/-= SAT(2*Vn.4H*Vm.4H), 32-bit saturating accum.
+constexpr uint32_t Sqdmlal4s(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E609000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqdmlsl4s(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E60B000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+// Products P = [24, 60, INT32_MAX(sat), 28]; accumulator chosen so lane2/lane3
+// drive positive and negative 32-bit accumulate saturation.
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlal4sSaturatingAccum) {
+  SetV128(state_.cpu, 0, 0xFFFFFFCE00000064ULL, 0x8000000800000064ULL);
+  SetV128(state_.cpu, 1, 0x0007800000050003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x0002800000060004ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlal4s(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000A0000007CULL);
+  EXPECT_EQ(r[1], 0x800000247FFFFFFFULL);  // lane2 sat +, lane3 in-range
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlsl4sSaturatingAccum) {
+  SetV128(state_.cpu, 0, 0xFFFFFFCE00000064ULL, 0x8000000800000064ULL);
+  SetV128(state_.cpu, 1, 0x0007800000050003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x0002800000060004ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlsl4s(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFFFF920000004CULL);
+  EXPECT_EQ(r[1], 0x8000000080000065ULL);  // lane3 sat -
+}
+// endregion
+
+// region digitalis - SUQADD / USQADD (saturating accumulate, mixed sign) JIT.
+//   SUQADD = 0x0E203800 | (q<<30) | (size<<22) | (rn<<5) | rd
+//   USQADD = SUQADD | (1<<29)  (U bit)
+constexpr uint32_t Suqadd(uint8_t rd, uint8_t rn, uint8_t size, bool q) {
+  return 0x0E203800u | (uint32_t{q} << 30) | (uint32_t{size} << 22) |
+         (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Usqadd(uint8_t rd, uint8_t rn, uint8_t size, bool q) {
+  return Suqadd(rd, rn, size, q) | (1u << 29);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Suqadd8b) {
+  SetV128(state_.cpu, 0, 0xCE32807F000A9C64ULL, 0ULL);  // Vd signed accumulator
+  SetV128(state_.cpu, 1, 0x1464C80A00051E32ULL, 0ULL);  // Vn unsigned addend
+  static const uint32_t code[] = {Suqadd(0, 1, 0b00, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xe27f487f000fba7fULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Usqadd8b) {
+  SetV128(state_.cpu, 0, 0xCE32807F000A9C64ULL, 0ULL);  // Vd unsigned accumulator
+  SetV128(state_.cpu, 1, 0x1464C80A00051E32ULL, 0ULL);  // Vn signed addend
+  static const uint32_t code[] = {Usqadd(0, 1, 0b00, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xe2964889000fba96ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Suqadd4h) {
+  SetV128(state_.cpu, 0, 0x7FFF8000FF9C0064ULL, 0ULL);
+  SetV128(state_.cpu, 1, 0x000A8000FFFF0032ULL, 0ULL);
+  static const uint32_t code[] = {Suqadd(0, 1, 0b01, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x7fff00007fff0096ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Usqadd4h) {
+  SetV128(state_.cpu, 0, 0x7FFF8000FF9C0064ULL, 0ULL);
+  SetV128(state_.cpu, 1, 0x000A8000FFFF0032ULL, 0ULL);
+  static const uint32_t code[] = {Usqadd(0, 1, 0b01, false)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x80090000ff9b0096ULL);
+  EXPECT_EQ(r[1], 0ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Suqadd16b) {  // Q=1 exercises the high half
+  SetV128(state_.cpu, 0, 0xCE32807F000A9C64ULL, 0x0102037F80FE0A14ULL);
+  SetV128(state_.cpu, 1, 0x1464C80A00051E32ULL, 0x05FF02018003FE10ULL);
+  static const uint32_t code[] = {Suqadd(0, 1, 0b00, true)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xe27f487f000fba7fULL);
+  EXPECT_EQ(r[1], 0x067f057f00017f24ULL);
+}
+// endregion
+
+// region digitalis - PMULL / PMULL2 .8H (poly8 widening carryless multiply) JIT.
+constexpr uint32_t Pmull8h(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E20E000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Pmull2_8h(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return Pmull8h(rd, rn, rm) | (1u << 30);  // Q=1 -> PMULL2 (high 8 bytes)
+}
+TEST_F(Arm64LiteTranslateRegionTest, Pmull8hPoly8) {
+  SetV128(state_.cpu, 1, 0xAA07108001FFCA53ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x5507108002FF53CAULL, 0ULL);
+  static const uint32_t code[] = {Pmull8h(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000255553F7E3F7EULL);
+  EXPECT_EQ(r[1], 0x2222001501004000ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Pmull2_8hPoly8UsesHighHalf) {
+  SetV128(state_.cpu, 1, 0xDEADBEEFDEADBEEFULL, 0xAA07108001FFCA53ULL);
+  SetV128(state_.cpu, 2, 0xDEADBEEFDEADBEEFULL, 0x5507108002FF53CAULL);
+  static const uint32_t code[] = {Pmull2_8h(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000255553F7E3F7EULL);
+  EXPECT_EQ(r[1], 0x2222001501004000ULL);
 }
 // endregion
 
