@@ -12311,6 +12311,30 @@ TEST_F(Arm64LiteTranslateRegionTest, I8mmUsdotAndMatMul) {
   EXPECT_EQ(r[0], 0x000000de0000006fULL);
   EXPECT_EQ(r[1], 0x0000020200000101ULL);
 }
+// I8MM by-element USDOT/SUDOT: index selects the 4-byte group of Vm; mixed sign.
+TEST_F(Arm64LiteTranslateRegionTest, I8mmUsdotSudotByElement) {
+  uint64_t r[2];
+  // USDOT v0.4s, v1.16b, v2.4b[1] = 0x4FA2F020 (Vn unsigned, Vm signed).
+  SetV128(state_.cpu, 0, 0, 0);
+  SetV128(state_.cpu, 1, 0x0807060504030280ULL, 0x01010101020202FFULL);
+  SetV128(state_.cpu, 2, 0xFFFFFFFF01010101ULL, 0xFEFEFEFE02020202ULL);
+  static const uint32_t usdot1[] = {0x4FA2F020u};
+  state_.cpu.insn_addr = ToGuestAddr(usdot1);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFFFFE6FFFFFF77ULL);
+  EXPECT_EQ(r[1], 0xFFFFFFFCFFFFFEFBULL);
+  // SUDOT v0.4s, v1.16b, v2.4b[2] = 0x4F02F820 (Vn signed, Vm unsigned).
+  SetV128(state_.cpu, 0, 0, 0);
+  SetV128(state_.cpu, 1, 0x0807060504030280ULL, 0x01010101020202FFULL);
+  SetV128(state_.cpu, 2, 0xFFFFFFFF01010101ULL, 0xFEFEFEFE02020202ULL);
+  static const uint32_t sudot2[] = {0x4F02F820u};
+  state_.cpu.insn_addr = ToGuestAddr(sudot2);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x00000034FFFFFF12ULL);
+  EXPECT_EQ(r[1], 0x000000080000000AULL);
+}
 // endregion
 
 // region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
