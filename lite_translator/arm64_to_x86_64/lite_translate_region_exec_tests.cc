@@ -12157,6 +12157,177 @@ TEST_F(Arm64LiteTranslateRegionTest, Frint64zVector2D) {
 }
 // endregion
 
+// region digitalis - LDGM/STGM/STZGM (FEAT_MTE tag-block): without MTE
+// backing, LDGM reads tags as zero (Rt=0) and STGM/STZGM are tag NOPs.
+TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
+  alignas(16) static uint8_t buf[64];
+  state_.cpu.x[0] = 0xFFFFFFFFFFFFFFFFULL;
+  state_.cpu.x[1] = ToGuestAddr(buf);
+  static const uint32_t ldgm[] = {0xD9E00020u};  // ldgm x0, [x1]
+  state_.cpu.insn_addr = ToGuestAddr(ldgm);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(ldgm) + 4);
+  EXPECT_EQ(state_.cpu.x[0], 0u);  // all tags read 0
+  static const uint32_t stgm[] = {0xD9A00020u};  // stgm x0, [x1] — NOP
+  state_.cpu.insn_addr = ToGuestAddr(stgm);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(stgm) + 4);
+  static const uint32_t stzgm[] = {0xD9200020u};  // stzgm x0, [x1] — NOP
+  state_.cpu.insn_addr = ToGuestAddr(stzgm);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(stzgm) + 4);
+}
+// endregion
+
+// region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
+// and outputs are validated against the SM3 round/expansion (the full sequence
+// reproduces the published SM3("abc") digest). Interpreter-only.
+TEST_F(Arm64LiteTranslateRegionTest, Sm3Ops) {
+  uint64_t r[2];
+  // SM3SS1 v0.4s, v1.4s, v2.4s, v3.4s = 0xCE420C20.
+  SetV128(state_.cpu, 1, 0x0000000200000001ULL, 0x7380166F00000003ULL);
+  SetV128(state_.cpu, 2, 0x0000000500000004ULL, 0xA96F30BC00000006ULL);
+  SetV128(state_.cpu, 3, 0x0000000800000007ULL, 0x79CC451900000009ULL);
+  static const uint32_t ss1[] = {0xCE420C20u};
+  state_.cpu.insn_addr = ToGuestAddr(ss1);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0ULL);
+  EXPECT_EQ(r[1], 0x5136869200000000ULL);
+
+  // SM3TT1A v0.4s, v1.4s, v2.s[0] = 0xCE428020.
+  SetV128(state_.cpu, 0, 0x172442D7DA8A0600ULL, 0x7380166F4914B2B9ULL);
+  SetV128(state_.cpu, 1, 0ULL, 0x1234567800000000ULL);
+  SetV128(state_.cpu, 2, 0x000000009ABCDEF0ULL, 0ULL);
+  static const uint32_t tt1a[] = {0xCE428020u};
+  state_.cpu.insn_addr = ToGuestAddr(tt1a);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x29657292172442D7ULL);
+  EXPECT_EQ(r[1], 0xB52C21697380166FULL);
+
+  // SM3TT2A v0.4s, v1.4s, v2.s[0] = 0xCE428820.
+  SetV128(state_.cpu, 0, 0xE38DEE4DB0FB0E4EULL, 0xA96F30BC163138AAULL);
+  SetV128(state_.cpu, 1, 0ULL, 0x0FEDCBA900000000ULL);
+  SetV128(state_.cpu, 2, 0x0000000011223344ULL, 0ULL);
+  static const uint32_t tt2a[] = {0xCE428820u};
+  state_.cpu.insn_addr = ToGuestAddr(tt2a);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xC550B189E38DEE4DULL);
+  EXPECT_EQ(r[1], 0x74158276A96F30BCULL);
+
+  // SM3PARTW1 v0.4s, v1.4s, v2.4s = 0xCE62C020.
+  SetV128(state_.cpu, 0, 0x89ABCDEF01234567ULL, 0x76543210FEDCBA98ULL);
+  SetV128(state_.cpu, 1, 0x102030400A0B0C0DULL, 0x99AABBCC55667788ULL);
+  SetV128(state_.cpu, 2, 0xCAFEBABEDEADBEEFULL, 0x12345678FEEDFACEULL);
+  static const uint32_t pw1[] = {0xCE62C020u};
+  state_.cpu.insn_addr = ToGuestAddr(pw1);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x493246EECAD6BCB8ULL);
+  EXPECT_EQ(r[1], 0x9C21E510E7C3C72BULL);
+
+  // SM3PARTW2 v0.4s, v1.4s, v2.4s = 0xCE62C420.
+  SetV128(state_.cpu, 0, 0x89ABCDEF01234567ULL, 0x76543210FEDCBA98ULL);
+  SetV128(state_.cpu, 1, 0x102030400A0B0C0DULL, 0x99AABBCC55667788ULL);
+  SetV128(state_.cpu, 2, 0xCAFEBABEDEADBEEFULL, 0x12345678FEEDFACEULL);
+  static const uint32_t pw2[] = {0xCE62C420u};
+  state_.cpu.insn_addr = ToGuestAddr(pw2);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x534D5759DA08FD0DULL);
+  EXPECT_EQ(r[1], 0xB13D8224B30A847CULL);
+}
+// endregion
+
+// region digitalis - SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY (key
+// expansion). Inputs/outputs are the single-instruction steps of the GB/T
+// 32907 standard test vector (whose full 8x-SM4E flow reproduces the published
+// ciphertext 681edf34 d206965e 86b3e94f 536e4246). Interpreter-only.
+TEST_F(Arm64LiteTranslateRegionTest, Sm4eAndSm4ekey) {
+  uint64_t r[2];
+  // SM4EKEY v0.4s, v1.4s, v2.4s: first key-expansion step -> round keys 0..3.
+  SetV128(state_.cpu, 1, 0xDF01FEBFA292FFA1ULL, 0xC42410CC99A12B0FULL);  // K^FK
+  SetV128(state_.cpu, 2, 0x1C232A3100070E15ULL, 0x545B6269383F464DULL);  // CK0..3
+  static const uint32_t sm4ekey[] = {0xCE62C820u};
+  state_.cpu.insn_addr = ToGuestAddr(sm4ekey);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x41662B61F12186F9ULL);  // rk0,rk1
+  EXPECT_EQ(r[1], 0x7BA920775A6AB19AULL);  // rk2,rk3
+
+  // SM4E v0.4s, v1.4s: first encryption step (4 rounds) of the plaintext.
+  SetV128(state_.cpu, 0, 0x89ABCDEF01234567ULL, 0x76543210FEDCBA98ULL);  // state
+  SetV128(state_.cpu, 1, 0x41662B61F12186F9ULL, 0x7BA920775A6AB19AULL);  // rk0..3
+  static const uint32_t sm4e[] = {0xCEC08420u};
+  state_.cpu.insn_addr = ToGuestAddr(sm4e);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xA18B4CB227FAD345ULL);
+  EXPECT_EQ(r[1], 0xCC13E2EE11C1E22AULL);
+}
+// endregion
+
+// region digitalis - I8MM (FEAT_I8MM): USDOT (mixed-sign dot product) and the
+// integer matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Interpreter-only; the
+// signed/unsigned/mixed forms must give distinct results (Vn byte0=0x80,
+// byte8=0xFF distinguish signed vs unsigned interpretation).
+TEST_F(Arm64LiteTranslateRegionTest, I8mmUsdotAndMatMul) {
+  // Vn (unsigned bytes), Vm (signed bytes) per the reference computation.
+  SetV128(state_.cpu, 1, 0x0807060504030280ULL, 0x01010101020202FFULL);
+  SetV128(state_.cpu, 2, 0xFFFFFFFF01010101ULL, 0xFEFEFEFE02020202ULL);
+  uint64_t r[2];
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t usdot[] = {0x4E829C20u};  // usdot v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(usdot);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xffffffe600000089ULL);
+  EXPECT_EQ(r[1], 0xfffffff80000020aULL);
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t smmla[] = {0x4E82A420u};  // smmla v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(smmla);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xfffffedeffffff6fULL);
+  EXPECT_EQ(r[1], 0x0000000200000001ULL);
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t ummla[] = {0x6E82A420u};  // ummla v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(ummla);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x00001ade00001a6fULL);
+  EXPECT_EQ(r[1], 0x0000060200000501ULL);
+
+  SetV128(state_.cpu, 0, 0, 0);
+  static const uint32_t usmmla[] = {0x4E82AC20u};  // usmmla v0.4s, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(usmmla);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x000000de0000006fULL);
+  EXPECT_EQ(r[1], 0x0000020200000101ULL);
+}
+// endregion
+
+// region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
+// the address and adjust the logical tag in bits[59:56]. Interpreter-only.
+TEST_F(Arm64LiteTranslateRegionTest, AddgSubgTagArithmetic) {
+  state_.cpu.x[1] = 0x0500000000001000ULL;  // tag 5, address 0x1000
+  static const uint32_t addg[] = {0x91810820u};  // addg x0, x1, #16, #2
+  state_.cpu.insn_addr = ToGuestAddr(addg);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.x[0], 0x0700000000001010ULL);  // tag (5+2)=7, addr 0x1010
+  static const uint32_t subg[] = {0xD1820C20u};  // subg x0, x1, #32, #3
+  state_.cpu.insn_addr = ToGuestAddr(subg);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.x[0], 0x0200000000000FE0ULL);  // tag (5-3)=2, addr 0xFE0
+}
+// endregion
+
 // region digitalis - RNDR (FEAT_RNG): MRS Xt, RNDR returns entropy and clears
 // NZCV (success). Interpreter-only. Two draws differ; flags end cleared.
 TEST_F(Arm64LiteTranslateRegionTest, RndrReturnsEntropyAndClearsFlags) {

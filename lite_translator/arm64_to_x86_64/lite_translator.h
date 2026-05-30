@@ -209,6 +209,18 @@ class LiteTranslator {
     return res;
   }
 
+  // region digitalis - ADDG/SUBG (MTE tag arithmetic). Rare; handled by the
+  // interpreter. End the region before this instruction (success_=false); the
+  // returned register is discarded along with the un-installed region.
+  Register AddSubImmTags(bool is_sub, Register src, uint8_t uimm6, uint8_t uimm4) {
+    UNUSED(is_sub);
+    UNUSED(uimm6);
+    UNUSED(uimm4);
+    success_ = false;
+    return src;
+  }
+  // endregion
+
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
                       Register src, uint64_t imm) {
     Register res = AllocTempReg();
@@ -2503,7 +2515,21 @@ class LiteTranslator {
   // {SDOT,UDOT} — are lowered.  The interpreter (interpreter.h:1237)
   // remains the executable spec; this JIT path produces bit-exact
   // output (32-bit integer arithmetic with defined wraparound).
+  // region digitalis - I8MM matrix multiply-accumulate: interpreter only.
+  void AdvSimdMatMul(const Decoder::MatMulArgs&) { success_ = false; }
+  // endregion
+
   void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
+    // region digitalis - the I8MM mixed-sign dot products (USDOT/SUDOT) need
+    // per-operand signedness; this SDOT/UDOT lowering assumes both operands
+    // share a sign, so bail to the interpreter for the mixed forms.
+    if (args.opcode == Decoder::DotProductOpcode::kUsdot ||
+        args.opcode == Decoder::DotProductOpcode::kUsdotIdx ||
+        args.opcode == Decoder::DotProductOpcode::kSudotIdx) {
+      success_ = false;
+      return;
+    }
+    // endregion
     const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
                             args.opcode == Decoder::DotProductOpcode::kSdotIdx);
     const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
@@ -11472,6 +11498,33 @@ class LiteTranslator {
   }
   void Xar(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
     UNUSED(rd, rn, rm, imm6);
+    Undefined();
+  }
+  // endregion
+
+  // region digitalis - SM3/SM4 (interpreter only).
+  void Sm4e(uint8_t rd, uint8_t rn) {
+    UNUSED(rd, rn);
+    Undefined();
+  }
+  void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
+    Undefined();
+  }
+  void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    UNUSED(rd, rn, rm, ra);
+    Undefined();
+  }
+  void Sm3tt(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm2, uint8_t op) {
+    UNUSED(rd, rn, rm, imm2, op);
+    Undefined();
+  }
+  void Sm3partw1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
+    Undefined();
+  }
+  void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
     Undefined();
   }
   // endregion

@@ -99,6 +99,21 @@ class Interpreter {
     return result;
   }
 
+  // region digitalis - ADDG/SUBG (FEAT_MTE). The address part is Xn +/- the
+  // 16-byte-scaled offset; bits[59:56] are then replaced by the logical tag
+  // (start tag +/- uimm4, mod 16). Digitalis does not enforce MTE, so tag
+  // exclusion (GCR_EL1) is ignored — the tag nibble is updated arithmetically,
+  // keeping tagged-pointer math consistent under top-byte-ignore.
+  Register AddSubImmTags(bool is_sub, Register src, uint8_t uimm6, uint8_t uimm4) {
+    uint64_t offset = static_cast<uint64_t>(uimm6) << 4;
+    uint64_t addr = is_sub ? (src - offset) : (src + offset);
+    uint8_t start_tag = static_cast<uint8_t>((src >> 56) & 0xF);
+    uint8_t new_tag = static_cast<uint8_t>(
+        (is_sub ? (start_tag - uimm4) : (start_tag + uimm4)) & 0xF);
+    return (addr & ~(0xFULL << 56)) | (static_cast<uint64_t>(new_tag) << 56);
+  }
+  // endregion
+
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
                       Register src, uint64_t imm) {
     CHECK(!exception_raised_);
@@ -991,6 +1006,13 @@ class Interpreter {
     switch (args.opcode) {
       case Decoder::MteLoadStoreOpcode::kStg:
       case Decoder::MteLoadStoreOpcode::kSt2g:
+      // region digitalis - STGM / STZGM tag-block stores: pure tag stores,
+      // NOP without MTE backing. STZGM's data-zeroing block size is defined by
+      // GMID_EL1 (not emulated here), so it is treated as a tag NOP rather than
+      // zeroing a guessed-size region (over-zeroing would corrupt memory).
+      case Decoder::MteLoadStoreOpcode::kStgm:
+      case Decoder::MteLoadStoreOpcode::kStzgm:
+      // endregion
         // Pure tag store — NOP without MTE backing.
         break;
       case Decoder::MteLoadStoreOpcode::kLdg: {
@@ -1001,6 +1023,15 @@ class Interpreter {
         }
         break;
       }
+      // region digitalis - LDGM: load tag multiple into Rt. Tags are packed as
+      // 4-bit nibbles; with no MTE backing all tags read 0, so Rt = 0.
+      case Decoder::MteLoadStoreOpcode::kLdgm: {
+        if (args.rt != 31) {
+          state_->cpu.x[args.rt] = 0;
+        }
+        break;
+      }
+      // endregion
       case Decoder::MteLoadStoreOpcode::kStzg: {
         // Zero the 16-byte granule containing access_addr.
         uint64_t aligned = access_addr & ~uint64_t{0x0F};
@@ -1324,10 +1355,15 @@ class Interpreter {
     memcpy(n_b, &src_n, 16);
     memcpy(m_b, &src_m, 16);
 
-    const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
-                            args.opcode == Decoder::DotProductOpcode::kSdotIdx);
-    const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
-                             args.opcode == Decoder::DotProductOpcode::kUdotIdx);
+    // Per-operand signedness covers SDOT/UDOT and the I8MM mixed-sign forms
+    // USDOT (Vn unsigned, Vm signed) and SUDOT (Vn signed, Vm unsigned).
+    using Op = Decoder::DotProductOpcode;
+    const bool n_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kSudotIdx);
+    const bool m_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kUsdot || args.opcode == Op::kUsdotIdx);
+    const bool is_indexed = (args.opcode == Op::kSdotIdx || args.opcode == Op::kUdotIdx ||
+                             args.opcode == Op::kUsdotIdx || args.opcode == Op::kSudotIdx);
 
     __uint128_t result = 0;
     uint8_t lanes = args.q ? 4 : 2;
@@ -1338,10 +1374,10 @@ class Interpreter {
         uint8_t n_byte = n_b[4 * i + k];
         uint8_t m_byte = is_indexed ? m_b[4 * args.index + k]
                                     : m_b[4 * i + k];
-        int32_t n_ext = is_signed ? static_cast<int32_t>(static_cast<int8_t>(n_byte))
-                                  : static_cast<int32_t>(n_byte);
-        int32_t m_ext = is_signed ? static_cast<int32_t>(static_cast<int8_t>(m_byte))
-                                  : static_cast<int32_t>(m_byte);
+        int32_t n_ext = n_signed ? static_cast<int32_t>(static_cast<int8_t>(n_byte))
+                                 : static_cast<int32_t>(n_byte);
+        int32_t m_ext = m_signed ? static_cast<int32_t>(static_cast<int8_t>(m_byte))
+                                 : static_cast<int32_t>(m_byte);
         // Cast through uint32_t to make wraparound well-defined; bit-pattern
         // of the result matches the signed-arithmetic case for both SDOT
         // and UDOT per ARM ARM C7.2.397 / C7.2.398.
@@ -1357,6 +1393,47 @@ class Interpreter {
       memcpy(&lo, &result, 8);
       result = 0;
       memcpy(&result, &lo, 8);
+    }
+    state_->cpu.v[args.rd] = result;
+  }
+  // endregion
+
+  // region digitalis - I8MM SMMLA/UMMLA/USMMLA (FEAT_I8MM). Vn holds a 2x8
+  // int8 matrix (two rows of 8), Vm holds an 8x2 matrix stored row-major as
+  // two rows of 8 (its transpose), Vd is a 2x2 int32 accumulator. The result
+  // is Vd + Vn * Vm^T: lane (2*i + j) accumulates the 8-element dot product of
+  // Vn row i with Vm row j. SMMLA = signed*signed, UMMLA = unsigned*unsigned,
+  // USMMLA = unsigned(Vn)*signed(Vm). Always .4S (full 128-bit result).
+  void AdvSimdMatMul(const Decoder::MatMulArgs& args) {
+    CHECK(!exception_raised_);
+    __uint128_t src_n = state_->cpu.v[args.rn];
+    __uint128_t src_m = state_->cpu.v[args.rm];
+    __uint128_t dst = state_->cpu.v[args.rd];
+    uint8_t n_b[16], m_b[16];
+    memcpy(n_b, &src_n, 16);
+    memcpy(m_b, &src_m, 16);
+
+    const bool n_signed = (args.opcode == Decoder::MatMulOpcode::kSmmla);
+    const bool m_signed = (args.opcode == Decoder::MatMulOpcode::kSmmla ||
+                           args.opcode == Decoder::MatMulOpcode::kUsmmla);
+
+    __uint128_t result = 0;
+    for (uint8_t i = 0; i < 2; i++) {       // row of Vn
+      for (uint8_t j = 0; j < 2; j++) {     // row of Vm (column of result)
+        int32_t acc;
+        memcpy(&acc, reinterpret_cast<const uint8_t*>(&dst) + (2 * i + j) * 4, 4);
+        for (uint8_t k = 0; k < 8; k++) {
+          uint8_t nb = n_b[8 * i + k];
+          uint8_t mb = m_b[8 * j + k];
+          int32_t ne = n_signed ? static_cast<int32_t>(static_cast<int8_t>(nb))
+                                 : static_cast<int32_t>(nb);
+          int32_t me = m_signed ? static_cast<int32_t>(static_cast<int8_t>(mb))
+                                 : static_cast<int32_t>(mb);
+          acc = static_cast<int32_t>(static_cast<uint32_t>(acc) +
+                                     static_cast<uint32_t>(ne * me));
+        }
+        memcpy(reinterpret_cast<uint8_t*>(&result) + (2 * i + j) * 4, &acc, 4);
+      }
     }
     state_->cpu.v[args.rd] = result;
   }
@@ -2300,6 +2377,158 @@ class Interpreter {
     memcpy(&vd, out, 16);
     state_->cpu.v[rd] = vd;
   }
+
+  // region digitalis - SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY
+  // (key expansion). Word i of a vector is bits[32*i+31:32*i] (word 0 = low).
+  // Each instruction performs the four SM4 rounds with the rolling update
+  //   t = w[(i+1)%4] ^ w[(i+2)%4] ^ w[(i+3)%4] ^ k[i]
+  //   t = S-box(each byte of t)
+  //   w[i] ^= L(t)
+  // where for SM4E (k = Vn round keys) L(t) = t ^ rol(t,2)^rol(t,10)^rol(t,18)
+  // ^rol(t,24), and for SM4EKEY (state seeded from Vn, k = Vm) the
+  // key-expansion linear map L'(t) = t ^ rol(t,13) ^ rol(t,23). Matches the
+  // ARM ARM SM4E/SM4EKEY pseudocode (standard SM4 S-box / transforms).
+  static uint32_t Sm4Subword(uint32_t x) {
+    static const uint8_t kSm4Sbox[256] = {
+        0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
+        0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
+        0x9c,0x42,0x50,0xf4,0x91,0xef,0x98,0x7a,0x33,0x54,0x0b,0x43,0xed,0xcf,0xac,0x62,
+        0xe4,0xb3,0x1c,0xa9,0xc9,0x08,0xe8,0x95,0x80,0xdf,0x94,0xfa,0x75,0x8f,0x3f,0xa6,
+        0x47,0x07,0xa7,0xfc,0xf3,0x73,0x17,0xba,0x83,0x59,0x3c,0x19,0xe6,0x85,0x4f,0xa8,
+        0x68,0x6b,0x81,0xb2,0x71,0x64,0xda,0x8b,0xf8,0xeb,0x0f,0x4b,0x70,0x56,0x9d,0x35,
+        0x1e,0x24,0x0e,0x5e,0x63,0x58,0xd1,0xa2,0x25,0x22,0x7c,0x3b,0x01,0x21,0x78,0x87,
+        0xd4,0x00,0x46,0x57,0x9f,0xd3,0x27,0x52,0x4c,0x36,0x02,0xe7,0xa0,0xc4,0xc8,0x9e,
+        0xea,0xbf,0x8a,0xd2,0x40,0xc7,0x38,0xb5,0xa3,0xf7,0xf2,0xce,0xf9,0x61,0x15,0xa1,
+        0xe0,0xae,0x5d,0xa4,0x9b,0x34,0x1a,0x55,0xad,0x93,0x32,0x30,0xf5,0x8c,0xb1,0xe3,
+        0x1d,0xf6,0xe2,0x2e,0x82,0x66,0xca,0x60,0xc0,0x29,0x23,0xab,0x0d,0x53,0x4e,0x6f,
+        0xd5,0xdb,0x37,0x45,0xde,0xfd,0x8e,0x2f,0x03,0xff,0x6a,0x72,0x6d,0x6c,0x5b,0x51,
+        0x8d,0x1b,0xaf,0x92,0xbb,0xdd,0xbc,0x7f,0x11,0xd9,0x5c,0x41,0x1f,0x10,0x5a,0xd8,
+        0x0a,0xc1,0x31,0x88,0xa5,0xcd,0x7b,0xbd,0x2d,0x74,0xd0,0x12,0xb8,0xe5,0xb4,0xb0,
+        0x89,0x69,0x97,0x4a,0x0c,0x96,0x77,0x7e,0x65,0xb9,0xf1,0x09,0xc5,0x6e,0xc6,0x84,
+        0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48};
+    return static_cast<uint32_t>(kSm4Sbox[x & 0xff]) |
+           (static_cast<uint32_t>(kSm4Sbox[(x >> 8) & 0xff]) << 8) |
+           (static_cast<uint32_t>(kSm4Sbox[(x >> 16) & 0xff]) << 16) |
+           (static_cast<uint32_t>(kSm4Sbox[(x >> 24) & 0xff]) << 24);
+  }
+  static uint32_t Sm4Rol(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
+  }
+  void Sm4e(uint8_t rd, uint8_t rn) {
+    CHECK(!exception_raised_);
+    uint32_t w[4], k[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn];
+    memcpy(w, &vd, 16);
+    memcpy(k, &vn, 16);
+    for (int i = 0; i < 4; i++) {
+      uint32_t t = w[(i + 1) % 4] ^ w[(i + 2) % 4] ^ w[(i + 3) % 4] ^ k[i];
+      t = Sm4Subword(t);
+      w[i] ^= t ^ Sm4Rol(t, 2) ^ Sm4Rol(t, 10) ^ Sm4Rol(t, 18) ^ Sm4Rol(t, 24);
+    }
+    memcpy(&vd, w, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint32_t w[4], k[4];
+    __uint128_t vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(w, &vn, 16);  // state seeded from Vn
+    memcpy(k, &vm, 16);  // constants/keys from Vm
+    for (int i = 0; i < 4; i++) {
+      uint32_t t = w[(i + 1) % 4] ^ w[(i + 2) % 4] ^ w[(i + 3) % 4] ^ k[i];
+      t = Sm4Subword(t);
+      w[i] ^= t ^ Sm4Rol(t, 13) ^ Sm4Rol(t, 23);
+    }
+    __uint128_t vd;
+    memcpy(&vd, w, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // endregion
+
+  // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/1B/2A/2B, SM3PARTW1/2.
+  // Word i of a vector is bits[32i+31:32i] (word 0 = low). Derived from the
+  // SM3 round/expansion (GB/T 32905); the full sequence reproduces the
+  // published SM3("abc") digest. P0(x)=x^rol(x,9)^rol(x,17),
+  // P1(x)=x^rol(x,15)^rol(x,23).
+  static uint32_t Sm3P0(uint32_t x) { return x ^ Sm4Rol(x, 9) ^ Sm4Rol(x, 17); }
+  static uint32_t Sm3Ror(uint32_t x, int n) { return Sm4Rol(x, 32 - n); }
+  // SM3SS1: Vd[3] = rol(rol(Vn[3],12) + Vm[3] + Va[3], 7); Vd[2:0] = 0.
+  void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    CHECK(!exception_raised_);
+    uint32_t n[4], m[4], a[4];
+    __uint128_t vn = state_->cpu.v[rn], vm = state_->cpu.v[rm], va = state_->cpu.v[ra];
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    memcpy(a, &va, 16);
+    uint32_t out[4] = {0, 0, 0, Sm4Rol(Sm4Rol(n[3], 12) + m[3] + a[3], 7)};
+    __uint128_t vd;
+    memcpy(&vd, out, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // SM3TT: op 00=TT1A, 01=TT1B, 10=TT2A, 11=TT2B. Vd holds the working state
+  // (D,C,B,A) for TT1 / (H,G,F,E) for TT2 in lanes 0..3; Vn[3] is SS2 (TT1) or
+  // SS1 (TT2); Vm[imm2] is W'[j] (TT1) or W[j] (TT2).
+  void Sm3tt(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm2, uint8_t op) {
+    CHECK(!exception_raised_);
+    uint32_t d[4], n[4], m[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(d, &vd, 16);
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    const bool is_tt2 = (op & 0b10);
+    const bool is_b = (op & 0b01);
+    const uint32_t wj = m[imm2 & 3];
+    uint32_t out[4];
+    if (!is_tt2) {
+      uint32_t ff = is_b ? ((d[3] & d[2]) | (d[3] & d[1]) | (d[2] & d[1]))
+                         : (d[3] ^ d[2] ^ d[1]);
+      uint32_t t = ff + d[0] + n[3] + wj;
+      out[0] = d[1];
+      out[1] = Sm3Ror(d[2], 23);
+      out[2] = d[3];
+      out[3] = t;
+    } else {
+      uint32_t gg = is_b ? ((d[3] & d[2]) | (~d[3] & d[1])) : (d[3] ^ d[2] ^ d[1]);
+      uint32_t t = gg + d[0] + n[3] + wj;
+      out[0] = d[1];
+      out[1] = Sm3Ror(d[2], 13);
+      out[2] = d[3];
+      out[3] = Sm3P0(t);
+    }
+    memcpy(&vd, out, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // SM3PARTW1: Vd[i] = P1(Vd[i] ^ Vn[i] ^ rol(Vm[i+1],15)); lane 3 uses the
+  // just-written Vd[0] for the rotate term.
+  void Sm3partw1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint32_t d[4], n[4], m[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(d, &vd, 16);
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    auto p1 = [](uint32_t x) { return x ^ Sm4Rol(x, 15) ^ Sm4Rol(x, 23); };
+    uint32_t t;
+    t = d[0] ^ n[0] ^ Sm4Rol(m[1], 15); d[0] = p1(t);
+    t = d[1] ^ n[1] ^ Sm4Rol(m[2], 15); d[1] = p1(t);
+    t = d[2] ^ n[2] ^ Sm4Rol(m[3], 15); d[2] = p1(t);
+    t = d[3] ^ n[3] ^ Sm4Rol(d[0], 15); d[3] = p1(t);
+    memcpy(&vd, d, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // SM3PARTW2: Vd[i] ^= rol(Vn[i],7) ^ Vm[i].
+  void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint32_t d[4], n[4], m[4];
+    __uint128_t vd = state_->cpu.v[rd], vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(d, &vd, 16);
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    for (int i = 0; i < 4; i++) d[i] ^= Sm4Rol(n[i], 7) ^ m[i];
+    memcpy(&vd, d, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  // endregion
 
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     CHECK(!exception_raised_);

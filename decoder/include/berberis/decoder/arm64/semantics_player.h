@@ -48,6 +48,16 @@ class SemanticsPlayer {
     }
   }
 
+  // region digitalis - ADDG/SUBG (add/subtract immediate, with tags).
+  // Rn/Rd = 31 mean SP (not ZR). The listener does the address + tag-nibble
+  // arithmetic on the value; the player handles the SP read/write.
+  void AddSubImmTags(const typename Decoder::AddSubImmTagsArgs& args) {
+    Register src = GetRegOrSp(args.src);
+    Register result = listener_->AddSubImmTags(args.is_sub, src, args.uimm6, args.uimm4);
+    SetRegOrSp(args.dst, result);
+  }
+  // endregion
+
   void LogicalImm(const typename Decoder::LogicalImmArgs& args) {
     Register src = GetRegOrZero(args.src);
     Register result = listener_->LogicalImm(args.opcode, args.is_64bit, src, args.imm);
@@ -386,6 +396,12 @@ class SemanticsPlayer {
   }
   // endregion
 
+  // region digitalis - I8MM matrix multiply-accumulate (SMMLA/UMMLA/USMMLA).
+  void AdvSimdMatMul(const typename Decoder::MatMulArgs& args) {
+    listener_->AdvSimdMatMul(args);
+  }
+  // endregion
+
   // region digitalis
   void SimdModifiedImm(const typename Decoder::SimdModifiedImmArgs& args) {
     listener_->SimdModifiedImm(args);
@@ -518,6 +534,30 @@ class SemanticsPlayer {
   }
   void Xar(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
     listener_->Xar(rd, rn, rm, imm6);
+  }
+  // endregion
+
+  // region digitalis - SM4 (FEAT_SM4).
+  void Sm4e(uint8_t rd, uint8_t rn) {
+    listener_->Sm4e(rd, rn);
+  }
+  void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Sm4ekey(rd, rn, rm);
+  }
+  // endregion
+
+  // region digitalis - SM3 (FEAT_SM3).
+  void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    listener_->Sm3ss1(rd, rn, rm, ra);
+  }
+  void Sm3tt(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm2, uint8_t op) {
+    listener_->Sm3tt(rd, rn, rm, imm2, op);
+  }
+  void Sm3partw1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Sm3partw1(rd, rn, rm);
+  }
+  void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Sm3partw2(rd, rn, rm);
   }
   // endregion
 

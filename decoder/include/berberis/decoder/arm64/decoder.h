@@ -205,6 +205,12 @@ class Decoder {
     kStzg,   // store tag + zero 16-byte granule
     kSt2g,   // store double tag (32-byte granule) — NOP without MTE backing
     kStz2g,  // store double tag + zero 32-byte granule
+    // region digitalis - tag-block (granule-multiple) forms (op2=00).
+    kLdgm,   // load tag multiple into Rt — without MTE, all tags read 0
+    kStgm,   // store tag multiple — NOP without MTE backing
+    kStzgm,  // store tag multiple + zero block — tag NOP; block size is
+             // GMID_EL1-defined (not emulated), so treated as a tag NOP
+    // endregion
   };
 
   struct MteLoadStoreArgs {
@@ -411,6 +417,11 @@ class Decoder {
     kUdot,      // UDOT vector
     kSdotIdx,   // SDOT by element
     kUdotIdx,   // UDOT by element
+    // region digitalis - I8MM mixed-sign dot products (FEAT_I8MM).
+    kUsdot,     // USDOT vector  (Vn unsigned, Vm signed)
+    kUsdotIdx,  // USDOT by element
+    kSudotIdx,  // SUDOT by element (Vn signed, Vm unsigned; vector form N/A)
+    // endregion
   };
 
   struct DotProductArgs {
@@ -420,6 +431,20 @@ class Decoder {
     uint8_t rm;
     uint8_t index;  // 0..3 for indexed forms; 0 for vector forms.
     bool q;         // True selects .4s form (4 lanes); false selects .2s (2 lanes).
+  };
+  // endregion
+
+  // region digitalis - I8MM 8-bit integer matrix multiply-accumulate.
+  enum class MatMulOpcode : uint8_t {
+    kSmmla,   // signed x signed
+    kUmmla,   // unsigned x unsigned
+    kUsmmla,  // Vn unsigned, Vm signed
+  };
+  struct MatMulArgs {
+    MatMulOpcode opcode;
+    uint8_t rd;
+    uint8_t rn;
+    uint8_t rm;
   };
   // endregion
 
@@ -505,6 +530,16 @@ class Decoder {
     bool is_sub;       // true for SUB, false for ADD
     bool set_flags;    // S bit: true to set NZCV flags (ADDS/SUBS/CMP/CMN)
   };
+
+  // region digitalis - ADDG/SUBG: add/subtract immediate, with tags (FEAT_MTE).
+  struct AddSubImmTagsArgs {
+    uint8_t dst;     // Xd|SP
+    uint8_t src;     // Xn|SP
+    uint8_t uimm6;   // address offset in units of 16 bytes (offset = uimm6<<4)
+    uint8_t uimm4;   // logical tag offset applied to bits[59:56]
+    bool is_sub;     // true for SUBG, false for ADDG
+  };
+  // endregion
 
   struct LogicalImmArgs {
     LogicalImmOpcode opcode;
@@ -2061,8 +2096,9 @@ class Decoder {
         DecodeAddSubImmediate();
         break;
       case 0b011:
-        // Add/subtract (immediate, with tags) - not implemented.
-        Undefined();
+        // region digitalis - Add/subtract (immediate, with tags): ADDG/SUBG.
+        DecodeAddSubImmTags();
+        // endregion
         break;
       case 0b100:
         // Logical (immediate).
@@ -2128,6 +2164,21 @@ class Decoder {
     };
     insn_consumer_->AddSubImm(args);
   }
+
+  // region digitalis - ADDG/SUBG (add/subtract immediate, with tags).
+  // Encoding: sf=1 op S=0 100011 0 uimm6[21:16] (00) uimm4[13:10] Rn Rd.
+  void DecodeAddSubImmTags() {
+    bool is_sub = GetBits<30, 1>();
+    const AddSubImmTagsArgs args = {
+        .dst = GetBits<0, 5>(),
+        .src = GetBits<5, 5>(),
+        .uimm6 = GetBits<16, 6>(),
+        .uimm4 = GetBits<10, 4>(),
+        .is_sub = is_sub,
+    };
+    insn_consumer_->AddSubImmTags(args);
+  }
+  // endregion
 
   void DecodeLogicalImmediate() {
     bool sf = GetBits<31, 1>();
@@ -2681,7 +2732,11 @@ class Decoder {
       // Observed in libcoldstart.so sha256_block_data_order prologue
       // where bits[11:10] of imm19 = 0b11 routed the LDR literal to
       // DecodeLoadStoreImmPostPreIndex(true) → STR x16, [x2, #7]!.
-      if (op_29 == 0) {
+      // LDR/LDRSW/PRFM (literal) all have bit[24]=0; the MTE tag load/store
+      // group (LDG/STG/ST2G/STZG/STZ2G and the LDGM/STGM/STZGM tag-block forms)
+      // shares op_29=0 but has bit[24]=1. Guard the literal gate on op_24==0 so
+      // it does not shadow the MTE encodings decoded below.
+      if (op_29 == 0 && op_24 == 0) {
         DecodeLoadLiteral();
         return;
       }
@@ -2761,6 +2816,14 @@ class Decoder {
       mte_op = MteLoadStoreOpcode::kSt2g;
     } else if (opc == 0b11 && op2 != 0b00) {
       mte_op = MteLoadStoreOpcode::kStz2g;
+    // region digitalis - tag-block (granule-multiple) forms: op2=00, imm9=0.
+    } else if (opc == 0b11 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kLdgm;
+    } else if (opc == 0b10 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kStgm;
+    } else if (opc == 0b00 && op2 == 0b00) {
+      mte_op = MteLoadStoreOpcode::kStzgm;
+    // endregion
     } else {
       return Undefined();
     }
@@ -3416,6 +3479,54 @@ class Decoder {
     }
     // endregion
 
+    // region digitalis - I8MM (FEAT_I8MM): USDOT (vector) and the integer
+    // matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Same prefix as DotProd
+    // (bits[28:24]=01110, bits[23:22]=10, bit21=0, bit15=1, bit14=0, bit10=1);
+    // bits[13:11] select the op:
+    //   011 -> USDOT vector (U=0; Vn unsigned, Vm signed)
+    //   100 -> SMMLA (U=0) / UMMLA (U=1)
+    //   101 -> USMMLA (U=0; Vn unsigned, Vm signed)
+    // All are .4S (Q=1) only.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0b10 &&
+        !GetBits<21, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
+        GetBits<10, 1>()) {
+      uint8_t b13_11 = GetBits<11, 3>();  // bits[13:11]
+      bool u = GetBits<29, 1>();
+      if (b13_11 == 0b011 && !u) {  // USDOT vector
+        const DotProductArgs args = {
+            .opcode = DotProductOpcode::kUsdot,
+            .rd = GetBits<0, 5>(),
+            .rn = GetBits<5, 5>(),
+            .rm = GetBits<16, 5>(),
+            .index = 0,
+            .q = GetBits<30, 1>(),
+        };
+        insn_consumer_->AdvSimdDotProduct(args);
+        return;
+      }
+      if (b13_11 == 0b100) {  // SMMLA / UMMLA
+        const MatMulArgs args = {
+            .opcode = u ? MatMulOpcode::kUmmla : MatMulOpcode::kSmmla,
+            .rd = GetBits<0, 5>(),
+            .rn = GetBits<5, 5>(),
+            .rm = GetBits<16, 5>(),
+        };
+        insn_consumer_->AdvSimdMatMul(args);
+        return;
+      }
+      if (b13_11 == 0b101 && !u) {  // USMMLA
+        const MatMulArgs args = {
+            .opcode = MatMulOpcode::kUsmmla,
+            .rd = GetBits<0, 5>(),
+            .rn = GetBits<5, 5>(),
+            .rm = GetBits<16, 5>(),
+        };
+        insn_consumer_->AdvSimdMatMul(args);
+        return;
+      }
+    }
+    // endregion
+
     // region digitalis
     // AdvSIMD Armv8.1-RDM three-same vector: SQRDMLAH / SQRDMLSH (NOT the
     // by-element form — that's already wired through AdvSimdVecXIdxOpcode).
@@ -3662,6 +3773,62 @@ class Decoder {
                             GetBits<5, 5>(),    // rn
                             GetBits<16, 5>(),   // rm
                             GetBits<10, 6>());  // imm6
+        return;
+      }
+    }
+    // endregion
+
+    // region digitalis - SM4 (FEAT_SM4): SM4E (2-register) and SM4EKEY
+    // (3-register). Same bit31=1, bits[30:24]=1001110 crypto prefix as
+    // SHA512/SHA3; distinguished by bits[23:21] and the low opcode bits.
+    //   SM4EKEY Vd,Vn,Vm : bits[23:21]=011, bits[15:12]=1100, bits[11:10]=10.
+    //   SM4E    Vd,Vn    : bits[23:21]=110, Rm=00000, bits[15:10]=100001.
+    if (bit31 && GetBits<24, 7>() == 0b1001110) {
+      uint8_t sm_b23_21 = GetBits<21, 3>();
+      // SM3SS1 (4-register) / SM3TT1A/1B/2A/2B (3-register, by-lane).
+      //   bits[23:21]=010, bit15=0 -> SM3SS1 (Ra = bits[14:10]).
+      //   bits[23:21]=010, bit15=1 -> SM3TT*, imm2=bits[13:12], op=bits[11:10]
+      //     (00=TT1A, 01=TT1B, 10=TT2A, 11=TT2B).
+      if (sm_b23_21 == 0b010) {
+        if (!GetBits<15, 1>()) {
+          insn_consumer_->Sm3ss1(GetBits<0, 5>(),    // rd
+                                 GetBits<5, 5>(),     // rn
+                                 GetBits<16, 5>(),    // rm
+                                 GetBits<10, 5>());   // ra
+        } else {
+          insn_consumer_->Sm3tt(GetBits<0, 5>(),    // rd
+                                GetBits<5, 5>(),     // rn
+                                GetBits<16, 5>(),    // rm
+                                GetBits<12, 2>(),    // imm2
+                                GetBits<10, 2>());   // op: 00/01/10/11
+        }
+        return;
+      }
+      // bits[23:21]=011, bits[15:12]=1100: SM3PARTW1 (bits[11:10]=00),
+      // SM3PARTW2 (01), SM4EKEY (10).
+      if (sm_b23_21 == 0b011 && GetBits<12, 4>() == 0b1100) {
+        uint8_t sub = GetBits<10, 2>();
+        if (sub == 0b00) {
+          insn_consumer_->Sm3partw1(GetBits<0, 5>(), GetBits<5, 5>(),
+                                    GetBits<16, 5>());
+          return;
+        }
+        if (sub == 0b01) {
+          insn_consumer_->Sm3partw2(GetBits<0, 5>(), GetBits<5, 5>(),
+                                    GetBits<16, 5>());
+          return;
+        }
+        if (sub == 0b10) {
+          insn_consumer_->Sm4ekey(GetBits<0, 5>(),   // rd
+                                  GetBits<5, 5>(),    // rn
+                                  GetBits<16, 5>());  // rm
+          return;
+        }
+      }
+      if (sm_b23_21 == 0b110 && GetBits<16, 5>() == 0 &&
+          GetBits<10, 6>() == 0b100001) {
+        insn_consumer_->Sm4e(GetBits<0, 5>(),   // rd
+                             GetBits<5, 5>());  // rn
         return;
       }
     }
