@@ -99,6 +99,21 @@ class Interpreter {
     return result;
   }
 
+  // region digitalis - ADDG/SUBG (FEAT_MTE). The address part is Xn +/- the
+  // 16-byte-scaled offset; bits[59:56] are then replaced by the logical tag
+  // (start tag +/- uimm4, mod 16). Digitalis does not enforce MTE, so tag
+  // exclusion (GCR_EL1) is ignored — the tag nibble is updated arithmetically,
+  // keeping tagged-pointer math consistent under top-byte-ignore.
+  Register AddSubImmTags(bool is_sub, Register src, uint8_t uimm6, uint8_t uimm4) {
+    uint64_t offset = static_cast<uint64_t>(uimm6) << 4;
+    uint64_t addr = is_sub ? (src - offset) : (src + offset);
+    uint8_t start_tag = static_cast<uint8_t>((src >> 56) & 0xF);
+    uint8_t new_tag = static_cast<uint8_t>(
+        (is_sub ? (start_tag - uimm4) : (start_tag + uimm4)) & 0xF);
+    return (addr & ~(0xFULL << 56)) | (static_cast<uint64_t>(new_tag) << 56);
+  }
+  // endregion
+
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
                       Register src, uint64_t imm) {
     CHECK(!exception_raised_);

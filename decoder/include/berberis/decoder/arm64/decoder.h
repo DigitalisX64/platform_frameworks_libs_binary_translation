@@ -506,6 +506,16 @@ class Decoder {
     bool set_flags;    // S bit: true to set NZCV flags (ADDS/SUBS/CMP/CMN)
   };
 
+  // region digitalis - ADDG/SUBG: add/subtract immediate, with tags (FEAT_MTE).
+  struct AddSubImmTagsArgs {
+    uint8_t dst;     // Xd|SP
+    uint8_t src;     // Xn|SP
+    uint8_t uimm6;   // address offset in units of 16 bytes (offset = uimm6<<4)
+    uint8_t uimm4;   // logical tag offset applied to bits[59:56]
+    bool is_sub;     // true for SUBG, false for ADDG
+  };
+  // endregion
+
   struct LogicalImmArgs {
     LogicalImmOpcode opcode;
     uint8_t dst;
@@ -2061,8 +2071,9 @@ class Decoder {
         DecodeAddSubImmediate();
         break;
       case 0b011:
-        // Add/subtract (immediate, with tags) - not implemented.
-        Undefined();
+        // region digitalis - Add/subtract (immediate, with tags): ADDG/SUBG.
+        DecodeAddSubImmTags();
+        // endregion
         break;
       case 0b100:
         // Logical (immediate).
@@ -2128,6 +2139,21 @@ class Decoder {
     };
     insn_consumer_->AddSubImm(args);
   }
+
+  // region digitalis - ADDG/SUBG (add/subtract immediate, with tags).
+  // Encoding: sf=1 op S=0 100011 0 uimm6[21:16] (00) uimm4[13:10] Rn Rd.
+  void DecodeAddSubImmTags() {
+    bool is_sub = GetBits<30, 1>();
+    const AddSubImmTagsArgs args = {
+        .dst = GetBits<0, 5>(),
+        .src = GetBits<5, 5>(),
+        .uimm6 = GetBits<16, 6>(),
+        .uimm4 = GetBits<10, 4>(),
+        .is_sub = is_sub,
+    };
+    insn_consumer_->AddSubImmTags(args);
+  }
+  // endregion
 
   void DecodeLogicalImmediate() {
     bool sf = GetBits<31, 1>();

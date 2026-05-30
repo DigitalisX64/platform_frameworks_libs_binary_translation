@@ -209,6 +209,18 @@ class LiteTranslator {
     return res;
   }
 
+  // region digitalis - ADDG/SUBG (MTE tag arithmetic). Rare; handled by the
+  // interpreter. End the region before this instruction (success_=false); the
+  // returned register is discarded along with the un-installed region.
+  Register AddSubImmTags(bool is_sub, Register src, uint8_t uimm6, uint8_t uimm4) {
+    UNUSED(is_sub);
+    UNUSED(uimm6);
+    UNUSED(uimm4);
+    success_ = false;
+    return src;
+  }
+  // endregion
+
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
                       Register src, uint64_t imm) {
     Register res = AllocTempReg();

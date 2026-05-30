@@ -12157,6 +12157,21 @@ TEST_F(Arm64LiteTranslateRegionTest, Frint64zVector2D) {
 }
 // endregion
 
+// region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
+// the address and adjust the logical tag in bits[59:56]. Interpreter-only.
+TEST_F(Arm64LiteTranslateRegionTest, AddgSubgTagArithmetic) {
+  state_.cpu.x[1] = 0x0500000000001000ULL;  // tag 5, address 0x1000
+  static const uint32_t addg[] = {0x91810820u};  // addg x0, x1, #16, #2
+  state_.cpu.insn_addr = ToGuestAddr(addg);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.x[0], 0x0700000000001010ULL);  // tag (5+2)=7, addr 0x1010
+  static const uint32_t subg[] = {0xD1820C20u};  // subg x0, x1, #32, #3
+  state_.cpu.insn_addr = ToGuestAddr(subg);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.x[0], 0x0200000000000FE0ULL);  // tag (5-3)=2, addr 0xFE0
+}
+// endregion
+
 // region digitalis - RNDR (FEAT_RNG): MRS Xt, RNDR returns entropy and clears
 // NZCV (success). Interpreter-only. Two draws differ; flags end cleared.
 TEST_F(Arm64LiteTranslateRegionTest, RndrReturnsEntropyAndClearsFlags) {

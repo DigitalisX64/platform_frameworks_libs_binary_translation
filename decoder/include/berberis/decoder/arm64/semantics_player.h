@@ -48,6 +48,16 @@ class SemanticsPlayer {
     }
   }
 
+  // region digitalis - ADDG/SUBG (add/subtract immediate, with tags).
+  // Rn/Rd = 31 mean SP (not ZR). The listener does the address + tag-nibble
+  // arithmetic on the value; the player handles the SP read/write.
+  void AddSubImmTags(const typename Decoder::AddSubImmTagsArgs& args) {
+    Register src = GetRegOrSp(args.src);
+    Register result = listener_->AddSubImmTags(args.is_sub, src, args.uimm6, args.uimm4);
+    SetRegOrSp(args.dst, result);
+  }
+  // endregion
+
   void LogicalImm(const typename Decoder::LogicalImmArgs& args) {
     Register src = GetRegOrZero(args.src);
     Register result = listener_->LogicalImm(args.opcode, args.is_64bit, src, args.imm);
