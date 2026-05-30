@@ -1353,6 +1353,8 @@ class Decoder {
     kFcvtpuV,   // FCVTPU: U=1, opcode=11010, bit23=1
     kFcvtasV,   // FCVTAS (vector, round-to-nearest ties-away): U=0, opcode=11100, bit23=0
     kFcvtauV,   // FCVTAU: U=1, opcode=11100, bit23=0
+    kUrecpe,    // URECPE  (vector, unsigned integer reciprocal estimate): U=0, opcode=11100, bit23=1, sz=0
+    kUrsqrte,   // URSQRTE (vector, unsigned integer reciprocal sqrt estimate): U=1, opcode=11100, bit23=1, sz=0
     // endregion
     // region digitalis BFCVTN/BFCVTN2 (Armv8.6-BF16).
     // Vector narrow FP32 -> BF16. Encoding shares opcode=10110 with FCVTN,
@@ -5527,12 +5529,21 @@ class Decoder {
         }
         break;
       // endregion
-      // region digitalis - vector FCVTAS/AU (round-to-nearest ties-away).
-      // Encoding: opcode=11100, bit23=0. bit23=1 is unallocated.
+      // region digitalis - opcode=11100 splits on bit23 ("a"):
+      //   bit23=0: FCVTAS (U=0) / FCVTAU (U=1) — FP convert round-to-nearest
+      //            ties-away.
+      //   bit23=1, sz(bit22)=0: URECPE (U=0) / URSQRTE (U=1) — unsigned integer
+      //            reciprocal / reciprocal-sqrt estimate (.2S/.4S only).
+      // bit23=1 with sz=1 is unallocated.
       case 0b11100:
-        if (GetBits<23, 1>()) { Undefined(); return; }
-        op = u ? AdvSimdTwoRegMiscOpcode::kFcvtauV
-               : AdvSimdTwoRegMiscOpcode::kFcvtasV;
+        if (GetBits<23, 1>()) {
+          if (GetBits<22, 1>()) { Undefined(); return; }  // sz=1 unallocated
+          op = u ? AdvSimdTwoRegMiscOpcode::kUrsqrte
+                 : AdvSimdTwoRegMiscOpcode::kUrecpe;
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFcvtauV
+                 : AdvSimdTwoRegMiscOpcode::kFcvtasV;
+        }
         break;
       // endregion
       // region digitalis: std FP32/FP64 FRINT* round-to-int.

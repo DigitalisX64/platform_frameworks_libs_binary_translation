@@ -7485,6 +7485,58 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis - URECPE / URSQRTE: unsigned integer reciprocal and
+      // reciprocal-square-root estimate (.2S/.4S). These are fixed-point
+      // estimates defined by the ARM ARM UnsignedRecipEstimate /
+      // UnsignedRSqrtEstimate pseudocode; the integer recurrences below are
+      // the bit-exact equivalents (matching the architectural estimate tables).
+      // An out-of-range input (top bit clear for URECPE, top two bits clear for
+      // URSQRTE) yields the saturated 0xFFFFFFFF estimate.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUrecpe:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUrsqrte: {
+        if (esize != 4) { Undefined(); return; }  // 32-bit lanes only
+        const bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUrsqrte);
+        for (uint8_t i = 0; i < num_elements; i++) {
+          uint32_t a = 0;
+          memcpy(&a, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+          uint32_t r;
+          if (!is_rsqrt) {
+            if ((a & 0x80000000u) == 0) {
+              r = 0xFFFFFFFFu;
+            } else {
+              int input = static_cast<int>((a >> 23) & 0x1FF);  // [256,511]
+              int a2 = input * 2 + 1;
+              int b = (1 << 19) / a2;
+              int estimate = (b + 1) / 2;  // [256,511]
+              r = static_cast<uint32_t>(estimate) << 23;
+            }
+          } else {
+            if ((a & 0xC0000000u) == 0) {
+              r = 0xFFFFFFFFu;
+            } else {
+              int input = static_cast<int>((a >> 23) & 0x1FF);  // [128,511]
+              int aa;
+              if (input < 256) {
+                aa = input * 2 + 1;
+              } else {
+                aa = (input >> 1) << 1;
+                aa = (aa + 1) * 2;
+              }
+              int b = 512;
+              while (static_cast<int64_t>(aa) * (b + 1) * (b + 1) < (1 << 28)) {
+                b += 1;
+              }
+              int estimate = (b + 1) / 2;  // [256,511]
+              r = static_cast<uint32_t>(estimate) << 23;
+            }
+          }
+          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+        }
+        break;
+      }
+      // endregion
+
       // region digitalis - SADDLV/UADDLV: add-long across vector. Sum all
       // lanes of Vn into a single 2x-width scalar result written to bottom
       // of Vd; upper bits cleared. Observed as `uaddlv h0, v0.8b` (insn
