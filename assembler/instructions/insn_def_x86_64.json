@@ -17,6 +17,16 @@
   "arch": "x86_64",
   "insns": [
     {
+      "comment": "CRC32C (Castagnoli) — accumulator in r64, data in r/m64 (REX.W).",
+      "encodings": {
+        "Crc32cx": { "feature": "SSE4_2", "opcodes": [ "F2", "0F", "38", "F1" ] }
+      },
+      "args": [
+        { "class": "GeneralReg64", "usage": "use_def" },
+        { "class": "GeneralReg64/Mem64", "usage": "use" }
+      ]
+    },
+    {
       "encodings": {
         "Adcq": { "opcode": "13" },
         "Sbbq": { "opcode": "1B" }

@@ -12179,6 +12179,38 @@ TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
 }
 // endregion
 
+// region digitalis - CRC32C* (Castagnoli) JIT via host SSE4.2 CRC32. Validate
+// the JIT against the interpreter (the validated software CRC32C), which also
+// verifies the newly-added host crc32 assembler encoding end-to-end.
+TEST_F(Arm64LiteTranslateRegionTest, Crc32cMatchesInterpreter) {
+  struct Case { uint32_t insn; uint64_t acc; uint64_t data; };
+  const Case cases[] = {
+      {0x1AC25020u, 0x00000000u, 0x000000ABu},        // CRC32CB
+      {0x1AC25020u, 0xFFFFFFFFu, 0x0000007Fu},        // CRC32CB
+      {0x1AC25420u, 0x12345678u, 0x0000BEEFu},        // CRC32CH
+      {0x1AC25820u, 0xDEADBEEFu, 0xCAFEBABEu},        // CRC32CW
+      {0x1AC25820u, 0x00000000u, 0xFFFFFFFFu},        // CRC32CW
+      {0x9AC25C20u, 0x89ABCDEFu, 0x0123456789ABCDEFu},// CRC32CX
+  };
+  for (const Case& c : cases) {
+    const uint32_t code[1] = {c.insn};
+    state_.cpu.x[1] = c.acc;
+    state_.cpu.x[2] = c.data;
+    state_.cpu.x[0] = 0;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    uint32_t jit = static_cast<uint32_t>(state_.cpu.x[0]);
+    state_.cpu.x[1] = c.acc;
+    state_.cpu.x[2] = c.data;
+    state_.cpu.x[0] = 0;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    uint32_t interp = static_cast<uint32_t>(state_.cpu.x[0]);
+    EXPECT_EQ(jit, interp) << "CRC32C insn=0x" << std::hex << c.insn
+                           << " acc=0x" << c.acc << " data=0x" << c.data;
+  }
+}
+// endregion
+
 // region digitalis - SHLL/SHLL2 (shift left long by element size) JIT.
 constexpr uint32_t Shll8h(uint8_t rd, uint8_t rn) { return 0x2E213800u | (rn << 5) | rd; }
 constexpr uint32_t Shll2_8h(uint8_t rd, uint8_t rn) { return 0x6E213800u | (rn << 5) | rd; }

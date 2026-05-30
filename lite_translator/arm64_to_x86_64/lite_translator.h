@@ -1409,6 +1409,27 @@ class LiteTranslator {
         // endregion
         break;
       }
+      // region digitalis - CRC32C* (Castagnoli) via the host SSE4.2 CRC32
+      // instruction, which uses the same polynomial as ARM's CRC32C ops.
+      // The accumulator is Wn (zero-extended), the data is Wm (b/h/w) or Xm
+      // (x). The IEEE CRC32* ops use a different polynomial and stay on the
+      // interpreter (they fall through to the default below). Bail if the
+      // host lacks SSE4.2.
+      case Decoder::DataProc2SrcOpcode::kCrc32cb:
+      case Decoder::DataProc2SrcOpcode::kCrc32ch:
+      case Decoder::DataProc2SrcOpcode::kCrc32cw:
+      case Decoder::DataProc2SrcOpcode::kCrc32cx: {
+        if (!host_platform::kHasSSE4_2) { success_ = false; return no_register; }
+        as_.Movl(res, src1);  // 32-bit CRC accumulator (Wn), zero-extended
+        switch (opcode) {
+          case Decoder::DataProc2SrcOpcode::kCrc32cb: as_.Crc32cb(res, src2); break;
+          case Decoder::DataProc2SrcOpcode::kCrc32ch: as_.Crc32ch(res, src2); break;
+          case Decoder::DataProc2SrcOpcode::kCrc32cw: as_.Crc32cw(res, src2); break;
+          default:                                    as_.Crc32cx(res, src2); break;
+        }
+        break;
+      }
+      // endregion
       default:
         Undefined();
         return no_register;
