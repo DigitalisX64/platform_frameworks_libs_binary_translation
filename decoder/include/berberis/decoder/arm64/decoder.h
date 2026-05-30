@@ -3573,6 +3573,13 @@ class Decoder {
       uint8_t bits23_21 = GetBits<21, 3>();
       uint8_t opcode2 = GetBits<10, 2>();   // bits[11:10]
       if (bits23_21 == 0b011) {
+        // RAX1 (FEAT_SHA3) shares this three-register prefix at opcode2=11.
+        if (opcode2 == 0b11) {
+          insn_consumer_->Rax1(GetBits<0, 5>(),   // rd
+                               GetBits<5, 5>(),    // rn
+                               GetBits<16, 5>());  // rm
+          return;
+        }
         Sha512Op op;
         switch (opcode2) {
           case 0b00: op = Sha512Op::kSha512h; break;
@@ -3591,6 +3598,36 @@ class Decoder {
                                GetBits<0, 5>(),   // rd
                                GetBits<5, 5>(),   // rn
                                0);                // rm unused
+        return;
+      }
+    }
+    // endregion
+
+    // region digitalis
+    // SHA3 (FEAT_SHA3): EOR3 / BCAX (four-register), XAR.  RAX1 is decoded
+    // in the SHA512 three-register block above (opcode2=11).
+    //   EOR3 Vd.16B,Vn,Vm,Va = 0xCE00.. (bits[23:21]=000, bit15=0)
+    //   BCAX Vd.16B,Vn,Vm,Va = 0xCE20.. (bits[23:21]=001, bit15=0)
+    //   XAR  Vd.2D,Vn,Vm,#imm6 = 0xCE80.. (bits[23:21]=100, imm6=bits[15:10])
+    if (bit31 && GetBits<24, 7>() == 0b1001110) {
+      uint8_t op23_21 = GetBits<21, 3>();
+      if ((op23_21 == 0b000 || op23_21 == 0b001) && !GetBits<15, 1>()) {
+        uint8_t rd = GetBits<0, 5>();
+        uint8_t rn = GetBits<5, 5>();
+        uint8_t ra = GetBits<10, 5>();
+        uint8_t rm = GetBits<16, 5>();
+        if (op23_21 == 0b000) {
+          insn_consumer_->Eor3(rd, rn, rm, ra);
+        } else {
+          insn_consumer_->Bcax(rd, rn, rm, ra);
+        }
+        return;
+      }
+      if (op23_21 == 0b100) {
+        insn_consumer_->Xar(GetBits<0, 5>(),   // rd
+                            GetBits<5, 5>(),    // rn
+                            GetBits<16, 5>(),   // rm
+                            GetBits<10, 6>());  // imm6
         return;
       }
     }

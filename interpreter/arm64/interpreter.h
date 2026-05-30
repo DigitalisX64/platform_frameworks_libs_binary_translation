@@ -2232,6 +2232,50 @@ class Interpreter {
   // region digitalis - SHA-512 (FEAT_SHA512). Each op operates on .2D vectors.
   // The references below match ARM ARM C7.2.85/86/87/88 pseudocode exactly,
   // double-checked against FIPS-180-4 section 4.1.3 (SHA-512 round functions).
+  // SHA3 (FEAT_SHA3).
+  //   EOR3 Vd = Vn ^ Vm ^ Va   (full 128-bit)
+  //   BCAX Vd = Vn ^ (Vm & ~Va)
+  //   RAX1 Vd[i] = Vn[i] ^ ROL(Vm[i], 1)   per 64-bit lane
+  //   XAR  Vd[i] = ROR(Vn[i] ^ Vm[i], imm6) per 64-bit lane
+  void Eor3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    CHECK(!exception_raised_);
+    state_->cpu.v[rd] =
+        state_->cpu.v[rn] ^ state_->cpu.v[rm] ^ state_->cpu.v[ra];
+  }
+  void Bcax(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+    CHECK(!exception_raised_);
+    state_->cpu.v[rd] =
+        state_->cpu.v[rn] ^ (state_->cpu.v[rm] & ~state_->cpu.v[ra]);
+  }
+  void Rax1(uint8_t rd, uint8_t rn, uint8_t rm) {
+    CHECK(!exception_raised_);
+    uint64_t n[2], m[2], out[2];
+    __uint128_t vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    for (int i = 0; i < 2; i++) {
+      uint64_t rol1 = (m[i] << 1) | (m[i] >> 63);
+      out[i] = n[i] ^ rol1;
+    }
+    __uint128_t vd;
+    memcpy(&vd, out, 16);
+    state_->cpu.v[rd] = vd;
+  }
+  void Xar(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
+    CHECK(!exception_raised_);
+    uint64_t n[2], m[2], out[2];
+    __uint128_t vn = state_->cpu.v[rn], vm = state_->cpu.v[rm];
+    memcpy(n, &vn, 16);
+    memcpy(m, &vm, 16);
+    for (int i = 0; i < 2; i++) {
+      uint64_t x = n[i] ^ m[i];
+      out[i] = imm6 ? ((x >> imm6) | (x << (64u - imm6))) : x;
+    }
+    __uint128_t vd;
+    memcpy(&vd, out, 16);
+    state_->cpu.v[rd] = vd;
+  }
+
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     CHECK(!exception_raised_);
     auto ror64 = [](uint64_t x, unsigned n) -> uint64_t {

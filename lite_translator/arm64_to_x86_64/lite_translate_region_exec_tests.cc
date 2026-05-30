@@ -11485,6 +11485,93 @@ TEST_F(Arm64LiteTranslateRegionTest, MulVsMlaIdxDispatch) {
 }
 // endregion
 
+// region digitalis - SHA3 (FEAT_SHA3): EOR3 / BCAX / RAX1 / XAR — interpreter.
+// Encodings verified via clang -march=armv8.2-a+sha3:
+//   EOR3 = 0xCE000000 | rm<<16 | ra<<10 | rn<<5 | rd
+//   BCAX = 0xCE200000 | rm<<16 | ra<<10 | rn<<5 | rd
+//   RAX1 = 0xCE608C00 | rm<<16 | rn<<5 | rd
+//   XAR  = 0xCE800000 | rm<<16 | imm6<<10 | rn<<5 | rd
+constexpr uint32_t Eor3Enc(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0xCE000000u | (uint32_t{rm} << 16) | (uint32_t{ra} << 10) |
+         (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t BcaxEnc(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0xCE200000u | (uint32_t{rm} << 16) | (uint32_t{ra} << 10) |
+         (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Rax1Enc(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xCE608C00u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t XarEnc(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
+  return 0xCE800000u | (uint32_t{rm} << 16) | (uint32_t{imm6} << 10) |
+         (uint32_t{rn} << 5) | rd;
+}
+static void SetV128(CPUState& cpu, unsigned idx, uint64_t lo, uint64_t hi) {
+  uint64_t lanes[2] = {lo, hi};
+  std::memcpy(&cpu.v[idx], lanes, 16);
+}
+static void GetV128(const CPUState& cpu, unsigned idx, uint64_t out[2]) {
+  std::memcpy(out, &cpu.v[idx], 16);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Eor3FullXor) {
+  SetV128(state_.cpu, 1, 0x1111111111111111ULL, 0xAAAAAAAAAAAAAAAAULL);
+  SetV128(state_.cpu, 2, 0x2222222222222222ULL, 0x5555555555555555ULL);
+  SetV128(state_.cpu, 3, 0x4444444444444444ULL, 0x0F0F0F0F0F0F0F0FULL);
+  static const uint32_t code[] = {Eor3Enc(0, 1, 2, 3)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x1111111111111111ULL ^ 0x2222222222222222ULL ^
+                      0x4444444444444444ULL);
+  EXPECT_EQ(r[1], 0xAAAAAAAAAAAAAAAAULL ^ 0x5555555555555555ULL ^
+                      0x0F0F0F0F0F0F0F0FULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, BcaxBitClearXor) {
+  SetV128(state_.cpu, 1, 0xFFFF0000FFFF0000ULL, 0x00FF00FF00FF00FFULL);  // Vn
+  SetV128(state_.cpu, 2, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);  // Vm
+  SetV128(state_.cpu, 3, 0x0F0F0F0F0F0F0F0FULL, 0xAAAAAAAAAAAAAAAAULL);  // Va
+  static const uint32_t code[] = {BcaxEnc(0, 1, 2, 3)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFF0000FFFF0000ULL ^
+                      (0xFFFFFFFFFFFFFFFFULL & ~0x0F0F0F0F0F0F0F0FULL));
+  EXPECT_EQ(r[1], 0x00FF00FF00FF00FFULL ^
+                      (0xFFFFFFFFFFFFFFFFULL & ~0xAAAAAAAAAAAAAAAAULL));
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Rax1RotXorPerLane) {
+  SetV128(state_.cpu, 1, 0x0000000000000001ULL, 0xF000000000000000ULL);  // Vn
+  SetV128(state_.cpu, 2, 0x8000000000000000ULL, 0x0000000000000001ULL);  // Vm
+  static const uint32_t code[] = {Rax1Enc(0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  // lane0: ROL(0x8000...,1)=1, 1^1=0.  lane1: ROL(1,1)=2, 0xF000...^2.
+  EXPECT_EQ(r[0], 0ULL);
+  EXPECT_EQ(r[1], 0xF000000000000002ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, XarRotRightPerLane) {
+  SetV128(state_.cpu, 1, 0x00000000000000FFULL, 0x0ULL);  // Vn
+  SetV128(state_.cpu, 2, 0x0F00000000000000ULL, 0x0ULL);  // Vm
+  static const uint32_t code[] = {XarEnc(0, 1, 2, 4)};    // imm6=4
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  uint64_t x0 = 0x00000000000000FFULL ^ 0x0F00000000000000ULL;
+  EXPECT_EQ(r[0], (x0 >> 4) | (x0 << 60));
+  EXPECT_EQ(r[1], 0ULL);
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to
