@@ -12179,6 +12179,43 @@ TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
 }
 // endregion
 
+// region digitalis - SHLL/SHLL2 (shift left long by element size) JIT.
+constexpr uint32_t Shll8h(uint8_t rd, uint8_t rn) { return 0x2E213800u | (rn << 5) | rd; }
+constexpr uint32_t Shll2_8h(uint8_t rd, uint8_t rn) { return 0x6E213800u | (rn << 5) | rd; }
+constexpr uint32_t Shll4s(uint8_t rd, uint8_t rn) { return 0x2E613800u | (rn << 5) | rd; }
+constexpr uint32_t Shll2d(uint8_t rd, uint8_t rn) { return 0x2EA13800u | (rn << 5) | rd; }
+TEST_F(Arm64LiteTranslateRegionTest, ShllVariants) {
+  uint64_t r[2];
+  // SHLL .8H: each of 8 low bytes -> byte<<8.
+  SetV128(state_.cpu, 1, 0x0807060504030201ULL, 0x100F0E0D0C0B0A09ULL);
+  static const uint32_t c0[] = {Shll8h(0, 1)};
+  EXPECT_TRUE(Run(c0, ToGuestAddr(c0) + sizeof(c0)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0400030002000100ULL);
+  EXPECT_EQ(r[1], 0x0800070006000500ULL);
+  // SHLL2 .8H: high 8 bytes.
+  static const uint32_t c1[] = {Shll2_8h(0, 1)};
+  EXPECT_TRUE(Run(c1, ToGuestAddr(c1) + sizeof(c1)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0C000B000A000900ULL);
+  EXPECT_EQ(r[1], 0x10000F000E000D00ULL);
+  // SHLL .4S: each of 4 low halfwords -> hw<<16.
+  SetV128(state_.cpu, 1, 0x0004000300020001ULL, 0ULL);
+  static const uint32_t c2[] = {Shll4s(0, 1)};
+  EXPECT_TRUE(Run(c2, ToGuestAddr(c2) + sizeof(c2)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0002000000010000ULL);
+  EXPECT_EQ(r[1], 0x0004000000030000ULL);
+  // SHLL .2D: each of 2 low words -> word<<32.
+  SetV128(state_.cpu, 1, 0x0000000200000001ULL, 0ULL);
+  static const uint32_t c3[] = {Shll2d(0, 1)};
+  EXPECT_TRUE(Run(c3, ToGuestAddr(c3) + sizeof(c3)));
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000100000000ULL);
+  EXPECT_EQ(r[1], 0x0000000200000000ULL);
+}
+// endregion
+
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
 // and outputs are validated against the SM3 round/expansion (the full sequence
 // reproduces the published SM3("abc") digest). Interpreter-only.

@@ -13611,6 +13611,28 @@ class LiteTranslator {
         return;
       }
 
+      // region digitalis - SHLL/SHLL2 (shift left long by element size). Each
+      // source element is zero-extended to twice its width and shifted left by
+      // the source element-size in bits (so the source lands in the high half).
+      // size=00 .8B->.8H, 01 .4H->.4S, 10 .2S->.2D. Q=0 (SHLL) reads the low 8
+      // source bytes, Q=1 (SHLL2) the high 8 (PSRLDQ first). Lowered as
+      // PMOVZX widen + PSLL by 8/16/32.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kShll: {
+        if (args.size > 0b10) { success_ = false; return; }
+        SimdRegister xn = AllocTempSimdReg();
+        if (xn == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        if (args.q) as_.Psrldq(xn, int8_t{8});  // SHLL2: bring high 8 bytes low
+        switch (args.size) {
+          case 0b00: as_.Pmovzxbw(xn, xn); as_.Psllw(xn, int8_t{8}); break;
+          case 0b01: as_.Pmovzxwd(xn, xn); as_.Pslld(xn, int8_t{16}); break;
+          default:   as_.Pmovzxdq(xn, xn); as_.Psllq(xn, int8_t{32}); break;  // 0b10
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+      // endregion
+
       // region digitalis - XTN / XTN2 (truncating extract narrow). args.size
       // selects the destination element width (00=.8B, 01=.4H, 10=.2S); each
       // source lane is twice as wide.  Q=0 writes the packed result to the low
