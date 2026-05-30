@@ -11971,6 +11971,37 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqdmull4sWithSaturation) {
   EXPECT_EQ(r[0], 0x0000003C00000018ULL);  // [24, 60]
   EXPECT_EQ(r[1], 0x0000001C7FFFFFFFULL);  // [SAT, 28]
 }
+// SQDMLAL/SQDMLSL .4S: Vd.4S +/-= SAT(2*Vn.4H*Vm.4H), 32-bit saturating accum.
+constexpr uint32_t Sqdmlal4s(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E609000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Sqdmlsl4s(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E60B000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+// Products P = [24, 60, INT32_MAX(sat), 28]; accumulator chosen so lane2/lane3
+// drive positive and negative 32-bit accumulate saturation.
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlal4sSaturatingAccum) {
+  SetV128(state_.cpu, 0, 0xFFFFFFCE00000064ULL, 0x8000000800000064ULL);
+  SetV128(state_.cpu, 1, 0x0007800000050003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x0002800000060004ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlal4s(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0000000A0000007CULL);
+  EXPECT_EQ(r[1], 0x800000247FFFFFFFULL);  // lane2 sat +, lane3 in-range
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqdmlsl4sSaturatingAccum) {
+  SetV128(state_.cpu, 0, 0xFFFFFFCE00000064ULL, 0x8000000800000064ULL);
+  SetV128(state_.cpu, 1, 0x0007800000050003ULL, 0ULL);
+  SetV128(state_.cpu, 2, 0x0002800000060004ULL, 0ULL);
+  static const uint32_t code[] = {Sqdmlsl4s(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xFFFFFF920000004CULL);
+  EXPECT_EQ(r[1], 0x8000000080000065ULL);  // lane3 sat -
+}
 // endregion
 
 // region digitalis - SUQADD / USQADD (saturating accumulate, mixed sign) JIT.

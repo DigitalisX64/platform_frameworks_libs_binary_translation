@@ -10729,16 +10729,20 @@ class LiteTranslator {
     // .4H->.4S form (size=01) is JIT-lowered: PMOVSXWD + PMULLD give exact
     // 32-bit products, and the doubling overflows only at the INT16_MIN^2
     // case (product == 0x40000000 -> SMAX), handled with a PCMPEQD blend.
-    // The .2S->.2D form (size=10) and the accumulating SQDMLAL/SQDMLSL
-    // (which need a second saturating add) bail to the interpreter.
+    // SQDMLAL/SQDMLSL add a second 32-bit signed *saturating* accumulate of
+    // that product into Vd; x86 has no 32-bit saturating add, so it is
+    // synthesised from PADDD/PSUBD + overflow detection (the carry into the
+    // sign bit) and a PSRAD-built saturation constant.  The .2S->.2D form
+    // (size=10) bails to the interpreter.
     if (args.opcode == Op::kSqdmull || args.opcode == Op::kSqdmlal ||
         args.opcode == Op::kSqdmlsl) {
       const bool is_acc = (args.opcode != Op::kSqdmull);
+      const bool is_sub = (args.opcode == Op::kSqdmlsl);
       const int32_t vn_o = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
       const int32_t vm_o = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
       const int32_t vd_o = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
       const int32_t extra = args.q ? 8 : 0;
-      if (args.size == 0b01 && !is_acc) {  // SQDMULL .4S (manual 32-bit sat)
+      if (args.size == 0b01) {  // .4S form (manual 32-bit saturation)
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
         SimdRegister xmask = AllocTempSimdReg();
@@ -10762,11 +10766,48 @@ class LiteTranslator {
         as_.Punpcklqdq(xsat, xsat);
         as_.Pand(xsat, xmask);   // SMAX in saturating lanes
         as_.Pandn(xmask, xn);    // ~mask & doubled (non-saturating lanes)
-        as_.Por(xmask, xsat);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xmask);
+        as_.Por(xmask, xsat);    // xmask = doubled saturated product P
+        if (!is_acc) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xmask);
+          return;
+        }
+        // result = SignedSat32(a +/- P) where a = Vd.4S accumulator, P=xmask.
+        SimdRegister xd = xn;    // reuse: a (accumulator)
+        SimdRegister xres = xm;  // reuse: result of the (non-saturating) op
+        SimdRegister xof = xsat; // reuse: overflow sign-bit mask
+        SimdRegister xtmp = AllocTempSimdReg();
+        if (xtmp == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+        if (is_sub) {
+          as_.Movdqa(xres, xd);
+          as_.Psubd(xres, xmask);     // diff = a - P
+          as_.Movdqa(xof, xd);
+          as_.Pxor(xof, xmask);       // a ^ P
+          as_.Movdqa(xtmp, xd);
+          as_.Pxor(xtmp, xres);       // a ^ diff
+          as_.Pand(xof, xtmp);        // overflow when (a^P)&(a^diff) sign set
+        } else {
+          as_.Movdqa(xres, xd);
+          as_.Paddd(xres, xmask);     // sum = a + P
+          as_.Movdqa(xof, xd);
+          as_.Pxor(xof, xres);        // a ^ sum
+          as_.Movdqa(xtmp, xmask);
+          as_.Pxor(xtmp, xres);       // P ^ sum
+          as_.Pand(xof, xtmp);        // overflow when (a^sum)&(P^sum) sign set
+        }
+        as_.Psrad(xof, int8_t{31});   // all-ones lanes where the add overflowed
+        as_.Psrad(xd, int8_t{31});    // a's sign extended (0 or -1)
+        as_.Movq(t, int64_t{0x7FFFFFFF7FFFFFFFLL});
+        as_.Movq(xmask, t);           // reuse xmask (P consumed) for the const
+        as_.Punpcklqdq(xmask, xmask);
+        as_.Pxor(xd, xmask);          // sat = (a>>31) ^ INT32_MAX (MAX or MIN)
+        as_.Pand(xd, xof);            // sat in overflow lanes
+        as_.Pandn(xof, xres);         // result in non-overflow lanes
+        as_.Por(xd, xof);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xd);
         return;
       }
-      success_ = false;  // size=01 accumulate / size=10 -> interpreter
+      success_ = false;  // size=10 -> interpreter
       return;
     }
     // endregion
