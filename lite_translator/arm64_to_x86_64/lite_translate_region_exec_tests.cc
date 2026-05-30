@@ -1421,6 +1421,105 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_1x8B_DoesNotTouchUpp
   }
   for (int i = 8; i < 16; ++i) EXPECT_EQ(buffer[i], 0xCC) << "hi " << i;
 }
+
+// region digitalis - de-interleaving LD2/LD3/LD4 and interleaving ST2/ST3/ST4.
+// LD2 {V0.4S, V1.4S}, [X0] — opcode=1000, size=10 (32-bit), Q=1, 2 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld2_4S_Deinterleaves) {
+  alignas(16) static uint32_t buffer[8] = {0x10, 0x20, 0x11, 0x21,
+                                           0x12, 0x22, 0x13, 0x23};
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, false, true, 0x00, 0b1000, 0b10, 0, 0),
+  };
+  memset(&state_.cpu.v[0], 0xEE, 16);
+  memset(&state_.cpu.v[1], 0xEE, 16);
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t* v0 = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  uint32_t* v1 = reinterpret_cast<uint32_t*>(&state_.cpu.v[1]);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(v0[i], 0x10u + i) << "v0 lane " << i;
+    EXPECT_EQ(v1[i], 0x20u + i) << "v1 lane " << i;
+  }
+}
+
+// LD3 {V0.8B, V1.8B, V2.8B}, [X0] — opcode=0100, size=00, Q=0, 3 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld3_8B_Deinterleaves) {
+  alignas(16) static uint8_t buffer[24];
+  for (int i = 0; i < 24; ++i) buffer[i] = static_cast<uint8_t>(i);  // a,b,c,...
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, true, 0x00, 0b0100, 0b00, 0, 0),
+  };
+  for (int r = 0; r < 3; ++r) memset(&state_.cpu.v[r], 0xEE, 16);
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int r = 0; r < 3; ++r) {
+    uint8_t* v = reinterpret_cast<uint8_t*>(&state_.cpu.v[r]);
+    for (int l = 0; l < 8; ++l) {
+      EXPECT_EQ(v[l], buffer[l * 3 + r]) << "v" << r << " lane " << l;
+    }
+    for (int l = 8; l < 16; ++l) EXPECT_EQ(v[l], 0x00) << "v" << r << " hi " << l;
+  }
+}
+
+// LD4 {V0.4H..V3.4H}, [X0] — opcode=0000, size=01 (16-bit), Q=0, 4 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld4_4H_Deinterleaves) {
+  alignas(16) static uint16_t buffer[16];
+  for (int i = 0; i < 16; ++i) buffer[i] = static_cast<uint16_t>(0x100 + i);
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(false, false, true, 0x00, 0b0000, 0b01, 0, 0),
+  };
+  for (int r = 0; r < 4; ++r) memset(&state_.cpu.v[r], 0xEE, 16);
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int r = 0; r < 4; ++r) {
+    uint16_t* v = reinterpret_cast<uint16_t*>(&state_.cpu.v[r]);
+    for (int l = 0; l < 4; ++l) {
+      EXPECT_EQ(v[l], buffer[l * 4 + r]) << "v" << r << " lane " << l;
+    }
+  }
+}
+
+// ST2 {V0.4S, V1.4S}, [X0], #32 — interleave on store, post-index immediate.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St2_4S_Interleaves) {
+  alignas(16) static uint32_t buffer[8];
+  memset(buffer, 0xCC, sizeof(buffer));
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, true, false, 0x1F, 0b1000, 0b10, 0, 0),
+  };
+  uint32_t* v0 = reinterpret_cast<uint32_t*>(&state_.cpu.v[0]);
+  uint32_t* v1 = reinterpret_cast<uint32_t*>(&state_.cpu.v[1]);
+  for (int i = 0; i < 4; ++i) { v0[i] = 0x10 + i; v1[i] = 0x20 + i; }
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(buffer[i * 2], 0x10u + i) << "even " << i;
+    EXPECT_EQ(buffer[i * 2 + 1], 0x20u + i) << "odd " << i;
+  }
+  EXPECT_EQ(state_.cpu.x[0], ToGuestAddr(buffer) + 32u);
+}
+
+// ST4 {V0.16B..V3.16B}, [X0] — RGBA byte interleave, Q=1, 4 regs.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St4_16B_Interleaves) {
+  alignas(16) static uint8_t buffer[64];
+  memset(buffer, 0xCC, sizeof(buffer));
+  static const uint32_t code[] = {
+      AdvSimdMultiEnc(true, false, false, 0x00, 0b0000, 0b00, 0, 0),
+  };
+  for (int r = 0; r < 4; ++r) {
+    uint8_t* v = reinterpret_cast<uint8_t*>(&state_.cpu.v[r]);
+    for (int i = 0; i < 16; ++i) v[i] = static_cast<uint8_t>(r * 0x40 + i);
+  }
+  state_.cpu.x[0] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  for (int l = 0; l < 16; ++l) {
+    for (int r = 0; r < 4; ++r) {
+      EXPECT_EQ(buffer[l * 4 + r], static_cast<uint8_t>(r * 0x40 + l))
+          << "lane " << l << " reg " << r;
+    }
+  }
+}
+// endregion
+
 // endregion
 
 // Test: single FMUL s0, s0, s1 (in-place multiply)

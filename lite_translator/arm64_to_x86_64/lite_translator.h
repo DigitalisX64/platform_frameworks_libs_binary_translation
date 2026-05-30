@@ -11500,10 +11500,88 @@ class LiteTranslator {
                    // for post-index immediate math, and that is encoded by Q
                    // (16- or 8-byte stride per register) — the transfer is
                    // bulk-vector regardless.
-    if (is_interleaved) { Undefined(); return; }
-    if (num_regs < 1 || num_regs > 4) { Undefined(); return; }
-
     const int32_t vec_bytes = q ? 16 : 8;
+
+    // region digitalis - de-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4
+    // (multiple-structure form).  Memory holds num_regs * (vec_bytes/esize)
+    // elements laid out structure-major: element index e in memory belongs to
+    // register (e % num_regs), lane (e / num_regs).  The universal lowering
+    // moves one element per PINSR (load) / PEXTR (store) directly between the
+    // computed memory operand and the destination/source lane — exact for every
+    // (num_regs, element-size, Q) combination, with no interpreter bailout.
+    // Q=0 zeroes the upper 64 bits of each loaded register via the initial
+    // PXOR.  Shuffle-based fast paths could replace the per-lane round-trip for
+    // the hot sizes, but the element-wise form keeps the whole class on the JIT.
+    if (is_interleaved) {
+      if (num_regs < 2 || num_regs > 4) { Undefined(); return; }
+      if (size > 3) { Undefined(); return; }
+      const int esize = 1 << size;
+      const int num_lanes = vec_bytes / esize;
+
+      Register ibase_orig = (rn == 31) ? GetSp() : GetReg(rn);
+      if (ibase_orig == no_register) { Undefined(); return; }
+      Register ibase = ApplyTbi(ibase_orig);
+      if (ibase == no_register) { Undefined(); return; }
+
+      SimdRegister xmm = AllocTempSimdReg();
+      if (xmm == no_simd_register) { Undefined(); return; }
+
+      for (uint8_t r = 0; r < num_regs; r++) {
+        const uint8_t vreg = (rt + r) & 31;
+        const int32_t vt_off = offsetof(ThreadState, cpu.v[0]) + vreg * 16;
+        if (is_store) {
+          as_.Movdqu(xmm, {.base = Assembler::rbp, .disp = vt_off});
+        } else {
+          as_.Pxor(xmm, xmm);
+        }
+        for (int l = 0; l < num_lanes; l++) {
+          const int32_t mem_off = (l * num_regs + r) * esize;
+          Assembler::Operand mem{.base = ibase, .disp = mem_off};
+          const int8_t lane = static_cast<int8_t>(l);
+          if (is_store) {
+            switch (esize) {
+              case 1: as_.Pextrb(mem, xmm, lane); break;
+              case 2: as_.Pextrw(mem, xmm, lane); break;
+              case 4: as_.Pextrd(mem, xmm, lane); break;
+              default: as_.Pextrq(mem, xmm, lane); break;  // esize == 8
+            }
+          } else {
+            switch (esize) {
+              case 1: as_.Pinsrb(xmm, mem, lane); break;
+              case 2: as_.Pinsrw(xmm, mem, lane); break;
+              case 4: as_.Pinsrd(xmm, mem, lane); break;
+              default: as_.Pinsrq(xmm, mem, lane); break;  // esize == 8
+            }
+          }
+        }
+        if (!is_store) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vt_off}, xmm);
+        }
+      }
+
+      if (postindex) {
+        Register new_base = AllocTempReg();
+        if (new_base == no_register) { Undefined(); return; }
+        Register reread_base = (rn == 31) ? GetSp() : GetReg(rn);
+        as_.Movq(new_base, reread_base);
+        if (rm == 31) {
+          as_.Addq(new_base, static_cast<int32_t>(num_regs) * vec_bytes);
+        } else {
+          Register rm_val = GetReg(rm);
+          if (rm_val == no_register) { Undefined(); return; }
+          as_.Addq(new_base, rm_val);
+        }
+        if (rn == 31) {
+          SetSp(new_base);
+        } else {
+          SetReg(rn, new_base);
+        }
+      }
+      return;
+    }
+    // endregion
+
+    if (num_regs < 1 || num_regs > 4) { Undefined(); return; }
 
     Register base_orig = (rn == 31) ? GetSp() : GetReg(rn);
     if (base_orig == no_register) { Undefined(); return; }
