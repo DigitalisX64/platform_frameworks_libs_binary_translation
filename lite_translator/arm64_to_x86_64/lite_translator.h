@@ -11502,6 +11502,17 @@ class LiteTranslator {
   }
   // endregion
 
+  // region digitalis - SM4 (interpreter only).
+  void Sm4e(uint8_t rd, uint8_t rn) {
+    UNUSED(rd, rn);
+    Undefined();
+  }
+  void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
+    UNUSED(rd, rn, rm);
+    Undefined();
+  }
+  // endregion
+
   // region digitalis
   void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
     UNUSED(rd, rn, opcode);

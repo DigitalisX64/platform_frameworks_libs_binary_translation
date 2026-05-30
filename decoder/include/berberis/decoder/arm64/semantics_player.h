@@ -537,6 +537,15 @@ class SemanticsPlayer {
   }
   // endregion
 
+  // region digitalis - SM4 (FEAT_SM4).
+  void Sm4e(uint8_t rd, uint8_t rn) {
+    listener_->Sm4e(rd, rn);
+  }
+  void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
+    listener_->Sm4ekey(rd, rn, rm);
+  }
+  // endregion
+
   // region digitalis
   void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
     listener_->CryptoAes(rd, rn, opcode);

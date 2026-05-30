@@ -12179,6 +12179,34 @@ TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
 }
 // endregion
 
+// region digitalis - SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY (key
+// expansion). Inputs/outputs are the single-instruction steps of the GB/T
+// 32907 standard test vector (whose full 8x-SM4E flow reproduces the published
+// ciphertext 681edf34 d206965e 86b3e94f 536e4246). Interpreter-only.
+TEST_F(Arm64LiteTranslateRegionTest, Sm4eAndSm4ekey) {
+  uint64_t r[2];
+  // SM4EKEY v0.4s, v1.4s, v2.4s: first key-expansion step -> round keys 0..3.
+  SetV128(state_.cpu, 1, 0xDF01FEBFA292FFA1ULL, 0xC42410CC99A12B0FULL);  // K^FK
+  SetV128(state_.cpu, 2, 0x1C232A3100070E15ULL, 0x545B6269383F464DULL);  // CK0..3
+  static const uint32_t sm4ekey[] = {0xCE62C820u};
+  state_.cpu.insn_addr = ToGuestAddr(sm4ekey);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x41662B61F12186F9ULL);  // rk0,rk1
+  EXPECT_EQ(r[1], 0x7BA920775A6AB19AULL);  // rk2,rk3
+
+  // SM4E v0.4s, v1.4s: first encryption step (4 rounds) of the plaintext.
+  SetV128(state_.cpu, 0, 0x89ABCDEF01234567ULL, 0x76543210FEDCBA98ULL);  // state
+  SetV128(state_.cpu, 1, 0x41662B61F12186F9ULL, 0x7BA920775A6AB19AULL);  // rk0..3
+  static const uint32_t sm4e[] = {0xCEC08420u};
+  state_.cpu.insn_addr = ToGuestAddr(sm4e);
+  InterpretInsn(&state_);
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0xA18B4CB227FAD345ULL);
+  EXPECT_EQ(r[1], 0xCC13E2EE11C1E22AULL);
+}
+// endregion
+
 // region digitalis - I8MM (FEAT_I8MM): USDOT (mixed-sign dot product) and the
 // integer matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Interpreter-only; the
 // signed/unsigned/mixed forms must give distinct results (Vn byte0=0x80,

@@ -3778,6 +3778,29 @@ class Decoder {
     }
     // endregion
 
+    // region digitalis - SM4 (FEAT_SM4): SM4E (2-register) and SM4EKEY
+    // (3-register). Same bit31=1, bits[30:24]=1001110 crypto prefix as
+    // SHA512/SHA3; distinguished by bits[23:21] and the low opcode bits.
+    //   SM4EKEY Vd,Vn,Vm : bits[23:21]=011, bits[15:12]=1100, bits[11:10]=10.
+    //   SM4E    Vd,Vn    : bits[23:21]=110, Rm=00000, bits[15:10]=100001.
+    if (bit31 && GetBits<24, 7>() == 0b1001110) {
+      uint8_t sm_b23_21 = GetBits<21, 3>();
+      if (sm_b23_21 == 0b011 && GetBits<12, 4>() == 0b1100 &&
+          GetBits<10, 2>() == 0b10) {
+        insn_consumer_->Sm4ekey(GetBits<0, 5>(),   // rd
+                                GetBits<5, 5>(),    // rn
+                                GetBits<16, 5>());  // rm
+        return;
+      }
+      if (sm_b23_21 == 0b110 && GetBits<16, 5>() == 0 &&
+          GetBits<10, 6>() == 0b100001) {
+        insn_consumer_->Sm4e(GetBits<0, 5>(),   // rd
+                             GetBits<5, 5>());  // rn
+        return;
+      }
+    }
+    // endregion
+
     Undefined();
   }
 
