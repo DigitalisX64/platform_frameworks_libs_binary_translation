@@ -22270,6 +22270,78 @@ TEST_F(Arm64LiteTranslateRegionTest, FccmpDCompoundLtTrue) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);  // equal -> Z=1,C=1
 }
+
+// FP16 FCCMP (Armv8.2-FP16): ftype=11, base 0x1EE00400. Operands widen to
+// FP32 via F16C, then UCOMISS (same NZCV mapping as S/D).
+//   1.0h=0x3C00  2.0h=0x4000  3.5h=0x4300  9.0h=0x4880  qNaN=0x7E00
+constexpr uint32_t FccmpH(uint8_t rn, uint8_t rm, uint8_t cond, uint8_t nzcv) {
+  return FccmpScalar(0x1EE00400, rn, rm, cond, nzcv);
+}
+
+// FCCMP H — condition TRUE, ordered equal: flags <- 0110 (Z=1, C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueOrderedEqual) {
+  StoreFp16Bits(state_.cpu, 1, 0x4300);  // 3.5h
+  StoreFp16Bits(state_.cpu, 2, 0x4300);  // 3.5h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),                   // Z=1 -> EQ true
+      FccmpH(1, 2, kCondEQ, 0b1010),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0110u);
+}
+
+// FCCMP H — condition TRUE, ordered less: flags <- 1000 (N=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueOrderedLess) {
+  StoreFp16Bits(state_.cpu, 1, 0x3C00);  // 1.0h
+  StoreFp16Bits(state_.cpu, 2, 0x4000);  // 2.0h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),
+      FccmpH(1, 2, kCondEQ, 0b0101),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1000u);
+}
+
+// FCCMP H — condition TRUE, ordered greater: flags <- 0010 (C=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueOrderedGreater) {
+  StoreFp16Bits(state_.cpu, 1, 0x4880);  // 9.0h
+  StoreFp16Bits(state_.cpu, 2, 0x4000);  // 2.0h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),
+      FccmpH(1, 2, kCondEQ, 0b1100),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0010u);
+}
+
+// FCCMP H — condition TRUE, unordered (NaN): flags <- 0011 (C=1, V=1).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondTrueUnordered) {
+  StoreFp16Bits(state_.cpu, 1, 0x7E00);  // qNaN
+  StoreFp16Bits(state_.cpu, 2, 0x3C00);  // 1.0h
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),
+      FccmpH(1, 2, kCondEQ, 0b1000),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
+}
+
+// FCCMP H — condition FALSE: nzcv immediate written to flags (no compare).
+TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondFalseWritesImmediate) {
+  StoreFp16Bits(state_.cpu, 1, 0x3C00);  // 1.0h (would be "equal" if compared)
+  StoreFp16Bits(state_.cpu, 2, 0x3C00);
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 10),                  // Z=0, N=1 -> EQ false
+      FccmpH(1, 2, kCondEQ, 0b1011),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1011u);
+}
 // endregion
 
 // region digitalis - FCMP NaN
@@ -38400,6 +38472,1043 @@ TEST_F(Arm64LiteTranslateRegionTest, SshrVec16BVdEqVnJit) {
   std::memcpy(r, &state_.cpu.v[0], 16);
   const int8_t expect[16] = { 1, -2,  2,  -3, 0, -1, 12, -13,
                               3, -4,  8,  -9, 15, 4, -4, -1};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+// endregion
+
+// region digitalis: SSRA .8B / .16B byte-form JIT (PMOVSXBW + PSRAW +
+// PACKSSWB + PADDB).
+//
+// Sibling of SSHR byte-form above with an accumulate step.  ARM SSRA
+// is `Vd[i] += SSHR(Vn[i], cnt)` per byte with native mod-256
+// wraparound.  The JIT packs the SSHR result to int8 first (no
+// saturation — arith-shifted bytes stay in [-128, 127]) and PADDB-s
+// into Vd, so any post-add overflow wraps modulo 256 natively at byte
+// width.  Coverage:
+//
+//   - .8B (!Q): low 8 bytes only; Vd[127:64] zeroed.
+//   - .16B (Q): both halves widened separately, PACKSSWB(lo, hi) into
+//     ARM lane order, full 16-byte PADDB into Vd.
+//   - shift==esize (cnt==8): SSHR sign-fill (negative→-1,
+//     non-negative→0), then PADDB into Vd.
+//   - byte mod-256 wraparound: Vd + SSHR result outside [-128, 127]
+//     wraps natively via PADDB.
+//   - Vd==Vn safety: PMOVSXBW reads Vn from memory BEFORE the Movq /
+//     Movdqu loads Vd, and the final Movdqu to vd_off happens last.
+constexpr uint32_t kSsraVec8B_1   = 0x0F0F1420;  // ssra v0.8b, v1.8b, #1
+constexpr uint32_t kSsraVec8B_4   = 0x0F0C1420;  // ssra v0.8b, v1.8b, #4
+constexpr uint32_t kSsraVec8B_7   = 0x0F091420;  // ssra v0.8b, v1.8b, #7
+constexpr uint32_t kSsraVec8B_8   = 0x0F081420;  // ssra v0.8b, v1.8b, #8
+constexpr uint32_t kSsraVec16B_1  = 0x4F0F1420;  // ssra v0.16b, v1.16b, #1
+constexpr uint32_t kSsraVec16B_4  = 0x4F0C1420;  // ssra v0.16b, v1.16b, #4
+constexpr uint32_t kSsraVec16B_7  = 0x4F091420;  // ssra v0.16b, v1.16b, #7
+constexpr uint32_t kSsraVec16B_8  = 0x4F081420;  // ssra v0.16b, v1.16b, #8
+constexpr uint32_t kSsraVec8B_VdEqVn_3  = 0x0F0D1400;  // ssra v0.8b, v0.8b, #3
+constexpr uint32_t kSsraVec16B_VdEqVn_3 = 0x4F0D1400;  // ssra v0.16b, v0.16b, #3
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraByteEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kSsraVec8B_1, 0x0F0F1420u);
+  EXPECT_EQ(kSsraVec8B_4, 0x0F0C1420u);
+  EXPECT_EQ(kSsraVec8B_7, 0x0F091420u);
+  EXPECT_EQ(kSsraVec8B_8, 0x0F081420u);
+  EXPECT_EQ(kSsraVec16B_1, 0x4F0F1420u);
+  EXPECT_EQ(kSsraVec16B_4, 0x4F0C1420u);
+  EXPECT_EQ(kSsraVec16B_7, 0x4F091420u);
+  EXPECT_EQ(kSsraVec16B_8, 0x4F081420u);
+  EXPECT_EQ(kSsraVec8B_VdEqVn_3, 0x0F0D1400u);
+  EXPECT_EQ(kSsraVec16B_VdEqVn_3, 0x4F0D1400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift1Jit) {
+  // SSHR(Vn,1) per byte:
+  //   {7,-7,14,-14,127,-128, 0,-1} >>1 = {3,-4, 7,-7,63,-64, 0,-1}
+  // Vd + SSHR (no wrap this case — picked to stay in int8 range):
+  //   {10,20,50,-50,40,-30,70,80} + {3,-4,7,-7,63,-64,0,-1}
+  //   = {13,16,57,-57,103,-94,70,79}
+  // Upper 8 bytes of Vn must be ignored; Vd[127:64] must be zeroed.
+  int8_t in_vn[16] = { 7, -7, 14, -14, 127, -128,  0, -1,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  int8_t in_vd[16] = {10, 20, 50, -50,  40,  -30, 70, 80,
+                       0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {13, 16, 57, -57, 103, -94, 70, 79};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper half zeroed (D-register semantics).
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BWrapAroundJit) {
+  // Mod-256 wraparound at byte width.  shift=1, Vd + SSHR(Vn,1)
+  // outside int8 range wraps natively via PADDB.
+  //   SSHR({100,-100, 90, -90, 127, -128, 50, -50}, 1)
+  //     = { 50, -50, 45, -45,  63,  -64, 25, -25}
+  //   Vd = {100, -90, 90,-90, 90, -90, 110,-110}
+  //   sum mod 256 (int8):
+  //     100+50=150  → 150-256=-106
+  //     -90+(-50)=-140 → -140+256=116
+  //     90+45=135   → 135-256=-121
+  //     -90+(-45)=-135 → -135+256=121
+  //     90+63=153   → 153-256=-103
+  //     -90+(-64)=-154 → -154+256=102
+  //     110+25=135  → 135-256=-121
+  //     -110+(-25)=-135 → -135+256=121
+  int8_t in_vn[16] = {100, -100, 90, -90, 127, -128,  50,  -50,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = {100,  -90, 90, -90,  90,  -90, 110, -110,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {-106, 116, -121, 121, -103, 102, -121, 121};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift4Jit) {
+  // SSHR(Vn,4) per byte:
+  //   {16,-16,100,-100,127,-128, 1,-1} >>4 = {1,-1, 6,-7, 7,-8, 0,-1}
+  // Vd + SSHR (no wrap):
+  //   {0, 0, 10, -10, 20, -20, 1, 100} + {1,-1,6,-7,7,-8,0,-1}
+  //   = {1,-1,16,-17,27,-28,1,99}
+  int8_t in_vn[16] = {16, -16, 100, -100, 127, -128, 1, -1,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = { 0,  0,  10,  -10,  20,  -20, 1, 100,
+                      0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {1, -1, 16, -17, 27, -28, 1, 99};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift7Jit) {
+  // shift==7 isolates sign bit: positive (incl. 0) -> 0; negative -> -1.
+  //   SSHR({1,-1,0,127,-128,64,-64,100}, 7) = {0,-1,0,0,-1,0,-1,0}
+  // Vd + SSHR:
+  //   {10, 20, 30, 40, -50, -60, -70, 80} + {0,-1,0,0,-1,0,-1,0}
+  //   = {10, 19, 30, 40, -51, -60, -71, 80}
+  int8_t in_vn[16] = {1, -1, 0, 127, -128, 64, -64, 100,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = {10, 20, 30, 40, -50, -60, -70, 80,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {10, 19, 30, 40, -51, -60, -71, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BShift8BoundarySignFillJit) {
+  // cnt==esize=8: SSHR sign-fill per byte (negative->-1, non-neg->0).
+  //   SSHR({1,-1,0,127,-128,64,-64,100}, 8) = {0,-1,0,0,-1,0,-1,0}
+  // Same SSHR result as shift=7; Vd accumulate gives same outcome.
+  int8_t in_vn[16] = {1, -1, 0, 127, -128, 64, -64, 100,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t in_vd[16] = {10, 20, 30, 40, -50, -60, -70, 80,
+                      0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {10, 19, 30, 40, -51, -60, -71, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BShift1Jit) {
+  // 16 bytes (.16B Q=1).  Low+high halves of Vn must both appear
+  // in Vd in the same lane order.  Tests upper-half ARM lane
+  // semantics: PACKSSWB(xn_lo, xn_hi) places hi in bits[127:64].
+  //   SSHR(Vn, 1):
+  //     low : { 7,-7,14,-14,127,-128, 0,-1} >>1 = { 3,-4, 7,-7,63,-64, 0,-1}
+  //     high: {31,-31,64,-64,  1, 127, 2,-2} >>1 = {15,-16,32,-32, 0,  63, 1,-1}
+  //   Vd accumulate (no wrap):
+  //     low : {10,20,50,-50,40,-30,70,80}  + above = {13,16,57,-57,103,-94,70,79}
+  //     high: {0,  0, 5, -5,10, 20, 30,40} + above = {15,-16,37,-37,10, 83, 31,39}
+  int8_t in_vn[16] = { 7,  -7, 14, -14, 127, -128, 0, -1,
+                      31, -31, 64, -64,   1,  127, 2, -2};
+  int8_t in_vd[16] = {10, 20, 50, -50, 40, -30, 70, 80,
+                       0,  0,  5,  -5, 10,  20, 30, 40};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec16B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[16] = {13, 16, 57, -57, 103, -94, 70, 79,
+                             15, -16, 37, -37,  10,  83, 31, 39};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BShift4Jit) {
+  // SSHR(Vn,4) per byte across both halves:
+  //   low : {16,-16,100,-100,127,-128,1,-1} >>4 = {1,-1,6,-7,7,-8,0,-1}
+  //   high: {32,-32, 64, -64, 15, -15,7,-7} >>4 = {2,-2,4,-4,0,-1,0,-1}
+  // Vd accumulate (no wrap):
+  //   low : {0, 0, 0,0,10, 5,0, 0}  + above = {1,-1,6,-7,17,-3,0,-1}
+  //   high: {1, 2, 3,4, 5, 6,7,8} + above = {3, 0, 7, 0, 5, 5, 7, 7}
+  int8_t in_vn[16] = {16, -16, 100, -100, 127, -128, 1, -1,
+                      32, -32,  64,  -64,  15,  -15, 7, -7};
+  int8_t in_vd[16] = {0, 0, 0, 0, 10, 5, 0, 0,
+                      1, 2, 3, 4,  5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec16B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[16] = {1, -1, 6, -7, 17, -3, 0, -1,
+                             3,  0, 7,  0,  5,  5, 7,  7};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BShift8BoundarySignFillJit) {
+  // cnt==esize=8: SSHR sign-fill per byte across all 16 lanes.
+  //   low : {1,-1, 0,127,-128,64,-64,100} sign-fill = {0,-1,0,0,-1,0,-1,0}
+  //   high: {-1, 0, 1,-128, 127,-50,50, 2} sign-fill = {-1,0,0,-1,0,-1,0,0}
+  // Vd accumulate:
+  //   low : { 5,10, 20, 30,-40,-50,-60, 70} + above = {5, 9, 20, 30, -41, -50, -61, 70}
+  //   high: {-5,15,-10, -1,  0,  1,  2,  3} + above = {-6, 15,-10,-2, 0, 0, 2, 3}
+  int8_t in_vn[16] = { 1,  -1,   0,  127, -128,  64, -64, 100,
+                      -1,   0,   1, -128,  127, -50,  50,   2};
+  int8_t in_vd[16] = { 5, 10,  20,   30,  -40, -50, -60,  70,
+                      -5, 15, -10,   -1,    0,   1,   2,   3};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kSsraVec16B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[16] = { 5,  9,  20, 30, -41, -50, -61, 70,
+                             -6, 15, -10, -2,   0,   0,   2,  3};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec8BVdEqVnJit) {
+  // Vd==Vn==v0, .8B.  Validates PMOVSXBW reads Vn from memory BEFORE
+  // the Movq load of Vd, and the final Movdqu writes Vd LAST.
+  // Bytes are both source (for SSHR) and accumulator (for the add).
+  //   SSHR({24,-25,64,-65,-1, 0,100,-100}, 3) = {3,-4, 8,-9,-1, 0,12,-13}
+  //   Vd_orig (== Vn_orig) = {24,-25,64,-65,-1, 0,100,-100}
+  //   Vd + SSHR =
+  //     {27,-29,72,-74,-2, 0,112,-113}
+  // Upper 8 bytes (originally 0x77..0x00 of Vn) must be zeroed in Vd
+  // post-write.
+  int8_t in[16] = { 24, -25, 64, -65,  -1,  0, 100, -100,
+                   0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSsraVec8B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const int8_t expect[8] = {27, -29, 72, -74, -2, 0, 112, -113};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper 8 bytes of Vd zeroed (D-register semantics) despite
+  // originally holding nonzero Vn data.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BVdEqVnJit) {
+  // Vd==Vn==v0, .16B.  Both PMOVSXBW loads must complete BEFORE the
+  // Movdqu load of Vd; the result PADDB-s into Vd; final Movdqu
+  // happens last.
+  //   SSHR(Vn, 3) per lane:
+  //     { 8, -9, 16,-17,  1,-1,100,-100} >>3 = { 1, -2, 2, -3, 0,-1, 12,-13}
+  //     {24,-25, 64,-65,127,32,-32,  -1} >>3 = { 3, -4, 8, -9,15, 4, -4, -1}
+  //   Vd_orig = Vn_orig:
+  //     { 8, -9, 16,-17,  1,-1,100,-100, 24,-25, 64,-65,127,32,-32, -1}
+  //   Vd + SSHR (no wrap):
+  //     { 9,-11, 18,-20,  1,-2,112,-113, 27,-29, 72,-74,142→-114, 36,-36, -2}
+  int8_t in[16] = { 8,  -9, 16, -17,   1, -1, 100, -100,
+                   24, -25, 64, -65, 127, 32, -32,   -1};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kSsraVec16B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  int8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // lane 12: 127 + 15 = 142 → wraps to -114 (142-256).
+  const int8_t expect[16] = { 9, -11, 18, -20,   1, -2, 112, -113,
+                             27, -29, 72, -74, -114, 36, -36,   -2};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+// endregion
+
+// region digitalis: USHR .8B / .16B byte-form JIT (PMOVZXBW + PSRLW +
+// PACKUSWB).
+//
+// Unsigned sibling of SSHR byte-form.  ARM USHR is `Vd[i] = Vn[i] >>
+// cnt` per byte, unsigned (zero-fill).  The JIT zero-extends each
+// byte to a u16 word, logical-right-shifts, and PACKUSWB-narrows back
+// to u8 — no actual saturation because PSRLW on a zero-extended byte
+// cannot exceed 0xFF.  Coverage:
+//
+//   - .8B (!Q): low 8 bytes only; Vd[127:64] zeroed.
+//   - .16B (Q): both halves widened separately, PACKUSWB(lo, hi) into
+//     ARM lane order.
+//   - shift==esize (cnt==8): all 8 valid bits shifted off the right
+//     yields 0 per byte (matches ARM USHR at shift==esize).
+//   - Vd==Vn safety: PMOVZXBW reads Vn from memory BEFORE the final
+//     Movdqu writes Vd.
+constexpr uint32_t kUshrVec8B_1   = 0x2F0F0420;  // ushr v0.8b, v1.8b, #1
+constexpr uint32_t kUshrVec8B_4   = 0x2F0C0420;  // ushr v0.8b, v1.8b, #4
+constexpr uint32_t kUshrVec8B_7   = 0x2F090420;  // ushr v0.8b, v1.8b, #7
+constexpr uint32_t kUshrVec8B_8   = 0x2F080420;  // ushr v0.8b, v1.8b, #8
+constexpr uint32_t kUshrVec16B_1  = 0x6F0F0420;  // ushr v0.16b, v1.16b, #1
+constexpr uint32_t kUshrVec16B_4  = 0x6F0C0420;  // ushr v0.16b, v1.16b, #4
+constexpr uint32_t kUshrVec16B_7  = 0x6F090420;  // ushr v0.16b, v1.16b, #7
+constexpr uint32_t kUshrVec16B_8  = 0x6F080420;  // ushr v0.16b, v1.16b, #8
+constexpr uint32_t kUshrVec8B_VdEqVn_3  = 0x2F0D0400;  // ushr v0.8b, v0.8b, #3
+constexpr uint32_t kUshrVec16B_VdEqVn_3 = 0x6F0D0400;  // ushr v0.16b, v0.16b, #3
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrByteEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kUshrVec8B_1, 0x2F0F0420u);
+  EXPECT_EQ(kUshrVec8B_4, 0x2F0C0420u);
+  EXPECT_EQ(kUshrVec8B_7, 0x2F090420u);
+  EXPECT_EQ(kUshrVec8B_8, 0x2F080420u);
+  EXPECT_EQ(kUshrVec16B_1, 0x6F0F0420u);
+  EXPECT_EQ(kUshrVec16B_4, 0x6F0C0420u);
+  EXPECT_EQ(kUshrVec16B_7, 0x6F090420u);
+  EXPECT_EQ(kUshrVec16B_8, 0x6F080420u);
+  EXPECT_EQ(kUshrVec8B_VdEqVn_3, 0x2F0D0400u);
+  EXPECT_EQ(kUshrVec16B_VdEqVn_3, 0x6F0D0400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec8BShift1Jit) {
+  // Bytes (u8) [7, 200, 14, 255, 127, 128, 0, 1] >> 1 ->
+  //            [3, 100,  7, 127,  63,  64, 0, 0]
+  // Upper 8 bytes of Vn must be ignored; Vd[127:64] must be zeroed.
+  uint8_t in[16] = {7, 200, 14, 255, 127, 128, 0, 1,
+                    0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {3, 100, 7, 127, 63, 64, 0, 0};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper half zeroed (D-register semantics).
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec8BShift4Jit) {
+  // Bytes (u8) [16, 240, 100, 200, 127, 255, 15, 1] >> 4 ->
+  //            [ 1,  15,   6,  12,   7,  15,  0, 0]
+  uint8_t in[16] = {16, 240, 100, 200, 127, 255, 15, 1,
+                    0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec8B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {1, 15, 6, 12, 7, 15, 0, 0};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec8BShift7Jit) {
+  // Shift==7 isolates top bit: top-bit-set bytes -> 1; else 0.
+  uint8_t in[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                    0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec8B_7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {0, 1, 0, 0, 1, 0, 1, 0};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec8BShift8BoundaryZeroJit) {
+  // cnt==esize=8: USHR semantics give 0 per byte (all bits shifted
+  // off).  PSRLW by 8 on a zero-extended byte word produces 0 — every
+  // 8 valid bits shift off the right, leaving 0.
+  uint8_t in[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                    0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec16BShift1Jit) {
+  // 16 bytes (.16B Q=1).  Low and high halves of Vn must both appear
+  // in Vd in the same lane order.
+  uint8_t in[16] = { 7, 200, 14, 255, 127, 128, 0,  1,
+                    31, 224, 64, 192,   1, 255, 2,  3};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec16B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = { 3, 100,  7, 127, 63,  64, 0, 0,
+                              15, 112, 32,  96,  0, 127, 1, 1};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec16BShift4Jit) {
+  uint8_t in[16] = {16, 240, 100, 200, 127, 255, 15, 1,
+                    32,  64, 128, 192,  15,  31,  7, 8};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec16B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = {1, 15, 6, 12, 7, 15, 0, 0,
+                              2,  4, 8, 12, 0,  1, 0, 0};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec16BShift8BoundaryZeroJit) {
+  // cnt==esize=8: USHR all 16 lanes -> 0.
+  uint8_t in[16] = { 1, 255,   0,  127, 128,  64, 200, 100,
+                   255,   0,   1,  128, 127, 200,  50,   2};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUshrVec16B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec8BVdEqVnJit) {
+  // Vd==Vn==v0.  PMOVZXBW reads Vn from memory BEFORE PACKUSWB writes
+  // to xn_lo, so writing Vd at the store doesn't disturb earlier reads.
+  uint8_t in[16] = {24, 250, 64, 200, 255,  0, 100, 200,
+                    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kUshrVec8B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // Each byte u8>>3: 24>>3=3, 250>>3=31, 64>>3=8, 200>>3=25,
+  //                  255>>3=31, 0>>3=0, 100>>3=12, 200>>3=25.
+  const uint8_t expect[8] = {3, 31, 8, 25, 31, 0, 12, 25};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper 8 bytes zeroed despite originally holding nonzero Vn data.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UshrVec16BVdEqVnJit) {
+  // Vd==Vn==v0, .16B.  Both PMOVZXBW loads must complete BEFORE the
+  // PACKUSWB writes; final Movdqu happens last.
+  uint8_t in[16] = { 8, 250, 16, 240,   1, 255, 100, 200,
+                    24, 200, 64, 192, 127, 128,  50,   2};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kUshrVec16B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  // u8>>3 per lane:
+  //   8>>3=1, 250>>3=31, 16>>3=2, 240>>3=30,
+  //   1>>3=0, 255>>3=31, 100>>3=12, 200>>3=25,
+  //   24>>3=3, 200>>3=25, 64>>3=8, 192>>3=24,
+  //   127>>3=15, 128>>3=16, 50>>3=6, 2>>3=0.
+  const uint8_t expect[16] = {1, 31, 2, 30,  0, 31, 12, 25,
+                              3, 25, 8, 24, 15, 16,  6,  0};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+// endregion
+
+// region digitalis: USRA .8B / .16B byte-form JIT (PMOVZXBW + PSRLW +
+// PACKUSWB + PADDB).
+//
+// Unsigned sibling of SSRA byte-form. ARM USRA is `Vd[i] = Vd[i] +
+// (Vn[i] >> cnt)` per byte, unsigned (zero-fill), with mod-256
+// wraparound on the u8 accumulate. The JIT zero-extends each byte to a
+// u16 word, logical-right-shifts, PACKUSWB-narrows back to u8 (no
+// actual saturation because PSRLW on a zero-extended byte cannot
+// exceed 0xFF), then PADDB into Vd for native mod-256 wrap. Coverage:
+//
+//   - .8B (!Q): low 8 bytes only; Vd[127:64] zeroed.
+//   - .16B (Q): both halves widened separately, PACKUSWB(lo, hi) into
+//     ARM lane order, PADDB into Vd.
+//   - shift==esize (cnt==8): USHR contribution is 0 → PADDB no-op →
+//     Vd unchanged (matches ARM USRA at shift==esize).
+//   - Mod-256 wraparound: Vd + USHR can exceed 255 even though USHR
+//     alone cannot (e.g. Vd=200, USHR=100 → 300 wraps to 44 via PADDB).
+//   - Vd==Vn safety: PMOVZXBW reads Vn from memory BEFORE the Movq /
+//     Movdqu loads Vd, and the final Movdqu writes Vd LAST.
+constexpr uint32_t kUsraVec8B_1   = 0x2F0F1420;  // usra v0.8b, v1.8b, #1
+constexpr uint32_t kUsraVec8B_4   = 0x2F0C1420;  // usra v0.8b, v1.8b, #4
+constexpr uint32_t kUsraVec8B_7   = 0x2F091420;  // usra v0.8b, v1.8b, #7
+constexpr uint32_t kUsraVec8B_8   = 0x2F081420;  // usra v0.8b, v1.8b, #8
+constexpr uint32_t kUsraVec16B_1  = 0x6F0F1420;  // usra v0.16b, v1.16b, #1
+constexpr uint32_t kUsraVec16B_4  = 0x6F0C1420;  // usra v0.16b, v1.16b, #4
+constexpr uint32_t kUsraVec16B_7  = 0x6F091420;  // usra v0.16b, v1.16b, #7
+constexpr uint32_t kUsraVec16B_8  = 0x6F081420;  // usra v0.16b, v1.16b, #8
+constexpr uint32_t kUsraVec8B_VdEqVn_3  = 0x2F0D1400;  // usra v0.8b, v0.8b, #3
+constexpr uint32_t kUsraVec16B_VdEqVn_3 = 0x6F0D1400;  // usra v0.16b, v0.16b, #3
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraByteEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kUsraVec8B_1, 0x2F0F1420u);
+  EXPECT_EQ(kUsraVec8B_4, 0x2F0C1420u);
+  EXPECT_EQ(kUsraVec8B_7, 0x2F091420u);
+  EXPECT_EQ(kUsraVec8B_8, 0x2F081420u);
+  EXPECT_EQ(kUsraVec16B_1, 0x6F0F1420u);
+  EXPECT_EQ(kUsraVec16B_4, 0x6F0C1420u);
+  EXPECT_EQ(kUsraVec16B_7, 0x6F091420u);
+  EXPECT_EQ(kUsraVec16B_8, 0x6F081420u);
+  EXPECT_EQ(kUsraVec8B_VdEqVn_3, 0x2F0D1400u);
+  EXPECT_EQ(kUsraVec16B_VdEqVn_3, 0x6F0D1400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8BShift1Jit) {
+  // USHR(Vn,1) per byte (unsigned):
+  //   {7, 200, 14, 255, 127, 128, 0, 1} >>1 = {3, 100, 7, 127, 63, 64, 0, 0}
+  // Vd + USHR (no wrap this case — picked to stay in u8 range):
+  //   {10, 20, 50, 30, 40, 80, 70, 80} + {3, 100, 7, 127, 63, 64, 0, 0}
+  //   = {13, 120, 57, 157, 103, 144, 70, 80}
+  // Upper 8 bytes of Vn must be ignored; Vd[127:64] must be zeroed.
+  uint8_t in_vn[16] = {7, 200, 14, 255, 127, 128, 0, 1,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  uint8_t in_vd[16] = {10, 20, 50, 30, 40, 80, 70, 80,
+                       0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {13, 120, 57, 157, 103, 144, 70, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper half zeroed (D-register semantics).
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8BWrapAroundJit) {
+  // Mod-256 wraparound at byte width.  shift=1, Vd + USHR(Vn,1)
+  // outside u8 range wraps natively via PADDB.
+  //   USHR({200, 254, 180, 250, 100, 220, 240, 198}, 1)
+  //     = {100, 127,  90, 125,  50, 110, 120,  99}
+  //   Vd = {200, 200, 200, 200, 250, 200, 200, 200}
+  //   sum mod 256 (u8):
+  //     200+100=300   → 44
+  //     200+127=327   → 71
+  //     200+90 =290   → 34
+  //     200+125=325   → 69
+  //     250+50 =300   → 44
+  //     200+110=310   → 54
+  //     200+120=320   → 64
+  //     200+99 =299   → 43
+  uint8_t in_vn[16] = {200, 254, 180, 250, 100, 220, 240, 198,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t in_vd[16] = {200, 200, 200, 200, 250, 200, 200, 200,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {44, 71, 34, 69, 44, 54, 64, 43};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8BShift4Jit) {
+  // USHR(Vn,4) per byte:
+  //   {16, 240, 100, 200, 127, 255, 15, 1} >>4 = {1, 15, 6, 12, 7, 15, 0, 0}
+  // Vd + USHR (no wrap):
+  //   {0, 0, 10, 30, 20, 40, 1, 100} + {1, 15, 6, 12, 7, 15, 0, 0}
+  //   = {1, 15, 16, 42, 27, 55, 1, 100}
+  uint8_t in_vn[16] = {16, 240, 100, 200, 127, 255, 15, 1,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t in_vd[16] = {0, 0, 10, 30, 20, 40, 1, 100,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec8B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {1, 15, 16, 42, 27, 55, 1, 100};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8BShift7Jit) {
+  // shift==7 isolates top bit: top-bit-set bytes -> 1; else 0.
+  //   USHR({1, 255, 0, 127, 128, 64, 200, 100}, 7) = {0, 1, 0, 0, 1, 0, 1, 0}
+  // Vd + USHR:
+  //   {10, 20, 30, 40, 50, 60, 70, 80} + {0, 1, 0, 0, 1, 0, 1, 0}
+  //   = {10, 21, 30, 40, 51, 60, 71, 80}
+  uint8_t in_vn[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t in_vd[16] = {10, 20, 30, 40, 50, 60, 70, 80,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec8B_7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {10, 21, 30, 40, 51, 60, 71, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8BShift8BoundaryNoOpJit) {
+  // cnt==esize=8: USHR contribution is 0 per byte (all bits shifted
+  // off).  PADDB(Vd, 0) leaves Vd unchanged — Vd_after == Vd_before
+  // per lane (D-reg semantics still zero the upper half).
+  uint8_t in_vn[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t in_vd[16] = {10, 20, 30, 40, 50, 60, 70, 80,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {10, 20, 30, 40, 50, 60, 70, 80};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec16BShift1Jit) {
+  // 16 bytes (.16B Q=1).  Low and high halves of Vn must both appear
+  // in Vd in the same lane order.  Tests upper-half ARM lane semantics:
+  // PACKUSWB(xn_lo, xn_hi) places hi in bits[127:64].
+  //   USHR(Vn, 1):
+  //     low : { 7, 200, 14, 255, 127, 128, 0,  1} >>1 = { 3, 100,  7, 127, 63,  64, 0, 0}
+  //     high: {31, 224, 64, 192,   1, 255, 2,  3} >>1 = {15, 112, 32,  96,  0, 127, 1, 1}
+  //   Vd accumulate (no wrap):
+  //     low : {10, 20, 50, 30, 40, 80, 70, 80}  + above = {13, 120, 57, 157, 103, 144, 70, 80}
+  //     high: { 0,  0,  5, 10, 20, 30, 50, 60}  + above = {15, 112, 37, 106,  20, 157, 51, 61}
+  uint8_t in_vn[16] = { 7, 200, 14, 255, 127, 128, 0,  1,
+                       31, 224, 64, 192,   1, 255, 2,  3};
+  uint8_t in_vd[16] = {10, 20, 50, 30, 40, 80, 70, 80,
+                        0,  0,  5, 10, 20, 30, 50, 60};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec16B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = {13, 120, 57, 157, 103, 144, 70, 80,
+                              15, 112, 37, 106,  20, 157, 51, 61};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec16BShift4Jit) {
+  // USHR(Vn,4) per byte across both halves:
+  //   low : {16, 240, 100, 200, 127, 255, 15, 1} >>4 = {1, 15, 6, 12, 7, 15, 0, 0}
+  //   high: {32,  64, 128, 192,  15,  31,  7, 8} >>4 = {2,  4, 8, 12, 0,  1, 0, 0}
+  // Vd accumulate (no wrap):
+  //   low : {0, 0, 0,0,10, 5,0,  0}  + above = {1, 15, 6, 12, 17, 20, 0, 0}
+  //   high: {1, 2, 3,4, 5, 6,7, 8}  + above = {3,  6, 11, 16, 5,  7, 7, 8}
+  uint8_t in_vn[16] = {16, 240, 100, 200, 127, 255, 15, 1,
+                       32,  64, 128, 192,  15,  31,  7, 8};
+  uint8_t in_vd[16] = {0, 0, 0, 0, 10, 5, 0, 0,
+                       1, 2, 3, 4,  5, 6, 7, 8};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec16B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = {1, 15, 6, 12, 17, 20, 0, 0,
+                              3,  6, 11, 16,  5,  7, 7, 8};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec16BShift8BoundaryNoOpJit) {
+  // cnt==esize=8 across all 16 lanes: USHR contribution is 0 per byte,
+  // PADDB(Vd, 0) leaves Vd unchanged.
+  uint8_t in_vn[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                       50, 60, 70, 80, 90, 100, 110, 120};
+  uint8_t in_vd[16] = {10, 20, 30, 40, 50, 60, 70, 80,
+                       11, 22, 33, 44, 55, 66, 77, 88};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUsraVec16B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = {10, 20, 30, 40, 50, 60, 70, 80,
+                              11, 22, 33, 44, 55, 66, 77, 88};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec8BVdEqVnJit) {
+  // Vd==Vn==v0, .8B.  Validates PMOVZXBW reads Vn from memory BEFORE
+  // the Movq load of Vd, and the final Movdqu writes Vd LAST.
+  // Bytes are both source (for USHR) and accumulator (for the add).
+  //   USHR({24, 250, 64, 200, 255, 0, 100, 200}, 3) = {3, 31, 8, 25, 31, 0, 12, 25}
+  //   Vd_orig (== Vn_orig) = {24, 250, 64, 200, 255, 0, 100, 200}
+  //   Vd + USHR mod 256:
+  //     24+3=27, 250+31=281→25, 64+8=72, 200+25=225,
+  //     255+31=286→30, 0+0=0, 100+12=112, 200+25=225
+  // Upper 8 bytes (originally 0x77..0x00 of Vn) must be zeroed in Vd
+  // post-write.
+  uint8_t in[16] = {24, 250, 64, 200, 255, 0, 100, 200,
+                    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kUsraVec8B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {27, 25, 72, 225, 30, 0, 112, 225};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper 8 bytes of Vd zeroed (D-register semantics) despite
+  // originally holding nonzero Vn data.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UsraVec16BVdEqVnJit) {
+  // Vd==Vn==v0, .16B.  Both PMOVZXBW loads must complete BEFORE the
+  // Movdqu load of Vd; result PADDB-s into Vd; final Movdqu happens
+  // last.
+  //   USHR(Vn, 3) per lane:
+  //     { 8, 250, 16, 240,   1, 255, 100, 200} >>3 = { 1, 31, 2, 30,  0, 31, 12, 25}
+  //     {24, 200, 64, 192, 127, 128,  50,   2} >>3 = { 3, 25, 8, 24, 15, 16,  6,  0}
+  //   Vd_orig = Vn_orig:
+  //     { 8, 250, 16, 240,   1, 255, 100, 200, 24, 200, 64, 192, 127, 128, 50,  2}
+  //   Vd + USHR mod 256:
+  //     8+1=9, 250+31=281→25, 16+2=18, 240+30=270→14,
+  //     1+0=1, 255+31=286→30, 100+12=112, 200+25=225,
+  //     24+3=27, 200+25=225, 64+8=72, 192+24=216,
+  //     127+15=142, 128+16=144, 50+6=56, 2+0=2.
+  uint8_t in[16] = { 8, 250, 16, 240,   1, 255, 100, 200,
+                    24, 200, 64, 192, 127, 128,  50,   2};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kUsraVec16B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = { 9,  25, 18,  14,   1,  30, 112, 225,
+                              27, 225, 72, 216, 142, 144,  56,   2};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+// endregion
+
+// region digitalis: URSHR vector .8B / .16B byte form JIT
+// (handoff-433).
+//
+// Unsigned rounding right shift at byte width:
+//   URSHR(x, cnt) = floor((x + 2^(cnt-1)) / 2^cnt)        for cnt ∈ [1, 8]
+//                 = (x >> cnt) + ((x >> (cnt-1)) & 1)     (identity used by JIT)
+//
+// JIT widens each byte to a u16 word (PMOVZXBW), computes the round
+// bit at word width via PSRLW(cnt-1) + a two-shift bracket
+// (PSLLW 15 + PSRLW 15) to isolate bit 0 per word, computes the
+// logical right shift (PSRLW cnt) on the widened bytes, adds the
+// round bit (PADDW), then packs back to bytes via PACKUSWB.
+// PACKUSWB never saturates: shifted ≤ 0x7F for cnt ≥ 1; +round ≤ 1
+// keeps the max at 0x80 — well below the 0xFF clamp boundary.
+//
+// shift==esize (cnt==8): PSRLW by 8 → 0; round bit = MSB of byte;
+// result per lane = MSB.  Matches ARM URSHR at shift==esize:
+// (x + 128) >> 8 ∈ {0, 1}.  No saturation.
+//
+// shift==1: cnt_minus_1==0, PSRLW(round, 0) is a no-op, two-shift
+// bracket isolates bit 0 of the widened word = bit 0 of original
+// byte = correct round bit at shift=1.
+//
+// URSHR is non-accumulating: result writes Vd directly, no Vd+
+// addition.  No mod-256 wraparound test needed (USRA's wraparound is
+// caused by the PADDB into Vd; URSHR has no PADDB into Vd).
+constexpr uint32_t kUrshrVec8B_1   = 0x2F0F2420;  // urshr v0.8b, v1.8b, #1
+constexpr uint32_t kUrshrVec8B_4   = 0x2F0C2420;  // urshr v0.8b, v1.8b, #4
+constexpr uint32_t kUrshrVec8B_7   = 0x2F092420;  // urshr v0.8b, v1.8b, #7
+constexpr uint32_t kUrshrVec8B_8   = 0x2F082420;  // urshr v0.8b, v1.8b, #8
+constexpr uint32_t kUrshrVec16B_1  = 0x6F0F2420;  // urshr v0.16b, v1.16b, #1
+constexpr uint32_t kUrshrVec16B_4  = 0x6F0C2420;  // urshr v0.16b, v1.16b, #4
+constexpr uint32_t kUrshrVec16B_7  = 0x6F092420;  // urshr v0.16b, v1.16b, #7
+constexpr uint32_t kUrshrVec16B_8  = 0x6F082420;  // urshr v0.16b, v1.16b, #8
+constexpr uint32_t kUrshrVec8B_VdEqVn_3  = 0x2F0D2400;  // urshr v0.8b, v0.8b, #3
+constexpr uint32_t kUrshrVec16B_VdEqVn_3 = 0x6F0D2400;  // urshr v0.16b, v0.16b, #3
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrByteEncodingMatchesLlvmMc) {
+  EXPECT_EQ(kUrshrVec8B_1, 0x2F0F2420u);
+  EXPECT_EQ(kUrshrVec8B_4, 0x2F0C2420u);
+  EXPECT_EQ(kUrshrVec8B_7, 0x2F092420u);
+  EXPECT_EQ(kUrshrVec8B_8, 0x2F082420u);
+  EXPECT_EQ(kUrshrVec16B_1, 0x6F0F2420u);
+  EXPECT_EQ(kUrshrVec16B_4, 0x6F0C2420u);
+  EXPECT_EQ(kUrshrVec16B_7, 0x6F092420u);
+  EXPECT_EQ(kUrshrVec16B_8, 0x6F082420u);
+  EXPECT_EQ(kUrshrVec8B_VdEqVn_3, 0x2F0D2400u);
+  EXPECT_EQ(kUrshrVec16B_VdEqVn_3, 0x6F0D2400u);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8BShift1Jit) {
+  // URSHR(Vn, 1) per byte = (Vn + 1) >> 1:
+  //   { 7, 200, 14, 255, 127, 128, 0, 1} →
+  //   { 4, 100,  7, 128,  64,  64, 0, 1}
+  // Upper 8 bytes of Vn ignored; Vd[127:64] zeroed (D-reg semantics).
+  uint8_t in_vn[16] = {7, 200, 14, 255, 127, 128, 0, 1,
+                       0x55, 0x66, 0x77, 0x11, 0x22, 0x33, 0x44, 0x55};
+  uint8_t in_vd[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00,
+                       0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memcpy(&state_.cpu.v[0], in_vd, 16);
+  static const uint32_t code[] = {kUrshrVec8B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {4, 100, 7, 128, 64, 64, 0, 1};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper half zeroed (D-register semantics).
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8BShift4Jit) {
+  // URSHR(Vn, 4) per byte = (Vn + 8) >> 4:
+  //   {16, 240, 100, 200, 127, 255, 15, 1} →
+  //   { 1,  15,   6,  13,   8,  16,  1, 0}
+  uint8_t in_vn[16] = {16, 240, 100, 200, 127, 255, 15, 1,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kUrshrVec8B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {1, 15, 6, 13, 8, 16, 1, 0};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8BShift7Jit) {
+  // URSHR(Vn, 7) per byte = (Vn + 64) >> 7:
+  //   {1, 255, 0, 127, 128, 64, 200, 100} →
+  //   {0,   2, 0,   1,   1,  1,   2,   1}
+  uint8_t in_vn[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kUrshrVec8B_7};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {0, 2, 0, 1, 1, 1, 2, 1};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8BShift8BoundaryJit) {
+  // cnt==esize=8: URSHR(x, 8) = (x + 128) >> 8 = MSB(x) (0 or 1).
+  //   {1, 255, 0, 127, 128, 64, 200, 100} →
+  //   {0,   1, 0,   0,   1,  0,   1,   0}
+  uint8_t in_vn[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                       0, 0, 0, 0, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kUrshrVec8B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {0, 1, 0, 0, 1, 0, 1, 0};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec16BShift1Jit) {
+  // 16 bytes.  Low and high halves of Vn must both appear in Vd in the
+  // same lane order.  Tests PACKUSWB(xn_lo, xn_hi) lane order.
+  //   URSHR(Vn, 1) = (Vn + 1) >> 1:
+  //     low : { 7, 200, 14, 255, 127, 128, 0,  1} →
+  //           { 4, 100,  7, 128,  64,  64, 0,  1}
+  //     high: {31, 224, 64, 192,   1, 255, 2,  3} →
+  //           {16, 112, 32,  96,   1, 128, 1,  2}
+  uint8_t in_vn[16] = { 7, 200, 14, 255, 127, 128, 0,  1,
+                       31, 224, 64, 192,   1, 255, 2,  3};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kUrshrVec16B_1};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = { 4, 100,  7, 128,  64,  64, 0, 1,
+                              16, 112, 32,  96,   1, 128, 1, 2};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec16BShift4Jit) {
+  // URSHR(Vn, 4) per byte across both halves:
+  //   low : {16, 240, 100, 200, 127, 255, 15, 1} →
+  //         { 1,  15,   6,  13,   8,  16,  1, 0}
+  //   high: {32,  64, 128, 192,  15,  31,  7, 8} →
+  //         { 2,   4,   8,  12,   1,   2,  0, 1}
+  uint8_t in_vn[16] = {16, 240, 100, 200, 127, 255, 15, 1,
+                       32,  64, 128, 192,  15,  31,  7, 8};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kUrshrVec16B_4};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = {1, 15, 6, 13, 8, 16, 1, 0,
+                              2,  4, 8, 12, 1,  2, 0, 1};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec16BShift8BoundaryJit) {
+  // cnt==esize=8 across all 16 lanes: result per lane = MSB(byte).
+  //   low : {1, 255, 0, 127, 128, 64, 200, 100} →
+  //         {0,   1, 0,   0,   1,  0,   1,   0}
+  //   high: {50, 60, 70, 80, 90, 100, 110, 200} →
+  //         { 0,  0,  0,  0,  0,   0,   0,   1}
+  uint8_t in_vn[16] = {1, 255, 0, 127, 128, 64, 200, 100,
+                       50, 60, 70, 80, 90, 100, 110, 200};
+  std::memcpy(&state_.cpu.v[1], in_vn, 16);
+  std::memset(&state_.cpu.v[0], 0xCC, 16);
+  static const uint32_t code[] = {kUrshrVec16B_8};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = {0, 1, 0, 0, 1, 0, 1, 0,
+                              0, 0, 0, 0, 0, 0, 0, 1};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec8BVdEqVnJit) {
+  // Vd==Vn==v0, .8B.  URSHR writes the result to Vd directly (no Vd
+  // accumulation).  PMOVZXBW reads Vn from memory BEFORE Movdqu writes
+  // Vd; final Movdqu writes Vd LAST.
+  //   URSHR({24, 250, 64, 200, 255, 0, 100, 200}, 3) = (x + 4) >> 3:
+  //     24→ 3, 250→31, 64→ 8, 200→25, 255→32, 0→0, 100→13, 200→25
+  // Upper 8 bytes (originally 0x77..0x00) must be zeroed in Vd
+  // post-write.
+  uint8_t in[16] = {24, 250, 64, 200, 255, 0, 100, 200,
+                    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kUrshrVec8B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[8] = {3, 31, 8, 25, 32, 0, 13, 25};
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], expect[i]) << "lane " << i;
+  }
+  // Upper 8 bytes of Vd zeroed (D-register semantics) despite
+  // originally holding nonzero data.
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, UrshrVec16BVdEqVnJit) {
+  // Vd==Vn==v0, .16B.  Both PMOVZXBW loads must complete BEFORE the
+  // final Movdqu writes Vd.
+  //   URSHR(Vn, 3) per lane = (x + 4) >> 3:
+  //     { 8, 250, 16, 240,   1, 255, 100, 200} →
+  //     { 1,  31,  2,  30,   0,  32,  13,  25}
+  //     {24, 200, 64, 192, 127, 128,  50,   2} →
+  //     { 3,  25,  8,  24,  16,  16,   6,   0}
+  uint8_t in[16] = { 8, 250, 16, 240,   1, 255, 100, 200,
+                    24, 200, 64, 192, 127, 128,  50,   2};
+  std::memcpy(&state_.cpu.v[0], in, 16);
+  static const uint32_t code[] = {kUrshrVec16B_VdEqVn_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expect[16] = { 1, 31,  2, 30,  0,  32, 13, 25,
+                               3, 25,  8, 24, 16,  16,  6,  0};
   for (int i = 0; i < 16; ++i) {
     EXPECT_EQ(r[i], expect[i]) << "lane " << i;
   }
