@@ -13206,6 +13206,57 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+
+      // region digitalis - XTN / XTN2 (truncating extract narrow). args.size
+      // selects the destination element width (00=.8B, 01=.4H, 10=.2S); each
+      // source lane is twice as wide.  Q=0 writes the packed result to the low
+      // 64 bits (upper zeroed); Q=1 (XTN2) writes the upper 64 bits, preserving
+      // Vd's low 64.  Truncation via mask-then-unsigned-pack (the mask makes
+      // PACKUS* saturation a no-op); .2D->.2S gathers the low dwords.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kXtn: {
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xz = AllocTempSimdReg();
+        if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xz, xz);
+        if (args.size == 0b00 || args.size == 0b01) {
+          SimdRegister xm = AllocTempSimdReg();
+          Register tmp = AllocTempReg();
+          if (xm == no_simd_register || tmp == no_register) { success_ = false; return; }
+          as_.Movq(tmp, args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                                          : int64_t{0x0000FFFF0000FFFFLL});
+          as_.Movq(xm, tmp);
+          as_.Punpcklqdq(xm, xm);
+          as_.Pand(xn, xm);
+          if (args.size == 0b00) {
+            as_.Packuswb(xn, xz);  // 8 words -> 8 bytes, low 64
+          } else {
+            as_.Packusdw(xn, xz);  // 4 dwords -> 4 words, low 64
+          }
+        } else if (args.size == 0b10) {
+          as_.Pshufd(xn, xn, int8_t{0b00001000});  // [d0, d2, *, *]
+          mask_low64(xn);                           // -> [d0, d2, 0, 0]
+        } else {
+          success_ = false;
+          return;
+        }
+        if (!args.q) {
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        } else {
+          // XTN2: shift packed result into the upper 64 bits, then merge with
+          // Vd's preserved low 64.
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          mask_low64(xd);
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        }
+        return;
+      }
+      // endregion
+
       // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 -- per-lane signed compare against 0.
       //   CMGT (Vn > 0)  ->  PCMPGTx(Vn, 0)
       //   CMLT (Vn < 0)  ->  PCMPGTx(0, Vn)

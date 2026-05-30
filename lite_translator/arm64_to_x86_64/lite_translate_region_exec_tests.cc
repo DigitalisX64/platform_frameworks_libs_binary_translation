@@ -11572,6 +11572,67 @@ TEST_F(Arm64LiteTranslateRegionTest, XarRotRightPerLane) {
 }
 // endregion
 
+// region digitalis - XTN / XTN2 (truncating extract narrow) — JIT.
+// Encodings (clang --target=aarch64):
+//   xtn  .8b=0x0E212800  xtn2 .16b=0x4E212800
+//   xtn  .4h=0x0E612800  xtn2 .8h =0x4E612800
+//   xtn  .2s=0x0EA12800  xtn2 .4s =0x4EA12800
+constexpr uint32_t Xtn8b(uint8_t rd, uint8_t rn) {
+  return 0x0E212800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Xtn2_16b(uint8_t rd, uint8_t rn) {
+  return 0x4E212800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Xtn4h(uint8_t rd, uint8_t rn) {
+  return 0x0E612800u | (uint32_t{rn} << 5) | rd;
+}
+constexpr uint32_t Xtn2s(uint8_t rd, uint8_t rn) {
+  return 0x0EA12800u | (uint32_t{rn} << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Xtn8bTruncates) {
+  SetV128(state_.cpu, 1, 0xDEF09ABC56781234ULL, 0x4444333322221111ULL);
+  static const uint32_t code[] = {Xtn8b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x44332211F0BC7834ULL);  // low byte of each of 8 halfwords
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Xtn4hTruncates) {
+  SetV128(state_.cpu, 1, 0x3333444411112222ULL, 0x7777888855556666ULL);
+  static const uint32_t code[] = {Xtn4h(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x8888666644442222ULL);  // low 16 of each of 4 words
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Xtn2sTruncates) {
+  SetV128(state_.cpu, 1, 0x1111111122222222ULL, 0x3333333344444444ULL);
+  static const uint32_t code[] = {Xtn2s(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x4444444422222222ULL);  // low 32 of each qword
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// XTN2: low 64 of Vd preserved, truncated bytes written to the upper 64.
+TEST_F(Arm64LiteTranslateRegionTest, Xtn2_16bUpperHalf) {
+  SetV128(state_.cpu, 0, 0x0123456789ABCDEFULL, 0xCCCCCCCCCCCCCCCCULL);  // Vd
+  SetV128(state_.cpu, 1, 0xDEF09ABC56781234ULL, 0x4444333322221111ULL);  // Vn
+  static const uint32_t code[] = {Xtn2_16b(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  GetV128(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], 0x0123456789ABCDEFULL);  // preserved
+  EXPECT_EQ(r[1], 0x44332211F0BC7834ULL);  // truncated bytes
+}
+// endregion
+
 // region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to
