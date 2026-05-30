@@ -7493,6 +7493,41 @@ class Interpreter {
       }
       // endregion
 
+      // region digitalis - FRINTTS vector (FRINT32Z/X, FRINT64Z/X). Per lane,
+      // round to a 32/64-bit integral FP value with saturation, reusing the
+      // scalar FrintTs helper. Element width comes from sz (size&1); the int
+      // target width + rounding mode come from the opcode (mapped to the same
+      // 6-bit selector the scalar FpDataProc1 path uses).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32zV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32xV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint64zV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrint64xV: {
+        uint8_t scalar_op;
+        switch (args.opcode) {
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32zV: scalar_op = 0b010000; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrint32xV: scalar_op = 0b010001; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrint64zV: scalar_op = 0b010010; break;
+          default:                                           scalar_op = 0b010011; break;  // kFrint64xV
+        }
+        uint8_t fp_esize = (args.size & 1) ? 8 : 4;
+        uint8_t fp_count = vec_len / fp_esize;
+        for (uint8_t i = 0; i < fp_count; i++) {
+          if (fp_esize == 4) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            float r = static_cast<float>(FrintTs(static_cast<double>(f), scalar_op));
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
+          } else {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            double r = FrintTs(d, scalar_op);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
+          }
+        }
+        break;
+      }
+      // endregion
+
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
         bool is_rsqrt =

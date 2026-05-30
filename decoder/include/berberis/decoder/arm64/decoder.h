@@ -1370,6 +1370,13 @@ class Decoder {
     kFcvtauV,   // FCVTAU: U=1, opcode=11100, bit23=0
     kUrecpe,    // URECPE  (vector, unsigned integer reciprocal estimate): U=0, opcode=11100, bit23=1, sz=0
     kUrsqrte,   // URSQRTE (vector, unsigned integer reciprocal sqrt estimate): U=1, opcode=11100, bit23=1, sz=0
+    // FRINTTS (vector): round to 32/64-bit integral FP, saturating. opcode
+    // 11110=FRINT32, 11111=FRINT64; bit23=0; U selects X(1)/Z(0); sz(bit22)
+    // selects FP32 (.2S/.4S) / FP64 (.2D).
+    kFrint32zV,
+    kFrint32xV,
+    kFrint64zV,
+    kFrint64xV,
     // endregion
     // region digitalis BFCVTN/BFCVTN2 (Armv8.6-BF16).
     // Vector narrow FP32 -> BF16. Encoding shares opcode=10110 with FCVTN,
@@ -5523,12 +5530,25 @@ class Decoder {
         }
         break;
       // endregion
-      // region digitalis - opcode=11111 with bit23=1, U=1 is FSQRT (vector).
-      // No defined encoding for U=0 / opcode=11111 in two-reg-misc.
+      // region digitalis - opcode=11111 splits on bit23:
+      //   bit23=1, U=1: FSQRT (vector).
+      //   bit23=0: FRINT64Z (U=0) / FRINT64X (U=1) — FRINTTS 64-bit.
       case 0b11111:
-        if (!u) { Undefined(); return; }
-        if (!GetBits<23, 1>()) { Undefined(); return; }
-        op = AdvSimdTwoRegMiscOpcode::kFsqrtV;
+        if (GetBits<23, 1>()) {
+          if (!u) { Undefined(); return; }
+          op = AdvSimdTwoRegMiscOpcode::kFsqrtV;
+        } else {
+          op = u ? AdvSimdTwoRegMiscOpcode::kFrint64xV
+                 : AdvSimdTwoRegMiscOpcode::kFrint64zV;
+        }
+        break;
+      // endregion
+      // region digitalis - opcode=11110, bit23=0: FRINT32Z (U=0) / FRINT32X
+      // (U=1) — FRINTTS 32-bit. bit23=1 is unallocated for this opcode.
+      case 0b11110:
+        if (GetBits<23, 1>()) { Undefined(); return; }
+        op = u ? AdvSimdTwoRegMiscOpcode::kFrint32xV
+               : AdvSimdTwoRegMiscOpcode::kFrint32zV;
         break;
       // endregion
       // region digitalis - opcode=11011 splits on whether this is the
