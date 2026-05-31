@@ -5620,8 +5620,8 @@ class Decoder {
       case 0b10110:
         // region digitalis - opcode=10110 splits on U:
         //   U=0 + size=10 -> BFCVTN/BFCVTN2 (FP32->BF16).
-        //   U=0 + size=00/01 -> FCVTN/FCVTN2 (FP16->? / FP64->FP32). Only
-        //     size=01 is currently implemented; size=00 is undefined here.
+        //   U=0 + size=00/01 -> FCVTN/FCVTN2: size=00 narrows FP32->FP16,
+        //     size=01 narrows FP64->FP32. Both are implemented.
         //   U=1 + size=01 -> FCVTXN/FCVTXN2 (FP64->FP32, round-to-odd).
         //   U=1 + size!=01 -> unallocated.
         // bit30 (q) selects low-half write (Q=0) vs high-half write (Q=1).

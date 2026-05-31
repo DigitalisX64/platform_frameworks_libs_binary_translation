@@ -13944,21 +13944,40 @@ class LiteTranslator {
       // FCVTN narrows 2 doubles to 2 floats (CVTPD2PS; Q=0 low+zero-upper,
       // Q=1/FCVTN2 upper-half merge).  size=00 (FP16) bails to the interpreter.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl: {
-        if (args.size != 0b01) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { success_ = false; return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
-        if (args.q) as_.Psrldq(xn, int8_t{8});  // FCVTL2: high 2 floats -> low
-        as_.Cvtps2pd(xn, xn);
+        if (args.size == 0b01) {
+          // FP32 -> FP64 widen.
+          if (args.q) as_.Psrldq(xn, int8_t{8});  // FCVTL2: high 2 floats -> low
+          as_.Cvtps2pd(xn, xn);
+        } else if (args.size == 0b00) {
+          // FP16 -> FP32 widen (4 lanes) via F16C; widening is exact.
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          if (args.q) as_.Psrldq(xn, int8_t{8});  // FCVTL2: high 4 halves -> low
+          as_.Vcvtph2ps(xn, xn);
+        } else {
+          success_ = false;
+          return;
+        }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn: {
-        if (args.size != 0b01) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { success_ = false; return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
-        as_.Cvtpd2ps(xn, xn);  // 2 doubles -> 2 floats in low 64, upper zeroed
+        if (args.size == 0b01) {
+          as_.Cvtpd2ps(xn, xn);  // 2 doubles -> 2 floats in low 64, upper zeroed
+        } else if (args.size == 0b00) {
+          // FP32 -> FP16 narrow (4 lanes) via F16C, round-to-nearest-even
+          // (imm8=0). Result in low 64, upper zeroed.
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+        } else {
+          success_ = false;
+          return;
+        }
         if (!args.q) {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         } else {
