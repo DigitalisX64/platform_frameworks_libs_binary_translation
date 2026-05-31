@@ -12524,6 +12524,79 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtnFp16MatchesInterpreter) {
   InterpretInsn(&state_);
   EXPECT_EQ(jit2, state_.cpu.v[0]);
 }
+
+// .2D->.2S saturating extracts SQXTN/UQXTN/SQXTUN (64->32). The JIT clamps
+// each 64-bit lane (PCMPGTQ-based) and packs via PSHUFD; validated against the
+// interpreter oracle across in-range / +overflow / negative / -overflow lanes.
+namespace {
+struct Sqxtn2dCase { uint64_t a; uint64_t b; };
+const Sqxtn2dCase kSqxtn2dCases[] = {
+    {5u, 0x0000000100000000ULL},               // in-range, +overflow
+    {0xFFFFFFFFFFFFFFFBULL, 0x000000007FFFFFFFULL},  // -5 / INT32_MAX
+    {0x8000000000000000ULL, 0x00000000FFFFFFFFULL},  // very negative / UINT32_MAX
+    {0xFFFFFFFF80000000ULL, 0x0000000012345678ULL},  // INT32_MIN / in-range
+};
+}  // namespace
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2dMatchesInterpreter) {
+  static const uint32_t code[] = {0x0ea14820u};  // sqxtn v0.2s, v1.2d
+  for (const Sqxtn2dCase& c : kSqxtn2dCases) {
+    uint64_t in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "SQXTN a=" << std::hex << c.a << " b=" << c.b;
+  }
+}
+TEST_F(Arm64LiteTranslateRegionTest, Uqxtn2dMatchesInterpreter) {
+  static const uint32_t code[] = {0x2ea14820u};  // uqxtn v0.2s, v1.2d
+  for (const Sqxtn2dCase& c : kSqxtn2dCases) {
+    uint64_t in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "UQXTN a=" << std::hex << c.a << " b=" << c.b;
+  }
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtun2dMatchesInterpreter) {
+  static const uint32_t code[] = {0x2ea12820u};  // sqxtun v0.2s, v1.2d
+  for (const Sqxtn2dCase& c : kSqxtn2dCases) {
+    uint64_t in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "SQXTUN a=" << std::hex << c.a << " b=" << c.b;
+  }
+}
+// SQXTN2 (Q=1) writes the high 64 bits and preserves Vd's low half.
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2dQ1MatchesInterpreter) {
+  static const uint32_t code[] = {0x4ea14820u};  // sqxtn2 v0.4s, v1.2d
+  uint64_t in[2] = {0x0000000100000000ULL, 0xFFFFFFFF80000000ULL};  // +ovf / INT32_MIN
+  memcpy(&state_.cpu.v[1], in, 16);
+  SetV128(state_.cpu, 0, 0xAABBCCDD11223344ULL, 0ULL);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xAABBCCDD11223344ULL);  // low preserved
+  __uint128_t jit = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], in, 16);
+  SetV128(state_.cpu, 0, 0xAABBCCDD11223344ULL, 0ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit, state_.cpu.v[0]);
+}
 // endregion
 
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs

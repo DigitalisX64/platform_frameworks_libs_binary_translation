@@ -13885,12 +13885,75 @@ class LiteTranslator {
       //                                        PACKUSWB/PACKUSDW (the clamp
       //                                        keeps values in the positive
       //                                        signed range so PACKUS is exact).
-      // .2D->.2S (size=10) has no x86 narrowing pack; bail to the interpreter.
+      // .2D->.2S (size=10) has no x86 narrowing pack; it is handled below by
+      // per-lane clamp + PSHUFD (SSE4.2).
       case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
       case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
-        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
         const auto opc = args.opcode;
+        if (args.size == 0b10) {
+          // .2D->.2S / .2D->.4S(2): 64->32 saturating narrow. x86 has no 64->32
+          // pack, so clamp each 64-bit lane into the destination range, then
+          // gather the two low dwords with PSHUFD. Signed clamps need PCMPGTQ
+          // (SSE4.2); bail to the interpreter when the host lacks it.
+          if (!host_platform::kHasSSE4_2) { success_ = false; return; }
+          SimdRegister x = AllocTempSimdReg();
+          SimdRegister c = AllocTempSimdReg();
+          SimdRegister m = AllocTempSimdReg();
+          SimdRegister t = AllocTempSimdReg();
+          Register gp = AllocTempReg();
+          if (x == no_simd_register || c == no_simd_register ||
+              m == no_simd_register || t == no_simd_register ||
+              gp == no_register) { success_ = false; return; }
+          as_.Movdqu(x, {.base = Assembler::rbp, .disp = vn_off});
+          auto set_const = [&](SimdRegister r, int64_t v) {
+            as_.Movq(gp, v);
+            as_.Movq(r, gp);
+            as_.Punpcklqdq(r, r);  // replicate to both 64-bit lanes
+          };
+          // x = (x & ~mask) | (val & mask), via x ^= (x ^ val) & mask.
+          auto blend = [&](SimdRegister val, SimdRegister mask) {
+            as_.Movdqa(t, x);
+            as_.Pxor(t, val);
+            as_.Pand(t, mask);
+            as_.Pxor(x, t);
+          };
+          if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn) {
+            set_const(c, int64_t{0x000000007FFFFFFFLL});      // INT32_MAX
+            as_.Movdqa(m, x); as_.Pcmpgtq(m, c);              // x > MAX
+            blend(c, m);
+            set_const(c, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
+            as_.Movdqa(m, c); as_.Pcmpgtq(m, x);              // x < MIN
+            blend(c, m);
+          } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
+            set_const(c, int64_t{0x00000000FFFFFFFFLL});      // UINT32_MAX
+            as_.Movdqa(m, x); as_.Pcmpgtq(m, c);              // x > UMAX (x>=0 region)
+            blend(c, m);
+            as_.Pxor(c, c);                                    // 0
+            as_.Movdqa(m, c); as_.Pcmpgtq(m, x);              // x < 0
+            as_.Pandn(m, x); as_.Movdqa(x, m);                // negatives -> 0
+          } else {  // kUqxtn: unsigned uint64 -> clamp to UINT32_MAX
+            set_const(c, int64_t{0x00000000FFFFFFFFLL});      // UINT32_MAX
+            as_.Movdqa(m, x); as_.Psrlq(m, int8_t{32});       // high 32 bits
+            as_.Pxor(t, t); as_.Pcmpeqq(m, t);                // mask: high32 == 0 (keep x)
+            as_.Movdqa(t, x); as_.Pxor(t, c); as_.Pandn(m, t); as_.Pxor(x, m);
+          }
+          as_.Pshufd(x, x, int8_t{0x08});  // {dword0, dword2} -> low 64
+          if (!args.q) {
+            mask_low64(x);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x);
+          } else {
+            as_.Pslldq(x, int8_t{8});
+            SimdRegister xd = AllocTempSimdReg();
+            if (xd == no_simd_register) { success_ = false; return; }
+            as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+            mask_low64(xd);
+            as_.Por(x, xd);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x);
+          }
+          return;
+        }
+        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xz = AllocTempSimdReg();
         if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }
