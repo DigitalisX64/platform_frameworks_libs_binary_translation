@@ -3261,6 +3261,94 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_NegZeroPassthrough) {
 // endregion
 
 // region digitalis
+// ORR/BIC (vector, immediate) are read-modify-write, unlike MOVI/MVNI. The
+// per-32-bit-lane immediate for "#0x0f" (cmode=0b0001) is 0x0000000F.
+
+// ORR v0.4s, #0x0f : Vd |= imm (full 128 bits, Q=1).
+TEST_F(Arm64LiteTranslateRegionTest, OrrImm4S_ReadModifyWrite) {
+  state_.cpu.v[0] =
+      (static_cast<__uint128_t>(0xFFFF0000FFFF0000ULL) << 64) | 0xAAAAAAAA55555555ULL;
+  static const uint32_t code[] = {0x4f0015e0u};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xAAAAAAAF5555555FULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0xFFFF000FFFFF000FULL);
+}
+
+// BIC v0.4s, #0x0f : Vd &= ~imm (full 128 bits, Q=1).
+TEST_F(Arm64LiteTranslateRegionTest, BicImm4S_ReadModifyWrite) {
+  state_.cpu.v[0] =
+      (static_cast<__uint128_t>(0x1111111111111111ULL) << 64) | 0x1111111111111111ULL;
+  static const uint32_t code[] = {0x6f0015e0u};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x1111111011111110ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x1111111011111110ULL);
+}
+
+// ORR v0.2s, #0x0f : Q=0 operates on the low 64 bits and zeroes the upper half.
+TEST_F(Arm64LiteTranslateRegionTest, OrrImm2S_ZeroesUpperHalf) {
+  state_.cpu.v[0] =
+      (static_cast<__uint128_t>(0xDEADBEEFDEADBEEFULL) << 64) | 0xAAAAAAAA55555555ULL;
+  static const uint32_t code[] = {0x0f0015e0u};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xAAAAAAAF5555555FULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+// ORR v0.8h, #0x0f : 16-bit-lane RMW (cmode=0b1001, imm 0x000F per halfword).
+TEST_F(Arm64LiteTranslateRegionTest, OrrImm8H_ReadModifyWrite) {
+  state_.cpu.v[0] =
+      (static_cast<__uint128_t>(0x1234123412341234ULL) << 64) | 0x1234123412341234ULL;
+  static const uint32_t code[] = {0x4f0095e0u};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x123F123F123F123FULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x123F123F123F123FULL);
+}
+
+// Regression: MOVI v0.4s, #0x0f still REPLACES Vd (not read-modify-write).
+TEST_F(Arm64LiteTranslateRegionTest, MoviImm4S_Replaces) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {0x4f0005e0u};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x0000000F0000000FULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x0000000F0000000FULL);
+}
+
+// MVNI v0.2s, #0x0f : Q=0 replace form (~imm) must zero the upper half.
+TEST_F(Arm64LiteTranslateRegionTest, MvniImm2S_ZeroesUpperHalf) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {0x2f0005e0u};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xFFFFFFF0FFFFFFF0ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+// Interpreter-path coverage (the JIT bails for it whenever a region ends here):
+// ORR v0.4s, #0x0f read-modify-write via the interpreter.
+TEST_F(Arm64LiteTranslateRegionTest, OrrImm4S_Interpreter) {
+  state_.cpu.v[0] =
+      (static_cast<__uint128_t>(0xFFFF0000FFFF0000ULL) << 64) | 0xAAAAAAAA55555555ULL;
+  static const uint32_t code[] = {0x4f0015e0u};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xAAAAAAAF5555555FULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0xFFFF000FFFFF000FULL);
+}
+
+// BIC v0.2s, #0x0f via the interpreter: Q=0 clears bits and zeroes the upper half.
+TEST_F(Arm64LiteTranslateRegionTest, BicImm2S_Interpreter_ZeroesUpper) {
+  state_.cpu.v[0] =
+      (static_cast<__uint128_t>(0xDEADBEEFDEADBEEFULL) << 64) | 0x1111111111111111ULL;
+  static const uint32_t code[] = {0x2f0015e0u};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x1111111011111110ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+// endregion
+
+// region digitalis
 // SQABS scalar: signed saturating absolute value, single-lane.
 // Encoding: AdvSimd scalar two-reg-misc with U=0, opcode=00111.
 // llvm-mc-21 checks at decoder.h:5398:

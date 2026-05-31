@@ -2697,15 +2697,51 @@ class LiteTranslator {
 
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
     // region digitalis
-    // Compute the 128-bit immediate at translation time (matches the
-    // interpreter's expand-and-replace semantics) and emit a constant load.
-    __uint128_t value =
-        ExpandSimdModifiedImmJit(args.op, args.cmode, args.abc, args.defgh, args.q);
+    const uint8_t cmode = args.cmode;
+    // ORR/BIC (vector, immediate) — cmode<0>==1 and cmode<3:2>!=11 — are
+    // read-modify-write, unlike the MOVI/MVNI/FMOV replace forms. The immediate
+    // is the MOVI-style (op=0) expansion; ORR (op=0) sets bits, BIC (op=1)
+    // clears them.
+    const bool is_orr_bic = (cmode & 1) && ((cmode & 0b1100) != 0b1100);
+    __uint128_t value = is_orr_bic
+        ? ExpandSimdModifiedImmJit(0, cmode, args.abc, args.defgh, args.q)
+        : ExpandSimdModifiedImmJit(args.op, cmode, args.abc, args.defgh, args.q);
     uint64_t lo = static_cast<uint64_t>(value);
-    uint64_t hi = static_cast<uint64_t>(value >> 64);
+    // Q==0 operates on the low 64 bits and zeroes the upper 64 of Vd.
+    uint64_t hi = args.q ? static_cast<uint64_t>(value >> 64) : 0;
     int32_t off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
     SimdRegister xd = AllocTempSimdReg();
     if (xd == no_simd_register) { success_ = false; return; }
+
+    if (is_orr_bic) {
+      // Materialise the immediate, load Vd (low 64 zero-extended when Q==0 so
+      // the upper half ends up zeroed), then OR (set) or AND-NOT (clear).
+      SimdRegister ximm = AllocTempSimdReg();
+      if (ximm == no_simd_register) { success_ = false; return; }
+      Register tmp = AllocTempReg();
+      if (tmp == no_register) { success_ = false; return; }
+      as_.Movq(tmp, static_cast<int64_t>(lo));
+      as_.Movq(ximm, tmp);  // zero-extends: upper 64 = 0
+      if (hi != 0) {
+        as_.Movq(tmp, static_cast<int64_t>(hi));
+        as_.Pinsrq(ximm, tmp, int8_t{1});
+      }
+      if (args.q) {
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = off});
+      } else {
+        as_.Movsd(xd, {.base = Assembler::rbp, .disp = off});  // zero-extends upper 64
+      }
+      if (args.op == 0) {
+        as_.Por(xd, ximm);
+        as_.Movdqu({.base = Assembler::rbp, .disp = off}, xd);
+      } else {
+        as_.Pandn(ximm, xd);  // ximm = ~imm & Vd
+        as_.Movdqu({.base = Assembler::rbp, .disp = off}, ximm);
+      }
+      return;
+    }
+
+    // MOVI/MVNI/FMOV: emit a constant load (replace).
     if (lo == 0 && hi == 0) {
       as_.Pxor(xd, xd);
     } else {
