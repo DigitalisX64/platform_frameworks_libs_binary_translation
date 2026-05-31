@@ -79,14 +79,18 @@ cc_test_library {
     name: "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
     defaults: ["berberis_test_library_defaults_64"],
     srcs: [
+        "arm64_to_x86_64/lite_translate_region_bench.cc",
         "arm64_to_x86_64/lite_translate_region_exec_tests.cc",
     ],
     header_libs: [
         "libberberis_base_headers",
         "libberberis_decoder_arm64_headers",
+        "libberberis_guest_os_primitives_headers",
         "libberberis_guest_state_arm64_headers",
         "libberberis_interpreter_arm64_headers",
         "libberberis_lite_translator_headers",
+        "libberberis_runtime_headers",
+        "libberberis_runtime_primitives_headers",
         "berberis_test_utils_headers",
     ],
 }
