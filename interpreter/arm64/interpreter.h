@@ -3347,8 +3347,25 @@ class Interpreter {
 
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
     CHECK(!exception_raised_);
-    __uint128_t value = ExpandSimdModifiedImm(args.op, args.cmode, args.abc, args.defgh, args.q);
-    state_->cpu.v[args.rd] = value;
+    const uint8_t cmode = args.cmode;
+    // ORR/BIC (vector, immediate) are encoded as cmode<0>==1 with cmode<3:2>!=11
+    // (the cmode<3:2>==11 forms are MOVI/MVNI shifting-ones, MOVI/FMOV). Unlike
+    // MOVI/MVNI they are read-modify-write: the immediate is the MOVI-style
+    // (op=0) expansion; ORR (op=0) sets those bits, BIC (op=1) clears them.
+    const bool is_orr_bic = (cmode & 1) && ((cmode & 0b1100) != 0b1100);
+    __uint128_t result;
+    if (is_orr_bic) {
+      const __uint128_t imm = ExpandSimdModifiedImm(0, cmode, args.abc, args.defgh, args.q);
+      const __uint128_t cur = state_->cpu.v[args.rd];
+      result = (args.op == 0) ? (cur | imm) : (cur & ~imm);
+    } else {
+      result = ExpandSimdModifiedImm(args.op, cmode, args.abc, args.defgh, args.q);
+    }
+    // Q==0 operates on the lower 64 bits; the upper 64 bits of Vd are zeroed.
+    if (!args.q) {
+      result = static_cast<__uint128_t>(static_cast<uint64_t>(result));
+    }
+    state_->cpu.v[args.rd] = result;
   }
 
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
