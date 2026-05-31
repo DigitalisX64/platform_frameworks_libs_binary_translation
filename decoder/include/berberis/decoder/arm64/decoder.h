@@ -2310,9 +2310,15 @@ class Decoder {
       case 0b110: {
         // This group contains: Unconditional branch (register), Exception generation, System.
         uint32_t opc_top = GetBits<22, 4>();
-        if (opc_top == 0b0000) {
+        // region digitalis - Exception generation is bits[25:24]==00 (the
+        // 11010100 prefix); the opc field lives in bits[23:21], so HLT (opc=010)
+        // and DCPS1-3 (opc=101) set bits 22/23 and must still route here rather
+        // than falling through to Undefined(). DecodeExceptionGeneration sorts
+        // out the individual opcodes.
+        if ((opc_top & 0b1100) == 0b0000) {
           // Exception generation (SVC, HVC, SMC, BRK, HLT, DCPS).
           DecodeExceptionGeneration();
+          // endregion
         } else if (opc_top == 0b0100) {
           // System (MSR, MRS, NOP, DMB, DSB, ISB, SYS, SYSL).
           DecodeSystem();
@@ -2401,17 +2407,23 @@ class Decoder {
       insn_consumer_->Svc(args);
       return;
     }
-    // region digitalis - BRK: opc=001, ll=00. Software breakpoint; delivers a
-    // synchronous SIGTRAP to the guest (so debuggers and sanitizers — HWASan,
-    // UBSan trap-on-error — see a breakpoint at the guest PC instead of an
-    // illegal-instruction abort). HLT (opc=010) and DCPS1-3 (opc=101) remain
-    // fatal-with-diagnostic via Undefined() below.
-    if (opc == 0b001 && ll == 0b00) {
+    // region digitalis - BRK (opc=001, ll=00) and HLT (opc=010, ll=00) are
+    // breakpoint-class instructions; both deliver a synchronous SIGTRAP to the
+    // guest (so debuggers and sanitizers — HWASan, UBSan trap-on-error — see a
+    // breakpoint at the guest PC rather than an illegal-instruction abort).
+    if (opc == 0b001 && ll == 0b00) {  // BRK
       insn_consumer_->Brk(imm16);
       return;
     }
+    if (opc == 0b010 && ll == 0b00) {  // HLT — same SIGTRAP path as BRK
+      insn_consumer_->Brk(imm16);
+      return;
+    }
+    // HVC (opc=000, ll=10), SMC (opc=000, ll=11) and DCPS1-3 (opc=101) are
+    // UNDEFINED at EL0 (privileged / debug-state-only). They fall through to
+    // Undefined(), which delivers SIGILL to the guest — the architecturally
+    // correct result for guest user-space. The translator itself never aborts.
     // endregion
-    // Other exception instructions not implemented yet.
     Undefined();
   }
 

@@ -12172,6 +12172,74 @@ TEST_F(Arm64LiteTranslateRegionTest, BrkDeliversSigtrap) {
   sigaction(SIGTRAP, &old_sa, nullptr);
   EXPECT_EQ(g_brk_signal, SIGTRAP);
 }
+
+// HLT is a breakpoint-class exception and shares BRK's synchronous-SIGTRAP
+// path. HVC/SMC/DCPS1-3 are UNDEFINED at EL0 and deliver SIGILL. Each test
+// confirms the opcode decodes and routes to a guest signal (never a translator
+// abort). All reuse BrkTrapHandler (records the signal, then siglongjmps out).
+TEST_F(Arm64LiteTranslateRegionTest, HltDeliversSigtrap) {
+  struct sigaction sa = {};
+  struct sigaction old_sa = {};
+  sa.sa_handler = BrkTrapHandler;
+  sigemptyset(&sa.sa_mask);
+  ASSERT_EQ(sigaction(SIGTRAP, &sa, &old_sa), 0);
+  static const uint32_t code[] = {0xD4400000u};  // HLT #0
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  g_brk_signal = 0;
+  if (sigsetjmp(g_brk_jmp, 1) == 0) {
+    InterpretInsn(&state_);
+  }
+  sigaction(SIGTRAP, &old_sa, nullptr);
+  EXPECT_EQ(g_brk_signal, SIGTRAP);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, HvcDeliversSigill) {
+  struct sigaction sa = {};
+  struct sigaction old_sa = {};
+  sa.sa_handler = BrkTrapHandler;
+  sigemptyset(&sa.sa_mask);
+  ASSERT_EQ(sigaction(SIGILL, &sa, &old_sa), 0);
+  static const uint32_t code[] = {0xD4000002u};  // HVC #0
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  g_brk_signal = 0;
+  if (sigsetjmp(g_brk_jmp, 1) == 0) {
+    InterpretInsn(&state_);
+  }
+  sigaction(SIGILL, &old_sa, nullptr);
+  EXPECT_EQ(g_brk_signal, SIGILL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SmcDeliversSigill) {
+  struct sigaction sa = {};
+  struct sigaction old_sa = {};
+  sa.sa_handler = BrkTrapHandler;
+  sigemptyset(&sa.sa_mask);
+  ASSERT_EQ(sigaction(SIGILL, &sa, &old_sa), 0);
+  static const uint32_t code[] = {0xD4000003u};  // SMC #0
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  g_brk_signal = 0;
+  if (sigsetjmp(g_brk_jmp, 1) == 0) {
+    InterpretInsn(&state_);
+  }
+  sigaction(SIGILL, &old_sa, nullptr);
+  EXPECT_EQ(g_brk_signal, SIGILL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Dcps1DeliversSigill) {
+  struct sigaction sa = {};
+  struct sigaction old_sa = {};
+  sa.sa_handler = BrkTrapHandler;
+  sigemptyset(&sa.sa_mask);
+  ASSERT_EQ(sigaction(SIGILL, &sa, &old_sa), 0);
+  static const uint32_t code[] = {0xD4A00001u};  // DCPS1
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  g_brk_signal = 0;
+  if (sigsetjmp(g_brk_jmp, 1) == 0) {
+    InterpretInsn(&state_);
+  }
+  sigaction(SIGILL, &old_sa, nullptr);
+  EXPECT_EQ(g_brk_signal, SIGILL);
+}
 // endregion
 
 // region digitalis - FRINTTS (FEAT_FRINTTS) scalar: round to a 32/64-bit
