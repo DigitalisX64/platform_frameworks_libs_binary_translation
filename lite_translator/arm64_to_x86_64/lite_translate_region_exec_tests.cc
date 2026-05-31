@@ -12456,6 +12456,74 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtxnVectorMatchesInterpreter) {
   EXPECT_NE(nan_bits & 0x007FFFFFu, 0u);            // mantissa nonzero (NaN)
   EXPECT_NE(nan_bits & 0x00400000u, 0u);            // quiet bit set
 }
+
+// Vector FCVTL/FCVTN FP16<->FP32 (size=00) via F16C. FCVTL widens 4 halves to
+// 4 floats (exact); FCVTN narrows 4 floats to 4 halves with round-to-nearest-
+// even. The JIT (VCVTPH2PS / VCVTPS2PH imm8=0) is validated against the
+// interpreter (_Float16) oracle, including inexact narrowing where rounding
+// must agree. Requires host F16C, as the existing FP16 vector JIT tests do.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtlFp16MatchesInterpreter) {
+  // 8 FP16 lanes: low 64 = 1.0/2.0/-1.5/0.5, high 64 = 3.0/-4.0/0.0/65504(max).
+  const uint16_t halves[8] = {0x3C00, 0x4000, 0xBE00, 0x3800,
+                              0x4200, 0xC400, 0x0000, 0x7BFF};
+  static const uint32_t code[] = {0x0e217820u};  // fcvtl v0.4s, v1.4h (Q=0)
+  memcpy(&state_.cpu.v[1], halves, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  __uint128_t jit = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], halves, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit, state_.cpu.v[0]);
+  uint32_t l0;
+  memcpy(&l0, &state_.cpu.v[0], 4);
+  EXPECT_EQ(l0, 0x3F800000u);  // lane 0 == 1.0f
+
+  static const uint32_t code2[] = {0x4e217820u};  // fcvtl2 v0.4s, v1.8h (Q=1)
+  memcpy(&state_.cpu.v[1], halves, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  EXPECT_TRUE(Run(code2, ToGuestAddr(code2) + sizeof(code2)));
+  __uint128_t jit2 = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], halves, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  state_.cpu.insn_addr = ToGuestAddr(code2);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit2, state_.cpu.v[0]);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnFp16MatchesInterpreter) {
+  // 4 FP32 lanes incl. inexact (1.1, pi) to exercise round-to-nearest-even.
+  const float fs[4] = {1.0f, 1.1f, 3.14159265f, -2.5f};
+  static const uint32_t code[] = {0x0e216820u};  // fcvtn v0.4h, v1.4s (Q=0)
+  memcpy(&state_.cpu.v[1], fs, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  __uint128_t jit = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], fs, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit, state_.cpu.v[0]);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);  // Q=0 zeroes upper
+  uint16_t h0, h1;
+  memcpy(&h0, &state_.cpu.v[0], 2);
+  memcpy(&h1, reinterpret_cast<const uint8_t*>(&state_.cpu.v[0]) + 2, 2);
+  EXPECT_EQ(h0, 0x3C00u);  // 1.0f -> 1.0h
+  EXPECT_EQ(h1, 0x3C66u);  // RNE(1.1f) -> 0x3C66
+
+  static const uint32_t code2[] = {0x4e216820u};  // fcvtn2 v0.8h, v1.4s (Q=1)
+  memcpy(&state_.cpu.v[1], fs, 16);
+  SetV128(state_.cpu, 0, 0x1122334455667788ULL, 0ULL);
+  EXPECT_TRUE(Run(code2, ToGuestAddr(code2) + sizeof(code2)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x1122334455667788ULL);  // low preserved
+  __uint128_t jit2 = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], fs, 16);
+  SetV128(state_.cpu, 0, 0x1122334455667788ULL, 0ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code2);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit2, state_.cpu.v[0]);
+}
 // endregion
 
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs

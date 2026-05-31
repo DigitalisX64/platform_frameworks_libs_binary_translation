@@ -8078,25 +8078,61 @@ class Interpreter {
       //   Q=1 writes into high half (lower preserved).
       // size=00 (half-precision) is not implemented yet.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl: {
-        if (args.size != 0b01) { Undefined(); return; }
-        uint8_t src_off = args.q ? 8 : 0;
-        for (uint8_t i = 0; i < 2; i++) {
-          float f;
-          memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + src_off + i * 4, 4);
-          double d = static_cast<double>(f);
-          memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &d, 8);
+        if (args.size == 0b01) {
+          // FP32 -> FP64 widen (2 lanes). FCVTL2 (Q=1) takes the high 2 floats.
+          uint8_t src_off = args.q ? 8 : 0;
+          for (uint8_t i = 0; i < 2; i++) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + src_off + i * 4, 4);
+            double d = static_cast<double>(f);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &d, 8);
+          }
+        } else if (args.size == 0b00) {
+          // FP16 -> FP32 widen (4 lanes). FCVTL2 (Q=1) takes the high 4 halves.
+          // Widening is exact, so the result is independent of rounding mode.
+          uint8_t src_off = args.q ? 8 : 0;
+          for (uint8_t i = 0; i < 4; i++) {
+            uint16_t h;
+            memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + src_off + i * 2, 2);
+            _Float16 hf;
+            memcpy(&hf, &h, 2);
+            float f = static_cast<float>(hf);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &f, 4);
+          }
+        } else {
+          Undefined();
+          return;
         }
         break;
       }
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtn: {
-        if (args.size != 0b01) { Undefined(); return; }
-        result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
-        uint8_t dst_off = args.q ? 8 : 0;
-        for (uint8_t i = 0; i < 2; i++) {
-          double d;
-          memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
-          float f = static_cast<float>(d);
-          memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 4, &f, 4);
+        if (args.size == 0b01) {
+          // FP64 -> FP32 narrow (2 lanes). FCVTN2 (Q=1) writes the high half.
+          result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+          uint8_t dst_off = args.q ? 8 : 0;
+          for (uint8_t i = 0; i < 2; i++) {
+            double d;
+            memcpy(&d, reinterpret_cast<const uint8_t*>(&src) + i * 8, 8);
+            float f = static_cast<float>(d);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 4, &f, 4);
+          }
+        } else if (args.size == 0b00) {
+          // FP32 -> FP16 narrow (4 lanes), round-to-nearest-even (the _Float16
+          // conversion matches the JIT's VCVTPS2PH imm8=0). FCVTN2 (Q=1) writes
+          // the high 64 bits and preserves the low half.
+          result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
+          uint8_t dst_off = args.q ? 8 : 0;
+          for (uint8_t i = 0; i < 4; i++) {
+            float f;
+            memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
+            _Float16 hf = static_cast<_Float16>(f);
+            uint16_t h;
+            memcpy(&h, &hf, 2);
+            memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 2, &h, 2);
+          }
+        } else {
+          Undefined();
+          return;
         }
         break;
       }
