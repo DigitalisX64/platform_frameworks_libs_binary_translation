@@ -12790,6 +12790,37 @@ TEST_F(Arm64LiteTranslateRegionTest, UsdotSudotJitMatchesInterpreter) {
   check(usdot_idx);
   check(sudot_idx);
 }
+
+// I8MM matrix multiply-accumulate SMMLA/UMMLA/USMMLA now JIT-lowered (widen
+// rows/cols, PMADDWD each pairing, fold with PHADDD). Validated against the
+// interpreter oracle with sign-spanning bytes and a non-zero accumulator.
+TEST_F(Arm64LiteTranslateRegionTest, MmlaJitMatchesInterpreter) {
+  const uint8_t nb[16] = {200, 5, 130, 1, 255, 0, 128, 7,
+                          9, 250, 3, 17, 100, 200, 1, 2};
+  const uint8_t mb[16] = {0xFE, 2, 0x80, 3, 0x7F, 1, 0xFF, 4,
+                          5, 6, 0x81, 8, 9, 10, 11, 12};
+  const __uint128_t din = (static_cast<__uint128_t>(0x0000000A00000003ULL) << 64) |
+                          0x0000000200000001ULL;
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t smmla[] = {0x4E82A420u};   // smmla v0.4s, v1.16b, v2.16b
+  static const uint32_t ummla[] = {0x6E82A420u};   // ummla v0.4s, v1.16b, v2.16b
+  static const uint32_t usmmla[] = {0x4E82AC20u};  // usmmla v0.4s, v1.16b, v2.16b
+  check(smmla);
+  check(ummla);
+  check(usmmla);
+}
 // endregion
 
 // region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to

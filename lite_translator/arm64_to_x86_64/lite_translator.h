@@ -2537,7 +2537,51 @@ class LiteTranslator {
   // remains the executable spec; this JIT path produces bit-exact
   // output (32-bit integer arithmetic with defined wraparound).
   // region digitalis - I8MM matrix multiply-accumulate: interpreter only.
-  void AdvSimdMatMul(const Decoder::MatMulArgs&) { success_ = false; }
+  void AdvSimdMatMul(const Decoder::MatMulArgs& args) {
+    // region digitalis - I8MM 8-bit matrix multiply-accumulate (Q=1 only):
+    // Vd is a 2x2 int32 matrix, Vn holds 2 rows of 8 int8, Vm holds 2 rows of
+    // 8 int8 (the result's columns). Output lane (2*i+j) += dot(Vn row i, Vm
+    // row j) over 8 bytes. Widen each 8-byte row to 8x16 (sign per operand,
+    // as in USDOT), PMADDWD each (row,col) pairing, then three PHADDDs fold the
+    // four partial vectors into [d00, d01, d10, d11].
+    using Op = Decoder::MatMulOpcode;
+    const bool n_signed = (args.opcode == Op::kSmmla);
+    const bool m_signed = (args.opcode == Op::kSmmla || args.opcode == Op::kUsmmla);
+    const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+    SimdRegister n0 = AllocTempSimdReg();
+    SimdRegister n1 = AllocTempSimdReg();
+    SimdRegister m0 = AllocTempSimdReg();
+    SimdRegister m1 = AllocTempSimdReg();
+    SimdRegister a = AllocTempSimdReg();
+    SimdRegister b = AllocTempSimdReg();
+    SimdRegister c = AllocTempSimdReg();
+    if (n0 == no_simd_register || n1 == no_simd_register || m0 == no_simd_register ||
+        m1 == no_simd_register || a == no_simd_register || b == no_simd_register ||
+        c == no_simd_register) { success_ = false; return; }
+    auto widen = [&](SimdRegister r, int32_t off, bool sgn) {
+      if (sgn) {
+        as_.Pmovsxbw(r, {.base = Assembler::rbp, .disp = off});
+      } else {
+        as_.Pmovzxbw(r, {.base = Assembler::rbp, .disp = off});
+      }
+    };
+    widen(n0, vn_off + 0, n_signed);  // Vn row 0
+    widen(n1, vn_off + 8, n_signed);  // Vn row 1
+    widen(m0, vm_off + 0, m_signed);  // Vm row 0
+    widen(m1, vm_off + 8, m_signed);  // Vm row 1
+    as_.Movdqa(a, n0); as_.Pmaddwd(a, m0);  // p00
+    as_.Movdqa(b, n0); as_.Pmaddwd(b, m1);  // p01
+    as_.Movdqa(c, n1); as_.Pmaddwd(c, m0);  // p10
+    as_.Pmaddwd(n1, m1);                     // p11
+    as_.Phaddd(a, b);   // [pair-sums of p00 | p01]
+    as_.Phaddd(c, n1);  // [pair-sums of p10 | p11]
+    as_.Phaddd(a, c);   // [d00, d01, d10, d11]
+    as_.Paddd(a, {.base = Assembler::rbp, .disp = vd_off});
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, a);
+    // endregion
+  }
   // endregion
 
   void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
