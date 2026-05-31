@@ -12755,6 +12755,41 @@ TEST_F(Arm64LiteTranslateRegionTest, I8mmUsdotSudotByElement) {
   EXPECT_EQ(r[0], 0x00000034FFFFFF12ULL);
   EXPECT_EQ(r[1], 0x000000080000000AULL);
 }
+
+// USDOT/SUDOT (I8MM mixed-sign dot) are now JIT-lowered via per-operand
+// widening (unsigned operand zero-extended, signed operand sign-extended,
+// then PMADDWD). Validate the JIT path against the interpreter oracle for the
+// vector (.4s/.2s) and by-element forms, using bytes that span the sign
+// boundary so signed vs unsigned widening matters.
+TEST_F(Arm64LiteTranslateRegionTest, UsdotSudotJitMatchesInterpreter) {
+  const uint8_t nb[16] = {200, 5, 130, 1, 255, 0, 128, 7,
+                          9, 250, 3, 17, 100, 200, 1, 2};
+  const uint8_t mb[16] = {0xFE, 2, 0x80, 3, 0x7F, 1, 0xFF, 4,
+                          5, 6, 0x81, 8, 9, 10, 11, 12};
+  const __uint128_t din = (static_cast<__uint128_t>(0x0000000A00000003ULL) << 64) |
+                          0x0000000200000001ULL;
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t usdot_4s[] = {0x4e829c20u};   // usdot v0.4s, v1.16b, v2.16b
+  static const uint32_t usdot_2s[] = {0x0e829c20u};   // usdot v0.2s, v1.8b, v2.8b
+  static const uint32_t usdot_idx[] = {0x4fa2f020u};  // usdot v0.4s, v1.16b, v2.4b[1]
+  static const uint32_t sudot_idx[] = {0x4f02f820u};  // sudot v0.4s, v1.16b, v2.4b[2]
+  check(usdot_4s);
+  check(usdot_2s);
+  check(usdot_idx);
+  check(sudot_idx);
+}
 // endregion
 
 // region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to

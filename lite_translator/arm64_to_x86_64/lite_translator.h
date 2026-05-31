@@ -2541,20 +2541,18 @@ class LiteTranslator {
   // endregion
 
   void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
-    // region digitalis - the I8MM mixed-sign dot products (USDOT/SUDOT) need
-    // per-operand signedness; this SDOT/UDOT lowering assumes both operands
-    // share a sign, so bail to the interpreter for the mixed forms.
-    if (args.opcode == Decoder::DotProductOpcode::kUsdot ||
-        args.opcode == Decoder::DotProductOpcode::kUsdotIdx ||
-        args.opcode == Decoder::DotProductOpcode::kSudotIdx) {
-      success_ = false;
-      return;
-    }
+    // region digitalis - Per-operand signedness covers SDOT/UDOT and the I8MM
+    // mixed-sign forms USDOT (Vn unsigned, Vm signed) and SUDOT (Vn signed, Vm
+    // unsigned). An unsigned byte zero-extended to 16 bits stays < 32768, so
+    // PMADDWD's signed 16x16 multiply yields the correct mixed-sign products.
+    using Op = Decoder::DotProductOpcode;
+    const bool n_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kSudotIdx);
+    const bool m_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kUsdot || args.opcode == Op::kUsdotIdx);
+    const bool is_indexed = (args.opcode == Op::kSdotIdx || args.opcode == Op::kUdotIdx ||
+                             args.opcode == Op::kUsdotIdx || args.opcode == Op::kSudotIdx);
     // endregion
-    const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
-                            args.opcode == Decoder::DotProductOpcode::kSdotIdx);
-    const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
-                             args.opcode == Decoder::DotProductOpcode::kUdotIdx);
 
     const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
@@ -2587,20 +2585,20 @@ class LiteTranslator {
       as_.Movd(xmm_m_lo, {.base = Assembler::rbp,
                           .disp = vm_off + 4 * args.index});
       as_.Pshufd(xmm_m_lo, xmm_m_lo, static_cast<int8_t>(0x00));
-      if (is_signed) {
+      if (m_signed) {
         as_.Pmovsxbw(xmm_m_lo, xmm_m_lo);
       } else {
         as_.Pmovzxbw(xmm_m_lo, xmm_m_lo);
       }
     } else {
       // Vector form: widen low 8 bytes of Vm from memory.
-      if (is_signed) {
+      if (m_signed) {
         as_.Pmovsxbw(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
       } else {
         as_.Pmovzxbw(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
       }
       if (args.q) {
-        if (is_signed) {
+        if (m_signed) {
           as_.Pmovsxbw(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
         } else {
           as_.Pmovzxbw(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
@@ -2609,13 +2607,13 @@ class LiteTranslator {
     }
 
     // Stage 2: widen Vn.
-    if (is_signed) {
+    if (n_signed) {
       as_.Pmovsxbw(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
     } else {
       as_.Pmovzxbw(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
     }
     if (args.q) {
-      if (is_signed) {
+      if (n_signed) {
         as_.Pmovsxbw(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
       } else {
         as_.Pmovzxbw(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
