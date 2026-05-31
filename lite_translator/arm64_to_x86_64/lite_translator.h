@@ -14944,13 +14944,74 @@ class LiteTranslator {
       // unsigned dst -> PACKUS*.  PACKUS* already clamps negatives to 0 and
       // over-range to max, which is exactly UnsignedSat.  Q=0 packs the low
       // half against zero (upper 64 zeroed); Q=1 packs low+high halves.
-      // .2S/.4S (size=10) and .1D/.2D (size=11) would need 64-bit widening with
-      // no narrowing pack on x86; bail to the interpreter.
+      // .2S/.4S (size=10) is handled by the per-lane scalar path below (32-bit
+      // sums fit in a 64-bit GP register, so a simple clamp suffices).  .1D/.2D
+      // (size=11) would need 65-bit saturation logic and bails to the
+      // interpreter.
       case Decoder::AdvSimdTwoRegMiscOpcode::kSuqadd:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd: {
-        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
         const bool usqadd =
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd);
+        if (args.size == 0b10) {
+          // .2S/.4S: per 32-bit lane, compute the mixed-sign sum in a 64-bit GP
+          // register (no overflow) and clamp to the destination range.
+          //   SUQADD: sat_s32( sext(Vd) + zext(Vn) )
+          //   USQADD: sat_u32( zext(Vd) + sext(Vn) )
+          SimdRegister xres = AllocTempSimdReg();
+          Register acc = AllocTempReg();
+          Register addend = AllocTempReg();
+          Register lim = AllocTempReg();
+          if (xres == no_simd_register || acc == no_register ||
+              addend == no_register || lim == no_register) {
+            success_ = false; return;
+          }
+          as_.Pxor(xres, xres);
+          const int lanes = args.q ? 4 : 2;
+          for (int i = 0; i < lanes; ++i) {
+            const int32_t d_off = vd_off + i * 4;
+            const int32_t n_off = vn_off + i * 4;
+            if (usqadd) {
+              as_.Movl(acc, {.base = Assembler::rbp, .disp = d_off});      // zext Vd
+              as_.Movsxlq(addend, {.base = Assembler::rbp, .disp = n_off});  // sext Vn
+            } else {
+              as_.Movsxlq(acc, {.base = Assembler::rbp, .disp = d_off});   // sext Vd
+              as_.Movl(addend, {.base = Assembler::rbp, .disp = n_off});   // zext Vn
+            }
+            as_.Addq(acc, addend);
+            if (usqadd) {
+              // clamp to [0, UINT32_MAX]
+              auto* ge0 = as_.MakeLabel();
+              as_.Testq(acc, acc);
+              as_.Jcc(Condition::kGreaterEqual, *ge0);
+              as_.Xorl(acc, acc);
+              as_.Bind(ge0);
+              auto* le_max = as_.MakeLabel();
+              as_.Movq(lim, int64_t{0xFFFFFFFFLL});
+              as_.Cmpq(acc, lim);
+              as_.Jcc(Condition::kLessEqual, *le_max);
+              as_.Movq(acc, int64_t{0xFFFFFFFFLL});
+              as_.Bind(le_max);
+            } else {
+              // clamp to [INT32_MIN, INT32_MAX]
+              auto* le_max = as_.MakeLabel();
+              as_.Movq(lim, int64_t{0x7FFFFFFFLL});
+              as_.Cmpq(acc, lim);
+              as_.Jcc(Condition::kLessEqual, *le_max);
+              as_.Movq(acc, int64_t{0x7FFFFFFFLL});
+              as_.Bind(le_max);
+              auto* ge_min = as_.MakeLabel();
+              as_.Movq(lim, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
+              as_.Cmpq(acc, lim);
+              as_.Jcc(Condition::kGreaterEqual, *ge_min);
+              as_.Movq(acc, static_cast<int64_t>(0xFFFFFFFF80000000ULL));
+              as_.Bind(ge_min);
+            }
+            as_.Pinsrd(xres, acc, static_cast<int8_t>(i));
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+          return;
+        }
+        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
         SimdRegister xd = AllocTempSimdReg();
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister dlo = AllocTempSimdReg();

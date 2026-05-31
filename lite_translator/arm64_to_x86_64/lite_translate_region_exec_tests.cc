@@ -12676,6 +12676,40 @@ TEST_F(Arm64LiteTranslateRegionTest, UrecpeUrsqrteMatchesInterpreter) {
   EXPECT_TRUE(Run(urecpe2s, ToGuestAddr(urecpe2s) + sizeof(urecpe2s)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
+
+// Wide SUQADD/USQADD .2S/.4S (32-bit lanes): mixed-sign saturating accumulate,
+// now JIT-lowered (sum in 64-bit GP + clamp). SUQADD reads Vd as a signed
+// accumulator + unsigned Vn; USQADD unsigned Vd + signed Vn. Validated against
+// the interpreter oracle with lanes that exercise both saturation directions.
+TEST_F(Arm64LiteTranslateRegionTest, SuqaddUsqadd4SMatchesInterpreter) {
+  // Vd lanes (accumulator) and Vn lanes (addend) chosen to hit +sat, -sat,
+  // and in-range under each opcode's signedness interpretation.
+  const uint32_t dl[4] = {0x7FFFFFF0u, 0x80000000u, 0x00000005u, 0xFFFFFFFBu};
+  const uint32_t nl[4] = {0x00000040u, 0x00000001u, 0xFFFFFFF0u, 0x7FFFFFFFu};
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[0], dl, 16);
+    memcpy(&state_.cpu.v[1], nl, 16);
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[0], dl, 16);
+    memcpy(&state_.cpu.v[1], nl, 16);
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t suqadd4s[] = {0x4ea03820u};
+  static const uint32_t usqadd4s[] = {0x6ea03820u};
+  static const uint32_t suqadd2s[] = {0x0ea03820u};  // Q=0 zeroes upper 64
+  static const uint32_t usqadd2s[] = {0x2ea03820u};
+  check(suqadd4s);
+  check(usqadd4s);
+  check(suqadd2s);
+  check(usqadd2s);
+  memcpy(&state_.cpu.v[0], dl, 16);
+  memcpy(&state_.cpu.v[1], nl, 16);
+  EXPECT_TRUE(Run(suqadd2s, ToGuestAddr(suqadd2s) + sizeof(suqadd2s)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
 // endregion
 
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
