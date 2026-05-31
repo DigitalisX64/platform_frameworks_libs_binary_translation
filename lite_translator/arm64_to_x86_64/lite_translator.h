@@ -2537,24 +2537,66 @@ class LiteTranslator {
   // remains the executable spec; this JIT path produces bit-exact
   // output (32-bit integer arithmetic with defined wraparound).
   // region digitalis - I8MM matrix multiply-accumulate: interpreter only.
-  void AdvSimdMatMul(const Decoder::MatMulArgs&) { success_ = false; }
+  void AdvSimdMatMul(const Decoder::MatMulArgs& args) {
+    // region digitalis - I8MM 8-bit matrix multiply-accumulate (Q=1 only):
+    // Vd is a 2x2 int32 matrix, Vn holds 2 rows of 8 int8, Vm holds 2 rows of
+    // 8 int8 (the result's columns). Output lane (2*i+j) += dot(Vn row i, Vm
+    // row j) over 8 bytes. Widen each 8-byte row to 8x16 (sign per operand,
+    // as in USDOT), PMADDWD each (row,col) pairing, then three PHADDDs fold the
+    // four partial vectors into [d00, d01, d10, d11].
+    using Op = Decoder::MatMulOpcode;
+    const bool n_signed = (args.opcode == Op::kSmmla);
+    const bool m_signed = (args.opcode == Op::kSmmla || args.opcode == Op::kUsmmla);
+    const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
+    const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
+    const int32_t vd_off = offsetof(ThreadState, cpu.v[0]) + args.rd * 16;
+    SimdRegister n0 = AllocTempSimdReg();
+    SimdRegister n1 = AllocTempSimdReg();
+    SimdRegister m0 = AllocTempSimdReg();
+    SimdRegister m1 = AllocTempSimdReg();
+    SimdRegister a = AllocTempSimdReg();
+    SimdRegister b = AllocTempSimdReg();
+    SimdRegister c = AllocTempSimdReg();
+    if (n0 == no_simd_register || n1 == no_simd_register || m0 == no_simd_register ||
+        m1 == no_simd_register || a == no_simd_register || b == no_simd_register ||
+        c == no_simd_register) { success_ = false; return; }
+    auto widen = [&](SimdRegister r, int32_t off, bool sgn) {
+      if (sgn) {
+        as_.Pmovsxbw(r, {.base = Assembler::rbp, .disp = off});
+      } else {
+        as_.Pmovzxbw(r, {.base = Assembler::rbp, .disp = off});
+      }
+    };
+    widen(n0, vn_off + 0, n_signed);  // Vn row 0
+    widen(n1, vn_off + 8, n_signed);  // Vn row 1
+    widen(m0, vm_off + 0, m_signed);  // Vm row 0
+    widen(m1, vm_off + 8, m_signed);  // Vm row 1
+    as_.Movdqa(a, n0); as_.Pmaddwd(a, m0);  // p00
+    as_.Movdqa(b, n0); as_.Pmaddwd(b, m1);  // p01
+    as_.Movdqa(c, n1); as_.Pmaddwd(c, m0);  // p10
+    as_.Pmaddwd(n1, m1);                     // p11
+    as_.Phaddd(a, b);   // [pair-sums of p00 | p01]
+    as_.Phaddd(c, n1);  // [pair-sums of p10 | p11]
+    as_.Phaddd(a, c);   // [d00, d01, d10, d11]
+    as_.Paddd(a, {.base = Assembler::rbp, .disp = vd_off});
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, a);
+    // endregion
+  }
   // endregion
 
   void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
-    // region digitalis - the I8MM mixed-sign dot products (USDOT/SUDOT) need
-    // per-operand signedness; this SDOT/UDOT lowering assumes both operands
-    // share a sign, so bail to the interpreter for the mixed forms.
-    if (args.opcode == Decoder::DotProductOpcode::kUsdot ||
-        args.opcode == Decoder::DotProductOpcode::kUsdotIdx ||
-        args.opcode == Decoder::DotProductOpcode::kSudotIdx) {
-      success_ = false;
-      return;
-    }
+    // region digitalis - Per-operand signedness covers SDOT/UDOT and the I8MM
+    // mixed-sign forms USDOT (Vn unsigned, Vm signed) and SUDOT (Vn signed, Vm
+    // unsigned). An unsigned byte zero-extended to 16 bits stays < 32768, so
+    // PMADDWD's signed 16x16 multiply yields the correct mixed-sign products.
+    using Op = Decoder::DotProductOpcode;
+    const bool n_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kSudotIdx);
+    const bool m_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                           args.opcode == Op::kUsdot || args.opcode == Op::kUsdotIdx);
+    const bool is_indexed = (args.opcode == Op::kSdotIdx || args.opcode == Op::kUdotIdx ||
+                             args.opcode == Op::kUsdotIdx || args.opcode == Op::kSudotIdx);
     // endregion
-    const bool is_signed = (args.opcode == Decoder::DotProductOpcode::kSdot ||
-                            args.opcode == Decoder::DotProductOpcode::kSdotIdx);
-    const bool is_indexed = (args.opcode == Decoder::DotProductOpcode::kSdotIdx ||
-                             args.opcode == Decoder::DotProductOpcode::kUdotIdx);
 
     const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
@@ -2587,20 +2629,20 @@ class LiteTranslator {
       as_.Movd(xmm_m_lo, {.base = Assembler::rbp,
                           .disp = vm_off + 4 * args.index});
       as_.Pshufd(xmm_m_lo, xmm_m_lo, static_cast<int8_t>(0x00));
-      if (is_signed) {
+      if (m_signed) {
         as_.Pmovsxbw(xmm_m_lo, xmm_m_lo);
       } else {
         as_.Pmovzxbw(xmm_m_lo, xmm_m_lo);
       }
     } else {
       // Vector form: widen low 8 bytes of Vm from memory.
-      if (is_signed) {
+      if (m_signed) {
         as_.Pmovsxbw(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
       } else {
         as_.Pmovzxbw(xmm_m_lo, {.base = Assembler::rbp, .disp = vm_off + 0});
       }
       if (args.q) {
-        if (is_signed) {
+        if (m_signed) {
           as_.Pmovsxbw(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
         } else {
           as_.Pmovzxbw(xmm_m_hi, {.base = Assembler::rbp, .disp = vm_off + 8});
@@ -2609,13 +2651,13 @@ class LiteTranslator {
     }
 
     // Stage 2: widen Vn.
-    if (is_signed) {
+    if (n_signed) {
       as_.Pmovsxbw(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
     } else {
       as_.Pmovzxbw(xmm_n_lo, {.base = Assembler::rbp, .disp = vn_off + 0});
     }
     if (args.q) {
-      if (is_signed) {
+      if (n_signed) {
         as_.Pmovsxbw(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
       } else {
         as_.Pmovzxbw(xmm_n_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
@@ -10640,12 +10682,13 @@ class LiteTranslator {
     // region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half).
     // Vd(narrow) = ((Vn op Vm) [+ round]) >> narrow_bits, taking the high
     // half of each wide lane.  R-variants add round = 1<<(narrow_bits-1).
-    // size=00 (.8B<-.8H) and 01 (.4H<-.4S); the .2S<-.2D form (size=10) has
-    // no x86 narrowing pack and bails to the interpreter.  Q=1 ("2" form)
-    // writes the upper 64 bits and preserves Vd's low 64.
+    // size=00 (.8B<-.8H), 01 (.4H<-.4S) use a narrowing pack; size=10
+    // (.2S<-.2D) has no 64->32 pack, so it shifts each 64-bit lane down by 32
+    // and gathers the dwords with PSHUFD.  Q=1 ("2" form) writes the upper 64
+    // bits and preserves Vd's low 64.
     if (args.opcode == Op::kAddhn || args.opcode == Op::kSubhn ||
         args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn) {
-      if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+      if (args.size > 0b10) { success_ = false; return; }
       const bool is_sub = (args.opcode == Op::kSubhn || args.opcode == Op::kRsubhn);
       const bool is_round = (args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn);
       const int32_t vn_o = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
@@ -10670,6 +10713,38 @@ class LiteTranslator {
         if (args.size == 0b00) as_.Paddw(xn, xr); else as_.Paddd(xn, xr);
         return true;
       };
+      if (args.size == 0b10) {
+        // .2S<-.2D / .4S<-.2D(2): 64-bit add/sub, then take the high 32 bits of
+        // each lane (no x86 64->32 pack, so PSRLQ then gather with PSHUFD).
+        if (is_sub) as_.Psubq(xn, xm); else as_.Paddq(xn, xm);
+        if (is_round) {
+          // Rounding adds 2^31 into each 64-bit lane before the >>32 truncate.
+          SimdRegister xr = AllocTempSimdReg();
+          Register t = AllocTempReg();
+          if (xr == no_simd_register || t == no_register) { success_ = false; return; }
+          as_.Movq(t, int64_t{0x0000000080000000LL});
+          as_.Movq(xr, t);
+          as_.Punpcklqdq(xr, xr);
+          as_.Paddq(xn, xr);
+        }
+        as_.Psrlq(xn, int8_t{32});         // high 32 of each lane -> low 32
+        as_.Pshufd(xn, xn, int8_t{0x08});  // {dword0, dword2} -> low 64
+        if (!args.q) {
+          as_.Pslldq(xn, int8_t{8});       // zero upper 64
+          as_.Psrldq(xn, int8_t{8});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+        } else {
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+          as_.Pslldq(xd, int8_t{8});
+          as_.Psrldq(xd, int8_t{8});
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+        }
+        return;
+      }
       if (args.size == 0b00) {
         if (is_sub) as_.Psubw(xn, xm); else as_.Paddw(xn, xm);
         if (is_round && !add_round(int64_t{0x0080008000800080LL})) { success_ = false; return; }
@@ -13709,6 +13784,55 @@ class LiteTranslator {
   }
   // endregion
 
+  // region digitalis - URECPE / URSQRTE estimate tables. The result of these
+  // unsigned integer reciprocal / reciprocal-sqrt estimates is a pure function
+  // of the 9-bit field (a>>23)&0x1FF (the saturation condition — top bit clear
+  // for URECPE, top two bits clear for URSQRTE — is encoded in that field's
+  // high bits), so a 512-entry table per op lets the JIT do a per-lane lookup
+  // that bit-matches the interpreter's UnsignedRecipEstimate/RSqrtEstimate.
+  static const uint32_t* BuildUnsignedEstimateTable(bool is_rsqrt) {
+    uint32_t* t = new uint32_t[512];
+    for (int idx = 0; idx < 512; ++idx) {
+      uint32_t r;
+      if (!is_rsqrt) {
+        if (idx < 256) {  // top bit (bit31 of input) clear -> saturate
+          r = 0xFFFFFFFFu;
+        } else {
+          int a2 = idx * 2 + 1;
+          int b = (1 << 19) / a2;
+          int estimate = (b + 1) / 2;
+          r = static_cast<uint32_t>(estimate) << 23;
+        }
+      } else {
+        if (idx < 128) {  // top two bits clear -> saturate
+          r = 0xFFFFFFFFu;
+        } else {
+          int aa;
+          if (idx < 256) {
+            aa = idx * 2 + 1;
+          } else {
+            aa = (idx >> 1) << 1;
+            aa = (aa + 1) * 2;
+          }
+          int b = 512;
+          while (static_cast<int64_t>(aa) * (b + 1) * (b + 1) < (1 << 28)) {
+            b += 1;
+          }
+          int estimate = (b + 1) / 2;
+          r = static_cast<uint32_t>(estimate) << 23;
+        }
+      }
+      t[idx] = r;
+    }
+    return t;
+  }
+  static const uint32_t* UnsignedEstimateTable(bool is_rsqrt) {
+    static const uint32_t* const kRecpe = BuildUnsignedEstimateTable(false);
+    static const uint32_t* const kRsqrte = BuildUnsignedEstimateTable(true);
+    return is_rsqrt ? kRsqrte : kRecpe;
+  }
+  // endregion
+
   void AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscArgs& args) {
     // region digitalis - JIT for CMEQZ (cmeq Vd, Vn, #0) used by the
     // dynamic linker's calculate_gnu_hash_neon. Other opcodes fall
@@ -13759,6 +13883,41 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+
+      // region digitalis - URECPE/URSQRTE (.2S/.4S): per-lane unsigned integer
+      // reciprocal / reciprocal-sqrt estimate. The result is a pure function of
+      // the 9-bit field (lane>>23)&0x1FF, so extract that index per lane and
+      // load the precomputed estimate from the table (matches the interpreter
+      // bit-for-bit). Q=0 zeroes the upper 64 bits (xres starts zeroed).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUrecpe:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUrsqrte: {
+        if (args.size != 0b10) { success_ = false; return; }  // 32-bit lanes only
+        const bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUrsqrte);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        Register tbl = AllocTempReg();
+        Register idx = AllocTempReg();
+        Register val = AllocTempReg();
+        if (xn == no_simd_register || xres == no_simd_register ||
+            tbl == no_register || idx == no_register || val == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xres, xres);
+        as_.Movq(tbl, reinterpret_cast<int64_t>(UnsignedEstimateTable(is_rsqrt)));
+        const int lanes = args.q ? 4 : 2;
+        for (int i = 0; i < lanes; ++i) {
+          as_.Pextrd(idx, xn, static_cast<int8_t>(i));
+          as_.Shrl(idx, int8_t{23});
+          as_.Andl(idx, int32_t{0x1FF});
+          as_.Movl(val, {.base = tbl, .index = idx, .scale = Assembler::kTimesFour});
+          as_.Pinsrd(xres, val, static_cast<int8_t>(i));
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        return;
+      }
+      // endregion
       // endregion
 
       // region digitalis - FCVTXN / FCVTXN2 (vector FP64->FP32, round-to-odd).
@@ -13885,12 +14044,75 @@ class LiteTranslator {
       //                                        PACKUSWB/PACKUSDW (the clamp
       //                                        keeps values in the positive
       //                                        signed range so PACKUS is exact).
-      // .2D->.2S (size=10) has no x86 narrowing pack; bail to the interpreter.
+      // .2D->.2S (size=10) has no x86 narrowing pack; it is handled below by
+      // per-lane clamp + PSHUFD (SSE4.2).
       case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
       case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
-        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
         const auto opc = args.opcode;
+        if (args.size == 0b10) {
+          // .2D->.2S / .2D->.4S(2): 64->32 saturating narrow. x86 has no 64->32
+          // pack, so clamp each 64-bit lane into the destination range, then
+          // gather the two low dwords with PSHUFD. Signed clamps need PCMPGTQ
+          // (SSE4.2); bail to the interpreter when the host lacks it.
+          if (!host_platform::kHasSSE4_2) { success_ = false; return; }
+          SimdRegister x = AllocTempSimdReg();
+          SimdRegister c = AllocTempSimdReg();
+          SimdRegister m = AllocTempSimdReg();
+          SimdRegister t = AllocTempSimdReg();
+          Register gp = AllocTempReg();
+          if (x == no_simd_register || c == no_simd_register ||
+              m == no_simd_register || t == no_simd_register ||
+              gp == no_register) { success_ = false; return; }
+          as_.Movdqu(x, {.base = Assembler::rbp, .disp = vn_off});
+          auto set_const = [&](SimdRegister r, int64_t v) {
+            as_.Movq(gp, v);
+            as_.Movq(r, gp);
+            as_.Punpcklqdq(r, r);  // replicate to both 64-bit lanes
+          };
+          // x = (x & ~mask) | (val & mask), via x ^= (x ^ val) & mask.
+          auto blend = [&](SimdRegister val, SimdRegister mask) {
+            as_.Movdqa(t, x);
+            as_.Pxor(t, val);
+            as_.Pand(t, mask);
+            as_.Pxor(x, t);
+          };
+          if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn) {
+            set_const(c, int64_t{0x000000007FFFFFFFLL});      // INT32_MAX
+            as_.Movdqa(m, x); as_.Pcmpgtq(m, c);              // x > MAX
+            blend(c, m);
+            set_const(c, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
+            as_.Movdqa(m, c); as_.Pcmpgtq(m, x);              // x < MIN
+            blend(c, m);
+          } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
+            set_const(c, int64_t{0x00000000FFFFFFFFLL});      // UINT32_MAX
+            as_.Movdqa(m, x); as_.Pcmpgtq(m, c);              // x > UMAX (x>=0 region)
+            blend(c, m);
+            as_.Pxor(c, c);                                    // 0
+            as_.Movdqa(m, c); as_.Pcmpgtq(m, x);              // x < 0
+            as_.Pandn(m, x); as_.Movdqa(x, m);                // negatives -> 0
+          } else {  // kUqxtn: unsigned uint64 -> clamp to UINT32_MAX
+            set_const(c, int64_t{0x00000000FFFFFFFFLL});      // UINT32_MAX
+            as_.Movdqa(m, x); as_.Psrlq(m, int8_t{32});       // high 32 bits
+            as_.Pxor(t, t); as_.Pcmpeqq(m, t);                // mask: high32 == 0 (keep x)
+            as_.Movdqa(t, x); as_.Pxor(t, c); as_.Pandn(m, t); as_.Pxor(x, m);
+          }
+          as_.Pshufd(x, x, int8_t{0x08});  // {dword0, dword2} -> low 64
+          if (!args.q) {
+            mask_low64(x);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x);
+          } else {
+            as_.Pslldq(x, int8_t{8});
+            SimdRegister xd = AllocTempSimdReg();
+            if (xd == no_simd_register) { success_ = false; return; }
+            as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+            mask_low64(xd);
+            as_.Por(x, xd);
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, x);
+          }
+          return;
+        }
+        if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xz = AllocTempSimdReg();
         if (xn == no_simd_register || xz == no_simd_register) { success_ = false; return; }

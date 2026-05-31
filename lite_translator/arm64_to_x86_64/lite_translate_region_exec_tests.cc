@@ -12524,6 +12524,158 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtnFp16MatchesInterpreter) {
   InterpretInsn(&state_);
   EXPECT_EQ(jit2, state_.cpu.v[0]);
 }
+
+// .2D->.2S saturating extracts SQXTN/UQXTN/SQXTUN (64->32). The JIT clamps
+// each 64-bit lane (PCMPGTQ-based) and packs via PSHUFD; validated against the
+// interpreter oracle across in-range / +overflow / negative / -overflow lanes.
+namespace {
+struct Sqxtn2dCase { uint64_t a; uint64_t b; };
+const Sqxtn2dCase kSqxtn2dCases[] = {
+    {5u, 0x0000000100000000ULL},               // in-range, +overflow
+    {0xFFFFFFFFFFFFFFFBULL, 0x000000007FFFFFFFULL},  // -5 / INT32_MAX
+    {0x8000000000000000ULL, 0x00000000FFFFFFFFULL},  // very negative / UINT32_MAX
+    {0xFFFFFFFF80000000ULL, 0x0000000012345678ULL},  // INT32_MIN / in-range
+};
+}  // namespace
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2dMatchesInterpreter) {
+  static const uint32_t code[] = {0x0ea14820u};  // sqxtn v0.2s, v1.2d
+  for (const Sqxtn2dCase& c : kSqxtn2dCases) {
+    uint64_t in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "SQXTN a=" << std::hex << c.a << " b=" << c.b;
+  }
+}
+TEST_F(Arm64LiteTranslateRegionTest, Uqxtn2dMatchesInterpreter) {
+  static const uint32_t code[] = {0x2ea14820u};  // uqxtn v0.2s, v1.2d
+  for (const Sqxtn2dCase& c : kSqxtn2dCases) {
+    uint64_t in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "UQXTN a=" << std::hex << c.a << " b=" << c.b;
+  }
+}
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtun2dMatchesInterpreter) {
+  static const uint32_t code[] = {0x2ea12820u};  // sqxtun v0.2s, v1.2d
+  for (const Sqxtn2dCase& c : kSqxtn2dCases) {
+    uint64_t in[2] = {c.a, c.b};
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], in, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "SQXTUN a=" << std::hex << c.a << " b=" << c.b;
+  }
+}
+// SQXTN2 (Q=1) writes the high 64 bits and preserves Vd's low half.
+TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2dQ1MatchesInterpreter) {
+  static const uint32_t code[] = {0x4ea14820u};  // sqxtn2 v0.4s, v1.2d
+  uint64_t in[2] = {0x0000000100000000ULL, 0xFFFFFFFF80000000ULL};  // +ovf / INT32_MIN
+  memcpy(&state_.cpu.v[1], in, 16);
+  SetV128(state_.cpu, 0, 0xAABBCCDD11223344ULL, 0ULL);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xAABBCCDD11223344ULL);  // low preserved
+  __uint128_t jit = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], in, 16);
+  SetV128(state_.cpu, 0, 0xAABBCCDD11223344ULL, 0ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit, state_.cpu.v[0]);
+}
+
+// ADDHN/SUBHN/RADDHN/RSUBHN .2S<-.2D (64->32 narrowing high half). The JIT
+// (PADDQ/PSUBQ + optional +2^31 round + PSRLQ#32 + PSHUFD) is validated
+// against the interpreter oracle, including rounding carry into the high half
+// and the Q=1 (…2) placement.
+TEST_F(Arm64LiteTranslateRegionTest, Addhn2dMatchesInterpreter) {
+  uint64_t nb[2] = {0x123456789ABCDEF0ULL, 0xFFFFFFFF80000000ULL};
+  uint64_t mb[2] = {0x0000000180000000ULL, 0x0000000100000000ULL};
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t addhn[] = {0x0ea24020u};
+  static const uint32_t subhn[] = {0x0ea26020u};
+  static const uint32_t raddhn[] = {0x2ea24020u};
+  static const uint32_t rsubhn[] = {0x2ea26020u};
+  check(addhn);
+  check(subhn);
+  check(raddhn);
+  check(rsubhn);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Addhn2dQ1MatchesInterpreter) {
+  uint64_t nb[2] = {0x123456789ABCDEF0ULL, 0xAAAAAAAA55555555ULL};
+  uint64_t mb[2] = {0x0000000180000000ULL, 0x1111111122222222ULL};
+  static const uint32_t code[] = {0x4ea24020u};  // addhn2 v0.4s, v1.2d, v2.2d
+  memcpy(&state_.cpu.v[1], nb, 16);
+  memcpy(&state_.cpu.v[2], mb, 16);
+  SetV128(state_.cpu, 0, 0xCAFEBABEDEADBEEFULL, 0ULL);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xCAFEBABEDEADBEEFULL);  // low preserved
+  __uint128_t jit = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], nb, 16);
+  memcpy(&state_.cpu.v[2], mb, 16);
+  SetV128(state_.cpu, 0, 0xCAFEBABEDEADBEEFULL, 0ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit, state_.cpu.v[0]);
+}
+
+// URECPE/URSQRTE (.2S/.4S) unsigned integer reciprocal / reciprocal-sqrt
+// estimate, now JIT-lowered via a 512-entry table lookup per lane. Validated
+// against the interpreter oracle across in-range and out-of-range (saturating)
+// inputs.
+TEST_F(Arm64LiteTranslateRegionTest, UrecpeUrsqrteMatchesInterpreter) {
+  const uint32_t lanes[4] = {0xFFFFFFFFu, 0x80000000u, 0x40000000u, 0x12345678u};
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], lanes, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], lanes, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t urecpe4s[] = {0x4ea1c820u};
+  static const uint32_t ursqrte4s[] = {0x6ea1c820u};
+  static const uint32_t urecpe2s[] = {0x0ea1c820u};   // Q=0 zeroes upper 64
+  static const uint32_t ursqrte2s[] = {0x2ea1c820u};
+  check(urecpe4s);
+  check(ursqrte4s);
+  check(urecpe2s);
+  check(ursqrte2s);
+  // Q=0 forms must zero the upper 64 bits of Vd.
+  memcpy(&state_.cpu.v[1], lanes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  EXPECT_TRUE(Run(urecpe2s, ToGuestAddr(urecpe2s) + sizeof(urecpe2s)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
 // endregion
 
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
@@ -12681,6 +12833,72 @@ TEST_F(Arm64LiteTranslateRegionTest, I8mmUsdotSudotByElement) {
   GetV128(state_.cpu, 0, r);
   EXPECT_EQ(r[0], 0x00000034FFFFFF12ULL);
   EXPECT_EQ(r[1], 0x000000080000000AULL);
+}
+
+// USDOT/SUDOT (I8MM mixed-sign dot) are now JIT-lowered via per-operand
+// widening (unsigned operand zero-extended, signed operand sign-extended,
+// then PMADDWD). Validate the JIT path against the interpreter oracle for the
+// vector (.4s/.2s) and by-element forms, using bytes that span the sign
+// boundary so signed vs unsigned widening matters.
+TEST_F(Arm64LiteTranslateRegionTest, UsdotSudotJitMatchesInterpreter) {
+  const uint8_t nb[16] = {200, 5, 130, 1, 255, 0, 128, 7,
+                          9, 250, 3, 17, 100, 200, 1, 2};
+  const uint8_t mb[16] = {0xFE, 2, 0x80, 3, 0x7F, 1, 0xFF, 4,
+                          5, 6, 0x81, 8, 9, 10, 11, 12};
+  const __uint128_t din = (static_cast<__uint128_t>(0x0000000A00000003ULL) << 64) |
+                          0x0000000200000001ULL;
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t usdot_4s[] = {0x4e829c20u};   // usdot v0.4s, v1.16b, v2.16b
+  static const uint32_t usdot_2s[] = {0x0e829c20u};   // usdot v0.2s, v1.8b, v2.8b
+  static const uint32_t usdot_idx[] = {0x4fa2f020u};  // usdot v0.4s, v1.16b, v2.4b[1]
+  static const uint32_t sudot_idx[] = {0x4f02f820u};  // sudot v0.4s, v1.16b, v2.4b[2]
+  check(usdot_4s);
+  check(usdot_2s);
+  check(usdot_idx);
+  check(sudot_idx);
+}
+
+// I8MM matrix multiply-accumulate SMMLA/UMMLA/USMMLA now JIT-lowered (widen
+// rows/cols, PMADDWD each pairing, fold with PHADDD). Validated against the
+// interpreter oracle with sign-spanning bytes and a non-zero accumulator.
+TEST_F(Arm64LiteTranslateRegionTest, MmlaJitMatchesInterpreter) {
+  const uint8_t nb[16] = {200, 5, 130, 1, 255, 0, 128, 7,
+                          9, 250, 3, 17, 100, 200, 1, 2};
+  const uint8_t mb[16] = {0xFE, 2, 0x80, 3, 0x7F, 1, 0xFF, 4,
+                          5, 6, 0x81, 8, 9, 10, 11, 12};
+  const __uint128_t din = (static_cast<__uint128_t>(0x0000000A00000003ULL) << 64) |
+                          0x0000000200000001ULL;
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = din;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t smmla[] = {0x4E82A420u};   // smmla v0.4s, v1.16b, v2.16b
+  static const uint32_t ummla[] = {0x6E82A420u};   // ummla v0.4s, v1.16b, v2.16b
+  static const uint32_t usmmla[] = {0x4E82AC20u};  // usmmla v0.4s, v1.16b, v2.16b
+  check(smmla);
+  check(ummla);
+  check(usmmla);
 }
 // endregion
 
