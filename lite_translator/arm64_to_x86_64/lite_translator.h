@@ -12118,9 +12118,21 @@ class LiteTranslator {
         }
         return res;
       }
-      case 0b000010:  // REV32 (sf=1) / REV W (sf=0) — interpreter-only.
-        Undefined();
-        return no_register;
+      case 0b000010:  // region digitalis - REV32 (sf=1) / REV (sf=0).
+        if (is_64bit) {
+          // REV32 Xd: byte-reverse each 32-bit word independently. BSWAPQ
+          // reverses all 8 bytes (also swapping the two words); rotating by 32
+          // swaps the words back, leaving each word byte-reversed in place.
+          as_.Movq(res, src);
+          as_.Bswapq(res);
+          as_.Rorq(res, int8_t{32});
+        } else {
+          // REV Wd: byte-reverse the 32-bit word (zero-extends).
+          as_.Movl(res, src);
+          as_.Bswapl(res);
+        }
+        return res;
+        // endregion
       case 0b000011:  // REV (byte reverse) — maps to x86 BSWAP
         if (is_64bit) {
           as_.Movq(res, src);

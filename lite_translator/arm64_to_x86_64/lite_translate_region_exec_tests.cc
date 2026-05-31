@@ -11952,6 +11952,21 @@ TEST_F(Arm64LiteTranslateRegionTest, Rev16XScalar) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 0x2211443366558877ULL);
 }
+// region digitalis - scalar REV32 Xd / REV Wd (DataProc1Src opcode 000010).
+TEST_F(Arm64LiteTranslateRegionTest, Rev32XScalar) {
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  static const uint32_t code[] = {0xDAC00820u};  // rev32 x0, x1
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Byte-reverse each 32-bit word: 0x11223344 -> 0x44332211, 0x55667788 -> 0x88776655.
+  EXPECT_EQ(state_.cpu.x[0], 0x4433221188776655ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, RevWScalar) {
+  state_.cpu.x[1] = 0x11223344AABBCCDDULL;
+  static const uint32_t code[] = {0x5AC00820u};  // rev w0, w1
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0xDDCCBBAAULL);  // low word byte-reversed, zero-extended
+}
+// endregion
 TEST_F(Arm64LiteTranslateRegionTest, FcvtlF32ToF64) {
   float in[2] = {1.5f, -2.5f};
   std::memcpy(&state_.cpu.v[1], in, 8);
