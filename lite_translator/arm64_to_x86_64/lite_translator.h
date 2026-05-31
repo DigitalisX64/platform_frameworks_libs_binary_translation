@@ -13784,6 +13784,55 @@ class LiteTranslator {
   }
   // endregion
 
+  // region digitalis - URECPE / URSQRTE estimate tables. The result of these
+  // unsigned integer reciprocal / reciprocal-sqrt estimates is a pure function
+  // of the 9-bit field (a>>23)&0x1FF (the saturation condition — top bit clear
+  // for URECPE, top two bits clear for URSQRTE — is encoded in that field's
+  // high bits), so a 512-entry table per op lets the JIT do a per-lane lookup
+  // that bit-matches the interpreter's UnsignedRecipEstimate/RSqrtEstimate.
+  static const uint32_t* BuildUnsignedEstimateTable(bool is_rsqrt) {
+    uint32_t* t = new uint32_t[512];
+    for (int idx = 0; idx < 512; ++idx) {
+      uint32_t r;
+      if (!is_rsqrt) {
+        if (idx < 256) {  // top bit (bit31 of input) clear -> saturate
+          r = 0xFFFFFFFFu;
+        } else {
+          int a2 = idx * 2 + 1;
+          int b = (1 << 19) / a2;
+          int estimate = (b + 1) / 2;
+          r = static_cast<uint32_t>(estimate) << 23;
+        }
+      } else {
+        if (idx < 128) {  // top two bits clear -> saturate
+          r = 0xFFFFFFFFu;
+        } else {
+          int aa;
+          if (idx < 256) {
+            aa = idx * 2 + 1;
+          } else {
+            aa = (idx >> 1) << 1;
+            aa = (aa + 1) * 2;
+          }
+          int b = 512;
+          while (static_cast<int64_t>(aa) * (b + 1) * (b + 1) < (1 << 28)) {
+            b += 1;
+          }
+          int estimate = (b + 1) / 2;
+          r = static_cast<uint32_t>(estimate) << 23;
+        }
+      }
+      t[idx] = r;
+    }
+    return t;
+  }
+  static const uint32_t* UnsignedEstimateTable(bool is_rsqrt) {
+    static const uint32_t* const kRecpe = BuildUnsignedEstimateTable(false);
+    static const uint32_t* const kRsqrte = BuildUnsignedEstimateTable(true);
+    return is_rsqrt ? kRsqrte : kRecpe;
+  }
+  // endregion
+
   void AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscArgs& args) {
     // region digitalis - JIT for CMEQZ (cmeq Vd, Vn, #0) used by the
     // dynamic linker's calculate_gnu_hash_neon. Other opcodes fall
@@ -13834,6 +13883,41 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
+
+      // region digitalis - URECPE/URSQRTE (.2S/.4S): per-lane unsigned integer
+      // reciprocal / reciprocal-sqrt estimate. The result is a pure function of
+      // the 9-bit field (lane>>23)&0x1FF, so extract that index per lane and
+      // load the precomputed estimate from the table (matches the interpreter
+      // bit-for-bit). Q=0 zeroes the upper 64 bits (xres starts zeroed).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUrecpe:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUrsqrte: {
+        if (args.size != 0b10) { success_ = false; return; }  // 32-bit lanes only
+        const bool is_rsqrt =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUrsqrte);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xres = AllocTempSimdReg();
+        Register tbl = AllocTempReg();
+        Register idx = AllocTempReg();
+        Register val = AllocTempReg();
+        if (xn == no_simd_register || xres == no_simd_register ||
+            tbl == no_register || idx == no_register || val == no_register) {
+          success_ = false; return;
+        }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xres, xres);
+        as_.Movq(tbl, reinterpret_cast<int64_t>(UnsignedEstimateTable(is_rsqrt)));
+        const int lanes = args.q ? 4 : 2;
+        for (int i = 0; i < lanes; ++i) {
+          as_.Pextrd(idx, xn, static_cast<int8_t>(i));
+          as_.Shrl(idx, int8_t{23});
+          as_.Andl(idx, int32_t{0x1FF});
+          as_.Movl(val, {.base = tbl, .index = idx, .scale = Assembler::kTimesFour});
+          as_.Pinsrd(xres, val, static_cast<int8_t>(i));
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
+        return;
+      }
+      // endregion
       // endregion
 
       // region digitalis - FCVTXN / FCVTXN2 (vector FP64->FP32, round-to-odd).

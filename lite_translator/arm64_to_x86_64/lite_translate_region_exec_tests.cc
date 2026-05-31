@@ -12644,6 +12644,38 @@ TEST_F(Arm64LiteTranslateRegionTest, Addhn2dQ1MatchesInterpreter) {
   InterpretInsn(&state_);
   EXPECT_EQ(jit, state_.cpu.v[0]);
 }
+
+// URECPE/URSQRTE (.2S/.4S) unsigned integer reciprocal / reciprocal-sqrt
+// estimate, now JIT-lowered via a 512-entry table lookup per lane. Validated
+// against the interpreter oracle across in-range and out-of-range (saturating)
+// inputs.
+TEST_F(Arm64LiteTranslateRegionTest, UrecpeUrsqrteMatchesInterpreter) {
+  const uint32_t lanes[4] = {0xFFFFFFFFu, 0x80000000u, 0x40000000u, 0x12345678u};
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], lanes, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], lanes, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t urecpe4s[] = {0x4ea1c820u};
+  static const uint32_t ursqrte4s[] = {0x6ea1c820u};
+  static const uint32_t urecpe2s[] = {0x0ea1c820u};   // Q=0 zeroes upper 64
+  static const uint32_t ursqrte2s[] = {0x2ea1c820u};
+  check(urecpe4s);
+  check(ursqrte4s);
+  check(urecpe2s);
+  check(ursqrte2s);
+  // Q=0 forms must zero the upper 64 bits of Vd.
+  memcpy(&state_.cpu.v[1], lanes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  EXPECT_TRUE(Run(urecpe2s, ToGuestAddr(urecpe2s) + sizeof(urecpe2s)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
 // endregion
 
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
