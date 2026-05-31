@@ -10682,12 +10682,13 @@ class LiteTranslator {
     // region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half).
     // Vd(narrow) = ((Vn op Vm) [+ round]) >> narrow_bits, taking the high
     // half of each wide lane.  R-variants add round = 1<<(narrow_bits-1).
-    // size=00 (.8B<-.8H) and 01 (.4H<-.4S); the .2S<-.2D form (size=10) has
-    // no x86 narrowing pack and bails to the interpreter.  Q=1 ("2" form)
-    // writes the upper 64 bits and preserves Vd's low 64.
+    // size=00 (.8B<-.8H), 01 (.4H<-.4S) use a narrowing pack; size=10
+    // (.2S<-.2D) has no 64->32 pack, so it shifts each 64-bit lane down by 32
+    // and gathers the dwords with PSHUFD.  Q=1 ("2" form) writes the upper 64
+    // bits and preserves Vd's low 64.
     if (args.opcode == Op::kAddhn || args.opcode == Op::kSubhn ||
         args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn) {
-      if (args.size != 0b00 && args.size != 0b01) { success_ = false; return; }
+      if (args.size > 0b10) { success_ = false; return; }
       const bool is_sub = (args.opcode == Op::kSubhn || args.opcode == Op::kRsubhn);
       const bool is_round = (args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn);
       const int32_t vn_o = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
@@ -10712,6 +10713,38 @@ class LiteTranslator {
         if (args.size == 0b00) as_.Paddw(xn, xr); else as_.Paddd(xn, xr);
         return true;
       };
+      if (args.size == 0b10) {
+        // .2S<-.2D / .4S<-.2D(2): 64-bit add/sub, then take the high 32 bits of
+        // each lane (no x86 64->32 pack, so PSRLQ then gather with PSHUFD).
+        if (is_sub) as_.Psubq(xn, xm); else as_.Paddq(xn, xm);
+        if (is_round) {
+          // Rounding adds 2^31 into each 64-bit lane before the >>32 truncate.
+          SimdRegister xr = AllocTempSimdReg();
+          Register t = AllocTempReg();
+          if (xr == no_simd_register || t == no_register) { success_ = false; return; }
+          as_.Movq(t, int64_t{0x0000000080000000LL});
+          as_.Movq(xr, t);
+          as_.Punpcklqdq(xr, xr);
+          as_.Paddq(xn, xr);
+        }
+        as_.Psrlq(xn, int8_t{32});         // high 32 of each lane -> low 32
+        as_.Pshufd(xn, xn, int8_t{0x08});  // {dword0, dword2} -> low 64
+        if (!args.q) {
+          as_.Pslldq(xn, int8_t{8});       // zero upper 64
+          as_.Psrldq(xn, int8_t{8});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+        } else {
+          as_.Pslldq(xn, int8_t{8});
+          SimdRegister xd = AllocTempSimdReg();
+          if (xd == no_simd_register) { success_ = false; return; }
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_o});
+          as_.Pslldq(xd, int8_t{8});
+          as_.Psrldq(xd, int8_t{8});
+          as_.Por(xn, xd);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_o}, xn);
+        }
+        return;
+      }
       if (args.size == 0b00) {
         if (is_sub) as_.Psubw(xn, xm); else as_.Paddw(xn, xm);
         if (is_round && !add_round(int64_t{0x0080008000800080LL})) { success_ = false; return; }

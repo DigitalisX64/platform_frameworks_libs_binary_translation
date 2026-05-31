@@ -12597,6 +12597,53 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2dQ1MatchesInterpreter) {
   InterpretInsn(&state_);
   EXPECT_EQ(jit, state_.cpu.v[0]);
 }
+
+// ADDHN/SUBHN/RADDHN/RSUBHN .2S<-.2D (64->32 narrowing high half). The JIT
+// (PADDQ/PSUBQ + optional +2^31 round + PSRLQ#32 + PSHUFD) is validated
+// against the interpreter oracle, including rounding carry into the high half
+// and the Q=1 (…2) placement.
+TEST_F(Arm64LiteTranslateRegionTest, Addhn2dMatchesInterpreter) {
+  uint64_t nb[2] = {0x123456789ABCDEF0ULL, 0xFFFFFFFF80000000ULL};
+  uint64_t mb[2] = {0x0000000180000000ULL, 0x0000000100000000ULL};
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[1], nb, 16);
+    memcpy(&state_.cpu.v[2], mb, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t addhn[] = {0x0ea24020u};
+  static const uint32_t subhn[] = {0x0ea26020u};
+  static const uint32_t raddhn[] = {0x2ea24020u};
+  static const uint32_t rsubhn[] = {0x2ea26020u};
+  check(addhn);
+  check(subhn);
+  check(raddhn);
+  check(rsubhn);
+}
+TEST_F(Arm64LiteTranslateRegionTest, Addhn2dQ1MatchesInterpreter) {
+  uint64_t nb[2] = {0x123456789ABCDEF0ULL, 0xAAAAAAAA55555555ULL};
+  uint64_t mb[2] = {0x0000000180000000ULL, 0x1111111122222222ULL};
+  static const uint32_t code[] = {0x4ea24020u};  // addhn2 v0.4s, v1.2d, v2.2d
+  memcpy(&state_.cpu.v[1], nb, 16);
+  memcpy(&state_.cpu.v[2], mb, 16);
+  SetV128(state_.cpu, 0, 0xCAFEBABEDEADBEEFULL, 0ULL);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xCAFEBABEDEADBEEFULL);  // low preserved
+  __uint128_t jit = state_.cpu.v[0];
+  memcpy(&state_.cpu.v[1], nb, 16);
+  memcpy(&state_.cpu.v[2], mb, 16);
+  SetV128(state_.cpu, 0, 0xCAFEBABEDEADBEEFULL, 0ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(jit, state_.cpu.v[0]);
+}
 // endregion
 
 // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
