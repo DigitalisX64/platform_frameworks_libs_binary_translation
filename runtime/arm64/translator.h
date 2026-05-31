@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -41,4 +40,3 @@ void InitTranslatorArch();
 }  // namespace berberis
 
 #endif  // BERBERIS_RUNTIME_ARM64_TRANSLATOR_H_
-// endregion

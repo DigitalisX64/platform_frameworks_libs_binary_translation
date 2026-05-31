@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -15,7 +14,6 @@
  * limitations under the License.
  */
 
-// region digitalis
 #include "translator.h"
 
 #include <cstdint>
@@ -74,12 +72,11 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> TryLiteTranslateAn
   MachineCode machine_code;
 
   params.end_pc = pc + GetExecutableRegionSize(pc);
-  // region digitalis - enable direct dispatch
+  // enable direct dispatch
   // JIT is stable (16 breaks total, all register pressure). Enable direct
   // dispatch so regions chain directly through the translation cache instead
   // of returning to the ExecuteGuest loop on every region boundary.
   params.allow_dispatch = true;
-  // endregion
   auto [success, stop_pc] = TryLiteTranslateRegion(pc, &machine_code, params);
 
   size_t size = stop_pc - pc;
@@ -106,7 +103,7 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> TryLiteTranslateAn
           kLiteTranslated};
 }
 
-// region digitalis - translation profiling counters
+// translation profiling counters
 static struct TranslationStats {
   uint64_t total_translations = 0;
   uint64_t jit_successes = 0;
@@ -114,7 +111,6 @@ static struct TranslationStats {
   uint64_t total_jit_insns = 0;  // sum of region sizes (in ARM64 instructions)
   uint64_t interpret_invocations = 0;
 } g_translation_stats;
-// endregion
 
 void TranslateRegion(GuestAddr pc) {
   TranslationCache* cache = TranslationCache::GetInstance();
@@ -135,7 +131,7 @@ void TranslateRegion(GuestAddr pc) {
   auto [success, host_code_piece, size, kind] = TryLiteTranslateAndInstallRegion(pc);
   if (success) {
     cache->SetTranslatedAndUnlock(pc, entry, size, kind, host_code_piece);
-    // region digitalis - profiling
+    // profiling
     g_translation_stats.jit_successes++;
     g_translation_stats.total_jit_insns += size / 4;
   } else {
@@ -157,7 +153,6 @@ void TranslateRegion(GuestAddr pc) {
                         ? (unsigned long)(g_translation_stats.total_jit_insns / g_translation_stats.jit_successes)
                         : 0UL);
   }
-  // endregion
 }
 
 // ATTENTION: This symbol gets called directly, without PLT. To keep text
@@ -169,7 +164,7 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleN
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(
     ThreadState* state) {
-  // region digitalis - interpreter invocation counter with syscall diagnostics
+  // interpreter invocation counter with syscall diagnostics
   g_translation_stats.interpret_invocations++;
   bool should_log = g_translation_stats.interpret_invocations <= 25 ||
                     g_translation_stats.interpret_invocations % 5000000 == 0;
@@ -183,22 +178,20 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleI
                     (unsigned long)state->cpu.x[1],
                     (unsigned long)state->cpu.x[2]);
   }
-  // endregion
   InterpretBatch(state, 500, TranslationCache::GetInstance());
-  // region digitalis - post-SVC diagnostics
+  // post-SVC diagnostics
   if (should_log && state->cpu.x[0] != pre_x0) {
     TRACE_AND_ALOGD("berberis: post-interp x0=0x%lx (was 0x%lx) pc=0x%lx",
                     (unsigned long)state->cpu.x[0],
                     (unsigned long)pre_x0,
                     (unsigned long)state->cpu.insn_addr);
   }
-  // endregion
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_GetDispatchAddress(
     ThreadState* state) {
   CHECK(state);
-  // region digitalis - dispatch watchdog for hang diagnosis
+  // dispatch watchdog for hang diagnosis
   static thread_local uint64_t dispatch_count = 0;
   dispatch_count++;
   if (dispatch_count % 10000 == 0) {
@@ -210,7 +203,6 @@ extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_
                     (unsigned long)state->cpu.x[30],
                     (unsigned long)state->cpu.x[1]);  // x1 for context
   }
-  // endregion
   if (ArePendingSignalsPresent(*state)) {
     return AsHostCode(kEntryExitGeneratedCode);
   }
@@ -224,4 +216,3 @@ berberis_HandleLiteCounterThresholdReached(ThreadState* state) {
 }
 
 }  // namespace berberis
-// endregion

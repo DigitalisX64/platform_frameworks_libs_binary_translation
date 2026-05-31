@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -39,4 +38,3 @@ long RunGuestSyscall___NR_epoll_pwait2(long arg_1,
 }  // namespace berberis
 
 #endif  // BERBERIS_KERNEL_API_ARM64_EPOLL_EMULATION_H_
-// endregion

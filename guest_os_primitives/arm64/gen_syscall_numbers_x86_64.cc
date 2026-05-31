@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -1370,4 +1369,3 @@ int ToGuestSyscallNumber(int nr) {
 }
 
 }  // namespace berberis
-// endregion

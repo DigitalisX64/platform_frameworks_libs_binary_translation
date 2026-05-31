@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -334,4 +333,3 @@ enum {
 }  // namespace berberis
 
 #endif  // BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GEN_SYSCALL_NUMBERS_ARCH_H_
-// endregion

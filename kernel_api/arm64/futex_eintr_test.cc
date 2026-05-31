@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -152,4 +151,3 @@ TEST_F(FutexEintrTest, FutexWaitReturnsEintrOnSignal) {
 }  // namespace
 
 }  // namespace berberis
-// endregion

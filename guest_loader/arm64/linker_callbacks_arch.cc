@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -32,4 +31,3 @@ bool InitializeLinkerCallbacksArch(LinkerCallbacks* linker_callbacks,
 }
 
 }  // namespace berberis
-// endregion

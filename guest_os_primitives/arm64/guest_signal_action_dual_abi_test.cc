@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -217,4 +216,3 @@ TEST(GuestSignalActionDualAbi, ResettingSaHandlerStyleToDfl) {
 }
 
 }  // namespace berberis
-// endregion

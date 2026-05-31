@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -84,4 +83,3 @@ ScopedVirtualGuestCallFrame::~ScopedVirtualGuestCallFrame() {
 }
 
 }  // namespace berberis
-// endregion

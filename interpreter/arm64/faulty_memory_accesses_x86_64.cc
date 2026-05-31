@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -193,4 +192,3 @@ void* FindFaultyMemoryAccessRecoveryAddrForTesting(void* fault_addr) {
 }
 
 }  // namespace berberis
-// endregion

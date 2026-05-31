@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -73,4 +72,3 @@ void InitTranslator() {
 }
 
 }  // namespace berberis
-// endregion

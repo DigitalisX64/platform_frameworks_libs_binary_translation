@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -178,4 +177,3 @@ class GuestContext {
 }  // namespace berberis
 
 #endif  // BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GUEST_CONTEXT_ARCH_H_
-// endregion

@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -221,4 +220,3 @@ TEST(UContextLayout, RestoreHonorsHandlerWritesToReserved) {
 }
 
 }  // namespace berberis
-// endregion

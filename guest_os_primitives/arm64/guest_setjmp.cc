@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -172,4 +171,3 @@ jmp_buf** GetHostJmpBufPtr(void* guest_jmp_buf) {
 }
 
 }  // namespace berberis
-// endregion

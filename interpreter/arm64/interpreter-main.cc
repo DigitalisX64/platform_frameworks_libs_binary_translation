@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -25,18 +24,14 @@
 #include "berberis/runtime_primitives/runtime_library.h"
 #include "berberis/runtime_primitives/translation_cache.h"
 
-// region digitalis
 #include "../faulty_memory_accesses.h"
-// endregion
 
 #include "interpreter.h"
 
 namespace berberis {
 
 void InitInterpreter() {
-  // region digitalis
   AddFaultyMemoryAccessRecoveryCode();
-  // endregion
 }
 
 void InterpretInsn(ThreadState* state) {
@@ -48,7 +43,6 @@ void InterpretInsn(ThreadState* state) {
   interpreter.FinalizeInsn(insn_len);
 }
 
-// region digitalis
 void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache) {
   // Create interpreter/decoder ONCE and reuse across instructions.
   // This eliminates per-instruction construction overhead (~60% of cost).
@@ -70,7 +64,7 @@ void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache) 
       break;
     }
 
-    // region digitalis - always check cache after each instruction
+    // always check cache after each instruction
     // Previously only checked on non-sequential PCs (branches). This caused
     // the interpreter to run over JIT'd code at consecutive PCs, executing
     // up to 500 instructions at interpreter speed when JIT'd code was available.
@@ -81,10 +75,7 @@ void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache) 
         code != kEntryTranslating) {
       break;
     }
-    // endregion
   }
 }
-// endregion
 
 }  // namespace berberis
-// endregion

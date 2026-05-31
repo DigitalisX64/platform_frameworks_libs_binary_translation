@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -129,14 +128,13 @@ class Decoder {
     kLsrv = 0b001001,
     kAsrv = 0b001010,
     kRorv = 0b001011,
-    // region digitalis - PACGA (Armv8.3-PAuth generic PAC compute)
+    // PACGA (Armv8.3-PAuth generic PAC compute)
     // PACGA Xd, Xn, Xm|SP: 64-bit only (sf=1, S=0, opcode=001100).
     // ARM ARM C7.2.179: produces a 32-bit PAC in Rd[63:32], zeros Rd[31:0].
     // Digitalis is PAC-blind (never inserts authentication codes), so the
     // PAC value is 0 and Rd = 0.  Interpreter handles this; JIT bails.
     kPacga = 0b001100,
-    // endregion
-    // region digitalis - CRC32 opcodes
+    // CRC32 opcodes
     kCrc32b = 0b010000,
     kCrc32h = 0b010001,
     kCrc32w = 0b010010,
@@ -145,10 +143,8 @@ class Decoder {
     kCrc32ch = 0b010101,
     kCrc32cw = 0b010110,
     kCrc32cx = 0b010111,
-    // endregion
   };
 
-  // region digitalis
   //
   // MTE (Memory Tagging Extension, Armv8.5-A) data-processing 2-source
   // opcodes. Encoding:
@@ -205,12 +201,11 @@ class Decoder {
     kStzg,   // store tag + zero 16-byte granule
     kSt2g,   // store double tag (32-byte granule) — NOP without MTE backing
     kStz2g,  // store double tag + zero 32-byte granule
-    // region digitalis - tag-block (granule-multiple) forms (op2=00).
+    // tag-block (granule-multiple) forms (op2=00).
     kLdgm,   // load tag multiple into Rt — without MTE, all tags read 0
     kStgm,   // store tag multiple — NOP without MTE backing
     kStzgm,  // store tag multiple + zero block — tag NOP; block size is
              // GMID_EL1-defined (not emulated), so treated as a tag NOP
-    // endregion
   };
 
   struct MteLoadStoreArgs {
@@ -220,9 +215,7 @@ class Decoder {
     int32_t imm;      // sign-extended imm9 << 4 (already scaled by 16-byte granule).
     uint8_t op2;      // 0b00=offset-no-wb (LDG), 0b01=post, 0b10=offset, 0b11=pre.
   };
-  // endregion
 
-  // region digitalis
   // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
   //
   // Encoding (observed bits, llvm-mc-verified with
@@ -262,9 +255,8 @@ class Decoder {
     uint8_t rot;      // FCADD: 0=#90, 1=#270; FCMLA: 0=#0, 1=#90, 2=#180, 3=#270.
     bool q;           // bit[30] — 0 = 64-bit vector, 1 = 128-bit vector.
   };
-  // endregion
 
-  // region digitalis indexed FCMLA
+  // indexed FCMLA
   // Advanced SIMD complex floating-point by element (Armv8.3-FCMA): FCMLA.
   //
   // FCADD has no by-element form; only FCMLA has an indexed encoding.
@@ -324,9 +316,7 @@ class Decoder {
     uint8_t rot;      // 0=#0, 1=#90, 2=#180, 3=#270.
     bool q;           // bit[30] — false = .2s (1 pair), true = .4s (2 pairs).
   };
-  // endregion
 
-  // region digitalis
   // Advanced SIMD BFloat16 three-same-extra (Armv8.6-BF16):
   //   BFDOT (vector), BFMMLA.
   //
@@ -386,9 +376,8 @@ class Decoder {
     uint8_t index;  // 0..3 for kBfdotIdx; 0..7 for kBfmlal{b,t}Idx; 0 otherwise.
     bool q;         // True selects 4S/.4s form; BFMMLA & BFMLAL ops always pass true.
   };
-  // endregion
 
-  // region digitalis hello-dotprod
+  // hello-dotprod
   // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT, vector
   // and by-element forms.
   //
@@ -417,11 +406,10 @@ class Decoder {
     kUdot,      // UDOT vector
     kSdotIdx,   // SDOT by element
     kUdotIdx,   // UDOT by element
-    // region digitalis - I8MM mixed-sign dot products (FEAT_I8MM).
+    // I8MM mixed-sign dot products (FEAT_I8MM).
     kUsdot,     // USDOT vector  (Vn unsigned, Vm signed)
     kUsdotIdx,  // USDOT by element
     kSudotIdx,  // SUDOT by element (Vn signed, Vm unsigned; vector form N/A)
-    // endregion
   };
 
   struct DotProductArgs {
@@ -432,9 +420,8 @@ class Decoder {
     uint8_t index;  // 0..3 for indexed forms; 0 for vector forms.
     bool q;         // True selects .4s form (4 lanes); false selects .2s (2 lanes).
   };
-  // endregion
 
-  // region digitalis - I8MM 8-bit integer matrix multiply-accumulate.
+  // I8MM 8-bit integer matrix multiply-accumulate.
   enum class MatMulOpcode : uint8_t {
     kSmmla,   // signed x signed
     kUmmla,   // unsigned x unsigned
@@ -446,7 +433,6 @@ class Decoder {
     uint8_t rn;
     uint8_t rm;
   };
-  // endregion
 
   //
   // Data Processing (3-source) opcodes.
@@ -490,7 +476,6 @@ class Decoder {
     kNzcv = 0xDA10,       // NZCV: op0=3, op1=3, CRn=4, CRm=2, op2=0
     kFpcr = 0xDA20,       // FPCR: op0=3, op1=3, CRn=4, CRm=4, op2=0
     kFpsr = 0xDA21,       // FPSR: op0=3, op1=3, CRn=4, CRm=4, op2=1
-    // region digitalis
     // Sysreg encoding (computed by DecodeSystem): (op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2.
     // ARM ARM C5.2.6: CTR_EL0 is op2=1, DCZID_EL0 is op2=7 (NOT both op2=7).
     // The prior values (kCtrEl0=0xD807, kDczidEl0=0xD80F) routed mrs DCZID_EL0
@@ -515,7 +500,6 @@ class Decoder {
     // RNG and reports success (NZCV cleared), rather than faulting.
     kRndr = 0xD920,
     kRndrrs = 0xD921,
-    // endregion
   };
 
   //
@@ -531,7 +515,7 @@ class Decoder {
     bool set_flags;    // S bit: true to set NZCV flags (ADDS/SUBS/CMP/CMN)
   };
 
-  // region digitalis - ADDG/SUBG: add/subtract immediate, with tags (FEAT_MTE).
+  // ADDG/SUBG: add/subtract immediate, with tags (FEAT_MTE).
   struct AddSubImmTagsArgs {
     uint8_t dst;     // Xd|SP
     uint8_t src;     // Xn|SP
@@ -539,7 +523,6 @@ class Decoder {
     uint8_t uimm4;   // logical tag offset applied to bits[59:56]
     bool is_sub;     // true for SUBG, false for ADDG
   };
-  // endregion
 
   struct LogicalImmArgs {
     LogicalImmOpcode opcode;
@@ -613,7 +596,6 @@ class Decoder {
     bool is_64bit_target;  // For signed loads: extend to 64-bit
   };
 
-  // region digitalis
   // LDR/LDRSW (literal) — PC-relative integer load. The decoder routes
   // PRFM (literal) to Nop() (no-op prefetch). bit[29]=0 (V=0) identifies
   // the integer form; SIMD/FP literal loads are decoded separately.
@@ -623,7 +605,6 @@ class Decoder {
     LoadStoreSize size;  // k32bit (LDR Wt / LDRSW Xt) or k64bit (LDR Xt)
     bool is_signed;    // True for LDRSW (sign-extend 32→64)
   };
-  // endregion
 
   struct LoadStorePairArgs {
     uint8_t rt1;       // First register
@@ -640,7 +621,7 @@ class Decoder {
     uint8_t rt;
     uint8_t rn;
     uint8_t rm;
-    // region digitalis - raw 3-bit ARMv8 option field:
+    // raw 3-bit ARMv8 option field:
     // 000=UXTB, 001=UXTH, 010=UXTW, 011=LSL (UXTX), 100=SXTB,
     // 101=SXTH, 110=SXTW, 111=SXTX. Only 010/011/110/111 are valid for
     // a load/store address; the encoded option is preserved so the JIT
@@ -652,7 +633,6 @@ class Decoder {
     // 0x34488 / 0x344a4 where ldrb [..., w, uxtw] is the entire decode
     // inner kernel.
     uint8_t extend_type;
-    // endregion
     uint8_t shift_amount;
     LoadStoreSize size;
     bool is_store;
@@ -737,7 +717,6 @@ class Decoder {
     uint32_t insn;     // Full instruction for unrecognized system instructions.
   };
 
-  // region digitalis
   //
   // SIMD/FP load/store size (extends LoadStoreSize with 128-bit).
   //
@@ -781,17 +760,15 @@ class Decoder {
     uint8_t rt;
     uint8_t rn;
     uint8_t rm;
-    // region digitalis - raw 3-bit ARMv8 option field for the offset
+    // raw 3-bit ARMv8 option field for the offset
     // register, same encoding as LoadStoreRegArgs::extend_type. See the
     // comment there.
     uint8_t extend_type;
-    // endregion
     uint8_t shift_amount;
     SimdLoadStoreSize size;
     bool is_store;
   };
 
-  // region digitalis
   // LDR (literal) — SIMD/FP form (V=1). Load 32/64/128 bits from the
   // PC-relative literal pool into V[rt]. The integer form is decoded
   // separately as LoadLiteral (V=0).
@@ -800,7 +777,6 @@ class Decoder {
     int64_t offset;          // PC-relative byte offset (imm19 * 4, sign-extended)
     SimdLoadStoreSize size;  // k32bit (S), k64bit (D), k128bit (Q)
   };
-  // endregion
 
   struct FpIntConvArgs {
     uint8_t rd;
@@ -812,7 +788,6 @@ class Decoder {
     uint8_t op;
   };
 
-  // region digitalis
   enum class FpFixedPointOp : uint8_t {
     kScvtf,   // Signed fixed-point to FP
     kUcvtf,   // Unsigned fixed-point to FP
@@ -828,7 +803,6 @@ class Decoder {
     uint8_t ftype;    // 00=S, 01=D
     uint8_t fbits;    // Number of fractional bits (1..32 for sf=0, 1..64 for sf=1)
   };
-  // endregion
 
   struct ConditionalCompareArgs {
     uint8_t rn;        // First operand register
@@ -846,20 +820,18 @@ class Decoder {
     kLdar,     // Load acquire
     kStlr,     // Store release
     kCas,      // Compare and swap
-    // region digitalis CASP (compare-and-swap pair, Armv8.1 LSE).
+    // CASP (compare-and-swap pair, Armv8.1 LSE).
     kCasp,     // Compare and swap pair (Rs:Rs+1 = expected, Rt:Rt+1 = new)
-    // endregion
     kSwp,      // Swap
     kLdadd,    // Atomic add
     kLdclr,    // Atomic bit clear
     kLdset,    // Atomic bit set
     kLdeor,    // Atomic exclusive or
-    // region digitalis atomic min/max (LSE Armv8.1).
+    // atomic min/max (LSE Armv8.1).
     kLdsmax,   // Atomic signed max
     kLdsmin,   // Atomic signed min
     kLdumax,   // Atomic unsigned max
     kLdumin,   // Atomic unsigned min
-    // endregion
   };
 
   struct LoadStoreExclusiveArgs {
@@ -879,9 +851,8 @@ class Decoder {
     kSmov,         // SMOV: signed move from Vn element to Xd/Wd
     kUmov,         // UMOV: unsigned move from Vn element to Xd/Wd
     kInsElement,   // INS (element): copy Vn element to Vd element
-    // region digitalis - scalar SIMD copy (DUP scalar / MOV Vd, Vn[index])
+    // scalar SIMD copy (DUP scalar / MOV Vd, Vn[index])
     kDupScalar,    // DUP (scalar) / MOV scalar: copy one Vn[index] element into bottom of Vd, zero upper
-    // endregion
   };
 
   struct AdvSimdCopyArgs {
@@ -893,7 +864,6 @@ class Decoder {
     bool q;            // Q bit: 0=64-bit vector, 1=128-bit vector
   };
 
-  // region digitalis
   //
   // AdvSIMD three same opcodes.
   // Encoding: 0 Q U 01110 size 1 Rm opcode 1 Rn Rd
@@ -915,12 +885,10 @@ class Decoder {
     kSmin,      // SMIN (vector): U=0, opcode=01101
     kUmax,      // UMAX (vector): U=1, opcode=01100
     kUmin,      // UMIN (vector): U=1, opcode=01101
-    // region digitalis
     kCmgt,      // CMGT (vector, register): U=0, opcode=00110
     kCmhi,      // CMHI (vector, register): U=1, opcode=00110 (unsigned >)
     kCmge,      // CMGE (vector, register): U=0, opcode=00111
     kCmhs,      // CMHS (vector, register): U=1, opcode=00111 (unsigned >=)
-    // endregion
     kShadd,     // SHADD (vector): U=0, opcode=00000
     kUhadd,     // UHADD (vector): U=1, opcode=00000
     kSqadd,     // SQADD (vector): U=0, opcode=00001
@@ -943,7 +911,6 @@ class Decoder {
     kMul,       // MUL (vector): U=0, opcode=10011
     kMla,       // MLA (vector): U=0, opcode=10010
     kMls,       // MLS (vector): U=1, opcode=10010
-    // region digitalis
     kSmaxp,     // SMAXP (vector): U=0, opcode=10100
     kUmaxp,     // UMAXP (vector): U=1, opcode=10100
     kSminp,     // SMINP (vector): U=0, opcode=10101
@@ -971,7 +938,6 @@ class Decoder {
     kFacgeV,    // FACGE  (vector): op_high=0, opcode=11101, U=1
     kFacgtV,    // FACGT  (vector): op_high=1, opcode=11101, U=1
     kFabdV,     // FABD   (vector): op_high=1, opcode=11010, U=1
-    // region digitalis
     kFmulxV,    // FMULX  (vector): op_high=0, opcode=11011, U=0
                 // FP16-three-same encoding: a=0, opcode_3=011, U=0.
                 // Same as kFmulV but with the ARM-defined ±0 * ±inf -> ±2.0
@@ -996,31 +962,27 @@ class Decoder {
     kFminpV,    // FMINP   (vector): op_high=1, opcode=11110, U=1
     kFmaxnmpV,  // FMAXNMP (vector): op_high=0, opcode=11000, U=1
     kFminnmpV,  // FMINNMP (vector): op_high=1, opcode=11000, U=1
-    // endregion
-    // region digitalis - SABD/UABD: vector absolute difference at .8b/.16b/
+    // SABD/UABD: vector absolute difference at .8b/.16b/
     // .4h/.8h/.2s/.4s. size=11 (64-bit lane) is reserved.  Verified with
     // llvm-mc:  sabd v0.8b,v1.8b,v2.8b = 0x0e227420 (opcode=01110, U=0);
     //           uabd v0.8b,v1.8b,v2.8b = 0x2e227420 (opcode=01110, U=1).
     kSabd,      // SABD (vector): U=0, opcode=01110
     kUabd,      // UABD (vector): U=1, opcode=01110
-    // endregion
-    // region digitalis - SABA/UABA: absolute-difference-and-accumulate at
+    // SABA/UABA: absolute-difference-and-accumulate at
     // .8b/.16b/.4h/.8h/.2s/.4s.  size=11 reserved.  Vd[i] += |Vn[i] - Vm[i]|.
     // Verified with llvm-mc:
     //   saba v0.8b,v1.8b,v2.8b = 0x0e227c20 (opcode=01111, U=0);
     //   uaba v0.8b,v1.8b,v2.8b = 0x2e227c20 (opcode=01111, U=1).
     kSaba,      // SABA (vector): U=0, opcode=01111
     kUaba,      // UABA (vector): U=1, opcode=01111
-    // endregion
-    // region digitalis - PMUL polynomial multiply (byte-lane GF(2) multiply).
+    // PMUL polynomial multiply (byte-lane GF(2) multiply).
     // .8b/.16b only; size=01/10/11 reserved per ARM ARM.
     // Verified with llvm-mc:
     //   pmul v0.8b,v1.8b,v2.8b   = 0x2e229c20 (opcode=10011, U=1, size=00, Q=0)
     //   pmul v0.16b,v1.16b,v2.16b = 0x6e229c20 (opcode=10011, U=1, size=00, Q=1)
     //   pmul v0.4h / v0.4s        invalid (size=01/10 reserved)
     kPmul,      // PMUL (vector): U=1, opcode=10011, size=00
-    // endregion
-    // region digitalis - SQDMULH / SQRDMULH saturating doubling multiply high.
+    // SQDMULH / SQRDMULH saturating doubling multiply high.
     // .4h/.8h/.2s/.4s; size=00 and size=11 reserved per ARM ARM.
     // Semantics (per lane): high half of (2 * signed(Vn[i]) * signed(Vm[i]) +
     // round), saturated to the destination element's signed range. SQRDMULH
@@ -1033,8 +995,7 @@ class Decoder {
     //   sqdmulh v0.8b / v0.2d      invalid (size=00/11 reserved)
     kSqdmulh,   // SQDMULH (vector):  U=0, opcode=10110
     kSqrdmulh,  // SQRDMULH (vector): U=1, opcode=10110
-    // endregion
-    // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector
+    // Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector
     // forms (NOT the by-element forms — those live in AdvSimdVecXIdxOpcode
     // as kSqrdmlahIdx / kSqrdmlshIdx).  These ride the "Advanced SIMD three
     // same extra" encoding class (bit21=0, bit15=1, bit10=1), which is
@@ -1053,8 +1014,6 @@ class Decoder {
     kSqrdmlshVec,  // SQRDMLSH (vector, three-same): three-same-extra
                    //   U=1, opcode4=0001, size ∈ {01,10}.
                    // Vd[i] = sat_signed(Vd[i] - SQRDMULH(Vn[i], Vm[i])).
-    // endregion
-    // endregion
   };
 
   struct AdvSimdThreeSameArgs {
@@ -1067,16 +1026,13 @@ class Decoder {
                        // collapses {op_high, sz} to sz here (0=single, 1=double);
                        // when is_fp16 is set, the lanes are 2-byte half.
     bool q;            // Q bit: 0=64-bit vector (D regs), 1=128-bit vector (Q regs)
-    // region digitalis: Armv8.2-FP16 NEON vector three-same.
+    // Armv8.2-FP16 NEON vector three-same.
     // FP16 vector three-same has a separate encoding (bit21=0, bits[15:14]=00,
     // bit22=1) from the standard three-same (bit21=1).  The decoder maps both
     // through this struct and the interpreter dispatches on this flag.
     bool is_fp16;
-    // endregion
   };
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD three different (widening/narrowing) opcodes.
   // Encoding: 0 Q U 01110 size 1 Rm opcode 00 Rn Rd
@@ -1097,20 +1053,18 @@ class Decoder {
     kUabdl,    // UABDL/UABDL2: U=1, opcode=0111
     kSabal,    // SABAL/SABAL2: U=0, opcode=0101
     kUabal,    // UABAL/UABAL2: U=1, opcode=0101
-    // region digitalis - wide add/sub: Vd(wide) = Vn(wide) op extend(Vm(narrow))
+    // wide add/sub: Vd(wide) = Vn(wide) op extend(Vm(narrow))
     kSaddw,    // SADDW/SADDW2: U=0, opcode=0001
     kUaddw,    // UADDW/UADDW2: U=1, opcode=0001
     kSsubw,    // SSUBW/SSUBW2: U=0, opcode=0011
     kUsubw,    // USUBW/USUBW2: U=1, opcode=0011
-    // endregion
-    // region digitalis - polynomial multiply (ARMv8 base PMULL + crypto PMULL64)
+    // polynomial multiply (ARMv8 base PMULL + crypto PMULL64)
     // PMULL/PMULL2: U=0, opcode=1110
     //   size=00: 8-bit element poly-mul, 8 lanes -> 8x 16-bit results
     //   size=11: 64-bit element poly-mul, 1 lane -> 128-bit result (PMULL64)
     //   size=01,10 are RESERVED. Used by libz CRC32 acceleration.
     kPmull,
-    // endregion
-    // region digitalis - narrowing high (add/sub of two wide vectors, take high
+    // narrowing high (add/sub of two wide vectors, take high
     // half of each result lane, write to half-width destination).
     //   ADDHN  / ADDHN2  : U=0, opcode=0100, round=0
     //   RADDHN / RADDHN2 : U=1, opcode=0100, round=1<<(narrow_bits-1)
@@ -1127,8 +1081,7 @@ class Decoder {
     //   raddhn  v0.2s,  v1.2d, v2.2d -> 0x2ea24020
     kAddhn,
     kRaddhn,
-    // endregion
-    // region digitalis - narrowing high subtract (subtract two wide vectors,
+    // narrowing high subtract (subtract two wide vectors,
     // take high half of each result lane, write to half-width destination).
     //   SUBHN  / SUBHN2  : U=0, opcode=0110, round=0
     //   RSUBHN / RSUBHN2 : U=1, opcode=0110, round=1<<(narrow_bits-1)
@@ -1145,8 +1098,7 @@ class Decoder {
     //   rsubhn  v0.2s,  v1.2d, v2.2d -> 0x2ea26020
     kSubhn,
     kRsubhn,
-    // endregion
-    // region digitalis - signed saturating doubling multiply long.
+    // signed saturating doubling multiply long.
     //   SQDMULL / SQDMULL2 : U=0, opcode=1101
     // For each lane, signed multiply two narrow source elements and double
     // the product. Saturate the result to the wide signed range; the only
@@ -1164,8 +1116,7 @@ class Decoder {
     //   sqdmull  v0.2d, v1.2s, v2.2s -> 0x0ea2d020 (Q=0, size=10)
     //   sqdmull2 v0.2d, v1.4s, v2.4s -> 0x4ea2d020 (Q=1, size=10)
     kSqdmull,
-    // endregion
-    // region digitalis - signed saturating doubling multiply-accumulate long.
+    // signed saturating doubling multiply-accumulate long.
     //   SQDMLAL / SQDMLAL2 : U=0, opcode=1001
     // For each lane: addend = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
     //   (first-stage saturation, identical to SQDMULL).
@@ -1181,8 +1132,7 @@ class Decoder {
     //   sqdmlal  v0.2d, v1.2s, v2.2s -> 0x0ea29020 (Q=0, size=10)
     //   sqdmlal2 v0.2d, v1.4s, v2.4s -> 0x4ea29020 (Q=1, size=10)
     kSqdmlal,
-    // endregion
-    // region digitalis - signed saturating doubling multiply-subtract long.
+    // signed saturating doubling multiply-subtract long.
     //   SQDMLSL / SQDMLSL2 : U=0, opcode=1011
     // For each lane: addend = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
     //   (first-stage saturation, identical to SQDMULL/SQDMLAL).
@@ -1198,7 +1148,6 @@ class Decoder {
     //   sqdmlsl  v0.2d, v1.2s, v2.2s -> 0x0ea2b020 (Q=0, size=10)
     //   sqdmlsl2 v0.2d, v1.4s, v2.4s -> 0x4ea2b020 (Q=1, size=10)
     kSqdmlsl,
-    // endregion
   };
 
   struct AdvSimdThreeDiffArgs {
@@ -1241,9 +1190,7 @@ class Decoder {
     bool postindex;    // Has post-index
     bool is_replicate; // True for LD1R-LD4R
   };
-  // endregion
 
-  // region digitalis
   //
   // FP data-processing (1 source) opcodes.
   //
@@ -1254,13 +1201,11 @@ class Decoder {
     kFsqrt = 0b000011,
     kFcvtToOther1 = 0b000100,  // FCVT to the other single/double
     kFcvtToOther2 = 0b000101,  // FCVT to half or from half
-    // region digitalis
     // BFCVT <Hd>, <Sn>: FP32 single -> BFloat16 with round-to-nearest-even.
     // Encoded with ftype=01 (the 6-bit opcode + ftype together discriminate
     // this from the FCVT-from-double cases above).  llvm-mc-verified:
     //   bfcvt h0, s1  =  0x1e634020
     kBfcvt = 0b000110,
-    // endregion
     kFrintn = 0b001000,
     kFrintp = 0b001001,
     kFrintm = 0b001010,
@@ -1268,14 +1213,13 @@ class Decoder {
     kFrinta = 0b001100,
     kFrintx = 0b001110,
     kFrinti = 0b001111,
-    // region digitalis - FRINTTS (FEAT_FRINTTS): round to a 32/64-bit signed
+    // FRINTTS (FEAT_FRINTTS): round to a 32/64-bit signed
     // integral FP value, saturating out-of-range / NaN to the most-negative
     // value. Z = toward zero, X = FPCR rounding mode (signals Inexact).
     kFrint32z = 0b010000,
     kFrint32x = 0b010001,
     kFrint64z = 0b010010,
     kFrint64x = 0b010011,
-    // endregion
   };
 
   struct FpDataProc1Args {
@@ -1319,7 +1263,6 @@ class Decoder {
     bool signal_nans; // true = FCMPE (signal all NaNs)
   };
 
-  // region digitalis
   // FP conditional compare args (FCCMP, FCCMPE).
   // If cond evaluates true, perform an FP compare (FCMP-style for FCCMP, FCMPE-style for FCCMPE)
   // and set NZCV; else copy nzcv immediate directly into NZCV.
@@ -1331,7 +1274,6 @@ class Decoder {
     uint8_t ftype;       // 00=S, 01=D
     bool signal_nans;    // true = FCCMPE, false = FCCMP
   };
-  // endregion
 
   //
   // AdvSIMD two-reg misc opcodes.
@@ -1362,7 +1304,7 @@ class Decoder {
     kFcvtl,
     kFabs,
     kFneg,
-    // region digitalis - FP FCMxxZero (FP32/FP64). The integer kCmxxZero
+    // FP FCMxxZero (FP32/FP64). The integer kCmxxZero
     // and Armv8.2-FP16 paths reuse the same kCmxxZero enum values disambiguated
     // by args.is_fp16; the FP32/FP64 form lives at a different opcode column
     // (01100/01101/01110 with bits[21:17]=10000, bit23=1), so it carries its
@@ -1372,8 +1314,6 @@ class Decoder {
     kFcmeqZero,  // FCMEQ zero: U=0, opcode=01101
     kFcmleZero,  // FCMLE zero: U=1, opcode=01101
     kFcmltZero,  // FCMLT zero: U=0, opcode=01110 (U=1 unallocated)
-    // endregion
-    // region digitalis
     // Across-lanes reductions share the two-reg-misc dispatch path but are
     // distinguished by bit20=1 (across-lanes group) vs bit20=0 (two-reg-misc).
     kAddv,      // ADDV: U=0, opcode=11011
@@ -1392,7 +1332,7 @@ class Decoder {
     kFrecpeV,   // FRECPE (vector): U=0, opcode=11101, bit23=1
     kFrsqrteV,  // FRSQRTE (vector): U=1, opcode=11101, bit23=1
     kFsqrtV,    // FSQRT  (vector): U=1, opcode=11111, bit23=1
-    // region digitalis - FCVT* vector rounding-mode variants.
+    // FCVT* vector rounding-mode variants.
     // Encoding follows the bit23 ("a") + opcode ("op") split in DDI 0487.
     // Pair  (signed,unsigned) -> bit U.
     kFcvtnsV,   // FCVTNS (vector, round-to-nearest ties-even): U=0, opcode=11010, bit23=0
@@ -1412,8 +1352,7 @@ class Decoder {
     kFrint32xV,
     kFrint64zV,
     kFrint64xV,
-    // endregion
-    // region digitalis BFCVTN/BFCVTN2 (Armv8.6-BF16).
+    // BFCVTN/BFCVTN2 (Armv8.6-BF16).
     // Vector narrow FP32 -> BF16. Encoding shares opcode=10110 with FCVTN,
     // but uses size=10 (vs FCVTN's size=00/01). bit30 = Q: Q=0 -> BFCVTN
     // (writes low 4H of Vd, upper 64 bits zeroed); Q=1 -> BFCVTN2 (writes
@@ -1421,8 +1360,7 @@ class Decoder {
     //   llvm-mc: bfcvtn  v0.4h, v1.4s  = 0x0ea16820
     //            bfcvtn2 v0.8h, v1.4s  = 0x4ea16820
     kBfcvtn,    // BFCVTN/BFCVTN2 (vector narrow FP32->BF16).
-    // endregion
-    // region digitalis a=0 column: FP16 vector FRINT* (round to
+    // a=0 column: FP16 vector FRINT* (round to
     // integral). Currently only the FP16 form of these is decoded (via
     // DecodeAdvSimdFp16TwoRegMisc); the std FP32/FP64 two-reg-misc dispatch
     // still routes opcodes 11000/11001 to Undefined() for now.
@@ -1433,8 +1371,7 @@ class Decoder {
     kFrintpV,   // FRINTP  (toward +inf):           a=1, U=0, opcode=11000
     kFrintzV,   // FRINTZ  (toward zero):           a=1, U=0, opcode=11001
     kFrintiV,   // FRINTI  (use current rounding):  a=1, U=1, opcode=11001
-    // endregion
-    // region digitalis - SQABS / SQNEG (signed saturating abs / negate).
+    // SQABS / SQNEG (signed saturating abs / negate).
     // Encoding: 0 Q U 01110 size 10000 00111 10 Rn Rd
     //   sqabs v0.8b, v1.8b   = 0x0e207820  (Q=0, U=0, size=00)
     //   sqabs v0.16b, v1.16b = 0x4e207820  (Q=1, U=0, size=00)
@@ -1449,8 +1386,7 @@ class Decoder {
     // Q=0) is not encoded for either op.
     kSqabs,     // SQABS: U=0, opcode=00111
     kSqneg,     // SQNEG: U=1, opcode=00111
-    // endregion
-    // region digitalis - SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
+    // SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
     // Encoding: 0 Q 1 01110 size 10000 10010 10 Rn Rd  (U=1 required;
     // U=0 with opcode=10010 is XTN). Sizes 00/01/10 only —
     // size=11 is unallocated for the narrow group (the .1d / .2d
@@ -1466,8 +1402,7 @@ class Decoder {
     // else cast to unsigned narrow. Q=0 writes low 64 bits of Vd
     // (upper zeroed); Q=1 writes upper 64 bits and preserves lower.
     kSqxtun,    // SQXTUN/SQXTUN2: U=1, opcode=10010
-    // endregion
-    // region digitalis - SHLL / SHLL2 (shift left long, by element size).
+    // SHLL / SHLL2 (shift left long, by element size).
     // Encoding: 0 Q 1 01110 size 10000 10011 10 Rn Rd  (U=1 required;
     // U=0 with opcode=10011 is unallocated). Sizes 00/01/10 only —
     // size=11 (source .1d / .2d) is unallocated (no wider destination).
@@ -1485,8 +1420,7 @@ class Decoder {
     // 64 bits (SHLL2). Both write all 128 bits of Vd. Functionally
     // equivalent to USHLL/USHLL2 with shift = esize_src.
     kShll,      // SHLL/SHLL2: U=1, opcode=10011
-    // endregion
-    // region digitalis - FCVTXN / FCVTXN2 (vector narrow FP64->FP32, round-to-odd).
+    // FCVTXN / FCVTXN2 (vector narrow FP64->FP32, round-to-odd).
     // Encoding: 0 Q 1 01110 0 sz 10000 10110 10 Rn Rd  with sz=1 (size=01).
     // U=1 distinguishes this from FCVTN (U=0, opcode=10110) and from BFCVTN
     // (U=0, opcode=10110, size=10). Only FP64 (size=01) source is encoded; the
@@ -1499,8 +1433,7 @@ class Decoder {
     // conversions): take the round-toward-zero result; if any bits were
     // discarded, force the LSB of the result mantissa to 1.
     kFcvtxn,    // FCVTXN/FCVTXN2: U=1, opcode=10110, size=01
-    // endregion
-    // region digitalis - across-lanes FP reductions FMAXV / FMINV /
+    // across-lanes FP reductions FMAXV / FMINV /
     // FMAXNMV / FMINNMV. These share AdvSIMD two-reg-misc dispatch path
     // but live in the across-lanes group (bit20=1) with U=1 mandatory.
     // The `size` field carries "o sz" (bit23=o picks max=0 / min=1;
@@ -1521,11 +1454,9 @@ class Decoder {
     kFminv,     // FMINV   (across .4S): opcode=01111, bit23=1
     kFmaxnmv,   // FMAXNMV (across .4S): opcode=01100, bit23=0
     kFminnmv,   // FMINNMV (across .4S): opcode=01100, bit23=1
-    // endregion
-    // endregion
   };
 
-  // region digitalis - SHA-512 (FEAT_SHA512) ops live outside the AdvSIMD
+  // SHA-512 (FEAT_SHA512) ops live outside the AdvSIMD
   // encoding family. The three-register SHA-512 group encodes:
   //   11001110 011 Rm 1000 o2 Rn Rd
   // with o2 = bits[11:10] picking the op. The two-register variant
@@ -1536,7 +1467,6 @@ class Decoder {
     kSha512su1,  // 3-reg, o2=10
     kSha512su0,  // 2-reg
   };
-  // endregion
 
   struct AdvSimdTwoRegMiscArgs {
     AdvSimdTwoRegMiscOpcode opcode;
@@ -1545,17 +1475,15 @@ class Decoder {
     uint8_t size;     // element size: 00=8b, 01=16b, 10=32b, 11=64b
     bool q;           // Q bit: 0=64-bit vector, 1=128-bit vector
     bool u;           // U bit from encoding
-    // region digitalis: Armv8.2-FP16 vector two-reg-misc.
+    // Armv8.2-FP16 vector two-reg-misc.
     // The FP16 encoding (DDI 0487 C7.2 "Advanced SIMD two-register
     // miscellaneous (FP16)") shares this struct.  When set, lanes are
     // 2-byte half and `size` carries no meaning (set to 0 by the FP16
     // dispatcher).  The interpreter reads is_fp16 inside each opcode
     // case and dispatches via FpHalfToSingle / FpSingleToHalf as.
     bool is_fp16;
-    // endregion
   };
 
-  // region digitalis
   //
   // AdvSIMD scalar two-reg misc opcodes.
   //
@@ -1564,22 +1492,19 @@ class Decoder {
     kUcvtf,   // UCVTF  (scalar): unsigned int → float                     (opcode=11101, U=1; size ∈ {S,D})
     kFcvtzs,  // FCVTZS (scalar): float → signed int, round toward zero    (opcode=11011, U=0; size ∈ {S,D})
     kFcvtzu,  // FCVTZU (scalar): float → unsigned int, round toward zero  (opcode=11011, U=1; size ∈ {S,D})
-    // region digitalis - scalar FRECPE / FRSQRTE.
+    // scalar FRECPE / FRSQRTE.
     kFrecpe,  // FRECPE  (scalar): FP reciprocal estimate                  (opcode=11101, U=0; size ∈ {10, 11})
     kFrsqrte, // FRSQRTE (scalar): FP reciprocal square-root estimate      (opcode=11101, U=1; size ∈ {10, 11})
-    // endregion
-    // region digitalis - scalar FCVTAS / FCVTAU.
+    // scalar FCVTAS / FCVTAU.
     kFcvtas,  // FCVTAS (scalar): float → signed int, round-to-nearest ties-away (opcode=11100, U=0; size ∈ {00, 01})
     kFcvtau,  // FCVTAU (scalar): float → unsigned int, round-to-nearest ties-away (opcode=11100, U=1; size ∈ {00, 01})
-    // endregion
-    // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
+    // scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
     kSqabs,   // SQABS  (scalar): saturating signed absolute value         (opcode=00111, U=0; size ∈ {B,H,S,D})
     kSqneg,   // SQNEG  (scalar): saturating signed negate                 (opcode=00111, U=1; size ∈ {B,H,S,D})
     kSqxtun,  // SQXTUN (scalar): signed→unsigned saturating extract narrow (opcode=10010, U=1; size ∈ {B,H,S})
     kSqxtn,   // SQXTN  (scalar): signed saturating extract narrow         (opcode=10100, U=0; size ∈ {B,H,S})
     kUqxtn,   // UQXTN  (scalar): unsigned saturating extract narrow       (opcode=10100, U=1; size ∈ {B,H,S})
     kFcvtxn,  // FCVTXN (scalar): FP64→FP32 round-to-odd narrow             (opcode=10110, U=1; size=01)
-    // endregion
   };
 
   struct AdvSimdScalarTwoRegMiscArgs {
@@ -1593,9 +1518,7 @@ class Decoder {
     //   in bytes via `1 << size`: 0=B, 1=H, 2=S, 3=D.
     uint8_t size;
   };
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar three same opcodes.
   // Encoding: 01 U 11110 size 1 Rm opcode 1 Rn Rd
@@ -1614,7 +1537,7 @@ class Decoder {
     kCmeq,    // CMEQ (scalar, D): U=1, opcode=10001
     kSshl,    // SSHL (scalar, D): U=0, opcode=01000 (signed shift left)
     kUshl,    // USHL (scalar, D): U=1, opcode=01000 (unsigned shift left)
-    // region digitalis - FP scalar three same.
+    // FP scalar three same.
     // For FP variants, size bits [23:22] = 1x where bit22 (sz) selects S (0) or D (1).
     kFabd,    // FABD (scalar, FP): U=1, bit23=1, opcode=11010
     kFcmgt,   // FCMGT (scalar, FP): U=1, bit23=1, opcode=11100
@@ -1631,8 +1554,7 @@ class Decoder {
     kFrsqrts, // FRSQRTS (scalar, FP): U=0, bit23=1, opcode=11111.
               // Reciprocal sqrt step: (3.0 - a*b)/2 with (0*inf) -> +1.5
               // saturation. FP16 scalar variant: a=1, U=0, opcode_3=111.
-    // endregion
-    // region digitalis - scalar saturating add/sub (B/H/S/D).
+    // scalar saturating add/sub (B/H/S/D).
     //   size=00 -> B,  01 -> H,  10 -> S,  11 -> D.
     //   Unlike the rest of the integer scalar three-same family which is
     //   D-form only, opcodes 00001 (SQADD/UQADD) and 00011 (SQSUB/UQSUB)
@@ -1647,8 +1569,7 @@ class Decoder {
     kUqaddScalar,
     kSqsubScalar,
     kUqsubScalar,
-    // endregion
-    // region digitalis - scalar saturating shift left (B/H/S/D).
+    // scalar saturating shift left (B/H/S/D).
     //   size = 00 -> B, 01 -> H, 10 -> S, 11 -> D.
     //   Shift amount is the low 8 bits of Vm (signed); negative shifts
     //   are arithmetic right (signed forms) or logical right (unsigned).
@@ -1665,8 +1586,7 @@ class Decoder {
     kUqshlScalar,
     kSqrshlScalar,
     kUqrshlScalar,
-    // endregion
-    // region digitalis - scalar rounding shift left (D only, non-saturating).
+    // scalar rounding shift left (D only, non-saturating).
     //   size = 11 -> D (only valid lane width).
     //   Shift amount is the low 8 bits of Vm (signed); negative shifts
     //   are arithmetic right (signed) or logical right (unsigned), with
@@ -1678,8 +1598,7 @@ class Decoder {
     //     URSHL  d, d, d  = 01 1 11110 11 1 Rm 0 1010 1 Rn Rd
     kSrshlScalar,
     kUrshlScalar,
-    // endregion
-    // region digitalis - scalar saturating doubling multiply high (H/S only).
+    // scalar saturating doubling multiply high (H/S only).
     //   size = 01 -> H, 10 -> S.  Lane widths B and D are unallocated for
     //   this opcode; the decoder rejects them as Undefined.
     //   Computes `Vd = sat_signed((2 * sext(Vn) * sext(Vm) + round) >>
@@ -1691,8 +1610,7 @@ class Decoder {
     //     SQRDMULH <V>d, <V>n, <V>m  = 01 1 11110 size 1 Rm 1 0110 1 Rn Rd
     kSqdmulhScalar,
     kSqrdmulhScalar,
-    // endregion
-    // region digitalis - Armv8.1-RDM scalar saturating rounding doubling
+    // Armv8.1-RDM scalar saturating rounding doubling
     //   multiply accumulate / subtract high (H/S only).
     //   size = 01 -> H, 10 -> S.  Lane widths B and D are unallocated for
     //   this opcode; the decoder rejects them as Undefined.
@@ -1707,7 +1625,6 @@ class Decoder {
     //   interpreter and JIT can dispatch on a single enum.
     kSqrdmlahScalar,
     kSqrdmlshScalar,
-    // endregion
   };
 
   struct AdvSimdScalarThreeSameArgs {
@@ -1717,13 +1634,12 @@ class Decoder {
     uint8_t rm;
     uint8_t size;   // integer: full size field; FP: 0 -> S (32-bit), 1 -> D (64-bit);
                     // FP16 scalar three-same: 0 (unused — interpreter checks is_fp16).
-    // region digitalis: Armv8.2-FP16 scalar three-same.  When true, the
+    // Armv8.2-FP16 scalar three-same.  When true, the
     // interpreter reads the low 16 bits of Vn/Vm as binary16 and performs
     // a widen-op-narrow round-trip through FP32 (FpHalfToSingle ->
     // semantic helper -> FpSingleToHalf).  Bit-exact for the FMULX
     // saturation case because ±2.0 is exactly representable in FP16.
     bool is_fp16 = false;
-    // endregion
   };
 
   // AdvSIMD scalar pairwise opcodes.
@@ -1732,7 +1648,6 @@ class Decoder {
   // a single scalar in Vd.
   enum class AdvSimdScalarPairwiseOpcode : uint8_t {
     kAddp,    // ADDP (scalar): U=0, size=11, opcode=11011 -> d-form
-    // region digitalis
     // FP scalar pairwise variants.  U=1 in the dispatch encoding selects the
     // FP32/FP64 forms (size[0] picks S vs D); U=0 with bit22=0 selects the
     // Armv8.2-FP16 forms (carried on AdvSimdScalarPairwiseArgs.is_fp16).
@@ -1743,7 +1658,6 @@ class Decoder {
     kFminnmpScalar,  // FMINNMP scalar:  opcode=01100, bit23=1
     kFmaxpScalar,    // FMAXP scalar:    opcode=01111, bit23=0
     kFminpScalar,    // FMINP scalar:    opcode=01111, bit23=1
-    // endregion
   };
 
   struct AdvSimdScalarPairwiseArgs {
@@ -1751,11 +1665,8 @@ class Decoder {
     uint8_t rd;
     uint8_t rn;
     uint8_t size;
-    // region digitalis
     bool is_fp16;
-    // endregion
   };
-  // endregion
 
   //
   // AdvSIMD shift by immediate opcodes.
@@ -1779,7 +1690,7 @@ class Decoder {
     kRshrn,
     kSqshrn,
     kUqshrn,
-    // region digitalis: AdvSIMD shift-by-immediate narrow family — the
+    // AdvSIMD shift-by-immediate narrow family — the
     // prior enum was missing SQSHRUN / SQRSHRUN / SQRSHRN / UQRSHRN.
     // Without these, opcodes 0b10010 / 0b10011 (both U-values) silently
     // fell through to the dispatch default and the U=1 variants of
@@ -1790,10 +1701,9 @@ class Decoder {
     kSqrshrun,
     kSqrshrn,
     kUqrshrn,
-    // endregion
     kSshll,
     kUshll,
-    // region digitalis: scalar fixed-point conversion shift-by-imm family.
+    // scalar fixed-point conversion shift-by-imm family.
     // Opcodes 11100 (SCVTF/UCVTF) and 11111 (FCVTZS/FCVTZU) of
     // DecodeAdvSimdScalarShiftByImm — convert between fixed-point integer
     // and floating-point with the encoded shift as fractional-bit count.
@@ -1805,7 +1715,6 @@ class Decoder {
     kUcvtfFixed,
     kFcvtzsFixed,
     kFcvtzuFixed,
-    // endregion
   };
 
   struct AdvSimdShiftImmArgs {
@@ -1816,17 +1725,13 @@ class Decoder {
     uint8_t immb;     // immb field (bits[18:16])
     bool q;           // Q bit
     bool u;           // U bit
-    // region digitalis
     // Scalar shift-by-immediate dispatch sets this; vector dispatch leaves
     // it false.  When set, the consumer must process exactly one element
     // regardless of esize (overrides num_elements = vec_len / esize), and
     // must zero the upper 64 bits of Vd to match ARM ARM scalar semantics.
-    // endregion
     bool scalar = false;
   };
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD vector x indexed element opcodes.
   //
@@ -1834,14 +1739,11 @@ class Decoder {
     kFmla,    // FMLA (by element)
     kFmls,    // FMLS (by element)
     kFmul,    // FMUL (by element)
-    // region digitalis
     kFmulx,   // FMULX (by element): U=1, opcode=1001.  Same lane semantics as
               // kFmul except (±0 * ±inf) lanes return ±2.0 instead of NaN.
-    // endregion
     kMul,     // MUL (by element)
     kMla,     // MLA (by element)
     kMls,     // MLS (by element)
-    // region digitalis
     kSqdmulhIdx,   // SQDMULH (by element): U=0, opcode=1100, size in {01,10}.
                    // Per-lane saturating doubling multiply high (no rounding).
     kSqrdmulhIdx,  // SQRDMULH (by element): U=0, opcode=1101, size in {01,10}.
@@ -1878,7 +1780,6 @@ class Decoder {
                    // size in {01,10}.  Same as kSqrdmlahIdx but subtracts the
                    // saturated rounded-doubled product: Vd[i] = SignedSat(
                    // Vd[i] - SignedSat(round(2*sn*sm) >> esize_bits)).
-    // endregion
   };
 
   struct AdvSimdVecXIdxArgs {
@@ -1890,9 +1791,7 @@ class Decoder {
     uint8_t size;     // 01=16b, 10=32b, 11=64b
     bool q;
   };
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar x indexed element (ARM ARM C4.1.71).
   // Encoding: 0 1 U 11111 size L M Rm opcode H 0 Rn Rd
@@ -1910,7 +1809,7 @@ class Decoder {
     kFmul,   // FMUL  (scalar by element): U=0, opcode=1001.
     kFmla,   // FMLA  (scalar by element): U=0, opcode=0001.  Fused multiply-add.
     kFmls,   // FMLS  (scalar by element): U=0, opcode=0101.  Fused negated multiply-add.
-    // region digitalis - Armv8.1-RDM scalar by-element saturating rounding
+    // Armv8.1-RDM scalar by-element saturating rounding
     //   doubling multiply accumulate / subtract high (H/S only).
     //   Stage 1: SQRDMULH(Vn, broadcast(Vm[index])).  Stage 2: signed-
     //   saturating ADD (SQRDMLAH) or SUB (SQRDMLSH) of stage-1 result
@@ -1922,7 +1821,6 @@ class Decoder {
     //     SQRDMLSH <V>d, <V>n, <Vm>.<T>[i] = 01 1 11111 size L M Rm 1111 H 0 Rn Rd
     kSqrdmlahScalarIdx,
     kSqrdmlshScalarIdx,
-    // endregion
   };
 
   struct AdvSimdScalarXIdxArgs {
@@ -1933,7 +1831,6 @@ class Decoder {
     uint8_t index;    // element index within rm
     uint8_t size;     // 10 = FP32 (single), 11 = FP64 (double)
   };
-  // endregion
 
   // Signextend bits from size to the corresponding signed type of sizeof(Type) size.
   template <unsigned size, typename Type>
@@ -2001,20 +1898,16 @@ class Decoder {
       return false;  // Reserved encoding.
     }
 
-    // region digitalis
     // Create a mask of (s + 1) ones. Handle s=63 to avoid UB from 1<<64.
     // uint64_t welem = (1ULL << (s + 1)) - 1;
     uint64_t welem = (s >= 63) ? ~0ULL : ((1ULL << (s + 1)) - 1);
-    // endregion
 
-    // region digitalis
     // Rotate right by r within esize bits.
     // // welem = ((welem >> r) | (welem << (esize - r))) & ((1ULL << esize) - 1);
     if (r != 0) {
       uint64_t mask = (esize >= 64) ? ~0ULL : ((1ULL << esize) - 1);
       welem = ((welem >> r) | (welem << (esize - r))) & mask;
     }
-    // endregion
 
     // Replicate the esize-bit pattern to fill 64 bits.
     uint64_t imm = 0;
@@ -2066,12 +1959,10 @@ class Decoder {
         break;
       case 0b0111:
       case 0b1111:
-        // region digitalis
         // SIMD & FP (op0 = x111).
         // // TODO: Implement SIMD/FP decoding.
         // Undefined();
         DecodeSimdFp();
-        // endregion
         break;
       default:
         Undefined();
@@ -2096,9 +1987,8 @@ class Decoder {
         DecodeAddSubImmediate();
         break;
       case 0b011:
-        // region digitalis - Add/subtract (immediate, with tags): ADDG/SUBG.
+        // Add/subtract (immediate, with tags): ADDG/SUBG.
         DecodeAddSubImmTags();
-        // endregion
         break;
       case 0b100:
         // Logical (immediate).
@@ -2113,10 +2003,8 @@ class Decoder {
         DecodeBitfield();
         break;
       case 0b111:
-        // region digitalis
         // Extract (EXTR/ROR).
         DecodeExtract();
-        // endregion
         break;
       default:
         Undefined();
@@ -2165,7 +2053,7 @@ class Decoder {
     insn_consumer_->AddSubImm(args);
   }
 
-  // region digitalis - ADDG/SUBG (add/subtract immediate, with tags).
+  // ADDG/SUBG (add/subtract immediate, with tags).
   // Encoding: sf=1 op S=0 100011 0 uimm6[21:16] (00) uimm4[13:10] Rn Rd.
   void DecodeAddSubImmTags() {
     bool is_sub = GetBits<30, 1>();
@@ -2178,7 +2066,6 @@ class Decoder {
     };
     insn_consumer_->AddSubImmTags(args);
   }
-  // endregion
 
   void DecodeLogicalImmediate() {
     bool sf = GetBits<31, 1>();
@@ -2282,7 +2169,6 @@ class Decoder {
         break;
       case 0b001:
       case 0b101:
-        // region digitalis
         // Both CBZ/CBNZ and TBZ/TBNZ have op0=x01.
         // Distinguish by bit25: 0=CBZ/CBNZ, 1=TBZ/TBNZ.
         // // Compare and branch: CBZ/CBNZ.
@@ -2292,11 +2178,9 @@ class Decoder {
         } else {
           DecodeCompareAndBranch();
         }
-        // endregion
         break;
       case 0b011:
       case 0b111:
-        // region digitalis
         // // Test and branch: TBZ/TBNZ.
         // DecodeTestAndBranch();
         // Same dispatch as above — both x01 and x11 can reach here.
@@ -2305,12 +2189,11 @@ class Decoder {
         } else {
           DecodeCompareAndBranch();
         }
-        // endregion
         break;
       case 0b110: {
         // This group contains: Unconditional branch (register), Exception generation, System.
         uint32_t opc_top = GetBits<22, 4>();
-        // region digitalis - Exception generation is bits[25:24]==00 (the
+        // Exception generation is bits[25:24]==00 (the
         // 11010100 prefix); the opc field lives in bits[23:21], so HLT (opc=010)
         // and DCPS1-3 (opc=101) set bits 22/23 and must still route here rather
         // than falling through to Undefined(). DecodeExceptionGeneration sorts
@@ -2318,7 +2201,6 @@ class Decoder {
         if ((opc_top & 0b1100) == 0b0000) {
           // Exception generation (SVC, HVC, SMC, BRK, HLT, DCPS).
           DecodeExceptionGeneration();
-          // endregion
         } else if (opc_top == 0b0100) {
           // System (MSR, MRS, NOP, DMB, DSB, ISB, SYS, SYSL).
           DecodeSystem();
@@ -2407,7 +2289,7 @@ class Decoder {
       insn_consumer_->Svc(args);
       return;
     }
-    // region digitalis - BRK (opc=001, ll=00) and HLT (opc=010, ll=00) are
+    // BRK (opc=001, ll=00) and HLT (opc=010, ll=00) are
     // breakpoint-class instructions; both deliver a synchronous SIGTRAP to the
     // guest (so debuggers and sanitizers — HWASan, UBSan trap-on-error — see a
     // breakpoint at the guest PC rather than an illegal-instruction abort).
@@ -2423,7 +2305,6 @@ class Decoder {
     // UNDEFINED at EL0 (privileged / debug-state-only). They fall through to
     // Undefined(), which delivers SIGILL to the guest — the architecturally
     // correct result for guest user-space. The translator itself never aborts.
-    // endregion
     Undefined();
   }
 
@@ -2439,7 +2320,7 @@ class Decoder {
     // NOP and other HINT instructions: SYS with CRn=0010, op0=00.
     if (op0 == 0b00 && l == 0) {
       if (crn == 0b0010) {
-        // region digitalis hint audit (HINT #N = CRm:op2[2:0]).
+        // hint audit (HINT #N = CRm:op2[2:0]).
         // The HINT (CRn=0010) space encodes a 7-bit hint number formed
         // by CRm:op2.  At EL0 every hint we see should be treated as a
         // no-op — the kernel handles any real sleep / wake / barrier
@@ -2472,12 +2353,11 @@ class Decoder {
         // every indirect-branch entry point starts with a BTI guard
         // and all four mnemonics also appear as explicit inline-asm
         // probes — process must not SIGILL.
-        // endregion
         insn_consumer_->Nop();
         return;
       }
       if (crn == 0b0011) {
-        // region digitalis barrier audit (CRn=0011).
+        // barrier audit (CRn=0011).
         // Memory and synchronization barriers.  Op2 selects the variant:
         //   CLREX = CRn=0011, CRm=imm,  op2=010
         //   DSB   = CRn=0011, CRm=opt,  op2=100  (incl. "DFB" — full)
@@ -2495,13 +2375,11 @@ class Decoder {
         // (Digitalis emulates LDXR/STXR pairs as cmpxchg, see
         //). Routing the whole CRn=0011 class to Nop is therefore
         // correct.
-        // endregion
         insn_consumer_->Nop();
         return;
       }
     }
 
-    // region digitalis
     // SYS instructions (op0=01): cache maintenance (DC, IC), TLB ops, etc.
     // Safe to treat as NOP in interpreter.
     if (op0 == 0b01 && l == 0) {
@@ -2513,7 +2391,6 @@ class Decoder {
       insn_consumer_->Nop();
       return;
     }
-    // endregion
 
     // MRS/MSR with op0 >= 2 (system register access).
     if (op0 >= 2) {
@@ -2545,7 +2422,7 @@ class Decoder {
   void DecodeBranchReg() {
     uint8_t opc = GetBits<21, 4>();
     uint8_t rn = GetBits<5, 5>();
-    // region digitalis PAuth BR/BLR/RET variants (Armv8.3-PAuth).
+    // PAuth BR/BLR/RET variants (Armv8.3-PAuth).
     // op3 = bits[15:10] distinguishes the PAC variants from the plain ones:
     //   000000 = no PAC; 000010 = A-key PAC; 000011 = B-key PAC.
     // BRAAZ/BRABZ (opc=0000) and BLRAAZ/BLRABZ (opc=0001) already route
@@ -2559,7 +2436,6 @@ class Decoder {
     // is needed.
     uint8_t op3 = GetBits<10, 6>();
     bool is_pac = (op3 == 0b000010 || op3 == 0b000011);
-    // endregion
 
     switch (opc) {
       case 0b0000: {
@@ -2586,10 +2462,9 @@ class Decoder {
       }
       case 0b0010: {
         // RET {Xn} (default Xn = X30), RETAA, RETAB.
-        // region digitalis: RETAA/RETAB are encoded with Rn=11111
+        // RETAA/RETAB are encoded with Rn=11111
         // but the architectural source register is implicitly X30 (LR).
         uint8_t src = is_pac ? 30 : rn;
-        // endregion
         const BranchRegArgs args = {
             .src = src,
             .link_reg = 0,
@@ -2599,7 +2474,7 @@ class Decoder {
         insn_consumer_->BranchReg(args);
         break;
       }
-      // region digitalis BRAA/BRAB/BLRAA/BLRAB (Armv8.3-PAuth).
+      // BRAA/BRAB/BLRAA/BLRAB (Armv8.3-PAuth).
       case 0b1000: {
         // BRAA Xn, Xm / BRAB Xn, Xm.
         if (!is_pac) { Undefined(); return; }
@@ -2624,7 +2499,6 @@ class Decoder {
         insn_consumer_->BranchReg(args);
         break;
       }
-      // endregion
       default:
         Undefined();
         break;
@@ -2651,14 +2525,12 @@ class Decoder {
     uint8_t op_24 = GetBits<24, 1>();
     uint8_t op4 = GetBits<10, 2>();
 
-    // region digitalis
     // Load/store exclusive/atomic: bit29=0, op_28_27=01, op_26=0
     // Includes: LDXR, STXR, LDAXR, STLXR, LDAR, STLR, CAS, CASP
     if (op_28_27 == 0b01 && op_26 == 0 && op_29 == 0) {
       DecodeLoadStoreExclusive();
       return;
     }
-    // endregion
 
     // Load/store pair: bit29=1, op_28_27=01, op_26=0
     // Encoding: opc[31:30] 101 0 0xx xxxxxxx (pairs)
@@ -2667,7 +2539,6 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // AdvSIMD LD/ST: bit29=0, bits[28:27]=01, bit[26]=1
     //   bit[24]=0: multiple structures (LD1-4, ST1-4)
     //   bit[24]=1: single structure (LD1/ST1 to one lane, LD1R-LD4R replicate)
@@ -2684,12 +2555,9 @@ class Decoder {
       DecodeSimdLoadStorePair();
       return;
     }
-    // endregion
 
-    // region digitalis
     // SIMD/FP load/store register (various): bits[29:27] = x11, bit[26]=1
     if (op_28_27 == 0b11 && op_26 == 1) {
-      // region digitalis
       // LDR (literal) — SIMD/FP form: opc(2) 011100 imm19 Rt with
       // bit[29]=0, bit[26]=1. Mirrors the integer LDR (literal) V-bit
       // fix in the bit[26]=0 branch below: without this check, the
@@ -2704,7 +2572,6 @@ class Decoder {
         DecodeSimdLoadLiteral();
         return;
       }
-      // endregion
       if (op_24) {
         DecodeSimdLoadStoreUnsignedImm();
         return;
@@ -2727,13 +2594,11 @@ class Decoder {
         return;
       }
     }
-    // endregion
 
     // Load/store register (various): bits[29:27] = x11, bit[26]=0
     // Encoding: size[31:30] 111 0 00xx ... (unscaled/pre/post)
     //           size[31:30] 111 0 01xx ... (unsigned offset)
     if (op_28_27 == 0b11 && op_26 == 0) {
-      // region digitalis
       // LDR/LDRSW/PRFM (literal) — opc(2) 011000 imm19 Rt with bit[29]=0
       // (V=0). Encoding e.g. `ldr x16, =literal` = 0x58007c50. Without
       // this branch, dispatch falls through to LDR (immediate)
@@ -2752,9 +2617,7 @@ class Decoder {
         DecodeLoadLiteral();
         return;
       }
-      // endregion
       if (op_24) {
-        // region digitalis
         // MTE load/store memory tags (LDG/STG/ST2G/STZG/STZ2G):
         //   bits[31:24]=11011001, bit[21]=1.
         // op_29=0 distinguishes from ordinary LDR/STR (unsigned imm), which
@@ -2764,7 +2627,6 @@ class Decoder {
           DecodeLoadStoreMemTag();
           return;
         }
-        // endregion
         // bit[24]=1: Load/store register (unsigned immediate).
         DecodeLoadStoreUnsignedImm();
         return;
@@ -2781,7 +2643,6 @@ class Decoder {
         return;
       }
       if (op4 == 0b00) {
-        // region digitalis
         // bit[21]=1: Atomic memory operations (SWP, LDADD, etc.)
         // bit[21]=0: Unscaled immediate (LDUR/STUR).
         if (GetBits<21, 1>()) {
@@ -2789,7 +2650,6 @@ class Decoder {
         } else {
           DecodeLoadStoreUnscaled();
         }
-        // endregion
         return;
       }
       if (op4 == 0b10) {
@@ -2803,7 +2663,6 @@ class Decoder {
     Undefined();
   }
 
-  // region digitalis
   // MTE load/store memory tags: LDG / STG / ST2G / STZG / STZ2G.
   // Common encoding: 11011001 opc 1 imm9 op2 Rn Rt
   // See `MteLoadStoreOpcode` for the per-opcode encoding citations.
@@ -2828,14 +2687,13 @@ class Decoder {
       mte_op = MteLoadStoreOpcode::kSt2g;
     } else if (opc == 0b11 && op2 != 0b00) {
       mte_op = MteLoadStoreOpcode::kStz2g;
-    // region digitalis - tag-block (granule-multiple) forms: op2=00, imm9=0.
+    // tag-block (granule-multiple) forms: op2=00, imm9=0.
     } else if (opc == 0b11 && op2 == 0b00) {
       mte_op = MteLoadStoreOpcode::kLdgm;
     } else if (opc == 0b10 && op2 == 0b00) {
       mte_op = MteLoadStoreOpcode::kStgm;
     } else if (opc == 0b00 && op2 == 0b00) {
       mte_op = MteLoadStoreOpcode::kStzgm;
-    // endregion
     } else {
       return Undefined();
     }
@@ -2848,9 +2706,7 @@ class Decoder {
         .op2 = op2,
     });
   }
-  // endregion
 
-  // region digitalis
   // LDR/LDRSW/PRFM (literal): opc(2) 011000 imm19 Rt, bit[29]=0.
   //   opc=00 → LDR Wt (32-bit, zero-extend)
   //   opc=01 → LDR Xt (64-bit)
@@ -2890,7 +2746,6 @@ class Decoder {
     };
     insn_consumer_->LoadLiteral(args);
   }
-  // endregion
 
   void DecodeLoadStoreUnsignedImm() {
     uint8_t size = GetBits<30, 2>();
@@ -2899,7 +2754,7 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // region digitalis - PRFM (immediate) is size=0b11, opc=0b10. The
+    // PRFM (immediate) is size=0b11, opc=0b10. The
     // previous check (opc=0b11) never fired and let PRFM execute as
     // LDRSW Xt, [Xn, #imm12] with Rt=0 (the prefetch type), silently
     // clobbering X0 with eight bytes from [Xn + imm12]. NOP it.
@@ -2907,7 +2762,6 @@ class Decoder {
       insn_consumer_->Nop();
       return;
     }
-    // endregion
 
     bool is_store = ((opc & 0b01) == 0) && ((opc & 0b10) == 0);
     bool is_signed = (opc & 0b10) != 0;
@@ -3005,14 +2859,13 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // region digitalis - PRFUM (prefetch unscaled) shares this encoding with
+    // PRFUM (prefetch unscaled) shares this encoding with
     // size=0b11, opc=0b10. NOP it; otherwise it would be decoded as LDURSW
     // into Rt (prefetch type code), clobbering the destination register.
     if (size == 0b11 && opc == 0b10) {
       insn_consumer_->Nop();
       return;
     }
-    // endregion
 
     int32_t offset = SignExtend<9>(imm9);
 
@@ -3059,7 +2912,7 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // region digitalis - PRFM (register) shares this encoding with
+    // PRFM (register) shares this encoding with
     // size=0b11, opc=0b10. Without this guard, the decoder treats the
     // prefetch as an LDRSW into Rt (where Rt is the prefetch type code,
     // typically 0 = pldl1keep), silently clobbering X0 with eight bytes
@@ -3070,7 +2923,6 @@ class Decoder {
       insn_consumer_->Nop();
       return;
     }
-    // endregion
 
     bool is_store;
     bool is_signed;
@@ -3096,7 +2948,7 @@ class Decoder {
 
     uint8_t shift_amount = s_bit ? size : 0;
 
-    // region digitalis - Validate option field. Only word-or-larger
+    // Validate option field. Only word-or-larger
     // offsets are encodable: 010=UXTW, 011=LSL/UXTX, 110=SXTW, 111=SXTX.
     // Other options are UNDEFINED per ARMv8.
     switch (option) {
@@ -3120,7 +2972,6 @@ class Decoder {
         .is_signed = is_signed,
         .is_64bit_target = is_64bit_target,
     };
-    // endregion
     insn_consumer_->LoadStoreReg(args);
   }
 
@@ -3153,7 +3004,6 @@ class Decoder {
     insn_consumer_->LoadStorePair(args);
   }
 
-  // region digitalis
   //
   // SIMD & FP - top-level decode for op0 = x111.
   //
@@ -3166,7 +3016,6 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // AdvSIMD scalar two-reg misc: bit31=0, bit30=1, bits[28:24]=11110, bits[21:17]=10000, bits[11:10]=10
     // Must be checked BEFORE FpDataProc1/FpIntConversion/FpDataProc2 because all share bits[28:24]=11110,
     // but scalar SIMD has bit30=1 while scalar FP has bit30=0.
@@ -3210,7 +3059,7 @@ class Decoder {
       return;
     }
 
-    // region digitalis: Armv8.2-FP16 scalar three-same.
+    // Armv8.2-FP16 scalar three-same.
     // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
     //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
     // i.e. bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=a, bit22=1,
@@ -3227,9 +3076,7 @@ class Decoder {
       DecodeAdvSimdScalarFp16ThreeSame();
       return;
     }
-    // endregion
 
-    // region digitalis
     // Cryptographic three-register SHA (SHA1C/SHA1P/SHA1M/SHA1SU0,
     // SHA256H/SHA256H2/SHA256SU1):
     //   bit31=0, bit30=1, bit29=0, bits[28:24]=11110, bits[23:22]=00,
@@ -3248,9 +3095,7 @@ class Decoder {
           GetBits<12, 3>());  // opcode
       return;
     }
-    // endregion
 
-    // region digitalis
     // Cryptographic two-register SHA (SHA1H, SHA1SU1, SHA256SU0):
     //   bit31=0, bit30=1, bit29=0, bits[28:24]=11110, bits[23:22]=00,
     //   bits[21:17]=10100, bit16=0, bits[15:14]=00, bits[13:12]=opcode,
@@ -3268,9 +3113,7 @@ class Decoder {
           GetBits<12, 2>());  // opcode
       return;
     }
-    // endregion
 
-    // region digitalis
     // AdvSIMD Armv8.1-RDM scalar three-same-extra: SQRDMLAH / SQRDMLSH
     // (scalar, non-indexed).  Sibling of the vector three-same-extra
     // dispatch above; differs only in bits[30:24] (scalar marker = 1 11110
@@ -3298,9 +3141,7 @@ class Decoder {
       DecodeAdvSimdScalarRdmThreeSame();
       return;
     }
-    // endregion
 
-    // region digitalis
     // FP <-> fixed-point conversion: bits[28:24]=11110, bit21=0
     // Must be checked BEFORE all bit21=1 FP checks.
     // Encoding: sf 0 S 11110 ftype 0 rmode opcode scale Rn Rd
@@ -3308,7 +3149,6 @@ class Decoder {
       DecodeFpFixedPointConversion();
       return;
     }
-    // endregion
 
     // Floating-point data-processing (1 source): bits[28:24]=11110, bit21=1, bits[14:10]=10000
     // Must be checked BEFORE FpIntConversion because both share bits[28:24]=11110 and bit21=1,
@@ -3326,7 +3166,6 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // FMOV (scalar, immediate): bit31=0, bits[28:24]=11110, bit21=1, bits[12:10]=100, bits[9:5]=00000
     // Encoding: 0 0 0 11110 ftype 1 imm8 100 00000 Rd
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() &&
@@ -3334,14 +3173,12 @@ class Decoder {
       DecodeFpMovImmediate();
       return;
     }
-    // endregion
 
     // Floating-point data-processing (2 source): bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=10
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b10) {
       DecodeFpDataProc2();
       return;
     }
-    // endregion
 
     // Floating-point compare: bit31=0, bits[28:24]=11110, bit21=1, bits[13:10]=1000
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 4>() == 0b1000) {
@@ -3349,16 +3186,13 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // Floating-point conditional compare: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=01
     // Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv  (op: 0=FCCMP, 1=FCCMPE)
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b01) {
       DecodeFpConditionalCompare();
       return;
     }
-    // endregion
 
-    // region digitalis
     // FCSEL: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=11
     if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b11) {
       DecodeFpCondSelect();
@@ -3367,7 +3201,7 @@ class Decoder {
 
     // Floating-point data-processing (3 source): bit31=0, bit30=0, bit29=0,
     // bits[28:24]=11111.  FMADD, FMSUB, FNMADD, FNMSUB.
-    // region digitalis: require bit30=0 (M) and bit29=0 (S) per ARM ARM
+    // require bit30=0 (M) and bit29=0 (S) per ARM ARM
     // encoding "M=0 S=0 11111 ftype o1 0 Rm o0 Ra Rn Rd".  Without these
     // constraints the prefix also catches the "AdvSIMD scalar x indexed
     // element" family (bit30=1, bits[28:24]=11111) — e.g. FMULX scalar
@@ -3376,15 +3210,12 @@ class Decoder {
     // any SIGILL.  Tightening here routes the scalar-x-indexed encodings
     // to the final Undefined() (no implementation yet) so the failure
     // mode is a diagnostic SIGILL rather than corrupted arithmetic.
-    // endregion
     if (!bit31 && !GetBits<30, 1>() && !GetBits<29, 1>() &&
         GetBits<24, 5>() == 0b11111) {
       DecodeFpDataProc3();
       return;
     }
-    // endregion
 
-    // region digitalis
     // AdvSIMD scalar x indexed element (ARM ARM C4.1.71):
     //   bit31=0, bit30=1, bits[28:24]=11111, bit10=0.
     // Sibling of vector-x-indexed (bits[28:24]=01111, dispatched below at
@@ -3395,9 +3226,7 @@ class Decoder {
       DecodeAdvSimdScalarXIndexedElement();
       return;
     }
-    // endregion
 
-    // region digitalis
     // AdvSIMD scalar shift by immediate (ARM ARM C4.1.6.10):
     //   bit31=0, bit30=1, bits[28:24]=11111, bit23=0, bit10=1, immh!=0.
     // Sibling of vector AdvSimdShiftByImm (bits[28:24]=01111, also bit10=1),
@@ -3416,17 +3245,13 @@ class Decoder {
       DecodeAdvSimdScalarShiftByImm();
       return;
     }
-    // endregion
 
-    // region digitalis
     // AdvSIMD three different: bit31=0, bits[28:24]=01110, bit21=1, bits[11:10]=00
     if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b00) {
       DecodeAdvSimdThreeDiff();
       return;
     }
-    // endregion
 
-    // region digitalis
     // AdvSIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT, BFMMLA,
     // BFMLALB, BFMLALT (vector forms).
     //   bit31=0, bit29=1, bits[28:24]=01110, bits[23:22] ∈ {01, 11},
@@ -3448,9 +3273,7 @@ class Decoder {
       DecodeAdvSimdBf16ThreeSame();
       return;
     }
-    // endregion
 
-    // region digitalis
     // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
     //   bit31=0, bits[28:24]=01110, bit21=0, bit15=1, bit14=1, bit10=1.
     // Must precede three-same / permute / copy / two-reg-misc to avoid
@@ -3466,9 +3289,8 @@ class Decoder {
       DecodeAdvSimdFcma();
       return;
     }
-    // endregion
 
-    // region digitalis hello-dotprod
+    // hello-dotprod
     // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT (vector).
     //   bit31=0, bits[28:24]=01110, bits[23:21]=100 (so bits[23:22]=10
     //   and bit21=0), bits[15:10]=100101 (bit15=1, bit14=0, bit13=0,
@@ -3489,9 +3311,8 @@ class Decoder {
       DecodeAdvSimdDotProductVec();
       return;
     }
-    // endregion
 
-    // region digitalis - I8MM (FEAT_I8MM): USDOT (vector) and the integer
+    // I8MM (FEAT_I8MM): USDOT (vector) and the integer
     // matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Same prefix as DotProd
     // (bits[28:24]=01110, bits[23:22]=10, bit21=0, bit15=1, bit14=0, bit10=1);
     // bits[13:11] select the op:
@@ -3537,9 +3358,7 @@ class Decoder {
         return;
       }
     }
-    // endregion
 
-    // region digitalis
     // AdvSIMD Armv8.1-RDM three-same vector: SQRDMLAH / SQRDMLSH (NOT the
     // by-element form — that's already wired through AdvSimdVecXIdxOpcode).
     //   bit31=0, bits[28:24]=01110, bit21=0, U=bit29=1, bit15=1, bit14=0,
@@ -3558,9 +3377,8 @@ class Decoder {
       DecodeAdvSimdRdmThreeSame();
       return;
     }
-    // endregion
 
-    // region digitalis: Armv8.2-FP16 NEON vector three-same.
+    // Armv8.2-FP16 NEON vector three-same.
     // Encoding (per ARM ARM C7.2 "Advanced SIMD three same (FP16)"):
     //   0 Q U 0 1 1 1 0 a 1 0 Rm 0 0 opcode 1 Rn Rd
     // i.e. bit31=0, bits[28:24]=01110, bit23=a, bit22=1, bit21=0,
@@ -3578,7 +3396,6 @@ class Decoder {
       DecodeAdvSimdFp16ThreeSame();
       return;
     }
-    // endregion
 
     // AdvSIMD three same: bit31=0, bits[28:24]=01110, bit21=1, bit10=1
     if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && GetBits<10, 1>()) {
@@ -3586,7 +3403,6 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // AdvSIMD permute (UZP1, TRN1, ZIP1, UZP2, TRN2, ZIP2):
     // bit31=0, bit29=0, bits[28:24]=01110, bit21=0, bit15=0, bits[11:10]=10.
     // The bit29=0 check disambiguates from EXT (bit29=1), which otherwise
@@ -3605,9 +3421,7 @@ class Decoder {
           GetBits<30, 1>()); // q
       return;
     }
-    // endregion
 
-    // region digitalis
     // Cryptographic AES (AESE, AESD, AESMC, AESIMC):
     //   bit31=0, bit30=1, bit29=0, bits[28:24]=01110, bits[23:22]=00,
     //   bits[21:17]=10100, bits[16:14]=001, bits[11:10]=10
@@ -3624,9 +3438,7 @@ class Decoder {
           GetBits<12, 2>());  // 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC
       return;
     }
-    // endregion
 
-    // region digitalis
     // Cryptographic AES (AESE, AESD, AESMC, AESIMC):
     //   bit31=0, bit30=1, bit29=0, bits[28:24]=01110, bits[23:22]=00,
     //   bits[21:17]=10100, bits[16:14]=001, bits[11:10]=10
@@ -3643,9 +3455,8 @@ class Decoder {
           GetBits<12, 2>());  // 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC
       return;
     }
-    // endregion
 
-    // region digitalis: Armv8.2-FP16 NEON vector two-register miscellaneous.
+    // Armv8.2-FP16 NEON vector two-register miscellaneous.
     // Encoding: 0 Q U 0 1 1 1 0 a 1 1 1 1 1 0 opcode 1 0 Rn Rd
     //   bit31=0, bits[28:24]=01110, bit23=a (free), bit22=1, bits[21:17]=11100,
     //   bits[11:10]=10.
@@ -3657,7 +3468,6 @@ class Decoder {
       DecodeAdvSimdFp16TwoRegMisc();
       return;
     }
-    // endregion
 
     // AdvSIMD two-reg misc: bit31=0, bits[28:24]=01110, bit21=1, bit17=0, bits[11:10]=10
     if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<17, 1>() && GetBits<10, 2>() == 0b10) {
@@ -3671,13 +3481,11 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // AdvSIMD vector x indexed element: bit31=0, bits[28:24]=01111, bit10=0
     if (!bit31 && GetBits<24, 5>() == 0b01111 && !GetBits<10, 1>()) {
       DecodeAdvSimdVecXIndexedElement();
       return;
     }
-    // endregion
 
     // AdvSIMD shift by immediate: bit31=0, bits[28:24]=01111, bit10=1, immh!=0000
     if (!bit31 && GetBits<24, 5>() == 0b01111 && GetBits<10, 1>() && GetBits<19, 4>() != 0) {
@@ -3685,7 +3493,6 @@ class Decoder {
       return;
     }
 
-    // region digitalis
     // AdvSIMD extract (EXT) and AdvSIMD table lookup (TBL/TBX) share most of
     // their encoding prefix. They differ on bit29 (op2 in the encoding tree):
     //   EXT: bit29=1   (i.e. bits[29:24]=101110)
@@ -3716,9 +3523,7 @@ class Decoder {
       }
       return;
     }
-    // endregion
 
-    // region digitalis
     // SHA-512 (FEAT_SHA512) — bit31=1 group, outside the AdvSIMD family.
     // Common prefix: bits[30:24]=1001110, bits[15:12]=1000.
     //   Three-register encoding: 11001110 011 Rm 1000 o2 Rn Rd, where
@@ -3758,9 +3563,7 @@ class Decoder {
         return;
       }
     }
-    // endregion
 
-    // region digitalis
     // SHA3 (FEAT_SHA3): EOR3 / BCAX (four-register), XAR.  RAX1 is decoded
     // in the SHA512 three-register block above (opcode2=11).
     //   EOR3 Vd.16B,Vn,Vm,Va = 0xCE00.. (bits[23:21]=000, bit15=0)
@@ -3788,9 +3591,8 @@ class Decoder {
         return;
       }
     }
-    // endregion
 
-    // region digitalis - SM4 (FEAT_SM4): SM4E (2-register) and SM4EKEY
+    // SM4 (FEAT_SM4): SM4E (2-register) and SM4EKEY
     // (3-register). Same bit31=1, bits[30:24]=1001110 crypto prefix as
     // SHA512/SHA3; distinguished by bits[23:21] and the low opcode bits.
     //   SM4EKEY Vd,Vn,Vm : bits[23:21]=011, bits[15:12]=1100, bits[11:10]=10.
@@ -3844,7 +3646,6 @@ class Decoder {
         return;
       }
     }
-    // endregion
 
     Undefined();
   }
@@ -3874,7 +3675,6 @@ class Decoder {
   //
   // SIMD/FP load/store (unsigned immediate) - bit[26]=1 variant.
   //
-  // region digitalis
   // LDR (literal) SIMD/FP: opc(2) 011100 imm19 Rt, bit[29]=0, bit[26]=1.
   //   opc=00 → LDR St (32-bit, S register)
   //   opc=01 → LDR Dt (64-bit, D register)
@@ -3903,7 +3703,6 @@ class Decoder {
 
     insn_consumer_->SimdLoadLiteral({.rt = rt, .offset = offset, .size = size});
   }
-  // endregion
 
   void DecodeSimdLoadStoreUnsignedImm() {
     uint8_t size = GetBits<30, 2>();
@@ -4046,7 +3845,7 @@ class Decoder {
     else if (size == 0b00 && opc == 0b11) { ls_size = SimdLoadStoreSize::k128bit; is_store = false; if (s_bit) shift_amount = 4; }
     else { Undefined(); return; }
 
-    // region digitalis - Reject UNDEFINED option encodings for the
+    // Reject UNDEFINED option encodings for the
     // offset register (only 010/011/110/111 are valid SIMD load/store
     // forms). Preserve the option so the handler can apply the right
     // extension.
@@ -4070,14 +3869,12 @@ class Decoder {
         .size = ls_size,
         .is_store = is_store,
     };
-    // endregion
     insn_consumer_->SimdLoadStoreReg(args);
   }
 
   //
   // SIMD/FP load/store pair - bit[26]=1 variant.
   //
-  // region digitalis
   //
   // AdvSIMD load/store multiple structures (LD1/ST1 with 1-4 registers).
   //
@@ -4105,12 +3902,11 @@ class Decoder {
       case 0b1010: num_regs = 2; is_interleaved = false; break;
       case 0b0110: num_regs = 3; is_interleaved = false; break;
       case 0b0010: num_regs = 4; is_interleaved = false; break;
-      // region digitalis - LD2 / LD3 / LD4 (de-interleaving on load,
+      // LD2 / LD3 / LD4 (de-interleaving on load,
       // interleaving on store). Distinct from LDn-with-1-reg-N-times.
       case 0b1000: num_regs = 2; is_interleaved = true; break;
       case 0b0100: num_regs = 3; is_interleaved = true; break;
       case 0b0000: num_regs = 4; is_interleaved = true; break;
-      // endregion
       default: Undefined(); return;
     }
 
@@ -4239,7 +4035,6 @@ class Decoder {
     };
     insn_consumer_->AdvSimdSingleStruct(args);
   }
-  // endregion
 
   void DecodeSimdLoadStorePair() {
     uint8_t opc = GetBits<30, 2>();
@@ -4301,7 +4096,6 @@ class Decoder {
     insn_consumer_->FpIntConversion(args);
   }
 
-  // region digitalis
   // FMOV (scalar, immediate): Dd/Sd = VFPExpandImm(imm8)
   void DecodeFpMovImmediate() {
     uint8_t ftype = GetBits<22, 2>();
@@ -4371,7 +4165,6 @@ class Decoder {
     uint8_t rd = GetBits<0, 5>();
     insn_consumer_->FpDataProc3(rd, rn, rm, ra, ftype, o1, o0);
   }
-  // endregion
 
   //
   // Stub decoders for SIMD/FP instruction groups (dispatch to Undefined for now,
@@ -4416,7 +4209,6 @@ class Decoder {
     insn_consumer_->Extr(rd, rn, rm, imms, sf);
   }
 
-  // region digitalis
   // Data Processing (1-source): CLZ, CLS, RBIT, REV, REV16, REV32
   void DecodeDataProc1Src() {
     bool sf = GetBits<31, 1>();
@@ -4427,7 +4219,7 @@ class Decoder {
     // Dispatch based on opcode2
     // 000000 = RBIT, 000001 = REV16, 000010 = REV32(32-bit)/REV(64-bit),
     // 000011 = REV(64-bit only), 000100 = CLZ, 000101 = CLS
-    // region digitalis PAuth DP-1Src as identity
+    // PAuth DP-1Src as identity
     // ARM ARM opcode2=00001 selects the PAuth family of DP-1Src ops
     // (PACIA/PACIB/PACDA/PACDB and AUT* siblings, the Z-variants where
     // Rn==RZR, plus XPACI/XPACD).  Digitalis does not implement pointer
@@ -4467,10 +4259,8 @@ class Decoder {
       Undefined();
       return;
     }
-    // endregion
     insn_consumer_->DataProc1Src(rd, rn, opcode2, sf);
   }
-  // endregion
 
   void DecodeConditionalCompare() {
     bool sf = GetBits<31, 1>();
@@ -4492,9 +4282,7 @@ class Decoder {
     };
     insn_consumer_->ConditionalCompare(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // FP data-processing (2 source).
   // Encoding: M S 11110 ftype 1 Rm opcode 10 Rn Rd
@@ -4506,10 +4294,8 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // region digitalis
     // ftype: 00=S, 01=D, 11=H (Armv8.2-FP16).  10 is reserved.
     if (ftype == 0b10) { Undefined(); return; }
-    // endregion
 
     // Validate opcode range.
     if (opcode > 0b1000) { Undefined(); return; }
@@ -4554,10 +4340,8 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t opcode2 = GetBits<0, 5>();
 
-    // region digitalis
     // ftype: 00=S, 01=D, 11=H (Armv8.2-FP16).  10 is reserved.
     if (ftype == 0b10) { Undefined(); return; }
-    // endregion
 
     bool with_zero = (opcode2 & 0b01000) != 0;
     bool signal_nans = (opcode2 & 0b10000) != 0;
@@ -4571,9 +4355,7 @@ class Decoder {
     };
     insn_consumer_->FpCompare(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // FP conditional compare (FCCMP / FCCMPE).
   // Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv
@@ -4587,10 +4369,8 @@ class Decoder {
     bool signal_nans = GetBits<4, 1>();
     uint8_t nzcv = GetBits<0, 4>();
 
-    // region digitalis
     // ftype: 00=S, 01=D, 11=H (Armv8.2-FP16).  10 is reserved.
     if (ftype == 0b10) { Undefined(); return; }
-    // endregion
 
     const FpConditionalCompareArgs args = {
         .rn = rn,
@@ -4602,9 +4382,7 @@ class Decoder {
     };
     insn_consumer_->FpConditionalCompare(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
   //
@@ -4659,9 +4437,8 @@ class Decoder {
     };
     insn_consumer_->AdvSimdFcma(args);
   }
-  // endregion
 
-  // region digitalis hello-dotprod
+  // hello-dotprod
   // SDOT / UDOT (vector).  Encoding already filtered by the DecodeArmV8
   // guard: bits[28:24]=01110, bits[23:22]=00, bit21=0, bits[15:10]=100101.
   // bit30 = Q (vector length), bit29 = U (SDOT=0 / UDOT=1).
@@ -4682,9 +4459,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdDotProduct(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD Armv8.1-RDM three-same vector: SQRDMLAH / SQRDMLSH.  These are
   // the non-indexed siblings of the by-element forms decoded under
@@ -4728,9 +4503,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdThreeSame(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD Armv8.1-RDM scalar three-same-extra: SQRDMLAH / SQRDMLSH
   // (scalar, non-indexed).  Scalar sibling of DecodeAdvSimdRdmThreeSame
@@ -4769,9 +4542,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdScalarThreeSame(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD BFloat16 three-same-extra: BFDOT (vec), BFMMLA, BFMLALB (vec),
   // BFMLALT (vec).
@@ -4832,9 +4603,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdBf16ThreeSame(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD three same.
   // Encoding: 0 Q U 01110 size 1 Rm opcode 1 Rn Rd
@@ -4842,7 +4611,7 @@ class Decoder {
   //   size = bits[23:22], Rm = bits[20:16]
   //   opcode = bits[15:11], Rn = bits[9:5], Rd = bits[4:0]
   //
-  // region digitalis: Armv8.2-FP16 vector three-same.
+  // Armv8.2-FP16 vector three-same.
   // Encoding: 0 Q U 0 1 1 1 0 a 1 0 Rm 0 0 opcode 1 Rn Rd
   // where a = bit23, opcode = bits[13:11] (3 bits).  Maps (a, U, opcode) to
   // the existing AdvSimdThreeSameOpcode set (which the interpreter then
@@ -4881,14 +4650,12 @@ class Decoder {
           case 0b000: op = AdvSimdThreeSameOpcode::kFmaxnmV; ok = true; break;
           case 0b001: op = AdvSimdThreeSameOpcode::kFmlaV;   ok = true; break;
           case 0b010: op = AdvSimdThreeSameOpcode::kFaddV;   ok = true; break;
-          // region digitalis: FP16 FMULX (a=0, U=0, opcode_3=011).
+          // FP16 FMULX (a=0, U=0, opcode_3=011).
           case 0b011: op = AdvSimdThreeSameOpcode::kFmulxV;  ok = true; break;
-          // endregion
           case 0b100: op = AdvSimdThreeSameOpcode::kFcmeqV;  ok = true; break;
           case 0b110: op = AdvSimdThreeSameOpcode::kFmaxV;   ok = true; break;
-          // region digitalis: FP16 FRECPS (a=0, U=0, opcode_3=111).
+          // FP16 FRECPS (a=0, U=0, opcode_3=111).
           case 0b111: op = AdvSimdThreeSameOpcode::kFrecpsV; ok = true; break;
-          // endregion
           default: break;  // 101 reserved — Undefined.
         }
       } else {
@@ -4897,9 +4664,8 @@ class Decoder {
           case 0b001: op = AdvSimdThreeSameOpcode::kFmlsV;   ok = true; break;
           case 0b010: op = AdvSimdThreeSameOpcode::kFsubV;   ok = true; break;
           case 0b110: op = AdvSimdThreeSameOpcode::kFminV;   ok = true; break;
-          // region digitalis: FP16 FRSQRTS (a=1, U=0, opcode_3=111).
+          // FP16 FRSQRTS (a=1, U=0, opcode_3=111).
           case 0b111: op = AdvSimdThreeSameOpcode::kFrsqrtsV; ok = true; break;
-          // endregion
           default: break;  // 011 reserved, 100 reserved, 101 reserved — Undefined.
         }
       }
@@ -4942,9 +4708,8 @@ class Decoder {
     };
     insn_consumer_->AdvSimdThreeSame(args);
   }
-  // endregion
 
-  // region digitalis: Armv8.2-FP16 scalar three-same.
+  // Armv8.2-FP16 scalar three-same.
   // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
   //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
   // where a = bit23, opcode_3 = bits[13:11] (3 bits).
@@ -4994,15 +4759,13 @@ class Decoder {
       op = AdvSimdScalarThreeSameOpcode::kFacgt;
       ok = true;
     } else if (!a && !u && opcode_3 == 0b111) {
-      // region digitalis: FP16 scalar FRECPS (a=0, U=0, opcode_3=111).
+      // FP16 scalar FRECPS (a=0, U=0, opcode_3=111).
       op = AdvSimdScalarThreeSameOpcode::kFrecps;
       ok = true;
-      // endregion
     } else if (a && !u && opcode_3 == 0b111) {
-      // region digitalis: FP16 scalar FRSQRTS (a=1, U=0, opcode_3=111).
+      // FP16 scalar FRSQRTS (a=1, U=0, opcode_3=111).
       op = AdvSimdScalarThreeSameOpcode::kFrsqrts;
       ok = true;
-      // endregion
     }
     // Reserved (a,U,op) combinations route to Undefined().
     if (!ok) {
@@ -5020,9 +4783,8 @@ class Decoder {
     };
     insn_consumer_->AdvSimdScalarThreeSame(args);
   }
-  // endregion
 
-  // region digitalis: Armv8.2-FP16 vector two-register miscellaneous.
+  // Armv8.2-FP16 vector two-register miscellaneous.
   // Encoding (per ARM ARM C7.2 "Advanced SIMD two-register miscellaneous (FP16)"):
   //   0 Q U 0 1 1 1 0 a 1 1 1 1 1 0 opcode 1 0 Rn Rd
   // i.e. bit31=0, bits[28:24]=01110, bit23=a, bits[22:17]=111110,
@@ -5060,13 +4822,12 @@ class Decoder {
           case 0b01101: op = AdvSimdTwoRegMiscOpcode::kCmeqZero; ok = true; break;  // FCMEQ #0
           case 0b01110: op = AdvSimdTwoRegMiscOpcode::kCmltZero; ok = true; break;  // FCMLT #0
           case 0b01111: op = AdvSimdTwoRegMiscOpcode::kFabs;     ok = true; break;  // FABS
-          // region digitalis a=0/a=1 columns: FRINT*/FCVT*-round.
+          // a=0/a=1 columns: FRINT*/FCVT*-round.
           case 0b11000: op = AdvSimdTwoRegMiscOpcode::kFrintpV;  ok = true; break;  // FRINTP
           case 0b11001: op = AdvSimdTwoRegMiscOpcode::kFrintzV;  ok = true; break;  // FRINTZ
           case 0b11010: op = AdvSimdTwoRegMiscOpcode::kFcvtpsV;  ok = true; break;  // FCVTPS
           case 0b11011: op = AdvSimdTwoRegMiscOpcode::kFcvtzsV;  ok = true; break;  // FCVTZS
           case 0b11101: op = AdvSimdTwoRegMiscOpcode::kFrecpeV;  ok = true; break;  // FRECPE
-          // endregion
           default: break;
         }
       } else {
@@ -5075,17 +4836,16 @@ class Decoder {
           case 0b01101: op = AdvSimdTwoRegMiscOpcode::kCmleZero; ok = true; break;  // FCMLE #0
           case 0b01111: op = AdvSimdTwoRegMiscOpcode::kFneg;     ok = true; break;  // FNEG
           case 0b11111: op = AdvSimdTwoRegMiscOpcode::kFsqrtV;   ok = true; break;  // FSQRT
-          // region digitalis a=0/a=1 columns.
+          // a=0/a=1 columns.
           case 0b11001: op = AdvSimdTwoRegMiscOpcode::kFrintiV;  ok = true; break;  // FRINTI
           case 0b11010: op = AdvSimdTwoRegMiscOpcode::kFcvtpuV;  ok = true; break;  // FCVTPU
           case 0b11011: op = AdvSimdTwoRegMiscOpcode::kFcvtzuV;  ok = true; break;  // FCVTZU
           case 0b11101: op = AdvSimdTwoRegMiscOpcode::kFrsqrteV; ok = true; break;  // FRSQRTE
-          // endregion
           default: break;
         }
       }
     } else {
-      // region digitalis a=0 column: FRINTN/A, FRINTM/X,
+      // a=0 column: FRINTN/A, FRINTM/X,
       // FCVTNS/NU, FCVTMS/MU, FCVTAS/AU, SCVTF/UCVTF in FP16 form.
       if (!u) {
         switch (opcode_5) {
@@ -5108,7 +4868,6 @@ class Decoder {
           default: break;
         }
       }
-      // endregion
     }
 
     if (!ok) {
@@ -5127,7 +4886,6 @@ class Decoder {
     };
     insn_consumer_->AdvSimdTwoRegMisc(args);
   }
-  // endregion
 
   void DecodeAdvSimdThreeSame() {
     bool q = GetBits<30, 1>();
@@ -5161,7 +4919,6 @@ class Decoder {
       op = u ? AdvSimdThreeSameOpcode::kSub : AdvSimdThreeSameOpcode::kAdd;
     } else if (opcode == 0b10001) {
       op = u ? AdvSimdThreeSameOpcode::kCmeq : AdvSimdThreeSameOpcode::kCmtst;
-    // region digitalis
     } else if (opcode == 0b00110) {
       op = u ? AdvSimdThreeSameOpcode::kCmhi : AdvSimdThreeSameOpcode::kCmgt;
     } else if (opcode == 0b00111) {
@@ -5170,7 +4927,6 @@ class Decoder {
       op = u ? AdvSimdThreeSameOpcode::kUmax : AdvSimdThreeSameOpcode::kSmax;
     } else if (opcode == 0b01101) {
       op = u ? AdvSimdThreeSameOpcode::kUmin : AdvSimdThreeSameOpcode::kSmin;
-    // endregion
     } else if (opcode == 0b00000) {
       op = u ? AdvSimdThreeSameOpcode::kUhadd : AdvSimdThreeSameOpcode::kShadd;
     } else if (opcode == 0b00001) {
@@ -5193,7 +4949,7 @@ class Decoder {
       if (u) { Undefined(); return; }
       op = AdvSimdThreeSameOpcode::kAddp;
     } else if (opcode == 0b10011) {
-      // region digitalis: U=1 -> PMUL polynomial multiply (size=00 only).
+      // U=1 -> PMUL polynomial multiply (size=00 only).
       // Previously U=1 routed to Undefined(); now dispatched to kPmul.
       if (u) {
         if (size != 0b00) { Undefined(); return; }
@@ -5201,16 +4957,13 @@ class Decoder {
       } else {
         op = AdvSimdThreeSameOpcode::kMul;
       }
-      // endregion
     } else if (opcode == 0b10010) {
       op = u ? AdvSimdThreeSameOpcode::kMls : AdvSimdThreeSameOpcode::kMla;
-    // region digitalis: SQDMULH (U=0) / SQRDMULH (U=1) saturating doubling
+    // SQDMULH (U=0) / SQRDMULH (U=1) saturating doubling
     // multiply high. size=00 and size=11 are reserved per ARM ARM.
     } else if (opcode == 0b10110) {
       if (size == 0b00 || size == 0b11) { Undefined(); return; }
       op = u ? AdvSimdThreeSameOpcode::kSqrdmulh : AdvSimdThreeSameOpcode::kSqdmulh;
-    // endregion
-    // region digitalis
     } else if (opcode == 0b10100) {
       op = u ? AdvSimdThreeSameOpcode::kUmaxp : AdvSimdThreeSameOpcode::kSmaxp;
     } else if (opcode == 0b10101) {
@@ -5238,18 +4991,17 @@ class Decoder {
                    : AdvSimdThreeSameOpcode::kFaddV;
             break;
           case 0b11011:
-            // region digitalis: U=0 -> FMULX (kFmulxV), U=1 -> FMUL (kFmulV).
+            // U=0 -> FMULX (kFmulxV), U=1 -> FMUL (kFmulV).
             // Previously U=0 routed to ok=false; the interpreter now grows
             // the FMULX special case (±0 * ±inf -> ±2.0) so we can dispatch.
             op = u ? AdvSimdThreeSameOpcode::kFmulV
                    : AdvSimdThreeSameOpcode::kFmulxV;
-            // endregion
             break;
           case 0b11001:
             if (u) { ok = false; break; }   // U=1 reserved here
             op = AdvSimdThreeSameOpcode::kFmlaV;
             break;
-          // region digitalis - FMAXNM/FMAX (op_high=0, U=0); FDIV (U=1);
+          // FMAXNM/FMAX (op_high=0, U=0); FDIV (U=1);
           // FCMEQ (U=0)/FCMGE (U=1)/FACGE (U=1) at opcode 11100/11101.
           case 0b11000:
             op = u ? AdvSimdThreeSameOpcode::kFmaxnmpV
@@ -5268,12 +5020,10 @@ class Decoder {
                    : AdvSimdThreeSameOpcode::kFmaxV;
             break;
           case 0b11111:
-            // region digitalis: op_high=0, opcode=11111: FRECPS (U=0) / FDIV (U=1).
+            // op_high=0, opcode=11111: FRECPS (U=0) / FDIV (U=1).
             op = u ? AdvSimdThreeSameOpcode::kFdivV
                    : AdvSimdThreeSameOpcode::kFrecpsV;
-            // endregion
             break;
-          // endregion
           default: ok = false; break;
         }
       } else {
@@ -5286,7 +5036,7 @@ class Decoder {
             if (u) { ok = false; break; }   // U=1 reserved here
             op = AdvSimdThreeSameOpcode::kFmlsV;
             break;
-          // region digitalis - FMINNM/FMIN (op_high=1, U=0); FCMGT (U=1)/FACGT (U=1).
+          // FMINNM/FMIN (op_high=1, U=0); FCMGT (U=1)/FACGT (U=1).
           case 0b11000:
             op = u ? AdvSimdThreeSameOpcode::kFminnmpV
                    : AdvSimdThreeSameOpcode::kFminnmV;
@@ -5305,13 +5055,11 @@ class Decoder {
                    : AdvSimdThreeSameOpcode::kFminV;
             break;
           case 0b11111:
-            // region digitalis: op_high=1, opcode=11111: FRSQRTS (U=0);
+            // op_high=1, opcode=11111: FRSQRTS (U=0);
             // U=1 is reserved.
             if (u) { ok = false; break; }
             op = AdvSimdThreeSameOpcode::kFrsqrtsV;
-            // endregion
             break;
-          // endregion
           default: ok = false; break;
         }
       }
@@ -5327,7 +5075,6 @@ class Decoder {
       // Pass sz as args.size (0 = single -> 4-byte elements,
       // 1 = double -> 8-byte elements). Interpreter dispatches on this.
       size = sz;
-    // endregion
     } else {
       Undefined();
       return;
@@ -5349,9 +5096,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdThreeSame(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD three different (widening/narrowing).
   // Encoding: 0 Q U 01110 size 1 Rm opcode 00 Rn Rd
@@ -5368,13 +5113,12 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // region digitalis - PMULL (opcode=1110) accepts size=00 (8-bit) and size=11 (64-bit, PMULL64).
+    // PMULL (opcode=1110) accepts size=00 (8-bit) and size=11 (64-bit, PMULL64).
     // Decoder rule: size=11 is reserved for all OTHER three-different opcodes; only PMULL allows it.
     if (size == 0b11 && !(u == 0 && opcode == 0b1110)) {
       Undefined();
       return;
     }
-    // endregion
 
     AdvSimdThreeDiffOpcode op;
 
@@ -5382,41 +5126,37 @@ class Decoder {
       case 0b0000:
         op = u ? AdvSimdThreeDiffOpcode::kUaddl : AdvSimdThreeDiffOpcode::kSaddl;
         break;
-      // region digitalis - polynomial multiply (used by libz CRC32-acc).
+      // polynomial multiply (used by libz CRC32-acc).
       case 0b1110:
         if (u != 0) { Undefined(); return; }  // U=1 with opcode=1110 is unallocated
         // size=01 and size=10 are unallocated for PMULL.
         if (size == 0b01 || size == 0b10) { Undefined(); return; }
         op = AdvSimdThreeDiffOpcode::kPmull;
         break;
-      // endregion
-      // region digitalis - wide add/sub variants (opcode 0001/0011)
+      // wide add/sub variants (opcode 0001/0011)
       case 0b0001:
         op = u ? AdvSimdThreeDiffOpcode::kUaddw : AdvSimdThreeDiffOpcode::kSaddw;
         break;
       case 0b0011:
         op = u ? AdvSimdThreeDiffOpcode::kUsubw : AdvSimdThreeDiffOpcode::kSsubw;
         break;
-      // endregion
       case 0b0010:
         op = u ? AdvSimdThreeDiffOpcode::kUsubl : AdvSimdThreeDiffOpcode::kSsubl;
         break;
-      // region digitalis - narrowing high: ADDHN/ADDHN2 (U=0), RADDHN/RADDHN2 (U=1).
+      // narrowing high: ADDHN/ADDHN2 (U=0), RADDHN/RADDHN2 (U=1).
       // size=11 already rejected above.
       case 0b0100:
         op = u ? AdvSimdThreeDiffOpcode::kRaddhn : AdvSimdThreeDiffOpcode::kAddhn;
         break;
-      // endregion
       case 0b0101:
         op = u ? AdvSimdThreeDiffOpcode::kUabal : AdvSimdThreeDiffOpcode::kSabal;
         break;
-      // region digitalis - narrowing high subtract: SUBHN/SUBHN2 (U=0),
+      // narrowing high subtract: SUBHN/SUBHN2 (U=0),
       // RSUBHN/RSUBHN2 (U=1). size=11 already rejected above.
       case 0b0110:
         op = u ? AdvSimdThreeDiffOpcode::kRsubhn : AdvSimdThreeDiffOpcode::kSubhn;
         break;
-      // endregion
-      // region digitalis - signed saturating doubling multiply long:
+      // signed saturating doubling multiply long:
       // SQDMULL / SQDMULL2 (U=0, opcode=1101). U=1 with opcode=1101 is
       // unallocated. size=00 is reserved (only halfword and word inputs
       // are defined); size=11 is already rejected by the top-of-routine
@@ -5426,8 +5166,7 @@ class Decoder {
         if (size == 0b00) { Undefined(); return; }
         op = AdvSimdThreeDiffOpcode::kSqdmull;
         break;
-      // endregion
-      // region digitalis - signed saturating doubling multiply-accumulate
+      // signed saturating doubling multiply-accumulate
       // long: SQDMLAL / SQDMLAL2 (U=0, opcode=1001). U=1 with opcode=1001
       // is unallocated. size=00 is reserved (only halfword and word inputs
       // are defined); size=11 is already rejected by the top-of-routine
@@ -5437,8 +5176,7 @@ class Decoder {
         if (size == 0b00) { Undefined(); return; }
         op = AdvSimdThreeDiffOpcode::kSqdmlal;
         break;
-      // endregion
-      // region digitalis - signed saturating doubling multiply-subtract
+      // signed saturating doubling multiply-subtract
       // long: SQDMLSL / SQDMLSL2 (U=0, opcode=1011). U=1 with opcode=1011
       // is unallocated. size=00 is reserved (only halfword and word inputs
       // are defined); size=11 is already rejected by the top-of-routine
@@ -5448,7 +5186,6 @@ class Decoder {
         if (size == 0b00) { Undefined(); return; }
         op = AdvSimdThreeDiffOpcode::kSqdmlsl;
         break;
-      // endregion
       case 0b0111:
         op = u ? AdvSimdThreeDiffOpcode::kUabdl : AdvSimdThreeDiffOpcode::kSabdl;
         break;
@@ -5476,9 +5213,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdThreeDiff(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD two-reg misc.
   // Encoding: 0 Q U 01110 size 10000 opcode 10 Rn Rd
@@ -5492,13 +5227,12 @@ class Decoder {
     uint8_t rd = GetBits<0, 5>();
 
     AdvSimdTwoRegMiscOpcode op;
-    // region digitalis - Armv8.2-FP16 across-lanes (FMAXV/FMINV/FMAXNMV/FMINNMV
+    // Armv8.2-FP16 across-lanes (FMAXV/FMINV/FMAXNMV/FMINNMV
     // on .8H) shares the across-lanes dispatch path with FP32 (.4S) and is
     // distinguished by U=0 vs FP32's U=1. The relevant cases below set this
     // flag; it is otherwise false. The interpreter reads args.is_fp16 inside
     // each across-lanes arm to dispatch the half-precision element path.
     bool is_fp16 = false;
-    // endregion
 
     switch (opcode) {
       case 0b00000:
@@ -5511,7 +5245,7 @@ class Decoder {
       case 0b00010:
         op = u ? AdvSimdTwoRegMiscOpcode::kUaddlp : AdvSimdTwoRegMiscOpcode::kSaddlp;
         break;
-      // region digitalis - opcode 00011 covers two distinct families:
+      // opcode 00011 covers two distinct families:
       //  bit20=0 (bits[21:17]=10000) -> two-reg-misc SUQADD (U=0) / USQADD (U=1)
       //  bit20=1 (bits[21:17]=11000) -> across-lanes  SADDLV (U=0) / UADDLV (U=1)
       // Observed `uaddlv h0, v0.8b` (insn 0x2e303800) in WhatsApp's
@@ -5524,7 +5258,6 @@ class Decoder {
           op = u ? AdvSimdTwoRegMiscOpcode::kUsqadd : AdvSimdTwoRegMiscOpcode::kSuqadd;
         }
         break;
-      // endregion
       case 0b00100:
         op = u ? AdvSimdTwoRegMiscOpcode::kClz : AdvSimdTwoRegMiscOpcode::kCls;
         break;
@@ -5538,14 +5271,13 @@ class Decoder {
       case 0b00110:
         op = u ? AdvSimdTwoRegMiscOpcode::kUadalp : AdvSimdTwoRegMiscOpcode::kSadalp;
         break;
-      // region digitalis - SQABS (U=0) / SQNEG (U=1) at opcode 00111.
+      // SQABS (U=0) / SQNEG (U=1) at opcode 00111.
       // All four sizes are valid; size=11 (.2d) is Q=1-only — the .1d form
       // (size=11, Q=0) is unallocated.
       case 0b00111:
         if (size == 0b11 && !q) { Undefined(); return; }
         op = u ? AdvSimdTwoRegMiscOpcode::kSqneg : AdvSimdTwoRegMiscOpcode::kSqabs;
         break;
-      // endregion
       case 0b01000:
         op = u ? AdvSimdTwoRegMiscOpcode::kCmgeZero : AdvSimdTwoRegMiscOpcode::kCmgtZero;
         break;
@@ -5553,7 +5285,7 @@ class Decoder {
         op = u ? AdvSimdTwoRegMiscOpcode::kCmleZero : AdvSimdTwoRegMiscOpcode::kCmeqZero;
         break;
       case 0b01010:
-        // region digitalis - bit20 distinguishes across-lanes (1) from two-reg-misc (0).
+        // bit20 distinguishes across-lanes (1) from two-reg-misc (0).
         // Across-lanes opcode=01010 is SMAXV (U=0) / UMAXV (U=1).
         // Two-reg-misc opcode=01010 is CMLT zero (U=0 only; U=1 unallocated).
         if (GetBits<20, 1>()) {
@@ -5573,7 +5305,7 @@ class Decoder {
           op = u ? AdvSimdTwoRegMiscOpcode::kUminv : AdvSimdTwoRegMiscOpcode::kSminv;
           if (size == 0b11) { Undefined(); return; }
         } else {
-          // region digitalis - vector FCVTNS/NU (bit23=0) and FCVTPS/PU (bit23=1).
+          // vector FCVTNS/NU (bit23=0) and FCVTPS/PU (bit23=1).
           if (!GetBits<23, 1>()) {
             op = u ? AdvSimdTwoRegMiscOpcode::kFcvtnuV
                    : AdvSimdTwoRegMiscOpcode::kFcvtnsV;
@@ -5581,15 +5313,13 @@ class Decoder {
             op = u ? AdvSimdTwoRegMiscOpcode::kFcvtpuV
                    : AdvSimdTwoRegMiscOpcode::kFcvtpsV;
           }
-          // endregion
         }
         break;
-        // endregion
       case 0b01011:
         op = u ? AdvSimdTwoRegMiscOpcode::kNeg : AdvSimdTwoRegMiscOpcode::kAbs;
         break;
       case 0b10010:
-        // region digitalis - opcode=10010 splits on U: XTN (U=0) / SQXTUN (U=1).
+        // opcode=10010 splits on U: XTN (U=0) / SQXTUN (U=1).
         // Sizes 00/01/10 are valid; size=11 has no encoded narrow form for SQXTUN.
         // XTN at size=11 already routes to Undefined via the existing dispatch in
         // DecodeAdvSimd that gates on the Q/size combination, but we gate here too
@@ -5601,15 +5331,13 @@ class Decoder {
           op = AdvSimdTwoRegMiscOpcode::kXtn;
         }
         break;
-        // endregion
-      // region digitalis - opcode=10011 is SHLL/SHLL2 (U=1 required).
+      // opcode=10011 is SHLL/SHLL2 (U=1 required).
       // size=11 is unallocated (no destination element wider than 64-bit).
       case 0b10011:
         if (!u) { Undefined(); return; }
         if (size == 0b11) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kShll;
         break;
-        // endregion
       case 0b10100:
         if (u) {
           op = AdvSimdTwoRegMiscOpcode::kUqxtn;
@@ -5618,7 +5346,7 @@ class Decoder {
         }
         break;
       case 0b10110:
-        // region digitalis - opcode=10110 splits on U:
+        // opcode=10110 splits on U:
         //   U=0 + size=10 -> BFCVTN/BFCVTN2 (FP32->BF16).
         //   U=0 + size=00/01 -> FCVTN/FCVTN2: size=00 narrows FP32->FP16,
         //     size=01 narrows FP64->FP32. Both are implemented.
@@ -5633,13 +5361,12 @@ class Decoder {
         } else {
           op = AdvSimdTwoRegMiscOpcode::kFcvtn;
         }
-        // endregion
         break;
       case 0b10111:
         if (u) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kFcvtl;
         break;
-      // region digitalis - bit20 splits opcode=01111 between
+      // bit20 splits opcode=01111 between
       // FABS/FNEG (bit20=0, two-reg-misc) and across-lanes
       // FMAXV/FMINV (bit20=1). bit23 picks max (0) vs min (1).
       // U=1 selects the FP32 (.4S) form; U=0 selects the FP16 (.8H) form
@@ -5655,8 +5382,7 @@ class Decoder {
           op = u ? AdvSimdTwoRegMiscOpcode::kFneg : AdvSimdTwoRegMiscOpcode::kFabs;
         }
         break;
-      // endregion
-      // region digitalis - opcode=01100 covers two distinct encodings:
+      // opcode=01100 covers two distinct encodings:
       //   bit20=1: across-lanes FMAXNMV (bit23=0) / FMINNMV (bit23=1).
       //     bit22 (sz) must be 0; U=1 selects FP32 (.4S), U=0 selects
       //     FP16 (.8H) — interpreter dispatches on args.is_fp16.
@@ -5695,8 +5421,7 @@ class Decoder {
         if (size == 0b11 && !q) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kFcmltZero;
         break;
-      // endregion
-      // region digitalis - opcode=11101 splits on bit23:
+      // opcode=11101 splits on bit23:
       //   bit23=0: SCVTF (U=0) / UCVTF (U=1) — vector int→FP.
       //   bit23=1: FRECPE (U=0) / FRSQRTE (U=1) — vector FP reciprocal estimate.
       case 0b11101:
@@ -5708,8 +5433,7 @@ class Decoder {
                  : AdvSimdTwoRegMiscOpcode::kScvtfV;
         }
         break;
-      // endregion
-      // region digitalis - opcode=11111 splits on bit23:
+      // opcode=11111 splits on bit23:
       //   bit23=1, U=1: FSQRT (vector).
       //   bit23=0: FRINT64Z (U=0) / FRINT64X (U=1) — FRINTTS 64-bit.
       case 0b11111:
@@ -5721,16 +5445,14 @@ class Decoder {
                  : AdvSimdTwoRegMiscOpcode::kFrint64zV;
         }
         break;
-      // endregion
-      // region digitalis - opcode=11110, bit23=0: FRINT32Z (U=0) / FRINT32X
+      // opcode=11110, bit23=0: FRINT32Z (U=0) / FRINT32X
       // (U=1) — FRINTTS 32-bit. bit23=1 is unallocated for this opcode.
       case 0b11110:
         if (GetBits<23, 1>()) { Undefined(); return; }
         op = u ? AdvSimdTwoRegMiscOpcode::kFrint32xV
                : AdvSimdTwoRegMiscOpcode::kFrint32zV;
         break;
-      // endregion
-      // region digitalis - opcode=11011 splits on whether this is the
+      // opcode=11011 splits on whether this is the
       // across-lanes group (bit20=1, ADDV) or two-reg-misc (bit20=0).
       // For bit20=0 with bit23=1, this is FCVTZS / FCVTZU (vector FP→int
       // truncating). bit23=0 / bit20=0 / opcode=11011 is FCVTMS/FCVTMU
@@ -5745,15 +5467,13 @@ class Decoder {
             op = u ? AdvSimdTwoRegMiscOpcode::kFcvtzuV
                    : AdvSimdTwoRegMiscOpcode::kFcvtzsV;
           } else {
-            // region digitalis - vector FCVTMS/MU (round toward -inf). .
+            // vector FCVTMS/MU (round toward -inf). .
             op = u ? AdvSimdTwoRegMiscOpcode::kFcvtmuV
                    : AdvSimdTwoRegMiscOpcode::kFcvtmsV;
-            // endregion
           }
         }
         break;
-      // endregion
-      // region digitalis - opcode=11100 splits on bit23 ("a"):
+      // opcode=11100 splits on bit23 ("a"):
       //   bit23=0: FCVTAS (U=0) / FCVTAU (U=1) — FP convert round-to-nearest
       //            ties-away.
       //   bit23=1, sz(bit22)=0: URECPE (U=0) / URSQRTE (U=1) — unsigned integer
@@ -5769,8 +5489,7 @@ class Decoder {
                  : AdvSimdTwoRegMiscOpcode::kFcvtasV;
         }
         break;
-      // endregion
-      // region digitalis: std FP32/FP64 FRINT* round-to-int.
+      // std FP32/FP64 FRINT* round-to-int.
       // Encoding (per ARM ARM C7.2 "Advanced SIMD two-register miscellaneous"):
       //   0 Q U 0 1110 size 10000 opcode 10 Rn Rd
       // with bit23 = 'a' (rounding-mode subset) and bit22 = 'sz' (0=FP32,
@@ -5812,7 +5531,6 @@ class Decoder {
                  : AdvSimdTwoRegMiscOpcode::kFrintzV;
         }
         break;
-      // endregion
       default:
         Undefined();
         return;
@@ -5825,16 +5543,13 @@ class Decoder {
         .size = size,
         .q = q,
         .u = u,
-        // region digitalis - across-lanes FP16 (FMAXV/FMINV/FMAXNMV/FMINNMV
+        // across-lanes FP16 (FMAXV/FMINV/FMAXNMV/FMINNMV
         // on .8H) is selected by U=0 in the across-lanes cases above; for
         // every other dispatch path is_fp16 stays false.
         .is_fp16 = is_fp16,
-        // endregion
     };
     insn_consumer_->AdvSimdTwoRegMisc(args);
   }
-  // endregion
-  // region digitalis
   //
   // AdvSIMD scalar two-reg misc.
   // Encoding: 01 U 11110 size 10000 opcode 10 Rn Rd
@@ -5865,13 +5580,11 @@ class Decoder {
           op = u ? AdvSimdScalarTwoRegMiscOpcode::kUcvtf
                  : AdvSimdScalarTwoRegMiscOpcode::kScvtf;
         } else {
-          // region digitalis
           op = u ? AdvSimdScalarTwoRegMiscOpcode::kFrsqrte
                  : AdvSimdScalarTwoRegMiscOpcode::kFrecpe;
-          // endregion
         }
         break;
-      // region digitalis - scalar FCVTAS / FCVTAU.
+      // scalar FCVTAS / FCVTAU.
       // opcode=11100 splits on bit23 of the `size` field per the ARM ARM
       // "AdvSIMD scalar two-register miscellaneous (FP)" table:
       //   bit23=0 (size ∈ {00, 01}): FCVTAS (U=0) / FCVTAU (U=1) —
@@ -5888,7 +5601,6 @@ class Decoder {
         op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtau
                : AdvSimdScalarTwoRegMiscOpcode::kFcvtas;
         break;
-      // endregion
       case 0b11011:
         // FCVTZS (U=0) / FCVTZU (U=1): float → integer, round toward zero.
         // Per ARM ARM "AdvSIMD scalar two-register miscellaneous (FP)" table,
@@ -5904,7 +5616,7 @@ class Decoder {
         op = u ? AdvSimdScalarTwoRegMiscOpcode::kFcvtzu
                : AdvSimdScalarTwoRegMiscOpcode::kFcvtzs;
         break;
-      // region digitalis - scalar SQABS / SQNEG / SQXTUN / FCVTXN.
+      // scalar SQABS / SQNEG / SQXTUN / FCVTXN.
       // Scalar twins of the vector ops at the same opcode bits (00111,
       // 10010, 10110); each is the one-lane collapse of the vector form.
       // llvm-mc-21 encoding checks:
@@ -5950,7 +5662,6 @@ class Decoder {
         if (!u || size != 0b01) { Undefined(); return; }
         op = AdvSimdScalarTwoRegMiscOpcode::kFcvtxn;
         break;
-      // endregion
       default:
         Undefined();
         return;
@@ -5967,8 +5678,6 @@ class Decoder {
     };
     insn_consumer_->AdvSimdScalarTwoRegMisc(args);
   }
-  // endregion
-  // region digitalis
   //
   // AdvSIMD scalar three same: ADD/SUB/CMxx/SSHL/USHL on scalar D-form.
   // Encoding: 01 U 11110 size 1 Rm opcode 1 Rn Rd
@@ -6022,7 +5731,7 @@ class Decoder {
           else { Undefined(); return; }
           break;
         case 0b11111:
-          // region digitalis: FRECPS (U=0, bit23=0) / FRSQRTS (U=0, bit23=1).
+          // FRECPS (U=0, bit23=0) / FRSQRTS (U=0, bit23=1).
           // Per ARM ARM C7.2.151 "FRECPS" and C7.2.155 "FRSQRTS":
           //   01 0 11110 0 sz 1 Rm 11111 1 Rn Rd   (FRECPS)
           //   01 0 11110 1 sz 1 Rm 11111 1 Rn Rd   (FRSQRTS)
@@ -6032,7 +5741,6 @@ class Decoder {
           if (u) { Undefined(); return; }
           op = bit23 ? AdvSimdScalarThreeSameOpcode::kFrsqrts
                      : AdvSimdScalarThreeSameOpcode::kFrecps;
-          // endregion
           break;
         default:
           Undefined();
@@ -6048,7 +5756,7 @@ class Decoder {
       // single-lane fast paths for DSP saturation.  See ARM ARM
       // C7.2.282 / .284 (SQADD / SQSUB) and C7.2.317 / .319 (UQADD /
       // UQSUB).
-      // region digitalis: opcodes 00001 / 00101 / 01001 / 01011 are B/H/S/D-capable;
+      // opcodes 00001 / 00101 / 01001 / 01011 are B/H/S/D-capable;
       // opcode 10110 (SQDMULH / SQRDMULH) is H/S-only (the per-arm guard
       // below rejects B and D for it).  All other integer scalar-three-same
       // opcodes accept D only.
@@ -6056,16 +5764,14 @@ class Decoder {
                              (opcode == 0b01001) || (opcode == 0b01011);
       const bool hs_only = (opcode == 0b10110);
       if (!all_sizes && !hs_only && size != 0b11) { Undefined(); return; }
-      // endregion
 
       switch (opcode) {
-        // region digitalis: SQADD / UQADD scalar (B/H/S/D).
+        // SQADD / UQADD scalar (B/H/S/D).
         case 0b00001:
           op = u ? AdvSimdScalarThreeSameOpcode::kUqaddScalar
                  : AdvSimdScalarThreeSameOpcode::kSqaddScalar;
           break;
-        // endregion
-        // region digitalis: SQSUB / UQSUB scalar (B/H/S/D).
+        // SQSUB / UQSUB scalar (B/H/S/D).
         // ARM ARM C7.2.317 / C7.2.319: encoding is opcode 0b00101
         // (NOT 0b00011 — verified against clang --target=aarch64,
         // e.g. sqsub b0,b1,b2 = 0x5e222c20 whose bits[15:11]=00101).
@@ -6075,20 +5781,17 @@ class Decoder {
           op = u ? AdvSimdScalarThreeSameOpcode::kUqsubScalar
                  : AdvSimdScalarThreeSameOpcode::kSqsubScalar;
           break;
-        // endregion
-        // region digitalis: SQSHL / UQSHL scalar (B/H/S/D).
+        // SQSHL / UQSHL scalar (B/H/S/D).
         case 0b01001:
           op = u ? AdvSimdScalarThreeSameOpcode::kUqshlScalar
                  : AdvSimdScalarThreeSameOpcode::kSqshlScalar;
           break;
-        // endregion
-        // region digitalis: SQRSHL / UQRSHL scalar (B/H/S/D).
+        // SQRSHL / UQRSHL scalar (B/H/S/D).
         case 0b01011:
           op = u ? AdvSimdScalarThreeSameOpcode::kUqrshlScalar
                  : AdvSimdScalarThreeSameOpcode::kSqrshlScalar;
           break;
-        // endregion
-        // region digitalis: SRSHL / URSHL scalar (D only, non-saturating).
+        // SRSHL / URSHL scalar (D only, non-saturating).
         //   size=11 is the only valid lane width for this scalar form
         //   (the all_sizes whitelist intentionally excludes 01010 so
         //   the `size != 0b11` guard above already rejects B/H/S).
@@ -6096,8 +5799,7 @@ class Decoder {
           op = u ? AdvSimdScalarThreeSameOpcode::kUrshlScalar
                  : AdvSimdScalarThreeSameOpcode::kSrshlScalar;
           break;
-        // endregion
-        // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+        // SQDMULH / SQRDMULH scalar (H/S only).
         //   Per ARM ARM C7.2.301 / .305: only size=01 (H) and size=10 (S)
         //   are allocated for this opcode; B and D are unallocated.
         case 0b10110:
@@ -6105,7 +5807,6 @@ class Decoder {
           op = u ? AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar
                  : AdvSimdScalarThreeSameOpcode::kSqdmulhScalar;
           break;
-        // endregion
         case 0b00110:
           op = u ? AdvSimdScalarThreeSameOpcode::kCmhi
                  : AdvSimdScalarThreeSameOpcode::kCmgt;
@@ -6142,9 +5843,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdScalarThreeSame(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar pairwise.
   // Encoding: 01 U 11110 size 11000 opcode 10 Rn Rd
@@ -6162,9 +5861,7 @@ class Decoder {
 
     AdvSimdScalarPairwiseOpcode op;
     bool ok = false;
-    // region digitalis
     bool is_fp16 = false;
-    // endregion
 
     if (!u) {
       // Integer leg: ADDP scalar (D-form) only.
@@ -6172,7 +5869,6 @@ class Decoder {
         op = AdvSimdScalarPairwiseOpcode::kAddp;
         ok = true;
       }
-      // region digitalis
       // Armv8.2-FP16 scalar pairwise (ARM ARM C7.2 "Advanced SIMD scalar
       // pairwise (FP16)"): U=0, bit22 (size[0]) must be 0; bit23 (size[1])
       // selects max- vs min- for FMAX*/FMIN*. FADDP is only allocated at
@@ -6203,7 +5899,6 @@ class Decoder {
             break;
         }
       }
-      // endregion
     } else {
       // FP leg.  size[1] selects min- (1) vs max- (0); size[0] selects S/D.
       bool size_hi = ((size >> 1) & 1) != 0;
@@ -6240,14 +5935,10 @@ class Decoder {
         .rd = rd,
         .rn = rn,
         .size = size,
-        // region digitalis
         .is_fp16 = is_fp16,
-        // endregion
     };
     insn_consumer_->AdvSimdScalarPairwise(args);
   }
-  // endregion
-  // region digitalis
   //
   // AdvSIMD scalar copy: DUP (scalar), aka MOV Vd, Vn[index].
   // Encoding: 0 1 0 11110 000 imm5 0 0000 1 Rn Rd
@@ -6279,8 +5970,6 @@ class Decoder {
     };
     insn_consumer_->AdvSimdCopy(args);
   }
-  // endregion
-  // region digitalis
   //
   // AdvSIMD copy (DUP, INS, SMOV, UMOV).
   //
@@ -6350,8 +6039,6 @@ class Decoder {
     };
     insn_consumer_->AdvSimdCopy(args);
   }
-  // endregion
-  // region digitalis
   //
   // AdvSIMD vector x indexed element.
   // Encoding: 0 Q U 01111 size L M Rm opcode H 0 Rn Rd
@@ -6368,7 +6055,7 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // region digitalis BF16 indexed
+    // BF16 indexed
     //
     // Armv8.6-BF16 by-element forms route through the vector x indexed
     // element subspace too: bit31=0, bit29=0 (U=0), bits[28:24]=01111,
@@ -6425,9 +6112,8 @@ class Decoder {
         return;
       }
     }
-    // endregion
 
-    // region digitalis hello-dotprod
+    // hello-dotprod
     // SDOT / UDOT (by element) — Armv8.4-DotProd.
     //   bit31=0, bits[28:24]=01111, bits[23:22]=10, opcode=bits[15:12]=1110,
     //   bit10=0.  bit30=Q (selects .4s vs .2s), bit29=U (SDOT/UDOT).
@@ -6457,9 +6143,8 @@ class Decoder {
       insn_consumer_->AdvSimdDotProduct(args);
       return;
     }
-    // endregion
 
-    // region digitalis - I8MM by-element USDOT / SUDOT (FEAT_I8MM).
+    // I8MM by-element USDOT / SUDOT (FEAT_I8MM).
     //   U=0, opcode=bits[15:12]=1111, index = H:L; the size field selects the
     //   mixed-sign flavour: size=10 -> USDOT (Vn unsigned, Vm signed),
     //   size=00 -> SUDOT (Vn signed, Vm unsigned). Vm = M:Rm[3:0].
@@ -6481,9 +6166,8 @@ class Decoder {
       insn_consumer_->AdvSimdDotProduct(args);
       return;
     }
-    // endregion
 
-    // region digitalis indexed FCMLA
+    // indexed FCMLA
     // FCMLA (by element) — Armv8.3-FCMA.
     //
     // Distinguished from FMLA/FMLS (by element) by U=1 (bit29).
@@ -6561,7 +6245,6 @@ class Decoder {
       // the existing paths below, which route opcode=0001/0101 with U=1
       // to Undefined and opcode=0011/0111 to the default Undefined.
     }
-    // endregion
 
     uint8_t rm;
     uint8_t index;
@@ -6574,7 +6257,7 @@ class Decoder {
       // 64-bit: Vm = M:Rm, index = H
       rm = (M << 4) | Rm4;
       index = H;
-    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
+    // FP16 vector indexed FMLA/FMLS/FMUL
     //
     // FP16 by-element FMLA/FMLS/FMUL — Armv8.2-FP16.  Encoding pattern:
     //   0 Q 0 01111 00 L M Rm[3:0] opcode H 0 Rn Rd
@@ -6598,8 +6281,7 @@ class Decoder {
       }
       rm = Rm4;
       index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
-    // endregion
-    // region digitalis integer MLA/MLS/MUL-idx halfword
+    // integer MLA/MLS/MUL-idx halfword
     //
     // Integer MUL/MLA/MLS by-element with halfword elements (.4h/.8h) —
     // Armv8-A baseline (not an extension; just a previously deferred
@@ -6641,7 +6323,6 @@ class Decoder {
       if (!((opcode == 0b1000 && !u) ||
             (opcode == 0b0000 && u) ||
             (opcode == 0b0100 && u) ||
-            // region digitalis
             (opcode == 0b1100 && !u) ||
             (opcode == 0b1101 && !u) ||
             // Widening MUL/MAC by element accept both U values.
@@ -6674,14 +6355,12 @@ class Decoder {
             //   sqrdmlsh v0.4h, v1.4h, v2.h[0] = 0x2F42F020   opcode=1111
             (opcode == 0b1101 && u) ||
             (opcode == 0b1111 && u)
-            // endregion
             )) {
         Undefined();
         return;
       }
       rm = Rm4;
       index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
-    // endregion
     } else {
       // Reserved.
       Undefined();
@@ -6699,7 +6378,7 @@ class Decoder {
         op = AdvSimdVecXIdxOpcode::kFmls;
         break;
       case 0b1001:
-        // region digitalis: FMUL/FMULX by element.  Per ARM ARM C7.2
+        // FMUL/FMULX by element.  Per ARM ARM C7.2
         // AdvSIMD-vector-x-indexed-element:
         //   U=0, opcode=1001 -> FMUL  (by element) -> kFmul.
         //   U=1, opcode=1001 -> FMULX (by element, Armv8.2-FP) -> kFmulx.
@@ -6709,9 +6388,8 @@ class Decoder {
         op = u ? AdvSimdVecXIdxOpcode::kFmulx
                : AdvSimdVecXIdxOpcode::kFmul;
         break;
-        // endregion
       case 0b1000:
-        // region digitalis follow-up: reject reserved
+        // follow-up: reject reserved
         // opcode=1000 with U=1.  Per ARM ARM C7.2 AdvSIMD-vector-x-indexed-element:
         //   U=0, opcode=1000 -> MUL (by element) — kept as kMul.
         //   U=1, opcode=1000 -> RESERVED — there is no instruction at this slot.
@@ -6730,7 +6408,6 @@ class Decoder {
         }
         op = AdvSimdVecXIdxOpcode::kMul;
         break;
-        // endregion
       case 0b0100:
         if (u) {
           op = AdvSimdVecXIdxOpcode::kMls;
@@ -6745,7 +6422,7 @@ class Decoder {
           Undefined(); return;
         }
         break;
-      // region digitalis: SQDMULH / SQRDMULH by element (vector).
+      // SQDMULH / SQRDMULH by element (vector).
       //   U=0, opcode=1100 -> SQDMULH (by element).
       //   U=0, opcode=1101 -> SQRDMULH (by element).
       //   U=1, opcode=1101 -> SQRDMLAH (Armv8.1-RDM, by element).
@@ -6801,7 +6478,6 @@ class Decoder {
         if (u || (size != 0b01 && size != 0b10)) { Undefined(); return; }
         op = AdvSimdVecXIdxOpcode::kSqdmlslIdx;
         break;
-      // endregion
       default:
         Undefined();
         return;
@@ -6818,9 +6494,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdVecXIndexedElement(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar x indexed element.
   // Encoding: 0 1 U 11111 size L M Rm opcode H 0 Rn Rd
@@ -6865,7 +6539,7 @@ class Decoder {
       op = AdvSimdScalarXIdxOpcode::kFmla;
     } else if (!u && opcode == 0b0101) {
       op = AdvSimdScalarXIdxOpcode::kFmls;
-    // region digitalis: Armv8.1-RDM scalar by-element SQRDMLAH / SQRDMLSH.
+    // Armv8.1-RDM scalar by-element SQRDMLAH / SQRDMLSH.
     //   U=1, opcode=1101 -> SQRDMLAH (scalar by element).
     //   U=1, opcode=1111 -> SQRDMLSH (scalar by element).
     //   size ∈ {01 (H), 10 (S)}; size=00 / size=11 reserved for this opcode.
@@ -6883,7 +6557,6 @@ class Decoder {
     } else if (u && opcode == 0b1111) {
       if (size != 0b01 && size != 0b10) { Undefined(); return; }
       op = AdvSimdScalarXIdxOpcode::kSqrdmlshScalarIdx;
-    // endregion
     } else {
       // Remaining opcodes (SQDMULL/SQDMULH/SQRDMULH) are not implemented —
       // raise SIGILL.
@@ -6902,7 +6575,7 @@ class Decoder {
       if (L) { Undefined(); return; }
       rm = static_cast<uint8_t>((M << 4) | Rm4);
       index = H;
-    // region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+    // Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
     //
     // Encoding "Advanced SIMD scalar x indexed element (FP16)" per ARM ARM
     // C7.2 uses size=0b00 (not 0b01 as a stale earlier comment claimed).
@@ -6924,8 +6597,7 @@ class Decoder {
     } else if (size == 0b00) {
       rm = Rm4;
       index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
-    // endregion
-    // region digitalis: Armv8.1-RDM scalar by-element H form (SQRDMLAH/SQRDMLSH).
+    // Armv8.1-RDM scalar by-element H form (SQRDMLAH/SQRDMLSH).
     //   8 elements in Vm.8H, index = H:L:M (3 bits, 0..7), Vm = Rm4 only
     //   (indexed source restricted to V0..V15 — bit-20 M slot is the
     //   index's low bit).  size=01 only applies to the RDM-by-element
@@ -6940,7 +6612,6 @@ class Decoder {
                 op == AdvSimdScalarXIdxOpcode::kSqrdmlshScalarIdx)) {
       rm = Rm4;
       index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
-    // endregion
     } else {
       // size=0b01 is reserved at this slot for FP opcodes.
       Undefined();
@@ -6956,9 +6627,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdScalarXIndexedElement(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD shift by immediate.
   // Encoding: 0 Q U 011110 immh:immb opcode 1 Rn Rd
@@ -7006,7 +6675,7 @@ class Decoder {
           op = AdvSimdShiftImmOpcode::kShl;
         }
         break;
-      // region digitalis: AdvSIMD saturating shift left (immediate) — verified
+      // AdvSIMD saturating shift left (immediate) — verified
       // against llvm-mc output for `sqshl`, `uqshl`, and `sqshlu` (the prior
       // dispatch swapped 0b01100 and 0b01110, sending real-world UQSHL to
       // the SQSHLU handler and SQSHLU to the UQSHL handler). The ARMv8 ARM
@@ -7023,8 +6692,7 @@ class Decoder {
           return;
         }
         break;
-      // endregion
-      // region digitalis: AdvSIMD narrow-shift dispatch — verified against
+      // AdvSIMD narrow-shift dispatch — verified against
       // llvm-mc output for shrn / rshrn / sqshrn / uqshrn / sqshrun /
       // sqrshrn / sqrshrun / uqrshrn (and the *2 upper-half forms, which
       // differ only in Q).
@@ -7054,11 +6722,10 @@ class Decoder {
       case 0b10011:
         op = u ? AdvSimdShiftImmOpcode::kUqrshrn : AdvSimdShiftImmOpcode::kSqrshrn;
         break;
-      // endregion
       case 0b10100:
         op = u ? AdvSimdShiftImmOpcode::kUshll : AdvSimdShiftImmOpcode::kSshll;
         break;
-      // region digitalis - Vector fixed-point conversion (ARM ARM C7.2
+      // Vector fixed-point conversion (ARM ARM C7.2
       // "Advanced SIMD shift by immediate"):
       //   opcode | U=0     | U=1
       //   -------+---------+---------
@@ -7081,7 +6748,6 @@ class Decoder {
         op = u ? AdvSimdShiftImmOpcode::kFcvtzuFixed
                : AdvSimdShiftImmOpcode::kFcvtzsFixed;
         break;
-      // endregion
       default:
         Undefined();
         return;
@@ -7098,9 +6764,7 @@ class Decoder {
     };
     insn_consumer_->AdvSimdShiftByImm(args);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar shift by immediate (ARM ARM C4.1.6.10).
   // Encoding: 0 1 U 1 1 1 1 1 0 immh immb opcode 1 Rn Rd
@@ -7279,7 +6943,6 @@ class Decoder {
     };
     insn_consumer_->AdvSimdShiftByImm(args);
   }
-  // endregion
 
   //
   // Load/store exclusive, ordered, and CAS.
@@ -7295,13 +6958,11 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // region digitalis
     // o2 distinguishes exclusive (o2=0) from ordered/CAS (o2=1):
     //   o2=0, o1=0: STXR/LDXR/STLXR/LDAXR (exclusive)
     //   o2=0, o1=1: CASP (exclusive pair CAS)
     //   o2=1, o1=0: STLR/LDAR (ordered, non-exclusive)
     //   o2=1, o1=1: CAS/CASA/CASL/CASAL
-    // endregion
 
     LoadStoreExclusiveArgs args;
     args.rt = rt;
@@ -7312,7 +6973,7 @@ class Decoder {
     args.release = false;
 
     if (o1 == 0) {
-      // region digitalis - check o2 to distinguish STLR/LDAR from STXR/LDXR
+      // check o2 to distinguish STLR/LDAR from STXR/LDXR
       if (o2) {
         // o2=1, o1=0: LDAR/STLR (ordered, non-exclusive)
         if (L) {
@@ -7332,9 +6993,8 @@ class Decoder {
           args.release = (o0 != 0);  // STLXR
         }
       }
-      // endregion
     } else {
-      // region digitalis CASP fix: o1=1 covers both CAS and CASP.
+      // CASP fix: o1=1 covers both CAS and CASP.
       // The o2 bit is the discriminator: o2=0 → CASP (pair); o2=1 → CAS (single).
       // Encodings confirmed via llvm-mc (clang-r563880c):
       //   casp   w0,w1,w2,w3,[x10] = 0x08207d42 → o2=0, o1=1
@@ -7360,7 +7020,6 @@ class Decoder {
         args.acquire = (L != 0);   // CASA/CASAL
         args.release = (o0 != 0);  // CASL/CASAL
       }
-      // endregion
     }
     insn_consumer_->LoadStoreExclusive(args);
   }
@@ -7394,7 +7053,7 @@ class Decoder {
     switch (full_op) {
       case 0b0000: args.op = AtomicOp::kLdadd; break;
       case 0b0001: args.op = AtomicOp::kLdclr; break;
-      // region digitalis fix: LDEOR/LDSET routing was swapped.
+      // fix: LDEOR/LDSET routing was swapped.
       // Per ARM ARM C7.2.149/162 and confirmed via llvm-mc:
       //   ldeor w0,w1,[x2] = 0xB820_2041 → opc=010 → kLdeor (XOR)
       //   ldset w0,w1,[x2] = 0xB820_3041 → opc=011 → kLdset (OR)
@@ -7412,9 +7071,8 @@ class Decoder {
       case 0b0101: args.op = AtomicOp::kLdsmin; break;
       case 0b0110: args.op = AtomicOp::kLdumax; break;
       case 0b0111: args.op = AtomicOp::kLdumin; break;
-      // endregion
       case 0b1000: args.op = AtomicOp::kSwp; break;
-      // region digitalis LDAPR (Armv8.3-LRCPC) as plain LDAR.
+      // LDAPR (Armv8.3-LRCPC) as plain LDAR.
       // LDAPR/LDAPRB/LDAPRH/LDAPR (Load-Acquire RCpc Register) shares the
       // atomic-memory-op encoding class with full_op=(o3<<3)|opc=0b1100
       // (o3=1, opc=0b100).  Verified via NDK r28 clang assembly:
@@ -7444,12 +7102,10 @@ class Decoder {
         args.release = false;
         break;
       }
-      // endregion
       default: Undefined(); return;
     }
     insn_consumer_->LoadStoreExclusive(args);
   }
-  // endregion
 
   //
   // Data Processing - Register.
@@ -7483,12 +7139,10 @@ class Decoder {
     // bit[28] = 1
     if (!op2_high) {
       // bit[28]=1, bit[24]=0
-      // region digitalis
       uint8_t op2_bits = GetBits<21, 3>();  // bits [23:21]
 
       // // uint8_t op2_bits = GetBits<21, 4>();  // bits [24:21]
       if (op2_bits == 0b000) {
-        // region digitalis
         // Add/sub with carry: ADC, ADCS, SBC, SBCS
         {
           bool sf = GetBits<31, 1>();
@@ -7499,10 +7153,8 @@ class Decoder {
           uint8_t rd = GetBits<0, 5>();
           insn_consumer_->AddSubWithCarry(rd, rn, rm, sf, op, s);
         }
-        // endregion
         return;
       }
-      // region digitalis
       if (op2_bits == 0b010) {
         // Conditional compare (register/immediate).
         DecodeConditionalCompare();
@@ -7515,7 +7167,6 @@ class Decoder {
         return;
       }
       if (op2_bits == 0b110) {
-        // region digitalis
         // Distinguish 2-source (bit30=0) from 1-source (bit30=1)
         if (GetBits<30, 1>()) {
           // Data processing (1-source): CLZ, CLS, RBIT, REV, REV16, REV32
@@ -7524,21 +7175,17 @@ class Decoder {
           // Data processing (2-source): UDIV, SDIV, LSLV, LSRV, ASRV, RORV
           DecodeDataProc2Src();
         }
-        // endregion
         return;
       }
-      // endregion
       Undefined();
       return;
     }
 
-    // region digitalis
     // bit[28]=1, bit[24]=1: always Data processing (3-source).
     // DataProc2Src has bits[28:24]=11010 (bit24=0), dispatched above.
     // // bit[21]=0: Data processing (2-source).
     // // bit[21]=1: Data processing (3-source).
     DecodeDataProc3Src();
-    // endregion
   }
 
   void DecodeLogicalShiftedReg() {
@@ -7671,7 +7318,6 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // region digitalis
     // MTE DP-2src: SUBP(opc=0,S=0), SUBPS(opc=0,S=1), IRG(opc=4,S=0),
     // GMI(opc=5,S=0). All require sf=1 (64-bit). Route them to the
     // MteDataProc listener BEFORE the S-bit check below, since SUBPS
@@ -7696,7 +7342,6 @@ class Decoder {
       insn_consumer_->MteDataProc(args);
       return;
     }
-    // endregion
 
     // S must be 0 for these instructions.
     if (s) {
@@ -7722,7 +7367,6 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rd = GetBits<0, 5>();
 
-    // region digitalis
     // Encode opcode from op31[1:0] and o0.
     // ARM64 DataProc3Src: op31[2] is the unsigned flag (U), op31[1:0]+o0 select the operation.
     // Map: MADD=000, MSUB=001, SMADDL=010, SMSUBL=011, SMULH=100,
@@ -7762,7 +7406,6 @@ class Decoder {
       // op31=101: 5 + (1<<1) + 1 - 2 = 6 (kUmsubl) ✓
       // op31=110: 5 + (2<<1) + 0 - 2 = 7 (kUmulh) ✓
     }
-    // endregion
 
     const DataProc3SrcArgs args = {
         .opcode = DataProc3SrcOpcode{opcode},
@@ -7782,4 +7425,3 @@ class Decoder {
 }  // namespace berberis
 
 #endif  // BERBERIS_DECODER_ARM64_DECODER_H_
-// endregion

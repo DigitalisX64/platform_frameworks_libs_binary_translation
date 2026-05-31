@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -108,4 +107,3 @@ GuestAddr InitKernelArgs(GuestAddr guest_sp,
 }
 
 }  // namespace berberis
-// endregion

@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -68,21 +67,19 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
   }
 
   while (translator.GetInsnAddr() < params.end_pc && !translator.is_region_end_reached()) {
-    // region digitalis - early region termination on register pressure
+    // early region termination on register pressure
     // When the GP register pool is nearly exhausted, end the region cleanly
     // instead of letting AllocTempReg fail and discarding all JIT work.
     if (translator.IsGpRegPoolLow()) {
       break;
     }
-    // endregion
-    // region digitalis - register guest PC label for backward branch inlining.
+    // register guest PC label for backward branch inlining.
     // Each guest PC gets an x86_64 label so backward branches (loops) can
     // emit a local jump instead of exiting the region.
     translator.RegisterGuestPcLabel(translator.GetInsnAddr());
-    // endregion
     uint8_t insn_size = decoder.Decode(ToHostAddr<const uint16_t>(translator.GetInsnAddr()));
     if (!translator.success()) {
-      // region digitalis - JIT break profiling
+      // JIT break profiling
       static uint64_t break_count = 0;
       break_count++;
       if (break_count <= 20 || break_count % 50000 == 0) {
@@ -93,7 +90,6 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
                         (unsigned long)fail_pc,
                         insn);
       }
-      // endregion
       return {false, translator.GetInsnAddr()};
     }
     translator.FreeTempRegs();
@@ -106,4 +102,3 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
 }
 
 }  // namespace berberis
-// endregion

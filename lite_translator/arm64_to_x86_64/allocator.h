@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -34,7 +33,7 @@ inline constexpr auto kAllocatableRegisters = []() {
   return true;
 };
 
-// region digitalis - add rcx+rdx to register pool (13 GP regs)
+// add rcx+rdx to register pool (13 GP regs)
 // RCX is saved/restored around variable shifts (SHL/SHR/SAR/ROR by CL) and NZCV flag emission.
 // RDX is saved/restored around DIV/IDIV/widening MUL instructions that clobber it.
 // RCX placed early (index 1) so it's used for permanent mappings, not temps.
@@ -53,7 +52,6 @@ inline constexpr x86_64::Assembler::Register kAllocatableRegisters<x86_64::Assem
      x86_64::Assembler::r14,
      x86_64::Assembler::r15,
      x86_64::Assembler::rdx};
-// endregion
 
 template <>
 inline constexpr x86_64::Assembler::XMMRegister
@@ -113,4 +111,3 @@ class Allocator {
 }  // namespace berberis
 
 #endif  // BERBERIS_LITE_TRANSLATOR_RISCV64_ALLOCATOR_H_
-// endregion

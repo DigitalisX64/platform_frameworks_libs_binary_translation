@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -27,4 +26,3 @@ void InitState();
 }  // namespace berberis::intrinsics
 
 #endif  // BERBERIS_INTRINSICS_ARM64_INTRINSICS_H_
-// endregion

@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -70,7 +69,7 @@ long RunGuestSyscall___NR_fadvise64(long arg_1, long arg_2, long arg_3, long arg
 }
 #endif
 
-// region digitalis - ioctl translation
+// ioctl translation
 //
 // Both arm64 and x86_64 use the asm-generic ioctl encoding
 // (<asm-generic/ioctl.h>) -- bionic's kernel-headers include
@@ -134,7 +133,6 @@ long RunGuestSyscall___NR_ioctl(long arg_1, long arg_2, long arg_3) {
       size);
   return syscall(__NR_ioctl, arg_1, arg_2, arg_3);
 }
-// endregion
 
 long RunGuestSyscall___NR_newfstatat(long arg_1, long arg_2, long arg_3, long arg_4) {
   struct stat host_stat;
@@ -175,7 +173,7 @@ void RunGuestSyscall(ThreadState* state) {
     OnSyscall(state, guest_nr);
   }
 
-  // region digitalis - vDSO fast path for the hottest time syscalls.
+  // vDSO fast path for the hottest time syscalls.
   // RunGuestSyscallImpl forwards via glibc syscall(), which always traps into
   // the kernel; the libc clock_gettime()/gettimeofday() wrappers instead read
   // the host vDSO and avoid kernel entry (measured ~365ns -> ~70ns per call, a
@@ -217,9 +215,8 @@ void RunGuestSyscall(ThreadState* state) {
     }
     return;
   }
-  // endregion
 
-  // region digitalis - futex BSS workaround
+  // futex BSS workaround
   // Bionic's pthread_mutex uses 16-bit atomics for the state field (offset 0-1),
   // leaving the adjacent __pad field (offset 2-3) untouched. When __futex_wait_ex
   // passes the 16-bit state as the expected 32-bit value, it assumes __pad is zero.
@@ -246,7 +243,6 @@ void RunGuestSyscall(ThreadState* state) {
       }
     }
   }
-  // endregion
 
   long result = RunGuestSyscallImpl(guest_nr,
                                     state->cpu.x[0],
@@ -267,4 +263,3 @@ void RunGuestSyscall(ThreadState* state) {
 }
 
 }  // namespace berberis
-// endregion

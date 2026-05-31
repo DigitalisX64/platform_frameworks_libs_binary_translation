@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -74,4 +73,3 @@ void RunGuestCall(GuestAddr pc, GuestArgumentBuffer* buf) {
 }
 
 }  // namespace berberis
-// endregion
