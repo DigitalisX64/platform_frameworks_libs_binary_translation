@@ -45,6 +45,7 @@ cc_library_static {
         "digitalis_extra_libc_trampolines.cc",
         "digitalis_extra_libm_trampolines.cc",
         "digitalis_extra_libnativehelper_trampolines.cc",
+        "digitalis_extra_libbinder_ndk_trampolines.cc",
     ],
     // Sources are #ifdef'd on __x86_64__ so non-x86_64 builds get an
     // empty static lib.
