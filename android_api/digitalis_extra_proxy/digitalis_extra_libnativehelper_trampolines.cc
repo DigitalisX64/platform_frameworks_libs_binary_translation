@@ -30,8 +30,6 @@
 //
 // Uncovered (and why), see digitalis/docs/proxy-coverage-gaps.md:
 //   jniThrowExceptionFmt    - variadic (struct __va_list); needs va-list marshalling.
-//   jniRegisterNativeMethods - JNINativeMethod[] holds guest function pointers
-//                              that each need a host->guest thunk.
 
 #if defined(__x86_64__)
 
@@ -57,6 +55,7 @@ using Sig_NioFields = jlong(JNIEnv*, jobject, jint*, jint*, jint*);
 using Sig_NioPointer = jlong(JNIEnv*, jobject);
 using Sig_NioBaseArray = jarray(JNIEnv*, jobject);
 using Sig_NioBaseArrayOffset = jint(JNIEnv*, jobject);
+using Sig_RegisterNatives = jint(JNIEnv*, const char*, const JNINativeMethod*, jint);
 
 // HostCode is `const void*`; a function pointer cannot carry the const, so drop
 // it before reinterpreting. `callee` is the host libnativehelper function the
@@ -136,6 +135,20 @@ void DoCustomTrampoline_jniGetNioBufferBaseArrayOffset(HostCode callee, ProcessS
   ret = HostFn<Sig_NioBaseArrayOffset>(callee)(ToHostJNIEnv(guest_env), arg_buf);
 }
 
+// jniRegisterNativeMethods does FindClass(className) then env->RegisterNatives.
+// className passes through verbatim; the JNINativeMethod array passes through
+// verbatim too (identical 3-pointer LP64 layout) — the guest function pointers
+// it carries are NOT wrapped here, exactly as the native bridge's own
+// JNIEnv::RegisterNatives trampoline leaves them: the ART native-bridge layer
+// recognizes guest native fnPtrs and routes their later invocation through the
+// translator. Only the JNIEnv* needs translation.
+void DoCustomTrampoline_jniRegisterNativeMethods(HostCode callee, ProcessState* state) {
+  auto [guest_env, arg_class, arg_methods, arg_num] = GuestParamsValues<Sig_RegisterNatives>(state);
+  auto&& [ret] = GuestReturnReference<Sig_RegisterNatives>(state);
+  ret = HostFn<Sig_RegisterNatives>(callee)(
+      ToHostJNIEnv(guest_env), arg_class, arg_methods, arg_num);
+}
+
 const KnownTrampoline kDigitalisExtraLibnativehelperTrampolines[] = {
     {"jniThrowException", DoCustomTrampoline_jniThrowException, nullptr},
     {"jniThrowNullPointerException", DoCustomTrampoline_jniThrowNullPointerException, nullptr},
@@ -148,6 +161,7 @@ const KnownTrampoline kDigitalisExtraLibnativehelperTrampolines[] = {
     {"jniGetNioBufferPointer", DoCustomTrampoline_jniGetNioBufferPointer, nullptr},
     {"jniGetNioBufferBaseArray", DoCustomTrampoline_jniGetNioBufferBaseArray, nullptr},
     {"jniGetNioBufferBaseArrayOffset", DoCustomTrampoline_jniGetNioBufferBaseArrayOffset, nullptr},
+    {"jniRegisterNativeMethods", DoCustomTrampoline_jniRegisterNativeMethods, nullptr},
 };
 constexpr size_t kCount =
     sizeof(kDigitalisExtraLibnativehelperTrampolines) /
