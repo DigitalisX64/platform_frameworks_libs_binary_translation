@@ -158,6 +158,68 @@ void RunKernel(Kernel k) {
   SUCCEED();
 }
 
+// Correctness guard for the fused compare-branch (B3.2): a taken conditional
+// branch whose target reads NZCV again before re-setting it. If the fusion
+// skips materialising cpu.flags on the taken path, the second B.EQ reads stale
+// flags and lands on the x0=13 path instead of x0=42.
+TEST(Arm64FusedFlagLiveness, TakenBranchTargetReadsFlags) {
+  static const uint32_t code[] = {
+      0xd2800000,  // mov  x0, #0
+      0xf100001f,  // cmp  x0, #0        (Z=1; fused with the next b.eq)
+      0x54000040,  // b.eq +8  -> idx4   (taken: Z==1)
+      0xd28000e0,  // mov  x0, #7        (skipped)
+      0x54000040,  // b.eq +8  -> idx6   (reads NZCV again; Z must still be 1)
+      0xd28001a0,  // mov  x0, #13       (reached only on stale flags = bug)
+      0xd2800540,  // mov  x0, #42       (correct path)
+  };
+  InitBerberis();
+  GuestAddr base = ToGuestAddr(code);
+  GuestMapShadow::GetInstance()->SetExecutable(base, sizeof(code));
+  GuestThread* thread = GetCurrentGuestThread();
+  auto& cpu = thread->state()->cpu;
+  cpu.insn_addr = base;
+  cpu.x[0] = 123;
+  GuestAddr stop = base + sizeof(code);
+  auto* cache = TranslationCache::GetInstance();
+  cache->SetStop(stop);
+  ExecuteGuest(thread->state());
+  cache->TestingClearStop(stop);
+  GuestMapShadow::GetInstance()->ClearExecutable(base, sizeof(code));
+  EXPECT_EQ(cpu.x[0], 42u);  // 13 (or 7) would mean a fused-flag staleness bug
+}
+
+// Sharper guard: a TAKEN b.ne (Z=0) whose target reads NZCV, with a prior
+// compare having left Z=1. If the taken path doesn't materialise cpu.flags, the
+// target's b.eq reads the stale Z=1 and lands on x0=99 instead of x0=42.
+TEST(Arm64FusedFlagLiveness, TakenNeTargetReadsStaleFlags) {
+  static const uint32_t code[] = {
+      0xd28000a0,  // mov  x0, #5
+      0xf100141f,  // cmp  x0, #5      (Z=1; fused with next b.ne)
+      0x54000021,  // b.ne +4 -> idx3  (Z=1 -> not taken; materialises Z=1)
+      0xf100181f,  // cmp  x0, #6      (Z=0; fused with next b.ne)
+      0x54000041,  // b.ne +8 -> idx6  (Z=0 -> TAKEN)
+      0xd28001a0,  // mov  x0, #13     (skipped)
+      0x54000060,  // b.eq +12 -> idx9 (reads NZCV: correct Z=0 -> not taken)
+      0xd2800540,  // mov  x0, #42     (correct)
+      0x14000002,  // b    +8 -> idx10
+      0xd2800c60,  // mov  x0, #99     (bug: stale Z=1 -> b.eq taken)
+      0xd503201f,  // nop
+  };
+  InitBerberis();
+  GuestAddr base = ToGuestAddr(code);
+  GuestMapShadow::GetInstance()->SetExecutable(base, sizeof(code));
+  GuestThread* thread = GetCurrentGuestThread();
+  auto& cpu = thread->state()->cpu;
+  cpu.insn_addr = base;
+  GuestAddr stop = base + sizeof(code);
+  auto* cache = TranslationCache::GetInstance();
+  cache->SetStop(stop);
+  ExecuteGuest(thread->state());
+  cache->TestingClearStop(stop);
+  GuestMapShadow::GetInstance()->ClearExecutable(base, sizeof(code));
+  EXPECT_EQ(cpu.x[0], 42u);  // 99 would mean stale flags on the taken path
+}
+
 TEST(DigitalisBench, Int) {
   RunKernel({"int", kInt, std::size(kInt), std::size(kInt) * 4u, 3'000'000, 18});
 }
