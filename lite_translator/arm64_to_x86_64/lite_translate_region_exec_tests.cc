@@ -11952,6 +11952,21 @@ TEST_F(Arm64LiteTranslateRegionTest, Rev16XScalar) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 0x2211443366558877ULL);
 }
+// region digitalis - scalar REV32 Xd / REV Wd (DataProc1Src opcode 000010).
+TEST_F(Arm64LiteTranslateRegionTest, Rev32XScalar) {
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  static const uint32_t code[] = {0xDAC00820u};  // rev32 x0, x1
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Byte-reverse each 32-bit word: 0x11223344 -> 0x44332211, 0x55667788 -> 0x88776655.
+  EXPECT_EQ(state_.cpu.x[0], 0x4433221188776655ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, RevWScalar) {
+  state_.cpu.x[1] = 0x11223344AABBCCDDULL;
+  static const uint32_t code[] = {0x5AC00820u};  // rev w0, w1
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0xDDCCBBAAULL);  // low word byte-reversed, zero-extended
+}
+// endregion
 TEST_F(Arm64LiteTranslateRegionTest, FcvtlF32ToF64) {
   float in[2] = {1.5f, -2.5f};
   std::memcpy(&state_.cpu.v[1], in, 8);
@@ -12674,6 +12689,40 @@ TEST_F(Arm64LiteTranslateRegionTest, UrecpeUrsqrteMatchesInterpreter) {
   memcpy(&state_.cpu.v[1], lanes, 16);
   state_.cpu.v[0] = ~__uint128_t{0};
   EXPECT_TRUE(Run(urecpe2s, ToGuestAddr(urecpe2s) + sizeof(urecpe2s)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+// Wide SUQADD/USQADD .2S/.4S (32-bit lanes): mixed-sign saturating accumulate,
+// now JIT-lowered (sum in 64-bit GP + clamp). SUQADD reads Vd as a signed
+// accumulator + unsigned Vn; USQADD unsigned Vd + signed Vn. Validated against
+// the interpreter oracle with lanes that exercise both saturation directions.
+TEST_F(Arm64LiteTranslateRegionTest, SuqaddUsqadd4SMatchesInterpreter) {
+  // Vd lanes (accumulator) and Vn lanes (addend) chosen to hit +sat, -sat,
+  // and in-range under each opcode's signedness interpretation.
+  const uint32_t dl[4] = {0x7FFFFFF0u, 0x80000000u, 0x00000005u, 0xFFFFFFFBu};
+  const uint32_t nl[4] = {0x00000040u, 0x00000001u, 0xFFFFFFF0u, 0x7FFFFFFFu};
+  auto check = [&](auto& code) {
+    memcpy(&state_.cpu.v[0], dl, 16);
+    memcpy(&state_.cpu.v[1], nl, 16);
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+    memcpy(&state_.cpu.v[0], dl, 16);
+    memcpy(&state_.cpu.v[1], nl, 16);
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]);
+  };
+  static const uint32_t suqadd4s[] = {0x4ea03820u};
+  static const uint32_t usqadd4s[] = {0x6ea03820u};
+  static const uint32_t suqadd2s[] = {0x0ea03820u};  // Q=0 zeroes upper 64
+  static const uint32_t usqadd2s[] = {0x2ea03820u};
+  check(suqadd4s);
+  check(usqadd4s);
+  check(suqadd2s);
+  check(usqadd2s);
+  memcpy(&state_.cpu.v[0], dl, 16);
+  memcpy(&state_.cpu.v[1], nl, 16);
+  EXPECT_TRUE(Run(suqadd2s, ToGuestAddr(suqadd2s) + sizeof(suqadd2s)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
 // endregion
