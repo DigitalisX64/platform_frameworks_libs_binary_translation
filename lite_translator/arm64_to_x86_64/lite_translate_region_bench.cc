@@ -96,6 +96,19 @@ constexpr uint32_t kMem[] = {
     0xf9400c26, 0xf9000c46, 0xf1000400, 0x54fffee1,
 };  // 10 words; stop = 10*4. ops/iter = 10.
 
+// syscall-heavy: clock_gettime(CLOCK_MONOTONIC) in a tight loop. Preamble
+// (idx0) copies the harness's x0 iteration count into x9; the loop (idx1..5)
+// issues svc #0 with x8=113, x0=1, x1=timespec buffer. Measures the syscall
+// emulation path; the vDSO fast path should raise this number.
+constexpr uint32_t kSys[] = {
+    0xaa0003e9,  // mov  x9, x0   (iter count)
+    0xd2800e28,  // mov  x8, #113 (__NR_clock_gettime)
+    0xd2800020,  // mov  x0, #1   (CLOCK_MONOTONIC)
+    0xd4000001,  // svc  #0
+    0xf1000529,  // subs x9, x9, #1
+    0x54ffff81,  // b.ne idx1
+};  // stop = 6*4; guest insns/iter (loop body) = 5.
+
 struct Kernel {
   const char* name;
   const uint32_t* code;
@@ -118,6 +131,13 @@ double TimeOnce(const Kernel& k) {
   GuestAddr stop = base + k.stop_off;
   auto* cache = TranslationCache::GetInstance();
 
+  // Valid pointer args for the mem (x1/x2) and syscall (x1=timespec) kernels;
+  // set before the warmup so even the warmup pass has a valid buffer.
+  static uint64_t srcbuf[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  static uint64_t dstbuf[8] = {0};
+  cpu.x[1] = ToGuestAddr(srcbuf);
+  cpu.x[2] = ToGuestAddr(dstbuf);
+
   // Warm the translation cache once (untimed).
   cpu.insn_addr = base;
   cpu.x[0] = 1;
@@ -127,9 +147,6 @@ double TimeOnce(const Kernel& k) {
   // Timed run.
   cpu.insn_addr = base;
   cpu.x[0] = k.iters;
-  // memcpy kernel needs valid src/dst pointers.
-  static uint64_t srcbuf[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-  static uint64_t dstbuf[8] = {0};
   cpu.x[1] = ToGuestAddr(srcbuf);
   cpu.x[2] = ToGuestAddr(dstbuf);
   struct timespec t0, t1;
@@ -237,6 +254,11 @@ TEST(DigitalisBench, Fp) {
 }
 TEST(DigitalisBench, Mem) {
   RunKernel({"mem", kMem, std::size(kMem), std::size(kMem) * 4u, 3'000'000, 10});
+}
+TEST(DigitalisBench, Syscall) {
+  // Fewer iters: each carries a clock_gettime. insns/iter counts the 5 loop-body
+  // guest instructions; the figure is syscall-bound, so a vDSO fast path shows.
+  RunKernel({"syscall", kSys, std::size(kSys), 6u * 4u, 1'000'000, 5});
 }
 
 }  // namespace
