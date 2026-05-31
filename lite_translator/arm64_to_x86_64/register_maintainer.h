@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -75,4 +74,3 @@ class RegisterFileMaintainer {
 }  // namespace berberis
 
 #endif  // BERBERIS_LITE_TRANSLATOR_RISCV64_REGISTER_MAINTAINER_H_
-// endregion

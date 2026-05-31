@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -43,4 +42,3 @@ void ResetSigactionRestorer(Guest_sigaction* guest_sa) {
 }
 
 }  // namespace berberis
-// endregion

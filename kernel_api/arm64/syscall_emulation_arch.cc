@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -54,4 +53,3 @@ void ConvertHostStatToGuestArch(const struct stat& host_stat, GuestAddr guest_ad
 }
 
 }  // namespace berberis
-// endregion

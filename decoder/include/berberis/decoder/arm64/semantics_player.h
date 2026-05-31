@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -48,7 +47,7 @@ class SemanticsPlayer {
     }
   }
 
-  // region digitalis - ADDG/SUBG (add/subtract immediate, with tags).
+  // ADDG/SUBG (add/subtract immediate, with tags).
   // Rn/Rd = 31 mean SP (not ZR). The listener does the address + tag-nibble
   // arithmetic on the value; the player handles the SP read/write.
   void AddSubImmTags(const typename Decoder::AddSubImmTagsArgs& args) {
@@ -56,7 +55,6 @@ class SemanticsPlayer {
     Register result = listener_->AddSubImmTags(args.is_sub, src, args.uimm6, args.uimm4);
     SetRegOrSp(args.dst, result);
   }
-  // endregion
 
   void LogicalImm(const typename Decoder::LogicalImmArgs& args) {
     Register src = GetRegOrZero(args.src);
@@ -87,7 +85,6 @@ class SemanticsPlayer {
     SetRegOrIgnore(args.dst, result);
   }
 
-  // region digitalis
   // LDR/LDRSW (literal) — PC-relative integer load. The listener
   // computes the target address from `(insn_addr + offset)` and reads
   // `size` bytes; LDRSW sign-extends 32→64. PRFM literal is decoded as
@@ -96,7 +93,6 @@ class SemanticsPlayer {
     Register result = listener_->LoadLiteral(args.size, args.is_signed, args.offset);
     SetRegOrIgnore(args.rt, result);
   }
-  // endregion
 
   void Bitfield(const typename Decoder::BitfieldArgs& args) {
     Register src = GetRegOrZero(args.src);
@@ -125,7 +121,7 @@ class SemanticsPlayer {
     Register target = GetRegOrZero(args.src);
     if (args.is_link) {
       // BLR: save return address in X30.
-      // region digitalis - snapshot target before overwriting X30.
+      // snapshot target before overwriting X30.
       // For BLR X30 (or any BLR Xn where Xn maps to the same host register as
       // X30), SetReg(30, ret_addr) would clobber the host register that still
       // holds the original branch target. Copy target to a fresh temp first so
@@ -133,7 +129,6 @@ class SemanticsPlayer {
       if (args.src == 30) {
         target = listener_->Copy(target);
       }
-      // endregion
       Register ret_addr = listener_->GetImm(listener_->GetInsnAddr() + 4);
       listener_->SetReg(30, ret_addr);
     }
@@ -196,7 +191,6 @@ class SemanticsPlayer {
   void LoadStorePair(const typename Decoder::LoadStorePairArgs& args) {
     Register base = GetRegOrSp(args.rn);
 
-    // region digitalis
     // For pre-index and signed-offset, compute address with offset.
     // // For pre-index, compute address first and write back.
     // Register addr = base;
@@ -210,7 +204,6 @@ class SemanticsPlayer {
       // Signed-offset: apply offset without writeback.
       addr = listener_->AddImm(base, args.offset);
     }
-    // endregion
 
     uint8_t scale = (args.size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
 
@@ -235,7 +228,7 @@ class SemanticsPlayer {
     Register base = GetRegOrSp(args.rn);
     Register offset_reg = GetRegOrZero(args.rm);
 
-    // region digitalis - Forward extend_type so the handler can apply
+    // Forward extend_type so the handler can apply
     // the correct 32->64 extension (UXTW vs SXTW vs LSL/SXTX) before
     // shift+add. Previously this collapsed to LSL and corrupted the
     // address whenever the offset W register had nonzero upper half or
@@ -250,18 +243,16 @@ class SemanticsPlayer {
                                            args.shift_amount);
       SetRegOrIgnore(args.rt, result);
     }
-    // endregion
   }
 
   void Svc(const typename Decoder::SvcArgs& args) {
     listener_->Svc(args.imm);
   }
 
-  // region digitalis - BRK breakpoint (delivers SIGTRAP to the guest).
+  // BRK breakpoint (delivers SIGTRAP to the guest).
   void Brk(uint16_t imm) {
     listener_->Brk(imm);
   }
-  // endregion
 
   void Mrs(const typename Decoder::MrsArgs& args) {
     Register result = listener_->Mrs(args.sysreg);
@@ -335,7 +326,6 @@ class SemanticsPlayer {
 
   void Undefined() { listener_->Undefined(); }
 
-  // region digitalis
   // MTE DP-2src: IRG / GMI / SUBP / SUBPS. The listener owns the full
   // SP/XZR semantics + (for SUBPS) NZCV update, because those rules
   // differ between the four opcodes (e.g., IRG dst can be SP, the others
@@ -352,9 +342,7 @@ class SemanticsPlayer {
   void MteLoadStore(const typename Decoder::MteLoadStoreArgs& args) {
     listener_->MteLoadStore(args);
   }
-  // endregion
 
-  // region digitalis
   // AdvSIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
   // The listener owns the per-rot lane shuffling (FCADD's "rotate operand2
   // by ±90°" and FCMLA's four-rot table) since exposing every variant via
@@ -362,9 +350,8 @@ class SemanticsPlayer {
   void AdvSimdFcma(const typename Decoder::FcmaArgs& args) {
     listener_->AdvSimdFcma(args);
   }
-  // endregion
 
-  // region digitalis indexed FCMLA
+  // indexed FCMLA
   // AdvSIMD complex floating-point by element (Armv8.3-FCMA): FCMLA-idx.
   // The listener owns broadcasting a single complex pair from Vm[index]
   // across every output pair; expressing the per-index broadcast through
@@ -373,9 +360,7 @@ class SemanticsPlayer {
   void AdvSimdFcmaIdx(const typename Decoder::FcmaIdxArgs& args) {
     listener_->AdvSimdFcmaIdx(args);
   }
-  // endregion
 
-  // region digitalis
   // AdvSIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT / BFMMLA.
   // The listener owns BF16-to-FP32 widening and the 2x4 * 4x2 matrix
   // iteration pattern because doing that through GetSimd*/SetSimd* would
@@ -383,9 +368,8 @@ class SemanticsPlayer {
   void AdvSimdBf16ThreeSame(const typename Decoder::Bf16ThreeSameArgs& args) {
     listener_->AdvSimdBf16ThreeSame(args);
   }
-  // endregion
 
-  // region digitalis hello-dotprod
+  // hello-dotprod
   // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT, vector
   // and by-element forms.  Lane layout (4 bytes packed per 32-bit lane)
   // and the per-form indexed broadcast belong in the listener since
@@ -394,15 +378,12 @@ class SemanticsPlayer {
   void AdvSimdDotProduct(const typename Decoder::DotProductArgs& args) {
     listener_->AdvSimdDotProduct(args);
   }
-  // endregion
 
-  // region digitalis - I8MM matrix multiply-accumulate (SMMLA/UMMLA/USMMLA).
+  // I8MM matrix multiply-accumulate (SMMLA/UMMLA/USMMLA).
   void AdvSimdMatMul(const typename Decoder::MatMulArgs& args) {
     listener_->AdvSimdMatMul(args);
   }
-  // endregion
 
-  // region digitalis
   void SimdModifiedImm(const typename Decoder::SimdModifiedImmArgs& args) {
     listener_->SimdModifiedImm(args);
   }
@@ -412,14 +393,12 @@ class SemanticsPlayer {
     listener_->SimdLoadStoreImm(args, base);
   }
 
-  // region digitalis
   // LDR (literal) — SIMD/FP form. The listener computes the address
   // from (insn_addr + offset) and loads `size` bytes into V[rt]
   // (32-bit S / 64-bit D / 128-bit Q), zero-extending the upper bits.
   void SimdLoadLiteral(const typename Decoder::SimdLoadLiteralArgs& args) {
     listener_->SimdLoadLiteral(args);
   }
-  // endregion
 
   void SimdLoadStoreImmPreIndex(const typename Decoder::SimdLoadStoreImmArgs& args) {
     Register base = GetRegOrSp(args.rn);
@@ -468,7 +447,6 @@ class SemanticsPlayer {
     listener_->FpIntConversion(args);
   }
 
-  // region digitalis
   void FpMovImmediate(uint8_t rd, uint8_t imm8, uint8_t ftype) {
     listener_->FpMovImmediate(rd, imm8, ftype);
   }
@@ -486,7 +464,6 @@ class SemanticsPlayer {
   void FpFixedPointConversion(const typename Decoder::FpFixedPointArgs& args) {
     listener_->FpFixedPointConversion(args);
   }
-  // endregion
 
   void AdvSimdCopy(const typename Decoder::AdvSimdCopyArgs& args) {
     listener_->AdvSimdCopy(args);
@@ -496,17 +473,14 @@ class SemanticsPlayer {
     listener_->AdvSimdThreeSame(args);
   }
 
-  // region digitalis
   void AdvSimdThreeDiff(const typename Decoder::AdvSimdThreeDiffArgs& args) {
     listener_->AdvSimdThreeDiff(args);
   }
-  // endregion
 
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
     listener_->AdvSimdExtract(rd, rn, rm, index, q);
   }
 
-  // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
     listener_->AdvSimdPermute(rd, rn, rm, size, opcode, q);
@@ -535,18 +509,16 @@ class SemanticsPlayer {
   void Xar(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm6) {
     listener_->Xar(rd, rn, rm, imm6);
   }
-  // endregion
 
-  // region digitalis - SM4 (FEAT_SM4).
+  // SM4 (FEAT_SM4).
   void Sm4e(uint8_t rd, uint8_t rn) {
     listener_->Sm4e(rd, rn);
   }
   void Sm4ekey(uint8_t rd, uint8_t rn, uint8_t rm) {
     listener_->Sm4ekey(rd, rn, rm);
   }
-  // endregion
 
-  // region digitalis - SM3 (FEAT_SM3).
+  // SM3 (FEAT_SM3).
   void Sm3ss1(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
     listener_->Sm3ss1(rd, rn, rm, ra);
   }
@@ -559,24 +531,18 @@ class SemanticsPlayer {
   void Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
     listener_->Sm3partw2(rd, rn, rm);
   }
-  // endregion
 
-  // region digitalis
   void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
     listener_->CryptoAes(rd, rn, opcode);
   }
-  // endregion
 
-  // region digitalis
   void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
     listener_->CryptoSha3Reg(rd, rn, rm, opcode);
   }
   void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
     listener_->CryptoSha2Reg(rd, rn, opcode);
   }
-  // endregion
 
-  // region digitalis
   void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t size,
                           bool q, bool is_store, bool postindex, uint8_t rm,
                           bool is_interleaved) {
@@ -587,9 +553,7 @@ class SemanticsPlayer {
   void AdvSimdSingleStruct(const typename Decoder::AdvSimdSingleStructArgs& args) {
     listener_->AdvSimdSingleStruct(args);
   }
-  // endregion
 
-  // region digitalis
   void AddSubWithCarry(uint8_t rd, uint8_t rn, uint8_t rm, bool is_64bit, bool is_sub, bool set_flags) {
     Register src1 = GetRegOrZero(rn);
     Register src2 = GetRegOrZero(rm);
@@ -609,7 +573,6 @@ class SemanticsPlayer {
     Register result = listener_->Extr(src_n, src_m, lsb, is_64bit);
     SetRegOrIgnore(rd, result);
   }
-  // endregion
 
   void ConditionalCompare(const typename Decoder::ConditionalCompareArgs& args) {
     Register rn = GetRegOrZero(args.rn);
@@ -634,17 +597,14 @@ class SemanticsPlayer {
     listener_->FpCompare(args);
   }
 
-  // region digitalis
   void FpConditionalCompare(const typename Decoder::FpConditionalCompareArgs& args) {
     listener_->FpConditionalCompare(args);
   }
-  // endregion
 
   void AdvSimdTwoRegMisc(const typename Decoder::AdvSimdTwoRegMiscArgs& args) {
     listener_->AdvSimdTwoRegMisc(args);
   }
 
-  // region digitalis
   void AdvSimdScalarTwoRegMisc(const typename Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
     listener_->AdvSimdScalarTwoRegMisc(args);
   }
@@ -656,24 +616,18 @@ class SemanticsPlayer {
   void AdvSimdScalarPairwise(const typename Decoder::AdvSimdScalarPairwiseArgs& args) {
     listener_->AdvSimdScalarPairwise(args);
   }
-  // endregion
 
   void AdvSimdShiftByImm(const typename Decoder::AdvSimdShiftImmArgs& args) {
     listener_->AdvSimdShiftByImm(args);
   }
-  // endregion
 
-  // region digitalis
   void AdvSimdVecXIndexedElement(const typename Decoder::AdvSimdVecXIdxArgs& args) {
     listener_->AdvSimdVecXIndexedElement(args);
   }
-  // endregion
 
-  // region digitalis
   void AdvSimdScalarXIndexedElement(const typename Decoder::AdvSimdScalarXIdxArgs& args) {
     listener_->AdvSimdScalarXIndexedElement(args);
   }
-  // endregion
 
  private:
   // ARM64: register 31 as zero register.
@@ -708,4 +662,3 @@ class SemanticsPlayer {
 }  // namespace berberis
 
 #endif  // BERBERIS_DECODER_ARM64_SEMANTICS_PLAYER_H_
-// endregion

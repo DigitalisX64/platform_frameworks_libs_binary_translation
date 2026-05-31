@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -25,4 +24,3 @@ bool IsProgramCounterProperlyAlignedForArch(GuestAddr pc) {
 }
 
 }  // namespace berberis
-// endregion

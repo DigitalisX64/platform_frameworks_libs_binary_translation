@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -324,7 +323,7 @@ TEST_F(Arm64LiteTranslateRegionTest, CbnzTaken) {
 }
 
 TEST_F(Arm64LiteTranslateRegionTest, SvcEndsRegion) {
-  // region digitalis - SVC sets success_=false so the interpreter handles it.
+  // SVC sets success_=false so the interpreter handles it.
   // The region translates MOVZ successfully, then fails at SVC.
   // The dispatch loop installs kInterpreted for the SVC address.
   static const uint32_t code[] = {
@@ -341,7 +340,6 @@ TEST_F(Arm64LiteTranslateRegionTest, SvcEndsRegion) {
   // SVC causes translation failure at its PC — interpreter will handle it.
   EXPECT_FALSE(success);
   EXPECT_EQ(stop_pc, ToGuestAddr(code) + 4);  // PC of the SVC instruction
-  // endregion
 }
 
 TEST_F(Arm64LiteTranslateRegionTest, Nop) {
@@ -352,7 +350,6 @@ TEST_F(Arm64LiteTranslateRegionTest, Nop) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
 }
 
-// region digitalis
 // CSEL Xd, Xn, Xm, cond: sf=1, op=0, S=0, 11010100, Rm, cond, 0, op2=0, Rn, Rd
 constexpr uint32_t CselX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
   return 0x9A800000 | (static_cast<uint32_t>(rm) << 16) |
@@ -1151,7 +1148,7 @@ TEST_F(Arm64LiteTranslateRegionTest, StpQ_SignedOffset_Positive) {
   }
 }
 
-// region digitalis - SIMD load JIT coverage (plan §C1 verify).
+// SIMD load JIT coverage (plan §C1 verify).
 //
 // The SIMD load JIT path (lite_translator.h:2207 SimdLoadStoreImm,
 // :2314 SimdLoadStorePair, :2348 SimdLoadStoreReg) was added piecemeal
@@ -1277,7 +1274,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SimdLoadRegOffset128Bit) {
   }
 }
 
-// region digitalis - AdvSIMD multi-register contiguous LD1/ST1 JIT
+// AdvSIMD multi-register contiguous LD1/ST1 JIT
 // (LD2/LD3/LD4 with de-interleaving remain interpreter-only).
 
 // Encoding helper for AdvSIMD multi-structure LD1/ST1:
@@ -1425,7 +1422,7 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St1_1x8B_DoesNotTouchUpp
   for (int i = 8; i < 16; ++i) EXPECT_EQ(buffer[i], 0xCC) << "hi " << i;
 }
 
-// region digitalis - de-interleaving LD2/LD3/LD4 and interleaving ST2/ST3/ST4.
+// de-interleaving LD2/LD3/LD4 and interleaving ST2/ST3/ST4.
 // LD2 {V0.4S, V1.4S}, [X0] — opcode=1000, size=10 (32-bit), Q=1, 2 regs.
 TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_Ld2_4S_Deinterleaves) {
   alignas(16) static uint32_t buffer[8] = {0x10, 0x20, 0x11, 0x21,
@@ -1521,9 +1518,7 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdMultiStruct_St4_16B_Interleaves) {
     }
   }
 }
-// endregion
 
-// endregion
 
 // Test: single FMUL s0, s0, s1 (in-place multiply)
 TEST_F(Arm64LiteTranslateRegionTest, FmulS_InPlace) {
@@ -1870,7 +1865,7 @@ TEST_F(Arm64LiteTranslateRegionTest, OrderfileCrashPattern_9Registers) {
   EXPECT_EQ(state_.cpu.x[9], 1ULL);    // counter incremented
 }
 
-// region digitalis - regression test for WhatsApp libsuperpack vtable dispatcher.
+// regression test for WhatsApp libsuperpack vtable dispatcher.
 // LDP Xt1, Xt2, [Xn] where Xt1 (or Xt2) aliases Xn must load BOTH values from
 // the *original* base address, not from "base updated with val1". Previously
 // LoadPair did SetReg(rt1, val1) between the two underlying Loads — and since
@@ -1922,9 +1917,8 @@ TEST_F(Arm64LiteTranslateRegionTest, LdpBaseAliasesSecondDest) {
   EXPECT_EQ(state_.cpu.x[1], 0xCAFEBABE'12345678ULL);
   EXPECT_EQ(state_.cpu.x[2], 0xF00DFACE'87654321ULL);
 }
-// endregion
 
-// region digitalis - STP pre-index probe tests.
+// STP pre-index probe tests.
 // STP Xt1, Xt2, [Xn, #imm]!  (pre-index, with writeback)
 // Encoding: sf=1 -> 1010_1001_10_imm7_Rt2_Rn_Rt1 (64-bit), type=11.
 //   bits[31:30]=10, bits[29:23]=1010_011, bit22=0(store), imm7=signed7, then rt2/rn/rt1.
@@ -2024,9 +2018,8 @@ TEST_F(Arm64LiteTranslateRegionTest, StpX_PreIndexNegative_X1Base) {
   EXPECT_EQ(new_x1[0], 0xAAAA'AAAA'AAAA'AAAAULL);
   EXPECT_EQ(new_x1[1], 0xBBBB'BBBB'BBBB'BBBBULL);
 }
-// endregion
 
-// region digitalis LDP/STP pre/post-index JIT exec-tests.
+// LDP/STP pre/post-index JIT exec-tests.
 // Confirms the decoder routes op2=01 (post-index) and op2=11 (pre-index) to
 // the LoadStorePair callback with is_postindex / is_preindex set, and that
 // the semantics_player + JIT pair correctly writes back the indexed base.
@@ -2149,9 +2142,8 @@ TEST_F(Arm64LiteTranslateRegionTest, StpPostIndexAliasRn) {
   // Base register must now be base + 0x10.
   EXPECT_EQ(state_.cpu.x[5], base + 0x10);
 }
-// endregion
 
-// region digitalis atomic-op JIT exec-tests.
+// atomic-op JIT exec-tests.
 // The interpreter path was verified by hello-lse and hello-barriers
 // at the integration level, but until now the JIT path for LSE
 // atomics had zero unit-test coverage.  A hot-loop regression would slip past
@@ -2217,7 +2209,6 @@ constexpr uint32_t SwpX(uint8_t rs, uint8_t rt, uint8_t rn) {
          (static_cast<uint32_t>(rn) << 5) | rt;
 }
 
-// region digitalis
 // W-form (size=10 → base 0xB8200000), H-form (size=01 → base 0x78200000),
 // and B-form (size=00 → base 0x38200000) variants of selected LSE LD<op>
 // opcodes.  The opc[14:12] field is identical across all four sizes:
@@ -2242,7 +2233,6 @@ constexpr uint32_t LdumaxB(uint8_t rs, uint8_t rt, uint8_t rn) {
   return 0x38206000 | (static_cast<uint32_t>(rs) << 16) |
          (static_cast<uint32_t>(rn) << 5) | rt;
 }
-// endregion
 
 // CASP / CASPX (compare-and-swap pair, Armv8.1 LSE — ):
 //   bit[31]=0, bit[30]=sz (0 W-pair, 1 X-pair), bits[29:23]=0010000, bit[22]=L,
@@ -2453,7 +2443,6 @@ TEST_F(Arm64LiteTranslateRegionTest, LduminPicksSmallerUnsignedX) {
   EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFFFFFFFFF00ULL);
 }
 
-// region digitalis
 // LSE W/B/H/XZR edge-case pinning suite.  These convert the source-only audit
 // of the kLdsmax/kLdumax/kLdset/kLdclr CAS-loop construction (handoff-308)
 // into runtime evidence.  Each test targets one specific invariant:
@@ -2573,7 +2562,6 @@ TEST_F(Arm64LiteTranslateRegionTest, LdsetXRtXzrDiscardsResult) {
   EXPECT_EQ(state_.cpu.x[0], expected_x0_after);
   EXPECT_EQ(state_.cpu.x[2], expected_x2_after);
 }
-// endregion
 
 // CASP 32-bit pair: equal expected → swap performed; Rs:Rs+1 receive the
 // (matching) old pair zero-extended (verify checkbox).
@@ -2757,9 +2745,8 @@ TEST_F(Arm64LiteTranslateRegionTest, BarriersDoNotBreakRegion) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 12ULL);
 }
-// endregion
 
-// region digitalis - FCVT*S/U scalar saturation diagnostic tests.
+// FCVT*S/U scalar saturation diagnostic tests.
 // Used to debug the unsigned sf=1 +Inf saturation path.
 constexpr uint32_t kFcvtnuXd0 = 0x9E610000;  // FCVTNU X0, D0
 constexpr uint32_t kFcvtpuXs0 = 0x9E290000;  // FCVTPU X0, S0
@@ -2963,9 +2950,7 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtauWdPosInfSaturates) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(UINT32_MAX));
 }
-// endregion
 
-// region digitalis
 // AdvSimd scalar two-reg-misc JIT lowerings: SCVTF / UCVTF / FCVTZS / FCVTZU /
 // FCVTAS / FCVTAU.  These all write the bottom S/D lane of Vd with the upper
 // 96/64 bits zeroed (single-lane semantics).
@@ -3258,9 +3243,7 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtxnSdDn_NegZeroPassthrough) {
             0x80000000u);  // -0.0f
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // ORR/BIC (vector, immediate) are read-modify-write, unlike MOVI/MVNI. The
 // per-32-bit-lane immediate for "#0x0f" (cmode=0b0001) is 0x0000000F.
 
@@ -3346,9 +3329,7 @@ TEST_F(Arm64LiteTranslateRegionTest, BicImm2S_Interpreter_ZeroesUpper) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x1111111011111110ULL);
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis
 // SQABS scalar: signed saturating absolute value, single-lane.
 // Encoding: AdvSimd scalar two-reg-misc with U=0, opcode=00111.
 // llvm-mc-21 checks at decoder.h:5398:
@@ -3447,9 +3428,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqabsBdBn_ZeroIdentity) {
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0ULL);
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // SQNEG scalar: signed saturating negate, single-lane.
 // Encoding: AdvSimd scalar two-reg-misc with U=1, opcode=00111 (same
 // dispatch shell as SQABS, just U bit flipped).
@@ -3550,9 +3529,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqnegDdDn_IntMinSaturates) {
             0x7FFFFFFFFFFFFFFFULL);  // INT64_MAX
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // SQXTN scalar: signed saturating extract narrow, single-lane.
 // Encoding: AdvSimd scalar two-reg-misc with U=0, opcode=10100.
 // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit src,
@@ -3669,9 +3646,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqxtnBdHn_ZeroIdentity) {
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0ULL);
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // UQXTN scalar: unsigned saturating extract narrow, single-lane.
 // Encoding: AdvSimd scalar two-reg-misc with U=1, opcode=10100.
 // size: 00 → 8-bit dst from 16-bit src, 01 → 16-bit dst from 32-bit src,
@@ -3786,9 +3761,7 @@ TEST_F(Arm64LiteTranslateRegionTest, UqxtnSdDn_AllOnesSaturates) {
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0xFFFFFFFFULL);
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // SQXTUN scalar: signed-source, unsigned-dst saturating extract narrow,
 // single-lane.  Encoding: AdvSimd scalar two-reg-misc with U=1,
 // opcode=10010.
@@ -3954,9 +3927,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqxtunBdHn_ZeroIdentity) {
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[0], 0ULL);
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // FRECPE scalar: single-lane FP reciprocal estimate.  AdvSimd scalar
 // two-reg-misc encoding with U=0, opcode=11101, bits[11:10]=10.
 // Decoder pins size ∈ {10, 11}; bit0 selects S (FP32, size=10) vs
@@ -4092,9 +4063,7 @@ TEST_F(Arm64LiteTranslateRegionTest, FrecpeDdDn_FourToQuarter) {
             0x3FD0000000000000ULL);  // 0.25d
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // FRSQRTE scalar: single-lane FP reciprocal-square-root estimate.  AdvSimd
 // scalar two-reg-misc encoding with U=1, opcode=11101, bits[11:10]=10.
 // Decoder pins size ∈ {10, 11}; bit0 selects S (FP32, size=10) vs
@@ -4233,9 +4202,7 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrteDdDn_PosInfToPosZero) {
   EXPECT_EQ(*reinterpret_cast<uint64_t*>(&state_.cpu.v[0]), 0ULL);
   EXPECT_EQ(reinterpret_cast<uint64_t*>(&state_.cpu.v[0])[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // FRINTA Sd, Sn / Dd, Dn (round to nearest, ties AWAY from zero).
 // FP data-processing 1-source, opcode=001100:
 //   FRINTA Sd, Sn: 0001_1110_0010_0110_0100_00nn_nnnd_dddd  (ftype=00)
@@ -5303,9 +5270,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtauV2dTiesAwayAndSat) {
   EXPECT_EQ(out[0], 1u);
   EXPECT_EQ(out[1], UINT64_MAX);
 }
-// endregion
 
-// region digitalis - SCVTF / UCVTF V: vector int -> FP for .2S, .4S, .2D.
+// SCVTF / UCVTF V: vector int -> FP for .2S, .4S, .2D.
 constexpr uint32_t kScvtfV4s00 = 0x4E21D800;
 constexpr uint32_t kScvtfV2s00 = 0x0E21D800;
 constexpr uint32_t kScvtfV2d00 = 0x4E61D800;
@@ -5413,9 +5379,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UcvtfV2dBit63Set) {
   EXPECT_EQ(out[0], 9223372036854775808.0);   // 2^63
   EXPECT_EQ(out[1], 18446744073709551616.0);  // 2^64 (UINT64_MAX rounds up)
 }
-// endregion
 
-// region digitalis - SABDL/UABDL/SABAL/UABAL .2D (size=10): Psubq +
+// SABDL/UABDL/SABAL/UABAL .2D (size=10): Psubq +
 // Pcmpgtq-against-zero signed-abs primitive (no SSE 64-bit max/min).
 
 // SABDL .2D (Q=0): signed 32→64 widening + abs diff.  Lane 1 exercises the
@@ -5662,9 +5627,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FjcvtzsTwoToTheFiftyThree) {
   EXPECT_EQ(state_.cpu.x[2], uint64_t{0});
   EXPECT_EQ(state_.cpu.flags & 0xC101, uint16_t{0});  // not exact: d != 0
 }
-// endregion
 
-// region digitalis: FMULX scalar three-same JIT lowering (FP32 / FP64).
+// FMULX scalar three-same JIT lowering (FP32 / FP64).
 // FMULX = FMUL except (±0 * ±inf) returns ±2.0 with sign(a) XOR sign(b).
 // Encoding (per ARM ARM C7.2.149 "FMULX (vector)" scalar subset and
 // llvm-mc verification):
@@ -5807,9 +5771,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarSZeroTimesFinite) {
   EXPECT_FLOAT_EQ(result, 0.0f);
   EXPECT_FALSE(std::signbit(result));
 }
-// endregion
 
-// region digitalis: FRECPS / FRSQRTS scalar three-same JIT (FP32/FP64).
+// FRECPS / FRSQRTS scalar three-same JIT (FP32/FP64).
 // FRECPS  = std::fma(-a, b, 2.0); FRSQRTS = std::fma(-a, b, 3.0)/2.
 // Special cases: NaN input -> default qNaN; (±0,±inf) cross -> +2.0/+1.5.
 // Encoding (per ARM ARM C7.2.151/155 and llvm-mc verification):
@@ -5996,9 +5959,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarSNewtonStepOnOne) {
   std::memcpy(&result, &state_.cpu.v[0], sizeof(float));
   EXPECT_FLOAT_EQ(result, 1.0f);
 }
-// endregion
 
-// region digitalis: FABD scalar three-same JIT lowering (FP32 / FP64).
+// FABD scalar three-same JIT lowering (FP32 / FP64).
 // FABD Sd, Sn, Sm = |Sn - Sm| in FP32; same for D form.  Matches the
 // interpreter's std::fabs(a - b) reference semantics.
 // Encoding (ARM ARM C7.2.96 "FABD" scalar and llvm-mc verification):
@@ -6120,9 +6082,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FabdScalarSInfMinusFinite) {
   EXPECT_EQ(result, inf);
   EXPECT_FALSE(std::signbit(result));
 }
-// endregion
 
-// region digitalis: FCMEQ / FCMGE / FCMGT / FACGE / FACGT scalar three-same
+// FCMEQ / FCMGE / FCMGT / FACGE / FACGT scalar three-same
 // JIT (FP32/FP64).  Encoding (per ARM ARM C7.2.85 "FCMEQ (scalar)",
 // C7.2.87 "FCMGE (scalar, register)", C7.2.89 "FCMGT (scalar, register)",
 // C7.2.61 "FACGE (scalar)", C7.2.63 "FACGT (scalar)"):
@@ -6356,9 +6317,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FacgtScalarSAbsEqualZero) {
   std::memcpy(&lane0, &state_.cpu.v[0], sizeof(uint32_t));
   EXPECT_EQ(lane0, 0u);
 }
-// endregion
 
-// region digitalis: AdvSimdScalarThreeSame FP16 compare family — FCMEQ /
+// AdvSimdScalarThreeSame FP16 compare family — FCMEQ /
 // FCMGE / FCMGT / FACGE / FACGT scalar Hd via F16C round-trip.
 // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)" —
 // bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=a, bit22=1, bit21=0,
@@ -6511,9 +6471,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmeqScalarHInPlace) {
     EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
   }
 }
-// endregion
 
-// region digitalis: AdvSimdScalarThreeSame FP16 FMULX scalar Hd via F16C
+// AdvSimdScalarThreeSame FP16 FMULX scalar Hd via F16C
 // round-trip.  Same lift recipe as the FP16 compare family (Pxor + Pinsrw +
 // Vcvtph2ps each FP16 source lane into FP32 xmm lane 0); the existing FP32
 // FMULX core (Mulss + cmpunord-blend with ±2.0 on the ±0×±inf special case)
@@ -6635,9 +6594,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxScalarHInPlace) {
     EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
   }
 }
-// endregion
 
-// region digitalis: AdvSimdScalarThreeSame FP16 FABD scalar Hd via F16C
+// AdvSimdScalarThreeSame FP16 FABD scalar Hd via F16C
 // round-trip.  Same lift recipe as FMULX H (Pxor + Pinsrw + Vcvtph2ps each
 // FP16 source lane into FP32 xmm lane 0); the existing FP32 FABD core
 // (Subss + AND with non-sign-bit mask) runs unchanged on the lifted
@@ -6751,9 +6709,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FabdScalarHInPlace) {
     EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
   }
 }
-// endregion
 
-// region digitalis: AdvSimdScalarThreeSame FP16 FRECPS scalar Hd via F16C
+// AdvSimdScalarThreeSame FP16 FRECPS scalar Hd via F16C
 // round-trip.  Same lift recipe as FMULX H / FABD H (Pxor + Pinsrw +
 // Vcvtph2ps each FP16 source lane into FP32 xmm lane 0); the existing FP32
 // FRECPS Newton-step core (Vfnmadd231ss of K_fma=+2.0 - a*b, with K_sat=+2.0
@@ -6866,9 +6823,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrecpsScalarHInPlace) {
     EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
   }
 }
-// endregion
 
-// region digitalis: FRSQRTS scalar H (FP16) — JIT-emitted via the same F16C
+// FRSQRTS scalar H (FP16) — JIT-emitted via the same F16C
 // round-trip recipe as FRECPS H, with the additional Divss-by-2 step routed
 // through `use_single` so it fires on the FP16-lifted FP32 lane 0.  Encoding
 // per ARM ARM C7.2.7 "FRSQRTS (scalar)" — a=1, U=0, opcode_3=111 (delta from
@@ -6961,9 +6917,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsScalarHInPlace) {
     EXPECT_EQ(reinterpret_cast<const uint16_t*>(&state_.cpu.v[5])[i], 0u);
   }
 }
-// endregion
 
-// region digitalis: AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
+// AdvSimdScalarPairwise JIT — ADDP scalar (D) and FADDP
 // scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar pairwise",
 // C7.2.6 "ADDP (scalar)", C7.2.66 "FADDP (scalar)"):
 //   ADDP  Vd.D, Vn.2D    = 0x5EF1B800 | (rn<<5) | rd  (U=0 size=11 op=11011)
@@ -7104,9 +7059,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FaddpScalarSInPlace) {
   EXPECT_EQ(upper[1], 0u);
   EXPECT_EQ(upper[2], 0u);
 }
-// endregion
 
-// region digitalis: AdvSimdScalarPairwise JIT — FMAXP / FMINP / FMAXNMP /
+// AdvSimdScalarPairwise JIT — FMAXP / FMINP / FMAXNMP /
 // FMINNMP scalar (S/D non-FP16).  Encoding (ARM ARM "Advanced SIMD scalar
 // pairwise", C7.2 — U=1 FP leg, opcode=01111 for max/min, opcode=01100 for
 // maxnm/minnm; size[1] selects min(=1) vs max(=0) family; size[0] selects
@@ -7389,9 +7343,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmaxpScalarSInPlace) {
   EXPECT_EQ(upper[1], 0u);
   EXPECT_EQ(upper[2], 0u);
 }
-// endregion
 
-// region digitalis: AdvSimdScalarPairwise JIT — FP16 forms (FADDP / FMAXP /
+// AdvSimdScalarPairwise JIT — FP16 forms (FADDP / FMAXP /
 // FMINP / FMAXNMP / FMINNMP scalar Hd).  Encoding (ARM ARM C7.2 "Advanced
 // SIMD scalar pairwise" — U=0 FP16 leg, bit22 (size[0]) = 0, bit23 (size[1])
 // selects max- vs min- for FMAX*/FMIN*; FADDP only allocated at bit23=0):
@@ -7537,9 +7490,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FminnmpScalarHBothNaN) {
   EXPECT_EQ(result & 0x7C00u, 0x7C00u);
   EXPECT_NE(result & 0x03FFu, 0u);
 }
-// endregion
 
-// region digitalis: FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// FMULX vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // Identical semantics to FMULX scalar, just lane-parallel.  Each lane
 // applies a*b except the (±0 * ±inf) saturation case, which yields ±2.0
 // with sign = sign(a) XOR sign(b) per-lane.
@@ -7657,9 +7609,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxVec2DRegular) {
   EXPECT_DOUBLE_EQ(r[0], 7.0);
   EXPECT_DOUBLE_EQ(r[1], -1.0);
 }
-// endregion
 
-// region digitalis: FP pairwise vector three-same (FADDP/FMAXP/FMINP/
+// FP pairwise vector three-same (FADDP/FMAXP/FMINP/
 // FMAXNMP/FMINNMP), interpreter path.  result low half = reduce(Vn pairs),
 // high half = reduce(Vm pairs).  FP32/64 encodings derived from FMULX
 // (U=1 in the FP three-same leg); FP16 from the FRECPS.4H base.
@@ -7801,9 +7752,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4H) {
   EXPECT_EQ(r[2], 0x4980);  // 5+6=11.0h
   EXPECT_EQ(r[3], 0x4B80);  // 7+8=15.0h
 }
-// endregion
 
-// region digitalis: FADD / FSUB / FMUL / FDIV vector three-same JIT
+// FADD / FSUB / FMUL / FDIV vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  Direct lowering to ADDPS/PD, SUBPS/PD,
 // MULPS/PD, DIVPS/PD (all SSE2).  Tests pick operand pairs that are
 // exactly representable in the target precision so the result is the
@@ -7974,9 +7924,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FdivVec2D) {
   EXPECT_DOUBLE_EQ(r[0], 2.25);
   EXPECT_DOUBLE_EQ(r[1], -0.125);
 }
-// endregion
 
-// region digitalis: FCMEQ / FCMGE / FCMGT / FACGE / FACGT vector three-same
+// FCMEQ / FCMGE / FCMGT / FACGE / FACGT vector three-same
 // JIT (FP32 .2S/.4S, FP64 .2D).  Encoding (per ARM ARM C7.2.85 / .87 / .89
 // vector form and C7.2.61 / .63 vector FACGE/FACGT):
 //   0 Q U 01110 op_high sz 1 Rm opcode_5 1 Rn Rd
@@ -8185,9 +8134,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FacgeVec2D) {
   EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);  // |-7| >= |5|
   EXPECT_EQ(r[1], 0xFFFFFFFFFFFFFFFFULL);  // |3| >= |-3|
 }
-// endregion
 
-// region digitalis: FCMxxZero vector two-reg-misc JIT (FP32 .2S/.4S, FP64 .2D).
+// FCMxxZero vector two-reg-misc JIT (FP32 .2S/.4S, FP64 .2D).
 //
 // FCMxx Vd.<T>, Vn.<T>, #0.0 compares each lane of Vn against +0.0 and writes
 // an all-ones mask on TRUE / zero on FALSE.  All five forms are ordered:
@@ -8394,9 +8342,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmltZeroVec2DStrict) {
   EXPECT_EQ(r[0], 0xFFFFFFFFFFFFFFFFULL);     // -5 < 0 -> true
   EXPECT_EQ(r[1], 0u);                          // 0 < 0 -> false
 }
-// endregion
 
-// region digitalis: FRECPE / FRSQRTE vector JIT (FP32 .2S/.4S, FP64 .2D).
+// FRECPE / FRSQRTE vector JIT (FP32 .2S/.4S, FP64 .2D).
 // Encoding (ARM ARM C7.2.118 / C7.2.131):
 //   FRECPE  V.4S, V.4S  = 0x4EA1D800 | (rn<<5) | rd  (U=0, opc=11101, bit23=1)
 //   FRECPE  V.2S, V.2S  = 0x0EA1D800 | (rn<<5) | rd  (Q=0)
@@ -8544,9 +8491,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrteVec2DNegative) {
   EXPECT_EQ(r[0], 0x7FF8000000000000ULL);                    // -3 -> qNaN
   EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(&r[1]), 4.0); // 1/sqrt(0.0625)
 }
-// endregion
 
-// region digitalis: SQABS / SQNEG vector JIT (B/H/S widths, .2D bails).
+// SQABS / SQNEG vector JIT (B/H/S widths, .2D bails).
 // Encoding (ARM ARM C7.2.241 / C7.2.243; AdvSimdTwoRegMisc opcode=00111):
 //   SQABS .8B  = 0x0E207800 | (rn<<5) | rd  (U=0, size=00, Q=0)
 //   SQABS .16B = 0x4E207800 | (rn<<5) | rd  (Q=1)
@@ -8746,9 +8692,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqnegVec8BUpperZero) {
   for (int i = 0; i < 8; i++) EXPECT_EQ(r[i], expected_low[i]) << "lane " << i;
   for (int i = 8; i < 16; i++) EXPECT_EQ(r[i], 0x00) << "lane " << i;
 }
-// endregion
 
-// region digitalis: SADDLP / UADDLP / SADALP / UADALP vector JIT
+// SADDLP / UADDLP / SADALP / UADALP vector JIT
 // (size=00 byte->half, size=01 half->word, size=10 word->dword).
 //
 // Encoding (ARM ARM C7.2.225 / C7.2.260 / C7.2.224 / C7.2.259;
@@ -9039,9 +8984,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UadalpVec4S) {
   EXPECT_EQ(r[0], uint64_t{0x1111111111111111ull} + uint64_t{0xFFFFFFFFu} + uint64_t{0xFFFFFFFFu});
   EXPECT_EQ(r[1], uint64_t{0xAAAABBBBCCCCDDDDull} + uint64_t{0x80000000u} + uint64_t{0x7FFFFFFFu});
 }
-// endregion
 
-// region digitalis: FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
+// FMAX / FMIN / FMAXNM / FMINNM vector three-same JIT
 // (FP32 .2S/.4S, FP64 .2D).  ARM and x86 disagree on NaN semantics:
 //   FMAX/FMIN  — IEEE: any NaN -> NaN result.
 //   FMAXNM/FMINNM — "max/min Number": one NaN -> return the non-NaN;
@@ -9310,9 +9254,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FminnmVec4SNaN) {
   EXPECT_TRUE(std::isnan(r[2]));
   EXPECT_FLOAT_EQ(r[3], 4.0f);
 }
-// endregion
 
-// region digitalis: FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// FMLA / FMLS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 // ARM ARM defines FMLA/FMLS as fused multiply-accumulate (one rounding).
 // The lowering uses Vfmadd231(ps|pd) / Vfnmadd231(ps|pd).  Tests pick
 // operand triples whose products are exactly representable in the target
@@ -9487,9 +9430,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4SFusedRounding) {
   std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
   EXPECT_EQ(r0_bits, ex_bits);
 }
-// endregion
 
-// region digitalis: FRECPS / FRSQRTS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
+// FRECPS / FRSQRTS vector three-same JIT (FP32 .2S/.4S, FP64 .2D).
 //
 // Encoding (verified with aarch64-linux-gnu-as / objdump):
 //   FRECPS  Vd.2S, Vn.2S, Vm.2S = 0x0E20FC00 | (rm<<16) | (rn<<5) | rd
@@ -9706,9 +9648,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrecpsVec4SFusedRounding) {
   std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
   EXPECT_EQ(r0_bits, ex_bits);
 }
-// endregion
 
-// region digitalis: AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL at
+// AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL at
 // FP32 (.2S / .4S) and FP64 (.2D).
 //
 // ARM ARM encoding:
@@ -10285,7 +10226,7 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarDRegular) {
   EXPECT_EQ(lane1, 0ULL);
 }
 
-// region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+// Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
 //
 // Encoding "Advanced SIMD scalar x indexed element (FP16)" per ARM ARM C7.2
 // uses size=0b00 (bits[23:22]).  Vm = Rm4 only (4 bits, V0..V15); the bit-20
@@ -10429,7 +10370,6 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlsIdxScalarHCorrect) {
   uint16_t r = reinterpret_cast<const uint16_t*>(&state_.cpu.v[0])[0];
   EXPECT_EQ(r, 0x9800u) << "expected fma(-a,a,1) -> FP16 0x9800, got 0x" << std::hex << r;
 }
-// endregion
 
 // Fused-vs-unfused divergence: pick (a, b, d) such that fma(a, b, d) differs
 // from (a*b)+d in float, proving the lowering uses VFMADD231PS.
@@ -10454,9 +10394,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlaIdxVec4SFusedRounding) {
   std::memcpy(&ex_bits, &expected, sizeof(uint32_t));
   EXPECT_EQ(r0_bits, ex_bits);
 }
-// endregion
 
-// region digitalis: FP16 vector FRECPS / FRSQRTS .4H / .8H — F16C round-trip
+// FP16 vector FRECPS / FRSQRTS .4H / .8H — F16C round-trip
 // JIT.  Encodings (verified via aarch64-linux-gnu-as):
 //   FRECPS  Vd.4H, Vn.4H, Vm.4H = 0x0E403C00 | (rm<<16) | (rn<<5) | rd
 //   FRECPS  Vd.8H, Vn.8H, Vm.8H = 0x4E403C00 | (rm<<16) | (rn<<5) | rd
@@ -10655,9 +10594,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec8HTwoPassRegular) {
   EXPECT_EQ(r[6], kHalf_1_0);  // (3 - 4*0.25)/2 = 1
   EXPECT_EQ(r[7], kHalf_1_0);  // (3 - 2*0.5)/2 = 1
 }
-// endregion
 
-// region digitalis: FP16 vector FMULX .4H / .8H — F16C round-trip JIT.
+// FP16 vector FMULX .4H / .8H — F16C round-trip JIT.
 // Encodings derived from the scalar FMULX H base (0x5E401C00, opcode_h=011)
 // by clearing the scalar-form high nibble (bits[31:28]=0101 -> 0000 for Q=0
 // or 0100 for Q=1):
@@ -10774,9 +10712,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulxVec8HTwoPassMixed) {
   EXPECT_EQ(r[6], kHalf_neg2_0);  // (+0, -inf) -> -2.0
   EXPECT_EQ(r[7], kHalf_2_0);     // (-0, -inf) -> +2.0
 }
-// endregion
 
-// region digitalis: FP16 vector FMLA / FMLS .4H / .8H — FP16 -> FP32 -> FP64
+// FP16 vector FMLA / FMLS .4H / .8H — FP16 -> FP32 -> FP64
 // round-trip JIT.  Encodings (verified via aarch64-linux-gnu-as -march=
 // armv8.2-a+fp16):
 //   FMLA Vd.4H, Vn.4H, Vm.4H = 0x0E400C00 | (rm<<16) | (rn<<5) | rd
@@ -11013,9 +10950,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmlaVec4HFusedRounding) {
   LoadVec8H(state_.cpu, 0, r);
   EXPECT_EQ(r[0], expected);
 }
-// endregion
 
-// region digitalis: FP16 vector by-element FMLA / FMLS / FMUL .4H / .8H.
+// FP16 vector by-element FMLA / FMLS / FMUL .4H / .8H.
 // Decoder dispatches size=0b00, U=0, opcode ∈ {0001 FMLA, 0101 FMLS,
 // 1001 FMUL} to AdvSimdVecXIndexedElement.  Encoding (verified via
 // aarch64-linux-gnu-as -march=armv8.2-a+fp16):
@@ -11237,9 +11173,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmulIdxVec8HTwoPass) {
   EXPECT_EQ(r[6], 0x4600);        //  3*2 = 6.0h
   EXPECT_EQ(r[7], kHalf_2_0);     //  1*2 = 2
 }
-// endregion
 
-// region digitalis: FP16 scalar FpDataProc3 — FMADD / FMSUB / FNMADD / FNMSUB
+// FP16 scalar FpDataProc3 — FMADD / FMSUB / FNMADD / FNMSUB
 // on Hn/Hm/Ha/Hd.  Encoding (verified via aarch64-linux-gnu-as
 // -march=armv8.2-a+fp16): bits[31:24]=00011111, bits[23:22]=11 (ftype=H),
 // bit21=O1, bits[20:16]=Rm, bit15=o0, bits[14:10]=Ra, bits[9:5]=Rn,
@@ -11412,9 +11347,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FmaddHSmallTail) {
   EXPECT_EQ(r[0], 0x1800u);  // 2^-9 = 0.001953125 in FP16.
   for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u);
 }
-// endregion
 
-// region digitalis: integer MUL/MLA/MLS by-element JIT tests.
+// integer MUL/MLA/MLS by-element JIT tests.
 //
 // Encoding: 0 Q U 01111 size L M Rm[3:0] opcode H 0 Rn Rd.
 //   - halfword (size=01): index = H:L:M (3 bits, 0..7), Vm restricted to V0..V15.
@@ -11673,9 +11607,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MulVsMlaIdxDispatch) {
   LoadVec8H(state_.cpu, 0, r);
   EXPECT_EQ(r[0], 79u);
 }
-// endregion
 
-// region digitalis - SHA3 (FEAT_SHA3): EOR3 / BCAX / RAX1 / XAR — interpreter.
+// SHA3 (FEAT_SHA3): EOR3 / BCAX / RAX1 / XAR — interpreter.
 // Encodings verified via clang -march=armv8.2-a+sha3:
 //   EOR3 = 0xCE000000 | rm<<16 | ra<<10 | rn<<5 | rd
 //   BCAX = 0xCE200000 | rm<<16 | ra<<10 | rn<<5 | rd
@@ -11760,9 +11693,8 @@ TEST_F(Arm64LiteTranslateRegionTest, XarRotRightPerLane) {
   EXPECT_EQ(r[0], (x0 >> 4) | (x0 << 60));
   EXPECT_EQ(r[1], 0ULL);
 }
-// endregion
 
-// region digitalis - XTN / XTN2 (truncating extract narrow) — JIT.
+// XTN / XTN2 (truncating extract narrow) — JIT.
 // Encodings (clang --target=aarch64):
 //   xtn  .8b=0x0E212800  xtn2 .16b=0x4E212800
 //   xtn  .4h=0x0E612800  xtn2 .8h =0x4E612800
@@ -11821,9 +11753,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Xtn2_16bUpperHalf) {
   EXPECT_EQ(r[0], 0x0123456789ABCDEFULL);  // preserved
   EXPECT_EQ(r[1], 0x44332211F0BC7834ULL);  // truncated bytes
 }
-// endregion
 
-// region digitalis - SQXTN / UQXTN / SQXTUN (saturating extract narrow) — JIT.
+// SQXTN / UQXTN / SQXTUN (saturating extract narrow) — JIT.
 // Encodings (clang --target=aarch64):
 //   sqxtn .8b=0x0E214800 .4h=0x0E614800 ; sqxtn2 .16b=0x4E214800
 //   uqxtn .8b=0x2E214800 .4h=0x2E614800
@@ -11918,9 +11849,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqxtn2_16bUpperHalf) {
   EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
   EXPECT_EQ(r[1], 0x7F7F7F7F7F7F7F7FULL);  // saturated
 }
-// endregion
 
-// region digitalis - scalar REV16 + FCVTL/FCVTN (FP32<->FP64) JIT.
+// scalar REV16 + FCVTL/FCVTN (FP32<->FP64) JIT.
 constexpr uint32_t Rev16W(uint8_t rd, uint8_t rn) {
   return 0x5AC00400u | (uint32_t{rn} << 5) | rd;
 }
@@ -11952,7 +11882,7 @@ TEST_F(Arm64LiteTranslateRegionTest, Rev16XScalar) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 0x2211443366558877ULL);
 }
-// region digitalis - scalar REV32 Xd / REV Wd (DataProc1Src opcode 000010).
+// scalar REV32 Xd / REV Wd (DataProc1Src opcode 000010).
 TEST_F(Arm64LiteTranslateRegionTest, Rev32XScalar) {
   state_.cpu.x[1] = 0x1122334455667788ULL;
   static const uint32_t code[] = {0xDAC00820u};  // rev32 x0, x1
@@ -11966,7 +11896,6 @@ TEST_F(Arm64LiteTranslateRegionTest, RevWScalar) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 0xDDCCBBAAULL);  // low word byte-reversed, zero-extended
 }
-// endregion
 TEST_F(Arm64LiteTranslateRegionTest, FcvtlF32ToF64) {
   float in[2] = {1.5f, -2.5f};
   std::memcpy(&state_.cpu.v[1], in, 8);
@@ -12013,9 +11942,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Fcvtn2F64ToF32Upper) {
   EXPECT_FLOAT_EQ(hi[0], 3.5f);
   EXPECT_FLOAT_EQ(hi[1], -4.5f);
 }
-// endregion
 
-// region digitalis - SIMD modified-immediate (MOVI/MVNI) JIT.  Encoded words
+// SIMD modified-immediate (MOVI/MVNI) JIT.  Encoded words
 // from clang --target=aarch64.  Values match the interpreter's expand-and-
 // replace semantics.
 TEST_F(Arm64LiteTranslateRegionTest, Movi4s) {
@@ -12068,9 +11996,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Movi8h) {
   EXPECT_EQ(r[0], 0x00AB00AB00AB00ABULL);
   EXPECT_EQ(r[1], 0x00AB00AB00AB00ABULL);
 }
-// endregion
 
-// region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half) JIT.
+// ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half) JIT.
 constexpr uint32_t Addhn8b(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x0E204000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
 }
@@ -12158,9 +12085,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Addhn2_16bUpper) {
   EXPECT_EQ(r[0], 0x1122334455667788ULL);  // preserved
   EXPECT_EQ(r[1], 0x0303030303030303ULL);
 }
-// endregion
 
-// region digitalis - BRK delivers a synchronous SIGTRAP (not SIGILL). Install a
+// BRK delivers a synchronous SIGTRAP (not SIGILL). Install a
 // host SIGTRAP handler that siglongjmps out, interpret a BRK, and confirm the
 // trap fired — proving BRK routes to the interpreter's breakpoint path rather
 // than the illegal-instruction (SIGILL) path.
@@ -12255,9 +12181,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Dcps1DeliversSigill) {
   sigaction(SIGILL, &old_sa, nullptr);
   EXPECT_EQ(g_brk_signal, SIGILL);
 }
-// endregion
 
-// region digitalis - FRINTTS (FEAT_FRINTTS) scalar: round to a 32/64-bit
+// FRINTTS (FEAT_FRINTTS) scalar: round to a 32/64-bit
 // integral FP value, saturating out-of-range/NaN to the most-negative value.
 // Interpreter-only (JIT bails); driven via InterpretInsn.
 TEST_F(Arm64LiteTranslateRegionTest, Frint32zScalarSingle) {
@@ -12326,9 +12251,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Frint64zVector2D) {
   EXPECT_DOUBLE_EQ(out[0], -5.0);
   EXPECT_DOUBLE_EQ(out[1], -9223372036854775808.0);  // > INT64_MAX -> saturate
 }
-// endregion
 
-// region digitalis - LDGM/STGM/STZGM (FEAT_MTE tag-block): without MTE
+// LDGM/STGM/STZGM (FEAT_MTE tag-block): without MTE
 // backing, LDGM reads tags as zero (Rt=0) and STGM/STZGM are tag NOPs.
 TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
   alignas(16) static uint8_t buf[64];
@@ -12348,9 +12272,8 @@ TEST_F(Arm64LiteTranslateRegionTest, LdgmStgmStzgmTagBlock) {
   InterpretInsn(&state_);
   EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(stzgm) + 4);
 }
-// endregion
 
-// region digitalis - CRC32C* (Castagnoli) JIT via host SSE4.2 CRC32. Validate
+// CRC32C* (Castagnoli) JIT via host SSE4.2 CRC32. Validate
 // the JIT against the interpreter (the validated software CRC32C), which also
 // verifies the newly-added host crc32 assembler encoding end-to-end.
 TEST_F(Arm64LiteTranslateRegionTest, Crc32cMatchesInterpreter) {
@@ -12380,9 +12303,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Crc32cMatchesInterpreter) {
                            << " acc=0x" << c.acc << " data=0x" << c.data;
   }
 }
-// endregion
 
-// region digitalis - SHLL/SHLL2 (shift left long by element size) JIT.
+// SHLL/SHLL2 (shift left long by element size) JIT.
 constexpr uint32_t Shll8h(uint8_t rd, uint8_t rn) { return 0x2E213800u | (rn << 5) | rd; }
 constexpr uint32_t Shll2_8h(uint8_t rd, uint8_t rn) { return 0x6E213800u | (rn << 5) | rd; }
 constexpr uint32_t Shll4s(uint8_t rd, uint8_t rn) { return 0x2E613800u | (rn << 5) | rd; }
@@ -12417,9 +12339,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ShllVariants) {
   EXPECT_EQ(r[0], 0x0000000100000000ULL);
   EXPECT_EQ(r[1], 0x0000000200000000ULL);
 }
-// endregion
 
-// region digitalis - FCVTXN/FCVTXN2 (FP64->FP32 round-to-odd) JIT. Validate the
+// FCVTXN/FCVTXN2 (FP64->FP32 round-to-odd) JIT. Validate the
 // JIT against the interpreter (the round-to-odd reference) across non-NaN edge
 // cases (exact, inexact, overflow, signed zero), the FCVTXN2 high-half write,
 // and that a NaN lane yields a quiet NaN.
@@ -12725,9 +12646,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SuqaddUsqadd4SMatchesInterpreter) {
   EXPECT_TRUE(Run(suqadd2s, ToGuestAddr(suqadd2s) + sizeof(suqadd2s)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
+// SM3 (FEAT_SM3): SM3SS1, SM3TT1A/2A, SM3PARTW1/2. Inputs
 // and outputs are validated against the SM3 round/expansion (the full sequence
 // reproduces the published SM3("abc") digest). Interpreter-only.
 TEST_F(Arm64LiteTranslateRegionTest, Sm3Ops) {
@@ -12787,9 +12707,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Sm3Ops) {
   EXPECT_EQ(r[0], 0x534D5759DA08FD0DULL);
   EXPECT_EQ(r[1], 0xB13D8224B30A847CULL);
 }
-// endregion
 
-// region digitalis - SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY (key
+// SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY (key
 // expansion). Inputs/outputs are the single-instruction steps of the GB/T
 // 32907 standard test vector (whose full 8x-SM4E flow reproduces the published
 // ciphertext 681edf34 d206965e 86b3e94f 536e4246). Interpreter-only.
@@ -12815,9 +12734,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Sm4eAndSm4ekey) {
   EXPECT_EQ(r[0], 0xA18B4CB227FAD345ULL);
   EXPECT_EQ(r[1], 0xCC13E2EE11C1E22AULL);
 }
-// endregion
 
-// region digitalis - I8MM (FEAT_I8MM): USDOT (mixed-sign dot product) and the
+// I8MM (FEAT_I8MM): USDOT (mixed-sign dot product) and the
 // integer matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Interpreter-only; the
 // signed/unsigned/mixed forms must give distinct results (Vn byte0=0x80,
 // byte8=0xFF distinguish signed vs unsigned interpretation).
@@ -12949,9 +12867,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MmlaJitMatchesInterpreter) {
   check(ummla);
   check(usmmla);
 }
-// endregion
 
-// region digitalis - ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
+// ADDG/SUBG (FEAT_MTE): add/sub a 16-byte-scaled offset to
 // the address and adjust the logical tag in bits[59:56]. Interpreter-only.
 TEST_F(Arm64LiteTranslateRegionTest, AddgSubgTagArithmetic) {
   state_.cpu.x[1] = 0x0500000000001000ULL;  // tag 5, address 0x1000
@@ -12964,9 +12881,8 @@ TEST_F(Arm64LiteTranslateRegionTest, AddgSubgTagArithmetic) {
   InterpretInsn(&state_);
   EXPECT_EQ(state_.cpu.x[0], 0x0200000000000FE0ULL);  // tag (5-3)=2, addr 0xFE0
 }
-// endregion
 
-// region digitalis - RNDR (FEAT_RNG): MRS Xt, RNDR returns entropy and clears
+// RNDR (FEAT_RNG): MRS Xt, RNDR returns entropy and clears
 // NZCV (success). Interpreter-only. Two draws differ; flags end cleared.
 TEST_F(Arm64LiteTranslateRegionTest, RndrReturnsEntropyAndClearsFlags) {
   static const uint32_t code0[] = {0xD53B2400u};      // mrs x0, RNDR
@@ -12980,9 +12896,8 @@ TEST_F(Arm64LiteTranslateRegionTest, RndrReturnsEntropyAndClearsFlags) {
   InterpretInsn(&state_);
   EXPECT_NE(state_.cpu.x[0], state_.cpu.x[1]);  // independent draws (entropy)
 }
-// endregion
 
-// region digitalis - URECPE / URSQRTE .4S (unsigned integer reciprocal /
+// URECPE / URSQRTE .4S (unsigned integer reciprocal /
 // reciprocal-sqrt estimate) — interpreter (JIT bails). Driven via InterpretInsn.
 constexpr uint32_t Urecpe4s(uint8_t rd, uint8_t rn) {
   return 0x4EA1C800u | (uint32_t{rn} << 5) | rd;
@@ -13014,9 +12929,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Ursqrte4sEstimate) {
   EXPECT_EQ(r[0], 0xB4800000FF800000ULL);
   EXPECT_EQ(r[1], 0xB500000093800000ULL);
 }
-// endregion
 
-// region digitalis - SQDMULL/SQDMLAL/SQDMLSL .2D (.2S->.2D, 64-bit saturation).
+// SQDMULL/SQDMLAL/SQDMLSL .2D (.2S->.2D, 64-bit saturation).
 constexpr uint32_t Sqdmull2d(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x0EA0D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
 }
@@ -13060,9 +12974,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqdmlsl2dAccum) {
   EXPECT_EQ(r[0], 0x0000000000000046ULL);           // 100-30
   EXPECT_EQ(r[1], 0x8000000000000065ULL);           // 100-INT64_MAX (in range)
 }
-// endregion
 
-// region digitalis - SQDMULL .4S (signed doubling widening multiply) JIT.
+// SQDMULL .4S (signed doubling widening multiply) JIT.
 constexpr uint32_t Sqdmull4s(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x0E60D000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
 }
@@ -13109,9 +13022,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqdmlsl4sSaturatingAccum) {
   EXPECT_EQ(r[0], 0xFFFFFF920000004CULL);
   EXPECT_EQ(r[1], 0x8000000080000065ULL);  // lane3 sat -
 }
-// endregion
 
-// region digitalis - SUQADD / USQADD (saturating accumulate, mixed sign) JIT.
+// SUQADD / USQADD (saturating accumulate, mixed sign) JIT.
 //   SUQADD = 0x0E203800 | (q<<30) | (size<<22) | (rn<<5) | rd
 //   USQADD = SUQADD | (1<<29)  (U bit)
 constexpr uint32_t Suqadd(uint8_t rd, uint8_t rn, uint8_t size, bool q) {
@@ -13171,9 +13083,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Suqadd16b) {  // Q=1 exercises the high hal
   EXPECT_EQ(r[0], 0xe27f487f000fba7fULL);
   EXPECT_EQ(r[1], 0x067f057f00017f24ULL);
 }
-// endregion
 
-// region digitalis - PMULL / PMULL2 .8H (poly8 widening carryless multiply) JIT.
+// PMULL / PMULL2 .8H (poly8 widening carryless multiply) JIT.
 constexpr uint32_t Pmull8h(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x0E20E000u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
 }
@@ -13200,9 +13111,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Pmull2_8hPoly8UsesHighHalf) {
   EXPECT_EQ(r[0], 0x000255553F7E3F7EULL);
   EXPECT_EQ(r[1], 0x2222001501004000ULL);
 }
-// endregion
 
-// region digitalis - SQDMULH / SQRDMULH (by element, vector) — interpreter.
+// SQDMULH / SQRDMULH (by element, vector) — interpreter.
 //
 // The JIT path bails (no x86_64 lowering yet); the runtime falls back to
 // InterpretInsn, which now handles SQDMULH-idx / SQRDMULH-idx via the
@@ -15205,7 +15115,6 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshVec4SStage1CornerAndStage2SatJit) {
   EXPECT_EQ(r[3], 0x42);
 }
 
-// region digitalis
 // Armv8.1-RDM scalar three-same-extra (SQRDMLAH / SQRDMLSH, scalar form).
 // Sibling of the vector form above.  JIT bails to interpreter (the
 // AdvSimdScalarThreeSame JIT dispatch only handles FP arms today);
@@ -15326,9 +15235,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarSStage1AndStage2Saturate) {
   InterpretInsn(&state_);
   EXPECT_EQ(static_cast<int32_t>(state_.cpu.v[0]), INT32_MIN);
 }
-// endregion
 
-// region digitalis
 // Armv8.1-RDM scalar by-element (SQRDMLAH / SQRDMLSH).  Reads one indexed
 // lane from Vm; same two-stage saturation semantics as the scalar
 // three-same form above.  JIT bails to interpreter.  Encoding (per
@@ -15432,9 +15339,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarIdxSStage1CornerSubtracts) {
   InterpretInsn(&state_);
   EXPECT_EQ(static_cast<int32_t>(state_.cpu.v[0]), 0);
 }
-// endregion
 
-// region digitalis
 // JIT-driven coverage for SQRDMLAH/SQRDMLSH scalar three-same and scalar
 // by-element (Armv8.1-RDM).  The InterpretInsn-driven tests above continue
 // to exercise the interpreter handler; the tests below drive Run() so the
@@ -15521,9 +15426,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlshScalarIdxSStage1CornerSubtractsJit)
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis
 // D-form scalar integer three-same encoders (ADD / SUB / CMGT / CMHI / CMGE /
 // CMHS / CMTST / CMEQ scalar).
 //
@@ -15707,9 +15610,7 @@ TEST_F(Arm64LiteTranslateRegionTest, CmeqScalarDNotEqualJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis
 // SQDMULH / SQRDMULH scalar three-same (H/S forms).
 //
 // Encoding (per ARM ARM C7.2.301 / .305): standard
@@ -15885,9 +15786,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqdmulhScalarSZeroOperandJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]) >> 32, uint64_t{0});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis
 // SQADD / UQADD / SQSUB / UQSUB scalar (B/H forms).
 //
 // Encoding (ARM ARM C7.2.282 / .284 / .317 / .319): standard
@@ -16406,9 +16305,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqaddScalarDIgnoresUpperVnVmQwordsJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{8});  // 3 + 5
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SSHL / USHL scalar D form (non-saturating variable shift).
+// SSHL / USHL scalar D form (non-saturating variable shift).
 // The shift amount is the low 8 bits of Vm sign-extended to int8_t; positive
 // values shift left, negative values shift right (arithmetic for SSHL, logical
 // for USHL).  Encoded with opcode 0b01000 in the AdvSimdScalarThreeSame class.
@@ -16553,9 +16451,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ShlScalarDIgnoresUpperVnVmJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SSHL.2D / USHL.2D vector form (per-lane signed/unsigned
+// SSHL.2D / USHL.2D vector form (per-lane signed/unsigned
 // variable shift across two 64-bit lanes).  Encoded as AdvSimdThreeSame Q=1,
 // size=11, opcode=01000; U=0 (SSHL) or U=1 (USHL).
 constexpr uint32_t SshlVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -16699,9 +16596,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ShlVec2DUpperBytesOfShiftIgnoredJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
 }
-// endregion
 
-// region digitalis: SSHL.2S / SSHL.4S / USHL.2S / USHL.4S vector forms
+// SSHL.2S / SSHL.4S / USHL.2S / USHL.4S vector forms
 // (per-lane signed/unsigned variable shift across 2 or 4 32-bit lanes).
 // Encoded as AdvSimdThreeSame size=10, opcode=01000; Q selects .2S (0) or
 // .4S (1); U selects SSHL (0) or USHL (1).
@@ -16868,9 +16764,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ShlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SSHL.4H / SSHL.8H / USHL.4H / USHL.8H vector forms
+// SSHL.4H / SSHL.8H / USHL.4H / USHL.8H vector forms
 // (per-lane signed/unsigned variable shifts across 16-bit H-lanes).
 // Encoded as AdvSimdThreeSame size=01, opcode=01000; Q selects .4H (0) or
 // .8H (1); U selects SSHL (0) or USHL (1).
@@ -17078,9 +16973,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SshlVec8HMixedQuadrantsAllLanesJit) {
             static_cast<uint64_t>(
                 Pack4H(0x8000, 0xFFFF, 0x0000, 0xFFFF)));
 }
-// endregion
 
-// region digitalis: SSHL.8B / SSHL.16B / USHL.8B / USHL.16B vector forms
+// SSHL.8B / SSHL.16B / USHL.8B / USHL.16B vector forms
 // (per-lane signed/unsigned variable shifts across 8-bit B-lanes).
 // Encoded as AdvSimdThreeSame size=00, opcode=01000; Q selects .8B (0) or
 // .16B (1); U selects SSHL (0) or USHL (1).
@@ -17306,9 +17200,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ShlVec8BUpperBytesOfShiftIgnoredJit) {
                 Pack8B(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQSHL.2D vector form (per-lane unsigned saturating variable
+// UQSHL.2D vector form (per-lane unsigned saturating variable
 // shift across two 64-bit lanes).  Encoded as AdvSimdThreeSame Q=1, size=11,
 // opcode=01001, U=1.
 constexpr uint32_t UqshlVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -17436,9 +17329,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshlVec2DUpperBytesOfShiftIgnoredJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
 }
-// endregion
 
-// region digitalis: UQSHL .2S / .4S vector form (per-lane unsigned saturating
+// UQSHL .2S / .4S vector form (per-lane unsigned saturating
 // variable shift at 32-bit width).  Encoded as AdvSimdThreeSame Q=0/1, size=10,
 // opcode=01001, U=1.  Width-32 thresholds: sh >= 32 -> a==0 ? 0 : UINT32_MAX;
 // |sh| >= 32 -> 0; saturate to UINT32_MAX instead of UINT64_MAX.  Q=0 zeroes
@@ -17598,9 +17490,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SQSHL.2D vector form (per-lane signed saturating variable
+// SQSHL.2D vector form (per-lane signed saturating variable
 // shift across two 64-bit lanes).  Encoded as AdvSimdThreeSame Q=1, size=11,
 // opcode=01001, U=0.  Same scaffolding as UQSHL.2D but with sign-aware
 // saturation: pos a → INT64_MAX, neg a → INT64_MIN.  Negative arm uses SAR
@@ -17756,9 +17647,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVec2DUpperBytesOfShiftIgnoredJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
 }
-// endregion
 
-// region digitalis: SQSHL.2S/.4S vector form (per-lane signed saturating
+// SQSHL.2S/.4S vector form (per-lane signed saturating
 // variable shift across 2 or 4 32-bit lanes).  Encoded as AdvSimdThreeSame
 // Q∈{0,1}, U=0, size=10, opcode=01001.  Mirrors the SQSHL.2D recipe with
 // width-32 substitutions: ShllByCl / SarlByCl, Cmpq sh,32 instead of 64,
@@ -17931,9 +17821,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQSHL / SQSHL .4H / .8H vector form (per-lane saturating
+// UQSHL / SQSHL .4H / .8H vector form (per-lane saturating
 // variable shift at 16-bit width).  Encoded as AdvSimdThreeSame size=01,
 // opcode=01001, U=1 (UQSHL) or U=0 (SQSHL).  Mirrors the .2S/.4S recipe with
 // width-16 substitutions: Movzxwl (UQSHL) / Movsxwl (SQSHL) lane load;
@@ -18184,9 +18073,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVec4HUpperHalfZeroedJit) {
             static_cast<uint64_t>(Pack4H(0x0001, 0xFFFF, 0x8000, 0x7FFF)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQSHL/SQSHL .8B and .16B vector encodings + JIT
+// UQSHL/SQSHL .8B and .16B vector encodings + JIT
 // exec coverage.  AdvSimdThreeSame size=00 opcode=01001, U=1 (UQSHL) /
 // U=0 (SQSHL), Q=0 (.8B) / Q=1 (.16B).
 constexpr uint32_t UqshlVec8B(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -18476,9 +18364,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVec8BUpperHalfZeroedJit) {
                 Pack8B(0x01, 0xFF, 0x80, 0x7F, 0xCA, 0xFE, 0xBA, 0xBE)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: URSHL.2D vector form (per-lane unsigned non-saturating
+// URSHL.2D vector form (per-lane unsigned non-saturating
 // rounded variable shift across two 64-bit lanes).  Encoded as
 // AdvSimdThreeSame Q=1, size=11, opcode=01010, U=1.
 constexpr uint32_t UrshlVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -18786,9 +18673,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UrshlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SRSHL.2D vector form (per-lane signed non-saturating
+// SRSHL.2D vector form (per-lane signed non-saturating
 // rounded variable shift across two 64-bit lanes).  Encoded as
 // AdvSimdThreeSame Q=1, size=11, opcode=01010, U=0.  Mirror of URSHL.2D
 // with two changes: the negative-arm data shift uses SAR (signed) instead
@@ -18932,9 +18818,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshlVec2DUpperBytesOfShiftIgnoredJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
 }
-// endregion
 
-// region digitalis: SRSHL.2S / .4S vector form (per-lane signed non-saturating
+// SRSHL.2S / .4S vector form (per-lane signed non-saturating
 // rounded variable shift across 2 or 4 32-bit lanes).  Encoded as
 // AdvSimdThreeSame Q∈{0,1}, size=10, opcode=01010, U=0.  Width-32 port of
 // SRSHL.2D — uses SAR (signed) for the negative-arm data shift; the
@@ -19123,9 +19008,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: URSHL / SRSHL .4H / .8H vector form (per-lane non-
+// URSHL / SRSHL .4H / .8H vector form (per-lane non-
 // saturating rounded variable shift across 4 or 8 16-bit lanes).  Encoded
 // as AdvSimdThreeSame size=01, opcode=01010, bit10=1.  Width-16 port of
 // the .2S/.4S recipe: Movzxwl (URSHL) / Movsxwl (SRSHL) for lane load,
@@ -19396,9 +19280,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshlVec4HUpperHalfZeroedJit) {
             static_cast<uint64_t>(Pack4H(0xCAFE, 0xBABE, 0xDEAD, 0xBEEF)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: URSHL / SRSHL .8B / .16B vector form (per-lane non-
+// URSHL / SRSHL .8B / .16B vector form (per-lane non-
 // saturating rounded variable shift across 8 or 16 8-bit lanes).  Encoded
 // as AdvSimdThreeSame size=00, opcode=01010, bit10=1.  Width-8 port of
 // the .4H/.8H recipe: Movzxbl (URSHL) / Movsxbl (SRSHL) for lane load,
@@ -19693,9 +19576,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshlVec8BUpperHalfZeroedJit) {
                 Pack8B(0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQRSHL.2D vector form (per-lane unsigned saturating
+// UQRSHL.2D vector form (per-lane unsigned saturating
 // rounded variable shift across two 64-bit lanes).  Encoded as
 // AdvSimdThreeSame Q=1, size=11, opcode=01011, U=1.  Combines UQSHL.2D
 // positive arm (shift-then-back-shift overflow + saturate-to-UINT64_MAX)
@@ -19849,9 +19731,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshlVec2DUpperBytesOfShiftIgnoredJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
 }
-// endregion
 
-// region digitalis: UQRSHL .2S / .4S vector forms (per-lane unsigned
+// UQRSHL .2S / .4S vector forms (per-lane unsigned
 // saturating rounded variable shift across 32-bit lanes).  Encoded as
 // AdvSimdThreeSame Q={0,1}, size=10, opcode=01011, U=1.  Same quadrant
 // structure as UQRSHL.2D but with width-32 thresholds and a Q=0 Vd[127:64]
@@ -20014,9 +19895,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SQRSHL.2D vector form (per-lane signed saturating
+// SQRSHL.2D vector form (per-lane signed saturating
 // rounded variable shift across two 64-bit lanes).  Encoded as
 // AdvSimdThreeSame Q=1, size=11, opcode=01011, U=0.  Combines SQSHL.2D
 // positive arm (SAR-back-shift overflow detector + sign-broadcast
@@ -20195,9 +20075,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2DUpperBytesOfShiftIgnoredJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0x200ULL});
 }
-// endregion
 
-// region digitalis: SQRSHL .2S / .4S vector forms (per-lane signed
+// SQRSHL .2S / .4S vector forms (per-lane signed
 // saturating rounded variable shift across 32-bit lanes).  Encoded as
 // AdvSimdThreeSame Q={0,1}, size=10, opcode=01011, U=0.  Same quadrant
 // structure as SQRSHL.2D but with width-32 thresholds and a Q=0 Vd[127:64]
@@ -20383,9 +20262,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec2SUpperBytesOfShiftIgnoredJit) {
             (uint64_t{0x200ULL} << 32) | uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQRSHL/SQRSHL vector .4H/.8H form (size=01).  Width-16
+// UQRSHL/SQRSHL vector .4H/.8H form (size=01).  Width-16
 // per-lane saturating+rounded variable shift.  Combines the UQSHL/SQSHL
 // .4H/.8H saturation scaffolding (Shrl-back-16 + Testl bits[31:16] for
 // UQRSHL; Shll-Sarl-back-16 sign-ext-from-low-16 fit check + sign-aware
@@ -20655,9 +20533,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec4HUpperHalfZeroedJit) {
             static_cast<uint64_t>(Pack4H(0xCAFE, 0xBABE, 0xDEAD, 0xBEEF)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQRSHL/SQRSHL vector .8B/.16B form (size=00).  Width-8
+// UQRSHL/SQRSHL vector .8B/.16B form (size=00).  Width-8
 // per-lane saturating+rounded variable shift.  Combines the UQSHL/SQSHL
 // .8B/.16B saturation scaffolding (Shrl-back-8 + Testl bits[31:8] for
 // UQRSHL; Shll-Sarl-back-24 sign-ext-from-low-8 fit check + sign-aware
@@ -20945,9 +20822,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshlVec8BUpperHalfZeroedJit) {
                 Pack8B(0x01, 0xFF, 0x80, 0x7F, 0xCA, 0xFE, 0xBA, 0xBE)));
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQSHL scalar D form (unsigned saturating variable shift).
+// UQSHL scalar D form (unsigned saturating variable shift).
 // Encoded with opcode 0b01001, U=1 in the AdvSimdScalarThreeSame class.
 constexpr uint32_t UqshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
   return ScalarThreeSameD(/*u=*/1, /*opcode=*/0b01001, rd, rn, rm);
@@ -21101,9 +20977,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarDIgnoresUpperVnVmJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQSHL scalar B / H / S forms (unsigned saturating
+// UQSHL scalar B / H / S forms (unsigned saturating
 // variable shift at 8/16/32-bit lane widths).  Same opcode (0b01001, U=1)
 // as UqshlScalarD with size encoded in bits 23:22 of the instruction.
 constexpr uint32_t UqshlScalarB(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -21290,9 +21165,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarSIgnoresUpperVnJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0xFFFFFFFFULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SQSHL scalar D form (signed saturating variable shift).
+// SQSHL scalar D form (signed saturating variable shift).
 // Encoded with opcode 0b01001, U=0 in the AdvSimdScalarThreeSame class.
 constexpr uint32_t SqshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
   return ScalarThreeSameD(/*u=*/0, /*opcode=*/0b01001, rd, rn, rm);
@@ -21503,9 +21377,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDIgnoresUpperVnVmJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x10ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SQSHL scalar B / H / S forms (signed saturating
+// SQSHL scalar B / H / S forms (signed saturating
 // variable shift at 8/16/32-bit lane widths).  Same opcode (0b01001, U=0)
 // as SqshlScalarD with size encoded in bits 23:22 of the instruction.
 constexpr uint32_t SqshlScalarB(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -21723,9 +21596,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarSIgnoresUpperVnJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x7FFFFFFFULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: URSHL scalar D form (unsigned non-saturating rounded
+// URSHL scalar D form (unsigned non-saturating rounded
 // variable shift).  Encoded with opcode 0b01010, U=1 in the
 // AdvSimdScalarThreeSame class.
 constexpr uint32_t UrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -21922,9 +21794,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UrshlScalarDIgnoresUpperVnVmJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x40ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SRSHL scalar D form (signed non-saturating rounded
+// SRSHL scalar D form (signed non-saturating rounded
 // variable shift).  Encoded with opcode 0b01010, U=0 in the
 // AdvSimdScalarThreeSame class.
 constexpr uint32_t SrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -22146,9 +22017,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshlScalarDIgnoresUpperVnVmJit) {
             uint64_t{0xFFFFFFFFFFFFFFFEULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQRSHL scalar D form (unsigned saturating rounded
+// UQRSHL scalar D form (unsigned saturating rounded
 // variable shift).  Encoded with opcode 0b01011, U=1 in the
 // AdvSimdScalarThreeSame class.
 constexpr uint32_t UqrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -22361,9 +22231,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshlScalarDIgnoresUpperVnVmJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{3});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: UQRSHL scalar B/H/S forms (unsigned saturating rounded
+// UQRSHL scalar B/H/S forms (unsigned saturating rounded
 // variable shift, lane width 8/16/32).  Sibling of UqrshlScalarD using the
 // same opcode 0b01011, U=1 in the AdvSimdScalarThreeSame class but with
 // size=00 / 01 / 10 respectively.
@@ -22643,9 +22512,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshlScalarSIgnoresUpperVnJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{0x80000000ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SQRSHL scalar D form (signed saturating rounded variable
+// SQRSHL scalar D form (signed saturating rounded variable
 // shift).  Encoded with opcode 0b01011, U=0 in the AdvSimdScalarThreeSame
 // class.
 constexpr uint32_t SqrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -22890,9 +22758,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarDIgnoresUpperVnVmJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{3});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
-// region digitalis: SQRSHL scalar B / H / S forms (signed saturating rounded
+// SQRSHL scalar B / H / S forms (signed saturating rounded
 // variable shift at sub-D widths).  Encoded with U=0, opcode=01011 in the
 // AdvSimdScalarThreeSame class; sizes 00/01/10 select lane width 8/16/32.
 constexpr uint32_t SqrshlScalarB(uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -23247,7 +23114,6 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshlScalarSIgnoresUpperVnJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), uint64_t{3});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), uint64_t{0});
 }
-// endregion
 
 // JIT-driven coverage for the SQDMULH/SQRDMULH .8h / .4h by-element path
 // (size=01).  The interpreter-driven tests above continue to exercise the
@@ -23735,9 +23601,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmlahIdxVec2SUpperZeroJit) {
   EXPECT_EQ(r[2], 0);   // upper-zero.
   EXPECT_EQ(r[3], 0);
 }
-// endregion
 
-// region digitalis - FCSEL JIT
+// FCSEL JIT
 //
 // FCSEL Sd|Dd|Hd, Sn, Sm, cond
 //   Encoding: 0001 1110 <ftype:2> 1 Rm cond 11 Rn Rd
@@ -24005,9 +23870,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FcselDNeFalseZeroExtendsVd) {
   std::memcpy(bytes, &state_.cpu.v[0], sizeof(bytes));
   for (int i = 8; i < 16; ++i) EXPECT_EQ(bytes[i], 0u) << "byte " << i;
 }
-// endregion
 
-// region digitalis - FCCMP / FCCMPE JIT
+// FCCMP / FCCMPE JIT
 //
 // FCCMP Sn, Sm, #nzcv, cond   /   FCCMP Dn, Dm, #nzcv, cond
 //   Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv
@@ -24203,9 +24067,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FccmpHCondFalseWritesImmediate) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b1011u);
 }
-// endregion
 
-// region digitalis - FCMP NaN
+// FCMP NaN
 //
 // FCMP Sn, Sm / FCMP Dn, Dm / FCMP Sn, #0.0 / FCMP Dn, #0.0
 // FCMPE variants share the same NZCV mapping (the quiet-vs-signalling NaN
@@ -24401,9 +24264,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FcmpHUnordered) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(ReadArmNzcv(state_.cpu), 0b0011u);
 }
-// endregion
 
-// region digitalis - BFCVT scalar (§H2 JIT bullet)
+// BFCVT scalar (§H2 JIT bullet)
 //
 // BFCVT <Hd>, <Sn>: narrow one FP32 to BF16 with round-to-nearest-even,
 // quiet-NaN payload preserved.  Encoding uses ftype=01 (D-form
@@ -24487,9 +24349,8 @@ TEST_F(Arm64LiteTranslateRegionTest, BfcvtScalarSignallingNanQuieted) {
   // Expected: (0x7F800001 >> 16) | 0x0040 = 0x7F80 | 0x0040 = 0x7FC0.
   EXPECT_EQ(LoadFp16Bits(state_.cpu, 0), uint16_t{0x7FC0});
 }
-// endregion
 
-// region digitalis - BFCVTN / BFCVTN2 vector (§H2)
+// BFCVTN / BFCVTN2 vector (§H2)
 //
 // BFCVTN  v.4h, v.4s:  4 FP32 (Vn) -> 4 BF16 (Vd low 64), upper 64 zeroed.
 // BFCVTN2 v.8h, v.4s:  4 FP32 (Vn) -> 4 BF16 (Vd high 64), lower 64 preserved.
@@ -24585,9 +24446,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Bfcvtn2VecPreservesLowerHalf) {
   EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 6), uint16_t{0x4040});
   EXPECT_EQ(LoadBf16Lane(state_.cpu, 0, 7), uint16_t{0x4080});
 }
-// endregion
 
-// region digitalis - BFDOT vector + indexed (§H2)
+// BFDOT vector + indexed (§H2)
 //
 // BFDOT: per-FP32-lane sum of two BF16-pair products.
 //   For each output lane i:
@@ -25255,9 +25115,8 @@ TEST_F(Arm64LiteTranslateRegionTest, BfmmlaNanPropagates) {
   EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 2), 0x40800000u);
   EXPECT_EQ(LoadFp32LaneBits(state_.cpu, 0, 3), 0x40800000u);
 }
-// endregion
 
-// region digitalis - FP scalar unary
+// FP scalar unary
 //
 // Scalar FP one-source ops (FpDataProc1 family).  These pin the
 // architectural behaviour of the FP32 / FP64 JIT lowerings at
@@ -25556,9 +25415,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FrintzDPositive) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(LoadFp64(state_.cpu, 0), 3.0);
 }
-// endregion
 
-// region digitalis - FP scalar arithmetic edges
+// FP scalar arithmetic edges
 //
 // Scalar FP two-source ops (FpDataProc2 family).  Pins the architectural
 // behaviour of FADD / FSUB / FMUL / FDIV at S (ftype=00) and D (ftype=01)
@@ -25757,9 +25615,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FdivDInfOverInfIsNan) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_TRUE(std::isnan(LoadFp64(state_.cpu, 0)));
 }
-// endregion
 
-// region digitalis - FP scalar↔int conversion edges
+// FP scalar↔int conversion edges
 //
 // Scalar FCVTZS / FCVTZU (FP → integer, truncate-toward-zero) and SCVTF /
 // UCVTF (integer → FP) JIT lowerings live in `FpIntConversion` at
@@ -25979,9 +25836,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UcvtfDXUint64MaxRoundsTo2p64) {
   const double expected = static_cast<double>(UINT64_MAX);  // 2^64
   EXPECT_EQ(LoadFp64(state_.cpu, 0), expected);
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for BIC/ORN/BSL/BIT/BIF/CMGT/CMHI
+// AdvSimdThreeSame JIT for BIC/ORN/BSL/BIT/BIF/CMGT/CMHI
 //
 // Encoding (DDI 0487 §C7.2 Advanced SIMD three same):
 //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
@@ -26179,9 +26035,8 @@ TEST_F(Arm64LiteTranslateRegionTest, CmhiVec4SUnsigned) {
   EXPECT_EQ(r[2], 0u);           // 1 !> 2
   EXPECT_EQ(r[3], 0u);           // 0x7FFFFFFF !> 0x80000000 (unsigned!)
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for MUL .8H/.4H (PMULLW)
+// AdvSimdThreeSame JIT for MUL .8H/.4H (PMULLW)
 // Closes the last open size on the MUL row of the §C2 NEON three-same table:
 // the JIT already handled MUL .4S/.2S via PMULLD; this region adds size=01
 // (16-bit lanes) via SSE2 PMULLW. Reuses SimdThreeSame() from the preceding
@@ -26236,9 +26091,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MulVec4HUpperZero) {
     EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
   }
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for MLA .8H (PMULLW+PADDW)
+// AdvSimdThreeSame JIT for MLA .8H (PMULLW+PADDW)
 // Direct sibling of the MUL .8H/.4H region above: the JIT already handled
 // MLA .4S/.2S via PMULLD+PADDD; this region adds size=01 (16-bit lanes) via
 // SSE2 PMULLW+PADDW. Reuses SimdThreeSame(). MLA (vector) encoding: U=0,
@@ -26268,9 +26122,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec8H) {
     EXPECT_EQ(r[i], expected) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for CMGE/CMHS (PCMPGT + invert)
+// AdvSimdThreeSame JIT for CMGE/CMHS (PCMPGT + invert)
 // Closes the last open compare-flavor entries on the §C2 NEON three-same
 // table: CMGT/CMHI already JITed via PCMPGT (with unsigned sign-flip);
 // CMGE = NOT(PCMPGT(Vm, Vn)), CMHS = same with pre-sign-flip. Reuses
@@ -26364,9 +26217,8 @@ TEST_F(Arm64LiteTranslateRegionTest, CmgeVec4HUpperZero) {
     EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
   }
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for SMAX/SMIN/UMAX/UMIN
+// AdvSimdThreeSame JIT for SMAX/SMIN/UMAX/UMIN
 // Direct PMAXS{B,W,D} / PMINS{B,W,D} / PMAXU{B,W,D} / PMINU{B,W,D} lowerings.
 // Per ARM DDI 0487, three-same opcodes:
 //   SMAX: U=0, opcode=0b01100. UMAX: U=1, opcode=0b01100.
@@ -26465,9 +26317,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UminVec4HUpperZero) {
     EXPECT_EQ(r_bytes[i], 0u) << "upper byte " << i;
   }
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for MUL/MLA .16B/.8B
+// AdvSimdThreeSame JIT for MUL/MLA .16B/.8B
 // Closes the byte-lane (size=00) entries on the §C2 MUL/MLA row. x86 has
 // no PMULLB, so the lowering widens each 8 bytes to 16-bit words via
 // PMOVZXBW (low half then high half), PMULLW per half, masks each word
@@ -26532,9 +26383,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec8BUpperZero) {
     EXPECT_EQ(r[i], 0u) << "upper byte " << i;
   }
 }
-// endregion
 
-// region digitalis - §C2 spec-table single-width coverage gaps
+// §C2 spec-table single-width coverage gaps
 // Closes the §C2 plan-verify checkbox "Unit tests in
 // lite_translate_region_exec_tests.cc for one representative of each lane
 // width (B/H/S/D) per opcode." Earlier handoffs covered the
@@ -26894,9 +26744,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MlaVec4S) {
   // INT32_MAX + (0x10000 * 0x10000) = INT32_MAX + 0 (mul truncates) = INT32_MAX
   EXPECT_EQ(r[3], INT32_MAX);
 }
-// endregion
 
-// region digitalis - AdvSimdThreeSame JIT for MLS vector
+// AdvSimdThreeSame JIT for MLS vector
 // MLS (vector): Vd[lane] = Vd[lane] - Vn[lane] * Vm[lane].  Uses the same
 // product recipe as kMla / kMul (byte: PMOVZXBW + PMULLW + PACKUSWB;
 // halfword: PMULLW; word: PMULLD) but PSUBs the product from Vd instead of
@@ -27035,9 +26884,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MlsVec8BUpperZero) {
     EXPECT_EQ(r[i], 0u) << "upper byte " << i;
   }
 }
-// endregion
 
-// region digitalis: SABD/UABD vector JIT
+// SABD/UABD vector JIT
 //
 // Encoding (per ARM ARM C7.2 "SABD/UABD (vector)", cross-checked via
 // llvm-mc):
@@ -27513,9 +27361,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UabaVec2SUpperZero) {
   EXPECT_EQ(r[2], 0u);
   EXPECT_EQ(r[3], 0u);
 }
-// endregion
 
-// region digitalis: CMTST (vector) JIT
+// CMTST (vector) JIT
 //
 // Encoding (per ARM ARM C7.2 "CMTST (vector)", cross-checked against
 // aarch64-linux-gnu-as):
@@ -27678,9 +27525,8 @@ TEST_F(Arm64LiteTranslateRegionTest, CmtstVec8BUpperZero) {
     EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
   }
 }
-// endregion
 
-// region digitalis: SHADD / UHADD vector JIT
+// SHADD / UHADD vector JIT
 
 TEST_F(Arm64LiteTranslateRegionTest, ShaddUhaddVecEncodingsMatchLlvmMc) {
   // SHADD: U=0, opcode=00000.
@@ -27870,9 +27716,7 @@ TEST_F(Arm64LiteTranslateRegionTest, UhaddVec8BUpperZero) {
     EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
   }
 }
-// endregion
 
-// region digitalis
 TEST_F(Arm64LiteTranslateRegionTest, SrhaddUrhaddVecEncodingsMatchLlvmMc) {
   // SRHADD: U=0, opcode=00010.
   EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
@@ -28062,9 +27906,7 @@ TEST_F(Arm64LiteTranslateRegionTest, UrhaddVec8BUpperZero) {
     EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
   }
 }
-// endregion
 
-// region digitalis
 TEST_F(Arm64LiteTranslateRegionTest, ShsubUhsubVecEncodingsMatchLlvmMc) {
   // SHSUB: U=0, opcode=00100.
   EXPECT_EQ(SimdThreeSame(/*q=*/0, /*u=*/0, /*size=*/0b00,
@@ -28253,9 +28095,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UhsubVec8BUpperZero) {
     EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
   }
 }
-// endregion
 
-// region digitalis - SQDMULH / SQRDMULH vector JIT.
+// SQDMULH / SQRDMULH vector JIT.
 //
 // SQDMULH:  result[i] = sat_intN((SInt(a[i]) * SInt(b[i]) * 2) >> N)
 // SQRDMULH: result[i] = sat_intN((SInt(a[i]) * SInt(b[i]) * 2 + 2^(N-1)) >> N)
@@ -28450,9 +28291,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrdmulhVec2SUpperZero) {
     EXPECT_EQ(r_bytes[i], 0x00u) << "upper byte " << i;
   }
 }
-// endregion
 
-// region digitalis - PMUL polynomial multiply (vector, byte lanes) JIT.
+// PMUL polynomial multiply (vector, byte lanes) JIT.
 //
 // PMUL .8B / .16B per-lane carry-less multiply over GF(2)[x], keeping the
 // low 8 bits of the polynomial product.  Encoding: AdvSimdThreeSame, U=1,
@@ -28529,9 +28369,8 @@ TEST_F(Arm64LiteTranslateRegionTest, PmulVec8BUpperZero) {
     EXPECT_EQ(r[i], 0x00u) << "upper lane " << i;
   }
 }
-// endregion
 
-// region digitalis: ABS / NEG / NOT vector two-reg-misc JIT
+// ABS / NEG / NOT vector two-reg-misc JIT
 //
 // Encoding (per ARM ARM C7.2 "ABS (vector)", "NEG (vector)", "NOT (vector)",
 // cross-checked against aarch64-linux-gnu-as output):
@@ -28688,9 +28527,8 @@ TEST_F(Arm64LiteTranslateRegionTest, NotVec8BUpperZero) {
   for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], static_cast<uint8_t>(~in[i])) << "lane " << i;
   for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper-half lane " << i;
 }
-// endregion
 
-// region digitalis: CMGT / CMGE / CMLE / CMLT vector-vs-zero two-reg-misc JIT
+// CMGT / CMGE / CMLE / CMLT vector-vs-zero two-reg-misc JIT
 //
 // Encodings (verified against aarch64-linux-gnu-as):
 //   cmgt v0.16b, v1.16b, #0 = 0x4E208820   (Q=1, U=0, opcode=01000, size=00)
@@ -28873,9 +28711,8 @@ TEST_F(Arm64LiteTranslateRegionTest, CmltZeroVec4S) {
   EXPECT_EQ(r[2], 0u);  // 0 < 0 false
   EXPECT_EQ(r[3], 0u);
 }
-// endregion
 
-// region digitalis: CNT vector two-reg-misc JIT (popcount nibble-LUT via PSHUFB)
+// CNT vector two-reg-misc JIT (popcount nibble-LUT via PSHUFB)
 constexpr uint32_t kCntVec16B = 0x4E205820;  // cnt v0.16b, v1.16b
 constexpr uint32_t kCntVec8B  = 0x0E205820;  // cnt v0.8b,  v1.8b
 
@@ -28915,9 +28752,8 @@ TEST_F(Arm64LiteTranslateRegionTest, CntVec8BUpperZero) {
     EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: RBIT vector two-reg-misc JIT (bit-reverse nibble-LUT via PSHUFB pair)
+// RBIT vector two-reg-misc JIT (bit-reverse nibble-LUT via PSHUFB pair)
 constexpr uint32_t kRbitVec16B = 0x6E605820;  // rbit v0.16b, v1.16b
 constexpr uint32_t kRbitVec8B  = 0x2E605820;  // rbit v0.8b,  v1.8b
 
@@ -28966,9 +28802,8 @@ TEST_F(Arm64LiteTranslateRegionTest, RbitVec8BUpperZero) {
     EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: CLZ vector two-reg-misc JIT (per-lane PEXTR + BSR + XOR + PINSR)
+// CLZ vector two-reg-misc JIT (per-lane PEXTR + BSR + XOR + PINSR)
 constexpr uint32_t kClzVec16B = 0x6E204820;  // clz v0.16b, v1.16b
 constexpr uint32_t kClzVec8B  = 0x2E204820;  // clz v0.8b,  v1.8b
 constexpr uint32_t kClzVec8H  = 0x6E604820;  // clz v0.8h,  v1.8h
@@ -29098,9 +28933,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ClzVec2SUpperZero) {
     EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: CLS vector two-reg-misc JIT (PCMPGT sign-mask + per-lane
+// CLS vector two-reg-misc JIT (PCMPGT sign-mask + per-lane
 // PEXTR + BSR + XOR + DEC + PINSR).  Encodings are CLZ with bit 29 (U) flipped
 // from 1 → 0.
 constexpr uint32_t kClsVec16B = 0x4E204820;  // cls v0.16b, v1.16b
@@ -29231,9 +29065,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ClsVec2SUpperZero) {
     EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: SHL / USHR / SSHR vector shift-by-immediate JIT
+// SHL / USHR / SSHR vector shift-by-immediate JIT
 //
 // SHL  Vd.T, Vn.T, #imm    → PSLL{W,D,Q}
 // USHR Vd.T, Vn.T, #imm    → PSRL{W,D,Q}
@@ -29490,9 +29323,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UshrVec8HSaturate) {
     EXPECT_EQ(r[i], 0u) << "lane " << i << " in=0x" << std::hex << in[i];
   }
 }
-// endregion
 
-// region digitalis: ZIP1 / ZIP2 vector permute JIT
+// ZIP1 / ZIP2 vector permute JIT
 //
 // ZIP1 Vd.<T>, Vn.<T>, Vm.<T>  -> interleave LOWER half of Vn and Vm
 // ZIP2 Vd.<T>, Vn.<T>, Vm.<T>  -> interleave UPPER half of Vn and Vm
@@ -29756,9 +29588,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Zip2Vec2S) {
   EXPECT_EQ(r[2], 0u);
   EXPECT_EQ(r[3], 0u);
 }
-// endregion
 
-// region digitalis: UZP1 / UZP2 vector permute JIT
+// UZP1 / UZP2 vector permute JIT
 //
 // UZP1 Vd.<T>, Vn.<T>, Vm.<T>  -> pick EVEN-indexed elements of Vn || Vm
 // UZP2 Vd.<T>, Vn.<T>, Vm.<T>  -> pick ODD-indexed  elements of Vn || Vm
@@ -30042,9 +29873,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Uzp2Vec2S) {
   EXPECT_EQ(r[2], 0u);
   EXPECT_EQ(r[3], 0u);
 }
-// endregion
 
-// region digitalis: TRN1 / TRN2 vector permute JIT
+// TRN1 / TRN2 vector permute JIT
 //
 // TRN1 Vd.<T>, Vn.<T>, Vm.<T>  ->  Vd[2i]   = Vn[2i],   Vd[2i+1] = Vm[2i]
 // TRN2 Vd.<T>, Vn.<T>, Vm.<T>  ->  Vd[2i]   = Vn[2i+1], Vd[2i+1] = Vm[2i+1]
@@ -30325,9 +30155,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Trn2Vec2S) {
   EXPECT_EQ(r[2], 0u);
   EXPECT_EQ(r[3], 0u);
 }
-// endregion
 
-// region digitalis: DUP (element) vector JIT
+// DUP (element) vector JIT
 //
 // DUP Vd.<T>, Vn.<Ts>[index]  ->  broadcast Vn[index] (one esize-byte
 // element) to every lane of Vd.  Q=0 zeroes the upper 64 bits of Vd.
@@ -30535,9 +30364,8 @@ TEST_F(Arm64LiteTranslateRegionTest, DupElemVec2DIdx1) {
   EXPECT_EQ(r[0], vn[1]);
   EXPECT_EQ(r[1], vn[1]);
 }
-// endregion
 
-// region digitalis: EXT q=0 vector JIT
+// EXT q=0 vector JIT
 //
 // EXT Vd.8B, Vn.8B, Vm.8B, #imm  ->  result[0..7] =
 //   Vn[imm..7] || Vm[0..imm-1]   (an 8-byte rotating window over Vn:Vm)
@@ -30716,9 +30544,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ExtVec16BIdx15OddImm) {
   EXPECT_EQ(r[0], vn[15]) << "byte 0";
   for (int i = 1; i < 16; ++i) EXPECT_EQ(r[i], vm[i - 1]) << "byte " << i;
 }
-// endregion
 
-// region digitalis: DUP (general) q=0 vector JIT
+// DUP (general) q=0 vector JIT
 // DUP Vd.8B, Wn / DUP Vd.2S, Wn — broadcast a GP register to the lower
 // 64 bits of Vd and zero the upper 64 bits per ARM D-register semantics.
 // The Q=1 forms (.16B / .4S / .2D) are already covered by MemsetPattern
@@ -30831,9 +30658,8 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGenVec8H_FromW7_HighBitsIgnored) {
   std::memcpy(r, &state_.cpu.v[0], 16);
   for (int i = 0; i < 8; ++i) EXPECT_EQ(r[i], 0x1234u) << "h lane " << i;
 }
-// endregion
 
-// region digitalis: __memset_aarch64 1024-byte zero-fill reproduction.
+// __memset_aarch64 1024-byte zero-fill reproduction.
 //
 // Reproduces the path Bionic's linker takes when scrubbing a freshly
 // re-allocated 1024-byte chunk from BionicSmallObjectAllocator.  That chunk
@@ -30933,9 +30759,8 @@ TEST_F(Arm64LiteTranslateRegionTest, MemsetAarch64_1024ByteZeroFill_Unrolled) {
       << static_cast<unsigned>(buffer[first_nonzero == kSize ? 0 : first_nonzero])
       << "); buffer must be fully zeroed";
 }
-// endregion
 
-// region digitalis: dispatch-enabled b.hi memset loop (VkCaps regression)
+// dispatch-enabled b.hi memset loop (VkCaps regression)
 //
 // Companion to MemsetAarch64_1024ByteZeroFill_Unrolled above.  That test
 // inlines the loop body 15 times so the whole memset runs in a single JIT
@@ -30996,7 +30821,7 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
     return true;
   }
 
-  // region digitalis: translate every region inside [code, code+sizeof(code))
+  // translate every region inside [code, code+sizeof(code))
   // by walking forward from code[0] and re-translating from each region's
   // stop_pc until end-of-code is reached.  Dispatch back-edges between
   // regions then resolve via TranslationCache lookups, letting the loop
@@ -31044,7 +30869,6 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
     cache->InvalidateGuestRange(code_start, code_end);
     return true;
   }
-  // endregion
 
  protected:
   ThreadState state_{};
@@ -32080,7 +31904,7 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   }
 }
 
-// region digitalis: Hypothesis C — surrounding-code interaction.
+// Hypothesis C — surrounding-code interaction.
 //
 // Combines production's bucket-FIND loop body (LDR + ANDS + b.eq) AND the
 // bucket-INSERT 5-instruction sequence in ONE contiguous block, run 256x
@@ -32191,7 +32015,6 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
 }
-// endregion
 
 // Production AddToMap bucket-FIND loop at linker offset 0x9cc80..0x9ccb4 in
 // CdEntryMapZip32<ZipStringOffset20>::AddToMap.  Uses the UXTW
@@ -32367,9 +32190,8 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest, AddToMapBucketFindUnderDispatch_UXT
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
 }
-// endregion
 
-// region digitalis: production AddToMap bucket-FIND loop, single-region pin
+// production AddToMap bucket-FIND loop, single-region pin
 // for the no-match (b.ne) path.  The existing UXTW dispatch test only
 // exercises the iter-0 b.eq fast path (bucket[0] empty).  This test fills
 // bucket[0] with a non-matching hash (top12 != x19) and exact non-zero
@@ -32457,9 +32279,8 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[2], 0xdeadbeefU);
 }
-// endregion
 
-// region digitalis: production AddToMap bucket-FIND loop, multi-region,
+// production AddToMap bucket-FIND loop, multi-region,
 // PARTIALLY POPULATED bucket array.  Pre-translates every region within
 // the code array so cross-region dispatches resolve via TranslationCache.
 //
@@ -32534,9 +32355,8 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
 }
-// endregion
 
-// region digitalis: production AddToMap bucket-FIND loop, multi-region,
+// production AddToMap bucket-FIND loop, multi-region,
 // FULLY POPULATED bucket array with non-matching hashes.  Equivalent to
 // the genuine pathological-data hypothesis (-266 hypothesis B): every
 // bucket is non-empty AND no hash matches.  The ARM ARM-defined loop
@@ -32603,9 +32423,8 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   // Z=1 and C=1, so b.ls=(C==0 OR Z==1) fires at x2=0).
   EXPECT_EQ(state_.cpu.x[2], 0ULL) << "watchdog should reach 0";
 }
-// endregion
 
-// region digitalis: Hypothesis G.1 — JIT `adds Wd, Wn, #imm` (W-form)
+// Hypothesis G.1 — JIT `adds Wd, Wn, #imm` (W-form)
 // must set ARM C=1 when the 32-bit unsigned sum wraps, so that a following
 // `b.hs target` (HS = C==1) takes the branch.
 //
@@ -32718,9 +32537,8 @@ TEST_F(Arm64LiteTranslateRegionTest, AddsW32JustBelowOverflowBhsFallsThrough) {
   EXPECT_EQ(state_.cpu.x[24], 0xFFFFFFFEULL) << "Setup invariant";
   EXPECT_EQ(state_.cpu.x[8], 0xFFFFFFFFULL);
 }
-// endregion
 
-// region digitalis: BFM (BFI / BFXIL) JIT
+// BFM (BFI / BFXIL) JIT
 // BFM merges bits of src into a destination register, leaving the other
 // destination bits alone.  Two ARM ARM aliases that share this encoding
 // are exercised here:
@@ -32812,9 +32630,8 @@ TEST_F(Arm64LiteTranslateRegionTest, BfcW_ClearBitfield) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 0x00000000FF0000FFULL);
 }
-// endregion
 
-// region digitalis: INS (element) JIT
+// INS (element) JIT
 // INS Vd.<T>[dst_idx], Vn.<T>[src_idx] — copy one esize-byte lane from Vn
 // to one lane of Vd, leaving every other lane of Vd unchanged.  These
 // tests pin the new JIT path's correctness on the four lane widths
@@ -32924,9 +32741,8 @@ TEST_F(Arm64LiteTranslateRegionTest, InsElemSelfS0FromS3) {
   EXPECT_EQ(r[2], 0x22222222u) << "s lane 2 untouched";
   EXPECT_EQ(r[3], 0xCAFEF00Du) << "s lane 3 (source) preserved";
 }
-// endregion
 
-// region digitalis: SQADD/UQADD/SQSUB/UQSUB vector JIT (byte/halfword)
+// SQADD/UQADD/SQSUB/UQSUB vector JIT (byte/halfword)
 //
 // Encoding (DDI 0487 §C7.2 Advanced SIMD three same):
 //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
@@ -33325,9 +33141,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqsubVec2SUpperZero) {
   EXPECT_EQ(r[2],    0u);
   EXPECT_EQ(r[3],    0u);
 }
-// endregion
 
-// region digitalis: ADDP (pairwise add) vector JIT — all lane widths.
+// ADDP (pairwise add) vector JIT — all lane widths.
 //
 // Encoding (DDI 0487 §C7.2 Advanced SIMD three same):
 //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
@@ -33498,9 +33313,8 @@ TEST_F(Arm64LiteTranslateRegionTest, AddpVec2D) {
   EXPECT_EQ(r[0], static_cast<uint64_t>(n[0] + n[1]));  // 0x0000000400000006
   EXPECT_EQ(r[1], 0ull);                                 // -1 + 1 = 0 (wrap)
 }
-// endregion
 
-// region digitalis: ADDV (across-lanes integer sum) vector JIT —
+// ADDV (across-lanes integer sum) vector JIT —
 // all 5 encoded lane forms.
 //
 // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
@@ -33644,9 +33458,8 @@ TEST_F(Arm64LiteTranslateRegionTest, AddvVec4SDoubleWrap) {
     EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: SADDLV / UADDLV (across-lanes long integer sum) vector
+// SADDLV / UADDLV (across-lanes long integer sum) vector
 // JIT — all 5 encoded lane forms × {signed, unsigned}.
 //
 // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
@@ -33867,9 +33680,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Saddlv4S) {
   EXPECT_EQ(r[0], static_cast<uint64_t>(-4));  // 0xFFFFFFFFFFFFFFFC
   EXPECT_EQ(r[1], 0ull);
 }
-// endregion
 
-// region digitalis: SMAXV / SMINV / UMAXV / UMINV (across-lanes integer
+// SMAXV / SMINV / UMAXV / UMINV (across-lanes integer
 // max/min reduce) vector JIT — all 5 encoded lane forms × {SMAXV, UMAXV}
 // plus byte/halfword/dword forms for SMINV and UMINV.
 //
@@ -34203,9 +34015,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Uminv4S) {
     EXPECT_EQ(r[i], 0u) << "dword " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: SMAXP / SMINP / UMAXP / UMINP (pairwise integer max/min) vector JIT
+// SMAXP / SMINP / UMAXP / UMINP (pairwise integer max/min) vector JIT
 // AdvSimdThreeSame encoding (DDI 0487 §C7.2):
 //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
 // SMAXP: U=0, opcode=10100.  UMAXP: U=1, opcode=10100.
@@ -34490,9 +34301,8 @@ TEST_F(Arm64LiteTranslateRegionTest, Uminp4S) {
   EXPECT_EQ(r[2], 1u);
   EXPECT_EQ(r[3], 0x80000000u);
 }
-// endregion
 
-// region digitalis: SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
+// SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
 //
 // Opcode bits (15-11) and U bit per decoder.h:5375-5403:
 //   SSRA opcode=00010 U=0  USRA opcode=00010 U=1
@@ -34745,9 +34555,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SriVec2D) {
                           << " want=" << want << " got=" << r[i];
   }
 }
-// endregion
 
-// region digitalis: SRSHR / URSHR / SRSRA / URSRA vector shift-by-immediate JIT
+// SRSHR / URSHR / SRSRA / URSRA vector shift-by-immediate JIT
 // (rounding right-shift family).
 //
 // Opcode bits (15:11) per decoder.h:5375-5403:
@@ -34997,9 +34806,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UrsraVec2D) {
     EXPECT_EQ(r[i], want) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis: SQSHL / UQSHL / SQSHLU vector shift-by-immediate JIT
+// SQSHL / UQSHL / SQSHLU vector shift-by-immediate JIT
 // (saturating left-shift family).
 //
 // Opcode bits (15:11), verified against llvm-mc-21 output:
@@ -35241,9 +35049,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshluVec8HShiftMax) {
         << "lane " << i << " in_n=" << in_n[i];
   }
 }
-// endregion
 
-// region digitalis: SHRN / SHRN2 vector shift-right-narrow exec tests.
+// SHRN / SHRN2 vector shift-right-narrow exec tests.
 // Pins the JIT lowering at lite_translator.h's AdvSimdShiftByImm kShrn
 // case (PSRL{W,D,Q} + PSHUFB).  Encodings verified with
 // aarch64-linux-gnu-as -march=armv8-a.
@@ -35403,9 +35210,8 @@ TEST_F(Arm64LiteTranslateRegionTest, ShrnVec8BShift8) {
     EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: RSHRN / RSHRN2 vector rounding-shift-right-narrow
+// RSHRN / RSHRN2 vector rounding-shift-right-narrow
 // exec tests.  Pin the JIT lowering at lite_translator.h's
 // AdvSimdShiftByImm kRshrn case (PADDW/PADDD/PADDQ + PSRL{W,D,Q} +
 // PSHUFB).  Encodings verified with aarch64-linux-gnu-as -march=armv8-a.
@@ -35575,9 +35381,8 @@ TEST_F(Arm64LiteTranslateRegionTest, RshrnVec8BShift8) {
     EXPECT_EQ(r[i], 0u) << "upper byte " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: UQSHRN / UQSHRN2 vector unsigned-saturating-shift-
+// UQSHRN / UQSHRN2 vector unsigned-saturating-shift-
 // right-narrow exec tests.  Pin the JIT lowering at lite_translator.h's
 // AdvSimdShiftByImm kUqshrn case (PSRL{W,D,Q} + PMINUW / PMINUD /
 // manual-64bit-clamp + PSHUFB).  Encodings verified with
@@ -35765,9 +35570,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshrnVec2SShift1) {
     EXPECT_EQ(r[i], 0u) << "upper word " << i << " not zeroed";
   }
 }
-// endregion
 
-// region digitalis: UQRSHRN / UQRSHRN2 vector unsigned-saturating-rounding-
+// UQRSHRN / UQRSHRN2 vector unsigned-saturating-rounding-
 // shift-right-narrow exec tests.  Pin the JIT lowering at
 // lite_translator.h's AdvSimdShiftByImm kUqrshrn case — same shared body
 // as kShrn/kRshrn/kUqshrn, with both is_rounding AND
@@ -35963,10 +35767,9 @@ TEST_F(Arm64LiteTranslateRegionTest, UqrshrnVec2SShift1JitBail) {
   static const uint32_t code[] = {kUqrshrnVec2S_1};
   EXPECT_FALSE(Run(code, ToGuestAddr(code) + sizeof(code)));
 }
-// endregion
 
 
-// region digitalis: SQSHRN / SQSHRN2 / SQRSHRN / SQRSHRN2 vector signed-
+// SQSHRN / SQSHRN2 / SQRSHRN / SQRSHRN2 vector signed-
 // saturating-shift-right-narrow exec tests.  Pin the JIT lowering at
 // lite_translator.h's AdvSimdShiftByImm kSqshrn/kSqrshrn cases — same
 // shared body as kShrn/kRshrn/kUqshrn/kUqrshrn, with is_saturating_signed
@@ -36323,10 +36126,9 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqrshrn2Vec8HShift5) {
     EXPECT_EQ(r[i + 4], SqrshrnRefS16(in[i], 5)) << "upper lane " << i;
   }
 }
-// endregion
 
 
-// region digitalis: SQSHRUN / SQSHRUN2 / SQRSHRUN / SQRSHRUN2 vector
+// SQSHRUN / SQSHRUN2 / SQRSHRUN / SQRSHRUN2 vector
 // signed-input/unsigned-output saturating-shift-right-narrow exec tests.
 // Pin the JIT lowering at lite_translator.h's AdvSimdShiftByImm
 // kSqshrun/kSqrshrun cases — same shared body as the SQSHRN/SQRSHRN
@@ -36676,10 +36478,9 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqrshrun2Vec8HShift5) {
     EXPECT_EQ(r[i + 4], SqrshrunRefU16(in[i], 5)) << "upper lane " << i;
   }
 }
-// endregion
 
 
-// region digitalis: SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
+// SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
 //
 // Vector encoding (DDI 0487 §C7.2.397 / §C7.2.398):
 //   0 Q U 01110 10 0 Rm[4:0] 100101 Rn Rd
@@ -36885,9 +36686,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SdotIdxVec2SUpperZero) {
   EXPECT_EQ(r[2], 0) << "upper-half lane 2 must be zero";
   EXPECT_EQ(r[3], 0) << "upper-half lane 3 must be zero";
 }
-// endregion
 
-// region digitalis - SSHLL / SSHLL2 / USHLL2 JIT exec tests.
+// SSHLL / SSHLL2 / USHLL2 JIT exec tests.
 // SSHLL widens narrow lanes via sign-extension before the left shift.
 // USHLL had Q=0 JIT coverage already; this also adds USHLL2 (Q=1) and
 // every (src,dst) size class for SSHLL.  Encodings verified via
@@ -37084,9 +36884,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SshllVec2DShift31) {
     EXPECT_EQ(r[i], expected) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis
 // LDR (literal) — regression tests. The decoder used to misroute
 // `ldr Xt, =literal` to the LDR (immediate) pre/post/reg/unscaled
 // handlers because the V=0 form shares op_28_27=11/op_26=0 with them.
@@ -37306,9 +37104,8 @@ TEST_F(Arm64LiteTranslateRegionTest, LdrLiteralQ_DoesNotClobberOtherRegs) {
   EXPECT_EQ(v0[2], 0x12345678u);
   EXPECT_EQ(v0[3], 0x9ABCDEF0u);
 }
-// endregion
 
-// region digitalis - Interpreter-direct tests for SIMD pair load/store with
+// Interpreter-direct tests for SIMD pair load/store with
 // pre-/post-index.  The JIT currently lowers only 128-bit (Q-register) SIMD
 // pair stores; 64-bit (D-register) pair stores bail to Undefined() and run
 // in the interpreter at production runtime.  Function prologues that save
@@ -37437,9 +37234,8 @@ TEST(Arm64InterpreterSimdPair, StpD_PreIndex_LdpD_PostIndex_Roundtrip) {
   EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[11] >> 64), 0ULL);
   EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[10] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis - Interpreter-direct tests for AdvSIMD modified-immediate
+// Interpreter-direct tests for AdvSIMD modified-immediate
 // MOVI with the scalar 64-bit form (`MOVI <Dd>, #imm`). Traces of FB Katana's
 // libcoldstart.so show `movi d9, #0` firing at the second of three unique JIT
 // bailout PCs (libcoldstart.so + 0x8BB424). These tests pin the interpreter's
@@ -37532,9 +37328,8 @@ TEST(Arm64InterpreterSimdModifiedImm, MoviD_Pattern_BitToByteExpansion) {
   EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9]), 0xFF00FF00FF00FF00ULL);
   EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[9] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis - SHLL / SHLL2 (shift left long by element size).
+// SHLL / SHLL2 (shift left long by element size).
 // AdvSimdTwoRegMisc opcode=10011, U=1, size in {00,01,10}. Source from low
 // (Q=0) or high (Q=1) 64 bits of Vn, widened to 2*esize and shifted left
 // by esize bits (placed in upper half of the widened lane; lower half zero).
@@ -37656,9 +37451,8 @@ TEST(Arm64InterpreterSimdTwoRegMisc, Shll2WordToDoubleReadsUpperHalf) {
   EXPECT_EQ(static_cast<uint64_t>(state.cpu.v[0] >> 64),
             0xDEADBEEF00000000ULL);
 }
-// endregion
 
-// region digitalis - PACGA (Armv8.3-PAuth generic PAC compute)
+// PACGA (Armv8.3-PAuth generic PAC compute)
 // ARM ARM C7.2.179: PACGA Xd, Xn, Xm|SP computes a 32-bit PAC keyed by
 // APGAKey_EL1 over Xn modified by Xm, places it in Rd[63:32], and zeros
 // Rd[31:0].  Digitalis is PAC-blind: no PAC is ever inserted, so the
@@ -37707,9 +37501,8 @@ TEST(Arm64InterpreterDataProc2Src, PacgaSpModifierReturnsZero) {
   EXPECT_EQ(state.cpu.sp, 0x7000000000ULL);
   EXPECT_EQ(state.cpu.insn_addr, ToGuestAddr(&insn) + 4);
 }
-// endregion
 
-// region digitalis: AdvSimdTableLookup JIT — TBL/TBX (8B/16B forms, 1..4
+// AdvSimdTableLookup JIT — TBL/TBX (8B/16B forms, 1..4
 // table registers).
 //   Encoding: bits[31]=0, bits[30]=Q, bits[29:24]=001110, bits[23:22]=00,
 //   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:13]=len, bit12=op, bits[11:10]=00,
@@ -38051,9 +37844,7 @@ TEST_F(Arm64LiteTranslateRegionTest, Tbl16BInPlaceVdEqualsVm) {
     EXPECT_EQ(out[i], table_bytes[idx_bytes[i]]) << "byte " << i;
   }
 }
-// endregion
 
-// region digitalis
 // Scalar shift-by-immediate D-form JIT exec tests.
 //
 // ARM ARM C4.1.6.10 specifies SSHR / USHR / SSRA / USRA / SRSHR / URSHR /
@@ -38198,9 +37989,7 @@ TEST_F(Arm64LiteTranslateRegionTest, UrsraScalarD) {
   EXPECT_EQ(r[0], want);
   EXPECT_EQ(r[1], 0ULL);
 }
-// endregion
 
-// region digitalis
 // AdvSimdScalarShiftByImm — saturating shifts at .D scalar:
 //   UQSHL D scalar, SQSHLU D scalar.  The 64-bit lane pipeline reuses
 //   PSLLQ / PSRLQ / PCMPEQQ (and PCMPGTQ for SQSHLU's negative pre-
@@ -38440,9 +38229,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarDImmEncodingMatchesLlvmMc) {
   EXPECT_EQ(kSqshlScalarD_62, 0x5F7E7420u);
   EXPECT_EQ(kSqshlScalarD_63, 0x5F7F7420u);
 }
-// endregion
 
-// region digitalis - AdvSimdShiftByImm SQSHL vector .2D (immh & 0b1000,
+// AdvSimdShiftByImm SQSHL vector .2D (immh & 0b1000,
 // args.scalar=false, Q=1) two-lane GPR fallback.  Same SSE blocker as
 // scalar D — the vector pipeline needs PSRAQ (AVX-512F-VL only) for the
 // signed back-shift recovery step.  JIT emits the scalar GPR detector
@@ -38593,9 +38381,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlVecDImmEncodingMatchesLlvmMc) {
   EXPECT_EQ(kSqshlVecD_62, 0x4F7E7420u);
   EXPECT_EQ(kSqshlVecD_63, 0x4F7F7420u);
 }
-// endregion
 
-// region digitalis
 // AdvSimdShiftByImm — UQSHL .2D vector form (per-lane unsigned saturating
 // left-shift by immediate).  Already JIT-driven via the existing vector
 // pipeline at lite_translator.h ~line 20030 — esize=64 uses Psllq (SSE2) +
@@ -38690,9 +38476,7 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshlVecDImmInPlaceVdEqualsVnJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64),
             uint64_t{0x00000000DEADBEEFULL} << 11);
 }
-// endregion
 
-// region digitalis
 // AdvSimdShiftByImm — SQSHLU .2D vector form (per-lane signed-to-unsigned
 // saturating left-shift by immediate).  Already JIT-driven via the
 // existing vector pipeline at lite_translator.h ~line 20040 — esize=64
@@ -38787,9 +38571,7 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshluVecDImmInPlaceVdEqualsVnJit) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL)
       << "negative lane pre-zeroed; Vd==Vn safe";
 }
-// endregion
 
-// region digitalis
 // AdvSimdShiftByImm — SQSHRN scalar D-source: signed-saturating narrow
 // shift, src lane is 64 bits, dst is signed 32-bit S.  ARM ARM
 // C7.2.236.  Encoding: `01 U=0 011111 immh immb 100101 Rn Rd` with
@@ -38936,9 +38718,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshrnScalarSDVdEqVnJit) {
       << "Vd[31:0] = INT32_MIN; Vd==Vn safe (Vn read before Vd store)";
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: SQSHRUN scalar D-source GPR fallback.
+// SQSHRUN scalar D-source GPR fallback.
 // AdvSimdShiftByImm — SQSHRUN scalar D-source: signed-saturating-
 // unsigned narrow shift, src lane is 64 bits, dst is unsigned 32-bit S.
 // ARM ARM C7.2.238.  Encoding: `01 U=1 011111 immh immb 100001 Rn Rd`
@@ -39082,9 +38863,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshrunScalarSDVdEqVnJit) {
       << "Vd[31:0] = 0 (negative clamps to 0); Vd==Vn safe";
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: SQRSHRN scalar D-source GPR fallback.
+// SQRSHRN scalar D-source GPR fallback.
 // AdvSimdShiftByImm — SQRSHRN scalar D-source: signed-saturating-
 // rounding narrow shift, src lane is 64 bits, dst is signed 32-bit S.
 // ARM ARM C7.2.226.  Encoding: `01 U=0 011111 immh immb 100011 Rn Rd`
@@ -39264,9 +39044,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqrshrnScalarSDVdEqVnJit) {
       << "Vd[31:0] = INT32_MIN (negative saturates); Vd==Vn safe";
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: AdvSimdShiftByImm — SSHR at .2D and scalar D.
+// AdvSimdShiftByImm — SSHR at .2D and scalar D.
 //
 // lite_translator.h's AdvSimdShiftImmOpcode::kSshr case promotes the
 // esize_bits==64 paths through a two-lane GPR fallback (PSRAQ is
@@ -39451,9 +39230,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SshrScalarDVdEqVnJit) {
             uint64_t{0xFFFFFFFFFFFFFFFEULL});  // -4 >> 1 = -2
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: AdvSimdShiftByImm — SSRA .2D AND scalar D.
+// AdvSimdShiftByImm — SSRA .2D AND scalar D.
 //
 // Sibling-promote of the SSHR .2D / scalar D fallback above.  SSRA's
 // per-lane semantics is Vd<i> = Vd<i> + SSHR(Vn<i>, shift), so the
@@ -39680,9 +39458,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SsraScalarDVdEqVnJit) {
             uint64_t{0xFFFFFFFFFFFFFFFAULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: SRSHR .2D / scalar D GPR fallback tests.
+// SRSHR .2D / scalar D GPR fallback tests.
 //
 // SRSHR is the signed rounding right shift, no accumulate.  Per lane:
 //   result = floor((Vn + 2^(shift-1)) / 2^shift)        [signed]
@@ -39899,9 +39676,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrshrScalarDVdEqVnJit) {
             uint64_t{0xFFFFFFFFFFFFFFFEULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: SRSRA vector .2D and scalar D JIT.
+// SRSRA vector .2D and scalar D JIT.
 //
 // Per-lane semantics (signed rounding right shift, accumulate):
 //   Vd<i> = Vd<i> + floor((Vn<i> + 2^(shift-1)) / 2^shift)
@@ -40134,9 +39910,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SrsraScalarDVdEqVnJit) {
             uint64_t{0xFFFFFFFFFFFFFFF9ULL});
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
-// endregion
 
-// region digitalis: SSHR .8B / .16B byte-form JIT (PMOVSXBW + PSRAW +
+// SSHR .8B / .16B byte-form JIT (PMOVSXBW + PSRAW +
 // PACKSSWB).
 //
 // Byte right-arithmetic-shift has no SSE equivalent (no PSRAB).  The
@@ -40337,9 +40112,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SshrVec16BVdEqVnJit) {
     EXPECT_EQ(r[i], expect[i]) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis: SSRA .8B / .16B byte-form JIT (PMOVSXBW + PSRAW +
+// SSRA .8B / .16B byte-form JIT (PMOVSXBW + PSRAW +
 // PACKSSWB + PADDB).
 //
 // Sibling of SSHR byte-form above with an accumulate step.  ARM SSRA
@@ -40632,9 +40406,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SsraVec16BVdEqVnJit) {
     EXPECT_EQ(r[i], expect[i]) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis: USHR .8B / .16B byte-form JIT (PMOVZXBW + PSRLW +
+// USHR .8B / .16B byte-form JIT (PMOVZXBW + PSRLW +
 // PACKUSWB).
 //
 // Unsigned sibling of SSHR byte-form.  ARM USHR is `Vd[i] = Vn[i] >>
@@ -40838,9 +40611,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UshrVec16BVdEqVnJit) {
     EXPECT_EQ(r[i], expect[i]) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis: USRA .8B / .16B byte-form JIT (PMOVZXBW + PSRLW +
+// USRA .8B / .16B byte-form JIT (PMOVZXBW + PSRLW +
 // PACKUSWB + PADDB).
 //
 // Unsigned sibling of SSRA byte-form. ARM USRA is `Vd[i] = Vd[i] +
@@ -41132,9 +40904,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UsraVec16BVdEqVnJit) {
     EXPECT_EQ(r[i], expect[i]) << "lane " << i;
   }
 }
-// endregion
 
-// region digitalis: URSHR vector .8B / .16B byte form JIT
+// URSHR vector .8B / .16B byte form JIT
 // (handoff-433).
 //
 // Unsigned rounding right shift at byte width:
@@ -41374,7 +41145,6 @@ TEST_F(Arm64LiteTranslateRegionTest, UrshrVec16BVdEqVnJit) {
     EXPECT_EQ(r[i], expect[i]) << "lane " << i;
   }
 }
-// endregion
 
 // AdvSimdScalarShiftByImm — UQSHL / SQSHLU at .S and .H scalar.
 // Vector pipeline runs as-is across all .4S/.4H lanes; the width-
@@ -41584,9 +41354,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SqshlScalarHNegativeSaturates) {
       << "SQSHL H negative overflow saturates to INT16_MIN; Vd[63:16] zero";
   EXPECT_EQ(r[1], 0ULL);
 }
-// endregion
 
-// region digitalis: AdvSimdScalarShiftByImm — scalar B saturating shift left.
+// AdvSimdScalarShiftByImm — scalar B saturating shift left.
 //
 // SQSHL / UQSHL / SQSHLU at scalar B (esize=8) light up through a
 // dedicated widen-then-clamp path in lite_translator.h (no PSLLB in
@@ -41741,9 +41510,8 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshlScalarBUpperLanesIgnored) {
       << "Result is from lane 0; upper bytes zeroed";
   EXPECT_EQ(r[1], 0ULL);
 }
-// endregion
 
-// region digitalis: SCVTF / UCVTF scalar fixed-point conversion JIT tests.
+// SCVTF / UCVTF scalar fixed-point conversion JIT tests.
 //
 // Encoding (ARM ARM C7.2.301 / C7.2.342, scalar form):
 //   01_U_111110_immh_immb_11100_1_Rn_Rd
@@ -42115,9 +41883,8 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtzuScalarDPositiveOverflow) {
       << "FCVTZU .D: positive overflow → UINT64_MAX";
   EXPECT_EQ(r[1], 0ULL);
 }
-// endregion
 
-// region digitalis: FpFixedPointConversion JIT tests (GPR↔FPR family).
+// FpFixedPointConversion JIT tests (GPR↔FPR family).
 //
 // Encoding (ARM ARM C7.2.298 / C7.2.339 / C7.2.171 / C7.2.181, GPR↔FPR
 // fixed-point form):
@@ -42450,9 +42217,7 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshrnScalarSDInRange) {
   EXPECT_EQ(r[0], uint64_t{0x00000001}) << "S0 = 1; Vd[63:32] zeroed";
   EXPECT_EQ(r[1], 0ULL);
 }
-// endregion
 
 }  // namespace
 
 }  // namespace berberis
-// endregion

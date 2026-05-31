@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -59,7 +58,7 @@ using Condition = LiteTranslator::Condition;
 // kFrameSizeAtTranslatedCode-byte frame (already reserved by
 // berberis_RunGeneratedCode).
 void LiteTranslator::EmitMxcsrToFpsrMirror() {
-  // region digitalis - skip mirror entirely if no SIMD/FP op was emitted in
+  // skip mirror entirely if no SIMD/FP op was emitted in
   // the region: MXCSR cannot have been dirtied by this region, so the mirror
   // would only OR in already-stale bits (which are no-ops) at significant
   // host cost. Integer-only hot loops like CdEntryMapZip32::AddToMap probe
@@ -71,7 +70,6 @@ void LiteTranslator::EmitMxcsrToFpsrMirror() {
   if (!fp_dirty_) {
     return;
   }
-  // endregion
   // stmxcsr [rsp]
   as_.Stmxcsr({.base = as_.rsp, .disp = 0});
   // eax = MXCSR & 0x3F  (isolate exception bits 0-5)
@@ -115,7 +113,7 @@ void LiteTranslator::ExitRegion(GuestAddr target) {
 
 void LiteTranslator::ExitRegionIndirect(Register target) {
   StoreMappedRegs();
-  // region digitalis - skip the mirror-spill scaffolding entirely when no
+  // skip the mirror-spill scaffolding entirely when no
   // FP/SIMD work happened in this region (see EmitMxcsrToFpsrMirror comment).
   if (!fp_dirty_) {
     // Move target to rax directly; no spill needed.
@@ -134,7 +132,6 @@ void LiteTranslator::ExitRegionIndirect(Register target) {
     as_.Movq(as_.rax, {.base = as_.rsp, .disp = 8});
     as_.Addq(as_.rsp, int32_t{16});
   }
-  // endregion
   if (params_.allow_dispatch) {
     EmitIndirectDispatch(&as_, as_.rax);
   } else {
@@ -278,7 +275,7 @@ void LiteTranslator::BranchCond(Decoder::Condition cond, int32_t offset) {
       break;
   }
 
-  // region digitalis - forward branch extension with back-edge detection
+  // forward branch extension with back-edge detection
   GuestAddr target = GetInsnAddr() + offset;
   if (offset <= 0) {
     // Backward branch (or self-loop): end region to prevent infinite loops.
@@ -287,7 +284,6 @@ void LiteTranslator::BranchCond(Decoder::Condition cond, int32_t offset) {
   // Taken path: always exit to branch target.
   ExitRegion(target);
   // Fall-through: continue translating if forward branch (is_region_end_reached_ not set).
-  // endregion
   as_.Bind(cont);
 }
 
@@ -445,4 +441,3 @@ void LiteTranslator::ConditionalCompare(bool is_neg, bool is_64bit, Register rn,
 }
 
 }  // namespace berberis
-// endregion

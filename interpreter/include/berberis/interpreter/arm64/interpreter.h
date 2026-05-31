@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -20,21 +19,16 @@
 
 #include "berberis/guest_state/guest_state.h"
 
-// region digitalis
 namespace berberis { class TranslationCache; }
-// endregion
 
 namespace berberis {
 
 void InitInterpreter();
 void InterpretInsn(ThreadState* state);
-// region digitalis
 // Batch interpreter — reuses Interpreter/Decoder objects across instructions
 // to eliminate per-instruction construction overhead (~3x faster).
 void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache);
-// endregion
 
 }  // namespace berberis
 
 #endif  // BERBERIS_INTERPRETER_ARM64_INTERPRETER_H_
-// endregion

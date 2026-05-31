@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -24,4 +23,3 @@ void InitGuestArch() {
 }
 
 }  // namespace berberis
-// endregion

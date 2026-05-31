@@ -187,8 +187,8 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
     }
   }
 #endif
-  // endregion
-  // region digitalis - log all executable mmaps and first 30
+
+  // log all executable mmaps and first 30
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   if (n <= 30 || n % 500 == 0 || (prot & 4)) {
     __android_log_print(ANDROID_LOG_DEBUG, "berberis",
@@ -196,8 +196,8 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
         (unsigned long)n, addr, result, (unsigned long)length, prot, flags, fd, (unsigned long)offset);
   }
 #endif
-  // endregion
-  // region digitalis - log failures with guest caller pin (LR/FP/TID)
+
+  // log failures with guest caller pin (LR/FP/TID)
   // FB Katana logcat shows a periodic mmap-EINVAL storm with flags=0 and
   // doubling lengths. To pin the guest caller, log x30 (guest LR = return
   // address) and x29 (guest FP, whose first qword is the caller's frame).

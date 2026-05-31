@@ -1,4 +1,3 @@
-// region digitalis
 // Copyright (C) 2026 utzcoz
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,11 +29,9 @@ cc_library_static {
             srcs: [
                 "translator_x86_64.cc",
             ],
-            // region digitalis
             header_libs: [
                 "libberberis_lite_translator_headers",
             ],
-            // endregion
         },
     },
     srcs: [
@@ -58,4 +55,3 @@ cc_library_static {
         "libberberis_runtime_headers",
     ],
 }
-// endregion

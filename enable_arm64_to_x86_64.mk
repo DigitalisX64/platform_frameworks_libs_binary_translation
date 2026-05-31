@@ -1,4 +1,3 @@
-# region digitalis
 #
 # Copyright (C) 2026 utzcoz
 #
@@ -37,4 +36,3 @@ PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
 BUILD_BERBERIS := true
 BUILD_BERBERIS_ARM64_TO_X86_64 := true
 $(call soong_config_set,berberis,translation_arch,arm64_to_x86_64)
-# endregion

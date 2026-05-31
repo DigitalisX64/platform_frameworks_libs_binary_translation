@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -43,4 +42,3 @@ CHECK_FIELD_LAYOUT(Guest_sigaction, sa_mask, 192, 64);
 }  // namespace berberis
 
 #endif  // BERBERIS_GUEST_OS_PRIMITIVES_ARM64_GUEST_SIGNAL_ARCH_H_
-// endregion

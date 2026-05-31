@@ -72,9 +72,7 @@ cc_library_static {
         "arm64_to_x86_64/lite_translator.cc",
     ],
 }
-// endregion
 
-// region digitalis
 cc_test_library {
     name: "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
     defaults: ["berberis_test_library_defaults_64"],

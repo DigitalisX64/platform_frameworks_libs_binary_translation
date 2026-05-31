@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -129,4 +128,3 @@ int ToGuestOpenFlags(int host_flags) {
 }
 
 }  // namespace berberis
-// endregion

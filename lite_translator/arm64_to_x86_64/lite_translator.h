@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -57,14 +56,13 @@ class LiteTranslator {
         pc_(pc),
         params_(params),
         is_region_end_reached_(false),
-        // region digitalis - track whether any SIMD/FP register was allocated.
+        // track whether any SIMD/FP register was allocated.
         // If not, this region can't have dirtied MXCSR exception bits, so the
         // MXCSR -> FPSR mirror at region exit can be elided. Integer-only hot
         // loops (e.g. bionic linker CdEntryMapZip32::AddToMap hash probe) hit
         // 9+ region exits per iteration; eliding the 12-x86-insn mirror saves
         // ~100 host insns per iteration there.
         fp_dirty_(false)
-        // endregion
         {}
 
   //
@@ -77,12 +75,11 @@ class LiteTranslator {
 
   Register GetReg(uint8_t reg) {
     CHECK_LT(reg, std::size(ThreadState{}.cpu.x));
-    // region digitalis - bail early if already in error state (e.g. from Undefined())
+    // bail early if already in error state (e.g. from Undefined())
     if (!success()) return no_register;
-    // endregion
     if (IsRegMappingEnabled()) {
       auto [mapped_reg, is_new_mapping] = GetMappedRegisterOrMap(reg);
-      // region digitalis - spill to temp when permanent pool is full
+      // spill to temp when permanent pool is full
       if (!success()) {
         // Pool full: clear failure and fall through to temp-based load.
         success_ = true;
@@ -93,7 +90,6 @@ class LiteTranslator {
         }
         return mapped_reg;
       }
-      // endregion
     }
     Register result = AllocTempReg();
     int32_t offset = offsetof(ThreadState, cpu.x[0]) + reg * 8;
@@ -103,9 +99,8 @@ class LiteTranslator {
 
   void SetReg(uint8_t reg, Register value) {
     CHECK_LT(reg, std::size(ThreadState{}.cpu.x));
-    // region digitalis - bail early if already in error state (e.g. from Undefined())
+    // bail early if already in error state (e.g. from Undefined())
     if (!success()) return;
-    // endregion
     if (IsRegMappingEnabled()) {
       auto [mapped_reg, _] = GetMappedRegisterOrMap(reg);
       if (success()) {
@@ -113,9 +108,8 @@ class LiteTranslator {
         gp_maintainer_.NoticeModified(reg);
         return;
       }
-      // region digitalis - spill: pool full, write through to ThreadState
+      // spill: pool full, write through to ThreadState
       success_ = true;
-      // endregion
     }
     int32_t offset = offsetof(ThreadState, cpu.x[0]) + reg * 8;
     as_.Movq({.base = Assembler::rbp, .disp = offset}, value);
@@ -166,13 +160,11 @@ class LiteTranslator {
   void ExitRegion(GuestAddr target);
   void ExitRegionIndirect(Register target);
 
-  // region digitalis
   // Mirror host MXCSR cumulative exception bits into emulated_fpsr at ARM FPSR
   // positions. Called from every region-exit path: System V x86_64 ABI lets
   // C++ runtime callees clobber MXCSR exception bits, so the capture must
   // happen here in JIT context, not in the interpreter MRS-FPSR handler.
   void EmitMxcsrToFpsrMirror();
-  // endregion
 
   //
   // Instruction implementations.
@@ -209,7 +201,7 @@ class LiteTranslator {
     return res;
   }
 
-  // region digitalis - ADDG/SUBG (MTE tag arithmetic). Rare; handled by the
+  // ADDG/SUBG (MTE tag arithmetic). Rare; handled by the
   // interpreter. End the region before this instruction (success_=false); the
   // returned register is discarded along with the un-installed region.
   Register AddSubImmTags(bool is_sub, Register src, uint8_t uimm6, uint8_t uimm4) {
@@ -219,7 +211,6 @@ class LiteTranslator {
     success_ = false;
     return src;
   }
-  // endregion
 
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
                       Register src, uint64_t imm) {
@@ -312,7 +303,6 @@ class LiteTranslator {
     return res;
   }
 
-  // region digitalis
   // LDR/LDRSW (literal): load from `[insn_addr + offset]`. The address
   // is constant at JIT time, so we materialize it via movabs and reuse
   // the standard Load() helper (which applies TBI, sets the recovery
@@ -324,7 +314,6 @@ class LiteTranslator {
     bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
     return Load(size, is_signed, is_64bit_target, addr, 0);
   }
-  // endregion
 
   Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
                     Register dst_val, Register src, uint8_t immr, uint8_t imms) {
@@ -371,7 +360,7 @@ class LiteTranslator {
         as_.Movzxwl(res, src);
         return res;
       }
-      // region digitalis - general UBFM (UBFX extract; UBFIZ insert).
+      // general UBFM (UBFX extract; UBFIZ insert).
       // imms >= immr  → UBFX: extract bits[imms:immr] of src to low bits of dst.
       // imms <  immr  → UBFIZ: insert low (imms+1) bits of src at position
       //                  (reg_size - immr); other dst bits zeroed.
@@ -417,7 +406,6 @@ class LiteTranslator {
         }
       }
       return res;
-      // endregion
     }
 
     // Handle common SBFM aliases with direct x86_64 instructions.
@@ -468,7 +456,7 @@ class LiteTranslator {
       }
     }
 
-    // region digitalis - general BFM (BFI / BFXIL / BFC).
+    // general BFM (BFI / BFXIL / BFC).
     // BFM merges bits from src into dst_val, leaving the other dst_val
     // bits unchanged. Two cases by immr/imms relationship:
     //   imms >= immr (BFXIL): take bits[imms:immr] of src and write them
@@ -534,7 +522,6 @@ class LiteTranslator {
       }
       return res;
     }
-    // endregion
 
     // For other complex bitfield operations not yet handled, fall back.
     Undefined();
@@ -569,14 +556,13 @@ class LiteTranslator {
       // CBZ: branch if zero, so skip branch (fall through) if nonzero.
       as_.Jcc(Condition::kNotEqual, *cont);
     }
-    // region digitalis - forward branch extension with back-edge detection
+    // forward branch extension with back-edge detection
     GuestAddr target = GetInsnAddr() + offset;
     if (offset <= 0) {
       // Backward branch: end region to prevent infinite loops.
       is_region_end_reached_ = true;
     }
     ExitRegion(target);
-    // endregion
     as_.Bind(cont);
   }
 
@@ -596,18 +582,17 @@ class LiteTranslator {
       // TBZ: branch if bit clear (CF=0), so skip if CF=1.
       as_.Jcc(Condition::kCarry, *cont);
     }
-    // region digitalis - forward branch extension with back-edge detection
+    // forward branch extension with back-edge detection
     GuestAddr target = GetInsnAddr() + offset;
     if (offset <= 0) {
       // Backward branch: end region to prevent infinite loops.
       is_region_end_reached_ = true;
     }
     ExitRegion(target);
-    // endregion
     as_.Bind(cont);
   }
 
-  // region digitalis - ARM64 TBI (Top Byte Ignore): mask the top 8 bits of an
+  // ARM64 TBI (Top Byte Ignore): mask the top 8 bits of an
   // address register before using it in a host x86 load/store. ARM64 ignores
   // the top byte of pointers in load/store; x86 doesn't, so we must clear it
   // ourselves. Returns a temp register holding (base & 0x00FFFFFFFFFFFFFF).
@@ -618,13 +603,11 @@ class LiteTranslator {
     as_.Shrq(tbi, static_cast<int8_t>(8));
     return tbi;
   }
-  // endregion
 
   Register Load(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
                 Register base, int32_t offset) {
-    // region digitalis - apply TBI mask before using base as memory operand.
+    // apply TBI mask before using base as memory operand.
     base = ApplyTbi(base);
-    // endregion
     AssemblerBase::Label* recovery_label = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery_label);
 
@@ -676,9 +659,8 @@ class LiteTranslator {
   }
 
   void Store(Decoder::LoadStoreSize size, Register base, int32_t offset, Register data) {
-    // region digitalis - apply TBI mask before using base as memory operand.
+    // apply TBI mask before using base as memory operand.
     base = ApplyTbi(base);
-    // endregion
     AssemblerBase::Label* recovery_label = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery_label);
 
@@ -718,7 +700,7 @@ class LiteTranslator {
   void LoadPair(Decoder::LoadStoreSize size, Register base, int32_t offset,
                 uint8_t rt1, uint8_t rt2, uint8_t scale) {
     UNUSED(offset);  // Already applied by caller in semantics_player.
-    // region digitalis - LDP Xt1, Xt2, [Xn]: when Xt1 (or Xt2) aliases Xn, the
+    // LDP Xt1, Xt2, [Xn]: when Xt1 (or Xt2) aliases Xn, the
     // ARM64 architecture loads BOTH pair elements using the *original* base
     // (post-index/writeback are decoded separately into base updates). The
     // previous implementation issued SetReg(rt1, val1) between the two Loads,
@@ -736,7 +718,6 @@ class LiteTranslator {
     if (!success()) return;
     if (rt1 != 31) SetReg(rt1, val1);
     if (rt2 != 31) SetReg(rt2, val2);
-    // endregion
   }
 
   void StorePair(Decoder::LoadStoreSize size, Register base, int32_t offset,
@@ -747,7 +728,7 @@ class LiteTranslator {
     Store(size, base, static_cast<int32_t>(scale), data2);
   }
 
-  // region digitalis - Apply the correct 32->64 extension to the offset
+  // Apply the correct 32->64 extension to the offset
   // register before shift+add. Without this, ldrb/ldr [Xn, Wm, UXTW]
   // and SXTW forms can produce wrong addresses (silent data corruption,
   // not faults — observed as Brotli "Bad context map" in
@@ -797,10 +778,9 @@ class LiteTranslator {
     as_.Addq(addr, base);
     Store(size, addr, 0, data);
   }
-  // endregion
 
   void Svc(uint16_t imm) {
-    // region digitalis - SVC must be handled by interpreter, not JIT.
+    // SVC must be handled by interpreter, not JIT.
     // Setting success_=false causes the region to end BEFORE this instruction.
     // The dispatch loop will then install kInterpreted for the SVC address,
     // and the interpreter handles the actual syscall. The previous approach
@@ -808,20 +788,17 @@ class LiteTranslator {
     // entry for this PC re-entered the same exit code.
     UNUSED(imm);
     success_ = false;
-    // endregion
   }
 
-  // region digitalis - BRK must be handled by the interpreter (which raises the
+  // BRK must be handled by the interpreter (which raises the
   // synchronous SIGTRAP). End the region before this instruction; the dispatch
   // loop installs kInterpreted for the BRK address, exactly like SVC.
   void Brk(uint16_t imm) {
     UNUSED(imm);
     success_ = false;
   }
-  // endregion
 
   Register Mrs(Decoder::SystemReg sysreg) {
-    // region digitalis
     if (sysreg == Decoder::SystemReg::kTpidrEl0) {
       // TPIDR_EL0: Thread-local storage pointer, stored in ThreadState.tls.
       Register res = AllocTempReg();
@@ -871,13 +848,11 @@ class LiteTranslator {
       as_.Movq(res, 0x410FD034ULL);
       return res;
     }
-    // endregion
     Undefined();
     return no_register;
   }
 
   void Msr(Decoder::SystemReg sysreg, Register src) {
-    // region digitalis
     if (sysreg == Decoder::SystemReg::kNzcv) {
       // MSR NZCV, Xn: write to ARM64 flags.
       // Input: N=bit31, Z=bit30, C=bit29, V=bit28.
@@ -899,7 +874,6 @@ class LiteTranslator {
       return;
     }
     UNUSED(src);
-    // endregion
     Undefined();
   }
 
@@ -984,7 +958,7 @@ class LiteTranslator {
     return res;
   }
 
-  // region digitalis - AddSubExtendedReg JIT
+  // AddSubExtendedReg JIT
   Register AddSubExtendedReg(bool is_sub, bool set_flags, bool is_64bit,
                               Register src1, Register src2,
                               uint8_t extend_type, uint8_t shift_amount) {
@@ -1072,9 +1046,7 @@ class LiteTranslator {
     }
     return res;
   }
-  // endregion
 
-  // region digitalis
   Register ConditionalSelect(Decoder::ConditionalSelectOpcode opcode, bool is_64bit,
                               Register src1, Register src2, Decoder::Condition cond) {
     // Prepare result = src2 (false case), then apply opcode transformation.
@@ -1240,7 +1212,6 @@ class LiteTranslator {
     as_.Bind(done);
     return result;
   }
-  // endregion
 
   Register DataProc2Src(Decoder::DataProc2SrcOpcode opcode, bool is_64bit,
                          Register src1, Register src2) {
@@ -1250,7 +1221,7 @@ class LiteTranslator {
       case Decoder::DataProc2SrcOpcode::kLsrv:
       case Decoder::DataProc2SrcOpcode::kAsrv:
       case Decoder::DataProc2SrcOpcode::kRorv: {
-        // region digitalis - save/restore rcx (now in allocator pool)
+        // save/restore rcx (now in allocator pool)
         // All variable-shift instructions use CL for the shift amount.
         as_.Subq(Assembler::rsp, 8);
         as_.Movq({.base = Assembler::rsp}, Assembler::rcx);  // save rcx
@@ -1262,7 +1233,6 @@ class LiteTranslator {
           as_.Movq(Assembler::rcx, src2);
           if (is_64bit) { as_.Movq(res, src1); } else { as_.Movl(res, src1); }
         }
-        // endregion
         if (is_64bit) {
           switch (opcode) {
             case Decoder::DataProc2SrcOpcode::kLslv: as_.ShlqByCl(res); break;
@@ -1280,18 +1250,17 @@ class LiteTranslator {
             default: break;
           }
         }
-        // region digitalis - restore rcx after shift
+        // restore rcx after shift
         if (res == Assembler::rcx) {
           as_.Addq(Assembler::rsp, 8);  // discard saved rcx (result is in rcx)
         } else {
           as_.Movq(Assembler::rcx, {.base = Assembler::rsp});
           as_.Addq(Assembler::rsp, 8);  // restore rcx
         }
-        // endregion
         break;
       }
       case Decoder::DataProc2SrcOpcode::kUdiv: {
-        // region digitalis - save/restore rdx (now in allocator pool)
+        // save/restore rdx (now in allocator pool)
         // ARM64 UDIV: Rd = Rn / Rm.  If Rm == 0, Rd = 0.
         // x86_64 DIV faults on divide-by-zero, so we must check first.
         Assembler::Label* zero = as_.MakeLabel();
@@ -1337,11 +1306,10 @@ class LiteTranslator {
           as_.Movq(Assembler::rdx, {.base = Assembler::rsp});
           as_.Addq(Assembler::rsp, 8);  // restore rdx
         }
-        // endregion
         break;
       }
       case Decoder::DataProc2SrcOpcode::kSdiv: {
-        // region digitalis - save/restore rdx (now in allocator pool)
+        // save/restore rdx (now in allocator pool)
         // ARM64 SDIV: Rd = Rn / Rm.  If Rm == 0, Rd = 0.
         // INT_MIN / -1: ARM64 returns INT_MIN, x86_64 faults.
         Assembler::Label* zero = as_.MakeLabel();
@@ -1406,10 +1374,9 @@ class LiteTranslator {
           as_.Movq(Assembler::rdx, {.base = Assembler::rsp});
           as_.Addq(Assembler::rsp, 8);  // restore rdx
         }
-        // endregion
         break;
       }
-      // region digitalis - CRC32C* (Castagnoli) via the host SSE4.2 CRC32
+      // CRC32C* (Castagnoli) via the host SSE4.2 CRC32
       // instruction, which uses the same polynomial as ARM's CRC32C ops.
       // The accumulator is Wn (zero-extended), the data is Wm (b/h/w) or Xm
       // (x). The IEEE CRC32* ops use a different polynomial and stay on the
@@ -1429,7 +1396,6 @@ class LiteTranslator {
         }
         break;
       }
-      // endregion
       default:
         Undefined();
         return no_register;
@@ -1469,7 +1435,7 @@ class LiteTranslator {
           as_.Subl(res, tmp);
         }
         break;
-      // region digitalis - wider multiply JIT
+      // wider multiply JIT
       case Decoder::DataProc3SrcOpcode::kSmaddl:
       case Decoder::DataProc3SrcOpcode::kSmsubl: {
         // SMADDL/SMSUBL: Xd = Xa ± (Wn * Wm) [signed 32×32→64]
@@ -1511,7 +1477,7 @@ class LiteTranslator {
         break;
       }
       case Decoder::DataProc3SrcOpcode::kSmulh: {
-        // region digitalis - save/restore rdx (now in allocator pool)
+        // save/restore rdx (now in allocator pool)
         // SMULH: Xd = (Xn * Xm) >> 64 [signed high multiply]
         // x86 IMUL r64: RAX * r64 → RDX:RAX (signed)
         as_.Subq(Assembler::rsp, 8);
@@ -1527,11 +1493,10 @@ class LiteTranslator {
         } else {
           as_.Addq(Assembler::rsp, 8);  // discard saved rdx
         }
-        // endregion
         break;
       }
       case Decoder::DataProc3SrcOpcode::kUmulh: {
-        // region digitalis - save/restore rdx (now in allocator pool)
+        // save/restore rdx (now in allocator pool)
         // UMULH: Xd = (Xn * Xm) >> 64 [unsigned high multiply]
         // x86 MUL r64: RAX * r64 → RDX:RAX (unsigned)
         as_.Subq(Assembler::rsp, 8);
@@ -1545,10 +1510,8 @@ class LiteTranslator {
         } else {
           as_.Addq(Assembler::rsp, 8);  // discard saved rdx
         }
-        // endregion
         break;
       }
-      // endregion
       default:
         Undefined();
         return no_register;
@@ -1560,7 +1523,6 @@ class LiteTranslator {
 
   void Undefined() { success_ = false; }
 
-  // region digitalis
   // MTE DP-2src (IRG/GMI/SUBP/SUBPS): bail to the interpreter. These
   // are rare in real workloads (MTE-built libraries only) and SUBPS
   // sets NZCV based on a 56-bit subtraction, which is awkward to emit
@@ -1575,9 +1537,8 @@ class LiteTranslator {
   // host fault-recovery slot if JIT'd; deferring keeps that complexity
   // out of the JIT until profiling shows it matters.
   void MteLoadStore(const Decoder::MteLoadStoreArgs&) { success_ = false; }
-  // endregion
 
-  // region digitalis FCADD/FCMLA JIT
+  // FCADD/FCMLA JIT
   //
   // AdvSIMD complex floating-point (FCADD / FCMLA) JIT path for FP32
   // and FP64.  The interpreter (interpreter.h::AdvSimdFcma) is the
@@ -1615,7 +1576,7 @@ class LiteTranslator {
   // VCVTPH2PS round-trip; that's a follow-up perf row.
   void AdvSimdFcma(const Decoder::FcmaArgs& args) {
     if (args.size == 0b01) {
-      // region digitalis FP16 vector FCMA JIT
+      // FP16 vector FCMA JIT
       //
       // Lower FP16 FCADD/FCMLA via F16C round-trip: widen each operand
       // half (4 FP16 lanes = 2 complex pairs) to FP32, run the FP32
@@ -1756,7 +1717,6 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = dst_off_fp16}, xmm_res2);
       }
       return;
-      // endregion
     }
 
     SimdRegister xmm_n = AllocTempSimdReg();
@@ -1940,9 +1900,8 @@ class LiteTranslator {
 
     as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_result);
   }
-  // endregion
 
-  // region digitalis indexed FCMLA
+  // indexed FCMLA
   //
   // AdvSIMD complex floating-point by element (FCMLA-idx) JIT path for
   // FP32 (.4s).  Same shape as AdvSimdFcma's FP32 FCMLA branch, except
@@ -1964,7 +1923,7 @@ class LiteTranslator {
   // round-trip follow-up as the FP16 FCMA-vector row.
   void AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
     if (args.size == 0b01) {
-      // region digitalis FP16 indexed FCMLA JIT
+      // FP16 indexed FCMLA JIT
       //
       // Lower FP16-indexed FCMLA via F16C round-trip on each half: read
       // the indexed complex pair Vm[2*index : 2*index+1] (2 FP16) into
@@ -2085,7 +2044,6 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = dst_off_fp16}, xmm_res2);
       }
       return;
-      // endregion
     }
 
     if (args.size != 0b10) {
@@ -2170,9 +2128,7 @@ class LiteTranslator {
     // FP32-indexed FCMLA mandates Q=1, so no Q=0 zero-clear is needed.
     as_.Movdqu({.base = Assembler::rbp, .disp = dst_off}, xmm_d);
   }
-  // endregion
 
-  // region digitalis
   // AdvSIMD BFloat16 three-same-extra (BFDOT / BFMMLA / BFMLAL{B,T}).
   //
   // Reference: ARM ARM C7.2.40 (BFDOT), C7.2.42 (BFMMLA), C7.2.39
@@ -2495,9 +2451,8 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n_lo);
     }
   }
-  // endregion
 
-  // region digitalis SDOT/UDOT JIT
+  // SDOT/UDOT JIT
   //
   // AdvSIMD integer dot product: SDOT/UDOT (vector and indexed-by-element).
   // Reference: ARM ARM C7.2.397 (SDOT), C7.2.398 (UDOT).
@@ -2536,9 +2491,9 @@ class LiteTranslator {
   // {SDOT,UDOT} — are lowered.  The interpreter (interpreter.h:1237)
   // remains the executable spec; this JIT path produces bit-exact
   // output (32-bit integer arithmetic with defined wraparound).
-  // region digitalis - I8MM matrix multiply-accumulate: interpreter only.
+  // I8MM matrix multiply-accumulate: interpreter only.
   void AdvSimdMatMul(const Decoder::MatMulArgs& args) {
-    // region digitalis - I8MM 8-bit matrix multiply-accumulate (Q=1 only):
+    // I8MM 8-bit matrix multiply-accumulate (Q=1 only):
     // Vd is a 2x2 int32 matrix, Vn holds 2 rows of 8 int8, Vm holds 2 rows of
     // 8 int8 (the result's columns). Output lane (2*i+j) += dot(Vn row i, Vm
     // row j) over 8 bytes. Widen each 8-byte row to 8x16 (sign per operand,
@@ -2580,12 +2535,10 @@ class LiteTranslator {
     as_.Phaddd(a, c);   // [d00, d01, d10, d11]
     as_.Paddd(a, {.base = Assembler::rbp, .disp = vd_off});
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, a);
-    // endregion
   }
-  // endregion
 
   void AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
-    // region digitalis - Per-operand signedness covers SDOT/UDOT and the I8MM
+    // Per-operand signedness covers SDOT/UDOT and the I8MM
     // mixed-sign forms USDOT (Vn unsigned, Vm signed) and SUDOT (Vn signed, Vm
     // unsigned). An unsigned byte zero-extended to 16 bits stays < 32768, so
     // PMADDWD's signed 16x16 multiply yields the correct mixed-sign products.
@@ -2596,7 +2549,6 @@ class LiteTranslator {
                            args.opcode == Op::kUsdot || args.opcode == Op::kUsdotIdx);
     const bool is_indexed = (args.opcode == Op::kSdotIdx || args.opcode == Op::kUdotIdx ||
                              args.opcode == Op::kUsdotIdx || args.opcode == Op::kSudotIdx);
-    // endregion
 
     const int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
     const int32_t vm_off = offsetof(ThreadState, cpu.v[0]) + args.rm * 16;
@@ -2696,7 +2648,6 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_n_lo);
     }
   }
-  // endregion
 
   // Mirror of the interpreter's ExpandSimdModifiedImm — pure function of the
   // (compile-time-known) encoding fields, so the JIT can materialise the full
@@ -2738,7 +2689,6 @@ class LiteTranslator {
   }
 
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
-    // region digitalis
     const uint8_t cmode = args.cmode;
     // ORR/BIC (vector, immediate) — cmode<0>==1 and cmode<3:2>!=11 — are
     // read-modify-write, unlike the MOVI/MVNI/FMOV replace forms. The immediate
@@ -2797,10 +2747,8 @@ class LiteTranslator {
       }
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = off}, xd);
-    // endregion
   }
 
-  // region digitalis
   // LDR (literal) SIMD/FP: load 32/64/128 bits from [insn_addr + offset]
   // into V[rt]. The address is constant at JIT time, so we materialize
   // it via movabs into a temp register and reuse the standard SIMD
@@ -2816,13 +2764,10 @@ class LiteTranslator {
         {.rt = args.rt, .rn = 0, .offset = 0, .size = args.size, .is_store = false},
         addr);
   }
-  // endregion
 
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
-    // region digitalis - apply TBI mask before using base as memory operand.
+    // apply TBI mask before using base as memory operand.
     base = ApplyTbi(base);
-    // endregion
-    // region digitalis
     // Handle 128-bit SIMD load/store with immediate offset (STR/LDR Q-register).
     if (args.size == Decoder::SimdLoadStoreSize::k128bit) {
       SimdRegister xmm = AllocTempSimdReg();
@@ -2921,15 +2866,12 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
     Undefined();
   }
 
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register addr) {
-    // region digitalis - apply TBI mask before using addr as memory operand.
+    // apply TBI mask before using addr as memory operand.
     addr = ApplyTbi(addr);
-    // endregion
-    // region digitalis
     // Handle 128-bit pair store/load (STP/LDP q-register).
     if (args.size == Decoder::SimdLoadStoreSize::k128bit) {
       SimdRegister xmm1 = AllocTempSimdReg();
@@ -2955,13 +2897,11 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
     Undefined();
   }
 
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                         Register base, Register offset_reg) {
-    // region digitalis
     // Handle SIMD load/store with register offset:
     //   LDR/STR Vt, [Xn, (X|W)m{, extend{ #shift}}]
     // The offset register may need UXTW / SXTW / UXTX / SXTX extension
@@ -2974,10 +2914,9 @@ class LiteTranslator {
       as_.Shlq(addr, static_cast<int8_t>(args.shift_amount));
     }
     as_.Addq(addr, base);
-    // region digitalis - apply TBI mask (top byte ignored on ARM64).
+    // apply TBI mask (top byte ignored on ARM64).
     as_.Shlq(addr, static_cast<int8_t>(8));
     as_.Shrq(addr, static_cast<int8_t>(8));
-    // endregion
 
     int32_t vreg_offset = offsetof(ThreadState, cpu.v[0]) + args.rt * 16;
 
@@ -3033,10 +2972,8 @@ class LiteTranslator {
       }
     }
     return;
-    // endregion
   }
 
-  // region digitalis
   // FCSEL Sd|Dd|Hd, Sn|Dn|Hn, Sm|Dm|Hm, cond.
   //   if ConditionHolds(cond) then result = V[rn] else result = V[rm];
   //   V[rd] = ZeroExtend(result, 128);
@@ -3202,7 +3139,6 @@ class LiteTranslator {
     as_.Movdqu({.base = Assembler::rbp, .disp = v_rd_off}, xmm);
   }
 
-  // region digitalis
   // FP <-> fixed-point conversion (GPR↔FPR, FpFixedPoint encoding family).
   //
   //   SCVTF / UCVTF: signed/unsigned integer in Wn/Xn → FP in Sd/Dd,
@@ -3475,7 +3411,6 @@ class LiteTranslator {
       SetReg(args.rd, tmp);
     }
   }
-  // endregion
 
   // FP data-processing (3 source): FMADD, FMSUB, FNMADD, FNMSUB at S/D.
   //
@@ -3506,7 +3441,6 @@ class LiteTranslator {
   // some inputs.
   void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra,
                    uint8_t ftype, bool o1, bool o0) {
-    // region digitalis
     if (ftype != 0b00 && ftype != 0b01 && ftype != 0b11) {
       success_ = false;
       return;
@@ -3605,7 +3539,6 @@ class LiteTranslator {
     } else {
       as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
     }
-    // endregion
   }
 
   // FMOV (scalar, immediate): JIT - load a FP constant into SIMD register
@@ -3650,10 +3583,9 @@ class LiteTranslator {
       success_ = false;  // fallback for half-precision
     }
   }
-  // endregion
 
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
-    // region digitalis - JIT support for FMOV GP↔FP conversions
+    // JIT support for FMOV GP↔FP conversions
     uint8_t rmode = args.rmode;
     uint8_t opcode = args.op;
 
@@ -4403,9 +4335,8 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
 
-    // region digitalis (FJCVTZS — Armv8.3-JSCVT, double -> int32 ECMAScript ToInt32)
+    // (FJCVTZS — Armv8.3-JSCVT, double -> int32 ECMAScript ToInt32)
     //
     // FJCVTZS Wd, Dn: rmode=11, opcode=110, ftype=01, sf=0.
     //
@@ -4507,13 +4438,11 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
 
     Undefined();
   }
 
   void AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
-    // region digitalis
     // Decode element size + lane index from imm5. The encoding is shared by
     // every AdvSimdCopy opcode that selects a lane (UMOV / SMOV / INS-general
     // / DUP-element). UMOV and INS-general are JIT-implemented below; the
@@ -4750,9 +4679,8 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = off_vd}, xmm);
       return;
     }
-    // endregion
 
-    // region digitalis - implement DUP (general) for memset fast path
+    // implement DUP (general) for memset fast path
     if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupGeneral) {
       // DUP (general): broadcast GP register Rn to all lanes of Vd.
       //   Q=1: full 128-bit broadcast (16B / 4S / 2D).
@@ -4816,12 +4744,11 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vreg_offset}, xmm);
       return;
     }
-    // endregion
     Undefined();
   }
 
   void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
-    // region digitalis - JIT for common SIMD three-same ops.
+    // JIT for common SIMD three-same ops.
     //
     // Implements MUL/MLA/MLS/ADD/SUB/AND/ORR/EOR/CMEQ at the lane sizes
     // the dynamic linker's calculate_gnu_hash_neon needs (4S MUL/MLA in
@@ -4851,7 +4778,7 @@ class LiteTranslator {
 
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kMul: {
-        // region digitalis - MUL .16B/.8B via PMOVZXBW + PMULLW + PACKUSWB (SSE4.1);
+        // MUL .16B/.8B via PMOVZXBW + PMULLW + PACKUSWB (SSE4.1);
         // .8H/.4H via PMULLW (SSE2); .4S/.2S via PMULLD (SSE4.1).
         // .2D / scalar 64-bit is reserved by the ARM ARM and falls back to the interpreter.
         if (args.size == 0b11) { Undefined(); return; }
@@ -4893,11 +4820,10 @@ class LiteTranslator {
         }
         if (!args.q) mask_low64(xn);
         store_full(vd_off, xn);
-        // endregion
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
-        // region digitalis - MLA .16B/.8B via PMOVZXBW+PMULLW+PACKUSWB+PADDB (SSE4.1);
+        // MLA .16B/.8B via PMOVZXBW+PMULLW+PACKUSWB+PADDB (SSE4.1);
         // .8H/.4H via PMULLW+PADDW (SSE2); .4S/.2S via PMULLD+PADDD (SSE4.1).
         // .2D / scalar 64-bit is reserved by the ARM ARM and falls back to the interpreter.
         if (args.size == 0b11) { Undefined(); return; }
@@ -4944,10 +4870,8 @@ class LiteTranslator {
         }
         if (!args.q) mask_low64(xd);
         store_full(vd_off, xd);
-        // endregion
         return;
       }
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kMls: {
         // MLS: Vd[lane] = Vd[lane] - Vn[lane] * Vm[lane].
         // Same product recipe as kMla / kMul (byte uses widen+PMULLW+
@@ -4997,8 +4921,6 @@ class LiteTranslator {
         store_full(vd_off, xd);
         return;
       }
-      // endregion
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kSabd: {
         // SABD: Vd[lane] = |signed(Vn[lane]) - signed(Vm[lane])|.
         // ARM ARM computes the difference in extended (unbounded) signed
@@ -5174,7 +5096,6 @@ class LiteTranslator {
         store_full(vd_off, xd);
         return;
       }
-      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAdd: {
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
@@ -5209,7 +5130,7 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // region digitalis - SQADD/UQADD/SQSUB/UQSUB vector for 8/16/32-bit lanes.
+      // SQADD/UQADD/SQSUB/UQSUB vector for 8/16/32-bit lanes.
       // x86 SSE2 has direct saturating add/sub for byte (PADD{S,US}B /
       // PSUB{S,US}B) and halfword (PADD{S,US}W / PSUB{S,US}W) lanes, which
       // match ARM's per-lane signed/unsigned saturation semantics exactly.
@@ -5362,8 +5283,7 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
-      // region digitalis - ADDP (pairwise add) vector for all lane widths.
+      // ADDP (pairwise add) vector for all lane widths.
       // ARM ADDP concatenates Vn:Vm and adds adjacent pairs; the lower half of
       // the result comes from Vn pairs, the upper half from Vm pairs.
       //
@@ -5465,7 +5385,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kAnd: {
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();
@@ -5521,7 +5440,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kCmtst: {
         // CMTST Vd, Vn, Vm — lane-wise (Vn & Vm) != 0 ? all-ones : 0.
         // Recipe: PAND(Vn, Vm), then PCMPEQ against zero (all-ones if the
@@ -5554,8 +5472,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kShadd:
       case Decoder::AdvSimdThreeSameOpcode::kUhadd: {
         // SHADD / UHADD Vd, Vn, Vm — per-lane (a + b) >> 1 with no overflow,
@@ -5643,8 +5559,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kSrhadd:
       case Decoder::AdvSimdThreeSameOpcode::kUrhadd: {
         // SRHADD / URHADD Vd, Vn, Vm — per-lane (a + b + 1) >> 1, signed
@@ -5742,8 +5656,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kShsub:
       case Decoder::AdvSimdThreeSameOpcode::kUhsub: {
         // SHSUB / UHSUB Vd, Vn, Vm — per-lane (a - b) >> 1 with floor-
@@ -5869,7 +5781,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kBic: {
         // BIC Vd, Vn, Vm: Vd = Vn AND NOT Vm.  x86 PANDN dst, src computes
         // dst = NOT(dst) AND src, so PANDN(xm, xn) lands ~Vm & Vn in xm.
@@ -6024,7 +5935,7 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // region digitalis - CMGE/CMHS vector via PCMPGT + invert (sign-flip for CMHS)
+      // CMGE/CMHS vector via PCMPGT + invert (sign-flip for CMHS)
       case Decoder::AdvSimdThreeSameOpcode::kCmge: {
         // CMGE Vd, Vn, Vm: lane-wise signed greater-than-or-equal.
         // x86 has no PCMPGE; compute NOT(Vm > Vn) instead, since
@@ -6102,8 +6013,7 @@ class LiteTranslator {
         store_full(vd_off, xm);
         return;
       }
-      // endregion
-      // region digitalis - SMAX/SMIN/UMAX/UMIN vector via PMAXS*/PMINS*/PMAXU*/PMINU*
+      // SMAX/SMIN/UMAX/UMIN vector via PMAXS*/PMINS*/PMAXU*/PMINU*
       case Decoder::AdvSimdThreeSameOpcode::kSmax:
       case Decoder::AdvSimdThreeSameOpcode::kSmin:
       case Decoder::AdvSimdThreeSameOpcode::kUmax:
@@ -6178,8 +6088,7 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
-      // region digitalis - SMAXP/SMINP/UMAXP/UMINP vector (pairwise)
+      // SMAXP/SMINP/UMAXP/UMINP vector (pairwise)
       case Decoder::AdvSimdThreeSameOpcode::kSmaxp:
       case Decoder::AdvSimdThreeSameOpcode::kSminp:
       case Decoder::AdvSimdThreeSameOpcode::kUmaxp:
@@ -6387,7 +6296,6 @@ class LiteTranslator {
         store_full(vd_off, xn);
         return;
       }
-      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kFaddV:
       case Decoder::AdvSimdThreeSameOpcode::kFsubV:
       case Decoder::AdvSimdThreeSameOpcode::kFmulV:
@@ -6943,7 +6851,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // region digitalis: FMULX vector three-same (FP32 .2S/.4S, FP64 .2D).
+      // FMULX vector three-same (FP32 .2S/.4S, FP64 .2D).
       //
       // Direct lift of the AdvSimdScalarThreeSame FMULX scalar pattern to
       // packed PS/PD:
@@ -6965,7 +6873,7 @@ class LiteTranslator {
       //
       // FP16 .4H/.8H via F16C round-trip — see dedicated branch below.
       case Decoder::AdvSimdThreeSameOpcode::kFmulxV: {
-        // region digitalis: FP16 vector FMULX .4H / .8H via F16C round-trip.
+        // FP16 vector FMULX .4H / .8H via F16C round-trip.
         // The interpreter computes each FP16 lane as
         // FpSingleToHalf(FmulxScalar<float>(a, b)) — i.e. the whole FMULX
         // (including the ±0×±∞ → ±2.0 special-case override and sign-of-xor
@@ -7075,7 +6983,6 @@ class LiteTranslator {
           }
           return;
         }
-        // endregion
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { success_ = false; return; }
 
@@ -7149,8 +7056,7 @@ class LiteTranslator {
         store_full(vd_off, xmm_input_unord);
         return;
       }
-      // endregion
-      // region digitalis: FMLA / FMLS vector three-same (FP32 .2S/.4S, FP64 .2D).
+      // FMLA / FMLS vector three-same (FP32 .2S/.4S, FP64 .2D).
       //
       // ARM ARM defines FMLA/FMLS as fused multiply-accumulate (single
       // rounding for the whole multiply-add).  x86 FMA3 packed forms have
@@ -7322,8 +7228,7 @@ class LiteTranslator {
         store_full(vd_off, xmm_d);
         return;
       }
-      // endregion
-      // region digitalis: FRECPS / FRSQRTS vector three-same (FP32 .2S/.4S, FP64 .2D).
+      // FRECPS / FRSQRTS vector three-same (FP32 .2S/.4S, FP64 .2D).
       //
       // Lane-parallel lift of the scalar FRECPS/FRSQRTS JIT path
       // (AdvSimdScalarThreeSame).  Same single-rounded structure:
@@ -7345,7 +7250,7 @@ class LiteTranslator {
       // fused semantics).  Reserved .1D shape (size=01 && q=0) bails.
       case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
       case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV: {
-        // region digitalis: FP16 vector FRECPS / FRSQRTS .4H / .8H via
+        // FP16 vector FRECPS / FRSQRTS .4H / .8H via
         // F16C round-trip.  The interpreter computes FP16 lanes as
         // FpSingleToHalf(FrecpsScalar<float>(a, b)) — i.e. the whole
         // Newton step is done in FP32 then narrowed to half.  Lift:
@@ -7474,7 +7379,6 @@ class LiteTranslator {
           }
           return;
         }
-        // endregion
         if (!host_platform::kHasFMA) { success_ = false; return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { success_ = false; return; }
@@ -7597,8 +7501,7 @@ class LiteTranslator {
         store_full(vd_off, xmm_m);
         return;
       }
-      // endregion
-      // region digitalis - SQDMULH / SQRDMULH three-same vector: saturating
+      // SQDMULH / SQRDMULH three-same vector: saturating
       // doubling multiply-high, with optional rounding.  Decoder restricts
       // size to {01, 10}.
       //
@@ -7779,8 +7682,7 @@ class LiteTranslator {
         // size=00 and size=11 reserved by the decoder; bail safely.
         success_ = false; return;
       }
-      // endregion
-      // region digitalis - PMUL polynomial multiply (vector, byte lanes).
+      // PMUL polynomial multiply (vector, byte lanes).
       //
       // ARM ARM C7.2.219: PMUL .8B/.16B performs per-lane carry-less multiply
       // over GF(2)[x]; the result is the low 8 bits of the polynomial product.
@@ -7871,8 +7773,7 @@ class LiteTranslator {
         store_full(vd_off, xacc);
         return;
       }
-      // endregion
-      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
+      // Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
       //
       // Decoder restricts size to {01, 10}.  size=01 (.4h/.8h) uses PMULHRSW
       // (SSSE3) for stage-1 SQRDMULH with corner fixup at (INT16_MIN,
@@ -8058,8 +7959,7 @@ class LiteTranslator {
         // size=00 / size=11 are reserved by the decoder; bail safely.
         success_ = false; return;
       }
-      // endregion
-      // region digitalis - SSHL / USHL vector form: signed/unsigned variable
+      // SSHL / USHL vector form: signed/unsigned variable
       // shift.  Per-lane shift count is the signed int8 in the low byte of
       // the corresponding Vm lane.  Per-lane GPR-branched recipe (the scalar
       // D recipe inlined N times, with element-width-specific zero and
@@ -8390,8 +8290,7 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
-      // region digitalis - UQSHL vector form: unsigned saturating variable
+      // UQSHL vector form: unsigned saturating variable
       // shift.  The per-lane shift count is the signed int8 in the low byte
       // of the corresponding Vm lane.  Per-lane GPR-branched recipe (the
       // UQSHL scalar D recipe inlined N times, with element-width-specific
@@ -8717,8 +8616,7 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
-      // region digitalis - SQSHL vector form: signed saturating variable
+      // SQSHL vector form: signed saturating variable
       // shift.  The per-lane shift count is the signed int8 in the low byte
       // of the corresponding Vm lane.  Per-lane GPR-branched recipe (the
       // SQSHL scalar D recipe inlined N times, with element-width-specific
@@ -9139,8 +9037,7 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
-      // region digitalis - URSHL vector form: unsigned non-saturating rounded
+      // URSHL vector form: unsigned non-saturating rounded
       // variable shift.  Per-lane GPR-branched recipe (the URSHL scalar D
       // recipe inlined N times, with element-width-specific thresholds).
       // Left shifts truncate (no saturation); right shifts add a round-half-up
@@ -9458,8 +9355,7 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
-      // region digitalis - SRSHL vector form: signed non-saturating rounded
+      // SRSHL vector form: signed non-saturating rounded
       // variable shift.  Per-lane GPR-branched recipe.  Mirror of URSHL with
       // two changes from the unsigned recipe: the data shift on the rounding-
       // quadrant arm uses SAR (signed) instead of SHR, and the |sh|>=W
@@ -9748,8 +9644,7 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
-      // region digitalis - UQRSHL vector form: unsigned saturating rounded
+      // UQRSHL vector form: unsigned saturating rounded
       // variable shift.  Per-lane GPR-branched recipe — combines the UQSHL
       // positive arm (shift-then-back-shift overflow detector + saturate-to-
       // UINT_W_MAX) with the URSHL negative arm (overflow-safe rounding
@@ -10148,8 +10043,7 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
-      // region digitalis - SQRSHL vector form: signed saturating rounded
+      // SQRSHL vector form: signed saturating rounded
       // variable shift.  Per-lane GPR-branched recipe — combines the SQSHL
       // positive arm (SAR-based back-shift overflow detector + sign-broadcast
       // XOR-with-INT_W_MAX saturation picker) with the SRSHL negative arm
@@ -10582,15 +10476,12 @@ class LiteTranslator {
         as_.Addq(Assembler::rsp, 8);
         return;
       }
-      // endregion
       default:
         Undefined();
         return;
     }
-    // endregion
   }
 
-  // region digitalis
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
     // JIT lowering for the widening multiply-and-(add|sub|just-store) family:
     //   {S,U}MULL{,2}, {S,U}MLAL{,2}, {S,U}MLSL{,2}
@@ -10679,7 +10570,7 @@ class LiteTranslator {
       return;
     }
 
-    // region digitalis - ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half).
+    // ADDHN/SUBHN/RADDHN/RSUBHN (narrowing high half).
     // Vd(narrow) = ((Vn op Vm) [+ round]) >> narrow_bits, taking the high
     // half of each wide lane.  R-variants add round = 1<<(narrow_bits-1).
     // size=00 (.8B<-.8H), 01 (.4H<-.4S) use a narrowing pack; size=10
@@ -10770,7 +10661,6 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
 
     // Widening add/sub family — same widen-then-binop pattern as the
     // multiply family below:
@@ -10930,7 +10820,7 @@ class LiteTranslator {
       }
     }
 
-    // region digitalis - SQDMULL (signed doubling widening multiply,
+    // SQDMULL (signed doubling widening multiply,
     // saturating): product = SAT(2 * SignedWiden(Vn) * Vm).  Only the
     // .4H->.4S form (size=01) is JIT-lowered: PMOVSXWD + PMULLD give exact
     // 32-bit products, and the doubling overflows only at the INT16_MIN^2
@@ -11087,7 +10977,6 @@ class LiteTranslator {
       success_ = false;  // size=00 -> interpreter (no SQDMULL byte form)
       return;
     }
-    // endregion
 
     const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
     const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
@@ -11172,10 +11061,9 @@ class LiteTranslator {
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
   }
-  // endregion
 
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
-    // region digitalis - JIT for EXT Vd.<T>, Vn.<T>, Vm.<T>, #imm.
+    // JIT for EXT Vd.<T>, Vn.<T>, Vm.<T>, #imm.
     // Concatenates Vn:Vm and extracts a vector starting at byte `index`
     // from Vn. Equivalent to:
     //   result = (Vn >> (index*8)) | (Vm << ((vlen-index)*8))
@@ -11243,13 +11131,11 @@ class LiteTranslator {
     as_.Pslldq(xm, static_cast<int8_t>(16 - index));
     as_.Por(xn, xm);
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
-    // endregion
   }
 
-  // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
-    // region digitalis: ZIP / UZP / TRN vector permute JIT
+    // ZIP / UZP / TRN vector permute JIT
     //
     // opcode encoding (3 bits, from Decoder::DecodeAdvSimd at decoder.h:2808):
     //   001=UZP1, 010=TRN1, 011=ZIP1, 101=UZP2, 110=TRN2, 111=ZIP2
@@ -11562,10 +11448,8 @@ class LiteTranslator {
       as_.Psrldq(xn, int8_t{8});
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
-    // endregion
   }
 
-  // region digitalis
   // JIT for AdvSIMD TBL/TBX (table lookup / table lookup extended).
   //   TBL Vd.<T>, {Vn.16B [, V(n+1) [, V(n+2) [, V(n+3)]]]}, Vm.<T>
   //   TBX Vd.<T>, {Vn.16B [, V(n+1) [, V(n+2) [, V(n+3)]]]}, Vm.<T>
@@ -11679,7 +11563,6 @@ class LiteTranslator {
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_acc);
   }
-  // endregion
 
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     UNUSED(op, rd, rn, rm);
@@ -11703,9 +11586,8 @@ class LiteTranslator {
     UNUSED(rd, rn, rm, imm6);
     Undefined();
   }
-  // endregion
 
-  // region digitalis - SM3/SM4 (interpreter only).
+  // SM3/SM4 (interpreter only).
   void Sm4e(uint8_t rd, uint8_t rn) {
     UNUSED(rd, rn);
     Undefined();
@@ -11730,9 +11612,7 @@ class LiteTranslator {
     UNUSED(rd, rn, rm);
     Undefined();
   }
-  // endregion
 
-  // region digitalis
   void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
     UNUSED(rd, rn, opcode);
     Undefined();  // interpreter fallback
@@ -11747,9 +11627,7 @@ class LiteTranslator {
     UNUSED(rd, rn, opcode);
     Undefined();  // interpreter fallback
   }
-  // endregion
 
-  // region digitalis
   // JIT for LD1 / ST1 multi-register contiguous AdvSIMD load/store
   // (`ld1 {Vt.T, ...}, [Xn]{, post}` / `st1 ...`). Promoted out of the
   // interpreter because `__dl___strchr_aarch64` in the dynamic linker
@@ -11767,7 +11645,7 @@ class LiteTranslator {
                    // bulk-vector regardless.
     const int32_t vec_bytes = q ? 16 : 8;
 
-    // region digitalis - de-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4
+    // de-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4
     // (multiple-structure form).  Memory holds num_regs * (vec_bytes/esize)
     // elements laid out structure-major: element index e in memory belongs to
     // register (e % num_regs), lane (e / num_regs).  The universal lowering
@@ -11844,7 +11722,6 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
 
     if (num_regs < 1 || num_regs > 4) { Undefined(); return; }
 
@@ -11906,7 +11783,7 @@ class LiteTranslator {
   }
 
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
-    // region digitalis - JIT for LD1R / LD1 / ST1 single-element variants
+    // JIT for LD1R / LD1 / ST1 single-element variants
     // with num_regs == 1.  Critical for `calculate_gnu_hash_neon`'s tail
     // (`ld1r v3.4s, [x10], #4`) in the dynamic linker — without this the
     // post-loop tail bails to the interpreter on every symbol resolve.
@@ -12062,9 +11939,7 @@ class LiteTranslator {
         SetReg(args.rn, new_base);
       }
     }
-    // endregion
   }
-  // endregion
 
   Register AddSubWithCarry(Register src1, Register src2, bool is_64bit,
                             bool is_sub, bool set_flags) {
@@ -12074,9 +11949,9 @@ class LiteTranslator {
   }
 
   Register DataProc1Src(Register src, uint8_t opcode2, bool is_64bit) {
-    // region digitalis - JIT support for REV, CLZ, RBIT
+    // JIT support for REV, CLZ, RBIT
     Register res = AllocTempReg();
-    // region digitalis PAuth DP-1Src as identity (emit a plain move)
+    // PAuth DP-1Src as identity (emit a plain move)
     // The decoder sets bit 0x40 to flag PAuth variants — Digitalis is PAC-blind,
     // so the JIT just copies src→dst (the upper-half clear of Movl handles the
     // sf=0 sign/zero-extend semantics; PAuth ops are X-form only but Movl is
@@ -12089,7 +11964,6 @@ class LiteTranslator {
       }
       return res;
     }
-    // endregion
     switch (opcode2) {
       case 0b000001: {  // REV16: reverse byte order within each 16-bit halfword.
         // res = ((src & 0x..00FF) << 8) | ((src & 0x..FF00) >> 8).
@@ -12118,7 +11992,7 @@ class LiteTranslator {
         }
         return res;
       }
-      case 0b000010:  // region digitalis - REV32 (sf=1) / REV (sf=0).
+      case 0b000010:  // REV32 (sf=1) / REV (sf=0).
         if (is_64bit) {
           // REV32 Xd: byte-reverse each 32-bit word independently. BSWAPQ
           // reverses all 8 bytes (also swapping the two words); rotating by 32
@@ -12132,7 +12006,6 @@ class LiteTranslator {
           as_.Bswapl(res);
         }
         return res;
-        // endregion
       case 0b000011:  // REV (byte reverse) — maps to x86 BSWAP
         if (is_64bit) {
           as_.Movq(res, src);
@@ -12171,10 +12044,9 @@ class LiteTranslator {
         Undefined();
         return no_register;
     }
-    // endregion
   }
 
-  // region digitalis - EXTR JIT
+  // EXTR JIT
   Register Extr(Register src_n, Register src_m, uint8_t lsb, bool is_64bit) {
     // EXTR Xd, Xn, Xm, #lsb: extract from pair (Xn:Xm) >> lsb
     // When Xn == Xm, this is a rotate right (ROR).
@@ -12203,16 +12075,14 @@ class LiteTranslator {
     }
     return res;
   }
-  // endregion
 
   void ConditionalCompare(bool is_neg, bool is_64bit, Register rn, Register rm,
                            Decoder::Condition cond, uint8_t nzcv);  // implemented in .cc
 
-  // region digitalis - Atomics JIT
+  // Atomics JIT
   void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
-    // region digitalis - apply TBI mask before using base as memory operand.
+    // apply TBI mask before using base as memory operand.
     base = ApplyTbi(base);
-    // endregion
     auto lss = static_cast<Decoder::LoadStoreSize>(args.size);
     Assembler::Operand mem{.base = base, .disp = 0};
 
@@ -12275,14 +12145,13 @@ class LiteTranslator {
           Register old_val = AllocTempReg();
           if (!success()) return;
           as_.Movq(old_val, Assembler::rax);
-          // region digitalis - byte/halfword forms only update low bits of RAX;
+          // byte/halfword forms only update low bits of RAX;
           // upper bits remain stale. ARM CAS Wt zero-extends to 64. Mask.
           if (args.size == 0) {
             as_.Andq(old_val, static_cast<int32_t>(0xFF));
           } else if (args.size == 1) {
             as_.Andq(old_val, static_cast<int32_t>(0xFFFF));
           }
-          // endregion
           SetReg(args.rs, old_val);
         }
         break;
@@ -12315,7 +12184,7 @@ class LiteTranslator {
         ExitGeneratedCode(GetInsnAddr());
         as_.Bind(cont);
 
-        // region digitalis - byte/halfword Xchg leaves upper bits of new_val
+        // byte/halfword Xchg leaves upper bits of new_val
         // as the original guest Xs (copied via Movq above), not zero. ARM SWP
         // Wt zero-extends the old memory value to 64. Mask.
         if (args.size == 0) {
@@ -12323,7 +12192,6 @@ class LiteTranslator {
         } else if (args.size == 1) {
           as_.Andq(new_val, static_cast<int32_t>(0xFFFF));
         }
-        // endregion
         if (args.rt < 31) SetReg(args.rt, new_val);
         break;
       }
@@ -12355,7 +12223,7 @@ class LiteTranslator {
         ExitGeneratedCode(GetInsnAddr());
         as_.Bind(cont);
 
-        // region digitalis - byte/halfword LockXadd only updates low bits of
+        // byte/halfword LockXadd only updates low bits of
         // addend; upper bits stay as guest Xs. ARM LDADD Wt zero-extends the
         // old memory value to 64. Mask.
         if (args.size == 0) {
@@ -12363,7 +12231,6 @@ class LiteTranslator {
         } else if (args.size == 1) {
           as_.Andq(addend, static_cast<int32_t>(0xFFFF));
         }
-        // endregion
         // addend now contains old value.
         if (args.rt < 31) SetReg(args.rt, addend);
         break;
@@ -12461,7 +12328,7 @@ class LiteTranslator {
         break;
       }
 
-      // region digitalis LSE bitwise atomics (LDCLR/LDSET/LDEOR).
+      // LSE bitwise atomics (LDCLR/LDSET/LDEOR).
       // x86 has no single-instruction equivalent; emit a CMPXCHG retry loop.
       // ARM: tmp = [Xn]; [Xn] = tmp <op> Xs; Xt = tmp (zero-extended for W form).
       case Decoder::AtomicOp::kLdclr:
@@ -12540,9 +12407,8 @@ class LiteTranslator {
         }
         break;
       }
-      // endregion
 
-      // region digitalis atomic min/max (LSE Armv8.1).
+      // atomic min/max (LSE Armv8.1).
       // x86 has no single-instruction equivalent; emit a CMPXCHG retry loop
       // with a sign- or zero-extended Cmpq+Cmovq to pick max/min.  ARM
       // semantics: tmp = [Xn]; [Xn] = is_max ? max(tmp, Xs) : min(tmp, Xs);
@@ -12659,9 +12525,8 @@ class LiteTranslator {
         }
         break;
       }
-      // endregion
 
-      // region digitalis CASP JIT (compare-and-swap pair).
+      // CASP JIT (compare-and-swap pair).
       // size=2 (32-bit pair): pack Rs:Rs+1 into a single 64-bit value and use
       //   LOCK CMPXCHGq.  Mirrors the interpreter's path (interpreter.h
       //   delegates the 32-bit pair to AtomicCASVal<uint64_t>).
@@ -12869,17 +12734,15 @@ class LiteTranslator {
         }
         break;
       }
-      // endregion
 
       default:
         Undefined();
         break;
     }
   }
-  // endregion
 
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
-    // region digitalis - JIT path for FP one-source ops across FP16/FP32/FP64.
+    // JIT path for FP one-source ops across FP16/FP32/FP64.
     //
     //   FMOV          : direct copy (no F16C).
     //   FABS / FNEG   : sign-bit clear / flip via GP register mask
@@ -13234,7 +13097,7 @@ class LiteTranslator {
       return;
     }
 
-    // region digitalis - BFCVT Hd, Sn (single -> BF16) (§H2).
+    // BFCVT Hd, Sn (single -> BF16) (§H2).
     //
     // Encoding: ftype=01 (D-form discriminant), opcode=0b000110.  The
     // source register is read as FP32 (Sn) despite ftype=01 — the
@@ -13298,7 +13161,6 @@ class LiteTranslator {
       as_.Movw({.base = Assembler::rbp, .disp = dst_offset}, bits);
       return;
     }
-    // endregion
 
     // FSQRT and FRINT*: SIMD lowering via SQRTSS/SQRTSD / ROUNDSS/ROUNDSD.
     int8_t round_imm = 0;
@@ -13349,10 +13211,9 @@ class LiteTranslator {
       }
       as_.Movss({.base = Assembler::rbp, .disp = dst_offset}, xmm_val);
     }
-    // endregion
   }
 
-  // region digitalis - FP arithmetic JIT
+  // FP arithmetic JIT
   //
   // FP16 (ftype=0b11) lowering: F16C round-trip.
   //   PINSRW [src] -> XMM lane0       (load the 16-bit half, upper lanes zero)
@@ -13416,7 +13277,7 @@ class LiteTranslator {
         if (is_double) as_.Subsd(xmm_n, xmm_m);
         else as_.Subss(xmm_n, xmm_m);
         break;
-      // region digitalis: scalar FMAX / FMIN / FMAXNM / FMINNM / FNMUL JIT.
+      // scalar FMAX / FMIN / FMAXNM / FMINNM / FNMUL JIT.
       //
       // FMAX/FMIN (NaN-propagating per ARM ARM): symmetric MAX with POR.
       //   tmp = m; MAXP{S,D} tmp, n   ; tmp lane0 = NaN if any NaN else max
@@ -13512,7 +13373,6 @@ class LiteTranslator {
         }
         break;
       }
-      // endregion
       default:
         // Any other opcode (reserved / future) — fall back to interpreter.
         Undefined();
@@ -13594,7 +13454,7 @@ class LiteTranslator {
       as_.Ucomiss(xmm_n, xmm_m);
     }
 
-    // region digitalis fix: emit the correct FP-specific ARM NZCV
+    // fix: emit the correct FP-specific ARM NZCV
     // mapping, not the integer-SUB EmitStoreArmNZCV.  UCOMISS/UCOMISD set
     // only ZF/PF/CF; SF and OF retain stale values, so the integer-flag
     // emission produced random N and V bits.  This silently broke any
@@ -13602,11 +13462,8 @@ class LiteTranslator {
     // they only depend on Z, which the integer mapping happened to set
     // correctly).  See note in EmitStoreArmFpNZCV below.
     EmitStoreArmFpNZCV();
-    // endregion
   }
-  // endregion
 
-  // region digitalis
   // FCCMP / FCCMPE: if cond evaluates true, perform UCOMISS/UCOMISD and map
   // x86 EFLAGS -> ARM NZCV via EmitStoreArmFpNZCV (same as FCMP); otherwise
   // write the immediate NZCV field directly to ThreadState::cpu.flags.
@@ -13794,9 +13651,8 @@ class LiteTranslator {
 
     as_.Bind(done);
   }
-  // endregion
 
-  // region digitalis - URECPE / URSQRTE estimate tables. The result of these
+  // URECPE / URSQRTE estimate tables. The result of these
   // unsigned integer reciprocal / reciprocal-sqrt estimates is a pure function
   // of the 9-bit field (a>>23)&0x1FF (the saturation condition — top bit clear
   // for URECPE, top two bits clear for URSQRTE — is encoded in that field's
@@ -13843,10 +13699,9 @@ class LiteTranslator {
     static const uint32_t* const kRsqrte = BuildUnsignedEstimateTable(true);
     return is_rsqrt ? kRsqrte : kRecpe;
   }
-  // endregion
 
   void AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscArgs& args) {
-    // region digitalis - JIT for CMEQZ (cmeq Vd, Vn, #0) used by the
+    // JIT for CMEQZ (cmeq Vd, Vn, #0) used by the
     // dynamic linker's calculate_gnu_hash_neon. Other opcodes fall
     // through to the interpreter.
     int32_t vn_off = offsetof(ThreadState, cpu.v[0]) + args.rn * 16;
@@ -13875,7 +13730,7 @@ class LiteTranslator {
         return;
       }
 
-      // region digitalis - SHLL/SHLL2 (shift left long by element size). Each
+      // SHLL/SHLL2 (shift left long by element size). Each
       // source element is zero-extended to twice its width and shifted left by
       // the source element-size in bits (so the source lands in the high half).
       // size=00 .8B->.8H, 01 .4H->.4S, 10 .2S->.2D. Q=0 (SHLL) reads the low 8
@@ -13896,7 +13751,7 @@ class LiteTranslator {
         return;
       }
 
-      // region digitalis - URECPE/URSQRTE (.2S/.4S): per-lane unsigned integer
+      // URECPE/URSQRTE (.2S/.4S): per-lane unsigned integer
       // reciprocal / reciprocal-sqrt estimate. The result is a pure function of
       // the 9-bit field (lane>>23)&0x1FF, so extract that index per lane and
       // load the precomputed estimate from the table (matches the interpreter
@@ -13929,10 +13784,8 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xres);
         return;
       }
-      // endregion
-      // endregion
 
-      // region digitalis - FCVTXN / FCVTXN2 (vector FP64->FP32, round-to-odd).
+      // FCVTXN / FCVTXN2 (vector FP64->FP32, round-to-odd).
       // Per lane, mirror the validated scalar FCVTXN: one-shot MXCSR RC=RTZ +
       // CVTSD2SS, then OR the FP32 LSB if that lane's PE (inexact) bit was set.
       // (PE stays 0 for NaN/Inf/exact, so those keep CVTSD2SS's value.) Two
@@ -13995,9 +13848,8 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
 
-      // region digitalis - XTN / XTN2 (truncating extract narrow). args.size
+      // XTN / XTN2 (truncating extract narrow). args.size
       // selects the destination element width (00=.8B, 01=.4H, 10=.2S); each
       // source lane is twice as wide.  Q=0 writes the packed result to the low
       // 64 bits (upper zeroed); Q=1 (XTN2) writes the upper 64 bits, preserving
@@ -14045,9 +13897,8 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
 
-      // region digitalis - SQXTN / UQXTN / SQXTUN (saturating extract narrow).
+      // SQXTN / UQXTN / SQXTUN (saturating extract narrow).
       // Same dst-width selection and Q=0/Q2 layout as XTN; the pack differs by
       // saturation flavour:
       //   SQXTN  signed src -> signed dst   : PACKSSWB / PACKSSDW
@@ -14171,9 +14022,8 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
 
-      // region digitalis - FCVTL / FCVTN (FP32<->FP64, size=01).  FCVTL widens
+      // FCVTL / FCVTN (FP32<->FP64, size=01).  FCVTL widens
       // 2 floats to 2 doubles (CVTPS2PD; Q=1/FCVTL2 takes the upper floats);
       // FCVTN narrows 2 doubles to 2 floats (CVTPD2PS; Q=0 low+zero-upper,
       // Q=1/FCVTN2 upper-half merge).  size=00 (FP16) bails to the interpreter.
@@ -14225,7 +14075,6 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
 
       // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 -- per-lane signed compare against 0.
       //   CMGT (Vn > 0)  ->  PCMPGTx(Vn, 0)
@@ -14944,7 +14793,7 @@ class LiteTranslator {
         return;
       }
 
-      // region digitalis - SUQADD / USQADD (per-lane saturating accumulate of
+      // SUQADD / USQADD (per-lane saturating accumulate of
       // mixed signedness) for byte/halfword lanes.
       //   SUQADD Vd, Vn: Vd[i] = SignedSat( int(Vd[i]) + uint(Vn[i]) )
       //   USQADD Vd, Vn: Vd[i] = UnsignedSat( uint(Vd[i]) + int(Vn[i]) )
@@ -15076,7 +14925,6 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, dlo);
         return;
       }
-      // endregion
 
       // CLZ V.<T>, V.<T> -- per-lane count leading zeros.
       //   size=00 .8B/.16B  -> 8-bit lane CLZ (result 0..8)
@@ -15139,7 +14987,6 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
-      // region digitalis
       // CLS V.<T>, V.<T> -- per-lane count leading sign bits (number of
       // consecutive bits below the MSB that equal the MSB; range 0..N-1).
       //   size=00 .8B/.16B  -> 8-bit lane CLS (result 0..7)
@@ -15217,14 +15064,12 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
-      // endregion
       // Vector FABS / FNEG (FP32 .2S/.4S, FP64 .2D, FP16 .4H/.8H).
       //   size=10 → FP32, size=11 → FP64.  FP64 requires Q=1.
       //   FABS: AND with broadcast mask 0x7FFFFFFF (FP32) or 0x7FFFFFFF_FFFFFFFF (FP64).
       //   FNEG: XOR with broadcast mask 0x80000000 (FP32) or 0x80000000_00000000 (FP64).
       //   FP16: broadcast 16-bit mask 0x7FFF (FABS) / 0x8000 (FNEG).  FP16
       //   FABS/FNEG are pure bit operations — no F16C round-trip required.
-      // region digitalis
       case Decoder::AdvSimdTwoRegMiscOpcode::kFabs:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
         const bool is_fabs =
@@ -15247,7 +15092,6 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
           return;
         }
-        // endregion
         if (args.size != 0b10 && args.size != 0b11) { Undefined(); return; }
         const bool is_double = (args.size & 1);
         if (is_double && !args.q) { Undefined(); return; }
@@ -15548,7 +15392,6 @@ class LiteTranslator {
       //   narrow imm=0). Per the standing rule, F16C round-trip is
       //   exact for FP16 unary FSQRT. The .8H form splits the upper 4
       //   half-lanes into a second F16C round-trip (no AVX YMM path).
-      // region digitalis
       // FCVTZS V (vector FP→signed int, truncating).  Handles .2S / .4S
       // (FP32 → S32) directly with CVTTPS2DQ plus an ARM-vs-x86 saturation
       // fix-up; .2D (FP64 → S64) via per-lane scalar Cvttsd2siq + scalar
@@ -16060,7 +15903,6 @@ class LiteTranslator {
       // ROUNDPS/PD imm=3 = truncate-toward-zero + suppress-inexact.  NaN/
       // +/-Inf/sign-of-zero pass through ADDPS/ADDPD and ROUNDPS/PD
       // unchanged, so the saturation classifiers still distinguish them.
-      // region digitalis
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtasV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtauV: {
         if (args.is_fp16) { success_ = false; return; }
@@ -16272,7 +16114,6 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
       // Vector SCVTF / UCVTF (signed/unsigned integer -> FP).
       //
       // Encoding: opcode=11101, bit23=0 (bit23=1 is FRECPE / FRSQRTE).  The
@@ -16307,7 +16148,6 @@ class LiteTranslator {
       //           back via Addsd.  This avoids the Cvtsi2sdq overflow when
       //           the input has bit63 set, and the LSB preservation keeps
       //           the conversion correctly rounded.
-      // region digitalis
       case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
         if (args.is_fp16) { success_ = false; return; }
@@ -16388,7 +16228,6 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // endregion
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
         if (args.is_fp16) {
           if (!host_platform::kHasF16C) { success_ = false; return; }
@@ -16441,7 +16280,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // region digitalis - ADDV (across-lanes integer sum). Result is a single
+      // ADDV (across-lanes integer sum). Result is a single
       // scalar in the lowest lane of Vd with all other bytes zeroed.
       //
       // Encoding (DDI 0487 §C7.2 Advanced SIMD across lanes):
@@ -16509,8 +16348,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // endregion
-      // region digitalis - SADDLV / UADDLV (across-lanes long integer sum).
+      // SADDLV / UADDLV (across-lanes long integer sum).
       // Each source element is widened to 2*esize before being summed; the
       // single 2*esize-wide result is written to the lowest lane of Vd with
       // all other bytes zeroed.
@@ -16651,8 +16489,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // endregion
-      // region digitalis - SMAXV / SMINV / UMAXV / UMINV (across-lanes
+      // SMAXV / SMINV / UMAXV / UMINV (across-lanes
       // integer max/min reduce).  Scan all source lanes; write the single
       // scalar max/min to the lowest lane of Vd with all other bytes of Vd
       // zeroed.  Result width equals esize (unlike SADDLV/UADDLV which
@@ -16770,8 +16607,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // endregion
-      // region digitalis - BFCVTN / BFCVTN2 (vector narrow FP32 -> BF16) (§H2).
+      // BFCVTN / BFCVTN2 (vector narrow FP32 -> BF16) (§H2).
       //
       // Q=0 BFCVTN  v.4h, v.4s:  writes 4 BF16 lanes into Vd.h[0..3], upper 64 bits zeroed.
       // Q=1 BFCVTN2 v.8h, v.4s:  writes 4 BF16 lanes into Vd.h[4..7], lower 64 bits preserved.
@@ -16872,15 +16708,12 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
       default:
         Undefined();
         return;
     }
-    // endregion
   }
 
-  // region digitalis
   //
   // AdvSimd scalar two-register-misc JIT dispatch.
   //
@@ -17870,7 +17703,7 @@ class LiteTranslator {
     }
   }
 
-  // region digitalis: FMULX / FRECPS / FRSQRTS (scalar three-same, FP32/FP64)
+  // FMULX / FRECPS / FRSQRTS (scalar three-same, FP32/FP64)
   // JIT.
   //
   // FMULX is identical to FMUL except the (zero * infinity) saturation case
@@ -17951,7 +17784,6 @@ class LiteTranslator {
     const bool is_facge = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacge);
     const bool is_facgt = (opc == Decoder::AdvSimdScalarThreeSameOpcode::kFacgt);
     const bool is_cmp = is_fcmeq || is_fcmge || is_fcmgt || is_facge || is_facgt;
-    // region digitalis
     const bool is_sqrdmlah_scalar =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlahScalar);
     const bool is_sqrdmlsh_scalar =
@@ -18009,8 +17841,7 @@ class LiteTranslator {
     const bool is_ushl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUshl);
     const bool is_shl_scalar_d = is_sshl_scalar_d || is_ushl_scalar_d;
-    // endregion
-    // region digitalis: UQSHL scalar (all sizes — B, H, S, D).
+    // UQSHL scalar (all sizes — B, H, S, D).
     // Unsigned saturating variable left shift; the shift amount is the low 8
     // bits of Vm interpreted as int8_t.  Negative shifts behave exactly like
     // USHL (no saturation possible on right shifts of a non-negative value);
@@ -18021,8 +17852,7 @@ class LiteTranslator {
     // form (bits_local==64) where the 64-bit ShlqByCl naturally truncates.
     const bool is_uqshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqshlScalar);
-    // endregion
-    // region digitalis: SQSHL scalar (all sizes — B, H, S, D).
+    // SQSHL scalar (all sizes — B, H, S, D).
     // Signed saturating variable left shift; same scaffolding as UQSHL but
     // the back-shift uses SAR (arithmetic) and the saturation target depends
     // on sign(a): positive a → INT_MAX_N, negative a → INT_MIN_N.  Negative
@@ -18033,8 +17863,7 @@ class LiteTranslator {
     // sign-extend step at N=64.
     const bool is_sqshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqshlScalar);
-    // endregion
-    // region digitalis: URSHL scalar (D form only — the size=11 path).
+    // URSHL scalar (D form only — the size=11 path).
     // Unsigned non-saturating rounded variable shift; left shifts discard
     // upper bits (same as USHL); right shifts add a round-half-up bias
     // 1 << (rshift-1) before the shift.  Implemented via the standard
@@ -18044,8 +17873,7 @@ class LiteTranslator {
     // so that a near UINT64_MAX doesn't wrap during the bias addition.
     const bool is_urshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUrshlScalar);
-    // endregion
-    // region digitalis: SRSHL scalar (D form only — the size=11 path).
+    // SRSHL scalar (D form only — the size=11 path).
     // Signed non-saturating rounded variable shift; the signed counterpart of
     // URSHL.  Left shifts truncate (same as SSHL).  Right shifts use the same
     // round-bit identity as URSHL but with SAR (signed arithmetic) on the
@@ -18056,8 +17884,7 @@ class LiteTranslator {
     // which >>s 64 = 0, so no dedicated |sh|=64 branch is needed.
     const bool is_srshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSrshlScalar);
-    // endregion
-    // region digitalis: UQRSHL scalar (all sizes — unsigned saturating
+    // UQRSHL scalar (all sizes — unsigned saturating
     // rounded variable shift, lane width N = 8/16/32/64).  Combines UQSHL
     // scalar positive arm (shift-then-mask-then-back-shift overflow detector
     // + saturation to umax_N = (1 << N) - 1) with URSHL D negative arm
@@ -18069,8 +17896,7 @@ class LiteTranslator {
     // size.
     const bool is_uqrshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kUqrshlScalar);
-    // endregion
-    // region digitalis: SQRSHL scalar (all sizes — signed saturating rounded
+    // SQRSHL scalar (all sizes — signed saturating rounded
     // variable shift, lane width N = 8/16/32/64).  Combines SQSHL B/H/S/D
     // positive arm (sign-extended load + SignExtendFromN between Shl/Sar
     // overflow detector + LoadIntMaxN + sign-broadcast XOR + MaskToN at
@@ -18085,7 +17911,6 @@ class LiteTranslator {
     // suffix is historical; the flag detects SQRSHL scalar at any size.
     const bool is_sqrshl_scalar_d =
         (opc == Decoder::AdvSimdScalarThreeSameOpcode::kSqrshlScalar);
-    // endregion
     if (!is_fmulx && !is_frecps && !is_frsqrts && !is_fabd && !is_cmp &&
         !is_sqrdm_scalar && !is_sq_d_r_mulh_scalar && !is_dform_int &&
         !is_satarith_scalar_bhsd && !is_shl_scalar_d && !is_uqshl_scalar_d &&
@@ -18093,7 +17918,7 @@ class LiteTranslator {
         !is_uqrshl_scalar_d && !is_sqrshl_scalar_d) {
       success_ = false; return;
     }
-    // region digitalis: SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
+    // SQRDMLAH/SQRDMLSH scalar three-same (Armv8.1-RDM).
     // Single-lane port of the AdvSimdThreeSame vector lowering:
     //   size=01 (H): SSSE3 PMULHRSW + (INT16_MIN)² corner fix, then PADDSW /
     //                PSUBSW for the stage-2 signed-saturating accumulate.
@@ -18244,8 +18069,7 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
       return;
     }
-    // endregion
-    // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+    // SQDMULH / SQRDMULH scalar (H/S only).
     //
     // Single-lane port of stage 1 of the SQRDMLAH/SQRDMLSH scalar recipe
     // above (same MOVQ/MOVD load shape, same corner-fix XOR), minus the
@@ -18383,8 +18207,7 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xp);
       return;
     }
-    // endregion
-    // region digitalis: SQADD / UQADD / SQSUB / UQSUB scalar (B/H/S sizes).
+    // SQADD / UQADD / SQSUB / UQSUB scalar (B/H/S sizes).
     //
     // ARM ARM C7.2.282 / .284 / .317 / .319: the scalar single-lane forms
     // saturate at width 8/16/32/64 selected by args.size.  Here we cover
@@ -18672,8 +18495,7 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
       return;
     }
-    // endregion
-    // region digitalis: SSHL / USHL scalar D form (non-saturating variable
+    // SSHL / USHL scalar D form (non-saturating variable
     // shift).  The shift amount comes from Vm[7:0] sign-extended to int64:
     //   * shift >= 64        → result = 0  (SSHL and USHL).
     //   * 0 <= shift < 64    → result = a << shift  (left, same for both).
@@ -18754,8 +18576,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: UQSHL scalar (all sizes — unsigned saturating variable
+    // UQSHL scalar (all sizes — unsigned saturating variable
     // left shift, lane width N = 8/16/32/64).  Like USHL scalar for the
     // right-shift branches; positive shifts add an overflow check that
     // saturates to umax_N = (1 << N) - 1 when bits get pushed past bit (N-1).
@@ -18901,8 +18722,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: SQSHL scalar (all sizes — signed saturating variable
+    // SQSHL scalar (all sizes — signed saturating variable
     // left shift, lane width N = 8/16/32/64).  Mirrors UQSHL scalar but:
     //   * Operand `a` is sign-extended from Vn[bits_local-1:0] to int64 at
     //     load time, so bit 63 of `a` carries the sign of the N-bit lane and
@@ -19074,8 +18894,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: URSHL scalar D form (unsigned non-saturating rounded
+    // URSHL scalar D form (unsigned non-saturating rounded
     // variable shift, 64-bit lane).  Left shifts truncate (no saturation —
     // bits past bit 63 are discarded); right shifts add a round-half-up bias
     // before the shift.  The standard identity
@@ -19163,8 +18982,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: SRSHL scalar D form (signed non-saturating rounded
+    // SRSHL scalar D form (signed non-saturating rounded
     // variable shift, 64-bit lane).  Direct mirror of URSHL D with two
     // changes: the data shift on the rounding-quadrant arm uses SAR (signed)
     // instead of SHR, and the |sh|>=64 boundary collapses into a single
@@ -19241,8 +19059,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: UQRSHL scalar (all sizes — unsigned saturating
+    // UQRSHL scalar (all sizes — unsigned saturating
     // rounded variable shift, lane width N = 8/16/32/64).  Combines UQSHL
     // scalar positive arm with URSHL D negative arm — saturation only on
     // the left-shift quadrant, rounding only on the right-shift quadrant,
@@ -19400,8 +19217,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: SQRSHL scalar (all sizes — signed saturating rounded
+    // SQRSHL scalar (all sizes — signed saturating rounded
     // variable shift, lane width N = 8/16/32/64).  Combines SQSHL B/H/S/D
     // positive arm with SRSHL D negative arm (parameterized on bits_local):
     //   * shift in [0, N-1]   → sign-extend + SAR-back-shift overflow
@@ -19582,8 +19398,7 @@ class LiteTranslator {
       as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, int32_t{0});
       return;
     }
-    // endregion
-    // region digitalis: D-form scalar integer ops (ADD / SUB / CMGT / CMHI /
+    // D-form scalar integer ops (ADD / SUB / CMGT / CMHI /
     //   CMGE / CMHS / CMTST / CMEQ scalar).  The ARM ARM restricts these to
     //   size=11 (D form); Vd[63:0] = scalar op result, Vd[127:64] = 0.
     //
@@ -19684,8 +19499,7 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
       return;
     }
-    // endregion
-    // region digitalis: FP16 path is JIT-emitted for FCMxx / FACxx (mask out),
+    // FP16 path is JIT-emitted for FCMxx / FACxx (mask out),
     // FMULX (real-FP out), FABD (real-FP out), FRECPS (real-FP out), and
     // FRSQRTS (real-FP out) via an F16C round-trip (each FP16 source lane is
     // lifted to FP32 in xmm lane 0; the existing FP32 core runs unchanged;
@@ -19699,7 +19513,6 @@ class LiteTranslator {
         !is_frsqrts) {
       success_ = false; return;
     }
-    // endregion
     if ((is_frecps || is_frsqrts) && !host_platform::kHasFMA) {
       success_ = false; return;
     }
@@ -19717,7 +19530,7 @@ class LiteTranslator {
           xmm_mask == no_simd_register) {
         success_ = false; return;
       }
-      // region digitalis: FP16 lift via F16C round-trip — Pxor + Pinsrw +
+      // FP16 lift via F16C round-trip — Pxor + Pinsrw +
       // Vcvtph2ps widens each FP16 source lane to FP32 in xmm lane 0.  The
       // existing FP32 FABD core (Subss + AND with non-sign-bit mask) then
       // runs unchanged on the lifted operands; lanes 1..3 stay FP32 +0 by
@@ -19741,14 +19554,13 @@ class LiteTranslator {
         as_.Movss(xmm_b, {.base = Assembler::rbp, .disp = src_m_off});
         as_.Subss(xmm_a, xmm_b);
       }
-      // endregion
       // Build non-sign-bit mask (all-ones shifted right by 1) and AND it
       // into the lane to clear the sign bit (== std::fabs).
       as_.Pcmpeqd(xmm_mask, xmm_mask);
       if (use_single) as_.Psrld(xmm_mask, int8_t{1});
       else as_.Psrlq(xmm_mask, int8_t{1});
       as_.Pand(xmm_a, xmm_mask);
-      // region digitalis: FP16 narrow via Vcvtps2ph (real-FP output, NOT a
+      // FP16 narrow via Vcvtps2ph (real-FP output, NOT a
       // mask — Vcvtps2ph is the right primitive here).  It rounds 4 FP32
       // lanes to 4 FP16 lanes in the dst xmm's low 64 bits and zero-fills
       // the upper 64 bits.  Lanes 1..3 are FP32 +0.0 (preserved through
@@ -19768,7 +19580,6 @@ class LiteTranslator {
           as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_a);
         }
       }
-      // endregion
       return;
     }
 
@@ -19885,7 +19696,7 @@ class LiteTranslator {
         success_ = false; return;
       }
 
-      // region digitalis: FP16 lift via F16C round-trip — Pxor + Pinsrw +
+      // FP16 lift via F16C round-trip — Pxor + Pinsrw +
       // Vcvtph2ps widens each FP16 source lane to FP32 in xmm lane 0.  The
       // existing FP32 FRECPS/FRSQRTS Newton-step core (Vfnmadd231ss of
       // K_fma - a*b, plus a Divss-by-2 step for FRSQRTS, with K_sat blend on
@@ -19914,7 +19725,6 @@ class LiteTranslator {
         as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
         as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
       }
-      // endregion
 
       // mul = a * b (only its NaN bit is observed via cmpunord below).
       as_.Movdqa(xmm_mul, xmm_n);
@@ -19991,7 +19801,7 @@ class LiteTranslator {
       as_.Pandn(xmm_iu, xmm_n);           // xmm_iu = (NOT iu) AND result_first
       as_.Por(xmm_m, xmm_iu);             // xmm_m = result_final
 
-      // region digitalis: FP16 narrow via Vcvtps2ph (real-FP output, NOT a
+      // FP16 narrow via Vcvtps2ph (real-FP output, NOT a
       // mask).  Rounds 4 FP32 lanes to 4 FP16 word lanes in dst xmm's low
       // 64 bits and zero-fills the upper 64 bits.  Lanes 1..3 of xmm_m are
       // FP32 +0 throughout the Pand/Por blend pipeline (the upper-zero
@@ -20011,7 +19821,6 @@ class LiteTranslator {
           as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_m);
         }
       }
-      // endregion
       return;
     }
 
@@ -20027,7 +19836,7 @@ class LiteTranslator {
       success_ = false; return;
     }
 
-    // region digitalis: when args.is_fp16, lift each FP16 source lane to
+    // when args.is_fp16, lift each FP16 source lane to
     // FP32 in xmm lane 0 (Pxor + Pinsrw + Vcvtph2ps), run the existing FP32
     // FMULX compute core on the lifted operands, then narrow the FP32 result
     // back to FP16 via Vcvtps2ph.  Vcvtph2ps puts FP32 +0.0 in lanes 1..3,
@@ -20050,7 +19859,6 @@ class LiteTranslator {
       as_.Movss(xmm_n, {.base = Assembler::rbp, .disp = src_n_off});
       as_.Movss(xmm_m, {.base = Assembler::rbp, .disp = src_m_off});
     }
-    // endregion
 
     // mul = a * b
     as_.Movdqa(xmm_mul, xmm_n);
@@ -20104,7 +19912,7 @@ class LiteTranslator {
 
     // Zero Vd, then write the scalar lane 0.  Matches AArch64 scalar
     // semantics: bits above the operand size are zero.
-    // region digitalis: FP16 narrow path uses Vcvtps2ph (real-FP-valued
+    // FP16 narrow path uses Vcvtps2ph (real-FP-valued
     // result, not an FP-width mask), which auto-zeroes upper 64 bits of dst
     // xmm; full Movdqu then writes Vd[15:0]=FP16 result, Vd[127:16]=0.
     if (args.is_fp16) {
@@ -20119,9 +19927,7 @@ class LiteTranslator {
         as_.Movss({.base = Assembler::rbp, .disp = dst_off}, xmm_input_unord);
       }
     }
-    // endregion
   }
-  // endregion
 
   // AdvSimd scalar pairwise JIT (ARM ARM "Advanced SIMD scalar pairwise").
   // Reads a pair of esize elements from Vn (lane[0] and lane[1] of the low
@@ -20359,10 +20165,8 @@ class LiteTranslator {
       }
     }
   }
-  // endregion
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
-    // region digitalis
     // Scalar shift-by-immediate dispatch.  The decoder forces D-form
     // (immh bit 3 set, esize=64) for the "simple" shift family — SSHR /
     // USHR / SSRA / USRA / SRSHR / URSHR / SRSRA / URSRA / SHL / SLI /
@@ -20463,8 +20267,7 @@ class LiteTranslator {
           success_ = false; return;
       }
     }
-    // endregion
-    // region digitalis - JIT for USHLL / SSHLL (unsigned/signed shift-left
+    // JIT for USHLL / SSHLL (unsigned/signed shift-left
     // long) at 8B→8H / 4H→4S / 2S→2D widening + Q=1 "long2" forms
     // (USHLL2/SSHLL2 reading the upper half of Vn).  Used by
     // calculate_gnu_hash_neon and many SIMD widening expansions.  Other
@@ -20536,7 +20339,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // region digitalis: SHL / USHR / SSHR vector shift-by-immediate JIT.
+      // SHL / USHR / SSHR vector shift-by-immediate JIT.
       //
       //   esize from immh:  bit3→8 (.2D), bit2→4 (.4S/.2S), bit1→2 (.8H/.4H),
       //                     bit0→1 (.16B/.8B — byte shift, no x86 equivalent,
@@ -20566,7 +20369,7 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 1
-        // region digitalis: SSHR .8B / .16B byte form JIT via
+        // SSHR .8B / .16B byte form JIT via
         // PMOVSXBW + PSRAW + PACKSSWB.
         //
         // SSHR's per-lane arithmetic right shift on bytes has no SSE
@@ -20624,8 +20427,7 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
           return;
         }
-        // endregion
-        // region digitalis: USHR .8B / .16B byte form JIT via
+        // USHR .8B / .16B byte form JIT via
         // PMOVZXBW + PSRLW + PACKUSWB.
         //
         // Unsigned sibling of the SSHR .8B / .16B byte form above.
@@ -20684,7 +20486,6 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
           return;
         }
-        // endregion
         if (is_byte) { success_ = false; return; }
         const bool is_left = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
         uint8_t esize_bits;
@@ -20702,7 +20503,7 @@ class LiteTranslator {
         } else {
           shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);  // 1..bits
         }
-        // region digitalis: SSHR .2D / scalar D GPR fallback.
+        // SSHR .2D / scalar D GPR fallback.
         //
         // SSHR's per-lane arithmetic right shift at .D needs PSRAQ,
         // which is AVX-512F-VL only.  For the .2D vector form and the
@@ -20764,7 +20565,6 @@ class LiteTranslator {
           }
           return;
         }
-        // endregion
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { success_ = false; return; }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
@@ -20797,8 +20597,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
-      // endregion
-      // region digitalis: SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
+      // SSRA / USRA / SLI / SRI vector shift-by-immediate JIT.
       //
       //   SSRA  Vd<i> = Vd<i> + (Vn<i> >> shift)        (arithmetic right shift, accumulate)
       //   USRA  Vd<i> = Vd<i> + (Vn<i> >> shift)        (logical right shift, accumulate)
@@ -20831,7 +20630,7 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 1 (8 bits)
-        // region digitalis: SSRA .8B / .16B byte form JIT via
+        // SSRA .8B / .16B byte form JIT via
         // PMOVSXBW + PSRAW + PACKSSWB + PADDB.
         //
         // Sibling-promote of the SSHR .8B / .16B byte form above.
@@ -20902,8 +20701,7 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
           return;
         }
-        // endregion
-        // region digitalis: USRA .8B / .16B byte form JIT via
+        // USRA .8B / .16B byte form JIT via
         // PMOVZXBW + PSRLW + PACKUSWB + PADDB.
         //
         // Unsigned sibling of the SSRA .8B / .16B byte form above with
@@ -20984,7 +20782,6 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
           return;
         }
-        // endregion
         if (is_byte) { success_ = false; return; }
         uint8_t esize_bits;
         if (immh & 0b1000) {
@@ -21004,7 +20801,7 @@ class LiteTranslator {
           // SSRA/USRA/SRI shift = 2*bits - immh:immb, range [1, bits].
           shift_count = static_cast<uint8_t>(2 * esize_bits - immh_immb);
         }
-        // region digitalis: SSRA .2D / scalar D GPR fallback.
+        // SSRA .2D / scalar D GPR fallback.
         //
         // SSRA's per-lane arithmetic right shift at .D needs PSRAQ,
         // which is AVX-512F-VL only.  Sibling of the SSHR .2D GPR
@@ -21079,7 +20876,6 @@ class LiteTranslator {
           }
           return;
         }
-        // endregion
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xd = AllocTempSimdReg();
         if (xn == no_simd_register || xd == no_simd_register) {
@@ -21157,8 +20953,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
         return;
       }
-      // endregion
-      // region digitalis: SRSHR / URSHR / SRSRA / URSRA vector
+      // SRSHR / URSHR / SRSRA / URSRA vector
       // shift-by-immediate JIT (rounding right-shift family).
       //
       // Per-lane semantics:
@@ -21209,7 +21004,7 @@ class LiteTranslator {
         const uint8_t immh = args.immh;
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);  // esize = 8
-        // region digitalis: URSHR .8B / .16B byte form JIT via
+        // URSHR .8B / .16B byte form JIT via
         // PMOVZXBW + PSRLW + two-shift bit-isolate + PADDW + PACKUSWB.
         //
         // Per-lane URSHR:  Vd<i> = floor((Vn<i> + 2^(cnt-1)) / 2^cnt)
@@ -21318,7 +21113,6 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
           return;
         }
-        // endregion
         if (is_byte) { success_ = false; return; }
         uint8_t esize_bits;
         if (immh & 0b1000) {
@@ -21336,7 +21130,7 @@ class LiteTranslator {
              args.opcode == Decoder::AdvSimdShiftImmOpcode::kUrsra);
         // Signed .2D bails — PSRAQ is AVX-512F-VL only.
         if (is_signed && esize_bits == 64) {
-          // region digitalis: SRSHR .2D / scalar D GPR fallback.
+          // SRSHR .2D / scalar D GPR fallback.
           //
           // Per-lane semantics (signed rounding right shift):
           //   result = floor((Vn + 2^(shift-1)) / 2^shift)
@@ -21439,8 +21233,7 @@ class LiteTranslator {
             }
             return;
           }
-          // endregion
-          // region digitalis: SRSRA .2D / scalar D GPR fallback.
+          // SRSRA .2D / scalar D GPR fallback.
           //
           // Per-lane semantics (signed rounding right shift, accumulate):
           //   result = Vd<i> + floor((Vn<i> + 2^(shift-1)) / 2^shift)
@@ -21554,7 +21347,6 @@ class LiteTranslator {
             }
             return;
           }
-          // endregion
           success_ = false; return;
         }
         const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
@@ -21629,8 +21421,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, result);
         return;
       }
-      // endregion
-      // region digitalis: SQSHL / UQSHL / SQSHLU vector shift-by-immediate
+      // SQSHL / UQSHL / SQSHLU vector shift-by-immediate
       // JIT (saturating left-shift family).
       //
       // Per-lane semantics:
@@ -21686,7 +21477,7 @@ class LiteTranslator {
         if (immh == 0) { success_ = false; return; }
         const bool is_byte = (immh == 0b0001);
         if (is_byte) {
-          // region digitalis - scalar byte (esize=8) saturating-shift path.
+          // scalar byte (esize=8) saturating-shift path.
           //
           // No PSLLB/PSRAB/PSRLB in baseline SSE, so we widen Vn[7:0] to
           // a single 16-bit lane via PMOVSXBW (signed sources: SQSHL /
@@ -21764,10 +21555,9 @@ class LiteTranslator {
           as_.Psrldq(xn_b, int8_t{15});
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_b);
           return;
-          // endregion
         }
         const bool is_dword = (immh & 0b1000) != 0;
-        // region digitalis: SQSHL scalar .D GPR fallback path.
+        // SQSHL scalar .D GPR fallback path.
         //
         // SQSHL (immediate) scalar .D (immh & 0b1000, args.scalar==true)
         // with shift_count in [0, 63].  The SSE vector .2D pipeline below
@@ -21924,7 +21714,6 @@ class LiteTranslator {
           as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, sat);
           return;
         }
-        // endregion
         uint8_t esize_bits;
         if (immh & 0b1000) {
           esize_bits = 64;
@@ -21958,9 +21747,7 @@ class LiteTranslator {
           switch (esize_bits) {
             case 16: as_.Pcmpgtw(xt, xn); break;
             case 32: as_.Pcmpgtd(xt, xn); break;
-            // region digitalis
             case 64: as_.Pcmpgtq(xt, xn); break;  // SSE4.2
-            // endregion
           }
           // xt = neg_mask (0xFFFF / 0xFFFFFFFF / 0xFFFFFFFFFFFFFFFF
           // where xn < 0).
@@ -21973,9 +21760,7 @@ class LiteTranslator {
         switch (esize_bits) {
           case 16: as_.Psllw(xs, cnt); break;
           case 32: as_.Pslld(xs, cnt); break;
-          // region digitalis
           case 64: as_.Psllq(xs, cnt); break;
-          // endregion
         }
         // xm = recover(xs, shift_count) using arith shift (signed) or
         // logical shift (unsigned).
@@ -21990,18 +21775,14 @@ class LiteTranslator {
           switch (esize_bits) {
             case 16: as_.Psrlw(xm, cnt); break;
             case 32: as_.Psrld(xm, cnt); break;
-            // region digitalis
             case 64: as_.Psrlq(xm, cnt); break;
-            // endregion
           }
         }
         // xm = eq_mask: per-lane all-ones if no overflow, else 0.
         switch (esize_bits) {
           case 16: as_.Pcmpeqw(xm, xn); break;
           case 32: as_.Pcmpeqd(xm, xn); break;
-          // region digitalis
           case 64: as_.Pcmpeqq(xm, xn); break;  // SSE4.1
-          // endregion
         }
 
         // Build saturation value in xt.
@@ -22030,22 +21811,20 @@ class LiteTranslator {
         as_.Por(xs, xm);                       // xs = blended result
 
         if (!args.q) {
-          // region digitalis - scalar B/H/S keep only `esize_bits/8` low bytes;
+          // scalar B/H/S keep only `esize_bits/8` low bytes;
           // vector .8B/.4H/.2S and scalar .D keep low 8 bytes.  Byte-granular
           // Pslldq/Psrldq trick zeros everything above the kept bytes.
           int8_t shift_bytes =
               (args.scalar && esize_bits < 64)
                   ? static_cast<int8_t>(16 - (esize_bits / 8))
                   : int8_t{8};
-          // endregion
           as_.Pslldq(xs, shift_bytes);
           as_.Psrldq(xs, shift_bytes);
         }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xs);
         return;
       }
-      // endregion
-      // region digitalis: SHRN / SHRN2 / RSHRN / RSHRN2 / UQSHRN / UQSHRN2
+      // SHRN / SHRN2 / RSHRN / RSHRN2 / UQSHRN / UQSHRN2
       // vector shift-right-narrow JIT.
       //
       //   immh=0001 → src 16-bit (.8H), dst 8-bit  (.8B / .16B for Q=1)
@@ -22197,7 +21976,7 @@ class LiteTranslator {
           // can't express cheaply.  Fall back to the interpreter.
           success_ = false; return;
         }
-        // region digitalis: SQSHRN / SQSHRUN / SQRSHRN scalar D-source
+        // SQSHRN / SQSHRUN / SQRSHRN scalar D-source
         // GPR fallback.
         //
         // The SIMD vector lowering needs PSRAQ for the per-lane signed
@@ -22302,7 +22081,6 @@ class LiteTranslator {
           as_.Movl({.base = Assembler::rbp, .disp = vd_off}, a);
           return;
         }
-        // endregion
         if (uses_signed_shift && src_bits == 64) {
           // Remaining signed-source-D paths that still need PSRAQ:
           //   - SQSHRN  vector .2S (args.scalar=false, src=64)
@@ -22619,8 +22397,7 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
-      // region digitalis: SCVTF / UCVTF scalar fixed-point conversion.
+      // SCVTF / UCVTF scalar fixed-point conversion.
       //
       //   Per ARM ARM C7.2.301 / C7.2.342 (scalar form):
       //     immh=01xx → .S (esize=32, source is 32-bit int)
@@ -22756,8 +22533,7 @@ class LiteTranslator {
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm);
         return;
       }
-      // endregion
-      // region digitalis: AdvSimdScalarShiftByImm JIT — FCVTZS (FP →
+      // AdvSimdScalarShiftByImm JIT — FCVTZS (FP →
       // signed fixed-point int, truncate toward zero).  Mirrors the
       // AdvSimdScalarTwoRegMisc kFcvtzs lowering at lines 11369-11427,
       // but multiplies the FP source by 2^+fbits before truncating so
@@ -22862,8 +22638,7 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
-      // region digitalis: AdvSimdScalarShiftByImm JIT — FCVTZU (FP →
+      // AdvSimdScalarShiftByImm JIT — FCVTZU (FP →
       // unsigned fixed-point int, truncate toward zero).  Mirrors the
       // AdvSimdScalarTwoRegMisc kFcvtzu lowering at lines 11429-11535,
       // but multiplies the FP source by 2^+fbits before truncating.
@@ -23011,16 +22786,13 @@ class LiteTranslator {
         }
         return;
       }
-      // endregion
       default:
         Undefined();
         return;
     }
-    // endregion
   }
 
-  // region digitalis
-  // region digitalis: AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL /
+  // AdvSIMD vector by-element JIT — FMLA / FMLS / FMUL /
   // FMULX at FP32 (.2S/.4S) and FP64 (.2D).  Shape:
   //   1. Load Vn into xmm_n.
   //   2. Load Vm; broadcast lane args.index across all lanes with PSHUFD
@@ -23045,7 +22817,7 @@ class LiteTranslator {
   // Reserved .1D shape (size=11 && q=0) and hosts without FMA bail.
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
     using Op = Decoder::AdvSimdVecXIdxOpcode;
-    // region digitalis: integer MUL/MLA/MLS by-element (halfword .4h/.8h
+    // integer MUL/MLA/MLS by-element (halfword .4h/.8h
     // size=01, word .2s/.4s size=10).
     //
     // Vd = Vn op (Vm.lane[index] broadcast across destination lanes), with
@@ -23136,9 +22908,8 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
       return;
     }
-    // endregion
 
-    // region digitalis: SQDMULH / SQRDMULH / SQRDMLAH / SQRDMLSH by-element
+    // SQDMULH / SQRDMULH / SQRDMLAH / SQRDMLSH by-element
     // (.4h / .8h, size=01).
     //
     // Per-lane (SQDMULH/SQRDMULH):
@@ -23284,9 +23055,8 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
       return;
     }
-    // endregion
 
-    // region digitalis: SQDMULH / SQRDMULH / SQRDMLAH / SQRDMLSH by-element
+    // SQDMULH / SQRDMULH / SQRDMLAH / SQRDMLSH by-element
     // (.2s / .4s, size=10).
     //
     // 32-bit-lane sibling of the size=01 arm above.  Stage 1 reconstructs
@@ -23497,9 +23267,8 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
       return;
     }
-    // endregion
 
-    // region digitalis: widening MUL/MAC by-element (size=01: .4h/.8h -> .4s).
+    // widening MUL/MAC by-element (size=01: .4h/.8h -> .4s).
     //
     // SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL by element with halfword sources
     // and word destination — 4 output lanes (.4s).  Q=0 (*MULL/*MLAL/*MLSL)
@@ -23597,9 +23366,8 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
 
-    // region digitalis: widening MUL/MAC by-element (size=10: .2s/.4s -> .2d).
+    // widening MUL/MAC by-element (size=10: .2s/.4s -> .2d).
     //
     // SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL by element with word sources and
     // doubleword destination — 2 output lanes (.2d).  Q=0 (*MULL/*MLAL/*MLSL)
@@ -23694,9 +23462,8 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
 
-    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element
+    // SQDMULL / SQDMLAL / SQDMLSL by element
     // (size=01: .4h/.8h -> .4s).
     //
     // Signed saturating doubling widening multiply (and accumulate /
@@ -23858,9 +23625,8 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
       return;
     }
-    // endregion
 
-    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element
+    // SQDMULL / SQDMLAL / SQDMLSL by element
     // (size=10: .2s/.4s -> .2d).
     //
     // 32-bit-source / 64-bit-destination sibling of the size=01 arm
@@ -24035,14 +23801,13 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, t_sum);
       return;
     }
-    // endregion
 
     if (args.opcode != Op::kFmla && args.opcode != Op::kFmls &&
         args.opcode != Op::kFmul && args.opcode != Op::kFmulx) {
       success_ = false;
       return;
     }
-    // region digitalis: FP16 vector by-element FMLA/FMLS/FMUL (size=00).
+    // FP16 vector by-element FMLA/FMLS/FMUL (size=00).
     //
     // Armv8.2-FP16.  Decoder routes size=0b00 with U=0 and opcode
     // ∈ {0001 FMLA, 0101 FMLS, 1001 FMUL} here; FMULX FP16 by-element
@@ -24206,7 +23971,6 @@ class LiteTranslator {
       }
       return;
     }
-    // endregion
     if (args.size != 0b10 && args.size != 0b11) {
       success_ = false;
       return;
@@ -24348,9 +24112,7 @@ class LiteTranslator {
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
   }
-  // endregion
 
-  // region digitalis
   // AdvSIMD scalar x indexed element — JIT lowering for FMULX scalar by
   // element only.  Same saturation shape as the three-same FMULX JIT
   // (handoff #120) and the vector by-element FMULX (handoff #124), but
@@ -24358,7 +24120,7 @@ class LiteTranslator {
   // (scalar destination semantics).
   void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
     using Op = Decoder::AdvSimdScalarXIdxOpcode;
-    // region digitalis: SQRDMLAH/SQRDMLSH scalar by-element (Armv8.1-RDM).
+    // SQRDMLAH/SQRDMLSH scalar by-element (Armv8.1-RDM).
     // Same single-lane saturation recipe as the scalar three-same form,
     // but reads Vm.lane[index] instead of Vm.lane[0].
     if (args.opcode == Op::kSqrdmlahScalarIdx ||
@@ -24476,7 +24238,6 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
       return;
     }
-    // endregion
     if (args.opcode != Op::kFmulx && args.opcode != Op::kFmul &&
         args.opcode != Op::kFmla && args.opcode != Op::kFmls) {
       success_ = false;
@@ -24493,7 +24254,7 @@ class LiteTranslator {
     }
     const bool is_double = (args.size == 0b11);
 
-    // region digitalis: Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
+    // Armv8.2-FP16 scalar by-element FMLA/FMLS/FMUL/FMULX.
     //
     // Lift each FP16 source lane to FP32 lane 0 via Pxor + Pinsrw + Vcvtph2ps
     // (same scalar-lift recipe as AdvSimdScalarThreeSame FP16).  For
@@ -24624,7 +24385,6 @@ class LiteTranslator {
       as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
       return;
     }
-    // endregion
 
     // FMUL / FMLA / FMLS — simpler scalar lowering without the FMULX
     // saturation shape.  Load Vn/Vm into XMM regs, broadcast the indexed
@@ -24792,7 +24552,6 @@ class LiteTranslator {
     }
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm_result);
   }
-  // endregion
 
   //
   // Accessor helpers.
@@ -24807,16 +24566,15 @@ class LiteTranslator {
     simd_allocator_.FreeTemps();
   }
 
-  // region digitalis - early region termination on register pressure
+  // early region termination on register pressure
   // Returns true if the GP temp register pool is too low for safe instruction translation.
   // Most instructions need 2-4 temps; below this threshold, end the region to preserve
   // already-translated JIT code instead of failing and discarding the entire region.
   bool IsGpRegPoolLow(uint32_t threshold = 4) const {
     return gp_allocator_.AvailableTempCount() < threshold;
   }
-  // endregion
 
-  // region digitalis - guest PC labels for backward branch inlining in loops.
+  // guest PC labels for backward branch inlining in loops.
   // Register a label at the current x86_64 code position for the given guest PC.
   // This allows backward branches (loops) to emit a local jump instead of
   // a full region exit + translation cache dispatch.
@@ -24830,14 +24588,12 @@ class LiteTranslator {
   // Returns true if a local jump was emitted (caller should NOT exit region).
   // Returns false if the target is not in this region (caller should exit normally).
   bool TryLocalBackwardBranch(GuestAddr target) {
-    // region digitalis - disabled: backward branch inlining traps the CPU
+    // disabled: backward branch inlining traps the CPU
     // in a tight loop without signal checks.  Dispatch on every backward
     // edge so signals are processed and translation stats remain visible.
     UNUSED(target);
     return false;
-    // endregion
   }
-  // endregion
 
   bool IsRegMappingEnabled() { return params_.enable_reg_mapping; }
 
@@ -24862,10 +24618,9 @@ class LiteTranslator {
   }
 
   SimdRegister AllocTempSimdReg() {
-    // region digitalis - any SIMD/FP work in the region marks MXCSR as
+    // any SIMD/FP work in the region marks MXCSR as
     // possibly-dirty so the mirror at region exit isn't elided.
     fp_dirty_ = true;
-    // endregion
     if (auto reg_option = simd_allocator_.AllocTemp()) {
       return reg_option.value();
     }
@@ -24873,12 +24628,11 @@ class LiteTranslator {
     return Assembler::no_xmm_register;
   }
 
-  // region digitalis - explicit marker for FP-affecting paths that don't go
+  // explicit marker for FP-affecting paths that don't go
   // through AllocTempSimdReg (e.g. a future scalar FP path that directly uses
   // a fixed XMM register). Currently unused; kept for forward use.
   void MarkFpDirty() { fp_dirty_ = true; }
   bool fp_dirty() const { return fp_dirty_; }
-  // endregion
 
  private:
   // Helper: extract ARM64 NZCV flags from x86_64 EFLAGS after ADD/SUB.
@@ -24889,7 +24643,7 @@ class LiteTranslator {
   // ARM64 V (overflow) at bit 0 is extracted via SETO.
   //
   // For SUB, ARM64 C = !x86_CF (ARM64 uses inverted borrow), so we XOR bit 8.
-  // region digitalis - use AL for overflow (avoids clobbering rcx in allocator pool).
+  // use AL for overflow (avoids clobbering rcx in allocator pool).
   // LAHF stores SF|ZF|CF to AH (bits 8-15). SETCC OF stores to AL (bits 0-7).
   // AND 0xC101 keeps N(bit15), Z(bit14), C(bit8), V(bit0). No rcx save/restore needed.
   void EmitStoreArmNZCV(bool is_sub) {
@@ -24902,9 +24656,8 @@ class LiteTranslator {
     int32_t flags_offset = offsetof(ThreadState, cpu.flags);
     as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, Assembler::rax);
   }
-  // endregion
 
-  // region digitalis: emit ARM FP-compare NZCV from x86 UCOMIS flags.
+  // emit ARM FP-compare NZCV from x86 UCOMIS flags.
   //
   // UCOMISS/UCOMISD set ZF/PF/CF and leave SF/OF untouched, so the integer
   // EmitStoreArmNZCV path (which copies SF into ARM N and OF into ARM V)
@@ -24943,7 +24696,6 @@ class LiteTranslator {
     int32_t flags_offset = offsetof(ThreadState, cpu.flags);
     as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, Assembler::rax);
   }
-  // endregion
 
   // Helper: emit shift of src into dst by a compile-time constant amount.
   void EmitShift(Register dst, Register src, Decoder::ShiftType shift_type,
@@ -24993,15 +24745,12 @@ class LiteTranslator {
   Allocator<SimdRegister> simd_allocator_;
   const LiteTranslateParams params_;
   bool is_region_end_reached_;
-  // region digitalis - see constructor comment.
+  // see constructor comment.
   bool fp_dirty_;
-  // endregion
-  // region digitalis - guest PC label map for backward branch inlining
+  // guest PC label map for backward branch inlining
   std::unordered_map<GuestAddr, Assembler::Label*> guest_pc_labels_;
-  // endregion
 };
 
 }  // namespace berberis
 
 #endif  // BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_H_
-// endregion

@@ -244,8 +244,8 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
             (unsigned long)cpu.x[28]);
       }
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
-      // endregion
-      // region digitalis - if this is a NESTED host signal (depth > 1) the
+
+      // if this is a NESTED host signal (depth > 1) the
       // first frame is still mid-ProcessGuestSignal (guest handler in flight).
       // Recording the guest CPU here gives forensic data the existing
       // "delivering signal" trace doesn't capture for the inner fault.

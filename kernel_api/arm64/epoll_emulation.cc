@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -90,4 +89,3 @@ long RunGuestSyscall___NR_epoll_pwait2(long, long, long, long, long, long) {
 }
 
 }  // namespace berberis
-// endregion

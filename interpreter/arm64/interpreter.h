@@ -1,4 +1,3 @@
-// region digitalis
 /*
  * Copyright (C) 2026 utzcoz
  *
@@ -26,7 +25,6 @@
 #include <type_traits>
 
 #include "../faulty_memory_accesses.h"
-// endregion
 
 #include "berberis/base/bit_util.h"
 #include "berberis/base/checks.h"
@@ -48,16 +46,13 @@ class Interpreter {
   explicit Interpreter(ThreadState* state)
       : state_(state), branch_taken_(false), exception_raised_(false) {}
 
-  // region digitalis
   // Reset per-instruction state for batch reuse — avoids reconstructing
   // the Interpreter object for every instruction in the batch.
   void Reset() {
     branch_taken_ = false;
     exception_raised_ = false;
   }
-  // endregion
 
-  // region digitalis
   // Memory fault handler — called when FaultyLoad/FaultyStore detects a fault.
   // Sets exception_raised_ to stop the interpreter batch. HandleFaultForRecovery
   // has already queued a SIGSEGV for guest delivery — the runtime will process it
@@ -69,7 +64,6 @@ class Interpreter {
   }
 
   bool HasException() const { return exception_raised_; }
-  // endregion
 
   //
   // Instruction implementations.
@@ -99,7 +93,7 @@ class Interpreter {
     return result;
   }
 
-  // region digitalis - ADDG/SUBG (FEAT_MTE). The address part is Xn +/- the
+  // ADDG/SUBG (FEAT_MTE). The address part is Xn +/- the
   // 16-byte-scaled offset; bits[59:56] are then replaced by the logical tag
   // (start tag +/- uimm4, mod 16). Digitalis does not enforce MTE, so tag
   // exclusion (GCR_EL1) is ignored — the tag nibble is updated arithmetically,
@@ -112,7 +106,6 @@ class Interpreter {
         (is_sub ? (start_tag - uimm4) : (start_tag + uimm4)) & 0xF);
     return (addr & ~(0xFULL << 56)) | (static_cast<uint64_t>(new_tag) << 56);
   }
-  // endregion
 
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit,
                       Register src, uint64_t imm) {
@@ -199,7 +192,6 @@ class Interpreter {
     return pc + offset;
   }
 
-  // region digitalis
   // LDR/LDRSW (literal): load from `[insn_addr + offset]`. The Load()
   // helper handles the FaultyLoad guard, sign/zero extension, and the
   // (is_64bit_target=true for LDRSW) widening for sign-extended loads.
@@ -209,12 +201,10 @@ class Interpreter {
     bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
     return Load(size, is_signed, is_64bit_target, target, 0);
   }
-  // endregion
 
   Register Bitfield(Decoder::BitfieldOpcode opcode, bool is_64bit,
                     Register dst_val, Register src, uint8_t immr, uint8_t imms) {
     CHECK(!exception_raised_);
-    // region digitalis
     // Simplified implementation based on ARM ARM pseudocode for BFM/SBFM/UBFM.
     // When imms >= immr: extract bits[imms:immr] (bitfield extract / shift right)
     // When imms < immr:  insert bits[imms:0] at position (regsize-immr) (bitfield insert / shift left)
@@ -295,7 +285,6 @@ class Interpreter {
     }
 
     return result;
-    // endregion
   }
 
   void Branch(int32_t offset) {
@@ -339,7 +328,6 @@ class Interpreter {
                 Register base, int32_t offset) {
     CHECK(!exception_raised_);
     void* ptr = ToHostAddr<void>(base + offset);
-    // region digitalis
     uint8_t data_bytes;
     switch (size) {
       case Decoder::LoadStoreSize::k8bit: data_bytes = 1; break;
@@ -353,7 +341,6 @@ class Interpreter {
       HandleMemoryFault(base + offset);
       return 0;
     }
-    // endregion
     uint64_t result;
 
     switch (size) {
@@ -413,7 +400,6 @@ class Interpreter {
   void Store(Decoder::LoadStoreSize size, Register base, int32_t offset, Register data) {
     CHECK(!exception_raised_);
     void* ptr = ToHostAddr<void>(base + offset);
-    // region digitalis
     uint8_t data_bytes;
     switch (size) {
       case Decoder::LoadStoreSize::k8bit: data_bytes = 1; break;
@@ -426,7 +412,6 @@ class Interpreter {
       HandleMemoryFault(base + offset);
       return;
     }
-    // endregion
   }
 
   Register AddImm(Register base, int32_t offset) {
@@ -438,7 +423,6 @@ class Interpreter {
     CHECK(!exception_raised_);
     void* ptr1 = ToHostAddr<void>(base + offset);
     void* ptr2 = ToHostAddr<void>(base + offset + scale);
-    // region digitalis
     uint8_t data_bytes = (size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
     FaultyLoadResult fl1 = FaultyLoad(ptr1, data_bytes);
     if (fl1.is_fault) { HandleMemoryFault(base + offset); return; }
@@ -447,7 +431,6 @@ class Interpreter {
 
     if (rt1 != 31) state_->cpu.x[rt1] = fl1.value;
     if (rt2 != 31) state_->cpu.x[rt2] = fl2.value;
-    // endregion
   }
 
   void StorePair(Decoder::LoadStoreSize size, Register base, int32_t offset,
@@ -455,14 +438,12 @@ class Interpreter {
     CHECK(!exception_raised_);
     void* ptr1 = ToHostAddr<void>(base + offset);
     void* ptr2 = ToHostAddr<void>(base + offset + scale);
-    // region digitalis
     uint8_t data_bytes = (size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
     if (FaultyStore(ptr1, data_bytes, data1)) { HandleMemoryFault(base + offset); return; }
     if (FaultyStore(ptr2, data_bytes, data2)) { HandleMemoryFault(base + offset + scale); return; }
-    // endregion
   }
 
-  // region digitalis - Apply the correct 32->64 extension to the offset
+  // Apply the correct 32->64 extension to the offset
   // register before shift+add. extend_type is the raw 3-bit ARMv8
   // option field; only 010=UXTW, 011=LSL/UXTX, 110=SXTW, 111=SXTX are
   // valid for memory ops. Bug history: collapsing all four to LSL
@@ -496,7 +477,6 @@ class Interpreter {
     uint64_t addr = base + off;
     Store(size, addr, 0, data);
   }
-  // endregion
 
   void Svc(uint16_t /*imm*/) {
     CHECK(!exception_raised_);
@@ -504,7 +484,7 @@ class Interpreter {
     RunGuestSyscall(state_);
   }
 
-  // region digitalis - BRK #imm: software breakpoint. Deliver a synchronous
+  // BRK #imm: software breakpoint. Deliver a synchronous
   // SIGTRAP at the current guest PC (the BRK), then stop the interpreter batch
   // so the host signal handler routes it to the guest's SIGTRAP action. The
   // guest PC stays at the BRK (insn_addr is not advanced), matching the
@@ -514,7 +494,6 @@ class Interpreter {
     BreakpointInsn(GetInsnAddr());
     exception_raised_ = true;
   }
-  // endregion
 
   Register Mrs(Decoder::SystemReg sysreg) {
     CHECK(!exception_raised_);
@@ -533,15 +512,13 @@ class Interpreter {
       case Decoder::SystemReg::kFpcr:
         return state_->cpu.cached_fpcr;
       case Decoder::SystemReg::kFpsr:
-        // region digitalis: Plan §L1 — host MXCSR cumulative exception
+        // Plan §L1 — host MXCSR cumulative exception
         // bits set by any FP op (interpreter OR JIT-emitted) reflect into
         // emulated_fpsr at MRS-read time. MXCSR bits are sticky on x86
         // (just like FPSR is on ARM), so this lazy mirror is sufficient
         // for cumulative-flag semantics without per-op JIT instrumentation.
         MirrorHostMxcsrToFpsr();
-        // endregion
         return state_->cpu.emulated_fpsr;
-      // region digitalis
       case Decoder::SystemReg::kCtrEl0:
         // CTR_EL0: Cache Type Register.
         // IminLine=4 (log2 of 16-byte icache line), DminLine=4 (log2 of 16-byte dcache line)
@@ -569,7 +546,6 @@ class Interpreter {
         state_->cpu.flags = 0;  // NZCV = 0b0000 (success)
         return static_cast<Register>(rng());
       }
-      // endregion
       default:
         Undefined();
         return 0;
@@ -593,7 +569,6 @@ class Interpreter {
       }
       case Decoder::SystemReg::kFpcr:
         state_->cpu.cached_fpcr = static_cast<uint32_t>(value);
-        // region digitalis
         // Mirror the ARM FPCR rounding-mode and flush-to-zero bits into the
         // host x86 MXCSR so subsequent interpreted FP ops observe the guest-
         // requested rounding mode and denormal behaviour. ARM RMode at
@@ -608,15 +583,13 @@ class Interpreter {
         // never raises SIGFPE. This is the foundation for §L1 — per-op
         // MXCSR->FPSR cumulative-flag mirroring is a follow-up.
         ProgramHostMxcsrFromFpcr(static_cast<uint32_t>(value));
-        // endregion
         break;
       case Decoder::SystemReg::kFpsr:
         state_->cpu.emulated_fpsr = static_cast<uint32_t>(value);
-        // region digitalis: Plan §L1 — clear host MXCSR cumulative exception
+        // Plan §L1 — clear host MXCSR cumulative exception
         // bits when guest writes FPSR. Without this, future MRS-reads would
         // re-merge stale MXCSR bits that the guest believed it had cleared.
         ClearHostMxcsrExceptions();
-        // endregion
         break;
       default:
         Undefined();
@@ -828,7 +801,7 @@ class Interpreter {
           result = ((val >> shift) | (val << (32 - shift))) & 0xFFFFFFFFULL;
         }
         break;
-      // region digitalis - CRC32 instructions
+      // CRC32 instructions
       case Decoder::DataProc2SrcOpcode::kCrc32b:
       case Decoder::DataProc2SrcOpcode::kCrc32h:
       case Decoder::DataProc2SrcOpcode::kCrc32w:
@@ -883,8 +856,7 @@ class Interpreter {
         result = crc;
         break;
       }
-      // endregion
-      // region digitalis - PACGA (Armv8.3-PAuth generic PAC compute)
+      // PACGA (Armv8.3-PAuth generic PAC compute)
       // ARM ARM C7.2.179: PACGA computes a 32-bit PAC for the value in
       // src1 keyed by src2 (or SP for Rm=31), places it in Rd[63:32], and
       // zeros Rd[31:0].  Digitalis is PAC-blind: no authentication codes
@@ -896,7 +868,6 @@ class Interpreter {
       case Decoder::DataProc2SrcOpcode::kPacga:
         result = 0;
         break;
-      // endregion
       default:
         Undefined();
         return 0;
@@ -909,7 +880,6 @@ class Interpreter {
     return result;
   }
 
-  // region digitalis
   //
   // MTE (Memory Tagging Extension, Armv8.5-A) data-processing 2-source:
   // IRG / GMI / SUBP / SUBPS. The translator has no MTE backing, so the
@@ -1006,13 +976,12 @@ class Interpreter {
     switch (args.opcode) {
       case Decoder::MteLoadStoreOpcode::kStg:
       case Decoder::MteLoadStoreOpcode::kSt2g:
-      // region digitalis - STGM / STZGM tag-block stores: pure tag stores,
+      // STGM / STZGM tag-block stores: pure tag stores,
       // NOP without MTE backing. STZGM's data-zeroing block size is defined by
       // GMID_EL1 (not emulated here), so it is treated as a tag NOP rather than
       // zeroing a guessed-size region (over-zeroing would corrupt memory).
       case Decoder::MteLoadStoreOpcode::kStgm:
       case Decoder::MteLoadStoreOpcode::kStzgm:
-      // endregion
         // Pure tag store — NOP without MTE backing.
         break;
       case Decoder::MteLoadStoreOpcode::kLdg: {
@@ -1023,7 +992,7 @@ class Interpreter {
         }
         break;
       }
-      // region digitalis - LDGM: load tag multiple into Rt. Tags are packed as
+      // LDGM: load tag multiple into Rt. Tags are packed as
       // 4-bit nibbles; with no MTE backing all tags read 0, so Rt = 0.
       case Decoder::MteLoadStoreOpcode::kLdgm: {
         if (args.rt != 31) {
@@ -1031,7 +1000,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
       case Decoder::MteLoadStoreOpcode::kStzg: {
         // Zero the 16-byte granule containing access_addr.
         uint64_t aligned = access_addr & ~uint64_t{0x0F};
@@ -1066,9 +1034,7 @@ class Interpreter {
       }
     }
   }
-  // endregion
 
-  // region digitalis
   // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
   //
   // FCADD <Vd>.<T>, <Vn>.<T>, <Vm>.<T>, #<rotation>:
@@ -1098,7 +1064,7 @@ class Interpreter {
 
     uint8_t vec_len = args.q ? 16 : 8;  // bytes in result vector
 
-    // region digitalis FP16 SIMD FCMA
+    // FP16 SIMD FCMA
     if (args.size == 0b01) {
       // Half-precision: 2 bytes per lane; pairs are 4 bytes each.
       // .4H (Q=0) has 2 pairs (lanes 0..3); .8H (Q=1) has 4 pairs (0..7).
@@ -1145,7 +1111,6 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result) + lane_im * 2, &hr_im, 2);
       }
     } else if (args.size == 0b10) {
-    // endregion
       // Single-precision: 4 bytes per lane; pairs are 8 bytes each.
       // 2S has 1 pair (lanes 0,1); 4S has 2 pairs (lanes 0..3).
       uint8_t pairs = (vec_len / 4) / 2;
@@ -1219,9 +1184,8 @@ class Interpreter {
     }
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis indexed FCMLA
+  // indexed FCMLA
   //
   // FCMLA (by element) — Armv8.3-FCMA.  Same per-rot rotation table as
   // FCMLA (vector), but Vm is replaced by a broadcast vector where every
@@ -1246,7 +1210,7 @@ class Interpreter {
 
     uint8_t vec_len = args.q ? 16 : 8;  // bytes in result vector.
 
-    // region digitalis FP16 SIMD FCMA indexed
+    // FP16 SIMD FCMA indexed
     if (args.size == 0b01) {
       // Half-precision: 2 bytes per lane; pairs are 4 bytes each.
       // Read the single broadcast complex pair from Vm[index].
@@ -1287,7 +1251,6 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result) + lane_im * 2, &hr_im, 2);
       }
     } else if (args.size == 0b10) {
-    // endregion
       // Single-precision: 4 bytes per lane; pairs are 8 bytes each.
       // Read the single broadcast complex pair from Vm[index].
       float m_re, m_im;
@@ -1329,9 +1292,8 @@ class Interpreter {
     }
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis hello-dotprod
+  // hello-dotprod
   // SDOT / UDOT (Armv8.4-DotProd), vector and by-element forms.
   //
   // Both forms accumulate a 4-byte dot product into each 32-bit destination
@@ -1396,9 +1358,8 @@ class Interpreter {
     }
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis - I8MM SMMLA/UMMLA/USMMLA (FEAT_I8MM). Vn holds a 2x8
+  // I8MM SMMLA/UMMLA/USMMLA (FEAT_I8MM). Vn holds a 2x8
   // int8 matrix (two rows of 8), Vm holds an 8x2 matrix stored row-major as
   // two rows of 8 (its transpose), Vd is a 2x2 int32 accumulator. The result
   // is Vd + Vn * Vm^T: lane (2*i + j) accumulates the 8-element dot product of
@@ -1437,9 +1398,7 @@ class Interpreter {
     }
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis
   // BFloat16 helpers.  BF16 is the upper 16 bits of an IEEE-754 single-
   // precision float; widening is a pure shift, narrowing rounds to nearest
   // even with NaN quieting.
@@ -1468,9 +1427,7 @@ class Interpreter {
     uint32_t rounded = bits + 0x7FFFu + lsb;
     return static_cast<uint16_t>(rounded >> 16);
   }
-  // endregion
 
-  // region digitalis
   // Narrow one FP64 to FP32 with the ARMv8 "Round to Odd" mode (used only by
   // FCVTXN / FCVTXN2). RtO is double-rounding-safe: take the
   // round-toward-zero result, then if any source bits were discarded force
@@ -1554,9 +1511,7 @@ class Interpreter {
 
     return sign | mant_f;
   }
-  // endregion
 
-  // region digitalis
   // Advanced SIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT (vec),
   // BFMMLA, BFMLALB/T (vec), BFDOT (idx), BFMLALB/T (idx).
   //
@@ -1683,7 +1638,6 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
   Register DataProc3Src(Decoder::DataProc3SrcOpcode opcode, bool is_64bit,
                         Register src1, Register src2, Register src3) {
@@ -1767,8 +1721,6 @@ class Interpreter {
     return result;
   }
 
-  // region digitalis
-  // region digitalis
   Register AddSubWithCarry(Register src1, Register src2, bool is_64bit, bool is_sub, bool set_flags) {
     CHECK(!exception_raised_);
     uint64_t op1 = is_64bit ? src1 : (src1 & 0xFFFFFFFFULL);
@@ -1793,14 +1745,13 @@ class Interpreter {
     uint64_t result;
     unsigned bits = is_64bit ? 64 : 32;
 
-    // region digitalis PAuth DP-1Src as identity
+    // PAuth DP-1Src as identity
     // The decoder sets bit 0x40 to mark a PAuth variant (PACIA/PACIB/PACDA/
     // PACDB/AUTI*/AUTD*/PACIZ*/PACDZ*/AUTIZ*/AUTDZ*/XPACI/XPACD).  Digitalis
     // never injects PAC bits, so authenticate/strip is the identity.
     if (opcode2 & 0x40) {
       return val;
     }
-    // endregion
 
     switch (opcode2) {
       case 0b000000: {
@@ -1869,9 +1820,7 @@ class Interpreter {
     if (!is_64bit) result &= 0xFFFFFFFFULL;
     return result;
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD three different (widening): operations on narrow elements producing wide results.
   //   Q=0 uses lower half of source registers, Q=1 uses upper half.
@@ -1885,7 +1834,7 @@ class Interpreter {
     __uint128_t dst = state_->cpu.v[args.rd];  // Needed for accumulate ops (MLAL, MLSL, ABAL)
     __uint128_t result = 0;
 
-    // region digitalis - PMULL handles size=00 (8-bit) and size=11 (64-bit, PMULL64).
+    // PMULL handles size=00 (8-bit) and size=11 (64-bit, PMULL64).
     // Dispatch it before the generic widening size table (which rejects size=11).
     if (args.opcode == Decoder::AdvSimdThreeDiffOpcode::kPmull) {
       auto poly_mul = [](uint64_t a, uint64_t b, unsigned in_bits) -> __uint128_t {
@@ -1924,7 +1873,6 @@ class Interpreter {
       state_->cpu.v[args.rd] = result;
       return;
     }
-    // endregion
 
     // Input element sizes.
     uint8_t in_esize;  // input element size in bytes
@@ -1992,7 +1940,7 @@ class Interpreter {
           set_result(i, static_cast<uint64_t>(get_signed(src_n, i) - get_signed(src_m, i)));
         }
         break;
-      // region digitalis - widening multiply-accumulate / multiply-subtract.
+      // widening multiply-accumulate / multiply-subtract.
       // Four arms parameterized by (is_signed, is_sub). Encodings differ only
       // in U (bit29: signed/unsigned) and bit13 (op: add/sub); decoder maps to
       // distinct enum values. Wraparound is the defined behaviour for both
@@ -2025,7 +1973,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
       case Decoder::AdvSimdThreeDiffOpcode::kUmull:
         for (uint8_t i = 0; i < num_elements; i++) {
           set_result(i, get_unsigned(src_n, i) * get_unsigned(src_m, i));
@@ -2066,7 +2013,7 @@ class Interpreter {
           set_result(i, get_accum(i) + static_cast<uint64_t>(diff < 0 ? -diff : diff));
         }
         break;
-      // region digitalis - wide add/sub: Vn is already wide (out_esize per elem);
+      // wide add/sub: Vn is already wide (out_esize per elem);
       // Vm is narrow (in_esize per elem, selected by Q=0 low half / Q=1 high half).
       case Decoder::AdvSimdThreeDiffOpcode::kUaddw:
       case Decoder::AdvSimdThreeDiffOpcode::kSaddw:
@@ -2093,8 +2040,7 @@ class Interpreter {
         }
         break;
       }
-      // endregion
-      // region digitalis - narrowing high: Vd(narrow) = ((Vn + Vm) [+ round]) >>
+      // narrowing high: Vd(narrow) = ((Vn + Vm) [+ round]) >>
       // narrow_bits. ADDHN: round=0. RADDHN: round=1<<(narrow_bits-1). Q=0 writes
       // narrow lanes to lower 64 bits of Vd (upper cleared); Q=1 writes narrow
       // lanes to upper 64 bits (lower preserved). size encodes narrow elem width;
@@ -2130,8 +2076,7 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result) + (args.q ? 8 : 0), narrow_lanes, 8);
         break;
       }
-      // endregion
-      // region digitalis - narrowing high subtract: Vd(narrow) =
+      // narrowing high subtract: Vd(narrow) =
       //   ((Vn - Vm) [+ round]) >> narrow_bits.
       // SUBHN: round=0. RSUBHN: round=1<<(narrow_bits-1). Q semantics and
       // source/dest shapes are identical to ADDHN/RADDHN. Two's-complement
@@ -2163,8 +2108,7 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result) + (args.q ? 8 : 0), narrow_lanes, 8);
         break;
       }
-      // endregion
-      // region digitalis - signed saturating doubling multiply long:
+      // signed saturating doubling multiply long:
       //   Vd_wide[i] = SignedSat(2 * Vn_narrow[i] * Vm_narrow[i])
       // The only input pair that overflows the wide signed range is
       // (INT_MIN, INT_MIN), which yields a positive product whose double
@@ -2190,8 +2134,7 @@ class Interpreter {
         }
         break;
       }
-      // endregion
-      // region digitalis - signed saturating doubling multiply-accumulate /
+      // signed saturating doubling multiply-accumulate /
       // multiply-subtract long:
       //   SQDMLAL: Vd_wide[i] = SignedSat(Vd_wide[i] + SignedSat(2*sn*sm)).
       //   SQDMLSL: Vd_wide[i] = SignedSat(Vd_wide[i] - SignedSat(2*sn*sm)).
@@ -2263,7 +2206,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
       default:
         Undefined();
         return;
@@ -2271,7 +2213,6 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
     CHECK(!exception_raised_);
@@ -2285,7 +2226,7 @@ class Interpreter {
     state_->cpu.v[rd] = result;
   }
 
-  // region digitalis - TBL / TBX (vector table lookup). Reads `len+1`
+  // TBL / TBX (vector table lookup). Reads `len+1`
   // consecutive Q registers starting at Rn to form a 16/32/48/64-byte
   // table, then for each lane i of Vm uses Vm[i] as an index into the
   // table.
@@ -2329,9 +2270,8 @@ class Interpreter {
     memcpy(&result, out, num_bytes);
     state_->cpu.v[rd] = result;
   }
-  // endregion
 
-  // region digitalis - SHA-512 (FEAT_SHA512). Each op operates on .2D vectors.
+  // SHA-512 (FEAT_SHA512). Each op operates on .2D vectors.
   // The references below match ARM ARM C7.2.85/86/87/88 pseudocode exactly,
   // double-checked against FIPS-180-4 section 4.1.3 (SHA-512 round functions).
   // SHA3 (FEAT_SHA3).
@@ -2378,7 +2318,7 @@ class Interpreter {
     state_->cpu.v[rd] = vd;
   }
 
-  // region digitalis - SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY
+  // SM4 (FEAT_SM4): SM4E (encryption rounds) and SM4EKEY
   // (key expansion). Word i of a vector is bits[32*i+31:32*i] (word 0 = low).
   // Each instruction performs the four SM4 rounds with the rolling update
   //   t = w[(i+1)%4] ^ w[(i+2)%4] ^ w[(i+3)%4] ^ k[i]
@@ -2443,9 +2383,8 @@ class Interpreter {
     memcpy(&vd, w, 16);
     state_->cpu.v[rd] = vd;
   }
-  // endregion
 
-  // region digitalis - SM3 (FEAT_SM3): SM3SS1, SM3TT1A/1B/2A/2B, SM3PARTW1/2.
+  // SM3 (FEAT_SM3): SM3SS1, SM3TT1A/1B/2A/2B, SM3PARTW1/2.
   // Word i of a vector is bits[32i+31:32i] (word 0 = low). Derived from the
   // SM3 round/expansion (GB/T 32905); the full sequence reproduces the
   // published SM3("abc") digest. P0(x)=x^rol(x,9)^rol(x,17),
@@ -2528,7 +2467,6 @@ class Interpreter {
     memcpy(&vd, d, 16);
     state_->cpu.v[rd] = vd;
   }
-  // endregion
 
   void Sha512(Decoder::Sha512Op op, uint8_t rd, uint8_t rn, uint8_t rm) {
     CHECK(!exception_raised_);
@@ -2593,9 +2531,7 @@ class Interpreter {
     memcpy(&result, out, 16);
     state_->cpu.v[rd] = result;
   }
-  // endregion
 
-  // region digitalis
   // Cryptographic AES — ARMv8 crypto extension (used by libcrypto / TLS in
   // apps like WhatsApp). Spec: ARM ARM C7.2.1 (AESE/AESD/AESMC/AESIMC).
   //   opcode 00 = AESE   : Vd = ShiftRows(SubBytes(Vd XOR Vn))
@@ -2719,9 +2655,7 @@ class Interpreter {
     memcpy(&result, out, 16);
     state_->cpu.v[rd] = result;
   }
-  // endregion
 
-  // region digitalis
   // Cryptographic three-register SHA — ARMv8 crypto extension. This cycle
   // implements the SHA-1 round-mix variants (SHA1C/SHA1P/SHA1M), which differ
   // only by which choice function f(B,C,D) is used, plus SHA1SU0 (message
@@ -2992,10 +2926,8 @@ class Interpreter {
     // Undefined (11).
     Undefined();
   }
-  // endregion
 
 
-  // region digitalis
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
     CHECK(!exception_raised_);
@@ -3060,9 +2992,7 @@ class Interpreter {
     }
     state_->cpu.v[rd] = result;
   }
-  // endregion
 
-  // region digitalis
   //
   // Multi-structure load/store. Two distinct families share this entry:
   //
@@ -3285,7 +3215,6 @@ class Interpreter {
       }
     }
   }
-  // endregion
 
   Register Extr(Register src_n, Register src_m, uint8_t lsb, bool is_64bit) {
     CHECK(!exception_raised_);
@@ -3301,7 +3230,6 @@ class Interpreter {
     if (!is_64bit) result &= 0xFFFFFFFFULL;
     return result;
   }
-  // endregion
 
   void ConditionalCompare(bool is_neg, bool is_64bit, Register rn, Register rm,
                           Decoder::Condition cond, uint8_t nzcv_imm) {
@@ -3340,7 +3268,6 @@ class Interpreter {
     exception_raised_ = true;
   }
 
-  // region digitalis
   //
   // SIMD/FP instruction implementations.
   //
@@ -3380,7 +3307,6 @@ class Interpreter {
     }
   }
 
-  // region digitalis
   // LDR (literal) SIMD/FP: load 32/64/128 bits from [insn_addr + offset]
   // into V[rt]. SimdLoadFromMemory zero-extends the upper bits and uses
   // FaultyLoad for fault recovery.
@@ -3390,7 +3316,6 @@ class Interpreter {
     void* host_addr = ToHostAddr<void>(addr);
     SimdLoadFromMemory(host_addr, args.rt, args.size);
   }
-  // endregion
 
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register base) {
     CHECK(!exception_raised_);
@@ -3417,11 +3342,10 @@ class Interpreter {
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                          Register base, Register offset_reg) {
     CHECK(!exception_raised_);
-    // region digitalis - Apply the offset register extension before
+    // Apply the offset register extension before
     // shift+add (see ApplyOffsetExtend comment above).
     uint64_t off = ApplyOffsetExtend(offset_reg, args.extend_type) << args.shift_amount;
     uint64_t addr = base + off;
-    // endregion
     void* host_addr = ToHostAddr<void>(addr);
 
     if (args.is_store) {
@@ -3431,7 +3355,6 @@ class Interpreter {
     }
   }
 
-  // region digitalis
   // FCSEL: Floating-point conditional select
   // If condition is true, Rd = Rn; else Rd = Rm.
   void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ftype, Decoder::Condition cond) {
@@ -3450,11 +3373,10 @@ class Interpreter {
       memcpy(&val, &state_->cpu.v[src], 8);
       memcpy(&state_->cpu.v[rd], &val, 8);
     } else if (ftype == 0b11) {
-      // region digitalis: half-precision FCSEL.
+      // half-precision FCSEL.
       uint16_t val;
       memcpy(&val, &state_->cpu.v[src], 2);
       memcpy(&state_->cpu.v[rd], &val, 2);
-      // endregion
     } else {
       Undefined();
     }
@@ -3591,7 +3513,7 @@ class Interpreter {
       state_->cpu.v[rd] = 0;
       memcpy(&state_->cpu.v[rd], &result, 8);
     } else if (ftype == 0b11) {
-      // region digitalis: Half-precision FMADD/FMSUB/FNMADD/FNMSUB.
+      // Half-precision FMADD/FMSUB/FNMADD/FNMSUB.
       // Use double-precision fma() so the multiply-add is computed exactly
       // before single-rounding back to FP16.  binary64 mantissa (53 bits)
       // covers any (binary16 * binary16) + binary16 product exactly, so the
@@ -3616,7 +3538,6 @@ class Interpreter {
       uint16_t result_bits = FpSingleToHalf(static_cast<float>(result));
       state_->cpu.v[rd] = 0;
       memcpy(&state_->cpu.v[rd], &result_bits, 2);
-      // endregion
     } else {
       Undefined();
     }
@@ -3652,7 +3573,7 @@ class Interpreter {
       uint64_t result = (sign << 63) | (exp << 52) | frac;
       memcpy(&state_->cpu.v[rd], &result, 8);
     } else if (ftype == 0b11) {
-      // region digitalis: half-precision FMOV immediate.
+      // half-precision FMOV immediate.
       // VFPExpandImm to FP16:
       //   sign = imm8[7]
       //   exp  = NOT(imm8[6]):Repeat(imm8[6], 2):imm8[5:4]   (5 bits)
@@ -3666,19 +3587,17 @@ class Interpreter {
       uint16_t frac = static_cast<uint16_t>(imm8 & 0xF) << 6;
       uint16_t result = (sign << 15) | (exp << 10) | frac;
       memcpy(&state_->cpu.v[rd], &result, 2);
-      // endregion
     } else {
       Undefined();
     }
   }
-  // endregion
 
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
     CHECK(!exception_raised_);
     uint8_t rmode = args.rmode;
     uint8_t opcode = args.op;
 
-    // endregion (digitalis FMOV trace removed)
+    // (digitalis FMOV trace removed)
 
     // FMOV between GP and FP registers (rmode=00, opcode=110 or 111)
     // ARM64 encoding: opcode=111 → GP to FP (FMOV Dd, Xn)
@@ -3777,7 +3696,6 @@ class Interpreter {
       return;
     }
 
-    // region digitalis
     // FCVTNS/FCVTNU/FCVTPS/FCVTPU/FCVTMS/FCVTMU: various rounding modes
     // rmode=00: round to nearest (ties to even)
     // rmode=01: round toward +inf
@@ -3874,9 +3792,8 @@ class Interpreter {
       }
       return;
     }
-    // endregion
 
-    // region digitalis (FJCVTZS — Armv8.3-JSCVT)
+    // (FJCVTZS — Armv8.3-JSCVT)
     // FJCVTZS Wd, Dn: convert double-precision FP to 32-bit signed integer
     // using ECMAScript ToInt32 semantics (round-toward-zero + modular reduction).
     // Encoding: ftype=01 (double), rmode=11, opcode=110, sf=0.
@@ -3923,7 +3840,6 @@ class Interpreter {
       }
       return;
     }
-    // endregion
 
     if (rmode == 0b11 && opcode == 0b000) {
       // FCVTZS: FP to signed integer, round toward zero (truncate).  Use the
@@ -4052,7 +3968,7 @@ class Interpreter {
         break;
       }
 
-      // region digitalis CASP (compare-and-swap pair, Armv8.1 LSE).
+      // CASP (compare-and-swap pair, Armv8.1 LSE).
       // CASP <Ws>,<Ws+1>,<Wt>,<Wt+1>,[<Xn>]: compare the pair at [Xn] against
       // {Rs+1, Rs}; if equal store {Rt+1, Rt}. The actual prior pair is
       // written back into {Rs+1, Rs}. ARM ARM C7.2.40.
@@ -4097,7 +4013,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AtomicOp::kLdadd: {
         uint64_t addend = (args.rs < 31) ? state_->cpu.x[args.rs] : 0;
@@ -4151,7 +4066,7 @@ class Interpreter {
         break;
       }
 
-      // region digitalis atomic min/max (LSE Armv8.1).
+      // atomic min/max (LSE Armv8.1).
       // x86 has no single-instruction equivalent; AtomicFetchSMax/SMin/UMax/UMin
       // implement these via __atomic_compare_exchange retry loops.
       case Decoder::AtomicOp::kLdsmax: {
@@ -4205,11 +4120,9 @@ class Interpreter {
         if (args.rt < 31) state_->cpu.x[args.rt] = old_val;
         break;
       }
-      // endregion
     }
   }
 
-  // region digitalis
   //
   // AdvSIMD copy: DUP (element), DUP (general), INS (general), SMOV, UMOV.
   //
@@ -4336,7 +4249,7 @@ class Interpreter {
         break;
       }
 
-      // region digitalis - scalar SIMD copy (DUP scalar / MOV Vd, Vn[index])
+      // scalar SIMD copy (DUP scalar / MOV Vd, Vn[index])
       case Decoder::AdvSimdCopyOpcode::kDupScalar: {
         // DUP (scalar): copy one esize-byte element from Vn[index] into the
         // bottom of Vd; upper bits are zeroed.
@@ -4348,7 +4261,6 @@ class Interpreter {
         state_->cpu.v[args.rd] = result;
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdCopyOpcode::kInsElement: {
         // INS (element): copy Vn[src_index] to Vd[dst_index].
@@ -4379,9 +4291,7 @@ class Interpreter {
         break;
     }
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD three same: element-wise vector arithmetic/logic operations.
   //
@@ -4512,7 +4422,6 @@ class Interpreter {
             });
         break;
 
-      // region digitalis
       // --- Compare: CMGT, CMHI, CMGE, CMHS ---
       case Decoder::AdvSimdThreeSameOpcode::kCmgt:
         // CMGT (signed >): if (Vn[i] > Vm[i]) signed, result = all-ones.
@@ -4552,7 +4461,6 @@ class Interpreter {
               return (a >= b) ? mask : 0;
             });
         break;
-      // endregion
 
       // --- Max/Min ---
       case Decoder::AdvSimdThreeSameOpcode::kSmax:
@@ -4576,7 +4484,7 @@ class Interpreter {
             });
         break;
 
-      // region digitalis - SABD/UABD: absolute-difference vector.
+      // SABD/UABD: absolute-difference vector.
       // Signed: |a - b| computed via the sign of the difference; for
       // INT_MIN inputs the difference fits in int64_t after sign-extension
       // because esize is at most 4 (32-bit lanes).
@@ -4593,9 +4501,8 @@ class Interpreter {
               return a > b ? (a - b) : (b - a);
             });
         break;
-      // endregion
 
-      // region digitalis - SABA/UABA: absolute-difference-and-accumulate.
+      // SABA/UABA: absolute-difference-and-accumulate.
       // Vd[i] = Vd[i] + |Vn[i] - Vm[i]|.  Read-modify-write Vd, so the loop
       // is structured like kMla/kMls (loads `d` from `dst` per lane).
       // size=11 is rejected at the decoder; esize <= 4 here, so the signed
@@ -4631,7 +4538,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       // --- Halving add/sub ---
       case Decoder::AdvSimdThreeSameOpcode::kShadd:
@@ -4796,7 +4702,6 @@ class Interpreter {
         break;
       }
 
-      // region digitalis
       // --- Pairwise max/min (SMAXP, UMAXP, SMINP, UMINP) ---
       case Decoder::AdvSimdThreeSameOpcode::kSmaxp:
       case Decoder::AdvSimdThreeSameOpcode::kUmaxp:
@@ -4847,14 +4752,13 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       // --- MUL / MLA / MLS ---
       case Decoder::AdvSimdThreeSameOpcode::kMul:
         AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
             [](uint64_t a, uint64_t b, uint8_t /*esize*/) -> uint64_t { return a * b; });
         break;
-      // region digitalis - PMUL polynomial multiply (byte lanes).
+      // PMUL polynomial multiply (byte lanes).
       // For each byte lane: multiply two 8-bit polynomials over GF(2),
       // keeping only the low 8 bits of the product. The decoder restricts
       // PMUL to size=00, so esize is always 1 byte here.
@@ -4875,8 +4779,7 @@ class Interpreter {
         }
         break;
       }
-      // endregion
-      // region digitalis - SQDMULH / SQRDMULH saturating doubling multiply high.
+      // SQDMULH / SQRDMULH saturating doubling multiply high.
       // For each lane: signed multiply two same-width source elements, double
       // (shift left by 1), saturate to the per-element signed range, and
       // return the high half. SQRDMULH adds a rounding constant of
@@ -4903,8 +4806,7 @@ class Interpreter {
             });
         break;
       }
-      // endregion
-      // region digitalis - Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
+      // Armv8.1-RDM SQRDMLAH / SQRDMLSH three-same vector.
       // Decoder restricts size to {01, 10}.  Stage 1 reuses the SQRDMULH
       // recipe per lane (doubled product + rounding constant, shifted by
       // bits_local, saturated to the signed narrow range).  Stage 2
@@ -4956,7 +4858,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
         // MLA: Vd[i] = Vd[i] + Vn[i] * Vm[i]
         uint64_t emask = ElementMask(esize);
@@ -5075,13 +4976,11 @@ class Interpreter {
       case Decoder::AdvSimdThreeSameOpcode::kFacgeV:
       case Decoder::AdvSimdThreeSameOpcode::kFacgtV:
       case Decoder::AdvSimdThreeSameOpcode::kFabdV:
-      // region digitalis
       case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
       case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
       case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
-      // endregion
         {
-        // region digitalis: FP16 vector lanes via float round-trip.
+        // FP16 vector lanes via float round-trip.
         // Promote each 2-byte half to binary32, do the op in binary32 (which
         // is exact for any single FP16 op because binary32's 24-bit mantissa
         // strictly contains binary16's 11), then narrow back to half.  FMA
@@ -5105,10 +5004,8 @@ class Interpreter {
                 rh = FpSingleToHalf(a - b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulV:
                 rh = FpSingleToHalf(a * b); break;
-              // region digitalis
               case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
                 rh = FpSingleToHalf(FmulxScalar<float>(a, b)); break;
-              // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFdivV:
                 rh = FpSingleToHalf(a / b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: {
@@ -5151,19 +5048,17 @@ class Interpreter {
                 break;
               case Decoder::AdvSimdThreeSameOpcode::kFabdV:
                 rh = FpSingleToHalf(std::fabs(a - b)); break;
-              // region digitalis: FP16 vector FRECPS / FRSQRTS via FP32.
+              // FP16 vector FRECPS / FRSQRTS via FP32.
               case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
                 rh = FpSingleToHalf(FrecpsScalar<float>(a, b)); break;
               case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
                 rh = FpSingleToHalf(FrsqrtsScalar<float>(a, b)); break;
-              // endregion
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &rh, 2);
           }
           break;
         }
-        // endregion
         bool is_double = (args.size == 0b01);
         uint8_t fp_esize = is_double ? 8 : 4;
         uint8_t fp_num = vec_len / fp_esize;
@@ -5177,10 +5072,8 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFaddV: r = a + b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFsubV: r = a - b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
-              // region digitalis
               case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
                 r = FmulxScalar<double>(a, b); break;
-              // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
               // FMAX/FMIN/FMAXNM/FMINNM: see FmaxScalar/FminScalar helpers for
@@ -5217,12 +5110,10 @@ class Interpreter {
               }
               case Decoder::AdvSimdThreeSameOpcode::kFabdV:
                 r = std::fabs(a - b); break;
-              // region digitalis
               case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
                 r = FrecpsScalar<double>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
                 r = FrsqrtsScalar<double>(a, b); break;
-              // endregion
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
@@ -5235,10 +5126,8 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFaddV: r = a + b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFsubV: r = a - b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
-              // region digitalis
               case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
                 r = FmulxScalar<float>(a, b); break;
-              // endregion
               case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
@@ -5272,12 +5161,10 @@ class Interpreter {
               }
               case Decoder::AdvSimdThreeSameOpcode::kFabdV:
                 r = std::fabs(a - b); break;
-              // region digitalis
               case Decoder::AdvSimdThreeSameOpcode::kFrecpsV:
                 r = FrecpsScalar<float>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV:
                 r = FrsqrtsScalar<float>(a, b); break;
-              // endregion
               default: Undefined(); return;
             }
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
@@ -5296,13 +5183,11 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis
   //
   // FP data-processing (1 source): FMOV, FABS, FNEG, FSQRT, FCVT, FRINTx.
   //
-  // region digitalis - FRINTTS (FEAT_FRINTTS) shared rounding. Round `src` to
+  // FRINTTS (FEAT_FRINTTS) shared rounding. Round `src` to
   // an integral value (toward zero for the Z variants, FPCR rounding mode via
   // rint for the X variants), then saturate to the signed 32- or 64-bit range.
   // Out-of-range inputs, NaN and infinities yield the most-negative value and
@@ -5320,7 +5205,6 @@ class Interpreter {
     }
     return r;
   }
-  // endregion
 
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
     CHECK(!exception_raised_);
@@ -5382,14 +5266,13 @@ class Interpreter {
         case 0b001111:  // FRINTI (round using FPCR rounding mode)
           result = std::rint(src);
           break;
-        // region digitalis - FRINTTS scalar (FP32).
+        // FRINTTS scalar (FP32).
         case 0b010000:  // FRINT32Z
         case 0b010001:  // FRINT32X
         case 0b010010:  // FRINT64Z
         case 0b010011:  // FRINT64X
           result = static_cast<float>(FrintTs(static_cast<double>(src), opcode));
           break;
-        // endregion
         default:
           Undefined();
           return;
@@ -5432,7 +5315,6 @@ class Interpreter {
           memcpy(&state_->cpu.v[args.rd], &half, 2);
           return;
         }
-        // region digitalis
         case 0b000110: {  // BFCVT Hd, Sn (single -> BF16)
           // The encoding uses ftype=01 even though the *source* is single-
           // precision (Sn), so explicitly reload the source as a 32-bit
@@ -5444,7 +5326,6 @@ class Interpreter {
           memcpy(&state_->cpu.v[args.rd], &bf, 2);
           return;
         }
-        // endregion
         case 0b001000:  // FRINTN
           result = std::nearbyint(src);
           break;
@@ -5466,14 +5347,13 @@ class Interpreter {
         case 0b001111:  // FRINTI
           result = std::rint(src);
           break;
-        // region digitalis - FRINTTS scalar (FP64).
+        // FRINTTS scalar (FP64).
         case 0b010000:  // FRINT32Z
         case 0b010001:  // FRINT32X
         case 0b010010:  // FRINT64Z
         case 0b010011:  // FRINT64X
           result = FrintTs(src, opcode);
           break;
-        // endregion
         default:
           Undefined();
           return;
@@ -5504,7 +5384,7 @@ class Interpreter {
         return;
       }
 
-      // region digitalis: half-precision 1-source arithmetic.
+      // half-precision 1-source arithmetic.
       uint16_t result_bits;
       switch (opcode) {
         case 0b000000:  // FMOV Hd, Hn
@@ -5562,7 +5442,6 @@ class Interpreter {
       }
       state_->cpu.v[args.rd] = 0;
       memcpy(&state_->cpu.v[args.rd], &result_bits, 2);
-      // endregion
     } else {
       Undefined();
     }
@@ -5588,14 +5467,13 @@ class Interpreter {
         case 0b0001: result = src_n / src_m; break;       // FDIV
         case 0b0010: result = src_n + src_m; break;       // FADD
         case 0b0011: result = src_n - src_m; break;       // FSUB
-        // region digitalis: ARM FMAX differs from libm fmax in NaN handling
+        // ARM FMAX differs from libm fmax in NaN handling
         // (any-NaN -> default NaN, not other-operand) and in +0/-0
         // disambiguation. See FmaxScalar/FminScalar/etc.
         case 0b0100: result = FmaxScalar<float>(src_n, src_m); break;    // FMAX
         case 0b0101: result = FminScalar<float>(src_n, src_m); break;    // FMIN
         case 0b0110: result = FmaxnmScalar<float>(src_n, src_m); break;  // FMAXNM
         case 0b0111: result = FminnmScalar<float>(src_n, src_m); break;  // FMINNM
-        // endregion
         case 0b1000: result = -(src_n * src_m); break;    // FNMUL
         default: Undefined(); return;
       }
@@ -5614,12 +5492,11 @@ class Interpreter {
         case 0b0001: result = src_n / src_m; break;       // FDIV
         case 0b0010: result = src_n + src_m; break;       // FADD
         case 0b0011: result = src_n - src_m; break;       // FSUB
-        // region digitalis: see comment above (single-precision arm).
+        // see comment above (single-precision arm).
         case 0b0100: result = FmaxScalar<double>(src_n, src_m); break;    // FMAX
         case 0b0101: result = FminScalar<double>(src_n, src_m); break;    // FMIN
         case 0b0110: result = FmaxnmScalar<double>(src_n, src_m); break;  // FMAXNM
         case 0b0111: result = FminnmScalar<double>(src_n, src_m); break;  // FMINNM
-        // endregion
         case 0b1000: result = -(src_n * src_m); break;    // FNMUL
         default: Undefined(); return;
       }
@@ -5627,7 +5504,7 @@ class Interpreter {
       state_->cpu.v[args.rd] = 0;
       memcpy(&state_->cpu.v[args.rd], &result, 8);
     } else if (ftype == 0b11) {
-      // region digitalis: Half-precision (Armv8.2-FP16).
+      // Half-precision (Armv8.2-FP16).
       // Round-trip through float: load uint16 -> FpHalfToSingle -> op in
       // float -> FpSingleToHalf back.  binary32 has 24 mantissa bits vs
       // binary16's 11, so single-rounding back to half is correct.
@@ -5655,7 +5532,6 @@ class Interpreter {
       uint16_t result_bits = FpSingleToHalf(result);
       state_->cpu.v[args.rd] = 0;
       memcpy(&state_->cpu.v[args.rd], &result_bits, 2);
-      // endregion
     } else {
       Undefined();
     }
@@ -5713,7 +5589,7 @@ class Interpreter {
         flags = CPUState::kFlagCarry;
       }
     } else if (args.ftype == 0b11) {
-      // region digitalis: Half-precision compare.
+      // Half-precision compare.
       uint16_t bits_n;
       memcpy(&bits_n, &state_->cpu.v[args.rn], 2);
       float src_n = FpHalfToSingle(bits_n);
@@ -5734,7 +5610,6 @@ class Interpreter {
       } else {
         flags = CPUState::kFlagCarry;
       }
-      // endregion
     } else {
       Undefined();
       return;
@@ -5743,7 +5618,6 @@ class Interpreter {
     state_->cpu.flags = flags;
   }
 
-  // region digitalis
   //
   // FP conditional compare: FCCMP / FCCMPE.
   // If cond is true, perform an FP compare and set NZCV;
@@ -5815,9 +5689,7 @@ class Interpreter {
 
     state_->cpu.flags = flags;
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar two-reg misc: scalar UCVTF, SCVTF, FCVTZS, FCVTZU.
   //
@@ -5932,7 +5804,7 @@ class Interpreter {
         }
         break;
       }
-      // region digitalis - scalar FCVTAS / FCVTAU.
+      // scalar FCVTAS / FCVTAU.
       // Single-lane collapse of vector kFcvtasV/kFcvtauV. std::round() is
       // round-to-nearest with ties-away-from-zero, which matches the ARM ARM
       // FCVTAS/FCVTAU semantics. NaN → 0 (signed) / 0 (unsigned). Out-of-range
@@ -6003,8 +5875,7 @@ class Interpreter {
         }
         break;
       }
-      // endregion
-      // region digitalis - scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
+      // scalar twins of vector SQABS / SQNEG / SQXTUN / FCVTXN.
       // Each is the single-lane collapse of the corresponding vector op
       // implemented in AdvSimdTwoRegMisc above; the result is the lane
       // value zero-extended to the full 128-bit Vd register.
@@ -6098,8 +5969,7 @@ class Interpreter {
         memcpy(&result, &f_bits, sizeof(f_bits));
         break;
       }
-      // endregion
-      // region digitalis - scalar FRECPE / FRSQRTE.
+      // scalar FRECPE / FRSQRTE.
       // ARM spec only requires ~8 bits of mantissa precision; computing the
       // exact 1/x or 1/sqrt(x) is well within bound. Mirrors the vector
       // kFrecpeV/kFrsqrteV implementation. args.size bit 1 is pinned to 1
@@ -6133,14 +6003,11 @@ class Interpreter {
         }
         break;
       }
-      // endregion
     }
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar three same: scalar (D-form, 64-bit) integer 3-operand ops.
   // Operates on the bottom 64-bit element of each register; upper bits zero.
@@ -6157,15 +6024,13 @@ class Interpreter {
       case Decoder::AdvSimdScalarThreeSameOpcode::kFcmeq:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFacgt:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
-      // region digitalis
       case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps:
       case Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts:
-      // endregion
         {
         __uint128_t src_n = state_->cpu.v[args.rn];
         __uint128_t src_m = state_->cpu.v[args.rm];
         __uint128_t result = 0;
-        // region digitalis: FP16 scalar three-same — widen/narrow round-trip
+        // FP16 scalar three-same — widen/narrow round-trip
         // through FP32.  Bit-exact for the FMULX ±2.0 saturation case
         // because ±2.0 is exactly representable in FP16; bit-exact for FABD
         // because FP32 subtraction of two FP16 inputs is exact and the
@@ -6203,7 +6068,7 @@ class Interpreter {
               r16 = (std::fabs(a) > std::fabs(b)) ? uint16_t{0xFFFF}
                                                   : uint16_t{0};
               break;
-            // region digitalis: FP16 scalar FRECPS / FRSQRTS — same widen/narrow
+            // FP16 scalar FRECPS / FRSQRTS — same widen/narrow
             // round-trip pattern.  Compute the refinement step in FP32 (exact
             // for any single FP16 op since FP32 strictly contains FP16's
             // mantissa precision) then narrow back to FP16 via one rounding.
@@ -6213,7 +6078,6 @@ class Interpreter {
             case Decoder::AdvSimdScalarThreeSameOpcode::kFrsqrts:
               r16 = FpSingleToHalf(FrsqrtsScalar<float>(a, b));
               break;
-            // endregion
             default:
               Undefined();
               return;
@@ -6221,7 +6085,6 @@ class Interpreter {
           state_->cpu.v[args.rd] = static_cast<__uint128_t>(r16);
           return;
         }
-        // endregion
         if (args.size == 1) {
           double a, b;
           memcpy(&a, &src_n, sizeof(a));
@@ -6248,7 +6111,6 @@ class Interpreter {
               r64 = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
             case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
               r64 = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFFFFFFFFFULL : 0; break;
-            // region digitalis
             case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps: {
               double d = FrecpsScalar<double>(a, b);
               memcpy(&r64, &d, sizeof(r64));
@@ -6259,7 +6121,6 @@ class Interpreter {
               memcpy(&r64, &d, sizeof(r64));
               break;
             }
-            // endregion
             default: r64 = 0; break;
           }
           result = static_cast<__uint128_t>(r64);
@@ -6289,7 +6150,6 @@ class Interpreter {
               r32 = (std::fabs(a) > std::fabs(b)) ? 0xFFFFFFFFu : 0; break;
             case Decoder::AdvSimdScalarThreeSameOpcode::kFacge:
               r32 = (std::fabs(a) >= std::fabs(b)) ? 0xFFFFFFFFu : 0; break;
-            // region digitalis
             case Decoder::AdvSimdScalarThreeSameOpcode::kFrecps: {
               float f = FrecpsScalar<float>(a, b);
               memcpy(&r32, &f, sizeof(r32));
@@ -6300,7 +6160,6 @@ class Interpreter {
               memcpy(&r32, &f, sizeof(r32));
               break;
             }
-            // endregion
             default: r32 = 0; break;
           }
           result = static_cast<__uint128_t>(r32);
@@ -6312,7 +6171,7 @@ class Interpreter {
         break;
     }
 
-    // region digitalis: scalar saturating add/sub (B/H/S/D).
+    // scalar saturating add/sub (B/H/S/D).
     //
     // SQADD / UQADD / SQSUB / UQSUB scalar operate on a single lane of
     // width 8 / 16 / 32 / 64 bits selected by args.size, not just D-form.
@@ -6391,9 +6250,8 @@ class Interpreter {
       default:
         break;
     }
-    // endregion
 
-    // region digitalis: scalar saturating shift left (B/H/S/D).
+    // scalar saturating shift left (B/H/S/D).
     // Covers four new opcodes: SQSHL, UQSHL, SQRSHL, UQRSHL.  The shift
     // amount comes from the low 8 bits of Vm interpreted as int8_t —
     // positive shifts left (saturating on the per-width range), negative
@@ -6505,7 +6363,7 @@ class Interpreter {
         state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
         return;
       }
-      // region digitalis: SRSHL / URSHL scalar (D only, non-saturating).
+      // SRSHL / URSHL scalar (D only, non-saturating).
       // Like SSHL / USHL but with rounding when shifting right.  Per ARM
       // ARM C7.2.270 / .335, the rounding term `1 << (rshift-1)` is added
       // before the right shift; left shifts behave identically to SSHL /
@@ -6545,8 +6403,7 @@ class Interpreter {
         state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
         return;
       }
-      // endregion
-      // region digitalis: SQDMULH / SQRDMULH scalar (H/S only).
+      // SQDMULH / SQRDMULH scalar (H/S only).
       // Per ARM ARM C7.2.301 / .305:
       //   Vd = sat_signed((2 * sext(Vn) * sext(Vm) + round) >> bits_local)
       // with bits_local = 16 (size=01, H) or 32 (size=10, S), and
@@ -6581,8 +6438,7 @@ class Interpreter {
             static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
         return;
       }
-      // endregion
-      // region digitalis: SQRDMLAH / SQRDMLSH scalar (H/S only, Armv8.1-RDM).
+      // SQRDMLAH / SQRDMLSH scalar (H/S only, Armv8.1-RDM).
       //   Vd[0:bits_local] = sat_signed(
       //       Vd[0:bits_local]
       //       ± sat_signed((2 * sext(Vn) * sext(Vm) + round) >> bits_local))
@@ -6623,11 +6479,9 @@ class Interpreter {
             static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
         return;
       }
-      // endregion
       default:
         break;
     }
-    // endregion
 
     // D-form integer ops below.
     uint64_t a = static_cast<uint64_t>(state_->cpu.v[args.rn]);
@@ -6685,9 +6539,7 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
   }
-  // endregion
 
-  // region digitalis
   //
   // AdvSIMD scalar pairwise.
   // ADDP scalar (D-form): Vd[0] = Vn.D[0] + Vn.D[1].
@@ -6708,7 +6560,7 @@ class Interpreter {
         // D-form only.
         r = lo + hi;
         break;
-      // region digitalis: FP scalar pairwise.  size[0] picks S (0) vs D (1)
+      // FP scalar pairwise.  size[0] picks S (0) vs D (1)
       // for the FP32/FP64 forms; args.is_fp16 selects the Armv8.2-FP16 form.
       // FMAX/FMIN: NaN-propagating (any-NaN -> NaN).
       // FMAXNM/FMINNM: NaN-quiet (single-NaN -> other operand).
@@ -6794,7 +6646,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
       default:
         Undefined();
         return;
@@ -6802,7 +6653,6 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = static_cast<__uint128_t>(r);
   }
-  // endregion
 
   //
   // AdvSIMD two-reg misc: unary element-wise vector operations.
@@ -6927,7 +6777,6 @@ class Interpreter {
         break;
       }
 
-      // region digitalis
       case Decoder::AdvSimdTwoRegMiscOpcode::kCls: {
         // CLS: count leading sign bits per element (number of consecutive
         // bits following the most-significant bit that equal the MSB; result
@@ -6954,7 +6803,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
         // ABS: absolute value per signed element.
@@ -6982,7 +6830,7 @@ class Interpreter {
         break;
       }
 
-      // region digitalis - SQABS / SQNEG (signed saturating abs / negate).
+      // SQABS / SQNEG (signed saturating abs / negate).
       // For each lane the source is sign-extended to int64_t. The only
       // input that saturates is INT_MIN_for_this_size: both |INT_MIN| and
       // -INT_MIN overflow the signed range, so they clamp to INT_MAX.
@@ -7014,14 +6862,13 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
-        // region digitalis: Armv8.2-FP16 vector FCMxx zero.
+        // Armv8.2-FP16 vector FCMxx zero.
         // The FP16 encoding of FCMGT/FCMEQ/FCMLT/FCMGE/FCMLE #0 routes to
         // the same enum values; is_fp16 flips the per-lane semantics from
         // integer signed compare to FP compare with FpHalfToSingle.
@@ -7045,7 +6892,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         // Integer signed compare against zero.
         uint64_t emask = ElementMask(esize);
         uint8_t bits = esize * 8;
@@ -7068,7 +6914,7 @@ class Interpreter {
         break;
       }
 
-      // region digitalis - FP FCMxxZero (FP32/FP64 two-reg-misc).
+      // FP FCMxxZero (FP32/FP64 two-reg-misc).
       // Per-lane compare against +0.0; sets all bits of the destination lane
       // when the predicate holds, else zero. args.size = bits[23:22]; bit22=0
       // selects FP32, bit22=1 selects FP64 (FP64 requires Q=1 by decoder).
@@ -7114,7 +6960,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kXtn: {
         // XTN: extract narrow — take lower half of each wider element.
@@ -7133,7 +6978,7 @@ class Interpreter {
         break;
       }
 
-      // region digitalis - SHLL / SHLL2 (shift left long by element size).
+      // SHLL / SHLL2 (shift left long by element size).
       // Source element width: esize (8/16/32 bits). Destination element width:
       // 2*esize (16/32/64 bits). Implicit shift amount = source element bits.
       // Each source element ends up in the upper half of the widened destination
@@ -7155,11 +7000,10 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kFabs: {
         // FABS (vector): floating-point absolute value per element.
-        // region digitalis: Armv8.2-FP16 vector FABS.
+        // Armv8.2-FP16 vector FABS.
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7170,7 +7014,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         if (args.size == 0b10) {
           // Single-precision elements (size=10 means float for this FP opcode group).
           uint8_t fp_count = args.q ? 4 : 2;
@@ -7197,7 +7040,7 @@ class Interpreter {
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kFneg: {
         // FNEG (vector): floating-point negate per element.
-        // region digitalis: Armv8.2-FP16 vector FNEG.
+        // Armv8.2-FP16 vector FNEG.
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7208,7 +7051,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         if (args.size == 0b10) {
           uint8_t fp_count = args.q ? 4 : 2;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7231,7 +7073,6 @@ class Interpreter {
         break;
       }
 
-      // region digitalis
       case Decoder::AdvSimdTwoRegMiscOpcode::kAddv: {
         // ADDV: add across vector — sum all elements, produce scalar result.
         uint64_t emask = ElementMask(esize);
@@ -7244,9 +7085,8 @@ class Interpreter {
         result = sum & emask;  // scalar result in bottom esize bytes, upper zeroed
         break;
       }
-      // endregion
 
-      // region digitalis - across-lanes FP reductions FMAXV / FMINV /
+      // across-lanes FP reductions FMAXV / FMINV /
       // FMAXNMV / FMINNMV. Reduce all lanes of an FP vector (.4S for
       // FP32, .8H for FP16; Q=1 pinned by the decoder) to a single
       // scalar FP element.
@@ -7317,9 +7157,8 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result), &out_bits, 4);
         break;
       }
-      // endregion
 
-      // region digitalis - across-lanes max/min reductions
+      // across-lanes max/min reductions
       // SMAXV/UMAXV/SMINV/UMINV: reduce a vector to a single scalar lane holding
       // the signed/unsigned max or min across all input lanes. The scalar result
       // is placed in the bottom esize bytes of Vd; upper bits are zeroed.
@@ -7355,15 +7194,14 @@ class Interpreter {
         result = acc & emask;
         break;
       }
-      // endregion
 
-      // region digitalis - SCVTF/UCVTF (vector, integer): per-lane signed or
+      // SCVTF/UCVTF (vector, integer): per-lane signed or
       // unsigned int-to-FP. Element size from `size` field: sz=0 -> single
       // (.4S / .2S), sz=1 -> double (.2D). Observed `ucvtf v0.4s, v0.4s`
       // (insn 0x6e21d800) in WhatsApp's libar-bundle3.so init path.
       case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
-        // region digitalis: FP16 form (SCVTF/UCVTF v.4h, v.4h).
+        // FP16 form (SCVTF/UCVTF v.4h, v.4h).
         // Per-lane sint16->half / uint16->half.
         if (args.is_fp16) {
           bool is_unsigned_fp16 = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV);
@@ -7379,7 +7217,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         // The decoder uses bit22 (sz) as the LOW bit of `size`; for FP
         // two-reg-misc the high bit of `size` is reserved. So sz = size&1.
         // Element width: sz=0 -> 32-bit (float), sz=1 -> 64-bit (double).
@@ -7410,16 +7247,15 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - FCVTZS/FCVTZU (vector, FP→int): per-lane FP-to-int
+      // FCVTZS/FCVTZU (vector, FP→int): per-lane FP-to-int
       // truncating conversion. sz=0 -> 32-bit float→int32, sz=1 -> 64-bit
       // double→int64. Out-of-range values saturate per the ARM ARM spec.
       // The decoder routes opcode=11011 with bit23=1 here, so args.size's
       // high bit is always 1 -- only the low bit (sz) selects single vs
       // double, unlike SCVTF/UCVTF whose bit23=0 path keeps size's high
       // bit clear. We don't reject "size & 0b10" the way SCVTF does.
-      // region digitalis - FCVT* vector with explicit rounding mode.
+      // FCVT* vector with explicit rounding mode.
       // Mirrors the scalar FpIntConversion rounding cases. Implements
       // FCVTN[S|U] (ties-to-even), FCVTM[S|U] (toward -inf),
       // FCVTP[S|U] (toward +inf), FCVTA[S|U] (ties-away-from-zero).
@@ -7455,7 +7291,7 @@ class Interpreter {
               return 0.0;
           }
         };
-        // region digitalis: FP16 form. Promote each half lane to
+        // FP16 form. Promote each half lane to
         // float, apply the same round-to-int, then narrow to int16/uint16.
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
@@ -7483,7 +7319,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         uint8_t fp_count = vec_len / fp_esize;
         for (uint8_t i = 0; i < fp_count; i++) {
@@ -7532,13 +7367,12 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
         bool is_unsigned =
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV);
-        // region digitalis: FP16 form (FCVTZS/ZU v.4h, v.4h).
+        // FP16 form (FCVTZS/ZU v.4h, v.4h).
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7564,7 +7398,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         uint8_t fp_count = vec_len / fp_esize;
         for (uint8_t i = 0; i < fp_count; i++) {
@@ -7611,16 +7444,15 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - FRECPE / FRSQRTE (vector): per-lane reciprocal /
+      // FRECPE / FRSQRTE (vector): per-lane reciprocal /
       // reciprocal-square-root estimate. The ARM spec only requires ~8 bits
       // of mantissa precision; computing 1/x and 1/sqrt(x) in full precision
       // is well within that bound, so callers that need the estimate as a
       // Newton-Raphson seed will converge identically.
-      // region digitalis - FSQRT (vector): per-lane square root.
+      // FSQRT (vector): per-lane square root.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFsqrtV: {
-        // region digitalis: Armv8.2-FP16 vector FSQRT.
+        // Armv8.2-FP16 vector FSQRT.
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7631,7 +7463,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         uint8_t fp_count = vec_len / fp_esize;
         for (uint8_t i = 0; i < fp_count; i++) {
@@ -7649,9 +7480,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis a=0/a=1 columns: FP16 vector FRINT*.
+      // a=0/a=1 columns: FP16 vector FRINT*.
       // Per-lane round-to-integral-FP-value with mode selected by opcode.
       // FRINTN ties-to-even, FRINTA ties-away, FRINTM toward -inf,
       // FRINTP toward +inf, FRINTZ toward zero, FRINTX/FRINTI use the
@@ -7685,7 +7515,7 @@ class Interpreter {
               return 0.0f;
           }
         };
-        // region digitalis: FP16 form (FRINT* v.4h / v.8h).
+        // FP16 form (FRINT* v.4h / v.8h).
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7696,8 +7526,7 @@ class Interpreter {
           }
           break;
         }
-        // endregion
-        // region digitalis: std FP32/FP64 FRINT*. `args.size`
+        // std FP32/FP64 FRINT*. `args.size`
         // here is (bit23=a, bit22=sz); only bit22 selects FP32 (0) vs FP64 (1).
         auto apply_round_f64 = [&](double x) -> double {
           if (x != x) return x;
@@ -7735,11 +7564,9 @@ class Interpreter {
           }
         }
         break;
-        // endregion
       }
-      // endregion
 
-      // region digitalis - FRINTTS vector (FRINT32Z/X, FRINT64Z/X). Per lane,
+      // FRINTTS vector (FRINT32Z/X, FRINT64Z/X). Per lane,
       // round to a 32/64-bit integral FP value with saturation, reusing the
       // scalar FrintTs helper. Element width comes from sz (size&1); the int
       // target width + rounding mode come from the opcode (mapped to the same
@@ -7772,13 +7599,12 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrecpeV:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV: {
         bool is_rsqrt =
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFrsqrteV);
-        // region digitalis: FP16 form (FRECPE/FRSQRTE v.4h, v.4h).
+        // FP16 form (FRECPE/FRSQRTE v.4h, v.4h).
         if (args.is_fp16) {
           uint8_t fp_count = args.q ? 8 : 4;
           for (uint8_t i = 0; i < fp_count; i++) {
@@ -7796,7 +7622,6 @@ class Interpreter {
           }
           break;
         }
-        // endregion
         uint8_t fp_esize = (args.size & 1) ? 8 : 4;
         // Same bit23=1 rationale as the FCVTZS case above.
         uint8_t fp_count = vec_len / fp_esize;
@@ -7825,9 +7650,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - URECPE / URSQRTE: unsigned integer reciprocal and
+      // URECPE / URSQRTE: unsigned integer reciprocal and
       // reciprocal-square-root estimate (.2S/.4S). These are fixed-point
       // estimates defined by the ARM ARM UnsignedRecipEstimate /
       // UnsignedRSqrtEstimate pseudocode; the integer recurrences below are
@@ -7877,9 +7701,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - SADDLV/UADDLV: add-long across vector. Sum all
+      // SADDLV/UADDLV: add-long across vector. Sum all
       // lanes of Vn into a single 2x-width scalar result written to bottom
       // of Vd; upper bits cleared. Observed as `uaddlv h0, v0.8b` (insn
       // 0x2e303800) in WhatsApp's libar-bundle3.so JNI_OnLoad path.
@@ -7905,9 +7728,8 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result), &r, out_esize);
         break;
       }
-      // endregion
 
-      // region digitalis - SUQADD / USQADD: per-lane saturating accumulate.
+      // SUQADD / USQADD: per-lane saturating accumulate.
       //  SUQADD Vd, Vn: Vd[i] = sat_signed( (int)Vd[i] + (uint)Vn[i] )
       //  USQADD Vd, Vn: Vd[i] = sat_unsigned( (uint)Vd[i] + (int)Vn[i] )
       // Per-lane element widths: 1/2/4/8 bytes. Observed as `usqadd v0.8b,
@@ -7949,9 +7771,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - pairwise add long instructions
+      // pairwise add long instructions
       case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlp:
       case Decoder::AdvSimdTwoRegMiscOpcode::kSadalp:
@@ -7990,9 +7811,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - saturating extract narrow: UQXTN / SQXTN.
+      // saturating extract narrow: UQXTN / SQXTN.
       // Source element size is 2*esize, destination is esize.
       // SQXTN: signed saturate source to [INT_min(esize), INT_max(esize)],
       //        write low esize bytes per element.
@@ -8033,9 +7853,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
+      // SQXTUN / SQXTUN2 (signed saturating extract unsigned narrow).
       // Read each lane as a signed value of width 2*esize, clamp to the
       // unsigned destination range [0, UMAX_dst], and write as an unsigned
       // value of width esize. Q=0 writes low 64 bits of Vd (upper zeroed);
@@ -8065,9 +7884,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis - floating-point convert long / narrow.
+      // floating-point convert long / narrow.
       // FCVTL: widen narrow FP source to wide FP destination.
       //   size=01 (sz=0): f32 -> f64, narrow lane count=2, wide count=2.
       //   Q=0 reads narrow elems from low half of Vn; Q=1 reads from high half.
@@ -8136,8 +7954,7 @@ class Interpreter {
         }
         break;
       }
-      // endregion
-      // region digitalis BFCVTN/BFCVTN2 (vector narrow FP32->BF16).
+      // BFCVTN/BFCVTN2 (vector narrow FP32->BF16).
       // BFCVTN  (Q=0): writes 4 BF16 lanes into Vd.h[0..3]; upper 64 bits zeroed.
       // BFCVTN2 (Q=1): writes 4 BF16 lanes into Vd.h[4..7]; lower 64 bits preserved.
       // Decoder pins size=10 (only valid FP32 source).
@@ -8153,8 +7970,7 @@ class Interpreter {
         }
         break;
       }
-      // endregion
-      // region digitalis FCVTXN / FCVTXN2 (vector narrow FP64->FP32, RtO).
+      // FCVTXN / FCVTXN2 (vector narrow FP64->FP32, RtO).
       // Decoder pins size=01 (FP64 source). Q=0 writes 2 narrow FP32 lanes
       // into Vd.s[0..1] (upper 64 bits zeroed); Q=1 writes Vd.s[2..3]
       // (lower 64 bits preserved). Round-to-odd is computed by
@@ -8172,7 +7988,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       // Less critical ops: leave as undefined for now.
       default:
@@ -8186,7 +8001,6 @@ class Interpreter {
   //
   // AdvSIMD shift by immediate: SSHR, USHR, SHL, SSRA, USRA, SLI, SRI, SHRN, SSHLL, USHLL.
   //
-  // region digitalis
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
     CHECK(!exception_raised_);
 
@@ -8194,7 +8008,7 @@ class Interpreter {
     __uint128_t src_m = state_->cpu.v[args.rm];
     __uint128_t result = state_->cpu.v[args.rd];
 
-    // region digitalis integer MUL/MLA/MLS by-element (.4h/.8h size=01,
+    // integer MUL/MLA/MLS by-element (.4h/.8h size=01,
     // .2s/.4s size=10).  Integer word-element ops share the FP32-sized
     // size=10 encoding slot with FMLA/FMLS/FMUL/FMULX, so we cannot
     // dispatch by size alone — opcode wins.  The decoder already filters
@@ -8256,9 +8070,8 @@ class Interpreter {
       state_->cpu.v[args.rd] = result;
       return;
     }
-    // endregion
 
-    // region digitalis: SQDMULH / SQRDMULH by-element (vector).
+    // SQDMULH / SQRDMULH by-element (vector).
     //   size=0b01 -> halfword (.4h/.8h, esize=2, 16-bit lanes).
     //   size=0b10 -> word     (.2s/.4s, esize=4, 32-bit lanes).
     // The indexed lane of Vm is broadcast across all destination lanes,
@@ -8309,9 +8122,8 @@ class Interpreter {
       state_->cpu.v[args.rd] = result;
       return;
     }
-    // endregion
 
-    // region digitalis: SQRDMLAH / SQRDMLSH by-element (Armv8.1-RDM).
+    // SQRDMLAH / SQRDMLSH by-element (Armv8.1-RDM).
     //   size=0b01 -> halfword (.4h/.8h, esize=2).
     //   size=0b10 -> word     (.2s/.4s, esize=4).
     // Non-widening: destination lane width matches source lane width.
@@ -8382,9 +8194,8 @@ class Interpreter {
       state_->cpu.v[args.rd] = result;
       return;
     }
-    // endregion
 
-    // region digitalis: widening MUL/MAC by element.
+    // widening MUL/MAC by element.
     //   size=01 (.4h/.8h sources -> .4s dst, esize 2->4, 4 output lanes).
     //   size=10 (.2s/.4s sources -> .2d dst, esize 4->8, 2 output lanes).
     // Q=0 (SMULL/SMLAL/SMLSL form):  uses Vn low half  (bytes 0..7).
@@ -8458,9 +8269,8 @@ class Interpreter {
       state_->cpu.v[args.rd] = new_result;
       return;
     }
-    // endregion
 
-    // region digitalis: SQDMULL / SQDMLAL / SQDMLSL by element.
+    // SQDMULL / SQDMLAL / SQDMLSL by element.
     // Saturating doubling widening multiply (and accumulate / subtract),
     // signed only.  Mirrors the SQDMULL/SQDMLAL/SQDMLSL three-different
     // vector arms at lines ~2074-2163, with Vm.lane[index] broadcast as
@@ -8553,9 +8363,8 @@ class Interpreter {
       state_->cpu.v[args.rd] = new_result;
       return;
     }
-    // endregion
 
-    // region digitalis FP16 vector indexed FMLA/FMLS/FMUL
+    // FP16 vector indexed FMLA/FMLS/FMUL
     if (args.size == 0b00) {
       // Half-precision: 2 bytes per lane.  Q=0 (.4h) → 4 output lanes,
       // Q=1 (.8h) → 8 output lanes.  Index selects one lane (0..7) from
@@ -8592,11 +8401,9 @@ class Interpreter {
           case Decoder::AdvSimdVecXIdxOpcode::kFmul:
             r = n * m_indexed;
             break;
-          // region digitalis
           case Decoder::AdvSimdVecXIdxOpcode::kFmulx:
             r = FmulxScalar<float>(n, m_indexed);
             break;
-          // endregion
           default:
             Undefined();
             return;
@@ -8609,7 +8416,6 @@ class Interpreter {
         memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
       }
     } else if (args.size == 0b10) {
-    // endregion
       // 32-bit float elements.
       uint8_t num_elements = args.q ? 4 : 2;
       float indexed;
@@ -8639,13 +8445,11 @@ class Interpreter {
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
             break;
           }
-          // region digitalis
           case Decoder::AdvSimdVecXIdxOpcode::kFmulx: {
             float r = FmulxScalar<float>(src, indexed);
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
             break;
           }
-          // endregion
           default:
             Undefined();
             return;
@@ -8681,13 +8485,11 @@ class Interpreter {
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
             break;
           }
-          // region digitalis
           case Decoder::AdvSimdVecXIdxOpcode::kFmulx: {
             double r = FmulxScalar<double>(src, indexed);
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
             break;
           }
-          // endregion
           default:
             Undefined();
             return;
@@ -8703,9 +8505,7 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
-  // region digitalis
   // AdvSIMD scalar x indexed element (sibling of vector form above).
   // Reads one lane from Vn (lane 0), one lane from Vm (args.index), computes
   // FmulxScalar, writes the result to Vd lane 0 and zeros the upper lanes.
@@ -8714,7 +8514,7 @@ class Interpreter {
 
     using Op = typename Decoder::AdvSimdScalarXIdxOpcode;
 
-    // region digitalis: SQRDMLAH / SQRDMLSH scalar by-element (Armv8.1-RDM).
+    // SQRDMLAH / SQRDMLSH scalar by-element (Armv8.1-RDM).
     //   Vd = sat_signed(
     //       Vd ± sat_signed((2 * sext(Vn) * sext(Vm[index]) + round) >>
     //                       bits_local))
@@ -8759,7 +8559,6 @@ class Interpreter {
           static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
       return;
     }
-    // endregion
 
     if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       Undefined();
@@ -8775,7 +8574,7 @@ class Interpreter {
     __uint128_t src_d = needs_dst ? state_->cpu.v[args.rd] : __uint128_t{0};
     __uint128_t result = 0;
 
-    // region digitalis: FP16 scalar by-element FMLA/FMLS/FMUL/FMULX
+    // FP16 scalar by-element FMLA/FMLS/FMUL/FMULX
     // (Armv8.2-FP16). Lift each FP16 lane to FP32 via FpHalfToSingle, run
     // the scalar op in FP32 (single rounding for FMUL/FMULX; binary64 for
     // FMLA/FMLS to mirror the FP32 FMLA path's single-round binary64
@@ -8823,7 +8622,6 @@ class Interpreter {
       state_->cpu.v[args.rd] = result;
       return;
     }
-    // endregion
 
     if (is_double) {
       double n_lane, m_lane, d_lane = 0.0;
@@ -8881,7 +8679,6 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
     CHECK(!exception_raised_);
@@ -8911,13 +8708,11 @@ class Interpreter {
     uint8_t rshift = (2 * bits) - ((immh << 3) | args.immb);  // for right shifts: shift = 2*esize*8 - (immh:immb)
 
     uint8_t vec_len = args.q ? 16 : 8;
-    // region digitalis
     // Scalar shift-by-immediate (DecodeAdvSimdScalarShiftByImm) sets
     // args.scalar=true to force single-lane semantics regardless of
     // esize.  For B/H/S esize this overrides the vector lane count
     // (16/8/4/2/1) → 1, so only the lowest element is read/written;
     // the zero-initialised result keeps Vd[127:esize] = 0 per ARM ARM.
-    // endregion
     uint8_t num_elements = args.scalar ? 1 : (vec_len / esize);
     uint64_t emask = ElementMask(esize);
 
@@ -9023,14 +8818,12 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis
         // Scalar narrow-shift dispatch (DecodeAdvSimdScalarShiftByImm)
         // sets args.scalar=true (and q=false) to mean: read exactly one
         // source element of src_esize bits and write Vd[esize-1:0],
         // leaving Vd[127:esize] = 0. The dst_offset / result-init
         // expressions already produce dst_offset=0 and result=0 when
         // q=false, so only src_count needs the per-scalar override.
-        // endregion
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         // Q=0: write lower half, Q=1: write upper half (SHRN2).
@@ -9089,7 +8882,6 @@ class Interpreter {
         break;
       }
 
-      // region digitalis
       case Decoder::AdvSimdShiftImmOpcode::kSrshr: {
         // SRSHR: signed rounding shift right.
         for (uint8_t i = 0; i < num_elements; i++) {
@@ -9233,9 +9025,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9263,9 +9054,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9293,9 +9083,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9310,9 +9099,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis: AdvSIMD narrow-shift family (saturating, rounding,
+      // AdvSIMD narrow-shift family (saturating, rounding,
       // and signed-saturating-unsigned variants). The non-rounding non-unsigned
       // variants live above (kShrn / kRshrn / kSqshrn / kUqshrn); these are
       // the four that were previously missing from the decoder and thus had
@@ -9329,9 +9117,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9360,9 +9147,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9388,9 +9174,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9417,9 +9202,8 @@ class Interpreter {
         uint8_t src_esize = esize * 2;
         if (src_esize > 8) { Undefined(); return; }
         uint8_t src_bits = src_esize * 8;
-        // region digitalis: see kShrn above for the scalar override rationale.
+        // see kShrn above for the scalar override rationale.
         uint8_t src_count = args.scalar ? 1 : (16 / src_esize);
-        // endregion
         uint8_t narrow_rshift = src_bits - ((immh << 3) | args.immb);
         result = args.q ? state_->cpu.v[args.rd] : static_cast<__uint128_t>(0);
         uint8_t dst_offset = args.q ? 8 : 0;
@@ -9435,9 +9219,8 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
-      // region digitalis: fixed-point conversion (SCVTF / UCVTF / FCVTZS /
+      // fixed-point conversion (SCVTF / UCVTF / FCVTZS /
       // FCVTZU at S/D, both scalar and vector forms). esize is 4 (S) or 8
       // (D); FP16 (esize=2) is rejected by the decoder. rshift is the
       // encoded fbits: esize=4 -> rshift ∈ [1..32]; esize=8 -> rshift ∈
@@ -9556,7 +9339,6 @@ class Interpreter {
         }
         break;
       }
-      // endregion
 
       default:
         Undefined();
@@ -9565,7 +9347,6 @@ class Interpreter {
 
     state_->cpu.v[args.rd] = result;
   }
-  // endregion
 
   //
   // Guest state getters/setters.
@@ -9608,7 +9389,6 @@ class Interpreter {
   }
 
  private:
-  // region digitalis
   // Program host x86 MXCSR rounding mode + FTZ/DAZ from an ARM FPCR value.
   // Plan §L1 (FP exception flags) infrastructure: writing FPCR via MSR must
   // program MXCSR rounding mode + DAZ/FTZ. Called from the kFpcr MSR case.
@@ -9736,7 +9516,6 @@ class Interpreter {
       memcpy(reinterpret_cast<uint8_t*>(result) + i * esize, &r, esize);
     }
   }
-  // endregion
 
   //
   // Flag update helpers.
@@ -9942,7 +9721,6 @@ class Interpreter {
     return extended << shift_amount;
   }
 
-  // region digitalis
   //
   // Memory access safety helpers.
   // (CheckPageAccess and RaiseGuestSegv removed — replaced by FaultyLoad/FaultyStore
@@ -9978,7 +9756,7 @@ class Interpreter {
     return static_cast<uint64_t>(exp);  // Returns original value
   }
 
-  // region digitalis: 128-bit compare-and-swap for CASP (64-bit pair).
+  // 128-bit compare-and-swap for CASP (64-bit pair).
   // Emit LOCK CMPXCHG16B via inline asm so we don't take a libatomic dependency
   // (the bare `__atomic_compare_exchange_n` on `__uint128_t` may lower to a
   // libcall without -mcx16).  The Digitalis host is x86_64; the upstream ARM64
@@ -9999,7 +9777,6 @@ class Interpreter {
         : "cc", "memory");
     return (static_cast<__uint128_t>(exp_hi) << 64) | exp_lo;
   }
-  // endregion
 
   template <typename T>
   uint64_t AtomicExchange(void* addr, uint64_t val) {
@@ -10031,7 +9808,7 @@ class Interpreter {
         __atomic_fetch_xor(static_cast<T*>(addr), static_cast<T>(bits), __ATOMIC_SEQ_CST));
   }
 
-  // region digitalis atomic min/max (LSE Armv8.1).
+  // atomic min/max (LSE Armv8.1).
   // No __atomic_fetch_max/min builtin exists; emulate via a CAS retry loop.
   // T is the signed/unsigned host type at the guest operation size; the
   // returned uint64_t is the prior memory value, zero-extended.
@@ -10086,13 +9863,11 @@ class Interpreter {
                                           __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
     return static_cast<uint64_t>(cur);
   }
-  // endregion
 
   //
   // SIMD helpers.
   //
 
-  // region digitalis
   // Half-precision float conversion helpers (IEEE 754 binary16).
   static uint16_t FpSingleToHalf(float f) {
     uint32_t fbits;
@@ -10121,7 +9896,6 @@ class Interpreter {
     return sign | static_cast<uint16_t>((exp + 15) << 10) | static_cast<uint16_t>(frac >> 13);
   }
 
-  // region digitalis
   // FMULX scalar semantics, parameterized by FP type.  Same as a * b except
   // the (zero * infinity) saturation case is replaced by ±2.0 (sign = sign of
   // a XOR sign of b), per ARM ARM C7.2.149 FMULX.  Standard FP NaN
@@ -10237,7 +10011,6 @@ class Interpreter {
     }
     return a < b ? a : b;
   }
-  // endregion
 
   static float FpHalfToSingle(uint16_t h) {
     uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
@@ -10269,7 +10042,6 @@ class Interpreter {
     memcpy(&result, &fbits, 4);
     return result;
   }
-  // endregion
 
   __uint128_t ExpandSimdModifiedImm(uint8_t op, uint8_t cmode, uint8_t abc, uint8_t defgh, bool q) {
     uint8_t imm8 = (abc << 5) | defgh;
@@ -10343,7 +10115,7 @@ class Interpreter {
   }
 
   void SimdLoadFromMemory(void* host_addr, uint8_t rt, Decoder::SimdLoadStoreSize size) {
-    // region digitalis - use FaultyLoad for sizes <= 8 bytes, two loads for 128-bit
+    // use FaultyLoad for sizes <= 8 bytes, two loads for 128-bit
     if (size == Decoder::SimdLoadStoreSize::k128bit) {
       FaultyLoadResult lo = FaultyLoad(host_addr, 8);
       if (lo.is_fault) { HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return; }
@@ -10366,7 +10138,6 @@ class Interpreter {
       state_->cpu.v[rt] = static_cast<__uint128_t>(fl.value);
       return;
     }
-    // endregion
     state_->cpu.v[rt] = 0;  // zero-extend upper bits
     switch (size) {
       case Decoder::SimdLoadStoreSize::k8bit: {
@@ -10401,7 +10172,7 @@ class Interpreter {
   }
 
   void SimdStoreToMemory(void* host_addr, uint8_t rt, Decoder::SimdLoadStoreSize size) {
-    // region digitalis - use FaultyStore for fault recovery
+    // use FaultyStore for fault recovery
     uint64_t lo_val = static_cast<uint64_t>(state_->cpu.v[rt]);
     uint64_t hi_val = static_cast<uint64_t>(state_->cpu.v[rt] >> 64);
     uint8_t bytes = 0;
@@ -10425,17 +10196,12 @@ class Interpreter {
         HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return;
       }
     }
-    // endregion
   }
-  // endregion
 
   ThreadState* state_;
   bool branch_taken_;
   bool exception_raised_;
-  // region digitalis
   // (removed: page cache variables no longer needed with FaultyLoad/FaultyStore)
-  // endregion
 };
 
 }  // namespace berberis
-// endregion
