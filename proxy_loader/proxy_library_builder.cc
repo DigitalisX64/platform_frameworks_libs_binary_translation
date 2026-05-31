@@ -106,6 +106,28 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
         thunk = reinterpret_cast<void*>(DoBadThunk);
       }
       if (function.marshal_and_call == DoBadTrampoline) {
+        // region digitalis - a primary-table entry marked DoBadTrampoline
+        // (incompatible signature, no upstream custom trampoline) can be
+        // overridden by a Digitalis-side extra trampoline registered for this
+        // library via RegisterExtraTrampolines. Consult the extras registry
+        // before falling back to the fatal DoBadTrampoline. arm64-only: the
+        // extras registry exists solely in the arm64-translation proxy loader,
+        // so this override is byte-identical-absent for riscv64/arm builds.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+        if (const KnownTrampoline* extra = FindExtraTrampoline(library_name_, name);
+            extra != nullptr && extra->marshal_and_call != DoBadTrampoline) {
+          void* extra_thunk = extra->thunk;
+          if (!extra_thunk) {
+            extra_thunk = dlsym(handle_, name);
+          }
+          if (!extra_thunk) {
+            extra_thunk = reinterpret_cast<void*>(DoBadThunk);
+          }
+          MakeTrampolineCallable(guest_addr, false, extra->marshal_and_call, extra_thunk, name);
+          return;
+        }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+        // endregion
         // HACK: DoBadTrampoline needs function name passed as callee!
         MakeTrampolineCallable(guest_addr, false, DoBadTrampoline, name, name);
       } else {
