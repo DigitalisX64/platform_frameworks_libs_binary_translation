@@ -16,6 +16,7 @@
 
 #include "berberis/interpreter/arm64/interpreter.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -545,6 +546,21 @@ class Interpreter {
         thread_local std::mt19937_64 rng(std::random_device{}());
         state_->cpu.flags = 0;  // NZCV = 0b0000 (success)
         return static_cast<Register>(rng());
+      }
+      case Decoder::SystemReg::kCntfrqEl0:
+        // Counter frequency: 19.2 MHz, the de-facto Android generic-timer rate.
+        // CNTVCT/CNTPCT below are scaled to match, so cntvct/cntfrq = seconds.
+        return 19200000ULL;
+      case Decoder::SystemReg::kCntvctEl0:
+      case Decoder::SystemReg::kCntpctEl0: {
+        // Monotonic virtual/physical counter backed by the host steady clock,
+        // expressed in 19.2 MHz ticks. __uint128_t intermediate avoids overflow.
+        uint64_t ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        return static_cast<Register>(
+            (static_cast<__uint128_t>(ns) * 19200000ULL) / 1000000000ULL);
       }
       default:
         Undefined();
@@ -4011,6 +4027,65 @@ class Interpreter {
           if (rs_lo < 31) state_->cpu.x[rs_lo] = static_cast<uint64_t>(old_pair);
           if (rs_hi < 31) state_->cpu.x[rs_hi] = static_cast<uint64_t>(old_pair >> 64);
         }
+        break;
+      }
+
+      // LDXP/LDAXP (load-exclusive pair). Loads a register pair atomically and
+      // arms the exclusive monitor (modeled as an address reservation, like
+      // LDXR). args.size: 2 = 32-bit pair (8 bytes), 3 = 64-bit pair (16 bytes).
+      case Decoder::AtomicOp::kLdxp: {
+        if (args.size == 2) {
+          uint64_t pair = AtomicLoad<uint64_t>(host_addr);
+          if (args.rt < 31) state_->cpu.x[args.rt] = pair & 0xFFFFFFFF;
+          if (args.rt2 < 31) state_->cpu.x[args.rt2] = (pair >> 32) & 0xFFFFFFFF;
+          state_->cpu.reservation_address = base;
+          memcpy(&state_->cpu.reservation_value, &pair, sizeof(pair));
+        } else {  // args.size == 3
+          // CMPXCHG16B with expected==desired==0 is an atomic 128-bit read
+          // (only writes when *addr==0, which leaves 0 in place).
+          __uint128_t pair = AtomicCASVal128(host_addr, 0, 0);
+          if (args.rt < 31) state_->cpu.x[args.rt] = static_cast<uint64_t>(pair);
+          if (args.rt2 < 31) state_->cpu.x[args.rt2] = static_cast<uint64_t>(pair >> 64);
+          state_->cpu.reservation_address = base;
+        }
+        break;
+      }
+
+      // STXP/STLXP (store-exclusive pair). Writes Rt:Rt2 atomically and reports
+      // success (0) / failure (1) in Rs.
+      //   32-bit pair: exact monitor — 64-bit CAS against the value LDXP read.
+      //   64-bit pair: reservation_value is only 64-bit so the full pair can't
+      //   be retained; model the monitor by address only and publish the pair
+      //   atomically (succeeds whenever the reservation is still held). This
+      //   matches a weak-but-legal LL/SC implementation and is correct for the
+      //   uncontended case; it does not detect a concurrent 128-bit overwrite.
+      case Decoder::AtomicOp::kStxp: {
+        bool success = false;
+        if (args.size == 2) {
+          uint64_t new_lo = (args.rt < 31) ? (state_->cpu.x[args.rt] & 0xFFFFFFFF) : 0;
+          uint64_t new_hi = (args.rt2 < 31) ? (state_->cpu.x[args.rt2] & 0xFFFFFFFF) : 0;
+          uint64_t new_pair = (new_hi << 32) | new_lo;
+          uint64_t expected;
+          memcpy(&expected, &state_->cpu.reservation_value, sizeof(expected));
+          if (state_->cpu.reservation_address == base) {
+            success = AtomicCAS<uint64_t>(host_addr, expected, new_pair);
+          }
+        } else {  // args.size == 3
+          if (state_->cpu.reservation_address == base) {
+            uint64_t new_lo = (args.rt < 31) ? state_->cpu.x[args.rt] : 0;
+            uint64_t new_hi = (args.rt2 < 31) ? state_->cpu.x[args.rt2] : 0;
+            __uint128_t desired = (static_cast<__uint128_t>(new_hi) << 64) | new_lo;
+            __uint128_t cur = AtomicCASVal128(host_addr, 0, 0);
+            for (;;) {
+              __uint128_t prev = AtomicCASVal128(host_addr, cur, desired);
+              if (prev == cur) break;
+              cur = prev;
+            }
+            success = true;
+          }
+        }
+        state_->cpu.reservation_address = 0;
+        if (args.rs < 31) state_->cpu.x[args.rs] = success ? 0 : 1;
         break;
       }
 
