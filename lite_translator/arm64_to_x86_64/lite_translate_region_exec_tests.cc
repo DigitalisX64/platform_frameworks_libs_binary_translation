@@ -42402,6 +42402,49 @@ TEST_F(Arm64LiteTranslateRegionTest, AdcsCarryOutOnSaturatedAddend) {
   EXPECT_FALSE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
 }
 
+// LD3/LD4 single-structure (one lane) use the odd opcode<0> bit and were
+// decoded to Undefined (TikTok hit `ld4 {...}[0]`). Each register receives one
+// de-interleaved element at the given lane.
+TEST_F(Arm64LiteTranslateRegionTest, Ld4Ld3SingleStructureLane) {
+  auto lane_byte = [&](int vreg, int lane) {
+    uint8_t b;
+    std::memcpy(&b, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane, 1);
+    return b;
+  };
+
+  // ld4 {v0.b,v1.b,v2.b,v3.b}[3], [x0]
+  alignas(16) uint8_t mem4[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+  for (int i = 0; i < 4; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&mem4[0]);
+  Interpret(0x0d602c00U);
+  EXPECT_EQ(lane_byte(0, 3), 0xAA);
+  EXPECT_EQ(lane_byte(1, 3), 0xBB);
+  EXPECT_EQ(lane_byte(2, 3), 0xCC);
+  EXPECT_EQ(lane_byte(3, 3), 0xDD);
+
+  // ld3 {v0.b,v1.b,v2.b}[3], [x0]
+  alignas(16) uint8_t mem3[3] = {0x11, 0x22, 0x33};
+  for (int i = 0; i < 4; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&mem3[0]);
+  Interpret(0x0d402c00U);
+  EXPECT_EQ(lane_byte(0, 3), 0x11);
+  EXPECT_EQ(lane_byte(1, 3), 0x22);
+  EXPECT_EQ(lane_byte(2, 3), 0x33);
+
+  // ld4 {v0.s,v1.s,v2.s,v3.s}[1], [x0]: four 32-bit words into lane 1.
+  alignas(16) uint32_t memw[4] = {0x01020304u, 0x05060708u, 0x090A0B0Cu, 0x0D0E0F10u};
+  for (int i = 0; i < 4; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&memw[0]);
+  Interpret(0x0d60b000U);
+  uint32_t w[4];
+  for (int i = 0; i < 4; i++)
+    std::memcpy(&w[i], reinterpret_cast<uint8_t*>(&state_.cpu.v[i]) + 4, 4);
+  EXPECT_EQ(w[0], 0x01020304u);
+  EXPECT_EQ(w[1], 0x05060708u);
+  EXPECT_EQ(w[2], 0x090A0B0Cu);
+  EXPECT_EQ(w[3], 0x0D0E0F10u);
+}
+
 }  // namespace
 
 }  // namespace berberis

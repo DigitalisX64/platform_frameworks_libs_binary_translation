@@ -3988,21 +3988,22 @@ class Decoder {
       return;
     }
 
-    // Non-replicate LD/ST single element to one lane.
-    // Decode element size and index from opcode/S/size/Q.
+    // Non-replicate LD/ST single element to one lane. The element size is
+    // selected by opcode<2:1> (00=B, 01=H, 10=S/D); opcode<0> is the low bit of
+    // the structure count. Index packs Q:S:size per the ARM ARM size group.
     uint8_t elem_size;
     uint8_t index;
-    switch (opcode) {
-      case 0b000:  // Byte
+    switch (opcode >> 1) {
+      case 0b00:  // Byte
         elem_size = 0;  // B
         index = (q << 3) | (s_bit << 2) | size;
         break;
-      case 0b010:  // Halfword
+      case 0b01:  // Halfword
         if (size & 1) { Undefined(); return; }
         elem_size = 1;  // H
         index = (q << 2) | (s_bit << 1) | (size >> 1);
         break;
-      case 0b100:  // Word or Doubleword
+      case 0b10:  // Word or Doubleword
         if (size == 0b00) {
           elem_size = 2;  // S
           index = (q << 1) | s_bit;
@@ -4017,25 +4018,15 @@ class Decoder {
         Undefined(); return;
     }
 
-    // Determine number of registers from opcode and R bit.
-    uint8_t num_regs;
+    // Structure count (selem) = (opcode<0> : R) + 1, giving LD1/2/3/4 or
+    // ST1/2/3/4. The odd opcodes (LD3/LD4/ST3/ST4) were previously unhandled.
+    uint8_t num_regs = static_cast<uint8_t>((((opcode & 1) << 1) | (r ? 1 : 0)) + 1);
     AdvSimdSingleStructOp op;
-    if (!r) {
-      switch (opcode) {
-        case 0b000: case 0b010: case 0b100:
-          num_regs = 1;
-          op = is_load ? AdvSimdSingleStructOp::kLd1 : AdvSimdSingleStructOp::kSt1;
-          break;
-        default: Undefined(); return;
-      }
-    } else {
-      switch (opcode) {
-        case 0b000: case 0b010: case 0b100:
-          num_regs = 2;
-          op = is_load ? AdvSimdSingleStructOp::kLd2 : AdvSimdSingleStructOp::kSt2;
-          break;
-        default: Undefined(); return;
-      }
+    switch (num_regs) {
+      case 1: op = is_load ? AdvSimdSingleStructOp::kLd1 : AdvSimdSingleStructOp::kSt1; break;
+      case 2: op = is_load ? AdvSimdSingleStructOp::kLd2 : AdvSimdSingleStructOp::kSt2; break;
+      case 3: op = is_load ? AdvSimdSingleStructOp::kLd3 : AdvSimdSingleStructOp::kSt3; break;
+      default: op = is_load ? AdvSimdSingleStructOp::kLd4 : AdvSimdSingleStructOp::kSt4; break;
     }
 
     const AdvSimdSingleStructArgs args = {
