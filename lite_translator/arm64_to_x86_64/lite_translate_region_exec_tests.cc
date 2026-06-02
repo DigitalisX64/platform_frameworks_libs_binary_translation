@@ -42362,6 +42362,46 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGeneral2DFromXReg) {
   EXPECT_EQ(r[1], 0xDEADBEEFCAFEF00DULL);
 }
 
+// ADC/ADCS carry-out must be correct when the addend is all-ones and carry-in
+// is 1 (the saturated-limb case bignum/Montgomery arithmetic hits constantly).
+// The carry-out was lost here, silently corrupting RSA/ECDSA verification and
+// thus all TLS.
+TEST_F(Arm64LiteTranslateRegionTest, AdcsCarryOutOnSaturatedAddend) {
+  // adcs x0, x1, x2 ; carry-in=1, x1=5, x2=0xFFFF...FF -> x0=5, carry-out=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  Interpret(0xba020020U);  // adcs x0, x1, x2
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagCarry) != 0) << "carry-out lost";
+  EXPECT_FALSE((state_.cpu.flags & CPUState::kFlagZero) != 0);
+
+  // carry-in=1, x1=0, x2=0xFFFF...FF -> x0=0 (=2^64 mod 2^64), carry-out=1, Z=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  Interpret(0xba020020U);  // adcs x0, x1, x2
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagZero) != 0);
+
+  // 32-bit: adcs w0, w1, w2 ; carry-in=1, w1=5, w2=0xFFFFFFFF -> w0=5, C=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFULL;
+  Interpret(0x3a020020U);  // adcs w0, w1, w2
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
+
+  // Sanity: no wrap, carry-in=0 -> normal sum, no carry-out.
+  state_.cpu.flags = 0;
+  state_.cpu.x[1] = 10;
+  state_.cpu.x[2] = 20;
+  Interpret(0xba020020U);  // adcs x0, x1, x2
+  EXPECT_EQ(state_.cpu.x[0], 30ULL);
+  EXPECT_FALSE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
+}
+
 }  // namespace
 
 }  // namespace berberis

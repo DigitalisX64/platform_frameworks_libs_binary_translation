@@ -1750,7 +1750,31 @@ class Interpreter {
     result = op1 + op2 + carry;
     if (!is_64bit) result &= 0xFFFFFFFFULL;
     if (set_flags) {
-      UpdateFlags(op1, op2 + carry, result, is_sub, is_64bit);
+      // Compute NZCV directly here rather than via UpdateFlags(op1, op2 + carry,
+      // ...): folding the carry into op2 wraps to 0 when op2 == all-ones and
+      // carry == 1, which would make the carry-out check (result < op1) miss
+      // the carry. That saturated-limb case is rare in ordinary code but
+      // pervasive in bignum/Montgomery arithmetic (it broke RSA/ECDSA signature
+      // verification, hence all TLS). op2 is already inverted above for SUB, so
+      // both ADC and SBC are handled as op1 + op2 + carry.
+      uint16_t flags = 0;
+      unsigned top_bit = is_64bit ? 63 : 31;
+      if ((result >> top_bit) & 1) flags |= CPUState::kFlagNegative;
+      if (result == 0) flags |= CPUState::kFlagZero;
+      // C: true carry-out of op1 + op2 + carry, computed in a wider type so the
+      // sum can exceed the operand width without losing the carry bit.
+      bool carry_out;
+      if (is_64bit) {
+        carry_out = (static_cast<__uint128_t>(op1) + op2 + carry) > ~uint64_t{0};
+      } else {
+        carry_out = (op1 + op2 + carry) > 0xFFFFFFFFULL;
+      }
+      if (carry_out) flags |= CPUState::kFlagCarry;
+      // V: signed overflow — both addends agree in sign but differ from result.
+      if (((op1 ^ result) & (op2 ^ result) & (uint64_t{1} << top_bit)) != 0) {
+        flags |= CPUState::kFlagOverflow;
+      }
+      state_->cpu.flags = flags;
     }
     return result;
   }
