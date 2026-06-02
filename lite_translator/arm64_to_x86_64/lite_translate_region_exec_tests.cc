@@ -42278,6 +42278,36 @@ TEST_F(Arm64LiteTranslateRegionTest, LoadStoreExclusivePair64) {
   EXPECT_EQ(mem[1], 0xCAFEF00D00000002ULL);
 }
 
+// STXP must FAIL (Rs=1) and leave memory untouched if the location changed
+// since LDXP — the exact-monitor contract lock-free code relies on. The 64-bit
+// pair previously published unconditionally and always reported success.
+TEST_F(Arm64LiteTranslateRegionTest, StoreExclusivePair64FailsOnConcurrentWrite) {
+  alignas(16) uint64_t mem[2] = {0x1111222233334444ULL, 0xAAAABBBBCCCCDDDDULL};
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  Interpret(0xc87f0801U);  // ldxp x1, x2, [x0] — arms the monitor
+  // Simulate another agent overwriting the pair between LDXP and STXP.
+  mem[0] = 0x9999999999999999ULL;
+  mem[1] = 0x8888888888888888ULL;
+  state_.cpu.x[1] = 0xDEADBEEF00000001ULL;
+  state_.cpu.x[2] = 0xCAFEF00D00000002ULL;
+  Interpret(0xc8230801U);  // stxp w3, x1, x2, [x0]
+  EXPECT_EQ(state_.cpu.x[3], 1ULL);              // failed
+  EXPECT_EQ(mem[0], 0x9999999999999999ULL);      // memory untouched
+  EXPECT_EQ(mem[1], 0x8888888888888888ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StoreExclusivePair32FailsOnConcurrentWrite) {
+  alignas(8) uint64_t mem = 0xAAAABBBBCCCCDDDDULL;
+  state_.cpu.x[0] = ToGuestAddr(&mem);
+  Interpret(0x887f0801U);  // ldxp w1, w2, [x0]
+  mem = 0x1234567899999999ULL;  // concurrent overwrite
+  state_.cpu.x[1] = 0x11111111ULL;
+  state_.cpu.x[2] = 0x22222222ULL;
+  Interpret(0x88230801U);  // stxp w3, w1, w2, [x0]
+  EXPECT_EQ(state_.cpu.x[3], 1ULL);          // failed
+  EXPECT_EQ(mem, 0x1234567899999999ULL);     // untouched
+}
+
 // MRS of the generic-timer counters: CNTFRQ_EL0 is a fixed 19.2 MHz; the
 // CNTVCT_EL0/CNTPCT_EL0 counters are monotonic and share that frequency.
 TEST_F(Arm64LiteTranslateRegionTest, MrsCounterTimer) {
@@ -42330,6 +42360,46 @@ TEST_F(Arm64LiteTranslateRegionTest, DupGeneral2DFromXReg) {
   std::memcpy(r, &state_.cpu.v[2], 16);
   EXPECT_EQ(r[0], 0xDEADBEEFCAFEF00DULL);
   EXPECT_EQ(r[1], 0xDEADBEEFCAFEF00DULL);
+}
+
+// ADC/ADCS carry-out must be correct when the addend is all-ones and carry-in
+// is 1 (the saturated-limb case bignum/Montgomery arithmetic hits constantly).
+// The carry-out was lost here, silently corrupting RSA/ECDSA verification and
+// thus all TLS.
+TEST_F(Arm64LiteTranslateRegionTest, AdcsCarryOutOnSaturatedAddend) {
+  // adcs x0, x1, x2 ; carry-in=1, x1=5, x2=0xFFFF...FF -> x0=5, carry-out=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  Interpret(0xba020020U);  // adcs x0, x1, x2
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagCarry) != 0) << "carry-out lost";
+  EXPECT_FALSE((state_.cpu.flags & CPUState::kFlagZero) != 0);
+
+  // carry-in=1, x1=0, x2=0xFFFF...FF -> x0=0 (=2^64 mod 2^64), carry-out=1, Z=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  Interpret(0xba020020U);  // adcs x0, x1, x2
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagZero) != 0);
+
+  // 32-bit: adcs w0, w1, w2 ; carry-in=1, w1=5, w2=0xFFFFFFFF -> w0=5, C=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFULL;
+  Interpret(0x3a020020U);  // adcs w0, w1, w2
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);
+  EXPECT_TRUE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
+
+  // Sanity: no wrap, carry-in=0 -> normal sum, no carry-out.
+  state_.cpu.flags = 0;
+  state_.cpu.x[1] = 10;
+  state_.cpu.x[2] = 20;
+  Interpret(0xba020020U);  // adcs x0, x1, x2
+  EXPECT_EQ(state_.cpu.x[0], 30ULL);
+  EXPECT_FALSE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
 }
 
 }  // namespace

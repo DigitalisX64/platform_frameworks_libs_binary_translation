@@ -1750,7 +1750,31 @@ class Interpreter {
     result = op1 + op2 + carry;
     if (!is_64bit) result &= 0xFFFFFFFFULL;
     if (set_flags) {
-      UpdateFlags(op1, op2 + carry, result, is_sub, is_64bit);
+      // Compute NZCV directly here rather than via UpdateFlags(op1, op2 + carry,
+      // ...): folding the carry into op2 wraps to 0 when op2 == all-ones and
+      // carry == 1, which would make the carry-out check (result < op1) miss
+      // the carry. That saturated-limb case is rare in ordinary code but
+      // pervasive in bignum/Montgomery arithmetic (it broke RSA/ECDSA signature
+      // verification, hence all TLS). op2 is already inverted above for SUB, so
+      // both ADC and SBC are handled as op1 + op2 + carry.
+      uint16_t flags = 0;
+      unsigned top_bit = is_64bit ? 63 : 31;
+      if ((result >> top_bit) & 1) flags |= CPUState::kFlagNegative;
+      if (result == 0) flags |= CPUState::kFlagZero;
+      // C: true carry-out of op1 + op2 + carry, computed in a wider type so the
+      // sum can exceed the operand width without losing the carry bit.
+      bool carry_out;
+      if (is_64bit) {
+        carry_out = (static_cast<__uint128_t>(op1) + op2 + carry) > ~uint64_t{0};
+      } else {
+        carry_out = (op1 + op2 + carry) > 0xFFFFFFFFULL;
+      }
+      if (carry_out) flags |= CPUState::kFlagCarry;
+      // V: signed overflow — both addends agree in sign but differ from result.
+      if (((op1 ^ result) & (op2 ^ result) & (uint64_t{1} << top_bit)) != 0) {
+        flags |= CPUState::kFlagOverflow;
+      }
+      state_->cpu.flags = flags;
     }
     return result;
   }
@@ -4047,18 +4071,18 @@ class Interpreter {
           if (args.rt < 31) state_->cpu.x[args.rt] = static_cast<uint64_t>(pair);
           if (args.rt2 < 31) state_->cpu.x[args.rt2] = static_cast<uint64_t>(pair >> 64);
           state_->cpu.reservation_address = base;
+          // reservation_value is __uint128_t, so retain the FULL 128-bit value
+          // for STXP's exact-monitor compare-and-swap below.
+          state_->cpu.reservation_value = pair;
         }
         break;
       }
 
       // STXP/STLXP (store-exclusive pair). Writes Rt:Rt2 atomically and reports
-      // success (0) / failure (1) in Rs.
-      //   32-bit pair: exact monitor — 64-bit CAS against the value LDXP read.
-      //   64-bit pair: reservation_value is only 64-bit so the full pair can't
-      //   be retained; model the monitor by address only and publish the pair
-      //   atomically (succeeds whenever the reservation is still held). This
-      //   matches a weak-but-legal LL/SC implementation and is correct for the
-      //   uncontended case; it does not detect a concurrent 128-bit overwrite.
+      // success (0) / failure (1) in Rs. Both widths use an exact monitor: a
+      // single compare-and-swap against the value LDXP read, so a concurrent
+      // modification since LDXP makes the CAS (and thus the STXP) fail and
+      // leaves memory untouched — the LL/SC contract lock-free code depends on.
       case Decoder::AtomicOp::kStxp: {
         bool success = false;
         if (args.size == 2) {
@@ -4075,13 +4099,11 @@ class Interpreter {
             uint64_t new_lo = (args.rt < 31) ? state_->cpu.x[args.rt] : 0;
             uint64_t new_hi = (args.rt2 < 31) ? state_->cpu.x[args.rt2] : 0;
             __uint128_t desired = (static_cast<__uint128_t>(new_hi) << 64) | new_lo;
-            __uint128_t cur = AtomicCASVal128(host_addr, 0, 0);
-            for (;;) {
-              __uint128_t prev = AtomicCASVal128(host_addr, cur, desired);
-              if (prev == cur) break;
-              cur = prev;
-            }
-            success = true;
+            __uint128_t expected = state_->cpu.reservation_value;
+            // CMPXCHG16B: stores desired and returns expected iff *addr ==
+            // expected; otherwise returns the current value and stores nothing.
+            __uint128_t prev = AtomicCASVal128(host_addr, expected, desired);
+            success = (prev == expected);
           }
         }
         state_->cpu.reservation_address = 0;
