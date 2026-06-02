@@ -24,6 +24,11 @@
 #include "berberis/base/checks.h"
 #include "berberis/base/host_signal.h"
 #include "berberis/base/scoped_errno.h"
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include "berberis/base/tracing.h"
+#endif
+// endregion digitalis
 #include "berberis/guest_os_primitives/guest_signal.h"
 #include "berberis/runtime_primitives/host_function_wrapper_impl.h"  // UnwrapHostFunction
 
@@ -57,11 +62,39 @@ void ConvertHostSigactionToGuest(const HostStructSigaction* host_sa, Guest_sigac
 #if defined(__i386__)
       if ((memcmp(handler, "\x58\xb8\x77\x00\x00\x00\xcd\x80", 8) != 0) &&  // x86 sigreturn
           (memcmp(handler, "\xb8\xad\x00\x00\x00\xcd\x80", 7) != 0)) {      // x86 rt_sigreturn
+        // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+        TRACE("Unrecognised x86 sa_restorer in host sigaction; tolerating");
+#else
+        // endregion digitalis
         LOG_ALWAYS_FATAL("Unknown x86 sa_restorer in host sigaction!");
+        // region digitalis
+#endif
+        // endregion digitalis
       }
 #elif defined(__x86_64__)
       if (memcmp(handler, "\x48\xc7\xc0\x0f\x00\x00\x00\x0f\x05", 9) != 0) {  // x86_64 sigreturn
+        // region digitalis
+        // Tolerate a non-canonical host sa_restorer instead of aborting. On
+        // Android the host is bionic with ART's libsigchain interposed on the
+        // signal chain, so a previously-installed host handler reports an
+        // sa_restorer that does not byte-match the canonical glibc/kernel
+        // sigreturn trampoline. The restorer is irrelevant to the guest
+        // (SA_RESTORER is stripped below and the guest gets its own restorer
+        // via ResetSigactionRestorer), so an unrecognised value is harmless.
+        // Apps that install a SIGSEGV handler and read back the old action via
+        // sigaction(.., &old) -- crash reporters such as uCrash/Breakpad/
+        // crashpad -- hit this path; a fatal abort here took the process down.
+        // The arm64-guest behaviour change is scoped to the arm64 build so the
+        // upstream riscv64 build keeps its original fatal check.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+        TRACE("Unrecognised x86_64 sa_restorer in host sigaction; tolerating");
+#else
+        // endregion digitalis
         LOG_ALWAYS_FATAL("Unknown x86_64 sa_restorer in host sigaction!");
+        // region digitalis
+#endif
+        // endregion digitalis
       }
 #elif defined(__riscv)
       LOG_ALWAYS_FATAL("Unimplemented for riscv64");
