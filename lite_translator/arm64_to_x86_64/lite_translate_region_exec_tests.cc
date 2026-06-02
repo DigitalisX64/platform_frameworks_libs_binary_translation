@@ -154,6 +154,14 @@ class Arm64LiteTranslateRegionTest : public ::testing::Test {
     return true;
   }
 
+  // Drives the interpreter for a single instruction. Interpreter-only ops
+  // (EXT, LDXP/STXP, MRS counter reads, etc.) deliberately bail out of the
+  // JIT, so Run() can't exercise them; this path tests them directly.
+  void Interpret(const uint32_t& insn) {
+    state_.cpu.insn_addr = ToGuestAddr(&insn);
+    InterpretInsn(&state_);
+  }
+
  protected:
   ThreadState state_{};
 };
@@ -42216,6 +42224,74 @@ TEST_F(Arm64LiteTranslateRegionTest, UqshrnScalarSDInRange) {
   std::memcpy(r, &state_.cpu.v[0], 16);
   EXPECT_EQ(r[0], uint64_t{0x00000001}) << "S0 = 1; Vd[63:32] zeroed";
   EXPECT_EQ(r[1], 0ULL);
+}
+
+// EXT with an odd imm4 must decode as EXT, not be swallowed by the AdvSIMD
+// two-reg-misc group (whose dispatch shares bits[28:24]/bits[11:10] with an
+// odd-imm4 EXT). The bit21 guard in the decoder keeps them apart.
+TEST_F(Arm64LiteTranslateRegionTest, ExtOddImm4) {
+  // ext v0.16b, v1.16b, v2.16b, #1: concatenate {v2:v1} and extract starting
+  // at byte 1, so result = v1 bytes[1..15] followed by v2 byte[0].
+  uint64_t* v1 = reinterpret_cast<uint64_t*>(&state_.cpu.v[1]);
+  uint64_t* v2 = reinterpret_cast<uint64_t*>(&state_.cpu.v[2]);
+  v1[0] = 0x0706050403020100ULL;
+  v1[1] = 0x0f0e0d0c0b0a0908ULL;
+  v2[0] = 0x1716151413121110ULL;
+  v2[1] = 0x1f1e1d1c1b1a1918ULL;
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  Interpret(0x6e020820U);  // ext v0.16b, v1.16b, v2.16b, #1
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x0807060504030201ULL);
+  EXPECT_EQ(r[1], 0x100f0e0d0c0b0a09ULL);
+}
+
+// LDXP/STXP (load/store-exclusive pair). bit31=1 of the o1=1,o2=0 exclusive
+// group selects the pair form; without the split it was mis-decoded as CASP.
+TEST_F(Arm64LiteTranslateRegionTest, LoadStoreExclusivePair32) {
+  alignas(8) uint64_t mem = 0xAAAABBBBCCCCDDDDULL;
+  state_.cpu.x[0] = ToGuestAddr(&mem);
+  Interpret(0x887f0801U);  // ldxp w1, w2, [x0]
+  EXPECT_EQ(state_.cpu.x[1], 0x00000000CCCCDDDDULL);
+  EXPECT_EQ(state_.cpu.x[2], 0x00000000AAAABBBBULL);
+  EXPECT_EQ(state_.cpu.reservation_address, ToGuestAddr(&mem));
+  // Store a fresh pair back; the reservation is still held → success (w3 = 0).
+  state_.cpu.x[1] = 0x11111111ULL;
+  state_.cpu.x[2] = 0x22222222ULL;
+  Interpret(0x88230801U);  // stxp w3, w1, w2, [x0]
+  EXPECT_EQ(state_.cpu.x[3], 0ULL);
+  EXPECT_EQ(mem, 0x2222222211111111ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LoadStoreExclusivePair64) {
+  alignas(16) uint64_t mem[2] = {0x1111222233334444ULL, 0xAAAABBBBCCCCDDDDULL};
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  Interpret(0xc87f0801U);  // ldxp x1, x2, [x0]
+  EXPECT_EQ(state_.cpu.x[1], 0x1111222233334444ULL);
+  EXPECT_EQ(state_.cpu.x[2], 0xAAAABBBBCCCCDDDDULL);
+  EXPECT_EQ(state_.cpu.reservation_address, ToGuestAddr(&mem[0]));
+  state_.cpu.x[1] = 0xDEADBEEF00000001ULL;
+  state_.cpu.x[2] = 0xCAFEF00D00000002ULL;
+  Interpret(0xc8230801U);  // stxp w3, x1, x2, [x0]
+  EXPECT_EQ(state_.cpu.x[3], 0ULL);
+  EXPECT_EQ(mem[0], 0xDEADBEEF00000001ULL);
+  EXPECT_EQ(mem[1], 0xCAFEF00D00000002ULL);
+}
+
+// MRS of the generic-timer counters: CNTFRQ_EL0 is a fixed 19.2 MHz; the
+// CNTVCT_EL0/CNTPCT_EL0 counters are monotonic and share that frequency.
+TEST_F(Arm64LiteTranslateRegionTest, MrsCounterTimer) {
+  Interpret(0xd53be001U);  // mrs x1, cntfrq_el0
+  EXPECT_EQ(state_.cpu.x[1], 19200000ULL);
+
+  Interpret(0xd53be041U);  // mrs x1, cntvct_el0
+  uint64_t t0 = state_.cpu.x[1];
+  EXPECT_GT(t0, 0ULL);
+  Interpret(0xd53be041U);  // mrs x1, cntvct_el0
+  EXPECT_GE(state_.cpu.x[1], t0);
+
+  Interpret(0xd53be021U);  // mrs x1, cntpct_el0
+  EXPECT_GE(state_.cpu.x[1], t0);
 }
 
 }  // namespace

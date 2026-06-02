@@ -500,6 +500,16 @@ class Decoder {
     // RNG and reports success (NZCV cleared), rather than faulting.
     kRndr = 0xD920,
     kRndrrs = 0xD921,
+    // Generic timer (FEAT_AdvSIMD-independent), all op0=3, op1=3, CRn=14, CRm=0:
+    //   CNTFRQ_EL0 op2=0 → 0xDF00 (counter frequency)
+    //   CNTPCT_EL0 op2=1 → 0xDF01 (physical count)
+    //   CNTVCT_EL0 op2=2 → 0xDF02 (virtual count)
+    // Read by timing/benchmark code (e.g. Unity, game engines) for a cheap
+    // monotonic clock; the interpreter backs the counters with the host
+    // monotonic clock and reports a matching frequency.
+    kCntfrqEl0 = 0xDF00,
+    kCntpctEl0 = 0xDF01,
+    kCntvctEl0 = 0xDF02,
   };
 
   //
@@ -822,6 +832,8 @@ class Decoder {
     kCas,      // Compare and swap
     // CASP (compare-and-swap pair, Armv8.1 LSE).
     kCasp,     // Compare and swap pair (Rs:Rs+1 = expected, Rt:Rt+1 = new)
+    kLdxp,     // Load exclusive pair (Rt, Rt2 <- [Rn], [Rn+sz])
+    kStxp,     // Store exclusive pair (result in Rs; stores Rt, Rt2)
     kSwp,      // Swap
     kLdadd,    // Atomic add
     kLdclr,    // Atomic bit clear
@@ -837,6 +849,7 @@ class Decoder {
   struct LoadStoreExclusiveArgs {
     AtomicOp op;
     uint8_t rt;        // Data register
+    uint8_t rt2;       // Second data register (LDXP/STXP pair)
     uint8_t rn;        // Base address register (31=SP)
     uint8_t rs;        // Status(STXR) or swap/compare(CAS/SWP) register
     uint8_t size;      // 0=8bit, 1=16bit, 2=32bit, 3=64bit
@@ -3470,7 +3483,11 @@ class Decoder {
     }
 
     // AdvSIMD two-reg misc: bit31=0, bits[28:24]=01110, bit21=1, bit17=0, bits[11:10]=10
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<17, 1>() && GetBits<10, 2>() == 0b10) {
+    // The bit21=1 check is load-bearing: EXT (bit21=0) with an odd imm4 also has
+    // bits[11:10]=10 and bit17 derived from Rm, so without it EXT is swallowed
+    // here and never reaches its handler below.
+    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && !GetBits<17, 1>() &&
+        GetBits<10, 2>() == 0b10) {
       DecodeAdvSimdTwoRegMisc();
       return;
     }
@@ -7001,19 +7018,35 @@ class Decoder {
       //   casa   w0,w1,[x10]       = 0x88e07d41 → o2=1, o1=1
       // Prior code routed both to kCas, silently miscompiling CASP.
       if (o2 == 0) {
-        // CASP: bit[31] must be 0 and bits[14:10] must be 11111.
-        // bit[30] = sz: 0 → 32-bit pair, 1 → 64-bit pair.
-        // Re-encode args.size to 2 (32-bit) or 3 (64-bit) so the
-        // interpreter/JIT can reuse their existing size dispatch.
-        uint8_t rt2 = GetBits<10, 5>();
-        if (GetBits<31, 1>() != 0 || rt2 != 0b11111) {
-          Undefined();
-          return;
+        // o1=1, o2=0 covers two distinct families distinguished by bit31:
+        //   bit31=1 → LDXP/STXP (load/store exclusive PAIR)
+        //   bit31=0 → CASP (compare-and-swap pair, LSE)
+        // bit[30] = sz: 0 → 32-bit pair, 1 → 64-bit pair. Re-encode args.size to
+        // 2 (32-bit) or 3 (64-bit) so the interpreter reuses its size dispatch.
+        if (GetBits<31, 1>() != 0) {
+          // LDXP/STXP: Rt2 (bits[14:10]) is the second data register; Rs is the
+          // STXP status register (ignored for LDXP). o0 adds acquire/release.
+          args.rt2 = GetBits<10, 5>();
+          args.size = (GetBits<30, 1>() != 0) ? 3 : 2;
+          if (L) {
+            args.op = AtomicOp::kLdxp;
+            args.acquire = (o0 != 0);  // LDAXP
+          } else {
+            args.op = AtomicOp::kStxp;
+            args.release = (o0 != 0);  // STLXP
+          }
+        } else {
+          // CASP: bits[14:10] must be 11111.
+          uint8_t rt2 = GetBits<10, 5>();
+          if (rt2 != 0b11111) {
+            Undefined();
+            return;
+          }
+          args.op = AtomicOp::kCasp;
+          args.acquire = (L != 0);   // CASPA/CASPAL
+          args.release = (o0 != 0);  // CASPL/CASPAL
+          args.size = (GetBits<30, 1>() != 0) ? 3 : 2;
         }
-        args.op = AtomicOp::kCasp;
-        args.acquire = (L != 0);   // CASPA/CASPAL
-        args.release = (o0 != 0);  // CASPL/CASPAL
-        args.size = (GetBits<30, 1>() != 0) ? 3 : 2;
       } else {
         // CAS family
         args.op = AtomicOp::kCas;
