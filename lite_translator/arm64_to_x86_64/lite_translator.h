@@ -4692,7 +4692,18 @@ class LiteTranslator {
       if (esize_bits == 0x08 && !args.q) { success_ = false; return; }
       SimdRegister xmm = AllocTempSimdReg();
       if (xmm == no_simd_register) { Undefined(); return; }
-      Register src = GetReg(args.rn);
+      Register src = no_register;
+      if (args.rn < 31) {
+        src = GetReg(args.rn);
+      } else {
+        // XZR/WZR source: DUP broadcasts zero, so the whole result vector is
+        // zero. Materialise a zero in a temp; the Movq/Movd + broadcast below
+        // then produce an all-zero Vd. `dup v0.2d, xzr` is a common compiler
+        // idiom to zero a vector register (seen in libcronet on NetEase).
+        src = AllocTempReg();
+        if (src == no_register) { success_ = false; return; }
+        as_.Xorq(src, src);
+      }
       // For 64-bit broadcast we must move the FULL 64 bits of the GP register
       // into the XMM register; using 32-bit MOVD here silently truncates the
       // upper half and the subsequent PSHUFD(0x44) then duplicates the low

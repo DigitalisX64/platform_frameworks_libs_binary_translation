@@ -42294,6 +42294,44 @@ TEST_F(Arm64LiteTranslateRegionTest, MrsCounterTimer) {
   EXPECT_GE(state_.cpu.x[1], t0);
 }
 
+// DUP (general) from the zero register must broadcast zero, not call
+// GetReg(31). `dup v.<T>, xzr/wzr` is a common compiler idiom to zero a vector;
+// the JIT handler previously called GetReg(31) and aborted (CHECK 31<31),
+// crashing apps whose libraries use it (e.g. libcronet on NetEase).
+TEST_F(Arm64LiteTranslateRegionTest, DupGeneralFromZeroReg) {
+  struct Case {
+    uint32_t insn;
+    const char* name;
+  };
+  const Case cases[] = {
+      {0x4e080fe0u, "dup v0.2d, xzr"},
+      {0x4e040fe0u, "dup v0.4s, wzr"},
+      {0x4e010fe0u, "dup v0.16b, wzr"},
+      {0x4e020fe0u, "dup v0.8h, wzr"},
+  };
+  for (const auto& c : cases) {
+    std::memset(&state_.cpu.v[0], 0xAB, 16);
+    const uint32_t code[] = {c.insn};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code))) << c.name;
+    uint64_t r[2];
+    std::memcpy(r, &state_.cpu.v[0], 16);
+    EXPECT_EQ(r[0], 0ULL) << c.name;
+    EXPECT_EQ(r[1], 0ULL) << c.name;
+  }
+}
+
+// Non-XZR DUP (general) still broadcasts the full register value.
+TEST_F(Arm64LiteTranslateRegionTest, DupGeneral2DFromXReg) {
+  state_.cpu.x[5] = 0xDEADBEEFCAFEF00DULL;
+  std::memset(&state_.cpu.v[2], 0x11, 16);
+  static const uint32_t code[] = {0x4e080ca2u};  // dup v2.2d, x5
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[2], 16);
+  EXPECT_EQ(r[0], 0xDEADBEEFCAFEF00DULL);
+  EXPECT_EQ(r[1], 0xDEADBEEFCAFEF00DULL);
+}
+
 }  // namespace
 
 }  // namespace berberis
