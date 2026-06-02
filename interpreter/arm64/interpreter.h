@@ -4047,18 +4047,18 @@ class Interpreter {
           if (args.rt < 31) state_->cpu.x[args.rt] = static_cast<uint64_t>(pair);
           if (args.rt2 < 31) state_->cpu.x[args.rt2] = static_cast<uint64_t>(pair >> 64);
           state_->cpu.reservation_address = base;
+          // reservation_value is __uint128_t, so retain the FULL 128-bit value
+          // for STXP's exact-monitor compare-and-swap below.
+          state_->cpu.reservation_value = pair;
         }
         break;
       }
 
       // STXP/STLXP (store-exclusive pair). Writes Rt:Rt2 atomically and reports
-      // success (0) / failure (1) in Rs.
-      //   32-bit pair: exact monitor — 64-bit CAS against the value LDXP read.
-      //   64-bit pair: reservation_value is only 64-bit so the full pair can't
-      //   be retained; model the monitor by address only and publish the pair
-      //   atomically (succeeds whenever the reservation is still held). This
-      //   matches a weak-but-legal LL/SC implementation and is correct for the
-      //   uncontended case; it does not detect a concurrent 128-bit overwrite.
+      // success (0) / failure (1) in Rs. Both widths use an exact monitor: a
+      // single compare-and-swap against the value LDXP read, so a concurrent
+      // modification since LDXP makes the CAS (and thus the STXP) fail and
+      // leaves memory untouched — the LL/SC contract lock-free code depends on.
       case Decoder::AtomicOp::kStxp: {
         bool success = false;
         if (args.size == 2) {
@@ -4075,13 +4075,11 @@ class Interpreter {
             uint64_t new_lo = (args.rt < 31) ? state_->cpu.x[args.rt] : 0;
             uint64_t new_hi = (args.rt2 < 31) ? state_->cpu.x[args.rt2] : 0;
             __uint128_t desired = (static_cast<__uint128_t>(new_hi) << 64) | new_lo;
-            __uint128_t cur = AtomicCASVal128(host_addr, 0, 0);
-            for (;;) {
-              __uint128_t prev = AtomicCASVal128(host_addr, cur, desired);
-              if (prev == cur) break;
-              cur = prev;
-            }
-            success = true;
+            __uint128_t expected = state_->cpu.reservation_value;
+            // CMPXCHG16B: stores desired and returns expected iff *addr ==
+            // expected; otherwise returns the current value and stores nothing.
+            __uint128_t prev = AtomicCASVal128(host_addr, expected, desired);
+            success = (prev == expected);
           }
         }
         state_->cpu.reservation_address = 0;

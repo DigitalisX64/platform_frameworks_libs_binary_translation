@@ -42278,6 +42278,36 @@ TEST_F(Arm64LiteTranslateRegionTest, LoadStoreExclusivePair64) {
   EXPECT_EQ(mem[1], 0xCAFEF00D00000002ULL);
 }
 
+// STXP must FAIL (Rs=1) and leave memory untouched if the location changed
+// since LDXP — the exact-monitor contract lock-free code relies on. The 64-bit
+// pair previously published unconditionally and always reported success.
+TEST_F(Arm64LiteTranslateRegionTest, StoreExclusivePair64FailsOnConcurrentWrite) {
+  alignas(16) uint64_t mem[2] = {0x1111222233334444ULL, 0xAAAABBBBCCCCDDDDULL};
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  Interpret(0xc87f0801U);  // ldxp x1, x2, [x0] — arms the monitor
+  // Simulate another agent overwriting the pair between LDXP and STXP.
+  mem[0] = 0x9999999999999999ULL;
+  mem[1] = 0x8888888888888888ULL;
+  state_.cpu.x[1] = 0xDEADBEEF00000001ULL;
+  state_.cpu.x[2] = 0xCAFEF00D00000002ULL;
+  Interpret(0xc8230801U);  // stxp w3, x1, x2, [x0]
+  EXPECT_EQ(state_.cpu.x[3], 1ULL);              // failed
+  EXPECT_EQ(mem[0], 0x9999999999999999ULL);      // memory untouched
+  EXPECT_EQ(mem[1], 0x8888888888888888ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StoreExclusivePair32FailsOnConcurrentWrite) {
+  alignas(8) uint64_t mem = 0xAAAABBBBCCCCDDDDULL;
+  state_.cpu.x[0] = ToGuestAddr(&mem);
+  Interpret(0x887f0801U);  // ldxp w1, w2, [x0]
+  mem = 0x1234567899999999ULL;  // concurrent overwrite
+  state_.cpu.x[1] = 0x11111111ULL;
+  state_.cpu.x[2] = 0x22222222ULL;
+  Interpret(0x88230801U);  // stxp w3, w1, w2, [x0]
+  EXPECT_EQ(state_.cpu.x[3], 1ULL);          // failed
+  EXPECT_EQ(mem, 0x1234567899999999ULL);     // untouched
+}
+
 // MRS of the generic-timer counters: CNTFRQ_EL0 is a fixed 19.2 MHz; the
 // CNTVCT_EL0/CNTPCT_EL0 counters are monotonic and share that frequency.
 TEST_F(Arm64LiteTranslateRegionTest, MrsCounterTimer) {
