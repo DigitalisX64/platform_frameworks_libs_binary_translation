@@ -21,8 +21,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -95,6 +98,12 @@ constexpr uint8_t kCondGT = 0xC;
 constexpr uint8_t kCondLE = 0xD;
 constexpr uint8_t kCondAL = 0xE;
 
+// LDRB Wt, [Xn, #imm9]!  (pre-index, writeback to Xn)
+constexpr uint32_t LdrbPreX(uint8_t rt, uint8_t rn, int16_t imm9) {
+  return 0x38400C00 | ((static_cast<uint32_t>(imm9) & 0x1FF) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
 // CBZ Xt, offset
 constexpr uint32_t CbzX(uint8_t rt, int32_t offset) {
   uint32_t imm19 = static_cast<uint32_t>(offset / 4) & 0x7FFFF;
@@ -107,7 +116,178 @@ constexpr uint32_t CbnzX(uint8_t rt, int32_t offset) {
   return 0xB5000000 | (imm19 << 5) | rt;
 }
 
+// --- Load/store unsigned-offset encoders for the memory differential fuzzer ---
+// imm is the SCALED immediate (units = access size), Rn is the base.
+constexpr uint32_t LdrXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xF9400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xF9000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrbWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrbWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrhWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrhWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrsbXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrshXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrswXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+// --- Extra LSE atomic encoders for the atomics fuzzer (others pre-exist).
+// LDADDAL = acquire+release (the variant shared_ptr's refcount decrement uses).
+constexpr uint32_t LdaddalX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8E00000 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t CasalX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xC8E0FC00 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+// 32-bit (W) variants exercise the zero-extension masking paths.
+constexpr uint32_t LdaddW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8200000 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t SwpW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8208000 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+
+// STP Xt1,Xt2,[Xn,#imm*8] (signed 7-bit scaled imm); LdpX is defined later.
+constexpr uint32_t StpX(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm7) {
+  return 0xA9000000 | ((static_cast<uint32_t>(imm7) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (rn << 5) | rt1;
+}
+
 constexpr uint32_t kNop = 0xD503201F;
+
+// --- Encoders used by the register-mapping differential fuzzer below. ---
+// All 64-bit register-register forms over x0..x30.
+// SUB Xd, Xn, Xm (shifted reg, no shift)
+constexpr uint32_t SubRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xCB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// AND Xd, Xn, Xm
+constexpr uint32_t AndRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x8A000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// ORR Xd, Xn, Xm
+constexpr uint32_t OrrRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xAA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// EOR Xd, Xn, Xm
+constexpr uint32_t EorRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xCA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// MADD Xd, Xn, Xm, Xa : Xd = Xa + Xn*Xm
+constexpr uint32_t MaddX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x9B000000 | (static_cast<uint32_t>(rm) << 16) | (ra << 10) | (rn << 5) | rd;
+}
+// MSUB Xd, Xn, Xm, Xa : Xd = Xa - Xn*Xm
+constexpr uint32_t MsubX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x9B008000 | (static_cast<uint32_t>(rm) << 16) | (ra << 10) | (rn << 5) | rd;
+}
+// LSLV/LSRV/ASRV/RORV Xd, Xn, Xm (variable shift — uses host CL/rcx)
+constexpr uint32_t LslvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t LsrvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02400 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t AsrvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t RorvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// UDIV/SDIV Xd, Xn, Xm (uses host rdx/rax, and rcx when divisor is rdx)
+constexpr uint32_t UdivX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC00800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t SdivX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC00C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// SMULH/UMULH Xd, Xn, Xm (widening multiply — clobbers host rdx:rax)
+constexpr uint32_t SmulhX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9B407C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t UmulhX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9BC07C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// ADDS/SUBS Xd, Xn, Xm (flag-setting, shifted reg, no shift)
+constexpr uint32_t AddsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xAB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t SubsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xEB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// ANDS Xd, Xn, Xm (flag-setting logical)
+constexpr uint32_t AndsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xEA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// Bitfield: SBFM/BFM/UBFM Xd, Xn, #immr, #imms (64-bit, N=1)
+constexpr uint32_t SbfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0x93400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+constexpr uint32_t BfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0xB3400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+constexpr uint32_t UbfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0xD3400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+// EXTR Xd, Xn, Xm, #lsb (64-bit)
+constexpr uint32_t ExtrX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t lsb) {
+  return 0x93C00000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(lsb) << 10) | (rn << 5) | rd;
+}
+// MOVK/MOVN Xd, #imm16, LSL #(hw*16)
+constexpr uint32_t MovkX(uint8_t rd, uint16_t imm16, uint8_t hw) {
+  return 0xF2800000 | (static_cast<uint32_t>(hw) << 21) |
+         (static_cast<uint32_t>(imm16) << 5) | rd;
+}
+constexpr uint32_t MovnHwX(uint8_t rd, uint16_t imm16, uint8_t hw) {
+  return 0x92800000 | (static_cast<uint32_t>(hw) << 21) |
+         (static_cast<uint32_t>(imm16) << 5) | rd;
+}
+// CSINC/CSINV/CSNEG Xd, Xn, Xm, cond  (CselX already defined above)
+constexpr uint32_t CsincX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0x9A800400 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsinvX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0xDA800000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsnegX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0xDA800400 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+// CCMP/CCMN Xn, Xm, #nzcv, cond (register form)
+constexpr uint32_t CcmpRegX(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0xFA400000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | nzcv;
+}
+constexpr uint32_t CcmnRegX(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0xBA400000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | nzcv;
+}
 
 // FMUL Sd, Sn, Sm (single-precision float multiply)
 // ARM64 encoding: 0001_1110_001_Rm_0000_10_Rn_Rd
@@ -42443,6 +42623,805 @@ TEST_F(Arm64LiteTranslateRegionTest, Ld4Ld3SingleStructureLane) {
   EXPECT_EQ(w[1], 0x05060708u);
   EXPECT_EQ(w[2], 0x090A0B0Cu);
   EXPECT_EQ(w[3], 0x0D0E0F10u);
+}
+
+// Differential fuzzer: drive random straight-line integer sequences through the
+// multi-region lite-translator JIT (register mapping ON, the production default)
+// and diff the resulting x0..xN against a pure-interpreter run of the identical
+// sequence from the identical initial state. The interpreter is the spec, so any
+// divergence is a JIT codegen bug — specifically the cross-instruction
+// register-mapping path, which single-instruction regions / disabled mapping
+// would mask. Deterministic seed so a failure reproduces verbatim.
+class Arm64RegMappingDifferentialTest : public ::testing::Test {
+ protected:
+  // Execute [code, code+n) the way production does: JIT each region (mapping ON),
+  // fall back to the interpreter for any instruction the JIT declines.
+  static void RunJit(ThreadState* state, const uint32_t* code, size_t n) {
+    GuestAddr start = ToGuestAddr(code);
+    GuestAddr end = start + n * 4;
+    state->cpu.insn_addr = start;
+    int guard = 0;
+    while (state->cpu.insn_addr < end && guard++ < 100000) {
+      MachineCode machine_code;
+      auto [success, stop_pc] = TryLiteTranslateRegion(
+          state->cpu.insn_addr, &machine_code,
+          LiteTranslateParams{.end_pc = end, .allow_dispatch = false});
+      if (!success || stop_pc <= state->cpu.insn_addr) {
+        // JIT declined the first instruction of this region — interpret one.
+        InterpretInsn(state);
+        continue;
+      }
+      HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+      TestingRunGeneratedCode(state, AsHostCode(host_code), stop_pc);
+    }
+  }
+
+  static void RunInterp(ThreadState* state, const uint32_t* code, size_t n) {
+    GuestAddr start = ToGuestAddr(code);
+    GuestAddr end = start + n * 4;
+    state->cpu.insn_addr = start;
+    int guard = 0;
+    while (state->cpu.insn_addr < end && guard++ < 100000) {
+      InterpretInsn(state);
+    }
+  }
+};
+
+TEST_F(Arm64RegMappingDifferentialTest, IntegerSequencesMatchInterpreter) {
+  uint64_t rng = 0x123456789abcdef0ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  // x0..x11: enough distinct guest regs to exceed the 13-entry GP pool once
+  // temps are accounted for, forcing the mapping/spill path.
+  constexpr int kNumRegs = 12;
+  constexpr int kIters = 6000;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 18);  // 6..23 instructions
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      uint8_t rd = next() % kNumRegs;
+      uint8_t rn = next() % kNumRegs;
+      uint8_t rm = next() % kNumRegs;
+      uint8_t ra = next() % kNumRegs;
+      switch (next() % 15) {
+        case 0: code.push_back(AddRegX(rd, rn, rm)); break;
+        case 1: code.push_back(SubRegX(rd, rn, rm)); break;
+        case 2: code.push_back(AndRegX(rd, rn, rm)); break;
+        case 3: code.push_back(OrrRegX(rd, rn, rm)); break;
+        case 4: code.push_back(EorRegX(rd, rn, rm)); break;
+        case 5: code.push_back(MaddX(rd, rn, rm, ra)); break;
+        case 6: code.push_back(MsubX(rd, rn, rm, ra)); break;
+        case 7: code.push_back(LslvX(rd, rn, rm)); break;
+        case 8: code.push_back(LsrvX(rd, rn, rm)); break;
+        case 9: code.push_back(AsrvX(rd, rn, rm)); break;
+        case 10: code.push_back(RorvX(rd, rn, rm)); break;
+        case 11: code.push_back(UdivX(rd, rn, rm)); break;
+        case 12: code.push_back(SdivX(rd, rn, rm)); break;
+        case 13: code.push_back(SmulhX(rd, rn, rm)); break;
+        default: code.push_back(UmulhX(rd, rn, rm)); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 0; i < kNumRegs; ++i) {
+      init[i] = next();
+    }
+
+    ThreadState jit_state{};
+    for (int i = 0; i < 32; ++i) jit_state.cpu.x[i] = init[i];
+    RunJit(&jit_state, code.data(), code.size());
+
+    ThreadState ref_state{};
+    for (int i = 0; i < 32; ++i) ref_state.cpu.x[i] = init[i];
+    RunInterp(&ref_state, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 0; i < kNumRegs; ++i) {
+      if (jit_state.cpu.x[i] != ref_state.cpu.x[i]) diverged = true;
+    }
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 0; i < kNumRegs; ++i) {
+        std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                      static_cast<unsigned long long>(jit_state.cpu.x[i]),
+                      static_cast<unsigned long long>(ref_state.cpu.x[i]));
+        regs += buf;
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Second differential pass: the bitfield / conditional-select / conditional-
+// compare / move-wide / flag-setting classes that dominate URL canonicalization
+// and string parsing (Cronet's GURL/ICU path). These mix flag generation
+// (ADDS/SUBS/ANDS/CCMP) with flag-consuming selects (CSEL family), so the run
+// also diffs NZCV to catch flag-codegen divergence under register mapping.
+TEST_F(Arm64RegMappingDifferentialTest, MixedClassesMatchInterpreter) {
+  uint64_t rng = 0x0fedcba987654321ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  constexpr int kNumRegs = 12;
+  constexpr int kIters = 8000;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 20);  // 6..25 instructions
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      uint8_t rd = next() % kNumRegs;
+      uint8_t rn = next() % kNumRegs;
+      uint8_t rm = next() % kNumRegs;
+      uint8_t cond = next() % 16;
+      uint8_t immr = next() % 64;
+      uint8_t imms = next() % 64;
+      uint8_t nzcv = next() % 16;
+      uint16_t imm16 = static_cast<uint16_t>(next());
+      uint8_t hw = next() % 4;
+      switch (next() % 20) {
+        case 0: code.push_back(AddRegX(rd, rn, rm)); break;
+        case 1: code.push_back(SubRegX(rd, rn, rm)); break;
+        case 2: code.push_back(AddsRegX(rd, rn, rm)); break;
+        case 3: code.push_back(SubsRegX(rd, rn, rm)); break;
+        case 4: code.push_back(AndsRegX(rd, rn, rm)); break;
+        case 5: code.push_back(AndRegX(rd, rn, rm)); break;
+        case 6: code.push_back(OrrRegX(rd, rn, rm)); break;
+        case 7: code.push_back(SbfmX(rd, rn, immr, imms)); break;
+        case 8: code.push_back(BfmX(rd, rn, immr, imms)); break;
+        case 9: code.push_back(UbfmX(rd, rn, immr, imms)); break;
+        case 10: code.push_back(ExtrX(rd, rn, rm, immr)); break;
+        case 11: code.push_back(MovkX(rd, imm16, hw)); break;
+        case 12: code.push_back(MovnHwX(rd, imm16, hw)); break;
+        case 13: code.push_back(CselX(rd, rn, rm, cond)); break;
+        case 14: code.push_back(CsincX(rd, rn, rm, cond)); break;
+        case 15: code.push_back(CsinvX(rd, rn, rm, cond)); break;
+        case 16: code.push_back(CsnegX(rd, rn, rm, cond)); break;
+        case 17: code.push_back(CcmpRegX(rn, rm, nzcv, cond)); break;
+        case 18: code.push_back(CcmnRegX(rn, rm, nzcv, cond)); break;
+        default: code.push_back(MaddX(rd, rn, rm, (next() % kNumRegs))); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 0; i < kNumRegs; ++i) {
+      init[i] = next();
+    }
+
+    ThreadState jit_state{};
+    for (int i = 0; i < 32; ++i) jit_state.cpu.x[i] = init[i];
+    RunJit(&jit_state, code.data(), code.size());
+
+    ThreadState ref_state{};
+    for (int i = 0; i < 32; ++i) ref_state.cpu.x[i] = init[i];
+    RunInterp(&ref_state, code.data(), code.size());
+
+    bool diverged = (jit_state.cpu.flags != ref_state.cpu.flags);
+    for (int i = 0; i < kNumRegs; ++i) {
+      if (jit_state.cpu.x[i] != ref_state.cpu.x[i]) diverged = true;
+    }
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 0; i < kNumRegs; ++i) {
+        std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                      static_cast<unsigned long long>(jit_state.cpu.x[i]),
+                      static_cast<unsigned long long>(ref_state.cpu.x[i]));
+        regs += buf;
+      }
+      std::snprintf(buf, sizeof(buf), "flags jit=%08x ref=%08x\n",
+                    jit_state.cpu.flags, ref_state.cpu.flags);
+      regs += buf;
+      std::string inits;
+      for (int i = 0; i < kNumRegs; ++i) {
+        std::snprintf(buf, sizeof(buf), "init x%d=%016llx\n", i,
+                      static_cast<unsigned long long>(init[i]));
+        inits += buf;
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n"
+             << regs << inits;
+    }
+  }
+}
+
+// Regression for the minimal divergence the fuzzer above pinned down: CCMN's
+// CMN (the is_neg arm of conditional-compare) must be non-destructive. x86 has
+// no non-destructive add, and the previous lowering issued `add rn, rm`, which
+// writes the sum back into rn. With cross-instruction register mapping, rn is
+// the live x86 register for the guest source register, so the add silently
+// corrupted that guest register for the rest of the JIT region. (CMP uses the
+// genuinely non-destructive `cmp`, so only CMN was affected; single-instruction
+// regions and disabled mapping both masked it.)
+//
+// SUB X10,X10,X3 leaves the real result in x10's mapped register; CCMN X10,X6
+// then reads it and must leave it intact (cond=AL forces the CMN to execute).
+TEST_F(Arm64LiteTranslateRegionTest, CcmnDoesNotClobberSourceUnderRegMapping) {
+  static const uint32_t code[] = {
+      SubRegX(10, 10, 3),           // X10 = X10 - X3 = 750
+      CcmnRegX(10, 6, 0, kCondAL),  // CMN X10, X6 — sets flags only, X10 intact
+  };
+  state_.cpu.x[10] = 1000;
+  state_.cpu.x[3] = 250;
+  state_.cpu.x[6] = 7;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[10], 750ULL);
+}
+
+// Loop differential: each iteration of a guest loop is its own JIT region
+// (backward branches exit the region and re-dispatch), so a guest register
+// modified in the loop body must be written back to ThreadState at the
+// region-exit before the next iteration reloads it. The straight-line fuzzers
+// above cannot exercise this cross-region persistence. This mirrors the
+// strtoumax digit-parse loop where NetEase Cloud Music hung: a pointer advanced
+// by a pre-index load-writeback plus an accumulator updated via umulh/mul.
+TEST_F(Arm64RegMappingDifferentialTest, PointerLoopPersistsAcrossRegions) {
+  // Data the loop walks (x1 reads via ldrb [x1,#1]!).
+  static const uint8_t databuf[64] = {
+      0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+      0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+      0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+      0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00,
+  };
+
+  // loop:
+  //   ldrb w4, [x1, #1]!   ; x1++, w4 = *x1     (pre-index writeback -> x1)
+  //   umulh x5, x3, x2     ; x5 = high(base*acc)
+  //   mul   x2, x3, x2     ; x2 = base*acc       (MUL = MADD with Ra=XZR)
+  //   add   x2, x2, x4     ; acc += byte
+  //   subs  x0, x0, #1     ; counter--, set flags
+  //   b.ne  loop           ; backward branch (exits region, re-dispatch)
+  static const uint32_t code[] = {
+      LdrbPreX(4, 1, 1),
+      UmulhX(5, 3, 2),
+      MaddX(2, 3, 2, 31),
+      AddRegX(2, 2, 4),
+      SubsImmX(0, 0, 1),
+      Bcond(kCondNE, -20),  // back to code[0]
+  };
+
+  auto run = [&](ThreadState* st, bool jit) {
+    for (int i = 0; i < 32; ++i) st->cpu.x[i] = 0;
+    st->cpu.x[0] = 6;                              // 6 iterations
+    st->cpu.x[1] = ToGuestAddr(&databuf[0]);       // pointer (pre-index reads [1..6])
+    st->cpu.x[2] = 0;                              // accumulator
+    st->cpu.x[3] = 16;                             // base
+    if (jit) {
+      RunJit(st, code, std::size(code));
+    } else {
+      RunInterp(st, code, std::size(code));
+    }
+  };
+
+  ThreadState js{};
+  run(&js, true);
+  ThreadState rs{};
+  run(&rs, false);
+
+  // Interpreter is the spec. The loop MUST terminate (x0==0), the pointer MUST
+  // have advanced by 6, and the accumulator MUST match.
+  EXPECT_EQ(rs.cpu.x[0], 0u) << "interpreter loop did not terminate";
+  EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "x0 (counter) JIT vs interp";
+  EXPECT_EQ(js.cpu.x[1], rs.cpu.x[1]) << "x1 (pointer) JIT vs interp — did it advance?";
+  EXPECT_EQ(js.cpu.x[2], rs.cpu.x[2]) << "x2 (accumulator) JIT vs interp";
+  EXPECT_EQ(js.cpu.x[1], ToGuestAddr(&databuf[0]) + 6) << "JIT pointer advanced by 6";
+}
+
+// NetEase Cloud Music login hangs on device with a worker thread spinning 9M+
+// region dispatches at bionic libc strtoumax's digit-parse loop top, parsing the
+// valid null-terminated string "0": the char pointer (x9) reloads ~7 bytes stale
+// each iteration (never reaching the terminator) and the accumulator fills with
+// pointer garbage. The input is valid and the ARM loop is correct, so it is a
+// translator bug in the multi-region loop (an OPEN lead — not the CCMN fix).
+//
+// These are the exact strtoumax bytes from the on-device guest libc.so. NOTE:
+// this isolated harness (single-region chain, allow_dispatch=false) does NOT yet
+// reproduce the device hang — strtoumax("0",16) returns 0 here under both the JIT
+// and the interpreter. The device repro is sensitive to region boundaries / cross
+// -region state this harness doesn't replicate; kept as a faithful starting point
+// and a guard that the isolated codegen stays correct.
+TEST_F(Arm64RegMappingDifferentialTest, StrtoumaxZeroDoesNotHang) {
+  static const uint32_t code[] = {
+      0xa9bf7bfd, 0x910003fd, 0x7100905f, 0x54000268, 0x7100045f, 0x54000220,
+      0x91000409, 0x14000002, 0x91000529, 0x385ff12a, 0x51002548, 0x7100151f,
+      0x54ffff83, 0x7100815f, 0x54ffff40, 0x7100ad5f, 0x540001e0, 0x7100b55f,
+      0x540001c1, 0x3840152a, 0x52800028, 0x1400000c, 0xb4000041, 0xf9000020,
+      0x94019542, 0xaa0003e8, 0x528002c9, 0xaa1f03e0, 0xb9000109, 0xa8c17bfd,
+      0xd65f03c0, 0x3840152a, 0x2a1f03e8, 0x528005eb, 0x6a0b005f, 0x54000221,
+      0x7100c15f, 0x540001e1, 0x3940012a, 0x321b014a, 0x7101e15f, 0x54000141,
+      0x3940052a, 0x5100e94b, 0x31002d7f, 0x5280020b, 0x540003c8, 0x321b014c,
+      0x51019d8c, 0x31001d9f, 0x54000348, 0x5280060a, 0x528007ab, 0x6a0b005f,
+      0x540001e1, 0x7100c15f, 0x540001a1, 0x3940012a, 0x321b014a, 0x7101895f,
+      0x540000a1, 0x3940052a, 0x5100e94b, 0x31002d7f, 0x54000168, 0x5280060a,
+      0x35000182, 0x52800102, 0x1400000a, 0x7100c15f, 0x5280014b, 0x5280010c,
+      0x1a8b018b, 0x350000a2, 0x14000003, 0x5280004b, 0x91000929, 0x2a0b03e2,
+      0xaa1f03eb, 0x2a1f03ed, 0x2a0203ec, 0xd1000529, 0x1280000e, 0x14000003,
+      0x38401d2a, 0x1280000d, 0x5100c14f, 0x710029ff, 0x540000c3, 0x321b014a,
+      0x5101ed4f, 0x310069ff, 0x540002a3, 0x51015d4f, 0x6b0c01ff, 0x5400024a,
+      0x37fffe8d, 0x9bcb7d8a, 0x9b0b7d8b, 0xeb0a03ff, 0x54000080, 0x38401d2a,
+      0x1280000d, 0x17ffffef, 0xab2f416b, 0x1a9f37ea, 0x9340014d, 0xca0a01aa,
+      0xf10001bf, 0xfa40a940, 0x38401d2a, 0x5a8e15cd, 0x17ffffe6, 0xb4000081,
+      0x710001bf, 0x9a890009, 0xf9000029, 0x310005bf, 0x540000a0, 0x7100011f,
+      0xda8b0560, 0xa8c17bfd, 0xd65f03c0, 0x940194df, 0x52800448, 0xb9000008,
+      0x92800000, 0xa8c17bfd,
+  };
+  static const char nptr[] = "0";          // valid, null-terminated
+  static uint64_t stack[256];
+
+  auto run = [&](ThreadState* st, bool jit) {
+    for (int i = 0; i < 32; ++i) st->cpu.x[i] = 0;
+    st->cpu.x[0] = ToGuestAddr(&nptr[0]);   // const char* nptr = "0"
+    st->cpu.x[1] = 0;                        // char** endptr = NULL
+    st->cpu.x[2] = 16;                       // int base = 16
+    st->cpu.sp = ToGuestAddr(&stack[200]);   // valid guest stack
+    GuestAddr ret_sentinel = ToGuestAddr(code) + sizeof(code);
+    st->cpu.x[30] = ret_sentinel;            // final `ret` lands past the code
+    if (jit) {
+      RunJit(st, code, std::size(code));
+    } else {
+      RunInterp(st, code, std::size(code));
+    }
+  };
+
+  ThreadState rs{};
+  run(&rs, false);
+  EXPECT_EQ(rs.cpu.x[0], 0u) << "interpreter: strtoumax(\"0\",,16) should be 0";
+
+  ThreadState js{};
+  run(&js, true);
+  EXPECT_EQ(js.cpu.x[0], 0u) << "JIT: strtoumax(\"0\",,16) — hang/garbage if nonzero";
+  EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "JIT vs interpreter strtoumax result";
+}
+
+// --- Register-offset (extended/shifted) load/store encoders, 64-bit.
+// LDR/STR Xt, [Xn, Xm/Wm, <ext> #3].  AND #0x1F bounds the index for the fuzzer.
+constexpr uint32_t AndImm5(uint8_t rd, uint8_t rn) {  // AND Xd, Xn, #0x1F
+  return 0x92401000 | (rn << 5) | rd;
+}
+constexpr uint32_t LdrXregLsl3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8607800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrXregUxtw3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8605800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrXregSxtw3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF860D800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t StrXregLsl3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8207800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrWregUxtw0(uint8_t rt, uint8_t rn, uint8_t rm) {  // 32-bit, UXTW #0
+  return 0xB8604800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrbWregUxtw(uint8_t rt, uint8_t rn, uint8_t rm) {  // byte, UXTW
+  return 0x38604800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+
+// FCVT precision conversions for the FP differential fuzzer (others pre-exist).
+constexpr uint32_t FcvtSToD(uint8_t d, uint8_t n) { return 0x1E22C000 | (n << 5) | d; }
+constexpr uint32_t FcvtDToS(uint8_t d, uint8_t n) { return 0x1E624000 | (n << 5) | d; }
+
+// Memory load/store differential fuzzer: random straight-line sequences mixing
+// loads/stores (base = x0, a fixed pointer into a scratch buffer, never a
+// destination) with register arithmetic, run through the multi-region JIT
+// (mapping ON) and diffed against the interpreter — both register state AND the
+// scratch buffer (so mis-stored bytes are caught). React Native / Fabric is
+// heavy C++ (object fields, vtables, pointer chasing) and renders blank under
+// translation while running fine natively; the load/store path is unfuzzed and
+// a prime suspect.
+TEST_F(Arm64RegMappingDifferentialTest, MemoryLoadStoreMatchesInterpreter) {
+  uint64_t rng = 0xa5a5f00dc0ffee11ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  constexpr int kNumRegs = 12;  // x0 = base; x1..x11 general
+  constexpr int kIters = 8000;
+  constexpr int kWords = 64;    // scratch buffer (512 bytes)
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 18);
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      // dst/src regs in x1..x11 (never x0 = base, never x12+).
+      uint8_t rd = 1 + (next() % (kNumRegs - 1));
+      uint8_t rn = 1 + (next() % (kNumRegs - 1));
+      uint8_t rm = 1 + (next() % (kNumRegs - 1));
+      uint8_t rt2 = 1 + (next() % (kNumRegs - 1));
+      // keep loads/stores inside the buffer: x0 points at scratch[16], offsets
+      // span scratch[0..47] in 8-byte units (0..31) — well inside [0,kWords).
+      uint16_t off8 = next() % 24;        // X access: scratch[16-16 .. ]
+      uint16_t off4 = next() % 48;
+      uint16_t off2 = next() % 96;
+      uint16_t off1 = next() % 192;
+      int8_t offp = static_cast<int8_t>((next() % 16));  // LDP/STP, +0..15 words
+      switch (next() % 16) {
+        case 0: code.push_back(LdrXuoff(rd, 0, off8)); break;
+        case 1: code.push_back(StrXuoff(rd, 0, off8)); break;
+        case 2: code.push_back(LdrWuoff(rd, 0, off4)); break;
+        case 3: code.push_back(StrWuoff(rd, 0, off4)); break;
+        case 4: code.push_back(LdrbWuoff(rd, 0, off1)); break;
+        case 5: code.push_back(StrbWuoff(rd, 0, off1)); break;
+        case 6: code.push_back(LdrhWuoff(rd, 0, off2)); break;
+        case 7: code.push_back(StrhWuoff(rd, 0, off2)); break;
+        case 8: code.push_back(LdrsbXuoff(rd, 0, off1)); break;
+        case 9: code.push_back(LdrshXuoff(rd, 0, off2)); break;
+        case 10: code.push_back(LdrswXuoff(rd, 0, off4)); break;
+        case 11: code.push_back(LdpX(rd, rt2 == rd ? (rt2 % 11) + 1 : rt2, 0, offp)); break;
+        case 12: code.push_back(StpX(rd, rt2, 0, offp)); break;
+        case 13: code.push_back(AddRegX(rd, rn, rm)); break;
+        case 14: code.push_back(EorRegX(rd, rn, rm)); break;
+        default: code.push_back(SubRegX(rd, rn, rm)); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 1; i < kNumRegs; ++i) init[i] = next();
+
+    alignas(16) uint64_t jit_mem[kWords];
+    alignas(16) uint64_t ref_mem[kWords];
+    for (int i = 0; i < kWords; ++i) jit_mem[i] = ref_mem[i] = 0x1111111100000000ULL | i;
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = init[i];
+      st->cpu.x[0] = ToGuestAddr(&mem[16]);  // base into the middle of the buffer
+    };
+
+    ThreadState js{};
+    run(&js, jit_mem);
+    RunJit(&js, code.data(), code.size());
+
+    ThreadState rs{};
+    run(&rs, ref_mem);
+    RunInterp(&rs, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 1; i < kNumRegs; ++i)
+      if (js.cpu.x[i] != rs.cpu.x[i]) diverged = true;
+    for (int i = 0; i < kWords; ++i)
+      if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 1; i < kNumRegs; ++i) {
+        if (js.cpu.x[i] != rs.cpu.x[i]) {
+          std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(js.cpu.x[i]),
+                        static_cast<unsigned long long>(rs.cpu.x[i]));
+          regs += buf;
+        }
+      }
+      for (int i = 0; i < kWords; ++i) {
+        if (jit_mem[i] != ref_mem[i]) {
+          std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(jit_mem[i]),
+                        static_cast<unsigned long long>(ref_mem[i]));
+          regs += buf;
+        }
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Regression for the atomics fuzzer's find: a 32-bit (W) CAS must zero-extend
+// the old value into Rs. On an x86 CMPXCHG *match*, EAX is left unwritten, so
+// RAX kept the expected operand's stale upper 32 bits (the full 64-bit Rs was
+// loaded into RAX). CAS Ws then returned a non-zero-extended old value, which
+// corrupts 32-bit std::atomic compare-exchange (e.g. lock-free refcounts) and
+// blanks React Native / Fabric under translation.
+TEST_F(Arm64LiteTranslateRegionTest, CasWZeroExtendsOldValueOnMatch) {
+  static uint64_t cell;
+  cell = 0x9999999900001234ULL;            // low32 = 0x1234 (matches expected)
+  static const uint32_t code[] = {
+      CasW(1, 2, 0),                        // CAS W1, W2, [X0]
+  };
+  state_.cpu.x[0] = ToGuestAddr(&cell);
+  state_.cpu.x[1] = 0xDEADBEEF00001234ULL;  // expected: W1=0x1234 (match), upper junk
+  state_.cpu.x[2] = 0x000000000000A55AULL;  // desired:  W2=0xA55A
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Old value returned in X1 must be the zero-extended 32-bit memory word.
+  EXPECT_EQ(state_.cpu.x[1], 0x0000000000001234ULL);
+  // Memory low 32 updated to desired; upper 32 untouched.
+  EXPECT_EQ(cell, 0x999999990000A55AULL);
+}
+
+// Atomics differential fuzzer: LSE atomic memory ops (LDADD/SWP/CAS/LDCLR/LDSET/
+// LDEOR + W/AL variants) all targeting [x0] (a fixed scratch slot), interleaved
+// with arithmetic, run through the JIT and diffed against the interpreter on both
+// the loaded old value AND the memory cell. C++ shared_ptr refcounts ride on
+// LDADD/CAS; a mistranslated atomic corrupts refcounts -> premature free ->
+// empty Fabric tree -> blank React Native UI. The JIT translates these
+// (LoadStoreExclusive), several with "mask upper bits" caveats, so they are a
+// prime suspect for the RN-renders-blank-under-translation bug.
+TEST_F(Arm64RegMappingDifferentialTest, AtomicsMatchInterpreter) {
+  uint64_t rng = 0x1234abcd5678ef90ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  constexpr int kNumRegs = 12;  // x0 = atomic base address; x1..x11 general
+  constexpr int kIters = 8000;
+  constexpr int kWords = 16;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 4 + static_cast<int>(next() % 14);
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      uint8_t rs = 1 + (next() % (kNumRegs - 1));
+      uint8_t rt = 1 + (next() % (kNumRegs - 1));
+      uint8_t rn = 1 + (next() % (kNumRegs - 1));
+      uint8_t rm = 1 + (next() % (kNumRegs - 1));
+      switch (next() % 13) {
+        case 0: code.push_back(LdaddX(rs, rt, 0)); break;
+        case 1: code.push_back(LdaddalX(rs, rt, 0)); break;
+        case 2: code.push_back(LdclrX(rs, rt, 0)); break;
+        case 3: code.push_back(LdeorX(rs, rt, 0)); break;
+        case 4: code.push_back(LdsetX(rs, rt, 0)); break;
+        case 5: code.push_back(SwpX(rs, rt, 0)); break;
+        case 6: code.push_back(CasX(rs, rt, 0)); break;
+        case 7: code.push_back(CasalX(rs, rt, 0)); break;
+        case 8: code.push_back(LdaddW(rs, rt, 0)); break;
+        case 9: code.push_back(SwpW(rs, rt, 0)); break;
+        case 10: code.push_back(CasW(rs, rt, 0)); break;
+        case 11: code.push_back(AddRegX(rs, rt, rm)); break;
+        default: code.push_back(SubRegX(rs, rt, rm)); break;
+      }
+      (void)rn;
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 1; i < kNumRegs; ++i) init[i] = next();
+
+    alignas(16) uint64_t jit_mem[kWords];
+    alignas(16) uint64_t ref_mem[kWords];
+    for (int i = 0; i < kWords; ++i) jit_mem[i] = ref_mem[i] = 0x2222222200000000ULL | i;
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = init[i];
+      st->cpu.x[0] = ToGuestAddr(&mem[8]);  // atomic target cell
+    };
+
+    ThreadState js{};
+    run(&js, jit_mem);
+    RunJit(&js, code.data(), code.size());
+
+    ThreadState rs2{};
+    run(&rs2, ref_mem);
+    RunInterp(&rs2, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 1; i < kNumRegs; ++i)
+      if (js.cpu.x[i] != rs2.cpu.x[i]) diverged = true;
+    for (int i = 0; i < kWords; ++i)
+      if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 1; i < kNumRegs; ++i)
+        if (js.cpu.x[i] != rs2.cpu.x[i]) {
+          std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(js.cpu.x[i]),
+                        static_cast<unsigned long long>(rs2.cpu.x[i]));
+          regs += buf;
+        }
+      for (int i = 0; i < kWords; ++i)
+        if (jit_mem[i] != ref_mem[i]) {
+          std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(jit_mem[i]),
+                        static_cast<unsigned long long>(ref_mem[i]));
+          regs += buf;
+        }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Scalar FP differential fuzzer: random straight-line single/double float
+// arithmetic (FADD/FSUB/FMUL/FDIV/FNEG/FABS/FSQRT/FCVT) over v0..v8, JIT vs
+// interpreter, diffing the full 128-bit V registers (scalar FP must zero the
+// unused upper lanes). Yoga (React Native's layout engine) is float-heavy; a
+// scalar-FP codegen bug would corrupt layout. Interpreter is the spec; ARM scalar
+// FP is deterministic so JIT must match bit-for-bit.
+TEST_F(Arm64RegMappingDifferentialTest, ScalarFpMatchesInterpreter) {
+  uint64_t rng = 0xfeedface0badf00dULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+  };
+  constexpr int kNumV = 9;
+  constexpr int kIters = 8000;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 16);
+    std::vector<uint32_t> code;
+    for (int i = 0; i < n; ++i) {
+      uint8_t d = next() % kNumV, a = next() % kNumV, b = next() % kNumV;
+      switch (next() % 13) {
+        case 0: code.push_back(FaddS(d, a, b)); break;
+        case 1: code.push_back(FsubS(d, a, b)); break;
+        case 2: code.push_back(FmulS(d, a, b)); break;
+        case 3: code.push_back(FdivS(d, a, b)); break;
+        case 4: code.push_back(FaddD(d, a, b)); break;
+        case 5: code.push_back(FsubD(d, a, b)); break;
+        case 6: code.push_back(FmulD(d, a, b)); break;
+        case 7: code.push_back(FdivD(d, a, b)); break;
+        case 8: code.push_back(FnegS(d, a)); break;
+        case 9: code.push_back(FabsS(d, a)); break;
+        case 10: code.push_back(FsqrtD(d, a)); break;
+        case 11: code.push_back(FcvtSToD(d, a)); break;
+        default: code.push_back(FcvtDToS(d, a)); break;
+      }
+    }
+
+    // Finite-ish but varied FP inputs (mix of small/large doubles).
+    double initv[kNumV];
+    for (int i = 0; i < kNumV; ++i) {
+      uint64_t r = next();
+      initv[i] = static_cast<double>(static_cast<int64_t>(r)) /
+                 static_cast<double>(1 + (r & 0xFFFF));
+    }
+
+    auto run = [&](ThreadState* st) {
+      std::memset(&st->cpu.v[0], 0, sizeof(st->cpu.v));
+      for (int i = 0; i < kNumV; ++i) {
+        std::memcpy(&st->cpu.v[i], &initv[i], 8);
+      }
+    };
+
+    ThreadState js{};
+    run(&js);
+    RunJit(&js, code.data(), code.size());
+    ThreadState rs{};
+    run(&rs);
+    RunInterp(&rs, code.data(), code.size());
+
+    // NaN-tolerant compare: ARM vs x86 differ on generated/propagated NaN
+    // sign+payload (a known, app-irrelevant relaxation), so treat low-lane
+    // NaN-vs-NaN as equal and only flag finite-value divergence (which would
+    // corrupt layout). Upper lanes must always match (scalar FP zeroes them).
+    auto both_nan = [](const void* a, const void* b) {
+      float fa, fb; double da, db;
+      std::memcpy(&fa, a, 4); std::memcpy(&fb, b, 4);
+      std::memcpy(&da, a, 8); std::memcpy(&db, b, 8);
+      return (std::isnan(fa) && std::isnan(fb)) || (std::isnan(da) && std::isnan(db));
+    };
+    bool diverged = false;
+    for (int i = 0; i < kNumV; ++i) {
+      const char* jp = reinterpret_cast<const char*>(&js.cpu.v[i]);
+      const char* rp = reinterpret_cast<const char*>(&rs.cpu.v[i]);
+      if (std::memcmp(jp + 8, rp + 8, 8) != 0) diverged = true;        // upper lane
+      if (std::memcmp(jp, rp, 8) != 0 && !both_nan(jp, rp)) diverged = true;  // low lane
+    }
+    if (diverged) {
+      std::string dump; char buf[80];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]); dump += buf;
+      }
+      std::string regs;
+      for (int i = 0; i < kNumV; ++i) {
+        uint64_t jl, jh, rl, rh;
+        std::memcpy(&jl, &js.cpu.v[i], 8); std::memcpy(&jh, reinterpret_cast<char*>(&js.cpu.v[i]) + 8, 8);
+        std::memcpy(&rl, &rs.cpu.v[i], 8); std::memcpy(&rh, reinterpret_cast<char*>(&rs.cpu.v[i]) + 8, 8);
+        if (jl != rl || jh != rh) {
+          std::snprintf(buf, sizeof(buf), "v%d jit=%016llx%016llx ref=%016llx%016llx\n", i,
+                        (unsigned long long)jh, (unsigned long long)jl,
+                        (unsigned long long)rh, (unsigned long long)rl);
+          regs += buf;
+        }
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Register-offset (extended/shifted) load/store differential fuzzer. C++ array,
+// std::vector and vtable accesses compile to LDR Xt,[Xn,Xm,LSL#3] /
+// [Xn,Wm,UXTW#3] / SXTW etc.; the extend path (ApplyOffsetExtend) has been a
+// past source of silent address-corruption bugs (Brotli "Bad context map"). Each
+// index is masked (AND #0x1F) right before use so the access stays inside the
+// scratch buffer. JIT vs interpreter, diffing registers + buffer.
+TEST_F(Arm64RegMappingDifferentialTest, RegisterOffsetLoadStoreMatchesInterpreter) {
+  uint64_t rng = 0x0ddba11deadc0de5ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+  };
+  constexpr int kNumRegs = 12;  // x0 = base; x1..x11 general/index
+  constexpr int kIters = 8000;
+  constexpr int kWords = 64;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 16);
+    std::vector<uint32_t> code;
+    for (int i = 0; i < n; ++i) {
+      uint8_t rt = 1 + (next() % (kNumRegs - 1));
+      uint8_t idx = 1 + (next() % (kNumRegs - 1));
+      uint8_t rn2 = 1 + (next() % (kNumRegs - 1));
+      uint8_t rm2 = 1 + (next() % (kNumRegs - 1));
+      switch (next() % 9) {
+        case 0: code.push_back(AndImm5(idx, idx)); code.push_back(LdrXregLsl3(rt, 0, idx)); break;
+        case 1: code.push_back(AndImm5(idx, idx)); code.push_back(LdrXregUxtw3(rt, 0, idx)); break;
+        case 2: code.push_back(AndImm5(idx, idx)); code.push_back(LdrXregSxtw3(rt, 0, idx)); break;
+        case 3: code.push_back(AndImm5(idx, idx)); code.push_back(StrXregLsl3(rt, 0, idx)); break;
+        case 4: code.push_back(AndImm5(idx, idx)); code.push_back(LdrWregUxtw0(rt, 0, idx)); break;
+        case 5: code.push_back(AndImm5(idx, idx)); code.push_back(LdrbWregUxtw(rt, 0, idx)); break;
+        case 6: code.push_back(AddRegX(rt, rn2, rm2)); break;
+        case 7: code.push_back(EorRegX(rt, rn2, rm2)); break;
+        default: code.push_back(SubRegX(rt, rn2, rm2)); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 1; i < kNumRegs; ++i) init[i] = next();
+
+    alignas(16) uint64_t jit_mem[kWords];
+    alignas(16) uint64_t ref_mem[kWords];
+    for (int i = 0; i < kWords; ++i) jit_mem[i] = ref_mem[i] = 0x3333333300000000ULL | (i * 7u);
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = init[i];
+      st->cpu.x[0] = ToGuestAddr(&mem[16]);
+    };
+
+    ThreadState js{}; run(&js, jit_mem); RunJit(&js, code.data(), code.size());
+    ThreadState rs{}; run(&rs, ref_mem); RunInterp(&rs, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 1; i < kNumRegs; ++i) if (js.cpu.x[i] != rs.cpu.x[i]) diverged = true;
+    for (int i = 0; i < kWords; ++i) if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump; char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) { std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]); dump += buf; }
+      std::string regs;
+      for (int i = 1; i < kNumRegs; ++i) if (js.cpu.x[i] != rs.cpu.x[i]) {
+        std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                      (unsigned long long)js.cpu.x[i], (unsigned long long)rs.cpu.x[i]); regs += buf;
+      }
+      for (int i = 0; i < kWords; ++i) if (jit_mem[i] != ref_mem[i]) {
+        std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                      (unsigned long long)jit_mem[i], (unsigned long long)ref_mem[i]); regs += buf;
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
 }
 
 }  // namespace

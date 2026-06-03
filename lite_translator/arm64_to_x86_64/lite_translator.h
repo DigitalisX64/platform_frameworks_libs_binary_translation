@@ -12156,12 +12156,21 @@ class LiteTranslator {
           Register old_val = AllocTempReg();
           if (!success()) return;
           as_.Movq(old_val, Assembler::rax);
-          // byte/halfword forms only update low bits of RAX;
-          // upper bits remain stale. ARM CAS Wt zero-extends to 64. Mask.
+          // Sub-64-bit CAS must zero-extend the old value into Rs. On a CMPXCHG
+          // *match* the destination accumulator (AL/AX/EAX) is left UNWRITTEN, so
+          // RAX keeps the expected operand's stale upper bits (we loaded the full
+          // 64-bit Rs into RAX). Byte/halfword are fixed by the AND masks; the
+          // 32-bit (W) form must also be re-zero-extended — a 32-bit MOV clears
+          // bits 63:32. Without this, CAS Ws returns a non-zero-extended old
+          // value (e.g. a 32-bit std::atomic compare-exchange sees garbage upper
+          // bits), which corrupts lock-free C++ structures such as React Native /
+          // Fabric's shared_ptr-heavy view tree (renders blank under translation).
           if (args.size == 0) {
             as_.Andq(old_val, static_cast<int32_t>(0xFF));
           } else if (args.size == 1) {
             as_.Andq(old_val, static_cast<int32_t>(0xFFFF));
+          } else if (args.size == 2) {
+            as_.Movl(old_val, old_val);
           }
           SetReg(args.rs, old_val);
         }
