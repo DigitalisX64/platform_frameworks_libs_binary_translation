@@ -22,9 +22,11 @@
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <time.h>
 
 #include <cerrno>
+#include <cstring>
 
 #include "berberis/base/macros.h"
 #include "berberis/base/scoped_errno.h"
@@ -206,6 +208,31 @@ void RunGuestSyscall(ThreadState* state) {
       if (state->cpu.x[1] != 0) {
         *ToHostAddr<struct timezone>(state->cpu.x[1]) = tz;
       }
+      state->cpu.x[0] = 0;
+    } else {
+      state->cpu.x[0] = -errno;
+    }
+    if (kInstrumentSyscalls) {
+      OnSyscallReturn(state, guest_nr);
+    }
+    return;
+  }
+
+  // uname: present an arm64 machine to the guest.
+  // The host kernel reports machine="x86_64" (and the host kernel release), which
+  // is incorrect for a guest that believes it is running on arm64 - cpuinfo is
+  // already redirected to an arm64 description, so uname must agree. Anti-emulator
+  // / anti-translation native code (e.g. obfuscated device-id SDKs) treats a
+  // "x86_64" machine string from an arm64 process as a translation signal. The
+  // other utsname fields describe the shared kernel accurately and pass through.
+  // utsname is char[]-only and laid out identically for arm64/x86_64 under LP64.
+  if (guest_nr == 160 && state->cpu.x[0] != 0) {  // __NR_uname
+    struct utsname uts;
+    int r = uname(&uts);
+    if (r == 0) {
+      strncpy(uts.machine, "aarch64", sizeof(uts.machine) - 1);
+      uts.machine[sizeof(uts.machine) - 1] = '\0';
+      *ToHostAddr<struct utsname>(state->cpu.x[0]) = uts;
       state->cpu.x[0] = 0;
     } else {
       state->cpu.x[0] = -errno;
