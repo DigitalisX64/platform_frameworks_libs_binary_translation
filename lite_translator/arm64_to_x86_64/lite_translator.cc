@@ -406,15 +406,27 @@ void LiteTranslator::ConditionalCompare(bool is_neg, bool is_64bit, Register rn,
   }
 
   // Condition is true: perform CMP (is_neg=false) or CMN (is_neg=true).
+  // CMN is non-destructive (it only sets NZCV from rn+rm), but x86 has no
+  // non-destructive add, so the sum must go to a scratch register — never into
+  // rn. With register mapping enabled, rn is the live x86 register for the
+  // guest source register, so adding into it would silently corrupt that guest
+  // register for the rest of the JIT region (CMP's Cmpq is genuinely
+  // non-destructive, so only the CMN path is affected). ADD sets the same
+  // EFLAGS regardless of where the result lands, so the scratch copy preserves
+  // the flag semantics.
   if (is_64bit) {
     if (is_neg) {
-      as_.Addq(rn, rm);  // CMN: add and check flags
+      Register tmp_cmn = AllocTempReg();
+      as_.Movq(tmp_cmn, rn);
+      as_.Addq(tmp_cmn, rm);  // CMN: add into scratch, only flags matter
     } else {
       as_.Cmpq(rn, rm);  // CMP: subtract and check flags
     }
   } else {
     if (is_neg) {
-      as_.Addl(rn, rm);
+      Register tmp_cmn = AllocTempReg();
+      as_.Movl(tmp_cmn, rn);
+      as_.Addl(tmp_cmn, rm);
     } else {
       as_.Cmpl(rn, rm);
     }

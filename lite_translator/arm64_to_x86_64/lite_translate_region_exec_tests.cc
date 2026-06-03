@@ -21,8 +21,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -108,6 +111,120 @@ constexpr uint32_t CbnzX(uint8_t rt, int32_t offset) {
 }
 
 constexpr uint32_t kNop = 0xD503201F;
+
+// --- Encoders used by the register-mapping differential fuzzer below. ---
+// All 64-bit register-register forms over x0..x30.
+// SUB Xd, Xn, Xm (shifted reg, no shift)
+constexpr uint32_t SubRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xCB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// AND Xd, Xn, Xm
+constexpr uint32_t AndRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x8A000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// ORR Xd, Xn, Xm
+constexpr uint32_t OrrRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xAA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// EOR Xd, Xn, Xm
+constexpr uint32_t EorRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xCA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// MADD Xd, Xn, Xm, Xa : Xd = Xa + Xn*Xm
+constexpr uint32_t MaddX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x9B000000 | (static_cast<uint32_t>(rm) << 16) | (ra << 10) | (rn << 5) | rd;
+}
+// MSUB Xd, Xn, Xm, Xa : Xd = Xa - Xn*Xm
+constexpr uint32_t MsubX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) {
+  return 0x9B008000 | (static_cast<uint32_t>(rm) << 16) | (ra << 10) | (rn << 5) | rd;
+}
+// LSLV/LSRV/ASRV/RORV Xd, Xn, Xm (variable shift — uses host CL/rcx)
+constexpr uint32_t LslvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t LsrvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02400 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t AsrvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t RorvX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC02C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// UDIV/SDIV Xd, Xn, Xm (uses host rdx/rax, and rcx when divisor is rdx)
+constexpr uint32_t UdivX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC00800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t SdivX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC00C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// SMULH/UMULH Xd, Xn, Xm (widening multiply — clobbers host rdx:rax)
+constexpr uint32_t SmulhX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9B407C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t UmulhX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9BC07C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// ADDS/SUBS Xd, Xn, Xm (flag-setting, shifted reg, no shift)
+constexpr uint32_t AddsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xAB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t SubsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xEB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// ANDS Xd, Xn, Xm (flag-setting logical)
+constexpr uint32_t AndsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xEA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// Bitfield: SBFM/BFM/UBFM Xd, Xn, #immr, #imms (64-bit, N=1)
+constexpr uint32_t SbfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0x93400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+constexpr uint32_t BfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0xB3400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+constexpr uint32_t UbfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0xD3400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+// EXTR Xd, Xn, Xm, #lsb (64-bit)
+constexpr uint32_t ExtrX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t lsb) {
+  return 0x93C00000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(lsb) << 10) | (rn << 5) | rd;
+}
+// MOVK/MOVN Xd, #imm16, LSL #(hw*16)
+constexpr uint32_t MovkX(uint8_t rd, uint16_t imm16, uint8_t hw) {
+  return 0xF2800000 | (static_cast<uint32_t>(hw) << 21) |
+         (static_cast<uint32_t>(imm16) << 5) | rd;
+}
+constexpr uint32_t MovnHwX(uint8_t rd, uint16_t imm16, uint8_t hw) {
+  return 0x92800000 | (static_cast<uint32_t>(hw) << 21) |
+         (static_cast<uint32_t>(imm16) << 5) | rd;
+}
+// CSINC/CSINV/CSNEG Xd, Xn, Xm, cond  (CselX already defined above)
+constexpr uint32_t CsincX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0x9A800400 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsinvX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0xDA800000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsnegX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0xDA800400 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+// CCMP/CCMN Xn, Xm, #nzcv, cond (register form)
+constexpr uint32_t CcmpRegX(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0xFA400000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | nzcv;
+}
+constexpr uint32_t CcmnRegX(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0xBA400000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | nzcv;
+}
 
 // FMUL Sd, Sn, Sm (single-precision float multiply)
 // ARM64 encoding: 0001_1110_001_Rm_0000_10_Rn_Rd
@@ -42443,6 +42560,250 @@ TEST_F(Arm64LiteTranslateRegionTest, Ld4Ld3SingleStructureLane) {
   EXPECT_EQ(w[1], 0x05060708u);
   EXPECT_EQ(w[2], 0x090A0B0Cu);
   EXPECT_EQ(w[3], 0x0D0E0F10u);
+}
+
+// Differential fuzzer: drive random straight-line integer sequences through the
+// multi-region lite-translator JIT (register mapping ON, the production default)
+// and diff the resulting x0..xN against a pure-interpreter run of the identical
+// sequence from the identical initial state. The interpreter is the spec, so any
+// divergence is a JIT codegen bug — specifically the cross-instruction
+// register-mapping path, which single-instruction regions / disabled mapping
+// would mask. Deterministic seed so a failure reproduces verbatim.
+class Arm64RegMappingDifferentialTest : public ::testing::Test {
+ protected:
+  // Execute [code, code+n) the way production does: JIT each region (mapping ON),
+  // fall back to the interpreter for any instruction the JIT declines.
+  static void RunJit(ThreadState* state, const uint32_t* code, size_t n) {
+    GuestAddr start = ToGuestAddr(code);
+    GuestAddr end = start + n * 4;
+    state->cpu.insn_addr = start;
+    int guard = 0;
+    while (state->cpu.insn_addr < end && guard++ < 100000) {
+      MachineCode machine_code;
+      auto [success, stop_pc] = TryLiteTranslateRegion(
+          state->cpu.insn_addr, &machine_code,
+          LiteTranslateParams{.end_pc = end, .allow_dispatch = false});
+      if (!success || stop_pc <= state->cpu.insn_addr) {
+        // JIT declined the first instruction of this region — interpret one.
+        InterpretInsn(state);
+        continue;
+      }
+      HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+      TestingRunGeneratedCode(state, AsHostCode(host_code), stop_pc);
+    }
+  }
+
+  static void RunInterp(ThreadState* state, const uint32_t* code, size_t n) {
+    GuestAddr start = ToGuestAddr(code);
+    GuestAddr end = start + n * 4;
+    state->cpu.insn_addr = start;
+    int guard = 0;
+    while (state->cpu.insn_addr < end && guard++ < 100000) {
+      InterpretInsn(state);
+    }
+  }
+};
+
+TEST_F(Arm64RegMappingDifferentialTest, IntegerSequencesMatchInterpreter) {
+  uint64_t rng = 0x123456789abcdef0ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  // x0..x11: enough distinct guest regs to exceed the 13-entry GP pool once
+  // temps are accounted for, forcing the mapping/spill path.
+  constexpr int kNumRegs = 12;
+  constexpr int kIters = 6000;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 18);  // 6..23 instructions
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      uint8_t rd = next() % kNumRegs;
+      uint8_t rn = next() % kNumRegs;
+      uint8_t rm = next() % kNumRegs;
+      uint8_t ra = next() % kNumRegs;
+      switch (next() % 15) {
+        case 0: code.push_back(AddRegX(rd, rn, rm)); break;
+        case 1: code.push_back(SubRegX(rd, rn, rm)); break;
+        case 2: code.push_back(AndRegX(rd, rn, rm)); break;
+        case 3: code.push_back(OrrRegX(rd, rn, rm)); break;
+        case 4: code.push_back(EorRegX(rd, rn, rm)); break;
+        case 5: code.push_back(MaddX(rd, rn, rm, ra)); break;
+        case 6: code.push_back(MsubX(rd, rn, rm, ra)); break;
+        case 7: code.push_back(LslvX(rd, rn, rm)); break;
+        case 8: code.push_back(LsrvX(rd, rn, rm)); break;
+        case 9: code.push_back(AsrvX(rd, rn, rm)); break;
+        case 10: code.push_back(RorvX(rd, rn, rm)); break;
+        case 11: code.push_back(UdivX(rd, rn, rm)); break;
+        case 12: code.push_back(SdivX(rd, rn, rm)); break;
+        case 13: code.push_back(SmulhX(rd, rn, rm)); break;
+        default: code.push_back(UmulhX(rd, rn, rm)); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 0; i < kNumRegs; ++i) {
+      init[i] = next();
+    }
+
+    ThreadState jit_state{};
+    for (int i = 0; i < 32; ++i) jit_state.cpu.x[i] = init[i];
+    RunJit(&jit_state, code.data(), code.size());
+
+    ThreadState ref_state{};
+    for (int i = 0; i < 32; ++i) ref_state.cpu.x[i] = init[i];
+    RunInterp(&ref_state, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 0; i < kNumRegs; ++i) {
+      if (jit_state.cpu.x[i] != ref_state.cpu.x[i]) diverged = true;
+    }
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 0; i < kNumRegs; ++i) {
+        std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                      static_cast<unsigned long long>(jit_state.cpu.x[i]),
+                      static_cast<unsigned long long>(ref_state.cpu.x[i]));
+        regs += buf;
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Second differential pass: the bitfield / conditional-select / conditional-
+// compare / move-wide / flag-setting classes that dominate URL canonicalization
+// and string parsing (Cronet's GURL/ICU path). These mix flag generation
+// (ADDS/SUBS/ANDS/CCMP) with flag-consuming selects (CSEL family), so the run
+// also diffs NZCV to catch flag-codegen divergence under register mapping.
+TEST_F(Arm64RegMappingDifferentialTest, MixedClassesMatchInterpreter) {
+  uint64_t rng = 0x0fedcba987654321ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  constexpr int kNumRegs = 12;
+  constexpr int kIters = 8000;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 20);  // 6..25 instructions
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      uint8_t rd = next() % kNumRegs;
+      uint8_t rn = next() % kNumRegs;
+      uint8_t rm = next() % kNumRegs;
+      uint8_t cond = next() % 16;
+      uint8_t immr = next() % 64;
+      uint8_t imms = next() % 64;
+      uint8_t nzcv = next() % 16;
+      uint16_t imm16 = static_cast<uint16_t>(next());
+      uint8_t hw = next() % 4;
+      switch (next() % 20) {
+        case 0: code.push_back(AddRegX(rd, rn, rm)); break;
+        case 1: code.push_back(SubRegX(rd, rn, rm)); break;
+        case 2: code.push_back(AddsRegX(rd, rn, rm)); break;
+        case 3: code.push_back(SubsRegX(rd, rn, rm)); break;
+        case 4: code.push_back(AndsRegX(rd, rn, rm)); break;
+        case 5: code.push_back(AndRegX(rd, rn, rm)); break;
+        case 6: code.push_back(OrrRegX(rd, rn, rm)); break;
+        case 7: code.push_back(SbfmX(rd, rn, immr, imms)); break;
+        case 8: code.push_back(BfmX(rd, rn, immr, imms)); break;
+        case 9: code.push_back(UbfmX(rd, rn, immr, imms)); break;
+        case 10: code.push_back(ExtrX(rd, rn, rm, immr)); break;
+        case 11: code.push_back(MovkX(rd, imm16, hw)); break;
+        case 12: code.push_back(MovnHwX(rd, imm16, hw)); break;
+        case 13: code.push_back(CselX(rd, rn, rm, cond)); break;
+        case 14: code.push_back(CsincX(rd, rn, rm, cond)); break;
+        case 15: code.push_back(CsinvX(rd, rn, rm, cond)); break;
+        case 16: code.push_back(CsnegX(rd, rn, rm, cond)); break;
+        case 17: code.push_back(CcmpRegX(rn, rm, nzcv, cond)); break;
+        case 18: code.push_back(CcmnRegX(rn, rm, nzcv, cond)); break;
+        default: code.push_back(MaddX(rd, rn, rm, (next() % kNumRegs))); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 0; i < kNumRegs; ++i) {
+      init[i] = next();
+    }
+
+    ThreadState jit_state{};
+    for (int i = 0; i < 32; ++i) jit_state.cpu.x[i] = init[i];
+    RunJit(&jit_state, code.data(), code.size());
+
+    ThreadState ref_state{};
+    for (int i = 0; i < 32; ++i) ref_state.cpu.x[i] = init[i];
+    RunInterp(&ref_state, code.data(), code.size());
+
+    bool diverged = (jit_state.cpu.flags != ref_state.cpu.flags);
+    for (int i = 0; i < kNumRegs; ++i) {
+      if (jit_state.cpu.x[i] != ref_state.cpu.x[i]) diverged = true;
+    }
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 0; i < kNumRegs; ++i) {
+        std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                      static_cast<unsigned long long>(jit_state.cpu.x[i]),
+                      static_cast<unsigned long long>(ref_state.cpu.x[i]));
+        regs += buf;
+      }
+      std::snprintf(buf, sizeof(buf), "flags jit=%08x ref=%08x\n",
+                    jit_state.cpu.flags, ref_state.cpu.flags);
+      regs += buf;
+      std::string inits;
+      for (int i = 0; i < kNumRegs; ++i) {
+        std::snprintf(buf, sizeof(buf), "init x%d=%016llx\n", i,
+                      static_cast<unsigned long long>(init[i]));
+        inits += buf;
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n"
+             << regs << inits;
+    }
+  }
+}
+
+// Regression for the minimal divergence the fuzzer above pinned down: CCMN's
+// CMN (the is_neg arm of conditional-compare) must be non-destructive. x86 has
+// no non-destructive add, and the previous lowering issued `add rn, rm`, which
+// writes the sum back into rn. With cross-instruction register mapping, rn is
+// the live x86 register for the guest source register, so the add silently
+// corrupted that guest register for the rest of the JIT region. (CMP uses the
+// genuinely non-destructive `cmp`, so only CMN was affected; single-instruction
+// regions and disabled mapping both masked it.)
+//
+// SUB X10,X10,X3 leaves the real result in x10's mapped register; CCMN X10,X6
+// then reads it and must leave it intact (cond=AL forces the CMN to execute).
+TEST_F(Arm64LiteTranslateRegionTest, CcmnDoesNotClobberSourceUnderRegMapping) {
+  static const uint32_t code[] = {
+      SubRegX(10, 10, 3),           // X10 = X10 - X3 = 750
+      CcmnRegX(10, 6, 0, kCondAL),  // CMN X10, X6 — sets flags only, X10 intact
+  };
+  state_.cpu.x[10] = 1000;
+  state_.cpu.x[3] = 250;
+  state_.cpu.x[6] = 7;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[10], 750ULL);
 }
 
 }  // namespace
