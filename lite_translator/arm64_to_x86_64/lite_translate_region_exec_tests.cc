@@ -42994,6 +42994,10 @@ TEST_F(Arm64RegMappingDifferentialTest, StrtoumaxZeroDoesNotHang) {
   EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "JIT vs interpreter strtoumax result";
 }
 
+// FCVT precision conversions for the FP differential fuzzer (others pre-exist).
+constexpr uint32_t FcvtSToD(uint8_t d, uint8_t n) { return 0x1E22C000 | (n << 5) | d; }
+constexpr uint32_t FcvtDToS(uint8_t d, uint8_t n) { return 0x1E624000 | (n << 5) | d; }
+
 // Memory load/store differential fuzzer: random straight-line sequences mixing
 // loads/stores (base = x0, a fixed pointer into a scratch buffer, never a
 // destination) with register arithmetic, run through the multi-region JIT
@@ -43223,6 +43227,103 @@ TEST_F(Arm64RegMappingDifferentialTest, AtomicsMatchInterpreter) {
                         static_cast<unsigned long long>(ref_mem[i]));
           regs += buf;
         }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Scalar FP differential fuzzer: random straight-line single/double float
+// arithmetic (FADD/FSUB/FMUL/FDIV/FNEG/FABS/FSQRT/FCVT) over v0..v8, JIT vs
+// interpreter, diffing the full 128-bit V registers (scalar FP must zero the
+// unused upper lanes). Yoga (React Native's layout engine) is float-heavy; a
+// scalar-FP codegen bug would corrupt layout. Interpreter is the spec; ARM scalar
+// FP is deterministic so JIT must match bit-for-bit.
+TEST_F(Arm64RegMappingDifferentialTest, ScalarFpMatchesInterpreter) {
+  uint64_t rng = 0xfeedface0badf00dULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+  };
+  constexpr int kNumV = 9;
+  constexpr int kIters = 8000;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 16);
+    std::vector<uint32_t> code;
+    for (int i = 0; i < n; ++i) {
+      uint8_t d = next() % kNumV, a = next() % kNumV, b = next() % kNumV;
+      switch (next() % 13) {
+        case 0: code.push_back(FaddS(d, a, b)); break;
+        case 1: code.push_back(FsubS(d, a, b)); break;
+        case 2: code.push_back(FmulS(d, a, b)); break;
+        case 3: code.push_back(FdivS(d, a, b)); break;
+        case 4: code.push_back(FaddD(d, a, b)); break;
+        case 5: code.push_back(FsubD(d, a, b)); break;
+        case 6: code.push_back(FmulD(d, a, b)); break;
+        case 7: code.push_back(FdivD(d, a, b)); break;
+        case 8: code.push_back(FnegS(d, a)); break;
+        case 9: code.push_back(FabsS(d, a)); break;
+        case 10: code.push_back(FsqrtD(d, a)); break;
+        case 11: code.push_back(FcvtSToD(d, a)); break;
+        default: code.push_back(FcvtDToS(d, a)); break;
+      }
+    }
+
+    // Finite-ish but varied FP inputs (mix of small/large doubles).
+    double initv[kNumV];
+    for (int i = 0; i < kNumV; ++i) {
+      uint64_t r = next();
+      initv[i] = static_cast<double>(static_cast<int64_t>(r)) /
+                 static_cast<double>(1 + (r & 0xFFFF));
+    }
+
+    auto run = [&](ThreadState* st) {
+      std::memset(&st->cpu.v[0], 0, sizeof(st->cpu.v));
+      for (int i = 0; i < kNumV; ++i) {
+        std::memcpy(&st->cpu.v[i], &initv[i], 8);
+      }
+    };
+
+    ThreadState js{};
+    run(&js);
+    RunJit(&js, code.data(), code.size());
+    ThreadState rs{};
+    run(&rs);
+    RunInterp(&rs, code.data(), code.size());
+
+    // NaN-tolerant compare: ARM vs x86 differ on generated/propagated NaN
+    // sign+payload (a known, app-irrelevant relaxation), so treat low-lane
+    // NaN-vs-NaN as equal and only flag finite-value divergence (which would
+    // corrupt layout). Upper lanes must always match (scalar FP zeroes them).
+    auto both_nan = [](const void* a, const void* b) {
+      float fa, fb; double da, db;
+      std::memcpy(&fa, a, 4); std::memcpy(&fb, b, 4);
+      std::memcpy(&da, a, 8); std::memcpy(&db, b, 8);
+      return (std::isnan(fa) && std::isnan(fb)) || (std::isnan(da) && std::isnan(db));
+    };
+    bool diverged = false;
+    for (int i = 0; i < kNumV; ++i) {
+      const char* jp = reinterpret_cast<const char*>(&js.cpu.v[i]);
+      const char* rp = reinterpret_cast<const char*>(&rs.cpu.v[i]);
+      if (std::memcmp(jp + 8, rp + 8, 8) != 0) diverged = true;        // upper lane
+      if (std::memcmp(jp, rp, 8) != 0 && !both_nan(jp, rp)) diverged = true;  // low lane
+    }
+    if (diverged) {
+      std::string dump; char buf[80];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]); dump += buf;
+      }
+      std::string regs;
+      for (int i = 0; i < kNumV; ++i) {
+        uint64_t jl, jh, rl, rh;
+        std::memcpy(&jl, &js.cpu.v[i], 8); std::memcpy(&jh, reinterpret_cast<char*>(&js.cpu.v[i]) + 8, 8);
+        std::memcpy(&rl, &rs.cpu.v[i], 8); std::memcpy(&rh, reinterpret_cast<char*>(&rs.cpu.v[i]) + 8, 8);
+        if (jl != rl || jh != rh) {
+          std::snprintf(buf, sizeof(buf), "v%d jit=%016llx%016llx ref=%016llx%016llx\n", i,
+                        (unsigned long long)jh, (unsigned long long)jl,
+                        (unsigned long long)rh, (unsigned long long)rl);
+          regs += buf;
+        }
+      }
       FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
     }
   }
