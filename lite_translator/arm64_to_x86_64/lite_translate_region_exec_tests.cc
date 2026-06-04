@@ -116,6 +116,63 @@ constexpr uint32_t CbnzX(uint8_t rt, int32_t offset) {
   return 0xB5000000 | (imm19 << 5) | rt;
 }
 
+// --- Load/store unsigned-offset encoders for the memory differential fuzzer ---
+// imm is the SCALED immediate (units = access size), Rn is the base.
+constexpr uint32_t LdrXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xF9400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xF9000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrbWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrbWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrhWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrhWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrsbXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrshXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrswXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+// --- Extra LSE atomic encoders for the atomics fuzzer (others pre-exist).
+// LDADDAL = acquire+release (the variant shared_ptr's refcount decrement uses).
+constexpr uint32_t LdaddalX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8E00000 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t CasalX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xC8E0FC00 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+// 32-bit (W) variants exercise the zero-extension masking paths.
+constexpr uint32_t LdaddW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8200000 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t SwpW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8208000 | (static_cast<uint32_t>(rs) << 16) | (rn << 5) | rt;
+}
+
+// STP Xt1,Xt2,[Xn,#imm*8] (signed 7-bit scaled imm); LdpX is defined later.
+constexpr uint32_t StpX(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm7) {
+  return 0xA9000000 | ((static_cast<uint32_t>(imm7) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (rn << 5) | rt1;
+}
+
 constexpr uint32_t kNop = 0xD503201F;
 
 // --- Encoders used by the register-mapping differential fuzzer below. ---
@@ -42935,6 +42992,240 @@ TEST_F(Arm64RegMappingDifferentialTest, StrtoumaxZeroDoesNotHang) {
   run(&js, true);
   EXPECT_EQ(js.cpu.x[0], 0u) << "JIT: strtoumax(\"0\",,16) — hang/garbage if nonzero";
   EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "JIT vs interpreter strtoumax result";
+}
+
+// Memory load/store differential fuzzer: random straight-line sequences mixing
+// loads/stores (base = x0, a fixed pointer into a scratch buffer, never a
+// destination) with register arithmetic, run through the multi-region JIT
+// (mapping ON) and diffed against the interpreter — both register state AND the
+// scratch buffer (so mis-stored bytes are caught). React Native / Fabric is
+// heavy C++ (object fields, vtables, pointer chasing) and renders blank under
+// translation while running fine natively; the load/store path is unfuzzed and
+// a prime suspect.
+TEST_F(Arm64RegMappingDifferentialTest, MemoryLoadStoreMatchesInterpreter) {
+  uint64_t rng = 0xa5a5f00dc0ffee11ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  constexpr int kNumRegs = 12;  // x0 = base; x1..x11 general
+  constexpr int kIters = 8000;
+  constexpr int kWords = 64;    // scratch buffer (512 bytes)
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 18);
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      // dst/src regs in x1..x11 (never x0 = base, never x12+).
+      uint8_t rd = 1 + (next() % (kNumRegs - 1));
+      uint8_t rn = 1 + (next() % (kNumRegs - 1));
+      uint8_t rm = 1 + (next() % (kNumRegs - 1));
+      uint8_t rt2 = 1 + (next() % (kNumRegs - 1));
+      // keep loads/stores inside the buffer: x0 points at scratch[16], offsets
+      // span scratch[0..47] in 8-byte units (0..31) — well inside [0,kWords).
+      uint16_t off8 = next() % 24;        // X access: scratch[16-16 .. ]
+      uint16_t off4 = next() % 48;
+      uint16_t off2 = next() % 96;
+      uint16_t off1 = next() % 192;
+      int8_t offp = static_cast<int8_t>((next() % 16));  // LDP/STP, +0..15 words
+      switch (next() % 16) {
+        case 0: code.push_back(LdrXuoff(rd, 0, off8)); break;
+        case 1: code.push_back(StrXuoff(rd, 0, off8)); break;
+        case 2: code.push_back(LdrWuoff(rd, 0, off4)); break;
+        case 3: code.push_back(StrWuoff(rd, 0, off4)); break;
+        case 4: code.push_back(LdrbWuoff(rd, 0, off1)); break;
+        case 5: code.push_back(StrbWuoff(rd, 0, off1)); break;
+        case 6: code.push_back(LdrhWuoff(rd, 0, off2)); break;
+        case 7: code.push_back(StrhWuoff(rd, 0, off2)); break;
+        case 8: code.push_back(LdrsbXuoff(rd, 0, off1)); break;
+        case 9: code.push_back(LdrshXuoff(rd, 0, off2)); break;
+        case 10: code.push_back(LdrswXuoff(rd, 0, off4)); break;
+        case 11: code.push_back(LdpX(rd, rt2 == rd ? (rt2 % 11) + 1 : rt2, 0, offp)); break;
+        case 12: code.push_back(StpX(rd, rt2, 0, offp)); break;
+        case 13: code.push_back(AddRegX(rd, rn, rm)); break;
+        case 14: code.push_back(EorRegX(rd, rn, rm)); break;
+        default: code.push_back(SubRegX(rd, rn, rm)); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 1; i < kNumRegs; ++i) init[i] = next();
+
+    alignas(16) uint64_t jit_mem[kWords];
+    alignas(16) uint64_t ref_mem[kWords];
+    for (int i = 0; i < kWords; ++i) jit_mem[i] = ref_mem[i] = 0x1111111100000000ULL | i;
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = init[i];
+      st->cpu.x[0] = ToGuestAddr(&mem[16]);  // base into the middle of the buffer
+    };
+
+    ThreadState js{};
+    run(&js, jit_mem);
+    RunJit(&js, code.data(), code.size());
+
+    ThreadState rs{};
+    run(&rs, ref_mem);
+    RunInterp(&rs, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 1; i < kNumRegs; ++i)
+      if (js.cpu.x[i] != rs.cpu.x[i]) diverged = true;
+    for (int i = 0; i < kWords; ++i)
+      if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 1; i < kNumRegs; ++i) {
+        if (js.cpu.x[i] != rs.cpu.x[i]) {
+          std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(js.cpu.x[i]),
+                        static_cast<unsigned long long>(rs.cpu.x[i]));
+          regs += buf;
+        }
+      }
+      for (int i = 0; i < kWords; ++i) {
+        if (jit_mem[i] != ref_mem[i]) {
+          std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(jit_mem[i]),
+                        static_cast<unsigned long long>(ref_mem[i]));
+          regs += buf;
+        }
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Regression for the atomics fuzzer's find: a 32-bit (W) CAS must zero-extend
+// the old value into Rs. On an x86 CMPXCHG *match*, EAX is left unwritten, so
+// RAX kept the expected operand's stale upper 32 bits (the full 64-bit Rs was
+// loaded into RAX). CAS Ws then returned a non-zero-extended old value, which
+// corrupts 32-bit std::atomic compare-exchange (e.g. lock-free refcounts) and
+// blanks React Native / Fabric under translation.
+TEST_F(Arm64LiteTranslateRegionTest, CasWZeroExtendsOldValueOnMatch) {
+  static uint64_t cell;
+  cell = 0x9999999900001234ULL;            // low32 = 0x1234 (matches expected)
+  static const uint32_t code[] = {
+      CasW(1, 2, 0),                        // CAS W1, W2, [X0]
+  };
+  state_.cpu.x[0] = ToGuestAddr(&cell);
+  state_.cpu.x[1] = 0xDEADBEEF00001234ULL;  // expected: W1=0x1234 (match), upper junk
+  state_.cpu.x[2] = 0x000000000000A55AULL;  // desired:  W2=0xA55A
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // Old value returned in X1 must be the zero-extended 32-bit memory word.
+  EXPECT_EQ(state_.cpu.x[1], 0x0000000000001234ULL);
+  // Memory low 32 updated to desired; upper 32 untouched.
+  EXPECT_EQ(cell, 0x999999990000A55AULL);
+}
+
+// Atomics differential fuzzer: LSE atomic memory ops (LDADD/SWP/CAS/LDCLR/LDSET/
+// LDEOR + W/AL variants) all targeting [x0] (a fixed scratch slot), interleaved
+// with arithmetic, run through the JIT and diffed against the interpreter on both
+// the loaded old value AND the memory cell. C++ shared_ptr refcounts ride on
+// LDADD/CAS; a mistranslated atomic corrupts refcounts -> premature free ->
+// empty Fabric tree -> blank React Native UI. The JIT translates these
+// (LoadStoreExclusive), several with "mask upper bits" caveats, so they are a
+// prime suspect for the RN-renders-blank-under-translation bug.
+TEST_F(Arm64RegMappingDifferentialTest, AtomicsMatchInterpreter) {
+  uint64_t rng = 0x1234abcd5678ef90ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+
+  constexpr int kNumRegs = 12;  // x0 = atomic base address; x1..x11 general
+  constexpr int kIters = 8000;
+  constexpr int kWords = 16;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 4 + static_cast<int>(next() % 14);
+    std::vector<uint32_t> code;
+    code.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      uint8_t rs = 1 + (next() % (kNumRegs - 1));
+      uint8_t rt = 1 + (next() % (kNumRegs - 1));
+      uint8_t rn = 1 + (next() % (kNumRegs - 1));
+      uint8_t rm = 1 + (next() % (kNumRegs - 1));
+      switch (next() % 13) {
+        case 0: code.push_back(LdaddX(rs, rt, 0)); break;
+        case 1: code.push_back(LdaddalX(rs, rt, 0)); break;
+        case 2: code.push_back(LdclrX(rs, rt, 0)); break;
+        case 3: code.push_back(LdeorX(rs, rt, 0)); break;
+        case 4: code.push_back(LdsetX(rs, rt, 0)); break;
+        case 5: code.push_back(SwpX(rs, rt, 0)); break;
+        case 6: code.push_back(CasX(rs, rt, 0)); break;
+        case 7: code.push_back(CasalX(rs, rt, 0)); break;
+        case 8: code.push_back(LdaddW(rs, rt, 0)); break;
+        case 9: code.push_back(SwpW(rs, rt, 0)); break;
+        case 10: code.push_back(CasW(rs, rt, 0)); break;
+        case 11: code.push_back(AddRegX(rs, rt, rm)); break;
+        default: code.push_back(SubRegX(rs, rt, rm)); break;
+      }
+      (void)rn;
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 1; i < kNumRegs; ++i) init[i] = next();
+
+    alignas(16) uint64_t jit_mem[kWords];
+    alignas(16) uint64_t ref_mem[kWords];
+    for (int i = 0; i < kWords; ++i) jit_mem[i] = ref_mem[i] = 0x2222222200000000ULL | i;
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = init[i];
+      st->cpu.x[0] = ToGuestAddr(&mem[8]);  // atomic target cell
+    };
+
+    ThreadState js{};
+    run(&js, jit_mem);
+    RunJit(&js, code.data(), code.size());
+
+    ThreadState rs2{};
+    run(&rs2, ref_mem);
+    RunInterp(&rs2, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 1; i < kNumRegs; ++i)
+      if (js.cpu.x[i] != rs2.cpu.x[i]) diverged = true;
+    for (int i = 0; i < kWords; ++i)
+      if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump;
+      char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]);
+        dump += buf;
+      }
+      std::string regs;
+      for (int i = 1; i < kNumRegs; ++i)
+        if (js.cpu.x[i] != rs2.cpu.x[i]) {
+          std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(js.cpu.x[i]),
+                        static_cast<unsigned long long>(rs2.cpu.x[i]));
+          regs += buf;
+        }
+      for (int i = 0; i < kWords; ++i)
+        if (jit_mem[i] != ref_mem[i]) {
+          std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                        static_cast<unsigned long long>(jit_mem[i]),
+                        static_cast<unsigned long long>(ref_mem[i]));
+          regs += buf;
+        }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
 }
 
 }  // namespace
