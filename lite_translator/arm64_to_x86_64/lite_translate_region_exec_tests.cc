@@ -43022,6 +43022,19 @@ constexpr uint32_t LdrbWregUxtw(uint8_t rt, uint8_t rn, uint8_t rm) {  // byte, 
 constexpr uint32_t FcvtSToD(uint8_t d, uint8_t n) { return 0x1E22C000 | (n << 5) | d; }
 constexpr uint32_t FcvtDToS(uint8_t d, uint8_t n) { return 0x1E624000 | (n << 5) | d; }
 
+// --- NEON encoders for the SIMD differential fuzzer. ---
+constexpr uint32_t AddV16B(uint8_t d, uint8_t n, uint8_t m) { return 0x4E208400 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t SubV16B(uint8_t d, uint8_t n, uint8_t m) { return 0x6E208400 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t AndV16B(uint8_t d, uint8_t n, uint8_t m) { return 0x4E201C00 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t OrrV16B(uint8_t d, uint8_t n, uint8_t m) { return 0x4EA01C00 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t EorV16B(uint8_t d, uint8_t n, uint8_t m) { return 0x6E201C00 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t AddV4S(uint8_t d, uint8_t n, uint8_t m) { return 0x4EA08400 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t SubV4S(uint8_t d, uint8_t n, uint8_t m) { return 0x6EA08400 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t MulV4S(uint8_t d, uint8_t n, uint8_t m) { return 0x4EA09C00 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t AddV8H(uint8_t d, uint8_t n, uint8_t m) { return 0x4E608400 | (m<<16)|(n<<5)|d; }
+constexpr uint32_t LdrQuoff(uint8_t t, uint8_t n, uint16_t imm) { return 0x3DC00000 | (static_cast<uint32_t>(imm)<<10)|(n<<5)|t; }
+constexpr uint32_t StrQuoff(uint8_t t, uint8_t n, uint16_t imm) { return 0x3D800000 | (static_cast<uint32_t>(imm)<<10)|(n<<5)|t; }
+
 // Memory load/store differential fuzzer: random straight-line sequences mixing
 // loads/stores (base = x0, a fixed pointer into a scratch buffer, never a
 // destination) with register arithmetic, run through the multi-region JIT
@@ -43420,6 +43433,126 @@ TEST_F(Arm64RegMappingDifferentialTest, RegisterOffsetLoadStoreMatchesInterprete
                       (unsigned long long)jit_mem[i], (unsigned long long)ref_mem[i]); regs += buf;
       }
       FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// SIMD/NEON differential fuzzer: 128-bit vector arithmetic (ADD/SUB/AND/ORR/EOR
+// .16B, ADD/SUB/MUL .4S, ADD .8H) interleaved with Q load/store to a scratch
+// buffer (base x0), JIT vs interpreter, diffing the full V registers + memory.
+// C++ memcpy / std::string SSO / Skia rasterization run on NEON; a vector
+// codegen bug corrupts data and can blank a React Native UI under translation.
+TEST_F(Arm64RegMappingDifferentialTest, SimdNeonMatchesInterpreter) {
+  uint64_t rng = 0xc0ffeebabe123456ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+  };
+  constexpr int kNumV = 8;
+  constexpr int kIters = 8000;
+  constexpr int kQ = 16;  // 16 x 128-bit slots
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 16);
+    std::vector<uint32_t> code;
+    for (int i = 0; i < n; ++i) {
+      uint8_t d = next() % kNumV, a = next() % kNumV, b = next() % kNumV;
+      uint16_t qoff = next() % 8;  // Q slot 0..7 within buffer middle
+      switch (next() % 11) {
+        case 0: code.push_back(AddV16B(d, a, b)); break;
+        case 1: code.push_back(SubV16B(d, a, b)); break;
+        case 2: code.push_back(AndV16B(d, a, b)); break;
+        case 3: code.push_back(OrrV16B(d, a, b)); break;
+        case 4: code.push_back(EorV16B(d, a, b)); break;
+        case 5: code.push_back(AddV4S(d, a, b)); break;
+        case 6: code.push_back(SubV4S(d, a, b)); break;
+        case 7: code.push_back(MulV4S(d, a, b)); break;
+        case 8: code.push_back(AddV8H(d, a, b)); break;
+        case 9: code.push_back(LdrQuoff(d, 0, qoff)); break;
+        default: code.push_back(StrQuoff(d, 0, qoff)); break;
+      }
+    }
+
+    uint64_t initv[kNumV * 2];
+    for (int i = 0; i < kNumV * 2; ++i) initv[i] = next();
+
+    alignas(16) uint64_t jit_mem[kQ * 2];
+    alignas(16) uint64_t ref_mem[kQ * 2];
+    for (int i = 0; i < kQ * 2; ++i) jit_mem[i] = ref_mem[i] = 0x4444444400000000ULL | i;
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      std::memset(&st->cpu.v[0], 0, sizeof(st->cpu.v));
+      for (int i = 0; i < kNumV; ++i) std::memcpy(&st->cpu.v[i], &initv[i * 2], 16);
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = 0;
+      st->cpu.x[0] = ToGuestAddr(&mem[8]);  // Q base (slot 4)
+    };
+
+    ThreadState js{}; run(&js, jit_mem); RunJit(&js, code.data(), code.size());
+    ThreadState rs{}; run(&rs, ref_mem); RunInterp(&rs, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 0; i < kNumV; ++i)
+      if (std::memcmp(&js.cpu.v[i], &rs.cpu.v[i], 16) != 0) diverged = true;
+    for (int i = 0; i < kQ * 2; ++i) if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump; char buf[80];
+      for (size_t i = 0; i < code.size(); ++i) { std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]); dump += buf; }
+      std::string regs;
+      for (int i = 0; i < kNumV; ++i) {
+        uint64_t jl, jh, rl, rh;
+        std::memcpy(&jl, &js.cpu.v[i], 8); std::memcpy(&jh, reinterpret_cast<char*>(&js.cpu.v[i]) + 8, 8);
+        std::memcpy(&rl, &rs.cpu.v[i], 8); std::memcpy(&rh, reinterpret_cast<char*>(&rs.cpu.v[i]) + 8, 8);
+        if (jl != rl || jh != rh) {
+          std::snprintf(buf, sizeof(buf), "v%d jit=%016llx%016llx ref=%016llx%016llx\n", i,
+                        (unsigned long long)jh,(unsigned long long)jl,(unsigned long long)rh,(unsigned long long)rl);
+          regs += buf;
+        }
+      }
+      for (int i = 0; i < kQ * 2; ++i) if (jit_mem[i] != ref_mem[i]) {
+        std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                      (unsigned long long)jit_mem[i],(unsigned long long)ref_mem[i]); regs += buf;
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Int->double conversion sanity (UCVTF/SCVTF) against KNOWN values, on BOTH the
+// JIT and the interpreter. parseInt/Number return their (double) result via an
+// integer->double convert; if UCVTF/SCVTF is wrong in BOTH back-ends (a shared
+// bug a JIT-vs-interpreter differential cannot see), parseInt yields 0 and React
+// Native renders blank. JSON.parse uses strtod (not this path) and still works.
+TEST_F(Arm64LiteTranslateRegionTest, IntToDoubleConvertKnownValues) {
+  struct Case { uint64_t x; double d; };
+  const Case cases[] = {{0, 0.0}, {7, 7.0}, {123, 123.0}, {255, 255.0},
+                        {1000000, 1000000.0}, {123456789, 123456789.0}};
+  auto bits = [](double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; };
+
+  for (const auto& c : cases) {
+    uint32_t ucvtf_d_x = 0x9E630000 | (1u << 5) | 0u;  // UCVTF d0, x1
+    // UCVTF Dd, Xn via interpreter.
+    std::memset(&state_.cpu.v[0], 0, 16);
+    state_.cpu.x[1] = c.x;
+    Interpret(ucvtf_d_x);
+    uint64_t got; std::memcpy(&got, &state_.cpu.v[0], 8);
+    EXPECT_EQ(got, bits(c.d)) << "interp UCVTF d0,x1 x=" << c.x;
+
+    // SCVTF Dd, Xn via interpreter.
+    std::memset(&state_.cpu.v[0], 0, 16);
+    state_.cpu.x[1] = c.x;
+    Interpret(0x9E620000 | (1u << 5) | 0u);  // SCVTF d0, x1
+    std::memcpy(&got, &state_.cpu.v[0], 8);
+    EXPECT_EQ(got, bits(c.d)) << "interp SCVTF d0,x1 x=" << c.x;
+
+    // UCVTF Dd, Xn via JIT (small values encodable with one MOVZ).
+    if (c.x <= 0xFFFF) {
+      static uint32_t code[2];
+      code[0] = MovzX(1, static_cast<uint16_t>(c.x & 0xFFFF));
+      code[1] = ucvtf_d_x;
+      std::memset(&state_.cpu.v[0], 0, 16);
+      if (Run(code, ToGuestAddr(code) + sizeof(code))) {
+        std::memcpy(&got, &state_.cpu.v[0], 8);
+        EXPECT_EQ(got, bits(static_cast<double>(c.x))) << "JIT UCVTF d0,x1 x=" << c.x;
+      }
     }
   }
 }
