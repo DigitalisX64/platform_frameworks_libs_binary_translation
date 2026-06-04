@@ -43516,6 +43516,47 @@ TEST_F(Arm64RegMappingDifferentialTest, SimdNeonMatchesInterpreter) {
   }
 }
 
+// Int->double conversion sanity (UCVTF/SCVTF) against KNOWN values, on BOTH the
+// JIT and the interpreter. parseInt/Number return their (double) result via an
+// integer->double convert; if UCVTF/SCVTF is wrong in BOTH back-ends (a shared
+// bug a JIT-vs-interpreter differential cannot see), parseInt yields 0 and React
+// Native renders blank. JSON.parse uses strtod (not this path) and still works.
+TEST_F(Arm64LiteTranslateRegionTest, IntToDoubleConvertKnownValues) {
+  struct Case { uint64_t x; double d; };
+  const Case cases[] = {{0, 0.0}, {7, 7.0}, {123, 123.0}, {255, 255.0},
+                        {1000000, 1000000.0}, {123456789, 123456789.0}};
+  auto bits = [](double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; };
+
+  for (const auto& c : cases) {
+    uint32_t ucvtf_d_x = 0x9E630000 | (1u << 5) | 0u;  // UCVTF d0, x1
+    // UCVTF Dd, Xn via interpreter.
+    std::memset(&state_.cpu.v[0], 0, 16);
+    state_.cpu.x[1] = c.x;
+    Interpret(ucvtf_d_x);
+    uint64_t got; std::memcpy(&got, &state_.cpu.v[0], 8);
+    EXPECT_EQ(got, bits(c.d)) << "interp UCVTF d0,x1 x=" << c.x;
+
+    // SCVTF Dd, Xn via interpreter.
+    std::memset(&state_.cpu.v[0], 0, 16);
+    state_.cpu.x[1] = c.x;
+    Interpret(0x9E620000 | (1u << 5) | 0u);  // SCVTF d0, x1
+    std::memcpy(&got, &state_.cpu.v[0], 8);
+    EXPECT_EQ(got, bits(c.d)) << "interp SCVTF d0,x1 x=" << c.x;
+
+    // UCVTF Dd, Xn via JIT (small values encodable with one MOVZ).
+    if (c.x <= 0xFFFF) {
+      static uint32_t code[2];
+      code[0] = MovzX(1, static_cast<uint16_t>(c.x & 0xFFFF));
+      code[1] = ucvtf_d_x;
+      std::memset(&state_.cpu.v[0], 0, 16);
+      if (Run(code, ToGuestAddr(code) + sizeof(code))) {
+        std::memcpy(&got, &state_.cpu.v[0], 8);
+        EXPECT_EQ(got, bits(static_cast<double>(c.x))) << "JIT UCVTF d0,x1 x=" << c.x;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 }  // namespace berberis
