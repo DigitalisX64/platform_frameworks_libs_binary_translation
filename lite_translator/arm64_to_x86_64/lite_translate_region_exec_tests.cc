@@ -42994,6 +42994,30 @@ TEST_F(Arm64RegMappingDifferentialTest, StrtoumaxZeroDoesNotHang) {
   EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "JIT vs interpreter strtoumax result";
 }
 
+// --- Register-offset (extended/shifted) load/store encoders, 64-bit.
+// LDR/STR Xt, [Xn, Xm/Wm, <ext> #3].  AND #0x1F bounds the index for the fuzzer.
+constexpr uint32_t AndImm5(uint8_t rd, uint8_t rn) {  // AND Xd, Xn, #0x1F
+  return 0x92401000 | (rn << 5) | rd;
+}
+constexpr uint32_t LdrXregLsl3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8607800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrXregUxtw3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8605800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrXregSxtw3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF860D800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t StrXregLsl3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8207800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrWregUxtw0(uint8_t rt, uint8_t rn, uint8_t rm) {  // 32-bit, UXTW #0
+  return 0xB8604800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrbWregUxtw(uint8_t rt, uint8_t rn, uint8_t rm) {  // byte, UXTW
+  return 0x38604800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+
 // FCVT precision conversions for the FP differential fuzzer (others pre-exist).
 constexpr uint32_t FcvtSToD(uint8_t d, uint8_t n) { return 0x1E22C000 | (n << 5) | d; }
 constexpr uint32_t FcvtDToS(uint8_t d, uint8_t n) { return 0x1E624000 | (n << 5) | d; }
@@ -43323,6 +43347,77 @@ TEST_F(Arm64RegMappingDifferentialTest, ScalarFpMatchesInterpreter) {
                         (unsigned long long)rh, (unsigned long long)rl);
           regs += buf;
         }
+      }
+      FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
+    }
+  }
+}
+
+// Register-offset (extended/shifted) load/store differential fuzzer. C++ array,
+// std::vector and vtable accesses compile to LDR Xt,[Xn,Xm,LSL#3] /
+// [Xn,Wm,UXTW#3] / SXTW etc.; the extend path (ApplyOffsetExtend) has been a
+// past source of silent address-corruption bugs (Brotli "Bad context map"). Each
+// index is masked (AND #0x1F) right before use so the access stays inside the
+// scratch buffer. JIT vs interpreter, diffing registers + buffer.
+TEST_F(Arm64RegMappingDifferentialTest, RegisterOffsetLoadStoreMatchesInterpreter) {
+  uint64_t rng = 0x0ddba11deadc0de5ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+  };
+  constexpr int kNumRegs = 12;  // x0 = base; x1..x11 general/index
+  constexpr int kIters = 8000;
+  constexpr int kWords = 64;
+
+  for (int iter = 0; iter < kIters; ++iter) {
+    int n = 6 + static_cast<int>(next() % 16);
+    std::vector<uint32_t> code;
+    for (int i = 0; i < n; ++i) {
+      uint8_t rt = 1 + (next() % (kNumRegs - 1));
+      uint8_t idx = 1 + (next() % (kNumRegs - 1));
+      uint8_t rn2 = 1 + (next() % (kNumRegs - 1));
+      uint8_t rm2 = 1 + (next() % (kNumRegs - 1));
+      switch (next() % 9) {
+        case 0: code.push_back(AndImm5(idx, idx)); code.push_back(LdrXregLsl3(rt, 0, idx)); break;
+        case 1: code.push_back(AndImm5(idx, idx)); code.push_back(LdrXregUxtw3(rt, 0, idx)); break;
+        case 2: code.push_back(AndImm5(idx, idx)); code.push_back(LdrXregSxtw3(rt, 0, idx)); break;
+        case 3: code.push_back(AndImm5(idx, idx)); code.push_back(StrXregLsl3(rt, 0, idx)); break;
+        case 4: code.push_back(AndImm5(idx, idx)); code.push_back(LdrWregUxtw0(rt, 0, idx)); break;
+        case 5: code.push_back(AndImm5(idx, idx)); code.push_back(LdrbWregUxtw(rt, 0, idx)); break;
+        case 6: code.push_back(AddRegX(rt, rn2, rm2)); break;
+        case 7: code.push_back(EorRegX(rt, rn2, rm2)); break;
+        default: code.push_back(SubRegX(rt, rn2, rm2)); break;
+      }
+    }
+
+    uint64_t init[32] = {};
+    for (int i = 1; i < kNumRegs; ++i) init[i] = next();
+
+    alignas(16) uint64_t jit_mem[kWords];
+    alignas(16) uint64_t ref_mem[kWords];
+    for (int i = 0; i < kWords; ++i) jit_mem[i] = ref_mem[i] = 0x3333333300000000ULL | (i * 7u);
+
+    auto run = [&](ThreadState* st, uint64_t* mem) {
+      for (int i = 0; i < 32; ++i) st->cpu.x[i] = init[i];
+      st->cpu.x[0] = ToGuestAddr(&mem[16]);
+    };
+
+    ThreadState js{}; run(&js, jit_mem); RunJit(&js, code.data(), code.size());
+    ThreadState rs{}; run(&rs, ref_mem); RunInterp(&rs, code.data(), code.size());
+
+    bool diverged = false;
+    for (int i = 1; i < kNumRegs; ++i) if (js.cpu.x[i] != rs.cpu.x[i]) diverged = true;
+    for (int i = 0; i < kWords; ++i) if (jit_mem[i] != ref_mem[i]) diverged = true;
+    if (diverged) {
+      std::string dump; char buf[64];
+      for (size_t i = 0; i < code.size(); ++i) { std::snprintf(buf, sizeof(buf), "0x%08x ", code[i]); dump += buf; }
+      std::string regs;
+      for (int i = 1; i < kNumRegs; ++i) if (js.cpu.x[i] != rs.cpu.x[i]) {
+        std::snprintf(buf, sizeof(buf), "x%d jit=%016llx ref=%016llx\n", i,
+                      (unsigned long long)js.cpu.x[i], (unsigned long long)rs.cpu.x[i]); regs += buf;
+      }
+      for (int i = 0; i < kWords; ++i) if (jit_mem[i] != ref_mem[i]) {
+        std::snprintf(buf, sizeof(buf), "mem[%d] jit=%016llx ref=%016llx\n", i,
+                      (unsigned long long)jit_mem[i], (unsigned long long)ref_mem[i]); regs += buf;
       }
       FAIL() << "iter=" << iter << " n=" << n << "\nseq: " << dump << "\n" << regs;
     }
