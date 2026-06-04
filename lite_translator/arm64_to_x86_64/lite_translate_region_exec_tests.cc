@@ -98,6 +98,12 @@ constexpr uint8_t kCondGT = 0xC;
 constexpr uint8_t kCondLE = 0xD;
 constexpr uint8_t kCondAL = 0xE;
 
+// LDRB Wt, [Xn, #imm9]!  (pre-index, writeback to Xn)
+constexpr uint32_t LdrbPreX(uint8_t rt, uint8_t rn, int16_t imm9) {
+  return 0x38400C00 | ((static_cast<uint32_t>(imm9) & 0x1FF) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
 // CBZ Xt, offset
 constexpr uint32_t CbzX(uint8_t rt, int32_t offset) {
   uint32_t imm19 = static_cast<uint32_t>(offset / 4) & 0x7FFFF;
@@ -42804,6 +42810,131 @@ TEST_F(Arm64LiteTranslateRegionTest, CcmnDoesNotClobberSourceUnderRegMapping) {
   state_.cpu.x[6] = 7;
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[10], 750ULL);
+}
+
+// Loop differential: each iteration of a guest loop is its own JIT region
+// (backward branches exit the region and re-dispatch), so a guest register
+// modified in the loop body must be written back to ThreadState at the
+// region-exit before the next iteration reloads it. The straight-line fuzzers
+// above cannot exercise this cross-region persistence. This mirrors the
+// strtoumax digit-parse loop where NetEase Cloud Music hung: a pointer advanced
+// by a pre-index load-writeback plus an accumulator updated via umulh/mul.
+TEST_F(Arm64RegMappingDifferentialTest, PointerLoopPersistsAcrossRegions) {
+  // Data the loop walks (x1 reads via ldrb [x1,#1]!).
+  static const uint8_t databuf[64] = {
+      0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+      0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+      0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+      0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00,
+  };
+
+  // loop:
+  //   ldrb w4, [x1, #1]!   ; x1++, w4 = *x1     (pre-index writeback -> x1)
+  //   umulh x5, x3, x2     ; x5 = high(base*acc)
+  //   mul   x2, x3, x2     ; x2 = base*acc       (MUL = MADD with Ra=XZR)
+  //   add   x2, x2, x4     ; acc += byte
+  //   subs  x0, x0, #1     ; counter--, set flags
+  //   b.ne  loop           ; backward branch (exits region, re-dispatch)
+  static const uint32_t code[] = {
+      LdrbPreX(4, 1, 1),
+      UmulhX(5, 3, 2),
+      MaddX(2, 3, 2, 31),
+      AddRegX(2, 2, 4),
+      SubsImmX(0, 0, 1),
+      Bcond(kCondNE, -20),  // back to code[0]
+  };
+
+  auto run = [&](ThreadState* st, bool jit) {
+    for (int i = 0; i < 32; ++i) st->cpu.x[i] = 0;
+    st->cpu.x[0] = 6;                              // 6 iterations
+    st->cpu.x[1] = ToGuestAddr(&databuf[0]);       // pointer (pre-index reads [1..6])
+    st->cpu.x[2] = 0;                              // accumulator
+    st->cpu.x[3] = 16;                             // base
+    if (jit) {
+      RunJit(st, code, std::size(code));
+    } else {
+      RunInterp(st, code, std::size(code));
+    }
+  };
+
+  ThreadState js{};
+  run(&js, true);
+  ThreadState rs{};
+  run(&rs, false);
+
+  // Interpreter is the spec. The loop MUST terminate (x0==0), the pointer MUST
+  // have advanced by 6, and the accumulator MUST match.
+  EXPECT_EQ(rs.cpu.x[0], 0u) << "interpreter loop did not terminate";
+  EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "x0 (counter) JIT vs interp";
+  EXPECT_EQ(js.cpu.x[1], rs.cpu.x[1]) << "x1 (pointer) JIT vs interp — did it advance?";
+  EXPECT_EQ(js.cpu.x[2], rs.cpu.x[2]) << "x2 (accumulator) JIT vs interp";
+  EXPECT_EQ(js.cpu.x[1], ToGuestAddr(&databuf[0]) + 6) << "JIT pointer advanced by 6";
+}
+
+// NetEase Cloud Music login hangs on device with a worker thread spinning 9M+
+// region dispatches at bionic libc strtoumax's digit-parse loop top, parsing the
+// valid null-terminated string "0": the char pointer (x9) reloads ~7 bytes stale
+// each iteration (never reaching the terminator) and the accumulator fills with
+// pointer garbage. The input is valid and the ARM loop is correct, so it is a
+// translator bug in the multi-region loop (an OPEN lead — not the CCMN fix).
+//
+// These are the exact strtoumax bytes from the on-device guest libc.so. NOTE:
+// this isolated harness (single-region chain, allow_dispatch=false) does NOT yet
+// reproduce the device hang — strtoumax("0",16) returns 0 here under both the JIT
+// and the interpreter. The device repro is sensitive to region boundaries / cross
+// -region state this harness doesn't replicate; kept as a faithful starting point
+// and a guard that the isolated codegen stays correct.
+TEST_F(Arm64RegMappingDifferentialTest, StrtoumaxZeroDoesNotHang) {
+  static const uint32_t code[] = {
+      0xa9bf7bfd, 0x910003fd, 0x7100905f, 0x54000268, 0x7100045f, 0x54000220,
+      0x91000409, 0x14000002, 0x91000529, 0x385ff12a, 0x51002548, 0x7100151f,
+      0x54ffff83, 0x7100815f, 0x54ffff40, 0x7100ad5f, 0x540001e0, 0x7100b55f,
+      0x540001c1, 0x3840152a, 0x52800028, 0x1400000c, 0xb4000041, 0xf9000020,
+      0x94019542, 0xaa0003e8, 0x528002c9, 0xaa1f03e0, 0xb9000109, 0xa8c17bfd,
+      0xd65f03c0, 0x3840152a, 0x2a1f03e8, 0x528005eb, 0x6a0b005f, 0x54000221,
+      0x7100c15f, 0x540001e1, 0x3940012a, 0x321b014a, 0x7101e15f, 0x54000141,
+      0x3940052a, 0x5100e94b, 0x31002d7f, 0x5280020b, 0x540003c8, 0x321b014c,
+      0x51019d8c, 0x31001d9f, 0x54000348, 0x5280060a, 0x528007ab, 0x6a0b005f,
+      0x540001e1, 0x7100c15f, 0x540001a1, 0x3940012a, 0x321b014a, 0x7101895f,
+      0x540000a1, 0x3940052a, 0x5100e94b, 0x31002d7f, 0x54000168, 0x5280060a,
+      0x35000182, 0x52800102, 0x1400000a, 0x7100c15f, 0x5280014b, 0x5280010c,
+      0x1a8b018b, 0x350000a2, 0x14000003, 0x5280004b, 0x91000929, 0x2a0b03e2,
+      0xaa1f03eb, 0x2a1f03ed, 0x2a0203ec, 0xd1000529, 0x1280000e, 0x14000003,
+      0x38401d2a, 0x1280000d, 0x5100c14f, 0x710029ff, 0x540000c3, 0x321b014a,
+      0x5101ed4f, 0x310069ff, 0x540002a3, 0x51015d4f, 0x6b0c01ff, 0x5400024a,
+      0x37fffe8d, 0x9bcb7d8a, 0x9b0b7d8b, 0xeb0a03ff, 0x54000080, 0x38401d2a,
+      0x1280000d, 0x17ffffef, 0xab2f416b, 0x1a9f37ea, 0x9340014d, 0xca0a01aa,
+      0xf10001bf, 0xfa40a940, 0x38401d2a, 0x5a8e15cd, 0x17ffffe6, 0xb4000081,
+      0x710001bf, 0x9a890009, 0xf9000029, 0x310005bf, 0x540000a0, 0x7100011f,
+      0xda8b0560, 0xa8c17bfd, 0xd65f03c0, 0x940194df, 0x52800448, 0xb9000008,
+      0x92800000, 0xa8c17bfd,
+  };
+  static const char nptr[] = "0";          // valid, null-terminated
+  static uint64_t stack[256];
+
+  auto run = [&](ThreadState* st, bool jit) {
+    for (int i = 0; i < 32; ++i) st->cpu.x[i] = 0;
+    st->cpu.x[0] = ToGuestAddr(&nptr[0]);   // const char* nptr = "0"
+    st->cpu.x[1] = 0;                        // char** endptr = NULL
+    st->cpu.x[2] = 16;                       // int base = 16
+    st->cpu.sp = ToGuestAddr(&stack[200]);   // valid guest stack
+    GuestAddr ret_sentinel = ToGuestAddr(code) + sizeof(code);
+    st->cpu.x[30] = ret_sentinel;            // final `ret` lands past the code
+    if (jit) {
+      RunJit(st, code, std::size(code));
+    } else {
+      RunInterp(st, code, std::size(code));
+    }
+  };
+
+  ThreadState rs{};
+  run(&rs, false);
+  EXPECT_EQ(rs.cpu.x[0], 0u) << "interpreter: strtoumax(\"0\",,16) should be 0";
+
+  ThreadState js{};
+  run(&js, true);
+  EXPECT_EQ(js.cpu.x[0], 0u) << "JIT: strtoumax(\"0\",,16) — hang/garbage if nonzero";
+  EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "JIT vs interpreter strtoumax result";
 }
 
 }  // namespace
