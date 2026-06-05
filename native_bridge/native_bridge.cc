@@ -44,7 +44,12 @@
 #include <cerrno>
 #include <cstring>
 
+// The in-APK guest-lib extract fallback (ExtractInApkLibToCache, below) is an
+// arm64-guest-only Digitalis feature; libziparchive is only linked into the
+// arm64 native bridge, so keep its header out of the riscv64 build.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 #include "ziparchive/zip_archive.h"
+#endif
 // endregion
 
 #include "berberis/base/algorithm.h"
@@ -182,6 +187,10 @@ bool BerberisNativeBridge::Initialize(std::string* error_msg) {
 // across launches, cleaned up by the OS), so the next launch reuses it.
 // Returns "" if anything fails — caller falls through to its existing
 // host-loader path.
+//
+// arm64-guest only: relies on libziparchive, which is not linked into the
+// riscv64 native bridge. The call site below is guarded by the same macro.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 static std::string ExtractInApkLibToCache(const char* libpath) {
   const char* bang = strstr(libpath, "!/");
   if (bang == nullptr) {
@@ -249,6 +258,7 @@ static std::string ExtractInApkLibToCache(const char* libpath) {
   DIGITALIS_LOG("ExtractInApkLibToCache: %s -> %s", libpath, out_path.c_str());
   return out_path;
 }
+#endif  // defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 // endregion
 
 void* BerberisNativeBridge::LoadLibrary(const char* libpath,
@@ -269,6 +279,7 @@ void* BerberisNativeBridge::LoadLibrary(const char* libpath,
   // Skip the broken guest-linker `!/` attempt entirely and extract first.
   // This also turns the previously-hanging Widgets case into a one-time
   // host-side ZIP extract + a normal cache-path dlopen.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   if (libpath != nullptr && strstr(libpath, "!/") != nullptr) {
     std::string extracted = ExtractInApkLibToCache(libpath);
     if (!extracted.empty()) {
@@ -281,6 +292,7 @@ void* BerberisNativeBridge::LoadLibrary(const char* libpath,
                     extracted.c_str(), cache_err ? cache_err : "(no error)");
     }
   }
+#endif  // defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   // endregion
 
   void* handle = LoadGuestLibrary(libpath, flags, ns);
@@ -526,6 +538,11 @@ extern "C" const char* __progname;
 // has no effect on guest libc: the guest has its own environ pointer
 // initialized from the envp on the guest stack at zygote startup, before
 // the app package is known.
+//
+// arm64-guest only: Qt-for-Android is an arm64 prebuilt-app scenario and this
+// pairs with the libziparchive extract fallback above. The call site in
+// FinalizeInit is guarded by the same macro.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 static void DigitalisInjectQtPluginPath(void* guest_libc,
                                         const BerberisNativeBridge& bridge) {
   const char* private_dir = berberis::GetAppPrivateDir();
@@ -687,6 +704,7 @@ static void DigitalisInjectQtPluginPath(void* guest_libc,
       "QT_PLUGIN_PATH=%s",
       old_count, extra, extract_dir);
 }
+#endif  // defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 // endregion
 
 bool BerberisNativeBridge::FinalizeInit() {
@@ -708,7 +726,9 @@ bool BerberisNativeBridge::FinalizeInit() {
   memcpy(berberis::ToHostAddr<char*>(addr), &__progname, sizeof(__progname));
 
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   DigitalisInjectQtPluginPath(libc, *this);
+#endif  // defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   // endregion
 
   // Now, when guest libc and proxy-libc are loaded,
