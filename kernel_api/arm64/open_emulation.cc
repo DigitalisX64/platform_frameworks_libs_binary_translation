@@ -20,6 +20,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <cstdio>
+#include <string>
+
 #include "berberis/base/tracing.h"
 
 namespace berberis {
@@ -106,6 +109,41 @@ int SwapArchSpecificBits(int flags) {
 }  // namespace
 
 const char* kGuestCpuinfoPath = "/system/etc/cpuinfo.arm64.txt";
+
+std::string FormatGuestCpuinfo(int num_cpus) {
+  if (num_cpus < 1) {
+    num_cpus = 1;
+  }
+  // One block per online CPU, in the ARM64 /proc/cpuinfo field layout the
+  // guest cpuinfo library parses. The feature list is the ARM64 ISA surface
+  // Digitalis translates (matches the HWCAPs the guest sees: LSE 'atomics',
+  // FP16 'fphp'/'asimdhp', RDM 'asimdrdm', LRCPC 'lrcpc', DC CVAP 'dcpop',
+  // dotprod 'asimddp', AES/PMULL/SHA1/SHA2/CRC32). The implementer/part/variant
+  // describe a generic ARMv8 core (0x41 = 'ARM', 0xd05 = Cortex-A55); only the
+  // CPU count is taken from the real device, so a guest sees the emulator's
+  // actual online core count rather than a hard-coded value.
+  std::string out;
+  out.reserve(static_cast<size_t>(num_cpus) * 256);
+  for (int i = 0; i < num_cpus; ++i) {
+    char block[512];
+    int n = snprintf(block, sizeof(block),
+                     "processor\t: %d\n"
+                     "BogoMIPS\t: 38.40\n"
+                     "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 "
+                     "atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n"
+                     "CPU implementer\t: 0x41\n"
+                     "CPU architecture: 8\n"
+                     "CPU variant\t: 0x1\n"
+                     "CPU part\t: 0xd05\n"
+                     "CPU revision\t: 0\n"
+                     "\n",
+                     i);
+    if (n > 0) {
+      out.append(block, static_cast<size_t>(n));
+    }
+  }
+  return out;
+}
 
 int ToHostOpenFlags(int guest_flags) {
   int unknown_guest_flags = guest_flags & ~(kCompatibleOpenFlags | kArchSpecificMask);

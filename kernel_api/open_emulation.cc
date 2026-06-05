@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include "berberis/base/arena_alloc.h"
@@ -239,6 +240,29 @@ const char* TryTranslateProcCpuinfoPath(const char* path, int flags) {
   return nullptr;
 }
 
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// Serve a guest /proc/cpuinfo synthesized from the real online CPU count out of
+// a memfd, instead of opening the static kGuestCpuinfoPath file. This keeps the
+// guest-visible core count in sync with the actual emulator/host CPU config
+// rather than a hard-coded value. Mirrors OpenatProcSelfMapsForGuest's
+// synthesize-into-a-memfd approach.
+int OpenatProcCpuinfoForGuest(int dirfd, int flags, mode_t mode) {
+  long online = sysconf(_SC_NPROCESSORS_ONLN);
+  std::string content = FormatGuestCpuinfo(online > 0 ? static_cast<int>(online) : 1);
+  if (content.empty()) {
+    // Unreachable in practice (FormatGuestCpuinfo always emits >=1 block); fall
+    // back to the static file so behaviour degrades rather than breaks.
+    return openat(dirfd, kGuestCpuinfoPath, flags, mode);
+  }
+  int mem_fd = CreateMemfdOrDie("[guest /proc/cpuinfo]");
+  WriteFullyOrDie(mem_fd, content.c_str(), content.size());
+  lseek(mem_fd, 0, 0);
+  TRACE("Openat for /proc/cpuinfo: synthesized %zu bytes for %ld online cpu(s)",
+        content.size(), online);
+  return mem_fd;
+}
+#endif
+
 }  // namespace
 
 bool IsFileDescriptorEmulatedProcSelfMaps(int fd) {
@@ -264,6 +288,15 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
   if (real_path == nullptr) {
     real_path = TryTranslateProcCpuinfoPath(path, host_flags);
   }
+
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // For the arm64 guest, synthesize /proc/cpuinfo from the real online CPU
+  // count instead of opening the static kGuestCpuinfoPath file. TryTranslate...
+  // returns exactly that sentinel pointer when it matched /proc/cpuinfo.
+  if (real_path == kGuestCpuinfoPath) {
+    return OpenatProcCpuinfoForGuest(dirfd, host_flags, mode);
+  }
+#endif
 
   return openat(dirfd, real_path != nullptr ? real_path : path, host_flags, mode);
 }

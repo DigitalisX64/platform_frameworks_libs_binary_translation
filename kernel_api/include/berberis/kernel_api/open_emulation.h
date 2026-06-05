@@ -25,6 +25,8 @@
 // #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <string>
+
 namespace berberis {
 
 int ToHostOpenFlags(int guest_flags);
@@ -37,6 +39,15 @@ bool IsFileDescriptorEmulatedProcSelfMaps(int fd);
 void CloseEmulatedProcSelfMapsFileDescriptor(int fd);
 
 extern const char* kGuestCpuinfoPath;
+
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// Builds a synthetic guest /proc/cpuinfo for `num_cpus` online CPUs, in the
+// ARM64 field layout the guest's cpuinfo library expects. Defined in the
+// arch-specific arm64/open_emulation.cc; consumed by OpenatForGuest, which
+// serves the result from a memfd instead of opening the static
+// kGuestCpuinfoPath file, so the reported core count tracks the real device.
+std::string FormatGuestCpuinfo(int num_cpus);
+#endif
 
 }  // namespace berberis
 
