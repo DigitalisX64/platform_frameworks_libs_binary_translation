@@ -43557,6 +43557,78 @@ TEST_F(Arm64LiteTranslateRegionTest, IntToDoubleConvertKnownValues) {
   }
 }
 
+// FCSEL with rd aliasing the selected source register must not corrupt the
+// result. Regression for an interpreter bug where V[rd] was zeroed BEFORE the
+// source was read: `fcsel d0, d0, d1, <true cond>` (rd == rn) returned 0
+// instead of d0. This is the exact shape libc strtod's sign-fixup epilogue
+// emits (`fcsel d0, d0, d1, eq`), which made strtod("3.14") return 0.
+TEST_F(Arm64LiteTranslateRegionTest, FcselDestAliasesSourceNotCorrupted) {
+  // FCSEL Dd, Dn, Dm, cond -> 0 0 0 11110 01 1 Rm cond 11 Rn Rd
+  auto fcsel_d = [](uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) -> uint32_t {
+    return 0x1E600C00u | (static_cast<uint32_t>(rm) << 16) |
+           (static_cast<uint32_t>(cond) << 12) | (static_cast<uint32_t>(rn) << 5) | rd;
+  };
+  // FCSEL Sd, Sn, Sm, cond (ftype=00).
+  auto fcsel_s = [](uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) -> uint32_t {
+    return 0x1E200C00u | (static_cast<uint32_t>(rm) << 16) |
+           (static_cast<uint32_t>(cond) << 12) | (static_cast<uint32_t>(rn) << 5) | rd;
+  };
+  constexpr uint8_t kEq = 0;  // Z==1
+  constexpr uint8_t kNe = 1;  // Z==0
+
+  auto set_d = [&](uint8_t idx, double d) {
+    std::memset(&state_.cpu.v[idx], 0, 16);
+    std::memcpy(&state_.cpu.v[idx], &d, 8);
+  };
+  auto get_d = [&](uint8_t idx) {
+    double d;
+    std::memcpy(&d, &state_.cpu.v[idx], 8);
+    return d;
+  };
+  auto set_s = [&](uint8_t idx, float f) {
+    std::memset(&state_.cpu.v[idx], 0, 16);
+    std::memcpy(&state_.cpu.v[idx], &f, 4);
+  };
+  auto get_s = [&](uint8_t idx) {
+    float f;
+    std::memcpy(&f, &state_.cpu.v[idx], 4);
+    return f;
+  };
+
+  // rd == rn, condition TRUE -> must keep V[rn] (the destination's own value).
+  state_.cpu.flags = CPUState::kFlagZero;  // Z=1 -> eq true
+  set_d(0, 3.14);
+  set_d(1, -3.14);
+  uint32_t insn = fcsel_d(0, 0, 1, kEq);  // fcsel d0, d0, d1, eq
+  Interpret(insn);
+  EXPECT_EQ(get_d(0), 3.14);
+
+  // rd == rm, condition FALSE -> must keep V[rm] (the destination's own value).
+  state_.cpu.flags = CPUState::kFlagZero;  // Z=1 -> ne false -> pick rm
+  set_d(0, 7.5);
+  set_d(1, -2.25);
+  insn = fcsel_d(1, 0, 1, kNe);  // fcsel d1, d0, d1, ne  (ne false -> d1)
+  Interpret(insn);
+  EXPECT_EQ(get_d(1), -2.25);
+
+  // Non-aliasing sanity: rd distinct, condition TRUE picks rn.
+  state_.cpu.flags = CPUState::kFlagZero;
+  set_d(0, 1.0);
+  set_d(1, 2.0);
+  set_d(2, 9.0);
+  insn = fcsel_d(2, 0, 1, kEq);  // fcsel d2, d0, d1, eq -> d0
+  Interpret(insn);
+  EXPECT_EQ(get_d(2), 1.0);
+
+  // Single-precision rd == rn aliasing.
+  state_.cpu.flags = CPUState::kFlagZero;
+  set_s(0, 6.25f);
+  set_s(1, -6.25f);
+  insn = fcsel_s(0, 0, 1, kEq);  // fcsel s0, s0, s1, eq
+  Interpret(insn);
+  EXPECT_EQ(get_s(0), 6.25f);
+}
+
 }  // namespace
 
 }  // namespace berberis
