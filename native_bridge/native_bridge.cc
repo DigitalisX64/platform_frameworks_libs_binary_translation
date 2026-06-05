@@ -555,9 +555,22 @@ static void DigitalisInjectQtPluginPath(void* guest_libc,
   if (len <= 0 || len >= static_cast<int>(sizeof(extract_dir))) {
     return;
   }
-  if (access(extract_dir, R_OK | X_OK) != 0) {
-    return;
-  }
+  // This runs at FinalizeInit, BEFORE any app library is extracted to the
+  // cache. On a COLD cache the extract dir does not exist yet, so we must NOT
+  // bail here: the QT_*_PLUGIN_PATH env injection below has to happen on the
+  // first launch too. Without it, Qt's platform-plugin search falls back to
+  // loading the plugin from its in-APK `base.apk!/lib/...` path — a second,
+  // partially-initialised copy of the plugin whose Q_GLOBAL_STATIC mutexes are
+  // null, which then SIGSEGVs on first use. Pointing QT_PLUGIN_PATH /
+  // QT_QPA_PLATFORM_PLUGIN_PATH at the cache dir (where ExtractInApkLibToCache
+  // drops the plugin moments later, by its native arm64-v8a name) makes Qt
+  // find and load the good cache copy instead. Create the dir now so the env
+  // var resolves; the symlink walk below finds nothing on a cold first launch
+  // (it adds the Qt-friendly symlinks on later warm launches once the plugin
+  // is in the cache) — QT_PLUGIN_PATH alone is enough to steer the first
+  // launch to the extracted plugin.
+  mkdir((std::string(private_dir) + "/cache").c_str(), 0700);
+  mkdir(extract_dir, 0700);
 
   // Walk extract dir and add multiple Qt-friendly symlinks for every
   // libplugins_<cat>_<name>_<src-abi>.so found:
