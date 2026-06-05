@@ -58,13 +58,6 @@ cc_defaults {
             ],
             static_libs: [
                 "libprocinfo",
-                // region digitalis: APK extract fallback for in-APK dlopen.
-                // libbase is already pulled in by libberberis_arm64, so we
-                // only need libziparchive (which header-uses libbase) and libz
-                // here.
-                "libziparchive",
-                "libz",
-                // endregion
             ],
         },
     },
@@ -100,6 +93,15 @@ cc_library_static {
     target: {
         android: {
             srcs: ["arm64/native_bridge.cc"],
+            static_libs: [
+                // In-APK guest-lib extract fallback (ExtractInApkLibToCache in
+                // the shared native_bridge.cc) is arm64-guest only and uses
+                // libziparchive. libbase is already pulled in by
+                // libberberis_arm64, so only libziparchive (which header-uses
+                // libbase) and libz are needed here.
+                "libziparchive",
+                "libz",
+            ],
         },
     },
 }
