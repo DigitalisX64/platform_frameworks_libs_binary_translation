@@ -3401,21 +3401,26 @@ class Interpreter {
     CHECK(!exception_raised_);
     bool condition_holds = EvaluateCondition(cond);
     uint8_t src = condition_holds ? rn : rm;
-    state_->cpu.v[rd] = 0;
+    // Read the chosen source value BEFORE clearing V[rd]. FCSEL very commonly
+    // has rd == rn (e.g. `fcsel d0, d0, d1, cond` for conditional negate/abs/
+    // min/max), so zeroing V[rd] first would wipe the source and yield 0.
     if (ftype == 0b00) {
       // Single-precision: copy 32 bits
       uint32_t val;
       memcpy(&val, &state_->cpu.v[src], 4);
+      state_->cpu.v[rd] = 0;
       memcpy(&state_->cpu.v[rd], &val, 4);
     } else if (ftype == 0b01) {
       // Double-precision: copy 64 bits
       uint64_t val;
       memcpy(&val, &state_->cpu.v[src], 8);
+      state_->cpu.v[rd] = 0;
       memcpy(&state_->cpu.v[rd], &val, 8);
     } else if (ftype == 0b11) {
       // half-precision FCSEL.
       uint16_t val;
       memcpy(&val, &state_->cpu.v[src], 2);
+      state_->cpu.v[rd] = 0;
       memcpy(&state_->cpu.v[rd], &val, 2);
     } else {
       Undefined();
