@@ -45,8 +45,11 @@ void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_si
   GuestContext ctx;
   ctx.Save(&state->cpu);
 
-  // region digitalis - capture pre-altstack SP for diagnostics
+  // region digitalis - capture pre-altstack SP for diagnostics (arm64-guest
+  // only; consumed by the forensics TRACE below).
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   uint64_t pre_altstack_sp = GetStackRegister(GetCPUState(*state));
+#endif
   // endregion
 
   // Switch to alternate stack.
@@ -55,6 +58,8 @@ void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_si
   }
 
   // region digitalis - signal-delivery forensics for FB-breakpad and similar
+  // (arm64-guest only).
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   TRACE(
       "berberis: delivering signal %d to handler=%p guest_pc=0x%lx "
       "fault_addr=%p si_code=%d pre_sp=0x%lx post_sp=0x%lx sa_flags=0x%lx",
@@ -66,6 +71,7 @@ void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_si
       (unsigned long)pre_altstack_sp,
       (unsigned long)GetStackRegister(GetCPUState(*state)),
       (unsigned long)sa->sa_flags);
+#endif
   // endregion
   TRACE("delivering signal %d at %p", info->si_signo, ToHostAddr<void>(sa->guest_sa_sigaction));
   // We get here only if guest set a custom signal action, default actions are handled by host.

@@ -19,10 +19,14 @@
 #include <cinttypes>
 #include <string>
 
-// region digitalis - per-DlOpen wall-clock latency + Set/ClearExecutable counters
+// region digitalis - per-DlOpen wall-clock latency + Set/ClearExecutable
+// counters. arm64-guest-only diagnostic for prebuilt-app (Qt6/RN) dlopen-hang
+// triage; riscv64 has no use for it, so keep it out of that build.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 #include <chrono>
 
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
+#endif
 // endregion
 
 #include "berberis/base/tracing.h"
@@ -117,14 +121,19 @@ void* GuestLoader::DlOpenExt(const char* libpath, int flags, const android_dlext
   // Log entry and exit so we see start markers even when the call blocks for
   // long stretches (the trace pull may happen before the call returns).
   // The Set/Clear counts isolate "linker mprotect churn" as a fraction of the
-  // total wall-clock — Qt6Widgets vs Qt6Network etc.
+  // total wall-clock — Qt6Widgets vs Qt6Network etc. arm64-guest only.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   TRACE_AND_ALOGD(
       "berberis: DlOpen ENTER libpath=\"%s\" flags=0x%x",
       libpath ? libpath : "(null)",
       flags);
   GuestMapShadowResetExecutableCounts();
   auto t0 = std::chrono::steady_clock::now();
+#endif
+  // endregion
   auto handle = linker_callbacks_.dlopen_ext_fn_(libpath, flags, extinfo, caller_addr_);
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   auto t1 = std::chrono::steady_clock::now();
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
   auto set_count = GuestMapShadowGetSetExecutableCount();
@@ -136,6 +145,7 @@ void* GuestLoader::DlOpenExt(const char* libpath, int flags, const android_dlext
       (unsigned long long)clear_count,
       libpath ? libpath : "(null)",
       handle);
+#endif
   // endregion
   TRACE("GuestLoader::DlOpen(...) = %p", handle);
   SetDlErrorIfNeeded();
