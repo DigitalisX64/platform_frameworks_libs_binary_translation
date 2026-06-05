@@ -537,6 +537,11 @@ extern "C" const char* __progname;
 // has no effect on guest libc: the guest has its own environ pointer
 // initialized from the envp on the guest stack at zygote startup, before
 // the app package is known.
+//
+// arm64-guest only: Qt-for-Android is an arm64 prebuilt-app scenario and this
+// pairs with the libziparchive extract fallback above. The call site in
+// FinalizeInit is guarded by the same macro.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 static void DigitalisInjectQtPluginPath(void* guest_libc,
                                         const NdktNativeBridge& bridge) {
   const char* private_dir = berberis::GetAppPrivateDir();
@@ -698,6 +703,7 @@ static void DigitalisInjectQtPluginPath(void* guest_libc,
       "QT_PLUGIN_PATH=%s",
       old_count, extra, extract_dir);
 }
+#endif  // defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 // endregion
 
 bool NdktNativeBridge::FinalizeInit() {
@@ -719,7 +725,9 @@ bool NdktNativeBridge::FinalizeInit() {
   memcpy(berberis::ToHostAddr<char*>(addr), &__progname, sizeof(__progname));
 
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   DigitalisInjectQtPluginPath(libc, *this);
+#endif  // defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   // endregion
 
   // Now, when guest libc and proxy-libc are loaded,
