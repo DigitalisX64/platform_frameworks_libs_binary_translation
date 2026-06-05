@@ -67,14 +67,18 @@ bool DoIntervalsIntersect(const void* start,
   return !not_intersect;
 }
 
-// region digitalis - per-thread Set/ClearExecutable counters.
+// region digitalis - per-thread Set/ClearExecutable counters. arm64-guest-only
+// diagnostic consumed by linker_callbacks.cc's DlOpen latency trace.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 thread_local uint64_t g_set_executable_count = 0;
 thread_local uint64_t g_clear_executable_count = 0;
+#endif
 // endregion
 
 }  // namespace
 
 // region digitalis - exposed for DlOpen-scoped diagnosis (see linker_callbacks.cc).
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 uint64_t GuestMapShadowGetSetExecutableCount() {
   return g_set_executable_count;
 }
@@ -85,6 +89,7 @@ void GuestMapShadowResetExecutableCounts() {
   g_set_executable_count = 0;
   g_clear_executable_count = 0;
 }
+#endif
 // endregion
 
 GuestMapShadow* GuestMapShadow::GetInstance() {
@@ -179,7 +184,9 @@ void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
     TRACE("SetExecutable: %zx..%zx", start, start + size);
   }
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   ++g_set_executable_count;
+#endif
   // endregion
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
@@ -194,7 +201,9 @@ void GuestMapShadow::ClearExecutable(GuestAddr start, size_t size) {
     TRACE("ClearExecutable: %zx..%zx", start, start + size);
   }
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   ++g_clear_executable_count;
+#endif
   // endregion
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
