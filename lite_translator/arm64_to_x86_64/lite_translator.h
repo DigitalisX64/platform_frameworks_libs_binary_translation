@@ -698,7 +698,7 @@ class LiteTranslator {
   }
 
   void LoadPair(Decoder::LoadStoreSize size, Register base, int32_t offset,
-                uint8_t rt1, uint8_t rt2, uint8_t scale) {
+                uint8_t rt1, uint8_t rt2, uint8_t scale, bool is_signed) {
     UNUSED(offset);  // Already applied by caller in semantics_player.
     // LDP Xt1, Xt2, [Xn]: when Xt1 (or Xt2) aliases Xn, the
     // ARM64 architecture loads BOTH pair elements using the *original* base
@@ -709,11 +709,11 @@ class LiteTranslator {
     // observed as WhatsApp's libsuperpack.so dispatcher (`ldp x0, x8, [x0];
     // ldr x3, [x8, #0x28]; br x3`) jumping into random xz-compressed bytes.
     // Fix: load both halves into temps first, then commit both via SetReg.
-    Register val1 = Load(size, /*is_signed=*/false, /*is_64bit_target=*/
-                         (size == Decoder::LoadStoreSize::k64bit), base, 0);
+    // LDPSW sign-extends each 32-bit element into its 64-bit target register.
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    Register val1 = Load(size, is_signed, is_64bit_target, base, 0);
     if (!success()) return;
-    Register val2 = Load(size, /*is_signed=*/false, /*is_64bit_target=*/
-                         (size == Decoder::LoadStoreSize::k64bit), base,
+    Register val2 = Load(size, is_signed, is_64bit_target, base,
                          static_cast<int32_t>(scale));
     if (!success()) return;
     if (rt1 != 31) SetReg(rt1, val1);

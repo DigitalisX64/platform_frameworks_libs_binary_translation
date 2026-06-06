@@ -625,6 +625,7 @@ class Decoder {
     bool is_store;
     bool is_preindex;
     bool is_postindex;
+    bool is_signed;     // LDPSW: 32-bit elements sign-extended to 64-bit.
   };
 
   struct LoadStoreRegArgs {
@@ -2989,7 +2990,14 @@ class Decoder {
   }
 
   void DecodeLoadStorePair() {
+    // opc = bits[31:30]: 00=32-bit, 01=LDPSW (load-only, 32-bit element sign-
+    // extended to 64-bit), 10=64-bit. bit31 alone selects the access width; the
+    // low opc bit (bit30) marks the signed-word load. Missing bit30 silently
+    // zero-extends LDPSW — observed as hello-qt's libQt6Gui rasteriser walking a
+    // negative path coordinate (e.g. -96) as +4294967200, blowing a DDA endpoint
+    // up to ~2^26 so the fill loop never converges (blank render).
     bool is_64bit = GetBits<31, 1>();
+    bool opc_low = GetBits<30, 1>();
     uint8_t type = GetBits<23, 2>(); // 01=post-index, 10=signed-offset, 11=pre-index
     bool is_load = GetBits<22, 1>();
     uint32_t imm7 = GetBits<15, 7>();
@@ -3003,6 +3011,7 @@ class Decoder {
 
     bool is_preindex = (type == 0b11);
     bool is_postindex = (type == 0b01);
+    bool is_signed = is_load && !is_64bit && opc_low;  // LDPSW
 
     const LoadStorePairArgs args = {
         .rt1 = rt1,
@@ -3013,6 +3022,7 @@ class Decoder {
         .is_store = !is_load,
         .is_preindex = is_preindex,
         .is_postindex = is_postindex,
+        .is_signed = is_signed,
     };
     insn_consumer_->LoadStorePair(args);
   }

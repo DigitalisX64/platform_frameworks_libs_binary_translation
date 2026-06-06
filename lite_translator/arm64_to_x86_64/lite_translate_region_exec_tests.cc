@@ -42994,6 +42994,110 @@ TEST_F(Arm64RegMappingDifferentialTest, StrtoumaxZeroDoesNotHang) {
   EXPECT_EQ(js.cpu.x[0], rs.cpu.x[0]) << "JIT vs interpreter strtoumax result";
 }
 
+// Floored-division idiom (the exact instruction sequence + encodings the hot
+// loop in libQt6Gui uses, where hello-qt wedges under Berberis even with the
+// JIT disabled). The sequence turns a truncating SDIV into a floored quotient
+// and a non-negative remainder via a sign-mask correction built from
+// `asr #63` shifted-register operands:
+//
+//   sdiv x9, x8, x24            ; q = trunc(a / b)
+//   msub x8, x9, x24, x8        ; r = a - q*b   (sign follows a)
+//   and  x10, x24, x8, asr #63  ; x10 = (r<0) ? b : 0
+//   add  x9,  x9,  x8, asr #63  ; q   = (r<0) ? q-1 : q   (floored quotient)
+//   add  x8,  x10, x8           ; r   = (r<0) ? r+b : r   (floored remainder)
+//
+// Inputs in x8 (dividend a) and x24 (divisor b); outputs x9 (floored quotient)
+// and x8 (floored remainder). The DDA loop that contains this marches a counter
+// by the resulting stride and exits ONLY on exact equality, so a single wrong
+// bit here turns into an infinite loop. Verify interpreter AND JIT against a
+// host int64 reference that mirrors real ARM64 semantics.
+TEST_F(Arm64LiteTranslateRegionTest, FlooredDivisionIdiomMatchesHardware) {
+  static const uint32_t code[] = {
+      0x9ad80d09u,  // sdiv x9, x8, x24
+      0x9b18a128u,  // msub x8, x9, x24, x8
+      0x8a88ff0au,  // and  x10, x24, x8, asr #63
+      0x8b88fd29u,  // add  x9, x9, x8, asr #63
+      0x8b080148u,  // add  x8, x10, x8
+  };
+  struct Case { int64_t a, b; } cases[] = {
+      {7, 3}, {-7, 3}, {8, 3}, {-8, 3}, {6, 3}, {-6, 3},
+      {1, 256}, {-1, 256}, {255, 256}, {-255, 256}, {256, 256},
+      {-100000, 7}, {100000, 7}, {0, 5}, {-1, 1}, {5, 1},
+  };
+  for (auto c : cases) {
+    int64_t q = c.a / c.b;             // C++ truncates toward zero, like SDIV.
+    int64_t r = c.a - q * c.b;
+    int64_t sign = (r >> 63);          // -1 if r<0 else 0 (arithmetic shift).
+    int64_t exp_x10 = c.b & sign;
+    int64_t exp_q = q + sign;
+    int64_t exp_r = exp_x10 + r;
+
+    // Interpreter path (single-step each instruction). Only x8/x24 are read; the
+    // idiom overwrites x9/x10/x8 and reads no flags, so resetting the inputs is
+    // sufficient between cases.
+    {
+      state_.cpu.x[8] = static_cast<uint64_t>(c.a);
+      state_.cpu.x[24] = static_cast<uint64_t>(c.b);
+      for (uint32_t insn : code) Interpret(insn);
+      EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[9]), exp_q)
+          << "INTERP quotient a=" << c.a << " b=" << c.b;
+      EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[8]), exp_r)
+          << "INTERP remainder a=" << c.a << " b=" << c.b;
+    }
+    // JIT path (translate the 5-instruction region and run it).
+    {
+      state_.cpu.x[8] = static_cast<uint64_t>(c.a);
+      state_.cpu.x[24] = static_cast<uint64_t>(c.b);
+      EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+      EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[9]), exp_q)
+          << "JIT quotient a=" << c.a << " b=" << c.b;
+      EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[8]), exp_r)
+          << "JIT remainder a=" << c.a << " b=" << c.b;
+    }
+  }
+}
+
+// LDPSW (load pair of signed words): each 32-bit element is sign-extended to
+// 64 bits — unlike LDP (32-bit), which zero-extends. The decoder previously
+// ignored opc bit30, so LDPSW was decoded as a 32-bit LDP and zero-extended;
+// hello-qt's libQt6Gui rasteriser loaded a negative path coordinate (-96) as
+// +4294967200, which blew a DDA-loop endpoint up to ~2^26 so the fill loop never
+// converged (blank render, even with the JIT disabled). Verify interpreter AND
+// JIT sign-extend.
+TEST_F(Arm64LiteTranslateRegionTest, LdpswSignExtends) {
+  alignas(8) static const int32_t mem[2] = {-96, 64};
+  // ldpsw x1, x2, [x0]   (opc=01, signed offset 0)
+  static const uint32_t code[] = {0x69400000u | (2u << 10) | (0u << 5) | 1u};
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  Interpret(code[0]);
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[1]), int64_t{-96}) << "INTERP rt1";
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[2]), int64_t{64}) << "INTERP rt2";
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[1]), int64_t{-96}) << "JIT rt1";
+  EXPECT_EQ(static_cast<int64_t>(state_.cpu.x[2]), int64_t{64}) << "JIT rt2";
+}
+
+// LDP (32-bit) still zero-extends — guard that the LDPSW fix did not regress the
+// unsigned 32-bit pair load.
+TEST_F(Arm64LiteTranslateRegionTest, Ldp32ZeroExtends) {
+  alignas(8) static const uint32_t mem[2] = {0xFFFFFFA0u, 0x40u};
+  // ldp w1, w2, [x0]   (opc=00, signed offset 0)
+  static const uint32_t code[] = {0x29400000u | (2u << 10) | (0u << 5) | 1u};
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  Interpret(code[0]);
+  EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFA0ull) << "INTERP rt1";
+  EXPECT_EQ(state_.cpu.x[2], 0x40ull) << "INTERP rt2";
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&mem[0]);
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFA0ull) << "JIT rt1";
+  EXPECT_EQ(state_.cpu.x[2], 0x40ull) << "JIT rt2";
+}
+
 // --- Register-offset (extended/shifted) load/store encoders, 64-bit.
 // LDR/STR Xt, [Xn, Xm/Wm, <ext> #3].  AND #0x1F bounds the index for the fuzzer.
 constexpr uint32_t AndImm5(uint8_t rd, uint8_t rn) {  // AND Xd, Xn, #0x1F

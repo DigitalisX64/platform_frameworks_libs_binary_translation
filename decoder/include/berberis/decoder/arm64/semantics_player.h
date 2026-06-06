@@ -212,7 +212,7 @@ class SemanticsPlayer {
       Register data2 = GetRegOrZero(args.rt2);
       listener_->StorePair(args.size, addr, 0, data1, data2, scale);
     } else {
-      listener_->LoadPair(args.size, addr, 0, args.rt1, args.rt2, scale);
+      listener_->LoadPair(args.size, addr, 0, args.rt1, args.rt2, scale, args.is_signed);
     }
 
     // Write back for pre-index and post-index.
