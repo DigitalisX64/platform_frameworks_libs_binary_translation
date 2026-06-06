@@ -420,7 +420,7 @@ class Interpreter {
   }
 
   void LoadPair(Decoder::LoadStoreSize size, Register base, int32_t offset,
-                uint8_t rt1, uint8_t rt2, uint8_t scale) {
+                uint8_t rt1, uint8_t rt2, uint8_t scale, bool is_signed) {
     CHECK(!exception_raised_);
     void* ptr1 = ToHostAddr<void>(base + offset);
     void* ptr2 = ToHostAddr<void>(base + offset + scale);
@@ -430,8 +430,15 @@ class Interpreter {
     FaultyLoadResult fl2 = FaultyLoad(ptr2, data_bytes);
     if (fl2.is_fault) { HandleMemoryFault(base + offset + scale); return; }
 
-    if (rt1 != 31) state_->cpu.x[rt1] = fl1.value;
-    if (rt2 != 31) state_->cpu.x[rt2] = fl2.value;
+    uint64_t v1 = fl1.value;
+    uint64_t v2 = fl2.value;
+    // LDPSW: 32-bit elements sign-extended to the 64-bit target register.
+    if (is_signed) {
+      v1 = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v1)));
+      v2 = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v2)));
+    }
+    if (rt1 != 31) state_->cpu.x[rt1] = v1;
+    if (rt2 != 31) state_->cpu.x[rt2] = v2;
   }
 
   void StorePair(Decoder::LoadStoreSize size, Register base, int32_t offset,
