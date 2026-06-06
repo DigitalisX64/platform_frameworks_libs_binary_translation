@@ -2544,6 +2544,77 @@ TEST_F(Arm64LiteTranslateRegionTest, LdclrClearsBitsX) {
   EXPECT_EQ(state_.cpu.x[1], 0xFFFFFFFF'FFFFFFFFULL);
 }
 
+// Atomic differential fuzzer: drive every LSE atomic through the JIT and the
+// interpreter from an identical (memory, operand) state and diff the resulting
+// memory value AND the destination register (old value). Random values exercise
+// sign/zero-extension and signed-vs-unsigned comparison (LDSMAX vs LDUMAX) that
+// the single-value tests above can't. Qt reference-counts QString/QArrayData via
+// atomic add (LDADD), so a wrong old value silently frees a live object — exactly
+// the kind of heap corruption that only shows up deep in a real app.
+TEST_F(Arm64LiteTranslateRegionTest, AtomicsMatchInterpreter) {
+  uint64_t rng = 0x9e3779b97f4a7c15ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  enum Kind { kRmw, kCas };
+  for (int iter = 0; iter < 8000; ++iter) {
+    uint64_t memval = next();
+    uint64_t rsval = next();
+    uint64_t rtval = next();
+    uint32_t enc = 0;
+    const char* name = "";
+    Kind kind = kRmw;
+    switch (next() % 16) {
+      case 0: enc = LdaddX(0, 1, 2); name = "ldadd x"; break;
+      case 1: enc = LdaddW(0, 1, 2); name = "ldadd w"; break;
+      case 2: enc = LdaddalX(0, 1, 2); name = "ldaddal x"; break;
+      case 3: enc = SwpX(0, 1, 2); name = "swp x"; break;
+      case 4: enc = SwpW(0, 1, 2); name = "swp w"; break;
+      case 5: enc = LdclrX(0, 1, 2); name = "ldclr x"; break;
+      case 6: enc = LdclrW(0, 1, 2); name = "ldclr w"; break;
+      case 7: enc = LdeorX(0, 1, 2); name = "ldeor x"; break;
+      case 8: enc = LdsetX(0, 1, 2); name = "ldset x"; break;
+      case 9: enc = LdsetH(0, 1, 2); name = "ldset h"; break;
+      case 10: enc = LdsmaxX(0, 1, 2); name = "ldsmax x"; break;
+      case 11: enc = LdsmaxW(0, 1, 2); name = "ldsmax w"; break;
+      case 12: enc = LdumaxX(0, 1, 2); name = "ldumax x"; break;
+      case 13: enc = LdumaxB(0, 1, 2); name = "ldumax b"; break;
+      case 14: enc = CasX(0, 1, 2); name = "cas x"; kind = kCas; break;
+      default: enc = CasW(0, 1, 2); name = "cas w"; kind = kCas; break;
+    }
+    // For CAS, make the expected operand match memory ~half the time so the swap
+    // path and the no-swap path are both exercised.
+    if (kind == kCas && (next() & 1)) rsval = memval;
+    const uint32_t code[] = {enc};
+
+    alignas(8) uint64_t mem = memval;
+    state_.cpu.x[0] = rsval;
+    state_.cpu.x[1] = rtval;
+    state_.cpu.x[2] = ToGuestAddr(&mem);
+    ASSERT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code))) << name << " iter=" << iter;
+    uint64_t jit_mem = mem;
+    uint64_t jit_old = (kind == kCas) ? state_.cpu.x[0] : state_.cpu.x[1];
+
+    mem = memval;
+    state_.cpu.x[0] = rsval;
+    state_.cpu.x[1] = rtval;
+    state_.cpu.x[2] = ToGuestAddr(&mem);
+    Interpret(enc);
+    uint64_t interp_mem = mem;
+    uint64_t interp_old = (kind == kCas) ? state_.cpu.x[0] : state_.cpu.x[1];
+
+    EXPECT_EQ(jit_mem, interp_mem)
+        << name << " MEM iter=" << iter << " memval=" << std::hex << memval
+        << " rs=" << rsval;
+    EXPECT_EQ(jit_old, interp_old)
+        << name << " OLD iter=" << iter << " memval=" << std::hex << memval
+        << " rs=" << rsval;
+  }
+}
+
 // LDEOR 64-bit: memory ^= Rs, old → Rt.
 TEST_F(Arm64LiteTranslateRegionTest, LdeorTogglesBitsX) {
   alignas(16) static uint64_t target = 0xAAAAAAAA'AAAAAAAAULL;
