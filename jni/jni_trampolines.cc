@@ -406,6 +406,57 @@ JNIEnv* ToHostJNIEnv(GuestType<JNIEnv*> guest_jni_env) {
   return it->second;
 }
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+// On a real device an app's own native code is implicitly exempt from non-SDK
+// (hidden) API restrictions. Under NativeBridge the guest app's native code is
+// translated guest code, which host ART classifies in a domain the app's
+// exemptions don't cover, so a JNI lookup of a hidden method from guest native
+// code is blocked. Gecko (Firefox) hits exactly this: AndroidBridge::GetMethodID
+// for android.os.MessageQueue.next() returns null and MOZ_CRASH()es the process.
+// Grant the process a blanket hidden-API exemption via host ART's VMRuntime as
+// soon as we have the host JavaVM, mirroring real-device behaviour. Best-effort:
+// any failure is traced and ignored. Called once, under g_jni_guard_mutex.
+void GrantHiddenApiExemptions(JavaVM* host_java_vm) {
+  JNIEnv* env = nullptr;
+  if (host_java_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK ||
+      env == nullptr) {
+    TRACE("GrantHiddenApiExemptions: no host JNIEnv, skipping");
+    return;
+  }
+  jclass vmruntime_class = env->FindClass("dalvik/system/VMRuntime");
+  jmethodID get_runtime =
+      vmruntime_class ? env->GetStaticMethodID(
+                            vmruntime_class, "getRuntime", "()Ldalvik/system/VMRuntime;")
+                      : nullptr;
+  jmethodID set_exemptions =
+      vmruntime_class ? env->GetMethodID(
+                            vmruntime_class, "setHiddenApiExemptions", "([Ljava/lang/String;)V")
+                      : nullptr;
+  jclass string_class = env->FindClass("java/lang/String");
+  if (vmruntime_class == nullptr || get_runtime == nullptr || set_exemptions == nullptr ||
+      string_class == nullptr) {
+    env->ExceptionClear();
+    TRACE("GrantHiddenApiExemptions: VMRuntime API not resolvable, skipping");
+    return;
+  }
+  jobject runtime = env->CallStaticObjectMethod(vmruntime_class, get_runtime);
+  // A single "L" entry matches the prefix of every signature, exempting all.
+  jstring all = env->NewStringUTF("L");
+  jobjectArray exemptions = env->NewObjectArray(1, string_class, all);
+  if (runtime != nullptr && exemptions != nullptr) {
+    env->CallVoidMethod(runtime, set_exemptions, exemptions);
+  }
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    TRACE("GrantHiddenApiExemptions: setHiddenApiExemptions threw, ignoring");
+  } else {
+    TRACE("GrantHiddenApiExemptions: granted blanket hidden-API exemption");
+  }
+}
+#endif
+// endregion
+
 GuestType<JavaVM*> ToGuestJavaVM(JavaVM* host_java_vm) {
   CHECK(host_java_vm);
   if (std::atomic_load_explicit(&g_java_vm_wrapped, std::memory_order_acquire) == 0U) {
@@ -417,6 +468,11 @@ GuestType<JavaVM*> ToGuestJavaVM(JavaVM* host_java_vm) {
   if (g_host_java_vm == nullptr) {
     g_guest_java_vm = *host_java_vm;
     g_host_java_vm = host_java_vm;
+    // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+    GrantHiddenApiExemptions(host_java_vm);
+#endif
+    // endregion
   }
 
   if (g_host_java_vm != host_java_vm) {
