@@ -2615,6 +2615,144 @@ TEST_F(Arm64LiteTranslateRegionTest, AtomicsMatchInterpreter) {
   }
 }
 
+// Integer load differential fuzzer: load from a random buffer through the JIT
+// and the interpreter and diff the destination register (and the writeback
+// register for pre/post-index). Random bytes (high bit often set) exercise the
+// sign/zero-extension of LDRSB/LDRSH/LDRSW and the register-offset extend/shift.
+// hello-qt's QFactoryLoader/compareStrings path is byte/half-load heavy and the
+// follow-on crash bisected to the integer load/store class.
+TEST_F(Arm64LiteTranslateRegionTest, IntLoadsMatchInterpreter) {
+  uint64_t rng = 0x0c0ffee5a5a5f00dULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  alignas(16) static uint8_t buf[64];
+  for (int iter = 0; iter < 12000; ++iter) {
+    for (int i = 0; i < 64; ++i) buf[i] = static_cast<uint8_t>(next());
+    const uint8_t rt = 1, rn = 0, rm = 2;
+    uint16_t uoff = static_cast<uint16_t>(next() % 8);
+    uint64_t rmval = next() % 8;            // small in-bounds index for reg-offset
+    int16_t pre = static_cast<int16_t>(next() % 8);
+    uint32_t enc = 0;
+    const char* name = "";
+    bool writeback = false;
+    (void)rm;
+    (void)rmval;
+    switch (next() % 9) {
+      case 0: enc = LdrbWuoff(rt, rn, uoff); name = "ldrb"; break;
+      case 1: enc = LdrhWuoff(rt, rn, uoff); name = "ldrh"; break;
+      case 2: enc = LdrWuoff(rt, rn, uoff); name = "ldr w"; break;
+      case 3: enc = LdrXuoff(rt, rn, uoff); name = "ldr x"; break;
+      case 4: enc = LdrsbXuoff(rt, rn, uoff); name = "ldrsb x"; break;
+      case 5: enc = LdrshXuoff(rt, rn, uoff); name = "ldrsh x"; break;
+      case 6: enc = LdrswXuoff(rt, rn, uoff); name = "ldrsw x"; break;
+      case 7: enc = LdrbPreX(rt, rn, pre); name = "ldrb pre-index"; writeback = true; break;
+      default: enc = LdrhWuoff(rt, rn, uoff); name = "ldrh2"; break;
+    }
+    const uint32_t code[] = {enc};
+
+    state_.cpu.x[rn] = ToGuestAddr(&buf[0]);
+    state_.cpu.x[rm] = rmval;
+    state_.cpu.x[rt] = 0xdeadbeefdeadbeefULL;
+    ASSERT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code))) << name << " iter=" << iter;
+    uint64_t jit_rt = state_.cpu.x[rt];
+    uint64_t jit_rn = state_.cpu.x[rn];
+
+    state_.cpu.x[rn] = ToGuestAddr(&buf[0]);
+    state_.cpu.x[rm] = rmval;
+    state_.cpu.x[rt] = 0xdeadbeefdeadbeefULL;
+    Interpret(enc);
+    uint64_t interp_rt = state_.cpu.x[rt];
+    uint64_t interp_rn = state_.cpu.x[rn];
+
+    EXPECT_EQ(jit_rt, interp_rt) << name << " RT iter=" << iter;
+    if (writeback) EXPECT_EQ(jit_rn, interp_rn) << name << " RN(writeback) iter=" << iter;
+  }
+}
+
+// Pre/post-index load+store differential fuzzer (all sizes). These have a base
+// writeback the unsigned-offset forms don't; the unsigned-offset fuzzer above
+// never exercises them. The hot loop in hello-qt's compareStrings advances its
+// string cursor with `ldrh w0,[x22],#2` (LDRH post-index), so this is the most
+// likely uncovered integer load/store form.
+constexpr uint32_t LsImmIdx(uint32_t size, uint32_t opc, uint32_t idx, uint8_t rt,
+                            uint8_t rn, int16_t imm9) {
+  // idx bits[11:10]: 00=unscaled (LDUR/STUR, no writeback), 01=post, 11=pre.
+  return (size << 30) | 0x38000000u | (opc << 22) |
+         ((static_cast<uint32_t>(imm9) & 0x1FF) << 12) | (idx << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+TEST_F(Arm64LiteTranslateRegionTest, PrePostIndexMatchesInterpreter) {
+  uint64_t rng = 0x1234abcd5678ef01ULL;
+  auto next = [&rng]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  alignas(16) static uint8_t buf[128];
+  const uint8_t rt = 1, rn = 3;
+  for (int iter = 0; iter < 12000; ++iter) {
+    for (int i = 0; i < 128; ++i) buf[i] = static_cast<uint8_t>(next());
+    uint32_t size = next() % 4;            // 00=b,01=h,10=w,11=x
+    const uint32_t idx_modes[] = {0u, 1u, 3u};  // unscaled, post, pre
+    uint32_t idx = idx_modes[next() % 3];
+    bool pre = (idx == 3);
+    int16_t imm9 = static_cast<int16_t>((next() % 33)) - 16;  // [-16,16]
+    bool is_store = (next() % 3) == 0;
+    uint32_t opc;
+    if (is_store) {
+      opc = 0;  // STR
+    } else {
+      // LDR (01), or for byte/half/word a signed load (10=S64, 11=S32).
+      uint32_t pick = next() % 4;
+      opc = (size == 3) ? 1 : (pick == 0 ? 2 : (pick == 1 ? 3 : 1));
+    }
+    uint32_t enc = LsImmIdx(size, opc, idx, rt, rn, imm9);
+    bool writeback = (idx != 0);
+    const uint32_t code[] = {enc};
+    uint64_t stval = next();
+    // Base points into the middle so base+imm9 and the access stay in bounds.
+    GuestAddr base = ToGuestAddr(&buf[48]);
+
+    auto run = [&](bool jit, uint64_t* out_rt, uint64_t* out_rn, uint64_t* out_mem) {
+      state_.cpu.x[rn] = base;
+      state_.cpu.x[rt] = stval;
+      if (jit) {
+        EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+      } else {
+        Interpret(enc);
+      }
+      *out_rt = state_.cpu.x[rt];
+      *out_rn = state_.cpu.x[rn];
+      // Access address: post-index (idx==1) uses base; unscaled and pre use
+      // base+imm9.
+      uint64_t acc = static_cast<uint64_t>(base) + ((idx == 1) ? 0 : imm9);
+      std::memcpy(out_mem, ToHostAddr<const void>(acc), 8);
+    };
+    // Reset buffer between the two runs so a store comparison is clean.
+    uint8_t saved[128];
+    std::memcpy(saved, buf, 128);
+    uint64_t jr, jn, jm;
+    run(true, &jr, &jn, &jm);
+    std::memcpy(buf, saved, 128);
+    uint64_t ir, in, im;
+    run(false, &ir, &in, &im);
+
+    EXPECT_EQ(jr, ir) << "RT size=" << size << " opc=" << opc << " pre=" << pre
+                      << " imm9=" << imm9 << " store=" << is_store << " iter=" << iter;
+    EXPECT_EQ(jn, in) << "RN(writeback) size=" << size << " pre=" << pre
+                      << " imm9=" << imm9 << " iter=" << iter;
+    if (is_store) {
+      EXPECT_EQ(jm, im) << "MEM size=" << size << " pre=" << pre << " imm9=" << imm9
+                        << " iter=" << iter;
+    }
+  }
+}
+
 // LDEOR 64-bit: memory ^= Rs, old → Rt.
 TEST_F(Arm64LiteTranslateRegionTest, LdeorTogglesBitsX) {
   alignas(16) static uint64_t target = 0xAAAAAAAA'AAAAAAAAULL;
