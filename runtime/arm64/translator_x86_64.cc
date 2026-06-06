@@ -18,11 +18,13 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <tuple>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
+#include "berberis/base/config_globals.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_os_primitives/guest_signal.h"
@@ -77,6 +79,14 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> TryLiteTranslateAn
   // dispatch so regions chain directly through the translation cache instead
   // of returning to the ExecuteGuest loop on every region boundary.
   params.allow_dispatch = true;
+  // Diagnostic knob: BERBERIS_FLAGS=disable-reg-map (or
+  // `setprop berberis.flags disable-reg-map`) turns off cross-instruction
+  // guest->host register mapping so every guest register read/write goes
+  // through ThreadState memory. Mirrors the riscv64 translator; used to bisect
+  // register-mapping codegen bugs from the interpreter-equivalent path.
+  if (IsConfigFlagSet(kDisableRegMap)) {
+    params.enable_reg_mapping = false;
+  }
   auto [success, stop_pc] = TryLiteTranslateRegion(pc, &machine_code, params);
 
   size_t size = stop_pc - pc;
@@ -124,6 +134,22 @@ void TranslateRegion(GuestAddr pc) {
   auto [is_executable, first_insn_size] = IsPcExecutable(pc, guest_map_shadow);
   if (!is_executable) {
     cache->SetTranslatedAndUnlock(pc, entry, first_insn_size, kSpecialHandler, {kEntryNoExec, 0});
+    return;
+  }
+
+  // Diagnostic knob: berberis.mode=interpret-only installs the interpreter for
+  // every region, bypassing the JIT entirely. Mirrors the riscv64 translator's
+  // mode handling; used to bisect whether a wrong-result/hang is a JIT codegen
+  // bug (renders correctly under interpret-only) or lives in the interpreter /
+  // syscall / proxy path (still wrong under interpret-only).
+  static const bool kInterpretOnly = []() {
+    const char* mode = GetTranslationModeConfig();
+    return mode != nullptr && 0 == strcmp(mode, "interpret-only");
+  }();
+  if (kInterpretOnly) {
+    cache->SetTranslatedAndUnlock(pc, entry, first_insn_size, kInterpreted, {kEntryInterpret, 0});
+    g_translation_stats.jit_failures++;
+    g_translation_stats.total_translations++;
     return;
   }
 
