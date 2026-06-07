@@ -324,6 +324,9 @@ class SemanticsPlayer {
 
   void Nop() { listener_->Nop(); }
 
+  // IC IVAU, Xt — invalidate the translation cache for the modified code line.
+  void IcIvau(uint8_t rt) { listener_->IcIvau(rt); }
+
   void Undefined() { listener_->Undefined(); }
 
   // MTE DP-2src: IRG / GMI / SUBP / SUBPS. The listener owns the full
