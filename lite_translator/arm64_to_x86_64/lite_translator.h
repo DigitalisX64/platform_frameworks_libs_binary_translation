@@ -2660,6 +2660,24 @@ class LiteTranslator {
   // Mirror of the interpreter's ExpandSimdModifiedImm — pure function of the
   // (compile-time-known) encoding fields, so the JIT can materialise the full
   // 128-bit MOVI/MVNI value at translation time and emit a constant load.
+  // VFPExpandImm (ARM ARM J1) for FMOV (vector, immediate). Single precision:
+  // float = a : NOT(b) : b*5 : c:d : e:f:g:h:Zeros(19).
+  static uint32_t VFPExpandImm32Jit(uint8_t imm8) {
+    uint32_t sign = (imm8 >> 7) & 1;
+    uint32_t b = (imm8 >> 6) & 1;
+    uint32_t exp = ((1 - b) << 7) | ((b ? 0x1Fu : 0u) << 2) | ((imm8 >> 4) & 0x3u);
+    uint32_t mantissa = static_cast<uint32_t>(imm8 & 0xFu) << 19;
+    return (sign << 31) | (exp << 23) | mantissa;
+  }
+  // Double precision: double = a : NOT(b) : b*8 : c:d : e:f:g:h:Zeros(48).
+  static uint64_t VFPExpandImm64Jit(uint8_t imm8) {
+    uint64_t sign = (imm8 >> 7) & 1;
+    uint64_t b = (imm8 >> 6) & 1;
+    uint64_t exp = ((1 - b) << 10) | ((b ? 0xFFull : 0ull) << 2) | ((imm8 >> 4) & 0x3ull);
+    uint64_t mantissa = static_cast<uint64_t>(imm8 & 0xFull) << 48;
+    return (sign << 63) | (exp << 52) | mantissa;
+  }
+
   static __uint128_t ExpandSimdModifiedImmJit(uint8_t op, uint8_t cmode,
                                               uint8_t abc, uint8_t defgh, bool q) {
     uint8_t imm8 = (abc << 5) | defgh;
@@ -2681,12 +2699,24 @@ class LiteTranslator {
             imm64 = uint64_t{v} | (uint64_t{v} << 32);
           }
           break;
-        case 0b111: for (int i = 0; i < 8; i++) imm64 |= uint64_t{imm8} << (i * 8); break;
+        case 0b111:
+          if (!(cmode & 1)) {
+            // MOVI 8-bit replicated (cmode=0b1110).
+            for (int i = 0; i < 8; i++) imm64 |= uint64_t{imm8} << (i * 8);
+          } else {
+            // FMOV (vector, immediate) single-precision (cmode=0b1111, op=0).
+            uint32_t f = VFPExpandImm32Jit(imm8);
+            imm64 = uint64_t{f} | (uint64_t{f} << 32);
+          }
+          break;
       }
     } else {
       if (cmode == 0b1110) {
         for (int i = 0; i < 8; i++)
           if (imm8 & (1 << i)) imm64 |= 0xFFULL << (i * 8);
+      } else if (cmode == 0b1111) {
+        // FMOV (vector, immediate) double-precision (op=1, cmode=0b1111).
+        imm64 = VFPExpandImm64Jit(imm8);
       } else {
         return ~ExpandSimdModifiedImmJit(0, cmode, abc, defgh, q);
       }
