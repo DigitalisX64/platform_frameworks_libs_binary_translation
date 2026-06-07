@@ -17,6 +17,16 @@
 #include "berberis/proxy_loader/proxy_library_builder.h"
 
 #include <dlfcn.h>
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#endif
+// endregion
 
 #include <cstring>
 
@@ -68,6 +78,59 @@ const KnownTrampoline* FindExtraTrampoline(const char* library_name, const char*
     }
   }
   return nullptr;
+}
+
+// Current protection (PROT_* mask) of the mapping containing `addr`, or -1 if
+// unknown. Parses /proc/self/maps; only called on the cold variable-interception
+// path, so the scan cost is irrelevant.
+int GuestPageProt(const void* addr) {
+  FILE* f = fopen("/proc/self/maps", "re");
+  if (f == nullptr) {
+    return -1;
+  }
+  uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+  char line[512];
+  int prot = -1;
+  while (fgets(line, sizeof(line), f) != nullptr) {
+    uintptr_t start = 0, end = 0;
+    char r = '-', w = '-', x = '-', p = '-';
+    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %c%c%c%c", &start, &end, &r, &w, &x, &p) == 6 &&
+        a >= start && a < end) {
+      prot = 0;
+      if (r == 'r') prot |= PROT_READ;
+      if (w == 'w') prot |= PROT_WRITE;
+      if (x == 'x') prot |= PROT_EXEC;
+      break;
+    }
+  }
+  fclose(f);
+  return prot;
+}
+
+// Store `size` bytes from `src` into the guest destination `dst`. A proxied
+// variable's guest slot (an imported-variable GOT entry in .data.rel.ro) can
+// already be GNU-RELRO read-only by the time this interception runs — the guest
+// linker mprotects it after relocation — so a plain store faults SEGV_ACCERR
+// (observed crashing Baidu Maps sub-processes at libmediandk/libc variable
+// slots; /proc/self/mem FOLL_FORCE writes are also refused on the relro page).
+// If the destination page is currently non-writable, temporarily restore write
+// access, store, and re-apply the EXACT original protection — never leave a
+// pre-relro writable page read-only, which would break the guest linker's later
+// relocations into the same page. Reached only under InterceptGuestSymbol's mutex.
+void StoreGuestVariable(void* dst, const void* src, size_t size) {
+  int prot = GuestPageProt(dst);
+  if (prot >= 0 && !(prot & PROT_WRITE)) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    uintptr_t a = reinterpret_cast<uintptr_t>(dst);
+    void* page = reinterpret_cast<void*>(a & ~(page_size - 1));
+    size_t span = (a + size) - reinterpret_cast<uintptr_t>(page);
+    if (mprotect(page, span, prot | PROT_WRITE) == 0) {
+      memcpy(dst, src, size);
+      mprotect(page, span, prot);
+      return;
+    }
+  }
+  memcpy(dst, src, size);
 }
 
 }  // namespace
@@ -174,8 +237,19 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
       if (!addr) {
         TRACE("proxy library \"%s\": symbol for variable \"%s\" is NULL", library_name_, name);
       } else {
+        // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+        // The guest variable slot may already be GNU-RELRO read-only by now; a
+        // plain store faults SEGV_ACCERR. Write via /proc/self/mem to bypass page
+        // write protection. See StoreGuestVariable.
+        StoreGuestVariable(ToHostAddr<void>(guest_addr), addr, sizeof(GuestAddr));
+#else
+        // endregion
         // TODO(b/287342829): copy variable.size bytes instead!
         memcpy(ToHostAddr<void>(guest_addr), addr, sizeof(GuestAddr));
+        // region digitalis
+#endif
+        // endregion
       }
       return;
     }
