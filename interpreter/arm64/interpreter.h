@@ -35,6 +35,7 @@
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/kernel_api/run_guest_syscall.h"
 #include "berberis/runtime_primitives/interpret_helpers.h"
+#include "berberis/runtime_primitives/runtime_library.h"
 
 namespace berberis {
 
@@ -3309,6 +3310,20 @@ class Interpreter {
   }
 
   void Nop() {}
+
+  // IC IVAU, Xt — Instruction Cache Invalidate by VA. ARM64 user-space JITs
+  // (e.g. PCRE2/sljit) issue this after writing new code at a (possibly reused)
+  // address. Invalidate the translation cache for that cache line so the next
+  // execution re-translates the new code instead of running a stale translation.
+  void IcIvau(uint8_t rt) {
+    if (rt == 31) {
+      return;
+    }
+    constexpr uint64_t kCacheLine = 64;
+    GuestAddr addr = state_->cpu.x[rt];
+    GuestAddr line = addr & ~(kCacheLine - 1);
+    InvalidateGuestRange(line, line + kCacheLine);
+  }
 
   void Undefined() {
     UndefinedInsn(GetInsnAddr());

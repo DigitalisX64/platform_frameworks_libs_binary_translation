@@ -1521,6 +1521,14 @@ class LiteTranslator {
 
   void Nop() {}
 
+  // IC IVAU, Xt — invalidate the translation cache for self-modified code. The
+  // address is only known at run time, so end the region here and let the
+  // interpreter perform the invalidation (see Interpreter::IcIvau).
+  void IcIvau(uint8_t rt) {
+    UNUSED(rt);
+    success_ = false;
+  }
+
   void Undefined() { success_ = false; }
 
   // MTE DP-2src (IRG/GMI/SUBP/SUBPS): bail to the interpreter. These

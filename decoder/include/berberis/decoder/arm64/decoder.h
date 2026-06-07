@@ -2395,8 +2395,20 @@ class Decoder {
     }
 
     // SYS instructions (op0=01): cache maintenance (DC, IC), TLB ops, etc.
-    // Safe to treat as NOP in interpreter.
     if (op0 == 0b01 && l == 0) {
+      // IC IVAU, Xt — Instruction Cache Invalidate by VA to Point of Unification
+      // (op1=011, CRn=0111, CRm=0101, op2=001). This is how ARM64 user-space
+      // signals self-modified code: a JIT (e.g. PCRE2/sljit) writes new code and
+      // issues IC IVAU per cache line. A binary translator MUST invalidate its
+      // translation cache for that address, otherwise it keeps running a stale
+      // translation of the previous code. (On riscv64 the equivalent is the
+      // riscv_flush_icache syscall; ARM64 has no such syscall.) All other cache
+      // maintenance (DC, IC IALLU, TLB) is safe to NOP for a shared-memory
+      // in-process translator.
+      if (op1 == 0b011 && crn == 0b0111 && crm == 0b0101 && op2 == 0b001) {
+        insn_consumer_->IcIvau(rt);
+        return;
+      }
       insn_consumer_->Nop();
       return;
     }
