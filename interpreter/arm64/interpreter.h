@@ -10167,6 +10167,26 @@ class Interpreter {
     return result;
   }
 
+  // VFPExpandImm for 32-bit single precision (ARM ARM J1: VFPExpandImm).
+  // imm8 = a:b:c:d:e:f:g:h. float = a : NOT(b) : b*5 : c:d : e:f:g:h:Zeros(19).
+  static uint32_t VFPExpandImm32(uint8_t imm8) {
+    uint32_t sign = (imm8 >> 7) & 1;
+    uint32_t b = (imm8 >> 6) & 1;
+    uint32_t exp = ((1 - b) << 7) | ((b ? 0x1Fu : 0u) << 2) | ((imm8 >> 4) & 0x3u);
+    uint32_t mantissa = static_cast<uint32_t>(imm8 & 0xFu) << 19;
+    return (sign << 31) | (exp << 23) | mantissa;
+  }
+
+  // VFPExpandImm for 64-bit double precision.
+  // double = a : NOT(b) : b*8 : c:d : e:f:g:h:Zeros(48).
+  static uint64_t VFPExpandImm64(uint8_t imm8) {
+    uint64_t sign = (imm8 >> 7) & 1;
+    uint64_t b = (imm8 >> 6) & 1;
+    uint64_t exp = ((1 - b) << 10) | ((b ? 0xFFull : 0ull) << 2) | ((imm8 >> 4) & 0x3ull);
+    uint64_t mantissa = static_cast<uint64_t>(imm8 & 0xFull) << 48;
+    return (sign << 63) | (exp << 52) | mantissa;
+  }
+
   __uint128_t ExpandSimdModifiedImm(uint8_t op, uint8_t cmode, uint8_t abc, uint8_t defgh, bool q) {
     uint8_t imm8 = (abc << 5) | defgh;
     uint64_t imm64 = 0;
@@ -10205,11 +10225,13 @@ class Interpreter {
           break;
         case 0b111:
           if (!(cmode & 1)) {
-            // 8-bit, replicated
+            // 8-bit, replicated (MOVI, cmode=0b1110)
             for (int i = 0; i < 8; i++) imm64 |= static_cast<uint64_t>(imm8) << (i * 8);
           } else {
-            // FMOV (immediate) - skip for now
-            for (int i = 0; i < 8; i++) imm64 |= static_cast<uint64_t>(imm8) << (i * 8);
+            // FMOV (vector, immediate) single-precision (cmode=0b1111, op=0).
+            // Expand imm8 to a 32-bit float and replicate across 32-bit lanes.
+            uint32_t f = VFPExpandImm32(imm8);
+            imm64 = static_cast<uint64_t>(f) | (static_cast<uint64_t>(f) << 32);
           }
           break;
       }
@@ -10222,6 +10244,10 @@ class Interpreter {
             imm64 |= 0xFFULL << (i * 8);
           }
         }
+      } else if (cmode == 0b1111) {
+        // FMOV (vector, immediate) double-precision (op=1, cmode=0b1111).
+        // Expand imm8 to a 64-bit double; the element is 64-bit (.2d).
+        imm64 = VFPExpandImm64(imm8);
       } else {
         // MVNI variants (op=1, cmode != 1110): NOT of the MOVI value
         // Reuse op=0 decode then invert

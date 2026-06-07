@@ -3727,6 +3727,58 @@ TEST_F(Arm64LiteTranslateRegionTest, BicImm2S_Interpreter_ZeroesUpper) {
   EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
 }
 
+// Regression: FMOV (vector, immediate) must expand imm8 via VFPExpandImm, not
+// byte-replicate it. fmov v0.4s, #1.0 (imm8=0x70) -> 0x3F800000 per lane. A
+// byte-replicate bug yields 0x70707070 (~2.97e29f), which corrupts floorf()/
+// area math and made Unity (Crossy Road) compute a garbage allocation size.
+TEST_F(Arm64LiteTranslateRegionTest, FmovImm4S_One_Jit) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {0x4f03f600u};  // fmov v0.4s, #1.0
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x3F8000003F800000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x3F8000003F800000ULL);
+}
+
+// fmov v0.4s, #-1.0 (imm8=0xF0) -> 0xBF800000 per lane (sign bit set).
+TEST_F(Arm64LiteTranslateRegionTest, FmovImm4S_NegOne_Jit) {
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {0x4f07f600u};  // fmov v0.4s, #-1.0
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0xBF800000BF800000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0xBF800000BF800000ULL);
+}
+
+// fmov v0.4s, #1.0 via the interpreter (the shared decoder path the bug lived on).
+TEST_F(Arm64LiteTranslateRegionTest, FmovImm4S_One_Interpreter) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {0x4f03f600u};  // fmov v0.4s, #1.0
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x3F8000003F800000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x3F8000003F800000ULL);
+}
+
+// fmov v0.2d, #1.0 (op=1, cmode=0b1111): 64-bit-lane double -> 0x3FF0000000000000.
+TEST_F(Arm64LiteTranslateRegionTest, FmovImm2D_One_Jit) {
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {0x6f03f600u};  // fmov v0.2d, #1.0
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x3FF0000000000000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x3FF0000000000000ULL);
+}
+
+// fmov v0.2d, #1.0 via the interpreter.
+TEST_F(Arm64LiteTranslateRegionTest, FmovImm2D_One_Interpreter) {
+  state_.cpu.v[0] = 0;
+  static const uint32_t code[] = {0x6f03f600u};  // fmov v0.2d, #1.0
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);
+  EXPECT_EQ(state_.cpu.insn_addr, ToGuestAddr(code) + 4);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0]), 0x3FF0000000000000ULL);
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0x3FF0000000000000ULL);
+}
+
 // SQABS scalar: signed saturating absolute value, single-lane.
 // Encoding: AdvSimd scalar two-reg-misc with U=0, opcode=00111.
 // llvm-mc-21 checks at decoder.h:5398:
