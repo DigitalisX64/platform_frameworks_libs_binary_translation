@@ -424,19 +424,40 @@ void GrantHiddenApiExemptions(JavaVM* host_java_vm) {
     TRACE("GrantHiddenApiExemptions: no host JNIEnv, skipping");
     return;
   }
+  // Clear any pending exception after EACH JNI lookup before making the next
+  // JNI call. On a target-SDK-35 app whose calling context host ART attributes
+  // to the app domain (e.g. bugsnag's NativeBridge on the stack), the
+  // GetMethodID for the core-platform method setHiddenApiExemptions is denied
+  // by hidden-API enforcement: it returns nullptr AND leaves a pending
+  // NoSuchMethodError. Making any further JNI call (the FindClass below, or a
+  // class resolution it triggers) while that exception is pending makes host
+  // ART abort with "No pending exception expected". Clearing after every lookup
+  // keeps this best-effort path able to bail cleanly instead of crashing the
+  // process.
   jclass vmruntime_class = env->FindClass("dalvik/system/VMRuntime");
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+  jclass string_class = env->FindClass("java/lang/String");
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
   jmethodID get_runtime =
       vmruntime_class ? env->GetStaticMethodID(
                             vmruntime_class, "getRuntime", "()Ldalvik/system/VMRuntime;")
                       : nullptr;
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
   jmethodID set_exemptions =
       vmruntime_class ? env->GetMethodID(
                             vmruntime_class, "setHiddenApiExemptions", "([Ljava/lang/String;)V")
                       : nullptr;
-  jclass string_class = env->FindClass("java/lang/String");
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
   if (vmruntime_class == nullptr || get_runtime == nullptr || set_exemptions == nullptr ||
       string_class == nullptr) {
-    env->ExceptionClear();
     TRACE("GrantHiddenApiExemptions: VMRuntime API not resolvable, skipping");
     return;
   }
