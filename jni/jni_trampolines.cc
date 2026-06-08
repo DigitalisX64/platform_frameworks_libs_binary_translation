@@ -345,9 +345,35 @@ void WrapJavaVM(void* java_vm) {
                        "JavaVM::AttachCurrentThreadAsDaemon");
 }
 
-// We set this to 1 when host JNIEnv/JavaVM functions are wrapped.
-std::atomic<uint32_t> g_jni_env_wrapped = {0};
+// We set this to 1 when host JavaVM functions are wrapped.
 std::atomic<uint32_t> g_java_vm_wrapped = {0};
+
+// region digitalis
+// Wrap each distinct host JNIEnv function table exactly once, keyed by the
+// JNINativeInterface* the env points at. A single process-global "wrapped once"
+// flag is insufficient for a guest that hosts more than one Java runtime /
+// function table: Chromium's sandboxed renderer is forked from its own
+// app-zygote and runs with a FRESH host JNIEnv whose table was never registered
+// as guest trampolines, and an inherited global flag then suppresses wrapping.
+// The renderer's first JNI call (NewStringUTF) then branches straight into host
+// libart and trips berberis_HandleNoExec (SIGSEGV). Observed with Brave's
+// sandboxed renderer. WrapJNIEnv (-> MakeTrampolineCallable) is idempotent per
+// host function address, so wrapping additional tables only registers new
+// addresses.
+std::mutex g_jni_wrap_mutex;
+
+void WrapJNIEnvTableOnce(JNIEnv* host_jni_env) {
+  if (host_jni_env == nullptr) {
+    return;
+  }
+  static auto* g_wrapped_jni_tables = new std::map<const void*, char>();
+  const void* table = *reinterpret_cast<const void* const*>(host_jni_env);
+  std::lock_guard<std::mutex> lock(g_jni_wrap_mutex);
+  if (g_wrapped_jni_tables->emplace(table, 0).second) {
+    WrapJNIEnv(host_jni_env);
+  }
+}
+// endregion
 
 }  // namespace
 
@@ -355,17 +381,12 @@ GuestType<JNIEnv*> ToGuestJNIEnv(JNIEnv* host_jni_env) {
   if (!host_jni_env) {
     return 0;
   }
-  // We need to wrap host JNI functions only once. We use an atomic variable
-  // to guard this initialization. Since we use very simple logic without
-  // waiting here, multiple threads can wrap host JNI functions simultaneously.
-  // This is OK since wrapping is thread-safe and later wrappings override
-  // previous ones atomically.
-  // TODO(halyavin) Consider creating a general mechanism for thread-safe
-  // initialization with parameters, if we need it in more than one place.
-  if (std::atomic_load_explicit(&g_jni_env_wrapped, std::memory_order_acquire) == 0U) {
-    WrapJNIEnv(host_jni_env);
-    std::atomic_store_explicit(&g_jni_env_wrapped, 1U, std::memory_order_release);
-  }
+  // region digitalis
+  // Wrap this host env's JNINativeInterface table the first time we see it.
+  // Per-table (not a single process-global flag) so a second Java runtime's
+  // fresh table — e.g. Chromium's forked sandboxed renderer — is wrapped too.
+  WrapJNIEnvTableOnce(host_jni_env);
+  // endregion
 
   std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
   pid_t thread_id = GettidSyscall();
