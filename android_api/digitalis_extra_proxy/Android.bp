@@ -36,9 +36,13 @@ cc_library_static {
         "berberis_arm64_defaults",
     ],
     header_libs: [
+        "libberberis_base_headers",
         "libberberis_guest_abi_arm64_headers",
+        "libberberis_guest_loader_headers",
+        "libberberis_guest_state_headers",
         "libberberis_jni_headers",
         "libberberis_proxy_loader_headers",
+        "libberberis_runtime_primitives_headers",
         "jni_headers",
     ],
     srcs: [
@@ -46,6 +50,7 @@ cc_library_static {
         "digitalis_extra_libm_trampolines.cc",
         "digitalis_extra_libnativehelper_trampolines.cc",
         "digitalis_extra_libbinder_ndk_trampolines.cc",
+        "digitalis_host_call_redirect.cc",
     ],
     // Sources are #ifdef'd on __x86_64__ so non-x86_64 builds get an
     // empty static lib.

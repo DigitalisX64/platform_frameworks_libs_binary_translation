@@ -66,6 +66,18 @@ struct GuestArgumentBuffer;
 void RunGuestCall(GuestAddr pc, GuestArgumentBuffer* buf);
 void ExecuteGuestCall(ThreadState* state);
 
+// region digitalis
+// Optional hook invoked by berberis_HandleNoExec before it raises SIGSEGV. A
+// higher layer that can resolve guest symbols may register a handler which
+// services the fault — e.g. redirecting a guest call that landed in a host
+// system library (because a hardened library resolved a host symbol from
+// /proc/self/maps and called it directly, bypassing the loader) to the guest's
+// own translatable counterpart of that library — and return true to resume the
+// guest. Returning false, or registering no hook, delivers the default SIGSEGV.
+using HandleNoExecHook = bool (*)(ThreadState* state);
+void SetHandleNoExecHook(HandleNoExecHook hook);
+// endregion
+
 }  // namespace berberis
 
 #endif  // BERBERIS_RUNTIME_PRIMITIVES_RUNTIME_LIBRARY_H_

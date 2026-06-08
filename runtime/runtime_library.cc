@@ -26,6 +26,16 @@
 
 namespace berberis {
 
+// region digitalis
+namespace {
+HandleNoExecHook g_handle_no_exec_hook = nullptr;
+}  // namespace
+
+void SetHandleNoExecHook(HandleNoExecHook hook) {
+  g_handle_no_exec_hook = hook;
+}
+// endregion
+
 // ATTENTION: this symbol gets called directly, without PLT. To keep text
 // sharable we should prevent preemption of this symbol, so do not export it!
 // TODO(b/232598137): may be set default visibility to protected instead?
@@ -41,6 +51,14 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleN
   TRACE("Trying to execute non-executable code at %p called from %p",
         ToHostAddr<void>(GetInsnAddr(cpu)),
         ToHostAddr<void>(GetLinkRegister(cpu)));
+  // region digitalis
+  // Give a registered handler a chance to service this fault (e.g. redirect a
+  // guest call that landed in a host system library to the guest's own
+  // translatable copy) and resume instead of crashing the guest.
+  if (g_handle_no_exec_hook != nullptr && g_handle_no_exec_hook(state)) {
+    return;
+  }
+  // endregion
   siginfo_t info{};
   info.si_signo = SIGSEGV;
   info.si_code = SEGV_ACCERR;
