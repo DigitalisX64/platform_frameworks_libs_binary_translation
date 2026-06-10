@@ -135,6 +135,17 @@ int GuestFcntl(int fd, int cmd, long arg_3) {
       }
       return ToGuestOpenFlags(result);
     }
+    // region digitalis
+#if defined(F_SETPIPE_SZ) && defined(F_GETPIPE_SZ)
+    case F_SETPIPE_SZ:
+    case F_GETPIPE_SZ:
+      // Pipe buffer sizing takes a plain int argument and the command values
+      // (1031/1032) are identical across guest and host, so pass through.
+      // bionic's debuggerd_handler issues F_SETPIPE_SZ while dumping a crashed
+      // process; returning ENOSYS here broke tombstones for guest crashes.
+      return fcntl(fd, cmd, arg_3);
+#endif
+    // endregion digitalis
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
     case F_SETFD:

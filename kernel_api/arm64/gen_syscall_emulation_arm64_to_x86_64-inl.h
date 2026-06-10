@@ -53,7 +53,8 @@ long RunGuestSyscallImpl(long guest_nr,
       // /proc/self/maps emulation
       return RunGuestSyscall___NR_close(arg_1);
     case 436:  // __NR_close_range
-      return syscall(436, arg_1, arg_2, arg_3);
+      // host fdsan-owner-aware emulation
+      return RunGuestSyscall___NR_close_range(arg_1, arg_2, arg_3);
     case 203:  // __NR_connect
       return syscall(42, arg_1, arg_2, arg_3);
     case 285:  // __NR_copy_file_range
@@ -63,7 +64,8 @@ long RunGuestSyscallImpl(long guest_nr,
     case 23:  // __NR_dup
       return syscall(32, arg_1);
     case 24:  // __NR_dup3
-      return syscall(292, arg_1, arg_2, arg_3);
+      // host fdsan-owner-aware emulation
+      return RunGuestSyscall___NR_dup3(arg_1, arg_2, arg_3);
     case 20:  // __NR_epoll_create1
       return syscall(291, arg_1);
     case 21:  // __NR_epoll_ctl
