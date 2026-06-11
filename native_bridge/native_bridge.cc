@@ -47,6 +47,7 @@
 // arm64 native bridge, so keep its header out of the riscv64 build.
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 #include "ziparchive/zip_archive.h"
+#include <android/fdsan.h>
 #endif
 // endregion
 
@@ -802,6 +803,27 @@ bool native_bridge_initialize(const android::NativeBridgeRuntimeCallbacks* runti
   g_runtime_callbacks = runtime_cbs;
   SetAppPropertiesFromCodeCachePath(private_dir);
   berberis::InitBerberis();
+
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // bionic's fdsan enforces, per host file descriptor, that the object holding
+  // it (a unique_fd, Parcel, Fence, DIR*, …) is the one that closes it. That
+  // invariant assumes a single party owns the fd table. Under translation the
+  // table is shared between host code and the guest, which issues raw close /
+  // close_range / dup3 syscalls (often aggressively, e.g. anti-tamper SDKs
+  // sweeping every fd) and so can close, replace, or reuse an fd a live host
+  // object still owns. The kernel-level syscall does not update the host
+  // fdsan owner table, so the host object's eventual close trips fdsan and a
+  // FATAL level aborts the whole process. The per-syscall emulation
+  // (RunGuestSyscall___NR_close / _close_range / _dup3) already avoids
+  // destroying live host-owned fds, but it cannot close every race or
+  // host-internal path. Demote fdsan to warn-once for the guest process so a
+  // genuine cross-boundary ownership mismatch logs instead of killing the app
+  // — matching the non-FATAL default real Android apps run with, while keeping
+  // the diagnostic. Host-only proxy bugs still surface as the logged warning.
+  android_fdsan_set_error_level(ANDROID_FDSAN_ERROR_LEVEL_WARN_ONCE);
+#endif
+  // endregion
 
   char version[PROP_VALUE_MAX];
   if (__system_property_get("ro.berberis.version", version)) {

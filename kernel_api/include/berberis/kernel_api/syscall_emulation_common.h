@@ -26,7 +26,14 @@
 
 // region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+#include <fcntl.h>
+#include <sys/resource.h>
+
 #include <android/fdsan.h>
+
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
 #endif
 // endregion
 
@@ -62,23 +69,113 @@ inline long RunGuestSyscall___NR_close(long arg_1) {
 #else
   CloseEmulatedProcSelfMapsFileDescriptor(arg_1);
   // region digitalis
-  // Route guest close() through host libc's android_fdsan_close_with_tag using
-  // the fd's current owner tag instead of a raw close syscall. A raw syscall
-  // closes the kernel fd but leaves the host libc fdsan owner tag table entry
-  // intact. When the kernel later reuses that fd value for a host open() (e.g.
-  // TinyLoader::OpenFile during ResetAllExecRegions in CloneGuestThread), the
-  // first host-side close on the new fd hits a stale tag and fdsan aborts
-  // ("expected to be unowned, actually owned by unique_fd 0x..."). Only needed
-  // for arm64 guest on Android (riscv64 guest doesn't hit this path yet).
+  // A guest close() arrives here as a raw syscall, but the host libc keeps an
+  // fdsan owner-tag table for this process that raw closes corrupt or trip
+  // over, so the host tag state must be reconciled by hand. Three cases:
+  //  - No host owner tag on the fd: plain raw close. An already-closed fd
+  //    stays a silent EBADF exactly like hardware. (Routing through
+  //    android_fdsan_close_with_tag here aborts with "double-close of file
+  //    descriptor N detected" when the fd is already closed — that abort took
+  //    down apps whose bundled SDKs double-close via raw syscalls.)
+  //  - Tagged but already closed: the tag is a stale leftover from an earlier
+  //    raw close. Scrub it with android_fdsan_exchange_owner_tag (which has no
+  //    error path) so a later host open() landing on this fd number isn't
+  //    poisoned (e.g. TinyLoader::OpenFile during CloneGuestThread aborted on
+  //    such a stale Parcel tag), then raw-close.
+  //  - Tagged and still open: a live host object (Fence, Parcel, unique_fd)
+  //    owns this fd. Closing it would yank the fd out from under the host
+  //    owner and make its eventual close abort ("expected to be owned by ...,
+  //    actually unowned" in Fence::~Fence on the BLASTBufferQueue release
+  //    path). Report success without closing and leave the close to the real
+  //    owner.
+  // Only needed for arm64 guest on Android (riscv64 guest doesn't hit this
+  // path yet).
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
   uint64_t tag = android_fdsan_get_owner_tag(arg_1);
-  return android_fdsan_close_with_tag(arg_1, tag);
+  if (tag != 0) {
+    if (fcntl(static_cast<int>(arg_1), F_GETFD) >= 0) {
+      TRACE("guest close(%ld) of live host-owned fd (tag 0x%llx): ignored",
+            arg_1,
+            static_cast<unsigned long long>(tag));
+      return 0;
+    }
+    android_fdsan_exchange_owner_tag(arg_1, tag, 0);
+  }
+  return syscall(__NR_close, arg_1);
 #else
   return syscall(__NR_close, arg_1);
 #endif
   // endregion
 #endif
 }
+
+// region digitalis
+inline long RunGuestSyscall___NR_close_range(long arg_1, long arg_2, long arg_3) {
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+  // CLOSE_RANGE_CLOEXEC only marks fds close-on-exec — nothing is destroyed,
+  // so the raw syscall is safe (CLOSE_RANGE_UNSHARE just unshares the table).
+  if ((arg_3 & CLOSE_RANGE_CLOEXEC) != 0) {
+    return syscall(__NR_close_range, arg_1, arg_2, arg_3);
+  }
+  // A raw close_range() would destroy every fd in range at the kernel level:
+  // fds owned by live host objects (Fence, Parcel, unique_fd, DIR*) get yanked
+  // out from under their owners — whose later fdsan-checked closes then abort —
+  // and host fdsan owner tags are left stale on the freed slots. Emulate it
+  // per-fd with the same tag rules as RunGuestSyscall___NR_close. Iterate the
+  // numeric range directly rather than enumerating /proc/self/fd, since
+  // opendir() would itself allocate a tagged DIR* fd in the middle of fd
+  // teardown. The guest passes UINT_MAX for "to the top"; clamp to the fd
+  // table's soft limit.
+  unsigned long lo = static_cast<unsigned long>(arg_1);
+  unsigned long hi = static_cast<unsigned long>(arg_2);
+  struct rlimit rl;
+  unsigned long max_fd = 4096;
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+    max_fd = static_cast<unsigned long>(rl.rlim_cur);
+  }
+  if (hi > max_fd) {
+    hi = max_fd;
+  }
+  for (unsigned long fd = lo; fd <= hi; ++fd) {
+    uint64_t tag = android_fdsan_get_owner_tag(static_cast<int>(fd));
+    if (tag != 0) {
+      if (fcntl(static_cast<int>(fd), F_GETFD) >= 0) {
+        TRACE("guest close_range [%lu, %lu]: skipping live host-owned fd %lu", lo, hi, fd);
+        continue;
+      }
+      android_fdsan_exchange_owner_tag(static_cast<int>(fd), tag, 0);
+    }
+    syscall(__NR_close, fd);
+  }
+  return 0;
+#else
+  return syscall(__NR_close_range, arg_1, arg_2, arg_3);
+#endif
+}
+
+inline long RunGuestSyscall___NR_dup3(long arg_1, long arg_2, long arg_3) {
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__ANDROID__)
+  // dup3 implicitly closes newfd inside the kernel, bypassing host fdsan. If
+  // newfd's slot still carries a stale owner tag from an earlier raw close,
+  // the guest's new fd would inherit it and poison later host-side closes —
+  // scrub it first. A newfd that a live host owner has tagged is yanked by
+  // dup3 exactly as on hardware; keep its tag so the owner's eventual
+  // tag-matched close stays silent, but trace it since the owner now holds
+  // the guest's duplicate.
+  uint64_t tag = android_fdsan_get_owner_tag(arg_2);
+  if (tag != 0) {
+    if (fcntl(static_cast<int>(arg_2), F_GETFD) < 0) {
+      android_fdsan_exchange_owner_tag(arg_2, tag, 0);
+    } else {
+      TRACE("guest dup3 onto live host-owned fd %ld (tag 0x%llx)",
+            arg_2,
+            static_cast<unsigned long long>(tag));
+    }
+  }
+#endif
+  return syscall(__NR_dup3, arg_1, arg_2, arg_3);
+}
+// endregion
 
 inline long RunGuestSyscall___NR_execve(long arg_1, long arg_2, long arg_3) {
   return static_cast<long>(ExecveForGuest(bit_cast<const char*>(arg_1),     // filename

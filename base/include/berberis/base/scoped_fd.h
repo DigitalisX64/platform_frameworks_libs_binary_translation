@@ -21,7 +21,11 @@
 
 // region digitalis
 #if defined(__ANDROID__)
+#include <sys/syscall.h>
+
 #include <android/fdsan.h>
+
+#include "berberis/base/tracing.h"
 #endif
 // endregion
 
@@ -41,16 +45,25 @@ class ScopedFd {
     if (fd_ != -1) {
       // region digitalis
 #if defined(__ANDROID__)
-      // Close with the fd's CURRENT fdsan owner tag instead of a bare close().
       // Berberis host-opens short-lived fds (e.g. TinyLoader::OpenFile during
-      // ResetAllExecRegions in CloneGuestThread) that can land on an fd number
-      // still carrying a stale fdsan owner tag — left by a previously-closed
-      // owner (an Android Parcel / unique_fd) whose close did not clear the host
-      // libc fdsan table. A bare close() is android_fdsan_close_with_tag(fd, 0),
-      // which then aborts with "expected to be unowned, actually owned by
-      // Parcel ...". Closing with the fd's current tag always passes the fdsan
-      // check and clears the table entry, so the fd can be safely reused.
-      android_fdsan_close_with_tag(fd_, android_fdsan_get_owner_tag(fd_));
+      // ResetAllExecRegions in CloneGuestThread). Two fdsan hazards on close:
+      //  - The fd number can carry a stale owner tag left behind by an earlier
+      //    raw-syscall close of a tagged fd. A bare close() is
+      //    android_fdsan_close_with_tag(fd, 0), which aborts on that stale tag
+      //    ("expected to be unowned, actually owned by Parcel ...").
+      //  - Our kernel fd can have been yanked (a wild guest close/close_range)
+      //    and the number REUSED by a live host owner (Fence, Parcel,
+      //    unique_fd). Closing here would destroy the new owner's fd, and
+      //    closing with the CURRENT tag would also strip its tag, making the
+      //    owner's own close abort later ("... actually unowned").
+      // A nonzero tag on our number always means a host object owns the slot
+      // now (Berberis never tags) — abandon instead of closing. An untagged fd
+      // gets a raw syscall close, which never enters fdsan's error paths.
+      if (android_fdsan_get_owner_tag(fd_) == 0) {
+        syscall(__NR_close, fd_);
+      } else {
+        TRACE("ScopedFd %d reused by a tagged host owner; abandoning close", fd_);
+      }
 #else
       // endregion
       close(fd_);
