@@ -510,13 +510,15 @@ TEST_F(Arm64LiteTranslateRegionTest, CbnzTaken) {
   EXPECT_TRUE(Run(code, branch_target));
 }
 
-TEST_F(Arm64LiteTranslateRegionTest, SvcEndsRegion) {
-  // SVC sets success_=false so the interpreter handles it.
-  // The region translates MOVZ successfully, then fails at SVC.
-  // The dispatch loop installs kInterpreted for the SVC address.
+TEST_F(Arm64LiteTranslateRegionTest, SvcTranslatedInline) {
+  // SVC is translated inline (EmitSyscall) and ends the region by chaining to
+  // the next instruction, rather than bailing to the interpreter. So the whole
+  // region — MOVZ plus the SVC — translates successfully and stop_pc lands past
+  // the SVC. (The emitted code calls RunGuestSyscall, which needs a live guest
+  // thread, so this checks translation success, not execution.)
   static const uint32_t code[] = {
       MovzX(0, 1),    // MOVZ X0, #1 (translatable)
-      0xD4000001,     // SVC #0 (interpreter handles syscall)
+      0xD4000001,     // SVC #0 (now JIT-translated inline)
   };
   MachineCode machine_code;
   auto [success, stop_pc] = TryLiteTranslateRegion(ToGuestAddr(code),
@@ -525,9 +527,8 @@ TEST_F(Arm64LiteTranslateRegionTest, SvcEndsRegion) {
                                                        .end_pc = ToGuestAddr(code) + 8,
                                                        .allow_dispatch = false,
                                                    });
-  // SVC causes translation failure at its PC — interpreter will handle it.
-  EXPECT_FALSE(success);
-  EXPECT_EQ(stop_pc, ToGuestAddr(code) + 4);  // PC of the SVC instruction
+  EXPECT_TRUE(success);
+  EXPECT_EQ(stop_pc, ToGuestAddr(code) + 8);  // region includes the SVC
 }
 
 TEST_F(Arm64LiteTranslateRegionTest, Nop) {
