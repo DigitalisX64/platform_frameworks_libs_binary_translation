@@ -100,6 +100,27 @@ void LiteTranslator::ExitGeneratedCode(GuestAddr target) {
   EmitExitGeneratedCode(&as_, as_.rax);
 }
 
+void LiteTranslator::Svc(uint16_t imm) {
+  UNUSED(imm);
+  // Translate the syscall inline rather than bailing to the interpreter. A
+  // success_=false bail would end the region BEFORE the SVC, mark the SVC PC
+  // kInterpreted, and route every syscall through a dispatcher round-trip plus
+  // an interpreter batch — costly on the hot path since real apps issue
+  // syscalls constantly (futex, ioctl, binder, IO).
+  //
+  // RunGuestSyscall reads and writes the guest register file in ThreadState
+  // directly (x8 = number, x0-x5 = args, x0 = result) and may run a guest
+  // signal handler, so flush the mapped guest registers and mirror the FP
+  // status first, exactly as a region exit does. EmitSyscall then stamps
+  // insn_addr, calls RunGuestSyscall, and direct-dispatches to pc+4, so this
+  // ends the region (like Branch). It does NOT exit to the SVC's own PC, which
+  // is what made an earlier attempt loop forever.
+  StoreMappedRegs();
+  EmitMxcsrToFpsrMirror();
+  is_region_end_reached_ = true;
+  EmitSyscall(&as_, GetInsnAddr());
+}
+
 void LiteTranslator::ExitRegion(GuestAddr target) {
   StoreMappedRegs();
   EmitMxcsrToFpsrMirror();

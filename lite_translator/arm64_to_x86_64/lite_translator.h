@@ -779,16 +779,11 @@ class LiteTranslator {
     Store(size, addr, 0, data);
   }
 
-  void Svc(uint16_t imm) {
-    // SVC must be handled by interpreter, not JIT.
-    // Setting success_=false causes the region to end BEFORE this instruction.
-    // The dispatch loop will then install kInterpreted for the SVC address,
-    // and the interpreter handles the actual syscall. The previous approach
-    // (ExitGeneratedCode to self) caused an infinite loop because the JIT
-    // entry for this PC re-entered the same exit code.
-    UNUSED(imm);
-    success_ = false;
-  }
+  // Emits the syscall inline and chains to the next instruction's region
+  // instead of bailing to the interpreter. Implemented in the .cc where
+  // code_gen_lib's EmitSyscall is in scope. See BranchCond for the same
+  // header-declaration / .cc-definition split.
+  void Svc(uint16_t imm);
 
   // BRK must be handled by the interpreter (which raises the
   // synchronous SIGTRAP). End the region before this instruction; the dispatch
