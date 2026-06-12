@@ -105,11 +105,13 @@ extern "C" void __wrap_free(void* ptr) {
   memcpy(&hdr16, p - 16, sizeof(hdr16));
 
   bool non_heap = (hdr8 == 0 && hdr16 == 0);
-  bool log = (n <= 4) || non_heap;
-  if (log) {
-    LogFreeCall(non_heap ? "SKIP-non-heap" : "ok", n, ptr, hdr16, hdr8);
-  }
   if (non_heap) {
+    // Load-bearing: the band-aid is actively dropping a free of a pointer
+    // with no Scudo chunk header (a static .bss/.rodata "shared null" on the
+    // deallocation path).  Surface that loudly — it is a rare anomaly, not a
+    // normal free.  Ordinary heap frees are forwarded silently below; do NOT
+    // log them (a per-free log floods every translated app's logcat).
+    LogFreeCall("SKIP-non-heap", n, ptr, hdr16, hdr8);
     g_free_skipped.fetch_add(1, std::memory_order_relaxed);
     return;
   }

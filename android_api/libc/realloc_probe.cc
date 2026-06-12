@@ -103,13 +103,12 @@ extern "C" void* __wrap_realloc(void* ptr, size_t size) {
     memcpy(&hdr16, p - 16, sizeof(hdr16));
     non_heap = (hdr8 == 0 && hdr16 == 0);
   }
-  // Log first 4 calls unconditionally so the diagnostic is visible at
-  // startup.  Beyond that, only log the all-zero-header symptom that
-  // triggers the Scudo abort path.
-  if (n <= 4 || non_heap) {
-    LogReallocCall(n, ptr, size);
-  }
   if (non_heap) {
+    // Load-bearing: surface the all-zero-header symptom that triggers the
+    // Scudo abort path (the band-aid actively rerouting a non-heap realloc).
+    // Do NOT log ordinary reallocs — a per-call log floods every translated
+    // app's logcat at startup.
+    LogReallocCall(n, ptr, size);
     // Qt shared-null / non-heap pointer.  Returning calloc(size, 1) gives
     // the caller a fresh writable buffer pre-zeroed to the same byte
     // pattern the shared null had, matching the COW semantics Qt expects.
