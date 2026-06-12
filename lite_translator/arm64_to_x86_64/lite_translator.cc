@@ -171,130 +171,11 @@ void LiteTranslator::ExitRegionIndirect(Register target) {
 //   V = bit 0  (CPUState::kFlagOverflow)
 //
 void LiteTranslator::BranchCond(Decoder::Condition cond, int32_t offset) {
-  // Load flags from ThreadState.
-  int32_t flags_offset = offsetof(ThreadState, cpu.flags);
-  Register flags_reg = AllocTempReg();
-  as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = flags_offset});
-
   Assembler::Label* cont = as_.MakeLabel();
 
-  // Evaluate condition and jump to continuation if NOT taken.
-  // We emit the inverse check: jump over the branch-taken path.
-  switch (cond) {
-    case Decoder::Condition::kEq:
-      // EQ: Z==1. Test bit 14.
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kNotCarry, *cont);  // skip if Z==0
-      break;
-    case Decoder::Condition::kNe:
-      // NE: Z==0. Test bit 14.
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cont);  // skip if Z==1
-      break;
-    case Decoder::Condition::kCs:
-      // CS/HS: C==1. Test bit 8.
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kNotCarry, *cont);
-      break;
-    case Decoder::Condition::kCc:
-      // CC/LO: C==0. Test bit 8.
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kCarry, *cont);
-      break;
-    case Decoder::Condition::kMi:
-      // MI: N==1. Test bit 15.
-      as_.Btl(flags_reg, static_cast<int8_t>(15));
-      as_.Jcc(Condition::kNotCarry, *cont);
-      break;
-    case Decoder::Condition::kPl:
-      // PL: N==0. Test bit 15.
-      as_.Btl(flags_reg, static_cast<int8_t>(15));
-      as_.Jcc(Condition::kCarry, *cont);
-      break;
-    case Decoder::Condition::kVs:
-      // VS: V==1. Test bit 0.
-      as_.Btl(flags_reg, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kNotCarry, *cont);
-      break;
-    case Decoder::Condition::kVc:
-      // VC: V==0. Test bit 0.
-      as_.Btl(flags_reg, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kCarry, *cont);
-      break;
-    case Decoder::Condition::kHi: {
-      // HI: C==1 && Z==0. Test C (bit 8) and Z (bit 14).
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kNotCarry, *cont);  // skip if C==0
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cont);     // skip if Z==1
-      break;
-    }
-    case Decoder::Condition::kLs: {
-      // LS: C==0 || Z==1.
-      // Branch taken if C==0 OR Z==1. Skip (to cont) only if C==1 AND Z==0.
-      Assembler::Label* taken = as_.MakeLabel();
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kNotCarry, *taken);  // C==0 -> take branch
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kNotCarry, *cont);   // C==1, Z==0 -> skip
-      as_.Bind(taken);
-      break;
-    }
-    case Decoder::Condition::kGe: {
-      // GE: N==V. Extract N (bit 15) and V (bit 0), compare.
-      Register tmp = AllocTempReg();
-      // Get N bit into bit 0 of tmp.
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));  // N is now in bit 0
-      // XOR with V (bit 0 of flags_reg) -- if same, result bit 0 is 0.
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kCarry, *cont);  // skip if N!=V
-      break;
-    }
-    case Decoder::Condition::kLt: {
-      // LT: N!=V.
-      Register tmp = AllocTempReg();
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kNotCarry, *cont);  // skip if N==V
-      break;
-    }
-    case Decoder::Condition::kGt: {
-      // GT: Z==0 && N==V.
-      // Skip if Z==1 or N!=V.
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cont);  // skip if Z==1
-      Register tmp = AllocTempReg();
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kCarry, *cont);  // skip if N!=V
-      break;
-    }
-    case Decoder::Condition::kLe: {
-      // LE: Z==1 || N!=V.
-      // Branch taken if Z==1 OR N!=V. Skip only if Z==0 AND N==V.
-      Assembler::Label* taken = as_.MakeLabel();
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *taken);  // Z==1 -> take branch
-      Register tmp = AllocTempReg();
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kNotCarry, *cont);  // Z==0, N==V -> skip
-      as_.Bind(taken);
-      break;
-    }
-    case Decoder::Condition::kAl:
-    case Decoder::Condition::kNv:
-      // AL/NV: always taken (NV behaves like AL).
-      break;
-  }
+  // Jump over the branch-taken path (to cont) when the condition is not
+  // satisfied. EmitJumpIfCondNotMet tests cpu.flags in memory directly.
+  EmitJumpIfCondNotMet(cond, *cont);
 
   // forward branch extension with back-edge detection
   GuestAddr target = GetInsnAddr() + offset;
@@ -320,111 +201,13 @@ void LiteTranslator::ConditionalCompare(bool is_neg, bool is_64bit, Register rn,
 
   int32_t flags_offset = offsetof(ThreadState, cpu.flags);
 
-  // Load current flags for condition evaluation.
-  Register flags_reg = AllocTempReg();
-  as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = flags_offset});
-
   Assembler::Label* cond_false = as_.MakeLabel();
   Assembler::Label* done = as_.MakeLabel();
 
-  // Evaluate condition — jump to cond_false if NOT met.
-  // Reuse the same condition evaluation logic as BranchCond.
-  switch (cond) {
-    case Decoder::Condition::kEq:
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      break;
-    case Decoder::Condition::kNe:
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      break;
-    case Decoder::Condition::kCs:
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      break;
-    case Decoder::Condition::kCc:
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      break;
-    case Decoder::Condition::kMi:
-      as_.Btl(flags_reg, static_cast<int8_t>(15));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      break;
-    case Decoder::Condition::kPl:
-      as_.Btl(flags_reg, static_cast<int8_t>(15));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      break;
-    case Decoder::Condition::kVs:
-      as_.Btl(flags_reg, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      break;
-    case Decoder::Condition::kVc:
-      as_.Btl(flags_reg, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      break;
-    case Decoder::Condition::kHi:
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      break;
-    case Decoder::Condition::kLs: {
-      Assembler::Label* cond_true = as_.MakeLabel();
-      as_.Btl(flags_reg, static_cast<int8_t>(8));
-      as_.Jcc(Condition::kNotCarry, *cond_true);
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      as_.Bind(cond_true);
-      break;
-    }
-    case Decoder::Condition::kGe: {
-      Register tmp = AllocTempReg();
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      break;
-    }
-    case Decoder::Condition::kLt: {
-      Register tmp = AllocTempReg();
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      break;
-    }
-    case Decoder::Condition::kGt:
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cond_false);
-      {
-        Register tmp = AllocTempReg();
-        as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
-        as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
-        as_.Jcc(Condition::kCarry, *cond_false);
-      }
-      break;
-    case Decoder::Condition::kLe: {
-      Assembler::Label* cond_true = as_.MakeLabel();
-      as_.Btl(flags_reg, static_cast<int8_t>(14));
-      as_.Jcc(Condition::kCarry, *cond_true);
-      Register tmp = AllocTempReg();
-      as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));
-      as_.Xorl(tmp, flags_reg);
-      as_.Btl(tmp, static_cast<int8_t>(0));
-      as_.Jcc(Condition::kNotCarry, *cond_false);
-      as_.Bind(cond_true);
-      break;
-    }
-    case Decoder::Condition::kAl:
-    case Decoder::Condition::kNv:
-      // Always true — just do the compare.
-      break;
-  }
+  // Evaluate condition — jump to cond_false if NOT met. Tests cpu.flags in
+  // memory directly (shared with BranchCond / CSEL); flags_offset is still
+  // used below to write the immediate-nzcv result on the false path.
+  EmitJumpIfCondNotMet(cond, *cond_false);
 
   // Condition is true: perform CMP (is_neg=false) or CMN (is_neg=true).
   // CMN is non-destructive (it only sets NZCV from rn+rm), but x86 has no

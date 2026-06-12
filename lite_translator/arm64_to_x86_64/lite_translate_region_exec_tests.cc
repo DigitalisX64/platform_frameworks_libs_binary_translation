@@ -90,6 +90,8 @@ constexpr uint8_t kCondCS = 0x2;
 constexpr uint8_t kCondCC = 0x3;
 constexpr uint8_t kCondMI = 0x4;
 constexpr uint8_t kCondPL = 0x5;
+constexpr uint8_t kCondVS = 0x6;
+constexpr uint8_t kCondVC = 0x7;
 constexpr uint8_t kCondHI = 0x8;
 constexpr uint8_t kCondLS = 0x9;
 constexpr uint8_t kCondGE = 0xA;
@@ -266,6 +268,11 @@ constexpr uint32_t MovnHwX(uint8_t rd, uint16_t imm16, uint8_t hw) {
   return 0x92800000 | (static_cast<uint32_t>(hw) << 21) |
          (static_cast<uint32_t>(imm16) << 5) | rd;
 }
+// MOVZ Xd, #imm16, LSL #(hw*16)
+constexpr uint32_t MovzHwX(uint8_t rd, uint16_t imm16, uint8_t hw) {
+  return 0xD2800000 | (static_cast<uint32_t>(hw) << 21) |
+         (static_cast<uint32_t>(imm16) << 5) | rd;
+}
 // CSINC/CSINV/CSNEG Xd, Xn, Xm, cond  (CselX already defined above)
 constexpr uint32_t CsincX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
   return 0x9A800400 | (static_cast<uint32_t>(rm) << 16) |
@@ -330,6 +337,28 @@ class Arm64LiteTranslateRegionTest : public ::testing::Test {
     HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
     TestingRunGeneratedCode(&state_, AsHostCode(host_code), expected_stop_addr);
 
+    EXPECT_EQ(state_.cpu.insn_addr, expected_stop_addr);
+    return true;
+  }
+
+  // Like Run(), but takes an explicit (code, count) so variable-length regions
+  // built at runtime (e.g. the all-conditions branch matrix) can be executed.
+  bool RunN(const uint32_t* code, size_t n, GuestAddr expected_stop_addr) {
+    GuestAddr start = ToGuestAddr(code);
+    GuestAddr code_end = start + n * sizeof(uint32_t);
+    state_.cpu.insn_addr = start;
+    MachineCode machine_code;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start,
+                                                     &machine_code,
+                                                     LiteTranslateParams{
+                                                         .end_pc = code_end,
+                                                         .allow_dispatch = false,
+                                                     });
+    if (!success || (stop_pc > code_end)) {
+      return false;
+    }
+    HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+    TestingRunGeneratedCode(&state_, AsHostCode(host_code), expected_stop_addr);
     EXPECT_EQ(state_.cpu.insn_addr, expected_stop_addr);
     return true;
   }
@@ -474,6 +503,78 @@ TEST_F(Arm64LiteTranslateRegionTest, CmpBranchGeTaken) {
   };
   GuestAddr branch_target = ToGuestAddr(code) + 16;
   EXPECT_TRUE(Run(code, branch_target));
+}
+
+// Exhaustive B.cond matrix: every ARM condition code, taken and not-taken,
+// against four NZCV setups built by CMP X0,#imm. This pins the shared
+// EmitJumpIfCondNotMet helper (which now tests cpu.flags in memory directly)
+// across all conditions including the N==V and C-flag (sub-derived) cases.
+TEST_F(Arm64LiteTranslateRegionTest, BranchAllConditions) {
+  // Region: <setup...>, B.cond +8, NOP, NOP. Taken exits to B.cond_pc+8
+  // (= setup_len+2 words in); not-taken falls through to end_pc.
+  auto check = [&](std::initializer_list<uint32_t> setup, uint8_t cond,
+                   bool expect_taken) {
+    std::vector<uint32_t> code(setup);
+    size_t bidx = code.size();
+    code.push_back(Bcond(cond, 8));
+    code.push_back(kNop);
+    code.push_back(kNop);
+    GuestAddr base = ToGuestAddr(code.data());
+    GuestAddr expected = expect_taken ? base + (bidx + 2) * sizeof(uint32_t)
+                                      : base + code.size() * sizeof(uint32_t);
+    EXPECT_TRUE(RunN(code.data(), code.size(), expected))
+        << "cond=" << static_cast<int>(cond) << " taken=" << expect_taken;
+  };
+  // Setups via CMP X0,#imm (SUBS XZR,X0,#imm) producing known NZCV:
+  //   A: X0=5,  CMP #5  -> N0 Z1 C1 V0
+  //   B: X0=10, CMP #5  -> N0 Z0 C1 V0
+  //   C: X0=5,  CMP #10 -> N1 Z0 C0 V0
+  //   D: X0=INT64_MIN, CMP #1 -> N0 Z0 C1 V1  (signed underflow sets V)
+  const std::initializer_list<uint32_t> A = {MovzX(0, 5), CmpImmX(0, 5)};
+  const std::initializer_list<uint32_t> B = {MovzX(0, 10), CmpImmX(0, 5)};
+  const std::initializer_list<uint32_t> C = {MovzX(0, 5), CmpImmX(0, 10)};
+  const std::initializer_list<uint32_t> D = {MovzHwX(0, 0x8000, 3),
+                                             CmpImmX(0, 1)};
+  check(A, kCondEQ, true);  check(B, kCondEQ, false);   // Z
+  check(B, kCondNE, true);  check(A, kCondNE, false);
+  check(A, kCondCS, true);  check(C, kCondCS, false);   // C
+  check(C, kCondCC, true);  check(A, kCondCC, false);
+  check(C, kCondMI, true);  check(A, kCondMI, false);   // N
+  check(A, kCondPL, true);  check(C, kCondPL, false);
+  check(D, kCondVS, true);  check(A, kCondVS, false);   // V
+  check(A, kCondVC, true);  check(D, kCondVC, false);
+  check(B, kCondHI, true);  check(A, kCondHI, false);   // C&Z
+  check(A, kCondLS, true);  check(B, kCondLS, false);
+  check(A, kCondGE, true);  check(C, kCondGE, false);   // N==V
+  check(C, kCondLT, true);  check(A, kCondLT, false);
+  check(B, kCondGT, true);  check(A, kCondGT, false);   // Z & N==V
+  check(A, kCondLE, true);  check(B, kCondLE, false);
+  check(A, kCondAL, true);                              // always
+}
+
+// Integer CCMP through the refactored ConditionalCompare condition eval.
+TEST_F(Arm64LiteTranslateRegionTest, CcmpConditionPaths) {
+  // cond TRUE: CCMP does CMP X0,X1 and sets NZCV. X0==X1 -> Z=1.
+  // Setup CMP X0,#5 (X0=5) -> Z=1 so the EQ condition is met.
+  static const uint32_t taken[] = {
+      MovzX(0, 5),                       // X0=5
+      MovzX(1, 5),                       // X1=5
+      CmpImmX(0, 5),                     // flags: Z=1 (EQ true)
+      CcmpRegX(0, 1, /*nzcv=*/0x0, kCondEQ),  // EQ met -> CMP X0,X1 -> Z=1
+  };
+  EXPECT_TRUE(Run(taken, ToGuestAddr(taken) + sizeof(taken)));
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+
+  // cond FALSE: CCMP writes the nzcv immediate. Use NE with Z=1 (NE false);
+  // nzcv=0x0 -> all flags cleared, in particular Z=0.
+  static const uint32_t imm[] = {
+      MovzX(0, 5),                       // X0=5
+      MovzX(1, 9),                       // X1=9
+      CmpImmX(0, 5),                     // flags: Z=1 (NE false)
+      CcmpRegX(0, 1, /*nzcv=*/0x0, kCondNE),  // NE not met -> flags = 0
+  };
+  EXPECT_TRUE(Run(imm, ToGuestAddr(imm) + sizeof(imm)));
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
 }
 
 TEST_F(Arm64LiteTranslateRegionTest, CbzTaken) {
