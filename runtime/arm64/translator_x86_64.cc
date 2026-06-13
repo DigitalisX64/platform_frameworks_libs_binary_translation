@@ -170,8 +170,9 @@ static struct TranslationStats {
   uint64_t interpret_invocations = 0;
 } g_translation_stats;
 
-// Optimizing (second-gear) translation install. Phase 0: HeavyOptimizeRegion
-// always bails, so this returns {false, ...} and the caller re-lites.
+// Optimizing (second-gear) translation install. The heavy optimizer translates
+// the region; if it bails on an instruction it does not yet handle, this returns
+// {false, ...} and the caller re-lite-translates the whole region.
 std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndInstallRegion(
     GuestAddr pc) {
   MachineCode machine_code;
@@ -179,7 +180,12 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndIn
       HeavyOptimizeRegion(pc, &machine_code, {.end_pc = pc + GetExecutableRegionSize(pc)});
   UNUSED(number_of_instructions);
   size_t size = stop_pc - pc;
-  if (!success && size == 0) {
+  // A heavy bail reverts to a full lite re-translation rather than installing
+  // only the successfully-optimized prefix: a partial heavy region fragments a
+  // hot loop into extra region boundaries, costing more per iteration than the
+  // single lite region it replaced. Only install when the whole region was
+  // optimized.
+  if (!success) {
     return {false, {}, 0, {}};
   }
   return {true, InstallTranslated(&machine_code, pc, size, "heavy"), size, kHeavyOptimized};
