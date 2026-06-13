@@ -852,6 +852,46 @@ TEST_F(Arm64LiteTranslateRegionTest, CselAlways) {
   EXPECT_EQ(state_.cpu.x[3], 100ULL);
 }
 
+// Exhaustive CSEL matrix: every ARM condition code, met and not-met, exercising
+// the branchless CMOVcc path (EmitCondToBoolReg) for all 16 codes incl. the
+// compound (HI/LS/GE/LT/GT/LE) and V-overflow cases. src1=100 (met), src2=200.
+TEST_F(Arm64LiteTranslateRegionTest, CselAllConditions) {
+  auto check = [&](std::initializer_list<uint32_t> setup, uint8_t cond,
+                   bool expect_met) {
+    std::vector<uint32_t> code(setup);
+    code.push_back(MovzX(1, 100));            // src1 (true case)
+    code.push_back(MovzX(2, 200));            // src2 (false case)
+    code.push_back(CselX(3, 1, 2, cond));     // X3 = cond ? X1 : X2
+    GuestAddr end = ToGuestAddr(code.data()) + code.size() * sizeof(uint32_t);
+    EXPECT_TRUE(RunN(code.data(), code.size(), end))
+        << "cond=" << static_cast<int>(cond) << " met=" << expect_met;
+    EXPECT_EQ(state_.cpu.x[3], expect_met ? 100ULL : 200ULL)
+        << "cond=" << static_cast<int>(cond) << " met=" << expect_met;
+  };
+  // Same NZCV setups as BranchAllConditions:
+  //   A: CMP 5,5   -> N0 Z1 C1 V0     B: CMP 10,5  -> N0 Z0 C1 V0
+  //   C: CMP 5,10  -> N1 Z0 C0 V0     D: INT64_MIN CMP 1 -> N0 Z0 C1 V1
+  const std::initializer_list<uint32_t> A = {MovzX(0, 5), CmpImmX(0, 5)};
+  const std::initializer_list<uint32_t> B = {MovzX(0, 10), CmpImmX(0, 5)};
+  const std::initializer_list<uint32_t> C = {MovzX(0, 5), CmpImmX(0, 10)};
+  const std::initializer_list<uint32_t> D = {MovzHwX(0, 0x8000, 3),
+                                             CmpImmX(0, 1)};
+  check(A, kCondEQ, true);  check(B, kCondEQ, false);
+  check(B, kCondNE, true);  check(A, kCondNE, false);
+  check(A, kCondCS, true);  check(C, kCondCS, false);
+  check(C, kCondCC, true);  check(A, kCondCC, false);
+  check(C, kCondMI, true);  check(A, kCondMI, false);
+  check(A, kCondPL, true);  check(C, kCondPL, false);
+  check(D, kCondVS, true);  check(A, kCondVS, false);
+  check(A, kCondVC, true);  check(D, kCondVC, false);
+  check(B, kCondHI, true);  check(A, kCondHI, false);
+  check(A, kCondLS, true);  check(B, kCondLS, false);
+  check(A, kCondGE, true);  check(C, kCondGE, false);
+  check(C, kCondLT, true);  check(A, kCondLT, false);
+  check(B, kCondGT, true);  check(A, kCondGT, false);
+  check(A, kCondLE, true);  check(B, kCondLE, false);
+}
+
 // STLR Wt, [Xn]: size=10, o2=1, L=0, o1=0, Rs=11111, o0=1, Rt2=11111
 // Encoding: 10 001000 1 0 0 11111 1 11111 Rn Rt
 constexpr uint32_t StlrW(uint8_t rt, uint8_t rn) {
