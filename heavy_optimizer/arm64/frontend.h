@@ -1469,9 +1469,109 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // AdvSIMD three-same INTEGER ops that lower to a single packed SSE2/SSE4.1
+  // instruction: ADD, SUB, AND, ORR, EOR, MUL, and CMEQ (register). Each loads
+  // the full 128-bit Vn and Vm with GenGetSimd<16> (MOVDQA), runs the packed op
+  // on the host XMM, and writes the result back with GenSetSimd<16> (MOVDQA).
+  // The 16-byte aligned MOVDQA access at the v[reg] displacement is the form
+  // RemoveLocalGuestContextAccesses recognizes for store-to-load forwarding, so
+  // reads of a just-written V register inside the region see the fresh value.
+  //
+  // For the D-form (Q=0) the upper 64 bits of Vd are zeroed: the result's low
+  // 64 bits are merged (MOVSD reg-reg) into a PXOR-zeroed XMM, exactly the
+  // single-store discipline SetVRegScalar uses, so the committed MOVDQA holds a
+  // clean zero-extended 64-bit value.
+  //
+  // Element size comes from args.size (00=byte, 01=half, 10=word, 11=double).
+  // The available packed ops constrain which sizes are handled:
+  //   ADD: Paddw (16), Paddd (32). 8-bit (Paddb) and 64-bit (Paddq) bail.
+  //   SUB: Psubd (32). 8/16/64-bit (Psubb/Psubw/Psubq) bail.
+  //   MUL: Pmullw (16), Pmulld (32). 8-bit and 64-bit have no packed op; bail.
+  //   AND/ORR/EOR: Pand/Por/Pxor are element-size-independent (one op covers
+  //     all). ORR with rn==rm is the AdvSIMD MOV (vector) alias and lowers the
+  //     same way.
+  //   CMEQ: Pcmpeqb/w/d are not in the ARM64 backend allowlist; bail (the lite
+  //     translator/interpreter handles CMEQ).
+  // Everything else (saturating, shifts, polynomial, FP, pairwise, widening,
+  // CMGT/CMHI/etc.) bails to the lite translator/interpreter.
   void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+
+    // Validate the (opcode, size) pair up front and emit nothing on bail. After
+    // this switch every reachable case has a single allowlisted packed op.
+    switch (args.opcode) {
+      case Decoder::AdvSimdThreeSameOpcode::kAdd:
+        if (args.size != 0b01 && args.size != 0b10) {
+          UndefinedReturningVoid();
+          return;
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kSub:
+        if (args.size != 0b10) {
+          UndefinedReturningVoid();
+          return;
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kMul:
+        if (args.size != 0b01 && args.size != 0b10) {
+          UndefinedReturningVoid();
+          return;
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kAnd:
+      case Decoder::AdvSimdThreeSameOpcode::kOrr:
+      case Decoder::AdvSimdThreeSameOpcode::kEor:
+        // Bitwise: element size is irrelevant; all forms are handled.
+        break;
+      default:
+        UndefinedReturningVoid();
+        return;
+    }
+
+    FpRegister vn = AllocTempSimdReg();
+    FpRegister vm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(vn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(vm.machine_reg(), vm_off);
+
+    // Run the packed op in place on vn (vn := vn OP vm).
+    switch (args.opcode) {
+      case Decoder::AdvSimdThreeSameOpcode::kAdd:
+        if (args.size == 0b01) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PadddXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kSub:
+        builder_.Gen<x86_64::PsubdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kMul:
+        if (args.size == 0b01) {
+          builder_.Gen<x86_64::PmullwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmulldXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kAnd:
+        builder_.Gen<x86_64::PandXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kOrr:
+        builder_.Gen<x86_64::PorXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kEor:
+        builder_.Gen<x86_64::PxorXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        break;
+      default:
+        // Unreachable: the validation switch above already bailed.
+        UndefinedReturningVoid();
+        return;
+    }
+
+    SetVRegFull(args.rd, vn, args.q);
   }
 
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
@@ -1907,6 +2007,30 @@ class HeavyOptimizerFrontend {
     }
     builder_.Gen<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off},
                                        merged.machine_reg());
+  }
+
+  // Write a full or D-form vector result to guest V[reg]. For the Q-form
+  // (q == true) all 128 bits of `value` are committed. For the D-form
+  // (q == false) the upper 64 bits MUST be zeroed (ARM64 writes of a 64-bit
+  // vector clear the rest of the register), so the low 64 bits of `value` are
+  // merged (MOVSD reg-reg, which copies the low 8 bytes and preserves the
+  // destination's upper lanes) into a PXOR-zeroed XMM before the store. Both
+  // paths use ONE 16-byte MOVDQA store at the v[reg] displacement, matching the
+  // single-store discipline of SetVRegScalar so RemoveLocalGuestContextAccesses
+  // forwards and dead-store-eliminates correctly (it keys on the store
+  // displacement, not its width).
+  void SetVRegFull(uint8_t reg, FpRegister value, bool q) {
+    if (!success()) {
+      return;
+    }
+    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    if (q) {
+      builder_.GenSetSimd<16>(off, value.machine_reg());
+      return;
+    }
+    FpRegister merged = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
+    builder_.GenSetSimd<16>(off, merged.machine_reg());
   }
 
   // Lower a scalar FP binary op through the guest-agnostic intrinsic layer.
