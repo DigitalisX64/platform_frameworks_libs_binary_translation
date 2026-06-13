@@ -131,8 +131,11 @@ class HeavyOptimizerFrontend {
   // Immediate-form data processing.
   //
 
-  // ADD/SUB (immediate). Only the non-flag-setting form is translated here; the
-  // flag-setting variant (SUBS/ADDS/CMP/CMN) needs NZCV and bails. Mirrors
+  // ADD/SUB (immediate), including the flag-setting SUBS/ADDS/CMP/CMN forms.
+  // When set_flags is true the op always emits (even imm==0) so host EFLAGS are
+  // valid, then EmitMaterializeNZCV packs NZCV into cpu.flags exactly as
+  // lite_translator.h::EmitStoreArmNZCV. CMP/CMN to XZR (rd==31) discard the
+  // result in the SemanticsPlayer (SetRegOrIgnore). Mirrors
   // lite_translator.h::AddSubImm: a 32-bit op uses the l-suffix insns (which
   // zero-extend the upper 32 bits, matching ARM64 W-register write semantics).
   Register AddSubImm(bool is_sub, bool set_flags, bool is_64bit, Register src, uint32_t imm) {
@@ -141,19 +144,23 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return AllocTempReg();
     }
-    // Validate first; emit nothing on bail.
-    if (set_flags) {
-      UndefinedReturningReg();
-      return AllocTempReg();
-    }
     // The ARM imm12 fits in int32 and x86 add/sub-immediate take int32.
     if (is_64bit) {
       Register res = Copy(src);
-      if (imm != 0) {
+      // When setting flags, always emit the op (even imm==0) so EFLAGS are valid.
+      if (set_flags || imm != 0) {
         if (is_sub) {
-          res = std::get<0>(Gen<x86_64::SubqRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+          auto [r, flags] = Gen<x86_64::SubqRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+          res = r;
+          if (set_flags) {
+            EmitMaterializeNZCV(flags, /*is_sub=*/true);
+          }
         } else {
-          res = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+          auto [r, flags] = Gen<x86_64::AddqRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+          res = r;
+          if (set_flags) {
+            EmitMaterializeNZCV(flags, /*is_sub=*/false);
+          }
         }
       }
       return res;
@@ -161,11 +168,19 @@ class HeavyOptimizerFrontend {
     // 32-bit: a 32-bit mov zero-extends src to 64, then the 32-bit op keeps the
     // upper 32 bits clear (ARM64 W-write semantics).
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-    if (imm != 0) {
+    if (set_flags || imm != 0) {
       if (is_sub) {
-        res = std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+        auto [r, flags] = Gen<x86_64::SublRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+        res = r;
+        if (set_flags) {
+          EmitMaterializeNZCV(flags, /*is_sub=*/true);
+        }
       } else {
-        res = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+        auto [r, flags] = Gen<x86_64::AddlRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+        res = r;
+        if (set_flags) {
+          EmitMaterializeNZCV(flags, /*is_sub=*/false);
+        }
       }
     }
     return res;
@@ -177,17 +192,14 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
-  // AND/ORR/EOR (immediate, decoded 64-bit bitmask). ANDS (flag-setting) bails.
-  // x86 logical-immediate forms only take a 32-bit immediate, but the bitmask
+  // AND/ORR/EOR (immediate, decoded 64-bit bitmask), including ANDS/TST. x86 AND
+  // clears CF and OF, so ANDS materializes ARM64 NZCV with C=0 and V=0 (is_sub
+  // false, no borrow XOR). x86 logical-immediate forms only take a 32-bit
+  // immediate, but the bitmask
   // immediate needs the full 64 bits, so materialize it into a register and use
   // the reg-reg forms (mirrors lite_translator.h::LogicalImm).
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit, Register src, uint64_t imm) {
     if (!success()) {
-      return AllocTempReg();
-    }
-    // Validate first; emit nothing on bail.
-    if (opcode == Decoder::LogicalImmOpcode::kAnds) {
-      UndefinedReturningReg();
       return AllocTempReg();
     }
     Register imm_reg = GetImm(imm);
@@ -196,6 +208,12 @@ class HeavyOptimizerFrontend {
       switch (opcode) {
         case Decoder::LogicalImmOpcode::kAnd:
           return std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, imm_reg));
+        case Decoder::LogicalImmOpcode::kAnds: {
+          // ANDS/TST: x86 AND clears CF and OF, so ARM64 C=0 and V=0 naturally.
+          auto [r, flags] = Gen<x86_64::AndqRegReg, kNoSSA>(res, imm_reg);
+          EmitMaterializeNZCV(flags, /*is_sub=*/false);
+          return r;
+        }
         case Decoder::LogicalImmOpcode::kOrr:
           return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, imm_reg));
         case Decoder::LogicalImmOpcode::kEor:
@@ -210,6 +228,11 @@ class HeavyOptimizerFrontend {
     switch (opcode) {
       case Decoder::LogicalImmOpcode::kAnd:
         return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg));
+      case Decoder::LogicalImmOpcode::kAnds: {
+        auto [r, flags] = Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg);
+        EmitMaterializeNZCV(flags, /*is_sub=*/false);
+        return r;
+      }
       case Decoder::LogicalImmOpcode::kOrr:
         return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, imm_reg));
       case Decoder::LogicalImmOpcode::kEor:
@@ -615,8 +638,9 @@ class HeavyOptimizerFrontend {
   // Register-form data processing.
   //
 
-  // AND/ORR/EOR/BIC/ORN/EON (shifted register). `invert` selects the BIC/ORN/EON
-  // variants (src2 is bitwise-inverted before the op). ANDS (flag-setting) bails.
+  // AND/ORR/EOR/BIC/ORN/EON (shifted register), including ANDS/BICS/TST. `invert`
+  // selects the BIC/ORN/EON variants (src2 is bitwise-inverted before the op).
+  // x86 AND clears CF and OF, so ANDS materializes NZCV with C=0 and V=0.
   // Mirrors lite_translator.h::LogicalShiftedReg.
   Register LogicalShiftedReg(Decoder::LogicalShiftedRegOpcode opcode,
                              bool is_64bit,
@@ -626,11 +650,6 @@ class HeavyOptimizerFrontend {
                              Decoder::ShiftType shift_type,
                              uint8_t shift_amount) {
     if (!success()) {
-      return AllocTempReg();
-    }
-    // Validate first; emit nothing on bail.
-    if (opcode == Decoder::LogicalShiftedRegOpcode::kAnds) {
-      UndefinedReturningReg();
       return AllocTempReg();
     }
     Register op2 = EmitShiftImm(src2, shift_type, shift_amount, is_64bit);
@@ -644,6 +663,12 @@ class HeavyOptimizerFrontend {
       switch (opcode) {
         case Decoder::LogicalShiftedRegOpcode::kAnd:
           return std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, op2));
+        case Decoder::LogicalShiftedRegOpcode::kAnds: {
+          // ANDS/BICS/TST: x86 AND clears CF and OF, so ARM64 C=0 and V=0.
+          auto [r, flags] = Gen<x86_64::AndqRegReg, kNoSSA>(res, op2);
+          EmitMaterializeNZCV(flags, /*is_sub=*/false);
+          return r;
+        }
         case Decoder::LogicalShiftedRegOpcode::kOrr:
           return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, op2));
         case Decoder::LogicalShiftedRegOpcode::kEor:
@@ -657,6 +682,11 @@ class HeavyOptimizerFrontend {
     switch (opcode) {
       case Decoder::LogicalShiftedRegOpcode::kAnd:
         return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, op2));
+      case Decoder::LogicalShiftedRegOpcode::kAnds: {
+        auto [r, flags] = Gen<x86_64::AndlRegReg, kNoSSA>(res, op2);
+        EmitMaterializeNZCV(flags, /*is_sub=*/false);
+        return r;
+      }
       case Decoder::LogicalShiftedRegOpcode::kOrr:
         return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, op2));
       case Decoder::LogicalShiftedRegOpcode::kEor:
@@ -667,9 +697,9 @@ class HeavyOptimizerFrontend {
     }
   }
 
-  // ADD/SUB (shifted register). Flag-setting variant bails (needs NZCV). ROR is
-  // not a valid shift for add/sub and bails. Mirrors
-  // lite_translator.h::AddSubShiftedReg.
+  // ADD/SUB (shifted register), including the flag-setting ADDS/SUBS/CMP/CMN
+  // forms (NZCV materialized via EmitMaterializeNZCV). ROR is not a valid shift
+  // for add/sub and bails. Mirrors lite_translator.h::AddSubShiftedReg.
   Register AddSubShiftedReg(bool is_sub,
                             bool set_flags,
                             bool is_64bit,
@@ -680,8 +710,8 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return AllocTempReg();
     }
-    // Validate first; emit nothing on bail.
-    if (set_flags || shift_type == Decoder::ShiftType::kRor) {
+    // Validate first; emit nothing on bail. ROR is not a valid shift for ADD/SUB.
+    if (shift_type == Decoder::ShiftType::kRor) {
       UndefinedReturningReg();
       return AllocTempReg();
     }
@@ -689,19 +719,36 @@ class HeavyOptimizerFrontend {
     if (is_64bit) {
       Register res = Copy(src1);
       if (is_sub) {
-        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, op2));
+        auto [r, flags] = Gen<x86_64::SubqRegReg, kNoSSA>(res, op2);
+        if (set_flags) {
+          EmitMaterializeNZCV(flags, /*is_sub=*/true);
+        }
+        return r;
       }
-      return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, op2));
+      auto [r, flags] = Gen<x86_64::AddqRegReg, kNoSSA>(res, op2);
+      if (set_flags) {
+        EmitMaterializeNZCV(flags, /*is_sub=*/false);
+      }
+      return r;
     }
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
     if (is_sub) {
-      return std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(res, op2));
+      auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, op2);
+      if (set_flags) {
+        EmitMaterializeNZCV(flags, /*is_sub=*/true);
+      }
+      return r;
     }
-    return std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(res, op2));
+    auto [r, flags] = Gen<x86_64::AddlRegReg, kNoSSA>(res, op2);
+    if (set_flags) {
+      EmitMaterializeNZCV(flags, /*is_sub=*/false);
+    }
+    return r;
   }
 
-  // ADD/SUB (extended register). Flag-setting variant bails (needs NZCV).
-  // Mirrors lite_translator.h::AddSubExtendedReg.
+  // ADD/SUB (extended register), including the flag-setting ADDS/SUBS/CMP/CMN
+  // forms (NZCV materialized via EmitMaterializeNZCV). Mirrors
+  // lite_translator.h::AddSubExtendedReg.
   Register AddSubExtendedReg(bool is_sub,
                              bool set_flags,
                              bool is_64bit,
@@ -713,7 +760,7 @@ class HeavyOptimizerFrontend {
       return AllocTempReg();
     }
     // Validate first; emit nothing on bail.
-    if (set_flags || shift_amount > 4 || extend_type > 0b111) {
+    if (shift_amount > 4 || extend_type > 0b111) {
       UndefinedReturningReg();
       return AllocTempReg();
     }
@@ -773,15 +820,31 @@ class HeavyOptimizerFrontend {
     if (is_64bit) {
       Register res = Copy(src1);
       if (is_sub) {
-        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, ext));
+        auto [r, flags] = Gen<x86_64::SubqRegReg, kNoSSA>(res, ext);
+        if (set_flags) {
+          EmitMaterializeNZCV(flags, /*is_sub=*/true);
+        }
+        return r;
       }
-      return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, ext));
+      auto [r, flags] = Gen<x86_64::AddqRegReg, kNoSSA>(res, ext);
+      if (set_flags) {
+        EmitMaterializeNZCV(flags, /*is_sub=*/false);
+      }
+      return r;
     }
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
     if (is_sub) {
-      return std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(res, ext));
+      auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, ext);
+      if (set_flags) {
+        EmitMaterializeNZCV(flags, /*is_sub=*/true);
+      }
+      return r;
     }
-    return std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(res, ext));
+    auto [r, flags] = Gen<x86_64::AddlRegReg, kNoSSA>(res, ext);
+    if (set_flags) {
+      EmitMaterializeNZCV(flags, /*is_sub=*/false);
+    }
+    return r;
   }
 
   Register ConditionalSelect(Decoder::ConditionalSelectOpcode opcode,
@@ -1368,6 +1431,29 @@ class HeavyOptimizerFrontend {
           typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>::OutputArgsTuple,
       Gen,
       (, kSSAMode))
+
+  // Materialize ARM64 NZCV into ThreadState.cpu.flags from the host EFLAGS that
+  // a preceding x86 ALU op left in `flags_vreg`. Bit-exact with
+  // lite_translator.h::EmitStoreArmNZCV:
+  //   PseudoReadFlags (LAHF + SETO) -> raw has N@15, Z@14, C@8, V@0
+  //   AND 0xC101                    -> keep only N, Z, C, V
+  //   if is_sub: XOR 0x0100         -> ARM borrow is inverted (ARM C = !x86 CF)
+  //   MOVW [rbp + cpu.flags], raw   -> 16-bit store of the packed NZCV
+  // cpu.flags is a uint16_t and the 2 bytes after it are alignment padding
+  // before cpu.cached_fpcr, but the 16-bit store mirrors lite exactly and never
+  // touches a neighbouring field.
+  void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
+    Register raw = AllocTempReg();
+    builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, raw, flags_vreg);
+    raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(0xC101)));
+    if (is_sub) {
+      raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(0x0100)));
+    }
+    builder_.Gen<x86_64::MovwOpReg>(
+        {.base = x86_64::kMachineRegRBP,
+         .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
+        raw);
+  }
 
   // Emit `src` shifted by a constant amount (LSL/LSR/ASR/ROR) into a fresh
   // register, mirroring lite_translator.h::EmitShift. A 32-bit shift uses the

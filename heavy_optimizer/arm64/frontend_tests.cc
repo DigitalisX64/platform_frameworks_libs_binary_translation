@@ -65,9 +65,24 @@ constexpr uint32_t AddImmX(uint8_t rd, uint8_t rn, uint16_t imm12) {
 constexpr uint32_t SubImmX(uint8_t rd, uint8_t rn, uint16_t imm12) {
   return 0xD1000000 | (static_cast<uint32_t>(imm12) << 10) | (rn << 5) | rd;
 }
-// SUBS Xd, Xn, #imm12 (flag-setting subtract -> must bail).
+// SUBS Xd, Xn, #imm12 (flag-setting subtract).
 constexpr uint32_t SubsImmX(uint8_t rd, uint8_t rn, uint16_t imm12) {
   return 0xF1000000 | (static_cast<uint32_t>(imm12) << 10) | (rn << 5) | rd;
+}
+// ADDS Xd, Xn, #imm12 (flag-setting add).
+constexpr uint32_t AddsImmX(uint8_t rd, uint8_t rn, uint16_t imm12) {
+  return 0xB1000000 | (static_cast<uint32_t>(imm12) << 10) | (rn << 5) | rd;
+}
+// CMP Xn, #imm12 == SUBS XZR, Xn, #imm12.
+constexpr uint32_t CmpImmX(uint8_t rn, uint16_t imm12) {
+  return SubsImmX(31, rn, imm12);
+}
+// SUBS/ADDS Wd, Wn, #imm12 (32-bit, flag-setting).
+constexpr uint32_t SubsImmW(uint8_t rd, uint8_t rn, uint16_t imm12) {
+  return 0x71000000 | (static_cast<uint32_t>(imm12) << 10) | (rn << 5) | rd;
+}
+constexpr uint32_t AddsImmW(uint8_t rd, uint8_t rn, uint16_t imm12) {
+  return 0x31000000 | (static_cast<uint32_t>(imm12) << 10) | (rn << 5) | rd;
 }
 // ADD/SUB Wd, Wn, #imm12 (32-bit).
 constexpr uint32_t AddImmW(uint8_t rd, uint8_t rn, uint16_t imm12) {
@@ -107,9 +122,39 @@ constexpr uint32_t AndRegLsr(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t shift) 
   return 0x8A400000 | (static_cast<uint32_t>(rm) << 16) |
          (static_cast<uint32_t>(shift) << 10) | (rn << 5) | rd;
 }
-// ANDS Xd, Xn, Xm (flag-setting -> must bail).
+// ANDS Xd, Xn, Xm (flag-setting AND, shifted register).
 constexpr uint32_t AndsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0xEA000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// SUBS/ADDS Xd, Xn, Xm (flag-setting, shifted register, no shift).
+constexpr uint32_t SubsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xEB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t AddsRegX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0xAB000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// SUBS/ADDS Wd, Wn, Wm (32-bit, flag-setting, shifted register, no shift).
+constexpr uint32_t SubsRegW(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6B000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t AddsRegW(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2B000000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// SUBS Xd, Xn, Xm, LSL #shift.
+constexpr uint32_t SubsRegLsl(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t shift) {
+  return 0xEB000000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(shift) << 10) | (rn << 5) | rd;
+}
+// ADDS Xd, Xn, Xm, UXTB #shift (extended register, flag-setting).
+constexpr uint32_t AddsExtX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t option, uint8_t shift) {
+  return 0xAB200000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(option) << 13) | (static_cast<uint32_t>(shift) << 10) |
+         (rn << 5) | rd;
+}
+// ANDS Xd, Xn, #bitmask (logical immediate, N=1 64-bit, flag-setting).
+constexpr uint32_t AndsImmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0xF2400000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
 }
 // ADD Xd, Xn, Xm, UXTB #shift (extended register).
 constexpr uint32_t AddExtX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t option, uint8_t shift) {
@@ -375,8 +420,278 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, AddImm32ZeroExtends) {
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0});  // 0xFFFFFFFF + 1 = 0, upper cleared
 }
 
-TEST_F(Arm64HeavyOptimizerFrontendTest, SubsImmBails) {
+//
+// Flag-setting integer ALU: assert BOTH the result register AND cpu.flags.
+// NZCV packing matches the lite translator: N=bit15, Z=bit14, C=bit8, V=bit0.
+//
+
+// SUBS producing Z=1, C=1 (equal operands -> no borrow).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsImmEqualSetsZC) {
+  // SUBS X0, X1, #5 with X1 == 5.
+  static const uint32_t code[] = {SubsImmX(0, 1, 5)};
+  state_.cpu.x[1] = 5;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);  // no borrow
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// SUBS producing N=1, C=0 (borrow: smaller minus larger).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsImmBorrowSetsNC) {
+  // SUBS X0, X1, #10 with X1 == 5 -> -5, borrow.
+  static const uint32_t code[] = {SubsImmX(0, 1, 10)};
+  state_.cpu.x[1] = 5;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFBULL});  // -5
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);  // ARM borrow -> C=0
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// SUBS signed overflow: INT64_MIN - 1 overflows -> V=1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsImmSignedOverflow) {
+  // SUBS X0, X1, #1 with X1 == INT64_MIN -> wraps to INT64_MAX, V=1.
   static const uint32_t code[] = {SubsImmX(0, 1, 1)};
+  state_.cpu.x[1] = 0x8000000000000000ULL;  // INT64_MIN
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x7FFFFFFFFFFFFFFFULL});  // INT64_MAX
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagOverflow);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);  // no unsigned borrow
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+}
+
+// ADDS producing C=1 (unsigned carry-out).
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddsImmCarryOut) {
+  // ADDS X0, X1, #1 with X1 == UINT64_MAX -> 0, carry out.
+  static const uint32_t code[] = {AddsImmX(0, 1, 1)};
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// ADDS producing V=1 (signed overflow): INT64_MAX + 1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddsImmSignedOverflow) {
+  // ADDS X0, X1, #1 with X1 == INT64_MAX -> INT64_MIN, V=1, N=1.
+  static const uint32_t code[] = {AddsImmX(0, 1, 1)};
+  state_.cpu.x[1] = 0x7FFFFFFFFFFFFFFFULL;  // INT64_MAX
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x8000000000000000ULL});  // INT64_MIN
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagOverflow);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+}
+
+// 32-bit SUBS (W form): borrow case with zero-extended result.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsImmW32) {
+  // SUBS W0, W1, #1 with W1 == 0 -> 0xFFFFFFFF, N=1, C=0 (borrow).
+  static const uint32_t code[] = {SubsImmW(0, 1, 1)};
+  state_.cpu.x[1] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFULL});  // W-result zero-extended
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+}
+
+// 32-bit ADDS (W form): carry-out at the 32-bit boundary, Z=1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddsImmW32CarryOut) {
+  // ADDS W0, W1, #1 with W1 == 0xFFFFFFFF -> 0, C=1, Z=1.
+  static const uint32_t code[] = {AddsImmW(0, 1, 1)};
+  state_.cpu.x[1] = 0xFFFFFFFFULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// CMP (SUBS to XZR): flags set, result discarded, x[0] untouched.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmpImmDiscardsResult) {
+  // X0 holds a sentinel; CMP X1, #5 (== SUBS XZR, X1, #5) with X1 == 5.
+  static const uint32_t code[] = {CmpImmX(1, 5)};
+  state_.cpu.x[0] = 0xDEADBEEFCAFEF00DULL;  // sentinel: must not be clobbered
+  state_.cpu.x[1] = 5;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xDEADBEEFCAFEF00DULL});  // untouched
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+}
+
+// SUBS shifted register: X0 = X1 - (X2 << 4), flags set.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsRegShifted) {
+  // SUBS X0, X1, X2, LSL #4 with X1 == 0x100, X2 == 0x10 -> 0x100 - 0x100 = 0.
+  static const uint32_t code[] = {SubsRegLsl(0, 1, 2, 4)};
+  state_.cpu.x[1] = 0x100;
+  state_.cpu.x[2] = 0x10;  // << 4 = 0x100
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+}
+
+// SUBS register (no shift): borrow case.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsRegBorrow) {
+  // SUBS X0, X1, X2 with X1 < X2 -> borrow (C=0), N=1.
+  static const uint32_t code[] = {SubsRegX(0, 1, 2)};
+  state_.cpu.x[1] = 3;
+  state_.cpu.x[2] = 10;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFF9ULL});  // -7
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);
+}
+
+// ADDS register (no shift): carry-out and overflow.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddsRegCarryAndOverflow) {
+  // ADDS X0, X1, X2 with X1 == X2 == INT64_MIN -> 0, C=1 (carry out), V=1.
+  static const uint32_t code[] = {AddsRegX(0, 1, 2)};
+  state_.cpu.x[1] = 0x8000000000000000ULL;
+  state_.cpu.x[2] = 0x8000000000000000ULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagOverflow);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+}
+
+// 32-bit SUBS register: equal operands -> Z=1, C=1, zero-extended result.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubsRegW32Equal) {
+  static const uint32_t code[] = {SubsRegW(0, 1, 2)};
+  state_.cpu.x[1] = 0xFFFFFFFF00001234ULL;  // W1 = 0x1234
+  state_.cpu.x[2] = 0x1234;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});  // upper 32 cleared
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+}
+
+// 32-bit ADDS register: carry-out at 32-bit boundary.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddsRegW32CarryOut) {
+  static const uint32_t code[] = {AddsRegW(0, 1, 2)};
+  state_.cpu.x[1] = 0xFFFFFFFFULL;
+  state_.cpu.x[2] = 1;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+}
+
+// ADDS extended register: X0 = X1 + ((X2 & 0xFF) << 2), flags set.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddsExtendedUxtb) {
+  // ADDS X0, X1, X2, UXTB #2 with low byte of X2 == 0x80.
+  static const uint32_t code[] = {AddsExtX(0, 1, 2, /*UXTB=*/0b000, 2)};
+  state_.cpu.x[1] = 0x1000;
+  state_.cpu.x[2] = 0xFFFFFF80ULL;  // low byte 0x80
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x1000 + (0x80 << 2)});
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// ANDS producing Z=1 (result zero), and C==0 && V==0 always for AND.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AndsRegZeroSetsZ) {
+  // ANDS X0, X1, X2 with disjoint bits -> 0, Z=1, C=0, V=0.
+  static const uint32_t code[] = {AndsRegX(0, 1, 2)};
+  state_.cpu.x[1] = 0x00FF;
+  state_.cpu.x[2] = 0xFF00;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);     // AND clears C
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);  // AND clears V
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+}
+
+// ANDS producing N=1 (MSB set), and C==0 && V==0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AndsRegNegativeSetsN) {
+  // ANDS X0, X1, X2 with top bit kept -> N=1, C=0, V=0.
+  static const uint32_t code[] = {AndsRegX(0, 1, 2)};
+  state_.cpu.x[1] = 0x8000000000000001ULL;
+  state_.cpu.x[2] = 0x8000000000000000ULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x8000000000000000ULL});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// ANDS logical immediate: Z=1, and C==0 && V==0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AndsImmZeroSetsZ) {
+  // ANDS X0, X1, #0xFF with X1 having no low byte -> 0, Z=1.
+  static const uint32_t code[] = {AndsImmX(0, 1, 0, 7)};
+  state_.cpu.x[1] = 0xAB00;  // low byte zero
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// TST (ANDS to XZR): flags set, result discarded.
+TEST_F(Arm64HeavyOptimizerFrontendTest, TstImmDiscardsResult) {
+  // TST X1, #0xFF == ANDS XZR, X1, #0xFF. X0 sentinel must be preserved.
+  static const uint32_t code[] = {AndsImmX(31, 1, 0, 7)};
+  state_.cpu.x[0] = 0x1234567890ABCDEFULL;  // sentinel
+  state_.cpu.x[1] = 0xAB00;                 // low byte zero -> Z=1
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x1234567890ABCDEFULL});  // untouched
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+}
+
+// ADC/SBC (add/subtract with carry) bails: needs the carry-in from cpu.flags.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AdcBails) {
+  // ADC X0, X1, X2 -> 0x9A000000 base | (rm<<16) | (rn<<5) | rd.
+  static const uint32_t code[] = {0x9A020020u};  // ADC X0, X1, X2
   state_.cpu.insn_addr = ToGuestAddr(code);
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
   EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
@@ -476,13 +791,6 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, OrnReg64) {
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFF});
 }
 
-TEST_F(Arm64HeavyOptimizerFrontendTest, AndsRegBails) {
-  static const uint32_t code[] = {AndsRegX(0, 1, 2)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
-  EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
-}
-
 TEST_F(Arm64HeavyOptimizerFrontendTest, AddExtendedUxtb) {
   // ADD X0, X1, X2, UXTB #2 -> X1 + ((X2 & 0xFF) << 2).
   static const uint32_t code[] = {AddExtX(0, 1, 2, /*UXTB=*/0b000, 2)};
@@ -533,15 +841,6 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, EorImm64) {
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
   ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0x1200});
-}
-
-TEST_F(Arm64HeavyOptimizerFrontendTest, AndsImmBails) {
-  // ANDS X0, X1, #0xFF (flag-setting logical immediate).
-  // 0xF2400000 base (ANDS) | (imms=7<<10).
-  static const uint32_t code[] = {0xF2400000u | (7u << 10) | (1u << 5) | 0u};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
-  EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, Madd64) {
@@ -864,6 +1163,39 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluRegionExecutes) {
   EXPECT_EQ(state_.cpu.x[0], uint64_t{5});
   EXPECT_EQ(state_.cpu.x[1], uint64_t{8});
   EXPECT_EQ(state_.cpu.x[2], uint64_t{7});
+}
+
+// A flag-setting SUBS inside a multi-insn region must produce valid IR (the
+// EmitMaterializeNZCV sequence — PseudoReadFlags + AND + store — must survive
+// GenCode's CheckMachineIR). A following ADC bails, ending the region.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MultiFlagSetterThenBailRegion) {
+  // MOVZ X0,#10; SUBS X1,X0,#3; ADC X2,X1,X0 (bails).
+  static const uint32_t code[] = {MovzX(0, 10), SubsImmX(1, 0, 3), 0x9A000022u /*ADC X2,X1,X0*/};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  // MOVZ + SUBS translate, the ADC bails -> partial region of 2.
+  EXPECT_EQ(n, 2u);
+}
+
+// Full region execution end-to-end with a flag-setter: MOVZ X0,#7; SUBS X1,X0,#7
+// must leave X1==0 and the Z and C flags set in cpu.flags after the region runs.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MultiFlagSetterRegionExecutes) {
+  static const uint32_t code[] = {MovzX(0, 7), SubsImmX(1, 0, 7)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  MachineCode mc;
+  auto [stop, ok, n] =
+      HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+  ASSERT_TRUE(ok);
+  ASSERT_EQ(n, 2u);
+  ScopedExecRegion exec(&mc);
+  TestingRunGeneratedCode(&state_, exec.get(), end_pc);
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{7});
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
 }
 
 // A non-MoveWide instruction must bail out of the optimizing frontend (the
