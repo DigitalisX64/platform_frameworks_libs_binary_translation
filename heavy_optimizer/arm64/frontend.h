@@ -28,8 +28,12 @@
 #include "berberis/decoder/arm64/semantics_player.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_arch.h"
+#include "berberis/intrinsics/intrinsics.h"
+#include "berberis/intrinsics/macro_assembler.h"
 #include "berberis/runtime_primitives/platform.h"
 
+#include "call_intrinsic.h"
+#include "inline_intrinsic.h"
 #include "simd_register.h"
 
 namespace berberis {
@@ -39,8 +43,11 @@ namespace berberis {
 // region machinery (StartRegion / GenJump / ExitGeneratedCode / ResolveJumps /
 // Finalize / StartInsn) is adapted from heavy_optimizer/riscv64/frontend.{h,cc}.
 //
-// Currently only MoveWide (MOVZ/MOVN) and MoveWideKeep (MOVK) are translated to
-// native x86_64; every other instruction calls Undefined() (sets success_ =
+// Integer/branch/load-store instructions are translated to native x86_64.
+// Scalar floating-point arithmetic (FADD/FSUB/FMUL/FDIV for S and D) is lowered
+// through the guest-agnostic intrinsic layer (inline_intrinsic.h +
+// machine_ir_intrinsic_binding.json), and FMOV/FABS/FNEG/FSQRT/FMOV-imm are
+// emitted directly. Anything not handled calls Undefined() (sets success_ =
 // false) so the two-gear runtime falls back to the lite translator/interpreter.
 // New instructions are added here as the optimizing tier grows.
 class HeavyOptimizerFrontend {
@@ -50,6 +57,8 @@ class HeavyOptimizerFrontend {
   static constexpr Register no_register = MachineReg{};
   using FpRegister = SimdReg;
   static constexpr SimdReg no_fp_register = SimdReg{};
+  using Float32 = intrinsics::Float32;
+  using Float64 = intrinsics::Float64;
 
   explicit HeavyOptimizerFrontend(x86_64::MachineIR* machine_ir, GuestAddr pc)
       : pc_(pc),
@@ -1214,46 +1223,188 @@ class HeavyOptimizerFrontend {
   // Floating-point scalar.
   //
 
+  // FCSEL: predicate-select between two scalar V regs. Not wired into the
+  // optimizing tier yet (needs basic-block manipulation + scalar select);
+  // bail to the lite translator/interpreter.
   void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ftype, Decoder::Condition cond) {
     UndefinedReturningVoid();
     UNUSED_ARGS(rd, rn, rm, ftype, cond);
   }
 
+  // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point). The FCvt* intrinsics + cvtsi2ss
+  // SSE ops are not in the ARM64 backend gen inputs (their macro-assembler defs
+  // live only in riscv64_to_x86_64/macro_def.json), so bail.
   void FpFixedPointConversion(const Decoder::FpFixedPointArgs& args) {
     UndefinedReturningVoid();
     UNUSED_ARGS(args);
   }
 
+  // FMADD/FMSUB/FNMADD/FNMSUB. Would need the FMA intrinsic bindings + scalar
+  // V-reg plumbing for three operands; bail for now.
   void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra, uint8_t ftype, bool o1, bool o0) {
     UndefinedReturningVoid();
     UNUSED_ARGS(rd, rn, rm, ra, ftype, o1, o0);
   }
 
+  // FMOV (scalar, immediate): the FP constant is fully known at translation
+  // time (VFPExpandImm of imm8). Zero the 16-byte V[d] slot, then store the
+  // 32/64-bit constant into lane 0. Mirrors lite_translator.h::FpMovImmediate;
+  // bail FP16 (ftype=0b11) and the reserved ftype=0b10.
   void FpMovImmediate(uint8_t rd, uint8_t imm8, uint8_t ftype) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, imm8, ftype);
+    if (!success()) {
+      return;
+    }
+    if (ftype != 0b00 && ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (ftype == 0b00) {
+      uint32_t imm32 = VFPExpandImm32(imm8);
+      Register tmp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(imm32)));
+      SetVRegScalarFromGp(rd, tmp, /*is_double=*/false);
+    } else {
+      uint64_t imm64 = VFPExpandImm64(imm8);
+      Register tmp = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(imm64)));
+      SetVRegScalarFromGp(rd, tmp, /*is_double=*/true);
+    }
   }
 
+  // FCVTZS/FCVTZU/SCVTF/UCVTF (FP<->int). The FCvtFloatToInteger* intrinsics +
+  // cvtsi2ss SSE ops are not available to the ARM64 backend (riscv64-only macro
+  // defs), so bail.
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
     UndefinedReturningVoid();
     UNUSED_ARGS(args);
   }
 
+  // FMOV(reg) / FABS / FNEG for FP32 (ftype=00) and FP64 (ftype=01). These are
+  // pure bit operations: copy (FMOV), sign-bit clear (FABS), sign-bit flip
+  // (FNEG). Everything stays in the XMM domain — read the scalar into an XMM,
+  // apply the sign mask there (PAND for FABS, XORPD for FNEG against a mask XMM),
+  // and write back. Keeping reads/writes of guest v[] in the XMM domain is
+  // required: RemoveLocalGuestContextAccesses forwards a prior 16-byte MOVDQA
+  // store of an XMM vreg straight into a same-offset GET, so a GP-domain read of
+  // the same v[] slot would funnel an XMM vreg into a GP operand and fail
+  // register-class intersection.
+  //
+  // FSQRT, FRINT*, FCVT (precision change), BFCVT, FP16, and ftype=10 bail:
+  // their SSE ops (Sqrt*, Round*, Cvt*) are not allowlisted for the ARM64
+  // backend.
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+
+    // FMOV / FABS / FNEG only. Anything else bails.
+    if (args.opcode != 0b000000 && args.opcode != 0b000001 && args.opcode != 0b000010) {
+      UndefinedReturningVoid();
+      return;
+    }
+
+    FpRegister val = GetVRegScalar(args.rn, is_double);
+
+    if (args.opcode != 0b000000) {
+      // Build the sign mask in a GP register (a fresh immediate, never a
+      // forwarded guest-context value, so the GP->XMM move is conflict-free),
+      // move it into an XMM, then PAND (FABS: clear sign) / XORPD (FNEG: flip
+      // sign). FP32 masks live in the low 32 bits; lanes above 0 are irrelevant
+      // because SetVRegScalar only commits lane 0.
+      FpRegister mask = AllocTempSimdReg();
+      if (is_double) {
+        uint64_t m = (args.opcode == 0b000001) ? 0x7FFFFFFFFFFFFFFFULL : 0x8000000000000000ULL;
+        Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(m)));
+        builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
+      } else {
+        uint32_t m = (args.opcode == 0b000001) ? 0x7FFFFFFFu : 0x80000000u;
+        Register gm = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(m)));
+        builder_.Gen<x86_64::MovdXRegReg>(mask.machine_reg(), gm);
+      }
+      if (args.opcode == 0b000001) {  // FABS
+        builder_.Gen<x86_64::PandXRegXReg>(val.machine_reg(), mask.machine_reg());
+      } else {  // FNEG
+        builder_.Gen<x86_64::XorpdXRegXReg>(val.machine_reg(), mask.machine_reg());
+      }
+    }
+    SetVRegScalar(args.rd, val, is_double);
   }
 
+  // FADD/FSUB/FMUL/FDIV for FP32 (ftype=00) and FP64 (ftype=01), lowered through
+  // the guest-agnostic intrinsic layer (InlineIntrinsicForHeavyOptimizer ->
+  // FXxxHostRounding -> SSE ADDSS/ADDSD/... per machine_ir_intrinsic_binding.json).
+  // Host default rounding is round-to-nearest, matching ARM FPCR.RMode=0.
+  //
+  // FPSR note: heavy-optimizer FP regions do NOT yet accumulate FPSR exception
+  // bits into cpu.emulated_fpsr (the FeGetExceptions/FeSetExceptions intrinsics
+  // are riscv64-only macro defs and convert to the RISC-V exception bit layout,
+  // not ARM's). FP *results* are correct without this; MRS-of-FPSR bails to the
+  // lite translator/interpreter, which maintains the flags. This is a follow-up.
+  //
+  // FMAX/FMIN/FMAXNM/FMINNM/FNMUL (opcode >= 0b0100), FP16 (ftype=0b11), and the
+  // reserved ftype=0b10 bail: their intrinsics/SSE ops are not wired here.
   void FpDataProc2(const Decoder::FpDataProc2Args& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (args.opcode > 0b0011) {
+      // FMAX/FMIN/FMAXNM/FMINNM/FNMUL not wired into the optimizing tier.
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+    FpRegister src1 = GetVRegScalar(args.rn, is_double);
+    FpRegister src2 = GetVRegScalar(args.rm, is_double);
+    FpRegister result = AllocTempSimdReg();
+    if (is_double) {
+      switch (args.opcode) {
+        case 0b0000:  // FMUL
+          EmitFpBinop<&intrinsics::FMul<Float64>>(result, src1, src2);
+          break;
+        case 0b0001:  // FDIV
+          EmitFpBinop<&intrinsics::FDiv<Float64>>(result, src1, src2);
+          break;
+        case 0b0010:  // FADD
+          EmitFpBinop<&intrinsics::FAdd<Float64>>(result, src1, src2);
+          break;
+        case 0b0011:  // FSUB
+          EmitFpBinop<&intrinsics::FSub<Float64>>(result, src1, src2);
+          break;
+      }
+    } else {
+      switch (args.opcode) {
+        case 0b0000:  // FMUL
+          EmitFpBinop<&intrinsics::FMul<Float32>>(result, src1, src2);
+          break;
+        case 0b0001:  // FDIV
+          EmitFpBinop<&intrinsics::FDiv<Float32>>(result, src1, src2);
+          break;
+        case 0b0010:  // FADD
+          EmitFpBinop<&intrinsics::FAdd<Float32>>(result, src1, src2);
+          break;
+        case 0b0011:  // FSUB
+          EmitFpBinop<&intrinsics::FSub<Float32>>(result, src1, src2);
+          break;
+      }
+    }
+    SetVRegScalar(args.rd, result, is_double);
   }
 
+  // FCMP/FCMPE: needs an x86 UCOMIS{S,D} -> ARM FP NZCV mapping (the Ucomis SSE
+  // ops are not allowlisted for the ARM64 backend); bail.
   void FpCompare(const Decoder::FpCompareArgs& args) {
     UndefinedReturningVoid();
     UNUSED_ARGS(args);
   }
 
+  // FCCMP/FCCMPE: same UCOMIS dependency as FCMP plus a predicate; bail.
   void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args) {
     UndefinedReturningVoid();
     UNUSED_ARGS(args);
@@ -1678,6 +1829,118 @@ class HeavyOptimizerFrontend {
         return std::get<0>(Gen<x86_64::RorlRegImm, kNoSSA>(dst, amt));
     }
     return dst;
+  }
+
+  //
+  // Scalar floating-point helpers.
+  //
+
+  // Load the low scalar of guest V[reg] into a fresh SimdReg. MOVSS loads the
+  // low 4 bytes (S) and MOVSD the low 8 bytes (D), each zeroing the rest of the
+  // host XMM, so the value sits in lane 0 ready for an SSE op.
+  //
+  // A MOVSD (8-byte) load is used for BOTH S and D: it is one of the SIMD
+  // opcodes RemoveLocalGuestContextAccesses recognizes as a guest-context GET
+  // (MOVSS is not), so a prior 16-byte MOVDQA store to the same v[reg] forwards
+  // correctly through the local optimizer instead of being dead-eliminated and
+  // leaving a stale memory read. For S the extra 4 bytes loaded are harmless:
+  // the scalar SSE op (ADDSS/MULSS/...) operates on lane 0 only.
+  [[nodiscard]] FpRegister GetVRegScalar(uint8_t reg, bool /*is_double*/) {
+    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    return FpRegister{
+        std::get<0>(Gen<x86_64::MovsdXRegOp>({.base = x86_64::kMachineRegRBP, .disp = off}))};
+  }
+
+  // Allocate a freshly-zeroed XMM. PXOR is dependency-breaking (zeroes
+  // regardless of prior contents), but its operand is use_def, so a PseudoDefReg
+  // first gives the vreg a lifetime for the data-flow analysis (mirrors the
+  // riscv64 frontend's self-XOR zeroing idiom).
+  [[nodiscard]] FpRegister AllocZeroedSimdReg() {
+    FpRegister zero = AllocTempSimdReg();
+    builder_.Gen<PseudoDefReg>(zero.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(zero.machine_reg(), zero.machine_reg());
+    return zero;
+  }
+
+  // Write the scalar `value` (in lane 0) to guest V[reg] and ZERO the upper
+  // bytes, matching ARM scalar-FP write semantics (a later vector read of the
+  // same register must see a clean zero-extended value).
+  //
+  // The whole 16-byte slot is written with ONE aligned MOVDQA store of a
+  // fully-formed XMM (lane 0 = the scalar, lanes above zero). A single store —
+  // rather than a zero-store followed by a partial MOVSS/MOVSD — is required
+  // because RemoveLocalGuestContextAccesses keys dead-store elimination on the
+  // store displacement alone (not its width): a later MOVSD to the same v[reg]
+  // offset would otherwise erase a preceding 16-byte zero-store and leave the
+  // upper 8 bytes stale. We merge `value`'s lane 0 into a zeroed XMM (MOVSS/
+  // MOVSD reg-reg preserve the dest's upper lanes), then store it once.
+  void SetVRegScalar(uint8_t reg, FpRegister value, bool is_double) {
+    if (!success()) {
+      return;
+    }
+    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    FpRegister merged = AllocZeroedSimdReg();
+    if (is_double) {
+      builder_.Gen<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
+    } else {
+      builder_.Gen<x86_64::MovssXRegXReg>(merged.machine_reg(), value.machine_reg());
+    }
+    builder_.Gen<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off},
+                                       merged.machine_reg());
+  }
+
+  // Write a scalar value held in a GP register (low 4 bytes for S, low 8 for D)
+  // to guest V[reg], zeroing the upper bytes. Same single-MOVDQA-store rationale
+  // as SetVRegScalar: move the GP value into lane 0 of a zeroed XMM, store once.
+  void SetVRegScalarFromGp(uint8_t reg, Register value, bool is_double) {
+    if (!success()) {
+      return;
+    }
+    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    FpRegister merged = AllocZeroedSimdReg();
+    if (is_double) {
+      // MOVQ xmm, r64 zero-extends into the XMM (upper 64 cleared).
+      builder_.Gen<x86_64::MovqXRegReg>(merged.machine_reg(), value);
+    } else {
+      // MOVD xmm, r32 zero-extends into the XMM (upper 96 cleared).
+      builder_.Gen<x86_64::MovdXRegReg>(merged.machine_reg(), value);
+    }
+    builder_.Gen<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off},
+                                       merged.machine_reg());
+  }
+
+  // Lower a scalar FP binary op through the guest-agnostic intrinsic layer.
+  // kFunction is intrinsics::FAdd/FSub/FMul/FDiv<FloatN>; passing rm=DYN makes
+  // InlineIntrinsic forward to the FXxxHostRounding variant bound to the SSE op
+  // in machine_ir_intrinsic_binding.json. frm is unused on the host-rounding
+  // path; a dummy temp register satisfies the signature.
+  template <auto kFunction>
+  void EmitFpBinop(FpRegister result, FpRegister src1, FpRegister src2) {
+    if (!success()) {
+      return;
+    }
+    Register frm = AllocTempReg();
+    builder_.Gen<PseudoDefReg>(frm);
+    InlineIntrinsicForHeavyOptimizer<kFunction>(
+        &builder_, result, GetFlagsRegister(), int8_t{0b111}, frm, src1, src2);
+  }
+
+  // VFPExpandImm (ARM ARM, FMOV scalar/vector immediate). The FP constant is a
+  // pure function of imm8, computed at translation time. Mirrors
+  // lite_translator.h::VFPExpandImm32Jit / VFPExpandImm64Jit.
+  static uint32_t VFPExpandImm32(uint8_t imm8) {
+    uint32_t sign = (imm8 >> 7) & 1;
+    uint32_t b = (imm8 >> 6) & 1;
+    uint32_t exp = ((1 - b) << 7) | ((b ? 0x1Fu : 0u) << 2) | ((imm8 >> 4) & 0x3u);
+    uint32_t mantissa = static_cast<uint32_t>(imm8 & 0xFu) << 19;
+    return (sign << 31) | (exp << 23) | mantissa;
+  }
+  static uint64_t VFPExpandImm64(uint8_t imm8) {
+    uint64_t sign = (imm8 >> 7) & 1;
+    uint64_t b = (imm8 >> 6) & 1;
+    uint64_t exp = ((1 - b) << 10) | ((b ? 0xFFull : 0ull) << 2) | ((imm8 >> 4) & 0x3ull);
+    uint64_t mantissa = static_cast<uint64_t>(imm8 & 0xFull) << 48;
+    return (sign << 63) | (exp << 52) | mantissa;
   }
 
   // Materialize a 0/1 predicate register that is 1 exactly when ARM64

@@ -13,9 +13,118 @@
   "See the License for the specific language governing permissions and",
   "limitations under the License.",
   "",
-  "The ARM64 optimizing backend lowers guest instructions directly to x86_64",
-  "LIR insns (allowlisted by backend/x86_64/lir_instructions.json), so there are",
-  "no guest-intrinsic -> machine-insn bindings here yet. SIMD/FP guest ops that",
-  "need an intrinsic bridge bail to the interpreter for now; this file grows as",
-  "those land."
+  "Guest-agnostic scalar-FP intrinsic -> x86_64 SSE lowering for the ARM64",
+  "optimizing backend. These mirror the riscv64 binding for the four basic",
+  "scalar FP arithmetic intrinsics (FADD/FSUB/FMUL/FDIV, Float32 and Float64,",
+  "with the AVX three-operand variants). The referenced x86 SSE ops are all",
+  "defined in the shared assembler defs (insn_def_x86.json), so the LIR gen",
+  "allowlist resolves cleanly without pulling in any riscv64-only macro defs.",
+  "FCvtFloatToInteger / FeGetExceptions / FeSetExceptionsAndRound are NOT bound",
+  "here: their macro-assembler defs live only in riscv64_to_x86_64/macro_def.json",
+  "(not in the ARM64 backend gen inputs), so those guest ops bail to the lite",
+  "translator / interpreter for now.",
+  {
+    "name": "FAddHostRounding<Float32>",
+    "insn": "AddssXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FAddHostRounding<Float32>",
+    "insn": "VaddssXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FAddHostRounding<Float64>",
+    "insn": "AddsdXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FAddHostRounding<Float64>",
+    "insn": "VaddsdXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FDivHostRounding<Float32>",
+    "insn": "DivssXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FDivHostRounding<Float32>",
+    "insn": "VdivssXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FDivHostRounding<Float64>",
+    "insn": "DivsdXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FDivHostRounding<Float64>",
+    "insn": "VdivsdXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FMulHostRounding<Float32>",
+    "insn": "MulssXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FMulHostRounding<Float32>",
+    "insn": "VmulssXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FMulHostRounding<Float64>",
+    "insn": "MulsdXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FMulHostRounding<Float64>",
+    "insn": "VmulsdXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FSubHostRounding<Float32>",
+    "insn": "SubssXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FSubHostRounding<Float32>",
+    "insn": "VsubssXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FSubHostRounding<Float64>",
+    "insn": "SubsdXRegXReg",
+    "in": [ 0, 1 ],
+    "out": [ 0 ]
+  },
+  {
+    "name": "FSubHostRounding<Float64>",
+    "insn": "VsubsdXRegXRegXReg",
+    "feature": "AVX",
+    "in": [ 1, 2 ],
+    "out": [ 0 ]
+  }
 ]

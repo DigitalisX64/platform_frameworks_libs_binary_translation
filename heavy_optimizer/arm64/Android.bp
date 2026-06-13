@@ -34,8 +34,18 @@ cc_library_headers {
 
 // The ARM64 optimizing frontend lowers the ARM64 decoder's SemanticsPlayer
 // callbacks into guest-agnostic x86_64 MachineIR (mirroring
-// heavy_optimizer/riscv64/Android.bp). Phase 1a translates MoveWide/MoveWideKeep
-// for real; everything else bails to the lite translator/interpreter.
+// heavy_optimizer/riscv64/Android.bp). Integer/branch/load-store and scalar-FP
+// arithmetic (FADD/FSUB/FMUL/FDIV) translate for real; remaining FP/SIMD bails
+// to the lite translator/interpreter.
+//
+// inline_intrinsic.h / call_intrinsic.h drive the guest-agnostic
+// intrinsic->x86_64-SSE lowering (ProcessBindings). That machinery and the
+// host x86_64 intrinsic implementations live in the riscv64 intrinsics header
+// set (intrinsics-inl.h / intrinsics_process_bindings-inl.h / macro_assembler.h
+// are host code-generation, not guest code), so the ARM64 backend reuses
+// libberberis_intrinsics_riscv64_headers as the shared host intrinsic emitter -
+// exactly as libberberis_backend_headers_arm64_to_x86_64 already reuses the
+// riscv64 macro-assembler header set.
 cc_library_static {
     name: "libberberis_heavy_optimizer_arm64",
     defaults: ["berberis_defaults_64"],
@@ -47,7 +57,7 @@ cc_library_static {
         "libberberis_decoder_arm64_headers",
         "libberberis_guest_state_arm64_headers",
         "libberberis_heavy_optimizer_arm64_headers",
-        "libberberis_intrinsics_arm64_headers",
+        "libberberis_intrinsics_riscv64_headers",
         "libberberis_runtime_primitives_headers",
     ],
     srcs: [
@@ -67,7 +77,7 @@ cc_test_library {
         "libberberis_decoder_arm64_headers",
         "libberberis_guest_state_arm64_headers",
         "libberberis_heavy_optimizer_arm64_headers",
-        "libberberis_intrinsics_arm64_headers",
+        "libberberis_intrinsics_riscv64_headers",
         "libberberis_runtime_primitives_headers",
     ],
     srcs: [
