@@ -30,6 +30,7 @@ cc_library_static {
                 "translator_x86_64.cc",
             ],
             header_libs: [
+                "libberberis_heavy_optimizer_arm64_headers",
                 "libberberis_lite_translator_headers",
             ],
         },

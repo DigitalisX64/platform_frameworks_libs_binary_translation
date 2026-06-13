@@ -1,0 +1,50 @@
+/*
+ * Copyright (C) 2026 utzcoz
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef BERBERIS_HEAVY_OPTIMIZER_ARM64_HEAVY_OPTIMIZE_REGION_H_
+#define BERBERIS_HEAVY_OPTIMIZER_ARM64_HEAVY_OPTIMIZE_REGION_H_
+
+#include <cstddef>
+#include <tuple>
+
+#include "berberis/assembler/machine_code.h"
+#include "berberis/guest_state/guest_addr.h"
+
+namespace berberis {
+
+struct HeavyOptimizeParams {
+  // Regions longer than ~200 insns are rare and the LivenessAnalyzer's memory
+  // use grows with region length, so cap region size like the riscv64 tier.
+  size_t max_number_of_instructions = 200;
+  GuestAddr end_pc = GetGuestAddrRangeEnd();
+};
+
+// Optimizing (second-gear) translation of the ARM64 region at `pc` into
+// `machine_code`. Returns {stop_pc, success, number_of_instructions}:
+//   success == false && stop_pc == pc  -> could not translate the first
+//   instruction; the caller must fall back to the lite tier / interpreter.
+//
+// NOTE: the ARM64 frontend is not yet implemented (P4 phase 0). This entry point
+// currently always bails (returns {pc, false, 0}) so a geared-up region falls
+// back to the lite translator. Later phases fill in the frontend.
+std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(
+    GuestAddr pc,
+    MachineCode* machine_code,
+    const HeavyOptimizeParams& params = HeavyOptimizeParams());
+
+}  // namespace berberis
+
+#endif  // BERBERIS_HEAVY_OPTIMIZER_ARM64_HEAVY_OPTIMIZE_REGION_H_

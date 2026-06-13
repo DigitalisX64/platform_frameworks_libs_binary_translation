@@ -30,6 +30,7 @@
 #include "berberis/guest_os_primitives/guest_signal.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_opaque.h"
+#include "berberis/heavy_optimizer/arm64/heavy_optimize_region.h"
 #include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/host_code.h"
@@ -44,6 +45,51 @@ namespace {
 GuestCodeEntry::Kind kSpecialHandler = GuestCodeEntry::Kind::kSpecialHandler;
 GuestCodeEntry::Kind kInterpreted = GuestCodeEntry::Kind::kInterpreted;
 GuestCodeEntry::Kind kLiteTranslated = GuestCodeEntry::Kind::kLiteTranslated;
+GuestCodeEntry::Kind kHeavyOptimized = GuestCodeEntry::Kind::kHeavyOptimized;
+
+// Translation strategy. The default preserves the historical ARM64 behaviour
+// (single-gear lite translation, falling back to the interpreter); the others
+// are opt-in via `berberis.mode=<name>` / BERBERIS_MODE. kTwoGear enables the
+// hotness-counter gear-up to the optimizing tier (P4); until the optimizing
+// frontend exists, HeavyOptimizeRegion always bails, so a geared-up region just
+// falls back to lite — correct, only slightly more work per hot region.
+enum class TranslationMode {
+  kInterpretOnly,
+  kLiteTranslateOrFallbackToInterpret,
+  kTwoGear,
+  kNumModes,
+};
+
+TranslationMode g_translation_mode = TranslationMode::kLiteTranslateOrFallbackToInterpret;
+
+void UpdateTranslationMode() {
+  // Indices must match the TranslationMode enum order.
+  constexpr const char* kTranslationModeNames[] = {
+      "interpret-only",
+      "lite-translate-or-interpret",
+      "two-gear",
+  };
+  static_assert(static_cast<int>(TranslationMode::kNumModes) ==
+                sizeof(kTranslationModeNames) / sizeof(char*));
+
+  const char* config_mode = GetTranslationModeConfig();
+  if (!config_mode) {
+    return;
+  }
+  for (int i = 0; i < static_cast<int>(TranslationMode::kNumModes); i++) {
+    if (0 == strcmp(config_mode, kTranslationModeNames[i])) {
+      g_translation_mode = TranslationMode(i);
+      TRACE("translation mode is manually set to '%s'", config_mode);
+      return;
+    }
+  }
+  LOG_ALWAYS_FATAL("Unrecognized translation mode '%s'", config_mode);
+}
+
+enum class TranslationGear {
+  kFirst,
+  kSecond,
+};
 
 size_t GetExecutableRegionSize(GuestAddr pc) {
   // With kGuestPageSize>=4k we scan at least 1k instructions, which should be enough for a single
@@ -65,6 +111,7 @@ void InitTranslatorArch() {
   // here (the arm64-specific translator) ensures the host fault signals are
   // claimed for arm64 guest processes.
   ClaimHostFaultSignals();
+  UpdateTranslationMode();
 }
 
 // Exported for testing only.
@@ -122,10 +169,32 @@ static struct TranslationStats {
   uint64_t interpret_invocations = 0;
 } g_translation_stats;
 
+// Optimizing (second-gear) translation install. Phase 0: HeavyOptimizeRegion
+// always bails, so this returns {false, ...} and the caller re-lites.
+std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndInstallRegion(
+    GuestAddr pc) {
+  MachineCode machine_code;
+  auto [stop_pc, success, number_of_instructions] =
+      HeavyOptimizeRegion(pc, &machine_code, {.end_pc = pc + GetExecutableRegionSize(pc)});
+  UNUSED(number_of_instructions);
+  size_t size = stop_pc - pc;
+  if (!success && size == 0) {
+    return {false, {}, 0, {}};
+  }
+  return {true, InstallTranslated(&machine_code, pc, size, "heavy"), size, kHeavyOptimized};
+}
+
+template <TranslationGear kGear = TranslationGear::kFirst>
 void TranslateRegion(GuestAddr pc) {
   TranslationCache* cache = TranslationCache::GetInstance();
 
-  GuestCodeEntry* entry = cache->AddAndLockForTranslation(pc, 0);
+  GuestCodeEntry* entry;
+  if constexpr (kGear == TranslationGear::kFirst) {
+    entry = cache->AddAndLockForTranslation(pc, 0);
+  } else {
+    CHECK(g_translation_mode == TranslationMode::kTwoGear);
+    entry = cache->LockForGearUpTranslation(pc);
+  }
   if (!entry) {
     return;
   }
@@ -137,32 +206,49 @@ void TranslateRegion(GuestAddr pc) {
     return;
   }
 
-  // Diagnostic knob: berberis.mode=interpret-only installs the interpreter for
-  // every region, bypassing the JIT entirely. Mirrors the riscv64 translator's
-  // mode handling; used to bisect whether a wrong-result/hang is a JIT codegen
-  // bug (renders correctly under interpret-only) or lives in the interpreter /
-  // syscall / proxy path (still wrong under interpret-only).
-  static const bool kInterpretOnly = []() {
-    const char* mode = GetTranslationModeConfig();
-    return mode != nullptr && 0 == strcmp(mode, "interpret-only");
-  }();
-  if (kInterpretOnly) {
-    cache->SetTranslatedAndUnlock(pc, entry, first_insn_size, kInterpreted, {kEntryInterpret, 0});
-    g_translation_stats.jit_failures++;
-    g_translation_stats.total_translations++;
-    return;
+  bool success = false;
+  HostCodePiece host_code_piece{kEntryInterpret, 0};
+  size_t size = first_insn_size;
+  GuestCodeEntry::Kind kind = kInterpreted;
+
+  if (g_translation_mode == TranslationMode::kInterpretOnly) {
+    // berberis.mode=interpret-only: install the interpreter for every region,
+    // bypassing the JIT. Diagnostic knob to bisect a JIT codegen bug (correct
+    // under interpret-only) from an interpreter/syscall/proxy bug (still wrong).
+    // success stays false -> counts as a jit_failure below, as before.
+  } else if (g_translation_mode == TranslationMode::kTwoGear &&
+             kGear == TranslationGear::kSecond) {
+    // Hot region gearing up: try the optimizing tier; if it bails (always, in
+    // phase 0) re-lite so the hot region stays JIT-compiled; only then interpret.
+    std::tie(success, host_code_piece, size, kind) = HeavyOptimizeAndInstallRegion(pc);
+    if (!success) {
+      std::tie(success, host_code_piece, size, kind) = TryLiteTranslateAndInstallRegion(pc);
+    }
+  } else {
+    // First gear: lite-translate, falling back to the interpreter. In two-gear
+    // mode enable self-profiling so the hotness counter can trigger the gear-up
+    // (berberis_HandleLiteCounterThresholdReached); the default mode leaves it
+    // off, preserving the historical single-gear behaviour exactly.
+    LiteTranslateParams params;
+    if (g_translation_mode == TranslationMode::kTwoGear) {
+      params.enable_self_profiling = true;
+      params.counter_location = &entry->invocation_counter;
+    }
+    std::tie(success, host_code_piece, size, kind) = TryLiteTranslateAndInstallRegion(pc, params);
   }
 
-  // Try lite translation first; fall back to interpreter on failure.
-  auto [success, host_code_piece, size, kind] = TryLiteTranslateAndInstallRegion(pc);
+  if (!success) {
+    host_code_piece = {kEntryInterpret, 0};
+    size = first_insn_size;
+    kind = kInterpreted;
+  }
+  cache->SetTranslatedAndUnlock(pc, entry, size, kind, host_code_piece);
+
+  // profiling
   if (success) {
-    cache->SetTranslatedAndUnlock(pc, entry, size, kind, host_code_piece);
-    // profiling
     g_translation_stats.jit_successes++;
     g_translation_stats.total_jit_insns += size / 4;
   } else {
-    cache->SetTranslatedAndUnlock(
-        pc, entry, first_insn_size, kInterpreted, {kEntryInterpret, 0});
     g_translation_stats.jit_failures++;
   }
   g_translation_stats.total_translations++;
@@ -237,8 +323,10 @@ extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void
 berberis_HandleLiteCounterThresholdReached(ThreadState* state) {
-  // Re-translate — stays as lite-translated or falls back to interpreted.
-  TranslateRegion(state->cpu.insn_addr);
+  // Only reachable in two-gear mode: the hotness counter is only emitted when
+  // self-profiling is enabled, which the default (single-gear) mode never does.
+  CHECK(g_translation_mode == TranslationMode::kTwoGear);
+  TranslateRegion<TranslationGear::kSecond>(state->cpu.insn_addr);
 }
 
 }  // namespace berberis

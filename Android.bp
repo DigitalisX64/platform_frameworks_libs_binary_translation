@@ -407,6 +407,7 @@ cc_test_host {
                 "libberberis_runtime_primitives_arm64",
                 "libberberis_guest_os_primitives_arm64",
                 "libberberis_guest_state_arm64",
+                "libberberis_heavy_optimizer_arm64",
                 "libberberis_kernel_api_arm64",
                 "libberberis_interpreter_arm64",
                 "libberberis_guest_abi_arm64",
@@ -656,6 +657,7 @@ cc_library_shared {
             static_libs: [
                 "libberberis_code_gen_lib_arm64",
                 "libberberis_guest_abi_arm64",
+                "libberberis_heavy_optimizer_arm64",
                 "libberberis_interpreter_arm64",
                 "libberberis_intrinsics_arm64",
                 "libberberis_lite_translator_arm64_to_x86_64",
