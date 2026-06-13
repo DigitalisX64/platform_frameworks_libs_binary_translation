@@ -50,9 +50,10 @@ GuestCodeEntry::Kind kHeavyOptimized = GuestCodeEntry::Kind::kHeavyOptimized;
 // Translation strategy. The default preserves the historical ARM64 behaviour
 // (single-gear lite translation, falling back to the interpreter); the others
 // are opt-in via `berberis.mode=<name>` / BERBERIS_MODE. kTwoGear enables the
-// hotness-counter gear-up to the optimizing tier (P4); until the optimizing
-// frontend exists, HeavyOptimizeRegion always bails, so a geared-up region just
-// falls back to lite — correct, only slightly more work per hot region.
+// hotness-counter gear-up to the optimizing tier, which re-translates a hot
+// region with the heavy optimizer (integer, branch, load/store, scalar FP, NEON
+// integer). Instructions the heavy frontend does not yet handle make it bail; a
+// bailed region re-lite-translates rather than dropping to the interpreter.
 enum class TranslationMode {
   kInterpretOnly,
   kLiteTranslateOrFallbackToInterpret,
@@ -218,8 +219,9 @@ void TranslateRegion(GuestAddr pc) {
     // success stays false -> counts as a jit_failure below, as before.
   } else if (g_translation_mode == TranslationMode::kTwoGear &&
              kGear == TranslationGear::kSecond) {
-    // Hot region gearing up: try the optimizing tier; if it bails (always, in
-    // phase 0) re-lite so the hot region stays JIT-compiled; only then interpret.
+    // Hot region gearing up: try the optimizing tier; if the heavy frontend
+    // bails on an instruction it does not yet handle, re-lite so the hot region
+    // stays JIT-compiled; only then interpret.
     std::tie(success, host_code_piece, size, kind) = HeavyOptimizeAndInstallRegion(pc);
     if (!success) {
       std::tie(success, host_code_piece, size, kind) = TryLiteTranslateAndInstallRegion(pc);
