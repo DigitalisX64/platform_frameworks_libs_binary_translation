@@ -47,13 +47,13 @@ GuestCodeEntry::Kind kInterpreted = GuestCodeEntry::Kind::kInterpreted;
 GuestCodeEntry::Kind kLiteTranslated = GuestCodeEntry::Kind::kLiteTranslated;
 GuestCodeEntry::Kind kHeavyOptimized = GuestCodeEntry::Kind::kHeavyOptimized;
 
-// Translation strategy. The default preserves the historical ARM64 behaviour
-// (single-gear lite translation, falling back to the interpreter); the others
-// are opt-in via `berberis.mode=<name>` / BERBERIS_MODE. kTwoGear enables the
-// hotness-counter gear-up to the optimizing tier, which re-translates a hot
-// region with the heavy optimizer (integer, branch, load/store, scalar FP, NEON
-// integer). Instructions the heavy frontend does not yet handle make it bail; a
-// bailed region re-lite-translates rather than dropping to the interpreter.
+// Translation strategy. The default is the two-gear tier: lite-translate every
+// region first, then re-translate hot regions (those crossing the hotness
+// counter) with the heavy optimizer (integer, branch, load/store, scalar FP,
+// NEON integer). Instructions the heavy frontend does not yet handle make it
+// bail, and a bailed region re-lite-translates rather than dropping to the
+// interpreter. The single-gear lite tier and interpret-only remain available,
+// opt-in via `berberis.mode=<name>` / BERBERIS_MODE (e.g. for bisection).
 enum class TranslationMode {
   kInterpretOnly,
   kLiteTranslateOrFallbackToInterpret,
@@ -61,7 +61,7 @@ enum class TranslationMode {
   kNumModes,
 };
 
-TranslationMode g_translation_mode = TranslationMode::kLiteTranslateOrFallbackToInterpret;
+TranslationMode g_translation_mode = TranslationMode::kTwoGear;
 
 void UpdateTranslationMode() {
   // Indices must match the TranslationMode enum order.
