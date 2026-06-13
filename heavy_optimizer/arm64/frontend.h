@@ -282,10 +282,18 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
+  // LDR/LDRSW (literal): load from [insn_addr + offset]. The address is constant
+  // at translation time, so materialize it with GetImm and reuse Load() (which
+  // applies TBI, emits the size-appropriate movzx/movsx, and sets the recovery
+  // point). Mirrors lite_translator.h::LoadLiteral.
   Register LoadLiteral(Decoder::LoadStoreSize size, bool is_signed, int64_t offset) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(size, is_signed, offset);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    GuestAddr target = GetInsnAddr() + offset;
+    Register addr = GetImm(target);
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    return Load(size, is_signed, is_64bit_target, addr, 0);
   }
 
   // SBFM/UBFM/BFM (bitfield move). Mirrors lite_translator.h::Bitfield. The
@@ -527,19 +535,92 @@ class HeavyOptimizerFrontend {
   // Integer loads / stores.
   //
 
+  // Integer load with a base+imm offset. Mirrors lite_translator.h::Load: ApplyTbi
+  // masks the top byte of the address (ARM64 TBI), then a size/sign-appropriate
+  // host load reads from {masked, offset}. A <32-bit unsigned load zero-extends to
+  // 32 (a 32-bit dest reg clears the upper 32); a signed load sign-extends to 32 or
+  // 64 per is_64bit_target; a 32-bit unsigned load zero-extends to 64 (Movl), and
+  // LDRSW (signed 32->64) uses Movsxlq. GenRecoveryBlockForLastInsn() exits the
+  // region if the host access faults, so the guest signal is delivered.
   Register Load(Decoder::LoadStoreSize size,
                 bool is_signed,
                 bool is_64bit_target,
                 Register base,
                 int32_t offset) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(size, is_signed, is_64bit_target, base, offset);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    Register masked = ApplyTbi(base);
+    Register res;
+    switch (size) {
+      case Decoder::LoadStoreSize::k64bit:
+        res = std::get<0>(Gen<x86_64::MovqRegOp>({.base = masked, .disp = offset}));
+        break;
+      case Decoder::LoadStoreSize::k32bit:
+        if (is_signed && is_64bit_target) {
+          // LDRSW: 32 -> sign-extend to 64.
+          res = std::get<0>(Gen<x86_64::MovsxlqRegOp>({.base = masked, .disp = offset}));
+        } else {
+          // 32-bit unsigned: zero-extends to 64.
+          res = std::get<0>(Gen<x86_64::MovlRegOp>({.base = masked, .disp = offset}));
+        }
+        break;
+      case Decoder::LoadStoreSize::k16bit:
+        if (is_signed) {
+          if (is_64bit_target) {
+            res = std::get<0>(Gen<x86_64::MovsxwqRegOp>({.base = masked, .disp = offset}));
+          } else {
+            res = std::get<0>(Gen<x86_64::MovsxwlRegOp>({.base = masked, .disp = offset}));
+          }
+        } else {
+          res = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = masked, .disp = offset}));
+        }
+        break;
+      case Decoder::LoadStoreSize::k8bit:
+        if (is_signed) {
+          if (is_64bit_target) {
+            res = std::get<0>(Gen<x86_64::MovsxbqRegOp>({.base = masked, .disp = offset}));
+          } else {
+            res = std::get<0>(Gen<x86_64::MovsxblRegOp>({.base = masked, .disp = offset}));
+          }
+        } else {
+          res = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = masked, .disp = offset}));
+        }
+        break;
+      default:
+        UndefinedReturningReg();
+        return AllocTempReg();
+    }
+    GenRecoveryBlockForLastInsn();
+    return res;
   }
 
+  // Integer store of the low `size` bytes of `data` to {ApplyTbi(base), offset}.
+  // Mirrors lite_translator.h::Store. GenRecoveryBlockForLastInsn() exits the
+  // region on a host fault so the guest signal handler runs.
   void Store(Decoder::LoadStoreSize size, Register base, int32_t offset, Register data) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(size, base, offset, data);
+    if (!success()) {
+      return;
+    }
+    Register masked = ApplyTbi(base);
+    switch (size) {
+      case Decoder::LoadStoreSize::k64bit:
+        Gen<x86_64::MovqOpReg>({.base = masked, .disp = offset}, data);
+        break;
+      case Decoder::LoadStoreSize::k32bit:
+        Gen<x86_64::MovlOpReg>({.base = masked, .disp = offset}, data);
+        break;
+      case Decoder::LoadStoreSize::k16bit:
+        Gen<x86_64::MovwOpReg>({.base = masked, .disp = offset}, data);
+        break;
+      case Decoder::LoadStoreSize::k8bit:
+        Gen<x86_64::MovbOpReg>({.base = masked, .disp = offset}, data);
+        break;
+      default:
+        UndefinedReturningVoid();
+        return;
+    }
+    GenRecoveryBlockForLastInsn();
   }
 
   // Plain 64-bit add of an immediate (used for address computation). Always
@@ -1456,6 +1537,18 @@ class HeavyOptimizerFrontend {
         raw);
   }
 
+  // ARM64 TBI (Top Byte Ignore): clear the top 8 bits of an address register
+  // before using it as a host x86 memory operand. ARM64 ignores the top byte of
+  // pointers in load/store; x86 does not, so we mask it ourselves. Returns a
+  // fresh register holding (base & 0x00FF'FFFF'FFFF'FFFF). Mirrors
+  // lite_translator.h::ApplyTbi (movq; shlq 8; shrq 8).
+  [[nodiscard]] Register ApplyTbi(Register base) {
+    Register tbi = Copy(base);
+    tbi = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(tbi, int8_t{8}));
+    tbi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(tbi, int8_t{8}));
+    return tbi;
+  }
+
   // Emit `src` shifted by a constant amount (LSL/LSR/ASR/ROR) into a fresh
   // register, mirroring lite_translator.h::EmitShift. A 32-bit shift uses the
   // l-suffix forms (which zero-extend the result, matching ARM64 W-write
@@ -1525,6 +1618,11 @@ class HeavyOptimizerFrontend {
   void GenJump(GuestAddr target);
   void ExitGeneratedCode(GuestAddr target);
   void ExitRegionIndirect(Register target);
+
+  // After a faulting host memory access, split off a recovery basic block that
+  // exits the region so the guest signal handler runs. Guest-agnostic; copied
+  // verbatim from heavy_optimizer/riscv64/frontend.cc.
+  void GenRecoveryBlockForLastInsn();
 
   void ResolveJumps();
   void ReplaceJumpWithBranch(MachineBasicBlock* bb, MachineBasicBlock* target_bb);

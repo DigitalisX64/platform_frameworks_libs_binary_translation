@@ -63,6 +63,30 @@ void HeavyOptimizerFrontend::ExitRegionIndirect(Register target) {
   builder_.Gen<PseudoIndirectJump>(target);
 }
 
+// After a faulting host memory access, split off a recovery basic block that
+// exits the region so the guest signal handler runs. This mechanism is
+// guest-agnostic and is copied verbatim from heavy_optimizer/riscv64.
+void HeavyOptimizerFrontend::GenRecoveryBlockForLastInsn() {
+  auto* ir = builder_.ir();
+  auto* current_bb = builder_.bb();
+  auto* continue_bb = ir->NewBasicBlock();
+  auto* recovery_bb = ir->NewBasicBlock();
+  ir->AddEdge(current_bb, continue_bb);
+  ir->AddEdge(current_bb, recovery_bb);
+
+  builder_.SetRecoveryPointAtLastInsn(recovery_bb);
+
+  // Note, even though there are two bb successors, we only explicitly branch to
+  // the continue_bb, since jump to the recovery_bb is set up by the signal
+  // handler.
+  builder_.Gen<PseudoBranch>(continue_bb);
+
+  builder_.StartBasicBlock(recovery_bb);
+  ExitGeneratedCode(GetInsnAddr());
+
+  builder_.StartBasicBlock(continue_bb);
+}
+
 //
 // Branches.
 //

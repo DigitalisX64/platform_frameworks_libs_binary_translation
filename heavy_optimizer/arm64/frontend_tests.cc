@@ -24,6 +24,7 @@
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/heavy_optimizer/arm64/heavy_optimize_region.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
 
@@ -312,13 +313,60 @@ constexpr uint32_t RetX(uint8_t rn) {
   return 0xD65F0000 | (static_cast<uint32_t>(rn) << 5);
 }
 
+// --- Load/store unsigned-offset encoders (same forms as the lite-translator
+// tests). `imm` is the SCALED immediate (units = access size); Rn is the base.
+constexpr uint32_t LdrXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xF9400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xF9000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrbWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrbWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrhWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrhWuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79000000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrsbXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x39800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrshXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x79800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrswXuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xB9800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+// LDR (literal): LDR Xt, label and LDRSW Xt, label. imm19 is the SCALED-by-4
+// signed PC-relative offset.
+constexpr uint32_t LdrLiteralX(uint8_t rt, int32_t off) {
+  uint32_t imm19 = static_cast<uint32_t>(off / 4) & 0x7FFFF;
+  return 0x58000000 | (imm19 << 5) | rt;
+}
+constexpr uint32_t LdrswLiteral(uint8_t rt, int32_t off) {
+  uint32_t imm19 = static_cast<uint32_t>(off / 4) & 0x7FFFF;
+  return 0x98000000 | (imm19 << 5) | rt;
+}
+
 // Heavy-optimize and execute one instruction, mirroring the riscv64 exec-test
 // harness. Returns false if the optimizing frontend bailed (didn't translate the
 // instruction) so a test can assert it actually went through the JIT.
 bool RunOneInstruction(ThreadState* state, GuestAddr stop_pc) {
+  GuestAddr start_pc = state->cpu.insn_addr;
   MachineCode machine_code;
   auto [new_addr, success, number_of_instructions] =
-      HeavyOptimizeRegion(state->cpu.insn_addr,
+      HeavyOptimizeRegion(start_pc,
                           &machine_code,
                           HeavyOptimizeParams{
                               .max_number_of_instructions = 1,
@@ -326,6 +374,15 @@ bool RunOneInstruction(ThreadState* state, GuestAddr stop_pc) {
   if (!success || number_of_instructions != 1) {
     return false;
   }
+
+  // The TranslationCache is a process-global singleton shared across tests. A
+  // prior test that exited to a guest PC outside its own region (e.g.
+  // BranchCondTargetOutsideRegionExits) can leave a non-default entry at an
+  // address that, by static-array layout, collides with this test's stop_pc;
+  // SetStop then fails to install the stop and the dispatcher reaches the stale
+  // entry -> berberis_HandleNoExec with a null guest thread. Clear any stale
+  // entries for this test's PC window so SetStop sees the default state.
+  TranslationCache::GetInstance()->InvalidateGuestRange(start_pc, stop_pc + 4);
 
   ScopedExecRegion exec(&machine_code);
   TestingRunGeneratedCode(state, exec.get(), stop_pc);
@@ -426,12 +483,13 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenBailRegion) {
 }
 
 // A single guest instruction whose decode fires several listener callbacks where
-// a later one bails (a post-index load calls Load then AddImm) must still produce
-// valid IR (one region exit, no trailing insns) — i.e. GenCode must not abort.
-// The Load bails first, so AddImm must emit nothing once success_ is false.
+// a later one bails must still produce valid IR (one region exit, no trailing
+// insns) — i.e. GenCode must not abort. LDP post-index decodes to LoadPair
+// (still bails this round) followed by an AddImm writeback; once LoadPair sets
+// success_ = false the AddImm must emit nothing.
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
-  // LDR X1, [X0], #8  (post-index): decodes to Load (bails) then AddImm.
-  static const uint32_t code[] = {0xF8408401};
+  // LDP X1, X2, [X0], #16 (post-index): LoadPair (bails) then AddImm writeback.
+  static const uint32_t code[] = {0xA8C10801};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   // No abort here is the assertion (GenCode runs CheckMachineIR internally).
@@ -443,12 +501,12 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
 
 // MoveWide followed by a multi-callback bail (the common on-device prefix shape).
 TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenMultiCallbackBail) {
-  static const uint32_t code[] = {MovzX(0, 0x11), 0xF8408401 /*LDR post-index, bails*/};
+  static const uint32_t code[] = {MovzX(0, 0x11), 0xA8C10801 /*LDP post-index, bails*/};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 1u);  // the MOVZ translated; the load bailed without corrupting IR
+  EXPECT_EQ(n, 1u);  // the MOVZ translated; the pair load bailed without corrupting IR
 }
 
 //
@@ -1298,6 +1356,9 @@ GuestAddr RunRegion(ThreadState* state,
   if (!ok) {
     return kNullGuestAddr;
   }
+  // Clear any stale process-global TranslationCache entries for this PC window
+  // so SetStop(end_pc) installs cleanly (see the note in RunOneInstruction).
+  TranslationCache::GetInstance()->InvalidateGuestRange(ToGuestAddr(code), end_pc + 4);
   ScopedExecRegion exec(&mc);
   TestingRunGeneratedCode(state, exec.get(), end_pc);
   return state->cpu.insn_addr;
@@ -1723,6 +1784,205 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchRegisterRet) {
   GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(landed, GuestAddr{0x1234});
+}
+
+//
+// Integer loads / stores. The base register points at a static buffer; the
+// optimizing frontend's Load/Store apply TBI then emit the size/sign-appropriate
+// host memory access and a recovery block for faults.
+//
+
+// LDR Xt, [Xn]: 64-bit load.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrX64) {
+  static uint64_t buf[2] = {0x1122334455667788ULL, 0};
+  static const uint32_t code[] = {LdrXuoff(0, 1, 0)};
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x1122334455667788ULL});
+}
+
+// STR Xt, [Xn]: 64-bit store.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrX64) {
+  static uint64_t buf[1] = {0};
+  static const uint32_t code[] = {StrXuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0xCAFEF00DDEADBEEFULL;
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(buf[0], uint64_t{0xCAFEF00DDEADBEEFULL});
+}
+
+// LDR Wt, [Xn]: 32-bit load zero-extends to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrW32ZeroExtends) {
+  static uint64_t buf[1] = {0xFFFFFFFFAABBCCDDULL};
+  static const uint32_t code[] = {LdrWuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0x1111111111111111ULL;  // preset upper bits must be cleared
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xAABBCCDDULL});  // upper 32 cleared
+}
+
+// STR Wt, [Xn]: 32-bit store writes only the low 4 bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrW32) {
+  static uint64_t buf[1] = {0xEEEEEEEEEEEEEEEEULL};
+  static const uint32_t code[] = {StrWuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0x99999999AABBCCDDULL;  // W0 = 0xAABBCCDD
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(buf[0], uint64_t{0xEEEEEEEEAABBCCDDULL});  // only low 4 bytes changed
+}
+
+// LDRB Wt, [Xn]: byte load zero-extends to 32 (upper bits cleared).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrbZeroExtends) {
+  static uint8_t buf[1] = {0xFE};
+  static const uint32_t code[] = {LdrbWuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0x1234567890ABCDEFULL;  // upper bits must be cleared
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFE});
+}
+
+// STRB Wt, [Xn]: byte store writes only the low byte.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Strb) {
+  static uint64_t buf[1] = {0xAABBCCDDEEFF1122ULL};
+  static const uint32_t code[] = {StrbWuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0x55;
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(buf[0], uint64_t{0xAABBCCDDEEFF1155ULL});  // only low byte changed
+}
+
+// LDRSB Xt, [Xn]: signed byte load sign-extends to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrsbSignExtends) {
+  static uint8_t buf[1] = {0x80};  // -128
+  static const uint32_t code[] = {LdrsbXuoff(0, 1, 0)};
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFF80ULL});  // sign-extended
+}
+
+// LDRH Wt, [Xn]: halfword load zero-extends to 32.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrhZeroExtends) {
+  static uint16_t buf[1] = {0xBEEF};
+  static const uint32_t code[] = {LdrhWuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0x1234567890ABCDEFULL;  // upper bits must be cleared
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xBEEF});
+}
+
+// STRH Wt, [Xn]: halfword store writes only the low 2 bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Strh) {
+  static uint64_t buf[1] = {0xAABBCCDDEEFF1122ULL};
+  static const uint32_t code[] = {StrhWuoff(0, 1, 0)};
+  state_.cpu.x[0] = 0x55AA;
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(buf[0], uint64_t{0xAABBCCDDEEFF55AAULL});  // only low 2 bytes changed
+}
+
+// LDRSH Xt, [Xn]: signed halfword load sign-extends to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrshSignExtends) {
+  static uint16_t buf[1] = {0x8000};  // INT16_MIN
+  static const uint32_t code[] = {LdrshXuoff(0, 1, 0)};
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFF8000ULL});  // sign-extended
+}
+
+// LDRSW Xt, [Xn]: signed 32-bit load sign-extends to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrswSignExtends) {
+  static uint32_t buf[1] = {0x80000000U};  // INT32_MIN
+  static const uint32_t code[] = {LdrswXuoff(0, 1, 0)};
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFF80000000ULL});  // sign-extended
+}
+
+// LDR Xt, [Xn, #imm]: base + scaled immediate offset (imm scaled by 8 -> byte 8).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrXImmOffset) {
+  static uint64_t buf[2] = {0xDEAD0000DEAD0000ULL, 0x0102030405060708ULL};
+  static const uint32_t code[] = {LdrXuoff(0, 1, 1)};  // [X1 + 8]
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0102030405060708ULL});
+}
+
+// LDR (literal): LDR Xt, label. The address is PC-relative and constant; the
+// literal value sits in the instruction stream after the load.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrLiteral64) {
+  // [0] LDR X0, #8  (offset to [2..3] = literal); [1] B over the literal;
+  // [2..3] the 64-bit literal value.
+  alignas(8) static const uint32_t code[] = {
+      LdrLiteralX(0, 8),  // [0] load from code+8
+      B(12),              // [1] branch past the literal to stop_pc
+      0x55667788u,        // [2] literal low word
+      0x11223344u,        // [3] literal high word
+  };
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, stop_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, stop_pc);
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x1122334455667788ULL});
+}
+
+// LDRSW (literal): signed 32-bit PC-relative load sign-extends to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrswLiteralSignExtends) {
+  alignas(8) static const uint32_t code[] = {
+      LdrswLiteral(0, 8),  // [0] load from code+8
+      B(8),                // [1] branch past the literal to stop_pc
+      0x80000000u,         // [2] literal (INT32_MIN)
+  };
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, stop_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, stop_pc);
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFF80000000ULL});  // sign-extended
+}
+
+// A multi-instruction region exercising GenCode's CheckMachineIR: LDR; ADD; then
+// a bail (SMULH). The load + add translate; the high-multiply bails.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LoadAddThenBailRegion) {
+  static uint64_t buf[1] = {0x1000};
+  static const uint32_t code[] = {
+      LdrXuoff(0, 1, 0),   // [0] X0 = [X1]
+      AddImmX(2, 0, 0x24),  // [1] X2 = X0 + 0x24
+      SmulhX(3, 0, 2),     // [2] SMULH bails
+  };
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  // LDR + ADD translate; SMULH bails -> partial region of 2 instructions.
+  EXPECT_EQ(n, 2u);
 }
 
 }  // namespace
