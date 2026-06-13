@@ -9313,6 +9313,14 @@ constexpr uint32_t SaddlpVec4S(uint8_t rd, uint8_t rn) {
 constexpr uint32_t SaddlpVec2S(uint8_t rd, uint8_t rn) {
   return 0x0EA02800u | (static_cast<uint32_t>(rn) << 5) | rd;
 }
+// REV16 (vector): reverse bytes within each 16-bit halfword. U=0, opcode=00001,
+// size=00 (the only valid size). .8B (Q=0) and .16B (Q=1).
+constexpr uint32_t Rev16Vec8B(uint8_t rd, uint8_t rn) {
+  return 0x0E201800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t Rev16Vec16B(uint8_t rd, uint8_t rn) {
+  return 0x4E201800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
 constexpr uint32_t UaddlpVec16B(uint8_t rd, uint8_t rn) {
   return SaddlpVec16B(rd, rn) | 0x20000000u;
 }
@@ -12461,6 +12469,46 @@ constexpr uint32_t Fcvtn2S(uint8_t rd, uint8_t rn) {
   return 0x4E616800u | (uint32_t{rn} << 5) | rd;
 }
 
+// REV16 .16B (vector): reverse bytes within each 16-bit halfword across all 16
+// bytes. Regression test for the decoder mis-routing U=0 opcode=00001 (REV16)
+// to Undefined (it had the U guard inverted), so vector REV16 never decoded.
+TEST_F(Arm64LiteTranslateRegionTest, Rev16Vec16B) {
+  const uint8_t n[16] = {
+      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+      0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01, 0x02,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {Rev16Vec16B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expected[16] = {
+      0x22, 0x11, 0x44, 0x33, 0x66, 0x55, 0x88, 0x77,
+      0xAA, 0x99, 0xCC, 0xBB, 0xEE, 0xDD, 0x02, 0x01,
+  };
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], expected[i]) << "byte " << i;
+  }
+}
+// REV16 .8B (vector, Q=0): low 8 bytes swapped per halfword, upper 64 bits zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, Rev16Vec8B) {
+  const uint8_t n[16] = {
+      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+      0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+  };
+  std::memcpy(&state_.cpu.v[1], n, 16);
+  static const uint32_t code[] = {Rev16Vec8B(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  const uint8_t expected[16] = {
+      0x22, 0x11, 0x44, 0x33, 0x66, 0x55, 0x88, 0x77,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Q=0 zeroes the upper 64
+  };
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(r[i], expected[i]) << "byte " << i;
+  }
+}
 TEST_F(Arm64LiteTranslateRegionTest, Rev16WScalar) {
   state_.cpu.x[1] = 0x11223344ULL;
   static const uint32_t code[] = {Rev16W(0, 1)};
