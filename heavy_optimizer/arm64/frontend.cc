@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "berberis/assembler/x86_64.h"
+#include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
@@ -26,6 +28,8 @@
 #include "berberis/guest_state/guest_state.h"
 
 namespace berberis {
+
+using Register = HeavyOptimizerFrontend::Register;
 
 int32_t HeavyOptimizerFrontend::GetThreadStateRegOffset(uint8_t reg) {
   return static_cast<int32_t>(offsetof(ThreadState, cpu.x[0]) + reg * sizeof(uint64_t));
@@ -57,6 +61,239 @@ void HeavyOptimizerFrontend::ExitGeneratedCode(GuestAddr target) {
 
 void HeavyOptimizerFrontend::ExitRegionIndirect(Register target) {
   builder_.Gen<PseudoIndirectJump>(target);
+}
+
+//
+// Branches.
+//
+
+// B (unconditional). SemanticsPlayer has already written X30 for the BL form.
+void HeavyOptimizerFrontend::Branch(int32_t offset) {
+  if (!success()) {
+    return;
+  }
+  is_uncond_branch_ = true;
+  GenJump(GetInsnAddr() + offset);
+}
+
+// BR / RET / BLR (indirect). SemanticsPlayer has already written X30 for BLR.
+// Mirrors lite_translator.h::BranchRegister, which does NOT mask the top byte
+// (no TBI): it simply exits indirect to `target`.
+void HeavyOptimizerFrontend::BranchRegister(Register target) {
+  if (!success()) {
+    return;
+  }
+  is_uncond_branch_ = true;
+  ExitRegionIndirect(target);
+}
+
+// Materialize a 0/1 predicate for ARM64 condition `cond` from the NZCV bits in
+// ThreadState.cpu.flags. Bit positions and boolean algebra mirror
+// lite_translator.h::EmitJumpIfCondNotMet exactly:
+//   N = bit 15, Z = bit 14, C = bit 8, V = bit 0.
+// The predicate is 1 iff the condition is satisfied. We extract each needed bit
+// to its low position with a shift+and and combine with and/or/xor; "not" is
+// xor with 1. kAl/kNv are unconditional and are handled by the caller before
+// reaching here.
+Register HeavyOptimizerFrontend::EmitArmCondPredicate(Decoder::Condition cond) {
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+  // Load the 16-bit NZCV word from ThreadState.cpu.flags. We use the 16-bit
+  // MovwRegOp form (not MovzxwlRegOp) on purpose: RemoveLoopGuestContextAccesses
+  // only recognizes MovwRegMemBaseDisp as a guest-context read of a 16-bit
+  // field, so for an in-region loop the flags read must use this opcode to stay
+  // consistent with the MovwOpReg write EmitMaterializeNZCV emits (otherwise the
+  // optimizer caches the flag write in a register and the read keeps loading a
+  // stale memory value, wedging the loop). MovwRegOp leaves the upper bits
+  // untouched, so mask to the low 16 to get a clean zero-extended value.
+  Register flags =
+      std::get<0>(Gen<x86_64::MovwRegOp>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}));
+  flags = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(flags, int32_t{0xFFFF}));
+
+  // bit_to_low(pos): (flags >> pos) & 1, as a fresh 0/1 register.
+  auto bit_to_low = [&](int8_t pos) -> Register {
+    Register r = std::get<0>(Gen<x86_64::MovlRegReg>(flags));
+    if (pos != 0) {
+      r = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(r, pos));
+    }
+    return std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(r, int32_t{1}));
+  };
+
+  switch (cond) {
+    case Decoder::Condition::kEq:  // Z==1
+      return bit_to_low(14);
+    case Decoder::Condition::kNe:  // Z==0
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(14), int32_t{1}));
+    case Decoder::Condition::kCs:  // C==1
+      return bit_to_low(8);
+    case Decoder::Condition::kCc:  // C==0
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(8), int32_t{1}));
+    case Decoder::Condition::kMi:  // N==1
+      return bit_to_low(15);
+    case Decoder::Condition::kPl:  // N==0
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(15), int32_t{1}));
+    case Decoder::Condition::kVs:  // V==1
+      return bit_to_low(0);
+    case Decoder::Condition::kVc:  // V==0
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(0), int32_t{1}));
+    case Decoder::Condition::kHi: {  // C==1 && Z==0
+      Register c = bit_to_low(8);
+      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(14), int32_t{1}));
+      return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(c, not_z));
+    }
+    case Decoder::Condition::kLs: {  // C==0 || Z==1
+      Register not_c = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(8), int32_t{1}));
+      Register z = bit_to_low(14);
+      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(not_c, z));
+    }
+    case Decoder::Condition::kGe: {  // N==V  -> !(N^V)
+      Register n = bit_to_low(15);
+      Register v = bit_to_low(0);
+      Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(n_xor_v, int32_t{1}));
+    }
+    case Decoder::Condition::kLt: {  // N!=V  -> N^V
+      Register n = bit_to_low(15);
+      Register v = bit_to_low(0);
+      return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
+    }
+    case Decoder::Condition::kGt: {  // Z==0 && N==V
+      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(14), int32_t{1}));
+      Register n = bit_to_low(15);
+      Register v = bit_to_low(0);
+      Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
+      Register n_eq_v = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(n_xor_v, int32_t{1}));
+      return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(not_z, n_eq_v));
+    }
+    case Decoder::Condition::kLe: {  // Z==1 || N!=V
+      Register z = bit_to_low(14);
+      Register n = bit_to_low(15);
+      Register v = bit_to_low(0);
+      Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
+      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(z, n_xor_v));
+    }
+    case Decoder::Condition::kAl:
+    case Decoder::Condition::kNv:
+      // Unconditional: handled by the caller; never reached.
+      CHECK(false);
+      return flags;
+  }
+  CHECK(false);
+  return flags;
+}
+
+// Branch to then_bb when `cond` is met, else_bb otherwise. The predicate is a
+// 0/1 value; TestlRegReg sets ZF=1 when it is 0 (not taken) and ZF=0 when it is
+// 1 (taken), so the then_bb is selected on kNotZero.
+void HeavyOptimizerFrontend::EmitCondBranch(Decoder::Condition cond,
+                                            MachineBasicBlock* then_bb,
+                                            MachineBasicBlock* else_bb) {
+  Register pred = EmitArmCondPredicate(cond);
+  builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNotZero,
+                                 then_bb,
+                                 else_bb,
+                                 std::get<0>(Gen<x86_64::TestlRegReg>(pred, pred)));
+}
+
+// B.cond (conditional). AL/NV are unconditional. Otherwise split into a taken
+// then_bb (GenJump to the target) and a fall-through else_bb in which
+// translation continues.
+void HeavyOptimizerFrontend::BranchCond(Decoder::Condition cond, int32_t offset) {
+  if (!success()) {
+    return;
+  }
+  GuestAddr target = GetInsnAddr() + offset;
+
+  // AL/NV always branch: lower as an unconditional B.
+  if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
+    is_uncond_branch_ = true;
+    GenJump(target);
+    return;
+  }
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* then_bb = ir->NewBasicBlock();
+  MachineBasicBlock* else_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, then_bb);
+  ir->AddEdge(cur_bb, else_bb);
+
+  EmitCondBranch(cond, then_bb, else_bb);
+
+  builder_.StartBasicBlock(then_bb);
+  GenJump(target);
+
+  // Continue translating the not-taken path. A backward target is handled as an
+  // in-region back-edge by GenJump+ResolveJumps (with the pending-signal
+  // check), so do NOT set is_uncond_branch_/region-end here.
+  builder_.StartBasicBlock(else_bb);
+}
+
+// CBZ (is_nonzero=false) / CBNZ (is_nonzero=true). Test the source for zero and
+// branch like B.cond, mirroring lite_translator.h::CompareAndBranch.
+void HeavyOptimizerFrontend::CompareAndBranch(bool is_nonzero,
+                                              bool is_64bit,
+                                              Register src,
+                                              int32_t offset) {
+  if (!success()) {
+    return;
+  }
+  GuestAddr target = GetInsnAddr() + offset;
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* then_bb = ir->NewBasicBlock();
+  MachineBasicBlock* else_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, then_bb);
+  ir->AddEdge(cur_bb, else_bb);
+
+  // TEST sets ZF=1 when src is zero. CBNZ branches when nonzero (ZF==0 ->
+  // kNotZero); CBZ branches when zero (ZF==1 -> kZero).
+  Register flags = is_64bit ? std::get<0>(Gen<x86_64::TestqRegReg>(src, src))
+                            : std::get<0>(Gen<x86_64::TestlRegReg>(src, src));
+  builder_.Gen<PseudoCondBranch>(
+      is_nonzero ? x86_64::Assembler::Condition::kNotZero : x86_64::Assembler::Condition::kZero,
+      then_bb,
+      else_bb,
+      flags);
+
+  builder_.StartBasicBlock(then_bb);
+  GenJump(target);
+
+  builder_.StartBasicBlock(else_bb);
+}
+
+// TBZ (is_nonzero=false) / TBNZ (is_nonzero=true). BT of bit `bit` of src sets
+// CF; branch like B.cond, mirroring lite_translator.h::TestAndBranch. Bt is a
+// 64-bit-register op, so it covers bits 0..63 directly.
+void HeavyOptimizerFrontend::TestAndBranch(bool is_nonzero,
+                                           Register src,
+                                           uint8_t bit,
+                                           int32_t offset) {
+  if (!success()) {
+    return;
+  }
+  GuestAddr target = GetInsnAddr() + offset;
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* then_bb = ir->NewBasicBlock();
+  MachineBasicBlock* else_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, then_bb);
+  ir->AddEdge(cur_bb, else_bb);
+
+  // BTQ src, bit -> CF = bit of src. TBNZ branches when the bit is set
+  // (CF==1 -> kCarry); TBZ branches when clear (CF==0 -> kNotCarry).
+  Register flags = std::get<0>(Gen<x86_64::BtqRegImm>(src, static_cast<int8_t>(bit)));
+  builder_.Gen<PseudoCondBranch>(
+      is_nonzero ? x86_64::Assembler::Condition::kCarry : x86_64::Assembler::Condition::kNotCarry,
+      then_bb,
+      else_bb,
+      flags);
+
+  builder_.StartBasicBlock(then_bb);
+  GenJump(target);
+
+  builder_.StartBasicBlock(else_bb);
 }
 
 void HeavyOptimizerFrontend::Undefined() {

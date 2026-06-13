@@ -496,31 +496,32 @@ class HeavyOptimizerFrontend {
   //
   // Branches.
   //
+  // The direct branch family translates to MachineIR control flow exactly like
+  // the riscv64 frontend: a conditional branch creates then_bb/else_bb basic
+  // blocks ending in a PseudoCondBranch, the taken path GenJumps to the target
+  // (which links in-region back-edges and adds the pending-signal check), and
+  // the not-taken path continues translating in else_bb. An unconditional B /
+  // BR sets is_uncond_branch_ so StartInsn opens a fresh block for whatever
+  // follows. The ARM64 condition is evaluated from ThreadState.cpu.flags
+  // (NZCV: N@15, Z@14, C@8, V@0) bit-for-bit as lite_translator's
+  // EmitJumpIfCondNotMet.
 
-  void Branch(int32_t offset) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(offset);
-  }
+  // B (unconditional). The SemanticsPlayer writes X30 for BL before this runs.
+  void Branch(int32_t offset);
 
-  void BranchCond(Decoder::Condition cond, int32_t offset) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(cond, offset);
-  }
+  // B.cond (conditional). AL/NV are unconditional.
+  void BranchCond(Decoder::Condition cond, int32_t offset);
 
-  void BranchRegister(Register target) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(target);
-  }
+  // BR/RET/BLR (indirect). The SemanticsPlayer writes X30 for BLR before this
+  // runs. Mirrors lite_translator's BranchRegister: no TBI masking of the top
+  // byte (it just exits indirect to `target`).
+  void BranchRegister(Register target);
 
-  void CompareAndBranch(bool is_nonzero, bool is_64bit, Register src, int32_t offset) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(is_nonzero, is_64bit, src, offset);
-  }
+  // CBZ (is_nonzero=false) / CBNZ (is_nonzero=true).
+  void CompareAndBranch(bool is_nonzero, bool is_64bit, Register src, int32_t offset);
 
-  void TestAndBranch(bool is_nonzero, Register src, uint8_t bit, int32_t offset) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(is_nonzero, src, bit, offset);
-  }
+  // TBZ (is_nonzero=false) / TBNZ (is_nonzero=true).
+  void TestAndBranch(bool is_nonzero, Register src, uint8_t bit, int32_t offset);
 
   //
   // Integer loads / stores.
@@ -1498,6 +1499,19 @@ class HeavyOptimizerFrontend {
     }
     return dst;
   }
+
+  // Materialize a 0/1 predicate register that is 1 exactly when ARM64
+  // condition `cond` is satisfied by the NZCV bits in ThreadState.cpu.flags
+  // (N@15, Z@14, C@8, V@0). The bit extraction and boolean combination mirror
+  // lite_translator.h::EmitJumpIfCondNotMet for every condition. `cond` must
+  // not be kAl/kNv (those are unconditional and handled by the caller).
+  [[nodiscard]] Register EmitArmCondPredicate(Decoder::Condition cond);
+
+  // Emit a conditional branch to then_bb when `cond` is met, else_bb otherwise,
+  // by testing the EmitArmCondPredicate result.
+  void EmitCondBranch(Decoder::Condition cond,
+                      MachineBasicBlock* then_bb,
+                      MachineBasicBlock* else_bb);
 
   [[nodiscard]] Register AllocTempReg() { return builder_.ir()->AllocVReg(); }
   [[nodiscard]] SimdReg AllocTempSimdReg() { return SimdReg{builder_.ir()->AllocVReg()}; }

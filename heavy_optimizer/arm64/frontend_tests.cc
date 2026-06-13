@@ -16,7 +16,9 @@
 
 #include "gtest/gtest.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -247,6 +249,67 @@ constexpr uint32_t Rev16X(uint8_t rd, uint8_t rn) {
 // REV Xd, Xn (DP-1Src) — must bail (no x86 BSWAP MachineIR op).
 constexpr uint32_t RevX(uint8_t rd, uint8_t rn) {
   return 0xDAC00C00 | (rn << 5) | rd;
+}
+
+// --- Branch encoders (same forms as the lite-translator tests). ---
+// B offset (unconditional, imm26 byte offset, multiple of 4).
+constexpr uint32_t B(int32_t offset) {
+  uint32_t imm26 = static_cast<uint32_t>(offset / 4) & 0x3FFFFFF;
+  return 0x14000000 | imm26;
+}
+// B.cond offset (imm19 byte offset, multiple of 4).
+constexpr uint32_t Bcond(uint8_t cond, int32_t offset) {
+  uint32_t imm19 = static_cast<uint32_t>(offset / 4) & 0x7FFFF;
+  return 0x54000000 | (imm19 << 5) | cond;
+}
+constexpr uint8_t kCondEQ = 0x0;
+constexpr uint8_t kCondNE = 0x1;
+constexpr uint8_t kCondCS = 0x2;
+constexpr uint8_t kCondCC = 0x3;
+constexpr uint8_t kCondMI = 0x4;
+constexpr uint8_t kCondPL = 0x5;
+constexpr uint8_t kCondVS = 0x6;
+constexpr uint8_t kCondVC = 0x7;
+constexpr uint8_t kCondHI = 0x8;
+constexpr uint8_t kCondLS = 0x9;
+constexpr uint8_t kCondGE = 0xA;
+constexpr uint8_t kCondLT = 0xB;
+constexpr uint8_t kCondGT = 0xC;
+constexpr uint8_t kCondLE = 0xD;
+constexpr uint8_t kCondAL = 0xE;
+// CBZ/CBNZ Xt, offset (imm19 byte offset).
+constexpr uint32_t CbzX(uint8_t rt, int32_t offset) {
+  uint32_t imm19 = static_cast<uint32_t>(offset / 4) & 0x7FFFF;
+  return 0xB4000000 | (imm19 << 5) | rt;
+}
+constexpr uint32_t CbnzX(uint8_t rt, int32_t offset) {
+  uint32_t imm19 = static_cast<uint32_t>(offset / 4) & 0x7FFFF;
+  return 0xB5000000 | (imm19 << 5) | rt;
+}
+// CBZ/CBNZ Wt, offset (32-bit variant: sf=0).
+constexpr uint32_t CbzW(uint8_t rt, int32_t offset) {
+  uint32_t imm19 = static_cast<uint32_t>(offset / 4) & 0x7FFFF;
+  return 0x34000000 | (imm19 << 5) | rt;
+}
+// TBZ/TBNZ Xt, #bit, offset (imm14 byte offset). bit5 picks bits 32..63.
+constexpr uint32_t TbzX(uint8_t rt, uint8_t bit, int32_t offset) {
+  uint32_t b5 = (bit >> 5) & 1;
+  uint32_t b40 = bit & 0x1F;
+  uint32_t imm14 = static_cast<uint32_t>(offset / 4) & 0x3FFF;
+  return 0x36000000 | (b5 << 31) | (b40 << 19) | (imm14 << 5) | rt;
+}
+constexpr uint32_t TbnzX(uint8_t rt, uint8_t bit, int32_t offset) {
+  uint32_t b5 = (bit >> 5) & 1;
+  uint32_t b40 = bit & 0x1F;
+  uint32_t imm14 = static_cast<uint32_t>(offset / 4) & 0x3FFF;
+  return 0x37000000 | (b5 << 31) | (b40 << 19) | (imm14 << 5) | rt;
+}
+// BR Xn / RET Xn (indirect).
+constexpr uint32_t BrX(uint8_t rn) {
+  return 0xD61F0000 | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t RetX(uint8_t rn) {
+  return 0xD65F0000 | (static_cast<uint32_t>(rn) << 5);
 }
 
 // Heavy-optimize and execute one instruction, mirroring the riscv64 exec-test
@@ -1206,6 +1269,460 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, NonMoveWideBails) {
   state_.cpu.insn_addr = ToGuestAddr(code);
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
   EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
+}
+
+//
+// Branch family. Branches need multi-block regions and a real target, so these
+// build a region (via HeavyOptimizeRegion) and execute it, asserting where
+// cpu.insn_addr lands. The convention used below: each region is a small array
+// of 32-bit instructions; `end_pc` is past the last instruction so the region
+// extends through the branch; the test asserts insn_addr equals the taken
+// target or the fall-through PC.
+//
+
+// Build, execute, and return where cpu.insn_addr ended up. Asserts the region
+// translated (ok) and translated all `expected_insns` instructions. The region
+// runs to wherever its control flow exits (a branch target outside the region,
+// or end_pc as a fall-through).
+GuestAddr RunRegion(ThreadState* state,
+                    const uint32_t* code,
+                    GuestAddr end_pc,
+                    bool* ok_out = nullptr) {
+  state->cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] =
+      HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+  if (ok_out) {
+    *ok_out = ok;
+  }
+  if (!ok) {
+    return kNullGuestAddr;
+  }
+  ScopedExecRegion exec(&mc);
+  TestingRunGeneratedCode(state, exec.get(), end_pc);
+  return state->cpu.insn_addr;
+}
+
+// Unconditional B forward: after a MOVZ, B +8 jumps past code[2]. Because the
+// fall-through (code[2]) is unreachable, the region ends at the B and exits to
+// the branch target (code+0xC). The MOVZ at [0] runs; nothing past the B does.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchUnconditionalForward) {
+  static const uint32_t code[] = {
+      MovzX(8, 0x55),  // [0] X8 = 0x55 (runs)
+      B(8),            // [1] B -> code+0xC (skips [2])
+      MovzX(9, 1),     // [2] unreachable -> not translated
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  GuestAddr branch_target = ToGuestAddr(code) + 4 + 8;  // code[1] addr + 8
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, branch_target);  // region exits to the B target
+  EXPECT_EQ(state_.cpu.x[8], uint64_t{0x55});  // [0] ran
+  EXPECT_EQ(state_.cpu.x[9], 0u);              // [2] never ran
+}
+
+// B.cond taken: SUBS makes X0-5==0 -> Z=1; B.EQ +8 should jump over code[3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondEqTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),      // [0] X0 = 5
+      SubsImmX(31, 0, 5),  // [1] CMP X0,#5 -> Z=1,C=1
+      Bcond(kCondEQ, 8),   // [2] B.EQ -> code+0x10 (skips [3])
+      MovzX(9, 1),         // [3] skipped when taken
+      MovzX(10, 2),        // [4] target
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);   // [3] skipped (branch taken)
+  EXPECT_EQ(state_.cpu.x[10], 2u);  // [4] executed
+}
+
+// B.cond not taken: X0-6 != 0 -> Z=0; B.EQ falls through and runs code[3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondEqNotTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),         // [0]
+      SubsImmX(31, 0, 6),  // [1] CMP X0,#6 -> Z=0 (5 != 6)
+      Bcond(kCondEQ, 8),   // [2] B.EQ not taken
+      MovzX(9, 1),         // [3] runs (fall-through)
+      MovzX(10, 2),        // [4]
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 1u);   // [3] ran (not taken)
+  EXPECT_EQ(state_.cpu.x[10], 2u);  // [4] ran
+}
+
+// Cover NE / LT / GE / HI / LS taken-and-not-taken using a parameterized
+// helper. For each condition we set NZCV via a SUBS that produces a known
+// relation, then assert the branch is/ isn't taken by whether code[3] ran.
+struct CondCase {
+  uint8_t cond;
+  uint16_t lhs;       // X0 value
+  uint16_t rhs_imm;   // CMP immediate
+  bool expect_taken;
+};
+
+void RunCondCase(ThreadState* state, const CondCase& c) {
+  const uint32_t code[] = {
+      MovzX(0, c.lhs),
+      SubsImmX(31, 0, c.rhs_imm),  // CMP X0, #rhs
+      Bcond(c.cond, 8),            // B.cond -> skip [3] when taken
+      MovzX(9, 1),                 // [3] runs only on fall-through
+      MovzX(10, 2),                // [4]
+  };
+  // Reset the registers and flags this case touches (ThreadState itself is not
+  // copy-assignable because of an atomic member, so zero fields individually).
+  state->cpu.x[0] = 0;
+  state->cpu.x[9] = 0;
+  state->cpu.x[10] = 0;
+  state->cpu.flags = 0;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  state->cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] =
+      HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+  ASSERT_TRUE(ok);
+  ScopedExecRegion exec(&mc);
+  TestingRunGeneratedCode(state, exec.get(), end_pc);
+  if (c.expect_taken) {
+    EXPECT_EQ(state->cpu.x[9], 0u) << "cond=" << int{c.cond} << " expected taken";
+  } else {
+    EXPECT_EQ(state->cpu.x[9], 1u) << "cond=" << int{c.cond} << " expected not taken";
+  }
+  EXPECT_EQ(state->cpu.x[10], 2u);
+}
+
+// NE: Z==0. 5 - 6 != 0 -> taken; 5 - 5 == 0 -> not taken.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondNe) {
+  RunCondCase(&state_, {kCondNE, 5, 6, /*taken=*/true});
+  RunCondCase(&state_, {kCondNE, 5, 5, /*taken=*/false});
+}
+
+// LT: N!=V (signed less-than). 3 - 5 < 0 -> taken; 5 - 3 > 0 -> not taken.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondLt) {
+  RunCondCase(&state_, {kCondLT, 3, 5, /*taken=*/true});
+  RunCondCase(&state_, {kCondLT, 5, 3, /*taken=*/false});
+}
+
+// GE: N==V (signed >=). 5 - 3 >= 0 -> taken; 3 - 5 < 0 -> not taken.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondGe) {
+  RunCondCase(&state_, {kCondGE, 5, 3, /*taken=*/true});
+  RunCondCase(&state_, {kCondGE, 3, 5, /*taken=*/false});
+}
+
+// HI: C==1 && Z==0 (unsigned >). 5 - 3: C=1,Z=0 -> taken; 5 - 5: Z=1 -> not.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondHi) {
+  RunCondCase(&state_, {kCondHI, 5, 3, /*taken=*/true});
+  RunCondCase(&state_, {kCondHI, 5, 5, /*taken=*/false});
+}
+
+// LS: C==0 || Z==1 (unsigned <=). 5 - 5: Z=1 -> taken; 5 - 3: C=1,Z=0 -> not.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondLs) {
+  RunCondCase(&state_, {kCondLS, 5, 5, /*taken=*/true});
+  RunCondCase(&state_, {kCondLS, 5, 3, /*taken=*/false});
+}
+
+// GT: Z==0 && N==V. 5 - 3 > 0 -> taken; 5 - 5 == 0 -> not taken.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondGt) {
+  RunCondCase(&state_, {kCondGT, 5, 3, /*taken=*/true});
+  RunCondCase(&state_, {kCondGT, 5, 5, /*taken=*/false});
+}
+
+// LE: Z==1 || N!=V. 5 - 5 == 0 -> taken; 5 - 3 > 0 -> not taken.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondLe) {
+  RunCondCase(&state_, {kCondLE, 5, 5, /*taken=*/true});
+  RunCondCase(&state_, {kCondLE, 5, 3, /*taken=*/false});
+}
+
+// CS/CC (carry). 5 - 3: no borrow -> C=1 (CS taken, CC not).
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondCsCc) {
+  RunCondCase(&state_, {kCondCS, 5, 3, /*taken=*/true});
+  RunCondCase(&state_, {kCondCS, 3, 5, /*taken=*/false});  // borrow -> C=0
+  RunCondCase(&state_, {kCondCC, 3, 5, /*taken=*/true});   // borrow -> C=0
+  RunCondCase(&state_, {kCondCC, 5, 3, /*taken=*/false});
+}
+
+// MI/PL (negative). 3 - 5 = -2 -> N=1 (MI taken, PL not).
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondMiPl) {
+  RunCondCase(&state_, {kCondMI, 3, 5, /*taken=*/true});
+  RunCondCase(&state_, {kCondMI, 5, 3, /*taken=*/false});
+  RunCondCase(&state_, {kCondPL, 5, 3, /*taken=*/true});
+  RunCondCase(&state_, {kCondPL, 3, 5, /*taken=*/false});
+}
+
+// VS/VC (overflow). ADDS INT64_MIN + INT64_MIN overflows -> V=1, so VS is taken
+// and VC is not. Builds INT64_MIN with MOVZ #0x8000 LSL #48.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondVsTaken) {
+  static const uint32_t code[] = {
+      MovzHwX(0, 0x8000, 3),  // [0] X0 = INT64_MIN
+      AddsRegX(31, 0, 0),     // [1] CMN-like: X0+X0 -> V=1 (flags only, rd=XZR)
+      Bcond(kCondVS, 8),      // [2] B.VS -> taken (skips [3])
+      MovzX(9, 1),            // [3] skipped when taken
+      MovzX(10, 2),           // [4] target
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);   // taken: [3] skipped
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondVcNotTaken) {
+  static const uint32_t code[] = {
+      MovzHwX(0, 0x8000, 3),  // [0] X0 = INT64_MIN
+      AddsRegX(31, 0, 0),     // [1] V=1
+      Bcond(kCondVC, 8),      // [2] B.VC -> NOT taken (V==1)
+      MovzX(9, 1),            // [3] runs (fall-through)
+      MovzX(10, 2),           // [4]
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 1u);   // not taken: [3] runs
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// AL: always taken (lowered to unconditional B). The fall-through is
+// unreachable, so the region exits to the B.AL target (code+0xC).
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondAlwaysTaken) {
+  static const uint32_t code[] = {
+      MovzX(8, 0x77),     // [0] runs
+      Bcond(kCondAL, 8),  // [1] B.AL -> code+0xC (skips [2])
+      MovzX(9, 1),        // [2] unreachable
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  GuestAddr branch_target = ToGuestAddr(code) + 4 + 8;
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, branch_target);
+  EXPECT_EQ(state_.cpu.x[8], uint64_t{0x77});
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+}
+
+// CBZ taken: X0 == 0 -> branch over code[2].
+TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbzTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 0),    // [0] X0 = 0
+      CbzX(0, 8),     // [1] CBZ X0 -> code+0x10 (skips [2])
+      MovzX(9, 1),    // [2] skipped
+      MovzX(10, 2),   // [3] target
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// CBZ not taken: X0 != 0 -> fall through, code[2] runs.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbzNotTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 7),
+      CbzX(0, 8),
+      MovzX(9, 1),  // [2] runs
+      MovzX(10, 2),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 1u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// CBNZ taken: X0 != 0 -> branch over code[2].
+TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbnzTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 9),
+      CbnzX(0, 8),
+      MovzX(9, 1),  // [2] skipped
+      MovzX(10, 2),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// CBZ 32-bit (W form): only the low 32 bits are tested. X0 = 0x1_0000_0000 has
+// W0 == 0 -> CBZ W0 must be taken even though X0 != 0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbzWUsesLow32) {
+  static const uint32_t code[] = {
+      MovzHwX(0, 1, 2),  // [0] X0 = 1 << 32 (W0 == 0)
+      CbzW(0, 8),        // [1] CBZ W0 -> taken (skips [2])
+      MovzX(9, 1),       // [2] skipped
+      MovzX(10, 2),      // [3] target
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// TBZ taken: bit clear -> branch. X0 = 0b100, test bit 0 (clear) -> taken.
+TEST_F(Arm64HeavyOptimizerFrontendTest, TestAndBranchTbzTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 0x4),   // [0] bit 0 == 0
+      TbzX(0, 0, 8),   // [1] TBZ X0,#0 -> taken (skips [2])
+      MovzX(9, 1),     // [2] skipped
+      MovzX(10, 2),    // [3] target
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// TBZ not taken: bit set -> fall through. X0 = 0b1, test bit 0 (set).
+TEST_F(Arm64HeavyOptimizerFrontendTest, TestAndBranchTbzNotTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 0x1),
+      TbzX(0, 0, 8),
+      MovzX(9, 1),  // [2] runs
+      MovzX(10, 2),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 1u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// TBNZ taken: bit set -> branch. Test bit 1 of 0b10.
+TEST_F(Arm64HeavyOptimizerFrontendTest, TestAndBranchTbnzTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 0x2),    // bit 1 set
+      TbnzX(0, 1, 8),   // TBNZ X0,#1 -> taken (skips [2])
+      MovzX(9, 1),
+      MovzX(10, 2),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// TBNZ on a high bit (>=32): test bit 40 of X0 = 1<<40 -> taken. Confirms Btq
+// covers the full 64-bit register (no bail for bit>=32).
+TEST_F(Arm64HeavyOptimizerFrontendTest, TestAndBranchTbnzHighBit) {
+  static const uint32_t code[] = {
+      MovzHwX(0, 0x100, 2),  // X0 = 0x100 << 32 = 1<<40
+      TbnzX(0, 40, 8),       // TBNZ X0,#40 -> taken (skips [2])
+      MovzX(9, 1),
+      MovzX(10, 2),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[9], 0u);
+  EXPECT_EQ(state_.cpu.x[10], 2u);
+}
+
+// B.cond whose target is OUTSIDE the region must exit to that guest address
+// (the common case). Region is just [SUBS-equal; B.EQ +0x40]; the target
+// code+0x44 is past end_pc, so the taken branch exits to it.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondTargetOutsideRegionExits) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),         // [0]
+      SubsImmX(31, 0, 5),  // [1] Z=1
+      Bcond(kCondEQ, 0x40),  // [2] B.EQ -> code + 8 + 0x40 = code+0x48 (outside)
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  GuestAddr expected_target = ToGuestAddr(code) + 8 + 0x40;
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, expected_target);
+}
+
+// In-region backward branch loop: a countdown. X0 starts at 3; the loop body
+// decrements X0 and branches back while X0 != 0, then exits. The accumulator
+// X1 counts iterations; after the loop X1 == 3 and X0 == 0.
+//   [0] MOVZ X0, #3
+//   [1] MOVZ X1, #0       (loop top = code+4)
+//   loop: (code+4)
+//   [2] ADD  X1, X1, #1
+//   [3] SUBS X0, X0, #1   (sets Z when X0 hits 0)
+//   [4] B.NE loop (-12 -> back to code+4 == [1]) ... but we want top at [2].
+// Put the loop top at [1] so the back-edge from [4] targets [1]; X1 then counts
+// the SUBS iterations: X0 3->2->1->0 gives X1 incremented each pass.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondBackwardLoop) {
+  // loop top is code[1]. [4] B.NE back to code[1].
+  // Iterations: enter with X0=3.
+  //   pass1: X1=0; ADD X1=1; SUBS X0=2 (Z=0) -> branch back
+  //   ... but X1 is re-zeroed each pass if [1] is in the loop. Keep [1] OUTSIDE
+  //   the loop by targeting code[2] instead.
+  static const uint32_t code[] = {
+      MovzX(0, 3),         // [0] X0 = 3
+      MovzX(1, 0),         // [1] X1 = 0
+      AddImmX(1, 1, 1),    // [2] loop top (code+8): X1++
+      SubsImmX(0, 0, 1),   // [3] X0-- (sets Z when reaches 0)
+      Bcond(kCondNE, -8),  // [4] B.NE -> code+8 ([2]) while X0 != 0
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);          // loop exits by falling through [4]
+  EXPECT_EQ(state_.cpu.x[0], 0u);     // counted down to zero
+  EXPECT_EQ(state_.cpu.x[1], 3u);     // body ran 3 times
+}
+
+// BR (indirect): exit to the address held in a register. X5 holds an arbitrary
+// guest address; BR X5 must land cpu.insn_addr there.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchRegisterBr) {
+  static const uint32_t code[] = {
+      MovzHwX(5, 0xBEEF, 0),  // [0] X5 = 0xBEEF (a sentinel target address)
+      BrX(5),                 // [1] BR X5 -> exit indirect to 0xBEEF
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, GuestAddr{0xBEEF});
+}
+
+// RET (indirect via X30 by default, here RET X3): same indirect-exit path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchRegisterRet) {
+  static const uint32_t code[] = {
+      MovzHwX(3, 0x1234, 0),  // [0] X3 = 0x1234
+      RetX(3),                // [1] RET X3 -> exit indirect to 0x1234
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, GuestAddr{0x1234});
 }
 
 }  // namespace
