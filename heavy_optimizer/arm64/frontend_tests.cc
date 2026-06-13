@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 
 #include "berberis/assembler/machine_code.h"
@@ -359,6 +360,68 @@ constexpr uint32_t LdrswLiteral(uint8_t rt, int32_t off) {
   return 0x98000000 | (imm19 << 5) | rt;
 }
 
+// --- Conditional select / compare encoders (same forms as the lite-translator
+// tests). cond is the 4-bit ARM condition (kCond* above).
+// CSEL/CSINC/CSINV/CSNEG Xd, Xn, Xm, cond.
+constexpr uint32_t CselX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0x9A800000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsincX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0x9A800400 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsinvX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0xDA800000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+constexpr uint32_t CsnegX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return 0xDA800400 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | rd;
+}
+// CCMP/CCMN Xn, Xm, #nzcv, cond (register form).
+constexpr uint32_t CcmpRegX(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0xFA400000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | nzcv;
+}
+constexpr uint32_t CcmnRegX(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0xBA400000 | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(cond) << 12) | (rn << 5) | nzcv;
+}
+
+// --- LDP/STP encoders (signed 7-bit scaled imm; 64-bit form, scale = 8). ---
+constexpr uint32_t StpX(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm7) {
+  return 0xA9000000 | ((static_cast<uint32_t>(imm7) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t LdpX(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm7) {
+  return 0xA9400000 | ((static_cast<uint32_t>(imm7) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (rn << 5) | rt1;
+}
+
+// --- Register-offset load/store encoders (same forms as the lite-translator
+// tests). ---
+// LDR Xt, [Xn, Xm, LSL #3] (64-bit, S=1, option=011=LSL).
+constexpr uint32_t LdrXregLsl3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8607800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+// LDR Xt, [Xn, Wm, UXTW #3] (option=010=UXTW).
+constexpr uint32_t LdrXregUxtw3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8605800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+// LDR Xt, [Xn, Wm, SXTW #3] (option=110=SXTW).
+constexpr uint32_t LdrXregSxtw3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF860D800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+// STR Xt, [Xn, Xm, LSL #3].
+constexpr uint32_t StrXregLsl3(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xF8207800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+// LDR Wt, [Xn, Wm, UXTW #0] (32-bit zero-extend, no shift).
+constexpr uint32_t LdrWregUxtw0(uint8_t rt, uint8_t rn, uint8_t rm) {
+  return 0xB8604800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rt;
+}
+
 // Heavy-optimize and execute one instruction, mirroring the riscv64 exec-test
 // harness. Returns false if the optimizing frontend bailed (didn't translate the
 // instruction) so a test can assert it actually went through the JIT.
@@ -484,12 +547,13 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenBailRegion) {
 
 // A single guest instruction whose decode fires several listener callbacks where
 // a later one bails must still produce valid IR (one region exit, no trailing
-// insns) — i.e. GenCode must not abort. LDP post-index decodes to LoadPair
-// (still bails this round) followed by an AddImm writeback; once LoadPair sets
-// success_ = false the AddImm must emit nothing.
+// insns) — i.e. GenCode must not abort. A SIMD LDP-Q post-index decodes to
+// SimdLoadStorePair (still bails this round) followed by an AddImm writeback;
+// once SimdLoadStorePair sets success_ = false the AddImm must emit nothing.
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
-  // LDP X1, X2, [X0], #16 (post-index): LoadPair (bails) then AddImm writeback.
-  static const uint32_t code[] = {0xA8C10801};
+  // LDP Q1, Q2, [X0], #32 (SIMD post-index): SimdLoadStorePair (bails) then the
+  // AddImm writeback.
+  static const uint32_t code[] = {0xACC10801};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   // No abort here is the assertion (GenCode runs CheckMachineIR internally).
@@ -501,12 +565,12 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
 
 // MoveWide followed by a multi-callback bail (the common on-device prefix shape).
 TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenMultiCallbackBail) {
-  static const uint32_t code[] = {MovzX(0, 0x11), 0xA8C10801 /*LDP post-index, bails*/};
+  static const uint32_t code[] = {MovzX(0, 0x11), 0xACC10801 /*SIMD LDP-Q post-index, bails*/};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 1u);  // the MOVZ translated; the pair load bailed without corrupting IR
+  EXPECT_EQ(n, 1u);  // the MOVZ translated; the SIMD pair load bailed without corrupting IR
 }
 
 //
@@ -1983,6 +2047,655 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, LoadAddThenBailRegion) {
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
   // LDR + ADD translate; SMULH bails -> partial region of 2 instructions.
   EXPECT_EQ(n, 2u);
+}
+
+//
+// Conditional select (CSEL / CSINC / CSINV / CSNEG). Each region seeds NZCV with
+// a CMP (SUBS to XZR), then runs the conditional select and asserts X3.
+//
+
+// CSEL EQ, condition met: X0==5, CMP X0,#5 -> Z=1, CSEL selects X1 (true case).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CselEqTaken) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),       // [0] X1 = 100 (true case)
+      MovzX(2, 200),       // [1] X2 = 200 (false case)
+      MovzX(0, 5),         // [2] X0 = 5
+      SubsImmX(31, 0, 5),  // [3] CMP X0,#5 -> Z=1
+      CselX(3, 1, 2, kCondEQ),  // [4] X3 = EQ ? X1 : X2
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{100});
+}
+
+// CSEL EQ, condition NOT met: X0==5, CMP X0,#6 -> Z=0, CSEL selects X2 (false).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CselEqNotTaken) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      MovzX(0, 5),
+      SubsImmX(31, 0, 6),  // Z=0 (5 != 6)
+      CselX(3, 1, 2, kCondEQ),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{200});
+}
+
+// CSEL LT, condition met: 3 - 5 = -2 -> N=1,V=0 -> LT (N!=V) holds -> X1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CselLtTaken) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      MovzX(0, 3),
+      SubsImmX(31, 0, 5),  // 3 - 5 -> N=1, V=0 -> LT holds
+      CselX(3, 1, 2, kCondLT),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{100});
+}
+
+// CSINC NE, condition NOT met (Z=1): selects src2 + 1. X2=200 -> 201.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CsincNotTakenIncrements) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      MovzX(0, 5),
+      SubsImmX(31, 0, 5),       // Z=1 -> NE not met
+      CsincX(3, 1, 2, kCondNE),  // X3 = NE ? X1 : X2 + 1
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{201});  // false case incremented
+}
+
+// CSINC NE, condition met (Z=0): selects src1 unmodified. X1=100.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CsincTakenSelectsSrc1) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      MovzX(0, 5),
+      SubsImmX(31, 0, 6),       // Z=0 -> NE met
+      CsincX(3, 1, 2, kCondNE),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{100});  // true case unmodified
+}
+
+// CSINV NE, condition NOT met (Z=1): selects ~src2. ~200 = 0xFF..FF37.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CsinvNotTakenInverts) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      MovzX(0, 5),
+      SubsImmX(31, 0, 5),        // Z=1 -> NE not met
+      CsinvX(3, 1, 2, kCondNE),  // X3 = NE ? X1 : ~X2
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], ~uint64_t{200});
+}
+
+// CSNEG NE, condition NOT met (Z=1): selects -src2. -200.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CsnegNotTakenNegates) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      MovzX(0, 5),
+      SubsImmX(31, 0, 5),        // Z=1 -> NE not met
+      CsnegX(3, 1, 2, kCondNE),  // X3 = NE ? X1 : -X2
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], static_cast<uint64_t>(-int64_t{200}));
+}
+
+// CSEL AL: always selects src1 regardless of flags.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CselAlwaysSelectsSrc1) {
+  static const uint32_t code[] = {
+      MovzX(1, 100),
+      MovzX(2, 200),
+      CselX(3, 1, 2, kCondAL),
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{100});
+}
+
+//
+// Conditional compare (CCMP / CCMN). Asserts the merged cpu.flags for both the
+// condition-met (real compare) and condition-not-met (nzcv immediate) paths.
+//
+
+// CCMP condition MET: CMP X0,#5 sets Z=1 (EQ holds) -> CCMP does CMP X0,X1.
+// X0==X1==5 -> the real compare sets Z=1, C=1, N=0, V=0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CcmpConditionMetRealCompare) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      MovzX(1, 5),
+      SubsImmX(31, 0, 5),  // CMP X0,#5 -> Z=1 (EQ condition will hold)
+      CcmpRegX(0, 1, /*nzcv=*/0x0, kCondEQ),  // EQ met -> CMP X0,X1 (5==5)
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);    // 5 - 5 == 0
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);   // no borrow
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);
+}
+
+// CCMP condition NOT met: NE fails after Z=1, so NZCV = the nzcv immediate.
+// nzcv = 0x6 = 0b0110 -> Z=1 (bit2), C=1 (bit1), N=0, V=0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CcmpConditionNotMetUsesImmediate) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      MovzX(1, 9),
+      SubsImmX(31, 0, 5),  // Z=1
+      CcmpRegX(0, 1, /*nzcv=*/0x6, kCondNE),  // NE NOT met -> NZCV = 0x6
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);     // bit2 of nzcv
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);    // bit1 of nzcv
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);  // bit3 clear
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagOverflow);  // bit0 clear
+}
+
+// CCMN condition met: CMN adds rn+rm. X0=INT64_MIN, X1=INT64_MIN -> overflow.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CcmnConditionMetRealCompare) {
+  static const uint32_t code[] = {
+      MovzHwX(0, 0x8000, 3),  // X0 = INT64_MIN
+      MovzHwX(1, 0x8000, 3),  // X1 = INT64_MIN
+      MovzX(2, 0),
+      SubsImmX(31, 2, 0),  // CMP X2,#0 -> Z=1 (EQ holds)
+      CcmnRegX(0, 1, /*nzcv=*/0x0, kCondEQ),  // EQ met -> CMN X0,X1 (overflow)
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagOverflow);   // signed overflow
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);      // unsigned carry out
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);       // sum is 0
+}
+
+//
+// Register-offset loads / stores. Base points at a static buffer; the offset
+// register is extended (UXTW/SXTW/LSL) and shifted before being added.
+//
+
+// LDR Xt, [Xn, Xm, LSL #3]: 64-bit element indexing (scale 8).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LoadRegLsl3) {
+  static uint64_t buf[4] = {0x1111111111111111ULL, 0x2222222222222222ULL,
+                            0x3333333333333333ULL, 0x4444444444444444ULL};
+  static const uint32_t code[] = {LdrXregLsl3(0, 1, 2)};  // X0 = [X1 + X2*8]
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 2;  // index 2
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x3333333333333333ULL});
+}
+
+// LDR Xt, [Xn, Wm, UXTW #3]: the W index is zero-extended (upper 32 ignored).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LoadRegUxtw3IgnoresUpper) {
+  static uint64_t buf[4] = {0xA0, 0xA1, 0xA2, 0xA3};
+  static const uint32_t code[] = {LdrXregUxtw3(0, 1, 2)};  // X0 = [X1 + UXTW(W2)*8]
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0xFFFFFFFF00000001ULL;  // W2 == 1; upper 32 must be ignored
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xA1});  // index 1
+}
+
+// LDR Xt, [Xn, Wm, SXTW #3]: the W index is sign-extended (negative offset).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LoadRegSxtw3Negative) {
+  static uint64_t buf[4] = {0xB0, 0xB1, 0xB2, 0xB3};
+  static const uint32_t code[] = {LdrXregSxtw3(0, 1, 2)};  // X0 = [X1 + SXTW(W2)*8]
+  state_.cpu.x[1] = ToGuestAddr(&buf[2]);     // base at index 2
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;     // W2 == -1 -> sign-extends to -1
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xB1});  // index 2 + (-1) = index 1
+}
+
+// LDR Wt, [Xn, Wm, UXTW #0]: 32-bit zero-extending load, no shift.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LoadRegW32Uxtw0) {
+  static uint32_t buf[4] = {0xC0, 0xC1, 0xC2, 0xC3};
+  static const uint32_t code[] = {LdrWregUxtw0(0, 1, 2)};  // W0 = [X1 + UXTW(W2)]
+  state_.cpu.x[0] = 0x1111111111111111ULL;  // upper bits must be cleared
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 8;  // byte offset 8 -> buf[2]
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xC2});  // upper 32 cleared
+}
+
+// STR Xt, [Xn, Xm, LSL #3]: register-offset store.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StoreRegLsl3) {
+  static uint64_t buf[4] = {0, 0, 0, 0};
+  static const uint32_t code[] = {StrXregLsl3(0, 1, 2)};  // [X1 + X2*8] = X0
+  state_.cpu.x[0] = 0xCAFEF00DDEADBEEFULL;
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 3;  // index 3
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(buf[3], uint64_t{0xCAFEF00DDEADBEEFULL});
+  EXPECT_EQ(buf[0], uint64_t{0});  // other slots untouched
+}
+
+//
+// Load/store pair (LDP / STP).
+//
+
+// STP then LDP round-trip through a static buffer. STP X0,X1,[X2] writes two
+// 64-bit slots; LDP X3,X4,[X2] reads them back.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StpLdpRoundTrip) {
+  alignas(16) static uint64_t buf[2] = {0, 0};
+  static const uint32_t code[] = {
+      StpX(0, 1, 2, 0),  // [0] STP X0, X1, [X2]
+      LdpX(3, 4, 2, 0),  // [1] LDP X3, X4, [X2]
+  };
+  state_.cpu.x[0] = 0x1122334455667788ULL;
+  state_.cpu.x[1] = 0x99AABBCCDDEEFF00ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf[0]);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(buf[0], uint64_t{0x1122334455667788ULL});
+  EXPECT_EQ(buf[1], uint64_t{0x99AABBCCDDEEFF00ULL});
+  EXPECT_EQ(state_.cpu.x[3], uint64_t{0x1122334455667788ULL});
+  EXPECT_EQ(state_.cpu.x[4], uint64_t{0x99AABBCCDDEEFF00ULL});
+}
+
+// LDP X0, X8, [X0]: the base aliases the first destination. Both halves must be
+// loaded from the ORIGINAL base, so X8 = obj[1] (not *(obj[0] + 8)). Mirrors the
+// lite-translator LdpBaseAliasesFirstDest regression.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdpBaseAliasesFirstDest) {
+  alignas(16) static uint64_t obj[2] = {
+      0xAAAABBBBCCCCDDDDULL,  // [0] becomes X0 after LDP
+      0x1122334455667788ULL,  // [8] must become X8 — NOT *(obj[0]+8)
+  };
+  static const uint32_t code[] = {LdpX(0, 8, 0, 0)};  // LDP X0, X8, [X0]
+  state_.cpu.x[0] = ToGuestAddr(&obj[0]);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xAAAABBBBCCCCDDDDULL});
+  EXPECT_EQ(state_.cpu.x[8], uint64_t{0x1122334455667788ULL});
+}
+
+//
+// Scalar floating-point. The optimizing tier lowers FADD/FSUB/FMUL/FDIV (S and
+// D) through the intrinsic layer and FMOV(reg)/FABS/FNEG/FMOV-imm directly; the
+// rest bail. Each region writes the source V regs via memcpy of float/double,
+// runs through the JIT (ASSERT the region didn't bail), then checks the low
+// 4/8 result bytes AND that the upper bytes of V[d] were zeroed.
+//
+
+// FP data-processing (2 source): 0001_1110_ftype_1_Rm_opcode_10_Rn_Rd.
+// opcode[15:12]: FMUL=0000, FDIV=0001, FADD=0010, FSUB=0011. ftype +0x400000=D.
+constexpr uint32_t FpDP2(uint32_t base, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return base | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmulS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E200800, rd, rn, rm); }
+constexpr uint32_t FmulD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E600800, rd, rn, rm); }
+constexpr uint32_t FdivS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E201800, rd, rn, rm); }
+constexpr uint32_t FdivD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E601800, rd, rn, rm); }
+constexpr uint32_t FaddS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E202800, rd, rn, rm); }
+constexpr uint32_t FaddD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E602800, rd, rn, rm); }
+constexpr uint32_t FsubS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E203800, rd, rn, rm); }
+constexpr uint32_t FsubD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E603800, rd, rn, rm); }
+// FMAX Sd,Sn,Sm (opcode=0100) — must bail in the optimizing tier.
+constexpr uint32_t FmaxS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E204800, rd, rn, rm); }
+
+// FP data-processing (1 source): 0001_1110_ftype_1_opcode[5:0]_10000_Rn_Rd.
+// opcode[20:15]: FMOV=000000, FABS=000001, FNEG=000010, FSQRT=000011.
+constexpr uint32_t FpDP1(uint32_t base, uint8_t rd, uint8_t rn) {
+  return base | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmovRegS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E204000, rd, rn); }
+constexpr uint32_t FmovRegD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E604000, rd, rn); }
+constexpr uint32_t FabsS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E20C000, rd, rn); }
+constexpr uint32_t FabsD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E60C000, rd, rn); }
+constexpr uint32_t FnegS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E214000, rd, rn); }
+constexpr uint32_t FnegD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E614000, rd, rn); }
+// FSQRT Sd,Sn (opcode=000011) — must bail in the optimizing tier.
+constexpr uint32_t FsqrtS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E21C000, rd, rn); }
+
+// FMOV (scalar, immediate): 0001_1110_ftype_1_imm8_100_00000_Rd.
+constexpr uint32_t FmovImmS(uint8_t rd, uint8_t imm8) {
+  return 0x1E201000 | (static_cast<uint32_t>(imm8) << 13) | rd;
+}
+constexpr uint32_t FmovImmD(uint8_t rd, uint8_t imm8) {
+  return 0x1E601000 | (static_cast<uint32_t>(imm8) << 13) | rd;
+}
+
+// Helpers to write/read the scalar lane of a guest V register and to read its
+// upper bytes (which an ARM scalar-FP write must zero).
+void SetVf32(ThreadState* s, unsigned reg, float v) {
+  std::memset(&s->cpu.v[reg], 0xAB, sizeof(s->cpu.v[reg]));  // poison upper bytes
+  std::memcpy(&s->cpu.v[reg], &v, sizeof(v));
+}
+void SetVf64(ThreadState* s, unsigned reg, double v) {
+  std::memset(&s->cpu.v[reg], 0xAB, sizeof(s->cpu.v[reg]));  // poison upper bytes
+  std::memcpy(&s->cpu.v[reg], &v, sizeof(v));
+}
+float GetVf32(const ThreadState* s, unsigned reg) {
+  float v;
+  std::memcpy(&v, &s->cpu.v[reg], sizeof(v));
+  return v;
+}
+double GetVf64(const ThreadState* s, unsigned reg) {
+  double v;
+  std::memcpy(&v, &s->cpu.v[reg], sizeof(v));
+  return v;
+}
+// Upper 96 bits (FP32 scalar) / upper 64 bits (FP64 scalar) of V[reg].
+uint64_t VUpperHi64(const ThreadState* s, unsigned reg) {
+  uint64_t hi;
+  std::memcpy(&hi, reinterpret_cast<const uint8_t*>(&s->cpu.v[reg]) + 8, sizeof(hi));
+  return hi;
+}
+uint32_t VWord1(const ThreadState* s, unsigned reg) {
+  uint32_t w;
+  std::memcpy(&w, reinterpret_cast<const uint8_t*>(&s->cpu.v[reg]) + 4, sizeof(w));
+  return w;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddS) {
+  static const uint32_t code[] = {FaddS(0, 1, 2)};
+  SetVf32(&state_, 1, 1.5f);
+  SetVf32(&state_, 2, 2.25f);
+  SetVf32(&state_, 0, 99.0f);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 3.75f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);          // upper word zeroed
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);      // upper 64 bits zeroed
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsubS) {
+  static const uint32_t code[] = {FsubS(0, 1, 2)};
+  SetVf32(&state_, 1, 5.0f);
+  SetVf32(&state_, 2, 1.25f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 3.75f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulS) {
+  static const uint32_t code[] = {FmulS(0, 1, 2)};
+  SetVf32(&state_, 1, 0.5f);
+  SetVf32(&state_, 2, 3.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FdivS) {
+  static const uint32_t code[] = {FdivS(0, 1, 2)};
+  SetVf32(&state_, 1, 9.0f);
+  SetVf32(&state_, 2, 4.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.25f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddD) {
+  static const uint32_t code[] = {FaddD(0, 1, 2)};
+  SetVf64(&state_, 1, 1.5);
+  SetVf64(&state_, 2, 2.25);
+  SetVf64(&state_, 0, 99.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 3.75);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);  // upper 64 bits zeroed
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsubD) {
+  static const uint32_t code[] = {FsubD(0, 1, 2)};
+  SetVf64(&state_, 1, 5.0);
+  SetVf64(&state_, 2, 1.25);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 3.75);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulD) {
+  static const uint32_t code[] = {FmulD(0, 1, 2)};
+  SetVf64(&state_, 1, 0.5);
+  SetVf64(&state_, 2, 3.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FdivD) {
+  static const uint32_t code[] = {FdivD(0, 1, 2)};
+  SetVf64(&state_, 1, 9.0);
+  SetVf64(&state_, 2, 4.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 2.25);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMOV Sd, Sn: bit-exact copy of lane 0, upper bytes zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovRegS) {
+  static const uint32_t code[] = {FmovRegS(0, 1)};
+  SetVf32(&state_, 1, -7.5f);
+  SetVf32(&state_, 0, 1.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), -7.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovRegD) {
+  static const uint32_t code[] = {FmovRegD(0, 1)};
+  SetVf64(&state_, 1, -7.5);
+  SetVf64(&state_, 0, 1.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -7.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FABS Sd, Sn: clear sign bit.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabsS) {
+  static const uint32_t code[] = {FabsS(0, 1)};
+  SetVf32(&state_, 1, -3.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 3.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FNEG Sd, Sn: flip sign bit.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnegS) {
+  static const uint32_t code[] = {FnegS(0, 1)};
+  SetVf32(&state_, 1, 3.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), -3.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FABS Dd, Dn: clear sign bit (high word).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabsD) {
+  static const uint32_t code[] = {FabsD(0, 1)};
+  SetVf64(&state_, 1, -3.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 3.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FNEG Dd, Dn: flip sign bit (high word).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnegD) {
+  static const uint32_t code[] = {FnegD(0, 1)};
+  SetVf64(&state_, 1, 3.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -3.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMOV Sd, #1.0 (imm8 = 0x70 encodes +1.0 in single precision).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovImmSOne) {
+  static const uint32_t code[] = {FmovImmS(0, 0x70)};
+  SetVf32(&state_, 0, 99.0f);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMOV Dd, #-2.0 (imm8 = 0x80 encodes -2.0 in double precision: VFPExpandImm
+// sign=1, exp=1024 -> 2^1).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovImmDNegTwo) {
+  static const uint32_t code[] = {FmovImmD(0, 0x80)};
+  SetVf64(&state_, 0, 99.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -2.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Multi-instruction FP region: chained FADD/FMUL across S and D, with an FMOV
+// reg in the middle, all in one JIT region. Exercises that scalar V-reg
+// read/write + zeroing compose correctly across several ops.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FpMultiInstructionRegion) {
+  static const uint32_t code[] = {
+      FaddS(0, 1, 2),   // S0 = S1 + S2 = 1.0 + 2.0 = 3.0
+      FmulS(0, 0, 3),   // S0 = S0 * S3 = 3.0 * 4.0 = 12.0
+      FmovRegS(4, 0),   // S4 = S0 = 12.0
+      FaddD(5, 6, 7),   // D5 = D6 + D7 = 10.0 + 0.5 = 10.5
+  };
+  SetVf32(&state_, 1, 1.0f);
+  SetVf32(&state_, 2, 2.0f);
+  SetVf32(&state_, 3, 4.0f);
+  SetVf64(&state_, 6, 10.0);
+  SetVf64(&state_, 7, 0.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 12.0f);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 4), 12.0f);
+  EXPECT_EQ(VUpperHi64(&state_, 4), 0u);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 5), 10.5);
+  EXPECT_EQ(VUpperHi64(&state_, 5), 0u);
+}
+
+// FMAX (a 2-source FP op the optimizing tier does NOT handle) must bail: the
+// region translates 0 instructions for a lone FMAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxBails) {
+  static const uint32_t code[] = {FmaxS(0, 1, 2)};
+  SetVf32(&state_, 1, 1.0f);
+  SetVf32(&state_, 2, 2.0f);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// FSQRT (a 1-source FP op the optimizing tier does NOT handle) must bail.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtBails) {
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  SetVf32(&state_, 1, 4.0f);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 }  // namespace

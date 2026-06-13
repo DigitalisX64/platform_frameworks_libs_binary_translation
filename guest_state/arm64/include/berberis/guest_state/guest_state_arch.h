@@ -19,7 +19,9 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 
+#include "berberis/base/config.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_opaque.h"
 #include "native_bridge_support/arm64/guest_state/guest_state_cpu_state.h"
@@ -29,6 +31,12 @@ namespace berberis {
 // Guest CPU state + interface to access guest memory.
 struct ThreadState {
   CPUState cpu;
+
+  // Scratch space for host x87/MXCSR use by the inline-intrinsic lowering: some
+  // host ops can only read/write memory operands. Mirrors the riscv64
+  // ThreadState so the guest-agnostic inline_intrinsic.h scratch path
+  // type-checks for the ARM64 optimizing backend too.
+  alignas(config::kScratchAreaAlign) uint8_t intrinsics_scratch_area[config::kScratchAreaSize];
 
   // Guest thread pointer.
   GuestThread* thread;
