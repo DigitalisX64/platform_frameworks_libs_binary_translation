@@ -5269,7 +5269,9 @@ class Decoder {
         op = u ? AdvSimdTwoRegMiscOpcode::kRev32 : AdvSimdTwoRegMiscOpcode::kRev64;
         break;
       case 0b00001:
-        if (!u) { Undefined(); return; }  // opcode=00001 U=0 is unallocated
+        // REV16 (vector) is U=0, opcode=00001 (REV64=U0/op0, REV32=U1/op0,
+        // REV16=U0/op1). U=1 at this opcode is unallocated.
+        if (u) { Undefined(); return; }
         op = AdvSimdTwoRegMiscOpcode::kRev16;
         break;
       case 0b00010:
