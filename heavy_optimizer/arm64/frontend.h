@@ -638,6 +638,14 @@ class HeavyOptimizerFrontend {
     return res;
   }
 
+  // LDP/LDPSW: load two adjacent sized elements at {base, 0} and {base, scale}.
+  // The SemanticsPlayer passes rt1/rt2 as register NUMBERS and applies any
+  // pre/post-index base writeback itself; this method commits the two loaded
+  // values to the destination registers. Mirrors lite_translator.h::LoadPair:
+  // both halves are loaded into temps FIRST, then committed via SetReg, so when
+  // a destination aliases the base register (e.g. `ldp x0, x8, [x0]`) the second
+  // load still reads from the original base. LDPSW (is_signed) sign-extends each
+  // 32-bit element into its 64-bit target.
   void LoadPair(Decoder::LoadStoreSize size,
                 Register base,
                 int32_t offset,
@@ -645,20 +653,52 @@ class HeavyOptimizerFrontend {
                 uint8_t rt2,
                 uint8_t scale,
                 bool is_signed) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(size, base, offset, rt1, rt2, scale, is_signed);
+    if (!success()) {
+      return;
+    }
+    UNUSED_ARGS(offset);  // Already applied by the SemanticsPlayer.
+    bool is_64bit_target = (size == Decoder::LoadStoreSize::k64bit) || is_signed;
+    Register val1 = Load(size, is_signed, is_64bit_target, base, 0);
+    if (!success()) {
+      return;
+    }
+    Register val2 = Load(size, is_signed, is_64bit_target, base, static_cast<int32_t>(scale));
+    if (!success()) {
+      return;
+    }
+    if (rt1 != 31) {
+      SetReg(rt1, val1);
+    }
+    if (rt2 != 31) {
+      SetReg(rt2, val2);
+    }
   }
 
+  // STP: store two adjacent sized elements at {base, 0} and {base, scale}.
+  // The SemanticsPlayer applies any pre/post-index base writeback itself.
+  // Mirrors lite_translator.h::StorePair.
   void StorePair(Decoder::LoadStoreSize size,
                  Register base,
                  int32_t offset,
                  Register data1,
                  Register data2,
                  uint8_t scale) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(size, base, offset, data1, data2, scale);
+    if (!success()) {
+      return;
+    }
+    UNUSED_ARGS(offset);  // Already applied by the SemanticsPlayer.
+    Store(size, base, 0, data1);
+    if (!success()) {
+      return;
+    }
+    Store(size, base, static_cast<int32_t>(scale), data2);
   }
 
+  // LDR (register offset): address = base + extend(offset_reg) << shift_amount,
+  // then the same TBI + sized/sign-appropriate access + recovery as Load().
+  // Mirrors lite_translator.h::LoadReg (+ ApplyOffsetExtend). The decoder only
+  // emits the word-or-larger options (010=UXTW, 011=LSL/UXTX, 110=SXTW,
+  // 111=SXTX); any other option was already rejected as UNDEFINED.
   Register LoadReg(Decoder::LoadStoreSize size,
                    bool is_signed,
                    bool is_64bit_target,
@@ -666,19 +706,26 @@ class HeavyOptimizerFrontend {
                    Register offset_reg,
                    uint8_t extend_type,
                    uint8_t shift_amount) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(size, is_signed, is_64bit_target, base, offset_reg, extend_type, shift_amount);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    Register addr = EmitRegOffsetAddr(base, offset_reg, extend_type, shift_amount);
+    return Load(size, is_signed, is_64bit_target, addr, 0);
   }
 
+  // STR (register offset): mirrors lite_translator.h::StoreReg (+
+  // ApplyOffsetExtend).
   void StoreReg(Decoder::LoadStoreSize size,
                 Register base,
                 Register offset_reg,
                 uint8_t extend_type,
                 uint8_t shift_amount,
                 Register data) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(size, base, offset_reg, extend_type, shift_amount, data);
+    if (!success()) {
+      return;
+    }
+    Register addr = EmitRegOffsetAddr(base, offset_reg, extend_type, shift_amount);
+    Store(size, addr, 0, data);
   }
 
   void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
@@ -929,15 +976,21 @@ class HeavyOptimizerFrontend {
     return r;
   }
 
+  // CSEL/CSINC/CSINV/CSNEG Rd, Rn, Rm, cond:
+  //   Rd = cond ? Rn : transform(Rm)
+  // where transform is identity (CSEL), +1 (CSINC), ~ (CSINV), or - (CSNEG).
+  // Mirrors lite_translator.h::ConditionalSelect: materialize the false case
+  // (transform(Rm)) into a result register, then conditionally overwrite it with
+  // Rn when the condition holds. Structured with then/merge basic blocks (the
+  // overwrite happens in then_bb, both paths fall into merge_bb) like BranchCond,
+  // since the heavy IR has no condition-immediate CMOV adapter. AL/NV always
+  // select Rn. 32-bit forms zero-extend. Defined in the .cc (needs basic-block
+  // manipulation). Returns the result register.
   Register ConditionalSelect(Decoder::ConditionalSelectOpcode opcode,
                              bool is_64bit,
                              Register src1,
                              Register src2,
-                             Decoder::Condition cond) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(opcode, is_64bit, src1, src2, cond);
-    return AllocTempReg();
-  }
+                             Decoder::Condition cond);
 
   // LSLV/LSRV/ASRV/RORV (variable shifts). UDIV/SDIV/CRC32/PACGA bail: division
   // needs x86 RDX:RAX setup plus ARM divide-by-zero / INT_MIN-overflow handling
@@ -1129,15 +1182,19 @@ class HeavyOptimizerFrontend {
     return std::get<0>(Gen<x86_64::ShrdlRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
   }
 
+  // CCMP/CCMN Rn, Rm, #nzcv, cond:
+  //   if cond holds: NZCV = flags of (Rn - Rm) [CMP] or (Rn + Rm) [CMN]
+  //   else:          NZCV = the 4-bit nzcv immediate (bit3=N,bit2=Z,bit1=C,bit0=V)
+  // Mirrors lite_translator.cc::ConditionalCompare: branch on the condition
+  // predicate to a compare-path bb (EmitMaterializeNZCV) vs an immediate-path bb
+  // (writes the packed nzcv to cpu.flags), then merge. Defined in the .cc (needs
+  // basic-block manipulation). AL/NV always take the compare path.
   void ConditionalCompare(bool is_neg,
                           bool is_64bit,
                           Register rn,
                           Register rm,
                           Decoder::Condition cond,
-                          uint8_t nzcv) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(is_neg, is_64bit, rn, rm, cond, nzcv);
-  }
+                          uint8_t nzcv);
 
   //
   // MTE.
@@ -1547,6 +1604,36 @@ class HeavyOptimizerFrontend {
     tbi = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(tbi, int8_t{8}));
     tbi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(tbi, int8_t{8}));
     return tbi;
+  }
+
+  // Compute the address for a register-offset load/store:
+  //   base + extend(offset_reg) << shift_amount
+  // The extend applies the correct 32->64 widening (UXTW zero-extends, SXTW
+  // sign-extends, LSL/UXTX/SXTX use the full 64-bit value), mirroring
+  // lite_translator.h::ApplyOffsetExtend. Returns a fresh register; the base is
+  // not modified (so an aliased base/dest stays correct).
+  [[nodiscard]] Register EmitRegOffsetAddr(Register base,
+                                           Register offset_reg,
+                                           uint8_t extend_type,
+                                           uint8_t shift_amount) {
+    Register addr;
+    switch (extend_type) {
+      case 0b010:  // UXTW: zero-extend the low 32 bits (a 32-bit mov zero-extends).
+        addr = std::get<0>(Gen<x86_64::MovlRegReg>(offset_reg));
+        break;
+      case 0b110:  // SXTW: sign-extend the low 32 bits to 64.
+        addr = std::get<0>(Gen<x86_64::MovsxlqRegReg>(offset_reg));
+        break;
+      case 0b011:  // LSL / UXTX: full 64-bit value, no extension.
+      case 0b111:  // SXTX: full 64-bit value, sign-extend is a no-op here.
+      default:
+        addr = Copy(offset_reg);
+        break;
+    }
+    if (shift_amount != 0) {
+      addr = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(addr, static_cast<int8_t>(shift_amount)));
+    }
+    return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(addr, base));
   }
 
   // Emit `src` shifted by a constant amount (LSL/LSR/ASR/ROR) into a fresh

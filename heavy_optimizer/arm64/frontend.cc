@@ -320,6 +320,182 @@ void HeavyOptimizerFrontend::TestAndBranch(bool is_nonzero,
   builder_.StartBasicBlock(else_bb);
 }
 
+// CSEL/CSINC/CSINV/CSNEG. Materialize the false case (transform(src2)) into a
+// result vreg, then conditionally overwrite it with src1 when `cond` holds.
+// Mirrors lite_translator.h::ConditionalSelect. AL/NV always select src1.
+Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpcode opcode,
+                                                   bool is_64bit,
+                                                   Register src1,
+                                                   Register src2,
+                                                   Decoder::Condition cond) {
+  if (!success()) {
+    return AllocTempReg();
+  }
+
+  // The false case = transform(src2), and the true case = src1, each produced
+  // into a fresh 64-bit-wide value (a 32-bit op clears the upper half, matching
+  // ARM64 W-write semantics). They are funneled into a single `result` vreg via
+  // PseudoCopy so that, after the conditional overwrite, `result` holds the
+  // selected operand on every control-flow edge.
+  auto width_adjust = [&](Register r) -> Register {
+    if (is_64bit) {
+      return Copy(r);
+    }
+    return std::get<0>(Gen<x86_64::MovlRegReg>(r));
+  };
+
+  Register false_val;
+  switch (opcode) {
+    case Decoder::ConditionalSelectOpcode::kCsel:
+      false_val = width_adjust(src2);
+      break;
+    case Decoder::ConditionalSelectOpcode::kCsinc:
+      false_val = width_adjust(src2);
+      if (is_64bit) {
+        false_val = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(false_val, int32_t{1}));
+      } else {
+        false_val = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(false_val, int32_t{1}));
+      }
+      break;
+    case Decoder::ConditionalSelectOpcode::kCsinv:
+      // ~src2. The heavy IR has only a 64-bit NOT; the 32-bit case re-clears the
+      // upper half with a 32-bit mov afterwards.
+      false_val = Copy(src2);
+      false_val = std::get<0>(Gen<x86_64::NotqReg, kNoSSA>(false_val));
+      if (!is_64bit) {
+        false_val = std::get<0>(Gen<x86_64::MovlRegReg>(false_val));
+      }
+      break;
+    case Decoder::ConditionalSelectOpcode::kCsneg: {
+      // -src2 = 0 - src2 (the heavy IR has no Neg op). The l-suffix subtract
+      // zero-extends the 32-bit result.
+      Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+      if (is_64bit) {
+        false_val = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(zero, src2));
+      } else {
+        false_val = std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(zero, src2));
+      }
+      break;
+    }
+  }
+
+  Register result = AllocTempReg();
+  builder_.Gen<PseudoCopy>(result, false_val, 8);
+
+  // AL/NV: always select src1 (unconditional). No branch needed.
+  if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
+    builder_.Gen<PseudoCopy>(result, width_adjust(src1), 8);
+    return result;
+  }
+
+  // Conditionally overwrite result with src1 when the condition holds. then_bb
+  // does the overwrite; both paths fall into merge_bb. result is the same vreg
+  // written on both edges, so its value after merge_bb is the selected operand.
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* then_bb = ir->NewBasicBlock();
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, then_bb);
+  ir->AddEdge(cur_bb, merge_bb);
+
+  EmitCondBranch(cond, then_bb, merge_bb);
+
+  builder_.StartBasicBlock(then_bb);
+  builder_.Gen<PseudoCopy>(result, width_adjust(src1), 8);
+  ir->AddEdge(then_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(merge_bb);
+  return result;
+}
+
+// CCMP/CCMN. If `cond` holds, set NZCV from a real CMP (is_neg=false) / CMN
+// (is_neg=true); otherwise set NZCV from the 4-bit nzcv immediate. Mirrors
+// lite_translator.cc::ConditionalCompare with then/else/merge basic blocks.
+void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
+                                                bool is_64bit,
+                                                Register rn,
+                                                Register rm,
+                                                Decoder::Condition cond,
+                                                uint8_t nzcv) {
+  if (!success()) {
+    return;
+  }
+
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+
+  // Pack the immediate-path NZCV: ARM bit3=N,bit2=Z,bit1=C,bit0=V map to
+  // cpu.flags N@15, Z@14, C@8, V@0 (the same layout EmitMaterializeNZCV writes).
+  auto emit_immediate_path = [&]() {
+    uint16_t flags_val = 0;
+    if (nzcv & 0x8) {
+      flags_val |= (1 << 15);  // N
+    }
+    if (nzcv & 0x4) {
+      flags_val |= (1 << 14);  // Z
+    }
+    if (nzcv & 0x2) {
+      flags_val |= (1 << 8);  // C
+    }
+    if (nzcv & 0x1) {
+      flags_val |= (1 << 0);  // V
+    }
+    Register imm_reg = GetImm(flags_val);
+    builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm_reg);
+  };
+
+  // The compare path: CMP is non-destructive (CmpqRegReg only defs FLAGS); CMN
+  // has no non-destructive x86 add, so add rn+rm into a scratch (never into rn,
+  // which is the live guest register under register mapping) and take its flags.
+  auto emit_compare_path = [&]() {
+    Register flags;
+    if (is_64bit) {
+      if (is_neg) {
+        Register tmp = Copy(rn);
+        flags = std::get<1>(Gen<x86_64::AddqRegReg, kNoSSA>(tmp, rm));
+      } else {
+        flags = std::get<0>(Gen<x86_64::CmpqRegReg>(rn, rm));
+      }
+    } else {
+      if (is_neg) {
+        Register tmp = std::get<0>(Gen<x86_64::MovlRegReg>(rn));
+        flags = std::get<1>(Gen<x86_64::AddlRegReg, kNoSSA>(tmp, rm));
+      } else {
+        flags = std::get<0>(Gen<x86_64::CmplRegReg>(rn, rm));
+      }
+    }
+    EmitMaterializeNZCV(flags, /*is_sub=*/!is_neg);
+  };
+
+  // AL/NV: always the compare path (no branch).
+  if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
+    emit_compare_path();
+    return;
+  }
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* cmp_bb = ir->NewBasicBlock();   // condition met -> real compare
+  MachineBasicBlock* imm_bb = ir->NewBasicBlock();   // condition not met -> nzcv imm
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, cmp_bb);
+  ir->AddEdge(cur_bb, imm_bb);
+
+  EmitCondBranch(cond, cmp_bb, imm_bb);
+
+  builder_.StartBasicBlock(cmp_bb);
+  emit_compare_path();
+  ir->AddEdge(cmp_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(imm_bb);
+  emit_immediate_path();
+  ir->AddEdge(imm_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(merge_bb);
+}
+
 void HeavyOptimizerFrontend::Undefined() {
   // Idempotent: a single guest instruction can trigger several listener calls
   // (e.g. a pre/post-index access calls AddImm then Load/Store). If more than one
