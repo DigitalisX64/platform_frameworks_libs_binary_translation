@@ -28,6 +28,7 @@
 #include "berberis/decoder/arm64/semantics_player.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state_arch.h"
+#include "berberis/runtime_primitives/platform.h"
 
 #include "simd_register.h"
 
@@ -130,10 +131,44 @@ class HeavyOptimizerFrontend {
   // Immediate-form data processing.
   //
 
+  // ADD/SUB (immediate). Only the non-flag-setting form is translated here; the
+  // flag-setting variant (SUBS/ADDS/CMP/CMN) needs NZCV and bails. Mirrors
+  // lite_translator.h::AddSubImm: a 32-bit op uses the l-suffix insns (which
+  // zero-extend the upper 32 bits, matching ARM64 W-register write semantics).
   Register AddSubImm(bool is_sub, bool set_flags, bool is_64bit, Register src, uint32_t imm) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(is_sub, set_flags, is_64bit, src, imm);
-    return AllocTempReg();
+    // A prior callback for this guest instruction may have already bailed (e.g.
+    // post-index Load() bails before this AddImm-equivalent runs); emit nothing.
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // Validate first; emit nothing on bail.
+    if (set_flags) {
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+    // The ARM imm12 fits in int32 and x86 add/sub-immediate take int32.
+    if (is_64bit) {
+      Register res = Copy(src);
+      if (imm != 0) {
+        if (is_sub) {
+          res = std::get<0>(Gen<x86_64::SubqRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+        } else {
+          res = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+        }
+      }
+      return res;
+    }
+    // 32-bit: a 32-bit mov zero-extends src to 64, then the 32-bit op keeps the
+    // upper 32 bits clear (ARM64 W-write semantics).
+    Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+    if (imm != 0) {
+      if (is_sub) {
+        res = std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+      } else {
+        res = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(res, static_cast<int32_t>(imm)));
+      }
+    }
+    return res;
   }
 
   Register AddSubImmTags(bool is_sub, Register src, uint8_t uimm6, uint8_t uimm4) {
@@ -142,10 +177,47 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
+  // AND/ORR/EOR (immediate, decoded 64-bit bitmask). ANDS (flag-setting) bails.
+  // x86 logical-immediate forms only take a 32-bit immediate, but the bitmask
+  // immediate needs the full 64 bits, so materialize it into a register and use
+  // the reg-reg forms (mirrors lite_translator.h::LogicalImm).
   Register LogicalImm(Decoder::LogicalImmOpcode opcode, bool is_64bit, Register src, uint64_t imm) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(opcode, is_64bit, src, imm);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // Validate first; emit nothing on bail.
+    if (opcode == Decoder::LogicalImmOpcode::kAnds) {
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+    Register imm_reg = GetImm(imm);
+    if (is_64bit) {
+      Register res = Copy(src);
+      switch (opcode) {
+        case Decoder::LogicalImmOpcode::kAnd:
+          return std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, imm_reg));
+        case Decoder::LogicalImmOpcode::kOrr:
+          return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, imm_reg));
+        case Decoder::LogicalImmOpcode::kEor:
+          return std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(res, imm_reg));
+        default:
+          UndefinedReturningReg();
+          return AllocTempReg();
+      }
+    }
+    // 32-bit op: the l-suffix form zero-extends the result to 64 bits.
+    Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+    switch (opcode) {
+      case Decoder::LogicalImmOpcode::kAnd:
+        return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg));
+      case Decoder::LogicalImmOpcode::kOrr:
+        return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, imm_reg));
+      case Decoder::LogicalImmOpcode::kEor:
+        return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(res, imm_reg));
+      default:
+        UndefinedReturningReg();
+        return AllocTempReg();
+    }
   }
 
   // MOVZ / MOVN: result is compile-time known.
@@ -193,14 +265,208 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
+  // SBFM/UBFM/BFM (bitfield move). Mirrors lite_translator.h::Bitfield. The
+  // 32-bit paths use l-suffix shifts/and (which zero-extend the upper 32 bits,
+  // matching ARM64 W-register write semantics).
   Register Bitfield(Decoder::BitfieldOpcode opcode,
                     bool is_64bit,
                     Register dst_val,
                     Register src,
                     uint8_t immr,
                     uint8_t imms) {
+    if (!success()) {
+      return AllocTempReg();
+    }
+    unsigned reg_size = is_64bit ? 64 : 32;
+
+    if (opcode == Decoder::BitfieldOpcode::kUbfm) {
+      // LSR: UBFM Rd, Rn, #shift, #(regsize-1).
+      if (imms == reg_size - 1) {
+        if (is_64bit) {
+          Register res = Copy(src);
+          if (immr != 0) {
+            res = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          }
+          return res;
+        }
+        Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        if (immr != 0) {
+          res = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+        }
+        return res;
+      }
+      // LSL: UBFM Rd, Rn, #(regsize-shift), #(regsize-1-shift).
+      if (imms + 1 == immr && imms < reg_size - 1) {
+        uint8_t shift = reg_size - immr;
+        if (is_64bit) {
+          Register res = Copy(src);
+          return std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
+        }
+        Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        return std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
+      }
+      // UXTB: UBFM Wd, Wn, #0, #7.
+      if (!is_64bit && immr == 0 && imms == 7) {
+        return std::get<0>(Gen<x86_64::MovzxblRegReg>(src));
+      }
+      // UXTH: UBFM Wd, Wn, #0, #15.
+      if (!is_64bit && immr == 0 && imms == 15) {
+        return std::get<0>(Gen<x86_64::MovzxwlRegReg>(src));
+      }
+      // General UBFM (UBFX extract; UBFIZ insert).
+      if (imms >= immr) {
+        // UBFX-like: extract bits[imms:immr] of src to low bits of dst.
+        unsigned width = imms - immr + 1;
+        uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        if (is_64bit) {
+          Register res = Copy(src);
+          if (immr != 0) {
+            res = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          }
+          if (width < 64) {
+            Register mask_reg = GetImm(mask);
+            res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, mask_reg));
+          }
+          return res;
+        }
+        Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        if (immr != 0) {
+          res = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+        }
+        if (width < 32) {
+          res = std::get<0>(
+              Gen<x86_64::AndlRegImm, kNoSSA>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
+        }
+        return res;
+      }
+      // UBFIZ-like: extract low (imms+1) bits of src, shift left by (reg_size-immr).
+      unsigned width = imms + 1;
+      unsigned pos = reg_size - immr;
+      uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+      if (is_64bit) {
+        Register res = Copy(src);
+        if (width < 64) {
+          Register mask_reg = GetImm(mask);
+          res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, mask_reg));
+        }
+        if (pos != 0) {
+          res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+        }
+        return res;
+      }
+      Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+      if (width < 32) {
+        res = std::get<0>(
+            Gen<x86_64::AndlRegImm, kNoSSA>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
+      }
+      if (pos != 0) {
+        res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+      }
+      return res;
+    }
+
+    if (opcode == Decoder::BitfieldOpcode::kSbfm) {
+      // ASR: SBFM Rd, Rn, #shift, #(regsize-1).
+      if (imms == reg_size - 1) {
+        if (is_64bit) {
+          Register res = Copy(src);
+          if (immr != 0) {
+            res = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          }
+          return res;
+        }
+        // 32-bit ASR: Sarl writes the low 32 and zero-extends to 64, matching
+        // ARM64 W-write semantics. Do NOT sign-extend further.
+        Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        if (immr != 0) {
+          res = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+        }
+        return res;
+      }
+      // SXTB: SBFM Xd/Wd, Wn, #0, #7.
+      if (immr == 0 && imms == 7) {
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::MovsxbqRegReg>(src));
+        }
+        return std::get<0>(Gen<x86_64::MovsxblRegReg>(src));
+      }
+      // SXTH: SBFM Xd/Wd, Wn, #0, #15.
+      if (immr == 0 && imms == 15) {
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::MovsxwqRegReg>(src));
+        }
+        return std::get<0>(Gen<x86_64::MovsxwlRegReg>(src));
+      }
+      // SXTW: SBFM Xd, Wn, #0, #31.
+      if (is_64bit && immr == 0 && imms == 31) {
+        return std::get<0>(Gen<x86_64::MovsxlqRegReg>(src));
+      }
+      // Other SBFM (SBFX/SBFIZ) needs an arithmetic-shift-based extraction that
+      // is fiddlier to lower correctly; bail conservatively.
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+
+    // General BFM (BFI / BFXIL / BFC).
+    //   result = (dst_val & ~mask) | (shifted_src & mask)
+    if (opcode == Decoder::BitfieldOpcode::kBfm) {
+      uint64_t mask;
+      Register res;
+      if (imms >= immr) {
+        // BFXIL: extract width = imms-immr+1 bits, deposit at bit 0.
+        unsigned width = imms - immr + 1;
+        mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        if (is_64bit) {
+          res = Copy(src);
+          if (immr != 0) {
+            res = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          }
+          Register mask_reg = GetImm(mask);
+          res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, mask_reg));
+        } else {
+          res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+          if (immr != 0) {
+            res = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          }
+          res = std::get<0>(
+              Gen<x86_64::AndlRegImm, kNoSSA>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
+        }
+      } else {
+        // BFI / BFC: extract low width = imms+1 bits, deposit at pos.
+        unsigned width = imms + 1;
+        unsigned pos = reg_size - immr;
+        uint64_t field_mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+        mask = (pos >= 64) ? 0 : (field_mask << pos);
+        if (is_64bit) {
+          res = Copy(src);
+          Register fmask_reg = GetImm(field_mask);
+          res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, fmask_reg));
+          if (pos != 0) {
+            res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+          }
+        } else {
+          res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+          res = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(
+              res, static_cast<int32_t>(field_mask & 0xFFFFFFFFULL)));
+          if (pos != 0) {
+            res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+          }
+        }
+      }
+      // Merge: res = res | (dst_val & ~mask). Copy dst_val into a fresh temp.
+      if (is_64bit) {
+        Register keep = Copy(dst_val);
+        Register notmask_reg = GetImm(~mask);
+        keep = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(keep, notmask_reg));
+        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, keep));
+      }
+      Register keep = std::get<0>(Gen<x86_64::MovlRegReg>(dst_val));
+      keep = std::get<0>(
+          Gen<x86_64::AndlRegImm, kNoSSA>(keep, static_cast<int32_t>((~mask) & 0xFFFFFFFFULL)));
+      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, keep));
+    }
+
     UndefinedReturningReg();
-    UNUSED_ARGS(opcode, is_64bit, dst_val, src, immr, imms);
     return AllocTempReg();
   }
 
@@ -252,10 +518,19 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(size, base, offset, data);
   }
 
+  // Plain 64-bit add of an immediate (used for address computation). Always
+  // non-flag-setting. Mirrors lite_translator.h::AddImm.
   Register AddImm(Register base, int32_t offset) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(base, offset);
-    return AllocTempReg();
+    // A prior callback (e.g. a post-index Load) may have already bailed; emit
+    // nothing so we don't append IR after the region-exit terminator.
+    if (!success()) {
+      return AllocTempReg();
+    }
+    Register res = Copy(base);
+    if (offset != 0) {
+      res = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(res, offset));
+    }
+    return res;
   }
 
   void LoadPair(Decoder::LoadStoreSize size,
@@ -340,6 +615,9 @@ class HeavyOptimizerFrontend {
   // Register-form data processing.
   //
 
+  // AND/ORR/EOR/BIC/ORN/EON (shifted register). `invert` selects the BIC/ORN/EON
+  // variants (src2 is bitwise-inverted before the op). ANDS (flag-setting) bails.
+  // Mirrors lite_translator.h::LogicalShiftedReg.
   Register LogicalShiftedReg(Decoder::LogicalShiftedRegOpcode opcode,
                              bool is_64bit,
                              bool invert,
@@ -347,11 +625,51 @@ class HeavyOptimizerFrontend {
                              Register src2,
                              Decoder::ShiftType shift_type,
                              uint8_t shift_amount) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(opcode, is_64bit, invert, src1, src2, shift_type, shift_amount);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // Validate first; emit nothing on bail.
+    if (opcode == Decoder::LogicalShiftedRegOpcode::kAnds) {
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+    Register op2 = EmitShiftImm(src2, shift_type, shift_amount, is_64bit);
+    if (invert) {
+      // NotqReg is 64-bit only; for the 32-bit case the upper half is re-cleared
+      // by the subsequent 32-bit op, so a 64-bit NOT is safe.
+      op2 = std::get<0>(Gen<x86_64::NotqReg, kNoSSA>(op2));
+    }
+    if (is_64bit) {
+      Register res = Copy(src1);
+      switch (opcode) {
+        case Decoder::LogicalShiftedRegOpcode::kAnd:
+          return std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, op2));
+        case Decoder::LogicalShiftedRegOpcode::kOrr:
+          return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, op2));
+        case Decoder::LogicalShiftedRegOpcode::kEor:
+          return std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(res, op2));
+        default:
+          UndefinedReturningReg();
+          return AllocTempReg();
+      }
+    }
+    Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+    switch (opcode) {
+      case Decoder::LogicalShiftedRegOpcode::kAnd:
+        return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, op2));
+      case Decoder::LogicalShiftedRegOpcode::kOrr:
+        return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, op2));
+      case Decoder::LogicalShiftedRegOpcode::kEor:
+        return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(res, op2));
+      default:
+        UndefinedReturningReg();
+        return AllocTempReg();
+    }
   }
 
+  // ADD/SUB (shifted register). Flag-setting variant bails (needs NZCV). ROR is
+  // not a valid shift for add/sub and bails. Mirrors
+  // lite_translator.h::AddSubShiftedReg.
   Register AddSubShiftedReg(bool is_sub,
                             bool set_flags,
                             bool is_64bit,
@@ -359,11 +677,31 @@ class HeavyOptimizerFrontend {
                             Register src2,
                             Decoder::ShiftType shift_type,
                             uint8_t shift_amount) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(is_sub, set_flags, is_64bit, src1, src2, shift_type, shift_amount);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // Validate first; emit nothing on bail.
+    if (set_flags || shift_type == Decoder::ShiftType::kRor) {
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+    Register op2 = EmitShiftImm(src2, shift_type, shift_amount, is_64bit);
+    if (is_64bit) {
+      Register res = Copy(src1);
+      if (is_sub) {
+        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, op2));
+      }
+      return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, op2));
+    }
+    Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+    if (is_sub) {
+      return std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(res, op2));
+    }
+    return std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(res, op2));
   }
 
+  // ADD/SUB (extended register). Flag-setting variant bails (needs NZCV).
+  // Mirrors lite_translator.h::AddSubExtendedReg.
   Register AddSubExtendedReg(bool is_sub,
                              bool set_flags,
                              bool is_64bit,
@@ -371,9 +709,79 @@ class HeavyOptimizerFrontend {
                              Register src2,
                              uint8_t extend_type,
                              uint8_t shift_amount) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(is_sub, set_flags, is_64bit, src1, src2, extend_type, shift_amount);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // Validate first; emit nothing on bail.
+    if (set_flags || shift_amount > 4 || extend_type > 0b111) {
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+
+    // Apply extension to src2.
+    // extend_type: 000=UXTB 001=UXTH 010=UXTW 011=UXTX 100=SXTB 101=SXTH
+    //              110=SXTW 111=SXTX.
+    Register ext;
+    switch (extend_type) {
+      case 0b000:  // UXTB
+        ext = std::get<0>(Gen<x86_64::MovzxblRegReg>(src2));
+        break;
+      case 0b001:  // UXTH
+        ext = std::get<0>(Gen<x86_64::MovzxwlRegReg>(src2));
+        break;
+      case 0b010:  // UXTW: 32-bit mov zero-extends to 64.
+        ext = std::get<0>(Gen<x86_64::MovlRegReg>(src2));
+        break;
+      case 0b011:  // UXTX: no extension.
+        ext = Copy(src2);
+        break;
+      case 0b100:  // SXTB
+        if (is_64bit) {
+          ext = std::get<0>(Gen<x86_64::MovsxbqRegReg>(src2));
+        } else {
+          ext = std::get<0>(Gen<x86_64::MovsxblRegReg>(src2));
+        }
+        break;
+      case 0b101:  // SXTH
+        if (is_64bit) {
+          ext = std::get<0>(Gen<x86_64::MovsxwqRegReg>(src2));
+        } else {
+          ext = std::get<0>(Gen<x86_64::MovsxwlRegReg>(src2));
+        }
+        break;
+      case 0b110:  // SXTW
+        if (is_64bit) {
+          ext = std::get<0>(Gen<x86_64::MovsxlqRegReg>(src2));
+        } else {
+          ext = std::get<0>(Gen<x86_64::MovlRegReg>(src2));
+        }
+        break;
+      default:  // 0b111 SXTX: no extension.
+        ext = Copy(src2);
+        break;
+    }
+
+    // Apply shift.
+    if (shift_amount > 0) {
+      if (is_64bit) {
+        ext = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(ext, static_cast<int8_t>(shift_amount)));
+      } else {
+        ext = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(ext, static_cast<int8_t>(shift_amount)));
+      }
+    }
+
+    if (is_64bit) {
+      Register res = Copy(src1);
+      if (is_sub) {
+        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, ext));
+      }
+      return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, ext));
+    }
+    Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+    if (is_sub) {
+      return std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(res, ext));
+    }
+    return std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(res, ext));
   }
 
   Register ConditionalSelect(Decoder::ConditionalSelectOpcode opcode,
@@ -386,23 +794,105 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
+  // LSLV/LSRV/ASRV/RORV (variable shifts). UDIV/SDIV/CRC32/PACGA bail: division
+  // needs x86 RDX:RAX setup plus ARM divide-by-zero / INT_MIN-overflow handling
+  // that is awkward in this MachineIR form, so those fall back to the lite
+  // translator. The variable shifts use the x86 shift-by-CL forms; the backend
+  // register allocator binds the count operand to RCX automatically.
   Register DataProc2Src(Decoder::DataProc2SrcOpcode opcode,
                         bool is_64bit,
                         Register src1,
                         Register src2) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(opcode, is_64bit, src1, src2);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    switch (opcode) {
+      case Decoder::DataProc2SrcOpcode::kLslv:
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::ShlqRegReg>(src1, src2));
+        }
+        return std::get<0>(Gen<x86_64::ShllRegReg>(src1, src2));
+      case Decoder::DataProc2SrcOpcode::kLsrv:
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::ShrqRegReg>(src1, src2));
+        }
+        return std::get<0>(Gen<x86_64::ShrlRegReg>(src1, src2));
+      case Decoder::DataProc2SrcOpcode::kAsrv:
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::SarqRegReg>(src1, src2));
+        }
+        return std::get<0>(Gen<x86_64::SarlRegReg>(src1, src2));
+      case Decoder::DataProc2SrcOpcode::kRorv:
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::RorqRegReg>(src1, src2));
+        }
+        return std::get<0>(Gen<x86_64::RorlRegReg>(src1, src2));
+      default:
+        UndefinedReturningReg();
+        return AllocTempReg();
+    }
   }
 
+  // MADD/MSUB and the signed/unsigned widening multiply-accumulates
+  // (SMADDL/SMSUBL/UMADDL/UMSUBL). SMULH/UMULH need the widening x86 MUL/IMUL
+  // into RDX:RAX and bail. Mirrors lite_translator.h::DataProc3Src.
+  //   MADD:  Rd = Ra + Rn * Rm     MSUB:  Rd = Ra - Rn * Rm
+  //   SMADDL: Xd = Xa + sext(Wn)*sext(Wm)   (UMADDL uses zext; *SUBL subtracts)
   Register DataProc3Src(Decoder::DataProc3SrcOpcode opcode,
                         bool is_64bit,
                         Register src1,
                         Register src2,
                         Register src3) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(opcode, is_64bit, src1, src2, src3);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    switch (opcode) {
+      case Decoder::DataProc3SrcOpcode::kMadd: {
+        if (is_64bit) {
+          Register prod = std::get<0>(Gen<x86_64::ImulqRegReg>(src1, src2));
+          return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(prod, src3));
+        }
+        Register prod = std::get<0>(Gen<x86_64::ImullRegReg>(src1, src2));
+        return std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(prod, src3));
+      }
+      case Decoder::DataProc3SrcOpcode::kMsub: {
+        if (is_64bit) {
+          Register prod = std::get<0>(Gen<x86_64::ImulqRegReg>(src1, src2));
+          Register res = Copy(src3);
+          return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
+        }
+        Register prod = std::get<0>(Gen<x86_64::ImullRegReg>(src1, src2));
+        Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src3));
+        return std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(res, prod));
+      }
+      case Decoder::DataProc3SrcOpcode::kSmaddl:
+      case Decoder::DataProc3SrcOpcode::kSmsubl: {
+        // Sign-extend both 32-bit sources to 64-bit, then 64-bit multiply.
+        Register ext1 = std::get<0>(Gen<x86_64::MovsxlqRegReg>(src1));
+        Register ext2 = std::get<0>(Gen<x86_64::MovsxlqRegReg>(src2));
+        Register prod = std::get<0>(Gen<x86_64::ImulqRegReg, kNoSSA>(ext1, ext2));
+        Register res = Copy(src3);
+        if (opcode == Decoder::DataProc3SrcOpcode::kSmaddl) {
+          return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, prod));
+        }
+        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
+      }
+      case Decoder::DataProc3SrcOpcode::kUmaddl:
+      case Decoder::DataProc3SrcOpcode::kUmsubl: {
+        // Zero-extend both 32-bit sources to 64-bit (Movl), then 64-bit multiply.
+        Register ext1 = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+        Register ext2 = std::get<0>(Gen<x86_64::MovlRegReg>(src2));
+        Register prod = std::get<0>(Gen<x86_64::ImulqRegReg, kNoSSA>(ext1, ext2));
+        Register res = Copy(src3);
+        if (opcode == Decoder::DataProc3SrcOpcode::kUmaddl) {
+          return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, prod));
+        }
+        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
+      }
+      default:
+        UndefinedReturningReg();
+        return AllocTempReg();
+    }
   }
 
   Register AddSubWithCarry(Register src1, Register src2, bool is_64bit, bool is_sub, bool set_flags) {
@@ -411,16 +901,87 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
+  // RBIT/REV16/REV32/REV/CLZ/CLS. Only REV16 and CLZ have a clean mapping here;
+  // REV/REV32 would need x86 BSWAP (no MachineIR op available) and RBIT/CLS have
+  // no direct mapping, so they bail. PAuth DP-1Src variants (opcode2 bit 0x40)
+  // are treated as identity because Digitalis is PAC-blind. Mirrors
+  // lite_translator.h::DataProc1Src.
   Register DataProc1Src(Register src, uint8_t opcode2, bool is_64bit) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(src, opcode2, is_64bit);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // PAuth DP-1Src: identity copy (the upper-half clear of a 32-bit mov handles
+    // the sf=0 zero-extend; PAuth ops are X-form, so the Movq branch is taken).
+    if (opcode2 & 0x40) {
+      if (is_64bit) {
+        return Copy(src);
+      }
+      return std::get<0>(Gen<x86_64::MovlRegReg>(src));
+    }
+    switch (opcode2) {
+      case 0b000001: {  // REV16: reverse byte order within each 16-bit halfword.
+        // res = ((src & lo_mask) << 8) | ((src & hi_mask) >> 8).
+        if (is_64bit) {
+          Register lo = Copy(src);
+          Register lo_mask = GetImm(0x00FF00FF00FF00FFULL);
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, lo_mask));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+          Register hi = Copy(src);
+          Register hi_mask = GetImm(0xFF00FF00FF00FF00ULL);
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, hi_mask));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{8}));
+          return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        }
+        Register lo = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(lo, 0x00FF00FF));
+        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{8}));
+        Register hi = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, static_cast<int32_t>(0xFF00FF00)));
+        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{8}));
+        return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+      }
+      case 0b000100:  // CLZ (count leading zeros) maps directly to x86 LZCNT.
+        // Without LZCNT the encoding decodes as BSR (wrong result for CLZ), so
+        // bail to the lite translator (which uses a BSR-with-zero-check sequence).
+        if (!host_platform::kHasLZCNT) {
+          UndefinedReturningReg();
+          return AllocTempReg();
+        }
+        if (is_64bit) {
+          return std::get<0>(Gen<x86_64::LzcntqRegReg>(src));
+        }
+        return std::get<0>(Gen<x86_64::LzcntlRegReg>(src));
+      default:
+        // RBIT (000000), REV32/REV (000010), REV (000011), CLS (000101): no
+        // clean x86 MachineIR mapping here — bail to the lite translator.
+        UndefinedReturningReg();
+        return AllocTempReg();
+    }
   }
 
+  // EXTR Rd, Rn, Rm, #lsb: Rd = (Rn:Rm) >> lsb. lsb==0 is a copy of Rm. The
+  // 32-bit non-zero case maps to x86 SHRD; the 64-bit non-zero case bails (the
+  // 64-bit SHRD form is not available as a MachineIR op). Mirrors
+  // lite_translator.h::Extr.
   Register Extr(Register src_n, Register src_m, uint8_t lsb, bool is_64bit) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(src_n, src_m, lsb, is_64bit);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    if (lsb == 0) {
+      if (is_64bit) {
+        return Copy(src_m);
+      }
+      return std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
+    }
+    if (is_64bit) {
+      // No 64-bit SHRD MachineIR op; bail to lite.
+      UndefinedReturningReg();
+      return AllocTempReg();
+    }
+    // SHRD dest, src, imm: dest = (src:dest) >> imm.
+    // ARM EXTR Wd = (Wn:Wm) >> lsb = SHRD(Wm, Wn, lsb): dest=Wm, src=Wn.
+    Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
+    return std::get<0>(Gen<x86_64::ShrdlRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
   }
 
   void ConditionalCompare(bool is_neg,
@@ -807,6 +1368,50 @@ class HeavyOptimizerFrontend {
           typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>::OutputArgsTuple,
       Gen,
       (, kSSAMode))
+
+  // Emit `src` shifted by a constant amount (LSL/LSR/ASR/ROR) into a fresh
+  // register, mirroring lite_translator.h::EmitShift. A 32-bit shift uses the
+  // l-suffix forms (which zero-extend the result, matching ARM64 W-write
+  // semantics). When shift_amount == 0 this is just a width-correct copy.
+  [[nodiscard]] Register EmitShiftImm(Register src,
+                                      Decoder::ShiftType shift_type,
+                                      uint8_t shift_amount,
+                                      bool is_64bit) {
+    if (is_64bit) {
+      Register dst = Copy(src);
+      if (shift_amount == 0) {
+        return dst;
+      }
+      int8_t amt = static_cast<int8_t>(shift_amount);
+      switch (shift_type) {
+        case Decoder::ShiftType::kLsl:
+          return std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(dst, amt));
+        case Decoder::ShiftType::kLsr:
+          return std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(dst, amt));
+        case Decoder::ShiftType::kAsr:
+          return std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(dst, amt));
+        case Decoder::ShiftType::kRor:
+          return std::get<0>(Gen<x86_64::RorqRegImm, kNoSSA>(dst, amt));
+      }
+      return dst;
+    }
+    Register dst = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+    if (shift_amount == 0) {
+      return dst;
+    }
+    int8_t amt = static_cast<int8_t>(shift_amount);
+    switch (shift_type) {
+      case Decoder::ShiftType::kLsl:
+        return std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(dst, amt));
+      case Decoder::ShiftType::kLsr:
+        return std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(dst, amt));
+      case Decoder::ShiftType::kAsr:
+        return std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(dst, amt));
+      case Decoder::ShiftType::kRor:
+        return std::get<0>(Gen<x86_64::RorlRegImm, kNoSSA>(dst, amt));
+    }
+    return dst;
+  }
 
   [[nodiscard]] Register AllocTempReg() { return builder_.ir()->AllocVReg(); }
   [[nodiscard]] SimdReg AllocTempSimdReg() { return SimdReg{builder_.ir()->AllocVReg()}; }
