@@ -479,7 +479,7 @@ def _allowlist_instructions(allowlist_files, machine_ir_intrinsic_binding_files)
     with open(machine_ir_intrinsic_binding_file) as machine_ir_intrinsic_binding_json:
       json_array = json.load(machine_ir_intrinsic_binding_json)
         # insn of type str is actually part of the file license.
-      while isinstance(json_array[0], str):
+      while json_array and isinstance(json_array[0], str):
         json_array.pop(0)
       for insn in json_array:
         if insn.get('usage', '') != 'interpret-only':

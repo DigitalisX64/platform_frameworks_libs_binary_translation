@@ -32,10 +32,10 @@ cc_library_headers {
     ],
 }
 
-// Phase 0: the optimizing frontend is not implemented yet, so this lib builds
-// only the bail-out HeavyOptimizeRegion entry point. Later phases add
-// frontend.{h,cc} + the MachineIR backend dependencies (mirroring
-// heavy_optimizer/riscv64/Android.bp).
+// The ARM64 optimizing frontend lowers the ARM64 decoder's SemanticsPlayer
+// callbacks into guest-agnostic x86_64 MachineIR (mirroring
+// heavy_optimizer/riscv64/Android.bp). Phase 1a translates MoveWide/MoveWideKeep
+// for real; everything else bails to the lite translator/interpreter.
 cc_library_static {
     name: "libberberis_heavy_optimizer_arm64",
     defaults: ["berberis_defaults_64"],
@@ -43,10 +43,32 @@ cc_library_static {
     local_include_dirs: ["."],
     header_libs: [
         "libberberis_base_headers",
+        "libberberis_backend_headers_arm64_to_x86_64",
+        "libberberis_decoder_arm64_headers",
         "libberberis_guest_state_arm64_headers",
         "libberberis_heavy_optimizer_arm64_headers",
+        "libberberis_intrinsics_arm64_headers",
     ],
     srcs: [
+        "frontend.cc",
         "heavy_optimize_region.cc",
+    ],
+}
+
+cc_test_library {
+    name: "libberberis_heavy_optimizer_arm64_unit_tests",
+    defaults: ["berberis_test_library_defaults_64"],
+    local_include_dirs: ["."],
+    header_libs: [
+        "berberis_test_utils_headers",
+        "libberberis_backend_headers_arm64_to_x86_64",
+        "libberberis_base_headers",
+        "libberberis_decoder_arm64_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_heavy_optimizer_arm64_headers",
+        "libberberis_intrinsics_arm64_headers",
+    ],
+    srcs: [
+        "frontend_tests.cc",
     ],
 }

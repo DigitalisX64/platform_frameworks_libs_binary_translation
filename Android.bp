@@ -399,6 +399,7 @@ cc_test_host {
     arch: {
         x86_64: {
             static_libs: [
+                "libberberis_backend_arm64_to_x86_64",
                 "libberberis_code_gen_lib_arm64",
                 "libberberis_runtime",
                 // Must use ARM64 runtime — it compiles runtime_library_x86_64.cc
@@ -410,10 +411,15 @@ cc_test_host {
                 "libberberis_heavy_optimizer_arm64",
                 "libberberis_kernel_api_arm64",
                 "libberberis_interpreter_arm64",
+                "libberberis_intrinsics_arm64",
+                // Host x86_64 macro-assembler constant pool referenced by the
+                // optimizing backend's code emitter (guest-independent data).
+                "libberberis_macro_assembler_riscv64_to_x86_64",
                 "libberberis_guest_abi_arm64",
             ],
             whole_static_libs: [
                 "libberberis_tests_main",
+                "libberberis_heavy_optimizer_arm64_unit_tests",
                 "libberberis_lite_translator_arm64_to_x86_64",
                 "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
                 "libberberis_kernel_api_arm64_unit_tests",
@@ -655,12 +661,16 @@ cc_library_shared {
     arch: {
         x86_64: {
             static_libs: [
+                "libberberis_backend_arm64_to_x86_64",
                 "libberberis_code_gen_lib_arm64",
                 "libberberis_guest_abi_arm64",
                 "libberberis_heavy_optimizer_arm64",
                 "libberberis_interpreter_arm64",
                 "libberberis_intrinsics_arm64",
                 "libberberis_lite_translator_arm64_to_x86_64",
+                // Host x86_64 macro-assembler constant pool referenced by the
+                // optimizing backend's code emitter (guest-independent data).
+                "libberberis_macro_assembler_riscv64_to_x86_64",
                 "libberberis_runtime_primitives_arm64",
             ],
             whole_static_libs: [

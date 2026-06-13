@@ -37,9 +37,9 @@ struct HeavyOptimizeParams {
 //   success == false && stop_pc == pc  -> could not translate the first
 //   instruction; the caller must fall back to the lite tier / interpreter.
 //
-// NOTE: the ARM64 frontend is not yet implemented (P4 phase 0). This entry point
-// currently always bails (returns {pc, false, 0}) so a geared-up region falls
-// back to the lite translator. Later phases fill in the frontend.
+// The frontend (heavy_optimizer/arm64/frontend.{h,cc}) drives the ARM64 decoder
+// through the SemanticsPlayer into x86_64 MachineIR. Instructions it does not yet
+// translate make it bail, so a geared-up region falls back to the lite tier.
 std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(
     GuestAddr pc,
     MachineCode* machine_code,
