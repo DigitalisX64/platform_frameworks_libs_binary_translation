@@ -222,6 +222,39 @@ void DoTrampoline_JNIEnv_CallStaticVoidMethodV(HostCode /* callee */, ProcessSta
   (arg_0->functions)->CallStaticVoidMethodA(arg_0, arg_1, arg_2, arg_3);
 }
 
+// region digitalis
+// jfieldID GetStaticFieldID(JNIEnv*, jclass, const char* name, const char* sig);
+//
+// A guest jclass is an opaque JNI reference passed through unchanged. Heavily
+// obfuscated anti-tamper SDKs (Baidu Maps' sofire / libsofiresec) resolve a
+// custom-loaded class via FindClass from a host-spawned worker thread whose
+// managed class-loader context can't see that class, so FindClass returns null;
+// the SDK then feeds that null straight into GetStaticFieldID. Under the
+// emulator's host ART CheckJNI (enabled on userdebug builds; OFF on production
+// devices) a null jclass is a process-fatal abort ("java_class == null in call
+// to GetStaticFieldID"), which on Baidu Maps kills the :SandBoxProcess. Mirror
+// the production (CheckJNI-off) path: on a null jclass, return a null jfieldID
+// to the guest without entering host ART, so the abort can't fire and the SDK
+// takes its own (null-tolerant) failure branch. arm64-guest only; the riscv64
+// build reproduces the original auto-generated forwarding (byte-identical).
+void DoTrampoline_JNIEnv_GetStaticFieldID(HostCode /* callee */, ProcessState* state) {
+  using PFN_callee = decltype(std::declval<JNIEnv>().functions->GetStaticFieldID);
+  auto [guest_env, arg_clazz, arg_name, arg_sig] = GuestParamsValues<PFN_callee>(state);
+  JNIEnv* arg_env = ToHostJNIEnv(guest_env);
+
+  auto&& [ret] = GuestReturnReference<PFN_callee>(state);
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (arg_clazz == nullptr) {
+    TRACE("GetStaticFieldID: guest passed null jclass; returning null jfieldID "
+          "instead of aborting under host CheckJNI");
+    ret = nullptr;
+    return;
+  }
+#endif
+  ret = (arg_env->functions)->GetStaticFieldID(arg_env, arg_clazz, arg_name, arg_sig);
+}
+// endregion
+
 struct KnownMethodTrampoline {
   unsigned index;
   TrampolineFunc marshal_and_call;

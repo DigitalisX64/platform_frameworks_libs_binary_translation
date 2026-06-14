@@ -1384,7 +1384,8 @@
       "const char *",
       "const char *"
     ],
-    "return_type": "jfieldID"
+    "return_type": "jfieldID",
+    "trampoline": "DoTrampoline_JNIEnv_GetStaticFieldID"
   },
   {
     "name": "GetStaticObjectField",
