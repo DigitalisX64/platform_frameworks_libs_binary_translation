@@ -182,11 +182,12 @@ constexpr size_t kDefaultGearUpMinInsns = 20;
 
 size_t GetGearUpMinInsns() {
   static const size_t value = []() -> size_t {
-    const char* env = getenv("BERBERIS_GEARUP_MIN_INSNS");
-    if (env) {
+    static ConfigStr config("BERBERIS_GEARUP_MIN_INSNS", "berberis.gearup_min_insns");
+    const char* str = config.get();
+    if (str) {
       char* end = nullptr;
-      unsigned long parsed = strtoul(env, &end, 10);
-      if (end != env && *end == '\0') {
+      unsigned long parsed = strtoul(str, &end, 10);
+      if (end != str && (*end == '\0' || *end == '\n')) {
         return static_cast<size_t>(parsed);
       }
     }

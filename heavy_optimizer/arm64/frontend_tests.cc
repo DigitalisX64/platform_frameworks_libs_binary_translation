@@ -232,6 +232,25 @@ constexpr uint32_t UbfmW(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
   return 0x53000000 | (static_cast<uint32_t>(immr) << 16) |
          (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
 }
+// SBFM Wd, Wn, #immr, #imms (32-bit, sf=0, N=0).
+constexpr uint32_t SbfmW(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
+  return 0x13000000 | (static_cast<uint32_t>(immr) << 16) |
+         (static_cast<uint32_t>(imms) << 10) | (rn << 5) | rd;
+}
+// ADR Xd, #offset (signed 21-bit byte offset from the instruction's PC).
+constexpr uint32_t Adr(uint8_t rd, int32_t offset) {
+  uint32_t imm = static_cast<uint32_t>(offset) & 0x1FFFFF;
+  return 0x10000000 | ((imm & 0x3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | rd;
+}
+// ADRP Xd, #imm (signed 21-bit page count; target = (PC & ~0xFFF) + (imm << 12)).
+constexpr uint32_t Adrp(uint8_t rd, int32_t imm) {
+  uint32_t u = static_cast<uint32_t>(imm) & 0x1FFFFF;
+  return 0x90000000 | ((u & 0x3) << 29) | (((u >> 2) & 0x7FFFF) << 5) | rd;
+}
+// MRS Xt, TPIDR_EL0.
+constexpr uint32_t MrsTpidrEl0(uint8_t rt) {
+  return 0xD53BD040 | rt;
+}
 // EXTR Xd, Xn, Xm, #lsb (64-bit) and Wd (32-bit).
 constexpr uint32_t ExtrX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t lsb) {
   return 0x93C00000 | (static_cast<uint32_t>(rm) << 16) |
@@ -1198,6 +1217,70 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SbfmSxtw64) {
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
   ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFF80000000ULL});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SbfxX) {
+  // SBFX X0, X1, #8, #8 (extract bits [15:8], sign-extend) == SBFM X0,X1,#8,#15.
+  static const uint32_t code[] = {SbfmX(0, 1, 8, 15)};
+  state_.cpu.x[1] = 0x000000000000A500ULL;  // byte at [15:8] = 0xA5 (sign bit set)
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFA5ULL});  // sign-extended
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SbfxXPositive) {
+  // SBFX X0, X1, #8, #8 with a non-negative field (top bit clear).
+  static const uint32_t code[] = {SbfmX(0, 1, 8, 15)};
+  state_.cpu.x[1] = 0x0000000000007F00ULL;  // byte at [15:8] = 0x7F
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x7F});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SbfxWOneBit) {
+  // SBFX W0, W1, #0, #1 (the bitwise-CRC inner loop's bit-0 sign-extend).
+  // W-write zeroes the upper 32 bits of X0.
+  static const uint32_t code[] = {SbfmW(0, 1, 0, 0)};
+  state_.cpu.x[1] = 0x00000001ULL;  // bit 0 set
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x00000000FFFFFFFFULL});  // all ones in low 32
+  state_.cpu.x[1] = 0x00000000ULL;  // bit 0 clear
+  state_.cpu.x[0] = 0xdeadbeefdeadbeefULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, AdrPositive) {
+  // ADR X0, #0x100: X0 = insn_addr + 0x100.
+  static const uint32_t code[] = {Adr(0, 0x100)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], ToGuestAddr(code) + 0x100);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, AdrpPageAligned) {
+  // ADRP X0, #2: X0 = (insn_addr & ~0xFFF) + (2 << 12).
+  static const uint32_t code[] = {Adrp(0, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], (ToGuestAddr(code) & ~GuestAddr{0xFFF}) + (GuestAddr{2} << 12));
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, MrsTpidrEl0) {
+  // MRS X0, TPIDR_EL0 reads ThreadState.tls.
+  static const uint32_t code[] = {MrsTpidrEl0(0)};
+  state_.tls = 0x1234567890ABCDEFULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x1234567890ABCDEFULL});
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, BfmBfi64) {

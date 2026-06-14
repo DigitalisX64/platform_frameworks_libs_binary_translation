@@ -285,10 +285,16 @@ class HeavyOptimizerFrontend {
     return res;
   }
 
+  // ADR / ADRP: the target is a pure function of the (translation-time-constant)
+  // guest PC and the decoded offset, so materialize it as an immediate. ADRP
+  // page-aligns the PC first. Mirrors lite_translator.h::PcRelAddr.
   Register PcRelAddr(bool is_adrp, int64_t offset) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(is_adrp, offset);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    GuestAddr pc = GetInsnAddr();
+    GuestAddr target = is_adrp ? ((pc & ~static_cast<GuestAddr>(0xFFF)) + offset) : (pc + offset);
+    return GetImm(static_cast<uint64_t>(target));
   }
 
   // LDR/LDRSW (literal): load from [insn_addr + offset]. The address is constant
@@ -441,8 +447,35 @@ class HeavyOptimizerFrontend {
       if (is_64bit && immr == 0 && imms == 31) {
         return std::get<0>(Gen<x86_64::MovsxlqRegReg>(src));
       }
-      // Other SBFM (SBFX/SBFIZ) needs an arithmetic-shift-based extraction that
-      // is fiddlier to lower correctly; bail conservatively.
+      // General SBFX (imms >= immr): sign-extend the field src[imms:immr] down to
+      // bit 0. Two shifts: LSL by (reg_size-1-imms) lands bit imms at the MSB,
+      // then ASR by (reg_size-1-imms+immr) shifts the field back to bit 0 while
+      // sign-extending from the field's top bit. For 32-bit the Sar writes the
+      // low 32 and zero-extends to 64, matching ARM64 W-write semantics. The
+      // imms < immr case (SBFIZ) wraps and is bailed.
+      if (imms >= immr) {
+        const uint8_t left = static_cast<uint8_t>(reg_size - 1 - imms);
+        const uint8_t right = static_cast<uint8_t>(left + immr);
+        if (is_64bit) {
+          Register res = Copy(src);
+          if (left != 0) {
+            res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(left)));
+          }
+          if (right != 0) {
+            res = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(res, static_cast<int8_t>(right)));
+          }
+          return res;
+        }
+        Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+        if (left != 0) {
+          res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(left)));
+        }
+        if (right != 0) {
+          res = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(res, static_cast<int8_t>(right)));
+        }
+        return res;
+      }
+      // SBFIZ (imms < immr) needs a rotate-based extraction; bail conservatively.
       UndefinedReturningReg();
       return AllocTempReg();
     }
@@ -756,7 +789,20 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(imm);
   }
 
+  // MRS Xt, TPIDR_EL0: read the guest thread-local-storage pointer from
+  // ThreadState.tls. This is the read the bionic stack-canary prologue and all
+  // TLS accesses issue, so it appears in nearly every real function; without it
+  // the heavy tier bails on almost all real-app code. Other system registers
+  // (NZCV, the CPU-detect MIDR/ID regs, FPSR) bail to the lite tier, which
+  // handles them. Mirrors lite_translator.h::Mrs for the TPIDR_EL0 case.
   Register Mrs(Decoder::SystemReg sysreg) {
+    if (sysreg == Decoder::SystemReg::kTpidrEl0) {
+      Register res = AllocTempReg();
+      if (success()) {
+        builder_.GenGet(res, static_cast<int32_t>(offsetof(ThreadState, tls)));
+      }
+      return res;
+    }
     UndefinedReturningReg();
     UNUSED_ARGS(sysreg);
     return AllocTempReg();
