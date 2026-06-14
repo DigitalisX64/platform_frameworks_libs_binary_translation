@@ -1495,14 +1495,90 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // LDR/STR (SIMD&FP, immediate): 128/64/32-bit (Q/D/S). A load zero-extends the
+  // rest of the 128-bit V[rt] (MOVSD/MOVSS already clear the unused lanes; the
+  // full 16-byte slot is then committed). The memory access uses the unaligned
+  // MOVDQU/MOVSD/MOVSS forms (guest memory is not 16-byte aligned) and a recovery
+  // block so a host fault is delivered to the guest signal handler. The V[rt]
+  // slot is 16-byte aligned, so its access uses GenGetSimd/GenSetSimd (MOVDQA).
+  // 8/16-bit (B/H) bail to the lite tier. Mirrors lite_translator.h::SimdLoadStoreImm.
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args, base);
+    if (!success()) {
+      return;
+    }
+    if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
+        args.size != Decoder::SimdLoadStoreSize::k64bit &&
+        args.size != Decoder::SimdLoadStoreSize::k128bit) {
+      UndefinedReturningVoid();
+      return;
+    }
+    Register masked = ApplyTbi(base);
+    const int32_t off = static_cast<int32_t>(args.offset);
+    const int32_t vreg_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt * 16);
+    FpRegister xmm = AllocTempSimdReg();
+    if (args.is_store) {
+      builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
+      switch (args.size) {
+        case Decoder::SimdLoadStoreSize::k128bit:
+          builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
+          break;
+        case Decoder::SimdLoadStoreSize::k64bit:
+          builder_.Gen<x86_64::MovsdOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
+          break;
+        default:  // k32bit
+          builder_.Gen<x86_64::MovssOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
+          break;
+      }
+      GenRecoveryBlockForLastInsn();
+    } else {
+      switch (args.size) {
+        case Decoder::SimdLoadStoreSize::k128bit:
+          xmm = FpRegister{std::get<0>(Gen<x86_64::MovdquXRegOp>({.base = masked, .disp = off}))};
+          break;
+        case Decoder::SimdLoadStoreSize::k64bit:
+          // MOVSD reg<-mem zero-extends the upper 64 bits of the XMM.
+          xmm = FpRegister{std::get<0>(Gen<x86_64::MovsdXRegOp>({.base = masked, .disp = off}))};
+          break;
+        default:  // k32bit; MOVSS reg<-mem zero-extends the upper 96 bits.
+          xmm = FpRegister{std::get<0>(Gen<x86_64::MovssXRegOp>({.base = masked, .disp = off}))};
+          break;
+      }
+      GenRecoveryBlockForLastInsn();
+      builder_.GenSetSimd<16>(vreg_off, xmm.machine_reg());
+    }
   }
 
+  // LDP/STP (SIMD&FP, 128-bit Q-pair). 64/32-bit pairs bail (the lite tier also
+  // only handles the Q form). Two recovery-wrapped 16-byte memory accesses at
+  // [addr] and [addr+16]. Mirrors lite_translator.h::SimdLoadStorePair.
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register addr) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args, addr);
+    if (!success()) {
+      return;
+    }
+    if (args.size != Decoder::SimdLoadStoreSize::k128bit) {
+      UndefinedReturningVoid();
+      return;
+    }
+    Register masked = ApplyTbi(addr);
+    const int32_t v1_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt1 * 16);
+    const int32_t v2_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt2 * 16);
+    if (args.is_store) {
+      FpRegister xmm1 = AllocTempSimdReg();
+      FpRegister xmm2 = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xmm1.machine_reg(), v1_off);
+      builder_.GenGetSimd<16>(xmm2.machine_reg(), v2_off);
+      builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
+      GenRecoveryBlockForLastInsn();
+      builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = 16}, xmm2.machine_reg());
+      GenRecoveryBlockForLastInsn();
+    } else {
+      FpRegister xmm1 = FpRegister{std::get<0>(Gen<x86_64::MovdquXRegOp>({.base = masked, .disp = 0}))};
+      GenRecoveryBlockForLastInsn();
+      FpRegister xmm2 = FpRegister{std::get<0>(Gen<x86_64::MovdquXRegOp>({.base = masked, .disp = 16}))};
+      GenRecoveryBlockForLastInsn();
+      builder_.GenSetSimd<16>(v1_off, xmm1.machine_reg());
+      builder_.GenSetSimd<16>(v2_off, xmm2.machine_reg());
+    }
   }
 
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args, Register base, Register offset) {

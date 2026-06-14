@@ -570,9 +570,9 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenBailRegion) {
 // SimdLoadStorePair (still bails this round) followed by an AddImm writeback;
 // once SimdLoadStorePair sets success_ = false the AddImm must emit nothing.
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
-  // LDP Q1, Q2, [X0], #32 (SIMD post-index): SimdLoadStorePair (bails) then the
-  // AddImm writeback.
-  static const uint32_t code[] = {0xACC10801};
+  // LDR H0, [X1], #2 (SIMD 16-bit post-index): SimdLoadStoreImm (bails on the
+  // H/B sizes) then the writeback callback -- a multi-callback bail.
+  static const uint32_t code[] = {0x7c402420};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   // No abort here is the assertion (GenCode runs CheckMachineIR internally).
@@ -584,7 +584,8 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
 
 // MoveWide followed by a multi-callback bail (the common on-device prefix shape).
 TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenMultiCallbackBail) {
-  static const uint32_t code[] = {MovzX(0, 0x11), 0xACC10801 /*SIMD LDP-Q post-index, bails*/};
+  static const uint32_t code[] = {MovzX(0, 0x11),
+                                  0x7c402420 /*LDR H0,[X1],#2 SIMD 16-bit post-index, bails*/};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
@@ -1940,6 +1941,110 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchRegisterRet) {
 //
 
 // LDR Xt, [Xn]: 64-bit load.
+// SIMD&FP load/store, unsigned-offset immediate (imm scaled by access size).
+// LDR/STR Qt = 128-bit, Dt = 64-bit, St = 32-bit.
+constexpr uint32_t LdrQuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x3DC00000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t StrQuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0x3D800000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrDuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xFD400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+constexpr uint32_t LdrSuoff(uint8_t rt, uint8_t rn, uint16_t imm) {
+  return 0xBD400000 | (static_cast<uint32_t>(imm) << 10) | (rn << 5) | rt;
+}
+// LDP/STP Qt1, Qt2, [Xn, #imm] (imm scaled by 16, signed imm7).
+constexpr uint32_t LdpQ(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0xAD400000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t StpQ(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0xAD000000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQ128) {
+  alignas(16) static const uint64_t buf[2] = {0x1122334455667788ULL, 0x99AABBCCDDEEFF00ULL};
+  static const uint32_t code[] = {LdrQuoff(0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);  // poison
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x1122334455667788ULL});
+  EXPECT_EQ(r[1], uint64_t{0x99AABBCCDDEEFF00ULL});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrQ128) {
+  alignas(16) static uint64_t buf[2] = {0, 0};
+  static const uint32_t code[] = {StrQuoff(0, 1, 0)};
+  const uint64_t v[2] = {0xCAFEF00DDEADBEEFULL, 0x0123456789ABCDEFULL};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], v[0]);
+  EXPECT_EQ(buf[1], v[1]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrD64ZeroesUpper) {
+  alignas(16) static const uint64_t buf[2] = {0x1122334455667788ULL, 0xdeadbeefdeadbeefULL};
+  static const uint32_t code[] = {LdrDuoff(0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);  // poison upper 64
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x1122334455667788ULL});
+  EXPECT_EQ(r[1], uint64_t{0});  // LDR D zero-extends to 128
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrS32ZeroesUpper) {
+  alignas(16) static const uint32_t buf[4] = {0xAABBCCDDu, 0x11111111u, 0x22222222u, 0x33333333u};
+  static const uint32_t code[] = {LdrSuoff(0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint32_t{0xAABBCCDDu});
+  EXPECT_EQ(r[1], uint32_t{0});
+  EXPECT_EQ(r[2], uint32_t{0});
+  EXPECT_EQ(r[3], uint32_t{0});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, StpLdpQ128) {
+  alignas(16) static uint64_t buf[4] = {0, 0, 0, 0};
+  const uint64_t v0[2] = {0x1111111122222222ULL, 0x3333333344444444ULL};
+  const uint64_t v1[2] = {0x5555555566666666ULL, 0x7777777788888888ULL};
+  std::memcpy(&state_.cpu.v[0], v0, 16);
+  std::memcpy(&state_.cpu.v[1], v1, 16);
+  static const uint32_t scode[] = {StpQ(0, 1, 2, 0)};
+  state_.cpu.x[2] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(scode);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(scode) + sizeof(scode)));
+  EXPECT_EQ(buf[0], v0[0]);
+  EXPECT_EQ(buf[1], v0[1]);
+  EXPECT_EQ(buf[2], v1[0]);
+  EXPECT_EQ(buf[3], v1[1]);
+  // LDP back into v2/v3 and verify round-trip.
+  std::memset(&state_.cpu.v[2], 0xAB, 16);
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  static const uint32_t lcode[] = {LdpQ(2, 3, 2, 0)};
+  state_.cpu.insn_addr = ToGuestAddr(lcode);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(lcode) + sizeof(lcode)));
+  uint64_t r2[2], r3[2];
+  std::memcpy(r2, &state_.cpu.v[2], 16);
+  std::memcpy(r3, &state_.cpu.v[3], 16);
+  EXPECT_EQ(r2[0], v0[0]);
+  EXPECT_EQ(r2[1], v0[1]);
+  EXPECT_EQ(r3[0], v1[0]);
+  EXPECT_EQ(r3[1], v1[1]);
+}
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, LdrX64) {
   static uint64_t buf[2] = {0x1122334455667788ULL, 0};
   static const uint32_t code[] = {LdrXuoff(0, 1, 0)};
