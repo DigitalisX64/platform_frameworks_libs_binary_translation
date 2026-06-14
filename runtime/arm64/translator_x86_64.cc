@@ -170,6 +170,31 @@ static struct TranslationStats {
   uint64_t interpret_invocations = 0;
 } g_translation_stats;
 
+// Minimum guest-instruction count for a region to be worth gearing up to the
+// heavy optimizer. Below this, the optimizing tier's global passes (register
+// allocation, loop-invariant hoisting, flag folding) have too little scope to
+// recoup their higher per-instruction codegen overhead, so the heavy region
+// runs no faster — and on tiny flag-heavy regions, slower — than the lite tier's
+// tight single-pass output. Declining gear-up keeps the lite region, which is
+// always correct and never slower than lite. Tunable via BERBERIS_GEARUP_MIN_INSNS
+// for measurement sweeps.
+constexpr size_t kDefaultGearUpMinInsns = 20;
+
+size_t GetGearUpMinInsns() {
+  static const size_t value = []() -> size_t {
+    const char* env = getenv("BERBERIS_GEARUP_MIN_INSNS");
+    if (env) {
+      char* end = nullptr;
+      unsigned long parsed = strtoul(env, &end, 10);
+      if (end != env && *end == '\0') {
+        return static_cast<size_t>(parsed);
+      }
+    }
+    return kDefaultGearUpMinInsns;
+  }();
+  return value;
+}
+
 // Optimizing (second-gear) translation install. The heavy optimizer translates
 // the region; if it bails on an instruction it does not yet handle, this returns
 // {false, ...} and the caller re-lite-translates the whole region.
@@ -178,7 +203,6 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndIn
   MachineCode machine_code;
   auto [stop_pc, success, number_of_instructions] =
       HeavyOptimizeRegion(pc, &machine_code, {.end_pc = pc + GetExecutableRegionSize(pc)});
-  UNUSED(number_of_instructions);
   size_t size = stop_pc - pc;
   // A heavy bail reverts to a full lite re-translation rather than installing
   // only the successfully-optimized prefix: a partial heavy region fragments a
@@ -186,6 +210,12 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndIn
   // single lite region it replaced. Only install when the whole region was
   // optimized.
   if (!success) {
+    return {false, {}, 0, {}};
+  }
+  // Decline gear-up for regions too small for the heavy optimizer to help. The
+  // caller re-lite-translates without self-profiling, so the region settles on
+  // the lite tier permanently instead of re-attempting gear-up every threshold.
+  if (number_of_instructions < GetGearUpMinInsns()) {
     return {false, {}, 0, {}};
   }
   return {true, InstallTranslated(&machine_code, pc, size, "heavy"), size, kHeavyOptimized};
