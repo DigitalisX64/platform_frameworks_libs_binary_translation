@@ -17,7 +17,7 @@
 // Digitalis-side extra trampolines for libwebviewchromium_plat_support, the
 // WebView hardware-accelerated-drawing support library. The upstream proxy
 // leaves every symbol as DoBadTrampoline, so a guest hitting any of them aborts
-// with `Bad '<sym>' call` (TikTok/Douyin's libclay.so calls RegisterDrawFunctor
+// with `Bad '<sym>' call` (Douyin's libclay.so calls RegisterDrawFunctor
 // during WebView init -> abort). This covers the whole C-ABI surface of the
 // library (17 of its 18 exported symbols) so those calls forward to the host
 // library instead of aborting. The host functions are reached via the dlsym'd
@@ -29,7 +29,7 @@
 //     (JNIEnv*)` JNI-registration entry points run jniRegisterNativeMethods on
 //     the *host* VM, so they need a valid HOST JNIEnv. Translating the guest
 //     JNIEnv via ToHostJNIEnv does NOT work here: these are called from
-//     guest-spawned worker threads (TikTok/Douyin's "lynx-card-servi" thread via
+//     guest-spawned worker threads (Douyin's "lynx-card-servi" thread via
 //     libclay.so) that were never attached to the host VM, so the guest JNIEnv
 //     has no host mapping and the host function would deref a null env and
 //     SIGSEGV at its first `*env` (confirmed by disassembly). Instead the custom
@@ -66,7 +66,8 @@ namespace {
 
 // jint Register{DrawFunctor,DrawGLFunctor,GraphicsUtils}(JNIEnv*): each calls
 // jniRegisterNativeMethods and returns its result (0 on success; a negative
-// value is treated as failure by the caller). The JNIEnv* is translated.
+// value is treated as failure by the caller). The guest JNIEnv* is ignored; a
+// host env is fetched from the host VM (see the trampoline below).
 using Sig_RegisterWebView = jint(JNIEnv*);
 
 // HostCode is `const void*`; a function pointer cannot carry the const, so drop
