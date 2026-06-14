@@ -641,6 +641,43 @@ void ClaimHostFaultSignals() {
     sigfillset(&sa.sa_mask);
     sigaction(sig, &sa, nullptr);
   }
+
+  // Neutralize a handler-less SIGALRM deadman watchdog.
+  //
+  // Anti-tamper SDKs (e.g. com.kuaishou.weapon / libweapon982.so) arm an
+  // ITIMER_REAL / alarm() / timer_create(SIGALRM) "deadman" timer and expect
+  // their integrity check to clear it before it fires; they deliberately leave
+  // SIGALRM with no handler so a missed deadline default-terminates the process
+  // (a check for debuggers / slow execution). Guest setitimer/timer_create
+  // forward straight to the host kernel, which raises a REAL host SIGALRM.
+  // Berberis installs no host handler for SIGALRM, so the host default action
+  // (Term) kills the process before any guest code runs ("exited due to signal
+  // 14 (Alarm clock)"). Under translation the integrity check runs slower than
+  // on bare metal, loses the race, and the app dies a few seconds after the SDK
+  // loads; on a fast host it passes.
+  //
+  // Set the baseline host disposition for SIGALRM to SIG_IGN so a handler-less
+  // deadman fire is discarded harmlessly. This only changes the UNHANDLED
+  // default from Term to Ignore: the moment the guest installs its own SIGALRM
+  // action, SetGuestSignalHandler -> GuestSignalAction::Change -> DoSigaction
+  // calls host sigaction(SIGALRM, ...) and replaces this SIG_IGN with the
+  // claimed guest wrapper (SIGALRM is not an IsReservedSignal), so a guest that
+  // legitimately uses alarm()/SIGALRM with a handler is unaffected. We only
+  // override when the disposition is still the untouched SIG_DFL. Covers every
+  // SIGALRM source (setitimer/alarm/timer_create) uniformly because it acts on
+  // the terminal disposition, not the arming syscall. arm64-guest only (this
+  // whole function is arm64-only).
+  {
+    struct sigaction old_sa = {};
+    if (sigaction(SIGALRM, nullptr, &old_sa) == 0 && (old_sa.sa_flags & SA_SIGINFO) == 0 &&
+        old_sa.sa_handler == SIG_DFL) {
+      struct sigaction sa = {};
+      sa.sa_handler = SIG_IGN;
+      sigemptyset(&sa.sa_mask);
+      sigaction(SIGALRM, &sa, nullptr);
+      TRACE("Berberis: host SIGALRM default set to SIG_IGN (deadman-watchdog guard)");
+    }
+  }
 }
 #endif
 // endregion
