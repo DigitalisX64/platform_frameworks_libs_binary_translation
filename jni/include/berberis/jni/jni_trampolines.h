@@ -36,6 +36,13 @@ JNIEnv* ToHostJNIEnv(GuestType<JNIEnv*> guest_jni_env);
 GuestType<JavaVM*> ToGuestJavaVM(JavaVM* host_java_vm);
 JavaVM* ToHostJavaVM(GuestType<JavaVM*> guest_java_vm);
 
+// The host (x86_64) ART JavaVM captured at JNI_OnLoad, or nullptr if not yet
+// captured. Lets a proxy trampoline obtain a valid host JNIEnv for the current
+// thread (via GetEnv / AttachCurrentThread) when it must call a host JNI
+// function but the guest-side JNIEnv it was handed is not a mapped host env
+// (e.g. a guest-spawned worker thread never attached to the host VM).
+JavaVM* GetHostJavaVM();
+
 void InitializeJNI();
 
 }  // namespace berberis

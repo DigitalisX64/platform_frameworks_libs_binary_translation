@@ -50,6 +50,7 @@ cc_library_static {
         "digitalis_extra_libm_trampolines.cc",
         "digitalis_extra_libnativehelper_trampolines.cc",
         "digitalis_extra_libbinder_ndk_trampolines.cc",
+        "digitalis_extra_libwebviewchromium_plat_support_trampolines.cc",
         "digitalis_host_call_redirect.cc",
     ],
     // Sources are #ifdef'd on __x86_64__ so non-x86_64 builds get an

@@ -573,6 +573,10 @@ JavaVM* ToHostJavaVM(GuestType<JavaVM*> guest_java_vm) {
   return ToHostAddr(guest_java_vm);
 }
 
+JavaVM* GetHostJavaVM() {
+  return g_host_java_vm;
+}
+
 namespace {
 
 GuestThreadExitListenerFn g_next_guest_thread_exit_listener = nullptr;
