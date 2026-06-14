@@ -452,7 +452,7 @@ class HeavyOptimizerFrontend {
       // then ASR by (reg_size-1-imms+immr) shifts the field back to bit 0 while
       // sign-extending from the field's top bit. For 32-bit the Sar writes the
       // low 32 and zero-extends to 64, matching ARM64 W-write semantics. The
-      // imms < immr case (SBFIZ) wraps and is bailed.
+      // imms < immr case (SBFIZ) is handled separately below.
       if (imms >= immr) {
         const uint8_t left = static_cast<uint8_t>(reg_size - 1 - imms);
         const uint8_t right = static_cast<uint8_t>(left + immr);
@@ -475,9 +475,32 @@ class HeavyOptimizerFrontend {
         }
         return res;
       }
-      // SBFIZ (imms < immr) needs a rotate-based extraction; bail conservatively.
-      UndefinedReturningReg();
-      return AllocTempReg();
+      // SBFIZ (imms < immr): sign-extend the low (imms+1) bits of src, then shift
+      // left by lsb = reg_size - immr. Two shifts mirror the general-SBFX idiom:
+      // LSL by (reg_size-1-imms) lands the field's top bit at the MSB, then ASR
+      // by (immr-1-imms) sign-extends and lands bit 0 at position lsb. Since
+      // imms < immr, right = immr-1-imms >= 0. For 32-bit the Sar writes the low
+      // 32 and zero-extends to 64 (ARM64 W-write semantics).
+      const uint8_t sbfiz_left = static_cast<uint8_t>(reg_size - 1 - imms);
+      const uint8_t sbfiz_right = static_cast<uint8_t>(immr - 1 - imms);
+      if (is_64bit) {
+        Register res = Copy(src);
+        if (sbfiz_left != 0) {
+          res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_left)));
+        }
+        if (sbfiz_right != 0) {
+          res = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_right)));
+        }
+        return res;
+      }
+      Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+      if (sbfiz_left != 0) {
+        res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_left)));
+      }
+      if (sbfiz_right != 0) {
+        res = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_right)));
+      }
+      return res;
     }
 
     // General BFM (BFI / BFXIL / BFC).
@@ -770,10 +793,14 @@ class HeavyOptimizerFrontend {
     Store(size, addr, 0, data);
   }
 
-  void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args, base);
-  }
+  // LDXR/STXR/LDAXR/STLXR (exclusive) and LDAR/STLR (acquire/release). Defined
+  // in the .cc (STXR needs basic-block manipulation for the reservation-address
+  // check and CMPXCHG status branch). Mirrors lite_translator.h::LoadStoreExclusive
+  // exactly: LDXR records cpu.reservation_address + the 64-bit cpu.reservation_value;
+  // STXR re-checks the address, does a sized LOCK CMPXCHG against the saved value,
+  // and writes status 0 (success) / 1 (fail) to Rs. Acquire/release are free on
+  // x86-TSO. The LSE atomics / pair / CAS / SWP ops in args.op still bail.
+  void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base);
 
   //
   // System.
@@ -1047,11 +1074,18 @@ class HeavyOptimizerFrontend {
                              Register src2,
                              Decoder::Condition cond);
 
-  // LSLV/LSRV/ASRV/RORV (variable shifts). UDIV/SDIV/CRC32/PACGA bail: division
-  // needs x86 RDX:RAX setup plus ARM divide-by-zero / INT_MIN-overflow handling
-  // that is awkward in this MachineIR form, so those fall back to the lite
-  // translator. The variable shifts use the x86 shift-by-CL forms; the backend
-  // register allocator binds the count operand to RCX automatically.
+  // UDIV/SDIV. Defined in the .cc: ARM division never traps, so these wrap the
+  // fixed-RDX:RAX x86 DIV/IDIV pseudo-op in guard blocks. UDIV/SDIV with Rm==0
+  // return 0; SDIV INT_MIN/-1 returns INT_MIN (x86 IDIV would #DE on both).
+  Register EmitUDiv(bool is_64bit, Register src1, Register src2);
+  Register EmitSDiv(bool is_64bit, Register src1, Register src2);
+
+  // LSLV/LSRV/ASRV/RORV (variable shifts) and UDIV/SDIV. CRC32/PACGA still bail.
+  // Division routes to the .cc EmitUDiv/EmitSDiv helpers because the ARM
+  // divide-by-zero (Rd=0) and SDIV INT_MIN/-1 (Rd=INT_MIN) guards need basic
+  // blocks around the fixed-RDX:RAX x86 DIV/IDIV pseudo-op. The variable shifts
+  // use the x86 shift-by-CL forms; the backend register allocator binds the
+  // count operand to RCX automatically.
   Register DataProc2Src(Decoder::DataProc2SrcOpcode opcode,
                         bool is_64bit,
                         Register src1,
@@ -1080,6 +1114,10 @@ class HeavyOptimizerFrontend {
           return std::get<0>(Gen<x86_64::RorqRegReg>(src1, src2));
         }
         return std::get<0>(Gen<x86_64::RorlRegReg>(src1, src2));
+      case Decoder::DataProc2SrcOpcode::kUdiv:
+        return EmitUDiv(is_64bit, src1, src2);
+      case Decoder::DataProc2SrcOpcode::kSdiv:
+        return EmitSDiv(is_64bit, src1, src2);
       default:
         UndefinedReturningReg();
         return AllocTempReg();
@@ -1087,8 +1125,9 @@ class HeavyOptimizerFrontend {
   }
 
   // MADD/MSUB and the signed/unsigned widening multiply-accumulates
-  // (SMADDL/SMSUBL/UMADDL/UMSUBL). SMULH/UMULH need the widening x86 MUL/IMUL
-  // into RDX:RAX and bail. Mirrors lite_translator.h::DataProc3Src.
+  // (SMADDL/SMSUBL/UMADDL/UMSUBL), plus SMULH/UMULH (high 64 bits of a 64x64
+  // product via the widening x86 IMUL/MUL into RDX:RAX). Mirrors
+  // lite_translator.h::DataProc3Src.
   //   MADD:  Rd = Ra + Rn * Rm     MSUB:  Rd = Ra - Rn * Rm
   //   SMADDL: Xd = Xa + sext(Wn)*sext(Wm)   (UMADDL uses zext; *SUBL subtracts)
   Register DataProc3Src(Decoder::DataProc3SrcOpcode opcode,
@@ -1142,6 +1181,13 @@ class HeavyOptimizerFrontend {
         }
         return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
       }
+      case Decoder::DataProc3SrcOpcode::kUmulh:
+        // UMULH: Xd = high 64 bits of (Xn * Xm), unsigned. MulqRegRegReg returns
+        // [low(RAX), high(RDX), flags]; the high half is the result. X-form only.
+        return std::get<1>(Gen<x86_64::MulqRegRegReg>(src1, src2));
+      case Decoder::DataProc3SrcOpcode::kSmulh:
+        // SMULH: Xd = high 64 bits of (Xn * Xm), signed (ImulqRegRegReg). X-form only.
+        return std::get<1>(Gen<x86_64::ImulqRegRegReg>(src1, src2));
       default:
         UndefinedReturningReg();
         return AllocTempReg();
@@ -1154,11 +1200,12 @@ class HeavyOptimizerFrontend {
     return AllocTempReg();
   }
 
-  // RBIT/REV16/REV32/REV/CLZ/CLS. Only REV16 and CLZ have a clean mapping here;
-  // REV/REV32 would need x86 BSWAP (no MachineIR op available) and RBIT/CLS have
-  // no direct mapping, so they bail. PAuth DP-1Src variants (opcode2 bit 0x40)
-  // are treated as identity because Digitalis is PAC-blind. Mirrors
-  // lite_translator.h::DataProc1Src.
+  // RBIT/REV16/REV32/REV/CLZ/CLS. REV16/REV32/REV are byte-reversed with SWAR
+  // shift/mask/or sequences (no x86 BSWAP MachineIR op). CLZ maps to LZCNT and
+  // CLS to LZCNT(x ^ (x>>1))-1 (both gated on host LZCNT). RBIT has no x86
+  // mapping and bails to the lite translator/interpreter. PAuth DP-1Src variants
+  // (opcode2 bit 0x40) are treated as identity because Digitalis is PAC-blind.
+  // Mirrors lite_translator.h::DataProc1Src.
   Register DataProc1Src(Register src, uint8_t opcode2, bool is_64bit) {
     if (!success()) {
       return AllocTempReg();
@@ -1193,6 +1240,84 @@ class HeavyOptimizerFrontend {
         hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{8}));
         return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
       }
+      case 0b000010:  // REV32 (sf=1) / REV (sf=0): byte-reverse each 32-bit word.
+        // No x86 BSWAP MachineIR op, so byte-swap with the SWAR shift/mask/or
+        // sequence: swap bytes within each halfword, then swap halves within each
+        // 32-bit word. For the X-form this byte-reverses each 32-bit word in place
+        // (no cross-word swap); for the W-form it byte-reverses the 32-bit value
+        // and zero-extends.
+        if (is_64bit) {
+          Register x = Copy(src);
+          // Swap bytes within each 16-bit halfword.
+          Register lo = Copy(x);
+          Register m1 = GetImm(0x00FF00FF00FF00FFULL);
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m1));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+          Register hi = Copy(x);
+          Register m2 = GetImm(0xFF00FF00FF00FF00ULL);
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m2));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{8}));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          // Swap 16-bit halves within each 32-bit word.
+          lo = Copy(x);
+          Register m3 = GetImm(0x0000FFFF0000FFFFULL);
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m3));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{16}));
+          hi = Copy(x);
+          Register m4 = GetImm(0xFFFF0000FFFF0000ULL);
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m4));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{16}));
+          return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        } else {
+          // REV Wd: byte-reverse the 32-bit word (zero-extends to 64).
+          Register lo = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+          lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(lo, 0x00FF00FF));
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{8}));
+          Register hi = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+          hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, static_cast<int32_t>(0xFF00FF00)));
+          hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{8}));
+          Register x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+          lo = Copy(x);
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{16}));
+          hi = Copy(x);
+          hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{16}));
+          return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+        }
+      case 0b000011:  // REV (64-bit full byte reverse).
+        // SWAR byte-swap: halfword swap, then halfword-pair swap within words,
+        // then 32-bit word swap. (No BSWAP MachineIR op.)
+        if (is_64bit) {
+          Register x = Copy(src);
+          // Swap bytes within each 16-bit halfword.
+          Register lo = Copy(x);
+          Register m1 = GetImm(0x00FF00FF00FF00FFULL);
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m1));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+          Register hi = Copy(x);
+          Register m2 = GetImm(0xFF00FF00FF00FF00ULL);
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m2));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{8}));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          // Swap 16-bit halves within each 32-bit word.
+          lo = Copy(x);
+          Register m3 = GetImm(0x0000FFFF0000FFFFULL);
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m3));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{16}));
+          hi = Copy(x);
+          Register m4 = GetImm(0xFFFF0000FFFF0000ULL);
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m4));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{16}));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          // Swap the two 32-bit words.
+          lo = Copy(x);
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{32}));
+          hi = Copy(x);
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{32}));
+          return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        }
+        // REV is X-form only for opcode2=000011; sf=0 is not encoded. Bail safely.
+        UndefinedReturningReg();
+        return AllocTempReg();
       case 0b000100:  // CLZ (count leading zeros) maps directly to x86 LZCNT.
         // Without LZCNT the encoding decodes as BSR (wrong result for CLZ), so
         // bail to the lite translator (which uses a BSR-with-zero-check sequence).
@@ -1204,9 +1329,35 @@ class HeavyOptimizerFrontend {
           return std::get<0>(Gen<x86_64::LzcntqRegReg>(src));
         }
         return std::get<0>(Gen<x86_64::LzcntlRegReg>(src));
+      case 0b000101:  // CLS (count leading sign bits).
+        // CLS = LZCNT(x ^ (x >>arith 1)) - 1. LZCNT(0) == reg_size, so the
+        // all-same-bits case yields reg_size-1 with no branch. Needs LZCNT for
+        // the zero-input result; without it, bail to the lite/interp path.
+        if (!host_platform::kHasLZCNT) {
+          UndefinedReturningReg();
+          return AllocTempReg();
+        }
+        if (is_64bit) {
+          Register sar = Copy(src);
+          sar = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(sar, int8_t{1}));
+          Register xored = Copy(src);
+          xored = std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(xored, sar));
+          Register lz = std::get<0>(Gen<x86_64::LzcntqRegReg>(xored));
+          return std::get<0>(Gen<x86_64::SubqRegImm, kNoSSA>(lz, int32_t{1}));
+        } else {
+          // 32-bit: Movl src into a clean 32-bit value first, Sarl/Lzcntl operate
+          // over 32 bits and zero-extend the result to 64 (ARM64 W-write).
+          Register clean = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+          Register sar = Copy(clean);
+          sar = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(sar, int8_t{1}));
+          Register xored = Copy(clean);
+          xored = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(xored, sar));
+          Register lz = std::get<0>(Gen<x86_64::LzcntlRegReg>(xored));
+          return std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(lz, int32_t{1}));
+        }
       default:
-        // RBIT (000000), REV32/REV (000010), REV (000011), CLS (000101): no
-        // clean x86 MachineIR mapping here — bail to the lite translator.
+        // RBIT (000000): no x86 bit-reverse op and the lite tier bails it too;
+        // fall back to the interpreter.
         UndefinedReturningReg();
         return AllocTempReg();
     }
@@ -1485,9 +1636,77 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // AdvSIMD modified immediate: MOVI / MVNI / vector FMOV (replace forms) and
+  // ORR / BIC (vector, immediate) (read-modify-write forms). The 128-bit value
+  // is a pure function of (op, cmode, abc, defgh, q) via AdvSIMDExpandImm, so it
+  // is computed at translation time (ExpandSimdModifiedImmJit, shared with the
+  // lite translator) and materialized into V[rd].
+  //
+  // Materialization uses only allowlisted XMM ops: a PXOR-zeroed XMM, MOVQ to
+  // load the low 64 bits from a GP reg, and (when the upper half is non-zero and
+  // Q==1) PINSRQ to insert the high 64 bits. For the D-form (Q==0) only the low
+  // 64 bits are inserted and the upper half stays zero (PXOR), matching ARM64
+  // 64-bit-vector write semantics. The commit is a single 16-byte MOVDQA store at
+  // the v[rd] displacement (GenSetSimd<16>). Mirrors lite_translator.h::Simd-
+  // ModifiedImm. Bails (FP16 vector FMOV / reserved cmodes) never reach here:
+  // the decoder rejects them upstream, and the lite tier handles whatever does.
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    const uint8_t cmode = args.cmode;
+    // ORR/BIC (vector, immediate): cmode<0>==1 and cmode<3:2>!=11. These read-
+    // modify-write V[rd] with the MOVI-style (op=0) expanded immediate: ORR
+    // (op=0) sets bits, BIC (op=1) clears them.
+    const bool is_orr_bic = (cmode & 1) && ((cmode & 0b1100) != 0b1100);
+    __uint128_t value =
+        is_orr_bic
+            ? ExpandSimdModifiedImmJit(0, cmode, args.abc, args.defgh, args.q)
+            : ExpandSimdModifiedImmJit(args.op, cmode, args.abc, args.defgh, args.q);
+    const uint64_t lo = static_cast<uint64_t>(value);
+    // Q==0 operates on the low 64 bits and zeroes the upper 64 of V[rd].
+    const uint64_t hi = args.q ? static_cast<uint64_t>(value >> 64) : 0;
+    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+    // Build the 128-bit immediate constant into a PXOR-zeroed XMM. For Q==0 the
+    // high half is left zero by construction.
+    FpRegister ximm = AllocZeroedSimdReg();
+    if (lo != 0) {
+      Register glo = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(lo)));
+      builder_.Gen<x86_64::MovqXRegReg>(ximm.machine_reg(), glo);  // zero-extends upper 64
+    }
+    if (hi != 0) {
+      Register ghi = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(hi)));
+      builder_.Gen<x86_64::PinsrqXRegRegImm>(ximm.machine_reg(), ghi, int8_t{1});
+    }
+
+    if (!is_orr_bic) {
+      // MOVI / MVNI / FMOV: replace V[rd] with the constant.
+      builder_.GenSetSimd<16>(off, ximm.machine_reg());
+      return;
+    }
+
+    // ORR/BIC: load current V[rd] (D-form must zero-extend the low 64 so the
+    // upper half ends up zeroed), then OR (set) / AND-NOT (clear) the immediate.
+    FpRegister xd = AllocTempSimdReg();
+    if (args.q) {
+      builder_.GenGetSimd<16>(xd.machine_reg(), off);
+    } else {
+      // MOVSD reg<-mem zero-extends the upper 64 bits of the XMM. The MOVSD load
+      // is one of the SIMD opcodes RemoveLocalGuestContextAccesses recognizes as
+      // a guest-context GET, so a prior 16-byte store forwards correctly.
+      xd = FpRegister{std::get<0>(Gen<x86_64::MovsdXRegOp>(
+          {.base = x86_64::kMachineRegRBP, .disp = off}))};
+    }
+    if (args.op == 0) {
+      builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), ximm.machine_reg());
+      builder_.GenSetSimd<16>(off, xd.machine_reg());
+    } else {
+      // BIC: xd = ~imm & Vd. PANDN(dst, src) computes dst = ~dst & src, so with
+      // dst=ximm, src=xd we get ~imm & Vd; the result lands in ximm.
+      builder_.Gen<x86_64::PandnXRegXReg>(ximm.machine_reg(), xd.machine_reg());
+      builder_.GenSetSimd<16>(off, ximm.machine_reg());
+    }
   }
 
   void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
@@ -1586,9 +1805,88 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args, base, offset);
   }
 
+  // AdvSIMD copy. Only DUP (general) — broadcast a GP register Rn across all
+  // lanes of Vd — is implemented in the optimizing tier. The other opcodes
+  // (DUP element, INS general/element, SMOV, UMOV) need byte/lane shuffles
+  // (PSHUFD/PSHUFLW) or 128-bit byte shifts (PSLLDQ/PSRLDQ) that are NOT in the
+  // ARM64 backend op allowlist, so they bail to the lite translator (which has
+  // those ops). Mirrors lite_translator.h::AdvSimdCopy's kDupGeneral path.
+  //
+  // imm5 encodes the element size: bit0=B(1), bit1=H(2), bit2=S(4), bit3=D(8).
+  //   B: MOVD Rn->xmm, then PSHUFB with a zeroed mask broadcasts byte 0 to all 16.
+  //   H: MOVD Rn->xmm (low halfword in lane 0), then PINSRW into all 8 lanes.
+  //   S: MOVD Rn->xmm, then PINSRD into all 4 lanes.
+  //   D: MOVQ Rn->xmm (FULL 64 bits — a 32-bit MOVD here would truncate a
+  //      pointer), then PUNPCKLQDQ self duplicates the low qword to both halves.
+  // Q==0 forms zero the upper 64 bits of Vd (D-register semantics): for B/H/S
+  // they are built into a PXOR-zeroed XMM whose upper half is only filled for the
+  // Q==1 broadcast, and the 64-bit (1D) Q==0 form is ARM-reserved and bails.
   void AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    if (args.opcode != Decoder::AdvSimdCopyOpcode::kDupGeneral) {
+      // DUP element / INS / SMOV / UMOV: not expressible with the allowlisted
+      // ops; the lite translator handles them.
+      UndefinedReturningVoid();
+      return;
+    }
+
+    const uint8_t esize_bits = args.imm5 & 0xf;
+    // 1D (Q==0, esize=D) is ARM-reserved.
+    if (esize_bits == 0x08 && !args.q) {
+      UndefinedReturningVoid();
+      return;
+    }
+
+    // Source GP value (XZR/WZR -> 0: a common compiler idiom to zero a vector).
+    Register src;
+    if (args.rn < 31) {
+      src = GetReg(args.rn);
+    } else {
+      src = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+    }
+
+    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+    if (esize_bits == 0x08) {  // D (Q==1 only): 2D broadcast.
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovqXRegReg>(xmm.machine_reg(), src);          // low qword = src, upper = 0
+      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm.machine_reg(), xmm.machine_reg());  // dup low qword
+      builder_.GenSetSimd<16>(off, xmm.machine_reg());
+      return;
+    }
+
+    if (esize_bits == 0x01) {  // B: byte broadcast.
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdXRegReg>(xmm.machine_reg(), src);  // byte 0 in lane 0
+      // PSHUFB with an all-zero mask selects byte 0 for every output byte.
+      FpRegister zero_mask = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PshufbXRegXReg>(xmm.machine_reg(), zero_mask.machine_reg());
+      // PSHUFB filled all 16 bytes; for Q==0 we still must zero the upper half.
+      SetVRegFull(args.rd, xmm, args.q);
+      return;
+    }
+
+    if (esize_bits == 0x02) {  // H: halfword broadcast via PINSRW into every lane.
+      // Build into a zeroed XMM so the Q==0 upper half stays 0 (only lanes 0..3
+      // are written for the D-form; the SetVRegFull merge then drops 4..7 too).
+      FpRegister xmm = AllocZeroedSimdReg();
+      const int8_t n = args.q ? int8_t{8} : int8_t{4};
+      for (int8_t lane = 0; lane < n; ++lane) {
+        builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
+      }
+      SetVRegFull(args.rd, xmm, args.q);
+      return;
+    }
+
+    // esize_bits == 0x04: S: word broadcast via PINSRD into every lane.
+    FpRegister xmm = AllocZeroedSimdReg();
+    const int8_t n = args.q ? int8_t{4} : int8_t{2};
+    for (int8_t lane = 0; lane < n; ++lane) {
+      builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
+    }
+    SetVRegFull(args.rd, xmm, args.q);
   }
 
   // AdvSIMD three-same INTEGER ops that lower to a single packed SSE2/SSE4.1
@@ -2189,6 +2487,55 @@ class HeavyOptimizerFrontend {
     uint64_t exp = ((1 - b) << 10) | ((b ? 0xFFull : 0ull) << 2) | ((imm8 >> 4) & 0x3ull);
     uint64_t mantissa = static_cast<uint64_t>(imm8 & 0xFull) << 48;
     return (sign << 63) | (exp << 52) | mantissa;
+  }
+
+  // AdvSIMDExpandImm (ARM ARM): the 128-bit MOVI/MVNI/FMOV(vector) immediate as
+  // a pure function of (op, cmode, abc, defgh, q). Identical to
+  // lite_translator.h::ExpandSimdModifiedImmJit; uses the VFPExpandImm helpers
+  // above for the FMOV (cmode=1111) forms.
+  static __uint128_t ExpandSimdModifiedImmJit(uint8_t op, uint8_t cmode, uint8_t abc,
+                                              uint8_t defgh, bool q) {
+    uint8_t imm8 = (abc << 5) | defgh;
+    uint64_t imm64 = 0;
+    if (op == 0) {
+      switch (cmode >> 1) {
+        case 0b000: imm64 = uint64_t{imm8} | (uint64_t{imm8} << 32); break;
+        case 0b001: imm64 = (uint64_t{imm8} << 8) | (uint64_t{imm8} << 40); break;
+        case 0b010: imm64 = (uint64_t{imm8} << 16) | (uint64_t{imm8} << 48); break;
+        case 0b011: imm64 = (uint64_t{imm8} << 24) | (uint64_t{imm8} << 56); break;
+        case 0b100: for (int i = 0; i < 4; i++) imm64 |= uint64_t{imm8} << (i * 16); break;
+        case 0b101: for (int i = 0; i < 4; i++) imm64 |= uint64_t{imm8} << (i * 16 + 8); break;
+        case 0b110:
+          if (!(cmode & 1)) {
+            uint32_t v = (uint32_t{imm8} << 8) | 0xFF;
+            imm64 = uint64_t{v} | (uint64_t{v} << 32);
+          } else {
+            uint32_t v = (uint32_t{imm8} << 16) | 0xFFFF;
+            imm64 = uint64_t{v} | (uint64_t{v} << 32);
+          }
+          break;
+        case 0b111:
+          if (!(cmode & 1)) {
+            for (int i = 0; i < 8; i++) imm64 |= uint64_t{imm8} << (i * 8);
+          } else {
+            uint32_t f = VFPExpandImm32(imm8);
+            imm64 = uint64_t{f} | (uint64_t{f} << 32);
+          }
+          break;
+      }
+    } else {
+      if (cmode == 0b1110) {
+        for (int i = 0; i < 8; i++)
+          if (imm8 & (1 << i)) imm64 |= 0xFFULL << (i * 8);
+      } else if (cmode == 0b1111) {
+        imm64 = VFPExpandImm64(imm8);
+      } else {
+        return ~ExpandSimdModifiedImmJit(0, cmode, abc, defgh, q);
+      }
+    }
+    __uint128_t result = static_cast<__uint128_t>(imm64);
+    if (q) result |= static_cast<__uint128_t>(imm64) << 64;
+    return result;
   }
 
   // Materialize a 0/1 predicate register that is 1 exactly when ARM64

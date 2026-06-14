@@ -409,6 +409,124 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   return result;
 }
 
+// UDIV Xd/Wd, Xn/Wn, Xm/Wm. ARM division never traps: if the divisor is 0 the
+// result is 0. x86 DIV #DE-faults on a zero divisor, so guard it with a branch.
+// Mirrors lite_translator.h::DataProc2Src kUdiv. The dividend goes into RAX and
+// the high half (zero, unsigned) into RDX; the DivRegRegReg pseudo-op binds
+// those fixed registers via the Gen<> SSA wrapper, so the divisor stays a free
+// vreg. A 32-bit DIV writes EAX, which zero-extends to the X register.
+Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register src2) {
+  if (!success()) {
+    return AllocTempReg();
+  }
+
+  Register result = AllocTempReg();
+  // Divide-by-zero path writes 0; the divide path overwrites result with the
+  // quotient. Both edges define `result`, so it holds the right value at merge.
+  Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+  builder_.Gen<PseudoCopy>(result, zero, 8);
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* div_bb = ir->NewBasicBlock();
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, div_bb);
+  ir->AddEdge(cur_bb, merge_bb);
+
+  // TEST sets ZF=1 when the divisor is zero -> skip the divide (result stays 0).
+  Register flags = is_64bit ? std::get<0>(Gen<x86_64::TestqRegReg>(src2, src2))
+                            : std::get<0>(Gen<x86_64::TestlRegReg>(src2, src2));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kZero, merge_bb, div_bb, flags);
+
+  builder_.StartBasicBlock(div_bb);
+  // High half of the dividend is 0 for unsigned division.
+  Register hi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+  Register quotient;
+  if (is_64bit) {
+    quotient = std::get<0>(Gen<x86_64::DivqRegRegReg>(src1, hi, src2));
+  } else {
+    quotient = std::get<0>(Gen<x86_64::DivlRegRegReg>(src1, hi, src2));
+  }
+  builder_.Gen<PseudoCopy>(result, quotient, 8);
+  ir->AddEdge(div_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(merge_bb);
+  return result;
+}
+
+// SDIV Xd/Wd, Xn/Wn, Xm/Wm. ARM division never traps: Rm==0 -> 0, and the
+// INT_MIN/-1 overflow case -> INT_MIN (x86 IDIV #DE-faults on both). Mirrors
+// lite_translator.h::DataProc2Src kSdiv. Three blocks: zero divisor (result
+// stays 0), divisor==-1 (result = -Rn, which is INT_MIN for INT_MIN input and
+// correct for every other Rn), and the real IDIV (RDX = sign-extension of RAX).
+Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register src2) {
+  if (!success()) {
+    return AllocTempReg();
+  }
+
+  Register result = AllocTempReg();
+  Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+  builder_.Gen<PseudoCopy>(result, zero, 8);
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* nonzero_bb = ir->NewBasicBlock();
+  MachineBasicBlock* neg_one_bb = ir->NewBasicBlock();
+  MachineBasicBlock* div_bb = ir->NewBasicBlock();
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+
+  // Divisor == 0 -> result stays 0.
+  ir->AddEdge(cur_bb, merge_bb);
+  ir->AddEdge(cur_bb, nonzero_bb);
+  Register zflags = is_64bit ? std::get<0>(Gen<x86_64::TestqRegReg>(src2, src2))
+                             : std::get<0>(Gen<x86_64::TestlRegReg>(src2, src2));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kZero, merge_bb, nonzero_bb, zflags);
+
+  // Divisor == -1 -> result = -Rn (= INT_MIN when Rn==INT_MIN, no IDIV).
+  builder_.StartBasicBlock(nonzero_bb);
+  ir->AddEdge(nonzero_bb, neg_one_bb);
+  ir->AddEdge(nonzero_bb, div_bb);
+  Register cflags = is_64bit
+                        ? std::get<0>(Gen<x86_64::CmpqRegImm>(src2, int32_t{-1}))
+                        : std::get<0>(Gen<x86_64::CmplRegImm>(src2, int32_t{-1}));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kEqual, neg_one_bb, div_bb, cflags);
+
+  // result = 0 - Rn (the heavy IR has no NEG op; a 32-bit sub zero-extends).
+  builder_.StartBasicBlock(neg_one_bb);
+  Register negbase = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+  Register neg;
+  if (is_64bit) {
+    neg = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(negbase, src1));
+  } else {
+    neg = std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(negbase, src1));
+  }
+  builder_.Gen<PseudoCopy>(result, neg, 8);
+  ir->AddEdge(neg_one_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  // Real division: RDX = sign-extension of the dividend (CQO/CDQ equivalent).
+  builder_.StartBasicBlock(div_bb);
+  Register quotient;
+  if (is_64bit) {
+    Register hi = std::get<0>(Gen<x86_64::SarqRegImm>(Copy(src1), int8_t{63}));
+    quotient = std::get<0>(Gen<x86_64::IdivqRegRegReg>(src1, hi, src2));
+  } else {
+    Register hi = std::get<0>(Gen<x86_64::SarlRegImm>(
+        std::get<0>(Gen<x86_64::MovlRegReg>(src1)), int8_t{31}));
+    quotient = std::get<0>(Gen<x86_64::IdivlRegRegReg>(src1, hi, src2));
+  }
+  builder_.Gen<PseudoCopy>(result, quotient, 8);
+  ir->AddEdge(div_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(merge_bb);
+  return result;
+}
+
 // CCMP/CCMN. If `cond` holds, set NZCV from a real CMP (is_neg=false) / CMN
 // (is_neg=true); otherwise set NZCV from the 4-bit nzcv immediate. Mirrors
 // lite_translator.cc::ConditionalCompare with then/else/merge basic blocks.
@@ -494,6 +612,182 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
   builder_.Gen<PseudoBranch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
+}
+
+// LDXR/STXR/LDAXR/STLXR (exclusive) and LDAR/STLR (acquire/release). Mirrors
+// lite_translator.h::LoadStoreExclusive byte-for-byte:
+//   * base is TBI-masked first (the top-byte-ignore tag is not part of the host
+//     address), then used for the reservation address, the load/store, and the
+//     CMPXCHG memory operand, so the heavy and lite/interp monitors agree on the
+//     same guest under tagged pointers.
+//   * LDAR/STLR: x86-TSO gives acquire/release for plain loads/stores, so they
+//     are a plain sized Load()/Store() (both emit fault recovery internally).
+//   * LDXR/LDAXR: Load() the value, then record cpu.reservation_address = base
+//     and cpu.reservation_value = value (64-bit slot, matching the lite tier and
+//     interpreter; only LDXP/STXP use the full 128-bit width).
+//   * STXR/STLXR: if cpu.reservation_address still equals base, do a sized
+//     LOCK CMPXCHG of the saved reservation_value (expected, in the accumulator)
+//     against [base] with Rt as the new value; clear cpu.reservation_address;
+//     Rs gets 0 on CMPXCHG success (ZF=1), 1 on CMPXCHG failure or address
+//     mismatch. XZR (reg 31) reads as 0 / discards writes.
+// This deliberately reuses the lite tier's reservation_address + reservation_value
+// + plain CMPXCHG monitor model (NOT the riscv64 heavy tier's
+// MemoryRegionReservation owner-tracking model), so the heavy, lite, and
+// interpreter tiers share one monitor scheme for the same guest.
+void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args,
+                                                Register base) {
+  if (!success()) {
+    return;
+  }
+
+  // Apply the TBI mask before using base as a memory operand or reservation key.
+  base = ApplyTbi(base);
+  auto lss = static_cast<Decoder::LoadStoreSize>(args.size);
+  const int32_t resv_addr_off = static_cast<int32_t>(offsetof(ThreadState, cpu.reservation_address));
+  const int32_t resv_val_off = static_cast<int32_t>(offsetof(ThreadState, cpu.reservation_value));
+
+  switch (args.op) {
+    case Decoder::AtomicOp::kLdar: {
+      // Load-acquire: x86-TSO provides acquire ordering for all loads.
+      Register res = Load(lss, /*is_signed=*/false, /*is_64bit_target=*/true, base, 0);
+      if (!success()) {
+        return;
+      }
+      if (args.rt != 31) {
+        SetReg(args.rt, res);
+      }
+      return;
+    }
+
+    case Decoder::AtomicOp::kStlr: {
+      // Store-release: x86-TSO provides release ordering for all stores.
+      Register data = (args.rt != 31) ? GetReg(args.rt) : GetImm(0);
+      if (!success()) {
+        return;
+      }
+      Store(lss, base, 0, data);
+      return;
+    }
+
+    case Decoder::AtomicOp::kLdxr: {
+      // Load-exclusive: load the value, then record the reservation.
+      Register res = Load(lss, /*is_signed=*/false, /*is_64bit_target=*/true, base, 0);
+      if (!success()) {
+        return;
+      }
+      // reservation_address = base.
+      builder_.Gen<x86_64::MovqOpReg>(
+          {.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
+      // reservation_value = res (low 64 bits of the 128-bit slot, as the lite
+      // tier does; the single-register forms only ever use 64 bits).
+      builder_.Gen<x86_64::MovqOpReg>(
+          {.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, res);
+      if (args.rt != 31) {
+        SetReg(args.rt, res);
+      }
+      return;
+    }
+
+    case Decoder::AtomicOp::kStxr: {
+      // Store-exclusive: compare-and-swap against the reservation. Structured to
+      // mirror the riscv64 heavy frontend's MemoryRegionReservationExchange: the
+      // status vreg (result) is written only in the two terminal predecessors of
+      // the merge block (XOR -> 0 on success, MOVQ #1 on failure), never in the
+      // entry block, so its live range is the simple two-def/one-use shape the
+      // lifetime analyzer expects.
+      Register new_val = (args.rt != 31) ? GetReg(args.rt) : GetImm(0);
+      Register resv_addr =
+          std::get<0>(Gen<x86_64::MovqRegOp>({.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}));
+      if (!success()) {
+        return;
+      }
+
+      // Clear the reservation (STXR always clears, success or not).
+      builder_.GenPutImm(resv_addr_off, 0);
+
+      Register status = AllocTempReg();
+      auto* ir = builder_.ir();
+      auto* cur_bb = builder_.bb();
+      MachineBasicBlock* match_bb = ir->NewBasicBlock();   // reservation addr matches base
+      MachineBasicBlock* fail_bb = ir->NewBasicBlock();    // addr mismatch or CMPXCHG fail
+      MachineBasicBlock* swap_ok_bb = ir->NewBasicBlock();  // CMPXCHG succeeded
+      MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+      ir->AddEdge(cur_bb, match_bb);
+      ir->AddEdge(cur_bb, fail_bb);
+
+      // if (reservation_address != base) goto fail_bb (status = 1).
+      builder_.Gen<PseudoCondBranch>(
+          x86_64::Assembler::Condition::kNotEqual,
+          fail_bb,
+          match_bb,
+          std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
+
+      // --- match path: sized LOCK CMPXCHG(expected, [base], new_val). ---
+      builder_.StartBasicBlock(match_bb);
+      // Load the expected value (saved reservation) into the CMPXCHG accumulator.
+      Register expected =
+          std::get<0>(Gen<x86_64::MovqRegOp>({.base = x86_64::kMachineRegRBP, .disp = resv_val_off}));
+      Register host_flags;
+      switch (args.size) {
+        case 0:
+          std::tie(expected, host_flags) =
+              Gen<x86_64::LockCmpXchgbRegOpReg>(expected, {.base = base}, new_val);
+          break;
+        case 1:
+          std::tie(expected, host_flags) =
+              Gen<x86_64::LockCmpXchgwRegOpReg>(expected, {.base = base}, new_val);
+          break;
+        case 2:
+          std::tie(expected, host_flags) =
+              Gen<x86_64::LockCmpXchglRegOpReg>(expected, {.base = base}, new_val);
+          break;
+        case 3:
+          std::tie(expected, host_flags) =
+              Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, new_val);
+          break;
+        default:
+          UndefinedReturningVoid();
+          return;
+      }
+      // No fault-recovery split here (unlike Load()/Store()): the CMPXCHG runs
+      // only when reservation_address == base, i.e. a prior LDXR already faulted
+      // in this page, so a fault is pathological. Splitting the block would also
+      // strand the CMPXCHG's FLAGS output across the recovery edge. This mirrors
+      // the riscv64 heavy frontend's MemoryRegionReservationExchange, which also
+      // omits recovery around the swap CMPXCHG.
+
+      // ZF=0 (kNotZero) means CMPXCHG failed -> fail_bb (status = 1); ZF=1 ->
+      // swap_ok_bb (status = 0).
+      ir->AddEdge(builder_.bb(), fail_bb);
+      ir->AddEdge(builder_.bb(), swap_ok_bb);
+      builder_.Gen<PseudoCondBranch>(
+          x86_64::Assembler::Condition::kNotZero, fail_bb, swap_ok_bb, host_flags);
+
+      // --- success: status = 0 (XOR self, with a PseudoDef to seat the value). ---
+      builder_.StartBasicBlock(swap_ok_bb);
+      builder_.Gen<PseudoDefReg>(status);
+      builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
+      ir->AddEdge(swap_ok_bb, merge_bb);
+      builder_.Gen<PseudoBranch>(merge_bb);
+
+      // --- failure (addr mismatch or CMPXCHG miss): status = 1. ---
+      builder_.StartBasicBlock(fail_bb);
+      builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
+      ir->AddEdge(fail_bb, merge_bb);
+      builder_.Gen<PseudoBranch>(merge_bb);
+
+      builder_.StartBasicBlock(merge_bb);
+      if (args.rs != 31) {
+        SetReg(args.rs, status);
+      }
+      return;
+    }
+
+    default:
+      // LSE atomics / CAS / SWP / pair forms are out of this category; bail.
+      UndefinedReturningVoid();
+      return;
+  }
 }
 
 void HeavyOptimizerFrontend::Undefined() {
