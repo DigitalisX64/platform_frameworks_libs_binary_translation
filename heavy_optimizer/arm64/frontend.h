@@ -1780,6 +1780,8 @@ class HeavyOptimizerFrontend {
   void Finalize(GuestAddr stop_pc);
 
   // Exported only for testing.
+  [[nodiscard]] bool has_in_region_backedge() const { return has_in_region_backedge_; }
+
   [[nodiscard]] const ArenaMap<GuestAddr, MachineInsnPosition>& branch_targets() const {
     return branch_targets_;
   }
@@ -2164,6 +2166,13 @@ class HeavyOptimizerFrontend {
   x86_64::MachineIRBuilder builder_;
   MachineReg flag_register_;
   bool is_uncond_branch_;
+  // Set when ResolveJumps links a backward branch into an in-region loop
+  // (a real hot loop captured in this region). Used by the runtime to decide
+  // whether a small region — or a region that later bailed — is still worth
+  // installing as heavy: an in-region loop avoids the per-iteration region-exit
+  // dispatch the lite tier pays, which is the heavy tier's biggest win on tight
+  // loops (e.g. integrity-check / CRC loops in real apps).
+  bool has_in_region_backedge_ = false;
   // IR positions of all guest instructions of the current region, plus all
   // branch targets the region jumps to. A target outside the current region has
   // an uninitialized position (its basic block is nullptr).

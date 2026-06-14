@@ -202,20 +202,34 @@ size_t GetGearUpMinInsns() {
 std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndInstallRegion(
     GuestAddr pc) {
   MachineCode machine_code;
-  auto [stop_pc, success, number_of_instructions] =
-      HeavyOptimizeRegion(pc, &machine_code, {.end_pc = pc + GetExecutableRegionSize(pc)});
+  bool has_in_region_backedge = false;
+  auto [stop_pc, success, number_of_instructions] = HeavyOptimizeRegion(
+      pc, &machine_code, {.end_pc = pc + GetExecutableRegionSize(pc)}, &has_in_region_backedge);
   size_t size = stop_pc - pc;
-  // A heavy bail reverts to a full lite re-translation rather than installing
-  // only the successfully-optimized prefix: a partial heavy region fragments a
-  // hot loop into extra region boundaries, costing more per iteration than the
-  // single lite region it replaced. Only install when the whole region was
-  // optimized.
+  // When the heavy frontend bails partway through, the prefix it did translate is
+  // still a valid region ending in an exit to the bailing PC. Install that prefix
+  // ONLY when it captured an in-region loop back-edge — i.e. the hot loop is
+  // fully inside the prefix and runs without the per-iteration region-exit
+  // dispatch the lite tier pays. That is the case a real-app integrity/CRC loop
+  // sitting in a function whose tail uses an unsupported instruction hits, and
+  // it is the heavy tier's biggest win. Without a captured back-edge, a partial
+  // prefix would just fragment a still-incomplete loop into extra region
+  // boundaries (slower than the single lite region) — so discard and re-lite.
   if (!success) {
+    if (has_in_region_backedge && size > 0) {
+      return {true, InstallTranslated(&machine_code, pc, size, "heavy"), size, kHeavyOptimized};
+    }
     return {false, {}, 0, {}};
   }
-  // Decline gear-up for regions too small for the heavy optimizer to help. The
-  // caller re-lite-translates without self-profiling, so the region settles on
-  // the lite tier permanently instead of re-attempting gear-up every threshold.
+  // Decline gear-up for fully-translated regions too small for the heavy
+  // optimizer to help. The size threshold (not the back-edge signal) governs the
+  // full-success path on purpose: a small loop the heavy tier translates in full
+  // is not automatically a win — e.g. a tight data-dependent CSEL loop is *slower*
+  // heavy than lite, so keep it lite. The back-edge signal only rescues a region
+  // that BAILED (above): there the alternative is re-liting and losing an
+  // already-captured in-region loop. The caller re-lite-translates a declined
+  // gear-up without self-profiling, so the region settles on the lite tier
+  // permanently instead of re-attempting gear-up every threshold.
   if (number_of_instructions < GetGearUpMinInsns()) {
     return {false, {}, 0, {}};
   }
@@ -297,7 +311,7 @@ void TranslateRegion(GuestAddr pc) {
                     (unsigned long)g_translation_stats.total_translations,
                     (unsigned long)pc,
                     (unsigned long)(success ? size / 4 : 0),
-                    success ? "JIT" : "INTERP",
+                    kind == kHeavyOptimized ? "HEAVY" : (success ? "JIT" : "INTERP"),
                     (unsigned long)g_translation_stats.jit_successes,
                     (unsigned long)g_translation_stats.jit_failures,
                     g_translation_stats.jit_successes > 0
