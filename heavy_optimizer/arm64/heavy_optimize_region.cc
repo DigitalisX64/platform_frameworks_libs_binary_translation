@@ -44,7 +44,8 @@ namespace berberis {
 // back to the lite translator / interpreter.
 std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(GuestAddr pc,
                                                         MachineCode* machine_code,
-                                                        const HeavyOptimizeParams& params) {
+                                                        const HeavyOptimizeParams& params,
+                                                        bool* out_has_in_region_backedge) {
   Arena arena;
   x86_64::MachineIR machine_ir(&arena);
   HeavyOptimizerFrontend frontend(&machine_ir, pc);
@@ -70,6 +71,10 @@ std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(GuestAddr pc,
   if (IsConfigFlagSet(kVerboseTranslation) || IsConfigFlagSet(kPrintTranslatedAddrs)) {
     // Trace only after all the potential failure points.
     TRACE("Heavy optimizing 0x%lx (%lu bytes)", pc, stop_pc - pc);
+  }
+
+  if (out_has_in_region_backedge) {
+    *out_has_in_region_backedge = frontend.has_in_region_backedge();
   }
 
   x86_64::GenCode(&machine_ir, machine_code);

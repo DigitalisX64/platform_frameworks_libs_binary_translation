@@ -603,6 +603,9 @@ void HeavyOptimizerFrontend::ReplaceJumpWithBranch(MachineBasicBlock* bb,
     ir->AddEdge(bb, target_bb);
   } else {
     CHECK(jump->kind() == PseudoJump::Kind::kJumpWithPendingSignalsCheck);
+    // This is a backward branch resolved into an in-region target, i.e. an
+    // in-region loop back-edge. Record that the region captured a hot loop.
+    has_in_region_backedge_ = true;
     // See EmitCheckSignalsAndMaybeReturn.
     auto* exit_bb = ir->NewBasicBlock();
     // Note that we intentionally don't mark exit_bb as recovery and therefore

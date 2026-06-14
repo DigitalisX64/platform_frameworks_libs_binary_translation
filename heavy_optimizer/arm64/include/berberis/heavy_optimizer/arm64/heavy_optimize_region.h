@@ -40,10 +40,15 @@ struct HeavyOptimizeParams {
 // The frontend (heavy_optimizer/arm64/frontend.{h,cc}) drives the ARM64 decoder
 // through the SemanticsPlayer into x86_64 MachineIR. Instructions it does not yet
 // translate make it bail, so a geared-up region falls back to the lite tier.
+// `out_has_in_region_backedge`, if non-null, is set to whether the region
+// captured an in-region loop back-edge (a hot loop translated without
+// per-iteration region-exit dispatch). The runtime uses it to decide whether a
+// small or partially-translated (bailed) region is still worth installing heavy.
 std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(
     GuestAddr pc,
     MachineCode* machine_code,
-    const HeavyOptimizeParams& params = HeavyOptimizeParams());
+    const HeavyOptimizeParams& params = HeavyOptimizeParams(),
+    bool* out_has_in_region_backedge = nullptr);
 
 }  // namespace berberis
 
