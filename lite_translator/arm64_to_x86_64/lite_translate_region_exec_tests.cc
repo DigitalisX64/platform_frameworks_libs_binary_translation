@@ -310,6 +310,70 @@ constexpr uint32_t LdrSUoff(uint8_t rt, uint8_t rn, uint16_t imm12) {
          (static_cast<uint32_t>(rn) << 5) | rt;
 }
 
+// libmaplibre's actual utf8_to_utf16 decode engine — the body called by
+// __codecvt_utf8_utf16<char16_t>::do_in. Captured verbatim from
+//   sample/.../merged_native_libs/.../arm64-v8a/libmaplibre.so
+// at vaddr 0x907070..0x907304 (165 instructions). Fully position-independent:
+// register-indexed loads only, no ADRP/literal/BL; every path ends in RET.
+// Entered with x0=frm, x1=frm_end, x2=&frm_nxt, x3=to, x4=to_end, x5=&to_nxt,
+// x6=maxcode, x7=mode; returns w0 = 0(ok)/1(partial)/2(error).
+// hello-maplibre throws "wstring_convert: from_bytes error" only under
+// lite/two-gear (interpret-only is fine), localizing a lite-codegen issue to
+// this conversion path.
+inline constexpr uint32_t kMaplibreUtf8ToUtf16Engine[] = {
+    0xd503245fU, 0xf9000040U, 0xf90000a3U, 0xf940004cU, 0x361001e7U,
+    0xcb0c0028U, 0xf1000d1fU, 0x5400018bU, 0x39400188U, 0x7103bd1fU,
+    0x54000121U, 0x39400588U, 0x7102ed1fU, 0x540000c1U, 0x39400988U,
+    0x7102fd1fU, 0x54000061U, 0x91000d8cU, 0xf900004cU, 0xeb01019fU,
+    0x54001102U, 0xf94000adU, 0x5287f808U, 0x529b0009U, 0x529b800aU,
+    0x1400000aU, 0x7900016dU, 0x9100058cU, 0xf900004cU, 0xf94000acU,
+    0x9100098dU, 0xf90000adU, 0xf940004cU, 0xeb01019fU, 0x54000fc2U,
+    0xaa0d03ebU, 0xeb0401bfU, 0x54000f62U, 0x3940018dU, 0xeb0601bfU,
+    0x54000ec8U, 0x363ffe2dU, 0x710309bfU, 0x54000e63U, 0x71037dbfU,
+    0x540001e8U, 0xcb0c002eU, 0xf10009dfU, 0x54000e6bU, 0x3940058eU,
+    0x121a05cfU, 0x710201ffU, 0x54000d41U, 0x120015ceU, 0x331a11aeU,
+    0xeb0601dfU, 0x54000cc8U, 0x7900016eU, 0x9100098cU, 0x17ffffe1U,
+    0x7103bdbfU, 0x540001a8U, 0xcb0c002fU, 0xf10009ffU, 0x54000c6bU,
+    0x3940058eU, 0x7103b5bfU, 0x540002a0U, 0x710381bfU, 0x540002e1U,
+    0x121b09d0U, 0x7102821fU, 0x540002e0U, 0x14000055U, 0x7103d1bfU,
+    0x54000a68U, 0xcb0c0030U, 0xf1000a1fU, 0x54000aabU, 0x3940058eU,
+    0x7103d1bfU, 0x540003a0U, 0x7103c1bfU, 0x540003e1U, 0x510241cfU,
+    0x7100c1ffU, 0x540003e3U, 0x14000047U, 0x121b09d0U, 0x7102021fU,
+    0x540000a0U, 0x14000043U, 0x121a05d0U, 0x7102021fU, 0x54000801U,
+    0xf10009ffU, 0x54000860U, 0x3940098fU, 0x121a05f0U, 0x7102021fU,
+    0x54000741U, 0x53144dadU, 0x331a15cdU, 0x330015edU, 0x12003daeU,
+    0xeb0601dfU, 0x54000688U, 0x7900016dU, 0x91000d8cU, 0x17ffffafU,
+    0x121c0dcfU, 0x710201ffU, 0x540000a0U, 0x1400002dU, 0x121a05cfU,
+    0x710201ffU, 0x54000541U, 0xf1000a1fU, 0x540005a0U, 0x3940098fU,
+    0x121a05f1U, 0x7102023fU, 0x54000481U, 0xf1000e1fU, 0x540004e0U,
+    0x39400d8cU, 0x121a0590U, 0x7102021fU, 0x540003c1U, 0xcb0b0090U,
+    0xf100121fU, 0x5400040bU, 0x2a0d03f0U, 0xd36e0a10U, 0xb37415d0U,
+    0xb37a15f0U, 0xb3401590U, 0xeb06021fU, 0x54000288U, 0x531e09adU,
+    0x9240158cU, 0x331a0decU, 0x330415cdU, 0x531e0dceU, 0x2a0a018cU,
+    0x2a0d19cdU, 0xaa0b03eeU, 0x78002dccU, 0x330415edU, 0xf90000aeU,
+    0x0b0801acU, 0xf940004dU, 0x2a09018cU, 0x7900016cU, 0x910011acU,
+    0x17ffff81U, 0x2a1f03e0U, 0xd65f03c0U, 0x52800040U, 0xd65f03c0U,
+    0xeb04017fU, 0x1a9f37e0U, 0xd65f03c0U, 0x52800020U, 0xd65f03c0U,
+};
+
+// __codecvt_utf8_utf16<char16_t>::do_in wrapper, vaddr 0x909718..0x909788
+// (28 instructions). It loads this->_Maxcode_ (off 0x10) / this->_Mode_
+// (off 0x18), shuffles do_in's args into the engine ABI, and BL's the engine
+// with callee-saved x19/x20 (the frm_nxt/to_nxt out-pointers) live across the
+// call. Two edits make it self-contained for the host replay:
+//   - idx0 PACIASP / idx26 AUTIASP -> NOP (PAC value is 0, so they are no-ops;
+//     on device the JIT bails on them and the interpreter runs them as no-ops).
+//   - idx19 BL is retargeted to the engine when the two blocks are laid out
+//     contiguously (engine first, wrapper second) at run time.
+inline constexpr uint32_t kMaplibreDoInWrapper[] = {
+    0xd503201fU, 0xd100c3ffU, 0xa9017bfdU, 0xa9024ff4U, 0x910043fdU,
+    0xaa0703f3U, 0xaa0603eaU, 0xaa0503e8U, 0xaa0203e9U, 0xf9400806U,
+    0xb9401807U, 0xaa0403f4U, 0xaa0303e1U, 0xa9000be5U, 0x910023e2U,
+    0x910003e5U, 0xaa0903e0U, 0xaa0803e3U, 0xaa0a03e4U, 0x00000000U,
+    0xa94023e9U, 0xf9000288U, 0xf9000269U, 0xa9424ff4U, 0xa9417bfdU,
+    0x9100c3ffU, 0xd503201fU, 0xd65f03c0U,
+};
+
 class Arm64LiteTranslateRegionTest : public ::testing::Test {
  public:
   template <typename T>
@@ -44182,6 +44246,241 @@ TEST_F(Arm64LiteTranslateRegionTest, FcselDestAliasesSourceNotCorrupted) {
   insn = fcsel_s(0, 0, 1, kEq);  // fcsel s0, s0, s1, eq
   Interpret(insn);
   EXPECT_EQ(get_s(0), 6.25f);
+}
+
+// Differential replay of libmaplibre's actual utf8_to_utf16 decode engine
+// (the body called by __codecvt_utf8_utf16<char16_t>::do_in). Runs the real
+// machine bytes region-by-region under the lite translator and
+// instruction-by-instruction under the interpreter, then compares the result
+// code (0=ok,1=partial,2=error) and the produced UTF-16 output. hello-maplibre
+// throws "wstring_convert: from_bytes error" only under lite/two-gear (interp
+// is fine), localizing a lite-codegen bug to this region.
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreUtf8ToUtf16EngineDifferential) {
+  const uint32_t* kEngine = kMaplibreUtf8ToUtf16Engine;
+  const size_t kN =
+      sizeof(kMaplibreUtf8ToUtf16Engine) / sizeof(kMaplibreUtf8ToUtf16Engine[0]);
+  const GuestAddr engine_start = ToGuestAddr(&kEngine[0]);
+  const GuestAddr engine_end = engine_start + kN * sizeof(uint32_t);
+  const GuestAddr kRetSentinel = 0x1000;  // x30; never executed/translated.
+
+  struct EngineRun {
+    uint32_t ret;
+    std::vector<uint16_t> out;
+    uint64_t consumed;
+  };
+
+  auto run_engine = [&](bool use_lite,
+                        const std::vector<uint8_t>& input) -> EngineRun {
+    std::vector<uint8_t> in = input;
+    std::vector<uint16_t> out(input.size() * 2 + 16, 0xCCCC);
+    uint64_t frm_nxt = 0, to_nxt = 0;
+
+    memset(&state_.cpu, 0, sizeof(state_.cpu));
+    state_.cpu.x[0] = ToGuestAddr(in.data());                 // frm
+    state_.cpu.x[1] = ToGuestAddr(in.data() + in.size());     // frm_end
+    state_.cpu.x[2] = ToGuestAddr(&frm_nxt);                  // &frm_nxt
+    state_.cpu.x[3] = ToGuestAddr(out.data());                // to
+    state_.cpu.x[4] = ToGuestAddr(out.data() + out.size());   // to_end
+    state_.cpu.x[5] = ToGuestAddr(&to_nxt);                   // &to_nxt
+    state_.cpu.x[6] = 0x10FFFF;                               // maxcode
+    state_.cpu.x[7] = 0;                                      // mode
+    state_.cpu.x[30] = kRetSentinel;
+    state_.cpu.insn_addr = engine_start;
+
+    int guard = 0;
+    while (state_.cpu.insn_addr != kRetSentinel && ++guard < 200000) {
+      if (use_lite) {
+        GuestAddr pc = state_.cpu.insn_addr;
+        MachineCode machine_code;
+        auto [success, stop_pc] = TryLiteTranslateRegion(
+            pc, &machine_code,
+            LiteTranslateParams{.end_pc = engine_end, .allow_dispatch = false});
+        if (!success) {
+          ADD_FAILURE() << "lite bailed translating region at offset "
+                        << (pc - engine_start);
+          break;
+        }
+        HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+        TestingRunGeneratedCode(&state_, AsHostCode(host_code), kRetSentinel);
+      } else {
+        InterpretInsn(&state_);
+      }
+    }
+    EXPECT_LT(guard, 200000) << (use_lite ? "lite" : "interp") << " runaway";
+
+    EngineRun r;
+    r.ret = static_cast<uint32_t>(state_.cpu.x[0]);
+    uint64_t produced = (to_nxt - ToGuestAddr(out.data())) / 2;
+    if (produced > out.size()) produced = out.size();
+    r.out.assign(out.begin(), out.begin() + produced);
+    r.consumed = frm_nxt - ToGuestAddr(in.data());
+    return r;
+  };
+
+  auto bytes = [](const char* s) {
+    return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(s),
+                                reinterpret_cast<const uint8_t*>(s) + strlen(s));
+  };
+
+  const std::vector<std::pair<const char*, std::vector<uint8_t>>> inputs = {
+      {"maplibre baseUrl", bytes("https://demotiles.maplibre.org")},
+      {"empty", {}},
+      {"single ascii", bytes("A")},
+      {"ascii run", bytes("0123456789abcdefghijklmnopqrstuvwxyz")},
+      {"2-byte (c2 a9)", {0xC2, 0xA9}},
+      {"3-byte euro (e2 82 ac)", {0xE2, 0x82, 0xAC}},
+      {"4-byte emoji (f0 9f 98 80)", {0xF0, 0x9F, 0x98, 0x80}},
+      {"mixed", {'a', 0xC2, 0xA9, 'z', 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 'b'}},
+      {"bom-prefixed", {0xEF, 0xBB, 0xBF, 'h', 'i'}},
+  };
+
+  for (const auto& [name, input] : inputs) {
+    SCOPED_TRACE(name);
+    EngineRun interp = run_engine(/*use_lite=*/false, input);
+    EngineRun lite = run_engine(/*use_lite=*/true, input);
+    EXPECT_EQ(interp.ret, lite.ret) << "result-code divergence";
+    EXPECT_EQ(interp.consumed, lite.consumed) << "bytes-consumed divergence";
+    EXPECT_EQ(interp.out, lite.out) << "UTF-16 output divergence";
+  }
+}
+
+// Differential replay of the FULL __codecvt_utf8_utf16<char16_t>::do_in path:
+// the do_in wrapper (which loads this->_Maxcode_/_Mode_ and shuffles args)
+// plus its BL into the utf8_to_utf16 engine, with the callee-saved x19/x20
+// out-pointers live across the call boundary. The engine-only test above
+// exonerated the engine's per-region codegen; this test covers the wrapper's
+// arg setup and the lite spill/restore of x19/x20 across the BL region split.
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreDoInWrapperDifferential) {
+  // Lay engine and wrapper out contiguously (engine first) so the wrapper's
+  // BL can reach the engine; patch the BL's PC-relative offset for this layout.
+  const size_t kEngineWords =
+      sizeof(kMaplibreUtf8ToUtf16Engine) / sizeof(kMaplibreUtf8ToUtf16Engine[0]);
+  const size_t kWrapperWords =
+      sizeof(kMaplibreDoInWrapper) / sizeof(kMaplibreDoInWrapper[0]);
+  std::vector<uint32_t> code;
+  code.insert(code.end(), kMaplibreUtf8ToUtf16Engine,
+              kMaplibreUtf8ToUtf16Engine + kEngineWords);
+  code.insert(code.end(), kMaplibreDoInWrapper,
+              kMaplibreDoInWrapper + kWrapperWords);
+  const size_t kBlIdx = kEngineWords + 19;  // wrapper's BL slot (placeholder 0).
+  const int32_t bl_off_words = 0 - static_cast<int32_t>(kBlIdx);  // -> engine[0]
+  code[kBlIdx] = 0x94000000U | (static_cast<uint32_t>(bl_off_words) & 0x03FFFFFFU);
+
+  const GuestAddr base = ToGuestAddr(code.data());
+  const GuestAddr code_end = base + code.size() * sizeof(uint32_t);
+  const GuestAddr doin_entry = base + kEngineWords * sizeof(uint32_t);
+  const GuestAddr kRetSentinel = 0x1000;
+
+  struct EngineRun {
+    uint32_t ret;
+    std::vector<uint16_t> out;
+    uint64_t consumed;
+  };
+
+  auto run_doin = [&](bool use_lite,
+                      const std::vector<uint8_t>& input) -> EngineRun {
+    std::vector<uint8_t> in = input;
+    std::vector<uint16_t> out(input.size() * 2 + 16, 0xCCCC);
+    uint64_t frm_nxt = 0, to_nxt = 0;
+    // Facet object: do_in reads only _Maxcode_ @+0x10 and _Mode_ @+0x18.
+    uint64_t facet[8] = {};
+    facet[2] = 0x10FFFF;  // +0x10: _Maxcode_
+    facet[3] = 0;         // +0x18: _Mode_ (low 32 bits)
+    uint64_t dummy_state = 0;
+    std::vector<uint64_t> stack(256, 0);  // wrapper sp; needs both directions.
+
+    memset(&state_.cpu, 0, sizeof(state_.cpu));
+    state_.cpu.x[0] = ToGuestAddr(&facet[0]);                 // this
+    state_.cpu.x[1] = ToGuestAddr(&dummy_state);              // state (unused)
+    state_.cpu.x[2] = ToGuestAddr(in.data());                 // frm
+    state_.cpu.x[3] = ToGuestAddr(in.data() + in.size());     // frm_end
+    state_.cpu.x[4] = ToGuestAddr(&frm_nxt);                  // &frm_nxt (out)
+    state_.cpu.x[5] = ToGuestAddr(out.data());                // to
+    state_.cpu.x[6] = ToGuestAddr(out.data() + out.size());   // to_end
+    state_.cpu.x[7] = ToGuestAddr(&to_nxt);                   // &to_nxt (out)
+    state_.cpu.sp = ToGuestAddr(&stack[128]);                 // sp
+    state_.cpu.x[30] = kRetSentinel;
+    state_.cpu.insn_addr = doin_entry;
+
+    int guard = 0;
+    while (state_.cpu.insn_addr != kRetSentinel && ++guard < 200000) {
+      if (use_lite) {
+        GuestAddr pc = state_.cpu.insn_addr;
+        MachineCode machine_code;
+        auto [success, stop_pc] = TryLiteTranslateRegion(
+            pc, &machine_code,
+            LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+        if (!success) {
+          // Mirror lite-translate-or-interpret: run the non-JITable insn under
+          // the interpreter, then resume lite at the next pc.
+          InterpretInsn(&state_);
+          continue;
+        }
+        HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+        TestingRunGeneratedCode(&state_, AsHostCode(host_code), kRetSentinel);
+      } else {
+        InterpretInsn(&state_);
+      }
+    }
+    EXPECT_LT(guard, 200000) << (use_lite ? "lite" : "interp") << " runaway";
+
+    EngineRun r;
+    r.ret = static_cast<uint32_t>(state_.cpu.x[0]);
+    uint64_t produced = (to_nxt - ToGuestAddr(out.data())) / 2;
+    if (produced > out.size()) produced = out.size();
+    r.out.assign(out.begin(), out.begin() + produced);
+    r.consumed = frm_nxt - ToGuestAddr(in.data());
+    return r;
+  };
+
+  auto bytes = [](const char* s) {
+    return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(s),
+                                reinterpret_cast<const uint8_t*>(s) + strlen(s));
+  };
+
+  const std::vector<std::pair<const char*, std::vector<uint8_t>>> inputs = {
+      {"maplibre baseUrl", bytes("https://demotiles.maplibre.org")},
+      {"empty", {}},
+      {"single ascii", bytes("A")},
+      {"ascii run", bytes("0123456789abcdefghijklmnopqrstuvwxyz")},
+      {"2-byte (c2 a9)", {0xC2, 0xA9}},
+      {"3-byte euro (e2 82 ac)", {0xE2, 0x82, 0xAC}},
+      {"4-byte emoji (f0 9f 98 80)", {0xF0, 0x9F, 0x98, 0x80}},
+      {"mixed", {'a', 0xC2, 0xA9, 'z', 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 'b'}},
+      {"bom-prefixed", {0xEF, 0xBB, 0xBF, 'h', 'i'}},
+  };
+
+  for (const auto& [name, input] : inputs) {
+    SCOPED_TRACE(name);
+    EngineRun interp = run_doin(/*use_lite=*/false, input);
+    EngineRun lite = run_doin(/*use_lite=*/true, input);
+    EXPECT_EQ(interp.ret, lite.ret) << "result-code divergence";
+    EXPECT_EQ(interp.consumed, lite.consumed) << "bytes-consumed divergence";
+    EXPECT_EQ(interp.out, lite.out) << "UTF-16 output divergence";
+  }
+}
+
+// The codecvt setup materializes _Maxcode_=0x10FFFF with `mov w6, #0x10ffff`
+// (MOVN w6,#0xffef,lsl#16); do_in compares each codepoint against it. A 32-bit
+// MOVN must zero-extend to 64-bit (the field is loaded back with a 64-bit LDR).
+// If lite leaves garbage in the upper 32 bits or miscomputes the low 32, the
+// maxcode comparison breaks. Verify lite == interpreter == 0x10FFFF.
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreMaxcodeMovnW) {
+  static const uint32_t code[] = {0x12bffde6U};  // mov w6, #0x10ffff
+
+  memset(&state_.cpu, 0, sizeof(state_.cpu));
+  state_.cpu.x[6] = 0xDEADBEEFDEADBEEFULL;
+  ASSERT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t lite_x6 = state_.cpu.x[6];
+
+  memset(&state_.cpu, 0, sizeof(state_.cpu));
+  state_.cpu.x[6] = 0xDEADBEEFDEADBEEFULL;
+  Interpret(code[0]);
+  uint64_t interp_x6 = state_.cpu.x[6];
+
+  EXPECT_EQ(lite_x6, 0x10FFFFULL) << "lite mov w6,#0x10ffff";
+  EXPECT_EQ(interp_x6, 0x10FFFFULL) << "interp mov w6,#0x10ffff";
+  EXPECT_EQ(lite_x6, interp_x6);
 }
 
 }  // namespace
