@@ -956,6 +956,83 @@ TEST_F(Arm64LiteTranslateRegionTest, CselAllConditions) {
   check(A, kCondLE, true);  check(B, kCondLE, false);
 }
 
+// Region replayed verbatim from libmaplibre's
+// mbgl::android::FileSource::getAPIBaseUrl: a back-to-back CMP/CSEL pair with a
+// non-flag-setting ADD and SUB sandwiched between each CMP and its CSEL. ARM
+// ADD/SUB without the S suffix do NOT touch NZCV, so each CSEL must read the
+// flags from its preceding CMP. Inputs: x0 = variant type index (2 here, the
+// "is a string" case), x8 = a pointer the value payload is derived from.
+//   cmp  w0, #2          ; Z = (x0 == 2)
+//   add  x1, x8, #8      ; x1 = payload ptr  (no flags)
+//   sub  w8, w0, #3      ; w8 = x0 - 3       (no flags)
+//   csel x9, x1, xzr, eq ; x9  = (x0==2) ? x1 : 0
+//   cmp  w8, #2          ; C = (w8 >=u 2)
+//   csel x22, xzr, x9, lo; x22 = (w8 <u 2) ? 0 : x9
+// With x0=2, x8=0x1000: x1=0x1008, x9=0x1008, w8=0xFFFFFFFF (>=u 2 so lo false),
+// x22=x9=0x1008. A miscompile here hands getAPIBaseUrl a bogus std::string
+// pointer and the from_bytes conversion throws.
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreGetApiBaseUrlCselChain) {
+  static const uint32_t code[] = {
+      0x7100081f,  // cmp  w0, #0x2
+      0x91002101,  // add  x1, x8, #0x8
+      0x51000c08,  // sub  w8, w0, #0x3
+      0x9a9f0029,  // csel x9, x1, xzr, eq
+      0x7100091f,  // cmp  w8, #0x2
+      0x9a8933f6,  // csel x22, xzr, x9, lo
+  };
+  state_.cpu.x[0] = 2;
+  state_.cpu.x[8] = 0x1000;
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[1], 0x1008ULL);
+  EXPECT_EQ(state_.cpu.x[9], 0x1008ULL);
+  EXPECT_EQ(state_.cpu.x[22], 0x1008ULL);
+}
+
+// Region replayed verbatim from libmaplibre's getAPIBaseUrl: the libc++ SSO
+// (small-string) destructor guard for the temporary key string at [sp]:
+//   ldrb w8, [sp]            ; w8 = first byte of the std::string control word
+//   tbz  w8, #0, skip        ; bit0 == 0 means a SHORT string (no heap buffer)
+//   ldr  x0, [sp, #0x10]     ; only reached for a LONG string: load heap ptr
+//   bl   operator delete     ; ... and free it
+// libc++ stores (size << 1) in the first byte of a short string, so bit0 is
+// the "is-long/heap" flag. For the key built here the byte is 0x18 (= 12 << 1,
+// bit0 == 0, SHORT), so the tbz MUST be taken and the operator-delete skipped.
+// If lite mis-evaluates the test-bit branch and falls through, it frees a
+// non-heap SSO pointer, corrupting the heap and making the later baseURL
+// from_bytes conversion read garbage. The load base is SP (Rn==31), so this
+// also exercises GetRegOrSp on the load path.
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreSsoDtorTbzShortString) {
+  alignas(16) static uint8_t stack_buf[64] = {};
+  stack_buf[0] = 0x18;  // libc++ short-string marker: size 12, bit0 == 0
+  static const uint32_t code[] = {
+      0x394003e8,  // ldrb w8, [sp]
+      0x36000048,  // tbz  w8, #0, +8  (skip the delete for a short string)
+      kNop,
+      kNop,
+  };
+  state_.cpu.sp = ToGuestAddr(stack_buf);
+  GuestAddr taken_target = ToGuestAddr(code) + 4 + 8;  // tbz pc + 8
+  EXPECT_TRUE(Run(code, taken_target));
+  EXPECT_EQ(state_.cpu.x[8], 0x18ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreSsoDtorTbzLongString) {
+  // Mirror of the above with a LONG-string marker (bit0 == 1): the tbz must NOT
+  // be taken and execution must fall through past it.
+  alignas(16) static uint8_t stack_buf[64] = {};
+  stack_buf[0] = 0x19;  // bit0 == 1 -> long/heap string
+  static const uint32_t code[] = {
+      0x394003e8,  // ldrb w8, [sp]
+      0x36000048,  // tbz  w8, #0, +8
+      kNop,
+      kNop,
+  };
+  state_.cpu.sp = ToGuestAddr(stack_buf);
+  GuestAddr fall_through = ToGuestAddr(code) + sizeof(code);
+  EXPECT_TRUE(Run(code, fall_through));
+  EXPECT_EQ(state_.cpu.x[8], 0x19ULL);
+}
+
 // STLR Wt, [Xn]: size=10, o2=1, L=0, o1=0, Rs=11111, o0=1, Rt2=11111
 // Encoding: 10 001000 1 0 0 11111 1 11111 Rn Rt
 constexpr uint32_t StlrW(uint8_t rt, uint8_t rn) {
