@@ -1033,6 +1033,90 @@ TEST_F(Arm64LiteTranslateRegionTest, MaplibreSsoDtorTbzLongString) {
   EXPECT_EQ(state_.cpu.x[8], 0x19ULL);
 }
 
+// Full guest-state JIT-vs-interpreter differential for libmaplibre's getAPIBaseUrl
+// SSO destructor-guard region, replayed VERBATIM (including the real ldr/bl that
+// the simplified Tbz tests above replaced with nops). On-device bisection showed
+// that JIT-compiling exactly this 4-insn region (with everything else, including
+// the downstream from_bytes, INTERPRETED) deterministically reproduces the
+// "wstring_convert: from_bytes error" crash. Since the downstream code runs in
+// the interpreter in that config, whatever this region corrupts must be
+// guest-visible state (a ThreadState register or guest memory). This test runs
+// the region through the lite JIT and the interpreter from an identical initial
+// state (using the real register values captured on-device) and diffs EVERY
+// field plus the stack, to surface the divergence the single-register tests miss.
+TEST_F(Arm64LiteTranslateRegionTest, MaplibreSsoDtorRegionFullStateDiff) {
+  static const uint32_t code[] = {
+      0x394003e8,  // ldrb w8, [sp]
+      0x36000068,  // tbz  w8, #0, +0xc   (short string -> skip ldr+bl)
+      0xf9400be0,  // ldr  x0, [sp, #0x10]
+      0x94184ba2,  // bl   <operator delete>  (not executed for short string)
+  };
+  // Real GP register values captured on-device at this region (FAIL run); pointer
+  // values are opaque here (the region only dereferences sp), so they exercise the
+  // codegen with realistic, value-dependent operands.
+  static const uint64_t kInit[31] = {
+      0x7eb8e083cfc0, 0x7eb7918eee00, 0x000000000000001f, 0x7eb99081f960,
+      0x7eb8e083cc4f, 0x7eb8e083cfdf, 0x000000000010ffff, 0x0000000000000000,
+      0x0000000000000018, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+      0x0000000000000005, 0x7eb790bffe92, 0x0000000000000000, 0x0000000000000000,
+      0x7eb6fd013cc0, 0x7eb7918eadd8, 0x7eb78f400000, 0x7eb91083d310,
+      0x7eb790bfff68, 0x7ebaebb4b040, 0x7eb790bfff10, 0x0000000000000000,
+      0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+      0x0000000000000000, 0x7eb790bfff30, 0x7eb6fc9aec9c,
+  };
+  constexpr size_t kStkSize = 512;
+  alignas(16) static uint8_t stk[kStkSize];
+
+  auto setup = [&]() {
+    memset(&state_.cpu, 0, sizeof(CPUState));
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = kInit[i];
+    memset(stk, 0xCD, sizeof(stk));
+    uint64_t sp = ToGuestAddr(stk) + 256;
+    *reinterpret_cast<uint8_t*>(sp) = 0x18;          // short-string marker
+    *reinterpret_cast<uint64_t*>(sp + 0x10) = 0xCAFEF00DDEADBEEFULL;
+    state_.cpu.sp = sp;
+  };
+
+  GuestAddr expected = ToGuestAddr(code) + sizeof(code);  // tbz target == region end
+
+  // --- JIT run ---
+  setup();
+  ASSERT_TRUE(Run(code, expected));
+  CPUState jit;
+  memcpy(&jit, &state_.cpu, sizeof(CPUState));
+  static uint8_t jit_stk[kStkSize];
+  memcpy(jit_stk, stk, kStkSize);
+
+  // --- Interpreter run (same initial state) ---
+  setup();
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  InterpretInsn(&state_);  // ldrb w8,[sp]  -> insn_addr = code+4
+  InterpretInsn(&state_);  // tbz (taken)   -> insn_addr = code+16
+  CPUState itp;
+  memcpy(&itp, &state_.cpu, sizeof(CPUState));
+  static uint8_t itp_stk[kStkSize];
+  memcpy(itp_stk, stk, kStkSize);
+
+  // --- Diff every guest-visible field ---
+  EXPECT_EQ(jit.insn_addr, itp.insn_addr) << "insn_addr diverged";
+  for (int i = 0; i < 31; i++) {
+    EXPECT_EQ(jit.x[i], itp.x[i])
+        << "x" << i << " diverged: JIT=0x" << std::hex << jit.x[i]
+        << " INTERP=0x" << itp.x[i];
+  }
+  EXPECT_EQ(jit.sp, itp.sp) << "sp diverged";
+  EXPECT_EQ(jit.flags, itp.flags) << "flags diverged";
+  EXPECT_EQ(jit.cached_fpcr, itp.cached_fpcr) << "cached_fpcr diverged";
+  EXPECT_EQ(jit.emulated_fpsr, itp.emulated_fpsr) << "emulated_fpsr diverged";
+  EXPECT_EQ(jit.reservation_address, itp.reservation_address)
+      << "reservation_address diverged";
+  for (int i = 0; i < 32; i++) {
+    EXPECT_EQ(memcmp(&jit.v[i], &itp.v[i], sizeof(jit.v[i])), 0)
+        << "v" << i << " diverged";
+  }
+  EXPECT_EQ(memcmp(jit_stk, itp_stk, kStkSize), 0) << "stack memory diverged";
+}
+
 // STLR Wt, [Xn]: size=10, o2=1, L=0, o1=0, Rs=11111, o0=1, Rt2=11111
 // Encoding: 10 001000 1 0 0 11111 1 11111 Rn Rt
 constexpr uint32_t StlrW(uint8_t rt, uint8_t rn) {
@@ -31653,6 +31737,99 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
  protected:
   ThreadState state_{};
 };
+
+// Full guest-state JIT-vs-interpreter differential for libmaplibre's getAPIBaseUrl
+// SSO destructor-guard region, run via the REAL dispatch path (allow_dispatch=true,
+// EmitDirectDispatch chaining through the TranslationCache) — the configuration
+// the device uses. On-device whole-library bisection (interpret one library /
+// offset window at a time, JIT the rest) cleanly localized the "from_bytes error"
+// crash to JIT of exactly this region. The allow_dispatch=false Run() differential
+// showed identical state, so this exercises the one untested variable: dispatch.
+TEST_F(Arm64LiteTranslateRegionDispatchTest, MaplibreSsoDtorRegionDispatchFullStateDiff) {
+  static const uint32_t code[] = {
+      0x394003e8,  // ldrb w8, [sp]
+      0x36000068,  // tbz  w8, #0, +0xc   (short string -> skip ldr+bl)
+      0xf9400be0,  // ldr  x0, [sp, #0x10]
+      0x94184ba2,  // bl   <operator delete>
+  };
+  static const uint64_t kInit[31] = {
+      0x7eb8e083cfc0, 0x7eb7918eee00, 0x000000000000001f, 0x7eb99081f960,
+      0x7eb8e083cc4f, 0x7eb8e083cfdf, 0x000000000010ffff, 0x0000000000000000,
+      0x0000000000000018, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+      0x0000000000000005, 0x7eb790bffe92, 0x0000000000000000, 0x0000000000000000,
+      0x7eb6fd013cc0, 0x7eb7918eadd8, 0x7eb78f400000, 0x7eb91083d310,
+      0x7eb790bfff68, 0x7ebaebb4b040, 0x7eb790bfff10, 0x0000000000000000,
+      0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+      0x0000000000000000, 0x7eb790bfff30, 0x7eb6fc9aec9c,
+  };
+  constexpr size_t kStkSize = 512;
+  alignas(16) static uint8_t stk[kStkSize];
+  auto setup = [&]() {
+    memset(&state_.cpu, 0, sizeof(CPUState));
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = kInit[i];
+    memset(stk, 0xCD, sizeof(stk));
+    uint64_t sp = ToGuestAddr(stk) + 256;
+    *reinterpret_cast<uint8_t*>(sp) = 0x18;
+    *reinterpret_cast<uint64_t*>(sp + 0x10) = 0xCAFEF00DDEADBEEFULL;
+    state_.cpu.sp = sp;
+  };
+
+  GuestAddr code_start = ToGuestAddr(code);
+  GuestAddr code_end = code_start + sizeof(code);  // == tbz target (586cac)
+
+  // --- JIT run via the real dispatch path ---
+  setup();
+  state_.cpu.insn_addr = code_start;
+  MachineCode machine_code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(
+      code_start, &machine_code, LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
+  ASSERT_TRUE(success);
+  auto* cache = TranslationCache::GetInstance();
+  GuestCodeEntry* entry = cache->AddAndLockForTranslation(code_start, 0);
+  ASSERT_NE(entry, nullptr);
+  HostCodeAddr host_code = GetDefaultCodePoolInstance()->Add(&machine_code);
+  cache->SetTranslatedAndUnlock(code_start, entry, static_cast<uint32_t>(stop_pc - code_start),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {host_code, machine_code.install_size()});
+  // Install the tbz target (code_end) as a stop stub so EmitDirectDispatch's
+  // chaining lookup resolves and cleanly returns to the harness.
+  GuestCodeEntry* tentry = cache->AddAndLockForTranslation(code_end, 0);
+  ASSERT_NE(tentry, nullptr);
+  cache->SetTranslatedAndUnlock(code_end, tentry, 4, GuestCodeEntry::Kind::kSpecialHandler,
+                                {kEntryExitGeneratedCode, 0});
+
+  TestingRunGeneratedCode(&state_, AsHostCode(host_code), code_end);
+  CPUState jit;
+  memcpy(&jit, &state_.cpu, sizeof(CPUState));
+  static uint8_t jit_stk[kStkSize];
+  memcpy(jit_stk, stk, kStkSize);
+  cache->InvalidateGuestRange(code_start, code_end + 4);
+
+  // --- Interpreter run ---
+  setup();
+  state_.cpu.insn_addr = code_start;
+  InterpretInsn(&state_);  // ldrb
+  InterpretInsn(&state_);  // tbz (taken) -> code_end
+  CPUState itp;
+  memcpy(&itp, &state_.cpu, sizeof(CPUState));
+  static uint8_t itp_stk[kStkSize];
+  memcpy(itp_stk, stk, kStkSize);
+
+  // --- Diff ---
+  EXPECT_EQ(jit.insn_addr, itp.insn_addr) << "insn_addr diverged";
+  for (int i = 0; i < 31; i++) {
+    EXPECT_EQ(jit.x[i], itp.x[i]) << "x" << i << " diverged: JIT=0x" << std::hex << jit.x[i]
+                                  << " INTERP=0x" << itp.x[i];
+  }
+  EXPECT_EQ(jit.sp, itp.sp) << "sp diverged";
+  EXPECT_EQ(jit.flags, itp.flags) << "flags diverged";
+  EXPECT_EQ(jit.cached_fpcr, itp.cached_fpcr) << "cached_fpcr diverged";
+  EXPECT_EQ(jit.emulated_fpsr, itp.emulated_fpsr) << "emulated_fpsr diverged";
+  EXPECT_EQ(jit.reservation_address, itp.reservation_address) << "reservation_address diverged";
+  for (int i = 0; i < 32; i++)
+    EXPECT_EQ(memcmp(&jit.v[i], &itp.v[i], sizeof(jit.v[i])), 0) << "v" << i << " diverged";
+  EXPECT_EQ(memcmp(jit_stk, itp_stk, kStkSize), 0) << "stack memory diverged";
+}
 
 TEST_F(Arm64LiteTranslateRegionDispatchTest, MemsetAarch64_1024ByteZeroFill_BhiLoop) {
   // Loop body only — start PC == b.hi target PC, so EmitDirectDispatch's
