@@ -134,6 +134,22 @@ extern "C" void __wrap_free(void* ptr) {
 
   uint64_t n = g_free_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
+  // GWP-ASan safety: GWP-ASan (the kernel's sampling allocator, ~1/1000 mallocs)
+  // places an allocation flush against a guard page for underflow detection, so
+  // the user pointer is page-aligned and the 16 bytes at [ptr-16] live in an
+  // unmapped guard page. Peeking the header there faults (SEGV_ACCERR, "Buffer
+  // Underflow"), an intermittent crash for any heavy-allocation app. A real Scudo
+  // chunk's header is never within 16 bytes of a page start, so when ptr is that
+  // close to a page boundary, skip the peek and free normally — it is a real
+  // (GWP-ASan-guarded) heap pointer, never a static shared-null.
+  if ((reinterpret_cast<uintptr_t>(ptr) & 0xfffUL) < 16) {
+    void* evicted = QuarantineSwap(ptr);
+    if (evicted != nullptr) {
+      __real_free(evicted);
+    }
+    return;
+  }
+
   // Peek the 16-byte window preceding ptr.  A real Scudo chunk has a
   // non-zero packed header at [-8..-1] (Scudo Standalone) plus origin
   // metadata at [-16..-9].  An all-zero window means the caller passed a
