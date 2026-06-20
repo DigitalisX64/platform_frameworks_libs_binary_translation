@@ -1,0 +1,38 @@
+// Copyright (C) 2026 utzcoz
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Minimal guest-only libgui.so stub. Some guest libraries (e.g. Google Filament's
+// Android platform layer, on the SwapChain-present path) dlopen("libgui.so") and
+// dlsym a small set of producer-side Surface helpers. Digitalis does NOT run a
+// real guest libgui: surface/buffer management is proxied to the host GPU stack
+// (which is why hello-vulkan renders without any guest libgui). The absence of
+// libgui.so made those dlopen()s fail and the guest then jumped to a bad address
+// (berberis_HandleNoExec SIGSEGV). This stub provides a guest libgui.so that
+// exists and exports the dlsym'd symbols as benign no-ops, so the dlopen/dlsym
+// succeed and the caller proceeds while the real present path stays on the
+// host-proxied route. It does NOT implement BufferQueue/SurfaceFlinger.
+//
+// Guest-only (native_bridge variant only; no host counterpart), installs as
+// /system/lib64/arm64/libgui.so.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_library {
+    name: "libgui_digitalis_guest_stub",
+    defaults: ["native_bridge_stub_library_defaults"],
+    stem: "libgui",
+    srcs: ["libgui_stub.cc"],
+}

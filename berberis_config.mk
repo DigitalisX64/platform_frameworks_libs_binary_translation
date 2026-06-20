@@ -86,7 +86,8 @@ BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 := \
     berberis_prebuilt_arm64 \
     berberis_program_runner_binfmt_misc_arm64 \
     berberis_program_runner_arm64 \
-    libberberis_arm64
+    libberberis_arm64 \
+    libgui_digitalis_guest_stub.native_bridge
 
 BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64 += $(NATIVE_BRIDGE_PRODUCT_PACKAGES)
 
@@ -144,6 +145,7 @@ BERBERIS_DISTRIBUTION_ARTIFACTS_ARM64 := \
     system/lib64/arm64/libcutils.so \
     system/lib64/arm64/libdl.so \
     system/lib64/arm64/libdl_android.so \
+    system/lib64/arm64/libgui.so \
     system/lib64/arm64/libicu.so \
     system/lib64/arm64/libicui18n.so \
     system/lib64/arm64/libicuuc.so \
