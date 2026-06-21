@@ -50,9 +50,34 @@ cc_library_static {
         "digitalis_extra_libm_trampolines.cc",
         "digitalis_extra_libnativehelper_trampolines.cc",
         "digitalis_extra_libbinder_ndk_trampolines.cc",
+        "digitalis_extra_libcamera2ndk_trampolines.cc",
         "digitalis_extra_libwebviewchromium_plat_support_trampolines.cc",
         "digitalis_host_call_redirect.cc",
     ],
     // Sources are #ifdef'd on __x86_64__ so non-x86_64 builds get an
     // empty static lib.
+}
+
+// Host-side ground-truth verification of the libcamera2ndk shared-camera V2
+// capture-callback marshalling (camera2ndk_shared_capture_callbacks.h). The
+// shared-camera API is untestable on the Digitalis emulator (see
+// digitalis/docs/proxy-coverage-gaps.md), so the per-field WrapGuestFunction
+// marshalling is verified here against the NDK header signatures by firing each
+// wrapped callback through the guest runtime. Linked into berberis_arm64_host_tests.
+cc_test_library {
+    name: "libberberis_digitalis_extra_proxy_arm64_unit_tests",
+    defaults: [
+        "berberis_arm64_defaults",
+    ],
+    host_supported: true,
+    header_libs: [
+        "libberberis_guest_abi_arm64_headers",
+        "berberis_test_utils_headers",
+    ],
+    srcs: [
+        "camera2ndk_shared_capture_callbacks_test.cc",
+    ],
+    shared: {
+        enabled: false,
+    },
 }
