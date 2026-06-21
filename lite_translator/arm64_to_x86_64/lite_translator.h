@@ -2381,7 +2381,6 @@ class LiteTranslator {
   // {SDOT,UDOT} — are lowered.  The interpreter (interpreter.h:1237)
   // remains the executable spec; this JIT path produces bit-exact
   // output (32-bit integer arithmetic with defined wraparound).
-  // I8MM matrix multiply-accumulate: interpreter only.
   void AdvSimdMatMul(const Decoder::MatMulArgs& args) {
     // I8MM 8-bit matrix multiply-accumulate (Q=1 only):
     // Vd is a 2x2 int32 matrix, Vn holds 2 rows of 8 int8, Vm holds 2 rows of
@@ -13966,7 +13965,8 @@ class LiteTranslator {
       // FCVTL / FCVTN (FP32<->FP64, size=01).  FCVTL widens
       // 2 floats to 2 doubles (CVTPS2PD; Q=1/FCVTL2 takes the upper floats);
       // FCVTN narrows 2 doubles to 2 floats (CVTPD2PS; Q=0 low+zero-upper,
-      // Q=1/FCVTN2 upper-half merge).  size=00 (FP16) bails to the interpreter.
+      // Q=1/FCVTN2 upper-half merge).  size=00 (FP16) is JIT-lowered via F16C
+      // (VCVTPH2PS / VCVTPS2PH), bailing to the interpreter only without F16C.
       case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtl: {
         SimdRegister xn = AllocTempSimdReg();
         if (xn == no_simd_register) { success_ = false; return; }
