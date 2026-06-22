@@ -424,6 +424,7 @@ cc_test_host {
                 "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
                 "libberberis_kernel_api_arm64_unit_tests",
                 "libberberis_guest_os_primitives_arm64_unit_tests",
+                "libberberis_digitalis_extra_proxy_arm64_unit_tests",
             ],
         },
     },
