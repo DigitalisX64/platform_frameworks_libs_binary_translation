@@ -1480,12 +1480,25 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Extr32) {
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFABCDEF0ULL});
 }
 
-TEST_F(Arm64HeavyOptimizerFrontendTest, Extr64Bails) {
-  // EXTR X0, X1, X2, #4 (64-bit non-zero lsb) bails (no 64-bit SHRD MachineIR op).
-  static const uint32_t code[] = {ExtrX(0, 1, 2, 4)};
+TEST_F(Arm64HeavyOptimizerFrontendTest, Extr64) {
+  // EXTR X0, X1, X2, #20: X0 = (X1:X2) >> 20 (low 64), via 64-bit SHRD.
+  static const uint32_t code[] = {ExtrX(0, 1, 2, 20)};
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  state_.cpu.x[2] = 0xAABBCCDDEEFF0011ULL;
   state_.cpu.insn_addr = ToGuestAddr(code);
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
-  EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x67788AABBCCDDEEFULL});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ror64ViaExtr) {
+  // ROR X0, X1, #13 is EXTR X0, X1, X1, #13 (Rn == Rm) — 64-bit rotate-right.
+  static const uint32_t code[] = {ExtrX(0, 1, 1, 13)};
+  state_.cpu.x[1] = 0x123456789ABCDEF0ULL;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xF78091A2B3C4D5E6ULL});
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, Clz64) {

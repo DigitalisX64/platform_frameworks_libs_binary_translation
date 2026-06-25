@@ -1428,10 +1428,9 @@ class HeavyOptimizerFrontend {
     }
   }
 
-  // EXTR Rd, Rn, Rm, #lsb: Rd = (Rn:Rm) >> lsb. lsb==0 is a copy of Rm. The
-  // 32-bit non-zero case maps to x86 SHRD; the 64-bit non-zero case bails (the
-  // 64-bit SHRD form is not available as a MachineIR op). Mirrors
-  // lite_translator.h::Extr.
+  // EXTR Rd, Rn, Rm, #lsb: Rd = (Rn:Rm) >> lsb. lsb==0 is a copy of Rm. Both the
+  // 32-bit and 64-bit non-zero cases map to x86 SHRD (the ROR Rn==Rm alias falls
+  // out for free). Mirrors lite_translator.h::Extr.
   Register Extr(Register src_n, Register src_m, uint8_t lsb, bool is_64bit) {
     if (!success()) {
       return AllocTempReg();
@@ -1442,13 +1441,12 @@ class HeavyOptimizerFrontend {
       }
       return std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
     }
-    if (is_64bit) {
-      // No 64-bit SHRD MachineIR op; bail to lite.
-      UndefinedReturningReg();
-      return AllocTempReg();
-    }
     // SHRD dest, src, imm: dest = (src:dest) >> imm.
-    // ARM EXTR Wd = (Wn:Wm) >> lsb = SHRD(Wm, Wn, lsb): dest=Wm, src=Wn.
+    // ARM EXTR Rd = (Rn:Rm) >> lsb = SHRD(Rm, Rn, lsb): dest=Rm, src=Rn.
+    if (is_64bit) {
+      Register res = Copy(src_m);
+      return std::get<0>(Gen<x86_64::ShrdqRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
+    }
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
     return std::get<0>(Gen<x86_64::ShrdlRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
   }
