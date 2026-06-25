@@ -11970,6 +11970,71 @@ class LiteTranslator {
         as_.Bind(done_label);
         return res;
       }
+      case 0b000000: {  // RBIT: reverse bit order.
+        // SWAR bit-reverse: swap adjacent bits, then bit-pairs, then nibbles,
+        // then reverse byte order with BSWAP. Needs one scratch register.
+        Register tmp = AllocTempReg();
+        if (tmp == no_register) {
+          success_ = false;
+          return no_register;
+        }
+        if (is_64bit) {
+          Register mask = AllocTempReg();
+          if (mask == no_register) {
+            success_ = false;
+            return no_register;
+          }
+          as_.Movq(res, src);
+          // res = ((res >> 1) & 0x5555...) | ((res & 0x5555...) << 1)
+          as_.Movq(tmp, res);
+          as_.Shrq(tmp, int8_t{1});
+          as_.Movq(mask, static_cast<int64_t>(0x5555555555555555LL));
+          as_.Andq(tmp, mask);
+          as_.Andq(res, mask);
+          as_.Shlq(res, int8_t{1});
+          as_.Orq(res, tmp);
+          // swap bit-pairs with 0x3333...
+          as_.Movq(tmp, res);
+          as_.Shrq(tmp, int8_t{2});
+          as_.Movq(mask, static_cast<int64_t>(0x3333333333333333LL));
+          as_.Andq(tmp, mask);
+          as_.Andq(res, mask);
+          as_.Shlq(res, int8_t{2});
+          as_.Orq(res, tmp);
+          // swap nibbles with 0x0F0F...
+          as_.Movq(tmp, res);
+          as_.Shrq(tmp, int8_t{4});
+          as_.Movq(mask, static_cast<int64_t>(0x0F0F0F0F0F0F0F0FLL));
+          as_.Andq(tmp, mask);
+          as_.Andq(res, mask);
+          as_.Shlq(res, int8_t{4});
+          as_.Orq(res, tmp);
+          // reverse byte order.
+          as_.Bswapq(res);
+        } else {
+          as_.Movl(res, src);
+          as_.Movl(tmp, res);
+          as_.Shrl(tmp, int8_t{1});
+          as_.Andl(tmp, static_cast<int32_t>(0x55555555));
+          as_.Andl(res, static_cast<int32_t>(0x55555555));
+          as_.Shll(res, int8_t{1});
+          as_.Orl(res, tmp);
+          as_.Movl(tmp, res);
+          as_.Shrl(tmp, int8_t{2});
+          as_.Andl(tmp, static_cast<int32_t>(0x33333333));
+          as_.Andl(res, static_cast<int32_t>(0x33333333));
+          as_.Shll(res, int8_t{2});
+          as_.Orl(res, tmp);
+          as_.Movl(tmp, res);
+          as_.Shrl(tmp, int8_t{4});
+          as_.Andl(tmp, static_cast<int32_t>(0x0F0F0F0F));
+          as_.Andl(res, static_cast<int32_t>(0x0F0F0F0F));
+          as_.Shll(res, int8_t{4});
+          as_.Orl(res, tmp);
+          as_.Bswapl(res);
+        }
+        return res;
+      }
       default:
         Undefined();
         return no_register;

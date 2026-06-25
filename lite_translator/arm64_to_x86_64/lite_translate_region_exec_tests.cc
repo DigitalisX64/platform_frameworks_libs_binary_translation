@@ -12760,6 +12760,19 @@ TEST_F(Arm64LiteTranslateRegionTest, RevWScalar) {
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[0], 0xDDCCBBAAULL);  // low word byte-reversed, zero-extended
 }
+// scalar RBIT Xd / Wd (DataProc1Src opcode 000000) — reverse bit order.
+TEST_F(Arm64LiteTranslateRegionTest, RbitXScalar) {
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  static const uint32_t code[] = {0xDAC00020u};  // rbit x0, x1
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x11EE66AA22CC4488ULL);
+}
+TEST_F(Arm64LiteTranslateRegionTest, RbitWScalar) {
+  state_.cpu.x[1] = 0xDEADBEEF12345678ULL;  // dirty upper bits must not leak.
+  static const uint32_t code[] = {0x5AC00020u};  // rbit w0, w1
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x000000001E6A2C48ULL);  // low word bit-reversed, zero-ext
+}
 TEST_F(Arm64LiteTranslateRegionTest, FcvtlF32ToF64) {
   float in[2] = {1.5f, -2.5f};
   std::memcpy(&state_.cpu.v[1], in, 8);
