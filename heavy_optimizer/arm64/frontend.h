@@ -1920,9 +1920,57 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
+    // INS (general): insert a GP register into one lane of Vd, preserving the
+    // others. Read v[rd] as an XMM (GenGetSimd<16>), PINSR the GP value at the
+    // lane, and store the full 128 bits back (GenSetSimd<16>) — staying in the
+    // XMM domain so the MOVDQA store/load forwarding stays consistent. The lane
+    // width and index come from imm5. Mirrors lite_translator.h's INS-general.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kInsGeneral) {
+      const uint8_t imm5 = args.imm5;
+      uint8_t esize;
+      int8_t lane;
+      if (imm5 & 0b00001) {
+        esize = 1;
+        lane = static_cast<int8_t>((imm5 >> 1) & 0xf);
+      } else if (imm5 & 0b00010) {
+        esize = 2;
+        lane = static_cast<int8_t>((imm5 >> 2) & 0x7);
+      } else if (imm5 & 0b00100) {
+        esize = 4;
+        lane = static_cast<int8_t>((imm5 >> 3) & 0x3);
+      } else if (imm5 & 0b01000) {
+        esize = 8;
+        lane = static_cast<int8_t>((imm5 >> 4) & 0x1);
+      } else {
+        UndefinedReturningVoid();  // reserved imm5
+        return;
+      }
+      const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xmm.machine_reg(), off);
+      Register src = (args.rn < 31) ? GetReg(args.rn)
+                                    : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+      switch (esize) {
+        case 1:
+          builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+        case 2:
+          builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+        case 4:
+          builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+        default:
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+      }
+      builder_.GenSetSimd<16>(off, xmm.machine_reg());
+      return;
+    }
+
     if (args.opcode != Decoder::AdvSimdCopyOpcode::kDupGeneral) {
-      // DUP element / INS / SMOV / UMOV: not expressible with the allowlisted
-      // ops; the lite translator handles them.
+      // DUP element / INS element / SMOV / UMOV: not expressible with the
+      // allowlisted ops; the lite translator handles them.
       UndefinedReturningVoid();
       return;
     }

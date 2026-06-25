@@ -3340,6 +3340,55 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtVec8H) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
 }
 
+// INS (general): insert a GP register into one vector lane, preserving the rest.
+TEST_F(Arm64HeavyOptimizerFrontendTest, InsGenS) {
+  static const uint32_t code[] = {0x4E141C20u};  // mov v0.s[2], w1
+  SetV128(&state_, 0, 0x2222222211111111ULL, 0x4444444433333333ULL);  // [11,22,33,44]
+  state_.cpu.x[1] = 0xFFFFFFFFDEADBEEFULL;  // only W1 (low 32) inserted
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x2222222211111111ULL);          // lanes 0,1 preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x44444444DEADBEEFULL);     // lane 2 = W1, lane 3 preserved
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, InsGenD) {
+  static const uint32_t code[] = {0x4E181C20u};  // mov v0.d[1], x1
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);       // low 64 preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x1122334455667788ULL);  // upper 64 = X1
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, InsGenB) {
+  static const uint32_t code[] = {0x4E0B1C20u};  // mov v0.b[5], w1
+  SetV128(&state_, 0, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  state_.cpu.x[1] = 0x000000AB;  // low byte inserted
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111AB1111111111ULL);   // byte 5 = 0xAB
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x2222222222222222ULL);  // upper preserved
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, InsGenH) {
+  static const uint32_t code[] = {0x4E0E1C20u};  // mov v0.h[3], w1
+  SetV128(&state_, 0, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  state_.cpu.x[1] = 0x0000BEEF;  // low halfword inserted
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xBEEF111111111111ULL);   // halfword 3 = 0xBEEF
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x2222222222222222ULL);  // upper preserved
+}
+
 // ADD .8H (Q=1): eight 16-bit lane adds via PADDW.
 TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec8H) {
   static const uint32_t code[] = {AddVec(0b01, /*q=*/true, 0, 1, 2)};
