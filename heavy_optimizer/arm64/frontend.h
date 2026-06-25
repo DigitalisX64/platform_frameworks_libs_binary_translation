@@ -2005,10 +2005,11 @@ class HeavyOptimizerFrontend {
   //   AND/ORR/EOR: Pand/Por/Pxor are element-size-independent (one op covers
   //     all). ORR with rn==rm is the AdvSIMD MOV (vector) alias and lowers the
   //     same way.
-  //   CMEQ: Pcmpeqb/w/d are not in the ARM64 backend allowlist; bail (the lite
-  //     translator/interpreter handles CMEQ).
+  //   CMEQ: Pcmpeqb (8), Pcmpeqw (16), Pcmpeqd (32). 64-bit (Pcmpeqq) bails.
+  //   CMGT (signed): Pcmpgtb (8), Pcmpgtw (16), Pcmpgtd (32). 64-bit bails.
   // Everything else (saturating, shifts, polynomial, FP, pairwise, widening,
-  // CMGT/CMHI/etc.) bails to the lite translator/interpreter.
+  // CMHI/CMHS unsigned compares, CMTST, etc.) bails to the lite translator/
+  // interpreter.
   void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
     if (!success()) {
       return;
@@ -2041,6 +2042,16 @@ class HeavyOptimizerFrontend {
       case Decoder::AdvSimdThreeSameOpcode::kOrr:
       case Decoder::AdvSimdThreeSameOpcode::kEor:
         // Bitwise: element size is irrelevant; all forms are handled.
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmeq:
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt:
+        // CMEQ -> PCMPEQ{B,W,D}; CMGT (signed) -> PCMPGT{B,W,D}. The 64-bit (2D)
+        // form needs PCMPEQQ/PCMPGTQ (SSE4.1/4.2), which are not in the backend
+        // allowlist, so it bails to the lite tier.
+        if (args.size == 0b11) {
+          UndefinedReturningVoid();
+          return;
+        }
         break;
       default:
         UndefinedReturningVoid();
@@ -2079,6 +2090,24 @@ class HeavyOptimizerFrontend {
         break;
       case Decoder::AdvSimdThreeSameOpcode::kEor:
         builder_.Gen<x86_64::PxorXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmeq:
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PcmpeqbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PcmpeqwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt:
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PcmpgtbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PcmpgtwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PcmpgtdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
         break;
       default:
         // Unreachable: the validation switch above already bailed.

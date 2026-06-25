@@ -3287,6 +3287,59 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec4S) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000040400000303ULL);
 }
 
+// CMEQ .4S (Q=1): per-lane equality -> all-ones / zero, via PCMPEQD.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec4S) {
+  static const uint32_t code[] = {0x6EA28C20u};  // cmeq v0.4s, v1.4s, v2.4s
+  SetV128(&state_, 1, 0x0000000200000001ULL, 0x0000000400000003ULL);  // [1,2,3,4]
+  SetV128(&state_, 2, 0x0000000900000001ULL, 0x0000000900000003ULL);  // [1,9,3,9]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);   // eq, ne
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);  // eq, ne
+}
+
+// CMEQ .16B (Q=1): per-byte equality via PCMPEQB.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec16B) {
+  static const uint32_t code[] = {0x6E228C20u};  // cmeq v0.16b, v1.16b, v2.16b
+  SetV128(&state_, 1, 0x1111111122222222ULL, 0x0000000000000000ULL);
+  SetV128(&state_, 2, 0x1111111133333333ULL, 0x0000000000000000ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFF00000000ULL);   // low 4 bytes differ, high 4 equal
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);  // all equal (0 == 0)
+}
+
+// CMGT .4S (Q=1): per-lane signed greater-than via PCMPGTD.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtVec4S) {
+  static const uint32_t code[] = {0x4EA23420u};  // cmgt v0.4s, v1.4s, v2.4s
+  SetV128(&state_, 1, 0xFFFFFFFF00000005ULL, 0x0000000700000002ULL);  // [5,-1,2,7]
+  SetV128(&state_, 2, 0x0000000300000003ULL, 0xFFFFFFFF00000002ULL);  // [3,3,2,-1]
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);   // 5>3 T, -1>3 F
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFF00000000ULL);  // 2>2 F, 7>-1 T
+}
+
+// CMGT .8H (Q=1): per-lane signed greater-than via PCMPGTW.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtVec8H) {
+  static const uint32_t code[] = {0x4E623420u};  // cmgt v0.8h, v1.8h, v2.8h
+  SetV128(&state_, 1, 0x00000064FFFB000AULL, 0x0000000000000000ULL);  // [10,-5,100,0]
+  SetV128(&state_, 2, 0x0001006400050005ULL, 0x0000000000000000ULL);  // [5,5,100,1]
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);   // only lane0 (10>5) true
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
 // ADD .8H (Q=1): eight 16-bit lane adds via PADDW.
 TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec8H) {
   static const uint32_t code[] = {AddVec(0b01, /*q=*/true, 0, 1, 2)};
@@ -3470,9 +3523,10 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, IntSimdMultiInstructionRegion) {
   EXPECT_EQ(VUpperHi64(&state_, 4), 0x0000001000000010ULL);
 }
 
-// CMEQ (register) must bail: Pcmpeq* is not in the ARM64 backend allowlist.
-TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVecBails) {
-  static const uint32_t code[] = {CmeqVec(0b10, /*q=*/true, 0, 1, 2)};
+// CMEQ .2D (64-bit elements) must bail: PCMPEQQ is not in the backend allowlist.
+// (The B/H/S forms are now lowered via PCMPEQB/W/D — see CmeqVec4S/16B.)
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec2DBails) {
+  static const uint32_t code[] = {CmeqVec(0b11, /*q=*/true, 0, 1, 2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
