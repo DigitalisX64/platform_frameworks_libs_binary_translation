@@ -1532,9 +1532,41 @@ class HeavyOptimizerFrontend {
   // FCVTZS/FCVTZU/SCVTF/UCVTF (FP<->int). The FCvtFloatToInteger* intrinsics +
   // cvtsi2ss SSE ops are not available to the ARM64 backend (riscv64-only macro
   // defs), so bail.
+  // FMOV between a general register and a scalar FP register, single (S/W) or
+  // double (D/X), via x86 MOVD/MOVQ. The rmode == 01 top-half (V.D[1]) forms and
+  // every FP<->int *conversion* in this group (SCVTF/UCVTF/FCVTZS/FCVTZU/...,
+  // FP16, ftype >= 0b10) bail to the lite tier, whose intrinsics cover them.
+  // Guest V[] access stays in the XMM domain (GetVRegScalar / SetVRegScalar*),
+  // and the GP<->XMM crossing is an explicit register move, not a forwarded
+  // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV subset).
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    if (args.rmode != 0b00 || (args.ftype != 0b00 && args.ftype != 0b01) ||
+        (args.op != 0b110 && args.op != 0b111)) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+    if (args.op == 0b111) {
+      // FMOV Sd, Wn / Dd, Xn: general register -> scalar FP (upper lanes zeroed).
+      if (args.rn == 31) {
+        SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);  // WZR/XZR -> 0
+      } else {
+        SetVRegScalarFromGp(args.rd, GetReg(args.rn), is_double);
+      }
+    } else {
+      // FMOV Wd, Sn / Xd, Dn: scalar FP -> general register.
+      if (args.rd == 31) {
+        return;  // WZR/XZR destination: discard.
+      }
+      FpRegister xmm = GetVRegScalar(args.rn, is_double);
+      Register gp = is_double
+                        ? std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()))
+                        : std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+      SetReg(args.rd, gp);
+    }
   }
 
   // FMOV(reg) / FABS / FNEG for FP32 (ftype=00) and FP64 (ftype=01). These are

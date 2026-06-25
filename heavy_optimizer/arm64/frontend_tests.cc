@@ -3090,6 +3090,57 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FmovRegD) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
+// FMOV (general): move between a general register and a scalar FP register.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovGenDFromX) {
+  // FMOV D0, X1: X -> D (lane 0), upper 64 bits zeroed.
+  static const uint32_t code[] = {0x9E670020u};  // fmov d0, x1
+  state_.cpu.x[1] = 0x1122334455667788ULL;
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // must be overwritten
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1122334455667788ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovGenXFromD) {
+  // FMOV X0, D1: D (lane 0) -> X.
+  static const uint32_t code[] = {0x9E660020u};  // fmov x0, d1
+  SetV128(&state_, 1, 0xAABBCCDDEEFF0011ULL, 0x7777777777777777ULL);
+  state_.cpu.x[0] = 0xFFFFFFFFFFFFFFFFULL;  // dirty, must be overwritten
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0xAABBCCDDEEFF0011ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovGenSFromW) {
+  // FMOV S0, W1: low 32 of X1 -> S (lane 0), upper bytes zeroed.
+  static const uint32_t code[] = {0x1E270020u};  // fmov s0, w1
+  state_.cpu.x[1] = 0xFFFFFFFF1234CAFEULL;  // only low 32 used
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000001234CAFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovGenWFromS) {
+  // FMOV W0, S1: low 32 of D1 -> W (zero-extended into X0).
+  static const uint32_t code[] = {0x1E260020u};  // fmov w0, s1
+  SetV128(&state_, 1, 0xAAAAAAAADEADBEEFULL, 0x7777777777777777ULL);
+  state_.cpu.x[0] = 0xFFFFFFFFFFFFFFFFULL;  // dirty upper must be cleared
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0x00000000DEADBEEFULL);
+}
+
 // FABS Sd, Sn: clear sign bit.
 TEST_F(Arm64HeavyOptimizerFrontendTest, FabsS) {
   static const uint32_t code[] = {FabsS(0, 1)};
