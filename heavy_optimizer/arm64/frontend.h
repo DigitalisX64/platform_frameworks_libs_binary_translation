@@ -1428,10 +1428,9 @@ class HeavyOptimizerFrontend {
     }
   }
 
-  // EXTR Rd, Rn, Rm, #lsb: Rd = (Rn:Rm) >> lsb. lsb==0 is a copy of Rm. The
-  // 32-bit non-zero case maps to x86 SHRD; the 64-bit non-zero case bails (the
-  // 64-bit SHRD form is not available as a MachineIR op). Mirrors
-  // lite_translator.h::Extr.
+  // EXTR Rd, Rn, Rm, #lsb: Rd = (Rn:Rm) >> lsb. lsb==0 is a copy of Rm. Both the
+  // 32-bit and 64-bit non-zero cases map to x86 SHRD (the ROR Rn==Rm alias falls
+  // out for free). Mirrors lite_translator.h::Extr.
   Register Extr(Register src_n, Register src_m, uint8_t lsb, bool is_64bit) {
     if (!success()) {
       return AllocTempReg();
@@ -1442,13 +1441,12 @@ class HeavyOptimizerFrontend {
       }
       return std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
     }
-    if (is_64bit) {
-      // No 64-bit SHRD MachineIR op; bail to lite.
-      UndefinedReturningReg();
-      return AllocTempReg();
-    }
     // SHRD dest, src, imm: dest = (src:dest) >> imm.
-    // ARM EXTR Wd = (Wn:Wm) >> lsb = SHRD(Wm, Wn, lsb): dest=Wm, src=Wn.
+    // ARM EXTR Rd = (Rn:Rm) >> lsb = SHRD(Rm, Rn, lsb): dest=Rm, src=Rn.
+    if (is_64bit) {
+      Register res = Copy(src_m);
+      return std::get<0>(Gen<x86_64::ShrdqRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
+    }
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
     return std::get<0>(Gen<x86_64::ShrdlRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
   }
@@ -1534,9 +1532,41 @@ class HeavyOptimizerFrontend {
   // FCVTZS/FCVTZU/SCVTF/UCVTF (FP<->int). The FCvtFloatToInteger* intrinsics +
   // cvtsi2ss SSE ops are not available to the ARM64 backend (riscv64-only macro
   // defs), so bail.
+  // FMOV between a general register and a scalar FP register, single (S/W) or
+  // double (D/X), via x86 MOVD/MOVQ. The rmode == 01 top-half (V.D[1]) forms and
+  // every FP<->int *conversion* in this group (SCVTF/UCVTF/FCVTZS/FCVTZU/...,
+  // FP16, ftype >= 0b10) bail to the lite tier, whose intrinsics cover them.
+  // Guest V[] access stays in the XMM domain (GetVRegScalar / SetVRegScalar*),
+  // and the GP<->XMM crossing is an explicit register move, not a forwarded
+  // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV subset).
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    if (args.rmode != 0b00 || (args.ftype != 0b00 && args.ftype != 0b01) ||
+        (args.op != 0b110 && args.op != 0b111)) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+    if (args.op == 0b111) {
+      // FMOV Sd, Wn / Dd, Xn: general register -> scalar FP (upper lanes zeroed).
+      if (args.rn == 31) {
+        SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);  // WZR/XZR -> 0
+      } else {
+        SetVRegScalarFromGp(args.rd, GetReg(args.rn), is_double);
+      }
+    } else {
+      // FMOV Wd, Sn / Xd, Dn: scalar FP -> general register.
+      if (args.rd == 31) {
+        return;  // WZR/XZR destination: discard.
+      }
+      FpRegister xmm = GetVRegScalar(args.rn, is_double);
+      Register gp = is_double
+                        ? std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()))
+                        : std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+      SetReg(args.rd, gp);
+    }
   }
 
   // FMOV(reg) / FABS / FNEG for FP32 (ftype=00) and FP64 (ftype=01). These are
@@ -1890,9 +1920,57 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
+    // INS (general): insert a GP register into one lane of Vd, preserving the
+    // others. Read v[rd] as an XMM (GenGetSimd<16>), PINSR the GP value at the
+    // lane, and store the full 128 bits back (GenSetSimd<16>) — staying in the
+    // XMM domain so the MOVDQA store/load forwarding stays consistent. The lane
+    // width and index come from imm5. Mirrors lite_translator.h's INS-general.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kInsGeneral) {
+      const uint8_t imm5 = args.imm5;
+      uint8_t esize;
+      int8_t lane;
+      if (imm5 & 0b00001) {
+        esize = 1;
+        lane = static_cast<int8_t>((imm5 >> 1) & 0xf);
+      } else if (imm5 & 0b00010) {
+        esize = 2;
+        lane = static_cast<int8_t>((imm5 >> 2) & 0x7);
+      } else if (imm5 & 0b00100) {
+        esize = 4;
+        lane = static_cast<int8_t>((imm5 >> 3) & 0x3);
+      } else if (imm5 & 0b01000) {
+        esize = 8;
+        lane = static_cast<int8_t>((imm5 >> 4) & 0x1);
+      } else {
+        UndefinedReturningVoid();  // reserved imm5
+        return;
+      }
+      const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xmm.machine_reg(), off);
+      Register src = (args.rn < 31) ? GetReg(args.rn)
+                                    : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+      switch (esize) {
+        case 1:
+          builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+        case 2:
+          builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+        case 4:
+          builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+        default:
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), src, lane);
+          break;
+      }
+      builder_.GenSetSimd<16>(off, xmm.machine_reg());
+      return;
+    }
+
     if (args.opcode != Decoder::AdvSimdCopyOpcode::kDupGeneral) {
-      // DUP element / INS / SMOV / UMOV: not expressible with the allowlisted
-      // ops; the lite translator handles them.
+      // DUP element / INS element / SMOV / UMOV: not expressible with the
+      // allowlisted ops; the lite translator handles them.
       UndefinedReturningVoid();
       return;
     }
@@ -1975,10 +2053,11 @@ class HeavyOptimizerFrontend {
   //   AND/ORR/EOR: Pand/Por/Pxor are element-size-independent (one op covers
   //     all). ORR with rn==rm is the AdvSIMD MOV (vector) alias and lowers the
   //     same way.
-  //   CMEQ: Pcmpeqb/w/d are not in the ARM64 backend allowlist; bail (the lite
-  //     translator/interpreter handles CMEQ).
+  //   CMEQ: Pcmpeqb (8), Pcmpeqw (16), Pcmpeqd (32). 64-bit (Pcmpeqq) bails.
+  //   CMGT (signed): Pcmpgtb (8), Pcmpgtw (16), Pcmpgtd (32). 64-bit bails.
   // Everything else (saturating, shifts, polynomial, FP, pairwise, widening,
-  // CMGT/CMHI/etc.) bails to the lite translator/interpreter.
+  // CMHI/CMHS unsigned compares, CMTST, etc.) bails to the lite translator/
+  // interpreter.
   void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
     if (!success()) {
       return;
@@ -2011,6 +2090,16 @@ class HeavyOptimizerFrontend {
       case Decoder::AdvSimdThreeSameOpcode::kOrr:
       case Decoder::AdvSimdThreeSameOpcode::kEor:
         // Bitwise: element size is irrelevant; all forms are handled.
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmeq:
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt:
+        // CMEQ -> PCMPEQ{B,W,D}; CMGT (signed) -> PCMPGT{B,W,D}. The 64-bit (2D)
+        // form needs PCMPEQQ/PCMPGTQ (SSE4.1/4.2), which are not in the backend
+        // allowlist, so it bails to the lite tier.
+        if (args.size == 0b11) {
+          UndefinedReturningVoid();
+          return;
+        }
         break;
       default:
         UndefinedReturningVoid();
@@ -2049,6 +2138,24 @@ class HeavyOptimizerFrontend {
         break;
       case Decoder::AdvSimdThreeSameOpcode::kEor:
         builder_.Gen<x86_64::PxorXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmeq:
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PcmpeqbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PcmpeqwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
+        break;
+      case Decoder::AdvSimdThreeSameOpcode::kCmgt:
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PcmpgtbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PcmpgtwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PcmpgtdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
         break;
       default:
         // Unreachable: the validation switch above already bailed.
