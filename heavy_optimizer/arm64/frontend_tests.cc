@@ -267,6 +267,12 @@ constexpr uint32_t Adrp(uint8_t rd, int32_t imm) {
 constexpr uint32_t MrsTpidrEl0(uint8_t rt) {
   return 0xD53BD040 | rt;
 }
+// MRS Xt, MIDR_EL1 — a non-TPIDR system register. The heavy frontend models only
+// MRS TPIDR_EL0 and declines every other MRS/MSR, so this is a stable "instruction
+// that bails the optimizer" marker for the partial-region tests.
+constexpr uint32_t MrsMidrEl1(uint8_t rt) {
+  return 0xD5380000 | rt;
+}
 // EXTR Xd, Xn, Xm, #lsb (64-bit) and Wd (32-bit).
 constexpr uint32_t ExtrX(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t lsb) {
   return 0x93C00000 | (static_cast<uint32_t>(rm) << 16) |
@@ -303,9 +309,13 @@ constexpr uint32_t ClsX(uint8_t rd, uint8_t rn) {
 constexpr uint32_t ClsW(uint8_t rd, uint8_t rn) {
   return 0x5AC01400 | (rn << 5) | rd;
 }
-// RBIT Xd, Xn (DP-1Src, opcode2=000000, sf=1) — must bail (no bit-reverse op).
+// RBIT Xd, Xn (DP-1Src, opcode2=000000, sf=1) — reverse bit order.
 constexpr uint32_t RbitX(uint8_t rd, uint8_t rn) {
   return 0xDAC00000 | (rn << 5) | rd;
+}
+// RBIT Wd, Wn (DP-1Src, opcode2=000000, sf=0) — reverse low-32 bit order, zero-ext.
+constexpr uint32_t RbitW(uint8_t rd, uint8_t rn) {
+  return 0x5AC00000 | (rn << 5) | rd;
 }
 
 // --- Branch encoders (same forms as the lite-translator tests). ---
@@ -590,13 +600,13 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiMoveWideRegion) {
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenBailRegion) {
-  // RBIT (DataProc1Src, no x86 bit-reverse op) still bails after the two MoveWides.
-  static const uint32_t code[] = {MovzX(0, 0x11), MovzX(1, 0x22), RbitX(2, 0)};
+  // MRS MIDR_EL1 (non-modeled system register) bails after the two MoveWides.
+  static const uint32_t code[] = {MovzX(0, 0x11), MovzX(1, 0x22), MrsMidrEl1(2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  // 2 MoveWide translate, the RBIT bails -> partial region.
+  // 2 MoveWide translate, the MRS bails -> partial region.
   EXPECT_EQ(n, 2u);
 }
 
@@ -1570,12 +1580,24 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ClsW32) {
   }
 }
 
-TEST_F(Arm64HeavyOptimizerFrontendTest, RbitBails) {
-  // RBIT has no x86 bit-reverse MachineIR op -> bails to lite/interpreter.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Rbit64) {
+  // RBIT X0, X1: reverse all 64 bits (SWAR bit-swap + byte reverse).
   static const uint32_t code[] = {RbitX(0, 1)};
+  state_.cpu.x[1] = 0x1122334455667788ULL;
   state_.cpu.insn_addr = ToGuestAddr(code);
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
-  EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x11EE66AA22CC4488ULL});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, RbitW32) {
+  // RBIT W0, W1: reverse the low 32 bits; upper 32 bits of X0 cleared.
+  static const uint32_t code[] = {RbitW(0, 1)};
+  state_.cpu.x[1] = 0xDEADBEEF12345678ULL;  // dirty upper bits must not leak.
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x000000001E6A2C48ULL});
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, SbfizX) {
@@ -1629,9 +1651,9 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluRegionNoBail) {
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluThenBailRegion) {
-  // MOVZ; ADD; SUB; then a bailing RBIT ends the region after 3 translated.
+  // MOVZ; ADD; SUB; then a bailing MRS ends the region after 3 translated.
   static const uint32_t code[] = {
-      MovzX(0, 0x10), AddImmX(1, 0, 4), SubImmX(2, 1, 2), RbitX(3, 2)};
+      MovzX(0, 0x10), AddImmX(1, 0, 4), SubImmX(2, 1, 2), MrsMidrEl1(3)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
@@ -1641,19 +1663,19 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluThenBailRegion) {
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluMixedShiftRegion) {
   // A mix of shifted-register, extended-register, logical-immediate and a
-  // multiply, then a bailing RBIT. Exercises CheckMachineIR over the whole run.
+  // multiply, then a bailing MRS. Exercises CheckMachineIR over the whole run.
   static const uint32_t code[] = {MovzX(0, 0x7),
                                   MovzX(1, 0x3),
                                   AddRegX(2, 0, 1),
                                   SubRegLsl(3, 2, 1, 2),
                                   AndImmX(4, 3, 0, 7),
                                   MaddX(5, 0, 1, 4),
-                                  RbitX(6, 5)};
+                                  MrsMidrEl1(6)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  // 6 translate, the RBIT bails.
+  // 6 translate, the MRS bails.
   EXPECT_EQ(n, 6u);
 }
 
@@ -2467,14 +2489,14 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, LoadAddThenBailRegion) {
   static const uint32_t code[] = {
       LdrXuoff(0, 1, 0),   // [0] X0 = [X1]
       AddImmX(2, 0, 0x24),  // [1] X2 = X0 + 0x24
-      RbitX(3, 0),         // [2] RBIT bails
+      MrsMidrEl1(3),       // [2] MRS MIDR_EL1 bails
   };
   state_.cpu.x[1] = ToGuestAddr(&buf[0]);
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  // LDR + ADD translate; RBIT bails -> partial region of 2 instructions.
+  // LDR + ADD translate; MRS bails -> partial region of 2 instructions.
   EXPECT_EQ(n, 2u);
 }
 

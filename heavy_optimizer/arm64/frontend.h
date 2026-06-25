@@ -1355,9 +1355,74 @@ class HeavyOptimizerFrontend {
           Register lz = std::get<0>(Gen<x86_64::LzcntlRegReg>(xored));
           return std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(lz, int32_t{1}));
         }
+      case 0b000000:  // RBIT: reverse bit order.
+        // SWAR bit-reverse: swap adjacent bits, then bit-pairs, then nibbles
+        // (each as ((x & m) << s) | ((x >> s) & m)), then reverse byte order
+        // with the same shift/mask/or sequence as REV (no x86 BSWAP MachineIR op).
+        if (is_64bit) {
+          Register x = Copy(src);
+          // Swap adjacent bits (mask 0x5555..., shift 1).
+          Register lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x5555555555555555ULL)));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{1}));
+          Register hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{1}));
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x5555555555555555ULL)));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          // Swap bit-pairs (mask 0x3333..., shift 2).
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x3333333333333333ULL)));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{2}));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{2}));
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x3333333333333333ULL)));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          // Swap nibbles (mask 0x0F0F..., shift 4).
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x0F0F0F0F0F0F0F0FULL)));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{4}));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{4}));
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x0F0F0F0F0F0F0F0FULL)));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          // Reverse byte order: halfword-byte swap, halfword-pair swap, word swap.
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x00FF00FF00FF00FFULL)));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{8}));
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x00FF00FF00FF00FFULL)));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x0000FFFF0000FFFFULL)));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{16}));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{16}));
+          hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x0000FFFF0000FFFFULL)));
+          x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+          lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(Copy(x), int8_t{32}));
+          hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{32}));
+          return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        } else {
+          // RBIT Wd: reverse the low 32 bits, zero-extend.
+          Register x = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+          Register lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x55555555));
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{1}));
+          Register hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{1}));
+          hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x55555555));
+          x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+          lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x33333333));
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{2}));
+          hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{2}));
+          hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x33333333));
+          x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+          lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x0F0F0F0F));
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{4}));
+          hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{4}));
+          hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x0F0F0F0F));
+          x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+          // Byte-reverse the 32-bit word: halfword-byte swap then halfword swap.
+          lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x00FF00FF));
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{8}));
+          hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{8}));
+          hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x00FF00FF));
+          x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+          lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(Copy(x), int8_t{16}));
+          hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{16}));
+          return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+        }
       default:
-        // RBIT (000000): no x86 bit-reverse op and the lite tier bails it too;
-        // fall back to the interpreter.
+        // Any remaining unhandled DP-1Src opcode: fall back to the interpreter.
         UndefinedReturningReg();
         return AllocTempReg();
     }
