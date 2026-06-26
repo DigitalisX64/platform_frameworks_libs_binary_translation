@@ -17,6 +17,8 @@
 #ifndef BERBERIS_RUNTIME_PRIMITIVES_CODE_POOL_H_
 #define BERBERIS_RUNTIME_PRIMITIVES_CODE_POOL_H_
 
+#include <unistd.h>
+
 #include <cstdint>
 #include <mutex>
 
@@ -43,7 +45,8 @@ class CodePool {
   CodePool()
       : exec_(ExecRegionFactory::Create(ExecRegionFactory::kExecRegionSize)),
         current_address_{exec_.begin()},
-        detached_size_{0} {};
+        detached_size_{0},
+        owner_pid_{getpid()} {};
 
   // Not copyable or movable
   CodePool(const CodePool&) = delete;
@@ -53,6 +56,26 @@ class CodePool {
 
   [[nodiscard]] HostCodeAddr Add(MachineCode* code) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Fork safety. The executable region is a MAP_SHARED memfd, so it is shared
+    // with every process forked from this one. The guest-clone path resets exec
+    // regions in the child (ResetCurrentGuestThreadAfterFork -> ResetAllExecRegions),
+    // but a host/framework-initiated fork -- in particular the Android zygote
+    // (and Chromium's app-zygote) forking renderer processes -- does not go
+    // through that path, so the child keeps sharing the parent's region. Multiple
+    // renderer siblings then translate into the SAME shared offsets (each starts
+    // from the parent's current_address_) and overwrite each other's code, so a
+    // later dispatch jumps into corrupted/mid-instruction bytes and crashes
+    // (observed as Chromium renderers dying with SIGSEGV/SIGILL "NO-RECOVERY").
+    // Detect the fork lazily on the first install after the pid changes and give
+    // this process a fresh private region. Parent translations stay valid: their
+    // executable alias remains mapped read-only and their recovery_map_ entries
+    // (inherited copy-on-write) still resolve.
+    pid_t cur_pid = getpid();
+    if (cur_pid != owner_pid_) {
+      ResetExecRegion();
+      owner_pid_ = cur_pid;
+    }
 
     uint32_t size = code->install_size();
 
@@ -106,6 +129,9 @@ class CodePool {
   RecoveryMap recovery_map_;
   mutable std::mutex mutex_;
   size_t detached_size_;
+  // The pid that owns the current exec region. A mismatch on Add() means this
+  // process forked since the region was created; see the fork-safety note there.
+  pid_t owner_pid_;
 };
 
 // Stored data for generated code.

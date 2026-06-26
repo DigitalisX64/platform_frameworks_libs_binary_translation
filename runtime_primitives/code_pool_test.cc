@@ -17,9 +17,13 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <string_view>
 
 #include "berberis/base/bit_util.h"
+#include "berberis/base/mmap.h"
 #include "berberis/runtime_primitives/code_pool.h"
 
 namespace berberis {
@@ -102,6 +106,83 @@ TEST(CodePool, Smoke) {
     ASSERT_EQ(host_code, AsHostCodeAddr(second_exec_region_memory_exec));
     EXPECT_EQ(std::string_view{bit_cast<const char*>(second_exec_region_memory_write)}, kCode);
   }
+}
+
+// Counts Create() calls (no gmock, so it survives fork's copy-on-write static
+// state) and hands out a fresh distinct exec/write region pair each time.
+class CountingExecRegionFactory {
+ public:
+  static const uint32_t kExecRegionSize;
+  static int create_count;
+
+  static ExecRegion Create(size_t /*size*/) {
+    ++create_count;
+    auto* exec = bit_cast<uint8_t*>(MmapImplOrDie({
+        .size = kExecRegionSize,
+        .prot = PROT_NONE,
+        .flags = MAP_PRIVATE | MAP_ANONYMOUS,
+        .berberis_flags = kMmapBerberis32Bit,
+    }));
+    auto* write = bit_cast<uint8_t*>(MmapImplOrDie({
+        .size = kExecRegionSize,
+        .prot = PROT_READ | PROT_WRITE,
+        .flags = MAP_PRIVATE | MAP_ANONYMOUS,
+    }));
+    return ExecRegion{exec, write, kExecRegionSize};
+  }
+};
+
+const uint32_t CountingExecRegionFactory::kExecRegionSize = sysconf(_SC_PAGESIZE);
+int CountingExecRegionFactory::create_count = 0;
+
+// The executable region is a MAP_SHARED memfd that survives fork, so a child
+// process must NOT keep translating into the parent's region (siblings would
+// corrupt each other's code -- the Chromium-renderer crash this guards against).
+// CodePool detects the fork lazily: the first Add() after the pid changes must
+// call ResetExecRegion() to obtain a fresh private region.
+TEST(CodePool, ForkResetsExecRegion) {
+  CountingExecRegionFactory::create_count = 0;
+  CodePool<CountingExecRegionFactory> code_pool;  // Create() #1 at construction.
+  ASSERT_EQ(CountingExecRegionFactory::create_count, 1);
+
+  // Parent translates once; the region has space, so no reset.
+  MachineCode parent_code;
+  constexpr std::string_view kParent = "aaaa";
+  parent_code.AddSequence(kParent.data(), kParent.size());
+  (void)code_pool.Add(&parent_code);
+  ASSERT_EQ(CountingExecRegionFactory::create_count, 1);
+
+  int pipefd[2];
+  ASSERT_EQ(pipe(pipefd), 0);
+
+  pid_t pid = fork();
+  ASSERT_NE(pid, -1);
+  if (pid == 0) {
+    // Child: getpid() now differs from the pool's owner pid, so the first Add()
+    // must reset the exec region (Create() #2).
+    close(pipefd[0]);
+    MachineCode child_code;
+    constexpr std::string_view kChild = "bbbb";
+    child_code.AddSequence(kChild.data(), kChild.size());
+    (void)code_pool.Add(&child_code);
+    int count = CountingExecRegionFactory::create_count;
+    ssize_t written = write(pipefd[1], &count, sizeof(count));
+    _exit((written == sizeof(count) && count == 2) ? 0 : 1);
+  }
+
+  close(pipefd[1]);
+  int child_count = -1;
+  ASSERT_EQ(read(pipefd[0], &child_count, sizeof(child_count)),
+            static_cast<ssize_t>(sizeof(child_count)));
+  close(pipefd[0]);
+  int status = 0;
+  ASSERT_EQ(waitpid(pid, &status, 0), pid);
+
+  // With the fix the child's first Add() resets -> create_count == 2.
+  // Without it the child would reuse the parent's region -> create_count == 1.
+  EXPECT_EQ(child_count, 2);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(DataPool, Smoke) {
