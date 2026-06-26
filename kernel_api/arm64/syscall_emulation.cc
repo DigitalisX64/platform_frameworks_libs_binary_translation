@@ -17,6 +17,7 @@
 #include <fcntl.h>  // AT_FDCWD, AT_SYMLINK_NOFOLLOW
 #include <linux/futex.h>
 #include <linux/sched.h>
+#include <linux/seccomp.h>
 #include <linux/unistd.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
@@ -241,6 +242,44 @@ void RunGuestSyscall(ThreadState* state) {
       OnSyscallReturn(state, guest_nr);
     }
     return;
+  }
+
+  // seccomp filter neutering
+  // Guests that harden themselves with their own seccomp policy (Chromium and
+  // Gecko install one in every renderer/GPU process) call seccomp() with a
+  // seccomp-bpf program built for the GUEST ABI: its architecture gate compares
+  // seccomp_data.arch against AUDIT_ARCH_AARCH64 and its per-syscall checks use
+  // AArch64 syscall numbers. Under translation the process actually executes as
+  // x86_64 and Berberis issues HOST x86_64 syscalls, so the filter never matches
+  // the running architecture -- the first post-install syscall trips
+  // SECCOMP_RET_TRAP/KILL and the kernel raises SIGSYS, killing the process. That
+  // is exactly what kills every Chromium renderer at launch (Chromium reports
+  // termination status 6 / LAUNCH_FAILED), leaving the browser UI process alive
+  // but unable to render any page. A guest filter also cannot meaningfully
+  // confine the host under translation, because it would govern the translator's
+  // own host syscalls (the b/110423578 caveat the prctl path already notes). So
+  // do NOT install a guest seccomp filter: report success to the guest while
+  // leaving the process unfiltered. The host zygote's native x86_64 seccomp
+  // policy still confines the app, so the OS sandbox is unchanged; only the
+  // guest's redundant, non-functional extra layer is dropped.
+  //
+  // SECCOMP_SET_MODE_STRICT (which permits only read/write/exit/sigreturn) would
+  // likewise instantly SIGSYS the translator, so it is neutered too. The query
+  // operations (SECCOMP_GET_ACTION_AVAIL / SECCOMP_GET_NOTIF_SIZES) install
+  // nothing and fall through to the host.
+  if (guest_nr == 277) {  // __NR_seccomp
+    unsigned int operation = static_cast<unsigned int>(state->cpu.x[0]);
+    if (operation == SECCOMP_SET_MODE_FILTER || operation == SECCOMP_SET_MODE_STRICT) {
+      TRACE(
+          "ignoring guest seccomp(operation=%u) under translation: a guest BPF "
+          "filter targets the AArch64 ABI and would SIGSYS the x86_64 host",
+          operation);
+      state->cpu.x[0] = 0;
+      if (kInstrumentSyscalls) {
+        OnSyscallReturn(state, guest_nr);
+      }
+      return;
+    }
   }
 
   // futex BSS workaround
