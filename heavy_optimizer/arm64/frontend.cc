@@ -660,12 +660,15 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
     }
 
     case Decoder::AtomicOp::kStlr: {
-      // Store-release: x86-TSO provides release ordering for all stores.
+      // Store-release: x86-TSO gives release ordering for free, but ARM STLR is
+      // sequentially consistent (RCsc) and also orders the store before later
+      // loads. x86 permits StoreLoad reordering, so emit MFENCE after the store.
       Register data = (args.rt != 31) ? GetReg(args.rt) : GetImm(0);
       if (!success()) {
         return;
       }
       Store(lss, base, 0, data);
+      builder_.Gen<x86_64::Mfence>();
       return;
     }
 
@@ -788,6 +791,11 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       UndefinedReturningVoid();
       return;
   }
+}
+
+void HeavyOptimizerFrontend::DataMemoryBarrier() {
+  // Full DMB/DSB -> MFENCE: recover the StoreLoad ordering x86 TSO omits.
+  builder_.Gen<x86_64::Mfence>();
 }
 
 void HeavyOptimizerFrontend::Undefined() {

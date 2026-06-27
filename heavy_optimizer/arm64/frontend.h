@@ -136,6 +136,10 @@ class HeavyOptimizerFrontend {
   void Undefined();
   void Nop() {}
 
+  // DMB/DSB full barrier: lowers to MFENCE (x86 TSO lacks StoreLoad ordering).
+  // The store-only/load-only barrier variants are NOPed in the decoder.
+  void DataMemoryBarrier();
+
   //
   // Immediate-form data processing.
   //

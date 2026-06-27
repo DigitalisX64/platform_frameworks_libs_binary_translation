@@ -2371,7 +2371,6 @@ class Decoder {
         return;
       }
       if (crn == 0b0011) {
-        // barrier audit (CRn=0011).
         // Memory and synchronization barriers.  Op2 selects the variant:
         //   CLREX = CRn=0011, CRm=imm,  op2=010
         //   DSB   = CRn=0011, CRm=opt,  op2=100  (incl. "DFB" — full)
@@ -2379,17 +2378,28 @@ class Decoder {
         //   ISB   = CRn=0011, CRm=imm,  op2=110
         //   SB    = CRn=0011, CRm=0000, op2=111  (Armv8.5-SB)
         //   TSB CSYNC = CRn=0011, CRm=0010, op2=010 (Armv8.4-TRBE)
-        // x86_64 already provides total store order with locked atomics
-        // (see kCas/kSwp/kLdadd handlers in interpreter.h and
-        // lite_translator.h: every LSE op uses `lock` or `xchg`).  ISB
-        // is unnecessary because we never patch code in-flight from the
-        // guest's perspective; the JIT cache is invalidated through
-        // the translator's own mechanism, not via guest ISB.  CLREX
-        // clears the LL/SC exclusive monitor, which we don't model
-        // (Digitalis emulates LDXR/STXR pairs as cmpxchg, see
-        //). Routing the whole CRn=0011 class to Nop is therefore
-        // correct.
-        insn_consumer_->Nop();
+        //
+        // x86_64 TSO provides StoreStore, LoadLoad and LoadStore ordering for
+        // free, but NOT StoreLoad. A full DMB/DSB (CRm option type 0b11=full or
+        // 0b00=reserved-treated-as-full: SY/ISH/NSH/OSH) is a FULL barrier that
+        // DOES order a prior store before a later load, so it must lower to an
+        // MFENCE — NOP-ing it drops StoreLoad ordering and breaks sequentially
+        // consistent guest code (flaky lock-free / seqlock corruption). The
+        // store-only (CRm type 0b10, *ST) and load-only (0b01, *LD) variants
+        // need only orderings x86 already gives, so they stay NOPs.
+        //
+        // ISB needs no DATA fence (guest code patching is handled via IC IVAU /
+        // the translator's own cache invalidation, not guest ISB). CLREX clears
+        // the LL/SC monitor, which we model as cmpxchg, and SB/TSB are
+        // speculation/trace barriers — all remain NOPs.
+        const bool is_dmb = (op2 == 0b101);
+        const bool is_dsb = (op2 == 0b100);
+        const uint8_t barrier_type = crm & 0b11;  // 11=full, 00=reserved(full), 10=ST, 01=LD
+        if ((is_dmb || is_dsb) && (barrier_type == 0b11 || barrier_type == 0b00)) {
+          insn_consumer_->DataMemoryBarrier();
+        } else {
+          insn_consumer_->Nop();
+        }
         return;
       }
     }
