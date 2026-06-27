@@ -449,6 +449,74 @@ TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   EXPECT_EQ(state_.cpu.x[2], 30ULL);
 }
 
+// Differential test of a real-world bump-allocator placement-new region: two CBZ
+// guards followed by a ldr/add/stp/str/adr construction sequence that builds a
+// vtable'd object in a freshly-allocated buffer and advances the arena descriptor.
+// Runs the region through the lite JIT and the interpreter with identical memory
+// and asserts the descriptor and constructed object match bit-for-bit — guarding
+// the chained allocator-construction path against codegen divergence.
+TEST_F(Arm64LiteTranslateRegionTest, AllocatorConstructionRegionDifferential) {
+  static const uint32_t code[] = {
+      0x34000054,  // cbz w20, +8        (fall through: x20!=0)
+      0xb40004b5,  // cbz x21, +0x94     (fall through: x21!=0)
+      0xf9400268,  // ldr x8, [x19]
+      0x8b1402a9,  // add x9, x21, x20
+      0xa900a675,  // stp x21, x9, [x19, #8]
+      0xf90002a8,  // str x8, [x21]
+      0xf9400668,  // ldr x8, [x19, #8]
+      0x91002109,  // add x9, x8, #8
+      0xf9000669,  // str x9, [x19, #8]
+      0xd503201f,  // nop
+      0x100c05c9,  // adr x9, +0x180b8
+      0xf9000509,  // str x9, [x8, #8]
+      0xf9400668,  // ldr x8, [x19, #8]
+      0x91002109,  // add x9, x8, #8
+      0xf9000669,  // str x9, [x19, #8]
+      0x3900211f,  // strb wzr, [x8, #8]
+      0xf9400668,  // ldr x8, [x19, #8]
+      0x91000508,  // add x8, x8, #1
+      0xa9002268,  // stp x8, x8, [x19]
+  };
+  // CRITICAL: use the SAME desc/buf addresses for both runs so absolute pointers
+  // written into the descriptor are directly comparable.
+  alignas(16) uint64_t desc[8];
+  alignas(16) uint8_t buf[0x40];
+  uint64_t jit_desc[8];
+  uint8_t jit_buf[0x40];
+
+  auto setup = [&]() {
+    memset(desc, 0, sizeof(desc));
+    memset(buf, 0xCD, sizeof(buf));
+    desc[0] = 0xAAAA5555AAAA5555ULL;  // [x19] sentinel -> stored into [x21]
+    for (int i = 0; i < 32; i++) state_.cpu.x[i] = 0;
+    state_.cpu.x[19] = ToGuestAddr(desc);
+    state_.cpu.x[20] = 0x200;
+    state_.cpu.x[21] = ToGuestAddr(buf);
+  };
+
+  // JIT path, then snapshot the resulting memory.
+  setup();
+  ASSERT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  memcpy(jit_desc, desc, sizeof(desc));
+  memcpy(jit_buf, buf, sizeof(buf));
+
+  // Interpreter path: same memory addresses, step every instruction.
+  setup();
+  GuestAddr start = ToGuestAddr(code);
+  GuestAddr end = start + sizeof(code);
+  state_.cpu.insn_addr = start;
+  int guard = 0;
+  while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < end && guard++ < 64) {
+    InterpretInsn(&state_);
+  }
+
+  // The descriptor (x19[0..2]) and the constructed object (buffer) must match bit-for-bit.
+  EXPECT_EQ(jit_desc[0], desc[0]) << "descriptor[0] (cur) JIT vs interp";
+  EXPECT_EQ(jit_desc[1], desc[1]) << "descriptor[1] (begin) JIT vs interp";
+  EXPECT_EQ(jit_desc[2], desc[2]) << "descriptor[2] (end) JIT vs interp";
+  EXPECT_EQ(0, memcmp(jit_buf, buf, sizeof(buf))) << "buffer bytes JIT vs interp";
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddImmediate) {
   static const uint32_t code[] = {
       MovzX(0, 100),      // MOVZ X0, #100
