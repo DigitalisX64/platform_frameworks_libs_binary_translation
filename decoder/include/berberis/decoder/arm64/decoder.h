@@ -2679,8 +2679,18 @@ class Decoder {
         return;
       }
       if (op4 == 0b10) {
-        // Load/store register (register offset).
-        DecodeLoadStoreRegOffset();
+        // bit[21]=1: Load/store register (register offset).
+        // bit[21]=0: Load/store register (unprivileged) — LDTR*/STTR*. At EL0
+        // these are semantically identical to LDUR/STUR and share the imm9
+        // layout, so route them to the unscaled handler (which decodes
+        // size/opc/imm9 and sign-extends signed loads correctly). Without the
+        // bit21 split they were misdecoded as register-offset, reinterpreting
+        // imm9 as rm/option/S — either Undefined or a wrong-address load.
+        if (GetBits<21, 1>()) {
+          DecodeLoadStoreRegOffset();
+        } else {
+          DecodeLoadStoreUnscaled();
+        }
         return;
       }
     }
