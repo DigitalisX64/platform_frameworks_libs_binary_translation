@@ -439,6 +439,146 @@ class Arm64LiteTranslateRegionTest : public ::testing::Test {
   ThreadState state_{};
 };
 
+// Interpreter-vs-EXPECTED for the NEON structured load/store family (LD1-4 /
+// ST1-4, multi-register interleaved and single-lane + replicate). Skia's glyph
+// blitter and pixel-format conversion lean heavily on these to de/interleave
+// coverage and channels; a mis-decode/mis-interpret here rearranges pixels and
+// fragments glyphs in EVERY translation mode (shared decoder), exactly the class
+// of the prior LD2-as-contiguous bug. Reference de-interleaving is computed in
+// C++ and compared against the interpreter.
+TEST_F(Arm64LiteTranslateRegionTest, StructuredLoadStoreInterpreterVsExpected) {
+  auto getv = [&](int i, uint8_t out[16]) { memcpy(out, &state_.cpu.v[i], 16); };
+  auto zerovs = [&]() {
+    for (int i = 0; i < 32; i++) {
+      uint64_t z[2] = {0, 0};
+      memcpy(&state_.cpu.v[i], z, 16);
+    }
+  };
+  alignas(16) uint8_t mem[128];
+  auto fill = [&]() {
+    for (int i = 0; i < 128; i++) mem[i] = (uint8_t)((i * 53) ^ 0x3C);
+  };
+  int checked = 0, fails = 0;
+  auto run = [&](uint32_t insn) {
+    zerovs();
+    state_.cpu.x[0] = ToGuestAddr(mem);
+    Interpret(insn);
+  };
+
+  // --- Multi-struct interleaved loads: V[rt+r][e] = mem[e*n + r] (elem size es) ---
+  struct LdN {
+    const char* name;
+    uint32_t insn;
+    int n;       // number of registers
+    int es;      // element size in bytes
+    int vlen;    // 8 (Q=0) or 16 (Q=1)
+  };
+  const LdN ldns[] = {
+      {"ld2.16b", 0x4c408000, 2, 1, 16}, {"ld3.16b", 0x4c404000, 3, 1, 16},
+      {"ld4.16b", 0x4c400000, 4, 1, 16}, {"ld2.8h", 0x4c408400, 2, 2, 16},
+      {"ld2.4s", 0x4c408800, 2, 4, 16},  {"ld2.2d", 0x4c408c00, 2, 8, 16},
+      {"ld3.8h", 0x4c404400, 3, 2, 16},  {"ld4.4s", 0x4c400800, 4, 4, 16},
+      {"ld2.8b", 0x0c408000, 2, 1, 8},   {"ld3.4h", 0x0c404400, 3, 2, 8},
+  };
+  for (const LdN& l : ldns) {
+    fill();
+    run(l.insn);
+    const int lanes = l.vlen / l.es;
+    for (int r = 0; r < l.n; r++) {
+      uint8_t got[16];
+      getv(r, got);
+      uint8_t want[16];
+      memset(want, 0, 16);
+      for (int e = 0; e < lanes; e++)
+        memcpy(want + e * l.es, mem + (e * l.n + r) * l.es, l.es);
+      checked++;
+      if (memcmp(got, want, 16) != 0 && fails < 20) {
+        fails++;
+        ADD_FAILURE() << l.name << " V" << r << " de-interleave mismatch";
+      }
+    }
+  }
+
+  // --- Multi-struct contiguous LD1 (1..4 regs, .16b): V[rt+r] = mem[r*16 ..] ---
+  const uint32_t ld1n[4] = {0x4c407000, 0x4c40a000, 0x4c406000, 0x4c402000};
+  for (int n = 1; n <= 4; n++) {
+    fill();
+    run(ld1n[n - 1]);
+    for (int r = 0; r < n; r++) {
+      uint8_t got[16];
+      getv(r, got);
+      checked++;
+      if (memcmp(got, mem + r * 16, 16) != 0 && fails < 20) {
+        fails++;
+        ADD_FAILURE() << "ld1x" << n << " V" << r << " contiguous mismatch";
+      }
+    }
+  }
+
+  // --- Multi-struct interleaved STORE: ST2/ST3/ST4 .16b/.8h/.4s ---
+  struct StN {
+    const char* name;
+    uint32_t insn;
+    int n;
+    int es;
+  };
+  const StN stns[] = {
+      {"st2.16b", 0x4c008000, 2, 1}, {"st3.8h", 0x4c004400, 3, 2}, {"st4.4s", 0x4c000800, 4, 4}};
+  for (const StN& st : stns) {
+    // Seed source registers V0..V(n-1) with distinct patterns, zero memory.
+    zerovs();
+    for (int r = 0; r < st.n; r++) {
+      uint8_t v[16];
+      for (int b = 0; b < 16; b++) v[b] = (uint8_t)(0x10 * (r + 1) + b);
+      memcpy(&state_.cpu.v[r], v, 16);
+    }
+    memset(mem, 0, sizeof(mem));
+    state_.cpu.x[0] = ToGuestAddr(mem);
+    Interpret(st.insn);
+    const int lanes = 16 / st.es;
+    uint8_t want[128];
+    memset(want, 0, sizeof(want));
+    for (int e = 0; e < lanes; e++)
+      for (int r = 0; r < st.n; r++) {
+        uint8_t src[16];
+        memcpy(src, &state_.cpu.v[r], 16);
+        memcpy(want + (e * st.n + r) * st.es, src + e * st.es, st.es);
+      }
+    checked++;
+    if (memcmp(mem, want, st.n * 16) != 0 && fails < 20) {
+      fails++;
+      ADD_FAILURE() << st.name << " interleaved store mismatch";
+    }
+  }
+
+  // --- Replicate loads: LD1R .16b (all 16 lanes = mem[0]); LD2R .4s ---
+  {
+    fill();
+    run(0x4d40c000);  // ld1r {v0.16b}
+    uint8_t got[16];
+    getv(0, got);
+    checked++;
+    bool ok = true;
+    for (int b = 0; b < 16; b++) ok &= (got[b] == mem[0]);
+    if (!ok && fails < 20) { fails++; ADD_FAILURE() << "ld1r.16b replicate mismatch"; }
+  }
+  {
+    fill();
+    run(0x4d60c800);  // ld2r {v0.4s, v1.4s}
+    for (int r = 0; r < 2; r++) {
+      uint8_t got[16];
+      getv(r, got);
+      checked++;
+      bool ok = true;
+      for (int e = 0; e < 4; e++) ok &= (memcmp(got + e * 4, mem + r * 4, 4) == 0);
+      if (!ok && fails < 20) { fails++; ADD_FAILURE() << "ld2r.4s V" << r << " replicate mismatch"; }
+    }
+  }
+
+  EXPECT_GT(checked, 30);
+  EXPECT_EQ(fails, 0);
+}
+
 // StoreLoad-ordering fix: ARM STLR is sequentially consistent (RCsc) and a full
 // DMB/DSB is a full barrier, but x86 TSO does NOT provide StoreLoad ordering. The
 // lite JIT must emit an MFENCE for STLR and for a full DMB (SY/ISH/...), while a
