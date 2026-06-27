@@ -439,6 +439,37 @@ class Arm64LiteTranslateRegionTest : public ::testing::Test {
   ThreadState state_{};
 };
 
+// StoreLoad-ordering fix: ARM STLR is sequentially consistent (RCsc) and a full
+// DMB/DSB is a full barrier, but x86 TSO does NOT provide StoreLoad ordering. The
+// lite JIT must emit an MFENCE for STLR and for a full DMB (SY/ISH/...), while a
+// store-only DMB (ISHST) needs none (x86 gives StoreStore for free). Dropping the
+// fence caused flaky, timing/GPU-dependent lock-free corruption (Helium glyphs).
+TEST_F(Arm64LiteTranslateRegionTest, StoreLoadBarrierEmitsMfence) {
+  auto region_bytes = [&](uint32_t insn) -> std::string {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    EXPECT_TRUE(ok);
+    std::string s;
+    mc.AsString(&s, InstructionSize::OneByte);
+    return s;
+  };
+  // MFENCE = 0F AE F0.
+  auto has_mfence = [](const std::string& s) {
+    return s.find("0f ae f0") != std::string::npos || s.find("0F AE F0") != std::string::npos;
+  };
+  EXPECT_TRUE(has_mfence(region_bytes(0x889ffc01))) << "STLR W must emit MFENCE";
+  EXPECT_TRUE(has_mfence(region_bytes(0xc89ffc01))) << "STLR X must emit MFENCE";
+  EXPECT_TRUE(has_mfence(region_bytes(0xd5033bbf))) << "DMB ISH (full) must emit MFENCE";
+  EXPECT_TRUE(has_mfence(region_bytes(0xd5033fbf))) << "DMB SY (full) must emit MFENCE";
+  EXPECT_TRUE(has_mfence(region_bytes(0xd5033f9f))) << "DSB SY (full) must emit MFENCE";
+  EXPECT_FALSE(has_mfence(region_bytes(0xd5033abf))) << "DMB ISHST (store-only) needs no MFENCE";
+  EXPECT_FALSE(has_mfence(region_bytes(0x88dffc01))) << "LDAR needs no MFENCE (x86 acquire is free)";
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   static const uint32_t code[] = {
       MovzX(0, 10),       // MOVZ X0, #10

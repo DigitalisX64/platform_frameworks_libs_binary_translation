@@ -16,6 +16,7 @@
 
 #include "berberis/interpreter/arm64/interpreter.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -3314,6 +3315,11 @@ class Interpreter {
   }
 
   void Nop() {}
+
+  // DMB/DSB full barrier: a full memory fence. x86 TSO lacks StoreLoad ordering,
+  // so a seq-cst thread fence (MFENCE on x86) is required to honor a guest full
+  // barrier; otherwise sequentially consistent guest code races.
+  void DataMemoryBarrier() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 
   // IC IVAU, Xt — Instruction Cache Invalidate by VA. ARM64 user-space JITs
   // (e.g. PCRE2/sljit) issue this after writing new code at a (possibly reused)
@@ -9924,7 +9930,10 @@ class Interpreter {
 
   template <typename T>
   void AtomicStore(void* addr, uint64_t val) {
-    __atomic_store_n(static_cast<T*>(addr), static_cast<T>(val), __ATOMIC_RELEASE);
+    // ARM STLR is sequentially consistent (RCsc), not merely release: it orders
+    // the store before any subsequent load. x86 release (a plain store) does not
+    // give StoreLoad ordering, so use SEQ_CST (MFENCE / locked xchg on x86).
+    __atomic_store_n(static_cast<T*>(addr), static_cast<T>(val), __ATOMIC_SEQ_CST);
   }
 
   template <typename T>

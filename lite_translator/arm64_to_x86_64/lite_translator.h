@@ -1403,6 +1403,11 @@ class LiteTranslator {
 
   void Nop() {}
 
+  // DMB/DSB full barrier: x86 TSO lacks StoreLoad ordering, so a full guest
+  // barrier must lower to MFENCE (the store-only/load-only variants are NOPed
+  // upstream in the decoder).
+  void DataMemoryBarrier() { as_.Mfence(); }
+
   // IC IVAU, Xt — invalidate the translation cache for self-modified code. The
   // address is only known at run time, so end the region here and let the
   // interpreter perform the invalidation (see Interpreter::IcIvau).
@@ -12091,11 +12096,16 @@ class LiteTranslator {
       }
 
       case Decoder::AtomicOp::kStlr: {
-        // Store-release: x86 TSO provides release semantics for stores.
+        // Store-release: x86 TSO gives release ordering for free, but ARM STLR is
+        // sequentially consistent (RCsc) — it also orders the store before any
+        // later load. x86 permits StoreLoad reordering, so emit MFENCE after the
+        // store to recover that ordering (matches the standard seq-cst-store
+        // lowering). Without it, seq_cst guest code races flakily.
         Register data = (args.rt < 31) ? GetReg(args.rt) : AllocTempReg();
         if (!success()) return;
         if (args.rt >= 31) as_.Xorl(data, data);
         Store(lss, base, 0, data);
+        as_.Mfence();
         break;
       }
 

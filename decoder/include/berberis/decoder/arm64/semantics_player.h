@@ -324,6 +324,9 @@ class SemanticsPlayer {
 
   void Nop() { listener_->Nop(); }
 
+  // DMB/DSB full barrier (SY/ISH/...): a StoreLoad fence the host must honor.
+  void DataMemoryBarrier() { listener_->DataMemoryBarrier(); }
+
   // IC IVAU, Xt — invalidate the translation cache for the modified code line.
   void IcIvau(uint8_t rt) { listener_->IcIvau(rt); }
 
