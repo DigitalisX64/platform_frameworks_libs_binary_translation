@@ -449,6 +449,555 @@ TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   EXPECT_EQ(state_.cpu.x[2], 30ULL);
 }
 
+// Interpreter-vs-EXPECTED for scalar FP arith (FADD/FSUB/FMUL/FDIV, single &
+// double) and int<->float conversions (SCVTF/FCVTZS), against C++ float/double.
+// FreeType/Skia use scalar FP for glyph scaling/subpixel positioning; a wrong FP
+// op would distort glyphs. Invisible to a JIT-vs-interp differential.
+TEST_F(Arm64LiteTranslateRegionTest, ScalarFpInterpreterVsExpected) {
+  uint64_t s = 0x1357ACE0ULL;
+  auto rnd = [&]() -> uint64_t {
+    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    return s >> 33;
+  };
+  auto rf = [&]() -> double {  // varied finite, non-NaN values
+    int kind = rnd() % 6;
+    if (kind == 0) return 0.0;
+    if (kind == 1) return (double)(int)(rnd() % 2000) - 1000.0;
+    if (kind == 2) return ((double)(int)(rnd() % 20000) - 10000.0) / 64.0;  // 1/64 subpixel
+    if (kind == 3) return -((double)(rnd() % 100000)) / 1024.0;
+    double a = (double)(int64_t)(rnd() | 1), b = (double)(int64_t)(rnd() | 1);
+    return a / b;
+  };
+  auto setS = [&](int i, float f) {
+    uint64_t parts[2] = {0, 0};
+    memcpy(parts, &f, 4);
+    memcpy(&state_.cpu.v[i], parts, 16);
+  };
+  auto setD = [&](int i, double f) {
+    uint64_t parts[2] = {0, 0};
+    memcpy(parts, &f, 8);
+    memcpy(&state_.cpu.v[i], parts, 16);
+  };
+  auto getS = [&](int i) -> float {
+    uint64_t parts[2];
+    memcpy(parts, &state_.cpu.v[i], 16);
+    float f;
+    uint32_t b = (uint32_t)parts[0];
+    memcpy(&f, &b, 4);
+    return f;
+  };
+  auto getD = [&](int i) -> double {
+    uint64_t parts[2];
+    memcpy(parts, &state_.cpu.v[i], 16);
+    double f;
+    memcpy(&f, &parts[0], 8);
+    return f;
+  };
+  auto bitsEq = [](double a, double b) {
+    uint64_t x, y;
+    memcpy(&x, &a, 8);
+    memcpy(&y, &b, 8);
+    return x == y;
+  };
+  auto bitsEqf = [](float a, float b) {
+    uint32_t x, y;
+    memcpy(&x, &a, 4);
+    memcpy(&y, &b, 4);
+    return x == y;
+  };
+
+  int checked = 0, fails = 0;
+  for (int iter = 0; iter < 20000 && fails < 30; iter++) {
+    int op = rnd() % 4;  // add sub mul div
+    bool dbl = rnd() & 1;
+    uint32_t base_s[4] = {0x1E202800, 0x1E203800, 0x1E200800, 0x1E201800};
+    uint32_t base_d[4] = {0x1E602800, 0x1E603800, 0x1E600800, 0x1E601800};
+    uint32_t rd = 0, rn = 1, rm = 2;
+    uint32_t insn = (dbl ? base_d[op] : base_s[op]) | (rm << 16) | (rn << 5) | rd;
+    double na = rf(), ma = rf();
+    if (op == 3 && ma == 0.0) ma = 1.0;  // skip div-by-zero (inf, separate concern)
+    checked++;
+    if (dbl) {
+      double exp = op == 0 ? na + ma : op == 1 ? na - ma : op == 2 ? na * ma : na / ma;
+      setD(rn, na);
+      setD(rm, ma);
+      Interpret(insn);
+      double got = getD(rd);
+      if (!bitsEq(got, exp) && !(std::isnan(got) && std::isnan(exp))) {
+        fails++;
+        ADD_FAILURE() << "fp64 op" << op << " a=" << na << " b=" << ma << " exp=" << exp
+                      << " got=" << got;
+      }
+    } else {
+      float nf = (float)na, mf = (float)ma;
+      float exp = op == 0 ? nf + mf : op == 1 ? nf - mf : op == 2 ? nf * mf : nf / mf;
+      setS(rn, nf);
+      setS(rm, mf);
+      Interpret(insn);
+      float got = getS(rd);
+      if (!bitsEqf(got, exp) && !(std::isnan(got) && std::isnan(exp))) {
+        fails++;
+        ADD_FAILURE() << "fp32 op" << op << " a=" << nf << " b=" << mf << " exp=" << exp
+                      << " got=" << got;
+      }
+    }
+  }
+  EXPECT_GT(checked, 5000);
+}
+
+// Interpreter-vs-EXPECTED for the widening 32x32->64 multiplies SMULL/UMULL and
+// multiply-accumulate SMADDL/UMADDL/SMSUBL/UMSUBL, with negative 32-bit operands.
+// FreeType ftgrays computes cell AREA as products of 32-bit edge coordinates
+// widened to 64-bit; a sign-extension error here corrupts diagonal-edge area
+// while axis-aligned (special-cased) edges stay correct — matching the symptom.
+TEST_F(Arm64LiteTranslateRegionTest, MulLongInterpreterVsExpected) {
+  uint64_t s = 0xF00DBA5EULL;
+  auto rnd = [&]() -> uint64_t {
+    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    return s >> 33;
+  };
+  auto pick = [&]() -> uint64_t {
+    switch (rnd() % 9) {
+      case 0: return 0;
+      case 1: return 1;
+      case 2: return 0xFFFFFFFFULL;          // -1 as W
+      case 3: return 0x80000000ULL;          // INT32_MIN as W
+      case 4: return 0x7FFFFFFFULL;          // INT32_MAX
+      case 5: return rnd() % 70000;          // can overflow 32-bit when squared
+      case 6: return (uint64_t)0 - (rnd() % 70000);
+      default: return ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    }
+  };
+  struct M { const char* name; uint32_t base; bool sign; int kind; };  // kind 0=mul 1=madd 2=msub
+  const M ms[] = {
+      {"smull", 0x9B207C00, true, 0}, {"umull", 0x9BA07C00, false, 0},
+      {"smaddl", 0x9B200000, true, 1}, {"umaddl", 0x9BA00000, false, 1},
+      {"smsubl", 0x9B208000, true, 2}, {"umsubl", 0x9BA08000, false, 2},
+  };
+  int checked = 0, fails = 0;
+  for (int iter = 0; iter < 30000 && fails < 30; iter++) {
+    const M& o = ms[rnd() % 6];
+    uint32_t rd = 1 + rnd() % 9, rn = 1 + rnd() % 9, rm = 1 + rnd() % 9, ra = 1 + rnd() % 9;
+    uint32_t insn = o.base | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+    uint64_t n = pick(), m = pick(), a = pick();
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+    state_.cpu.x[rn] = n;
+    state_.cpu.x[rm] = m;
+    state_.cpu.x[ra] = a;
+    uint64_t un = state_.cpu.x[rn], um = state_.cpu.x[rm], ua = state_.cpu.x[ra];
+    Interpret(insn);
+    uint64_t got = state_.cpu.x[rd];
+    uint64_t prod = o.sign
+                        ? (uint64_t)((int64_t)(int32_t)(uint32_t)un * (int64_t)(int32_t)(uint32_t)um)
+                        : ((uint64_t)(uint32_t)un * (uint64_t)(uint32_t)um);
+    uint64_t exp = o.kind == 0 ? prod : (o.kind == 1 ? ua + prod : ua - prod);
+    checked++;
+    if (got != exp) {
+      fails++;
+      ADD_FAILURE() << o.name << " Wn=0x" << std::hex << (uint32_t)un << " Wm=0x" << (uint32_t)um
+                    << " Xa=0x" << ua << " EXPECTED=0x" << exp << " INTERP=0x" << got << std::dec;
+    }
+  }
+  EXPECT_GT(checked, 10000);
+}
+
+// Interpreter-vs-EXPECTED for integer stores (STRB/STRH/STR W&X) and STP (W&X),
+// verifying the written bytes against an independent reference. FreeType ftgrays
+// writes its cell array via exactly these. A wrong store width/order/value is a
+// garbled-glyph candidate invisible to a JIT-vs-interp differential.
+TEST_F(Arm64LiteTranslateRegionTest, StoresInterpreterVsExpected) {
+  int checked = 0, fails = 0;
+  struct S { const char* name; uint32_t base; int bytes; };
+  const S strs[] = {{"strb", 0x39000000, 1}, {"strh", 0x79000000, 2},
+                    {"str_w", 0xB9000000, 4}, {"str_x", 0xF9000000, 8}};
+  const uint64_t vals[] = {0x1122334455667788ULL, 0xFFFFFFFFFFFFFFFFULL,
+                           0x80000000FF00A55AULL, 0x00000000DEADBEEFULL, 0};
+  for (const S& s : strs) {
+    for (uint64_t v : vals) {
+      for (int off = 0; off + s.bytes <= 90; off += s.bytes) {  // aligned: imm scaled by size
+        alignas(16) uint8_t buf[128];
+        memset(buf, 0xCC, sizeof(buf));
+        uint32_t imm = (uint32_t)(off / s.bytes);
+        uint32_t rt = 0, rn = 1;
+        uint32_t insn = s.base | (imm << 10) | (rn << 5) | rt;
+        for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+        state_.cpu.x[rt] = v;
+        state_.cpu.x[rn] = ToGuestAddr(buf);
+        Interpret(insn);
+        // Expected: low `bytes` of v written at off; rest of buf unchanged (0xCC).
+        uint8_t exp[128];
+        memset(exp, 0xCC, sizeof(exp));
+        memcpy(exp + off, &v, s.bytes);
+        checked++;
+        if (memcmp(buf, exp, sizeof(buf)) != 0 && fails < 20) {
+          fails++;
+          uint64_t gotw = 0;
+          memcpy(&gotw, buf + off, s.bytes);
+          ADD_FAILURE() << s.name << " off=" << off << " v=0x" << std::hex << v << " stored=0x"
+                        << gotw << std::dec;
+        }
+      }
+    }
+  }
+  // STP Xt, Xt2, [Xn, #imm] (64-bit) and STP Wt, Wt2 (32-bit).
+  struct P { uint32_t base; int bytes; };
+  const P stps[] = {{0xA9000000, 8}, {0x29000000, 4}};
+  for (const P& p : stps) {
+    for (int k = 0; k < (int)(sizeof(vals) / sizeof(vals[0])); k++) {
+      alignas(16) uint8_t buf[128];
+      memset(buf, 0xCC, sizeof(buf));
+      uint64_t v1 = vals[k], v2 = vals[(k + 2) % 5];
+      uint32_t imm7 = 2;  // scaled by access size; offset = 2*bytes
+      int off = imm7 * p.bytes;
+      uint32_t rt = 0, rt2 = 3, rn = 1;
+      uint32_t insn = p.base | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
+      for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+      state_.cpu.x[rt] = v1;
+      state_.cpu.x[rt2] = v2;
+      state_.cpu.x[rn] = ToGuestAddr(buf);
+      Interpret(insn);
+      uint8_t exp[128];
+      memset(exp, 0xCC, sizeof(exp));
+      memcpy(exp + off, &v1, p.bytes);
+      memcpy(exp + off + p.bytes, &v2, p.bytes);
+      checked++;
+      if (memcmp(buf, exp, sizeof(buf)) != 0 && fails < 20) {
+        fails++;
+        uint64_t g1 = 0, g2 = 0;
+        memcpy(&g1, buf + off, p.bytes);
+        memcpy(&g2, buf + off + p.bytes, p.bytes);
+        ADD_FAILURE() << "stp bytes=" << p.bytes << " v1=0x" << std::hex << v1 << " v2=0x" << v2
+                      << " got1=0x" << g1 << " got2=0x" << g2 << std::dec;
+      }
+    }
+  }
+  EXPECT_GT(checked, 20);
+}
+
+// Interpreter-vs-EXPECTED for the conditional-select family across ALL 16
+// conditions and many flag states, plus SBFX/UBFX bitfield extraction. A wrong
+// condition evaluation (GE/LT/GT/LE depend on N,V) or a wrong signed bitfield
+// extract corrupts the rasterizer's branchless coverage clamps. Independent C++
+// reference; invisible to a JIT-vs-interp differential.
+TEST_F(Arm64LiteTranslateRegionTest, CondAndBitfieldInterpreterVsExpected) {
+  // Evaluate ARM condition from packed flags (N@15 Z@14 C@8 V@0).
+  auto cond_holds = [](uint32_t cond, uint16_t f) -> bool {
+    int N = (f >> 15) & 1, Z = (f >> 14) & 1, C = (f >> 8) & 1, V = (f >> 0) & 1;
+    switch (cond >> 1) {
+      case 0: return Z;                       // EQ/NE
+      case 1: return C;                       // CS/CC
+      case 2: return N;                       // MI/PL
+      case 3: return V;                       // VS/VC
+      case 4: return C && !Z;                 // HI/LS
+      case 5: return N == V;                  // GE/LT
+      case 6: return (N == V) && !Z;          // GT/LE
+      default: return true;                   // AL/NV
+    }
+    return true;
+  };
+  auto holds = [&](uint32_t cond, uint16_t f) -> bool {
+    bool r = cond_holds(cond, f);
+    return (cond & 1) && cond < 14 ? !r : r;  // odd condition (except NV) inverts
+  };
+  int checked = 0, fails = 0;
+
+  // --- Conditional selects: csel/csinc/csinv/csneg, W and X, all conds ---
+  const uint16_t flag_states[] = {0x0000, 0xC101, 0x8000, 0x4000, 0x0100, 0x0001,
+                                  0x8001, 0x0101, 0xC000, 0x8100, 0x4001, 0xC100};
+  struct CS { uint32_t b64, b32; };
+  const CS csops[] = {{0x9A800000, 0x1A800000},   // csel
+                      {0x9A800400, 0x1A800400},   // csinc
+                      {0xDA800000, 0x5A800000},   // csinv
+                      {0xDA800400, 0x5A800400}};  // csneg
+  for (int oi = 0; oi < 4; oi++) {
+    for (uint32_t cond = 0; cond < 16; cond++) {
+      for (uint16_t f : flag_states) {
+        for (int w = 0; w < 2; w++) {
+          uint64_t n = 0x1122334455667788ULL, m = 0x99AABBCCDDEEFF00ULL;
+          uint32_t rd = 0, rn = 1, rm = 2;
+          uint32_t insn = (w ? csops[oi].b32 : csops[oi].b64) | (rm << 16) | (cond << 12) |
+                          (rn << 5) | rd;
+          for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+          state_.cpu.x[rn] = n;
+          state_.cpu.x[rm] = m;
+          state_.cpu.flags = f;
+          Interpret(insn);
+          uint64_t got = state_.cpu.x[rd];
+          bool t = holds(cond, f);
+          uint64_t sel;
+          if (t) {
+            sel = n;
+          } else {
+            switch (oi) {
+              case 0: sel = m; break;
+              case 1: sel = m + 1; break;
+              case 2: sel = ~m; break;
+              default: sel = (uint64_t)(0 - m); break;
+            }
+          }
+          uint64_t exp = w ? (sel & 0xffffffffULL) : sel;
+          checked++;
+          if (got != exp && fails < 30) {
+            fails++;
+            ADD_FAILURE() << "csop" << oi << (w ? ".w" : ".x") << " cond=" << cond << " flags=0x"
+                          << std::hex << f << " EXPECTED=0x" << exp << " INTERP=0x" << got
+                          << std::dec;
+          }
+        }
+      }
+    }
+  }
+  EXPECT_GT(checked, 1000);
+}
+
+// Interpreter-vs-EXPECTED for every signed/unsigned integer load width, at many
+// offsets over a buffer full of high-bit-set bytes. Catches a sign/width
+// mis-decode (the hello-qt LDPSW class) that a JIT-vs-interp differential cannot
+// see. FreeType ftgrays reads its cell array via exactly these loads.
+TEST_F(Arm64LiteTranslateRegionTest, LoadsInterpreterVsExpected) {
+  alignas(16) uint8_t buf[128];
+  for (int i = 0; i < 128; i++) buf[i] = (uint8_t)((i * 37) ^ 0x80);  // many top bits set
+  struct L {
+    const char* name;
+    uint32_t base;  // unsigned-offset encoding, rt/rn/imm = 0
+    int bytes;
+    bool is_signed;
+    bool x_target;  // true=Xt(64), false=Wt(32)
+  };
+  const L loads[] = {
+      {"ldrb", 0x39400000, 1, false, false}, {"ldrh", 0x79400000, 2, false, false},
+      {"ldr_w", 0xB9400000, 4, false, false}, {"ldr_x", 0xF9400000, 8, false, true},
+      {"ldrsb_w", 0x39C00000, 1, true, false}, {"ldrsb_x", 0x39800000, 1, true, true},
+      {"ldrsh_w", 0x79C00000, 2, true, false}, {"ldrsh_x", 0x79800000, 2, true, true},
+      {"ldrsw_x", 0xB9800000, 4, true, true},
+  };
+  int checked = 0, fails = 0;
+  for (const L& l : loads) {
+    for (int off = 0; off + l.bytes <= 64 && fails < 30; off++) {
+      // unsigned offset is scaled by access size; only test aligned offsets.
+      if (off % l.bytes != 0) continue;
+      uint32_t imm = (uint32_t)(off / l.bytes);
+      uint32_t rt = 0, rn = 1;
+      uint32_t insn = l.base | (imm << 10) | (rn << 5) | rt;
+      uint64_t raw = 0;
+      memcpy(&raw, buf + off, l.bytes);  // little-endian assemble
+      uint64_t exp;
+      if (l.is_signed) {
+        int64_t s = (int64_t)(raw << (64 - l.bytes * 8)) >> (64 - l.bytes * 8);
+        exp = l.x_target ? (uint64_t)s : ((uint64_t)(uint32_t)(int32_t)s);
+      } else {
+        exp = raw;  // already zero-extended
+      }
+      for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+      state_.cpu.x[rt] = 0xDEADBEEFDEADBEEFULL;  // ensure the load overwrites it
+      state_.cpu.x[rn] = ToGuestAddr(buf);
+      Interpret(insn);
+      uint64_t got = state_.cpu.x[rt];
+      checked++;
+      if (got != exp) {
+        fails++;
+        ADD_FAILURE() << l.name << " off=" << off << " insn=0x" << std::hex << insn
+                      << " bytes=0x" << raw << " EXPECTED=0x" << exp << " INTERP=0x" << got
+                      << std::dec;
+      }
+    }
+  }
+  EXPECT_GT(checked, 50);
+}
+
+// Interpreter-vs-EXPECTED NZCV flag check for ADDS/SUBS (and thus CMP/CMN), both
+// W and X forms, against an independent C++ reference. A wrong C (carry/borrow) or
+// V (signed overflow) flag makes every conditional select / signed branch in the
+// rasterizer's coverage clamps go the wrong way — a garbled-glyph candidate that
+// a JIT-vs-interpreter differential cannot see (shared semantics).
+TEST_F(Arm64LiteTranslateRegionTest, FlagsInterpreterVsExpected) {
+  uint64_t seed = 0xBEEF1234CAFEULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  auto pick = [&]() -> uint64_t {
+    switch (rnd() % 11) {
+      case 0: return 0;
+      case 1: return 1;
+      case 2: return ~0ULL;
+      case 3: return 0x80000000ULL;
+      case 4: return 0x7FFFFFFFULL;
+      case 5: return 0xFFFFFFFFULL;
+      case 6: return 0x8000000000000000ULL;
+      case 7: return 0x7FFFFFFFFFFFFFFFULL;
+      case 8: return rnd() % 5;
+      case 9: return (uint64_t)0 - (rnd() % 5);
+      default: return ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    }
+  };
+  // Pack to the ThreadState layout: N@15 Z@14 C@8 V@0.
+  auto pack = [](int N, int Z, int C, int V) -> uint16_t {
+    return (uint16_t)((N << 15) | (Z << 14) | (C << 8) | (V << 0));
+  };
+  auto flags_add = [&](bool w, uint64_t n, uint64_t m) -> uint16_t {
+    if (w) {
+      uint32_t a = (uint32_t)n, b = (uint32_t)m, r = a + b;
+      int N = (r >> 31) & 1, Z = (r == 0);
+      int C = (((uint64_t)a + (uint64_t)b) >> 32) & 1;
+      int V = ((~(a ^ b) & (a ^ r)) >> 31) & 1;
+      return pack(N, Z, C, V);
+    }
+    uint64_t r = n + m;
+    int N = (r >> 63) & 1, Z = (r == 0);
+    int C = (r < n) ? 1 : 0;  // unsigned overflow on add
+    int V = ((~(n ^ m) & (n ^ r)) >> 63) & 1;
+    return pack(N, Z, C, V);
+  };
+  auto flags_sub = [&](bool w, uint64_t n, uint64_t m) -> uint16_t {
+    if (w) {
+      uint32_t a = (uint32_t)n, b = (uint32_t)m, r = a - b;
+      int N = (r >> 31) & 1, Z = (r == 0);
+      int C = (a >= b) ? 1 : 0;  // no-borrow
+      int V = (((a ^ b) & (a ^ r)) >> 31) & 1;
+      return pack(N, Z, C, V);
+    }
+    uint64_t r = n - m;
+    int N = (r >> 63) & 1, Z = (r == 0);
+    int C = (n >= m) ? 1 : 0;
+    int V = (((n ^ m) & (n ^ r)) >> 63) & 1;
+    return pack(N, Z, C, V);
+  };
+
+  int checked = 0, fails = 0;
+  for (int iter = 0; iter < 40000 && fails < 40; iter++) {
+    bool is_sub = rnd() & 1;
+    bool w = rnd() & 1;
+    uint32_t base = is_sub ? (w ? 0x6B000000 : 0xEB000000) : (w ? 0x2B000000 : 0xAB000000);
+    uint32_t rd = 1 + rnd() % 9, rn = 1 + rnd() % 9, rm = 1 + rnd() % 9;
+    uint32_t insn = base | (rm << 16) | (rn << 5) | rd;
+    uint64_t n = pick(), m = pick();
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+    state_.cpu.x[rn] = n;
+    state_.cpu.x[rm] = m;
+    state_.cpu.flags = 0;
+    uint64_t un = state_.cpu.x[rn], um = state_.cpu.x[rm];
+    Interpret(insn);
+    uint16_t got = state_.cpu.flags & 0xC101;
+    uint16_t exp = is_sub ? flags_sub(w, un, um) : flags_add(w, un, um);
+    checked++;
+    if (got != exp) {
+      fails++;
+      ADD_FAILURE() << "iter " << iter << (is_sub ? " subs" : " adds") << (w ? ".w" : ".x")
+                    << " n=0x" << std::hex << un << " m=0x" << um << " EXPECTED_NZCV=0x" << exp
+                    << " INTERP_NZCV=0x" << got << std::dec;
+    }
+  }
+  EXPECT_GT(checked, 10000);
+}
+
+// Interpreter-vs-EXPECTED fuzzer for integer ALU/div/mul/shift, both W (32-bit)
+// and X (64-bit) forms, with edge operands (negatives, INT_MIN, 0, -1). Unlike a
+// JIT-vs-interpreter differential (which is blind to a shared decoder/semantics
+// bug because both tiers agree), this compares the interpreter against an
+// independent C++ reference of the ARM ARM semantics. Targets the FreeType
+// ftgrays integer path (FT_DIV_MOD = 32-bit SDIV + 32-bit MSUB on negatives,
+// signed area/cover multiply+shift) — a Helium garbled-glyph candidate.
+TEST_F(Arm64LiteTranslateRegionTest, IntegerInterpreterVsExpected) {
+  uint64_t seed = 0xA5A5F00DD00DULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  // Operand pool biased to edge cases the divide/modulo/shift paths care about.
+  auto pick = [&]() -> uint64_t {
+    switch (rnd() % 10) {
+      case 0: return 0;
+      case 1: return 1;
+      case 2: return ~0ULL;                 // -1
+      case 3: return 0x80000000ULL;         // INT32_MIN (zero-extended)
+      case 4: return 0xFFFFFFFF80000000ULL;  // INT32_MIN sign-extended
+      case 5: return 0x7FFFFFFFULL;         // INT32_MAX
+      case 6: return rnd() % 257;           // small
+      case 7: return (uint64_t)0 - (rnd() % 257);  // small negative
+      default: return ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    }
+  };
+  auto z32 = [](uint64_t v) -> uint64_t { return v & 0xffffffffULL; };
+
+  struct Op { const char* name; uint32_t base64; uint32_t base32; bool three; };
+  // base64/base32 = encoding with rd/rn/rm/ra = 0; `three` means uses Ra.
+  const Op ops[] = {
+      {"add", 0x8B000000, 0x0B000000, false}, {"sub", 0xCB000000, 0x4B000000, false},
+      {"and", 0x8A000000, 0x0A000000, false}, {"orr", 0xAA000000, 0x2A000000, false},
+      {"eor", 0xCA000000, 0x4A000000, false}, {"mul", 0x9B007C00, 0x1B007C00, false},
+      {"sdiv", 0x9AC00C00, 0x1AC00C00, false}, {"udiv", 0x9AC00800, 0x1AC00800, false},
+      {"asrv", 0x9AC02800, 0x1AC02800, false}, {"lslv", 0x9AC02000, 0x1AC02000, false},
+      {"lsrv", 0x9AC02400, 0x1AC02400, false}, {"smulh", 0x9B407C00, 0, false},
+      {"madd", 0x9B000000, 0x1B000000, true}, {"msub", 0x9B008000, 0x1B008000, true},
+  };
+
+  auto expect = [&](const char* name, bool w, uint64_t n, uint64_t m, uint64_t a) -> uint64_t {
+    auto S = [](uint64_t v) { return (int64_t)v; };
+    auto S32 = [](uint64_t v) { return (int32_t)(uint32_t)v; };
+    std::string op = name;
+    if (op == "add") return w ? z32(n + m) : n + m;
+    if (op == "sub") return w ? z32(n - m) : n - m;
+    if (op == "and") return w ? z32(n & m) : (n & m);
+    if (op == "orr") return w ? z32(n | m) : (n | m);
+    if (op == "eor") return w ? z32(n ^ m) : (n ^ m);
+    if (op == "mul") return w ? z32(n * m) : n * m;
+    if (op == "madd") return w ? z32(a + n * m) : a + n * m;
+    if (op == "msub") return w ? z32(a - n * m) : a - n * m;
+    if (op == "udiv") {
+      if (w) { uint32_t mm = (uint32_t)m; return mm == 0 ? 0 : z32((uint32_t)n / mm); }
+      return m == 0 ? 0 : n / m;
+    }
+    if (op == "sdiv") {
+      if (w) {
+        int32_t nn = S32(n), mm = S32(m);
+        if (mm == 0) return 0;
+        if (nn == INT32_MIN && mm == -1) return z32((uint32_t)INT32_MIN);
+        return z32((uint32_t)(int32_t)(nn / mm));
+      }
+      int64_t nn = S(n), mm = S(m);
+      if (mm == 0) return 0;
+      if (nn == INT64_MIN && mm == -1) return (uint64_t)INT64_MIN;
+      return (uint64_t)(nn / mm);
+    }
+    if (op == "asrv") return w ? z32((uint32_t)(S32(n) >> (m & 31))) : (uint64_t)(S(n) >> (m & 63));
+    if (op == "lsrv") return w ? z32((uint32_t)n >> (m & 31)) : (n >> (m & 63));
+    if (op == "lslv") return w ? z32((uint32_t)n << (m & 31)) : (n << (m & 63));
+    if (op == "smulh") return (uint64_t)(((__int128)S(n) * (__int128)S(m)) >> 64);
+    return 0;
+  };
+
+  int checked = 0;
+  for (int iter = 0; iter < 40000; iter++) {
+    const Op& o = ops[rnd() % (sizeof(ops) / sizeof(ops[0]))];
+    bool w = (o.base32 != 0) && (rnd() & 1);
+    if (o.base32 == 0 && w) continue;  // smulh: 64-bit only
+    uint32_t base = w ? o.base32 : o.base64;
+    uint32_t rd = 1 + rnd() % 9, rn = 1 + rnd() % 9, rm = 1 + rnd() % 9, ra = 1 + rnd() % 9;
+    uint32_t insn = base | (rm << 16) | (rn << 5) | rd;
+    if (o.three) insn |= (ra << 10);
+    uint64_t n = pick(), m = pick(), a = pick();
+
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+    state_.cpu.x[rn] = n;
+    state_.cpu.x[rm] = m;
+    if (o.three) state_.cpu.x[ra] = a;
+    // re-read (rd may alias rn/rm/ra; capture the actual source values used)
+    uint64_t un = state_.cpu.x[rn], um = state_.cpu.x[rm], ua = o.three ? state_.cpu.x[ra] : 0;
+    Interpret(insn);
+    uint64_t got = state_.cpu.x[rd];
+    uint64_t exp = expect(o.name, w, un, um, ua);
+    checked++;
+    if (got != exp) {
+      ADD_FAILURE() << "iter " << iter << " " << o.name << (w ? ".w" : ".x") << " insn=0x"
+                    << std::hex << insn << " n=0x" << un << " m=0x" << um << " a=0x" << ua
+                    << " EXPECTED=0x" << exp << " INTERP=0x" << got << std::dec;
+      if (checked > 50) break;  // stop spamming once a class is found
+    }
+  }
+  EXPECT_GT(checked, 10000);
+}
+
 // Differential fuzzer: random multi-instruction integer-ALU regions run through
 // the lite JIT and the interpreter with identical inputs, comparing every guest
 // register. Multi-instruction regions exercise cross-instruction register
