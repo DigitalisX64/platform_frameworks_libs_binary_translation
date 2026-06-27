@@ -449,6 +449,196 @@ TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   EXPECT_EQ(state_.cpu.x[2], 30ULL);
 }
 
+// Interpreter-vs-EXPECTED for NEON-vector FP arith (.4s/.2d FADD/FSUB/FMUL/FDIV)
+// and integer-vector ADD/MUL (.4s), against per-lane C++. Curves/diagonals use
+// the complex (possibly NEON) coverage path while vertical stems use the simple
+// integer path — a per-lane NEON bug would break exactly the symptom seen.
+TEST_F(Arm64LiteTranslateRegionTest, NeonVectorInterpreterVsExpected) {
+  uint64_t s = 0xC0DEFACEULL;
+  auto rnd = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 33; };
+  auto rf = [&]() -> double {
+    int k = rnd() % 5;
+    if (k == 0) return 0.0;
+    if (k == 1) return (double)(int)(rnd() % 4000) - 2000.0;
+    if (k == 2) return ((double)(int)(rnd() % 20000) - 10000.0) / 256.0;
+    double a = (double)(int64_t)(rnd() | 1), b = (double)(int64_t)((rnd() | 1) & 0xffffff) + 1;
+    return a / b;
+  };
+  auto setv = [&](int i, const uint64_t p[2]) { memcpy(&state_.cpu.v[i], p, 16); };
+  auto getv = [&](int i, uint64_t p[2]) { memcpy(p, &state_.cpu.v[i], 16); };
+  int checked = 0, fails = 0;
+
+  // --- FP vector: .4s and .2d, FADD/FSUB/FMUL/FDIV ---
+  for (int iter = 0; iter < 12000 && fails < 30; iter++) {
+    int op = rnd() % 4;
+    bool d2 = rnd() & 1;  // .2d else .4s
+    uint32_t enc4[4] = {0x4E20D400, 0x4EA0D400, 0x6E20DC00, 0x6E20FC00};
+    uint32_t enc2[4] = {0x4E60D400, 0x4EE0D400, 0x6E60DC00, 0x6E60FC00};
+    uint32_t rd = 0, rn = 1, rm = 2;
+    uint32_t insn = (d2 ? enc2[op] : enc4[op]) | (rm << 16) | (rn << 5) | rd;
+    uint64_t pn[2], pm[2], pe[2];
+    if (d2) {
+      double a[2], b[2], r[2];
+      for (int j = 0; j < 2; j++) { a[j] = rf(); b[j] = rf(); if (op == 3 && b[j] == 0) b[j] = 1; }
+      memcpy(pn, a, 16); memcpy(pm, b, 16);
+      for (int j = 0; j < 2; j++)
+        r[j] = op == 0 ? a[j] + b[j] : op == 1 ? a[j] - b[j] : op == 2 ? a[j] * b[j] : a[j] / b[j];
+      memcpy(pe, r, 16);
+    } else {
+      float a[4], b[4], r[4];
+      for (int j = 0; j < 4; j++) { a[j] = (float)rf(); b[j] = (float)rf(); if (op == 3 && b[j] == 0) b[j] = 1; }
+      memcpy(pn, a, 16); memcpy(pm, b, 16);
+      for (int j = 0; j < 4; j++)
+        r[j] = op == 0 ? a[j] + b[j] : op == 1 ? a[j] - b[j] : op == 2 ? a[j] * b[j] : a[j] / b[j];
+      memcpy(pe, r, 16);
+    }
+    for (int i = 0; i < 32; i++) { uint64_t z[2] = {0, 0}; setv(i, z); }
+    setv(rn, pn); setv(rm, pm);
+    Interpret(insn);
+    uint64_t got[2]; getv(rd, got);
+    checked++;
+    if ((got[0] != pe[0] || got[1] != pe[1]) && fails < 30) {
+      fails++;
+      ADD_FAILURE() << "fpvec op" << op << (d2 ? ".2d" : ".4s") << " EXP=0x" << std::hex << pe[1]
+                    << pe[0] << " GOT=0x" << got[1] << got[0] << std::dec;
+    }
+  }
+
+  // --- Integer vector ADD/MUL .4s ---
+  for (int iter = 0; iter < 8000 && fails < 30; iter++) {
+    bool mul = rnd() & 1;
+    uint32_t insn = (mul ? 0x4EA09C00 : 0x4EA08400) | (2 << 16) | (1 << 5) | 0;
+    uint32_t a[4], b[4], e[4];
+    for (int j = 0; j < 4; j++) { a[j] = (uint32_t)rnd(); b[j] = (uint32_t)rnd(); e[j] = mul ? a[j] * b[j] : a[j] + b[j]; }
+    uint64_t pn[2], pm[2], pe[2];
+    memcpy(pn, a, 16); memcpy(pm, b, 16); memcpy(pe, e, 16);
+    for (int i = 0; i < 32; i++) { uint64_t z[2] = {0, 0}; setv(i, z); }
+    setv(1, pn); setv(2, pm);
+    Interpret(insn);
+    uint64_t got[2]; getv(0, got);
+    checked++;
+    if ((got[0] != pe[0] || got[1] != pe[1]) && fails < 30) {
+      fails++;
+      ADD_FAILURE() << "ivec " << (mul ? "mul" : "add") << ".4s EXP=0x" << std::hex << pe[1] << pe[0]
+                    << " GOT=0x" << got[1] << got[0] << std::dec;
+    }
+  }
+  EXPECT_GT(checked, 5000);
+}
+
+// Interpreter-vs-EXPECTED for the sign-extension-heavy paths not yet covered:
+// register-offset loads with SXTW/UXTW (the exact hello-qt failure mode — a
+// sign-extended offset register), extended-register ADD/SUB, and SBFX/UBFX.
+// FreeType ftgrays indexes its cell array with [base, Wm, sxtw]-style addressing
+// where Wm can be negative; a zero-extend-where-sign-extend bug reads the wrong
+// cell and fragments diagonal edges.
+TEST_F(Arm64LiteTranslateRegionTest, SignExtendPathsInterpreterVsExpected) {
+  int checked = 0, fails = 0;
+  auto ext = [](uint64_t v, int opt) -> uint64_t {
+    switch (opt) {
+      case 0: return v & 0xFF;
+      case 1: return v & 0xFFFF;
+      case 2: return v & 0xFFFFFFFFULL;
+      case 3: return v;
+      case 4: return (uint64_t)(int64_t)(int8_t)v;
+      case 5: return (uint64_t)(int64_t)(int16_t)v;
+      case 6: return (uint64_t)(int64_t)(int32_t)v;
+      default: return v;
+    }
+  };
+
+  // --- Register-offset 64-bit load: LDR Xt,[Xn, Rm, <ext> #shift] ---
+  alignas(16) uint8_t buf[256];
+  for (int i = 0; i < 256; i++) buf[i] = (uint8_t)((i * 31) ^ 0x5A);
+  for (int opt = 2; opt <= 6; opt++) {            // UXTW=2, SXTW=6 (and SXTX=3)
+    if (opt != 2 && opt != 3 && opt != 6) continue;
+    for (int shift = 0; shift <= 3; shift += 3) {  // S=0 or S=1 (LSL #3 for 64-bit)
+      for (int sgn = -2; sgn <= 2; sgn++) {
+        uint64_t off_reg = (uint64_t)(int64_t)(int32_t)sgn;  // small +/- as W
+        uint64_t scaled = ext(off_reg, opt) << shift;
+        uint64_t base_addr = ToGuestAddr(buf) + 64;
+        uint64_t ea = base_addr + scaled;
+        if (ea < ToGuestAddr(buf) || ea + 8 > ToGuestAddr(buf) + 256) continue;
+        uint32_t rt = 0, rn = 1, rm = 2;
+        uint32_t insn = 0xF8600800 | (rm << 16) | (opt << 13) | ((shift ? 1u : 0u) << 12) |
+                        (rn << 5) | rt;
+        for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+        state_.cpu.x[rn] = base_addr;
+        state_.cpu.x[rm] = off_reg;
+        Interpret(insn);
+        uint64_t exp = 0;
+        memcpy(&exp, ToHostAddr<const uint8_t>(ea), 8);
+        checked++;
+        if (state_.cpu.x[rt] != exp && fails < 20) {
+          fails++;
+          ADD_FAILURE() << "ldr[xn,rm,opt=" << opt << ",sh=" << (shift ? 1 : 0)
+                        << "] sgn=" << sgn << " EXPECTED=0x" << std::hex << exp << " INTERP=0x"
+                        << state_.cpu.x[rt] << std::dec;
+        }
+      }
+    }
+  }
+
+  // --- Extended-register ADD/SUB (64-bit): Xd = Xn +/- (ext(Rm,opt) << shift) ---
+  uint64_t s = 0x9E37ULL;
+  auto rnd = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 33; };
+  for (int iter = 0; iter < 8000 && fails < 30; iter++) {
+    bool sub = rnd() & 1;
+    int opt = rnd() % 8;
+    int shift = rnd() % 5;
+    uint64_t n = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    uint64_t m = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    uint32_t rd = 1 + rnd() % 9, rn = 1 + rnd() % 9, rm = 1 + rnd() % 9;
+    uint32_t base = sub ? 0xCB200000 : 0x8B200000;
+    uint32_t insn = base | (rm << 16) | (opt << 13) | (shift << 10) | (rn << 5) | rd;
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+    state_.cpu.x[rn] = n;
+    state_.cpu.x[rm] = m;
+    uint64_t un = state_.cpu.x[rn], um = state_.cpu.x[rm];
+    Interpret(insn);
+    uint64_t addend = ext(um, opt) << shift;
+    uint64_t exp = sub ? un - addend : un + addend;
+    checked++;
+    if (state_.cpu.x[rd] != exp && fails < 30) {
+      fails++;
+      ADD_FAILURE() << (sub ? "sub" : "add") << "_ext opt=" << opt << " sh=" << shift << " n=0x"
+                    << std::hex << un << " m=0x" << um << " EXPECTED=0x" << exp << " INTERP=0x"
+                    << state_.cpu.x[rd] << std::dec;
+    }
+  }
+
+  // --- SBFX/UBFX (64-bit), all lsb/width ---
+  for (int lsb = 0; lsb < 64 && fails < 30; lsb += 5) {
+    for (int width = 1; width <= 64 - lsb; width += 7) {
+      uint64_t v = 0xF731C95A8E2D6B40ULL;
+      uint32_t immr = lsb, imms = lsb + width - 1;
+      for (int sgn = 0; sgn < 2; sgn++) {
+        uint32_t base = sgn ? 0x93400000 : 0xD3400000;  // SBFM : UBFM
+        uint32_t rd = 0, rn = 1;
+        uint32_t insn = base | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+        for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+        state_.cpu.x[rn] = v;
+        Interpret(insn);
+        uint64_t field = (v >> lsb) & ((width == 64) ? ~0ULL : ((1ULL << width) - 1));
+        uint64_t exp;
+        if (sgn) {
+          exp = (uint64_t)(((int64_t)(field << (64 - width))) >> (64 - width));
+        } else {
+          exp = field;
+        }
+        checked++;
+        if (state_.cpu.x[rd] != exp && fails < 30) {
+          fails++;
+          ADD_FAILURE() << (sgn ? "sbfx" : "ubfx") << " lsb=" << lsb << " w=" << width
+                        << " EXPECTED=0x" << std::hex << exp << " INTERP=0x" << state_.cpu.x[rd]
+                        << std::dec;
+        }
+      }
+    }
+  }
+  EXPECT_GT(checked, 1000);
+}
+
 // Interpreter-vs-EXPECTED for scalar FP arith (FADD/FSUB/FMUL/FDIV, single &
 // double) and int<->float conversions (SCVTF/FCVTZS), against C++ float/double.
 // FreeType/Skia use scalar FP for glyph scaling/subpixel positioning; a wrong FP
