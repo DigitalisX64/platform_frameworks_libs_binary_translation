@@ -449,6 +449,119 @@ TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   EXPECT_EQ(state_.cpu.x[2], 30ULL);
 }
 
+// Differential fuzzer: random multi-instruction integer-ALU regions run through
+// the lite JIT and the interpreter with identical inputs, comparing every guest
+// register. Multi-instruction regions exercise cross-instruction register
+// MAPPING and the RDX/RCX/RAX save-restore around DIV/MUL/shift — the scenario a
+// register-mapping clobber (a destructive x86 op overwriting a mapped guest reg)
+// hides in, which single-instruction tests cannot reach.
+TEST_F(Arm64LiteTranslateRegionTest, IntegerRegMapDifferentialFuzz) {
+  uint64_t seed = 0x0C0FFEE123456789ULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  const uint32_t kMaxReg = 10;  // x0..x9 — enough to force mapping incl. RDX/RCX slots
+  auto gen = [&]() -> uint32_t {
+    uint32_t rd = rnd() % kMaxReg, rn = rnd() % kMaxReg, rm = rnd() % kMaxReg,
+             ra = rnd() % kMaxReg;
+    uint32_t cond = rnd() % 14;        // omit AL(14)/NV(15)
+    uint32_t nzcv = rnd() % 16;
+    uint32_t imm12 = rnd() % 4096;
+    uint32_t immr = rnd() % 64, imms = rnd() % 64;
+    switch (rnd() % 24) {
+      case 0: return 0x8B000000 | (rm << 16) | (rn << 5) | rd;  // add
+      case 1: return 0xCB000000 | (rm << 16) | (rn << 5) | rd;  // sub
+      case 2: return 0x8A000000 | (rm << 16) | (rn << 5) | rd;  // and
+      case 3: return 0xAA000000 | (rm << 16) | (rn << 5) | rd;  // orr
+      case 4: return 0xCA000000 | (rm << 16) | (rn << 5) | rd;  // eor
+      case 5: return 0x9B007C00 | (rm << 16) | (rn << 5) | rd;  // mul
+      case 6: return 0x9AC00C00 | (rm << 16) | (rn << 5) | rd;  // sdiv
+      case 7: return 0x9AC00800 | (rm << 16) | (rn << 5) | rd;  // udiv
+      case 8: return 0x9AC02800 | (rm << 16) | (rn << 5) | rd;  // asrv
+      case 9: return 0x9AC02000 | (rm << 16) | (rn << 5) | rd;  // lslv
+      case 10: return 0x9AC02400 | (rm << 16) | (rn << 5) | rd;  // lsrv
+      case 11: return 0x9B407C00 | (rm << 16) | (rn << 5) | rd;  // smulh
+      case 12: return 0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;  // msub
+      case 13: return 0x9B000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;  // madd
+      case 14: return 0xAB000000 | (rm << 16) | (rn << 5) | rd;  // adds
+      case 15: return 0xEB000000 | (rm << 16) | (rn << 5) | rd;  // subs
+      case 16: return 0xEB00001F | (rm << 16) | (rn << 5);       // cmp (subs xzr)
+      case 17: return 0xAB00001F | (rm << 16) | (rn << 5);       // cmn (adds xzr)
+      case 18: return 0xFA400000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv;  // ccmp
+      case 19: return 0xBA400000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv;  // ccmn
+      case 20: return 0x9A800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csel
+      case 21: return 0x9A800400 | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csinc
+      case 22: return 0xDA800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csinv
+      case 23: return 0xDA800400 | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csneg
+    }
+    (void)imm12; (void)immr; (void)imms;
+    return 0xD503201FU;  // nop
+  };
+
+  int regions_run = 0;
+  for (int iter = 0; iter < 6000; iter++) {
+    const int n = 3 + static_cast<int>(rnd() % 6);
+    static uint32_t code[16];
+    for (int i = 0; i < n; i++) code[i] = static_cast<uint32_t>(gen());
+    uint64_t init[31];
+    for (int i = 0; i < 31; i++)
+      init[i] = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    uint16_t init_flags = static_cast<uint16_t>(rnd() & 0xC101);  // N@15 Z@14 C@8 V@0
+
+    GuestAddr start = ToGuestAddr(&code[0]);
+    GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
+
+    // JIT.
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = init[i];
+    state_.cpu.flags = init_flags;
+    state_.cpu.insn_addr = start;
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+    if (!ok || stop > code_end || stop == start) continue;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    uint64_t jit_x[31];
+    for (int i = 0; i < 31; i++) jit_x[i] = state_.cpu.x[i];
+    uint16_t jit_flags = state_.cpu.flags;
+
+    // Interpreter to the same stop PC.
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = init[i];
+    state_.cpu.flags = init_flags;
+    state_.cpu.insn_addr = start;
+    int guard = 0;
+    while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < stop && guard++ < 64)
+      InterpretInsn(&state_);
+    regions_run++;
+
+    if ((jit_flags & 0xC101) != (state_.cpu.flags & 0xC101)) {
+      std::string dis;
+      for (int j = 0; j < n; j++) {
+        char b[16];
+        snprintf(b, sizeof(b), " %08x", code[j]);
+        dis += b;
+      }
+      ADD_FAILURE() << "iter " << iter << " FLAGS diverged: JIT=0x" << std::hex << jit_flags
+                    << " INTERP=0x" << state_.cpu.flags << std::dec << " region:" << dis;
+    }
+    for (int i = 0; i < 31; i++) {
+      if (jit_x[i] != state_.cpu.x[i]) {
+        std::string dis;
+        for (int j = 0; j < n; j++) {
+          char b[16];
+          snprintf(b, sizeof(b), " %08x", code[j]);
+          dis += b;
+        }
+        ADD_FAILURE() << "iter " << iter << " diverged at x" << i << ": JIT=0x" << std::hex
+                      << jit_x[i] << " INTERP=0x" << state_.cpu.x[i] << std::dec << " region:" << dis;
+        break;
+      }
+    }
+  }
+  EXPECT_GT(regions_run, 1000) << "fuzzer translated too few regions to be meaningful";
+}
+
 // Differential test of a real-world bump-allocator placement-new region: two CBZ
 // guards followed by a ldr/add/stp/str/adr construction sequence that builds a
 // vtable'd object in a freshly-allocated buffer and advances the arena descriptor.
