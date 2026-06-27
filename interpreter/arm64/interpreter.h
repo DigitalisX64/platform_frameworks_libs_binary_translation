@@ -2264,12 +2264,16 @@ class Interpreter {
 
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
     CHECK(!exception_raised_);
-    // EXT: extract bytes from concatenation of Vn:Vm at byte position index.
+    // EXT: result = bytes[index .. index+datasize) of the concatenation Vm:Vn,
+    // where Vn is the LOW operand and Vm the HIGH operand, each `num_bytes` wide
+    // (8 for Q=0, 16 for Q=1). Vm therefore starts at byte `num_bytes`, not 16 —
+    // for Q=0 placing it at 16 leaves Vm unreachable and pulls Vn's stale upper
+    // half into the result lanes. Bits[127:64] are zeroed for Q=0.
+    const unsigned num_bytes = q ? 16 : 8;
     uint8_t bytes[32];
-    memcpy(bytes, &state_->cpu.v[rn], 16);
-    memcpy(bytes + 16, &state_->cpu.v[rm], 16);
+    memcpy(bytes, &state_->cpu.v[rn], num_bytes);
+    memcpy(bytes + num_bytes, &state_->cpu.v[rm], num_bytes);
     __uint128_t result = 0;
-    unsigned num_bytes = q ? 16 : 8;
     memcpy(&result, bytes + index, num_bytes);
     state_->cpu.v[rd] = result;
   }
@@ -4781,26 +4785,80 @@ class Interpreter {
             });
         break;
 
-      // --- Saturating shift (simplified — treat as regular shift for now) ---
+      // --- Variable saturating / rounding shifts (SQSHL/UQSHL/SRSHL/URSHL/
+      //     SQRSHL/UQRSHL). The per-lane shift count is the signed low byte of
+      //     the Vm element: >=0 shifts left, <0 shifts right by its magnitude.
+      //     Signed (S*) ops sign-extend the source and shift right arithmetically;
+      //     rounding (R*) ops add 1<<(rshift-1) before a right shift; saturating
+      //     (Q*) ops clamp to the element's signed/unsigned range. ---
       case Decoder::AdvSimdThreeSameOpcode::kSqshl:
       case Decoder::AdvSimdThreeSameOpcode::kUqshl:
       case Decoder::AdvSimdThreeSameOpcode::kSrshl:
       case Decoder::AdvSimdThreeSameOpcode::kUrshl:
       case Decoder::AdvSimdThreeSameOpcode::kSqrshl:
-      case Decoder::AdvSimdThreeSameOpcode::kUqrshl:
-        // Fallback: treat as SSHL/USHL for basic functionality.
-        AdvSimdThreeSameElementWise(src_n, src_m, esize, num_elements, &result,
-            [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
-              int32_t shift = static_cast<int8_t>(b & 0xFF);
-              uint32_t bits = es * 8;
-              if (shift >= 0) {
-                return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
+      case Decoder::AdvSimdThreeSameOpcode::kUqrshl: {
+        const bool is_signed = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqshl ||
+                                args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrshl ||
+                                args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrshl);
+        const bool rounding = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrshl ||
+                               args.opcode == Decoder::AdvSimdThreeSameOpcode::kUrshl ||
+                               args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrshl ||
+                               args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqrshl);
+        const bool saturating = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqshl ||
+                                 args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqshl ||
+                                 args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrshl ||
+                                 args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqrshl);
+        AdvSimdThreeSameElementWise(
+            src_n, src_m, esize, num_elements, &result,
+            [is_signed, rounding, saturating](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
+              const uint32_t bits = es * 8;
+              const int32_t shift = static_cast<int8_t>(b & 0xFF);
+              // Sign- or zero-extend the element into a wide signed accumulator.
+              __int128 v;
+              if (is_signed) {
+                v = static_cast<__int128>(static_cast<int64_t>(a << (64 - bits)) >> (64 - bits));
               } else {
-                uint32_t rshift = static_cast<uint32_t>(-shift);
-                return (rshift >= bits) ? 0 : (a >> rshift);
+                v = static_cast<__int128>(a & (bits >= 64 ? ~0ULL : ((1ULL << bits) - 1)));
               }
+              __int128 res;
+              if (shift >= 0) {
+                const uint32_t lshift = static_cast<uint32_t>(shift);
+                // A shift >= element width moves every bit out of the lane: for
+                // non-saturating ops the masked result is 0; for saturating ops
+                // a non-zero source pins to the range extreme (a large sentinel
+                // clamped below). Capping at `bits` also keeps v<<lshift inside
+                // the 128-bit accumulator (v is at most `bits`<=64 wide).
+                if (lshift >= bits) {
+                  res = saturating ? (v > 0 ? (__int128{1} << 100)
+                                            : (v < 0 ? -(__int128{1} << 100) : __int128{0}))
+                                   : __int128{0};
+                } else {
+                  res = v << lshift;
+                }
+              } else {
+                const uint32_t rshift = static_cast<uint32_t>(-shift);
+                if (rounding && rshift >= 1 && rshift <= 127) {
+                  v += (__int128{1} << (rshift - 1));
+                }
+                res = (rshift >= 128) ? (is_signed && v < 0 ? __int128{-1} : __int128{0})
+                                      : (v >> rshift);  // arithmetic for signed v
+              }
+              if (saturating) {
+                if (is_signed) {
+                  const __int128 maxv = (__int128{1} << (bits - 1)) - 1;
+                  const __int128 minv = -(__int128{1} << (bits - 1));
+                  res = res > maxv ? maxv : (res < minv ? minv : res);
+                } else {
+                  const __int128 maxv =
+                      (bits >= 64) ? static_cast<__int128>(~0ULL) : ((__int128{1} << bits) - 1);
+                  res = res < 0 ? __int128{0} : (res > maxv ? maxv : res);
+                }
+              }
+              const uint64_t mask = (bits >= 64) ? ~0ULL : ((1ULL << bits) - 1);
+              return static_cast<uint64_t>(res) & mask;
             });
         break;
+      }
 
       // --- ADDP (pairwise add) ---
       case Decoder::AdvSimdThreeSameOpcode::kAddp: {
@@ -7932,6 +7990,12 @@ class Interpreter {
             sum = (existing + sum) & ElementMask(out_esize);
           }
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * out_esize, &sum, out_esize);
+        }
+        // Q=0 (64-bit destination, vec_len==8) must zero bits[127:64]. The
+        // accumulate seed copied the full prior Vd, so clear the unused upper
+        // half rather than leaving stale destination bytes there.
+        if (vec_len < 16) {
+          memset(reinterpret_cast<uint8_t*>(&result) + vec_len, 0, 16 - vec_len);
         }
         break;
       }

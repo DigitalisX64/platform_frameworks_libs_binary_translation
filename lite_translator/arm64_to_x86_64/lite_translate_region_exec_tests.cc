@@ -517,6 +517,78 @@ TEST_F(Arm64LiteTranslateRegionTest, AllocatorConstructionRegionDifferential) {
   EXPECT_EQ(0, memcmp(jit_buf, buf, sizeof(buf))) << "buffer bytes JIT vs interp";
 }
 
+// Helpers for the interpreter NEON regression tests below.
+static void SetV(ThreadState* state, int i, uint64_t lo, uint64_t hi) {
+  uint64_t parts[2] = {lo, hi};
+  memcpy(&state->cpu.v[i], parts, 16);
+}
+static void GetV(ThreadState* state, int i, uint64_t* lo, uint64_t* hi) {
+  uint64_t parts[2];
+  memcpy(parts, &state->cpu.v[i], 16);
+  *lo = parts[0];
+  *hi = parts[1];
+}
+
+// EXT .8B (Q=0) in the interpreter: the concatenation is Vm:Vn with Vm at byte
+// offset 8 (not 16). Previously result lanes [8,15] pulled Vn's stale upper half.
+TEST_F(Arm64LiteTranslateRegionTest, ExtByte8bInterpreter) {
+  const uint32_t insn = 0x2e021820;  // ext v0.8b, v1.8b, v2.8b, #3
+  SetV(&state_, 0, 0, 0);
+  SetV(&state_, 1, 0x8138268683868942ULL, 0x7741559918559252ULL);  // hi must be ignored
+  SetV(&state_, 2, 0x3622262609912460ULL, 0x8051243884390451ULL);
+  Interpret(insn);
+  uint64_t lo, hi;
+  GetV(&state_, 0, &lo, &hi);
+  EXPECT_EQ(lo, 0x9124608138268683ULL) << "EXT .8b low half (bytes 5-7 must come from Vm)";
+  EXPECT_EQ(hi, 0ULL) << "EXT .8b must zero bits[127:64]";
+}
+
+// SADALP .4h (Q=0) accumulate in the interpreter must zero bits[127:64] rather
+// than leaving the prior destination's stale upper half.
+TEST_F(Arm64LiteTranslateRegionTest, SadalpUpperHalfZeroInterpreter) {
+  const uint32_t insn = 0x0e206820;  // sadalp v0.4h, v1.8b
+  SetV(&state_, 0, 0x0010001000100010ULL, 0xAAAAAAAAAAAAAAAAULL);  // dst accumulator + stale hi
+  SetV(&state_, 1, 0x0101010101010101ULL, 0);
+  Interpret(insn);
+  uint64_t lo, hi;
+  GetV(&state_, 0, &lo, &hi);
+  EXPECT_EQ(lo, 0x0012001200120012ULL) << "SADALP accumulate (each pair 1+1=2, +0x10)";
+  EXPECT_EQ(hi, 0ULL) << "SADALP .4h Q=0 must zero bits[127:64]";
+}
+
+// SRSHL .4s in the interpreter: a negative per-lane shift count is a signed
+// rounding arithmetic right shift, not a logical shift.
+TEST_F(Arm64LiteTranslateRegionTest, SrshlSignedRoundingInterpreter) {
+  const uint32_t insn = 0x4ea15400;  // srshl v0.4s, v0.4s, v1.4s
+  // lanes: -16>>4(round)=-1 ; +16>>4=+1 ; INT_MIN>>2=0xE0000000 ; +1>>1=+1
+  SetV(&state_, 0, 0x00000010FFFFFFF0ULL, 0x0000000180000000ULL);
+  SetV(&state_, 1, 0x000000FC000000FCULL, 0x000000FF000000FEULL);  // shifts -4,-4,-2,-1
+  Interpret(insn);
+  uint64_t lo, hi;
+  GetV(&state_, 0, &lo, &hi);
+  EXPECT_EQ(lo, 0x00000001FFFFFFFFULL) << "SRSHL lanes 0,1: -1 and +1 (arithmetic+round)";
+  EXPECT_EQ(hi, 0x00000001E0000000ULL) << "SRSHL lanes 2,3: 0xE0000000 and +1";
+}
+
+// LDTRSB/LDTRSH/LDTRSW (unprivileged signed loads) must decode (not Undefined or
+// misroute) and sign-extend. Regression for the bit21 load/store dispatch split.
+TEST_F(Arm64LiteTranslateRegionTest, LdtrSignedLoadsInterpreter) {
+  alignas(8) uint8_t buf[16];
+  memset(buf, 0, sizeof(buf));
+  buf[1] = 0x80;                                          // for ldtrsb [x1,#1]
+  *reinterpret_cast<uint16_t*>(&buf[2]) = 0x8000;         // for ldtrsh [x1,#2]
+  *reinterpret_cast<uint32_t*>(&buf[4]) = 0x80000000U;    // for ldtrsw [x1,#4]
+  state_.cpu.x[1] = ToGuestAddr(buf);
+  Interpret(0x38c01820);  // ldtrsb w0, [x1, #1]
+  EXPECT_EQ(state_.cpu.x[0], 0xFFFFFF80ULL) << "LDTRSB sign-extends byte to Wt";
+  state_.cpu.x[1] = ToGuestAddr(buf);
+  Interpret(0x78802820);  // ldtrsh x0, [x1, #2]
+  EXPECT_EQ(state_.cpu.x[0], 0xFFFFFFFFFFFF8000ULL) << "LDTRSH sign-extends half to Xt";
+  state_.cpu.x[1] = ToGuestAddr(buf);
+  Interpret(0xb8804820);  // ldtrsw x0, [x1, #4]
+  EXPECT_EQ(state_.cpu.x[0], 0xFFFFFFFF80000000ULL) << "LDTRSW sign-extends word to Xt";
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddImmediate) {
   static const uint32_t code[] = {
       MovzX(0, 100),      // MOVZ X0, #100
