@@ -6601,15 +6601,28 @@ class LiteTranslator {
           }
           load_full(xn, vn_off);
           load_full(xm, vm_off);
+          // ARM FMAX/FMAXNM are computed as -FMIN(-a,-b). x86 MAXPS/MINPS return
+          // the SECOND source on a +-0 tie (OR-of-signs), which is correct only
+          // for FMIN (most-negative). Negating inputs+output makes FMAX reuse the
+          // FMIN lowering and get ARM's AND-of-signs (most-positive) for the +-0
+          // tie; because the negation is applied twice, a propagated-NaN's sign
+          // is preserved too. FMIN/FMINNM are already correct, so no negation.
+          SimdRegister sign_mask = no_simd_register;
+          if (is_max) {
+            sign_mask = AllocTempSimdReg();
+            if (sign_mask == no_simd_register) { success_ = false; return; }
+            as_.Pcmpeqd(sign_mask, sign_mask);
+            if (is_double) as_.Psllq(sign_mask, static_cast<int8_t>(63));
+            else as_.Pslld(sign_mask, static_cast<int8_t>(31));
+            as_.Pxor(xn, sign_mask);
+            as_.Pxor(xm, sign_mask);
+          }
           auto cmpunord = [&](SimdRegister dst, SimdRegister src) {
             if (is_double) as_.Cmpunordpd(dst, src); else as_.Cmpunordps(dst, src);
           };
+          // Always FMIN now (FMAX reaches here with negated operands).
           auto minmax = [&](SimdRegister dst, SimdRegister src) {
-            if (is_double) {
-              if (is_max) as_.Maxpd(dst, src); else as_.Minpd(dst, src);
-            } else {
-              if (is_max) as_.Maxps(dst, src); else as_.Minps(dst, src);
-            }
+            if (is_double) as_.Minpd(dst, src); else as_.Minps(dst, src);
           };
           if (!is_nm) {
             // FMAX / FMIN — NaN-propagating: maxab|maxba|OR.
@@ -6642,9 +6655,19 @@ class LiteTranslator {
             as_.Pandn(t_mask_b, xm);         // ~mask_b & b
             as_.Por(t_mask_a, t_an_sub);     // a' in t_mask_a
             as_.Por(t_mask_b, t_bn_sub);     // b' in t_mask_b
-            minmax(t_mask_a, t_mask_b);
+            // minab|minba|OR so the +-0 tie gets OR-of-signs (most-negative,
+            // ARM's FMINNM rule), not x86's "return 2nd source on tie". The
+            // operands are NaN-free here (NaN lanes were substituted above).
+            SimdRegister t_nm = AllocTempSimdReg();
+            if (t_nm == no_simd_register) { success_ = false; return; }
+            as_.Movdqa(t_nm, t_mask_b);
+            minmax(t_nm, t_mask_a);          // min(b', a')
+            minmax(t_mask_a, t_mask_b);      // min(a', b')
+            as_.Por(t_mask_a, t_nm);
             as_.Movdqa(xn, t_mask_a);
           }
+          // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+          if (is_max) as_.Pxor(xn, sign_mask);
           // .2S (q=0, FP32 only) zeroes upper 64 bits of the destination.
           if (!args.q) mask_low64(xn);
           store_full(vd_off, xn);
@@ -22115,6 +22138,9 @@ class LiteTranslator {
           success_ = false; return;
         }
         as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // SQRSHRUN computes its rounding carry pre-shift into xcarry and adds
+        // it after the arithmetic shift (see below); other forms leave it unused.
+        SimdRegister xcarry = no_simd_register;
         if (is_rounding) {
           // Broadcast the per-lane rounding constant (1 << (rshift - 1))
           // across all SIMD lanes, then add.  The 64-bit pattern packs
@@ -22137,11 +22163,16 @@ class LiteTranslator {
               break;
             default: success_ = false; return;
           }
-          SimdRegister xround = AllocTempSimdReg();
-          if (xround == no_simd_register) { success_ = false; return; }
-          as_.Movq(r1, static_cast<int64_t>(round_pattern));
-          as_.Movq(xround, r1);
-          as_.Pinsrq(xround, r1, int8_t{1});
+          // SQRSHRUN does not use a broadcast rounding addend (it uses the
+          // carry-bit identity below), so skip building xround for it.
+          SimdRegister xround = no_simd_register;
+          if (!is_saturating_signed_to_unsigned) {
+            xround = AllocTempSimdReg();
+            if (xround == no_simd_register) { success_ = false; return; }
+            as_.Movq(r1, static_cast<int64_t>(round_pattern));
+            as_.Movq(xround, r1);
+            as_.Pinsrq(xround, r1, int8_t{1});
+          }
           if (is_saturating_unsigned) {
             switch (src_bits) {
               case 16:
@@ -22163,11 +22194,35 @@ class LiteTranslator {
               }
               // src_bits == 64 already bailed above.
             }
+          } else if (is_saturating_signed_to_unsigned) {
+            // SQRSHRUN: the rounding-add must NOT saturate at INT_MAX before
+            // the shift.  When shift == dst_bits, a source within round_const
+            // of INT_MAX rounds up to a MID-RANGE unsigned output (not the
+            // saturated extreme), so a signed-saturating add (PADDSW / pre-
+            // clamp PADDD) drops exactly 1 LSB there.  Use the exact identity
+            //   (x + (1 << (s-1))) >> s  ==  (x >> s) + bit(s-1 of x)
+            // for arithmetic >>: compute the carry bit now (xn intact) and add
+            // it after the arithmetic shift below.  No wide add → no premature
+            // saturation.  Isolate bit (cnt-1) into bit 0 of each lane by
+            // shifting it to the top (left by src_bits-cnt) then logically back.
+            xcarry = AllocTempSimdReg();
+            if (xcarry == no_simd_register) { success_ = false; return; }
+            as_.Movdqa(xcarry, xn);
+            switch (src_bits) {
+              case 16:
+                as_.Psllw(xcarry, static_cast<int8_t>(16 - narrow_rshift));
+                as_.Psrlw(xcarry, int8_t{15});
+                break;
+              case 32:
+                as_.Pslld(xcarry, static_cast<int8_t>(32 - narrow_rshift));
+                as_.Psrld(xcarry, int8_t{31});
+                break;
+              // src_bits == 64 already bailed above.
+            }
           } else if (uses_signed_shift) {
-            // SQRSHRN and SQRSHRUN both need a signed-saturating wide add.
-            // The downstream clamp (signed-to-signed for SQRSHRN; signed-
-            // to-unsigned for SQRSHRUN) drives the saturated INT*_MAX
-            // value to the correct dst-max value in either case.
+            // SQRSHRN (signed→signed): a signed-saturating wide add is exact —
+            // the boundary value saturates to INT*_MAX, which the downstream
+            // signed clamp drives to the correct dst-max value.
             switch (src_bits) {
               case 16:
                 // PADDSW is signed-saturating word add (SSE2).
@@ -22180,8 +22235,8 @@ class LiteTranslator {
                 // it cannot cause negative underflow — no lower
                 // pre-clamp needed.  Lanes that hit the upper clamp
                 // settle at exactly INT32_MAX after the add, which the
-                // post-shift PMINSD-vs-signed-max (SQRSHRN) or PMINSD-
-                // vs-0xFFFF (SQRSHRUN) drives to the saturated dst value.
+                // post-shift PMINSD-vs-signed-max drives to the saturated
+                // dst value (SQRSHRN only; SQRSHRUN uses the carry-bit path).
                 const uint32_t clamp_lane =
                     0x7FFFFFFFu - static_cast<uint32_t>(round_lane);
                 const uint64_t clamp_pattern =
@@ -22218,6 +22273,15 @@ class LiteTranslator {
             case 16: as_.Psrlw(xn, cnt); break;
             case 32: as_.Psrld(xn, cnt); break;
             case 64: as_.Psrlq(xn, cnt); break;
+          }
+        }
+        if (is_rounding && is_saturating_signed_to_unsigned) {
+          // SQRSHRUN: add the rounding carry (0/1 per lane) computed pre-shift.
+          // Post-shift values are small (|x>>cnt| ≤ INT*_MAX>>1), so a plain
+          // PADDW/PADDD cannot overflow before the unsigned clamp below.
+          switch (src_bits) {
+            case 16: as_.Paddw(xn, xcarry); break;
+            case 32: as_.Paddd(xn, xcarry); break;
           }
         }
         if (is_saturating_signed) {
