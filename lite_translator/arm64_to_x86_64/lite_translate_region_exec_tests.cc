@@ -1053,6 +1053,71 @@ TEST_F(Arm64LiteTranslateRegionTest, NeonVarShiftInterpVsExpected) {
   }
 }
 
+// 128-bit (Q-register) SIMD LDP/STP interp-vs-EXPECTED. This is the core of
+// bionic memcpy/memmove (ldp q,q / stp q,q), which copies glyph-mask rows; the
+// #3 garble looks like a stride/layout shear of the mask, so a wrong 128-bit
+// pair load/store (byte order, half, offset scale, pre/post writeback) is the
+// prime suspect. Bailed in lite, interpreter-only, untested (only d/s pairs were).
+TEST_F(Arm64LiteTranslateRegionTest, NeonQRegLdpStpInterpVsExpected) {
+  alignas(16) static uint8_t buf[1024];
+  auto fill = [&]() { for (int i = 0; i < 1024; i++) buf[i] = (uint8_t)(i * 7 + 11); };
+  auto getv = [&](int r, uint8_t out[16]) { memcpy(out, &state_.cpu.v[r], 16); };
+  auto setv = [&](int r, int seed) {
+    uint8_t v[16];
+    for (int i = 0; i < 16; i++) v[i] = (uint8_t)(seed * 31 + i * 13 + 5);
+    memcpy(&state_.cpu.v[r], v, 16);
+  };
+
+  // LDP cases: {enc, rt1, rt2, access_off, wb_delta} ; wb_delta=INT_MIN => no writeback
+  const int NWB = 0x7fffffff;
+  struct LC { uint32_t enc; int rt1, rt2, aoff, wb; };
+  const LC ld[] = {
+      {0xad400400, 0, 1, 0, NWB},      {0xad410c02, 2, 3, 32, NWB},
+      {0xadc08400, 0, 1, 16, 16},      // pre-index: addr=base+16, x0=base+16
+      {0xacc11404, 4, 5, 0, 32},       // post-index: addr=base, x0=base+32
+      {0xad7f0400, 0, 1, -32, NWB},    {0xad4f1c06, 6, 7, 480, NWB}};
+  for (const LC& c : ld) {
+    fill();
+    GuestAddr base = ToGuestAddr(buf) + 512;  // mid-buffer so -32 is valid
+    state_.cpu.x[0] = base;
+    for (int r = 0; r < 8; r++) state_.cpu.v[r] = 0;
+    Interpret(c.enc);
+    uint8_t g1[16], g2[16];
+    getv(c.rt1, g1);
+    getv(c.rt2, g2);
+    const uint8_t* mem = buf + (base - ToGuestAddr(buf)) + c.aoff;
+    EXPECT_EQ(memcmp(g1, mem, 16), 0) << "LDP enc=0x" << std::hex << c.enc << " rt1 mismatch";
+    EXPECT_EQ(memcmp(g2, mem + 16, 16), 0) << "LDP enc=0x" << std::hex << c.enc << " rt2 mismatch";
+    if (c.wb != NWB)
+      EXPECT_EQ(state_.cpu.x[0], base + c.wb) << "LDP enc=0x" << std::hex << c.enc << " writeback";
+  }
+
+  // STP cases: {enc, rt1, rt2, access_off, wb_delta}
+  struct SC { uint32_t enc; int rt1, rt2, aoff, wb; };
+  const SC st[] = {
+      {0xad000400, 0, 1, 0, NWB},   {0xad010c02, 2, 3, 32, NWB},
+      {0xad808400, 0, 1, 16, 16},   {0xac811404, 4, 5, 0, 32}};
+  for (const SC& c : st) {
+    fill();
+    GuestAddr base = ToGuestAddr(buf) + 256;
+    state_.cpu.x[0] = base;
+    setv(c.rt1, c.rt1 + 1);
+    setv(c.rt2, c.rt2 + 1);
+    Interpret(c.enc);
+    uint8_t e1[16], e2[16];
+    getv(c.rt1, e1);
+    getv(c.rt2, e2);
+    const uint8_t* mem = buf + (base - ToGuestAddr(buf)) + c.aoff;
+    EXPECT_EQ(memcmp(mem, e1, 16), 0) << "STP enc=0x" << std::hex << c.enc << " mem rt1 mismatch";
+    EXPECT_EQ(memcmp(mem + 16, e2, 16), 0) << "STP enc=0x" << std::hex << c.enc << " mem rt2 mismatch";
+    if (c.wb != NWB)
+      EXPECT_EQ(state_.cpu.x[0], base + c.wb) << "STP enc=0x" << std::hex << c.enc << " writeback";
+    // bytes outside [mem, mem+32) must be untouched.
+    EXPECT_EQ(buf[(base - ToGuestAddr(buf)) + c.aoff - 1], (uint8_t)(((base - ToGuestAddr(buf)) + c.aoff - 1) * 7 + 11))
+        << "STP enc=0x" << std::hex << c.enc << " underflow write";
+  }
+}
+
 // Bailed two-reg-misc (CMXX-vs-0, ABS/NEG, CLS/CLZ/CNT, SADDLP/UADDLP/SADALP/
 // UADALP pairwise-long(+acc), SUQADD/USQADD, SQABS/SQNEG) interp-vs-EXPECTED.
 TEST_F(Arm64LiteTranslateRegionTest, NeonBailedTwoRegMiscInterpVsExpected) {
