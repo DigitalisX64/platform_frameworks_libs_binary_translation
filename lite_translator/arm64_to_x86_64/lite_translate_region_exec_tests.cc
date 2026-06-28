@@ -610,6 +610,108 @@ TEST_F(Arm64LiteTranslateRegionTest, StoreLoadBarrierEmitsMfence) {
   EXPECT_FALSE(has_mfence(region_bytes(0x88dffc01))) << "LDAR needs no MFENCE (x86 acquire is free)";
 }
 
+// Interpreter-vs-EXPECTED for fused multiply-add (FMLA/FMLS vector, FMADD/FMSUB
+// scalar) — the core operation for matrix-vector coordinate transforms (e.g. a
+// glyph-rendering device matrix). ARM FMLA is FUSED (single rounding), so the
+// reference uses std::fma. A wrong FMLA mis-transforms every coordinate (glyph
+// displacement) — CPU-side and shared interp+JIT. Verified against std::fma and
+// JIT-vs-interpreter.
+TEST_F(Arm64LiteTranslateRegionTest, FmaInterpreterVsExpected) {
+  auto setS4 = [&](int i, float a, float b, float c, float d) {
+    float v[4] = {a, b, c, d};
+    memcpy(&state_.cpu.v[i], v, 16);
+  };
+  auto getS4 = [&](int i, float out[4]) { memcpy(out, &state_.cpu.v[i], 16); };
+  auto setD2 = [&](int i, double a, double b) {
+    double v[2] = {a, b};
+    memcpy(&state_.cpu.v[i], v, 16);
+  };
+  auto getD2 = [&](int i, double out[2]) { memcpy(out, &state_.cpu.v[i], 16); };
+  auto bitsf = [](float a, float b) {
+    uint32_t x, y;
+    memcpy(&x, &a, 4);
+    memcpy(&y, &b, 4);
+    return x == y;
+  };
+  auto bitsd = [](double a, double b) {
+    uint64_t x, y;
+    memcpy(&x, &a, 8);
+    memcpy(&y, &b, 8);
+    return x == y;
+  };
+
+  // Values where fused (single-rounding) differs from non-fused (two-rounding):
+  // a*b is inexact and the addend cancels high bits.
+  struct F {
+    float n, m, d;
+  };
+  const F cases[] = {{1.0f, 1.0f, 1.0f},
+                     {1.1f, 2.2f, 3.3f},
+                     {1e18f, 1e18f, -1e36f},
+                     {0.1f, 0.1f, -0.01f},
+                     {123456.7f, 765432.1f, -9.4e10f},
+                     {-3.5f, 2.25f, 7.0f},
+                     {16777217.0f, 1.0f, 0.5f}};  // 2^24+1 rounding edge
+
+  for (const F& c : cases) {
+    // FMLA v0.4s, v1.4s, v2.4s : v0 = v0 + v1*v2 (fused).
+    setS4(0, c.d, c.d, c.d, c.d);
+    setS4(1, c.n, c.n, c.n, c.n);
+    setS4(2, c.m, c.m, c.m, c.m);
+    Interpret(0x4e22cc20);
+    float got[4];
+    getS4(0, got);
+    float exp = std::fma(c.n, c.m, c.d);
+    EXPECT_TRUE(bitsf(got[0], exp))
+        << "FMLA.4s n=" << c.n << " m=" << c.m << " d=" << c.d << " exp=" << exp
+        << " got=" << got[0];
+
+    // FMLS v0.4s, v1.4s, v2.4s : v0 = v0 - v1*v2 (fused) = fma(-n, m, d).
+    setS4(0, c.d, c.d, c.d, c.d);
+    setS4(1, c.n, c.n, c.n, c.n);
+    setS4(2, c.m, c.m, c.m, c.m);
+    Interpret(0x4ea2cc20);
+    getS4(0, got);
+    float expS = std::fma(-c.n, c.m, c.d);
+    EXPECT_TRUE(bitsf(got[0], expS)) << "FMLS.4s exp=" << expS << " got=" << got[0];
+
+    // FMLA v0.2d : double.
+    setD2(0, c.d, c.d);
+    setD2(1, c.n, c.n);
+    setD2(2, c.m, c.m);
+    Interpret(0x4e62cc20);
+    double gotd[2];
+    getD2(0, gotd);
+    double expd = std::fma((double)c.n, (double)c.m, (double)c.d);
+    EXPECT_TRUE(bitsd(gotd[0], expd)) << "FMLA.2d exp=" << expd << " got=" << gotd[0];
+
+    // FMADD s0, s1, s2, s3 : s0 = s3 + s1*s2 (fused).
+    setS4(1, c.n, 0, 0, 0);
+    setS4(2, c.m, 0, 0, 0);
+    setS4(3, c.d, 0, 0, 0);
+    Interpret(0x1f020c20);
+    getS4(0, got);
+    EXPECT_TRUE(bitsf(got[0], exp)) << "FMADD.s exp=" << exp << " got=" << got[0];
+
+    // FMSUB s0, s1, s2, s3 : s0 = s3 - s1*s2 (fused).
+    setS4(1, c.n, 0, 0, 0);
+    setS4(2, c.m, 0, 0, 0);
+    setS4(3, c.d, 0, 0, 0);
+    Interpret(0x1f028c20);
+    getS4(0, got);
+    EXPECT_TRUE(bitsf(got[0], expS)) << "FMSUB.s exp=" << expS << " got=" << got[0];
+
+    // FMLA v0.4s, v1.4s, v2.s[1] : v0[i] = v0[i] + v1[i]*v2[1] (fused, by-element)
+    // — the matrix*vector coordinate-transform form.
+    setS4(0, c.d, c.d, c.d, c.d);
+    setS4(1, c.n, c.n, c.n, c.n);
+    setS4(2, 0.0f, c.m, 0.0f, 0.0f);  // indexed element 1 = m
+    Interpret(0x4fa21020);            // fmla v0.4s, v1.4s, v2.s[1]
+    getS4(0, got);
+    EXPECT_TRUE(bitsf(got[0], exp)) << "FMLA.4s by-elem exp=" << exp << " got=" << got[0];
+  }
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   static const uint32_t code[] = {
       MovzX(0, 10),       // MOVZ X0, #10
