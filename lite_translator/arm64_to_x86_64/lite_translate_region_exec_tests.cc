@@ -38881,6 +38881,49 @@ TEST_F(Arm64LiteTranslateRegionTest, Sqrshrun2Vec8HShift5) {
   }
 }
 
+// Boundary regression: SQRSHRUN at shift == dst_bits.  When the shift equals
+// the destination width, a source value within round_const of INT_MAX rounds up
+// to a MID-RANGE unsigned output (e.g. 0x7FFF >>8 with round → 128), NOT the
+// saturated extreme.  The PADDSW (src=16) / PMINSD-preclamp+PADDD (src=32)
+// lowering saturated the rounding sum at INT_MAX *before* the shift, dropping
+// exactly 1 LSB at this boundary.  Architectural reference widens the add.
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrunVec8BShift8Boundary) {
+  // shift=8, round=128.  0x7FFF+128 = 0x807F → >>8 = 128 (valid, not sat).
+  //   0x7F80+128 = 0x8000 → >>8 = 128.   0x7F7F+128 = 0x7FFF → >>8 = 127.
+  int16_t in[8] = {0x7FFF, 0x7F80, 0x7F7F, 0x0100,
+                   static_cast<int16_t>(0x8000), 0x4000, 0x0001, 0x00FF};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {0x2F088C20};  // sqrshrun v0.8b, v1.8h, #8
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], SqrshrunRefU8(in[i], 8))
+        << "lane " << i << " in=0x" << std::hex << static_cast<uint16_t>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SqrshrunVec4HShift16Boundary) {
+  // shift=16, round=0x8000.  0x7FFFFFFF+0x8000 = 0x80007FFF → >>16 = 0x8000
+  // (valid).  0x7FFF8000+0x8000 = 0x80000000 → >>16 = 0x8000.
+  int32_t in[4] = {0x7FFFFFFF, 0x7FFF8000, static_cast<int32_t>(0x80000000),
+                   0x00010000};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {0x2F108C20};  // sqrshrun v0.4h, v1.4s, #16
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], SqrshrunRefU16(in[i], 16))
+        << "lane " << i << " in=0x" << std::hex << static_cast<uint32_t>(in[i]);
+  }
+  for (int i = 4; i < 8; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper halfword " << i << " not zeroed";
+  }
+}
+
 
 // SDOT/UDOT JIT (Armv8.4-DotProd) exec tests
 //
