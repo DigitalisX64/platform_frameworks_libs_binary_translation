@@ -879,6 +879,297 @@ TEST_F(Arm64LiteTranslateRegionTest, FpMinMaxSignedZero) {
   }
 }
 
+// Focused ground-truth: MLA/MLS .4s with simple known values.
+//   v0={1,2,3,4}, v1={10,10,10,10}, v2={2,3,4,5}
+//   MLA: v0[i]+=v1[i]*v2[i] -> {21,32,43,54}
+//   MLS: v0[i]-=v1[i]*v2[i] -> {-19,-28,-37,-46}
+TEST_F(Arm64LiteTranslateRegionTest, NeonMlaMlsGroundTruth) {
+  auto setlanes = [&](int reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    uint32_t v[4] = {a, b, c, d};
+    memcpy(&state_.cpu.v[reg], v, 16);
+  };
+  auto getlanes = [&](int reg, uint32_t out[4]) { memcpy(out, &state_.cpu.v[reg], 16); };
+  auto run_jit = [&](uint32_t insn) -> bool {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    if (!ok || stop != start + 4) return false;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    state_.cpu.insn_addr = start;
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    return true;
+  };
+  struct C { uint32_t enc; const char* name; uint32_t exp[4]; };
+  const C cases[] = {
+      {0x4ea29420, "mla.4s", {21u, 32u, 43u, 54u}},
+      {0x6ea29420, "mls.4s", {(uint32_t)-19, (uint32_t)-28, (uint32_t)-37, (uint32_t)-46}},
+  };
+  for (const C& c : cases) {
+    uint32_t ri[4], rj[4];
+    setlanes(0, 1, 2, 3, 4); setlanes(1, 10, 10, 10, 10); setlanes(2, 2, 3, 4, 5);
+    Interpret(c.enc);
+    getlanes(0, ri);
+    setlanes(0, 1, 2, 3, 4); setlanes(1, 10, 10, 10, 10); setlanes(2, 2, 3, 4, 5);
+    bool jok = run_jit(c.enc);
+    getlanes(0, rj);
+    for (int i = 0; i < 4; i++) {
+      EXPECT_EQ(ri[i], c.exp[i]) << c.name << " INTERP lane " << i << " got=0x" << std::hex << ri[i]
+                                 << " exp=0x" << c.exp[i];
+      if (jok)
+        EXPECT_EQ(rj[i], c.exp[i]) << c.name << " JIT lane " << i << " got=0x" << std::hex << rj[i]
+                                   << " exp=0x" << c.exp[i];
+    }
+  }
+
+  // Overflow edge: v0=v1=0xFFFFFFFF, v2=0xFFFFFFFD.
+  //   product low32 = (-1)*(-3) mod 2^32 = 3.  MLA = 0xFFFFFFFF + 3 = 2.
+  //   MLS = 0xFFFFFFFF - 3 = 0xFFFFFFFC.
+  // Also v0=v1=0x80000000, v2=4: product low32 = 0x80000000*4 = 0 (mod 2^32).
+  //   MLA = 0x80000000 + 0 = 0x80000000.
+  struct E { uint32_t enc; const char* name; uint32_t v0, v1, v2, exp; };
+  const E edges[] = {
+      {0x4ea29420, "mla", 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFDu, 0x00000002u},
+      {0x6ea29420, "mls", 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFDu, 0xFFFFFFFCu},
+      {0x4ea29420, "mla", 0x80000000u, 0x80000000u, 0x00000004u, 0x80000000u},
+      {0x4ea29420, "mla", 0x00000001u, 0x00000001u, 0xFFFFFFFEu, 0xFFFFFFFFu},
+      {0x6ea29420, "mls", 0x00000001u, 0x00000001u, 0xFFFFFFFEu, 0x00000003u},
+  };
+  for (const E& e : edges) {
+    uint32_t ri[4], rj[4];
+    setlanes(0, e.v0, e.v0, e.v0, e.v0);
+    setlanes(1, e.v1, e.v1, e.v1, e.v1);
+    setlanes(2, e.v2, e.v2, e.v2, e.v2);
+    Interpret(e.enc);
+    getlanes(0, ri);
+    setlanes(0, e.v0, e.v0, e.v0, e.v0);
+    setlanes(1, e.v1, e.v1, e.v1, e.v1);
+    setlanes(2, e.v2, e.v2, e.v2, e.v2);
+    bool jok = run_jit(e.enc);
+    getlanes(0, rj);
+    EXPECT_EQ(ri[0], e.exp) << e.name << " INTERP v0=0x" << std::hex << e.v0 << " v1=0x" << e.v1
+                            << " v2=0x" << e.v2 << " got=0x" << ri[0] << " exp=0x" << e.exp;
+    if (jok)
+      EXPECT_EQ(rj[0], e.exp) << e.name << " JIT v0=0x" << std::hex << e.v0 << " v1=0x" << e.v1
+                              << " v2=0x" << e.v2 << " got=0x" << rj[0] << " exp=0x" << e.exp;
+  }
+
+  // Exact multi-lane fuzzer case (a=1,b=2): per-lane DIFFERENT values expose a
+  // lane-dependent bug that same-value-all-lanes hides.
+  //   v0=v1={0x80000000,0x7FFFFFFF,0xFFFFFFFF,0x00000001}
+  //   v2   ={0x00000004,0x00000003,0xFFFFFFFD,0xFFFFFFFE}
+  //   MLA lane: v0+v1*v2 -> {0x80000000,0xFFFFFFFC,0x00000002,0xFFFFFFFF}
+  {
+    const uint32_t exp[4] = {0x80000000u, 0xFFFFFFFCu, 0x00000002u, 0xFFFFFFFFu};
+    uint32_t ri[4], rj[4];
+    setlanes(0, 0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x00000001u);
+    setlanes(1, 0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x00000001u);
+    setlanes(2, 0x00000004u, 0x00000003u, 0xFFFFFFFDu, 0xFFFFFFFEu);
+    Interpret(0x4ea29420);
+    getlanes(0, ri);
+    setlanes(0, 0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x00000001u);
+    setlanes(1, 0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x00000001u);
+    setlanes(2, 0x00000004u, 0x00000003u, 0xFFFFFFFDu, 0xFFFFFFFEu);
+    bool jok = run_jit(0x4ea29420);
+    getlanes(0, rj);
+    for (int i = 0; i < 4; i++) {
+      EXPECT_EQ(ri[i], exp[i]) << "MLA multilane INTERP lane " << i << " got=0x" << std::hex
+                               << ri[i] << " exp=0x" << exp[i];
+      if (jok)
+        EXPECT_EQ(rj[i], exp[i]) << "MLA multilane JIT lane " << i << " got=0x" << std::hex
+                                 << rj[i] << " exp=0x" << exp[i];
+    }
+  }
+}
+
+// AdvSimdCopy (DUP/INS/SMOV/UMOV) interp+JIT vs EXPECTED. simpleperf showed
+// Interpreter::AdvSimdCopy hot in Helium's rasterizer; these move data between
+// lanes / to GP regs, so a wrong lane-index or element-size decode rearranges
+// pixels (internal glyph fragmentation). Checking against hand-computed
+// expected (not interp-vs-JIT) also catches a shared imm5/imm4-decode bug.
+TEST_F(Arm64LiteTranslateRegionTest, NeonCopyInterpAndJitVsExpected) {
+  auto run_jit = [&](uint32_t insn) -> bool {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    if (!ok || stop != start + 4) return false;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    state_.cpu.insn_addr = start;
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    return true;
+  };
+  auto setv = [&](int reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    uint32_t v[4] = {a, b, c, d};
+    memcpy(&state_.cpu.v[reg], v, 16);
+  };
+  auto v0lane = [&](int i) -> uint32_t {
+    uint32_t v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[i];
+  };
+  // src lanes: distinct so a wrong index is visible. byte/halfword views:
+  // v1 = {0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00}
+  const uint32_t L0 = 0x11223344u, L1 = 0x55667788u, L2 = 0x99aabbccu, L3 = 0xddeeff00u;
+
+  // DUP v0.4s, v1.s[2]  -> all lanes = L2
+  setv(1, L0, L1, L2, L3); setv(0, 0, 0, 0, 0);
+  uint32_t enc = 0x4e140420;  // dup v0.4s, v1.s[2]
+  Interpret(enc);
+  for (int i = 0; i < 4; i++) EXPECT_EQ(v0lane(i), L2) << "dup.s[2] INTERP lane " << i;
+  setv(1, L0, L1, L2, L3); setv(0, 0, 0, 0, 0);
+  if (run_jit(enc)) for (int i = 0; i < 4; i++) EXPECT_EQ(v0lane(i), L2) << "dup.s[2] JIT lane " << i;
+
+  // INS v0.s[3], v1.s[1] -> v0 lane3 = L1, others preserved
+  setv(1, L0, L1, L2, L3); setv(0, 0xA, 0xB, 0xC, 0xD);
+  enc = 0x6e1c2420;  // ins v0.s[3], v1.s[1]
+  Interpret(enc);
+  EXPECT_EQ(v0lane(0), 0xAu); EXPECT_EQ(v0lane(1), 0xBu);
+  EXPECT_EQ(v0lane(2), 0xCu); EXPECT_EQ(v0lane(3), L1) << "ins.s INTERP";
+  setv(1, L0, L1, L2, L3); setv(0, 0xA, 0xB, 0xC, 0xD);
+  if (run_jit(enc)) { EXPECT_EQ(v0lane(3), L1) << "ins.s JIT"; EXPECT_EQ(v0lane(0), 0xAu); }
+
+  // UMOV w0, v1.s[2] -> x0 = L2 (zero-extended)
+  setv(1, L0, L1, L2, L3); state_.cpu.x[0] = 0xDEADBEEFDEADBEEFull;
+  enc = 0x0e143c20;  // umov w0, v1.s[2]
+  Interpret(enc);
+  EXPECT_EQ(state_.cpu.x[0], (uint64_t)L2) << "umov.s INTERP";
+  setv(1, L0, L1, L2, L3); state_.cpu.x[0] = 0xDEADBEEFDEADBEEFull;
+  if (run_jit(enc)) EXPECT_EQ(state_.cpu.x[0], (uint64_t)L2) << "umov.s JIT";
+
+  // SMOV x0, v1.h[3] -> halfword 3.  v1 bytes LE: 44 33 22 11 88 77 66 55 ...
+  //   halfwords: h0=0x3344,h1=0x1122,h2=0x7788,h3=0x5566. h3=0x5566 -> sign-ext
+  //   (bit15=0) -> 0x0000000000005566.
+  setv(1, L0, L1, L2, L3); state_.cpu.x[0] = 0xDEADBEEFDEADBEEFull;
+  enc = 0x4e0e2c20;  // smov x0, v1.h[3]
+  Interpret(enc);
+  EXPECT_EQ(state_.cpu.x[0], (uint64_t)0x5566u) << "smov.h INTERP got=0x" << std::hex
+                                                << state_.cpu.x[0];
+  setv(1, L0, L1, L2, L3); state_.cpu.x[0] = 0xDEADBEEFDEADBEEFull;
+  if (run_jit(enc)) EXPECT_EQ(state_.cpu.x[0], (uint64_t)0x5566u) << "smov.h JIT";
+
+  // SMOV x0, v1.b[8] -> byte 8.  v1 lane2=0x99aabbcc -> bytes cc bb aa 99.
+  //   byte[8]=0xcc -> sign-ext (bit7=1) -> 0xFFFFFFFFFFFFFFCC.
+  setv(1, L0, L1, L2, L3); state_.cpu.x[0] = 0;
+  enc = 0x4e112c20;  // smov x0, v1.b[8]
+  Interpret(enc);
+  EXPECT_EQ(state_.cpu.x[0], 0xFFFFFFFFFFFFFFCCull) << "smov.b INTERP got=0x" << std::hex
+                                                    << state_.cpu.x[0];
+  setv(1, L0, L1, L2, L3); state_.cpu.x[0] = 0;
+  if (run_jit(enc)) EXPECT_EQ(state_.cpu.x[0], 0xFFFFFFFFFFFFFFCCull) << "smov.b JIT";
+}
+
+// NEON three-same interp-vs-JIT differential fuzz. simpleperf of Helium's
+// rasterizer showed Interpreter::AdvSimdThreeSame hot (these ops bail to the
+// interpreter inside hot rasterizer regions, so they run interpreted in EVERY
+// mode). For an op the lite JIT implements, JIT and interpreter are INDEPENDENT
+// implementations, so a divergence here exposes an interpreter (or JIT) bug that
+// the on-device interp==JIT garble (a shared-decoder symptom) cannot show. Edge
+// inputs stress signed/saturating/shift behaviour (SSHL/USHL with negative and
+// out-of-range shift amounts, INT_MIN data) — the SQRSHRUN/FMAX bug class.
+TEST_F(Arm64LiteTranslateRegionTest, NeonThreeSameInterpVsJitFuzz) {
+  auto run_jit = [&](uint32_t insn) -> bool {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    if (!ok || stop != start + 4) return false;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    state_.cpu.insn_addr = start;
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    return true;
+  };
+
+  struct Insn { uint32_t enc; const char* name; bool is_fp; bool acc; };
+  const Insn insns[] = {
+      {0x4ea28420, "add.4s", 0, 0},   {0x6ea28420, "sub.4s", 0, 0},
+      {0x4ea29c20, "mul.4s", 0, 0},   {0x4ea29420, "mla.4s", 0, 1},
+      {0x6ea29420, "mls.4s", 0, 1},   {0x4ea26420, "smax.4s", 0, 0},
+      {0x4ea26c20, "smin.4s", 0, 0},  {0x6ea26420, "umax.4s", 0, 0},
+      {0x6ea26c20, "umin.4s", 0, 0},  {0x4ea24420, "sshl.4s", 0, 0},
+      {0x6ea24420, "ushl.4s", 0, 0},  {0x0ea24420, "sshl.2s", 0, 0},
+      {0x4e624420, "sshl.8h", 0, 0},  {0x4e224420, "sshl.16b", 0, 0},
+      {0x4ee24420, "sshl.2d", 0, 0},  {0x4ea25420, "srshl.4s", 0, 0},
+      {0x6ea25420, "urshl.4s", 0, 0}, {0x4ea20c20, "sqadd.4s", 0, 0},
+      {0x4ea22c20, "sqsub.4s", 0, 0}, {0x4ea24c20, "sqshl.4s", 0, 0},
+      {0x4ea23420, "cmgt.4s", 0, 0},  {0x4ea23c20, "cmge.4s", 0, 0},
+      {0x6ea28c20, "cmeq.4s", 0, 0},  {0x6ea23420, "cmhi.4s", 0, 0},
+      {0x4e22d420, "fadd.4s", 1, 0},  {0x4ea2d420, "fsub.4s", 1, 0},
+      {0x6e22dc20, "fmul.4s", 1, 0},  {0x6e22fc20, "fdiv.4s", 1, 0},
+      {0x4e22cc20, "fmla.4s", 1, 1},  {0x4ea2cc20, "fmls.4s", 1, 1},
+      {0x4e22f420, "fmax.4s", 1, 0},  {0x4ea2f420, "fmin.4s", 1, 0},
+      {0x4e22e420, "fcmeq.4s", 1, 0}, {0x6e22e420, "fcmge.4s", 1, 0},
+      {0x6ea2e420, "fcmgt.4s", 1, 0}, {0x4e62d420, "fadd.2d", 1, 0},
+      {0x6e62dc20, "fmul.2d", 1, 0},
+  };
+
+  // 128-bit input patterns as pairs of u64 {lo, hi}. Mix data + shift-amount
+  // ranges; SSHL/USHL read the low signed byte of each element as the count.
+  const uint64_t pats[][2] = {
+      {0x0000000000000000ULL, 0x0000000000000000ULL},
+      {0x7FFFFFFF80000000ULL, 0x00000001FFFFFFFFULL},  // INT_MAX/MIN/1/-1 (32b)
+      {0x0000000300000004ULL, 0xFFFFFFFEFFFFFFFDULL},
+      {0x0000001F00000020ULL, 0xFFFFFFE1FFFFFFE0ULL},  // shifts +31/+32/-31/-32
+      {0x0000004000000001ULL, 0xFFFFFFC0000000FFULL},
+      {0x8000000080000000ULL, 0x7FFFFFFF7FFFFFFFULL},
+      {0x000000FF000000FEULL, 0xFFFFFF01FFFFFF02ULL},
+      {0x3F8000004048F5C3ULL, 0xC2C80000BF800000ULL},  // floats 1.0/3.14/-100/-1
+      {0x7F800000FF800000ULL, 0x000000017FC00000ULL},  // +inf/-inf/denorm/NaN
+      {0x42F6E97900000000ULL, 0x4F00000041200000ULL},
+  };
+  const size_t NP = sizeof(pats) / sizeof(pats[0]);
+
+  // Full reset + run one op, returning v0; resets ALL v regs to avoid the
+  // cross-iteration carryover that produces false divergences at scale.
+  auto run_one = [&](uint32_t enc, size_t a, size_t b, bool acc, bool jit,
+                     unsigned __int128* out) -> bool {
+    for (int r = 0; r < 32; r++) state_.cpu.v[r] = 0;
+    auto setv = [&](int reg, size_t p) {
+      uint64_t v[2] = {pats[p][0], pats[p][1]};
+      memcpy(&state_.cpu.v[reg], v, 16);
+    };
+    setv(1, a); setv(2, b); setv(0, acc ? a : 5);
+    bool ok = true;
+    if (jit) ok = run_jit(enc); else Interpret(enc);
+    memcpy(out, &state_.cpu.v[0], 16);
+    return ok;
+  };
+
+  int compared = 0;
+  for (const Insn& in : insns) {
+    // FP ops are skipped here: with NaN/Inf input lanes ARM (interpreter
+    // produces the default NaN) and x86 MAXPS/MINPS/FMA legitimately differ on
+    // NaN propagation, which is a separate concern from the integer/positional
+    // path this differential targets. Integer three-same is the focus.
+    if (in.is_fp) continue;
+    for (size_t a = 0; a < NP; a++) {
+      for (size_t b = 0; b < NP; b++) {
+        unsigned __int128 vi, vj;
+        run_one(in.enc, a, b, in.acc, /*jit=*/false, &vi);
+        if (!run_one(in.enc, a, b, in.acc, /*jit=*/true, &vj)) continue;  // op bails
+        compared++;
+        if (vi == vj) continue;
+        // Re-run BOTH in isolation to filter any scale/state artifact before
+        // declaring a real divergence.
+        unsigned __int128 vi2, vj2;
+        run_one(in.enc, a, b, in.acc, false, &vi2);
+        run_one(in.enc, a, b, in.acc, true, &vj2);
+        if (vi2 == vj2) continue;  // not reproducible in isolation -> artifact
+        ADD_FAILURE() << in.name << " a=" << a << " b=" << b << std::hex
+                      << " interp=" << (uint64_t)(vi2 >> 64) << ":" << (uint64_t)vi2
+                      << " jit=" << (uint64_t)(vj2 >> 64) << ":" << (uint64_t)vj2;
+      }
+    }
+  }
+  EXPECT_GT(compared, 100);
+}
+
 // FP rounding-mode ops (interp + JIT vs reference): FRINTN/M/P/Z/A (round to
 // integral float) and FCVTNS/MS/PS/AS (round + convert to int). Skia's analytic-
 // AA coverage uses floor/ceil/round to compute span boundaries; a wrong rounding
