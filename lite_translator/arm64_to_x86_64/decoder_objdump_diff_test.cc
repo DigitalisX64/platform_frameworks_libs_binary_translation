@@ -330,6 +330,42 @@ TEST(DecoderObjdumpDiff, RasterizerRange) {
   EXPECT_EQ(mismatches, 0);
 }
 
+// MSR (immediate) to a PSTATE field (CRn=0b0100) must decode to Nop, not
+// Undefined. Found via the rasterizer-range decoder diff: Chromium's MTE-
+// hardened Scudo toggles `msr TCO, #imm`, which previously decoded as
+// Undefined (a latent SIGILL had that dead MTE path ever executed). All PSTATE
+// immediates are EL0-irrelevant for translation and must be NOPs.
+TEST(DecoderObjdumpDiff, MsrImmediatePstateIsNop) {
+  // Base MSR-immediate encoding; insert op1/CRm/op2. Verified: TCO #0 == the
+  // 0xD503409F seen in libchrome's disassembly.
+  auto msr_imm = [](uint32_t op1, uint32_t crm, uint32_t op2) -> uint32_t {
+    return 0xD500401Fu | (op1 << 16) | (crm << 8) | (op2 << 5);
+  };
+  struct Case {
+    const char* name;
+    uint32_t op1;
+    uint32_t op2;
+  };
+  // (op1, op2) per the ARM ARM PSTATE field selectors.
+  const Case cases[] = {
+      {"UAO", 0b000, 0b011},     {"PAN", 0b000, 0b100},  {"SPSel", 0b000, 0b101},
+      {"SSBS", 0b011, 0b001},    {"DIT", 0b011, 0b010},  {"TCO", 0b011, 0b100},
+      {"DAIFSet", 0b011, 0b110}, {"DAIFClr", 0b011, 0b111},
+  };
+  EXPECT_EQ(msr_imm(0b011, 0, 0b100), 0xD503409Fu);  // TCO #0 ground truth
+  for (const auto& c : cases) {
+    for (uint32_t crm = 0; crm < 16; ++crm) {
+      uint32_t enc = msr_imm(c.op1, crm, c.op2);
+      Recorder rec;
+      Recorder::Decoder dec(&rec);
+      rec.h.clear();
+      dec.Decode(reinterpret_cast<const uint16_t*>(&enc));
+      EXPECT_EQ(rec.h, "Nop") << "msr " << c.name << ", #" << crm << " (0x" << std::hex << enc
+                              << ") decoded as [" << rec.h << "]";
+    }
+  }
+}
+
 }  // namespace
 
 }  // namespace berberis

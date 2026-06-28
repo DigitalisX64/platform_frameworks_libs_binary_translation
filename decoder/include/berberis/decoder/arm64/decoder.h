@@ -2402,6 +2402,24 @@ class Decoder {
         }
         return;
       }
+      if (crn == 0b0100) {
+        // MSR (immediate): write a PSTATE field. CRm:op2 select the field; Rt
+        // is fixed 0b11111. Encodings (op1:op2), verified against the ARM ARM:
+        //   CFINV=000:000, XAFLAG=000:001, AXFLAG=000:010, UAO=000:011,
+        //   PAN=000:100, SPSel=000:101, ALLINT=001:000, SSBS=011:001,
+        //   DIT=011:010, SVCRSM/SVCRZA(SME)=011:011, TCO=011:100,
+        //   DAIFSet=011:110, DAIFClr=011:111.
+        // All of these PSTATE bits are EL0-irrelevant for binary translation:
+        // they govern MTE tag-check (TCO), data-independent timing (DIT),
+        // speculative-store-bypass (SSBS), privileged access control
+        // (PAN/UAO/SPSel/ALLINT) and interrupt masking (DAIF) — none affects the
+        // data computation we translate, and at EL0 user code cannot change the
+        // privileged ones anyway. So every MSR-immediate is a no-op here, exactly
+        // like the HINT space above. NOPing avoids a spurious SIGILL on MTE/
+        // DIT/SSBS-hardened guest code (e.g. Chromium's Scudo `msr TCO` toggles).
+        insn_consumer_->Nop();
+        return;
+      }
     }
 
     // SYS instructions (op0=01): cache maintenance (DC, IC), TLB ops, etc.
