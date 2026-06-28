@@ -812,6 +812,73 @@ TEST_F(Arm64LiteTranslateRegionTest, FpGridOpsInterpAndJitVsExpected) {
   }
 }
 
+// FMAX/FMIN/FMAXNM/FMINNM .4s signed-zero rule (interp AND JIT): for a +-0 tie,
+// FMAX returns the MOST-POSITIVE sign (AND of signs) and FMIN the MOST-NEGATIVE
+// (OR of signs). x86 MAXPS/MINPS return the 2nd source on a tie, so FMAX was
+// wrong for +0-vs-(-0). Also checks normal values + NaN propagation don't
+// regress.
+TEST_F(Arm64LiteTranslateRegionTest, FpMinMaxSignedZero) {
+  const float pz = 0.0f, nz = -0.0f, nan = std::nanf("");
+  auto u = [](float f) { uint32_t b; memcpy(&b, &f, 4); return b; };
+  auto setS = [&](int i, float a) {
+    float v[4] = {a, a, a, a};
+    memcpy(&state_.cpu.v[i], v, 16);
+  };
+  auto got0 = [&]() {
+    float v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[0];
+  };
+
+  struct Case {
+    uint32_t enc;
+    const char* name;
+    float a, b, exp;
+  };
+  const Case cases[] = {
+      // FMAX (0x4e22f420): +-0 tie -> most positive (+0); -0,-0 -> -0.
+      {0x4e22f420, "fmax", pz, nz, pz}, {0x4e22f420, "fmax", nz, pz, pz},
+      {0x4e22f420, "fmax", nz, nz, nz}, {0x4e22f420, "fmax", 3.0f, 5.0f, 5.0f},
+      {0x4e22f420, "fmax", 5.0f, 3.0f, 5.0f},
+      // FMIN (0x4ea2f420): +-0 tie -> most negative (-0); +0,+0 -> +0.
+      {0x4ea2f420, "fmin", pz, nz, nz}, {0x4ea2f420, "fmin", nz, pz, nz},
+      {0x4ea2f420, "fmin", pz, pz, pz}, {0x4ea2f420, "fmin", 3.0f, 5.0f, 3.0f},
+      // FMAXNM (0x4e22c420): same +-0 rule; ignores NaN (returns the number).
+      {0x4e22c420, "fmaxnm", pz, nz, pz}, {0x4e22c420, "fmaxnm", nan, 5.0f, 5.0f},
+      // FMINNM (0x4ea2c420).
+      {0x4ea2c420, "fminnm", pz, nz, nz}, {0x4ea2c420, "fminnm", nan, 5.0f, 5.0f},
+  };
+
+  for (const Case& c : cases) {
+    // Interpreter.
+    setS(0, 0);
+    setS(1, c.a);
+    setS(2, c.b);
+    Interpret(c.enc);
+    EXPECT_EQ(u(got0()), u(c.exp)) << c.name << " INTERP a=" << c.a << " b=" << c.b
+                                   << " exp_bits=0x" << std::hex << u(c.exp) << " got_bits=0x"
+                                   << u(got0()) << std::dec;
+    // JIT.
+    setS(0, 0);
+    setS(1, c.a);
+    setS(2, c.b);
+    static uint32_t code[1];
+    code[0] = c.enc;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    if (ok && stop == start + 4) {
+      HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+      state_.cpu.insn_addr = start;
+      TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+      EXPECT_EQ(u(got0()), u(c.exp)) << c.name << " JIT a=" << c.a << " b=" << c.b
+                                     << " exp_bits=0x" << std::hex << u(c.exp) << " got_bits=0x"
+                                     << u(got0()) << std::dec;
+    }
+  }
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   static const uint32_t code[] = {
       MovzX(0, 10),       // MOVZ X0, #10

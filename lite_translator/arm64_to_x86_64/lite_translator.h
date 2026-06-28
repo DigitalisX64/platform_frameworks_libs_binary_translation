@@ -6601,15 +6601,28 @@ class LiteTranslator {
           }
           load_full(xn, vn_off);
           load_full(xm, vm_off);
+          // ARM FMAX/FMAXNM are computed as -FMIN(-a,-b). x86 MAXPS/MINPS return
+          // the SECOND source on a +-0 tie (OR-of-signs), which is correct only
+          // for FMIN (most-negative). Negating inputs+output makes FMAX reuse the
+          // FMIN lowering and get ARM's AND-of-signs (most-positive) for the +-0
+          // tie; because the negation is applied twice, a propagated-NaN's sign
+          // is preserved too. FMIN/FMINNM are already correct, so no negation.
+          SimdRegister sign_mask = no_simd_register;
+          if (is_max) {
+            sign_mask = AllocTempSimdReg();
+            if (sign_mask == no_simd_register) { success_ = false; return; }
+            as_.Pcmpeqd(sign_mask, sign_mask);
+            if (is_double) as_.Psllq(sign_mask, static_cast<int8_t>(63));
+            else as_.Pslld(sign_mask, static_cast<int8_t>(31));
+            as_.Pxor(xn, sign_mask);
+            as_.Pxor(xm, sign_mask);
+          }
           auto cmpunord = [&](SimdRegister dst, SimdRegister src) {
             if (is_double) as_.Cmpunordpd(dst, src); else as_.Cmpunordps(dst, src);
           };
+          // Always FMIN now (FMAX reaches here with negated operands).
           auto minmax = [&](SimdRegister dst, SimdRegister src) {
-            if (is_double) {
-              if (is_max) as_.Maxpd(dst, src); else as_.Minpd(dst, src);
-            } else {
-              if (is_max) as_.Maxps(dst, src); else as_.Minps(dst, src);
-            }
+            if (is_double) as_.Minpd(dst, src); else as_.Minps(dst, src);
           };
           if (!is_nm) {
             // FMAX / FMIN — NaN-propagating: maxab|maxba|OR.
@@ -6642,9 +6655,19 @@ class LiteTranslator {
             as_.Pandn(t_mask_b, xm);         // ~mask_b & b
             as_.Por(t_mask_a, t_an_sub);     // a' in t_mask_a
             as_.Por(t_mask_b, t_bn_sub);     // b' in t_mask_b
-            minmax(t_mask_a, t_mask_b);
+            // minab|minba|OR so the +-0 tie gets OR-of-signs (most-negative,
+            // ARM's FMINNM rule), not x86's "return 2nd source on tie". The
+            // operands are NaN-free here (NaN lanes were substituted above).
+            SimdRegister t_nm = AllocTempSimdReg();
+            if (t_nm == no_simd_register) { success_ = false; return; }
+            as_.Movdqa(t_nm, t_mask_b);
+            minmax(t_nm, t_mask_a);          // min(b', a')
+            minmax(t_mask_a, t_mask_b);      // min(a', b')
+            as_.Por(t_mask_a, t_nm);
             as_.Movdqa(xn, t_mask_a);
           }
+          // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+          if (is_max) as_.Pxor(xn, sign_mask);
           // .2S (q=0, FP32 only) zeroes upper 64 bits of the destination.
           if (!args.q) mask_low64(xn);
           store_full(vd_off, xn);
