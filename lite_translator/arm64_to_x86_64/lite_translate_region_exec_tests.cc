@@ -984,6 +984,75 @@ TEST_F(Arm64LiteTranslateRegionTest, NeonMlaMlsGroundTruth) {
   }
 }
 
+// SSHL/USHL/SRSHL/URSHL .4s interpreter vs ARM-ARM EXPECTED. These per-element
+// signed/unsigned (rounding) variable shifts BAIL in the lite JIT (interpreter-
+// only, so they run interpreted in EVERY mode), are used in fixed-point coverage
+// scaling, and have tricky negative-shift / out-of-width / rounding edges — the
+// SQRSHRUN/FMAX bug class. The reference is computed in int64 per the ARM
+// pseudocode (shift = SInt(Vm[i]<7:0>); >=0 left, <0 right, S forms arithmetic,
+// R forms add 1<<(n-1) before the right shift).
+TEST_F(Arm64LiteTranslateRegionTest, NeonVarShiftInterpVsExpected) {
+  auto setv = [&](int reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    uint32_t v[4] = {a, b, c, d};
+    memcpy(&state_.cpu.v[reg], v, 16);
+  };
+  auto v0lane = [&](int i) -> uint32_t {
+    uint32_t v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[i];
+  };
+  enum Kind { kS, kU, kSR, kUR };
+  auto ref = [](uint32_t vn, int8_t s, Kind k) -> uint32_t {
+    bool sgn = (k == kS || k == kSR);
+    bool rnd = (k == kSR || k == kUR);
+    if (s >= 0) {  // left shift (rounding bit irrelevant)
+      if (s >= 32) return 0u;
+      return (uint32_t)(vn << s);
+    }
+    int n = -(int)s;  // right shift by n
+    // 64-bit accumulator: sign- or zero-extend the 32-bit source.
+    int64_t x = sgn ? (int64_t)(int32_t)vn : (int64_t)(uint32_t)vn;
+    if (rnd) {
+      if (n <= 63) x += (int64_t)1 << (n - 1);  // round half up
+      // n>63 can't occur for int8 shift on 32-bit data in our test set
+    }
+    int64_t r;
+    if (n >= 64) {
+      r = sgn ? (x < 0 ? -1 : 0) : 0;
+    } else {
+      r = sgn ? (x >> n) : (int64_t)((uint64_t)x >> n);
+    }
+    return (uint32_t)r;
+  };
+
+  struct Op { uint32_t enc; const char* name; Kind k; };
+  const Op ops[] = {
+      {0x4ea24420, "sshl", kS},  {0x6ea24420, "ushl", kU},
+      {0x4ea25420, "srshl", kSR}, {0x6ea25420, "urshl", kUR},
+  };
+  const uint32_t data[] = {0x00000000u, 0x00000001u, 0x7FFFFFFFu, 0x80000000u,
+                           0xFFFFFFFFu, 0x12345678u, 0xFFFF0000u, 0x0000FFFFu,
+                           0xABCDEF01u, 0x40000000u};
+  // shift amounts placed in the low byte of each Vm lane (signed).
+  const int8_t shifts[] = {0,  1,   4,   8,   16,  31,  32,  33,
+                           -1, -4,  -8,  -16, -31, -32, -33, -40};
+  for (const Op& op : ops) {
+    for (uint32_t d : data) {
+      for (int8_t s : shifts) {
+        setv(1, d, d, d, d);
+        uint32_t sm = (uint32_t)(uint8_t)s;  // low byte = signed shift
+        setv(2, sm, sm, sm, sm);
+        setv(0, 0, 0, 0, 0);
+        Interpret(op.enc);
+        uint32_t want = ref(d, s, op.k);
+        EXPECT_EQ(v0lane(0), want)
+            << op.name << " d=0x" << std::hex << d << " s=" << std::dec << (int)s << " got=0x"
+            << std::hex << v0lane(0) << " exp=0x" << want;
+      }
+    }
+  }
+}
+
 // AdvSimdCopy (DUP/INS/SMOV/UMOV) interp+JIT vs EXPECTED. simpleperf showed
 // Interpreter::AdvSimdCopy hot in Helium's rasterizer; these move data between
 // lanes / to GP regs, so a wrong lane-index or element-size decode rearranges
