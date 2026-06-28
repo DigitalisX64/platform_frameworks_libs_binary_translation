@@ -5262,8 +5262,11 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
                 r = FmulxScalar<double>(a, b); break;
-              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
-              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
+              // FMLA/FMLS are FUSED multiply-add (single rounding) per the ARM
+              // ARM; `d + a*b` would round twice. Use std::fma so coordinate
+              // transforms (matrix*vector via FMLA) match hardware exactly.
+              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = std::fma(a, b, d); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = std::fma(-a, b, d); break;
               // FMAX/FMIN/FMAXNM/FMINNM: see FmaxScalar/FminScalar helpers for
               // NaN propagation and +0/-0 sign disambiguation.
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
@@ -5316,8 +5319,10 @@ class Interpreter {
               case Decoder::AdvSimdThreeSameOpcode::kFmulV: r = a * b; break;
               case Decoder::AdvSimdThreeSameOpcode::kFmulxV:
                 r = FmulxScalar<float>(a, b); break;
-              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = d + a * b; break;
-              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = d - a * b; break;
+              // FUSED multiply-add (single rounding) per the ARM ARM — std::fma,
+              // not `d + a*b` (which rounds twice).
+              case Decoder::AdvSimdThreeSameOpcode::kFmlaV: r = std::fma(a, b, d); break;
+              case Decoder::AdvSimdThreeSameOpcode::kFmlsV: r = std::fma(-a, b, d); break;
               case Decoder::AdvSimdThreeSameOpcode::kFmaxV:
                 r = FmaxScalar<float>(a, b); break;
               case Decoder::AdvSimdThreeSameOpcode::kFminV:
@@ -8623,14 +8628,14 @@ class Interpreter {
           case Decoder::AdvSimdVecXIdxOpcode::kFmla: {
             float dst;
             memcpy(&dst, reinterpret_cast<uint8_t*>(&result) + i * 4, 4);
-            float r = dst + src * indexed;
+            float r = std::fma(src, indexed, dst);  // FUSED (single rounding)
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
             break;
           }
           case Decoder::AdvSimdVecXIdxOpcode::kFmls: {
             float dst;
             memcpy(&dst, reinterpret_cast<uint8_t*>(&result) + i * 4, 4);
-            float r = dst - src * indexed;
+            float r = std::fma(-src, indexed, dst);  // FUSED
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &r, 4);
             break;
           }
@@ -8663,14 +8668,14 @@ class Interpreter {
           case Decoder::AdvSimdVecXIdxOpcode::kFmla: {
             double dst;
             memcpy(&dst, reinterpret_cast<uint8_t*>(&result) + i * 8, 8);
-            double r = dst + src * indexed;
+            double r = std::fma(src, indexed, dst);  // FUSED (single rounding)
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
             break;
           }
           case Decoder::AdvSimdVecXIdxOpcode::kFmls: {
             double dst;
             memcpy(&dst, reinterpret_cast<uint8_t*>(&result) + i * 8, 8);
-            double r = dst - src * indexed;
+            double r = std::fma(-src, indexed, dst);  // FUSED
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 8, &r, 8);
             break;
           }
