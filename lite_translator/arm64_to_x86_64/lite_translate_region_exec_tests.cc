@@ -984,6 +984,684 @@ TEST_F(Arm64LiteTranslateRegionTest, NeonMlaMlsGroundTruth) {
   }
 }
 
+// SSHL/USHL/SRSHL/URSHL .4s interpreter vs ARM-ARM EXPECTED. These per-element
+// signed/unsigned (rounding) variable shifts BAIL in the lite JIT (interpreter-
+// only, so they run interpreted in EVERY mode), are used in fixed-point coverage
+// scaling, and have tricky negative-shift / out-of-width / rounding edges — the
+// SQRSHRUN/FMAX bug class. The reference is computed in int64 per the ARM
+// pseudocode (shift = SInt(Vm[i]<7:0>); >=0 left, <0 right, S forms arithmetic,
+// R forms add 1<<(n-1) before the right shift).
+TEST_F(Arm64LiteTranslateRegionTest, NeonVarShiftInterpVsExpected) {
+  auto setv = [&](int reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    uint32_t v[4] = {a, b, c, d};
+    memcpy(&state_.cpu.v[reg], v, 16);
+  };
+  auto v0lane = [&](int i) -> uint32_t {
+    uint32_t v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[i];
+  };
+  enum Kind { kS, kU, kSR, kUR };
+  auto ref = [](uint32_t vn, int8_t s, Kind k) -> uint32_t {
+    bool sgn = (k == kS || k == kSR);
+    bool rnd = (k == kSR || k == kUR);
+    if (s >= 0) {  // left shift (rounding bit irrelevant)
+      if (s >= 32) return 0u;
+      return (uint32_t)(vn << s);
+    }
+    int n = -(int)s;  // right shift by n
+    // 64-bit accumulator: sign- or zero-extend the 32-bit source.
+    int64_t x = sgn ? (int64_t)(int32_t)vn : (int64_t)(uint32_t)vn;
+    if (rnd) {
+      if (n <= 63) x += (int64_t)1 << (n - 1);  // round half up
+      // n>63 can't occur for int8 shift on 32-bit data in our test set
+    }
+    int64_t r;
+    if (n >= 64) {
+      r = sgn ? (x < 0 ? -1 : 0) : 0;
+    } else {
+      r = sgn ? (x >> n) : (int64_t)((uint64_t)x >> n);
+    }
+    return (uint32_t)r;
+  };
+
+  struct Op { uint32_t enc; const char* name; Kind k; };
+  const Op ops[] = {
+      {0x4ea24420, "sshl", kS},  {0x6ea24420, "ushl", kU},
+      {0x4ea25420, "srshl", kSR}, {0x6ea25420, "urshl", kUR},
+  };
+  const uint32_t data[] = {0x00000000u, 0x00000001u, 0x7FFFFFFFu, 0x80000000u,
+                           0xFFFFFFFFu, 0x12345678u, 0xFFFF0000u, 0x0000FFFFu,
+                           0xABCDEF01u, 0x40000000u};
+  // shift amounts placed in the low byte of each Vm lane (signed).
+  const int8_t shifts[] = {0,  1,   4,   8,   16,  31,  32,  33,
+                           -1, -4,  -8,  -16, -31, -32, -33, -40};
+  for (const Op& op : ops) {
+    for (uint32_t d : data) {
+      for (int8_t s : shifts) {
+        setv(1, d, d, d, d);
+        uint32_t sm = (uint32_t)(uint8_t)s;  // low byte = signed shift
+        setv(2, sm, sm, sm, sm);
+        setv(0, 0, 0, 0, 0);
+        Interpret(op.enc);
+        uint32_t want = ref(d, s, op.k);
+        EXPECT_EQ(v0lane(0), want)
+            << op.name << " d=0x" << std::hex << d << " s=" << std::dec << (int)s << " got=0x"
+            << std::hex << v0lane(0) << " exp=0x" << want;
+      }
+    }
+  }
+}
+
+// 128-bit (Q-register) SIMD LDP/STP interp-vs-EXPECTED. This is the core of
+// bionic memcpy/memmove (ldp q,q / stp q,q), which copies glyph-mask rows; the
+// #3 garble looks like a stride/layout shear of the mask, so a wrong 128-bit
+// pair load/store (byte order, half, offset scale, pre/post writeback) is the
+// prime suspect. Bailed in lite, interpreter-only, untested (only d/s pairs were).
+TEST_F(Arm64LiteTranslateRegionTest, NeonQRegLdpStpInterpVsExpected) {
+  alignas(16) static uint8_t buf[1024];
+  auto fill = [&]() { for (int i = 0; i < 1024; i++) buf[i] = (uint8_t)(i * 7 + 11); };
+  auto getv = [&](int r, uint8_t out[16]) { memcpy(out, &state_.cpu.v[r], 16); };
+  auto setv = [&](int r, int seed) {
+    uint8_t v[16];
+    for (int i = 0; i < 16; i++) v[i] = (uint8_t)(seed * 31 + i * 13 + 5);
+    memcpy(&state_.cpu.v[r], v, 16);
+  };
+
+  // LDP cases: {enc, rt1, rt2, access_off, wb_delta} ; wb_delta=INT_MIN => no writeback
+  const int NWB = 0x7fffffff;
+  struct LC { uint32_t enc; int rt1, rt2, aoff, wb; };
+  const LC ld[] = {
+      {0xad400400, 0, 1, 0, NWB},      {0xad410c02, 2, 3, 32, NWB},
+      {0xadc08400, 0, 1, 16, 16},      // pre-index: addr=base+16, x0=base+16
+      {0xacc11404, 4, 5, 0, 32},       // post-index: addr=base, x0=base+32
+      {0xad7f0400, 0, 1, -32, NWB},    {0xad4f1c06, 6, 7, 480, NWB}};
+  for (const LC& c : ld) {
+    fill();
+    GuestAddr base = ToGuestAddr(buf) + 512;  // mid-buffer so -32 is valid
+    state_.cpu.x[0] = base;
+    for (int r = 0; r < 8; r++) state_.cpu.v[r] = 0;
+    Interpret(c.enc);
+    uint8_t g1[16], g2[16];
+    getv(c.rt1, g1);
+    getv(c.rt2, g2);
+    const uint8_t* mem = buf + (base - ToGuestAddr(buf)) + c.aoff;
+    EXPECT_EQ(memcmp(g1, mem, 16), 0) << "LDP enc=0x" << std::hex << c.enc << " rt1 mismatch";
+    EXPECT_EQ(memcmp(g2, mem + 16, 16), 0) << "LDP enc=0x" << std::hex << c.enc << " rt2 mismatch";
+    if (c.wb != NWB)
+      EXPECT_EQ(state_.cpu.x[0], base + c.wb) << "LDP enc=0x" << std::hex << c.enc << " writeback";
+  }
+
+  // STP cases: {enc, rt1, rt2, access_off, wb_delta}
+  struct SC { uint32_t enc; int rt1, rt2, aoff, wb; };
+  const SC st[] = {
+      {0xad000400, 0, 1, 0, NWB},   {0xad010c02, 2, 3, 32, NWB},
+      {0xad808400, 0, 1, 16, 16},   {0xac811404, 4, 5, 0, 32}};
+  for (const SC& c : st) {
+    fill();
+    GuestAddr base = ToGuestAddr(buf) + 256;
+    state_.cpu.x[0] = base;
+    setv(c.rt1, c.rt1 + 1);
+    setv(c.rt2, c.rt2 + 1);
+    Interpret(c.enc);
+    uint8_t e1[16], e2[16];
+    getv(c.rt1, e1);
+    getv(c.rt2, e2);
+    const uint8_t* mem = buf + (base - ToGuestAddr(buf)) + c.aoff;
+    EXPECT_EQ(memcmp(mem, e1, 16), 0) << "STP enc=0x" << std::hex << c.enc << " mem rt1 mismatch";
+    EXPECT_EQ(memcmp(mem + 16, e2, 16), 0) << "STP enc=0x" << std::hex << c.enc << " mem rt2 mismatch";
+    if (c.wb != NWB)
+      EXPECT_EQ(state_.cpu.x[0], base + c.wb) << "STP enc=0x" << std::hex << c.enc << " writeback";
+    // bytes outside [mem, mem+32) must be untouched.
+    EXPECT_EQ(buf[(base - ToGuestAddr(buf)) + c.aoff - 1], (uint8_t)(((base - ToGuestAddr(buf)) + c.aoff - 1) * 7 + 11))
+        << "STP enc=0x" << std::hex << c.enc << " underflow write";
+  }
+}
+
+// Bailed two-reg-misc (CMXX-vs-0, ABS/NEG, CLS/CLZ/CNT, SADDLP/UADDLP/SADALP/
+// UADALP pairwise-long(+acc), SUQADD/USQADD, SQABS/SQNEG) interp-vs-EXPECTED.
+TEST_F(Arm64LiteTranslateRegionTest, NeonBailedTwoRegMiscInterpVsExpected) {
+  auto sext = [](uint64_t v, int b) -> int64_t { return (int64_t)(v << (64 - b)) >> (64 - b); };
+  auto sclamp = [](int64_t x, int b) -> uint64_t {
+    int64_t lo = -(int64_t{1} << (b - 1)), hi = (int64_t{1} << (b - 1)) - 1;
+    x = x < lo ? lo : (x > hi ? hi : x);
+    return (uint64_t)x & (b == 64 ? ~0ULL : ((1ULL << b) - 1));
+  };
+  const uint64_t vals[] = {0x0, 0x1, 0x7f, 0x80, 0xff, 0x7fffffff, 0x80000000,
+                           0xffffffff, 0x40000000, 0x00010000, 0xdeadbeef, 2, 0xfffffffe};
+
+  // --- unary (result from Vn only): CMXX0/ABS/NEG/CLS/CLZ/CNT ---
+  enum UK { C_EQ, C_GT, C_GE, C_LE, C_LT, ABS, NEG, CLS, CLZ, CNT };
+  struct U { uint32_t enc; const char* name; int esz; UK k; };
+  const U un[] = {
+      {0x4ea09820, "cmeq0.4s", 4, C_EQ}, {0x4ea08820, "cmgt0.4s", 4, C_GT},
+      {0x6ea08820, "cmge0.4s", 4, C_GE}, {0x6ea09820, "cmle0.4s", 4, C_LE},
+      {0x4ea0a820, "cmlt0.4s", 4, C_LT}, {0x4e209820, "cmeq0.16b", 1, C_EQ},
+      {0x4e20a820, "cmlt0.16b", 1, C_LT},{0x4ea0b820, "abs.4s", 4, ABS},
+      {0x6ea0b820, "neg.4s", 4, NEG},    {0x4e20b820, "abs.16b", 1, ABS},
+      {0x4ea04820, "cls.4s", 4, CLS},    {0x6ea04820, "clz.4s", 4, CLZ},
+      {0x4e205820, "cnt.16b", 1, CNT}};
+  for (const U& op : un) {
+    int bits = op.esz * 8;
+    uint64_t m = (1ULL << bits) - 1;
+    for (uint64_t raw : vals) {
+      uint64_t a = raw & m;
+      uint8_t vn[16];
+      for (int e = 0; e < 16 / op.esz; e++) memcpy(vn + e * op.esz, &a, op.esz);
+      memcpy(&state_.cpu.v[1], vn, 16);
+      state_.cpu.v[0] = 0;
+      Interpret(op.enc);
+      uint8_t got[16];
+      memcpy(got, &state_.cpu.v[0], 16);
+      int64_t sa = sext(a, bits);
+      uint64_t want = 0;
+      switch (op.k) {
+        case C_EQ: want = (a == 0) ? m : 0; break;
+        case C_GT: want = (sa > 0) ? m : 0; break;
+        case C_GE: want = (sa >= 0) ? m : 0; break;
+        case C_LE: want = (sa <= 0) ? m : 0; break;
+        case C_LT: want = (sa < 0) ? m : 0; break;
+        case ABS: want = (uint64_t)(sa < 0 ? -sa : sa) & m; break;
+        case NEG: want = (uint64_t)(-(int64_t)a) & m; break;
+        case CLS: { int c = 0; for (int i = bits - 2; i >= 0; i--) {
+                      if (((a >> i) & 1) == ((a >> (bits - 1)) & 1)) c++; else break; } want = c; break; }
+        case CLZ: { int c = 0; for (int i = bits - 1; i >= 0; i--) {
+                      if (((a >> i) & 1) == 0) c++; else break; } want = c; break; }
+        case CNT: want = __builtin_popcountll(a & 0xff); break;
+      }
+      uint64_t g = 0; memcpy(&g, got, op.esz); g &= m;
+      EXPECT_EQ(g, want) << op.name << " a=0x" << std::hex << a << " got=0x" << g
+                         << " exp=0x" << want;
+    }
+  }
+
+  // --- pairwise-long (+accumulate): result wide = (src[2i]+src[2i+1]) [+ Vd[i]] ---
+  enum LK { SADDLP, UADDLP, SADALP, UADALP };
+  struct L { uint32_t enc; const char* name; int ssz; LK k; };  // ssz = src elem bytes
+  const L lp[] = {
+      {0x4ea02820, "saddlp.2d", 4, SADDLP}, {0x6e202820, "uaddlp.8h", 1, UADDLP},
+      {0x4ea06820, "sadalp.2d", 4, SADALP}, {0x6ea06820, "uadalp.2d", 4, UADALP},
+      {0x4e206820, "sadalp.8h", 1, SADALP}, {0x6e606820, "uadalp.4s", 2, UADALP}};
+  for (const L& op : lp) {
+    int sbits = op.ssz * 8, dbits = sbits * 2, dnel = 16 / (op.ssz * 2);
+    uint64_t sm = (1ULL << sbits) - 1, dm = (dbits == 64) ? ~0ULL : ((1ULL << dbits) - 1);
+    bool acc = (op.k == SADALP || op.k == UADALP), sgn = (op.k == SADDLP || op.k == SADALP);
+    uint8_t vn[16], vd[16];
+    for (int i = 0; i < 16; i++) { vn[i] = (uint8_t)(i * 23 + 7); vd[i] = (uint8_t)(i * 5 + 1); }
+    memcpy(&state_.cpu.v[1], vn, 16);
+    memcpy(&state_.cpu.v[0], vd, 16);
+    Interpret(op.enc);
+    uint8_t got[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    auto sel = [&](int i) { uint64_t x = 0; memcpy(&x, vn + i * op.ssz, op.ssz); x &= sm;
+                            return sgn ? (uint64_t)sext(x, sbits) : x; };
+    auto del = [&](int i) { uint64_t x = 0; memcpy(&x, vd + i * (op.ssz * 2), op.ssz * 2); return x & dm; };
+    for (int i = 0; i < dnel; i++) {
+      uint64_t s = (sel(2 * i) + sel(2 * i + 1)) & dm;
+      uint64_t want = acc ? ((del(i) + s) & dm) : s;
+      uint64_t g = 0; memcpy(&g, got + i * (op.ssz * 2), op.ssz * 2); g &= dm;
+      EXPECT_EQ(g, want) << op.name << " lane " << i << " got=0x" << std::hex << g
+                         << " exp=0x" << want;
+    }
+  }
+
+  // --- SUQADD/USQADD (saturating mixed-sign accumulate) + SQABS/SQNEG ---
+  struct SQ { uint32_t enc; const char* name; int kind; };  // 0 suqadd 1 usqadd 2 sqabs 3 sqneg
+  const SQ sq[] = {{0x4ea03820, "suqadd.4s", 0}, {0x6ea03820, "usqadd.4s", 1},
+                   {0x4ea07820, "sqabs.4s", 2},  {0x6ea07820, "sqneg.4s", 3}};
+  for (const SQ& op : sq) {
+    int bits = 32;
+    uint64_t m = 0xffffffffULL;
+    for (uint64_t raw : vals) {
+      uint64_t a = raw & m, d = 0x80000005ULL & m;
+      uint8_t vn[16], vd[16];
+      for (int e = 0; e < 4; e++) { memcpy(vn + e * 4, &a, 4); memcpy(vd + e * 4, &d, 4); }
+      memcpy(&state_.cpu.v[1], vn, 16);
+      memcpy(&state_.cpu.v[0], vd, 16);
+      Interpret(op.enc);
+      uint8_t got[16];
+      memcpy(got, &state_.cpu.v[0], 16);
+      uint64_t want = 0;
+      if (op.kind == 0) want = sclamp(sext(d, bits) + (int64_t)a, bits);              // suqadd
+      else if (op.kind == 1) { int64_t r = (int64_t)d + sext(a, bits);                // usqadd
+                               r = r < 0 ? 0 : (r > (int64_t)m ? (int64_t)m : r); want = (uint64_t)r & m; }
+      else if (op.kind == 2) { int64_t s = sext(a, bits); want = sclamp(s < 0 ? -s : s, bits); }
+      else want = sclamp(-sext(a, bits), bits);                                       // sqneg
+      uint64_t g = 0; memcpy(&g, got, 4); g &= m;
+      EXPECT_EQ(g, want) << op.name << " a=0x" << std::hex << a << " got=0x" << g
+                         << " exp=0x" << want;
+    }
+  }
+}
+
+// Bailed shift-by-immediate (SSHR/USHR/SRSHR/URSHR/SSRA/USRA/SHL/SLI/SRI +
+// widening SSHLL/USHLL) interp-vs-EXPECTED. Bailed in lite, interpreter-only,
+// used for fixed-point coverage scaling. Reference is element-wise ARM ARM.
+TEST_F(Arm64LiteTranslateRegionTest, NeonBailedShiftImmInterpVsExpected) {
+  enum SK { SSHR, USHR, SRSHR, URSHR, SSRA, USRA, SHL, SLI, SRI, SSHLL, USHLL };
+  struct S { uint32_t enc; const char* name; int esz; int n; SK k; };  // esz=src elem bytes
+  const S sh[] = {
+      {0x4f3b0420, "sshr.4s#5", 4, 5, SSHR},   {0x6f3b0420, "ushr.4s#5", 4, 5, USHR},
+      {0x4f0d0420, "sshr.16b#3", 1, 3, SSHR},  {0x6f0d0420, "ushr.16b#3", 1, 3, USHR},
+      {0x6f3f0420, "ushr.4s#1", 4, 1, USHR},   {0x6f210420, "ushr.4s#31", 4, 31, USHR},
+      {0x4f255420, "shl.4s#5", 4, 5, SHL},     {0x4f0f5420, "shl.16b#7", 1, 7, SHL},
+      {0x4f3b2420, "srshr.4s#5", 4, 5, SRSHR}, {0x6f3b2420, "urshr.4s#5", 4, 5, URSHR},
+      {0x4f3b1420, "ssra.4s#5", 4, 5, SSRA},   {0x6f3b1420, "usra.4s#5", 4, 5, USRA},
+      {0x0f0ba420, "sshll.8h#3", 1, 3, SSHLL}, {0x2f15a420, "ushll.4s#5", 2, 5, USHLL},
+      {0x6f255420, "sli.4s#5", 4, 5, SLI},     {0x6f3b4420, "sri.4s#5", 4, 5, SRI}};
+  const uint64_t vals[] = {0x0, 0x1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff,
+                           0x7fffffff, 0x80000000, 0xffffffff, 0xdeadbeef, 0x12345678};
+  for (const S& op : sh) {
+    int bits = op.esz * 8;
+    uint64_t m = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+    bool isLong = (op.k == SSHLL || op.k == USHLL);
+    int dbits = isLong ? bits * 2 : bits;
+    uint64_t dm = (dbits == 64) ? ~0ULL : ((1ULL << dbits) - 1);
+    int dnelem = isLong ? (16 / (op.esz * 2)) : (16 / op.esz);
+    for (uint64_t raw : vals) {
+      uint64_t a = raw & m;
+      // Vn: fill enough lanes. For long ops only the LOW half lanes are used.
+      uint8_t vn[16];
+      for (int i = 0; i < 16; i++) vn[i] = 0;
+      int src_lanes = isLong ? dnelem : (16 / op.esz);
+      for (int e = 0; e < src_lanes; e++) memcpy(vn + e * op.esz, &a, op.esz);
+      memcpy(&state_.cpu.v[1], vn, 16);
+      uint64_t vd = 0x99887766ULL & m;  // for SSRA/USRA/SLI/SRI accumulate/insert
+      uint8_t vd0[16];
+      for (int e = 0; e < (16 / op.esz); e++) memcpy(vd0 + e * op.esz, &vd, op.esz);
+      memcpy(&state_.cpu.v[0], vd0, 16);
+      Interpret(op.enc);
+      uint8_t got[16];
+      memcpy(got, &state_.cpu.v[0], 16);
+      int64_t sa = (int64_t)(a << (64 - bits)) >> (64 - bits);
+      uint64_t want = 0;
+      switch (op.k) {
+        case SSHR: want = (uint64_t)(sa >> op.n) & m; break;
+        case USHR: want = (op.n >= bits ? 0 : (a >> op.n)) & m; break;
+        case SRSHR: want = (uint64_t)((sa + (int64_t{1} << (op.n - 1))) >> op.n) & m; break;
+        case URSHR: want = ((a + (1ULL << (op.n - 1))) >> op.n) & m; break;
+        case SSRA: want = (vd + ((uint64_t)(sa >> op.n) & m)) & m; break;
+        case USRA: want = (vd + ((a >> op.n) & m)) & m; break;
+        case SHL: want = (a << op.n) & m; break;
+        case SLI: want = ((a << op.n) | (vd & ((1ULL << op.n) - 1))) & m; break;
+        case SRI: { uint64_t topmask = m & ~(m >> op.n);
+                    want = ((a >> op.n) | (vd & topmask)) & m; break; }
+        case SSHLL: want = ((uint64_t)(sa << op.n)) & dm; break;
+        case USHLL: want = (a << op.n) & dm; break;
+      }
+      uint64_t g = 0;
+      memcpy(&g, got, isLong ? (op.esz * 2) : op.esz);
+      g &= dm;
+      EXPECT_EQ(g, want) << op.name << " a=0x" << std::hex << a << " got=0x" << g
+                         << " exp=0x" << want;
+    }
+  }
+}
+
+// Bailed pairwise (ADDP/SMAXP/UMAXP/SMINP/UMINP) + across-lanes (ADDV/SMAXV/
+// UMINV/UADDLV/SADDLV) interp-vs-EXPECTED. Bailed in lite, interpreter-only,
+// heavily used by the rasterizer (addp/uaddlp/uaddlv). Pairwise rearranges;
+// across-lanes reduces. Reference is element-wise ARM ARM.
+TEST_F(Arm64LiteTranslateRegionTest, NeonBailedPairwiseAcrossInterpVsExpected) {
+  auto sext = [](uint64_t v, int bits) -> int64_t {
+    return (int64_t)(v << (64 - bits)) >> (64 - bits);
+  };
+  // --- pairwise ---
+  enum PWK { PADD, SMAXP, UMAXP, SMINP, UMINP };
+  struct PW { uint32_t enc; const char* name; int esz; PWK k; };
+  const PW pw[] = {
+      {0x4ea2bc20, "addp.4s", 4, PADD},   {0x4e22bc20, "addp.16b", 1, PADD},
+      {0x4ea2a420, "smaxp.4s", 4, SMAXP}, {0x6ea2a420, "umaxp.4s", 4, UMAXP},
+      {0x4ea2ac20, "sminp.4s", 4, SMINP}, {0x6ea2ac20, "uminp.4s", 4, UMINP},
+      {0x4e22a420, "smaxp.16b", 1, SMAXP}};
+  for (const PW& op : pw) {
+    int bits = op.esz * 8, ne = 16 / op.esz;
+    uint64_t m = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+    uint8_t vn[16], vm[16];
+    for (int i = 0; i < 16; i++) { vn[i] = (uint8_t)(i * 13 + 1); vm[i] = (uint8_t)(i * 7 + 9); }
+    memcpy(&state_.cpu.v[1], vn, 16);
+    memcpy(&state_.cpu.v[2], vm, 16);
+    state_.cpu.v[0] = 0;
+    Interpret(op.enc);
+    uint8_t got[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    auto el = [&](const uint8_t* v, int i) { uint64_t x = 0; memcpy(&x, v + i * op.esz, op.esz); return x & m; };
+    for (int i = 0; i < ne; i++) {
+      uint64_t a, b;
+      if (i < ne / 2) { a = el(vn, 2 * i); b = el(vn, 2 * i + 1); }
+      else { int j = i - ne / 2; a = el(vm, 2 * j); b = el(vm, 2 * j + 1); }
+      uint64_t want = 0;
+      switch (op.k) {
+        case PADD: want = (a + b) & m; break;
+        case SMAXP: want = (sext(a, bits) > sext(b, bits) ? a : b); break;
+        case UMAXP: want = a > b ? a : b; break;
+        case SMINP: want = (sext(a, bits) < sext(b, bits) ? a : b); break;
+        case UMINP: want = a < b ? a : b; break;
+      }
+      uint64_t g = 0; memcpy(&g, got + i * op.esz, op.esz); g &= m;
+      EXPECT_EQ(g, want) << op.name << " lane " << i << " got=0x" << std::hex << g
+                         << " exp=0x" << want;
+    }
+  }
+
+  // --- across-lanes (reduce to scalar in Vd[0], rest zeroed) ---
+  enum AK { ADDV, SMAXV, UMINV, UADDLV, SADDLV };
+  struct AV { uint32_t enc; const char* name; int esz; AK k; };
+  const AV av[] = {
+      {0x4eb1b820, "addv.4s", 4, ADDV},  {0x4e31b820, "addv.16b", 1, ADDV},
+      {0x4e71b820, "addv.8h", 2, ADDV},  {0x4eb0a820, "smaxv.4s", 4, SMAXV},
+      {0x6e31a820, "uminv.16b", 1, UMINV},{0x6e303820, "uaddlv.16b", 1, UADDLV},
+      {0x6e703820, "uaddlv.8h", 2, UADDLV},{0x4e303820, "saddlv.16b", 1, SADDLV}};
+  for (const AV& op : av) {
+    int bits = op.esz * 8, ne = 16 / op.esz;
+    uint64_t m = (1ULL << bits) - 1;
+    uint8_t vn[16];
+    for (int i = 0; i < 16; i++) vn[i] = (uint8_t)(i * 11 + 5);
+    memcpy(&state_.cpu.v[1], vn, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};  // poison, must be overwritten/zeroed
+    Interpret(op.enc);
+    uint8_t got[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    auto el = [&](int i) { uint64_t x = 0; memcpy(&x, vn + i * op.esz, op.esz); return x & m; };
+    int64_t acc = 0;
+    uint64_t want = 0, dbits = bits;
+    if (op.k == ADDV) { for (int i = 0; i < ne; i++) acc += el(i); want = (uint64_t)acc & m; }
+    else if (op.k == SMAXV) { acc = sext(el(0), bits); for (int i = 1; i < ne; i++) { int64_t v = sext(el(i), bits); if (v > acc) acc = v; } want = (uint64_t)acc & m; }
+    else if (op.k == UMINV) { want = el(0); for (int i = 1; i < ne; i++) if (el(i) < want) want = el(i); }
+    else if (op.k == UADDLV) { for (int i = 0; i < ne; i++) acc += (int64_t)el(i); dbits = bits * 2; want = (uint64_t)acc & ((1ULL << dbits) - 1); }
+    else if (op.k == SADDLV) { for (int i = 0; i < ne; i++) acc += sext(el(i), bits); dbits = bits * 2; want = (uint64_t)acc & ((1ULL << dbits) - 1); }
+    uint64_t g = 0; memcpy(&g, got, (dbits + 7) / 8); g &= ((dbits == 64) ? ~0ULL : ((1ULL << dbits) - 1));
+    EXPECT_EQ(g, want) << op.name << " scalar got=0x" << std::hex << g << " exp=0x" << want;
+    // bytes above the scalar result must be zero.
+    for (int i = (int)((dbits + 7) / 8); i < 16; i++)
+      EXPECT_EQ(got[i], 0u) << op.name << " byte " << i << " not zeroed";
+  }
+}
+
+// Bailed permute (ZIP/UZP/TRN) + table-lookup (TBL/TBX) interp-vs-EXPECTED.
+// These REARRANGE elements/bytes between lanes — the textbook cause of "internal
+// glyph fragmentation"; Skia uses them to de/interleave coverage channels. All
+// bailed in lite, interpreter-only. Reference is the exact ARM ARM permutation.
+TEST_F(Arm64LiteTranslateRegionTest, NeonBailedPermuteTblInterpVsExpected) {
+  // --- permute: element-wise, esz-byte elements over `total` bytes (16 or 8) ---
+  enum PK { ZIP1, ZIP2, UZP1, UZP2, TRN1, TRN2 };
+  struct P { uint32_t enc; const char* name; int esz; int total; PK k; };
+  const P perm[] = {
+      {0x4e023820, "zip1.16b", 1, 16, ZIP1}, {0x4e027820, "zip2.16b", 1, 16, ZIP2},
+      {0x4e021820, "uzp1.16b", 1, 16, UZP1}, {0x4e025820, "uzp2.16b", 1, 16, UZP2},
+      {0x4e022820, "trn1.16b", 1, 16, TRN1}, {0x4e026820, "trn2.16b", 1, 16, TRN2},
+      {0x4e823820, "zip1.4s", 4, 16, ZIP1},  {0x4e821820, "uzp1.4s", 4, 16, UZP1},
+      {0x4e422820, "trn1.8h", 2, 16, TRN1},  {0x0e023820, "zip1.8b", 1, 8, ZIP1}};
+  for (const P& op : perm) {
+    int ne = op.total / op.esz;  // elements
+    uint8_t vn[16] = {0}, vm[16] = {0};
+    for (int e = 0; e < ne; e++)
+      for (int j = 0; j < op.esz; j++) {
+        vn[e * op.esz + j] = (uint8_t)(0x10 + e);  // distinct per element
+        vm[e * op.esz + j] = (uint8_t)(0x80 + e);
+      }
+    memcpy(&state_.cpu.v[1], vn, 16);
+    memcpy(&state_.cpu.v[2], vm, 16);
+    state_.cpu.v[0] = 0;
+    Interpret(op.enc);
+    uint8_t got[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    uint8_t exp[16] = {0};
+    auto put = [&](int dstE, const uint8_t* srcV, int srcE) {
+      memcpy(exp + dstE * op.esz, srcV + srcE * op.esz, op.esz);
+    };
+    int half = ne / 2;
+    for (int i = 0; i < half; i++) {
+      switch (op.k) {
+        case ZIP1: put(2 * i, vn, i); put(2 * i + 1, vm, i); break;
+        case ZIP2: put(2 * i, vn, half + i); put(2 * i + 1, vm, half + i); break;
+        case UZP1: put(i, vn, 2 * i); put(half + i, vm, 2 * i); break;
+        case UZP2: put(i, vn, 2 * i + 1); put(half + i, vm, 2 * i + 1); break;
+        case TRN1: put(2 * i, vn, 2 * i); put(2 * i + 1, vm, 2 * i); break;
+        case TRN2: put(2 * i, vn, 2 * i + 1); put(2 * i + 1, vm, 2 * i + 1); break;
+      }
+    }
+    for (int i = 0; i < 16; i++)
+      EXPECT_EQ(got[i], exp[i]) << op.name << " byte " << i << " got=0x" << std::hex
+                                << (int)got[i] << " exp=0x" << (int)exp[i];
+  }
+
+  // --- TBL/TBX: result[i] = idx<16*nregs ? table[idx] : (TBL?0:Vd[i]) ---
+  struct T { uint32_t enc; const char* name; int nregs; int outbytes; bool tbx; };
+  const T tbls[] = {
+      {0x4e020020, "tbl.16b.1", 1, 16, false}, {0x4e032020, "tbl.16b.2", 2, 16, false},
+      {0x0e020020, "tbl.8b.1", 1, 8, false},   {0x4e021020, "tbx.16b.1", 1, 16, true},
+      {0x4e044020, "tbl.16b.3", 3, 16, false}};
+  for (const T& op : tbls) {
+    // table regs v1.. : byte value = reg_local_index*16 + byte (distinct across table)
+    for (int r = 0; r < op.nregs; r++) {
+      uint8_t tr[16];
+      for (int j = 0; j < 16; j++) tr[j] = (uint8_t)(0xC0 + r * 16 + j);
+      memcpy(&state_.cpu.v[1 + r], tr, 16);
+    }
+    // index reg is v(1+nregs); mix in-range and out-of-range indices.
+    uint8_t idx[16];
+    for (int i = 0; i < 16; i++) idx[i] = (uint8_t)((i * 7 + 3) % (16 * op.nregs + 5));
+    memcpy(&state_.cpu.v[1 + op.nregs], idx, 16);
+    uint8_t vd0[16];
+    for (int i = 0; i < 16; i++) vd0[i] = (uint8_t)(0x33 + i);
+    memcpy(&state_.cpu.v[0], vd0, 16);
+    Interpret(op.enc);
+    uint8_t got[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    for (int i = 0; i < op.outbytes; i++) {
+      uint8_t ix = idx[i];
+      uint8_t want;
+      if (ix < 16 * op.nregs)
+        want = (uint8_t)(0xC0 + (ix / 16) * 16 + (ix % 16));  // table[ix]
+      else
+        want = op.tbx ? vd0[i] : 0;
+      EXPECT_EQ(got[i], want) << op.name << " out byte " << i << " idx=" << (int)ix
+                              << " got=0x" << std::hex << (int)got[i] << " exp=0x" << (int)want;
+    }
+    for (int i = op.outbytes; i < 16; i++)
+      EXPECT_EQ(got[i], 0u) << op.name << " upper byte " << i << " not zeroed";
+  }
+}
+
+// Bailed narrowing (XTN/SQXTN/UQXTN/SQXTUN), narrow-high (ADDHN/SUBHN/RADDHN/
+// RSUBHN), and byte-reverse (REV16/32/64) interp-vs-EXPECTED. All bailed in lite,
+// interpreter-only, and they REARRANGE/NARROW bytes — the strongest "internal
+// glyph fragmentation" candidates. Reference is element-wise ARM ARM in uint64.
+TEST_F(Arm64LiteTranslateRegionTest, NeonBailedNarrowRevInterpVsExpected) {
+  // --- narrowing: source .8h/.4s/.2d -> dest .8b/.4h/.2s (lower half, upper 0) ---
+  enum NK { XTN, SQXTN, UQXTN, SQXTUN, ADDHN, SUBHN, RADDHN, RSUBHN };
+  struct N { uint32_t enc; const char* name; int ssz; NK k; };  // ssz = source elem bytes
+  const N narrow[] = {
+      {0x0e212820, "xtn.8b", 2, XTN},    {0x0e612820, "xtn.4h", 4, XTN},
+      {0x0ea12820, "xtn.2s", 8, XTN},    {0x0e214820, "sqxtn.8b", 2, SQXTN},
+      {0x0e614820, "sqxtn.4h", 4, SQXTN},{0x2e214820, "uqxtn.8b", 2, UQXTN},
+      {0x2e614820, "uqxtn.4h", 4, UQXTN},{0x2e212820, "sqxtun.8b", 2, SQXTUN},
+      {0x2e612820, "sqxtun.4h", 4, SQXTUN},{0x0e224020, "addhn.8b", 2, ADDHN},
+      {0x0e624020, "addhn.4h", 4, ADDHN},{0x0e226020, "subhn.8b", 2, SUBHN},
+      {0x0e626020, "subhn.4h", 4, SUBHN},{0x2e224020, "raddhn.8b", 2, RADDHN},
+      {0x2e626020, "rsubhn.4h", 4, RSUBHN}};
+  const uint64_t wv[] = {0x0, 0x1, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff,
+                         0x10000, 0x7fffffff, 0x80000000, 0xffffffff, 0x123456789aLL,
+                         0x7fffffffffffffffLL, 0x8000000000000000ULL, 0xffffffffffffffffULL};
+  const size_t NW = sizeof(wv) / sizeof(wv[0]);
+  for (const N& op : narrow) {
+    int sbits = op.ssz * 8, dbits = sbits / 2, nelem = 16 / op.ssz;
+    uint64_t smask = (sbits == 64) ? ~0ULL : ((1ULL << sbits) - 1);
+    uint64_t dmask = (1ULL << dbits) - 1;
+    bool has2 = (op.k >= ADDHN);
+    for (size_t ai = 0; ai < NW; ai++) {
+      for (size_t bi = 0; bi < (has2 ? NW : 1); bi++) {
+        uint64_t a = wv[ai] & smask, b = wv[bi] & smask;
+        uint8_t vn[16], vm[16];
+        for (int e = 0; e < nelem; e++) {
+          memcpy(vn + e * op.ssz, &a, op.ssz);
+          memcpy(vm + e * op.ssz, &b, op.ssz);
+        }
+        memcpy(&state_.cpu.v[1], vn, 16);
+        memcpy(&state_.cpu.v[2], vm, 16);
+        state_.cpu.v[0] = 0;
+        Interpret(op.enc);
+        uint8_t got[16];
+        memcpy(got, &state_.cpu.v[0], 16);
+        int64_t sa = (int64_t)(a << (64 - sbits)) >> (64 - sbits);
+        uint64_t want = 0;
+        switch (op.k) {
+          case XTN: want = a & dmask; break;
+          case SQXTN: {
+            int64_t lo = -(int64_t{1} << (dbits - 1)), hi = (int64_t{1} << (dbits - 1)) - 1;
+            int64_t x = sa < lo ? lo : (sa > hi ? hi : sa); want = (uint64_t)x & dmask; break;
+          }
+          case UQXTN: want = a > dmask ? dmask : a; break;
+          case SQXTUN: { int64_t x = sa < 0 ? 0 : (sa > (int64_t)dmask ? (int64_t)dmask : sa);
+                         want = (uint64_t)x & dmask; break; }
+          case ADDHN: want = (((a + b) & smask) >> dbits) & dmask; break;
+          case SUBHN: want = (((a - b) & smask) >> dbits) & dmask; break;
+          case RADDHN: want = (((a + b + (1ULL << (dbits - 1))) & smask) >> dbits) & dmask; break;
+          case RSUBHN: want = (((a - b + (1ULL << (dbits - 1))) & smask) >> dbits) & dmask; break;
+        }
+        uint64_t got_i = 0;
+        memcpy(&got_i, got, op.ssz / 2);  // dest lane 0 (dbits)
+        got_i &= dmask;
+        EXPECT_EQ(got_i, want) << op.name << " a=0x" << std::hex << a << " b=0x" << b
+                               << " got=0x" << got_i << " exp=0x" << want;
+        // upper 64 bits must be zero (non-2 variant).
+        uint64_t hi64;
+        memcpy(&hi64, got + 8, 8);
+        EXPECT_EQ(hi64, 0u) << op.name << " upper half not zeroed";
+      }
+    }
+  }
+
+  // --- byte reverse: reverse esz-byte elements within csz-byte containers ---
+  struct R { uint32_t enc; const char* name; int esz; int csz; };
+  const R rev[] = {{0x4e201820, "rev16.16b", 1, 2}, {0x6e200820, "rev32.16b", 1, 4},
+                   {0x6e600820, "rev32.8h", 2, 4},  {0x4e200820, "rev64.16b", 1, 8},
+                   {0x4ea00820, "rev64.4s", 4, 8}};
+  for (const R& op : rev) {
+    uint8_t src[16];
+    for (int i = 0; i < 16; i++) src[i] = (uint8_t)(i * 17 + 3);
+    memcpy(&state_.cpu.v[1], src, 16);
+    state_.cpu.v[0] = 0;
+    Interpret(op.enc);
+    uint8_t got[16], exp[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    int epc = op.csz / op.esz;  // elements per container
+    for (int c = 0; c < 16; c += op.csz)
+      for (int e = 0; e < epc; e++)
+        memcpy(exp + c + e * op.esz, src + c + (epc - 1 - e) * op.esz, op.esz);
+    for (int i = 0; i < 16; i++)
+      EXPECT_EQ(got[i], exp[i]) << op.name << " byte " << i << " got=0x" << std::hex
+                                << (int)got[i] << " exp=0x" << (int)exp[i];
+  }
+}
+
+// Bailed three-same integer ops interp-vs-EXPECTED. Deduction: the decoder is
+// exonerated (decoder-vs-objdump diff, 0 mismatches over the real rasterizer) and
+// the on-device garble is identical in interpret-only and two-gear, so every
+// JIT-IMPLEMENTED op is correct (else the two modes would differ); the bug must
+// be an interpreter-semantics edge case in a JIT-BAILED op the rasterizer uses.
+// The lite JIT bails SMAX/SMIN/UMAX/UMIN, CMGT/CMGE/CMHI/CMHS/CMTST, SQADD/SQSUB/
+// UQADD/UQSUB, and the halving adds — coverage-clamp / compare-mask / saturating
+// ops, all interpreter-only and untested this session. Reference computed element-
+// wise in int64 per the ARM ARM; edge inputs stress sign/saturation/halving.
+TEST_F(Arm64LiteTranslateRegionTest, NeonBailedThreeSameInterpVsExpected) {
+  enum K { SMAX, SMIN, UMAX, UMIN, CMGT, CMGE, CMHI, CMHS, CMTST,
+           SQADD, UQADD, SQSUB, UQSUB, SHADD, UHADD, SRHADD, URHADD, SHSUB, UHSUB };
+  struct Op { uint32_t enc; const char* name; int esz; K k; };
+  const Op ops[] = {
+      {0x4ea26420, "smax.4s", 4, SMAX},   {0x4ea26c20, "smin.4s", 4, SMIN},
+      {0x6ea26420, "umax.4s", 4, UMAX},   {0x6ea26c20, "umin.4s", 4, UMIN},
+      {0x4e226420, "smax.16b", 1, SMAX},  {0x6e226420, "umax.16b", 1, UMAX},
+      {0x4e626420, "smax.8h", 2, SMAX},   {0x4ea23420, "cmgt.4s", 4, CMGT},
+      {0x4ea23c20, "cmge.4s", 4, CMGE},   {0x6ea23420, "cmhi.4s", 4, CMHI},
+      {0x6ea23c20, "cmhs.4s", 4, CMHS},   {0x4ea28c20, "cmtst.4s", 4, CMTST},
+      {0x4e223420, "cmgt.16b", 1, CMGT},  {0x6e223420, "cmhi.16b", 1, CMHI},
+      {0x4ea20c20, "sqadd.4s", 4, SQADD}, {0x6ea20c20, "uqadd.4s", 4, UQADD},
+      {0x4ea22c20, "sqsub.4s", 4, SQSUB}, {0x6ea22c20, "uqsub.4s", 4, UQSUB},
+      {0x4e220c20, "sqadd.16b", 1, SQADD},{0x6e220c20, "uqadd.16b", 1, UQADD},
+      {0x4e620c20, "sqadd.8h", 2, SQADD}, {0x4ea20420, "shadd.4s", 4, SHADD},
+      {0x6ea20420, "uhadd.4s", 4, UHADD}, {0x4ea21420, "srhadd.4s", 4, SRHADD},
+      {0x6ea21420, "urhadd.4s", 4, URHADD},{0x4ea22420, "shsub.4s", 4, SHSUB},
+      {0x6ea22420, "uhsub.4s", 4, UHSUB}, {0x4e220420, "shadd.16b", 1, SHADD},
+      {0x6e221420, "urhadd.16b", 1, URHADD}};
+  // edge values (interpreted at each esize via masking).
+  const uint64_t vals[] = {0x0, 0x1, 0x2, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff,
+                           0x7fffffff, 0x80000000, 0xffffffff, 0x55, 0xaa, 0x40000000};
+  const size_t NV = sizeof(vals) / sizeof(vals[0]);
+
+  auto sat = [](int64_t x, int bits, bool sgn) -> uint64_t {
+    if (sgn) {
+      int64_t lo = -(int64_t{1} << (bits - 1)), hi = (int64_t{1} << (bits - 1)) - 1;
+      if (x < lo) x = lo;
+      if (x > hi) x = hi;
+    } else {
+      int64_t hi = (bits == 64) ? -1 : (int64_t)((uint64_t{1} << bits) - 1);
+      if (x < 0) x = 0;
+      if ((uint64_t)x > (uint64_t)hi) x = hi;
+    }
+    uint64_t m = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+    return (uint64_t)x & m;
+  };
+  auto satu = [](uint64_t x, int bits) -> uint64_t {
+    uint64_t hi = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+    return x > hi ? hi : x;
+  };
+
+  for (const Op& op : ops) {
+    int bits = op.esz * 8;
+    uint64_t emask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1);
+    int nelem = 16 / op.esz;
+    for (size_t ai = 0; ai < NV; ai++) {
+      for (size_t bi = 0; bi < NV; bi++) {
+        // fill all lanes with the (a,b) pair masked to esize.
+        uint64_t a = vals[ai] & emask, b = vals[bi] & emask;
+        uint8_t vn[16], vm[16];
+        for (int e = 0; e < nelem; e++) {
+          memcpy(vn + e * op.esz, &a, op.esz);
+          memcpy(vm + e * op.esz, &b, op.esz);
+        }
+        memcpy(&state_.cpu.v[1], vn, 16);
+        memcpy(&state_.cpu.v[2], vm, 16);
+        state_.cpu.v[0] = 0;
+        Interpret(op.enc);
+        uint8_t got[16];
+        memcpy(got, &state_.cpu.v[0], 16);
+        // expected for lane 0 (all lanes identical).
+        int64_t sa = (int64_t)(a << (64 - bits)) >> (64 - bits);  // sign-extend
+        int64_t sb = (int64_t)(b << (64 - bits)) >> (64 - bits);
+        uint64_t ua = a, ub = b;
+        uint64_t want = 0;
+        switch (op.k) {
+          case SMAX: want = sat(sa > sb ? sa : sb, bits, true); break;
+          case SMIN: want = sat(sa < sb ? sa : sb, bits, true); break;
+          case UMAX: want = ua > ub ? ua : ub; break;
+          case UMIN: want = ua < ub ? ua : ub; break;
+          case CMGT: want = (sa > sb) ? emask : 0; break;
+          case CMGE: want = (sa >= sb) ? emask : 0; break;
+          case CMHI: want = (ua > ub) ? emask : 0; break;
+          case CMHS: want = (ua >= ub) ? emask : 0; break;
+          case CMTST: want = ((ua & ub) != 0) ? emask : 0; break;
+          case SQADD: want = sat(sa + sb, bits, true); break;
+          case UQADD: want = satu(ua + ub, bits); break;
+          case SQSUB: want = sat(sa - sb, bits, true); break;
+          case UQSUB: want = (ua >= ub) ? (ua - ub) : 0; break;
+          case SHADD: want = (uint64_t)((sa + sb) >> 1) & emask; break;
+          case UHADD: want = ((ua + ub) >> 1) & emask; break;
+          case SRHADD: want = (uint64_t)((sa + sb + 1) >> 1) & emask; break;
+          case URHADD: want = ((ua + ub + 1) >> 1) & emask; break;
+          case SHSUB: want = (uint64_t)((sa - sb) >> 1) & emask; break;
+          case UHSUB: want = (uint64_t)(((int64_t)ua - (int64_t)ub) >> 1) & emask; break;
+        }
+        uint64_t got0 = 0;
+        memcpy(&got0, got, op.esz);
+        EXPECT_EQ(got0, want) << op.name << " a=0x" << std::hex << a << " b=0x" << b
+                              << " got=0x" << got0 << " exp=0x" << want;
+      }
+    }
+  }
+}
+
 // AdvSimdCopy (DUP/INS/SMOV/UMOV) interp+JIT vs EXPECTED. simpleperf showed
 // Interpreter::AdvSimdCopy hot in Helium's rasterizer; these move data between
 // lanes / to GP regs, so a wrong lane-index or element-size decode rearranges
