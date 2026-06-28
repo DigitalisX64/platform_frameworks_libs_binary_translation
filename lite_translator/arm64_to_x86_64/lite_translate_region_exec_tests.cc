@@ -2963,6 +2963,15 @@ TEST_F(Arm64LiteTranslateRegionTest, NeonStructuredLoadStoreDifferentialFuzz) {
       0x4c9f8000,  // st2 {v0-v1}.16b, [x0], #32
       0x4cc50000,  // ld4 {v0-v3}.16b, [x0], x5
       0x4c408400,  // ld2 {v0-v1}.8h,  [x0]
+      // Single-structure / replicate forms (AdvSimdSingleStruct) with writeback:
+      0x4ddfc140,  // ld1r {v0.16b}, [x0], #1
+      0x4ddfc940,  // ld1r {v0.4s},  [x0], #4
+      0x0ddf0d40,  // ld1  {v0.b}[3], [x0], #1
+      0x4ddf8140,  // ld1  {v0.s}[2], [x0], #4
+      0x0d9f0d40,  // st1  {v0.b}[3], [x0], #1
+      0x4d9f8140,  // st1  {v0.s}[2], [x0], #4
+      0x0dff9140,  // ld2  {v0.s,v1.s}[1], [x0], #8
+      0x4d40c140,  // ld1r {v0.16b}, [x0]
   };
   const int kNumOps = sizeof(kOps) / sizeof(kOps[0]);
   alignas(16) static uint8_t buf[4096];
@@ -3051,6 +3060,115 @@ TEST_F(Arm64LiteTranslateRegionTest, NeonStructuredLoadStoreDifferentialFuzz) {
     }
   }
   EXPECT_GT(regions_run, 500) << "fuzzer translated too few regions to be meaningful";
+}
+
+// Scalar FP + FP<->int differential fuzzer over FINITE inputs (no NaN/Inf, which
+// legitimately differ in x86 vs ARM default-NaN propagation). Covers the scalar
+// arithmetic and conversion ops Skia uses for analytic-AA coverage geometry
+// (FADD/FMUL/FSUB/FDIV/FMADD/FMAXNM/FRINTA + FCVTZS/FCVTZU/SCVTF/UCVTF/FCVT/FMOV/
+// FCVTNS/FCVTMS). Multi-instruction over s0..s7 (and the GP result of FCVT-to-int
+// / FMOV-to-gp), JIT vs interpreter, diffs every V and GP register.
+TEST_F(Arm64LiteTranslateRegionTest, ScalarFpDifferentialFuzz) {
+  uint64_t seed = 0x9E3779B97F4A7C15ULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  struct Op {
+    uint32_t enc;
+    uint32_t mask;  // rd/rn(/rm/ra)
+  };
+  const Op ops[] = {
+      {0x1e222820, 0x1F03FF}, {0x1e220820, 0x1F03FF}, {0x1e223820, 0x1F03FF},  // fadd/fmul/fsub s
+      {0x1e221820, 0x1F03FF}, {0x1e226820, 0x1F03FF},                          // fdiv / fmaxnm s
+      {0x1f020c20, 0x1F83FF},  // fmadd s (rd/rn/rm/ra)
+      {0x1e380020, 0x3FF},    {0x1e390020, 0x3FF},                             // fcvtzs/fcvtzu w<-s
+      {0x1e220020, 0x3FF},    {0x1e230020, 0x3FF},                             // scvtf/ucvtf s<-w
+      {0x1e624020, 0x3FF},    {0x1e22c020, 0x3FF},                             // fcvt s<-d / d<-s
+      {0x1e260020, 0x3FF},    {0x1e270020, 0x3FF},                             // fmov w<-s / s<-w
+      {0x1e200020, 0x3FF},    {0x1e300020, 0x3FF},    {0x1e264020, 0x3FF},     // fcvtns/fcvtms/frinta
+  };
+  const int kNum = sizeof(ops) / sizeof(ops[0]);
+  const uint32_t kMaxReg = 8;
+  // Finite float bit patterns to seed registers (both s and w views).
+  const uint32_t fbits[] = {0x3f800000, 0x40490fdb, 0xc2c80000, 0xbf800000, 0x41200000,
+                            0x3dcccccd, 0x447a0000, 0x00000005, 0xc0000000, 0x42f6e979};
+  const int NF = sizeof(fbits) / sizeof(fbits[0]);
+  auto gen = [&]() -> uint32_t {
+    const Op& o = ops[rnd() % kNum];
+    uint32_t e = o.enc & ~o.mask;
+    if (o.mask & 0x7C00) e |= static_cast<uint32_t>(rnd() % kMaxReg) << 10;  // ra (fmadd)
+    if (o.mask & 0x1F0000) e |= static_cast<uint32_t>(rnd() % kMaxReg) << 16;
+    if (o.mask & 0x3E0) e |= static_cast<uint32_t>(rnd() % kMaxReg) << 5;
+    if (o.mask & 0x1F) e |= static_cast<uint32_t>(rnd() % kMaxReg);
+    return e;
+  };
+
+  int regions_run = 0;
+  for (int iter = 0; iter < 9000; iter++) {
+    const int n = 3 + static_cast<int>(rnd() % 6);
+    static uint32_t code[16];
+    for (int i = 0; i < n; i++) code[i] = gen();
+    uint64_t initx[31];
+    unsigned __int128 initv[8];
+    for (int i = 0; i < 31; i++)
+      initx[i] = static_cast<uint64_t>(fbits[rnd() % NF]) | (static_cast<uint64_t>(rnd() % 64) << 32);
+    for (int i = 0; i < 8; i++) {
+      uint64_t lo = static_cast<uint64_t>(fbits[rnd() % NF]) |
+                    (static_cast<uint64_t>(fbits[rnd() % NF]) << 32);
+      memcpy(&initv[i], &lo, 8);
+      uint64_t hi = 0;
+      memcpy(reinterpret_cast<uint8_t*>(&initv[i]) + 8, &hi, 8);
+    }
+    GuestAddr start = ToGuestAddr(&code[0]);
+    GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
+
+    auto setup = [&]() {
+      for (int i = 0; i < 31; i++) state_.cpu.x[i] = initx[i];
+      for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+      for (int i = 0; i < 8; i++) memcpy(&state_.cpu.v[i], &initv[i], 16);
+      state_.cpu.flags = 0;
+      state_.cpu.insn_addr = start;
+    };
+
+    setup();
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+    if (!ok || stop > code_end || stop == start) continue;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    uint64_t jit_x[31];
+    unsigned __int128 jit_v[32];
+    for (int i = 0; i < 31; i++) jit_x[i] = state_.cpu.x[i];
+    for (int i = 0; i < 32; i++) memcpy(&jit_v[i], &state_.cpu.v[i], 16);
+
+    setup();
+    int guard = 0;
+    while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < stop && guard++ < 64)
+      InterpretInsn(&state_);
+    regions_run++;
+
+    bool diverged = false;
+    std::string what;
+    for (int i = 0; i < 31 && !diverged; i++)
+      if (jit_x[i] != state_.cpu.x[i]) { diverged = true; what = "x" + std::to_string(i); }
+    for (int i = 0; i < 32 && !diverged; i++) {
+      unsigned __int128 iv;
+      memcpy(&iv, &state_.cpu.v[i], 16);
+      if (jit_v[i] != iv) { diverged = true; what = "v" + std::to_string(i); }
+    }
+    if (diverged) {
+      std::string dis;
+      for (int j = 0; j < n; j++) {
+        char b[16];
+        snprintf(b, sizeof(b), " %08x", code[j]);
+        dis += b;
+      }
+      ADD_FAILURE() << "iter " << iter << " diverged at " << what << " region:" << dis;
+    }
+  }
+  EXPECT_GT(regions_run, 1000) << "fuzzer translated too few regions to be meaningful";
 }
 
 // Multi-instruction NEON differential fuzzer for the remaining lite-JIT SIMD
