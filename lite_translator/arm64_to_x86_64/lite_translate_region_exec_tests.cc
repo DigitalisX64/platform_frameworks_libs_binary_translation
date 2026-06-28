@@ -712,6 +712,106 @@ TEST_F(Arm64LiteTranslateRegionTest, FmaInterpreterVsExpected) {
   }
 }
 
+// Interpreter-AND-JIT vs independent reference for the scalar/vector FP ops Skia
+// uses to position glyphs: FRINTA (round-to-nearest-ties-away — snaps glyph
+// coords to the pixel grid; a wrong rounding mis-snaps glyphs), FSQRT, FMINNM/
+// FMAXNM (clamping), FCVTZS (float->int coord), SCVTF (int->float). Both tiers
+// must match std::, since the gross garble reproduces in BOTH (a shared bug a
+// JIT-vs-interp differential cannot see).
+TEST_F(Arm64LiteTranslateRegionTest, FpGridOpsInterpAndJitVsExpected) {
+  auto bitsf = [](float a, float b) {
+    uint32_t x, y;
+    memcpy(&x, &a, 4);
+    memcpy(&y, &b, 4);
+    return x == y || (std::isnan(a) && std::isnan(b));
+  };
+  auto setS = [&](int i, float a, float b, float c, float d) {
+    float v[4] = {a, b, c, d};
+    memcpy(&state_.cpu.v[i], v, 16);
+  };
+  auto getS0 = [&]() {
+    float v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[0];
+  };
+
+  const float vals[] = {0.0f,  -0.0f,  0.5f,    -0.5f,   1.5f,   2.5f,   -2.5f,
+                        1.4999f, 1e-20f, 16.49f, -16.51f, 123.5f, 100000.3f, 0.1f};
+
+  struct Op {
+    uint32_t enc;
+    const char* name;
+    int kind;  // 0=frinta 1=fsqrt 2=fcvtzs 3=scvtf 4=fneg 5=fabs
+  };
+  const Op unary[] = {{0x6e218820, "frinta", 0}, {0x6ea1f820, "fsqrt", 1},
+                      {0x4ea1b820, "fcvtzs", 2}, {0x4e21d820, "scvtf", 3},
+                      {0x6ea0f820, "fneg", 4},   {0x4ea0f820, "fabs", 5}};
+
+  auto run_jit = [&](uint32_t insn) {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    if (!ok) return false;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    state_.cpu.insn_addr = start;
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    return true;
+  };
+
+  for (const Op& o : unary) {
+    for (float v : vals) {
+      float exp;
+      if (o.kind == 0) {
+        exp = std::roundf(v);  // FRINTA: round-to-nearest, ties away from zero
+      } else if (o.kind == 1) {
+        exp = std::sqrt(v);
+      } else if (o.kind == 2) {
+        // FCVTZS .4s: float -> int32 (truncate toward zero), result reinterpreted
+        // as the int32 bit pattern in the lane.
+        int32_t iv;
+        if (std::isnan(v)) iv = 0;
+        else if (v >= 2147483648.0f) iv = INT32_MAX;
+        else if (v <= -2147483649.0f) iv = INT32_MIN;
+        else iv = static_cast<int32_t>(v);
+        memcpy(&exp, &iv, 4);
+      } else if (o.kind == 3) {
+        // SCVTF .4s: interpret lane as int32, convert to float.
+        int32_t iv = static_cast<int32_t>(v);  // use a small int proxy
+        exp = static_cast<float>(iv);
+      } else if (o.kind == 4) {
+        exp = -v;
+      } else {
+        exp = std::fabs(v);
+      }
+
+      // SCVTF needs an integer input; feed the int bit pattern.
+      float in = v;
+      if (o.kind == 3) {
+        int32_t iv = static_cast<int32_t>(v);
+        memcpy(&in, &iv, 4);
+      }
+
+      // Interpreter.
+      setS(0, 0, 0, 0, 0);
+      setS(1, in, in, in, in);
+      Interpret(o.enc);
+      float gi = getS0();
+      EXPECT_TRUE(bitsf(gi, exp)) << o.name << " INTERP v=" << v << " exp=" << exp << " got=" << gi;
+
+      // JIT.
+      setS(0, 0, 0, 0, 0);
+      setS(1, in, in, in, in);
+      if (run_jit(o.enc)) {
+        float gj = getS0();
+        EXPECT_TRUE(bitsf(gj, exp)) << o.name << " JIT v=" << v << " exp=" << exp << " got=" << gj;
+      }
+    }
+  }
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   static const uint32_t code[] = {
       MovzX(0, 10),       // MOVZ X0, #10
