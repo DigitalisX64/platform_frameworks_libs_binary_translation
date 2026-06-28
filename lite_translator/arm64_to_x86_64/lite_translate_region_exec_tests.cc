@@ -879,6 +879,101 @@ TEST_F(Arm64LiteTranslateRegionTest, FpMinMaxSignedZero) {
   }
 }
 
+// FP rounding-mode ops (interp + JIT vs reference): FRINTN/M/P/Z/A (round to
+// integral float) and FCVTNS/MS/PS/AS (round + convert to int). Skia's analytic-
+// AA coverage uses floor/ceil/round to compute span boundaries; a wrong rounding
+// mode (FPCR<->MXCSR mishandling) miscomputes coverage spans. Tie values (2.5,
+// -2.5) distinguish ties-even (N) from ties-away (A) and the directed modes.
+TEST_F(Arm64LiteTranslateRegionTest, FpRoundingModesInterpAndJit) {
+  auto bitsf = [](float a, float b) {
+    uint32_t x, y;
+    memcpy(&x, &a, 4);
+    memcpy(&y, &b, 4);
+    return x == y;
+  };
+  auto setS = [&](float a) {
+    float v[4] = {a, a, a, a};
+    memcpy(&state_.cpu.v[1], v, 16);
+    float z[4] = {0, 0, 0, 0};
+    memcpy(&state_.cpu.v[0], z, 16);
+  };
+  auto getf0 = [&]() {
+    float v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[0];
+  };
+  auto geti0 = [&]() {
+    int32_t v[4];
+    memcpy(v, &state_.cpu.v[0], 16);
+    return v[0];
+  };
+  auto run_jit = [&](uint32_t insn) {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+    if (!ok || stop != start + 4) return false;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    state_.cpu.insn_addr = start;
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    return true;
+  };
+
+  const float vals[] = {2.5f,  3.5f,  -2.5f,  -3.5f,  0.5f,   -0.5f,
+                        1.5f,  2.49f, 2.51f,  -2.51f, 100.5f, -0.0f};
+
+  struct R {
+    uint32_t enc;
+    const char* name;
+    float (*ref)(float);
+  };
+  const R rints[] = {
+      {0x4e218820, "frintn", [](float f) { return std::nearbyintf(f); }},  // ties-even
+      {0x4e219820, "frintm", [](float f) { return std::floor(f); }},
+      {0x4ea18820, "frintp", [](float f) { return std::ceil(f); }},
+      {0x4ea19820, "frintz", [](float f) { return std::trunc(f); }},
+      {0x6e218820, "frinta", [](float f) { return std::round(f); }},  // ties-away
+  };
+  for (const R& r : rints) {
+    for (float v : vals) {
+      float exp = r.ref(v);
+      setS(v);
+      Interpret(r.enc);
+      EXPECT_TRUE(bitsf(getf0(), exp)) << r.name << " INTERP v=" << v << " exp=" << exp
+                                       << " got=" << getf0();
+      setS(v);
+      if (run_jit(r.enc))
+        EXPECT_TRUE(bitsf(getf0(), exp))
+            << r.name << " JIT v=" << v << " exp=" << exp << " got=" << getf0();
+    }
+  }
+
+  struct C {
+    uint32_t enc;
+    const char* name;
+    float (*round)(float);
+  };
+  const C cvts[] = {
+      {0x4e21a820, "fcvtns", [](float f) { return std::nearbyintf(f); }},
+      {0x4e21b820, "fcvtms", [](float f) { return std::floor(f); }},
+      {0x4ea1a820, "fcvtps", [](float f) { return std::ceil(f); }},
+      {0x4e21c820, "fcvtas", [](float f) { return std::round(f); }},
+  };
+  for (const C& c : cvts) {
+    for (float v : vals) {
+      int32_t exp = static_cast<int32_t>(c.round(v));
+      setS(v);
+      Interpret(c.enc);
+      EXPECT_EQ(geti0(), exp) << c.name << " INTERP v=" << v << " exp=" << exp << " got=" << geti0();
+      setS(v);
+      if (run_jit(c.enc))
+        EXPECT_EQ(geti0(), exp) << c.name << " JIT v=" << v << " exp=" << exp << " got=" << geti0();
+    }
+  }
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, AddRegister) {
   static const uint32_t code[] = {
       MovzX(0, 10),       // MOVZ X0, #10
