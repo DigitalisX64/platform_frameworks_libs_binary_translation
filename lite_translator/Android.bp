@@ -79,6 +79,7 @@ cc_test_library {
     srcs: [
         "arm64_to_x86_64/lite_translate_region_bench.cc",
         "arm64_to_x86_64/lite_translate_region_exec_tests.cc",
+        "arm64_to_x86_64/decoder_objdump_diff_test.cc",
     ],
     header_libs: [
         "libberberis_base_headers",
