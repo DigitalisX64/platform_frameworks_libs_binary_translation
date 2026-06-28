@@ -3368,6 +3368,97 @@ TEST_F(Arm64LiteTranslateRegionTest, IntegerAddrRegMapDifferentialFuzz) {
   EXPECT_GT(regions_run, 1000) << "fuzzer translated too few regions to be meaningful";
 }
 
+// Differential fuzzer for the remaining unfuzzed ops seen disassembling Helium's
+// hot lite-JIT regions: GP byte-reverse / bit ops (REV/REV32/REV16/RBIT/CLZ/CLS,
+// X and W) used in Chromium's hash-table hashing, and DUP-general (GP->vector
+// broadcast, .2d/.4s/.8h/.16b). Multi-instruction over x0..x9 and v0..v9, JIT vs
+// interpreter, diffs all GP and V registers.
+TEST_F(Arm64LiteTranslateRegionTest, RevAndDupGeneralDifferentialFuzz) {
+  uint64_t seed = 0xCAFEF00DD15EA5E5ULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  struct Op {
+    uint32_t enc;
+    uint32_t mask;  // rd/rn (0x3FF)
+  };
+  const Op ops[] = {
+      {0xdac00c20, 0x3FF}, {0xdac00820, 0x3FF}, {0xdac00420, 0x3FF},  // rev/rev32/rev16 x
+      {0xdac00020, 0x3FF}, {0xdac01020, 0x3FF}, {0xdac01420, 0x3FF},  // rbit/clz/cls x
+      {0x5ac00820, 0x3FF}, {0x5ac00420, 0x3FF}, {0x5ac00020, 0x3FF},  // rev/rev16/rbit w
+      {0x5ac01020, 0x3FF},                                            // clz w
+      {0x4e080c20, 0x3FF}, {0x4e040c20, 0x3FF},                       // dup v.2d/v.4s, gp
+      {0x4e020c20, 0x3FF}, {0x4e010c20, 0x3FF},                       // dup v.8h/v.16b, gp
+  };
+  const int kNum = sizeof(ops) / sizeof(ops[0]);
+  const uint32_t kMaxReg = 10;
+  auto gen = [&]() -> uint32_t {
+    const Op& o = ops[rnd() % kNum];
+    uint32_t e = o.enc & ~o.mask;
+    e |= static_cast<uint32_t>(rnd() % kMaxReg) << 5;
+    e |= static_cast<uint32_t>(rnd() % kMaxReg);
+    return e;
+  };
+
+  int regions_run = 0;
+  for (int iter = 0; iter < 9000; iter++) {
+    const int n = 3 + static_cast<int>(rnd() % 6);
+    static uint32_t code[16];
+    for (int i = 0; i < n; i++) code[i] = gen();
+    uint64_t initx[31];
+    unsigned __int128 initv[10];
+    for (int i = 0; i < 31; i++)
+      initx[i] = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+    for (int i = 0; i < 10; i++) {
+      uint64_t lo = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+      uint64_t hi = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+      memcpy(&initv[i], &lo, 8);
+      memcpy(reinterpret_cast<uint8_t*>(&initv[i]) + 8, &hi, 8);
+    }
+    GuestAddr start = ToGuestAddr(&code[0]);
+    GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
+    auto setup = [&]() {
+      for (int i = 0; i < 31; i++) state_.cpu.x[i] = initx[i];
+      for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+      for (int i = 0; i < 10; i++) memcpy(&state_.cpu.v[i], &initv[i], 16);
+      state_.cpu.flags = 0;
+      state_.cpu.insn_addr = start;
+    };
+    setup();
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+    if (!ok || stop > code_end || stop == start) continue;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    uint64_t jit_x[31];
+    unsigned __int128 jit_v[32];
+    for (int i = 0; i < 31; i++) jit_x[i] = state_.cpu.x[i];
+    for (int i = 0; i < 32; i++) memcpy(&jit_v[i], &state_.cpu.v[i], 16);
+    setup();
+    int guard = 0;
+    while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < stop && guard++ < 64)
+      InterpretInsn(&state_);
+    regions_run++;
+    bool d = false;
+    std::string what;
+    for (int i = 0; i < 31 && !d; i++)
+      if (jit_x[i] != state_.cpu.x[i]) { d = true; what = "x" + std::to_string(i); }
+    for (int i = 0; i < 32 && !d; i++) {
+      unsigned __int128 iv;
+      memcpy(&iv, &state_.cpu.v[i], 16);
+      if (jit_v[i] != iv) { d = true; what = "v" + std::to_string(i); }
+    }
+    if (d) {
+      std::string dis;
+      for (int j = 0; j < n; j++) { char b[16]; snprintf(b, sizeof(b), " %08x", code[j]); dis += b; }
+      ADD_FAILURE() << "iter " << iter << " diverged at " << what << " region:" << dis;
+    }
+  }
+  EXPECT_GT(regions_run, 1000) << "fuzzer translated too few regions to be meaningful";
+}
+
 // Conditional-branch evaluation differential: for every condition code and every
 // NZCV combination, and for CBZ/CBNZ/TBZ/TBNZ over a range of register values,
 // run the single-branch region through the lite JIT and the interpreter and
@@ -3449,6 +3540,9 @@ TEST_F(Arm64LiteTranslateRegionTest, GpLoadStoreWritebackDifferentialFuzz) {
       {0xf8656801, false}, {0xf8657801, false}, {0xf8256801, false}, {0x38656801, false},  // ldr/str [x0,x5{,lsl#3}] / ldrb
       {0xf8654801, false}, {0xb8804401, false}, {0x38801401, false}, {0xb8803001, false},  // ldr [x0,w5,uxtw] / ldrsw / ldrsb / ldursw
       {0xf9400c01, false},                                                                 // ldr [x0,#24]
+      // Acquire/release atomics (refcount/hash paths, seen in Helium's hot JIT):
+      {0x88dffd41, false}, {0xc8dffd41, false}, {0x889ffd41, false}, {0xc89ffd41, false},  // ldar/stlr w/x
+      {0x08dffd41, false}, {0x48dffd41, false}, {0x089ffd41, false},                       // ldarb/ldarh/stlrb
   };
   const int kNum = sizeof(ops) / sizeof(ops[0]);
   alignas(16) static uint8_t buf[4096];
