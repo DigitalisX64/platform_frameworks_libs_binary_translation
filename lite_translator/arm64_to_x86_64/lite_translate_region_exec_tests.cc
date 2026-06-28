@@ -3250,6 +3250,60 @@ TEST_F(Arm64LiteTranslateRegionTest, IntegerAddrRegMapDifferentialFuzz) {
   EXPECT_GT(regions_run, 1000) << "fuzzer translated too few regions to be meaningful";
 }
 
+// Conditional-branch evaluation differential: for every condition code and every
+// NZCV combination, and for CBZ/CBNZ/TBZ/TBNZ over a range of register values,
+// run the single-branch region through the lite JIT and the interpreter and
+// assert the resulting guest PC (taken vs not-taken) matches. A miscompiled
+// condition makes a rasterizer loop iterate the wrong number of times and drifts
+// its stride — the lite-JIT glyph shear (crisp interpret-only). Straight-line
+// fuzzers never evaluate a branch, so this class was untested.
+TEST_F(Arm64LiteTranslateRegionTest, ConditionalBranchEvalDifferential) {
+  auto branch_pc = [&](uint32_t insn, uint16_t flags, uint64_t x0, bool jit) -> uint64_t {
+    static uint32_t code[1];
+    code[0] = insn;
+    GuestAddr start = ToGuestAddr(&code[0]);
+    for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+    state_.cpu.x[0] = x0;
+    state_.cpu.flags = flags;
+    state_.cpu.insn_addr = start;
+    if (jit) {
+      MachineCode mc;
+      auto [ok, stop] = TryLiteTranslateRegion(
+          start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+      if (!ok) return ~0ULL;
+      HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+      TestingRunGeneratedCode(&state_, AsHostCode(hc), state_.cpu.insn_addr);
+    } else {
+      InterpretInsn(&state_);
+    }
+    return state_.cpu.insn_addr - start;  // 8 = taken (+8), 4 = fall through
+  };
+
+  // B.<cond> #8 over all conditions x all NZCV.
+  for (uint32_t cond = 0; cond < 14; cond++) {  // skip AL(14)/NV(15)
+    uint32_t insn = 0x54000040u | cond;
+    for (uint32_t f = 0; f < 16; f++) {
+      uint16_t flags = static_cast<uint16_t>((((f >> 3) & 1) << 15) | (((f >> 2) & 1) << 14) |
+                                             (((f >> 1) & 1) << 8) | ((f & 1) << 0));  // N Z C V
+      uint64_t j = branch_pc(insn, flags, 0, true);
+      if (j == ~0ULL) continue;
+      uint64_t i = branch_pc(insn, flags, 0, false);
+      EXPECT_EQ(j, i) << "b.cond cond=" << cond << " flags=0x" << std::hex << flags;
+    }
+  }
+  // CBZ/CBNZ x0 and TBZ/TBNZ x0,#5 over representative register values.
+  const uint64_t xs[] = {0, 1, 0x20, 0xFFFFFFFFULL, 0x100000000ULL, ~0ULL, 0x20ULL << 0};
+  const uint32_t mems[] = {0xb4000040u, 0xb5000040u, 0x36280040u, 0x37280040u};  // cbz/cbnz/tbz#5/tbnz#5
+  for (uint32_t insn : mems) {
+    for (uint64_t x0 : xs) {
+      uint64_t j = branch_pc(insn, 0, x0, true);
+      if (j == ~0ULL) continue;
+      uint64_t i = branch_pc(insn, 0, x0, false);
+      EXPECT_EQ(j, i) << "test-branch insn=0x" << std::hex << insn << " x0=0x" << x0;
+    }
+  }
+}
+
 // Memory-backed GP load/store differential fuzzer with WRITEBACK. The Skia
 // rasterizer advances row/source pointers with post/pre-indexed loads and stores
 // (`ldrb w,[src],#1`, `str ...,[dst],#stride`); a wrong writeback or address
