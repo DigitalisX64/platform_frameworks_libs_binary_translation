@@ -9428,7 +9428,10 @@ class Interpreter {
       // "Vd[127:esize*num_elements] = 0" requirement.
       case Decoder::AdvSimdShiftImmOpcode::kScvtfFixed: {
         if (esize != 4 && esize != 8) { Undefined(); return; }
-        double scale = static_cast<double>(uint64_t{1} << rshift);
+        // 2^rshift. ldexp avoids the UB of `1 << 64` for the .2D max-fbits
+        // corner (rshift==64), where a host shift count == width silently
+        // collapsed the scale to 1.0.
+        double scale = std::ldexp(1.0, rshift);
         for (uint8_t i = 0; i < num_elements; i++) {
           if (esize == 4) {
             int32_t ival;
@@ -9446,7 +9449,10 @@ class Interpreter {
       }
       case Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed: {
         if (esize != 4 && esize != 8) { Undefined(); return; }
-        double scale = static_cast<double>(uint64_t{1} << rshift);
+        // 2^rshift. ldexp avoids the UB of `1 << 64` for the .2D max-fbits
+        // corner (rshift==64), where a host shift count == width silently
+        // collapsed the scale to 1.0.
+        double scale = std::ldexp(1.0, rshift);
         for (uint8_t i = 0; i < num_elements; i++) {
           if (esize == 4) {
             uint32_t ival;
@@ -9464,7 +9470,10 @@ class Interpreter {
       }
       case Decoder::AdvSimdShiftImmOpcode::kFcvtzsFixed: {
         if (esize != 4 && esize != 8) { Undefined(); return; }
-        double scale = static_cast<double>(uint64_t{1} << rshift);
+        // 2^rshift. ldexp avoids the UB of `1 << 64` for the .2D max-fbits
+        // corner (rshift==64), where a host shift count == width silently
+        // collapsed the scale to 1.0.
+        double scale = std::ldexp(1.0, rshift);
         for (uint8_t i = 0; i < num_elements; i++) {
           if (esize == 4) {
             float fval;
@@ -9506,7 +9515,10 @@ class Interpreter {
       }
       case Decoder::AdvSimdShiftImmOpcode::kFcvtzuFixed: {
         if (esize != 4 && esize != 8) { Undefined(); return; }
-        double scale = static_cast<double>(uint64_t{1} << rshift);
+        // 2^rshift. ldexp avoids the UB of `1 << 64` for the .2D max-fbits
+        // corner (rshift==64), where a host shift count == width silently
+        // collapsed the scale to 1.0.
+        double scale = std::ldexp(1.0, rshift);
         for (uint8_t i = 0; i < num_elements; i++) {
           if (esize == 4) {
             float fval;

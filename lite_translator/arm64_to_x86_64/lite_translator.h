@@ -22546,87 +22546,110 @@ class LiteTranslator {
         }
         const bool is_unsigned =
             (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUcvtfFixed);
+        // Vector forms convert EVERY lane: .2S/.4S (esize 32) or .2D
+        // (esize 64, Q=1).  args.scalar forces a single lane.  An earlier
+        // scalar-only lowering converted lane 0 alone and zeroed the rest,
+        // which sheared Skia's vectorized glyph rasterization (the lanes
+        // beyond 0 went to 0.0).
+        const uint8_t esize_bytes = esize_bits / 8;
+        const uint8_t vec_len = args.q ? 16 : 8;
+        const uint8_t num_elements =
+            args.scalar ? 1 : static_cast<uint8_t>(vec_len / esize_bytes);
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
+        SimdRegister xzero = AllocTempSimdReg();
         Register gp_int = AllocTempReg();
         Register gp_scale = AllocTempReg();
+        Register low_bit = no_register;
+        if (is_double && is_unsigned) {
+          low_bit = AllocTempReg();
+        }
         if (xmm == no_simd_register || xscale == no_simd_register ||
-            gp_int == no_register || gp_scale == no_register) {
+            xzero == no_simd_register || gp_int == no_register ||
+            gp_scale == no_register ||
+            (is_double && is_unsigned && low_bit == no_register)) {
           success_ = false; return;
         }
 
-        // Load integer source from Vn low half.
-        if (is_double) {
-          as_.Movq(gp_int, {.base = Assembler::rbp, .disp = vn_off});
-        } else {
-          // .S form: Movl loads 32-bit and zero-extends gp_int[63:32]=0.
-          // For SCVTF we'll use Cvtsi2ssl which reads the 32-bit subreg
-          // as int32 (signed).  For UCVTF we'll use Cvtsi2ssq which
-          // treats the zero-extended 64-bit value as int64 (unsigned
-          // source fits in int64's positive range).
-          as_.Movl(gp_int, {.base = Assembler::rbp, .disp = vn_off});
-        }
+        // Zero Vd up front: clears unused lanes and Vd[127:esize*elems].
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
 
-        // Pre-zero xmm so the final Movdqu zeroes Vd[127:esize].
-        as_.Pxor(xmm, xmm);
-
-        // Integer → FP conversion.
-        if (is_double && is_unsigned) {
-          // UCVTF .D: uint64 → double.  Branch on the sign bit: values
-          // < 2^63 convert directly via signed CVTSI2SDQ (exact); values
-          // ≥ 2^63 go through round-to-odd halve / convert / double-back
-          // to preserve single-rounding when bit 63 is set.
-          Register low_bit = AllocTempReg();
-          if (low_bit == no_register) { success_ = false; return; }
-          Assembler::Label* neg_path = as_.MakeLabel();
-          Assembler::Label* done = as_.MakeLabel();
-          as_.Testq(gp_int, gp_int);
-          as_.Jcc(Assembler::Condition::kNegative, *neg_path);
-          as_.Cvtsi2sdq(xmm, gp_int);
-          as_.Jmp(*done);
-          as_.Bind(neg_path);
-          as_.Movq(low_bit, gp_int);
-          as_.Andq(low_bit, static_cast<int32_t>(1));   // captured LSB
-          as_.Shrq(gp_int, static_cast<int8_t>(1));     // logical halve
-          as_.Orq(gp_int, low_bit);                     // round-to-odd
-          as_.Cvtsi2sdq(xmm, gp_int);
-          as_.Addsd(xmm, xmm);                          // double back
-          as_.Bind(done);
-        } else if (is_double) {
-          // SCVTF .D: int64 → double.
-          as_.Cvtsi2sdq(xmm, gp_int);
-        } else if (is_unsigned) {
-          // UCVTF .S: uint32 (zero-extended to uint64) → float, via
-          // signed-int64 conversion which is exact for values ≤ 2^32 - 1.
-          as_.Cvtsi2ssq(xmm, gp_int);
-        } else {
-          // SCVTF .S: int32 → float.
-          as_.Cvtsi2ssl(xmm, gp_int);
-        }
-
-        // Scale by 2^-fbits.  Multiplication by a power of 2 is exact
-        // in IEEE-754 (just biases the exponent), so this preserves
-        // the single-rounding semantics of the cvtsi2{ss,sd} step.
+        // 2^-fbits scale (exact power of two: just an exponent bias),
+        // computed once and reused across lanes.
         if (is_double) {
           // FP64 2^-fbits = sign 0, exp (1023 - fbits), mantissa 0.
           const uint64_t scale_bits =
               static_cast<uint64_t>(1023u - fbits) << 52;
           as_.Movq(gp_scale, static_cast<int64_t>(scale_bits));
           as_.Movq(xscale, gp_scale);
-          as_.Mulsd(xmm, xscale);
         } else {
           // FP32 2^-fbits = sign 0, exp (127 - fbits), mantissa 0.
           const uint32_t scale_bits =
               static_cast<uint32_t>(127u - fbits) << 23;
           as_.Movl(gp_scale, static_cast<int32_t>(scale_bits));
           as_.Movd(xscale, gp_scale);
-          as_.Mulss(xmm, xscale);
         }
 
-        // Store the FP result.  PXOR above + Cvtsi2/Mul writing only
-        // the bottom lane gives Vd[127:esize] = 0 for free.
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xmm);
+        for (uint8_t lane = 0; lane < num_elements; lane++) {
+          const int32_t loff = vn_off + lane * esize_bytes;
+          const int32_t soff = vd_off + lane * esize_bytes;
+          // Load integer source lane.  The .S Movl zero-extends
+          // gp_int[63:32]=0, so Cvtsi2ssq below reads the unsigned 32-bit
+          // value (UCVTF .S), while Cvtsi2ssl reads the int32 subreg
+          // (SCVTF .S).
+          if (is_double) {
+            as_.Movq(gp_int, {.base = Assembler::rbp, .disp = loff});
+          } else {
+            as_.Movl(gp_int, {.base = Assembler::rbp, .disp = loff});
+          }
+          // Integer → FP conversion (result in xmm low lane).
+          if (is_double && is_unsigned) {
+            // UCVTF .D: uint64 → double.  Values < 2^63 convert directly
+            // via signed CVTSI2SDQ (exact); values ≥ 2^63 go through
+            // round-to-odd halve / convert / double-back to preserve
+            // single-rounding when bit 63 is set.
+            Assembler::Label* neg_path = as_.MakeLabel();
+            Assembler::Label* done = as_.MakeLabel();
+            as_.Testq(gp_int, gp_int);
+            as_.Jcc(Assembler::Condition::kNegative, *neg_path);
+            as_.Cvtsi2sdq(xmm, gp_int);
+            as_.Jmp(*done);
+            as_.Bind(neg_path);
+            as_.Movq(low_bit, gp_int);
+            as_.Andq(low_bit, static_cast<int32_t>(1));   // captured LSB
+            as_.Shrq(gp_int, static_cast<int8_t>(1));     // logical halve
+            as_.Orq(gp_int, low_bit);                     // round-to-odd
+            as_.Cvtsi2sdq(xmm, gp_int);
+            as_.Addsd(xmm, xmm);                          // double back
+            as_.Bind(done);
+          } else if (is_double) {
+            // SCVTF .D: int64 → double.
+            as_.Cvtsi2sdq(xmm, gp_int);
+          } else if (is_unsigned) {
+            // UCVTF .S: uint32 (zero-extended to uint64) → float, via
+            // signed-int64 conversion which is exact for values ≤ 2^32-1.
+            as_.Cvtsi2ssq(xmm, gp_int);
+          } else {
+            // SCVTF .S: int32 → float.
+            as_.Cvtsi2ssl(xmm, gp_int);
+          }
+          // Scale by 2^-fbits.
+          if (is_double) {
+            as_.Mulsd(xmm, xscale);
+          } else {
+            as_.Mulss(xmm, xscale);
+          }
+          // Store this lane (bounce xmm → GP → memory; Vd already zeroed).
+          if (is_double) {
+            as_.Movq(gp_int, xmm);
+            as_.Movq({.base = Assembler::rbp, .disp = soff}, gp_int);
+          } else {
+            as_.Movd(gp_int, xmm);
+            as_.Movl({.base = Assembler::rbp, .disp = soff}, gp_int);
+          }
+        }
         return;
       }
       // AdvSimdScalarShiftByImm JIT — FCVTZS (FP →
@@ -22642,6 +22665,7 @@ class LiteTranslator {
         if (!(immh & 0b1100)) { success_ = false; return; }
         const bool is_double = (immh & 0b1000) != 0;
         const uint8_t esize_bits = is_double ? 64 : 32;
+        const uint8_t esize_bytes = esize_bits / 8;
         const uint16_t immh_immb =
             static_cast<uint16_t>((immh << 3) | args.immb);
         // fbits = 2*esize - immh:immb.  Valid range: [1, esize_bits].
@@ -22650,6 +22674,12 @@ class LiteTranslator {
         if (fbits == 0 || fbits > esize_bits) {
           success_ = false; return;
         }
+        // Vector forms truncate EVERY lane (.2S/.4S/.2D); args.scalar
+        // forces a single lane.  Earlier scalar-only lowering left lanes
+        // beyond 0 zeroed.
+        const uint8_t vec_len = args.q ? 16 : 8;
+        const uint8_t num_elements =
+            args.scalar ? 1 : static_cast<uint8_t>(vec_len / esize_bytes);
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
@@ -22663,74 +22693,74 @@ class LiteTranslator {
           success_ = false; return;
         }
 
-        // Load FP source from Vn low half.
-        if (is_double) {
-          as_.Movsd(xmm, {.base = Assembler::rbp, .disp = vn_off});
-        } else {
-          as_.Movss(xmm, {.base = Assembler::rbp, .disp = vn_off});
-        }
+        // Zero Vd up front (clears unused lanes / Vd[127:esize*elems]).
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
 
-        // Scale by 2^+fbits.  Multiplication by a power of 2 is exact
-        // in IEEE-754 (just biases the exponent), so the subsequent
-        // truncate-to-int gives the architecturally-correct fixed-point
-        // result.  NaN propagates through MULSS/MULSD (NaN * x = NaN);
-        // ±inf stays ±inf (saturates below).
+        // 2^+fbits scale (exact power of two), computed once.  NaN
+        // propagates through MULSS/MULSD (NaN*x=NaN); ±inf stays ±inf.
         if (is_double) {
           const uint64_t scale_bits =
               static_cast<uint64_t>(1023u + fbits) << 52;
           as_.Movq(gp_scale, static_cast<int64_t>(scale_bits));
           as_.Movq(xscale, gp_scale);
-          as_.Mulsd(xmm, xscale);
         } else {
           const uint32_t scale_bits =
               static_cast<uint32_t>(127u + fbits) << 23;
           as_.Movl(gp_scale, static_cast<int32_t>(scale_bits));
           as_.Movd(xscale, gp_scale);
-          as_.Mulss(xmm, xscale);
         }
 
-        // Truncate to int with ARM saturation fixup (mirror of
-        // kFcvtzs at lines 11369-11427).
-        //   NaN              -> 0
-        //   positive overflow -> INT_MAX
-        //   negative overflow -> INT_MIN (matches x86 cvtt indefinite)
-        //   in-range          -> trunc toward zero
-        if (is_double) {
-          as_.Cvttsd2siq(tmp, xmm);
-        } else {
-          as_.Cvttss2sil(tmp, xmm);
-        }
-        Assembler::Label* nan_path = as_.MakeLabel();
-        Assembler::Label* done = as_.MakeLabel();
-        if (is_double) as_.Ucomisd(xmm, xmm);
-        else as_.Ucomiss(xmm, xmm);
-        as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
-        if (is_double) {
-          as_.Movq(sign_tmp, xmm);
-          as_.Testq(sign_tmp, sign_tmp);
-        } else {
-          as_.Movd(sign_tmp, xmm);
-          as_.Testl(sign_tmp, sign_tmp);
-        }
-        as_.Jcc(Assembler::Condition::kNegative, *done);
-        if (is_double) as_.Testq(tmp, tmp);
-        else as_.Testl(tmp, tmp);
-        as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
-        if (is_double) as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
-        else as_.Movl(tmp, int32_t{INT32_MAX});
-        as_.Jmp(*done);
-        as_.Bind(nan_path);
-        if (is_double) as_.Xorq(tmp, tmp);
-        else as_.Xorl(tmp, tmp);
-        as_.Bind(done);
-
-        // Zero Vd, then write the int result to lane 0.
-        as_.Pxor(xzero, xzero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
-        if (is_double) {
-          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, tmp);
-        } else {
-          as_.Movl({.base = Assembler::rbp, .disp = vd_off}, tmp);
+        for (uint8_t lane = 0; lane < num_elements; lane++) {
+          const int32_t loff = vn_off + lane * esize_bytes;
+          const int32_t soff = vd_off + lane * esize_bytes;
+          // Load FP source lane and scale by 2^+fbits.
+          if (is_double) {
+            as_.Movsd(xmm, {.base = Assembler::rbp, .disp = loff});
+            as_.Mulsd(xmm, xscale);
+          } else {
+            as_.Movss(xmm, {.base = Assembler::rbp, .disp = loff});
+            as_.Mulss(xmm, xscale);
+          }
+          // Truncate to int with ARM saturation fixup.
+          //   NaN              -> 0
+          //   positive overflow -> INT_MAX
+          //   negative overflow -> INT_MIN (matches x86 cvtt indefinite)
+          //   in-range          -> trunc toward zero
+          if (is_double) {
+            as_.Cvttsd2siq(tmp, xmm);
+          } else {
+            as_.Cvttss2sil(tmp, xmm);
+          }
+          Assembler::Label* nan_path = as_.MakeLabel();
+          Assembler::Label* done = as_.MakeLabel();
+          if (is_double) as_.Ucomisd(xmm, xmm);
+          else as_.Ucomiss(xmm, xmm);
+          as_.Jcc(Assembler::Condition::kParityEven, *nan_path);
+          if (is_double) {
+            as_.Movq(sign_tmp, xmm);
+            as_.Testq(sign_tmp, sign_tmp);
+          } else {
+            as_.Movd(sign_tmp, xmm);
+            as_.Testl(sign_tmp, sign_tmp);
+          }
+          as_.Jcc(Assembler::Condition::kNegative, *done);
+          if (is_double) as_.Testq(tmp, tmp);
+          else as_.Testl(tmp, tmp);
+          as_.Jcc(Assembler::Condition::kPositiveOrZero, *done);
+          if (is_double) as_.Movq(tmp, static_cast<int64_t>(INT64_MAX));
+          else as_.Movl(tmp, int32_t{INT32_MAX});
+          as_.Jmp(*done);
+          as_.Bind(nan_path);
+          if (is_double) as_.Xorq(tmp, tmp);
+          else as_.Xorl(tmp, tmp);
+          as_.Bind(done);
+          // Store this lane.
+          if (is_double) {
+            as_.Movq({.base = Assembler::rbp, .disp = soff}, tmp);
+          } else {
+            as_.Movl({.base = Assembler::rbp, .disp = soff}, tmp);
+          }
         }
         return;
       }
@@ -22746,6 +22776,7 @@ class LiteTranslator {
         if (!(immh & 0b1100)) { success_ = false; return; }
         const bool is_double = (immh & 0b1000) != 0;
         const uint8_t esize_bits = is_double ? 64 : 32;
+        const uint8_t esize_bytes = esize_bits / 8;
         const uint16_t immh_immb =
             static_cast<uint16_t>((immh << 3) | args.immb);
         // fbits = 2*esize - immh:immb.  Valid range: [1, esize_bits].
@@ -22754,6 +22785,12 @@ class LiteTranslator {
         if (fbits == 0 || fbits > esize_bits) {
           success_ = false; return;
         }
+        // Vector forms truncate EVERY lane (.2S/.4S/.2D); args.scalar
+        // forces a single lane.  Earlier scalar-only lowering left lanes
+        // beyond 0 zeroed.
+        const uint8_t vec_len = args.q ? 16 : 8;
+        const uint8_t num_elements =
+            args.scalar ? 1 : static_cast<uint8_t>(vec_len / esize_bytes);
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
@@ -22761,124 +22798,122 @@ class LiteTranslator {
         Register tmp = AllocTempReg();
         Register sign_tmp = AllocTempReg();
         Register gp_scale = AllocTempReg();
+        SimdRegister bound_xmm = no_simd_register;
+        SimdRegister bound2_xmm = no_simd_register;
+        if (is_double) {
+          bound_xmm = AllocTempSimdReg();
+          bound2_xmm = AllocTempSimdReg();
+        }
         if (xmm == no_simd_register || xscale == no_simd_register ||
             xzero == no_simd_register || tmp == no_register ||
-            sign_tmp == no_register || gp_scale == no_register) {
+            sign_tmp == no_register || gp_scale == no_register ||
+            (is_double && (bound_xmm == no_simd_register ||
+                           bound2_xmm == no_simd_register))) {
           success_ = false; return;
         }
 
-        // Load FP source from Vn low half.
-        if (is_double) {
-          as_.Movsd(xmm, {.base = Assembler::rbp, .disp = vn_off});
-        } else {
-          as_.Movss(xmm, {.base = Assembler::rbp, .disp = vn_off});
-        }
+        // Zero Vd up front (clears unused lanes / Vd[127:esize*elems]).
+        as_.Pxor(xzero, xzero);
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
 
-        // Scale by 2^+fbits.  Multiply by a power of 2 is exact in
-        // IEEE-754, so single-rounding semantics are preserved.  NaN
-        // propagates (NaN * x = NaN); ±inf stays ±inf; ±0 stays ±0.
+        // 2^+fbits scale (exact power of two) and the .D classification
+        // bounds (2^63, 2^64), all computed once and reused across lanes.
+        // NaN propagates (NaN*x=NaN); ±inf stays ±inf; ±0 stays ±0.
         if (is_double) {
           const uint64_t scale_bits =
               static_cast<uint64_t>(1023u + fbits) << 52;
           as_.Movq(gp_scale, static_cast<int64_t>(scale_bits));
           as_.Movq(xscale, gp_scale);
-          as_.Mulsd(xmm, xscale);
+          as_.Movq(tmp, int64_t{0x43E0000000000000LL});  // 2^63
+          as_.Movq(bound_xmm, tmp);
+          as_.Movq(tmp, int64_t{0x43F0000000000000LL});  // 2^64
+          as_.Movq(bound2_xmm, tmp);
         } else {
           const uint32_t scale_bits =
               static_cast<uint32_t>(127u + fbits) << 23;
           as_.Movl(gp_scale, static_cast<int32_t>(scale_bits));
           as_.Movd(xscale, gp_scale);
-          as_.Mulss(xmm, xscale);
         }
 
-        if (is_double) {
-          // FP64 → u64.  Mirror of kFcvtzu at lines 11451-11496:
-          // NaN→0, negative→0, [0, 2^63)→direct cvttsd2siq,
-          // [2^63, 2^64)→subtract-2^63 + cvtt + Btsq bit63,
-          // [2^64, +inf]→UINT64_MAX.
-          SimdRegister bound_xmm = AllocTempSimdReg();
-          SimdRegister bound2_xmm = AllocTempSimdReg();
-          if (bound_xmm == no_simd_register ||
-              bound2_xmm == no_simd_register) {
-            success_ = false; return;
+        for (uint8_t lane = 0; lane < num_elements; lane++) {
+          const int32_t loff = vn_off + lane * esize_bytes;
+          const int32_t soff = vd_off + lane * esize_bytes;
+          if (is_double) {
+            as_.Movsd(xmm, {.base = Assembler::rbp, .disp = loff});
+            as_.Mulsd(xmm, xscale);
+          } else {
+            as_.Movss(xmm, {.base = Assembler::rbp, .disp = loff});
+            as_.Mulss(xmm, xscale);
           }
-          // 2^63, 2^64 constants in FP64.
-          as_.Movq(tmp, int64_t{0x43E0000000000000LL});
-          as_.Movq(bound_xmm, tmp);
-          as_.Movq(tmp, int64_t{0x43F0000000000000LL});
-          as_.Movq(bound2_xmm, tmp);
 
-          Assembler::Label* zero_path = as_.MakeLabel();
-          Assembler::Label* direct_path = as_.MakeLabel();
-          Assembler::Label* sat_max = as_.MakeLabel();
-          Assembler::Label* done = as_.MakeLabel();
-          // NaN → 0.
-          as_.Ucomisd(xmm, xmm);
-          as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
-          // FP < 0 → 0 (sign bit set; -0.0 falls through to direct_path
-          // where cvtt(-0.0)=0 is also correct).
-          as_.Movq(sign_tmp, xmm);
-          as_.Testq(sign_tmp, sign_tmp);
-          as_.Jcc(Assembler::Condition::kNegative, *zero_path);
-          // FP < 2^63 → direct cvttsd2siq is exact.
-          as_.Ucomisd(xmm, bound_xmm);
-          as_.Jcc(Assembler::Condition::kBelow, *direct_path);
-          // FP ≥ 2^64 → saturate to UINT64_MAX.
-          as_.Ucomisd(xmm, bound2_xmm);
-          as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
-          // [2^63, 2^64): subtract 2^63, cvtt, OR bit63.
-          as_.Subsd(xmm, bound_xmm);
-          as_.Cvttsd2siq(tmp, xmm);
-          as_.Btsq(tmp, int8_t{63});
-          as_.Jmp(*done);
-          as_.Bind(sat_max);
-          as_.Movq(tmp, static_cast<int64_t>(-1));
-          as_.Jmp(*done);
-          as_.Bind(direct_path);
-          as_.Cvttsd2siq(tmp, xmm);
-          as_.Jmp(*done);
-          as_.Bind(zero_path);
-          as_.Xorq(tmp, tmp);
-          as_.Bind(done);
-        } else {
-          // FP32 → u32 via cvtt-Q (int64), classify by upper-32
-          // zero-ness.  Mirror of kFcvtzu at lines 11499-11525.
-          Assembler::Label* zero_path = as_.MakeLabel();
-          Assembler::Label* done = as_.MakeLabel();
-          as_.Ucomiss(xmm, xmm);
-          as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
-          // FP sign-bit check via raw bits.  -0.0 falls through;
-          // cvtt(-0.0)=0.
-          as_.Movd(sign_tmp, xmm);
-          as_.Testl(sign_tmp, sign_tmp);
-          as_.Jcc(Assembler::Condition::kNegative, *zero_path);
-          // cvtt-Q to int64; valid u32 outputs have upper-32 = 0.
-          as_.Cvttss2siq(tmp, xmm);
-          // sign_tmp = upper-32 of tmp; nonzero ⇒ overflow.
-          as_.Movq(sign_tmp, tmp);
-          as_.Shrq(sign_tmp, int8_t{32});
-          as_.Testl(sign_tmp, sign_tmp);
-          Assembler::Label* sat_max = as_.MakeLabel();
-          as_.Jcc(Assembler::Condition::kNotZero, *sat_max);
-          // tmp's bottom 32 bits already correct; truncate via Movl
-          // into tmp (auto-zero-extends to 64).
-          as_.Movl(tmp, tmp);
-          as_.Jmp(*done);
-          as_.Bind(sat_max);
-          as_.Movl(tmp, int32_t{-1});  // 0xFFFFFFFF
-          as_.Jmp(*done);
-          as_.Bind(zero_path);
-          as_.Xorl(tmp, tmp);
-          as_.Bind(done);
-        }
+          if (is_double) {
+            // FP64 → u64: NaN→0, negative→0, [0, 2^63)→direct cvttsd2siq,
+            // [2^63, 2^64)→subtract-2^63 + cvtt + Btsq bit63,
+            // [2^64, +inf]→UINT64_MAX.
+            Assembler::Label* zero_path = as_.MakeLabel();
+            Assembler::Label* direct_path = as_.MakeLabel();
+            Assembler::Label* sat_max = as_.MakeLabel();
+            Assembler::Label* done = as_.MakeLabel();
+            as_.Ucomisd(xmm, xmm);
+            as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+            as_.Movq(sign_tmp, xmm);
+            as_.Testq(sign_tmp, sign_tmp);
+            as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+            as_.Ucomisd(xmm, bound_xmm);
+            as_.Jcc(Assembler::Condition::kBelow, *direct_path);
+            as_.Ucomisd(xmm, bound2_xmm);
+            as_.Jcc(Assembler::Condition::kAboveEqual, *sat_max);
+            as_.Subsd(xmm, bound_xmm);
+            as_.Cvttsd2siq(tmp, xmm);
+            as_.Btsq(tmp, int8_t{63});
+            as_.Jmp(*done);
+            as_.Bind(sat_max);
+            as_.Movq(tmp, static_cast<int64_t>(-1));
+            as_.Jmp(*done);
+            as_.Bind(direct_path);
+            as_.Cvttsd2siq(tmp, xmm);
+            as_.Jmp(*done);
+            as_.Bind(zero_path);
+            as_.Xorq(tmp, tmp);
+            as_.Bind(done);
+          } else {
+            // FP32 → u32 via cvtt-Q (int64), classify by upper-32
+            // zero-ness.
+            Assembler::Label* zero_path = as_.MakeLabel();
+            Assembler::Label* done = as_.MakeLabel();
+            as_.Ucomiss(xmm, xmm);
+            as_.Jcc(Assembler::Condition::kParityEven, *zero_path);
+            // FP sign-bit check via raw bits.  -0.0 falls through;
+            // cvtt(-0.0)=0.
+            as_.Movd(sign_tmp, xmm);
+            as_.Testl(sign_tmp, sign_tmp);
+            as_.Jcc(Assembler::Condition::kNegative, *zero_path);
+            // cvtt-Q to int64; valid u32 outputs have upper-32 = 0.
+            as_.Cvttss2siq(tmp, xmm);
+            // sign_tmp = upper-32 of tmp; nonzero ⇒ overflow.
+            as_.Movq(sign_tmp, tmp);
+            as_.Shrq(sign_tmp, int8_t{32});
+            as_.Testl(sign_tmp, sign_tmp);
+            Assembler::Label* sat_max = as_.MakeLabel();
+            as_.Jcc(Assembler::Condition::kNotZero, *sat_max);
+            // tmp's bottom 32 bits already correct; truncate via Movl
+            // into tmp (auto-zero-extends to 64).
+            as_.Movl(tmp, tmp);
+            as_.Jmp(*done);
+            as_.Bind(sat_max);
+            as_.Movl(tmp, int32_t{-1});  // 0xFFFFFFFF
+            as_.Jmp(*done);
+            as_.Bind(zero_path);
+            as_.Xorl(tmp, tmp);
+            as_.Bind(done);
+          }
 
-        // Zero Vd, then write the int result to lane 0.
-        as_.Pxor(xzero, xzero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
-        if (is_double) {
-          as_.Movq({.base = Assembler::rbp, .disp = vd_off}, tmp);
-        } else {
-          as_.Movl({.base = Assembler::rbp, .disp = vd_off}, tmp);
+          // Store this lane.
+          if (is_double) {
+            as_.Movq({.base = Assembler::rbp, .disp = soff}, tmp);
+          } else {
+            as_.Movl({.base = Assembler::rbp, .disp = soff}, tmp);
+          }
         }
         return;
       }

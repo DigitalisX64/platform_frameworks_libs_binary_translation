@@ -2933,6 +2933,396 @@ TEST_F(Arm64LiteTranslateRegionTest, NeonRegMapDifferentialFuzz) {
   EXPECT_GT(regions_run, 1000) << "fuzzer translated too few regions to be meaningful";
 }
 
+// Exhaustive AdvSIMD shift-by-immediate JIT-vs-interpreter differential.
+// On-device bisection (forcing SIMD classes to the interpreter via a bail mask)
+// localized Helium's garbled-glyph render to the AdvSimdShiftByImm lite-JIT
+// handler.  These handlers read Vn and write Vd directly through ThreadState
+// memory (rbp-relative) rather than mapped XMM registers, so a single-instruction
+// region fully captures their codegen — there is no cross-instruction state for a
+// region fuzzer to expose that a per-encoding sweep would miss.  This enumerates
+// every (opcode, U, immh, immb, Q) the decoder accepts, drives a set of input
+// vectors chosen to stress sign bits / rounding carry / lane boundaries, runs each
+// through the JIT and the interpreter from identical state, and diffs Vd (all 128
+// bits, including the upper-half-zero behaviour for !Q).  Any encoding the JIT
+// declines to translate (success_=false → region ends at start) is skipped: those
+// run on the interpreter on-device and cannot be the garble source.
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdShiftByImmDifferential) {
+  // Encoding: 0 Q U 011110 immh(4) immb(3) opcode(5) 1 Rn Rd
+  auto enc = [](bool q, bool u, uint8_t immh, uint8_t immb, uint8_t opcode,
+                uint8_t rn, uint8_t rd) -> uint32_t {
+    return (static_cast<uint32_t>(q) << 30) | (static_cast<uint32_t>(u) << 29) |
+           (0b011110u << 23) | (static_cast<uint32_t>(immh) << 19) |
+           (static_cast<uint32_t>(immb) << 16) | (static_cast<uint32_t>(opcode) << 11) |
+           (1u << 10) | (static_cast<uint32_t>(rn) << 5) | rd;
+  };
+  // Input vectors for Vn (hi:lo).  Cover sign-bit-set lanes at every element
+  // width, rounding-carry boundaries, alternating bits, and small magnitudes.
+  const uint64_t kInputs[][2] = {
+      {0x0000000000000000ULL, 0x0000000000000000ULL},
+      {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL},
+      {0x8080808080808080ULL, 0x8080808080808080ULL},
+      {0x7F7F7F7F7F7F7F7FULL, 0x7F7F7F7F7F7F7F7FULL},
+      {0x8000800080008000ULL, 0x8000800080008000ULL},
+      {0x0001000100010001ULL, 0x0001000100010001ULL},
+      {0x80000000FFFFFFFFULL, 0x000000017FFFFFFFULL},
+      {0x0102040810204080ULL, 0x8040201008040201ULL},
+      {0xAAAAAAAAAAAAAAAAULL, 0x5555555555555555ULL},
+      {0xFFFFFFFF00000000ULL, 0x00000000FFFFFFFFULL},
+      {0x123456789ABCDEF0ULL, 0x0FEDCBA987654321ULL},
+      {0xC0C0C0C0C0C0C0C0ULL, 0x4040404040404040ULL},
+  };
+  const int kNumInputs = sizeof(kInputs) / sizeof(kInputs[0]);
+  const uint64_t kSentinelHi = 0xDEADBEEFCAFEBABEULL;
+  const uint64_t kSentinelLo = 0x0123456789ABCDEFULL;
+
+  int compared = 0, jit_accepted = 0;
+  int failures = 0;
+  std::vector<std::string> sigs;
+  auto sig_seen = [&](const std::string& s) {
+    for (const auto& e : sigs) if (e == s) return true;
+    sigs.push_back(s);
+    return false;
+  };
+  for (uint8_t opcode = 0; opcode < 32; opcode++) {
+    for (uint8_t u = 0; u <= 1; u++) {
+      for (uint8_t q = 0; q <= 1; q++) {
+        for (uint8_t immh = 1; immh < 16; immh++) {
+          for (uint8_t immb = 0; immb < 8; immb++) {
+            uint32_t code[1] = {enc(q, u, immh, immb, opcode, /*rn=*/1, /*rd=*/0)};
+            GuestAddr start = ToGuestAddr(&code[0]);
+            GuestAddr code_end = start + 4;
+
+            // JIT translate; skip encodings the JIT declines (interp-only).
+            MachineCode mc;
+            auto [ok, stop] = TryLiteTranslateRegion(
+                start, &mc,
+                LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+            if (!ok || stop != code_end) continue;
+            jit_accepted++;
+            HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+
+            for (int in = 0; in < kNumInputs; in++) {
+              // JIT run.
+              for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+              memcpy(&state_.cpu.v[1], kInputs[in], 16);
+              uint64_t sent[2] = {kSentinelLo, kSentinelHi};
+              memcpy(&state_.cpu.v[0], sent, 16);
+              state_.cpu.insn_addr = start;
+              TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+              unsigned __int128 jit_vd;
+              memcpy(&jit_vd, &state_.cpu.v[0], 16);
+
+              // Interpreter run, identical start state.
+              for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+              memcpy(&state_.cpu.v[1], kInputs[in], 16);
+              memcpy(&state_.cpu.v[0], sent, 16);
+              state_.cpu.insn_addr = start;
+              InterpretInsn(&state_);
+              unsigned __int128 interp_vd;
+              memcpy(&interp_vd, &state_.cpu.v[0], 16);
+
+              compared++;
+              if (jit_vd != interp_vd) {
+                failures++;
+                char key[64];
+                snprintf(key, sizeof(key), "opcode=%d U=%d Q=%d immh=%d", (int)opcode,
+                         (int)u, (int)q, (int)immh);
+                if (!sig_seen(key)) {
+                  ADD_FAILURE()
+                      << "DIVERGE " << key << " (e.g. insn=0x" << std::hex << code[0]
+                      << " immb=" << std::dec << (int)immb << " input#" << in << std::hex
+                      << " Vn=0x" << kInputs[in][0] << ":" << kInputs[in][1] << " JIT=0x"
+                      << (uint64_t)(jit_vd >> 64) << ":" << (uint64_t)jit_vd << " INTERP=0x"
+                      << (uint64_t)(interp_vd >> 64) << ":" << (uint64_t)interp_vd
+                      << std::dec << ")";
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_GT(jit_accepted, 50) << "JIT accepted too few shift-imm encodings";
+  EXPECT_GT(compared, 500) << "compared too few encoding/input pairs";
+  if (failures == 0) {
+    printf("AdvSimdShiftByImmDifferential: %d encodings JIT-accepted, %d pairs, ALL MATCH\n",
+           jit_accepted, compared);
+  }
+}
+
+// Exhaustive scalar FP<->integer conversion (FpIntConversion) JIT-vs-interpreter
+// differential.  Covers FCVTZS/FCVTZU (truncate), FCVTNS/NU/PS/PU/MS/MU (round
+// modes), FCVTAS/AU (ties-away), SCVTF/UCVTF (int->FP), and FMOV GP<->FP across
+// sf={0,1} and ftype={S,D}.  This handler snaps glyph coordinates float<->int in
+// Skia, so it is in the hot path for web-text rendering; this pins its
+// per-instruction codegen against the interpreter so a future regression in any
+// rounding/saturation branch is caught at build time.  Drives FP-domain inputs
+// (fractional/tie/overflow/NaN/Inf) and integer inputs, runs each
+// single-instruction region through the JIT and the interpreter from identical
+// state, and diffs both the GP destination and the V destination (the FP->GP
+// path writes Xd; the GP->FP path writes Vd; FMOV does either).
+TEST_F(Arm64LiteTranslateRegionTest, FpIntConversionDifferential) {
+  // Encoding: sf 0 0 11110 ftype 1 rmode opcode 000000 Rn Rd
+  auto enc = [](bool sf, uint8_t ftype, uint8_t rmode, uint8_t opcode, uint8_t rn,
+                uint8_t rd) -> uint32_t {
+    return (static_cast<uint32_t>(sf) << 31) | (0b11110u << 24) |
+           (static_cast<uint32_t>(ftype) << 22) | (1u << 21) |
+           (static_cast<uint32_t>(rmode) << 19) | (static_cast<uint32_t>(opcode) << 16) |
+           (static_cast<uint32_t>(rn) << 5) | rd;
+  };
+  // FP test values (exercised as both float and double sources) and integer
+  // sources for the int->FP direction.
+  const double kFp[] = {
+      0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 1.4, 1.6, -1.4, -1.6,
+      3.49, 3.51, -3.49, -3.51, 100.9, -100.9, 0.9999, -0.9999,
+      127.5, 128.5, 255.5, 65535.5, 2147483647.0, 2147483648.0,
+      -2147483648.0, -2147483649.0, 4294967295.0, 4294967296.0,
+      9.2233720368547758e18, -9.2233720368547758e18, 1.8446744073709552e19,
+      1e30, -1e30, 16777216.5, 16777217.0,
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+  const int kNumFp = sizeof(kFp) / sizeof(kFp[0]);
+  const int64_t kInt[] = {
+      0, 1, -1, 2, -2, 7, -7, 127, -128, 255, 256, 1000, -1000, 65535, 65536,
+      0x7FFFFFFFLL, -0x80000000LL, 0xFFFFFFFFLL, 0x100000000LL,
+      0x123456789ABCDEFLL, -0x123456789ABCDEFLL, INT64_MAX, INT64_MIN, -1LL /*u64 max*/,
+  };
+  const int kNumInt = sizeof(kInt) / sizeof(kInt[0]);
+  const uint8_t RN = 5, RD = 6;
+  const uint64_t kSentX = 0xCAFEF00DDEADBEEFULL;
+  const uint64_t kSentVlo = 0x1122334455667788ULL, kSentVhi = 0x99AABBCCDDEEFF00ULL;
+
+  // (rmode, opcode) pairs the decoder maps; we just sweep all and let the JIT
+  // decline what it can't translate.
+  int jit_accepted = 0, compared = 0, failures = 0;
+  std::vector<std::string> sigs;
+  auto sig_seen = [&](const std::string& s) {
+    for (const auto& e : sigs) if (e == s) return true;
+    sigs.push_back(s);
+    return false;
+  };
+
+  for (uint8_t sf = 0; sf <= 1; sf++) {
+    for (uint8_t ftype = 0; ftype <= 1; ftype++) {       // 00=S, 01=D
+      for (uint8_t rmode = 0; rmode < 4; rmode++) {
+        for (uint8_t opcode = 0; opcode < 8; opcode++) {
+          uint32_t code[1] = {enc(sf, ftype, rmode, opcode, RN, RD)};
+          GuestAddr start = ToGuestAddr(&code[0]);
+          GuestAddr code_end = start + 4;
+          MachineCode mc;
+          auto [ok, stop] = TryLiteTranslateRegion(
+              start, &mc,
+              LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+          if (!ok || stop != code_end) continue;
+          jit_accepted++;
+          HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+
+          // Number of input rows: max of FP and int sets so both directions get
+          // good coverage; index each with modulo.
+          const int rows = (kNumFp > kNumInt ? kNumFp : kNumInt);
+          for (int r = 0; r < rows; r++) {
+            const double fv = kFp[r % kNumFp];
+            const int64_t iv = kInt[r % kNumInt];
+            // Build the V[RN] source: float bits for ftype=S, double for D.
+            uint64_t vlo;
+            if (ftype == 0) {
+              float f = static_cast<float>(fv);
+              uint32_t fb;
+              memcpy(&fb, &f, 4);
+              vlo = fb;  // upper 32 zero
+            } else {
+              memcpy(&vlo, &fv, 8);
+            }
+
+            auto setup = [&]() {
+              for (int i = 0; i < 31; i++) state_.cpu.x[i] = kSentX;
+              for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+              state_.cpu.x[RN] = static_cast<uint64_t>(iv);
+              memcpy(&state_.cpu.v[RN], &vlo, 8);
+              uint64_t sv[2] = {kSentVlo, kSentVhi};
+              memcpy(&state_.cpu.v[RD], sv, 16);
+              state_.cpu.x[RD] = kSentX;
+              state_.cpu.insn_addr = start;
+            };
+
+            setup();
+            TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+            uint64_t jit_xd = state_.cpu.x[RD];
+            unsigned __int128 jit_vd;
+            memcpy(&jit_vd, &state_.cpu.v[RD], 16);
+
+            setup();
+            InterpretInsn(&state_);
+            uint64_t interp_xd = state_.cpu.x[RD];
+            unsigned __int128 interp_vd;
+            memcpy(&interp_vd, &state_.cpu.v[RD], 16);
+
+            compared++;
+            if (jit_xd != interp_xd || jit_vd != interp_vd) {
+              failures++;
+              char key[80];
+              snprintf(key, sizeof(key), "sf=%d ftype=%d rmode=%d opcode=%d", (int)sf,
+                       (int)ftype, (int)rmode, (int)opcode);
+              if (!sig_seen(key)) {
+                ADD_FAILURE()
+                    << "DIVERGE " << key << " (insn=0x" << std::hex << code[0]
+                    << std::dec << " row=" << r << " fv=" << fv << " iv=0x" << std::hex
+                    << (uint64_t)iv << " | Xd JIT=0x" << jit_xd << " INTERP=0x" << interp_xd
+                    << " | Vd JIT=0x" << (uint64_t)(jit_vd >> 64) << ":" << (uint64_t)jit_vd
+                    << " INTERP=0x" << (uint64_t)(interp_vd >> 64) << ":"
+                    << (uint64_t)interp_vd << std::dec << ")";
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_GT(jit_accepted, 20) << "JIT accepted too few FpIntConversion encodings";
+  EXPECT_GT(compared, 200);
+  if (failures == 0) {
+    printf("FpIntConversionDifferential: %d encodings JIT-accepted, %d pairs, ALL MATCH\n",
+           jit_accepted, compared);
+  }
+}
+
+// Multi-instruction register-mapping differential for scalar FP<->integer
+// conversions.  FpIntConversion uses GetReg/SetReg to read/write mapped guest
+// x-registers; a handler that destructively touched a MAPPED source register
+// would corrupt it for the rest of the region (the CCMN reg-clobber class),
+// invisible to a single-instruction test that never re-reads the clobbered
+// register.  This interleaves FCVTZS/SCVTF/FMOV/FCVTNS/etc. with GP-ALU ops over
+// x0..x7 (forcing GP mapping + spill), runs JIT vs interpreter from identical
+// state, and diffs every x and v register to guard against such a clobber.
+TEST_F(Arm64LiteTranslateRegionTest, FpIntConversionRegMapDifferentialFuzz) {
+  uint64_t seed = 0x9E3779B97F4A7C15ULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  auto encFpInt = [](bool sf, uint8_t ftype, uint8_t rmode, uint8_t opcode, uint8_t rn,
+                     uint8_t rd) -> uint32_t {
+    return (static_cast<uint32_t>(sf) << 31) | (0b11110u << 24) |
+           (static_cast<uint32_t>(ftype) << 22) | (1u << 21) |
+           (static_cast<uint32_t>(rmode) << 19) | (static_cast<uint32_t>(opcode) << 16) |
+           (static_cast<uint32_t>(rn) << 5) | rd;
+  };
+  // (sf, ftype, rmode, opcode) templates the JIT translates.
+  struct FpIntTmpl { uint8_t sf, ftype, rmode, opcode; };
+  const FpIntTmpl kFpInt[] = {
+      {0, 0, 3, 0}, {1, 1, 3, 0},  // FCVTZS Wd,Sn / Xd,Dn
+      {0, 0, 3, 1}, {1, 1, 3, 1},  // FCVTZU Wd,Sn / Xd,Dn
+      {0, 0, 0, 2}, {1, 1, 0, 2},  // SCVTF  Sd,Wn / Dd,Xn
+      {0, 0, 0, 3}, {1, 1, 0, 3},  // UCVTF  Sd,Wn / Dd,Xn
+      {0, 0, 0, 6}, {0, 0, 0, 7},  // FMOV   Wd,Sn / Sd,Wn
+      {1, 1, 0, 6}, {1, 1, 0, 7},  // FMOV   Xd,Dn / Dd,Xn
+      {0, 0, 0, 0}, {1, 1, 0, 0},  // FCVTNS Wd,Sn / Xd,Dn
+      {0, 0, 1, 0}, {1, 1, 2, 0},  // FCVTPS Wd,Sn / FCVTMS Xd,Dn
+      {0, 0, 0, 4}, {1, 1, 0, 4},  // FCVTAS Wd,Sn / Xd,Dn
+      {0, 0, 3, 0},                // pad
+  };
+  const int kNumFpInt = sizeof(kFpInt) / sizeof(kFpInt[0]);
+  // GP-ALU 3-register ops (base encodings with rd/rn/rm = 0).
+  const uint32_t kAlu[] = {
+      0x8B000000,  // add  Xd, Xn, Xm
+      0xCB000000,  // sub  Xd, Xn, Xm
+      0xAA000000,  // orr  Xd, Xn, Xm
+      0x8A000000,  // and  Xd, Xn, Xm
+      0xCA000000,  // eor  Xd, Xn, Xm
+      0x0B000000,  // add  Wd, Wn, Wm
+      0x4B000000,  // sub  Wd, Wn, Wm
+  };
+  const int kNumAlu = sizeof(kAlu) / sizeof(kAlu[0]);
+  const uint8_t kMaxReg = 8;  // x0..x7 / v0..v7 -> force mapping + spill
+
+  auto gen = [&]() -> uint32_t {
+    uint8_t rd = rnd() % kMaxReg, rn = rnd() % kMaxReg;
+    if (rnd() % 2 == 0) {
+      const FpIntTmpl& t = kFpInt[rnd() % kNumFpInt];
+      return encFpInt(t.sf, t.ftype, t.rmode, t.opcode, rn, rd);
+    }
+    uint8_t rm = rnd() % kMaxReg;
+    return (kAlu[rnd() % kNumAlu] & ~0x1F03FFu) | (static_cast<uint32_t>(rm) << 16) |
+           (static_cast<uint32_t>(rn) << 5) | rd;
+  };
+
+  int regions_run = 0;
+  for (int iter = 0; iter < 12000; iter++) {
+    const int n = 3 + static_cast<int>(rnd() % 7);
+    static uint32_t code[16];
+    for (int i = 0; i < n; i++) code[i] = gen();
+    uint64_t initx[8];
+    uint64_t initv[8][2];
+    for (int i = 0; i < 8; i++) {
+      initx[i] = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+      // FP-ish lane values that stay mostly in-range for the conversions.
+      initv[i][0] = ((rnd() & 0xffffULL) << 16) | 0x40000000ULL;
+      initv[i][1] = 0;
+    }
+    GuestAddr start = ToGuestAddr(&code[0]);
+    GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
+
+    auto setup = [&]() {
+      for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+      for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+      for (int i = 0; i < 8; i++) {
+        state_.cpu.x[i] = initx[i];
+        memcpy(&state_.cpu.v[i], initv[i], 16);
+      }
+      state_.cpu.insn_addr = start;
+    };
+
+    setup();
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+    if (!ok || stop > code_end || stop == start) continue;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    setup();
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    uint64_t jit_x[31];
+    unsigned __int128 jit_v[32];
+    for (int i = 0; i < 31; i++) jit_x[i] = state_.cpu.x[i];
+    for (int i = 0; i < 32; i++) memcpy(&jit_v[i], &state_.cpu.v[i], 16);
+
+    setup();
+    int guard = 0;
+    while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < stop && guard++ < 64)
+      InterpretInsn(&state_);
+    regions_run++;
+
+    bool diverged = false;
+    for (int i = 0; i < 31 && !diverged; i++) {
+      if (jit_x[i] != state_.cpu.x[i]) {
+        std::string dis;
+        for (int j = 0; j < n; j++) { char b[16]; snprintf(b, sizeof(b), " %08x", code[j]); dis += b; }
+        ADD_FAILURE() << "iter " << iter << " diverged at x" << i << ": JIT=0x" << std::hex
+                      << jit_x[i] << " INTERP=0x" << state_.cpu.x[i] << std::dec
+                      << " region:" << dis;
+        diverged = true;
+      }
+    }
+    for (int i = 0; i < 32 && !diverged; i++) {
+      unsigned __int128 iv;
+      memcpy(&iv, &state_.cpu.v[i], 16);
+      if (jit_v[i] != iv) {
+        std::string dis;
+        for (int j = 0; j < n; j++) { char b[16]; snprintf(b, sizeof(b), " %08x", code[j]); dis += b; }
+        ADD_FAILURE() << "iter " << iter << " diverged at v" << i << ": JIT=0x" << std::hex
+                      << (uint64_t)(jit_v[i] >> 64) << ":" << (uint64_t)jit_v[i] << " INTERP=0x"
+                      << (uint64_t)(iv >> 64) << ":" << (uint64_t)iv << std::dec
+                      << " region:" << dis;
+        diverged = true;
+      }
+    }
+    if (diverged) break;
+  }
+  EXPECT_GT(regions_run, 2000) << "fuzzer translated too few regions to be meaningful";
+}
+
 // Memory-backed NEON structured load/store (LD1-4 / ST1-4) differential fuzzer.
 // Skia's A8 glyph blitter de/interleaves coverage and channels with LD2/LD4/ST4
 // in a post-indexed loop (`ld4 {...},[ptr],#stride`); a wrong de-interleave lane
