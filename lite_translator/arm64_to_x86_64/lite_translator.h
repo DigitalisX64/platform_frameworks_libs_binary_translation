@@ -22558,7 +22558,6 @@ class LiteTranslator {
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
-        SimdRegister xzero = AllocTempSimdReg();
         Register gp_int = AllocTempReg();
         Register gp_scale = AllocTempReg();
         Register low_bit = no_register;
@@ -22566,15 +22565,15 @@ class LiteTranslator {
           low_bit = AllocTempReg();
         }
         if (xmm == no_simd_register || xscale == no_simd_register ||
-            xzero == no_simd_register || gp_int == no_register ||
-            gp_scale == no_register ||
+            gp_int == no_register || gp_scale == no_register ||
             (is_double && is_unsigned && low_bit == no_register)) {
           success_ = false; return;
         }
 
-        // Zero Vd up front: clears unused lanes and Vd[127:esize*elems].
-        as_.Pxor(xzero, xzero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        // NB: do NOT pre-zero Vd here.  For the in-place forms (rd == rn)
+        // a Movdqu zero of Vd would clobber the Vn source before the
+        // per-lane loads below; the unused high bytes are zeroed AFTER the
+        // loop instead (the loop never reads Vn beyond esize*num_elements).
 
         // 2^-fbits scale (exact power of two: just an exponent bias),
         // computed once and reused across lanes.
@@ -22641,7 +22640,7 @@ class LiteTranslator {
           } else {
             as_.Mulss(xmm, xscale);
           }
-          // Store this lane (bounce xmm → GP → memory; Vd already zeroed).
+          // Store this lane (bounce xmm → GP → memory).
           if (is_double) {
             as_.Movq(gp_int, xmm);
             as_.Movq({.base = Assembler::rbp, .disp = soff}, gp_int);
@@ -22649,6 +22648,16 @@ class LiteTranslator {
             as_.Movd(gp_int, xmm);
             as_.Movl({.base = Assembler::rbp, .disp = soff}, gp_int);
           }
+        }
+        // Zero Vd[127:esize*num_elements] now that every Vn lane has been
+        // read (in-place-safe: never touches a not-yet-consumed Vn lane).
+        const int used_bytes = esize_bytes * num_elements;
+        if (used_bytes < 16) {
+          as_.Xorl(gp_int, gp_int);
+          if (used_bytes == 4) {
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off + 4}, gp_int);
+          }
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, gp_int);
         }
         return;
       }
@@ -22683,19 +22692,17 @@ class LiteTranslator {
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
-        SimdRegister xzero = AllocTempSimdReg();
         Register tmp = AllocTempReg();
         Register sign_tmp = AllocTempReg();
         Register gp_scale = AllocTempReg();
         if (xmm == no_simd_register || xscale == no_simd_register ||
-            xzero == no_simd_register || tmp == no_register ||
-            sign_tmp == no_register || gp_scale == no_register) {
+            tmp == no_register || sign_tmp == no_register ||
+            gp_scale == no_register) {
           success_ = false; return;
         }
 
-        // Zero Vd up front (clears unused lanes / Vd[127:esize*elems]).
-        as_.Pxor(xzero, xzero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        // NB: do NOT pre-zero Vd (would clobber Vn for the in-place rd==rn
+        // forms); the unused high bytes are zeroed after the loop.
 
         // 2^+fbits scale (exact power of two), computed once.  NaN
         // propagates through MULSS/MULSD (NaN*x=NaN); ±inf stays ±inf.
@@ -22762,6 +22769,15 @@ class LiteTranslator {
             as_.Movl({.base = Assembler::rbp, .disp = soff}, tmp);
           }
         }
+        // In-place-safe upper-zero of Vd[127:esize*num_elements].
+        const int used_bytes = esize_bytes * num_elements;
+        if (used_bytes < 16) {
+          as_.Xorl(tmp, tmp);
+          if (used_bytes == 4) {
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off + 4}, tmp);
+          }
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, tmp);
+        }
         return;
       }
       // AdvSimdScalarShiftByImm JIT — FCVTZU (FP →
@@ -22794,7 +22810,6 @@ class LiteTranslator {
 
         SimdRegister xmm = AllocTempSimdReg();
         SimdRegister xscale = AllocTempSimdReg();
-        SimdRegister xzero = AllocTempSimdReg();
         Register tmp = AllocTempReg();
         Register sign_tmp = AllocTempReg();
         Register gp_scale = AllocTempReg();
@@ -22805,16 +22820,15 @@ class LiteTranslator {
           bound2_xmm = AllocTempSimdReg();
         }
         if (xmm == no_simd_register || xscale == no_simd_register ||
-            xzero == no_simd_register || tmp == no_register ||
-            sign_tmp == no_register || gp_scale == no_register ||
+            tmp == no_register || sign_tmp == no_register ||
+            gp_scale == no_register ||
             (is_double && (bound_xmm == no_simd_register ||
                            bound2_xmm == no_simd_register))) {
           success_ = false; return;
         }
 
-        // Zero Vd up front (clears unused lanes / Vd[127:esize*elems]).
-        as_.Pxor(xzero, xzero);
-        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xzero);
+        // NB: do NOT pre-zero Vd (would clobber Vn for the in-place rd==rn
+        // forms); the unused high bytes are zeroed after the loop.
 
         // 2^+fbits scale (exact power of two) and the .D classification
         // bounds (2^63, 2^64), all computed once and reused across lanes.
@@ -22914,6 +22928,15 @@ class LiteTranslator {
           } else {
             as_.Movl({.base = Assembler::rbp, .disp = soff}, tmp);
           }
+        }
+        // In-place-safe upper-zero of Vd[127:esize*num_elements].
+        const int used_bytes = esize_bytes * num_elements;
+        if (used_bytes < 16) {
+          as_.Xorl(tmp, tmp);
+          if (used_bytes == 4) {
+            as_.Movl({.base = Assembler::rbp, .disp = vd_off + 4}, tmp);
+          }
+          as_.Movq({.base = Assembler::rbp, .disp = vd_off + 8}, tmp);
         }
         return;
       }
