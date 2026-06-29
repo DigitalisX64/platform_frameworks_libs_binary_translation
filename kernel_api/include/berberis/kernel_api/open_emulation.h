@@ -25,7 +25,9 @@
 // #include <sys/stat.h>
 #include <sys/types.h>
 
+// region digitalis
 #include <string>
+// endregion
 
 namespace berberis {
 
@@ -40,6 +42,7 @@ void CloseEmulatedProcSelfMapsFileDescriptor(int fd);
 
 extern const char* kGuestCpuinfoPath;
 
+// region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 // Builds a synthetic guest /proc/cpuinfo for `num_cpus` online CPUs, in the
 // ARM64 field layout the guest's cpuinfo library expects. Defined in the
@@ -48,6 +51,7 @@ extern const char* kGuestCpuinfoPath;
 // kGuestCpuinfoPath file, so the reported core count tracks the real device.
 std::string FormatGuestCpuinfo(int num_cpus);
 #endif
+// endregion digitalis
 
 }  // namespace berberis
 

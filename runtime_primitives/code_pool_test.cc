@@ -21,11 +21,15 @@
 #include <cstddef>
 #include <string_view>
 
+// region digitalis
 #include <sys/wait.h>
 #include <unistd.h>
+// endregion
 
 #include "berberis/base/bit_util.h"
+// region digitalis
 #include "berberis/base/mmap.h"
+// endregion
 #include "berberis/runtime_primitives/code_pool.h"
 
 namespace berberis {
@@ -110,6 +114,7 @@ TEST(CodePool, Smoke) {
   }
 }
 
+// region digitalis
 // Counts Create() calls (no gmock, so it survives fork's copy-on-write static
 // state) and hands out a fresh distinct exec/write region pair each time.
 class CountingExecRegionFactory {
@@ -186,6 +191,7 @@ TEST(CodePool, ForkResetsExecRegion) {
   ASSERT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 0);
 }
+// endregion
 
 TEST(DataPool, Smoke) {
   DataPool data_pool;
