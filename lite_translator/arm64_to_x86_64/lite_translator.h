@@ -1149,6 +1149,16 @@ class LiteTranslator {
         Assembler::Label* done = as_.MakeLabel();
         as_.Subq(Assembler::rsp, 8);
         as_.Movq({.base = Assembler::rsp}, Assembler::rdx);  // save rdx (clobbered by DIV)
+        // If src2 is rdx, save rcx and (below) use it as the divisor, since rdx
+        // is clobbered by the upcoming Xorl. The rcx SAVE must happen BEFORE the
+        // divide-by-zero branch so the stack stays balanced on the zero path
+        // too: the `done` block always restores rcx when src2==rdx, so a save
+        // that only ran on the non-zero path would leave the zero path popping a
+        // phantom slot (corrupting rcx/rdx and unbalancing rsp).
+        if (src2 == Assembler::rdx) {
+          as_.Subq(Assembler::rsp, 8);
+          as_.Movq({.base = Assembler::rsp}, Assembler::rcx);  // save rcx
+        }
         if (is_64bit) {
           as_.Testq(src2, src2);
         } else {
@@ -1156,12 +1166,10 @@ class LiteTranslator {
         }
         as_.Jcc(Condition::kEqual, *zero);
         // DIV uses RDX:RAX / divisor → quotient in RAX.
-        // Move src1 to rax BEFORE clearing rdx (src1 might be rdx).
+        // Move src1 to rax BEFORE clobbering rcx/rdx (src1 might be rcx or rdx).
         as_.Movq(Assembler::rax, src1);
-        // If src2 is rdx, save rcx (now in pool) then use it as temp for divisor.
+        // Now that src1 is safely in rax, copy the divisor out of rdx into rcx.
         if (src2 == Assembler::rdx) {
-          as_.Subq(Assembler::rsp, 8);
-          as_.Movq({.base = Assembler::rsp}, Assembler::rcx);  // save rcx
           as_.Movq(Assembler::rcx, Assembler::rdx);
         }
         as_.Xorl(Assembler::rdx, Assembler::rdx);
@@ -1198,6 +1206,16 @@ class LiteTranslator {
         Assembler::Label* done = as_.MakeLabel();
         as_.Subq(Assembler::rsp, 8);
         as_.Movq({.base = Assembler::rsp}, Assembler::rdx);  // save rdx (clobbered by CQO/IDIV)
+        // If src2 is rdx, save rcx and (in do_div) use it as the divisor, since
+        // rdx is clobbered by CQO. The rcx SAVE must happen BEFORE the zero and
+        // src2==-1 branches so the stack stays balanced on those paths too: the
+        // `done` block always restores rcx when src2==rdx, so a save that only
+        // ran on the do_div path would leave the zero / -1 paths popping a
+        // phantom slot (corrupting rcx/rdx and unbalancing rsp).
+        if (src2 == Assembler::rdx) {
+          as_.Subq(Assembler::rsp, 8);
+          as_.Movq({.base = Assembler::rsp}, Assembler::rcx);  // save rcx
+        }
         if (is_64bit) {
           as_.Testq(src2, src2);
         } else {
@@ -1223,12 +1241,11 @@ class LiteTranslator {
         as_.Jmp(*done);
         as_.Bind(do_div);
         // Sign-extend src1 into RDX:RAX for IDIV.
-        // Move src1 to rax BEFORE CQO/CDQ clobbers rdx (src1 might be rdx).
+        // Move src1 to rax BEFORE clobbering rcx/rdx (src1 might be rcx or rdx).
         as_.Movq(Assembler::rax, src1);
-        // If src2 is rdx, save rcx (now in pool) then use it as temp for divisor.
+        // Now that src1 is safely in rax, copy the divisor out of rdx into rcx
+        // (rcx was already saved above before the branches).
         if (src2 == Assembler::rdx) {
-          as_.Subq(Assembler::rsp, 8);
-          as_.Movq({.base = Assembler::rsp}, Assembler::rcx);  // save rcx
           as_.Movq(Assembler::rcx, Assembler::rdx);
         }
         if (is_64bit) {
