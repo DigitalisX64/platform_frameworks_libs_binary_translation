@@ -24,7 +24,9 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+// region digitalis
 #include <string>
+// endregion
 #include <utility>
 
 #include "berberis/base/arena_alloc.h"
@@ -240,6 +242,7 @@ const char* TryTranslateProcCpuinfoPath(const char* path, int flags) {
   return nullptr;
 }
 
+// region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 // Serve a guest /proc/cpuinfo synthesized from the real online CPU count out of
 // a memfd, instead of opening the static kGuestCpuinfoPath file. This keeps the
@@ -262,6 +265,7 @@ int OpenatProcCpuinfoForGuest(int dirfd, int flags, mode_t mode) {
   return mem_fd;
 }
 #endif
+// endregion
 
 }  // namespace
 
@@ -341,7 +345,6 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
     real_path = TryRedirectNdkLibcxxLinkerScript(path);
   }
 #endif
-  // endregion
 
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   // For the arm64 guest, synthesize /proc/cpuinfo from the real online CPU
@@ -351,6 +354,7 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
     return OpenatProcCpuinfoForGuest(dirfd, host_flags, mode);
   }
 #endif
+  // endregion
 
   return openat(dirfd, real_path != nullptr ? real_path : path, host_flags, mode);
 }

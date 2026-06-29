@@ -125,10 +125,12 @@ filegroup {
     srcs: ["riscv64_to_x86_64/machine_ir_intrinsic_binding.json"],
 }
 
+// region digitalis
 filegroup {
     name: "libberberis_machine_ir_intrinsic_binding_arm64_to_x86_64",
     srcs: ["arm64_to_x86_64/machine_ir_intrinsic_binding.json"],
 }
+// endregion
 
 filegroup {
     name: "libberberis_macro_assembler_gen_inputs_all_to_x86_32_or_x86_64",

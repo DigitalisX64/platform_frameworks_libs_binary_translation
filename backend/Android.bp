@@ -45,6 +45,7 @@ filegroup {
     ],
 }
 
+// region digitalis
 filegroup {
     name: "libberberis_backend_gen_inputs_arm64_to_x86_64",
     srcs: [
@@ -54,6 +55,7 @@ filegroup {
         ":libberberis_macro_assembler_gen_inputs_all_to_x86_64",
     ],
 }
+// endregion
 
 genrule_defaults {
     name: "berberis_backend_machine_ir_gen_headers_x86_64_defaults",
@@ -86,11 +88,13 @@ genrule {
     srcs: [":libberberis_backend_gen_inputs_riscv64_to_x86_64"],
 }
 
+// region digitalis
 genrule {
     name: "libberberis_backend_machine_ir_gen_headers_arm64_to_x86_64",
     defaults: ["berberis_backend_machine_ir_gen_headers_x86_64_defaults"],
     srcs: [":libberberis_backend_gen_inputs_arm64_to_x86_64"],
 }
+// endregion
 
 genrule_defaults {
     name: "libberberis_backend_machine_ir_gen_sources_x86_64_defaults",
@@ -150,6 +154,7 @@ cc_library_headers {
     export_generated_headers: ["libberberis_backend_machine_ir_gen_headers_riscv64_to_x86_64"],
 }
 
+// region digitalis
 cc_library_headers {
     name: "libberberis_backend_headers_arm64_to_x86_64",
     defaults: ["berberis_defaults_64"],
@@ -172,6 +177,7 @@ cc_library_headers {
     generated_headers: ["libberberis_backend_machine_ir_gen_headers_arm64_to_x86_64"],
     export_generated_headers: ["libberberis_backend_machine_ir_gen_headers_arm64_to_x86_64"],
 }
+// endregion
 
 filegroup {
     name: "berberis_backend_srcs",
@@ -222,6 +228,7 @@ cc_library_static {
     ],
 }
 
+// region digitalis
 cc_library_static {
     name: "libberberis_backend_arm64_to_x86_64",
     defaults: [
@@ -233,6 +240,7 @@ cc_library_static {
         "libberberis_backend_headers_arm64_to_x86_64",
     ],
 }
+// endregion
 
 cc_library_headers {
     name: "libberberis_backend_testing_x86_64_headers",

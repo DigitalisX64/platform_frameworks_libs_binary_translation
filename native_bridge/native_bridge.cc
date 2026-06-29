@@ -981,11 +981,11 @@ bool native_bridge_initAnonymousNamespace(const char* public_ns_sonames,
   LOG_NB("native_bridge_initAnonymousNamespace(public_ns_sonames=%s, anon_ns_library_path=%s)",
          public_ns_sonames,
          anon_ns_library_path);
-  bool result = g_ndkt_native_bridge.InitAnonymousNamespace(public_ns_sonames, anon_ns_library_path);
   // region digitalis
+  bool result = g_ndkt_native_bridge.InitAnonymousNamespace(public_ns_sonames, anon_ns_library_path);
   DIGITALIS_LOG("initAnonymousNamespace: result=%d", result);
-  // endregion
   return result;
+  // endregion
 }
 
 native_bridge_namespace_t* native_bridge_createNamespace(const char* name,
@@ -1027,11 +1027,11 @@ bool native_bridge_linkNamespaces(native_bridge_namespace_t* from,
          to,
          shared_libs_sonames);
 
-  bool result = g_ndkt_native_bridge.LinkNamespaces(from, to, shared_libs_sonames);
   // region digitalis
+  bool result = g_ndkt_native_bridge.LinkNamespaces(from, to, shared_libs_sonames);
   DIGITALIS_LOG("linkNamespaces: result=%d", result);
-  // endregion
   return result;
+  // endregion
 }
 
 void* native_bridge_loadLibraryExt(const char* libpath, int flag, native_bridge_namespace_t* ns) {
@@ -1042,12 +1042,12 @@ void* native_bridge_loadLibraryExt(const char* libpath, int flag, native_bridge_
   // endregion
   LOG_NB("native_bridge_loadLibraryExt(path=%s)", libpath);
 
-  void* result = g_ndkt_native_bridge.LoadLibrary(libpath, flag, ns);
   // region digitalis
+  void* result = g_ndkt_native_bridge.LoadLibrary(libpath, flag, ns);
   DIGITALIS_LOG("loadLibraryExt: result=%p dlerror=%s", result,
                 result ? "ok" : (g_ndkt_native_bridge.DlError() ? g_ndkt_native_bridge.DlError() : "(null)"));
-  // endregion
   return result;
+  // endregion
 }
 
 native_bridge_namespace_t* native_bridge_getVendorNamespace() {
@@ -1058,13 +1058,13 @@ native_bridge_namespace_t* native_bridge_getVendorNamespace() {
 
 native_bridge_namespace_t* native_bridge_getExportedNamespace(const char* name) {
   LOG_NB("native_bridge_getExportedNamespace(name=%s)", name);
-  auto* result = g_ndkt_native_bridge.GetExportedNamespace(name);
   // region digitalis
+  auto* result = g_ndkt_native_bridge.GetExportedNamespace(name);
   DIGITALIS_LOG("getExportedNamespace: name=%s result=%p guest=%p",
                 name ? name : "(null)",
                 result, result ? result->guest_namespace : nullptr);
-  // endregion
   return result;
+  // endregion
 }
 
 void native_bridge_preZygoteFork() {

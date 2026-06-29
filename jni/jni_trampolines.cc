@@ -573,9 +573,11 @@ JavaVM* ToHostJavaVM(GuestType<JavaVM*> guest_java_vm) {
   return ToHostAddr(guest_java_vm);
 }
 
+// region digitalis
 JavaVM* GetHostJavaVM() {
   return g_host_java_vm;
 }
+// endregion
 
 namespace {
 

@@ -17,7 +17,9 @@
 #ifndef BERBERIS_RUNTIME_PRIMITIVES_CODE_POOL_H_
 #define BERBERIS_RUNTIME_PRIMITIVES_CODE_POOL_H_
 
+// region digitalis
 #include <unistd.h>
+// endregion
 
 #include <cstdint>
 #include <mutex>
@@ -46,7 +48,9 @@ class CodePool {
       : exec_(ExecRegionFactory::Create(ExecRegionFactory::kExecRegionSize)),
         current_address_{exec_.begin()},
         detached_size_{0},
+        // region digitalis
         owner_pid_{getpid()} {};
+        // endregion
 
   // Not copyable or movable
   CodePool(const CodePool&) = delete;
@@ -57,6 +61,7 @@ class CodePool {
   [[nodiscard]] HostCodeAddr Add(MachineCode* code) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // region digitalis
     // Fork safety. The executable region is a MAP_SHARED memfd, so it is shared
     // with every process forked from this one. The guest-clone path resets exec
     // regions in the child (ResetCurrentGuestThreadAfterFork -> ResetAllExecRegions),
@@ -76,6 +81,7 @@ class CodePool {
       ResetExecRegion();
       owner_pid_ = cur_pid;
     }
+    // endregion
 
     uint32_t size = code->install_size();
 
@@ -129,9 +135,11 @@ class CodePool {
   RecoveryMap recovery_map_;
   mutable std::mutex mutex_;
   size_t detached_size_;
+  // region digitalis
   // The pid that owns the current exec region. A mismatch on Add() means this
   // process forked since the region was created; see the fork-safety note there.
   pid_t owner_pid_;
+  // endregion
 };
 
 // Stored data for generated code.
