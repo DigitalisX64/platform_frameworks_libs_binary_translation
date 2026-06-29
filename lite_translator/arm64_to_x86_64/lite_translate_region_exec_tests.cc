@@ -2988,7 +2988,12 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdShiftByImmDifferential) {
       for (uint8_t q = 0; q <= 1; q++) {
         for (uint8_t immh = 1; immh < 16; immh++) {
           for (uint8_t immb = 0; immb < 8; immb++) {
-            uint32_t code[1] = {enc(q, u, immh, immb, opcode, /*rn=*/1, /*rd=*/0)};
+            // inplace=1 exercises rd == rn: a handler that pre-zeros Vd would
+            // clobber the Vn source before reading it (the bug that escaped the
+            // rd != rn sweep).  rn is always 1; rd is 0 (separate) or 1 (in-place).
+            for (int inplace = 0; inplace <= 1; inplace++) {
+            const uint8_t rd = inplace ? 1 : 0;
+            uint32_t code[1] = {enc(q, u, immh, immb, opcode, /*rn=*/1, rd)};
             GuestAddr start = ToGuestAddr(&code[0]);
             GuestAddr code_end = start + 4;
 
@@ -3006,27 +3011,27 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdShiftByImmDifferential) {
               for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
               memcpy(&state_.cpu.v[1], kInputs[in], 16);
               uint64_t sent[2] = {kSentinelLo, kSentinelHi};
-              memcpy(&state_.cpu.v[0], sent, 16);
+              if (!inplace) memcpy(&state_.cpu.v[0], sent, 16);
               state_.cpu.insn_addr = start;
               TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
               unsigned __int128 jit_vd;
-              memcpy(&jit_vd, &state_.cpu.v[0], 16);
+              memcpy(&jit_vd, &state_.cpu.v[rd], 16);
 
               // Interpreter run, identical start state.
               for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
               memcpy(&state_.cpu.v[1], kInputs[in], 16);
-              memcpy(&state_.cpu.v[0], sent, 16);
+              if (!inplace) memcpy(&state_.cpu.v[0], sent, 16);
               state_.cpu.insn_addr = start;
               InterpretInsn(&state_);
               unsigned __int128 interp_vd;
-              memcpy(&interp_vd, &state_.cpu.v[0], 16);
+              memcpy(&interp_vd, &state_.cpu.v[rd], 16);
 
               compared++;
               if (jit_vd != interp_vd) {
                 failures++;
                 char key[64];
-                snprintf(key, sizeof(key), "opcode=%d U=%d Q=%d immh=%d", (int)opcode,
-                         (int)u, (int)q, (int)immh);
+                snprintf(key, sizeof(key), "opcode=%d U=%d Q=%d immh=%d inplace=%d", (int)opcode,
+                         (int)u, (int)q, (int)immh, inplace);
                 if (!sig_seen(key)) {
                   ADD_FAILURE()
                       << "DIVERGE " << key << " (e.g. insn=0x" << std::hex << code[0]
@@ -3038,6 +3043,7 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdShiftByImmDifferential) {
                 }
               }
             }
+            }  // inplace
           }
         }
       }
@@ -3321,6 +3327,188 @@ TEST_F(Arm64LiteTranslateRegionTest, FpIntConversionRegMapDifferentialFuzz) {
     if (diverged) break;
   }
   EXPECT_GT(regions_run, 2000) << "fuzzer translated too few regions to be meaningful";
+}
+
+// HIGH-REGISTER-PRESSURE mixed-region differential.  Helium's residual blank
+// diagonal glyphs (w/v/k/A/T) are a region-structural lite-JIT bug invisible to
+// the existing fuzzers because they use few guest registers (x0..x9) and so never
+// exhaust the 13-entry GP pool.  Large real glyph-rasterizer regions DO exhaust
+// it, forcing GetReg's spill-to-temp path, SIMD handlers' AllocTempReg under a
+// near-full pool, the Alloc()/AllocTemp() high-water (max_temp_regs_allocated)
+// reservation, and early region termination (IsGpRegPoolLow).  This interleaves
+// GP-ALU, NEON three-same, scalar FP arithmetic, FP<->int conversions, and vector
+// shift/fixed-point-conversion ops over x0..x18 / v0..v18 in long (up to 16-insn)
+// regions, runs JIT vs interpreter from identical state, and diffs every x and v
+// register, looking for a spill/pressure-triggered clobber.
+TEST_F(Arm64LiteTranslateRegionTest, HighPressureMixedRegionDifferentialFuzz) {
+  uint64_t seed = 0xD1CEC0DE5EED1234ULL;
+  auto rnd = [&]() -> uint64_t {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed >> 33;
+  };
+  const uint32_t R = 19;  // x0..x18 / v0..v18 -> blow past the 13-entry GP pool
+  // NEON three-same (Rd=0,Rn=1,Rm=2 base; reg fields masked & re-inserted).
+  const uint32_t kNeon3[] = {
+      0x4ea28420, 0x6ea28420, 0x4ea29c20, 0x4e208420, 0x4e608420, 0x4ee28420,
+      0x4e201c20, 0x4ea01c20, 0x6e201c20, 0x4ea29420 /*mla*/, 0x6ea29420 /*mls*/,
+      0x4ea26420 /*smax*/, 0x6ea26c20 /*umin*/, 0x4ea24420 /*sshl*/, 0x4ea23420 /*cmgt*/,
+  };
+  // Scalar FP arith (ftype S/D) FADD/FSUB/FMUL/FDIV (Rd=0,Rn=1,Rm=2 base).
+  const uint32_t kFpArith[] = {
+      0x1e202800, 0x1e203800, 0x1e200800, 0x1e201800,  // S: fadd/fsub/fmul/fdiv
+      0x1e602800, 0x1e603800, 0x1e600800, 0x1e601800,  // D
+  };
+  // Vector shift-imm incl. the just-fixed fixed-point conversions (Rd=0,Rn=1).
+  const uint32_t kVShift[] = {
+      0x4f2a5400 /*shl.4s #10*/, 0x6f2a0400 /*ushr.4s*/, 0x4f2a0400 /*sshr.4s*/,
+      0x4f25e400 /*scvtf.4s #fbits*/, 0x4f25fc00 /*fcvtzs.4s*/,
+      0x4f60e400 /*scvtf.2d*/, 0x6f60e400 /*ucvtf.2d*/,
+  };
+  // FpIntConversion templates (sf,ftype,rmode,opcode).
+  struct FI { uint8_t sf, ft, rm, op; };
+  const FI kFpInt[] = {
+      {0,0,3,0},{1,1,3,0},{0,0,3,1},{1,1,0,2},{0,0,0,2},{0,0,0,7},{0,0,0,6},
+      {1,1,0,7},{0,0,0,0},{1,1,2,0},{0,0,0,4},
+  };
+  auto encFI = [](FI t, uint8_t rn, uint8_t rd) -> uint32_t {
+    return (uint32_t(t.sf) << 31) | (0b11110u << 24) | (uint32_t(t.ft) << 22) |
+           (1u << 21) | (uint32_t(t.rm) << 19) | (uint32_t(t.op) << 16) |
+           (uint32_t(rn) << 5) | rd;
+  };
+  const uint32_t kAlu[] = {0x8B000000, 0xCB000000, 0x8A000000, 0xAA000000, 0xCA000000,
+                           0x0B000000, 0x4B000000, 0x9B007C00 /*mul*/};
+  auto gen = [&]() -> uint32_t {
+    uint8_t rd = rnd() % R, rn = rnd() % R, rm = rnd() % R;
+    switch (rnd() % 6) {
+      case 0: case 1: {  // GP-ALU 3-reg
+        uint32_t base = kAlu[rnd() % (sizeof(kAlu)/sizeof(kAlu[0]))];
+        return (base & ~0x1F03FFu) | (uint32_t(rm) << 16) | (uint32_t(rn) << 5) | rd;
+      }
+      case 2: {  // NEON three-same
+        uint32_t base = kNeon3[rnd() % (sizeof(kNeon3)/sizeof(kNeon3[0]))];
+        return (base & ~0x1F03FFu) | (uint32_t(rm) << 16) | (uint32_t(rn) << 5) | rd;
+      }
+      case 3: {  // scalar FP arith
+        uint32_t base = kFpArith[rnd() % (sizeof(kFpArith)/sizeof(kFpArith[0]))];
+        return (base & ~0x1F03E0u) | (uint32_t(rm) << 16) | (uint32_t(rn) << 5) | rd;
+      }
+      case 4: {  // vector shift / fixed-point conversion
+        uint32_t base = kVShift[rnd() % (sizeof(kVShift)/sizeof(kVShift[0]))];
+        return (base & ~0x3E0u & ~0x1Fu) | (uint32_t(rn) << 5) | rd;
+      }
+      default:  // FpIntConversion
+        return encFI(kFpInt[rnd() % (sizeof(kFpInt)/sizeof(kFpInt[0]))], rn, rd);
+    }
+  };
+
+  int regions_run = 0;
+  for (int iter = 0; iter < 20000; iter++) {
+    const int n = 4 + static_cast<int>(rnd() % 13);
+    static uint32_t code[20];
+    for (int i = 0; i < n; i++) code[i] = gen();
+    uint64_t initx[R];
+    uint64_t initv[R][2];
+    // Each 32-bit lane is a finite normal float (exp 0x7D, no NaN/Inf); viewed
+    // as a 64-bit double each pair is also finite (exp ~0x3e8).  This keeps the
+    // FP ops away from benign ARM-vs-x86 NaN-PAYLOAD differences (which are not
+    // a translator bug) while still exercising conversions and arithmetic.
+    auto lane = [&]() -> uint32_t { return 0x3e800000u | (uint32_t)(rnd() & 0x003fffffu); };
+    for (uint32_t i = 0; i < R; i++) {
+      initx[i] = ((rnd() & 0xffffffffULL) << 32) | (rnd() & 0xffffffffULL);
+      initv[i][0] = (uint64_t)lane() | ((uint64_t)lane() << 32);
+      initv[i][1] = (uint64_t)lane() | ((uint64_t)lane() << 32);
+    }
+    GuestAddr start = ToGuestAddr(&code[0]);
+    GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
+
+    auto setup = [&]() {
+      for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+      for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+      for (uint32_t i = 0; i < R; i++) {
+        state_.cpu.x[i] = initx[i];
+        memcpy(&state_.cpu.v[i], initv[i], 16);
+      }
+      state_.cpu.insn_addr = start;
+    };
+
+    setup();
+    MachineCode mc;
+    auto [ok, stop] = TryLiteTranslateRegion(
+        start, &mc, LiteTranslateParams{.end_pc = code_end, .allow_dispatch = false});
+    if (!ok || stop > code_end || stop == start) continue;
+    HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+    setup();
+    TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+    uint64_t jit_x[31];
+    unsigned __int128 jit_v[32];
+    for (int i = 0; i < 31; i++) jit_x[i] = state_.cpu.x[i];
+    for (int i = 0; i < 32; i++) memcpy(&jit_v[i], &state_.cpu.v[i], 16);
+
+    setup();
+    int guard = 0;
+    while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < stop && guard++ < 80)
+      InterpretInsn(&state_);
+    regions_run++;
+
+    int target = -1;  // 0..30 = x, 100+i = v
+    for (int i = 0; i < 31 && target < 0; i++)
+      if (jit_x[i] != state_.cpu.x[i]) target = i;
+    for (int i = 0; i < 32 && target < 0; i++) {
+      unsigned __int128 iv; memcpy(&iv, &state_.cpu.v[i], 16);
+      if (jit_v[i] != iv) target = 100 + i;
+    }
+    if (target < 0) continue;
+
+    // Delta-debug: greedily reduce the region to the minimal instruction set
+    // that still diverges at `target` (same inputs), to expose the root cause.
+    auto divergesAt = [&](const uint32_t* c, int m) -> bool {
+      GuestAddr s = ToGuestAddr(c);
+      GuestAddr e = s + static_cast<GuestAddr>(m) * 4;
+      auto init = [&]() {
+        for (int i = 0; i < 31; i++) state_.cpu.x[i] = 0;
+        for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+        for (uint32_t i = 0; i < R; i++) { state_.cpu.x[i] = initx[i]; memcpy(&state_.cpu.v[i], initv[i], 16); }
+        state_.cpu.insn_addr = s;
+      };
+      init();
+      MachineCode m2;
+      auto [ok2, stop2] = TryLiteTranslateRegion(
+          s, &m2, LiteTranslateParams{.end_pc = e, .allow_dispatch = false});
+      if (!ok2 || stop2 != e) return false;
+      HostCodeAddr hc2 = GetDefaultCodePoolInstance()->Add(&m2);
+      TestingRunGeneratedCode(&state_, AsHostCode(hc2), stop2);
+      uint64_t jx = 0; unsigned __int128 jv = 0;
+      if (target < 100) jx = state_.cpu.x[target]; else memcpy(&jv, &state_.cpu.v[target - 100], 16);
+      init();
+      int g = 0;
+      while (state_.cpu.insn_addr >= s && state_.cpu.insn_addr < stop2 && g++ < 80) InterpretInsn(&state_);
+      if (target < 100) return jx != state_.cpu.x[target];
+      unsigned __int128 iv; memcpy(&iv, &state_.cpu.v[target - 100], 16); return jv != iv;
+    };
+    static uint32_t cur[20]; int m = n;
+    for (int i = 0; i < n; i++) cur[i] = code[i];
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (int i = 0; i < m; i++) {
+        static uint32_t trial[20]; int tm = 0;
+        for (int j = 0; j < m; j++) if (j != i) trial[tm++] = cur[j];
+        if (tm > 0 && divergesAt(trial, tm)) {
+          for (int j = 0; j < tm; j++) cur[j] = trial[j];
+          m = tm; changed = true; break;
+        }
+      }
+    }
+    std::string dis, inx, inv;
+    for (int j = 0; j < m; j++) { char b[16]; snprintf(b, sizeof(b), " %08x", cur[j]); dis += b; }
+    for (uint32_t i = 0; i < R; i++) { char b[32]; snprintf(b, sizeof(b), " x%u=0x%llx", i, (unsigned long long)initx[i]); inx += b; }
+    for (uint32_t i = 0; i < R; i++) { char b[48]; snprintf(b, sizeof(b), " v%u=0x%llx:%llx", i, (unsigned long long)initv[i][1], (unsigned long long)initv[i][0]); inv += b; }
+    ADD_FAILURE() << "iter " << iter << " MINIMAL(" << m << ") diverged at "
+                  << (target < 100 ? "x" : "v") << (target < 100 ? target : target - 100)
+                  << " region:" << dis << "\n  initx:" << inx << "\n  initv:" << inv;
+    break;
+  }
+  EXPECT_GT(regions_run, 3000) << "fuzzer translated too few regions to be meaningful";
 }
 
 // Memory-backed NEON structured load/store (LD1-4 / ST1-4) differential fuzzer.
