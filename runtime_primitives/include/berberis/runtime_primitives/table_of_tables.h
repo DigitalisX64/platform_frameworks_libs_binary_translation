@@ -152,7 +152,20 @@ class TableOfTables {
   // Use a 16Mb memfd region to fill the main/default table.
   // Linux has a limited number of maps (sysctl vm.max_map_count).
   // A larger region size allows us to stay within the limit.
-  static constexpr size_t kMemfdRegionSize = 1 << 24;
+  // region digitalis - use a 64Mb region rather than the upstream 16Mb (kept
+  // commented below). Each memfd chunk is mapped at file offset 0, so chunks
+  // never coalesce -- every chunk is its own VMA. With sizeof(T)==4 a child
+  // table is 64Mb, so a 64Mb region makes each child table a single VMA (was
+  // four) and the 128Mb main table two (was eight): ~4x fewer maps for this
+  // structure, which matters inside a VMA-heavy translated host near
+  // vm.max_map_count (e.g. a Chromium GPU/renderer process). Cost: the shared
+  // default memfd commits one region of tmpfs, ~48Mb more RAM per translation
+  // cache; use 1 << 25 (32Mb, two VMAs/child) if RAM is tighter than map
+  // headroom. Reserved address space is unchanged, so this does not help
+  // against an RLIMIT_AS ceiling.
+  // static constexpr size_t kMemfdRegionSize = 1 << 24;
+  static constexpr size_t kMemfdRegionSize = 1 << 26;
+  // endregion
   static_assert(sizeof(Key) == 8);
 #elif !defined(BERBERIS_GUEST_LP64)
   static constexpr size_t kTableBits = 16;
