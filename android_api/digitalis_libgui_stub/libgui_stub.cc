@@ -40,9 +40,29 @@ struct ANativeWindow;
 namespace android {
 struct Surface {
   static int hook_perform(ANativeWindow* window, int operation, ...);
+  static int hook_query(const ANativeWindow* window, int what, int* value);
 };
 }  // namespace android
 
 int android::Surface::hook_perform(ANativeWindow* /*window*/, int /*operation*/, ...) {
+  return 0;
+}
+
+// android::Surface::hook_query(const ANativeWindow*, int what, int* value) — the
+// static implementation behind ANativeWindow's `query` hook (NATIVE_WINDOW_WIDTH/
+// HEIGHT/FORMAT/MIN_UNDEQUEUED_BUFFERS/... getters). Kuaishou's Kwai media player
+// (libAemonPlayer.so) resolves this host libgui symbol directly by parsing
+// /proc/self/maps + the ELF export table and calls it, so the guest `blr` lands in
+// host x86_64 code and traps in berberis_HandleNoExec. The host-call redirect then
+// reroutes it to this guest copy; before this stub exported the symbol the redirect
+// failed and the launch SIGSEGV'd (~25% of launches). Under Digitalis the real
+// surface/present path stays on the host-proxied GPU route, so this guest-side query
+// is a no-op: zero the caller's out-parameter (avoid an uninitialised read) and
+// return 0 (success) so the caller proceeds. Mangles to
+// _ZN7android7Surface10hook_queryEPK13ANativeWindowiPi.
+int android::Surface::hook_query(const ANativeWindow* /*window*/, int /*what*/, int* value) {
+  if (value != nullptr) {
+    *value = 0;
+  }
   return 0;
 }
