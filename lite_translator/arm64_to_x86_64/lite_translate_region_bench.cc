@@ -119,17 +119,44 @@ struct Kernel {
 };
 
 double TimeOnce(const Kernel& k) {
-  // Copy the kernel into a fresh page-aligned buffer so each run translates
-  // anew is NOT what we want — keep the same buffer across runs so the cache is
-  // warm. Caller passes a stable buffer via static storage below.
+  // Keep the kernel in a stable static buffer so the 5 timed runs share a warm
+  // translation cache. Two hazards come with reusing one buffer across kernels,
+  // and both are handled below.
+  //
+  // (1) UDF guard tail. The lite translator forms a region up to
+  // `pc + GetExecutableRegionSize(pc)`, and GuestMapShadow is PAGE-granular, so
+  // formation does NOT stop at k.n_words — it keeps decoding whatever bytes
+  // follow the kernel in the page. Because the buffer is reused, those trailing
+  // bytes are the PREVIOUS (often larger) kernel's leftover loop code, and a
+  // conditional loop-back branch (b.ne) does not end a region — its fall-through
+  // is translated inline. Formation would then splice two kernels into one hybrid
+  // region that never reaches the stop PC and spins at 100% CPU. That is exactly
+  // what wedged `DigitalisBench.Branch`/`.Fp`/`.Mem` when they ran after `.Int`.
+  // Zero-filling the words at and past k.stop_off makes them UDF (0x00000000):
+  // formation fails to decode there, so the region is clamped to
+  // [base, base+stop_off) and base+stop_off stays a dispatch boundary where
+  // SetStop halts execution cleanly. (The first kernel gets this for free from
+  // zeroed heap past its fresh buffer; the guard makes it deterministic for every
+  // kernel regardless of run order.)
+  static constexpr size_t kUdfGuardWords = 4;
   static std::vector<uint32_t> buf;
-  buf.assign(k.code, k.code + k.n_words);
+  buf.assign(k.n_words + kUdfGuardWords, 0u);  // zero => UDF guard tail
+  std::copy(k.code, k.code + k.n_words, buf.begin());
+  size_t exec_size = (k.n_words + kUdfGuardWords) * 4;
   GuestAddr base = ToGuestAddr(buf.data());
-  GuestMapShadow::GetInstance()->SetExecutable(base, k.n_words * 4);
+  GuestMapShadow::GetInstance()->SetExecutable(base, exec_size);
   GuestThread* thread = GetCurrentGuestThread();
   auto& cpu = thread->state()->cpu;
   GuestAddr stop = base + k.stop_off;
   auto* cache = TranslationCache::GetInstance();
+
+  // (2) Stale-cache invalidation. The translation cache is keyed by guest address
+  // and is NOT invalidated when we overwrite the reused buffer with new bytes, so
+  // without this a later kernel would execute an earlier kernel's stale cached
+  // region (measuring the wrong code) — a self-modifying-code contract violation.
+  // Invalidate the range we are about to translate, exactly as real SMC / IC IVAU
+  // handling does.
+  cache->InvalidateGuestRange(base, base + exec_size);
 
   // Valid pointer args for the mem (x1/x2) and syscall (x1=timespec) kernels;
   // set before the warmup so even the warmup pass has a valid buffer.
@@ -154,7 +181,7 @@ double TimeOnce(const Kernel& k) {
   ExecuteGuest(thread->state());
   clock_gettime(CLOCK_MONOTONIC, &t1);
   cache->TestingClearStop(stop);
-  GuestMapShadow::GetInstance()->ClearExecutable(base, k.n_words * 4);
+  GuestMapShadow::GetInstance()->ClearExecutable(base, exec_size);
 
   return (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
 }
