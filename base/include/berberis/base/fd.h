@@ -23,6 +23,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+// region digitalis
+#if defined(__ANDROID__)
+#include <android/fdsan.h>
+
+#include <cerrno>
+#endif
+// endregion
+
 #include "berberis/base/bit_util.h"
 #include "berberis/base/logging.h"
 #include "berberis/base/raw_syscall.h"
@@ -59,6 +67,52 @@ inline void WriteFullyOrDie(int fd, const void* data, size_t size) {
 inline void CloseUnsafe(int fd) {
   RawSyscall(__NR_close, fd);
 }
+
+// region digitalis
+// Translator-internal fds live in the same fd table as the guest app's fds, so
+// guest fd hygiene can destroy them: a forked child sweeping "its" descriptors
+// before exec (Chromium's CloseSuperfluousFds, posix_spawn file actions) closes
+// every fd it doesn't recognize. The guest close/close_range emulation in
+// kernel_api spares fds that carry a live host fdsan owner tag, but fds Berberis
+// creates for itself (the TableOfTables memfds, exec-region memfds) were
+// untagged, so a sweep raw-closed them and the next translator use of the
+// cached fd died on EBADF (seen as a MmapImplOrDie abort in
+// TableOfTables::AllocateIfNecessary when a Chromium fork child reset its
+// signal handlers). Tag such fds as host-owned so the existing guards skip
+// them, and close them with their tag so no stale tag is left on the slot.
+// fdsan is bionic-only; on other hosts these degrade to a raw close.
+#if defined(__ANDROID__)
+inline uint64_t HostOwnedFdTag() {
+  // Any stable non-zero cookie works; debuggerd shows it as a generic native
+  // owner in the "open files" list. bionic's enum has no translator slot.
+  return android_fdsan_create_owner_tag(ANDROID_FDSAN_OWNER_TYPE_GENERIC_00,
+                                        reinterpret_cast<uint64_t>(&CloseUnsafe));
+}
+#endif
+
+inline void TagHostOwnedFdUnsafe(int fd) {
+#if defined(__ANDROID__)
+  // Scrub any stale tag left on this slot by an earlier raw close, then claim
+  // the fd. exchange has no error path and does not touch errno.
+  android_fdsan_exchange_owner_tag(fd, android_fdsan_get_owner_tag(fd), HostOwnedFdTag());
+#else
+  static_cast<void>(fd);
+#endif
+}
+
+inline void CloseHostOwnedFdUnsafe(int fd) {
+#if defined(__ANDROID__)
+  // Close with the fd's current tag: always passes the fdsan check and clears
+  // the table entry (same pattern as ScopedFd). Preserve errno per this file's
+  // contract.
+  int saved_errno = errno;
+  android_fdsan_close_with_tag(fd, android_fdsan_get_owner_tag(fd));
+  errno = saved_errno;
+#else
+  RawSyscall(__NR_close, fd);
+#endif
+}
+// endregion
 
 }  // namespace berberis
 

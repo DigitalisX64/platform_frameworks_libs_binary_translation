@@ -57,8 +57,11 @@ class ScopedFd {
       //    closing with the CURRENT tag would also strip its tag, making the
       //    owner's own close abort later ("... actually unowned").
       // A nonzero tag on our number always means a host object owns the slot
-      // now (Berberis never tags) — abandon instead of closing. An untagged fd
-      // gets a raw syscall close, which never enters fdsan's error paths.
+      // now — abandon instead of closing. (ScopedFd itself never tags, and
+      // Berberis' tagged internal fds — see fd.h — are always closed with
+      // their tag, so no stale Berberis tag can sit on a reused slot.) An
+      // untagged fd gets a raw syscall close, which never enters fdsan's
+      // error paths.
       if (android_fdsan_get_owner_tag(fd_) == 0) {
         syscall(__NR_close, fd_);
       } else {

@@ -23,6 +23,9 @@
 #include <cstdint>
 #include <mutex>
 
+// region digitalis
+#include "berberis/base/fd.h"
+// endregion
 #include "berberis/base/logging.h"
 #include "berberis/base/memfd_backed_mmap.h"
 #include "berberis/base/mmap.h"
@@ -41,7 +44,11 @@ class TableOfTables {
     int main_memfd = CreateAndFillMemfd("main", kMemfdRegionSize, default_table_);
     main_table_ = static_cast<decltype(main_table_)>(
         CreateMemfdBackedMapOrDie(main_memfd, kTableSize * sizeof(T*), kMemfdRegionSize));
-    close(main_memfd);
+    // region digitalis - CreateAndFillMemfd tags its memfds as host-owned;
+    // close with the tag so the fdsan slot is left clean for reuse.
+    // close(main_memfd);
+    CloseHostOwnedFdUnsafe(main_memfd);
+    // endregion
 
     // The default table is read-only.
     MprotectOrDie(default_table_, kChildTableBytes, PROT_READ);
@@ -91,7 +98,11 @@ class TableOfTables {
     if (default_memfd_ == -1) {
       return;
     }
-    close(default_memfd_);
+    // region digitalis - CreateAndFillMemfd tags its memfds as host-owned;
+    // close with the tag so the fdsan slot is left clean for reuse.
+    // close(default_memfd_);
+    CloseHostOwnedFdUnsafe(default_memfd_);
+    // endregion
     default_memfd_ = -1;
   }
 

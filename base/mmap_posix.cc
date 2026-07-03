@@ -19,8 +19,14 @@
 #include <sys/mman.h>
 
 #include <atomic>
+// region digitalis
+#include <cerrno>
+// endregion
 #include <cstdint>
 #include <cstdlib>
+// region digitalis
+#include <cstring>
+// endregion
 #include <random>  // for old versions of GLIBC only (see below)
 
 #include "berberis/base/bit_util.h"
@@ -125,7 +131,22 @@ void* MmapImpl(MmapImplArgs args) {
 
 void* MmapImplOrDie(MmapImplArgs args) {
   void* ptr = MmapImpl(args);
-  CHECK_NE(ptr, MAP_FAILED);
+  // region digitalis - the bare CHECK printed only "0xff..ff != 0xff..ff" on
+  // failure, hiding both errno and the arguments; name them so a field abort
+  // (EBADF from a swept fd, ENOMEM from a resource ceiling, ...) is
+  // self-diagnosing.
+  // CHECK_NE(ptr, MAP_FAILED);
+  if (ptr == MAP_FAILED) {
+    FATAL("mmap(addr=%p, size=%zu, prot=0x%x, flags=0x%x, fd=%d, offset=0x%llx) failed: %s",
+          args.addr,
+          args.size,
+          args.prot,
+          args.flags,
+          args.fd,
+          static_cast<unsigned long long>(args.offset),
+          strerror(errno));
+  }
+  // endregion
   return ptr;
 }
 

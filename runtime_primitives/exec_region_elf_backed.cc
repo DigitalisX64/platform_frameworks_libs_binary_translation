@@ -73,6 +73,10 @@ ExecRegion ExecRegionElfBackedFactory::Create(size_t size) {
   CHECK_GE(region_size, size);
 
   auto fd = CreateMemfdOrDie("exec");
+  // region digitalis - tag as host-owned so a concurrent guest fd sweep can't
+  // close the fd between here and the maps below; see fd.h.
+  TagHostOwnedFdUnsafe(fd);
+  // endregion
   FtruncateOrDie(fd, static_cast<off64_t>(region_size));
 
   ExecRegion result{
@@ -85,7 +89,10 @@ ExecRegion ExecRegionElfBackedFactory::Create(size_t size) {
           {.size = region_size, .prot = PROT_READ | PROT_WRITE, .flags = MAP_SHARED, .fd = fd})),
       region_size};
 
-  CloseUnsafe(fd);
+  // region digitalis - close with the tag so the fdsan slot is left clean.
+  // CloseUnsafe(fd);
+  CloseHostOwnedFdUnsafe(fd);
+  // endregion
   return result;
 }
 
