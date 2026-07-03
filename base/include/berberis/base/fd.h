@@ -24,10 +24,13 @@
 #include <unistd.h>
 
 // region digitalis
-#if defined(__ANDROID__)
-#include <android/fdsan.h>
+#include <sys/stat.h>
 
 #include <cerrno>
+#include <cstdint>
+
+#if defined(__ANDROID__)
+#include <android/fdsan.h>
 #endif
 // endregion
 
@@ -111,6 +114,37 @@ inline void CloseHostOwnedFdUnsafe(int fd) {
 #else
   RawSyscall(__NR_close, fd);
 #endif
+}
+
+// Identity of the open file description behind an fd. Two descriptors name the
+// same file iff their (st_dev, st_ino) match. Used to detect a translator-owned
+// fd being silently replaced: the fdsan host-owner tag stops a guest
+// close/close_range sweep from raw-closing our fds, but a guest dup2/dup3 onto
+// one of our fd numbers is legal POSIX (the emulation only TRACEs and proceeds),
+// so the kernel swaps our file description for the guest's target. A cached fd
+// can re-fstat its identity and heal if it no longer matches.
+struct FdIdentity {
+  uint64_t dev = 0;
+  uint64_t ino = 0;
+  bool valid = false;  // false when the fd cannot be fstat'd (closed/invalid).
+};
+
+inline FdIdentity GetFdIdentityUnsafe(int fd) {
+  // Preserve errno per this file's contract.
+  int saved_errno = errno;
+  FdIdentity id;
+  struct stat st;
+  if (fstat(fd, &st) == 0) {
+    id.dev = static_cast<uint64_t>(st.st_dev);
+    id.ino = static_cast<uint64_t>(st.st_ino);
+    id.valid = true;
+  }
+  errno = saved_errno;
+  return id;
+}
+
+inline bool FdIdentityMatches(const FdIdentity& a, const FdIdentity& b) {
+  return a.valid && b.valid && a.dev == b.dev && a.ino == b.ino;
 }
 // endregion
 
