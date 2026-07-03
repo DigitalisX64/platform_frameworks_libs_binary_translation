@@ -48,7 +48,7 @@
 #include "berberis/base/tracing.h"
 #include "berberis/guest_loader/guest_loader.h"
 #include "berberis/guest_state/guest_addr.h"
-#include "berberis/guest_state/guest_state_opaque.h"
+#include "berberis/guest_state/guest_state.h"
 #include "berberis/runtime_primitives/runtime_library.h"
 
 namespace berberis {
@@ -112,7 +112,24 @@ bool RedirectHostSystemLibCallToGuest(ThreadState* state) {
   if (!IsHostSystemLibPath(info.dli_fname)) {
     return false;
   }
+  // ResolveGuestEquivalent runs guest linker code on THIS thread's CPUState the
+  // first (uncached) time a library/symbol is resolved: DlOpen relocates the
+  // guest copy and runs its constructors, DlSym walks its symbol table. That
+  // nested guest call is a normal AAPCS64 call, so it is free to clobber the
+  // caller-saved registers x0-x18 and v0-v7/v16-v31 — and here those registers
+  // still hold the *arguments* of the redirected function, because the guest is
+  // mid-`br <target>` (a tail branch), not at a call-return boundary.
+  // ScopedVirtualGuestCallFrame only preserves sp/x29/x30/pc, so without this
+  // snapshot the redirected function would execute with the linker's leftover
+  // garbage in its argument registers. Observed: Kuaishou's libAemonPlayer
+  // reaches libgui Surface::hook_query with x0=0 / x2=0x10 and faults writing
+  // through the bogus out-parameter — flaky (~17% of launches) exactly because
+  // only the first, uncached resolution runs guest code; cached resolutions
+  // touch no registers. Snapshot the full guest register file and restore it
+  // after resolution so the redirect is transparent: only the PC is rerouted.
+  const CPUState saved_cpu = cpu;
   GuestAddr guest_pc = ResolveGuestEquivalent(Basename(info.dli_fname), info.dli_sname);
+  cpu = saved_cpu;
   if (guest_pc == 0) {
     return false;
   }
