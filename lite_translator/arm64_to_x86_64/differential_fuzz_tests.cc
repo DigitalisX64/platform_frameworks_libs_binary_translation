@@ -326,22 +326,25 @@ class Arm64DifferentialFuzz : public ::testing::Test {
   // forms are non-destructive; x86 SSE is destructive, so a missing source-copy
   // is a mapping clobber -- rd may alias rn or rm.
   //
-  // Two op classes are intentionally EXCLUDED from this generator:
+  // The register-controlled variable shifts (SSHL 0x08 / SQSHL 0x09 / SRSHL
+  // 0x0A / SQRSHL 0x0B, both U variants) ARE included: the shift count is the
+  // low signed byte of each Rm lane, so with fully-random data it exercises the
+  // full +/-128 range including the out-of-range counts. An earlier exhaustive
+  // sweep here found a real interpreter divergence -- SRSHL/SQRSHL at shift
+  // == -128 sign-broadcast to -1 instead of rounding to 0 (the round constant
+  // 1<<127 lifts the small source positive) -- which is now fixed in the
+  // interpreter lambda, so these opcodes are again bit-exact and gate the fix
+  // going forward.
+  //
+  // One op class is intentionally EXCLUDED:
   //   * FP three-same (opcodes 0x18/0x1A/0x1C = FMAXNM/FADD/FMAX etc.): with
   //     NaN/Inf input lanes ARM materializes the default NaN while x86 SSE
   //     propagates a host NaN payload -- an implementation-defined difference,
   //     not a miscompile (the sibling NeonThreeSameInterpVsJitFuzz skips FP too).
-  //   * Register-controlled variable shifts (SSHL 0x08 / SQSHL 0x09 / SRSHL
-  //     0x0A / URSHL): the shift count is the low signed byte of each Rm lane,
-  //     which with fully-random data ranges far outside +/-esize. The exhaustive
-  //     sweep surfaced a real JIT<->interp divergence here (SRSHL.16B rounding
-  //     at out-of-range counts) -- a candidate translator bug that is a separate
-  //     investigation, not something to hide by leaving it green. Excluded so
-  //     this reusable harness stays a clean regression gate; the shift-rounding
-  //     hunt is tracked as a follow-up. Only opcodes proven bit-exact are here.
   uint32_t GenNeonThreeSame() {
-    static const uint8_t kOpc[] = {0x01, 0x05, 0x06, 0x07, 0x0C,
-                                   0x0D, 0x10, 0x11, 0x12, 0x13};
+    static const uint8_t kOpc[] = {0x01, 0x05, 0x06, 0x07, 0x08, 0x09,
+                                   0x0A, 0x0B, 0x0C, 0x0D, 0x10, 0x11,
+                                   0x12, 0x13};
     uint32_t q = Rnd() & 1, u = Rnd() & 1, size = Rnd() % 4;
     uint32_t opcode = kOpc[Rnd() % (sizeof(kOpc) / sizeof(kOpc[0]))];
     uint32_t rn = Rnd() % 8, rm = Rnd() % 8;
@@ -480,6 +483,18 @@ TEST_F(Arm64DifferentialFuzz, HistoricalBugEncodingsInCorpus) {
   EXPECT_TRUE(saw_vec_scvtf) << "shift-imm generator no longer produces vector SCVTF/UCVTF";
   EXPECT_TRUE(saw_inplace_convert) << "shift-imm generator no longer produces rd==rn convert";
 
+  // The variable-shift SRSHL/SQRSHL class (interp shift==-128 rounding bug) must
+  // stay reachable from the three-same generator so its regression stays gated.
+  bool saw_srshl_or_sqrshl = false;
+  Seed(0xD1A6511F7B0BC0DEULL);
+  for (int i = 0; i < 20000; i++) {
+    uint32_t insn = GenNeonThreeSame();
+    uint32_t opcode = (insn >> 11) & 0x1F;
+    if (opcode == 0x0A || opcode == 0x0B) saw_srshl_or_sqrshl = true;  // SRSHL / SQRSHL
+  }
+  EXPECT_TRUE(saw_srshl_or_sqrshl)
+      << "three-same generator no longer produces SRSHL/SQRSHL (rounding-shift class)";
+
   // (b) Concrete regenerated encodings now match JIT==interp.
   auto run_one = [&](const uint32_t* code, int n, const InitState& in) -> Result {
     std::string desc;
@@ -540,6 +555,32 @@ TEST_F(Arm64DifferentialFuzz, HistoricalBugEncodingsInCorpus) {
     uint32_t code[1] = {0x4F0FFC42U};  // fcvtzs v2.4s,v2.4s,#1
     Result r = run_one(code, 1, in);
     (void)r;
+  }
+
+  // 5) SRSHL/SQRSHL shift==-128 rounding: srshl v0.16b,v1.16b,v2.16b with a
+  // negative source (0x80 per byte) and a per-byte shift count of -128
+  // (0x80). The rounding constant 1<<127 lifts the small source positive so
+  // the ARM result is 0 in every lane; the interpreter previously skipped the
+  // round (1<<127 overflows signed __int128) and sign-broadcast to -1 (0xFF).
+  // Assert BOTH tiers now yield all-zero Vd, not just JIT==interp equivalence.
+  {
+    InitState in = RandomInit();
+    unsigned __int128 neg_bytes = 0, shift_neg128 = 0;
+    for (int b = 0; b < 16; b++) {
+      neg_bytes |= (static_cast<unsigned __int128>(0x80)) << (b * 8);     // -128 source
+      shift_neg128 |= (static_cast<unsigned __int128>(0x80)) << (b * 8);  // shift = -128
+    }
+    in.v[1] = neg_bytes;
+    in.v[2] = shift_neg128;
+    for (uint32_t code0 : {0x4E225420U /*srshl*/, 0x4E225C20U /*sqrshl*/}) {
+      in.v[0] = ~static_cast<unsigned __int128>(0);  // poison Vd to catch a no-op
+      uint32_t code[1] = {code0};
+      Result r = run_one(code, 1, in);
+      EXPECT_NE(r, kDeclined) << "rounding-shift region unexpectedly JIT-declined";
+      // run_one already asserted JIT==interp; state_ holds the interp result.
+      EXPECT_EQ(state_.cpu.v[0], static_cast<__uint128_t>(0))
+          << "rounding shift by -128 must floor to 0, got sign-broadcast";
+    }
   }
 }
 

@@ -4846,8 +4846,22 @@ class Interpreter {
                 if (rounding && rshift >= 1 && rshift <= 127) {
                   v += (__int128{1} << (rshift - 1));
                 }
-                res = (rshift >= 128) ? (is_signed && v < 0 ? __int128{-1} : __int128{0})
-                                      : (v >> rshift);  // arithmetic for signed v
+                // A right shift by >= 128 (only reachable at shift == -128)
+                // moves every source bit out of the lane. For non-rounding ops
+                // the arithmetic result is the sign broadcast (all-ones for a
+                // negative signed source, 0 otherwise). For rounding ops the
+                // round constant 1<<(rshift-1) == 1<<127 dominates the small
+                // (<2^63) source and lifts the pre-shift value into
+                // [0, 2^rshift), so the rounded result floors to 0 for both
+                // signs. The round-add above is skipped at rshift == 128 only
+                // because 1<<127 overflows a signed __int128, so account for
+                // its effect (result 0) directly here rather than falling into
+                // the non-rounding sign-broadcast (which gave the wrong -1 for a
+                // negative SRSHL/SQRSHL source).
+                res = (rshift >= 128)
+                          ? (rounding ? __int128{0}
+                                      : (is_signed && v < 0 ? __int128{-1} : __int128{0}))
+                          : (v >> rshift);  // arithmetic for signed v
               }
               if (saturating) {
                 if (is_signed) {
