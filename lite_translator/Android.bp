@@ -77,6 +77,7 @@ cc_test_library {
     name: "libberberis_lite_translator_arm64_to_x86_64_unit_tests",
     defaults: ["berberis_test_library_defaults_64"],
     srcs: [
+        "arm64_to_x86_64/differential_fuzz_tests.cc",
         "arm64_to_x86_64/lite_translate_region_bench.cc",
         "arm64_to_x86_64/lite_translate_region_exec_tests.cc",
         "arm64_to_x86_64/decoder_objdump_diff_test.cc",
