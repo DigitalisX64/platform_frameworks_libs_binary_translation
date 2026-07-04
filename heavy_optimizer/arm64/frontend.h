@@ -2643,6 +2643,221 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP vector FMAX/FMIN/FMAXNM/FMINNM (.2S/.4S/.2D). x86 MAXP{S,D}/MINP{S,D}
+    // disagree with ARM on both NaN and signed-zero results, so mirror
+    // lite_translator.h's vector sequence exactly. Everything is computed as
+    // FMIN (FMAX = -FMIN(-a,-b)): x86 MINP{S,D} returns the SECOND source on a
+    // +-0 tie, which gives ARM's OR-of-signs (most-negative) for FMIN and, after
+    // the double negation, AND-of-signs (most-positive) for FMAX. NaN-propagating
+    // FMAX/FMIN (any NaN in -> NaN out) use the symmetric MIN|MIN|POR idiom;
+    // NaN-suppressing FMAXNM/FMINNM (exactly one NaN -> the number) substitute
+    // each NaN lane with the other operand via a CMPUNORDP{S,D} self-compare mask
+    // before the MIN. FP16 (is_fp16, needs an F16C round-trip not in the backend
+    // gen inputs) bails to lite; the decoder already filters the reserved
+    // sz=1&&!Q (.1D) shape, so only .2S/.4S/.2D reach here.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
+                           args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV);
+      const bool is_nm = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
+                          args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV);
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      // FMAX: negate both inputs so the shared FMIN lowering computes it; the
+      // per-lane sign mask (all-ones << 31/63) is XORed in now and, after the
+      // MIN, XORed back out of the result.
+      FpRegister sign_mask = no_fp_register;
+      if (is_max) {
+        // AllocZeroedSimdReg establishes a def before the all-ones self-compare
+        // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
+        sign_mask = AllocZeroedSimdReg();
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
+        if (is_double) {
+          builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
+        } else {
+          builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+        }
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign_mask.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign_mask.machine_reg());
+      }
+      auto gen_min = [&](FpRegister dst, FpRegister src) {
+        if (is_double) {
+          builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+        } else {
+          builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+        }
+      };
+      auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
+        if (is_double) {
+          builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+        }
+      };
+      FpRegister result;
+      if (!is_nm) {
+        // NaN-propagating: tmp = xm; MIN(tmp, xn); MIN(xn, xm); POR(xn, tmp).
+        FpRegister tmp = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xm.machine_reg());
+        gen_min(tmp, xn);
+        gen_min(xn, xm);
+        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), tmp.machine_reg());
+        result = xn;
+      } else {
+        // NaN-suppressing: substitute each NaN lane with the other operand
+        // (a' = select(isnan(a), b, a); b' = select(isnan(b), a, b)), then MIN.
+        FpRegister mask_a = AllocTempSimdReg();
+        FpRegister mask_b = AllocTempSimdReg();
+        FpRegister an_sub = AllocTempSimdReg();
+        FpRegister bn_sub = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), xn.machine_reg());
+        gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), xm.machine_reg());
+        gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
+        builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), xm.machine_reg());  // mask_a & b
+        builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), xn.machine_reg());  // mask_b & a
+        builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), xn.machine_reg());  // ~mask_a & a
+        builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), xm.machine_reg());  // ~mask_b & b
+        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
+        builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
+        // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
+        // operands are NaN-free here (NaN lanes were substituted above).
+        FpRegister t_nm = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
+        gen_min(t_nm, mask_a);      // min(b', a')
+        gen_min(mask_a, mask_b);    // min(a', b')
+        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
+        result = mask_a;
+      }
+      // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+      if (is_max) {
+        builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, result, args.q);
+      return;
+    }
+
+    // FP vector FADD/FSUB/FMUL/FDIV (.2S/.4S FP32, .2D FP64) lower directly to
+    // SSE2 packed FP arithmetic (ADDP{S,D}/SUBP{S,D}/MULP{S,D}/DIVP{S,D}), whose
+    // default-rounding IEEE-754 results match ARM's lane-for-lane. Mirrors
+    // lite_translator.h's non-FP16 path exactly. FP16 (is_fp16) needs an F16C
+    // round-trip absent from the backend Gen inputs and bails to lite; the
+    // decoder already rejects the reserved sz=1&&!Q (.1D) shape, so only
+    // .2S/.4S/.2D reach here.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFsubV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmulV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFdivV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (is_double) {
+        switch (args.opcode) {
+          case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+            builder_.Gen<x86_64::AddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+            builder_.Gen<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+            builder_.Gen<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          default:  // kFdivV
+            builder_.Gen<x86_64::DivpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+        }
+      } else {
+        switch (args.opcode) {
+          case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+            builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+            builder_.Gen<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+            builder_.Gen<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          default:  // kFdivV
+            builder_.Gen<x86_64::DivpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+        }
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // FP vector FCMEQ/FCMGE/FCMGT (.2S/.4S FP32, .2D FP64) produce a per-lane
+    // all-ones/zero mask. Mirrors lite_translator.h's non-FP16 path: the SSE
+    // legacy-encoded CMP{EQ,LT,LE}P{S,D} predicates are ordered, returning FALSE
+    // (zero) for any NaN operand, exactly matching ARM's unordered-is-false rule.
+    //   FCMEQ: CMPEQP* xn, xm                 -> xn = (xn == xm)
+    //   FCMGE: CMPLEP* xm, xn   [result = xm] -> xm = (xm <= xn) == (xn >= xm)
+    //   FCMGT: CMPLTP* xm, xn   [result = xm] -> xm = (xm <  xn) == (xn >  xm)
+    // FP16 (is_fp16, needs an F16C round-trip absent from the backend Gen inputs)
+    // bails to lite; the decoder already rejects the reserved sz=1&&!Q (.1D)
+    // shape, so only .2S/.4S/.2D reach here. FACGE/FACGT (abs-compare) are NOT
+    // handled here — they need a sign-clear pre-mask and still bail to lite.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmeqV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmgeV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmgtV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      FpRegister result;
+      if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmeqV) {
+        if (is_double) {
+          builder_.Gen<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        result = xn;
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmgeV) {
+        // (xm <= xn) == (xn >= xm); mask lands in xm.
+        if (is_double) {
+          builder_.Gen<x86_64::CmplepdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmplepsXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        }
+        result = xm;
+      } else {  // FCMGT
+        // (xm < xn) == (xn > xm); mask lands in xm.
+        if (is_double) {
+          builder_.Gen<x86_64::CmpltpdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpltpsXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        }
+        result = xm;
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, result, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
@@ -3267,6 +3482,89 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // CLZ / CLS V.<T>, V.<T> — per-lane count-leading-zeros / count-leading-
+      // sign-bits. size=00 .8B/.16B (N=8), size=01 .4H/.8H (N=16), size=10
+      // .2S/.4S (N=32); size=11 reserved. Mirrors lite kClz/kCls but uses LZCNT
+      // (branchless: LZCNT_32(0)==32) instead of the lite tier's BSR + zero
+      // branch. Each lane is scalarized: PEXTR{b,w,d} zero-extends the element
+      // into a GP reg, LZCNTL counts leading zeros over 32 bits, and SUBL folds
+      // the width correction — CLZ_N = LZCNT_32(x) - (32-N). CLS first maps
+      // negative lanes to ~x (vector PCMPGT sign mask + PXOR, exactly the lite
+      // preprocess) so CLS = CLZ_N(y) - 1 = LZCNT_32(y) - (33-N); the y==0 lane
+      // (all-same-bits input) then yields N-1 with no branch. Bails to lite if
+      // the host lacks LZCNT.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kClz:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCls: {
+        if (args.size == 0b11 || !host_platform::kHasLZCNT) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_cls = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCls);
+        const int lane_bits = 8 << args.size;             // 8, 16, 32
+        const int bytes_per_lane = 1 << args.size;        // 1, 2, 4
+        const int lanes_per_vec = (args.q ? 16 : 8) / bytes_per_lane;
+        // CLZ_N = LZCNT_32 - (32-lane_bits); CLS subtracts one more.
+        const int32_t correction =
+            static_cast<int32_t>(32 - lane_bits) + (is_cls ? 1 : 0);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xd = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (is_cls) {
+          // y = (x < 0) ? ~x : x per lane: xsign = (0 > xn) all-ones mask, then
+          // xn ^= xsign collapses negative lanes to ~x, positive lanes unchanged.
+          FpRegister xsign = AllocZeroedSimdReg();
+          switch (args.size) {
+            case 0b00:
+              builder_.Gen<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+              break;
+            case 0b01:
+              builder_.Gen<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+              break;
+            default:  // 0b10
+              builder_.Gen<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+              break;
+          }
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xsign.machine_reg());
+        }
+        for (int i = 0; i < lanes_per_vec; ++i) {
+          Register lane;
+          switch (args.size) {
+            case 0b00:
+              lane = std::get<0>(
+                  Gen<x86_64::PextrbRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(i)));
+              break;
+            case 0b01:
+              lane = std::get<0>(
+                  Gen<x86_64::PextrwRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(i)));
+              break;
+            default:  // 0b10
+              lane = std::get<0>(
+                  Gen<x86_64::PextrdRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(i)));
+              break;
+          }
+          Register cnt = std::get<0>(Gen<x86_64::LzcntlRegReg>(lane));
+          if (correction != 0) {
+            cnt = std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(cnt, correction));
+          }
+          switch (args.size) {
+            case 0b00:
+              builder_.Gen<x86_64::PinsrbXRegRegImm>(xd.machine_reg(), cnt,
+                                                     static_cast<int8_t>(i));
+              break;
+            case 0b01:
+              builder_.Gen<x86_64::PinsrwXRegRegImm>(xd.machine_reg(), cnt,
+                                                     static_cast<int8_t>(i));
+              break;
+            default:  // 0b10
+              builder_.Gen<x86_64::PinsrdXRegRegImm>(xd.machine_reg(), cnt,
+                                                     static_cast<int8_t>(i));
+              break;
+          }
+        }
+        SetVRegFull(args.rd, xd, args.q);
+        return;
+      }
+
       default:
         UndefinedReturningVoid();
         return;
@@ -3288,9 +3586,153 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // AdvSIMD shift-by-immediate (vector and scalar).  Mirrors the high-value
+  // subset of lite_translator.h::AdvSimdShiftByImm into the optimizing tier so
+  // NEON widening/shift loops (calculate_gnu_hash_neon and every SIMD widening
+  // expansion) stop bailing the heavy region wholesale to lite.  Covered here:
+  //   * USHLL / SSHLL (incl. UXTL/SXTL == #0) — 8B->8H / 4H->4S / 2S->2D
+  //     widening, both Q halves (long2 reads Vn[127:64]).
+  //   * SHL / USHR / SSHR at H/S/D lanes (esize 16/32/64).
+  // Everything else (byte-lane SHL/USHR/SSHR, SSHR .2D which needs PSRAQ, and
+  // SLI/SRI/SSRA/USRA/rounding/saturating/narrow/fixed-point conversions) calls
+  // Undefined() which sets success_=false and bails the region to lite — the
+  // lite tier already lowers those correctly (a heavy bail is correct-but-slow,
+  // acceptable for the rarer shift variants).
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    const uint8_t immh = args.immh;
+    if (immh == 0) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const int32_t vn_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdShiftImmOpcode::kUshll:
+      case Decoder::AdvSimdShiftImmOpcode::kSshll: {
+        // USHLL/SSHLL Vd.<wide>, Vn.<narrow>, #shift.  esize = 8 <<
+        // highest-set-bit(immh); Q=1 ("long2") widens the upper 64 of Vn.
+        // Left-shift is bit-identical signed/unsigned, so PSLL{W,D,Q} is
+        // shared after the signed/unsigned widen.  Result is always a full
+        // 128-bit register (SetVRegFull q=true).
+        if (immh & 0b1000) {  // RESERVED for shift-left-long.
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshll);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (args.q) {
+          // Bring Vn[127:64] into the low 64 so PMOVSX/PMOVZX widens it.
+          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        }
+        uint8_t shift_imm;
+        if (immh & 0b0100) {  // 2S -> 2D
+          shift_imm = static_cast<uint8_t>(immh_immb - 32);
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          if (shift_imm != 0) {
+            builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          }
+        } else if (immh & 0b0010) {  // 4H -> 4S
+          shift_imm = static_cast<uint8_t>(immh_immb - 16);
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          if (shift_imm != 0) {
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          }
+        } else {  // immh & 0b0001: 8B -> 8H
+          shift_imm = static_cast<uint8_t>(immh_immb - 8);
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          if (shift_imm != 0) {
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          }
+        }
+        SetVRegFull(args.rd, xn, /*q=*/true);
+        return;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kShl:
+      case Decoder::AdvSimdShiftImmOpcode::kUshr:
+      case Decoder::AdvSimdShiftImmOpcode::kSshr: {
+        // esize from immh: bit3->64, bit2->32, bit1->16, bit0->8 (byte, no
+        // x86 packed shift -> bail to lite, which widens via PMOVSX/PACKSS).
+        if (immh == 0b0001) {  // byte lane
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else {  // immh & 0b0010
+          esize_bits = 16;
+        }
+        const bool is_left =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
+        // SHL count = immh:immb - esize (0..esize-1); USHR/SSHR count =
+        // 2*esize - immh:immb (1..esize).  PSLL/PSRL/PSRA saturate to
+        // 0/sign-fill at count>=esize, matching ARM at the boundary.
+        const uint8_t shift_count =
+            is_left ? static_cast<uint8_t>(immh_immb - esize_bits)
+                    : static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        const bool is_arith =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr);
+        // SSHR .2D / scalar-D needs PSRAQ (AVX-512F-VL only) -> bail to lite,
+        // whose GPR fallback ships each 64-bit lane through SARQ.
+        if (is_arith && esize_bits == 64) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        if (is_left) {
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), cnt);
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else if (is_arith) {  // SSHR, esize 16 or 32
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else {  // USHR
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+          }
+        }
+        // Q=0 (incl. scalar) forms zero Vd[127:64] via SetVRegFull.
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+      default:
+        UndefinedReturningVoid();
+        return;
+    }
   }
 
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
