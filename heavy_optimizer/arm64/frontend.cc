@@ -786,8 +786,149 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       return;
     }
 
+    case Decoder::AtomicOp::kCas: {
+      // CAS Xs, Xt, [Xn]: compare [Xn] with Xs; on a match store Xt to [Xn];
+      // the old value of [Xn] is written back to Xs. Mirrors lite_translator.h's
+      // kCas: x86 LOCK CMPXCHG compares RAX with [mem], stores the source on a
+      // match, and leaves the old memory value in RAX. GenRecoveryBlockForLastInsn()
+      // delivers a guest fault on a bad pointer. Plain CAS never branches, so the
+      // CMPXCHG's FLAGS output is discarded (std::get<0> keeps only the RAX
+      // result); nothing FLAGS-class is live across the recovery edge — unlike
+      // STXR, where the FLAGS feed a branch and recovery is therefore omitted.
+      Register expected = (args.rs != 31) ? GetReg(args.rs) : GetImm(0);
+      Register desired = (args.rt != 31) ? GetReg(args.rt) : GetImm(0);
+      switch (args.size) {
+        case 0:
+          expected =
+              std::get<0>(Gen<x86_64::LockCmpXchgbRegOpReg>(expected, {.base = base}, desired));
+          break;
+        case 1:
+          expected =
+              std::get<0>(Gen<x86_64::LockCmpXchgwRegOpReg>(expected, {.base = base}, desired));
+          break;
+        case 2:
+          expected =
+              std::get<0>(Gen<x86_64::LockCmpXchglRegOpReg>(expected, {.base = base}, desired));
+          break;
+        case 3:
+          expected =
+              std::get<0>(Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, desired));
+          break;
+        default:
+          UndefinedReturningVoid();
+          return;
+      }
+      GenRecoveryBlockForLastInsn();
+      // The old value is now in RAX (expected). ARM CAS Ws zero-extends the old
+      // value to 64 bits; on a CMPXCHG *match* the accumulator keeps the full
+      // 64-bit operand's upper bits, so re-zero-extend the sub-64 forms (mirrors
+      // lite's byte/halfword AND masks and 32-bit MOVL).
+      if (args.rs != 31) {
+        if (args.size == 0) {
+          expected =
+              std::get<0>(Gen<x86_64::AndqRegImm>(expected, static_cast<int32_t>(0xFF)));
+        } else if (args.size == 1) {
+          expected =
+              std::get<0>(Gen<x86_64::AndqRegImm>(expected, static_cast<int32_t>(0xFFFF)));
+        } else if (args.size == 2) {
+          expected = std::get<0>(Gen<x86_64::MovlRegReg>(expected));
+        }
+        SetReg(args.rs, expected);
+      }
+      return;
+    }
+
+    case Decoder::AtomicOp::kSwp: {
+      // SWP Xs, Xt, [Xn]: atomically swap [Xn] with Xs; the old value goes to
+      // Xt. Mirrors lite_translator.h's kSwp: x86 XCHG with a memory operand is
+      // implicitly LOCKed. XCHG has no FLAGS operand, so the recovery split is
+      // exactly as safe as a plain Store's.
+      Register new_val = (args.rs != 31) ? GetReg(args.rs) : GetImm(0);
+      switch (args.size) {
+        case 0:
+          new_val = std::get<0>(Gen<x86_64::XchgbRegOp>(new_val, {.base = base}));
+          break;
+        case 1:
+          new_val = std::get<0>(Gen<x86_64::XchgwRegOp>(new_val, {.base = base}));
+          break;
+        case 2:
+          new_val = std::get<0>(Gen<x86_64::XchglRegOp>(new_val, {.base = base}));
+          break;
+        case 3:
+          new_val = std::get<0>(Gen<x86_64::XchgqRegOp>(new_val, {.base = base}));
+          break;
+        default:
+          UndefinedReturningVoid();
+          return;
+      }
+      GenRecoveryBlockForLastInsn();
+      // byte/halfword XCHG leaves the upper bits of new_val as the original guest
+      // Xs; ARM SWP Wt zero-extends the old memory value to 64. The 32-bit XCHG
+      // already zero-extends (a 32-bit reg write clears bits 63:32), matching
+      // lite, which only masks the byte/halfword forms.
+      if (args.size == 0) {
+        new_val = std::get<0>(Gen<x86_64::AndqRegImm>(new_val, static_cast<int32_t>(0xFF)));
+      } else if (args.size == 1) {
+        new_val = std::get<0>(Gen<x86_64::AndqRegImm>(new_val, static_cast<int32_t>(0xFFFF)));
+      }
+      if (args.rt != 31) {
+        SetReg(args.rt, new_val);
+      }
+      return;
+    }
+
+    case Decoder::AtomicOp::kLdadd: {
+      // LDADD Xs, Xt, [Xn]: atomically add Xs to [Xn]; the old value goes to Xt.
+      // Mirrors lite_translator.h's kLdadd: x86 LOCK XADD adds the source to
+      // [mem] and leaves the old memory value in the source register. ARM LDADD
+      // does not set NZCV, so the XADD's FLAGS output is discarded (std::get<0>
+      // keeps only the value); nothing FLAGS-class is live across the recovery
+      // edge.
+      Register addend = (args.rs != 31) ? GetReg(args.rs) : GetImm(0);
+      // LOCK XADD models FLAGS as use_def (XADD writes all flags from the sum),
+      // so the frontend Gen adapter takes an explicit FLAGS operand; the value
+      // is ignored — Gen overrides it with GetFlagsRegister() — but must be
+      // passed to satisfy the operand count.
+      switch (args.size) {
+        case 0:
+          addend =
+              std::get<0>(Gen<x86_64::LockXaddbOpReg>({.base = base}, addend, GetFlagsRegister()));
+          break;
+        case 1:
+          addend =
+              std::get<0>(Gen<x86_64::LockXaddwOpReg>({.base = base}, addend, GetFlagsRegister()));
+          break;
+        case 2:
+          addend =
+              std::get<0>(Gen<x86_64::LockXaddlOpReg>({.base = base}, addend, GetFlagsRegister()));
+          break;
+        case 3:
+          addend =
+              std::get<0>(Gen<x86_64::LockXaddqOpReg>({.base = base}, addend, GetFlagsRegister()));
+          break;
+        default:
+          UndefinedReturningVoid();
+          return;
+      }
+      GenRecoveryBlockForLastInsn();
+      // byte/halfword XADD only updates the low bits of addend; ARM LDADD Wt
+      // zero-extends the old memory value to 64. The 32-bit XADD already
+      // zero-extends, so mirror lite and mask only the byte/halfword forms.
+      if (args.size == 0) {
+        addend = std::get<0>(Gen<x86_64::AndqRegImm>(addend, static_cast<int32_t>(0xFF)));
+      } else if (args.size == 1) {
+        addend = std::get<0>(Gen<x86_64::AndqRegImm>(addend, static_cast<int32_t>(0xFFFF)));
+      }
+      if (args.rt != 31) {
+        SetReg(args.rt, addend);
+      }
+      return;
+    }
+
     default:
-      // LSE atomics / CAS / SWP / pair forms are out of this category; bail.
+      // Remaining LSE atomics (LDCLR/LDSET/LDEOR, LDSMAX/MIN, LDUMAX/MIN),
+      // CASP, and the LDXP/STXP pair forms are not yet mirrored into the heavy
+      // tier; bail to the lite translator (correct, just slower).
       UndefinedReturningVoid();
       return;
   }

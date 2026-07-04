@@ -4135,6 +4135,181 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, LdxrhStxrh16RoundTrip) {
   EXPECT_EQ(state_.cpu.x[2], uint64_t{0});          // success
 }
 
+// LSE single-register atomics: CAS / SWP / LDADD, heavy-tier mirror of the lite
+// lowering (LOCK CMPXCHG / XCHG / LOCK XADD). Encodings verified with clang
+// -march=armv8.1-a+lse:
+//   cas   x5,x1,[x2] = 0xc8a57c41   cas   w5,w1,[x2] = 0x88a57c41
+//   swp   x5,x1,[x2] = 0xf8258041   swp   w5,w1,[x2] = 0xb8258041
+//   ldadd x5,x1,[x2] = 0xf8250041   ldadd w5,w1,[x2] = 0xb8250041
+constexpr uint32_t CasX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xC8A07C00u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t CasW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x88A07C00u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t SwpX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8208000u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t SwpW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8208000u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdaddX(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xF8200000u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdaddW(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0xB8200000u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+// Byte forms (size=00) — exercise the byte AND-0xFF zero-extension path.
+//   casb w5,w1,[x2]=0x08a57c41  swpb w5,w1,[x2]=0x38258041  ldaddb=0x38250041
+constexpr uint32_t CasB(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x08A07C00u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t SwpB(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x38208000u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdaddB(uint8_t rs, uint8_t rt, uint8_t rn) {
+  return 0x38200000u | (static_cast<uint32_t>(rs) << 16) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+
+// CAS (64-bit) success: [Xn] equals the expected value in Xs, so Xt is stored
+// and the old value is returned in Xs.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Cas64Match) {
+  alignas(8) static uint64_t buf = 0x1111222233334444ULL;
+  static const uint32_t code[] = {CasX(5, 1, 2)};  // CAS X5, X1, [X2]
+  state_.cpu.x[5] = 0x1111222233334444ULL;          // expected == memory
+  state_.cpu.x[1] = 0xAABBCCDDEEFF0011ULL;          // desired
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xAABBCCDDEEFF0011ULL});   // stored on match
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0x1111222233334444ULL});  // old value
+}
+
+// CAS (64-bit) mismatch: [Xn] differs from Xs, so memory is untouched and Xs is
+// updated with the actual old value.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Cas64Mismatch) {
+  alignas(8) static uint64_t buf = 0x1111222233334444ULL;
+  static const uint32_t code[] = {CasX(5, 1, 2)};  // CAS X5, X1, [X2]
+  state_.cpu.x[5] = 0xDEADBEEFDEADBEEFULL;          // expected != memory
+  state_.cpu.x[1] = 0xAABBCCDDEEFF0011ULL;          // desired
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x1111222233334444ULL});  // untouched
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0x1111222233334444ULL});  // actual old value
+}
+
+// CAS (32-bit) match: only the low 32 bits are compared/stored; the old value
+// returned in Ws is zero-extended to 64 bits.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Cas32MatchZeroExtends) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFF89ABCDEFULL;  // low32 = 0x89ABCDEF
+  static const uint32_t code[] = {CasW(5, 1, 2)};  // CAS W5, W1, [X2]
+  state_.cpu.x[5] = 0x1111111189ABCDEFULL;          // low32 expected == memory low32
+  state_.cpu.x[1] = 0x2222222212345678ULL;          // desired low32 = 0x12345678
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFF12345678ULL});  // only low32 stored
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0x89ABCDEF});  // old value zero-extended
+}
+
+// SWP (64-bit): swap Xs into [Xn], old value to Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Swp64) {
+  alignas(8) static uint64_t buf = 0x1111222233334444ULL;
+  static const uint32_t code[] = {SwpX(5, 1, 2)};  // SWP X5, X1, [X2]
+  state_.cpu.x[5] = 0xAABBCCDDEEFF0011ULL;          // new value
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xAABBCCDDEEFF0011ULL});   // memory = Xs
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0x1111222233334444ULL});  // old value to Xt
+}
+
+// SWP (32-bit): only the low 32 bits swap; old value in Wt is zero-extended.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Swp32ZeroExtends) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFF89ABCDEFULL;
+  static const uint32_t code[] = {SwpW(5, 1, 2)};  // SWP W5, W1, [X2]
+  state_.cpu.x[5] = 0x1234567812345678ULL;          // new low32 = 0x12345678
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFF12345678ULL});  // only low32 written
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0x89ABCDEF});  // old value zero-extended
+}
+
+// LDADD (64-bit): [Xn] += Xs; old value to Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd64) {
+  alignas(8) static uint64_t buf = 0x0000000000000100ULL;
+  static const uint32_t code[] = {LdaddX(5, 1, 2)};  // LDADD X5, X1, [X2]
+  state_.cpu.x[5] = 0x0000000000000023ULL;            // addend
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x0000000000000123ULL});    // 0x100 + 0x23
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0x0000000000000100ULL});  // old value to Xt
+}
+
+// LDADD (32-bit): 32-bit add; old value in Wt zero-extended to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd32ZeroExtends) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFF00000100ULL;  // low32 = 0x100
+  static const uint32_t code[] = {LdaddW(5, 1, 2)};  // LDADD W5, W1, [X2]
+  state_.cpu.x[5] = 0x0000000000000023ULL;            // addend low32 = 0x23
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFF00000123ULL});    // only low32 updated
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0x00000100});   // old value zero-extended
+}
+
+// Byte CAS match: exercises the AND-0xFF zero-extension of the old value. Only
+// the low byte is compared/stored; the returned old value is zero-extended.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Cas8MatchZeroExtends) {
+  alignas(8) static uint64_t buf = 0x1122334455667789ULL;  // low byte = 0x89
+  static const uint32_t code[] = {CasB(5, 1, 2)};  // CASB W5, W1, [X2]
+  state_.cpu.x[5] = 0xFFFFFFFFFFFFFF89ULL;          // expected low byte == 0x89
+  state_.cpu.x[1] = 0xAAAAAAAAAAAAAAABULL;          // desired low byte = 0xAB
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x11223344556677ABULL});  // only low byte stored
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0x89});        // old value zero-extended
+}
+
+// Byte SWP: exercises the AND-0xFF zero-extension.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Swp8ZeroExtends) {
+  alignas(8) static uint64_t buf = 0x1122334455667789ULL;  // low byte = 0x89
+  static const uint32_t code[] = {SwpB(5, 1, 2)};  // SWPB W5, W1, [X2]
+  state_.cpu.x[5] = 0x11111111111111CDULL;          // new low byte = 0xCD
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x11223344556677CDULL});  // only low byte written
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0x89});        // old value zero-extended
+}
+
+// Byte LDADD: exercises the AND-0xFF zero-extension; add wraps within the byte.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd8ZeroExtends) {
+  alignas(8) static uint64_t buf = 0x11223344556677F0ULL;  // low byte = 0xF0
+  static const uint32_t code[] = {LdaddB(5, 1, 2)};  // LDADDB W5, W1, [X2]
+  state_.cpu.x[5] = 0x0000000000000015ULL;            // addend low byte = 0x15
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x1122334455667705ULL});    // 0xF0 + 0x15 = 0x105 -> 0x05
+  EXPECT_EQ(state_.cpu.x[1], uint64_t{0xF0});          // old value zero-extended
+}
+
+// XZR forms: CAS/SWP/LDADD with Rs or Rt == 31 read as zero / discard.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SwpXzrDiscardsOldValue) {
+  alignas(8) static uint64_t buf = 0x1111222233334444ULL;
+  static const uint32_t code[] = {SwpX(5, 31, 2)};  // SWP X5, XZR, [X2]
+  state_.cpu.x[5] = 0xAABBCCDDEEFF0011ULL;           // new value
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xAABBCCDDEEFF0011ULL});    // memory still written
+}
+
 }  // namespace
 
 }  // namespace berberis
