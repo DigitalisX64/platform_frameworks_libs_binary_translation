@@ -246,6 +246,7 @@
         "PsubbXRegXReg",
         "PsubdXRegXReg",
         "PsubqXRegXReg",
+        "PsubusbXRegXReg",
         "PsubwXRegXReg",
         "PunpckhbwXRegXReg",
         "PunpckhdqXRegXReg",

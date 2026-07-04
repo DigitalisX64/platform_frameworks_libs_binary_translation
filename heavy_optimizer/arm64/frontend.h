@@ -4829,8 +4829,81 @@ class HeavyOptimizerFrontend {
   }
 
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len, uint8_t op, bool q) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, len, op, q);
+    if (!success()) {
+      return;
+    }
+    // TBL/TBX: per-byte gather across 1..4 consecutive table registers, mirroring
+    // the lite lowering (register-domain-pure, no BB-splits). For each table reg r,
+    // shift the index vector down by r*16 (bytewise) so PSHUFB picks lane (idx-r*16)
+    // when it is in [0,15]; an in-range mask built via PSUBUSB/PCMPEQB gates the
+    // result and forms the running "any table hit" mask. TBL zeroes misses; TBX
+    // blends the original Vd back into the miss lanes.
+    const uint8_t table_regs = static_cast<uint8_t>(len + 1);  // 1..4
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rd * 16);
+
+    FpRegister xmm_idx        = AllocTempSimdReg();
+    FpRegister xmm_acc        = AllocTempSimdReg();
+    FpRegister xmm_in_range   = AllocTempSimdReg();
+    FpRegister xmm_const15    = AllocTempSimdReg();
+    FpRegister xmm_zero       = AllocTempSimdReg();
+    FpRegister xmm_tmp_idx    = AllocTempSimdReg();
+    FpRegister xmm_tmp_mask   = AllocTempSimdReg();
+    FpRegister xmm_tmp_lookup = AllocTempSimdReg();
+
+    // Load the index vector once. Vm is the per-byte selector.
+    builder_.GenGetSimd<16>(xmm_idx.machine_reg(), vm_off);
+    // acc = 0, in_range = 0, zero = 0. MOVQ from a zero GP reg zero-extends to a
+    // full 128-bit zero and is a proper full-def (a self-PXOR would read an
+    // undefined vreg and trip the lifetime analysis in this tier).
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_acc.machine_reg(), GetImm(uint64_t{0}));
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_in_range.machine_reg(), GetImm(uint64_t{0}));
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_zero.machine_reg(), GetImm(uint64_t{0}));
+    // const15 = byte-broadcast(0x0F).
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_const15.machine_reg(),
+                                      GetImm(uint64_t{0x0F0F0F0F0F0F0F0FULL}));
+    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm_const15.machine_reg(), xmm_const15.machine_reg());
+
+    for (uint8_t r = 0; r < table_regs; ++r) {
+      const int32_t vn_off_r =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + ((rn + r) & 31) * 16);
+
+      // shifted_idx_r = Vm - r*16 (bytewise wrap). For r=0 this is just Vm.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_idx.machine_reg());
+      if (r != 0) {
+        const uint64_t broadcast =
+            uint64_t{0x0101010101010101ULL} * static_cast<uint64_t>(r * 16);
+        builder_.Gen<x86_64::MovqXRegReg>(xmm_tmp_mask.machine_reg(), GetImm(broadcast));
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm_tmp_mask.machine_reg(),
+                                                 xmm_tmp_mask.machine_reg());
+        builder_.Gen<x86_64::PsubbXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_tmp_mask.machine_reg());
+      }
+
+      // in_range_r = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0).
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_idx.machine_reg());
+      builder_.Gen<x86_64::PsubusbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_const15.machine_reg());
+      builder_.Gen<x86_64::PcmpeqbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_zero.machine_reg());
+
+      // looked_up_r = PSHUFB(V[(rn+r)%32], shifted_idx_r), masked by in_range.
+      builder_.GenGetSimd<16>(xmm_tmp_lookup.machine_reg(), vn_off_r);
+      builder_.Gen<x86_64::PshufbXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_idx.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_mask.machine_reg());
+
+      builder_.Gen<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_lookup.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xmm_in_range.machine_reg(), xmm_tmp_mask.machine_reg());
+    }
+
+    if (op /* TBX */) {
+      // result = acc | (Vd & ~in_range_all).
+      builder_.GenGetSimd<16>(xmm_tmp_lookup.machine_reg(), vd_off);
+      // xmm_tmp_mask := ~in_range_all & Vd
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_in_range.machine_reg());
+      builder_.Gen<x86_64::PandnXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_lookup.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_mask.machine_reg());
+    }
+
+    // SetVRegFull zeroes Vd[127:64] when q=false (D-register semantics).
+    SetVRegFull(rd, xmm_acc, q);
   }
 
   void AdvSimdMultiStruct(uint8_t rt,
