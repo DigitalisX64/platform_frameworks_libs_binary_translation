@@ -3371,9 +3371,153 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // AdvSIMD shift-by-immediate (vector and scalar).  Mirrors the high-value
+  // subset of lite_translator.h::AdvSimdShiftByImm into the optimizing tier so
+  // NEON widening/shift loops (calculate_gnu_hash_neon and every SIMD widening
+  // expansion) stop bailing the heavy region wholesale to lite.  Covered here:
+  //   * USHLL / SSHLL (incl. UXTL/SXTL == #0) — 8B->8H / 4H->4S / 2S->2D
+  //     widening, both Q halves (long2 reads Vn[127:64]).
+  //   * SHL / USHR / SSHR at H/S/D lanes (esize 16/32/64).
+  // Everything else (byte-lane SHL/USHR/SSHR, SSHR .2D which needs PSRAQ, and
+  // SLI/SRI/SSRA/USRA/rounding/saturating/narrow/fixed-point conversions) calls
+  // Undefined() which sets success_=false and bails the region to lite — the
+  // lite tier already lowers those correctly (a heavy bail is correct-but-slow,
+  // acceptable for the rarer shift variants).
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    const uint8_t immh = args.immh;
+    if (immh == 0) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const int32_t vn_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
+
+    switch (args.opcode) {
+      case Decoder::AdvSimdShiftImmOpcode::kUshll:
+      case Decoder::AdvSimdShiftImmOpcode::kSshll: {
+        // USHLL/SSHLL Vd.<wide>, Vn.<narrow>, #shift.  esize = 8 <<
+        // highest-set-bit(immh); Q=1 ("long2") widens the upper 64 of Vn.
+        // Left-shift is bit-identical signed/unsigned, so PSLL{W,D,Q} is
+        // shared after the signed/unsigned widen.  Result is always a full
+        // 128-bit register (SetVRegFull q=true).
+        if (immh & 0b1000) {  // RESERVED for shift-left-long.
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshll);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (args.q) {
+          // Bring Vn[127:64] into the low 64 so PMOVSX/PMOVZX widens it.
+          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        }
+        uint8_t shift_imm;
+        if (immh & 0b0100) {  // 2S -> 2D
+          shift_imm = static_cast<uint8_t>(immh_immb - 32);
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          if (shift_imm != 0) {
+            builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          }
+        } else if (immh & 0b0010) {  // 4H -> 4S
+          shift_imm = static_cast<uint8_t>(immh_immb - 16);
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          if (shift_imm != 0) {
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          }
+        } else {  // immh & 0b0001: 8B -> 8H
+          shift_imm = static_cast<uint8_t>(immh_immb - 8);
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          if (shift_imm != 0) {
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          }
+        }
+        SetVRegFull(args.rd, xn, /*q=*/true);
+        return;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kShl:
+      case Decoder::AdvSimdShiftImmOpcode::kUshr:
+      case Decoder::AdvSimdShiftImmOpcode::kSshr: {
+        // esize from immh: bit3->64, bit2->32, bit1->16, bit0->8 (byte, no
+        // x86 packed shift -> bail to lite, which widens via PMOVSX/PACKSS).
+        if (immh == 0b0001) {  // byte lane
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else {  // immh & 0b0010
+          esize_bits = 16;
+        }
+        const bool is_left =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
+        // SHL count = immh:immb - esize (0..esize-1); USHR/SSHR count =
+        // 2*esize - immh:immb (1..esize).  PSLL/PSRL/PSRA saturate to
+        // 0/sign-fill at count>=esize, matching ARM at the boundary.
+        const uint8_t shift_count =
+            is_left ? static_cast<uint8_t>(immh_immb - esize_bits)
+                    : static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        const bool is_arith =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr);
+        // SSHR .2D / scalar-D needs PSRAQ (AVX-512F-VL only) -> bail to lite,
+        // whose GPR fallback ships each 64-bit lane through SARQ.
+        if (is_arith && esize_bits == 64) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        if (is_left) {
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), cnt);
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else if (is_arith) {  // SSHR, esize 16 or 32
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else {  // USHR
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+          }
+        }
+        // Q=0 (incl. scalar) forms zero Vd[127:64] via SetVRegFull.
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+      default:
+        UndefinedReturningVoid();
+        return;
+    }
   }
 
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {

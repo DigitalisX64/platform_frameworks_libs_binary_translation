@@ -3099,6 +3099,37 @@ constexpr uint32_t SqxtunVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t ShllVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b10011, rd, rn);
 }
+// AdvSIMD shift by immediate (vector): 0 Q U 011110 immh immb opcode 1 Rn Rd.
+constexpr uint32_t AdvSimdShiftImm(
+    bool q, bool u, uint8_t immh, uint8_t immb, uint8_t opcode, uint8_t rd, uint8_t rn) {
+  return 0x0F000400u | (static_cast<uint32_t>(q) << 30) | (static_cast<uint32_t>(u) << 29) |
+         (static_cast<uint32_t>(immh) << 19) | (static_cast<uint32_t>(immb) << 16) |
+         (static_cast<uint32_t>(opcode) << 11) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+// USHLL/USHLL2: U=1, opcode=10100.
+constexpr uint32_t UshllVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10100, rd, rn);
+}
+// SSHLL/SSHLL2: U=0, opcode=10100.
+constexpr uint32_t SshllVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10100, rd, rn);
+}
+// SHL: U=0, opcode=01010.
+constexpr uint32_t ShlVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b01010, rd, rn);
+}
+// USHR: U=1, opcode=00000.
+constexpr uint32_t UshrVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b00000, rd, rn);
+}
+// SSHR: U=0, opcode=00000.
+constexpr uint32_t SshrVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b00000, rd, rn);
+}
+// SSRA (bails in heavy): U=0, opcode=00010.
+constexpr uint32_t SsraVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b00010, rd, rn);
+}
 // SQXTN/SQXTN2: U=0, opcode=10100.
 constexpr uint32_t SqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10100, rd, rn);
@@ -5909,6 +5940,97 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ShllVec2D) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000500000000ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000A00000000ULL);
+}
+
+// UXTL v0.8h, v1.8b, #0 (USHLL #0, immh=0001, immb=0): zero-extend low 8 bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UxtlVec8H) {
+  static const uint32_t code[] = {UshllVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/0, 0, 1)};
+  SetV128(&state_, 1, 0x0807060504030201ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0004000300020001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0008000700060005ULL);
+}
+
+// SXTL v0.4s, v1.4h, #0 (SSHLL #0, immh=0010, immb=0): sign-extend low 4 hwords.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SxtlVec4S) {
+  static const uint32_t code[] = {SshllVec(/*q=*/false, /*immh=*/0b0010, /*immb=*/0, 0, 1)};
+  // hwords lane0..3 = 0001 FFFF 8000 7FFF.
+  SetV128(&state_, 1, 0x7FFF8000FFFF0001ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFF00000001ULL);   // words 00000001 FFFFFFFF
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00007FFFFFFF8000ULL);  // words FFFF8000 00007FFF
+}
+
+// USHLL2 v0.4s, v1.8h, #3 (q=1, immh=0010, immb=3): widen UPPER 4 hwords << 3.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ushll2Vec4S) {
+  static const uint32_t code[] = {UshllVec(/*q=*/true, /*immh=*/0b0010, /*immb=*/3, 0, 1)};
+  // upper hwords lane4..7 = 0001 0002 0003 0004.
+  SetV128(&state_, 1, 0xBBBBBBBBBBBBBBBBULL, 0x0004000300020001ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000001000000008ULL);   // 0x0001<<3, 0x0002<<3
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000002000000018ULL);  // 0x0003<<3, 0x0004<<3
+}
+
+// SHL v0.8h, v1.8h, #4 (q=1, immh=0010, immb=4): left-shift 8 hwords by 4.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ShlVec8H) {
+  static const uint32_t code[] = {ShlVec(/*q=*/true, /*immh=*/0b0010, /*immb=*/4, 0, 1)};
+  SetV128(&state_, 1, 0x1000010000100001ULL, 0x800000FF00030002ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000100001000010ULL);   // 1<<4,10<<4,100<<4,1000<<4(=0)
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000FF000300020ULL);  // 2<<4,3<<4,FF<<4,8000<<4(=0)
+}
+
+// USHR v0.4s, v1.4s, #8 (q=1, immh=0111, immb=0): logical right-shift 4 words by 8.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshrVec4S) {
+  static const uint32_t code[] = {UshrVec(/*q=*/true, /*immh=*/0b0111, /*immb=*/0, 0, 1)};
+  SetV128(&state_, 1, 0xFF00000000000100ULL, 0x800000000000FF00ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00FF000000000001ULL);   // 0x100>>8, 0xFF000000>>8
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00800000000000FFULL);  // 0xFF00>>8, 0x80000000>>8
+}
+
+// SSHR v0.4h, v1.4h, #2 (q=0, immh=0011, immb=6): arith right-shift 4 hwords, upper zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshrVec4H) {
+  static const uint32_t code[] = {SshrVec(/*q=*/false, /*immh=*/0b0011, /*immb=*/6, 0, 1)};
+  // hwords lane0..3 = 0004 FFFC(-4) 8000(-32768) 000C(12).
+  SetV128(&state_, 1, 0x000C8000FFFC0004ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0003E000FFFF0001ULL);   // 1, -1, -8192(0xE000), 3
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // D-form upper zero
+}
+
+// SSRA (accumulate) is not mirrored into the heavy tier — it must bail to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SsraVecBails) {
+  static const uint32_t code[] = {SsraVec(/*q=*/true, /*immh=*/0b0010, /*immb=*/4, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 // SQXTN v0.8b, v1.8h (size=00, Q=0): signed saturating narrow (PACKSSWB).
