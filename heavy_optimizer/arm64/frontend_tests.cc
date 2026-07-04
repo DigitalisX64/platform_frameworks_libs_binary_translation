@@ -3069,6 +3069,20 @@ constexpr uint32_t FdivVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm)
   return AdvSimdThreeSame(
       q, /*u=*/true, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11111, rd, rn, rm);
 }
+// FP three-same vector compares (opcode=11100). FCMEQ op_high=0/U=0;
+// FCMGE op_high=0/U=1; FCMGT op_high=1/U=1. size field = {op_high, sz}, sz=dbl.
+constexpr uint32_t FcmeqVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11100, rd, rn, rm);
+}
+constexpr uint32_t FcmgeVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/true, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11100, rd, rn, rm);
+}
+constexpr uint32_t FcmgtVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/true, /*size=*/static_cast<uint8_t>(0b10 | dbl), /*opcode=*/0b11100, rd, rn, rm);
+}
 
 // --- AdvSIMD two-register-miscellaneous encoders. ---
 // Encoding: 0 Q U 01110 size(2) 1 0000 opcode(5) 10 Rn(5) Rd(5).
@@ -4152,6 +4166,91 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FaddVec2S) {
   ASSERT_TRUE(ok);
   // FADD -> 11.0, 22.0 ; upper 64 zeroed.
   EXPECT_EQ(VLo64(&state_, 0), 0x41B0000041300000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Shared FP32 .4S operands for the compare tests:
+//   v1 = 1.0, 2.0, 3.0, NaN ; v2 = 1.0, 5.0, 2.0, 1.0.
+// NaN lane exercises ARM's unordered-is-false rule (all three ops -> 0).
+static constexpr uint64_t kCmpV1Lo = 0x400000003F800000ULL;  // 1.0, 2.0
+static constexpr uint64_t kCmpV1Hi = 0x7FC0000040400000ULL;  // 3.0, NaN
+static constexpr uint64_t kCmpV2Lo = 0x40A000003F800000ULL;  // 1.0, 5.0
+static constexpr uint64_t kCmpV2Hi = 0x3F80000040000000ULL;  // 2.0, 1.0
+
+// FCMEQ v0.4s, v1.4s, v2.4s: per-lane FP32 equal -> all-ones/zero mask.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmeqVec4S) {
+  static const uint32_t code[] = {FcmeqVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, kCmpV1Lo, kCmpV1Hi);
+  SetV128(&state_, 2, kCmpV2Lo, kCmpV2Hi);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // eq: 1==1 T, 2==5 F, 3==2 F, NaN==1 F.
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FCMGE v0.4s, v1.4s, v2.4s (U=1): per-lane FP32 >= -> all-ones/zero mask.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgeVec4S) {
+  static const uint32_t code[] = {FcmgeVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, kCmpV1Lo, kCmpV1Hi);
+  SetV128(&state_, 2, kCmpV2Lo, kCmpV2Hi);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ge: 1>=1 T, 2>=5 F, 3>=2 T, NaN>=1 F.
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);
+}
+
+// FCMGT v0.4s, v1.4s, v2.4s (op_high=1, U=1): per-lane FP32 > -> mask.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgtVec4S) {
+  static const uint32_t code[] = {FcmgtVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, kCmpV1Lo, kCmpV1Hi);
+  SetV128(&state_, 2, kCmpV2Lo, kCmpV2Hi);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // gt: 1>1 F, 2>5 F, 3>2 T, NaN>1 F.
+  EXPECT_EQ(VLo64(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);
+}
+
+// FCMGE v0.2s, v1.2s, v2.2s (Q=0): two FP32 lanes, Vd[127:64] zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgeVec2S) {
+  static const uint32_t code[] = {FcmgeVec(/*dbl=*/false, /*q=*/false, 0, 1, 2)};
+  // v1 = 3.0, 1.0 ; v2 = 2.0, 1.0.
+  SetV128(&state_, 1, 0x3F80000040400000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x3F80000040000000ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ge: 3>=2 T, 1>=1 T ; upper 64 zeroed.
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FCMGT v0.2d, v1.2d, v2.2d (op_high=1, U=1, FP64): per-lane double >.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgtVec2D) {
+  static const uint32_t code[] = {FcmgtVec(/*dbl=*/true, /*q=*/true, 0, 1, 2)};
+  // v1 = 5.0, 2.0 ; v2 = 3.0, 2.0.
+  SetV128(&state_, 1, 0x4014000000000000ULL, 0x4000000000000000ULL);
+  SetV128(&state_, 2, 0x4008000000000000ULL, 0x4000000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // gt: 5>3 T, 2>2 F.
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 

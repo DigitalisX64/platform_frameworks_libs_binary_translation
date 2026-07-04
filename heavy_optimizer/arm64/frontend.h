@@ -2805,6 +2805,59 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP vector FCMEQ/FCMGE/FCMGT (.2S/.4S FP32, .2D FP64) produce a per-lane
+    // all-ones/zero mask. Mirrors lite_translator.h's non-FP16 path: the SSE
+    // legacy-encoded CMP{EQ,LT,LE}P{S,D} predicates are ordered, returning FALSE
+    // (zero) for any NaN operand, exactly matching ARM's unordered-is-false rule.
+    //   FCMEQ: CMPEQP* xn, xm                 -> xn = (xn == xm)
+    //   FCMGE: CMPLEP* xm, xn   [result = xm] -> xm = (xm <= xn) == (xn >= xm)
+    //   FCMGT: CMPLTP* xm, xn   [result = xm] -> xm = (xm <  xn) == (xn >  xm)
+    // FP16 (is_fp16, needs an F16C round-trip absent from the backend Gen inputs)
+    // bails to lite; the decoder already rejects the reserved sz=1&&!Q (.1D)
+    // shape, so only .2S/.4S/.2D reach here. FACGE/FACGT (abs-compare) are NOT
+    // handled here — they need a sign-clear pre-mask and still bail to lite.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmeqV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmgeV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmgtV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      FpRegister result;
+      if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmeqV) {
+        if (is_double) {
+          builder_.Gen<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        result = xn;
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFcmgeV) {
+        // (xm <= xn) == (xn >= xm); mask lands in xm.
+        if (is_double) {
+          builder_.Gen<x86_64::CmplepdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmplepsXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        }
+        result = xm;
+      } else {  // FCMGT
+        // (xm < xn) == (xn > xm); mask lands in xm.
+        if (is_double) {
+          builder_.Gen<x86_64::CmpltpdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpltpsXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        }
+        result = xm;
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, result, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
