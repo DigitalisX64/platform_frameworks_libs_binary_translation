@@ -2376,10 +2376,79 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // DUP (element): broadcast Vn.<T>[index] (one esize-byte element) to every
+    // lane of Vd. Q=0 fills the low 64 and zeros the upper 64 (D-register
+    // semantics); Q=1 fills all 128. imm5 encodes (esize, index) exactly as
+    // UMOV/SMOV/INS-element above. Lowering mirrors lite_translator.h's
+    // DUP-element:
+    //   esize=1 → PSHUFB with a materialized {idx}×16 byte-index mask.
+    //   esize=2 → PSHUFB with a {idx*2, idx*2+1}×8 halfword-index mask.
+    //   esize=4 → PSHUFD imm = idx*0x55 (broadcast dword[idx]).
+    //   esize=8 → PSHUFD imm 0x44 (idx=0) / 0xEE (idx=1); (8,Q=0)=1D reserved.
+    // Both halves of the 128-bit index mask are identical, so it is built
+    // qword-at-a-time via MOVQ r->xmm + PUNPCKLQDQ self-broadcast (the same
+    // mask-materialization recipe used elsewhere in this file). SetVRegFull with
+    // q=false zeros the upper 64 for the D-form. Stays entirely in the XMM
+    // domain so MOVDQA store/load forwarding remains consistent.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupElement) {
+      const uint8_t imm5_low4 = args.imm5 & 0xf;
+      uint8_t esize;
+      uint8_t index;
+      if (imm5_low4 & 0x1) {
+        esize = 1;
+        index = (args.imm5 >> 1) & 0xf;
+      } else if (imm5_low4 & 0x2) {
+        esize = 2;
+        index = (args.imm5 >> 2) & 0x7;
+      } else if (imm5_low4 & 0x4) {
+        esize = 4;
+        index = (args.imm5 >> 3) & 0x3;
+      } else if (imm5_low4 & 0x8) {
+        esize = 8;
+        index = (args.imm5 >> 4) & 0x1;
+      } else {
+        UndefinedReturningVoid();  // reserved imm5
+        return;
+      }
+      // DUP Vd.1D (esize=8, Q=0) is ARM-reserved.
+      if (esize == 8 && !args.q) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const int32_t vn_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xmm.machine_reg(), vn_off);
+      if (esize == 1 || esize == 2) {
+        uint64_t mask_qword;
+        if (esize == 1) {
+          mask_qword = 0x0101010101010101ULL * static_cast<uint64_t>(index);
+        } else {
+          const uint64_t b0 = static_cast<uint64_t>(index) * 2;
+          const uint64_t pair = ((b0 + 1) << 8) | b0;
+          mask_qword = pair | (pair << 16) | (pair << 32) | (pair << 48);
+        }
+        Register r =
+            std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(mask_qword)));
+        FpRegister mask = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), r);
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(mask.machine_reg(), mask.machine_reg());
+        builder_.Gen<x86_64::PshufbXRegXReg>(xmm.machine_reg(), mask.machine_reg());
+      } else if (esize == 4) {
+        const int8_t imm = static_cast<int8_t>(static_cast<uint8_t>(index * 0x55));
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xmm.machine_reg(), xmm.machine_reg(), imm);
+      } else {  // esize == 8, Q=1
+        const int8_t imm =
+            (index == 0) ? static_cast<int8_t>(0x44) : static_cast<int8_t>(0xEE);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xmm.machine_reg(), xmm.machine_reg(), imm);
+      }
+      SetVRegFull(args.rd, xmm, args.q);
+      return;
+    }
+
     if (args.opcode != Decoder::AdvSimdCopyOpcode::kDupGeneral) {
-      // DUP (element): needs a PSHUFB byte-broadcast mask constant / PSHUFD
-      // lane-select the optimizer allowlist doesn't cover cleanly; the lite
-      // translator handles it.
+      // Any remaining AdvSimdCopy opcode (e.g. kDupScalar) is not lowered by the
+      // optimizing tier; the lite translator handles it.
       UndefinedReturningVoid();
       return;
     }

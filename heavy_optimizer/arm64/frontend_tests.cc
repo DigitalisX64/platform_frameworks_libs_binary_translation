@@ -4771,8 +4771,95 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, DupGenV2DXzr) {
 }
 
 // DUP (element) must bail: needs PSHUFD/PSHUFLW not in the backend allowlist.
-TEST_F(Arm64HeavyOptimizerFrontendTest, DupElementBails) {
-  static const uint32_t code[] = {DupElem(/*q=*/true, /*imm5=*/0x08, 0, 1)};  // dup v0.2d, v1.d[0]
+// DUP (element): broadcast Vn.<T>[index] to every lane of Vd.
+// dup v0.16b, v1.b[5] — byte broadcast (Q=1). byte[5] of V1 = 0x0D.
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV16B) {
+  static const uint32_t code[] = {DupElem(/*q=*/true, /*imm5=*/0x0B, 0, 1)};
+  ASSERT_EQ(code[0], 0x4e0b0420u);
+  SetV128(&state_, 1, 0x0F0E0D0C0B0A0908ULL, 0x1F1E1D1C1B1A1918ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0D0D0D0D0D0D0D0DULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0D0D0D0D0D0D0D0DULL);
+}
+
+// dup v0.8b, v1.b[2] — byte broadcast, D-form (Q=0) upper-zero. byte[2] = 0x0A.
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV8BUpperZero) {
+  static const uint32_t code[] = {DupElem(/*q=*/false, /*imm5=*/0x05, 0, 1)};
+  ASSERT_EQ(code[0], 0x0e050420u);
+  SetV128(&state_, 1, 0x0F0E0D0C0B0A0908ULL, 0x1F1E1D1C1B1A1918ULL);
+  SetV128(&state_, 0, 0x9999999999999999ULL, 0x8888888888888888ULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0A0A0A0A0A0A0A0AULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);  // D-form zeroes the upper 64 bits
+}
+
+// dup v0.8h, v1.h[3] — halfword broadcast (Q=1). h[3] = 0x0004.
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV8H) {
+  static const uint32_t code[] = {DupElem(/*q=*/true, /*imm5=*/0x0E, 0, 1)};
+  ASSERT_EQ(code[0], 0x4e0e0420u);
+  SetV128(&state_, 1, 0x0004000300020001ULL, 0x0008000700060005ULL);
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0004000400040004ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0004000400040004ULL);
+}
+
+// dup v0.4s, v1.s[2] — word broadcast (Q=1). s[2] = 0x33333333.
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV4S) {
+  static const uint32_t code[] = {DupElem(/*q=*/true, /*imm5=*/0x14, 0, 1)};
+  ASSERT_EQ(code[0], 0x4e140420u);
+  SetV128(&state_, 1, 0x2222222211111111ULL, 0x4444444433333333ULL);
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3333333333333333ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x3333333333333333ULL);
+}
+
+// dup v0.2d, v1.d[1] — doubleword broadcast, high lane (Q=1). d[1] = 0xBBBB...
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV2DIdx1) {
+  static const uint32_t code[] = {DupElem(/*q=*/true, /*imm5=*/0x18, 0, 1)};
+  ASSERT_EQ(code[0], 0x4e180420u);
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xBBBBBBBBBBBBBBBBULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xBBBBBBBBBBBBBBBBULL);
+}
+
+// dup v0.2d, v1.d[0] — doubleword broadcast, low lane (Q=1). d[0] full 64 bits.
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV2DIdx0) {
+  static const uint32_t code[] = {DupElem(/*q=*/true, /*imm5=*/0x08, 0, 1)};
+  ASSERT_EQ(code[0], 0x4e080420u);
+  SetV128(&state_, 1, 0x1122334455667788ULL, 0x99999999AAAAAAAAULL);
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1122334455667788ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x1122334455667788ULL);
+}
+
+// dup v0.1d, v1.d[0] (esize=D, Q=0) is ARM-reserved: the heavy tier bails.
+TEST_F(Arm64HeavyOptimizerFrontendTest, DupElemV1DReservedBails) {
+  static const uint32_t code[] = {DupElem(/*q=*/false, /*imm5=*/0x08, 0, 1)};
+  ASSERT_EQ(code[0], 0x0e080420u);
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
