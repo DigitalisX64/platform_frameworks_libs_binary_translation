@@ -1503,11 +1503,71 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
-  // FMADD/FMSUB/FNMADD/FNMSUB. Would need the FMA intrinsic bindings + scalar
-  // V-reg plumbing for three operands; bail for now.
+  // FMADD/FMSUB/FNMADD/FNMSUB (FP data-processing, 3 source) at S/D. Lowered to
+  // the x86 FMA3 231-form ops, which — like ARM's fused multiply-add — round the
+  // whole a+n*m once. A plain MUL+ADD would double-round and is wrong, so a host
+  // without FMA3 bails to the lite tier (which uses libc fma()/fmaf()). Mirrors
+  // lite_translator.h::FpDataProc3's S/D paths. The FMA231 op is use_def on its
+  // dest (the accumulator = Ra), so copy Ra into a fresh temp first to avoid
+  // clobbering the guest V[ra] mapping:
+  //   FMADD  (o1=0,o0=0) Ra + Rn*Rm     -> Vfmadd231  (acc + Rn*Rm)
+  //   FMSUB  (o1=0,o0=1) Ra - Rn*Rm     -> Vfnmadd231 (acc + -(Rn*Rm))
+  //   FNMADD (o1=1,o0=0) -(Ra + Rn*Rm)  -> Vfnmsub231 (-(Rn*Rm) - acc)
+  //   FNMSUB (o1=1,o0=1) Rn*Rm - Ra     -> Vfmsub231  (Rn*Rm - acc)
+  // FP16 (ftype=0b11, needs F16C widen/narrow ops not in the backend gen inputs)
+  // and the reserved ftype=0b10 bail to the lite tier.
   void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra, uint8_t ftype, bool o1, bool o0) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, ra, ftype, o1, o0);
+    if (!success()) {
+      return;
+    }
+    if (ftype != 0b00 && ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (!host_platform::kHasFMA) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (ftype == 0b01);
+    FpRegister xmm_n = GetVRegScalar(rn, is_double);
+    FpRegister xmm_m = GetVRegScalar(rm, is_double);
+    FpRegister xmm_a = GetVRegScalar(ra, is_double);
+    FpRegister acc = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(acc.machine_reg(), xmm_a.machine_reg());
+    if (!o1 && !o0) {  // FMADD
+      if (is_double) {
+        builder_.Gen<x86_64::Vfmadd231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfmadd231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    } else if (!o1 && o0) {  // FMSUB
+      if (is_double) {
+        builder_.Gen<x86_64::Vfnmadd231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfnmadd231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    } else if (o1 && !o0) {  // FNMADD
+      if (is_double) {
+        builder_.Gen<x86_64::Vfnmsub231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfnmsub231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    } else {  // FNMSUB
+      if (is_double) {
+        builder_.Gen<x86_64::Vfmsub231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfmsub231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    }
+    SetVRegScalar(rd, acc, is_double);
   }
 
   // FMOV (scalar, immediate): the FP constant is fully known at translation
@@ -1533,44 +1593,60 @@ class HeavyOptimizerFrontend {
     }
   }
 
-  // FCVTZS/FCVTZU/SCVTF/UCVTF (FP<->int). The FCvtFloatToInteger* intrinsics +
-  // cvtsi2ss SSE ops are not available to the ARM64 backend (riscv64-only macro
-  // defs), so bail.
   // FMOV between a general register and a scalar FP register, single (S/W) or
-  // double (D/X), via x86 MOVD/MOVQ. The rmode == 01 top-half (V.D[1]) forms and
-  // every FP<->int *conversion* in this group (SCVTF/UCVTF/FCVTZS/FCVTZU/...,
-  // FP16, ftype >= 0b10) bail to the lite tier, whose intrinsics cover them.
+  // double (D/X), via x86 MOVD/MOVQ; plus SCVTF/UCVTF (integer -> FP) via the
+  // x86 CVTSI2SS/SD ops (EmitScvtfUcvtf) and FCVTZS/FCVTZU (FP -> int, truncate
+  // toward zero) via CVTT{SS,SD}2SI + the ARM saturation/NaN fix-up (EmitFcvtz).
+  // The rmode == 01 top-half (V.D[1]) forms, the rounding FP -> int conversions
+  // (FCVTNS/PS/MS/AS/...), FP16, and ftype >= 0b10 bail to the lite tier, whose
+  // intrinsics cover them.
   // Guest V[] access stays in the XMM domain (GetVRegScalar / SetVRegScalar*),
   // and the GP<->XMM crossing is an explicit register move, not a forwarded
-  // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV subset).
+  // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV +
+  // SCVTF/UCVTF subset).
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
     if (!success()) {
       return;
     }
-    if (args.rmode != 0b00 || (args.ftype != 0b00 && args.ftype != 0b01) ||
-        (args.op != 0b110 && args.op != 0b111)) {
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
       UndefinedReturningVoid();
       return;
     }
     const bool is_double = (args.ftype == 0b01);
-    if (args.op == 0b111) {
-      // FMOV Sd, Wn / Dd, Xn: general register -> scalar FP (upper lanes zeroed).
-      if (args.rn == 31) {
-        SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);  // WZR/XZR -> 0
+    if (args.rmode == 0b00 && (args.op == 0b110 || args.op == 0b111)) {
+      if (args.op == 0b111) {
+        // FMOV Sd, Wn / Dd, Xn: general register -> scalar FP (upper lanes zeroed).
+        if (args.rn == 31) {
+          SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);  // WZR/XZR -> 0
+        } else {
+          SetVRegScalarFromGp(args.rd, GetReg(args.rn), is_double);
+        }
       } else {
-        SetVRegScalarFromGp(args.rd, GetReg(args.rn), is_double);
+        // FMOV Wd, Sn / Xd, Dn: scalar FP -> general register.
+        if (args.rd == 31) {
+          return;  // WZR/XZR destination: discard.
+        }
+        FpRegister xmm = GetVRegScalar(args.rn, is_double);
+        Register gp = is_double
+                          ? std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()))
+                          : std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+        SetReg(args.rd, gp);
       }
-    } else {
-      // FMOV Wd, Sn / Xd, Dn: scalar FP -> general register.
-      if (args.rd == 31) {
-        return;  // WZR/XZR destination: discard.
-      }
-      FpRegister xmm = GetVRegScalar(args.rn, is_double);
-      Register gp = is_double
-                        ? std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()))
-                        : std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
-      SetReg(args.rd, gp);
+      return;
     }
+    // SCVTF (op 010) / UCVTF (op 011): integer -> FP, unscaled (rmode == 00).
+    if (args.rmode == 0b00 && (args.op == 0b010 || args.op == 0b011)) {
+      EmitScvtfUcvtf(args, is_double);
+      return;
+    }
+    // FCVTZS (op 000) / FCVTZU (op 001): FP -> int, truncate (rmode == 11).
+    if (args.rmode == 0b11 && (args.op == 0b000 || args.op == 0b001)) {
+      EmitFcvtz(args, is_double);
+      return;
+    }
+    // Everything else (rmode==01 V.D[1] FMOV, rounding FP->int conversions)
+    // bails to the lite tier.
+    UndefinedReturningVoid();
   }
 
   // FMOV(reg) / FABS / FNEG for FP32 (ftype=00) and FP64 (ftype=01). These are
@@ -1693,18 +1769,34 @@ class HeavyOptimizerFrontend {
     SetVRegScalar(args.rd, result, is_double);
   }
 
-  // FCMP/FCMPE: needs an x86 UCOMIS{S,D} -> ARM FP NZCV mapping (the Ucomis SSE
-  // ops are not allowlisted for the ARM64 backend); bail.
-  void FpCompare(const Decoder::FpCompareArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
-  }
+  // FCMP/FCMPE Sn/Dn, Sm/Dm (or #0.0): compare and set NZCV. Lowers to x86
+  // UCOMIS{S,D} (now allowlisted as UcomiseXRegXReg) followed by the FP-specific
+  // EFLAGS->ARM-NZCV mapping (EmitStoreArmFpNZCV). Defined in the .cc (the NZCV
+  // mapping is a branch tree over PF/ZF/CF and needs basic-block manipulation).
+  // FP16 (ftype 0b11, would need F16C widening ops not in the backend gen
+  // inputs) and the reserved ftype 0b10 bail to the lite tier.
+  void FpCompare(const Decoder::FpCompareArgs& args);
 
-  // FCCMP/FCCMPE: same UCOMIS dependency as FCMP plus a predicate; bail.
-  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
-  }
+  // FCCMP/FCCMPE: if `cond` holds, perform the FCMP compare + NZCV mapping;
+  // otherwise write the 4-bit nzcv immediate straight to cpu.flags. Mirrors
+  // lite_translator.h::FpConditionalCompare; defined in the .cc (then/else/merge
+  // basic blocks, same shape as ConditionalCompare). The signal_nans (FCCMPE)
+  // bit does not change the architectural NZCV output — UCOMIS already signals
+  // on SNaN — so it is ignored, matching lite.
+  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args);
+
+  // SCVTF/UCVTF Sd/Dd, Wn/Xn (unscaled, rmode == 00): convert a signed/unsigned
+  // integer general register to scalar FP via x86 CVTSI2SS/SD. Defined in the .cc
+  // because the sf==1 unsigned form needs a basic-block split (values >= 2^63 use
+  // the round-to-odd halve/convert/double fix-up). Mirrors
+  // lite_translator.h::FpIntConversion's SCVTF/UCVTF path.
+  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double);
+
+  // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): FP -> integer
+  // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
+  // BB-split lowering (a shared `result` GP vreg merged via PseudoCopy). Mirrors
+  // lite_translator.h::FpIntConversion's FCVTZS/FCVTZU paths.
+  void EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double);
 
   //
   // Advanced SIMD (Args-struct forms).
@@ -2726,6 +2818,14 @@ class HeavyOptimizerFrontend {
   void EmitCondBranch(Decoder::Condition cond,
                       MachineBasicBlock* then_bb,
                       MachineBasicBlock* else_bb);
+
+  // Map the x86 EFLAGS a preceding UCOMIS{S,D} left in `flags_vreg` to ARM64 FP
+  // NZCV and store the packed word into ThreadState.cpu.flags. Bit-exact with
+  // lite_translator.h::EmitStoreArmFpNZCV: unordered(PF)=C,V; equal(ZF)=Z,C;
+  // less(CF)=N; greater=C. Reads the flags into a GP register once (PseudoRead
+  // Flags), then a PF>ZF>CF branch tree selects the leaf that writes cpu.flags.
+  // Leaves the builder positioned at the tree's merge block.
+  void EmitStoreArmFpNZCV(Register flags_vreg);
 
   [[nodiscard]] Register AllocTempReg() { return builder_.ir()->AllocVReg(); }
   [[nodiscard]] SimdReg AllocTempSimdReg() { return SimdReg{builder_.ir()->AllocVReg()}; }
