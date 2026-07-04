@@ -2995,6 +2995,127 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // XTN/XTN2 Vd.<Tb>, Vn.<Ta> — truncating narrow: keep the low half of each
+      // element. size=00 (8H->8B) / size=01 (4S->4H): mask off the high half of
+      // every lane, then PACKUSWB/PACKUSDW into the low 64 (the mask guarantees
+      // all values sit in the unsigned pack's non-saturating range, so the pack
+      // is a pure truncation). size=10 (.2D->.2S): PSHUFD gathers dwords {0,2}
+      // into the low 64. Q=0 zero-extends the upper 64; Q=1 (XTN2) merges into
+      // Vd's high 64. size=11 is reserved and bails. Mirrors lite kXtn.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kXtn: {
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (args.size == 0b00 || args.size == 0b01) {
+          FpRegister xz = AllocZeroedSimdReg();
+          FpRegister xm = AllocTempSimdReg();
+          Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(
+              args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                                : int64_t{0x0000FFFF0000FFFFLL}));
+          builder_.Gen<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
+          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (args.size == 0b00) {
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          }
+        } else if (args.size == 0b10) {
+          builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                  int8_t{0b00001000});
+        } else {  // size=11 reserved
+          UndefinedReturningVoid();
+          return;
+        }
+        SetVRegNarrow(args.rd, xn, args.q);
+        return;
+      }
+
+      // SHLL/SHLL2 Vd.<Ta>, Vn.<Tb>, #<esize> — shift-left-long: zero-extend each
+      // narrow lane, then shift left by the source element width (8/16/32). Q=0
+      // widens Vn's low 8 bytes; Q=1 (SHLL2) the high 8 bytes (PSRLDQ brings them
+      // low first). The widened result always fills all 128 bits, so it is stored
+      // full regardless of Q. size=11 is unallocated and bails. Mirrors lite kShll.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kShll: {
+        if (args.size > 0b10) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (args.q) {
+          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        }
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), int8_t{32});
+            break;
+        }
+        SetVRegFull(args.rd, xn, /*q=*/true);
+        return;
+      }
+
+      // SQXTN/UQXTN/SQXTUN Vd.<Tb>, Vn.<Ta> — saturating extract narrow. Same
+      // dst-width and Q layout as XTN; the pack flavour differs by saturation:
+      //   SQXTN  signed->signed    : PACKSSWB / PACKSSDW
+      //   SQXTUN signed->unsigned  : PACKUSWB / PACKUSDW
+      //   UQXTN  unsigned->unsigned : PMINUW/PMINUD clamp to the unsigned dst max
+      //                               (keeps values in the positive signed range
+      //                               so the following PACKUS is exact), then
+      //                               PACKUSWB / PACKUSDW.
+      // size=00 (8H->8B) and size=01 (4S->4H) only; size=10 (.2D->.2S) needs the
+      // SSE4.2 PCMPGTQ clamp/blend and bails to lite, matching the register-pure
+      // heavy-tier convention. Mirrors lite kSqxtn/kUqxtn/kSqxtun.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
+        if (args.size != 0b00 && args.size != 0b01) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const auto opc = args.opcode;
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn) {
+          FpRegister xm = AllocTempSimdReg();
+          Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(
+              args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                                : int64_t{0x0000FFFF0000FFFFLL}));
+          builder_.Gen<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
+          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          if (args.size == 0b00) {
+            builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          }
+        } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
+          if (args.size == 0b00) {
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          }
+        } else {  // kSqxtn
+          if (args.size == 0b00) {
+            builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          }
+        }
+        SetVRegNarrow(args.rd, xn, args.q);
+        return;
+      }
+
       default:
         UndefinedReturningVoid();
         return;
@@ -3495,6 +3616,29 @@ class HeavyOptimizerFrontend {
     FpRegister merged = AllocZeroedSimdReg();
     builder_.Gen<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
     builder_.GenSetSimd<16>(off, merged.machine_reg());
+  }
+
+  // Commit a narrowing-op result: the narrowed lanes occupy the low 64 bits of
+  // `narrowed`. Q=0 stores them to Vd.low with the upper 64 zeroed; Q=1 (the
+  // "2" form) shifts them into Vd.high (PSLLDQ by 8) while preserving Vd's
+  // existing low 64 (masked via MOVSD into a zeroed reg, then POR). Mirrors the
+  // Q=0/Q2 store discipline of lite_translator.h's XTN/SQXTN family.
+  void SetVRegNarrow(uint8_t rd, FpRegister narrowed, bool q) {
+    if (!success()) {
+      return;
+    }
+    if (!q) {
+      SetVRegFull(rd, narrowed, /*q=*/false);
+      return;
+    }
+    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rd * 16);
+    builder_.Gen<x86_64::PslldqXRegImm>(narrowed.machine_reg(), int8_t{8});
+    FpRegister xd = AllocTempSimdReg();
+    FpRegister xd_low = AllocZeroedSimdReg();
+    builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+    builder_.Gen<x86_64::MovsdXRegXReg>(xd_low.machine_reg(), xd.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(narrowed.machine_reg(), xd_low.machine_reg());
+    SetVRegFull(rd, narrowed, /*q=*/true);
   }
 
   // Lower a scalar FP binary op through the guest-agnostic intrinsic layer.

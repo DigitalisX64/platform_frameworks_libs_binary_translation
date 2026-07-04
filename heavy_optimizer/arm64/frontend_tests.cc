@@ -3078,6 +3078,26 @@ constexpr uint32_t NegVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t AbsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01011, rd, rn);
 }
+// XTN/XTN2: U=0, opcode=10010.
+constexpr uint32_t XtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10010, rd, rn);
+}
+// SQXTUN/SQXTUN2: U=1, opcode=10010.
+constexpr uint32_t SqxtunVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b10010, rd, rn);
+}
+// SHLL/SHLL2: U=1, opcode=10011.
+constexpr uint32_t ShllVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b10011, rd, rn);
+}
+// SQXTN/SQXTN2: U=0, opcode=10100.
+constexpr uint32_t SqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10100, rd, rn);
+}
+// UQXTN/UQXTN2: U=1, opcode=10100.
+constexpr uint32_t UqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b10100, rd, rn);
+}
 // CMEQ #0: U=0, opcode=01001.
 constexpr uint32_t CmeqZeroVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01001, rd, rn);
@@ -5644,6 +5664,193 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, AbsVec4S) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000200000005ULL);   // [5,2]
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x8000000000000001ULL);  // [1,INT_MIN preserved]
+}
+
+// ---- AdvSIMD two-reg-misc widening/narrowing (heavy mirror). ----
+
+// XTN v0.8b, v1.8h (size=00, Q=0): truncate 8 halfwords to their low bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, XtnVec8B) {
+  static const uint32_t code[] = {XtnVec(0b00, /*q=*/false, 0, 1)};
+  // halfwords h0..h7 = 0102 ABCD 1234 00FF | 5566 7788 99AA BBCC.
+  SetV128(&state_, 1, 0x00FF1234ABCD0102ULL, 0xBBCC99AA77885566ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xCCAA8866FF34CD02ULL);   // low bytes of each hword
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zeroed
+}
+
+// XTN2 v0.16b, v1.8h (size=00, Q=1): narrowed bytes into Vd.high, Vd.low kept.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Xtn2Vec16B) {
+  static const uint32_t code[] = {XtnVec(0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x00FF1234ABCD0102ULL, 0xBBCC99AA77885566ULL);
+  SetV128(&state_, 0, 0x1122334455667788ULL, 0xBBBBBBBBBBBBBBBBULL);  // low preserved
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1122334455667788ULL);   // Vd.low preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xCCAA8866FF34CD02ULL);  // narrowed into high
+}
+
+// XTN v0.4h, v1.4s (size=01, Q=0): truncate 4 dwords to their low halfwords.
+TEST_F(Arm64HeavyOptimizerFrontendTest, XtnVec4H) {
+  static const uint32_t code[] = {XtnVec(0b01, /*q=*/false, 0, 1)};
+  // dwords 1111AAAA 2222BBBB | 3333CCCC 4444DDDD.
+  SetV128(&state_, 1, 0x2222BBBB1111AAAAULL, 0x4444DDDD3333CCCCULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xDDDDCCCCBBBBAAAAULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// XTN v0.2s, v1.2d (size=10, Q=0): PSHUFD gathers the low dword of each qword.
+TEST_F(Arm64HeavyOptimizerFrontendTest, XtnVec2S) {
+  static const uint32_t code[] = {XtnVec(0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x1234567890ABCDEFULL, 0xFEDCBA9876543210ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7654321090ABCDEFULL);   // [d0.lo32, d1.lo32]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SHLL v0.8h, v1.8b, #8 (size=00, Q=0): zero-extend low 8 bytes to words << 8.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ShllVec8H) {
+  static const uint32_t code[] = {ShllVec(0b00, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x0807060504030201ULL, 0x1817161514131211ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0400030002000100ULL);   // words 0100 0200 0300 0400
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0800070006000500ULL);
+}
+
+// SHLL2 v0.8h, v1.16b, #8 (size=00, Q=1): widen Vn's HIGH 8 bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Shll2Vec8H) {
+  static const uint32_t code[] = {ShllVec(0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0807060504030201ULL, 0x100F0E0D0C0B0A09ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0C000B000A000900ULL);   // words 0900 0A00 0B00 0C00
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x10000F000E000D00ULL);
+}
+
+// SHLL v0.4s, v1.4h, #16 (size=01, Q=0): zero-extend low 4 hwords to dwords << 16.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ShllVec4S) {
+  static const uint32_t code[] = {ShllVec(0b01, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x0004000300020001ULL, 0x0008000700060005ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0002000000010000ULL);   // dwords 00010000 00020000
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0004000000030000ULL);
+}
+
+// SHLL v0.2d, v1.2s, #32 (size=10, Q=0): zero-extend low 2 dwords to qwords << 32.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ShllVec2D) {
+  static const uint32_t code[] = {ShllVec(0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x0000000A00000005ULL, 0xDEADBEEFCAFEBABEULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000500000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000A00000000ULL);
+}
+
+// SQXTN v0.8b, v1.8h (size=00, Q=0): signed saturating narrow (PACKSSWB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnVec8B) {
+  static const uint32_t code[] = {SqxtnVec(0b00, /*q=*/false, 0, 1)};
+  // hwords 0001 007F 0080 FFFF | FF80 FF00 0100 8000.
+  SetV128(&state_, 1, 0xFFFF0080007F0001ULL, 0x80000100FF00FF80ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x807F8080FF7F7F01ULL);   // signed-sat bytes
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UQXTN v0.8b, v1.8h (size=00, Q=0): unsigned saturating narrow (PMINUW+PACKUSWB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqxtnVec8B) {
+  static const uint32_t code[] = {UqxtnVec(0b00, /*q=*/false, 0, 1)};
+  // hwords 0001 00FF 0100 00AB | FFFF 0080 1234 0000.
+  SetV128(&state_, 1, 0x00AB010000FF0001ULL, 0x000012340080FFFFULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00FF80FFABFFFF01ULL);   // clamp-to-255 bytes
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQXTUN v0.8b, v1.8h (size=00, Q=0): signed->unsigned saturating narrow (PACKUSWB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtunVec8B) {
+  static const uint32_t code[] = {SqxtunVec(0b00, /*q=*/false, 0, 1)};
+  // hwords 0001 00FF 0100 FFFF | 007F 8000 00AB 7FFF.
+  SetV128(&state_, 1, 0xFFFF010000FF0001ULL, 0x7FFF00AB8000007FULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFAB007F00FFFF01ULL);   // neg->0, >255->255
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQXTN v0.4h, v1.4s (size=01, Q=0): signed saturating narrow 4 dwords (PACKSSDW).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnVec4H) {
+  static const uint32_t code[] = {SqxtnVec(0b01, /*q=*/false, 0, 1)};
+  // dwords 00000001 00007FFF | 00008000 FFFF8000.
+  SetV128(&state_, 1, 0x00007FFF00000001ULL, 0xFFFF800000008000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x80007FFF7FFF0001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQXTN2 v0.16b, v1.8h (size=00, Q=1): saturating narrow into Vd.high, Vd.low kept.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Sqxtn2Vec16B) {
+  static const uint32_t code[] = {SqxtnVec(0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFFFF0080007F0001ULL, 0x80000100FF00FF80ULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEBABEULL, 0xBBBBBBBBBBBBBBBBULL);  // low preserved
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xDEADBEEFCAFEBABEULL);   // Vd.low preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x807F8080FF7F7F01ULL);  // narrowed into high
+}
+
+// SQXTN size=10 (.2D->.2S) needs the SSE4.2 clamp/blend and must bail to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnVec2SBails) {
+  static const uint32_t code[] = {SqxtnVec(0b10, /*q=*/false, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 // A two-reg-misc opcode we do NOT yet mirror (CLZ) must still bail cleanly.
