@@ -3191,6 +3191,14 @@ constexpr uint32_t SsraVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8
 constexpr uint32_t UsraVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
   return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b00010, rd, rn);
 }
+// SLI (shift-left-insert): U=1, opcode=01010.
+constexpr uint32_t SliVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b01010, rd, rn);
+}
+// SRI (shift-right-insert): U=1, opcode=01000.
+constexpr uint32_t SriVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b01000, rd, rn);
+}
 // SQXTN/SQXTN2: U=0, opcode=10100.
 constexpr uint32_t SqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10100, rd, rn);
@@ -6531,6 +6539,93 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SsraVec2DBails) {
 // USRA .16B byte lane has no x86 packed byte shift — must bail to lite.
 TEST_F(Arm64HeavyOptimizerFrontendTest, UsraVec16BBails) {
   static const uint32_t code[] = {UsraVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SLI v0.4s, v1.4s, #8 (q=1, immh=0101, immb=0): Vd<i> = (Vn<i>><<8) with Vd's
+// low 8 bits preserved per word.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SliVec4S) {
+  static const uint32_t code[] = {SliVec(/*q=*/true, /*immh=*/0b0101, /*immb=*/0, 0, 1)};
+  // Vn words 0x00000001 0x000000FF 0x12345678 0x80000001.
+  SetV128(&state_, 1, 0x000000FF00000001ULL, 0x8000000112345678ULL);
+  // Vd words 0xAABBCCDD 0x11223344 0x55667788 0x99AABBCC.
+  SetV128(&state_, 0, 0x11223344AABBCCDDULL, 0x99AABBCC55667788ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (Vn<<8)|(Vd&0xFF): 0x000001DD 0x0000FF44 0x34567888 0x000001CC.
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000FF44000001DDULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000001CC34567888ULL);
+}
+
+// SLI v0.2s, v1.2s, #0 (q=0, immh=0100, immb=0): shift 0 -> whole Vn inserted,
+// D-form upper zeroed. Exercises the inv==esize boundary (clears all of Vd).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SliVec2SZero) {
+  static const uint32_t code[] = {SliVec(/*q=*/false, /*immh=*/0b0100, /*immb=*/0, 0, 1)};
+  SetV128(&state_, 1, 0xDEADBEEF12345678ULL, 0xAAAAAAAAAAAAAAAAULL);
+  SetV128(&state_, 0, 0xBBBBBBBBAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xDEADBEEF12345678ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // D-form upper zero
+}
+
+// SRI v0.4h, v1.4h, #4 (q=0, immh=0011, immb=4): Vd<i> = USHR(Vn<i>,4) with
+// Vd's high 4 bits preserved per hword; D-form upper zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SriVec4H) {
+  static const uint32_t code[] = {SriVec(/*q=*/false, /*immh=*/0b0011, /*immb=*/4, 0, 1)};
+  // Vn hwords 0x1234 0xFF00 0x000F 0x8421.
+  SetV128(&state_, 1, 0x8421000FFF001234ULL, 0xBBBBBBBBBBBBBBBBULL);
+  // Vd hwords 0xAAAA 0xBBBB 0xCCCC 0xDDDD.
+  SetV128(&state_, 0, 0xDDDDCCCCBBBBAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (Vd&0xF000)|(Vn>>4): 0xA123 0xBFF0 0xC000 0xD842.
+  EXPECT_EQ(VLo64(&state_, 0), 0xD842C000BFF0A123ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // D-form upper zero
+}
+
+// SRI v0.2d, v1.2d, #4 (q=1, immh=1111, immb=4): Vd<i> = USHR(Vn<i>,4) with
+// Vd's high 4 bits preserved per dword (PSRLQ/PSLLQ/POR).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SriVec2D) {
+  static const uint32_t code[] = {SriVec(/*q=*/true, /*immh=*/0b1111, /*immb=*/4, 0, 1)};
+  SetV128(&state_, 1, 0x0000000000000100ULL, 0xFF00000000000000ULL);
+  SetV128(&state_, 0, 0x1111111111111111ULL, 0xF222222222222222ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (Vd&0xF00..0)|(Vn>>4): 0x1000000000000010, 0xFFF0000000000000.
+  EXPECT_EQ(VLo64(&state_, 0), 0x1000000000000010ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFF0000000000000ULL);
+}
+
+// SRI v0.4s, v1.4s, #32 (q=1, immh=0100, immb=0): shift==esize -> USHR gives 0,
+// all of Vd preserved. Exercises the inv==0 boundary (Vd unchanged).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SriVec4SFull) {
+  static const uint32_t code[] = {SriVec(/*q=*/true, /*immh=*/0b0100, /*immb=*/0, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
+  SetV128(&state_, 0, 0x2222222211111111ULL, 0x4444444433333333ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x2222222211111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4444444433333333ULL);
+}
+
+// SLI .16B byte lane has no x86 packed byte shift — must bail to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SliVec16BBails) {
+  static const uint32_t code[] = {SliVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
