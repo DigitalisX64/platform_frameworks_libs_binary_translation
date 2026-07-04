@@ -2201,15 +2201,94 @@ class HeavyOptimizerFrontend {
   //     same way.
   //   CMEQ: Pcmpeqb (8), Pcmpeqw (16), Pcmpeqd (32). 64-bit (Pcmpeqq) bails.
   //   CMGT (signed): Pcmpgtb (8), Pcmpgtw (16), Pcmpgtd (32). 64-bit bails.
+  //   CMGE (signed >=): NOT(Pcmpgt(Vm, Vn)); CMHI/CMHS (unsigned >, >=):
+  //     sign-bias both operands then the signed Pcmpgt (+ invert for CMHS).
+  //     All three are 8/16/32-bit; the 64-bit form needs PCMPGTQ and bails.
+  //     Handled in a self-contained pre-switch block (result register varies).
   // Everything else (saturating, shifts, polynomial, FP, pairwise, widening,
-  // CMHI/CMHS unsigned compares, CMTST, etc.) bails to the lite translator/
-  // interpreter.
+  // CMTST, etc.) bails to the lite translator/interpreter.
   void AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArgs& args) {
     if (!success()) {
       return;
     }
     const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
     const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+
+    // CMGE/CMHI/CMHS (signed >= / unsigned > / unsigned >=) — handled here as
+    // self-contained sequences because their result does not always land in vn
+    // (the accumulator the shared switch below assumes) and the unsigned forms
+    // need a sign-bias step. x86 has no unsigned vector compare, so CMHI/CMHS
+    // flip the per-lane sign bit of both operands (XOR with the width's sign
+    // mask) to map the unsigned ordering onto the signed PCMPGT*. CMGE =
+    // NOT(Vm > Vn); CMHS = NOT(biased Vm > biased Vn). The .2D (size=11) form
+    // needs PCMPGTQ (not allowlisted) and bails to the lite tier.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmge ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhi ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhs) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_unsigned =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhi) ||
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhs);
+      // CMHI computes (Vn > Vm) with no invert; CMGE/CMHS compute (Vm > Vn)
+      // then invert into (Vn >= Vm) / (Vn >=u Vm) via XOR with all-ones.
+      const bool invert =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmge) ||
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhs);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (is_unsigned) {
+        // Build the per-lane sign-bit mask and XOR it into both operands.
+        FpRegister sign = AllocZeroedSimdReg();
+        switch (args.size) {
+          case 0b00: {
+            // 0x80 in every byte (no PSLLB on x86): broadcast from a GPR.
+            Register t = std::get<0>(
+                Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
+            builder_.Gen<x86_64::MovqXRegReg>(sign.machine_reg(), t);
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(sign.machine_reg(), sign.machine_reg());
+            break;
+          }
+          case 0b01:
+            builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+            builder_.Gen<x86_64::PsllwXRegImm>(sign.machine_reg(), int8_t{15});
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+            builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
+            break;
+        }
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+      }
+      // CMHI (no invert): PCMPGT(xn, xm) -> result in xn.
+      // CMGE/CMHS (invert): PCMPGT(xm, xn) -> result in xm, then invert.
+      FpRegister res = invert ? xm : xn;
+      FpRegister a = invert ? xm : xn;
+      FpRegister b = invert ? xn : xm;
+      switch (args.size) {
+        case 0b00:
+          builder_.Gen<x86_64::PcmpgtbXRegXReg>(a.machine_reg(), b.machine_reg());
+          break;
+        case 0b01:
+          builder_.Gen<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
+          break;
+        default:  // 0b10
+          builder_.Gen<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
+          break;
+      }
+      if (invert) {
+        FpRegister ones = AllocZeroedSimdReg();
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
+      }
+      SetVRegFull(args.rd, res, args.q);
+      return;
+    }
 
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
@@ -2509,6 +2588,78 @@ class HeavyOptimizerFrontend {
             break;
         }
         SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // CMEQ Vd.<T>, Vn.<T>, #0 — per-lane integer compare-equal against zero.
+      // PCMPEQ{B,W,D} against a zeroed register. size=11 (.2D) needs PCMPEQQ
+      // (not allowlisted) and bails, matching the lite translator.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: {
+        if (args.size == 0b11) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PcmpeqbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            break;
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // CMGT/CMGE/CMLE/CMLT Vd.<T>, Vn.<T>, #0 — per-lane signed integer
+      // compare against zero. CMGT/CMLE compute (Vn > 0) via PCMPGT(Vn, 0);
+      // CMGE/CMLT compute (0 > Vn) via PCMPGT(0, Vn). CMGE = NOT(0 > Vn) and
+      // CMLE = NOT(Vn > 0), inverted with XOR against all-ones. size=11 (.2D)
+      // needs PCMPGTQ (not allowlisted) and bails; FP16 lanes bail too.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
+        if (args.is_fp16 || args.size == 0b11) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool n_gt_z =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero);
+        const bool invert =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        // For (Vn > 0) the result lands in xn; for (0 > Vn) it lands in xz.
+        FpRegister res = n_gt_z ? xn : xz;
+        FpRegister a = n_gt_z ? xn : xz;
+        FpRegister b = n_gt_z ? xz : xn;
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PcmpgtbXRegXReg>(a.machine_reg(), b.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
+            break;
+        }
+        if (invert) {
+          FpRegister ones = AllocZeroedSimdReg();
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
+        }
+        SetVRegFull(args.rd, res, args.q);
         return;
       }
 

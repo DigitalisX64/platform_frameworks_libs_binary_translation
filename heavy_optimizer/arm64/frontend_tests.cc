@@ -3055,6 +3055,38 @@ constexpr uint32_t NegVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t AbsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01011, rd, rn);
 }
+// CMEQ #0: U=0, opcode=01001.
+constexpr uint32_t CmeqZeroVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01001, rd, rn);
+}
+// CMGT #0: U=0, opcode=01000.
+constexpr uint32_t CmgtZeroVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01000, rd, rn);
+}
+// CMGE #0: U=1, opcode=01000.
+constexpr uint32_t CmgeZeroVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b01000, rd, rn);
+}
+// CMLE #0: U=1, opcode=01001.
+constexpr uint32_t CmleZeroVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b01001, rd, rn);
+}
+// CMLT #0: U=0, opcode=01010 (bit20=0 selects two-reg-misc, not SMAXV).
+constexpr uint32_t CmltZeroVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01010, rd, rn);
+}
+// CMGE (vector, register, signed >=): U=0, opcode=00111.
+constexpr uint32_t CmgeVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b00111, rd, rn, rm);
+}
+// CMHI (vector, register, unsigned >): U=1, opcode=00110.
+constexpr uint32_t CmhiVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00110, rd, rn, rm);
+}
+// CMHS (vector, register, unsigned >=): U=1, opcode=00111.
+constexpr uint32_t CmhsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00111, rd, rn, rm);
+}
 
 // Helpers to write/read the scalar lane of a guest V register and to read its
 // upper bytes (which an ARM scalar-FP write must zero).
@@ -5140,6 +5172,175 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ClzVecBails) {
   // clz v0.4s, v1.4s : U=0, opcode=00100, size=10, Q=1.
   static const uint32_t code[] = {AdvSimdTwoRegMisc(/*q=*/true, /*u=*/false, /*size=*/0b10,
                                                     /*opcode=*/0b00100, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// ---- AdvSIMD two-reg-misc compare-against-zero (heavy mirror, wave 2). ----
+
+// CMEQ #0 .4S (Q=1): per-lane equal-to-zero via PCMPEQD against a zeroed reg.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqZeroVec4S) {
+  static const uint32_t code[] = {CmeqZeroVec(0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0000000500000000ULL, 0x00000000FFFFFFFFULL);  // [0,5,-1,0]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);   // [T,F]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFF00000000ULL);  // [F,T]
+}
+
+// CMEQ #0 .2S (Q=0): the upper 64 bits of Vd must be zeroed by SetVRegFull.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqZeroVec2S) {
+  static const uint32_t code[] = {CmeqZeroVec(0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x0000000500000000ULL, 0x1111111111111111ULL);  // [0,5]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);   // [T,F]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zeroed
+}
+
+// CMGT #0 .8H (Q=1): per-lane signed greater-than-zero via PCMPGTW(Vn, 0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtZeroVec8H) {
+  static const uint32_t code[] = {CmgtZeroVec(0b01, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFF9C0000FFFF0005ULL, 0x0000000000000000ULL);  // [5,-1,0,-100 | 0,0,0,0]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);   // only lane0 (5>0)
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// CMGE #0 .16B (Q=1): per-byte signed >= 0 via NOT(PCMPGTB(0, Vn)).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgeZeroVec16B) {
+  static const uint32_t code[] = {CmgeZeroVec(0b00, /*q=*/true, 0, 1)};
+  // low bytes [0x00,0x7F,0x80,0xFF,0x01,0x40,0xC0,0x00]; high 8 bytes all 0.
+  SetV128(&state_, 1, 0x00C04001FF807F00ULL, 0x0000000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF00FFFF0000FFFFULL);   // [T,T,F,F,T,T,F,T]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);  // all bytes >=0
+}
+
+// CMLE #0 .16B (Q=1): per-byte signed <= 0 via NOT(PCMPGTB(Vn, 0)).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmleZeroVec16B) {
+  static const uint32_t code[] = {CmleZeroVec(0b00, /*q=*/true, 0, 1)};
+  // low bytes [0x00,0x01,0x7F,0x80,0xFF,0x40,0xC0,0x00]; high 8 bytes all 0.
+  SetV128(&state_, 1, 0x00C040FF807F0100ULL, 0x0000000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF00FFFF0000FFULL);   // [T,F,F,T,T,F,T,T]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);  // all bytes <=0
+}
+
+// CMLT #0 .4S (Q=1): per-lane signed < 0 via PCMPGTD(0, Vn).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmltZeroVec4S) {
+  static const uint32_t code[] = {CmltZeroVec(0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFF00000005ULL, 0x8000000000000000ULL);  // [5,-1,0,INT_MIN]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFF00000000ULL);   // [F,T]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFF00000000ULL);  // [F,T]
+}
+
+// CMEQ/CMGT #0 .2D must bail: PCMPEQQ/PCMPGTQ are not in the backend allowlist.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqZeroVec2DBails) {
+  static const uint32_t code[] = {CmeqZeroVec(0b11, /*q=*/true, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtZeroVec2DBails) {
+  static const uint32_t code[] = {CmgtZeroVec(0b11, /*q=*/true, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// ---- AdvSIMD three-same signed/unsigned compares (heavy mirror, wave 2). ----
+
+// CMGE .4S (Q=1): signed >= via NOT(PCMPGTD(Vm, Vn)).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgeVec4S) {
+  static const uint32_t code[] = {CmgeVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFFFFFF00000005ULL, 0x0000000700000002ULL);  // [5,-1,2,7]
+  SetV128(&state_, 2, 0x0000000300000003ULL, 0xFFFFFFFF00000002ULL);  // [3,3,2,-1]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);   // 5>=3 T, -1>=3 F
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);  // 2>=2 T, 7>=-1 T
+}
+
+// CMHI .16B (Q=1): unsigned > via sign-bias (GPR broadcast) + PCMPGTB.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmhiVec16B) {
+  static const uint32_t code[] = {CmhiVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x55AA000110FF8000ULL, 0x0000000000000000ULL);
+  SetV128(&state_, 2, 0x54AA000010FE7F01ULL, 0x0000000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF0000FF00FFFF00ULL);   // [F,T,T,F,T,F,F,T]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // 0 >u 0 all false
+}
+
+// CMHI .4S (Q=1): unsigned > via sign-bias (PSLLD imm) + PCMPGTD.
+// Exercises the newly added PslldXRegImm LIR op.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmhiVec4S) {
+  static const uint32_t code[] = {CmhiVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000005ULL, 0x00000000FFFFFFFFULL);  // [5,2^31,-1,0]
+  SetV128(&state_, 2, 0x7FFFFFFF00000003ULL, 0x00000001FFFFFFFFULL);  // [3,2^31-1,-1,1]
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);   // 5>3 T, 2^31>2^31-1 T
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // 0xFFFFFFFF>0xFFFFFFFF F, 0>1 F
+}
+
+// CMHS .8H (Q=1): unsigned >= via sign-bias (PSLLW imm) + PCMPGTW + invert.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmhsVec8H) {
+  static const uint32_t code[] = {CmhsVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFF000080000005ULL, 0x8000FFFF00000001ULL);
+  SetV128(&state_, 2, 0xFFFF00017FFF0005ULL, 0x8001000000000002ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF0000FFFFFFFFULL);   // [T,T,F,T]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000FFFFFFFF0000ULL);  // [F,T,T,F]
+}
+
+// CMHI .2D must bail: PCMPGTQ is not in the backend allowlist.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmhiVec2DBails) {
+  static const uint32_t code[] = {CmhiVec(0b11, /*q=*/true, 0, 1, 2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
