@@ -3247,6 +3247,19 @@ constexpr uint32_t UqshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uin
 constexpr uint32_t SqshrunVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
   return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10000, rd, rn);
 }
+// SQRSHRN/SQRSHRN2 (signed rounding saturating narrow): U=0, opcode=10011.
+constexpr uint32_t SqrshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10011, rd, rn);
+}
+// UQRSHRN/UQRSHRN2 (unsigned rounding saturating narrow): U=1, opcode=10011.
+constexpr uint32_t UqrshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10011, rd, rn);
+}
+// SQRSHRUN/SQRSHRUN2 (signed rounding saturating narrow to unsigned): U=1,
+// opcode=10001.
+constexpr uint32_t SqrshrunVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10001, rd, rn);
+}
 // SQXTN/SQXTN2: U=0, opcode=10100.
 constexpr uint32_t SqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10100, rd, rn);
@@ -6975,6 +6988,76 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Sqshrun2Vec16B) {
 // (AVX-512F-VL) which baseline SSE lacks — heavy bails to lite.
 TEST_F(Arm64HeavyOptimizerFrontendTest, SqshrnVecSrc64Bails) {
   static const uint32_t code[] = {SqshrnVec(/*q=*/false, /*immh=*/0b0100, /*immb=*/4, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SQRSHRN v0.8b, v1.8h, #4 (immh=0001, immb=4, Q=0): signed rounding saturating
+// narrow 16->8. PADDSW pre-add of (1<<3)=8 (saturating), PSRAW #4, PMINSW/PMAXSW
+// clamp to [-128,127].
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrshrnVec8B) {
+  static const uint32_t code[] = {SqrshrnVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0078 07F8 7FFF 0088 ; lanes 4-7: FFF8 FF88 8000 0000.
+  SetV128(&state_, 1, 0x00887FFF07F80078ULL, 0x00008000FF88FFF8ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ((lane + 8) >>4 signed) clamped [-128,127], low byte per lane:
+  //   120->8, 2040->127->7F, 32767(PADDSW-sat->32767)->2047->7F, 136->9,
+  //   -8->0, -120->-7->F9, -32760->-2048->-128->80, 0->0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x0080F900097F7F08ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// UQRSHRN v0.4h, v1.4s, #12 (immh=0010, immb=4, Q=0): unsigned rounding
+// saturating narrow 32->16. PMINUD pre-clamp to (0xFFFFFFFF-0x800), PADDD
+// +0x800, PSRLD #12, PMINUD clamp to 0xFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqrshrnVec4H) {
+  static const uint32_t code[] = {UqrshrnVec(/*q=*/false, /*immh=*/0b0010, /*immb=*/4, 0, 1)};
+  // Vn.4s words: 0x00001800 0xFFFFFFFF | 0x00002800 0x00000700. shift=12.
+  SetV128(&state_, 1, 0xFFFFFFFF00001800ULL, 0x0000070000002800ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ((word + 0x800) >>12 unsigned) clamped 0xFFFF, low 16 per lane:
+  //   0x1800->2, 0xFFFFFFFF(preclamp+add->0xFFFFFFFF)>>12=0xFFFFF->0xFFFF,
+  //   0x2800->3, 0x0700->0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000003FFFF0002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// SQRSHRUN2 v0.16b, v1.8h, #4 (immh=0001, immb=4, Q=1): signed->unsigned
+// rounding saturating narrow 16->8 into the upper half. Carry-bit identity
+// ((x+8)>>4 == (x>>4)+bit3(x)) avoids premature saturation; PMAXSW-vs-0 then
+// PMINSW cap to [0,255]; Vd[63:0] preserved.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Sqrshrun2Vec16B) {
+  static const uint32_t code[] = {SqrshrunVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0078 FF88 07FF 0FF8 ; lanes 4-7: FFFF 0100 0808 0000.
+  SetV128(&state_, 1, 0x0FF807FFFF880078ULL, 0x000008080100FFFFULL);
+  // Vd low 64 preserved; upper is overwritten by the narrowed lanes.
+  SetV128(&state_, 0, 0x1111222233334444ULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ((lane + 8) >>4 signed) clamped [0,255], low byte per lane:
+  //   120->8, -120->-7->0, 2047->128->80, 4088->256->255->FF,
+  //   -1->0->0, 256->16->10, 2056->129->81, 0->0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111222233334444ULL);       // Vd[63:0] preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00811000FF800008ULL);
+}
+
+// SQRSHRN v0.2s, v1.2d, #28 (immh=0100, immb=4, Q=0): src=64 needs PSRAQ which
+// baseline SSE lacks — heavy bails to lite (same as the non-rounding sibling).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrshrnVecSrc64Bails) {
+  static const uint32_t code[] = {SqrshrnVec(/*q=*/false, /*immh=*/0b0100, /*immb=*/4, 0, 1)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(

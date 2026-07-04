@@ -4274,20 +4274,32 @@ class HeavyOptimizerFrontend {
       }
       case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
       case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
-      case Decoder::AdvSimdShiftImmOpcode::kSqshrun: {
-        // Non-rounding saturating shift-right narrow (vector, 16/32-bit
-        // source).  Mirrors lite_translator.h::AdvSimdShiftByImm's saturating
-        // narrow path: shift each wide lane right (arithmetic for a signed
-        // source, logical for unsigned) -> clamp to the destination range ->
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrun:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrun: {
+        // (Rounding and non-rounding) saturating shift-right narrow (vector,
+        // 16/32-bit source).  Mirrors lite_translator.h::AdvSimdShiftByImm's
+        // saturating narrow path: (rounding only) add the per-lane rounding
+        // bias -> shift each wide lane right (arithmetic for a signed source,
+        // logical for unsigned) -> clamp to the destination range ->
         // PSHUFB-gather the low half of each lane into the packed low 64.
-        //   SQSHRN  (signed->signed):        PSRA{W,D} + PMINS/PMAXS clamp.
-        //   UQSHRN  (unsigned->unsigned):    PSRL{W,D} + PMINU clamp.
-        //   SQSHRUN (signed->unsigned):      PSRA{W,D} + PMAXS-vs-0 + PMINS.
+        //   SQSHRN/SQRSHRN   (signed->signed):     PSRA{W,D} + PMINS/PMAXS clamp.
+        //   UQSHRN/UQRSHRN   (unsigned->unsigned): PSRL{W,D} + PMINU clamp.
+        //   SQSHRUN/SQRSHRUN (signed->unsigned):   PSRA{W,D} + PMAXS-vs-0 + PMINS.
+        // Rounding bias:
+        //   SQRSHRN: signed-saturating pre-add of (1<<(shift-1)) — PADDSW for
+        //     src16, PMINSD-preclamp+PADDD for src32 (no integer PADDSD).
+        //   UQRSHRN: unsigned-saturating pre-add — PADDUSW for src16,
+        //     PMINUD-preclamp+PADDD for src32.
+        //   SQRSHRUN: the carry-bit identity (x+(1<<(s-1)))>>s == (x>>s) +
+        //     bit(s-1 of x) for arithmetic >> — compute the carry pre-shift
+        //     (PSLL then PSRL to bit 0), add it after the shift; avoids a
+        //     premature signed saturation that would drop 1 LSB at the boundary.
         // src=64 needs PSRAQ (AVX-512F-VL) for the signed shift and a manual
-        // hi32-nonzero rewrite for the unsigned clamp — both of which the lite
-        // tier also bails, so bail here.  The scalar forms and the rounding
-        // siblings (SQRSHRN/UQRSHRN/SQRSHRUN) fall to lite via the default
-        // bail below (a later cycle mirrors them).
+        // hi32-nonzero rewrite for the unsigned clamp; UQRSHRN src=64 needs a
+        // saturating PADDQ — all of which the lite tier also bails, so bail
+        // here.  The scalar forms fall to lite via the bail below.
         if (immh & 0b1000) {  // RESERVED for narrowing shifts.
           UndefinedReturningVoid();
           return;
@@ -4308,19 +4320,111 @@ class HeavyOptimizerFrontend {
           UndefinedReturningVoid();
           return;
         }
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrun);
         const bool is_saturating_signed =
-            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn);
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
+        const bool is_saturating_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
         const bool is_signed_to_unsigned =
-            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrun);
-        // Signed source (SQSHRN/SQSHRUN) uses an arithmetic right shift;
-        // unsigned source (UQSHRN) uses a logical right shift.
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrun) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrun);
+        // Signed source (SQSHRN/SQSHRUN + rounding) uses an arithmetic right
+        // shift; unsigned source (UQSHRN/UQRSHRN) uses a logical right shift.
         const bool uses_signed_shift =
             is_saturating_signed || is_signed_to_unsigned;
         const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
         const int8_t cnt = static_cast<int8_t>(narrow_rshift);
 
+        // Materialize a broadcast constant (`pattern` in both qwords) into a
+        // fresh SIMD reg — the rounding bias and the clamp bounds need this.
+        auto broadcast = [&](uint64_t pattern) -> FpRegister {
+          FpRegister x = AllocTempSimdReg();
+          Register gr =
+              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
+          builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+          return x;
+        };
+
         FpRegister xn = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+
+        // xcarry holds the SQRSHRUN pre-shift rounding carry (0/1 per lane);
+        // computed while xn is intact, added back after the arithmetic shift.
+        FpRegister xcarry;
+        if (is_rounding) {
+          const uint64_t round_lane = uint64_t{1} << (narrow_rshift - 1);
+          const uint64_t round_pattern =
+              (src_bits == 16) ? round_lane * uint64_t{0x0001000100010001ULL}
+                               : round_lane * uint64_t{0x0000000100000001ULL};
+          if (is_saturating_unsigned) {
+            FpRegister xround = broadcast(round_pattern);
+            if (src_bits == 16) {
+              // PADDUSW: unsigned-saturating word add (SSE2).
+              builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(),
+                                                    xround.machine_reg());
+            } else {
+              // No unsigned-saturating PADDUSD in baseline SSE; pre-clamp xn to
+              // (0xFFFFFFFF - round_lane) so the plain PADDD cannot overflow
+              // past UINT32_MAX. Lanes hitting the pre-clamp settle at exactly
+              // UINT32_MAX, which the post-shift PMINUD then narrows correctly.
+              const uint32_t clamp_lane =
+                  0xFFFFFFFFu - static_cast<uint32_t>(round_lane);
+              const uint64_t clamp_pattern =
+                  (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+              FpRegister xclamp = broadcast(clamp_pattern);
+              builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(),
+                                                   xclamp.machine_reg());
+              builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
+                                                  xround.machine_reg());
+            }
+          } else if (is_signed_to_unsigned) {
+            // SQRSHRUN carry-bit identity: isolate bit (cnt-1) of each lane into
+            // bit 0 (shift it to the top, then logically back). No wide add ->
+            // no premature saturation.
+            xcarry = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xcarry.machine_reg(),
+                                                 xn.machine_reg());
+            if (src_bits == 16) {
+              builder_.Gen<x86_64::PsllwXRegImm>(
+                  xcarry.machine_reg(), static_cast<int8_t>(16 - narrow_rshift));
+              builder_.Gen<x86_64::PsrlwXRegImm>(xcarry.machine_reg(), int8_t{15});
+            } else {
+              builder_.Gen<x86_64::PslldXRegImm>(
+                  xcarry.machine_reg(), static_cast<int8_t>(32 - narrow_rshift));
+              builder_.Gen<x86_64::PsrldXRegImm>(xcarry.machine_reg(), int8_t{31});
+            }
+          } else {  // SQRSHRN (signed->signed).
+            FpRegister xround = broadcast(round_pattern);
+            if (src_bits == 16) {
+              // PADDSW: signed-saturating word add (SSE2).
+              builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(),
+                                                   xround.machine_reg());
+            } else {
+              // No integer PADDSD in baseline SSE; pre-clamp xn to
+              // (0x7FFFFFFF - round_lane) so the plain PADDD cannot overflow
+              // positively. The round constant is positive, so no negative
+              // underflow is possible. Lanes hitting the pre-clamp settle at
+              // exactly INT32_MAX after the add, which the post-shift
+              // PMINSD-vs-signed-max then drives to the saturated dst value.
+              const uint32_t clamp_lane =
+                  0x7FFFFFFFu - static_cast<uint32_t>(round_lane);
+              const uint64_t clamp_pattern =
+                  (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+              FpRegister xclamp = broadcast(clamp_pattern);
+              builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(),
+                                                   xclamp.machine_reg());
+              builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
+                                                  xround.machine_reg());
+            }
+          }
+        }
+
         if (uses_signed_shift) {
           if (src_bits == 16) {
             builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
@@ -4335,16 +4439,18 @@ class HeavyOptimizerFrontend {
           }
         }
 
-        // Materialize a broadcast constant (`pattern` in both qwords) into a
-        // fresh SIMD reg — the clamp bounds below need this.
-        auto broadcast = [&](uint64_t pattern) -> FpRegister {
-          FpRegister x = AllocTempSimdReg();
-          Register gr =
-              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
-          builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
-          builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
-          return x;
-        };
+        if (is_rounding && is_signed_to_unsigned) {
+          // SQRSHRUN: add the pre-shift rounding carry. Post-shift magnitudes
+          // are small (|x>>cnt| <= INT*_MAX>>1), so a plain PADD cannot overflow
+          // before the unsigned clamp below.
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(),
+                                                xcarry.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
+                                                xcarry.machine_reg());
+          }
+        }
 
         if (is_saturating_signed) {
           // Clamp each src-lane to the signed dst range:
