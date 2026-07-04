@@ -904,6 +904,234 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
   SetVRegScalar(args.rd, result, is_double);
 }
 
+// FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): scalar FP -> GP
+// integer via x86 CVTT{SS,SD}2SI, which returns the destination type's INT_MIN
+// ("indefinite") for NaN / Inf / overflow. ARM's by-sign saturation is rebuilt
+// with a BB-split fix-up ladder, bit-for-bit with lite_translator.h's FCVTZS /
+// FCVTZU paths. A single `result` GP vreg is merged across the fix-up branches
+// via PseudoCopy (mirrors ConditionalSelect); FLAGS never cross a basic block —
+// each UCOMI/TEST is consumed by the PseudoCondBranch in its own block.
+void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double) {
+  if (!success()) {
+    return;
+  }
+  const bool is_unsigned = (args.op == 0b001);
+  auto* ir = builder_.ir();
+
+  FpRegister xmm = GetVRegScalar(args.rn, is_double);
+
+  // xmm self-compare: PF=1 iff NaN.
+  auto ucomi_self = [&]() -> Register {
+    return is_double
+               ? std::get<0>(Gen<x86_64::UcomisdXRegXReg>(xmm.machine_reg(), xmm.machine_reg()))
+               : std::get<0>(Gen<x86_64::UcomissXRegXReg>(xmm.machine_reg(), xmm.machine_reg()));
+  };
+  // xmm raw bits -> GP, then TEST self: SF = FP sign bit (bit 31 / bit 63).
+  auto fp_sign_flags = [&]() -> Register {
+    if (is_double) {
+      Register raw = std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()));
+      return std::get<0>(Gen<x86_64::TestqRegReg>(raw, raw));
+    }
+    Register raw = std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+    return std::get<0>(Gen<x86_64::TestlRegReg>(raw, raw));
+  };
+  // Truncating convert to a signed 64-bit GP (Q-form).
+  auto cvtt_q = [&](FpRegister x) -> Register {
+    return is_double ? std::get<0>(Gen<x86_64::Cvttsd2siqRegXReg>(x.machine_reg()))
+                     : std::get<0>(Gen<x86_64::Cvttss2siqRegXReg>(x.machine_reg()));
+  };
+  // Materialize an FP constant (given its raw bits) into a fresh XMM.
+  auto fp_const = [&](uint64_t bits) -> FpRegister {
+    FpRegister c = AllocTempSimdReg();
+    if (is_double) {
+      builder_.Gen<x86_64::MovqXRegReg>(c.machine_reg(), GetImm(bits));
+    } else {
+      builder_.Gen<x86_64::MovdXRegReg>(c.machine_reg(), GetImm(bits & 0xFFFFFFFF));
+    }
+    return c;
+  };
+
+  Register result = AllocTempReg();
+
+  if (!is_unsigned) {
+    // FCVTZS: NaN -> 0; positive overflow -> INT_MAX; negative overflow ->
+    // INT_MIN (already the cvtt indefinite value). Default keeps the cvtt tmp.
+    Register tmp;
+    if (args.sf) {
+      tmp = cvtt_q(xmm);
+    } else {
+      tmp = is_double ? std::get<0>(Gen<x86_64::Cvttsd2silRegXReg>(xmm.machine_reg()))
+                      : std::get<0>(Gen<x86_64::Cvttss2silRegXReg>(xmm.machine_reg()));
+    }
+    builder_.Gen<PseudoCopy>(result, tmp, 8);  // default: keep tmp
+
+    auto* cur_bb = builder_.bb();
+    MachineBasicBlock* nan_bb = ir->NewBasicBlock();
+    MachineBasicBlock* notnan_bb = ir->NewBasicBlock();
+    MachineBasicBlock* pos_bb = ir->NewBasicBlock();
+    MachineBasicBlock* ovf_bb = ir->NewBasicBlock();
+    MachineBasicBlock* done_bb = ir->NewBasicBlock();
+
+    ir->AddEdge(cur_bb, nan_bb);
+    ir->AddEdge(cur_bb, notnan_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kParityEven, nan_bb, notnan_bb,
+                                   ucomi_self());
+
+    builder_.StartBasicBlock(nan_bb);
+    builder_.Gen<PseudoCopy>(result, GetImm(0), 8);
+    ir->AddEdge(nan_bb, done_bb);
+    builder_.Gen<PseudoBranch>(done_bb);
+
+    // Non-NaN: FP < 0 keeps tmp (in-range neg or INT_MIN indefinite); FP >= 0
+    // falls to the positive-overflow test.
+    builder_.StartBasicBlock(notnan_bb);
+    ir->AddEdge(notnan_bb, done_bb);
+    ir->AddEdge(notnan_bb, pos_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNegative, done_bb, pos_bb,
+                                   fp_sign_flags());
+
+    // FP >= 0: tmp >= 0 keeps it (in-range positive); tmp < 0 == INT_MIN means
+    // positive overflow -> INT_MAX.
+    builder_.StartBasicBlock(pos_bb);
+    Register tmp_flags = args.sf ? std::get<0>(Gen<x86_64::TestqRegReg>(tmp, tmp))
+                                 : std::get<0>(Gen<x86_64::TestlRegReg>(tmp, tmp));
+    ir->AddEdge(pos_bb, done_bb);
+    ir->AddEdge(pos_bb, ovf_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kPositiveOrZero, done_bb, ovf_bb,
+                                   tmp_flags);
+
+    builder_.StartBasicBlock(ovf_bb);
+    const uint64_t int_max = args.sf ? static_cast<uint64_t>(INT64_MAX) : uint64_t{0x7FFFFFFF};
+    builder_.Gen<PseudoCopy>(result, GetImm(int_max), 8);
+    ir->AddEdge(ovf_bb, done_bb);
+    builder_.Gen<PseudoBranch>(done_bb);
+
+    builder_.StartBasicBlock(done_bb);
+    if (args.rd != 31) {
+      SetReg(args.rd, result);
+    }
+    return;
+  }
+
+  // FCVTZU: NaN / (FP < 0, incl -0) -> 0; FP > UINT*_MAX -> UINT*_MAX.
+  MachineBasicBlock* zero_bb = ir->NewBasicBlock();
+  MachineBasicBlock* notnan_bb = ir->NewBasicBlock();
+  MachineBasicBlock* done_bb = ir->NewBasicBlock();
+
+  auto* cur_bb = builder_.bb();
+  ir->AddEdge(cur_bb, zero_bb);
+  ir->AddEdge(cur_bb, notnan_bb);
+  builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kParityEven, zero_bb, notnan_bb,
+                                 ucomi_self());
+
+  if (!args.sf) {
+    // sf=0 (uint32): Q-form cvtt always fits int64. Upper-32 zero -> in-range
+    // (low 32 are the answer); upper-32 non-zero -> saturate to UINT32_MAX.
+    MachineBasicBlock* pos_bb = ir->NewBasicBlock();
+    MachineBasicBlock* ovf_bb = ir->NewBasicBlock();
+
+    builder_.StartBasicBlock(notnan_bb);
+    ir->AddEdge(notnan_bb, zero_bb);
+    ir->AddEdge(notnan_bb, pos_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNegative, zero_bb, pos_bb,
+                                   fp_sign_flags());
+
+    builder_.StartBasicBlock(pos_bb);
+    Register tmp = cvtt_q(xmm);
+    builder_.Gen<PseudoCopy>(result, tmp, 8);  // default in-range
+    Register hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(tmp), int8_t{32}));
+    Register hi_flags = std::get<0>(Gen<x86_64::TestqRegReg>(hi, hi));
+    ir->AddEdge(pos_bb, done_bb);
+    ir->AddEdge(pos_bb, ovf_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kZero, done_bb, ovf_bb, hi_flags);
+
+    builder_.StartBasicBlock(ovf_bb);
+    builder_.Gen<PseudoCopy>(result, GetImm(uint64_t{0xFFFFFFFF}), 8);
+    ir->AddEdge(ovf_bb, done_bb);
+    builder_.Gen<PseudoBranch>(done_bb);
+  } else {
+    // sf=1 (uint64): cvtt-Q covers [0, 2^63) directly. FP >= 2^63 uses the
+    // offset trick (subtract 2^63, cvtt, set bit 63); FP >= 2^64 saturates.
+    const uint64_t bits_2p63 = is_double ? 0x43E0000000000000ULL : 0x5F000000ULL;
+    const uint64_t bits_2p64 = is_double ? 0x43F0000000000000ULL : 0x5F800000ULL;
+
+    MachineBasicBlock* cmp_bb = ir->NewBasicBlock();
+    MachineBasicBlock* direct_bb = ir->NewBasicBlock();
+    MachineBasicBlock* ge63_bb = ir->NewBasicBlock();
+    MachineBasicBlock* satmax_bb = ir->NewBasicBlock();
+    MachineBasicBlock* inrange_bb = ir->NewBasicBlock();
+
+    builder_.StartBasicBlock(notnan_bb);
+    ir->AddEdge(notnan_bb, zero_bb);
+    ir->AddEdge(notnan_bb, cmp_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNegative, zero_bb, cmp_bb,
+                                   fp_sign_flags());
+
+    // FP >= 0: FP < 2^63 -> direct cvtt-Q; else check the upper bound.
+    builder_.StartBasicBlock(cmp_bb);
+    FpRegister bound63 = fp_const(bits_2p63);
+    Register lt_flags = is_double
+                            ? std::get<0>(Gen<x86_64::UcomisdXRegXReg>(xmm.machine_reg(),
+                                                                       bound63.machine_reg()))
+                            : std::get<0>(Gen<x86_64::UcomissXRegXReg>(xmm.machine_reg(),
+                                                                       bound63.machine_reg()));
+    ir->AddEdge(cmp_bb, direct_bb);
+    ir->AddEdge(cmp_bb, ge63_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kBelow, direct_bb, ge63_bb,
+                                   lt_flags);
+
+    builder_.StartBasicBlock(direct_bb);
+    builder_.Gen<PseudoCopy>(result, cvtt_q(xmm), 8);
+    ir->AddEdge(direct_bb, done_bb);
+    builder_.Gen<PseudoBranch>(done_bb);
+
+    // FP >= 2^63: FP >= 2^64 (or +Inf) saturates; else the offset trick.
+    builder_.StartBasicBlock(ge63_bb);
+    FpRegister bound64 = fp_const(bits_2p64);
+    Register ge_flags = is_double
+                            ? std::get<0>(Gen<x86_64::UcomisdXRegXReg>(xmm.machine_reg(),
+                                                                       bound64.machine_reg()))
+                            : std::get<0>(Gen<x86_64::UcomissXRegXReg>(xmm.machine_reg(),
+                                                                       bound64.machine_reg()));
+    ir->AddEdge(ge63_bb, satmax_bb);
+    ir->AddEdge(ge63_bb, inrange_bb);
+    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kAboveEqual, satmax_bb, inrange_bb,
+                                   ge_flags);
+
+    builder_.StartBasicBlock(satmax_bb);
+    builder_.Gen<PseudoCopy>(result, GetImm(~uint64_t{0}), 8);  // UINT64_MAX
+    ir->AddEdge(satmax_bb, done_bb);
+    builder_.Gen<PseudoBranch>(done_bb);
+
+    // FP in [2^63, 2^64): subtract 2^63 (exact), cvtt to int64, set bit 63.
+    // Subss/Subsd is use_def; copy the source into a temp first.
+    builder_.StartBasicBlock(inrange_bb);
+    FpRegister bound63b = fp_const(bits_2p63);
+    FpRegister xsub = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xsub.machine_reg(), xmm.machine_reg());
+    if (is_double) {
+      builder_.Gen<x86_64::SubsdXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
+    } else {
+      builder_.Gen<x86_64::SubssXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
+    }
+    Register tmp = cvtt_q(xsub);
+    tmp = std::get<0>(Gen<x86_64::BtsqRegImm, kNoSSA>(tmp, int8_t{63}));
+    builder_.Gen<PseudoCopy>(result, tmp, 8);
+    ir->AddEdge(inrange_bb, done_bb);
+    builder_.Gen<PseudoBranch>(done_bb);
+  }
+
+  builder_.StartBasicBlock(zero_bb);
+  builder_.Gen<PseudoCopy>(result, GetImm(0), 8);
+  ir->AddEdge(zero_bb, done_bb);
+  builder_.Gen<PseudoBranch>(done_bb);
+
+  builder_.StartBasicBlock(done_bb);
+  if (args.rd != 31) {
+    SetReg(args.rd, result);
+  }
+}
+
 // LDXR/STXR/LDAXR/STLXR (exclusive) and LDAR/STLR (acquire/release). Mirrors
 // lite_translator.h::LoadStoreExclusive byte-for-byte:
 //   * base is TBI-masked first (the top-byte-ignore tag is not part of the host

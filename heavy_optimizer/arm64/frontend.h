@@ -1503,11 +1503,71 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
-  // FMADD/FMSUB/FNMADD/FNMSUB. Would need the FMA intrinsic bindings + scalar
-  // V-reg plumbing for three operands; bail for now.
+  // FMADD/FMSUB/FNMADD/FNMSUB (FP data-processing, 3 source) at S/D. Lowered to
+  // the x86 FMA3 231-form ops, which — like ARM's fused multiply-add — round the
+  // whole a+n*m once. A plain MUL+ADD would double-round and is wrong, so a host
+  // without FMA3 bails to the lite tier (which uses libc fma()/fmaf()). Mirrors
+  // lite_translator.h::FpDataProc3's S/D paths. The FMA231 op is use_def on its
+  // dest (the accumulator = Ra), so copy Ra into a fresh temp first to avoid
+  // clobbering the guest V[ra] mapping:
+  //   FMADD  (o1=0,o0=0) Ra + Rn*Rm     -> Vfmadd231  (acc + Rn*Rm)
+  //   FMSUB  (o1=0,o0=1) Ra - Rn*Rm     -> Vfnmadd231 (acc + -(Rn*Rm))
+  //   FNMADD (o1=1,o0=0) -(Ra + Rn*Rm)  -> Vfnmsub231 (-(Rn*Rm) - acc)
+  //   FNMSUB (o1=1,o0=1) Rn*Rm - Ra     -> Vfmsub231  (Rn*Rm - acc)
+  // FP16 (ftype=0b11, needs F16C widen/narrow ops not in the backend gen inputs)
+  // and the reserved ftype=0b10 bail to the lite tier.
   void FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra, uint8_t ftype, bool o1, bool o0) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, ra, ftype, o1, o0);
+    if (!success()) {
+      return;
+    }
+    if (ftype != 0b00 && ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (!host_platform::kHasFMA) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (ftype == 0b01);
+    FpRegister xmm_n = GetVRegScalar(rn, is_double);
+    FpRegister xmm_m = GetVRegScalar(rm, is_double);
+    FpRegister xmm_a = GetVRegScalar(ra, is_double);
+    FpRegister acc = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(acc.machine_reg(), xmm_a.machine_reg());
+    if (!o1 && !o0) {  // FMADD
+      if (is_double) {
+        builder_.Gen<x86_64::Vfmadd231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfmadd231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    } else if (!o1 && o0) {  // FMSUB
+      if (is_double) {
+        builder_.Gen<x86_64::Vfnmadd231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfnmadd231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    } else if (o1 && !o0) {  // FNMADD
+      if (is_double) {
+        builder_.Gen<x86_64::Vfnmsub231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfnmsub231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    } else {  // FNMSUB
+      if (is_double) {
+        builder_.Gen<x86_64::Vfmsub231sdXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      } else {
+        builder_.Gen<x86_64::Vfmsub231ssXRegXRegXReg>(
+            acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
+      }
+    }
+    SetVRegScalar(rd, acc, is_double);
   }
 
   // FMOV (scalar, immediate): the FP constant is fully known at translation
@@ -1535,9 +1595,11 @@ class HeavyOptimizerFrontend {
 
   // FMOV between a general register and a scalar FP register, single (S/W) or
   // double (D/X), via x86 MOVD/MOVQ; plus SCVTF/UCVTF (integer -> FP) via the
-  // x86 CVTSI2SS/SD ops (EmitScvtfUcvtf). The rmode == 01 top-half (V.D[1]) forms
-  // and the FP -> int truncating conversions (FCVTZS/FCVTZU/FCVTAS/...), FP16,
-  // and ftype >= 0b10 bail to the lite tier, whose intrinsics cover them.
+  // x86 CVTSI2SS/SD ops (EmitScvtfUcvtf) and FCVTZS/FCVTZU (FP -> int, truncate
+  // toward zero) via CVTT{SS,SD}2SI + the ARM saturation/NaN fix-up (EmitFcvtz).
+  // The rmode == 01 top-half (V.D[1]) forms, the rounding FP -> int conversions
+  // (FCVTNS/PS/MS/AS/...), FP16, and ftype >= 0b10 bail to the lite tier, whose
+  // intrinsics cover them.
   // Guest V[] access stays in the XMM domain (GetVRegScalar / SetVRegScalar*),
   // and the GP<->XMM crossing is an explicit register move, not a forwarded
   // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV +
@@ -1577,7 +1639,12 @@ class HeavyOptimizerFrontend {
       EmitScvtfUcvtf(args, is_double);
       return;
     }
-    // Everything else (rmode==01 V.D[1] FMOV, FP->int truncating conversions)
+    // FCVTZS (op 000) / FCVTZU (op 001): FP -> int, truncate (rmode == 11).
+    if (args.rmode == 0b11 && (args.op == 0b000 || args.op == 0b001)) {
+      EmitFcvtz(args, is_double);
+      return;
+    }
+    // Everything else (rmode==01 V.D[1] FMOV, rounding FP->int conversions)
     // bails to the lite tier.
     UndefinedReturningVoid();
   }
@@ -1724,6 +1791,12 @@ class HeavyOptimizerFrontend {
   // the round-to-odd halve/convert/double fix-up). Mirrors
   // lite_translator.h::FpIntConversion's SCVTF/UCVTF path.
   void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double);
+
+  // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): FP -> integer
+  // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
+  // BB-split lowering (a shared `result` GP vreg merged via PseudoCopy). Mirrors
+  // lite_translator.h::FpIntConversion's FCVTZS/FCVTZU paths.
+  void EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double);
 
   //
   // Advanced SIMD (Args-struct forms).
