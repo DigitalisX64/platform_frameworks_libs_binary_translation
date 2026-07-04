@@ -2772,9 +2772,59 @@ class HeavyOptimizerFrontend {
   // Advanced SIMD (decomposed-primitive forms).
   //
 
+  // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index — extract a vector from the byte-wise
+  // concatenation Vm:Vn (Vn is the low half) starting at byte `index`. Mirrors
+  // lite_translator.h::AdvSimdExtract: for the 8-byte form (Q=0) PUNPCKLQDQ
+  // packs Vn.low64 into bytes 0..7 and Vm.low64 into bytes 8..15 so a single
+  // PSRLDQ walks a contiguous 16-byte window; for the 16-byte form (Q=1) the
+  // window is (Vn >> index) | (Vm << (16-index)) via PSRLDQ/PSLLDQ + POR. The
+  // index-out-of-range cases (imm4[3]=1 for Q=0, index>=16 for Q=1) are
+  // UNDEFINED and bail, matching the lite tier.
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, index, q);
+    if (!success()) {
+      return;
+    }
+    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rn * 16);
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    if (!q) {
+      // 64-bit form: 8-byte window, index 0..7 (imm4[3] set is UNDEFINED).
+      if (index >= 8) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      // Concatenate Vn.low64 (bytes 0..7) with Vm.low64 (bytes 8..15); the
+      // upper 64 of Vn/Vm never participate in the Q=0 window.
+      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (index != 0) {
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), static_cast<int8_t>(index));
+      }
+      // The wanted 8-byte window sits in the low 64 bits; SetVRegFull(q=false)
+      // zero-extends the upper 64.
+      SetVRegFull(rd, xn, /*q=*/false);
+      return;
+    }
+    // 128-bit form: 16-byte window, index 0..15.
+    FpRegister xn = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    if (index == 0) {
+      SetVRegFull(rd, xn, /*q=*/true);
+      return;
+    }
+    if (index >= 16) {
+      UndefinedReturningVoid();
+      return;
+    }
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    // result = (Vn >> index bytes) | (Vm << (16-index) bytes).
+    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), static_cast<int8_t>(index));
+    builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), static_cast<int8_t>(16 - index));
+    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    SetVRegFull(rd, xn, /*q=*/true);
   }
 
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size, uint8_t opcode, bool q) {

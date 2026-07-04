@@ -3043,6 +3043,12 @@ constexpr uint32_t Rev64Vec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t Rev32Vec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b00000, rd, rn);
 }
+// EXT Vd.<T>, Vn.<T>, Vm.<T>, #index:
+//   0 Q 101110 00 0 Rm 0 imm4 0 Rn Rd
+constexpr uint32_t ExtVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm4) {
+  return 0x2e000000u | (static_cast<uint32_t>(q) << 30) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(imm4) << 11) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
 // CNT: U=0, opcode=00101, size=00.
 constexpr uint32_t CntVec(bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, /*size=*/0b00, /*opcode=*/0b00101, rd, rn);
@@ -5147,6 +5153,51 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Rev32Vec8B) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x3322110077665544ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// EXT .8B (size implied, Q=0), #3: window from the Vm:Vn concatenation with Vn
+// low. Result bytes 5..7 must come from Vm; upper 64 zeroed. Same vector as the
+// lite ExtByte8bInterpreter test (insn 0x2e021820).
+TEST_F(Arm64HeavyOptimizerFrontendTest, ExtVec8B) {
+  static const uint32_t code[] = {ExtVec(/*q=*/false, 0, 1, 2, /*imm4=*/3)};
+  SetV128(&state_, 1, 0x8138268683868942ULL, 0x7741559918559252ULL);  // Vn; hi ignored
+  SetV128(&state_, 2, 0x3622262609912460ULL, 0x8051243884390451ULL);  // Vm
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);   // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x9124608138268683ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// EXT .16B (Q=1), #4: window from the 32-byte Vm:Vn concatenation starting at
+// byte 4 (Vn low, Vm high).
+TEST_F(Arm64HeavyOptimizerFrontendTest, ExtVec16B) {
+  static const uint32_t code[] = {ExtVec(/*q=*/true, 0, 1, 2, /*imm4=*/4)};
+  SetV128(&state_, 1, 0x0011223344556677ULL, 0x8899AABBCCDDEEFFULL);  // Vn
+  SetV128(&state_, 2, 0x0102030405060708ULL, 0x090A0B0C0D0E0F10ULL);  // Vm
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);   // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xCCDDEEFF00112233ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x050607088899AABBULL);
+}
+
+// EXT .16B (Q=1), #0: index 0 copies Vn verbatim (fast path, no byte shift).
+TEST_F(Arm64HeavyOptimizerFrontendTest, ExtVec16BIndex0) {
+  static const uint32_t code[] = {ExtVec(/*q=*/true, 0, 1, 2, /*imm4=*/0)};
+  SetV128(&state_, 1, 0x0011223344556677ULL, 0x8899AABBCCDDEEFFULL);  // Vn
+  SetV128(&state_, 2, 0x0102030405060708ULL, 0x090A0B0C0D0E0F10ULL);  // Vm
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);   // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0011223344556677ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x8899AABBCCDDEEFFULL);
 }
 
 // CNT .16B (Q=1): per-byte population count.
