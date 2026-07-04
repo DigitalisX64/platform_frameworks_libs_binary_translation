@@ -3636,11 +3636,15 @@ class HeavyOptimizerFrontend {
   //     esize 16/32 only — SSRA .2D needs PSRAQ and bails).
   //   * SLI / SRI (shift-and-insert) at H/S/D lanes (all three; PSLL/PSRL mask
   //     round trip + shifted Vn + POR).
-  // Everything else (byte-lane SHL/USHR/SSHR/SSRA/USRA/SLI/SRI, SSHR/SSRA .2D
-  // which need PSRAQ, and rounding/saturating/narrow/fixed-point conversions)
-  // calls Undefined() which sets success_=false and bails the region to lite — the
-  // lite tier already lowers those correctly (a heavy bail is correct-but-slow,
-  // acceptable for the rarer shift variants).
+  //   * SRSHR / URSHR / SRSRA / URSRA (rounding right shift + accumulate) at
+  //     H/S/D lanes (URSHR/URSRA all three; SRSHR/SRSRA esize 16/32 only —
+  //     signed .2D needs PSRAQ and bails). Round bit via a PSRL/PSLL/PSRL
+  //     bit-bracket, PADD, then (accumulate) PADD into Vd.
+  // Everything else (byte-lane SHL/USHR/SSHR/SSRA/USRA/SLI/SRI/rounding, SSHR/
+  // SSRA/SRSHR/SRSRA .2D which need PSRAQ, and saturating/narrow/fixed-point
+  // conversions) calls Undefined() which sets success_=false and bails the
+  // region to lite — the lite tier already lowers those correctly (a heavy
+  // bail is correct-but-slow, acceptable for the rarer shift variants).
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
     if (!success()) {
       return;
@@ -3835,6 +3839,115 @@ class HeavyOptimizerFrontend {
         // Q=0 (.4H/.2S, incl. scalar) zero Vd[127:64] via SetVRegFull's D-form
         // merge, discarding the accumulate's garbage in the upper lanes.
         SetVRegFull(args.rd, xd, args.q);
+        return;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kSrshr:
+      case Decoder::AdvSimdShiftImmOpcode::kUrshr:
+      case Decoder::AdvSimdShiftImmOpcode::kSrsra:
+      case Decoder::AdvSimdShiftImmOpcode::kUrsra: {
+        // Rounding right shift (+ accumulate). Per lane:
+        //   *RSHR Vd<i> = floor((Vn<i> + 2^(shift-1)) / 2^shift)
+        //   *RSRA Vd<i> = Vd<i> + floor((Vn<i> + 2^(shift-1)) / 2^shift)
+        // Mirrors lite_translator.h::AdvSimdShiftByImm rounding family (H/S/D
+        // packed path): shift Vn right (arith for signed, logical for
+        // unsigned) into xn, isolate bit (shift-1) of Vn as the +round term in
+        // xr via a PSRL/PSLL/PSRL bit-bracket, PADD them, then (accumulate)
+        // PADD into Vd. Byte lane (needs PMOVZXBW widening) and signed .2D
+        // SRSHR/SRSRA (need PSRAQ, AVX-512F-VL only) bail to lite, which ships
+        // a widening / GPR fallback (correct-but-slow).
+        if (immh == 0b0001) {  // byte lane
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else {  // immh & 0b0010
+          esize_bits = 16;
+        }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrshr ||
+             args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra);
+        const bool is_accumulate =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra ||
+             args.opcode == Decoder::AdvSimdShiftImmOpcode::kUrsra);
+        // Signed .2D needs PSRAQ (AVX-512F-VL) -> bail; lite's GPR fallback
+        // ships each 64-bit lane through SARQ + round.
+        if (is_signed && esize_bits == 64) {
+          UndefinedReturningVoid();
+          return;
+        }
+        // count = 2*esize - immh:immb, range [1, esize]. At count==esize PSRL
+        // saturates to 0 and the round bit isolates the MSB, giving the
+        // ARM-correct result (floor((x + 2^(esize-1)) / 2^esize) = MSB).
+        const uint8_t shift_count =
+            static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        const int8_t cnt_minus_1 = static_cast<int8_t>(shift_count - 1);
+        const int8_t esize_minus_1 = static_cast<int8_t>(esize_bits - 1);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xr = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        builder_.GenGetSimd<16>(xr.machine_reg(), vn_off);
+        // Main shifted value in xn (arith for signed H/S, logical otherwise).
+        if (esize_bits == 16) {
+          if (is_signed) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else if (esize_bits == 32) {
+          if (is_signed) {
+            builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else {  // 64 (unsigned only; signed .2D bailed above)
+          builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+        }
+        // Round bit in xr: isolate bit (shift-1) of Vn into bit 0 per lane via
+        // PSRL(cnt-1) then a PSLL(esize-1)/PSRL(esize-1) bit-0 bracket.
+        if (esize_bits == 16) {
+          builder_.Gen<x86_64::PsrlwXRegImm>(xr.machine_reg(), cnt_minus_1);
+          builder_.Gen<x86_64::PsllwXRegImm>(xr.machine_reg(), esize_minus_1);
+          builder_.Gen<x86_64::PsrlwXRegImm>(xr.machine_reg(), esize_minus_1);
+        } else if (esize_bits == 32) {
+          builder_.Gen<x86_64::PsrldXRegImm>(xr.machine_reg(), cnt_minus_1);
+          builder_.Gen<x86_64::PslldXRegImm>(xr.machine_reg(), esize_minus_1);
+          builder_.Gen<x86_64::PsrldXRegImm>(xr.machine_reg(), esize_minus_1);
+        } else {  // 64
+          builder_.Gen<x86_64::PsrlqXRegImm>(xr.machine_reg(), cnt_minus_1);
+          builder_.Gen<x86_64::PsllqXRegImm>(xr.machine_reg(), esize_minus_1);
+          builder_.Gen<x86_64::PsrlqXRegImm>(xr.machine_reg(), esize_minus_1);
+        }
+        // shifted + round bit.
+        if (esize_bits == 16) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        } else if (esize_bits == 32) {
+          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        }
+        FpRegister result = xn;
+        if (is_accumulate) {
+          FpRegister xd = AllocTempSimdReg();
+          const int32_t vd_off =
+              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          // Load orig Vd before the writeback; rd==rn safe (independent temps).
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          }
+          result = xd;
+        }
+        // Q=0 (.4H/.2S, incl. scalar D) zero Vd[127:64] via SetVRegFull.
+        SetVRegFull(args.rd, result, args.q);
         return;
       }
       case Decoder::AdvSimdShiftImmOpcode::kSli:
