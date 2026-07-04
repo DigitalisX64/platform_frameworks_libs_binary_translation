@@ -2955,8 +2955,17 @@ constexpr uint32_t FaddS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E
 constexpr uint32_t FaddD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E602800, rd, rn, rm); }
 constexpr uint32_t FsubS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E203800, rd, rn, rm); }
 constexpr uint32_t FsubD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E603800, rd, rn, rm); }
-// FMAX Sd,Sn,Sm (opcode=0100) — must bail in the optimizing tier.
+// FMAX/FMIN/FMAXNM/FMINNM (opcode 0100/0101/0110/0111).
 constexpr uint32_t FmaxS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E204800, rd, rn, rm); }
+constexpr uint32_t FmaxD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E604800, rd, rn, rm); }
+constexpr uint32_t FminS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E205800, rd, rn, rm); }
+constexpr uint32_t FminD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E605800, rd, rn, rm); }
+constexpr uint32_t FmaxnmS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E206800, rd, rn, rm); }
+constexpr uint32_t FmaxnmD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E606800, rd, rn, rm); }
+constexpr uint32_t FminnmS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E207800, rd, rn, rm); }
+constexpr uint32_t FminnmD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E607800, rd, rn, rm); }
+// FNMUL Sd,Sn,Sm (opcode=1000) — still bails in the optimizing tier.
+constexpr uint32_t FnmulS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E208800, rd, rn, rm); }
 
 // FP data-processing (1 source): 0001_1110_ftype_1_opcode[5:0]_10000_Rn_Rd.
 // opcode[20:15]: FMOV=000000, FABS=000001, FNEG=000010, FSQRT=000011.
@@ -3772,8 +3781,142 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FpMultiInstructionRegion) {
 
 // FMAX (a 2-source FP op the optimizing tier does NOT handle) must bail: the
 // region translates 0 instructions for a lone FMAX.
-TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxBails) {
+// FMAX/FMIN (NaN-propagating) and FMAXNM/FMINNM (NaN-suppressing) scalar S/D.
+// Common cases where ARM semantics and the x86 idiom agree are asserted; the
+// +-0 sign corner is intentionally not pinned (it matches the lite tier's
+// MAX|MAX|POR idiom, whatever that yields, keeping the two tiers consistent).
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxS) {
   static const uint32_t code[] = {FmaxS(0, 1, 2)};
+  SetVf32(&state_, 1, 1.0f);
+  SetVf32(&state_, 2, 2.0f);
+  SetVf32(&state_, 0, 99.0f);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxD) {
+  static const uint32_t code[] = {FmaxD(0, 1, 2)};
+  SetVf64(&state_, 1, 1.5);
+  SetVf64(&state_, 2, -3.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminS) {
+  static const uint32_t code[] = {FminS(0, 1, 2)};
+  SetVf32(&state_, 1, 1.0f);
+  SetVf32(&state_, 2, 2.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminD) {
+  static const uint32_t code[] = {FminD(0, 1, 2)};
+  SetVf64(&state_, 1, 1.5);
+  SetVf64(&state_, 2, -3.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -3.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMAX propagates a NaN operand (ARM IEEE 754-2008 maxNum-less semantics).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxNaNPropagatesS) {
+  static const uint32_t code[] = {FmaxS(0, 1, 2)};
+  SetV128(&state_, 1, 0x7FC00000u, 0);  // QNaN in lane 0
+  SetVf32(&state_, 2, 3.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(static_cast<uint32_t>(VLo64(&state_, 0)), 0x7FC00000u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmS) {
+  static const uint32_t code[] = {FmaxnmS(0, 1, 2)};
+  SetVf32(&state_, 1, 1.0f);
+  SetVf32(&state_, 2, 2.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMAXNM suppresses a single NaN and returns the number.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmNaNSuppressesS) {
+  static const uint32_t code[] = {FmaxnmS(0, 1, 2)};
+  SetV128(&state_, 1, 0x7FC00000u, 0);  // QNaN in lane 0
+  SetVf32(&state_, 2, 3.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 3.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmNaNSuppressesD) {
+  static const uint32_t code[] = {FmaxnmD(0, 1, 2)};
+  SetV128(&state_, 1, 0x7FF8000000000000ull, 0);  // QNaN in lane 0
+  SetVf64(&state_, 2, 2.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 2.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmS) {
+  static const uint32_t code[] = {FminnmS(0, 1, 2)};
+  SetVf32(&state_, 1, 4.0f);
+  SetVf32(&state_, 2, 7.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 4.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmNaNSuppressesD) {
+  static const uint32_t code[] = {FminnmD(0, 1, 2)};
+  SetV128(&state_, 1, 0x7FF8000000000000ull, 0);  // QNaN in lane 0
+  SetVf64(&state_, 2, -5.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -5.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FNMUL (opcode 1000) is still not wired into the optimizing tier: must bail.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulBails) {
+  static const uint32_t code[] = {FnmulS(0, 1, 2)};
   SetVf32(&state_, 1, 1.0f);
   SetVf32(&state_, 2, 2.0f);
   state_.cpu.insn_addr = ToGuestAddr(code);

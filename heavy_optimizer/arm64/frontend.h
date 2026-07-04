@@ -1776,14 +1776,97 @@ class HeavyOptimizerFrontend {
       UndefinedReturningVoid();
       return;
     }
-    if (args.opcode > 0b0011) {
-      // FMAX/FMIN/FMAXNM/FMINNM/FNMUL not wired into the optimizing tier.
+    if (args.opcode > 0b0111) {
+      // FNMUL (0b1000) not yet wired into the optimizing tier.
       UndefinedReturningVoid();
       return;
     }
     const bool is_double = (args.ftype == 0b01);
     FpRegister src1 = GetVRegScalar(args.rn, is_double);
     FpRegister src2 = GetVRegScalar(args.rm, is_double);
+
+    // FMAX/FMIN/FMAXNM/FMINNM (0b0100..0b0111). x86 MAXP{S,D}/MINP{S,D} have
+    // ARM-incompatible NaN and signed-zero semantics, so mirror the lite tier's
+    // explicit sequences. Packed ops run on the scalar-loaded registers; only
+    // lane 0 is written back by SetVRegScalar, so upper-lane garbage is
+    // irrelevant. NaN-propagating FMAX/FMIN (ARM: any NaN in -> NaN out) use the
+    // symmetric MAX|MAX|POR idiom (the POR keeps a NaN exponent if either input
+    // was NaN, and the two-sided MAX makes +-0 order-independent). NaN-
+    // suppressing FMAXNM/FMINNM (ARM: exactly one NaN -> the number) substitute
+    // each NaN lane with the other operand — via a CMPUNORDP{S,D} self-compare
+    // mask — before the MAX/MIN. Mirrors lite_translator.h's scalar path.
+    if (args.opcode >= 0b0100 && args.opcode <= 0b0111) {
+      const bool is_max = (args.opcode == 0b0100 || args.opcode == 0b0110);
+      const bool is_nm = (args.opcode == 0b0110 || args.opcode == 0b0111);
+      FpRegister n = src1;
+      FpRegister m = src2;
+      if (!is_nm) {
+        // NaN-propagating: tmp = m; MAXP tmp,n; MAXP n,m; POR n,tmp.
+        FpRegister tmp = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
+        if (is_max) {
+          if (is_double) {
+            builder_.Gen<x86_64::MaxpdXRegXReg>(tmp.machine_reg(), n.machine_reg());
+            builder_.Gen<x86_64::MaxpdXRegXReg>(n.machine_reg(), m.machine_reg());
+          } else {
+            builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
+            builder_.Gen<x86_64::MaxpsXRegXReg>(n.machine_reg(), m.machine_reg());
+          }
+        } else {
+          if (is_double) {
+            builder_.Gen<x86_64::MinpdXRegXReg>(tmp.machine_reg(), n.machine_reg());
+            builder_.Gen<x86_64::MinpdXRegXReg>(n.machine_reg(), m.machine_reg());
+          } else {
+            builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
+            builder_.Gen<x86_64::MinpsXRegXReg>(n.machine_reg(), m.machine_reg());
+          }
+        }
+        builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
+        SetVRegScalar(args.rd, n, is_double);
+      } else {
+        // NaN-suppressing: mask_a=isnan(n), mask_b=isnan(m). Substitute the NaN
+        // lanes with the other operand (an_sub = isnan(n) ? m; bn_sub =
+        // isnan(m) ? n), giving sub_n = select(isnan(n), m, n) and sub_m =
+        // select(isnan(m), n, m); then MAX/MIN the substituted pair.
+        FpRegister mask_a = AllocTempSimdReg();
+        FpRegister mask_b = AllocTempSimdReg();
+        FpRegister an_sub = AllocTempSimdReg();
+        FpRegister bn_sub = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
+        if (is_double) {
+          builder_.Gen<x86_64::CmpunordpdXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
+          builder_.Gen<x86_64::CmpunordpdXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
+          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
+        }
+        builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());
+        builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());
+        builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());
+        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
+        builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
+        if (is_max) {
+          if (is_double) {
+            builder_.Gen<x86_64::MaxpdXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
+          } else {
+            builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
+          }
+        } else {
+          if (is_double) {
+            builder_.Gen<x86_64::MinpdXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
+          } else {
+            builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
+          }
+        }
+        SetVRegScalar(args.rd, mask_a, is_double);
+      }
+      return;
+    }
+
     FpRegister result = AllocTempSimdReg();
     if (is_double) {
       switch (args.opcode) {
