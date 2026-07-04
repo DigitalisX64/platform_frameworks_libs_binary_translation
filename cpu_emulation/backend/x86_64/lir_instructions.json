@@ -197,6 +197,7 @@
         "PackuswbXRegXReg",
         "PaddbXRegXReg",
         "PadddXRegXReg",
+        "PaddqXRegXReg",
         "PaddwXRegXReg",
         "PandXRegXReg",
         "PandnXRegXReg",
