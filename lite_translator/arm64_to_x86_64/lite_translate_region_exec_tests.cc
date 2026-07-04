@@ -12651,6 +12651,83 @@ TEST_F(Arm64LiteTranslateRegionTest, FdivVec2D) {
   EXPECT_DOUBLE_EQ(r[1], -0.125);
 }
 
+// FABD (vector) = |Vn - Vm| per lane.  Encoding: U=1, op_high=1, opcode=11010
+//   .4S = 0x6EA0D400 | (rm<<16) | (rn<<5) | rd
+//   .2D = 0x6EE0D400 | ...
+//   .2S = 0x2EA0D400 | ...
+constexpr uint32_t FabdVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6EA0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabdVec2D(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6EE0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabdVec2S(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x2EA0D400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FabdVec4S) {
+  StoreVec4S(state_.cpu, 1, 1.0f, -2.0f, 5.0f, -8.0f);
+  StoreVec4S(state_.cpu, 2, 4.0f,  3.0f, 5.0f,  2.0f);
+  static const uint32_t code[] = {FabdVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 3.0f);   // |1 - 4|
+  EXPECT_FLOAT_EQ(r[1], 5.0f);   // |-2 - 3|
+  EXPECT_FLOAT_EQ(r[2], 0.0f);   // |5 - 5|
+  EXPECT_FLOAT_EQ(r[3], 10.0f);  // |-8 - 2|
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FabdVec2D) {
+  StoreVec2D(state_.cpu, 1, 1.5,  -8.0);
+  StoreVec2D(state_.cpu, 2, 4.0,   3.0);
+  static const uint32_t code[] = {FabdVec2D(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double r[2];
+  LoadVec2D(state_.cpu, 0, r);
+  EXPECT_DOUBLE_EQ(r[0], 2.5);   // |1.5 - 4|
+  EXPECT_DOUBLE_EQ(r[1], 11.0);  // |-8 - 3|
+}
+
+// .2S (q=0): only the low 2 FP32 lanes participate; Vd[127:64] must be zeroed.
+TEST_F(Arm64LiteTranslateRegionTest, FabdVec2SUpperZero) {
+  StoreVec4S(state_.cpu, 1, 2.0f, -4.0f, 7.0f, 7.0f);
+  StoreVec4S(state_.cpu, 2, 3.0f, -1.0f, 9.0f, 9.0f);
+  static const uint32_t code[] = {FabdVec2S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  float r[4];
+  LoadVec4S(state_.cpu, 0, r);
+  EXPECT_FLOAT_EQ(r[0], 1.0f);  // |2 - 3|
+  EXPECT_FLOAT_EQ(r[1], 3.0f);  // |-4 - -1|
+  uint32_t lane2_bits, lane3_bits;
+  std::memcpy(&lane2_bits, &r[2], sizeof(uint32_t));
+  std::memcpy(&lane3_bits, &r[3], sizeof(uint32_t));
+  EXPECT_EQ(lane2_bits, 0u);
+  EXPECT_EQ(lane3_bits, 0u);
+}
+
+// ARM FABD is FPAbs(FPSub(a,b)); a NaN difference keeps its payload but the
+// sign bit is cleared (result bit31 == 0).
+TEST_F(Arm64LiteTranslateRegionTest, FabdVec4SNaNSignCleared) {
+  float neg_nan;
+  uint32_t neg_nan_bits = 0xFFC00000u;  // negative quiet NaN
+  std::memcpy(&neg_nan, &neg_nan_bits, sizeof(float));
+  StoreVec4S(state_.cpu, 1, neg_nan, 3.0f, 0.0f, 0.0f);
+  StoreVec4S(state_.cpu, 2, 1.0f,    9.0f, 0.0f, 0.0f);
+  static const uint32_t code[] = {FabdVec4S(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], sizeof(r));
+  EXPECT_EQ(r[0] >> 31, 0u);              // sign bit cleared
+  EXPECT_EQ(r[0] & 0x7FFFFFFFu, 0x7FC00000u);  // still a quiet NaN payload
+  float lane1;
+  std::memcpy(&lane1, &r[1], sizeof(float));
+  EXPECT_FLOAT_EQ(lane1, 6.0f);  // |3 - 9|
+}
+
 // FCMEQ / FCMGE / FCMGT / FACGE / FACGT vector three-same
 // JIT (FP32 .2S/.4S, FP64 .2D).  Encoding (per ARM ARM C7.2.85 / .87 / .89
 // vector form and C7.2.61 / .63 vector FACGE/FACGT):

@@ -6339,16 +6339,42 @@ class LiteTranslator {
         return;
       }
       case Decoder::AdvSimdThreeSameOpcode::kFabdV: {
-        // FP16 vector FABD .4H / .8H via F16C round-trip:
-        //   widen each operand half to FP32, compute (a - b) at FP32, clear
-        //   the FP32 sign bit (0x7FFFFFFF per dword) before narrow.
-        // The sign-clear constant is built in an XMM temp with the
-        // `PCMPEQD self ; PSRLD 1` idiom — avoids a memory-side rodata load.
-        // F16C round-trip is bit-exact for FP16 FSUB (FP32 mantissa strictly
-        // contains FP16's), and a subsequent bitwise AND is bit-exact by
-        // construction, so the FP16 round-trip composes cleanly with the
-        // sign-clear step. FP32/FP64 forms still bail to the interpreter.
-        if (!args.is_fp16) { Undefined(); return; }
+        // FP vector FABD = |a - b|: a packed SUB then a sign-clear (bitwise AND
+        // with 0x7FFF…). ARM FABD is FPAbs(FPSub(a,b)); x86 SUBP{S,D} matches
+        // ARM FPSub lane-for-lane under default rounding, and clearing the sign
+        // bit yields FPAbs — including on NaN, where ARM FPAbs also clears the
+        // sign bit. The sign-clear constant is built in an XMM temp with the
+        // `PCMPEQD self ; PSRLD/PSRLQ 1` idiom (avoids a rodata load).
+        //
+        // FP32 (.2S/.4S, args.size=0b00) and FP64 (.2D, args.size=0b01) lower
+        // directly; FP16 (.4H/.8H) uses an F16C round-trip: widen each operand
+        // half to FP32, compute (a-b) at FP32, sign-clear the FP32 result, then
+        // narrow. The F16C round-trip is bit-exact for FP16 FSUB (FP32's
+        // mantissa strictly contains FP16's) and the subsequent AND is exact by
+        // construction, so it composes cleanly. .1D (Q=0, size=01) is
+        // ARM-reserved and rejected by the decoder before reaching here.
+        if (!args.is_fp16) {
+          const bool is_double = (args.size & 1);
+          SimdRegister xn = AllocTempSimdReg();
+          SimdRegister xm = AllocTempSimdReg();
+          SimdRegister mask = AllocTempSimdReg();
+          if (xn == no_simd_register || xm == no_simd_register ||
+              mask == no_simd_register) {
+            success_ = false; return;
+          }
+          load_full(xn, vn_off);
+          load_full(xm, vm_off);
+          if (is_double) as_.Subpd(xn, xm);
+          else           as_.Subps(xn, xm);
+          as_.Pcmpeqd(mask, mask);
+          if (is_double) as_.Psrlq(mask, int8_t{1});  // 0x7FFFFFFFFFFFFFFF/qword
+          else           as_.Psrld(mask, int8_t{1});  // 0x7FFFFFFF/dword
+          as_.Pand(xn, mask);
+          // .2S (q=0, FP32) zeroes the destination's upper 64 bits.
+          if (!args.q) mask_low64(xn);
+          store_full(vd_off, xn);
+          return;
+        }
         if (!host_platform::kHasF16C) { Undefined(); return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();

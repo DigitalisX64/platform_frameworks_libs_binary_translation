@@ -3069,6 +3069,11 @@ constexpr uint32_t FdivVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm)
   return AdvSimdThreeSame(
       q, /*u=*/true, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11111, rd, rn, rm);
 }
+// FABD (vector): op_high=1, U=1, opcode=11010 -> |Vn - Vm| per lane.
+constexpr uint32_t FabdVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/true, /*size=*/static_cast<uint8_t>(0b10 | dbl), /*opcode=*/0b11010, rd, rn, rm);
+}
 // FP three-same vector compares (opcode=11100). FCMEQ op_high=0/U=0;
 // FCMGE op_high=0/U=1; FCMGT op_high=1/U=1. size field = {op_high, sz}, sz=dbl.
 constexpr uint32_t FcmeqVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -4220,6 +4225,71 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgtVec4S) {
   // gt: 1>1 F, 2>5 F, 3>2 T, NaN>1 F.
   EXPECT_EQ(VLo64(&state_, 0), 0u);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);
+}
+
+// FABD v0.4s, v1.4s, v2.4s (op_high=1, U=1): per-lane |v1 - v2| FP32.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdVec4S) {
+  static const uint32_t code[] = {FabdVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  // v1 = 1.0, -2.0, 3.5, -10.0 ; v2 = 2.0, -3.0, 3.0, 5.0.
+  SetV128(&state_, 1, 0xC00000003F800000ULL, 0xC120000040600000ULL);
+  SetV128(&state_, 2, 0xC040000040000000ULL, 0x40A0000040400000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // |1-2|=1, |-2- -3|=1, |3.5-3|=0.5, |-10-5|=15.
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F8000003F800000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x417000003F000000ULL);
+}
+
+// FABD v0.2d, v1.2d, v2.2d (FP64): per-lane |v1 - v2|.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdVec2D) {
+  static const uint32_t code[] = {FabdVec(/*dbl=*/true, /*q=*/true, 0, 1, 2)};
+  // v1 = 6.0, -8.0 ; v2 = 2.0, 4.0.
+  SetV128(&state_, 1, 0x4018000000000000ULL, 0xC020000000000000ULL);
+  SetV128(&state_, 2, 0x4000000000000000ULL, 0x4010000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // |6-2|=4.0, |-8-4|=12.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x4010000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4028000000000000ULL);
+}
+
+// FABD v0.2s, v1.2s, v2.2s (Q=0): two FP32 lanes, Vd[127:64] zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdVec2S) {
+  static const uint32_t code[] = {FabdVec(/*dbl=*/false, /*q=*/false, 0, 1, 2)};
+  // v1 lanes 0,1 = 1.0, 2.0 ; v2 = 10.0, 20.0.
+  SetV128(&state_, 1, 0x400000003F800000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x41A0000041200000ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // |1-10|=9.0, |2-20|=18.0 ; upper 64 zeroed.
+  EXPECT_EQ(VLo64(&state_, 0), 0x4190000041100000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// ARM FABD is FPAbs(FPSub); a NaN difference keeps its payload with the sign
+// bit cleared (result high bit == 0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdVec4SNaNSignCleared) {
+  static const uint32_t code[] = {FabdVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  // v1 lane0 = -qNaN (0xFFC00000), lane1 = 3.0 ; v2 lane0 = 1.0, lane1 = 9.0.
+  SetV128(&state_, 1, 0x40400000FFC00000ULL, 0ULL);
+  SetV128(&state_, 2, 0x411000003F800000ULL, 0ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lane0 = |NaN - 1| -> 0x7FC00000 (sign cleared) ; lane1 = |3-9| = 6.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x40C000007FC00000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 // FCMGE v0.2s, v1.2s, v2.2s (Q=0): two FP32 lanes, Vd[127:64] zeroed.
