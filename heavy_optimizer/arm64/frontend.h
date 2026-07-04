@@ -3640,9 +3640,15 @@ class HeavyOptimizerFrontend {
   //     H/S/D lanes (URSHR/URSRA all three; SRSHR/SRSRA esize 16/32 only —
   //     signed .2D needs PSRAQ and bails). Round bit via a PSRL/PSLL/PSRL
   //     bit-bracket, PADD, then (accumulate) PADD into Vd.
-  // Everything else (byte-lane SHL/USHR/SSHR/SSRA/USRA/SLI/SRI/rounding, SSHR/
-  // SSRA/SRSHR/SRSRA .2D which need PSRAQ, and saturating/narrow/fixed-point
-  // conversions) calls Undefined() which sets success_=false and bails the
+  //   * SQSHL / UQSHL / SQSHLU (saturating shift left) at vector H/S lanes
+  //     (all three; UQSHL/SQSHLU also .2D via PSLLQ/PSRLQ/PCMPEQQ; SQSHL .2D
+  //     needs PSRAQ recovery and bails). Shift-left, recover via the inverse
+  //     shift, PCMPEQ-vs-source for a per-lane no-overflow mask, blend the
+  //     shifted value with the per-lane saturation limit.
+  // Everything else (byte-lane SHL/USHR/SSHR/SSRA/USRA/SLI/SRI/rounding/
+  // saturating, SSHR/SSRA/SRSHR/SRSRA/SQSHL .2D which need PSRAQ, scalar
+  // saturating B/H/S/D, and narrow/fixed-point conversions) calls Undefined()
+  // which sets success_=false and bails the
   // region to lite — the lite tier already lowers those correctly (a heavy
   // bail is correct-but-slow, acceptable for the rarer shift variants).
   void AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArgs& args) {
@@ -4024,6 +4030,143 @@ class HeavyOptimizerFrontend {
         builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), xn.machine_reg());
         // Q=0 (.4H/.2S, incl. scalar D) zero Vd[127:64] via SetVRegFull.
         SetVRegFull(args.rd, xd, args.q);
+        return;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kSqshl:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshl:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshlu: {
+        // Saturating shift left by immediate. Per lane, shift Vn left by
+        // `shift`; if the result overflows the element's saturating range,
+        // replace it with the saturation limit. Mirrors
+        // lite_translator.h::AdvSimdShiftByImm SQSHL/UQSHL/SQSHLU vector packed
+        // pipeline (H/S lanes for all three; UQSHL/SQSHLU also .2D via
+        // PSLLQ/PSRLQ/PCMPEQQ; SQSHL .2D needs PSRAQ recovery and bails).
+        // Mechanism: shift-left into xs, recover with the inverse shift into xm,
+        // PCMPEQ against the source to build a per-lane "no-overflow" mask,
+        // blend the shifted value with the per-lane saturation target. SQSHLU
+        // pre-zeros negative source lanes so the unsigned clamp yields the
+        // architectural 0.
+        //
+        // Scalar B/H/S/D forms (args.scalar — saturating shift accepts any
+        // non-zero immh) and byte-lane vector forms bail to lite, which has
+        // full scalar + byte coverage (correct-but-slow).
+        if (args.scalar || immh == 0b0001) {
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else {  // immh & 0b0010
+          esize_bits = 16;
+        }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshl);
+        const bool is_sqshlu =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshlu);
+        // SQSHL .2D needs PSRAQ (AVX-512F-VL) for the signed back-shift
+        // recovery -> bail; lite ships each 64-bit lane through a GPR fallback.
+        if (is_signed && esize_bits == 64) {
+          UndefinedReturningVoid();
+          return;
+        }
+        // SQSHL/UQSHL/SQSHLU count = immh:immb - esize, range [0, esize-1].
+        const uint8_t shift_count =
+            static_cast<uint8_t>(immh_immb - esize_bits);
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xs = AllocTempSimdReg();
+        FpRegister xm = AllocTempSimdReg();
+        // xt starts zeroed so its self-referencing PCMPEQ/PXOR idioms below
+        // (all-ones / re-zero) read a defined register — the heavy tier's SSA
+        // lifetime analysis rejects a use-before-def, unlike the lite tier's
+        // physical registers.
+        FpRegister xt = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+
+        if (is_sqshlu) {
+          // pos_xn = (Vn < 0) ? 0 : Vn. Pre-zero negative source lanes so the
+          // unsigned clamp below yields the architectural 0. xt is already zero
+          // (AllocZeroedSimdReg), so PCMPGT(xt, xn) yields the neg-lane mask.
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PcmpgtwXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PcmpgtdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          }
+          builder_.Gen<x86_64::PandnXRegXReg>(xt.machine_reg(), xn.machine_reg());  // ~neg & xn
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xn.machine_reg(), xt.machine_reg());
+        }
+
+        // xs = xn << cnt.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xs.machine_reg(), xn.machine_reg());
+        if (esize_bits == 16) {
+          builder_.Gen<x86_64::PsllwXRegImm>(xs.machine_reg(), cnt);
+        } else if (esize_bits == 32) {
+          builder_.Gen<x86_64::PslldXRegImm>(xs.machine_reg(), cnt);
+        } else {
+          builder_.Gen<x86_64::PsllqXRegImm>(xs.machine_reg(), cnt);
+        }
+        // xm = recover(xs): arithmetic (signed) / logical (unsigned) shift-right
+        // by the same count. If it reproduces the source, the shift did not
+        // overflow that lane.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xm.machine_reg(), xs.machine_reg());
+        if (is_signed) {  // SQSHL, esize 16/32 (esize 64 bailed above).
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xm.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsradXRegImm>(xm.machine_reg(), cnt);
+          }
+        } else {  // UQSHL / SQSHLU, esize 16/32/64.
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), cnt);
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrlqXRegImm>(xm.machine_reg(), cnt);
+          }
+        }
+        // xm = eq_mask: per-lane all-ones where recover(shift) == source.
+        if (esize_bits == 16) {
+          builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        } else if (esize_bits == 32) {
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PcmpeqqXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        }
+
+        // Saturation target in xt.
+        if (is_signed) {
+          // SQSHL: sat = INT_MAX XOR neg_mask(xn). (esize 16/32 only.)
+          builder_.Gen<x86_64::PxorXRegXReg>(xt.machine_reg(), xt.machine_reg());
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PcmpgtwXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PcmpgtdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          }
+          // xn is now free (its value was consumed by the eq_mask + neg_mask);
+          // reuse it to hold INT_MAX = PSRL(all-ones, 1).
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          } else {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+          }
+          builder_.Gen<x86_64::PxorXRegXReg>(xt.machine_reg(), xn.machine_reg());
+        } else {
+          // UQSHL / SQSHLU: sat = UINT_MAX (all-ones) per lane.
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xt.machine_reg(), xt.machine_reg());
+        }
+
+        // Blend: result = (eq_mask & shifted) | (~eq_mask & sat).
+        builder_.Gen<x86_64::PandXRegXReg>(xs.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xt.machine_reg());
+        builder_.Gen<x86_64::PorXRegXReg>(xs.machine_reg(), xm.machine_reg());
+        // Q=0 (.4H/.2S) zero Vd[127:64] via SetVRegFull's D-form merge.
+        SetVRegFull(args.rd, xs, args.q);
         return;
       }
       default:
