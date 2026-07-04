@@ -5972,14 +5972,62 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Sqxtn2Vec16B) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x807F8080FF7F7F01ULL);  // narrowed into high
 }
 
-// SQXTN size=10 (.2D->.2S) needs the SSE4.2 clamp/blend and must bail to lite.
-TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnVec2SBails) {
+// SQXTN v0.2s, v1.2d (size=10, Q=0): signed saturating 64->32 narrow via the
+// PCMPGTQ clamp/blend. lane0 = -2^31-1 (< INT32_MIN) -> INT32_MIN 0x80000000;
+// lane1 = +2^31 (> INT32_MAX) -> INT32_MAX 0x7FFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnVec2S) {
   static const uint32_t code[] = {SqxtnVec(0b10, /*q=*/false, 0, 1)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetV128(&state_, 1, 0xFFFFFFFF7FFFFFFFULL, 0x0000000080000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFF80000000ULL);   // {INT32_MIN, INT32_MAX}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UQXTN v0.2s, v1.2d (size=10, Q=0): unsigned saturating 64->32 narrow.
+// lane0 = 0x00000000ABCDEF01 (high32==0) passes; lane1 = 0x0000000100000000
+// (high32!=0) -> UINT32_MAX 0xFFFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqxtnVec2S) {
+  static const uint32_t code[] = {UqxtnVec(0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x00000000ABCDEF01ULL, 0x0000000100000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFABCDEF01ULL);   // {0xABCDEF01, UINT32_MAX}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQXTUN v0.2s, v1.2d (size=10, Q=0): signed->unsigned saturating 64->32 narrow.
+// lane0 = -1 (negative) -> 0; lane1 = 0x0000000123456789 (> UINT32_MAX) ->
+// UINT32_MAX 0xFFFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtunVec2S) {
+  static const uint32_t code[] = {SqxtunVec(0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0x0000000123456789ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFF00000000ULL);   // {0, UINT32_MAX}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQXTN2 v0.4s, v1.2d (size=10, Q=1): narrow into Vd.high, Vd.low preserved.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Sqxtn2Vec4S) {
+  static const uint32_t code[] = {SqxtnVec(0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFF7FFFFFFFULL, 0x0000000080000000ULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEBABEULL, 0xBBBBBBBBBBBBBBBBULL);  // low preserved
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xDEADBEEFCAFEBABEULL);   // Vd.low preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x7FFFFFFF80000000ULL);  // narrowed into high
 }
 
 // A two-reg-misc opcode we do NOT yet mirror (CLZ) must still bail cleanly.

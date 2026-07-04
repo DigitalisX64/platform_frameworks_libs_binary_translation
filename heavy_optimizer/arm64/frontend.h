@@ -3161,17 +3161,78 @@ class HeavyOptimizerFrontend {
       //                               (keeps values in the positive signed range
       //                               so the following PACKUS is exact), then
       //                               PACKUSWB / PACKUSDW.
-      // size=00 (8H->8B) and size=01 (4S->4H) only; size=10 (.2D->.2S) needs the
-      // SSE4.2 PCMPGTQ clamp/blend and bails to lite, matching the register-pure
-      // heavy-tier convention. Mirrors lite kSqxtn/kUqxtn/kSqxtun.
+      // size=00 (8H->8B) and size=01 (4S->4H) use the x86 narrowing packs.
+      // size=10 (.2D->.2S) has no 64->32 x86 pack, so each 64-bit lane is
+      // clamped into the destination range with PCMPGTQ/PCMPEQQ (SSE4.2/4.1)
+      // masked blends and the two low dwords gathered with PSHUFD — a bit-exact
+      // mirror of lite kSqxtn/kUqxtn/kSqxtun's size=10 path. size=11 is reserved.
       case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn:
       case Decoder::AdvSimdTwoRegMiscOpcode::kUqxtn:
       case Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun: {
-        if (args.size != 0b00 && args.size != 0b01) {
+        const auto opc = args.opcode;
+        if (args.size == 0b10) {
+          FpRegister x = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(x.machine_reg(), vn_off);
+          // Broadcast a 64-bit constant into both lanes.
+          auto set_const = [&](FpRegister r, int64_t v) {
+            Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(v));
+            builder_.Gen<x86_64::MovqXRegReg>(r.machine_reg(), gp);
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
+          };
+          // x = (x & ~mask) | (val & mask), via x ^= (x ^ val) & mask.
+          auto blend = [&](FpRegister val, FpRegister mask) {
+            FpRegister t = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+            builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
+            builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
+            builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), t.machine_reg());
+          };
+          if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn) {
+            FpRegister c = AllocTempSimdReg();
+            FpRegister m = AllocTempSimdReg();
+            set_const(c, int64_t{0x000000007FFFFFFFLL});  // INT32_MAX
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > MAX
+            blend(c, m);
+            set_const(c, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < MIN
+            blend(c, m);
+          } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
+            FpRegister c = AllocTempSimdReg();
+            FpRegister m = AllocTempSimdReg();
+            set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > UMAX
+            blend(c, m);
+            FpRegister z = AllocZeroedSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), z.machine_reg());
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < 0
+            builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), x.machine_reg());     // neg -> 0
+            builder_.Gen<x86_64::MovdqaXRegXReg>(x.machine_reg(), m.machine_reg());
+          } else {  // kUqxtn: unsigned uint64 -> clamp to UINT32_MAX
+            FpRegister c = AllocTempSimdReg();
+            FpRegister m = AllocTempSimdReg();
+            set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+            builder_.Gen<x86_64::PsrlqXRegImm>(m.machine_reg(), int8_t{32});  // high 32 bits
+            FpRegister z = AllocZeroedSimdReg();
+            builder_.Gen<x86_64::PcmpeqqXRegXReg>(m.machine_reg(), z.machine_reg());  // high32==0
+            FpRegister t = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+            builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), c.machine_reg());
+            builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), t.machine_reg());
+            builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), m.machine_reg());
+          }
+          builder_.Gen<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(),
+                                                  int8_t{0b00001000});
+          SetVRegNarrow(args.rd, x, args.q);
+          return;
+        }
+        if (args.size != 0b00 && args.size != 0b01) {  // size=11 reserved
           UndefinedReturningVoid();
           return;
         }
-        const auto opc = args.opcode;
         FpRegister xn = AllocTempSimdReg();
         FpRegister xz = AllocZeroedSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
