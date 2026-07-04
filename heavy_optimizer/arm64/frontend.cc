@@ -790,6 +790,120 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
   builder_.StartBasicBlock(merge_bb);
 }
 
+// SCVTF (op 010) / UCVTF (op 011), unscaled (rmode == 00): convert a general
+// register integer to scalar FP via x86 CVTSI2SS/SD, which reads a SIGNED
+// source. Mirrors lite_translator.h::FpIntConversion's SCVTF/UCVTF path.
+//   * SCVTF: the L-form sign-extends the 32-bit source (sf=0), the Q-form takes
+//     the 64-bit source (sf=1) — both match ARM's signed convert directly.
+//   * UCVTF sf=0 (32-bit unsigned): zero-extend with a 32-bit MOV (auto-clears
+//     the upper 32) then Q-convert (value <= UINT32_MAX < INT64_MAX, exact).
+//   * UCVTF sf=1 (64-bit unsigned): values < 2^63 Q-convert directly; values
+//     >= 2^63 branch to the round-to-odd halve/convert/double fix-up so the
+//     round-to-nearest-even result matches static_cast<float|double>(uint64_t)
+//     bit-for-bit. Two paths write a shared merge XMM.
+// The scalar result is committed with SetVRegScalar (upper V[] bytes zeroed).
+void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
+                                            bool is_double) {
+  if (!success()) {
+    return;
+  }
+  const bool is_unsigned = (args.op == 0b011);
+
+  // rn == 31 is WZR/XZR -> 0; static_cast<FP>(0) == +0.0.
+  if (args.rn == 31) {
+    SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);
+    return;
+  }
+
+  Register src = GetReg(args.rn);
+
+  // SCVTF (any sf): straight-line signed convert.
+  if (!is_unsigned) {
+    FpRegister xmm = AllocTempSimdReg();
+    if (args.sf) {
+      if (is_double) {
+        builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xmm.machine_reg(), src);
+      } else {
+        builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), src);
+      }
+    } else {
+      if (is_double) {
+        builder_.Gen<x86_64::Cvtsi2sdlXRegReg>(xmm.machine_reg(), src);
+      } else {
+        builder_.Gen<x86_64::Cvtsi2sslXRegReg>(xmm.machine_reg(), src);
+      }
+    }
+    SetVRegScalar(args.rd, xmm, is_double);
+    return;
+  }
+
+  // UCVTF sf=0: zero-extend the 32-bit source, convert as signed 64-bit.
+  if (!args.sf) {
+    Register zx = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+    FpRegister xmm = AllocTempSimdReg();
+    if (is_double) {
+      builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xmm.machine_reg(), zx);
+    } else {
+      builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), zx);
+    }
+    SetVRegScalar(args.rd, xmm, is_double);
+    return;
+  }
+
+  // UCVTF sf=1: 64-bit unsigned. Branch on the sign bit (bit 63). Both paths
+  // write the shared merge XMM `result`, defined on every edge into merge_bb.
+  FpRegister result = AllocTempSimdReg();
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* direct_bb = ir->NewBasicBlock();
+  MachineBasicBlock* fixup_bb = ir->NewBasicBlock();
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, direct_bb);
+  ir->AddEdge(cur_bb, fixup_bb);
+
+  // TEST sets SF = bit 63; take the fix-up path when the source is >= 2^63.
+  Register flags = std::get<0>(Gen<x86_64::TestqRegReg>(src, src));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kNegative, fixup_bb, direct_bb, flags);
+
+  // Direct: value < 2^63, signed Q-convert is exact.
+  builder_.StartBasicBlock(direct_bb);
+  {
+    FpRegister xd = AllocTempSimdReg();
+    if (is_double) {
+      builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xd.machine_reg(), src);
+    } else {
+      builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xd.machine_reg(), src);
+    }
+    builder_.Gen<x86_64::MovdqaXRegXReg>(result.machine_reg(), xd.machine_reg());
+  }
+  ir->AddEdge(direct_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  // Fix-up: value >= 2^63. odd = (src >> 1) | (src & 1); convert; double.
+  builder_.StartBasicBlock(fixup_bb);
+  {
+    Register low_bit = std::get<0>(Gen<x86_64::AndqRegImm>(Copy(src), int32_t{1}));
+    Register halved = std::get<0>(Gen<x86_64::ShrqRegImm>(Copy(src), int8_t{1}));
+    Register odd = std::get<0>(Gen<x86_64::OrqRegReg>(halved, low_bit));
+    FpRegister xf = AllocTempSimdReg();
+    if (is_double) {
+      builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xf.machine_reg(), odd);
+      builder_.Gen<x86_64::AddsdXRegXReg>(xf.machine_reg(), xf.machine_reg());
+    } else {
+      builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xf.machine_reg(), odd);
+      builder_.Gen<x86_64::AddssXRegXReg>(xf.machine_reg(), xf.machine_reg());
+    }
+    builder_.Gen<x86_64::MovdqaXRegXReg>(result.machine_reg(), xf.machine_reg());
+  }
+  ir->AddEdge(fixup_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(merge_bb);
+  SetVRegScalar(args.rd, result, is_double);
+}
+
 // LDXR/STXR/LDAXR/STLXR (exclusive) and LDAR/STLR (acquire/release). Mirrors
 // lite_translator.h::LoadStoreExclusive byte-for-byte:
 //   * base is TBI-masked first (the top-byte-ignore tag is not part of the host

@@ -3217,6 +3217,128 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FmovImmDNegTwo) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
+// SCVTF / UCVTF (integer -> scalar FP). Expected values are computed with the
+// host's own static_cast so each test cross-checks the heavy lowering against
+// the native conversion, and the upper V[] bytes are asserted zeroed.
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfSFromW) {
+  static const uint32_t code[] = {0x1e220020u};  // scvtf s0, w1
+  state_.cpu.x[1] = 0xFFFFFFF9ULL;               // W1 = -7 (signed)
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), static_cast<float>(int32_t{-7}));
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfDFromX) {
+  static const uint32_t code[] = {0x9e620020u};  // scvtf d0, x1
+  state_.cpu.x[1] = static_cast<uint64_t>(int64_t{-123456789});
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), static_cast<double>(int64_t{-123456789}));
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfSFromX) {
+  static const uint32_t code[] = {0x9e220020u};  // scvtf s0, x1
+  state_.cpu.x[1] = static_cast<uint64_t>(int64_t{-1000003});
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), static_cast<float>(int64_t{-1000003}));
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfDFromW) {
+  static const uint32_t code[] = {0x1e620020u};  // scvtf d0, w1
+  state_.cpu.x[1] = 0xFFFFFF85ULL;               // W1 = -123 (signed)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), static_cast<double>(int32_t{-123}));
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfSFromWzr) {
+  static const uint32_t code[] = {0x1e2203e0u};  // scvtf s0, wzr
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 0.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfSFromW) {
+  static const uint32_t code[] = {0x1e230020u};  // ucvtf s0, w1
+  state_.cpu.x[1] = 0xFFFFFFFFULL;               // W1 = 4294967295 (unsigned)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), static_cast<float>(uint32_t{0xFFFFFFFFu}));
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfDFromW) {
+  static const uint32_t code[] = {0x1e630020u};  // ucvtf d0, w1
+  state_.cpu.x[1] = 0x1FFFFFFFFULL;              // upper bits ignored; W1 = 0xFFFFFFFF
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), static_cast<double>(uint32_t{0xFFFFFFFFu}));
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfDFromXSmall) {
+  // Source < 2^63: the direct Q-convert path.
+  static const uint32_t code[] = {0x9e630020u};  // ucvtf d0, x1
+  state_.cpu.x[1] = 5ULL;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 5.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfDFromXLarge) {
+  // Source >= 2^63: exercises the round-to-odd halve/convert/double fix-up.
+  static const uint32_t code[] = {0x9e630020u};  // ucvtf d0, x1
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;       // UINT64_MAX
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), static_cast<double>(uint64_t{0xFFFFFFFFFFFFFFFFULL}));
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfSFromXLarge) {
+  static const uint32_t code[] = {0x9e230020u};  // ucvtf s0, x1
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;       // UINT64_MAX
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), static_cast<float>(uint64_t{0xFFFFFFFFFFFFFFFFULL}));
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
 // Multi-instruction FP region: chained FADD/FMUL across S and D, with an FMOV
 // reg in the middle, all in one JIT region. Exercises that scalar V-reg
 // read/write + zeroing compose correctly across several ops.

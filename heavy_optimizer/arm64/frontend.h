@@ -1533,44 +1533,53 @@ class HeavyOptimizerFrontend {
     }
   }
 
-  // FCVTZS/FCVTZU/SCVTF/UCVTF (FP<->int). The FCvtFloatToInteger* intrinsics +
-  // cvtsi2ss SSE ops are not available to the ARM64 backend (riscv64-only macro
-  // defs), so bail.
   // FMOV between a general register and a scalar FP register, single (S/W) or
-  // double (D/X), via x86 MOVD/MOVQ. The rmode == 01 top-half (V.D[1]) forms and
-  // every FP<->int *conversion* in this group (SCVTF/UCVTF/FCVTZS/FCVTZU/...,
-  // FP16, ftype >= 0b10) bail to the lite tier, whose intrinsics cover them.
+  // double (D/X), via x86 MOVD/MOVQ; plus SCVTF/UCVTF (integer -> FP) via the
+  // x86 CVTSI2SS/SD ops (EmitScvtfUcvtf). The rmode == 01 top-half (V.D[1]) forms
+  // and the FP -> int truncating conversions (FCVTZS/FCVTZU/FCVTAS/...), FP16,
+  // and ftype >= 0b10 bail to the lite tier, whose intrinsics cover them.
   // Guest V[] access stays in the XMM domain (GetVRegScalar / SetVRegScalar*),
   // and the GP<->XMM crossing is an explicit register move, not a forwarded
-  // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV subset).
+  // guest-context GET. Mirrors lite_translator.h::FpIntConversion (FMOV +
+  // SCVTF/UCVTF subset).
   void FpIntConversion(const Decoder::FpIntConvArgs& args) {
     if (!success()) {
       return;
     }
-    if (args.rmode != 0b00 || (args.ftype != 0b00 && args.ftype != 0b01) ||
-        (args.op != 0b110 && args.op != 0b111)) {
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
       UndefinedReturningVoid();
       return;
     }
     const bool is_double = (args.ftype == 0b01);
-    if (args.op == 0b111) {
-      // FMOV Sd, Wn / Dd, Xn: general register -> scalar FP (upper lanes zeroed).
-      if (args.rn == 31) {
-        SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);  // WZR/XZR -> 0
+    if (args.rmode == 0b00 && (args.op == 0b110 || args.op == 0b111)) {
+      if (args.op == 0b111) {
+        // FMOV Sd, Wn / Dd, Xn: general register -> scalar FP (upper lanes zeroed).
+        if (args.rn == 31) {
+          SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);  // WZR/XZR -> 0
+        } else {
+          SetVRegScalarFromGp(args.rd, GetReg(args.rn), is_double);
+        }
       } else {
-        SetVRegScalarFromGp(args.rd, GetReg(args.rn), is_double);
+        // FMOV Wd, Sn / Xd, Dn: scalar FP -> general register.
+        if (args.rd == 31) {
+          return;  // WZR/XZR destination: discard.
+        }
+        FpRegister xmm = GetVRegScalar(args.rn, is_double);
+        Register gp = is_double
+                          ? std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()))
+                          : std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+        SetReg(args.rd, gp);
       }
-    } else {
-      // FMOV Wd, Sn / Xd, Dn: scalar FP -> general register.
-      if (args.rd == 31) {
-        return;  // WZR/XZR destination: discard.
-      }
-      FpRegister xmm = GetVRegScalar(args.rn, is_double);
-      Register gp = is_double
-                        ? std::get<0>(Gen<x86_64::MovqRegXReg>(xmm.machine_reg()))
-                        : std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
-      SetReg(args.rd, gp);
+      return;
     }
+    // SCVTF (op 010) / UCVTF (op 011): integer -> FP, unscaled (rmode == 00).
+    if (args.rmode == 0b00 && (args.op == 0b010 || args.op == 0b011)) {
+      EmitScvtfUcvtf(args, is_double);
+      return;
+    }
+    // Everything else (rmode==01 V.D[1] FMOV, FP->int truncating conversions)
+    // bails to the lite tier.
+    UndefinedReturningVoid();
   }
 
   // FMOV(reg) / FABS / FNEG for FP32 (ftype=00) and FP64 (ftype=01). These are
@@ -1708,6 +1717,13 @@ class HeavyOptimizerFrontend {
   // bit does not change the architectural NZCV output — UCOMIS already signals
   // on SNaN — so it is ignored, matching lite.
   void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args);
+
+  // SCVTF/UCVTF Sd/Dd, Wn/Xn (unscaled, rmode == 00): convert a signed/unsigned
+  // integer general register to scalar FP via x86 CVTSI2SS/SD. Defined in the .cc
+  // because the sf==1 unsigned form needs a basic-block split (values >= 2^63 use
+  // the round-to-odd halve/convert/double fix-up). Mirrors
+  // lite_translator.h::FpIntConversion's SCVTF/UCVTF path.
+  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double);
 
   //
   // Advanced SIMD (Args-struct forms).
