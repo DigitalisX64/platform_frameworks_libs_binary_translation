@@ -1766,8 +1766,9 @@ class HeavyOptimizerFrontend {
   // not ARM's). FP *results* are correct without this; MRS-of-FPSR bails to the
   // lite translator/interpreter, which maintains the flags. This is a follow-up.
   //
-  // FMAX/FMIN/FMAXNM/FMINNM/FNMUL (opcode >= 0b0100), FP16 (ftype=0b11), and the
-  // reserved ftype=0b10 bail: their intrinsics/SSE ops are not wired here.
+  // FMUL/FDIV/FADD/FSUB, FMAX/FMIN/FMAXNM/FMINNM (opcode 0b0100..0b0111), and
+  // FNMUL (0b1000) are wired here. FP16 (ftype=0b11) and the reserved ftype=0b10
+  // bail: their intrinsics/SSE ops are not available in this tier.
   void FpDataProc2(const Decoder::FpDataProc2Args& args) {
     if (!success()) {
       return;
@@ -1776,8 +1777,8 @@ class HeavyOptimizerFrontend {
       UndefinedReturningVoid();
       return;
     }
-    if (args.opcode > 0b0111) {
-      // FNMUL (0b1000) not yet wired into the optimizing tier.
+    if (args.opcode > 0b1000) {
+      // Opcodes above FNMUL (0b1000) are reserved.
       UndefinedReturningVoid();
       return;
     }
@@ -1871,6 +1872,7 @@ class HeavyOptimizerFrontend {
     if (is_double) {
       switch (args.opcode) {
         case 0b0000:  // FMUL
+        case 0b1000:  // FNMUL: -(n * m) — negate the product below.
           EmitFpBinop<&intrinsics::FMul<Float64>>(result, src1, src2);
           break;
         case 0b0001:  // FDIV
@@ -1886,6 +1888,7 @@ class HeavyOptimizerFrontend {
     } else {
       switch (args.opcode) {
         case 0b0000:  // FMUL
+        case 0b1000:  // FNMUL: -(n * m) — negate the product below.
           EmitFpBinop<&intrinsics::FMul<Float32>>(result, src1, src2);
           break;
         case 0b0001:  // FDIV
@@ -1898,6 +1901,24 @@ class HeavyOptimizerFrontend {
           EmitFpBinop<&intrinsics::FSub<Float32>>(result, src1, src2);
           break;
       }
+    }
+    if (args.opcode == 0b1000) {
+      // FNMUL: flip the sign bit of the product. Build the sign mask in a fresh
+      // GP register (never a forwarded guest value, so the GP->XMM move is
+      // conflict-free), move it into an XMM, then XORPD. FP32 masks live in the
+      // low 32 bits; upper lanes are irrelevant because SetVRegScalar commits
+      // only lane 0. Mirrors lite_translator.h's FpDataProc2 FNMUL path.
+      FpRegister sign = AllocTempSimdReg();
+      if (is_double) {
+        Register gs = std::get<0>(Gen<x86_64::MovqRegImm>(
+            static_cast<int64_t>(0x8000000000000000ULL)));
+        builder_.Gen<x86_64::MovqXRegReg>(sign.machine_reg(), gs);
+      } else {
+        Register gs = std::get<0>(Gen<x86_64::MovlRegImm>(
+            static_cast<int32_t>(0x80000000u)));
+        builder_.Gen<x86_64::MovdXRegReg>(sign.machine_reg(), gs);
+      }
+      builder_.Gen<x86_64::XorpdXRegXReg>(result.machine_reg(), sign.machine_reg());
     }
     SetVRegScalar(args.rd, result, is_double);
   }

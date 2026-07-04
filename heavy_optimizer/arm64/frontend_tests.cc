@@ -2964,8 +2964,9 @@ constexpr uint32_t FmaxnmS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x
 constexpr uint32_t FmaxnmD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E606800, rd, rn, rm); }
 constexpr uint32_t FminnmS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E207800, rd, rn, rm); }
 constexpr uint32_t FminnmD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E607800, rd, rn, rm); }
-// FNMUL Sd,Sn,Sm (opcode=1000) — still bails in the optimizing tier.
+// FNMUL Sd/Dd (opcode=1000): -(n * m).
 constexpr uint32_t FnmulS(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E208800, rd, rn, rm); }
+constexpr uint32_t FnmulD(uint8_t rd, uint8_t rn, uint8_t rm) { return FpDP2(0x1E608800, rd, rn, rm); }
 
 // FP data-processing (1 source): 0001_1110_ftype_1_opcode[5:0]_10000_Rn_Rd.
 // opcode[20:15]: FMOV=000000, FABS=000001, FNEG=000010, FSQRT=000011.
@@ -3934,16 +3935,57 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmNaNSuppressesD) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
-// FNMUL (opcode 1000) is still not wired into the optimizing tier: must bail.
-TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulBails) {
+// FNMUL Sd,Sn,Sm (opcode 1000): -(n * m). Positive product -> negated.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulS) {
   static const uint32_t code[] = {FnmulS(0, 1, 2)};
-  SetVf32(&state_, 1, 1.0f);
-  SetVf32(&state_, 2, 2.0f);
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetVf32(&state_, 1, 3.0f);
+  SetVf32(&state_, 2, 4.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), -12.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FNMUL with one negative operand: -((-2)*3) = +6 (the sign flip re-negates a
+// negative product back to positive), confirming it is a true sign-bit XOR.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulSNegOperand) {
+  static const uint32_t code[] = {FnmulS(0, 1, 2)};
+  SetVf32(&state_, 1, -2.0f);
+  SetVf32(&state_, 2, 3.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 6.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulD) {
+  static const uint32_t code[] = {FnmulD(0, 1, 2)};
+  SetVf64(&state_, 1, 0.5);
+  SetVf64(&state_, 2, 3.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -1.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulDNegOperand) {
+  static const uint32_t code[] = {FnmulD(0, 1, 2)};
+  SetVf64(&state_, 1, -4.0);
+  SetVf64(&state_, 2, 2.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 10.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 // FSQRT (a 1-source FP op the optimizing tier does NOT handle) must bail.
