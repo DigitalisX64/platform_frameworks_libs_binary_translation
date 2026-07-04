@@ -2858,6 +2858,45 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP vector FABD = |a - b| (.2S/.4S FP32, .2D FP64): a packed SUB then a
+    // sign-clear (bitwise AND with 0x7FFF…). ARM FABD is FPAbs(FPSub(a,b)); x86
+    // SUBP{S,D} matches ARM FPSub lane-for-lane under default rounding, and
+    // clearing the sign bit yields FPAbs — including on NaN, where ARM FPAbs
+    // also clears the sign bit. Mirrors lite_translator.h's non-FP16 path. The
+    // sign-clear mask (0x7FFFFFFF/dword FP32, 0x7FFFFFFFFFFFFFFF/qword FP64) is
+    // built with the PCMPEQD-self ; PSRLD/PSRLQ 1 idiom. FP16 (needs an F16C
+    // round-trip absent from the backend Gen inputs) bails to lite; the decoder
+    // already rejects the reserved sz=1&&!Q (.1D) shape.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFabdV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (is_double) {
+        builder_.Gen<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+      // AllocZeroedSimdReg establishes a def before the all-ones self-compare
+      // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
+      FpRegister mask = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(mask.machine_reg(), mask.machine_reg());
+      if (is_double) {
+        builder_.Gen<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
+      } else {
+        builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
+      }
+      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
