@@ -1693,18 +1693,21 @@ class HeavyOptimizerFrontend {
     SetVRegScalar(args.rd, result, is_double);
   }
 
-  // FCMP/FCMPE: needs an x86 UCOMIS{S,D} -> ARM FP NZCV mapping (the Ucomis SSE
-  // ops are not allowlisted for the ARM64 backend); bail.
-  void FpCompare(const Decoder::FpCompareArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
-  }
+  // FCMP/FCMPE Sn/Dn, Sm/Dm (or #0.0): compare and set NZCV. Lowers to x86
+  // UCOMIS{S,D} (now allowlisted as UcomiseXRegXReg) followed by the FP-specific
+  // EFLAGS->ARM-NZCV mapping (EmitStoreArmFpNZCV). Defined in the .cc (the NZCV
+  // mapping is a branch tree over PF/ZF/CF and needs basic-block manipulation).
+  // FP16 (ftype 0b11, would need F16C widening ops not in the backend gen
+  // inputs) and the reserved ftype 0b10 bail to the lite tier.
+  void FpCompare(const Decoder::FpCompareArgs& args);
 
-  // FCCMP/FCCMPE: same UCOMIS dependency as FCMP plus a predicate; bail.
-  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
-  }
+  // FCCMP/FCCMPE: if `cond` holds, perform the FCMP compare + NZCV mapping;
+  // otherwise write the 4-bit nzcv immediate straight to cpu.flags. Mirrors
+  // lite_translator.h::FpConditionalCompare; defined in the .cc (then/else/merge
+  // basic blocks, same shape as ConditionalCompare). The signal_nans (FCCMPE)
+  // bit does not change the architectural NZCV output — UCOMIS already signals
+  // on SNaN — so it is ignored, matching lite.
+  void FpConditionalCompare(const Decoder::FpConditionalCompareArgs& args);
 
   //
   // Advanced SIMD (Args-struct forms).
@@ -2726,6 +2729,14 @@ class HeavyOptimizerFrontend {
   void EmitCondBranch(Decoder::Condition cond,
                       MachineBasicBlock* then_bb,
                       MachineBasicBlock* else_bb);
+
+  // Map the x86 EFLAGS a preceding UCOMIS{S,D} left in `flags_vreg` to ARM64 FP
+  // NZCV and store the packed word into ThreadState.cpu.flags. Bit-exact with
+  // lite_translator.h::EmitStoreArmFpNZCV: unordered(PF)=C,V; equal(ZF)=Z,C;
+  // less(CF)=N; greater=C. Reads the flags into a GP register once (PseudoRead
+  // Flags), then a PF>ZF>CF branch tree selects the leaf that writes cpu.flags.
+  // Leaves the builder positioned at the tree's merge block.
+  void EmitStoreArmFpNZCV(Register flags_vreg);
 
   [[nodiscard]] Register AllocTempReg() { return builder_.ir()->AllocVReg(); }
   [[nodiscard]] SimdReg AllocTempSimdReg() { return SimdReg{builder_.ir()->AllocVReg()}; }

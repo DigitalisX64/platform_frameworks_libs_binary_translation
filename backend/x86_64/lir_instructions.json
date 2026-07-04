@@ -91,6 +91,8 @@
         "TestqRegReg",
         "TestwRegImm",
         "TestwRegReg",
+        "UcomisdXRegXReg",
+        "UcomissXRegXReg",
         "Lfence",
         "LockCmpXchgbRegMemRegInsns",
         "LockCmpXchgwRegMemRegInsns",

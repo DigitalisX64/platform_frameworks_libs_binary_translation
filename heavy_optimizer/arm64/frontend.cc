@@ -614,6 +614,182 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
   builder_.StartBasicBlock(merge_bb);
 }
 
+// Map the x86 EFLAGS a UCOMIS{S,D} left in `flags_vreg` to ARM64 FP NZCV and
+// store the packed 16-bit word to ThreadState.cpu.flags. Bit-exact with
+// lite_translator.h::EmitStoreArmFpNZCV, which branches on the x86 FLAGS
+// directly; here the flags are first read into a GP register (PseudoReadFlags:
+// LAHF + SETO) so the branch tree can test individual bits without keeping the
+// single host FLAGS live across basic-block boundaries. In that GP word:
+// CF@8, PF@10, ZF@14 (OF@0, unused here). Priority PF > ZF > CF matches lite:
+//   PF set   -> unordered -> NZCV C,V   (0x0101)
+//   ZF set   -> equal     -> NZCV Z,C   (0x4100)
+//   CF set   -> less      -> NZCV N     (0x8000)
+//   else     -> greater   -> NZCV C     (0x0100)
+void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
+  if (!success()) {
+    return;
+  }
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+
+  Register raw = AllocTempReg();
+  builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, raw, flags_vreg);
+
+  auto* ir = builder_.ir();
+  MachineBasicBlock* uo_bb = ir->NewBasicBlock();       // unordered (PF)
+  MachineBasicBlock* chk_eq_bb = ir->NewBasicBlock();   // test ZF
+  MachineBasicBlock* eq_bb = ir->NewBasicBlock();       // equal (ZF)
+  MachineBasicBlock* chk_lt_bb = ir->NewBasicBlock();   // test CF
+  MachineBasicBlock* lt_bb = ir->NewBasicBlock();       // less (CF)
+  MachineBasicBlock* gt_bb = ir->NewBasicBlock();       // greater (default)
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+
+  // Fill a leaf block: write the packed NZCV immediate and jump to merge.
+  auto store_leaf = [&](uint16_t nzcv_word, MachineBasicBlock* bb) {
+    builder_.StartBasicBlock(bb);
+    Register imm = GetImm(nzcv_word);
+    builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
+    ir->AddEdge(bb, merge_bb);
+    builder_.Gen<PseudoBranch>(merge_bb);
+  };
+
+  // PF (bit 10) set -> unordered, else fall to the ZF test.
+  auto* cur_bb = builder_.bb();
+  ir->AddEdge(cur_bb, uo_bb);
+  ir->AddEdge(cur_bb, chk_eq_bb);
+  Register pf = std::get<0>(Gen<x86_64::TestlRegImm>(raw, int32_t{1 << 10}));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kNotZero, uo_bb, chk_eq_bb, pf);
+
+  // ZF (bit 14) set -> equal, else fall to the CF test.
+  builder_.StartBasicBlock(chk_eq_bb);
+  ir->AddEdge(chk_eq_bb, eq_bb);
+  ir->AddEdge(chk_eq_bb, chk_lt_bb);
+  Register zf = std::get<0>(Gen<x86_64::TestlRegImm>(raw, int32_t{1 << 14}));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kNotZero, eq_bb, chk_lt_bb, zf);
+
+  // CF (bit 8) set -> less, else greater.
+  builder_.StartBasicBlock(chk_lt_bb);
+  ir->AddEdge(chk_lt_bb, lt_bb);
+  ir->AddEdge(chk_lt_bb, gt_bb);
+  Register cf = std::get<0>(Gen<x86_64::TestlRegImm>(raw, int32_t{1 << 8}));
+  builder_.Gen<PseudoCondBranch>(
+      x86_64::Assembler::Condition::kNotZero, lt_bb, gt_bb, cf);
+
+  store_leaf(0x0101, uo_bb);  // unordered: C,V
+  store_leaf(0x4100, eq_bb);  // equal:     Z,C
+  store_leaf(0x8000, lt_bb);  // less:      N
+  store_leaf(0x0100, gt_bb);  // greater:   C
+
+  builder_.StartBasicBlock(merge_bb);
+}
+
+// FCMP/FCMPE Sn/Dn, Sm/Dm (or #0.0). Mirrors lite_translator.h::FpCompare:
+// load lane 0 of the operands, UCOMIS{S,D}, then EmitStoreArmFpNZCV. S/D only;
+// FP16 (ftype 0b11) and the reserved ftype 0b10 bail to the lite tier.
+void HeavyOptimizerFrontend::FpCompare(const Decoder::FpCompareArgs& args) {
+  if (!success()) {
+    return;
+  }
+  if (args.ftype != 0b00 && args.ftype != 0b01) {
+    Undefined();
+    return;
+  }
+  const bool is_double = (args.ftype == 0b01);
+
+  FpRegister xmm_n = GetVRegScalar(args.rn, is_double);
+  FpRegister xmm_m = args.with_zero ? AllocZeroedSimdReg() : GetVRegScalar(args.rm, is_double);
+
+  Register flags = is_double
+                       ? std::get<0>(Gen<x86_64::UcomisdXRegXReg>(xmm_n.machine_reg(),
+                                                                  xmm_m.machine_reg()))
+                       : std::get<0>(Gen<x86_64::UcomissXRegXReg>(xmm_n.machine_reg(),
+                                                                  xmm_m.machine_reg()));
+  EmitStoreArmFpNZCV(flags);
+}
+
+// FCCMP/FCCMPE: if `cond` holds do the FCMP compare + NZCV mapping, else write
+// the 4-bit nzcv immediate straight to cpu.flags. Same then/else/merge shape as
+// ConditionalCompare; the compare path's EmitStoreArmFpNZCV creates its own
+// sub-tree, so the edge into merge is taken from whatever block it leaves the
+// builder in. S/D only; FP16 / reserved ftype bail.
+void HeavyOptimizerFrontend::FpConditionalCompare(
+    const Decoder::FpConditionalCompareArgs& args) {
+  if (!success()) {
+    return;
+  }
+  if (args.ftype != 0b00 && args.ftype != 0b01) {
+    Undefined();
+    return;
+  }
+  const bool is_double = (args.ftype == 0b01);
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+
+  // Pack the false-path NZCV immediate: bit3=N,bit2=Z,bit1=C,bit0=V map to
+  // cpu.flags N@15, Z@14, C@8, V@0 (same layout EmitMaterializeNZCV writes).
+  auto emit_immediate_path = [&]() {
+    uint16_t flags_val = 0;
+    if (args.nzcv & 0x8) {
+      flags_val |= (1 << 15);  // N
+    }
+    if (args.nzcv & 0x4) {
+      flags_val |= (1 << 14);  // Z
+    }
+    if (args.nzcv & 0x2) {
+      flags_val |= (1 << 8);  // C
+    }
+    if (args.nzcv & 0x1) {
+      flags_val |= (1 << 0);  // V
+    }
+    Register imm = GetImm(flags_val);
+    builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
+  };
+
+  auto emit_compare_path = [&]() {
+    FpRegister xmm_n = GetVRegScalar(args.rn, is_double);
+    FpRegister xmm_m = GetVRegScalar(args.rm, is_double);
+    Register flags = is_double
+                         ? std::get<0>(Gen<x86_64::UcomisdXRegXReg>(xmm_n.machine_reg(),
+                                                                    xmm_m.machine_reg()))
+                         : std::get<0>(Gen<x86_64::UcomissXRegXReg>(xmm_n.machine_reg(),
+                                                                    xmm_m.machine_reg()));
+    EmitStoreArmFpNZCV(flags);
+  };
+
+  // AL/NV: always the compare path (no predicate branch). The compare path's
+  // NZCV sub-tree leaves the builder at its merge; translation continues there.
+  if (args.cond == Decoder::Condition::kAl || args.cond == Decoder::Condition::kNv) {
+    emit_compare_path();
+    return;
+  }
+
+  auto* ir = builder_.ir();
+  auto* cur_bb = builder_.bb();
+  MachineBasicBlock* cmp_bb = ir->NewBasicBlock();
+  MachineBasicBlock* imm_bb = ir->NewBasicBlock();
+  MachineBasicBlock* merge_bb = ir->NewBasicBlock();
+  ir->AddEdge(cur_bb, cmp_bb);
+  ir->AddEdge(cur_bb, imm_bb);
+
+  // Condition is read from the pre-compare cpu.flags (EmitCondBranch loads them
+  // in cur_bb, before the compare path overwrites them).
+  EmitCondBranch(args.cond, cmp_bb, imm_bb);
+
+  builder_.StartBasicBlock(cmp_bb);
+  emit_compare_path();
+  // emit_compare_path built an NZCV sub-tree; connect its tail to merge.
+  MachineBasicBlock* cmp_tail = builder_.bb();
+  ir->AddEdge(cmp_tail, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(imm_bb);
+  emit_immediate_path();
+  ir->AddEdge(imm_bb, merge_bb);
+  builder_.Gen<PseudoBranch>(merge_bb);
+
+  builder_.StartBasicBlock(merge_bb);
+}
+
 // LDXR/STXR/LDAXR/STLXR (exclusive) and LDAR/STLR (acquire/release). Mirrors
 // lite_translator.h::LoadStoreExclusive byte-for-byte:
 //   * base is TBI-masked first (the top-byte-ignore tag is not part of the host

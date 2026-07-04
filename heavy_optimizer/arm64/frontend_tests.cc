@@ -3268,6 +3268,214 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtBails) {
 }
 
 //
+// FCMP / FCMPE / FCCMP: compare two scalar FP regs (or #0.0) and set ARM NZCV
+// in cpu.flags. Each test drives the full heavy pipeline (RunRegion) and asserts
+// the four flag bits. NZCV layout: N@bit15, Z@bit14, C@bit8, V@bit0.
+//
+
+// FCMP/FCMPE: 0001_1110_ftype_1_Rm_00_1000_Rn_opcode2.
+// opcode2[4:0]: FCMP=00000, FCMP#0=01000, FCMPE=10000, FCMPE#0=11000.
+constexpr uint32_t FcmpS(uint8_t rn, uint8_t rm) {
+  return 0x1E202000u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpD(uint8_t rn, uint8_t rm) {
+  return 0x1E602000u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5);
+}
+constexpr uint32_t FcmpZeroS(uint8_t rn) { return 0x1E202000u | (static_cast<uint32_t>(rn) << 5) | 0x08u; }
+constexpr uint32_t FcmpZeroD(uint8_t rn) { return 0x1E602000u | (static_cast<uint32_t>(rn) << 5) | 0x08u; }
+constexpr uint32_t FcmpeS(uint8_t rn, uint8_t rm) {
+  return 0x1E202000u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | 0x10u;
+}
+// FCMP Hn, Hm (ftype=0b11): FP16 must bail to the lite tier.
+constexpr uint32_t FcmpH(uint8_t rn, uint8_t rm) {
+  return 0x1EE02000u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5);
+}
+
+// FCCMP/FCCMPE: 0001_1110_ftype_1_Rm_cond_01_Rn_op_nzcv. op(bit4): 0=FCCMP,1=FCCMPE.
+constexpr uint32_t FccmpS(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0x1E200400u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(cond) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | nzcv;
+}
+constexpr uint32_t FccmpD(uint8_t rn, uint8_t rm, uint8_t nzcv, uint8_t cond) {
+  return 0x1E600400u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(cond) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | nzcv;
+}
+
+float MakeNanF() {
+  uint32_t bits = 0x7FC00000u;
+  float v;
+  std::memcpy(&v, &bits, sizeof(v));
+  return v;
+}
+
+// ARM64 condition field values.
+constexpr uint8_t kCondEq = 0;   // Z==1
+constexpr uint8_t kCondNe = 1;   // Z==0
+constexpr uint8_t kCondAl = 14;  // always
+
+// Assert cpu.flags carries exactly the given NZCV bits.
+void ExpectNZCV(const ThreadState& s, bool n, bool z, bool c, bool v) {
+  EXPECT_EQ(static_cast<bool>(s.cpu.flags & CPUState::kFlagNegative), n);
+  EXPECT_EQ(static_cast<bool>(s.cpu.flags & CPUState::kFlagZero), z);
+  EXPECT_EQ(static_cast<bool>(s.cpu.flags & CPUState::kFlagCarry), c);
+  EXPECT_EQ(static_cast<bool>(s.cpu.flags & CPUState::kFlagOverflow), v);
+}
+
+// FCMP greater (Sn > Sm): NZCV = 0,0,1,0 (C only).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpSGreater) {
+  static const uint32_t code[] = {FcmpS(1, 2)};
+  SetVf32(&state_, 1, 2.0f);
+  SetVf32(&state_, 2, 1.0f);
+  state_.cpu.flags = 0xFFFF;  // prove the store clears N/Z/V
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/false, /*c=*/true, /*v=*/false);
+}
+
+// FCMP less (Sn < Sm): NZCV = 1,0,0,0 (N only).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpSLess) {
+  static const uint32_t code[] = {FcmpS(1, 2)};
+  SetVf32(&state_, 1, 1.0f);
+  SetVf32(&state_, 2, 2.0f);
+  state_.cpu.flags = 0xFFFF;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/true, /*z=*/false, /*c=*/false, /*v=*/false);
+}
+
+// FCMP equal: NZCV = 0,1,1,0 (Z,C).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpSEqual) {
+  static const uint32_t code[] = {FcmpS(1, 2)};
+  SetVf32(&state_, 1, 2.5f);
+  SetVf32(&state_, 2, 2.5f);
+  state_.cpu.flags = 0;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/true, /*c=*/true, /*v=*/false);
+}
+
+// FCMP unordered (Sn is NaN): NZCV = 0,0,1,1 (C,V).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpSUnordered) {
+  static const uint32_t code[] = {FcmpS(1, 2)};
+  SetVf32(&state_, 1, MakeNanF());
+  SetVf32(&state_, 2, 1.0f);
+  state_.cpu.flags = 0;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/false, /*c=*/true, /*v=*/true);
+}
+
+// FCMP D-form, less: exercises the UCOMISD path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpDLess) {
+  static const uint32_t code[] = {FcmpD(3, 4)};
+  SetVf64(&state_, 3, -5.0);
+  SetVf64(&state_, 4, 5.0);
+  state_.cpu.flags = 0xFFFF;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/true, /*z=*/false, /*c=*/false, /*v=*/false);
+}
+
+// FCMP Sn, #0.0 (with_zero): negative operand -> less -> N.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpZeroSNegative) {
+  static const uint32_t code[] = {FcmpZeroS(5)};
+  SetVf32(&state_, 5, -1.0f);
+  state_.cpu.flags = 0xFFFF;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/true, /*z=*/false, /*c=*/false, /*v=*/false);
+}
+
+// FCMP Dn, #0.0: exactly 0.0 -> equal -> Z,C.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpZeroDEqual) {
+  static const uint32_t code[] = {FcmpZeroD(6)};
+  SetVf64(&state_, 6, 0.0);
+  state_.cpu.flags = 0;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/true, /*c=*/true, /*v=*/false);
+}
+
+// FCMPE produces the same NZCV as FCMP for ordered operands.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpeSGreater) {
+  static const uint32_t code[] = {FcmpeS(3, 4)};
+  SetVf32(&state_, 3, 9.0f);
+  SetVf32(&state_, 4, 4.0f);
+  state_.cpu.flags = 0xFFFF;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/false, /*c=*/true, /*v=*/false);
+}
+
+// FCCMP, condition TRUE (eq with Z pre-set): takes the compare path.
+// 3.0 > 1.0 -> greater -> C.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FccmpSCondTrueCompares) {
+  static const uint32_t code[] = {FccmpS(1, 2, /*nzcv=*/0x0, kCondEq)};
+  SetVf32(&state_, 1, 3.0f);
+  SetVf32(&state_, 2, 1.0f);
+  state_.cpu.flags = CPUState::kFlagZero;  // eq holds
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/false, /*c=*/true, /*v=*/false);
+}
+
+// FCCMP, condition FALSE (eq with Z clear): writes the nzcv immediate #0b1010
+// (N=1,Z=0,C=1,V=0) verbatim, ignoring the operands.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FccmpSCondFalseWritesImm) {
+  static const uint32_t code[] = {FccmpS(1, 2, /*nzcv=*/0b1010, kCondEq)};
+  SetVf32(&state_, 1, 3.0f);  // would be "greater" if the compare ran
+  SetVf32(&state_, 2, 1.0f);
+  state_.cpu.flags = 0;  // eq fails (Z clear)
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/true, /*z=*/false, /*c=*/true, /*v=*/false);
+}
+
+// FCCMP with AL always takes the compare path. D-form, equal -> Z,C.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FccmpDAlwaysCompares) {
+  static const uint32_t code[] = {FccmpD(5, 6, /*nzcv=*/0b0001, kCondAl)};
+  SetVf64(&state_, 5, 7.5);
+  SetVf64(&state_, 6, 7.5);
+  state_.cpu.flags = 0;
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/true, /*c=*/true, /*v=*/false);
+}
+
+// FCCMP, condition FALSE via NE (Z pre-set so ne fails): imm #0b0110 (Z,C).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FccmpSNeCondFalseWritesImm) {
+  static const uint32_t code[] = {FccmpS(1, 2, /*nzcv=*/0b0110, kCondNe)};
+  SetVf32(&state_, 1, 1.0f);  // would be "less" if the compare ran
+  SetVf32(&state_, 2, 2.0f);
+  state_.cpu.flags = CPUState::kFlagZero;  // ne fails
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  ExpectNZCV(state_, /*n=*/false, /*z=*/true, /*c=*/true, /*v=*/false);
+}
+
+// FP16 FCMP must bail to the lite tier (no F16C widening ops in the heavy tier).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpHBails) {
+  static const uint32_t code[] = {FcmpH(1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+//
 // AdvSIMD three-same INTEGER: ADD, SUB, AND, ORR, EOR, MUL. Each asserts the
 // result lanes and, for the D-form (Q=0), that the upper 64 bits of Vd are
 // zeroed. CMEQ, saturating, and unsupported sizes must bail.
