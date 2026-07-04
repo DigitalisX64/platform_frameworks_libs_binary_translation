@@ -3227,6 +3227,14 @@ constexpr uint32_t UqshlVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint
 constexpr uint32_t SqshluVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
   return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b01100, rd, rn);
 }
+// SHRN/SHRN2: U=0, opcode=10000.
+constexpr uint32_t ShrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10000, rd, rn);
+}
+// RSHRN/RSHRN2: U=0, opcode=10001.
+constexpr uint32_t RshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10001, rd, rn);
+}
 // SQXTN/SQXTN2: U=0, opcode=10100.
 constexpr uint32_t SqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10100, rd, rn);
@@ -6832,6 +6840,63 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqshlVec2DBails) {
 // UQSHL .16B byte lane has no x86 packed byte shift — must bail to lite.
 TEST_F(Arm64HeavyOptimizerFrontendTest, UqshlVec16BBails) {
   static const uint32_t code[] = {UqshlVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SHRN v0.8b, v1.8h, #4 (immh=0001, immb=4, Q=0): shift-right narrow 16->8.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ShrnVec8B) {
+  static const uint32_t code[] = {ShrnVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0010 00F0 0100 0FF0 ; lanes 4-7: 1230 FF00 00A0 00B0.
+  SetV128(&state_, 1, 0x0FF0010000F00010ULL, 0x00B000A0FF001230ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lane>>4 low byte: 01 0F 10 FF 23 F0 0A 0B.
+  EXPECT_EQ(VLo64(&state_, 0), 0x0B0AF023FF100F01ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// RSHRN2 v0.8h, v1.4s, #4 (immh=0011, immb=4, Q=1): rounding narrow 32->16 into
+// the upper half; exercises the wrap-on-overflow-is-benign edge on lane 3.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Rshrn2Vec8H) {
+  static const uint32_t code[] = {RshrnVec(/*q=*/true, /*immh=*/0b0011, /*immb=*/4, 0, 1)};
+  // Vn.4s words: 0x00000078 0x00000008 0x00012345 0xFFFFFFF8. round=8, shift=4.
+  SetV128(&state_, 1, 0x0000000800000078ULL, 0xFFFFFFF800012345ULL);
+  // Vd low 64 preserved; upper is overwritten by the narrowed lanes.
+  SetV128(&state_, 0, 0x1111222233334444ULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (word+8)>>4 low 16: 0x0008 0x0001 0x1234 0x0000 (lane3 wraps but bit is dropped).
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111222233334444ULL);       // Vd[63:0] preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000123400010008ULL);
+}
+
+// RSHRN v0.2s, v1.2d, #4 (immh=0111, immb=4, Q=0): rounding narrow 64->32 (PSRLQ/PADDQ path).
+TEST_F(Arm64HeavyOptimizerFrontendTest, RshrnVec2S) {
+  static const uint32_t code[] = {RshrnVec(/*q=*/false, /*immh=*/0b0111, /*immb=*/4, 0, 1)};
+  // Vn.2d dwords: 0x78, 0x12345678. round=8, shift=4.
+  SetV128(&state_, 1, 0x0000000000000078ULL, 0x0000000012345678ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (dword+8)>>4 low 32: 0x00000008, 0x01234568.
+  EXPECT_EQ(VLo64(&state_, 0), 0x0123456800000008ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// SHRN with immh bit3 set (immh=1000) is RESERVED for narrowing shifts — bail to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ShrnVecReservedBails) {
+  static const uint32_t code[] = {ShrnVec(/*q=*/false, /*immh=*/0b1000, /*immb=*/4, 0, 1)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(

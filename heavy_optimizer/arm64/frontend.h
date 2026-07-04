@@ -4169,6 +4169,109 @@ class HeavyOptimizerFrontend {
         SetVRegFull(args.rd, xs, args.q);
         return;
       }
+      case Decoder::AdvSimdShiftImmOpcode::kShrn:
+      case Decoder::AdvSimdShiftImmOpcode::kRshrn: {
+        // SHRN/RSHRN Vd.<narrow>, Vn.<wide>, #shift — shift-right narrow.
+        // Mirrors lite_translator.h::AdvSimdShiftByImm's non-saturating narrow
+        // path: (RSHRN only) broadcast+add the per-lane rounding constant ->
+        // logical right shift (PSRL{W,D,Q}) -> PSHUFB gather of each wide
+        // lane's low half into the packed low 64. src_bits = 8<<highest-set-
+        // bit(immh); dst = src/2. immh bit3 set is RESERVED (bail). SHRN/RSHRN
+        // have no scalar form, so args.scalar is always false here. The
+        // saturating narrows (SQSHRN/UQSHRN/SQRSHRN/UQRSHRN/SQSHRUN/SQRSHRUN)
+        // still bail to lite via the default case below.
+        if (immh & 0b1000) {  // RESERVED for narrowing shifts.
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t src_bits;
+        if (immh & 0b0100) {
+          src_bits = 64;
+        } else if (immh & 0b0010) {
+          src_bits = 32;
+        } else {  // immh == 0b0001
+          src_bits = 16;
+        }
+        const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kRshrn);
+        const int8_t cnt = static_cast<int8_t>(narrow_rshift);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (is_rounding) {
+          // Broadcast the per-lane rounding constant (1 << (rshift-1)) across
+          // every src-width lane, then add. Wrap-on-overflow is benign — the
+          // shift range [1, dst_bits] keeps the add's carry inside the low
+          // half PSHUFB gathers; any wrap at bit src_bits is dropped anyway.
+          const uint64_t round_lane = uint64_t{1} << (narrow_rshift - 1);
+          uint64_t round_pattern;
+          if (src_bits == 16) {
+            round_pattern = round_lane * uint64_t{0x0001000100010001ULL};
+          } else if (src_bits == 32) {
+            round_pattern = round_lane * uint64_t{0x0000000100000001ULL};
+          } else {
+            round_pattern = round_lane;
+          }
+          FpRegister xround = AllocTempSimdReg();
+          Register gr = std::get<0>(
+              Gen<x86_64::MovqRegImm>(static_cast<int64_t>(round_pattern)));
+          builder_.Gen<x86_64::MovqXRegReg>(xround.machine_reg(), gr);
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(xround.machine_reg(), gr, int8_t{1});
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xround.machine_reg());
+          } else if (src_bits == 32) {
+            builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xround.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xround.machine_reg());
+          }
+        }
+        // Logical right shift by cnt (in [1, dst_bits] <= src_bits/2), so the
+        // high bits the narrow discards never reach the kept low half — SHRN's
+        // untyped shift is bit-identical to a logical shift here.
+        if (src_bits == 16) {
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+        } else if (src_bits == 32) {
+          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+        } else {
+          builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+        }
+        // PSHUFB narrow: the low-8 selector entries gather each wide lane's low
+        // half into the packed low 64; the high-8 entries (0x80) zero the upper
+        // 64.  src 16 -> low byte of each .8H lane; src 32 -> low half of each
+        // .4S lane; src 64 -> low word of each .2D lane.
+        int64_t mask_lo;
+        if (src_bits == 16) {
+          mask_lo = static_cast<int64_t>(0x0E0C0A0806040200LL);
+        } else if (src_bits == 32) {
+          mask_lo = static_cast<int64_t>(0x0D0C090805040100LL);
+        } else {
+          mask_lo = static_cast<int64_t>(0x0B0A090803020100LL);
+        }
+        FpRegister xmask = AllocTempSimdReg();
+        Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(mask_lo));
+        builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
+        Register gmhi = std::get<0>(
+            Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
+        builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+        if (!args.q) {
+          // SHRN: narrowed lanes sit in the low 64; SetVRegFull zeroes
+          // Vd[127:64] via its D-form merge.
+          SetVRegFull(args.rd, xn, /*q=*/false);
+        } else {
+          // SHRN2: place the narrowed lanes in Vd[127:64], preserving Vd[63:0].
+          const int32_t vd_off =
+              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          FpRegister xd = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          FpRegister xdlow = AllocZeroedSimdReg();
+          builder_.Gen<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
+          builder_.GenSetSimd<16>(vd_off, xdlow.machine_reg());
+        }
+        return;
+      }
       default:
         UndefinedReturningVoid();
         return;
