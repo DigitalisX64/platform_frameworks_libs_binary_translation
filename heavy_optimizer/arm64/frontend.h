@@ -3632,8 +3632,10 @@ class HeavyOptimizerFrontend {
   //   * USHLL / SSHLL (incl. UXTL/SXTL == #0) — 8B->8H / 4H->4S / 2S->2D
   //     widening, both Q halves (long2 reads Vn[127:64]).
   //   * SHL / USHR / SSHR at H/S/D lanes (esize 16/32/64).
-  // Everything else (byte-lane SHL/USHR/SSHR, SSHR .2D which needs PSRAQ, and
-  // SLI/SRI/SSRA/USRA/rounding/saturating/narrow/fixed-point conversions) calls
+  //   * SSRA / USRA (shift-accumulate) at H/S/D lanes (USRA all three; SSRA
+  //     esize 16/32 only — SSRA .2D needs PSRAQ and bails).
+  // Everything else (byte-lane SHL/USHR/SSHR/SSRA/USRA, SSHR/SSRA .2D which need
+  // PSRAQ, and SLI/SRI/rounding/saturating/narrow/fixed-point conversions) calls
   // Undefined() which sets success_=false and bails the region to lite — the
   // lite tier already lowers those correctly (a heavy bail is correct-but-slow,
   // acceptable for the rarer shift variants).
@@ -3766,6 +3768,71 @@ class HeavyOptimizerFrontend {
         }
         // Q=0 (incl. scalar) forms zero Vd[127:64] via SetVRegFull.
         SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+      case Decoder::AdvSimdShiftImmOpcode::kSsra:
+      case Decoder::AdvSimdShiftImmOpcode::kUsra: {
+        // Shift-accumulate: Vd<i> += (Vn<i> >>{arith,logical} shift) per lane.
+        // Mirrors lite_translator.h::AdvSimdShiftByImm SSRA/USRA (H/S/D lanes):
+        // shift the source, then PADD the packed result into Vd's current value.
+        // Byte lane needs PMOVSX/PMOVZX widening + PACK (no x86 packed byte
+        // shift); SSRA .2D needs PSRAQ (AVX-512F-VL). Both bail to lite, which
+        // ships a widening / GPR fallback (correct-but-slow).
+        if (immh == 0b0001) {  // byte lane
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t esize_bits;
+        if (immh & 0b1000) {
+          esize_bits = 64;
+        } else if (immh & 0b0100) {
+          esize_bits = 32;
+        } else {  // immh & 0b0010
+          esize_bits = 16;
+        }
+        const bool is_arith =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSsra);
+        if (is_arith && esize_bits == 64) {  // SSRA .2D / scalar-D: PSRAQ only.
+          UndefinedReturningVoid();
+          return;
+        }
+        // SSRA/USRA count = 2*esize - immh:immb, range [1, esize]. At the
+        // esize boundary PSRL saturates to 0 (USRA: add 0 -> Vd unchanged) and
+        // PSRA sign-fills (SSRA: add 0/-1 per lane) — both match ARM.
+        const uint8_t shift_count =
+            static_cast<uint8_t>(2 * esize_bits - immh_immb);
+        const int8_t cnt = static_cast<int8_t>(shift_count);
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        // Load Vd's current value up front; rd==rn is safe because xn/xd are
+        // independent temps and the writeback (SetVRegFull) happens last.
+        builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+        if (is_arith) {  // SSRA, esize 16 or 32.
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+            builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          } else {  // 32
+            builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+            builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          }
+        } else {  // USRA, esize 16/32/64.
+          if (esize_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+            builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          } else if (esize_bits == 32) {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+            builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          } else {  // 64
+            builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+            builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          }
+        }
+        // Q=0 (.4H/.2S, incl. scalar) zero Vd[127:64] via SetVRegFull's D-form
+        // merge, discarding the accumulate's garbage in the upper lanes.
+        SetVRegFull(args.rd, xd, args.q);
         return;
       }
       default:
