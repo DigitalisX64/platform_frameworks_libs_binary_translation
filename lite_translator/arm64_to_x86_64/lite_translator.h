@@ -11916,11 +11916,51 @@ class LiteTranslator {
     }
   }
 
+  // ADC/ADCS/SBC/SBCS (add/subtract with the guest carry flag).
+  //   ADC: res = src1 + src2 + C
+  //   SBC: res = src1 + ~src2 + C  (ARM subtract-with-carry)
+  // The guest carry (ARM NZCV C = cpu.flags bit 8) feeds x86 CF, then one x86
+  // ADC/SBB does the carry op:
+  //   ADC — ARM C maps directly to x86 CF, so load CF from bit 8 and ADC.
+  //   SBC — x86 SBB computes src1 - src2 - CF = src1 + ~src2 + (1 - CF), while
+  //         ARM SBC wants src1 + ~src2 + C, so SBB needs CF = !C: complement
+  //         the loaded CF with CMC. On output x86 SBB's CF is the borrow, and
+  //         EmitStoreArmNZCV(is_sub=true) already inverts it back to ARM's
+  //         "carry = no borrow" convention.
+  // res is a fresh temp (never aliases the mapped rn/rm), and MOV does not
+  // touch FLAGS, so the carry loaded by Btw survives up to the ADC/SBB.
   Register AddSubWithCarry(Register src1, Register src2, bool is_64bit,
                             bool is_sub, bool set_flags) {
-    UNUSED(src1, src2, is_64bit, is_sub, set_flags);
-    Undefined();
-    return no_register;
+    Register res = AllocTempReg();
+    if (!success()) return no_register;
+    // MOV first (no FLAGS effect), then load the guest carry into x86 CF.
+    if (is_64bit) {
+      as_.Movq(res, src1);
+    } else {
+      as_.Movl(res, src1);
+    }
+    const int32_t flags_offset = offsetof(ThreadState, cpu.flags);
+    as_.Btw({.base = Assembler::rbp, .disp = flags_offset}, static_cast<int8_t>(8));
+    if (is_sub) {
+      as_.Cmc();  // SBB wants CF = !(ARM carry).
+    }
+    if (is_64bit) {
+      if (is_sub) {
+        as_.Sbbq(res, src2);
+      } else {
+        as_.Adcq(res, src2);
+      }
+    } else {
+      if (is_sub) {
+        as_.Sbbl(res, src2);
+      } else {
+        as_.Adcl(res, src2);
+      }
+    }
+    if (set_flags) {
+      EmitStoreArmNZCV(is_sub);
+    }
+    return res;
   }
 
   Register DataProc1Src(Register src, uint8_t opcode2, bool is_64bit) {
