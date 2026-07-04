@@ -2434,6 +2434,75 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // REV64 V.<T>, V.<T> (U=0): reverse element order within each 64-bit
+      // doubleword. size=00 byte-reverse via PSHUFB + a materialized per-lane
+      // byte-index mask; size=01 halfword-reverse via PSHUFLW then PSHUFHW
+      // (imm=0x1B reverses the four words in each 64-bit half); size=10
+      // word-reverse via PSHUFD (imm=0xB1 swaps the two 32-bit words in each
+      // 64-bit half). The Q=0 forms shuffle both halves and let SetVRegFull
+      // discard the upper 64. size=11 is reserved and bails.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev64: {
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00: {
+            FpRegister xmask = AllocTempSimdReg();
+            Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0001020304050607LL}));
+            builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+            Register mhi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x08090A0B0C0D0E0FLL}));
+            builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), mhi, int8_t{1});
+            builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+            break;
+          }
+          case 0b01:
+            builder_.Gen<x86_64::PshuflwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                     int8_t{0x1B});
+            builder_.Gen<x86_64::PshufhwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                     int8_t{0x1B});
+            break;
+          case 0b10:
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                    static_cast<int8_t>(0xB1));
+            break;
+          default:  // 0b11 reserved
+            UndefinedReturningVoid();
+            return;
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // REV32 V.<T>, V.<T> (U=1): reverse element order within each 32-bit
+      // word. size=00 byte-reverse via PSHUFB + mask; size=01 halfword-swap
+      // via PSHUFLW then PSHUFHW (imm=0xB1 swaps the two words in each 32-bit
+      // lane). size>=10 is reserved for REV32 and bails.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev32: {
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00: {
+            FpRegister xmask = AllocTempSimdReg();
+            Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0405060700010203LL}));
+            builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+            Register mhi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0C0D0E0F08090A0BLL}));
+            builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), mhi, int8_t{1});
+            builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+            break;
+          }
+          case 0b01:
+            builder_.Gen<x86_64::PshuflwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                     static_cast<int8_t>(0xB1));
+            builder_.Gen<x86_64::PshufhwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                     static_cast<int8_t>(0xB1));
+            break;
+          default:  // size >= 0b10 reserved
+            UndefinedReturningVoid();
+            return;
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
       // CNT V.16B / V.8B (size=00): per-byte population count via the
       // Mula-Wojcik nibble-LUT (two PSHUFB lookups on the low/high nibbles,
       // summed with PADDB). Table = popcount-per-nibble; mask = 0x0F broadcast.
