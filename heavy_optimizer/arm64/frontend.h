@@ -2749,6 +2749,62 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP vector FADD/FSUB/FMUL/FDIV (.2S/.4S FP32, .2D FP64) lower directly to
+    // SSE2 packed FP arithmetic (ADDP{S,D}/SUBP{S,D}/MULP{S,D}/DIVP{S,D}), whose
+    // default-rounding IEEE-754 results match ARM's lane-for-lane. Mirrors
+    // lite_translator.h's non-FP16 path exactly. FP16 (is_fp16) needs an F16C
+    // round-trip absent from the backend Gen inputs and bails to lite; the
+    // decoder already rejects the reserved sz=1&&!Q (.1D) shape, so only
+    // .2S/.4S/.2D reach here.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFsubV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmulV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFdivV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (is_double) {
+        switch (args.opcode) {
+          case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+            builder_.Gen<x86_64::AddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+            builder_.Gen<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+            builder_.Gen<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          default:  // kFdivV
+            builder_.Gen<x86_64::DivpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+        }
+      } else {
+        switch (args.opcode) {
+          case Decoder::AdvSimdThreeSameOpcode::kFaddV:
+            builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFsubV:
+            builder_.Gen<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          case Decoder::AdvSimdThreeSameOpcode::kFmulV:
+            builder_.Gen<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+          default:  // kFdivV
+            builder_.Gen<x86_64::DivpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            break;
+        }
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {

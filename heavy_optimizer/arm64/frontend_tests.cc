@@ -3050,6 +3050,25 @@ constexpr uint32_t FminnmVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t r
   return AdvSimdThreeSame(
       q, /*u=*/false, /*size=*/static_cast<uint8_t>(0b10 | dbl), /*opcode=*/0b11000, rd, rn, rm);
 }
+// FP three-same vector arithmetic. FADD op_high=0/opcode=11010/U=0;
+// FSUB op_high=1/opcode=11010/U=0; FMUL op_high=0/opcode=11011/U=1;
+// FDIV op_high=0/opcode=11111/U=1. size field = {op_high, sz}, sz=dbl.
+constexpr uint32_t FaddVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11010, rd, rn, rm);
+}
+constexpr uint32_t FsubVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(0b10 | dbl), /*opcode=*/0b11010, rd, rn, rm);
+}
+constexpr uint32_t FmulVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/true, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11011, rd, rn, rm);
+}
+constexpr uint32_t FdivVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/true, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11111, rd, rn, rm);
+}
 
 // --- AdvSIMD two-register-miscellaneous encoders. ---
 // Encoding: 0 Q U 01110 size(2) 1 0000 opcode(5) 10 Rn(5) Rd(5).
@@ -4056,6 +4075,84 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVec2D) {
   // FMAX -> 2.5, -3.0.
   EXPECT_EQ(VLo64(&state_, 0), 0x4004000000000000ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0xC008000000000000ULL);
+}
+
+// FADD v0.4s, v1.4s, v2.4s: per-lane FP32 add.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddVec4S) {
+  static const uint32_t code[] = {FaddVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  // v1 = 1.0, -2.0, 3.5, -10.0 ; v2 = 2.0, -3.0, 3.0, 5.0.
+  SetV128(&state_, 1, 0xC00000003F800000ULL, 0xC120000040600000ULL);
+  SetV128(&state_, 2, 0xC040000040000000ULL, 0x40A0000040400000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FADD -> 3.0, -5.0, 6.5, -5.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0xC0A0000040400000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC0A0000040D00000ULL);
+}
+
+// FSUB v0.4s, v1.4s, v2.4s: per-lane FP32 subtract.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsubVec4S) {
+  static const uint32_t code[] = {FsubVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xC00000003F800000ULL, 0xC120000040600000ULL);
+  SetV128(&state_, 2, 0xC040000040000000ULL, 0x40A0000040400000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FSUB -> -1.0, 1.0, 0.5, -15.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F800000BF800000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC17000003F000000ULL);
+}
+
+// FMUL v0.4s, v1.4s, v2.4s (U=1): per-lane FP32 multiply.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulVec4S) {
+  static const uint32_t code[] = {FmulVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xC00000003F800000ULL, 0xC120000040600000ULL);
+  SetV128(&state_, 2, 0xC040000040000000ULL, 0x40A0000040400000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMUL -> 2.0, 6.0, 10.5, -50.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x40C0000040000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC248000041280000ULL);
+}
+
+// FDIV v0.2d, v1.2d, v2.2d (U=1, FP64): per-lane double divide.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FdivVec2D) {
+  static const uint32_t code[] = {FdivVec(/*dbl=*/true, /*q=*/true, 0, 1, 2)};
+  // v1 = 6.0, -8.0 ; v2 = 2.0, 4.0.
+  SetV128(&state_, 1, 0x4018000000000000ULL, 0xC020000000000000ULL);
+  SetV128(&state_, 2, 0x4000000000000000ULL, 0x4010000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FDIV -> 3.0, -2.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x4008000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC000000000000000ULL);
+}
+
+// FADD v0.2s, v1.2s, v2.2s (Q=0): two FP32 lanes, Vd[127:64] zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddVec2S) {
+  static const uint32_t code[] = {FaddVec(/*dbl=*/false, /*q=*/false, 0, 1, 2)};
+  // v1 lanes 0,1 = 1.0, 2.0 ; v2 = 10.0, 20.0.
+  SetV128(&state_, 1, 0x400000003F800000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x41A0000041200000ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FADD -> 11.0, 22.0 ; upper 64 zeroed.
+  EXPECT_EQ(VLo64(&state_, 0), 0x41B0000041300000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 // FMINNM v0.2d, v1.2d, v2.2d: per-lane number-min of two FP64 lanes.
