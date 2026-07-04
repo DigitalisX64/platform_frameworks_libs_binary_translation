@@ -2643,6 +2643,112 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP vector FMAX/FMIN/FMAXNM/FMINNM (.2S/.4S/.2D). x86 MAXP{S,D}/MINP{S,D}
+    // disagree with ARM on both NaN and signed-zero results, so mirror
+    // lite_translator.h's vector sequence exactly. Everything is computed as
+    // FMIN (FMAX = -FMIN(-a,-b)): x86 MINP{S,D} returns the SECOND source on a
+    // +-0 tie, which gives ARM's OR-of-signs (most-negative) for FMIN and, after
+    // the double negation, AND-of-signs (most-positive) for FMAX. NaN-propagating
+    // FMAX/FMIN (any NaN in -> NaN out) use the symmetric MIN|MIN|POR idiom;
+    // NaN-suppressing FMAXNM/FMINNM (exactly one NaN -> the number) substitute
+    // each NaN lane with the other operand via a CMPUNORDP{S,D} self-compare mask
+    // before the MIN. FP16 (is_fp16, needs an F16C round-trip not in the backend
+    // gen inputs) bails to lite; the decoder already filters the reserved
+    // sz=1&&!Q (.1D) shape, so only .2S/.4S/.2D reach here.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV) {
+      if (args.is_fp16) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
+                           args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV);
+      const bool is_nm = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
+                          args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV);
+      const bool is_double = (args.size & 1);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      // FMAX: negate both inputs so the shared FMIN lowering computes it; the
+      // per-lane sign mask (all-ones << 31/63) is XORed in now and, after the
+      // MIN, XORed back out of the result.
+      FpRegister sign_mask = no_fp_register;
+      if (is_max) {
+        // AllocZeroedSimdReg establishes a def before the all-ones self-compare
+        // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
+        sign_mask = AllocZeroedSimdReg();
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
+        if (is_double) {
+          builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
+        } else {
+          builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+        }
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign_mask.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign_mask.machine_reg());
+      }
+      auto gen_min = [&](FpRegister dst, FpRegister src) {
+        if (is_double) {
+          builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+        } else {
+          builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+        }
+      };
+      auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
+        if (is_double) {
+          builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+        }
+      };
+      FpRegister result;
+      if (!is_nm) {
+        // NaN-propagating: tmp = xm; MIN(tmp, xn); MIN(xn, xm); POR(xn, tmp).
+        FpRegister tmp = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xm.machine_reg());
+        gen_min(tmp, xn);
+        gen_min(xn, xm);
+        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), tmp.machine_reg());
+        result = xn;
+      } else {
+        // NaN-suppressing: substitute each NaN lane with the other operand
+        // (a' = select(isnan(a), b, a); b' = select(isnan(b), a, b)), then MIN.
+        FpRegister mask_a = AllocTempSimdReg();
+        FpRegister mask_b = AllocTempSimdReg();
+        FpRegister an_sub = AllocTempSimdReg();
+        FpRegister bn_sub = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), xn.machine_reg());
+        gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), xm.machine_reg());
+        gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
+        builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), xm.machine_reg());  // mask_a & b
+        builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), xn.machine_reg());  // mask_b & a
+        builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), xn.machine_reg());  // ~mask_a & a
+        builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), xm.machine_reg());  // ~mask_b & b
+        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
+        builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
+        // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
+        // operands are NaN-free here (NaN lanes were substituted above).
+        FpRegister t_nm = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
+        gen_min(t_nm, mask_a);      // min(b', a')
+        gen_min(mask_a, mask_b);    // min(a', b')
+        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
+        result = mask_a;
+      }
+      // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+      if (is_max) {
+        builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, result, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {

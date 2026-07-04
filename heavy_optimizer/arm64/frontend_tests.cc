@@ -3031,6 +3031,25 @@ constexpr uint32_t OrrVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
 constexpr uint32_t EorVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/true, /*size=*/0b00, /*opcode=*/0b00011, rd, rn, rm);
 }
+// FP three-same vector. The 'size' field carries {op_high, sz}: op_high (bit23)
+// selects max(0)/min(1); sz (bit22) selects FP32(0)/FP64(1). FMAX/FMIN use
+// opcode=11110, FMAXNM/FMINNM use opcode=11000, all U=0.
+constexpr uint32_t FmaxVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11110, rd, rn, rm);
+}
+constexpr uint32_t FminVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(0b10 | dbl), /*opcode=*/0b11110, rd, rn, rm);
+}
+constexpr uint32_t FmaxnmVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(dbl), /*opcode=*/0b11000, rd, rn, rm);
+}
+constexpr uint32_t FminnmVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(
+      q, /*u=*/false, /*size=*/static_cast<uint8_t>(0b10 | dbl), /*opcode=*/0b11000, rd, rn, rm);
+}
 
 // --- AdvSIMD two-register-miscellaneous encoders. ---
 // Encoding: 0 Q U 01110 size(2) 1 0000 opcode(5) 10 Rn(5) Rd(5).
@@ -3971,6 +3990,150 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmNaNSuppressesD) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -5.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// --- Vector FMAX/FMIN/FMAXNM/FMINNM (AdvSimdThreeSame) heavy mirror. ---
+
+// FMAX v0.4s, v1.4s, v2.4s: per-lane max of four FP32 lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVec4S) {
+  static const uint32_t code[] = {FmaxVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  // v1 lanes 0..3 = 1.0, -2.0, 3.5, -10.0 ; v2 = 2.0, -3.0, 3.0, 5.0.
+  SetV128(&state_, 1, 0xC00000003F800000ULL, 0xC120000040600000ULL);
+  SetV128(&state_, 2, 0xC040000040000000ULL, 0x40A0000040400000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMAX -> 2.0, -2.0, 3.5, 5.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000000040000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x40A0000040600000ULL);
+}
+
+// FMIN v0.4s, v1.4s, v2.4s: per-lane min of the same four FP32 lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminVec4S) {
+  static const uint32_t code[] = {FminVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xC00000003F800000ULL, 0xC120000040600000ULL);
+  SetV128(&state_, 2, 0xC040000040000000ULL, 0x40A0000040400000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMIN -> 1.0, -3.0, 3.0, -10.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0xC04000003F800000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC120000040400000ULL);
+}
+
+// FMAX v0.2s, v1.2s, v2.2s (Q=0): only two lanes, Vd[127:64] zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVec2S) {
+  static const uint32_t code[] = {FmaxVec(/*dbl=*/false, /*q=*/false, 0, 1, 2)};
+  // v1 lanes 0,1 = 1.0, -5.0 ; v2 = 2.0, -2.0.
+  SetV128(&state_, 1, 0xC0A000003F800000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0xC000000040000000ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMAX -> 2.0, -2.0 ; upper 64 zeroed.
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000000040000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMAX v0.2d, v1.2d, v2.2d: per-lane max of two FP64 lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVec2D) {
+  static const uint32_t code[] = {FmaxVec(/*dbl=*/true, /*q=*/true, 0, 1, 2)};
+  // v1 = 1.5, -3.0 ; v2 = 2.5, -10.0.
+  SetV128(&state_, 1, 0x3FF8000000000000ULL, 0xC008000000000000ULL);
+  SetV128(&state_, 2, 0x4004000000000000ULL, 0xC024000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMAX -> 2.5, -3.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x4004000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC008000000000000ULL);
+}
+
+// FMINNM v0.2d, v1.2d, v2.2d: per-lane number-min of two FP64 lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmVec2D) {
+  static const uint32_t code[] = {FminnmVec(/*dbl=*/true, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x3FF8000000000000ULL, 0xC008000000000000ULL);  // 1.5, -3.0
+  SetV128(&state_, 2, 0x4004000000000000ULL, 0xC024000000000000ULL);  // 2.5, -10.0
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMINNM -> 1.5, -10.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x3FF8000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC024000000000000ULL);
+}
+
+// FMAXNM v0.4s: suppresses a single NaN lane and returns the other operand.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmVecNaNSuppress4S) {
+  static const uint32_t code[] = {FmaxnmVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  // v1 lanes = qNaN, 5.0, 1.0, 2.0 ; v2 = 3.0, qNaN, 7.0, 1.0.
+  SetV128(&state_, 1, 0x40A000007FC00000ULL, 0x400000003F800000ULL);
+  SetV128(&state_, 2, 0x7FC0000040400000ULL, 0x3F80000040E00000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // FMAXNM -> 3.0, 5.0, 7.0, 2.0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x40A0000040400000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4000000040E00000ULL);
+}
+
+// FMAX v0.4s propagates a NaN lane (any NaN input -> NaN out) per ARM ARM.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVecNaNPropagate4S) {
+  static const uint32_t code[] = {FmaxVec(/*dbl=*/false, /*q=*/true, 0, 1, 2)};
+  // v1 lane0 = qNaN, rest 1.0 ; v2 lane0 = 3.0, rest 2.0.
+  SetV128(&state_, 1, 0x3F8000007FC00000ULL, 0x3F8000003F800000ULL);
+  SetV128(&state_, 2, 0x4000000040400000ULL, 0x4000000040000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lane0 = NaN (0x7FC00000 after the double negation); lanes 1..3 = max(1,2)=2.
+  EXPECT_EQ(static_cast<uint32_t>(VLo64(&state_, 0)), 0x7FC00000u);
+  EXPECT_EQ(VLo64(&state_, 0) >> 32, 0x40000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4000000040000000ULL);
+}
+
+// FMAX signed-zero tie: ARM FMAX(+-0) = AND-of-signs -> +0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVecZeroTie2S) {
+  static const uint32_t code[] = {FmaxVec(/*dbl=*/false, /*q=*/false, 0, 1, 2)};
+  // v1 lanes = +0.0, -0.0 ; v2 lanes = -0.0, +0.0.
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x0000000080000000ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // Both lanes -> +0.0 (0x00000000); upper 64 zeroed.
+  EXPECT_EQ(VLo64(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMIN signed-zero tie: ARM FMIN(+-0) = OR-of-signs -> -0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminVecZeroTie2S) {
+  static const uint32_t code[] = {FminVec(/*dbl=*/false, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0x1111111111111111ULL);  // +0.0, -0.0
+  SetV128(&state_, 2, 0x0000000080000000ULL, 0x2222222222222222ULL);  // -0.0, +0.0
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // Both lanes -> -0.0 (0x80000000); upper 64 zeroed.
+  EXPECT_EQ(VLo64(&state_, 0), 0x8000000080000000ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
