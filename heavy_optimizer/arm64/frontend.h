@@ -2046,13 +2046,16 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args, base, offset);
   }
 
-  // AdvSIMD copy. Only DUP (general) — broadcast a GP register Rn across all
-  // lanes of Vd — is implemented in the optimizing tier. The other opcodes
-  // (DUP element, INS general/element, SMOV, UMOV) need byte/lane shuffles
-  // (PSHUFD/PSHUFLW) or 128-bit byte shifts (PSLLDQ/PSRLDQ) that are NOT in the
-  // ARM64 backend op allowlist, so they bail to the lite translator (which has
-  // those ops). Mirrors lite_translator.h::AdvSimdCopy's kDupGeneral path.
+  // AdvSIMD copy. DUP (general), INS (general), UMOV, SMOV, and INS (element)
+  // are implemented in the optimizing tier; DUP (element) still bails to the
+  // lite translator (its PSHUFB byte-broadcast mask constant / PSHUFD lane
+  // select don't map cleanly onto the optimizer allowlist). The lane-select
+  // moves (UMOV/SMOV/INS-element) route through PEXTR/PINSR in the XMM domain
+  // for MOVDQA store/load-forwarding consistency. Mirrors
+  // lite_translator.h::AdvSimdCopy.
   //
+  // DUP (general) — broadcast a GP register Rn across all lanes of Vd —
+  // lowers as follows:
   // imm5 encodes the element size: bit0=B(1), bit1=H(2), bit2=S(4), bit3=D(8).
   //   B: MOVD Rn->xmm, then PSHUFB with a zeroed mask broadcasts byte 0 to all 16.
   //   H: MOVD Rn->xmm (low halfword in lane 0), then PINSRW into all 8 lanes.
@@ -2114,9 +2117,186 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // UMOV / SMOV / INS (element): lane-select moves. Decode element size and
+    // the (destination) lane index from imm5 — the same encoding kInsGeneral
+    // uses. All three stay in the XMM domain (GenGetSimd<16> full loads,
+    // PEXTR/PINSR, GenSetSimd<16> full stores), NOT a narrow memory access to
+    // a v[] sub-lane, so the MOVDQA store/load forwarding the optimizer relies
+    // on stays consistent (a partial-width access to a 16-byte v[] slot could
+    // be reordered around a wide store/load of the same slot). The lite tier
+    // is memory-direct instead — safe there because the single-pass lite
+    // translator never reorders.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kUmov ||
+        args.opcode == Decoder::AdvSimdCopyOpcode::kSmov ||
+        args.opcode == Decoder::AdvSimdCopyOpcode::kInsElement) {
+      const uint8_t imm5_low4 = args.imm5 & 0xf;
+      uint8_t esize;
+      uint8_t index;
+      if (imm5_low4 & 0x1) {
+        esize = 1;
+        index = (args.imm5 >> 1) & 0xf;
+      } else if (imm5_low4 & 0x2) {
+        esize = 2;
+        index = (args.imm5 >> 2) & 0x7;
+      } else if (imm5_low4 & 0x4) {
+        esize = 4;
+        index = (args.imm5 >> 3) & 0x3;
+      } else if (imm5_low4 & 0x8) {
+        esize = 8;
+        index = (args.imm5 >> 4) & 0x1;
+      } else {
+        UndefinedReturningVoid();  // reserved imm5
+        return;
+      }
+      const int32_t vn_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+
+      // UMOV Vn.<T>[index] -> Rd (unsigned). Canonical (esize, Q) pairs: B/H/S
+      // with Q=0 (Wd), D with Q=1 (Xd). PEXTR zero-extends the extracted
+      // element into the GP register (upper bits cleared) — exactly UMOV's
+      // unsigned semantics; the 32-bit PEXTR forms clear the upper 32 bits,
+      // matching a Wd write. rd==31 (WZR/XZR) discards the result.
+      if (args.opcode == Decoder::AdvSimdCopyOpcode::kUmov) {
+        const bool canonical = (esize == 8 && args.q) || (esize != 8 && !args.q);
+        if (!canonical) {
+          UndefinedReturningVoid();
+          return;
+        }
+        if (args.rd < 31) {
+          FpRegister xn = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          Register res;
+          switch (esize) {
+            case 1:
+              res = std::get<0>(
+                  Gen<x86_64::PextrbRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+              break;
+            case 2:
+              res = std::get<0>(
+                  Gen<x86_64::PextrwRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+              break;
+            case 4:
+              res = std::get<0>(
+                  Gen<x86_64::PextrdRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+              break;
+            default:
+              res = std::get<0>(
+                  Gen<x86_64::PextrqRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+              break;
+          }
+          SetReg(args.rd, res);
+        }
+        return;
+      }
+
+      // SMOV Vn.<T>[index] -> Rd (signed). Canonical: (1,*), (2,*), (4,Q=1).
+      // Extract the raw element (zero-extended by PEXTR) then re-sign-extend
+      // the low esize bits to the destination width; the 32-bit Movsx*l forms
+      // clear the upper 32 (Wd), the 64-bit Movsx*q forms fill it (Xd). No
+      // 32-bit sign-extend-from-memory LIR op exists, so this two-step is why
+      // SMOV routes through PEXTR + a RegReg sign-extend.
+      if (args.opcode == Decoder::AdvSimdCopyOpcode::kSmov) {
+        const bool canonical = (esize == 1) || (esize == 2) || (esize == 4 && args.q);
+        if (!canonical) {
+          UndefinedReturningVoid();
+          return;
+        }
+        if (args.rd < 31) {
+          FpRegister xn = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          Register raw;
+          if (esize == 4) {
+            raw = std::get<0>(
+                Gen<x86_64::PextrdRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+          } else if (esize == 2) {
+            raw = std::get<0>(
+                Gen<x86_64::PextrwRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+          } else {
+            raw = std::get<0>(
+                Gen<x86_64::PextrbRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(index)));
+          }
+          Register res;
+          if (esize == 1 && !args.q) {
+            res = std::get<0>(Gen<x86_64::MovsxblRegReg>(raw));
+          } else if (esize == 1) {
+            res = std::get<0>(Gen<x86_64::MovsxbqRegReg>(raw));
+          } else if (esize == 2 && !args.q) {
+            res = std::get<0>(Gen<x86_64::MovsxwlRegReg>(raw));
+          } else if (esize == 2) {
+            res = std::get<0>(Gen<x86_64::MovsxwqRegReg>(raw));
+          } else /* esize == 4 && q */ {
+            res = std::get<0>(Gen<x86_64::MovsxlqRegReg>(raw));
+          }
+          SetReg(args.rd, res);
+        }
+        return;
+      }
+
+      // INS (element): Vn.<T>[src_index] -> Vd.<T>[index], other Vd lanes kept.
+      // src_index comes from imm4, decoded against the same esize. Load both Vd
+      // and Vn as full XMMs, PEXTR the source lane into a GP temp, PINSR it into
+      // Vd at the dest lane, store Vd back. Loading both before storing is
+      // correct for the rd==rn self-INS case (e.g. INS V0.S[0], V0.S[3]). The
+      // decoder enforces Q=1, so the full 128-bit Vd is in play.
+      uint8_t src_index;
+      switch (esize) {
+        case 1:
+          src_index = args.imm4 & 0xF;
+          break;
+        case 2:
+          src_index = (args.imm4 >> 1) & 0x7;
+          break;
+        case 4:
+          src_index = (args.imm4 >> 2) & 0x3;
+          break;
+        default /* esize == 8 */:
+          src_index = (args.imm4 >> 3) & 0x1;
+          break;
+      }
+      const int32_t vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xd = AllocTempSimdReg();
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      switch (esize) {
+        case 1: {
+          Register t = std::get<0>(
+              Gen<x86_64::PextrbRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
+          builder_.Gen<x86_64::PinsrbXRegRegImm>(
+              xd.machine_reg(), t, static_cast<int8_t>(index));
+          break;
+        }
+        case 2: {
+          Register t = std::get<0>(
+              Gen<x86_64::PextrwRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
+          builder_.Gen<x86_64::PinsrwXRegRegImm>(
+              xd.machine_reg(), t, static_cast<int8_t>(index));
+          break;
+        }
+        case 4: {
+          Register t = std::get<0>(
+              Gen<x86_64::PextrdRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
+          builder_.Gen<x86_64::PinsrdXRegRegImm>(
+              xd.machine_reg(), t, static_cast<int8_t>(index));
+          break;
+        }
+        default: {
+          Register t = std::get<0>(
+              Gen<x86_64::PextrqRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(
+              xd.machine_reg(), t, static_cast<int8_t>(index));
+          break;
+        }
+      }
+      builder_.GenSetSimd<16>(vd_off, xd.machine_reg());
+      return;
+    }
+
     if (args.opcode != Decoder::AdvSimdCopyOpcode::kDupGeneral) {
-      // DUP element / INS element / SMOV / UMOV: not expressible with the
-      // allowlisted ops; the lite translator handles them.
+      // DUP (element): needs a PSHUFB byte-broadcast mask constant / PSHUFD
+      // lane-select the optimizer allowlist doesn't cover cleanly; the lite
+      // translator handles it.
       UndefinedReturningVoid();
       return;
     }
