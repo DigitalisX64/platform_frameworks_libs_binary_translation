@@ -940,12 +940,114 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, TstImmDiscardsResult) {
 }
 
 // ADC/SBC (add/subtract with carry) bails: needs the carry-in from cpu.flags.
-TEST_F(Arm64HeavyOptimizerFrontendTest, AdcBails) {
-  // ADC X0, X1, X2 -> 0x9A000000 base | (rm<<16) | (rn<<5) | rd.
-  static const uint32_t code[] = {0x9A020020u};  // ADC X0, X1, X2
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
-  EXPECT_FALSE(RunOneInstruction(&state_, stop_pc));
+// ADC/SBC (no flags) with a carry-in: the heavy tier now mirrors the lite
+// Btw/Cmc/Adc(Sbb) path instead of bailing.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AdcSbcCarryIn) {
+  // ADC X0, X1, X2 with carry-in=1: 5 + 10 + 1 = 16 (ADC does not set flags).
+  static const uint32_t adc[] = {0x9A020020u};  // ADC X0, X1, X2
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 10;
+  state_.cpu.insn_addr = ToGuestAddr(adc);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(adc) + sizeof(adc)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{16});
+  EXPECT_EQ(state_.cpu.flags, uint16_t{CPUState::kFlagCarry});  // unchanged
+
+  // ADC with carry-in=0: 5 + 10 + 0 = 15.
+  state_.cpu.flags = 0;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 10;
+  state_.cpu.insn_addr = ToGuestAddr(adc);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(adc) + sizeof(adc)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{15});
+
+  // SBC X0, X1, X2 with carry-in=1: 100 - 30 - (1-1) = 70.
+  static const uint32_t sbc[] = {0xDA020020u};  // SBC X0, X1, X2
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 100;
+  state_.cpu.x[2] = 30;
+  state_.cpu.insn_addr = ToGuestAddr(sbc);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sbc) + sizeof(sbc)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{70});
+
+  // SBC with carry-in=0: 100 - 30 - (1-0) = 69.
+  state_.cpu.flags = 0;
+  state_.cpu.x[1] = 100;
+  state_.cpu.x[2] = 30;
+  state_.cpu.insn_addr = ToGuestAddr(sbc);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sbc) + sizeof(sbc)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{69});
+}
+
+// ADCS carry-out on a saturated addend (the RSA/TLS bignum case) — the naive
+// carry-fold loses the carry; verify the fused Adc keeps it.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AdcsSaturatedCarryOut) {
+  static const uint32_t adcs[] = {0xBA020020u};  // ADCS X0, X1, X2
+  // carry-in=1, x1=5, x2=all-ones -> x0=5, carry-out=1, Z=0.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  state_.cpu.insn_addr = ToGuestAddr(adcs);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(adcs) + sizeof(adcs)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{5});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry) << "carry-out lost";
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+
+  // carry-in=1, x1=0, x2=all-ones -> x0=0, carry-out=1, Z=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  state_.cpu.insn_addr = ToGuestAddr(adcs);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(adcs) + sizeof(adcs)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+}
+
+// SBCS flags: ARM carry = "no borrow" (inverted from x86 CF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SbcsBorrowFlags) {
+  static const uint32_t sbcs[] = {0xFA020020u};  // SBCS X0, X1, X2
+  // carry-in=1, no borrow: 100 - 30 = 70, ARM C=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 100;
+  state_.cpu.x[2] = 30;
+  state_.cpu.insn_addr = ToGuestAddr(sbcs);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sbcs) + sizeof(sbcs)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{70});
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);  // no borrow -> C=1
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+
+  // carry-in=1, borrow: 30 - 100 = -70, ARM C=0, N=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 30;
+  state_.cpu.x[2] = 100;
+  state_.cpu.insn_addr = ToGuestAddr(sbcs);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sbcs) + sizeof(sbcs)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFBAULL});  // -70
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);  // borrow -> C=0
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+}
+
+// 32-bit ADCS (W form) zero-extends the result, and NGC (SBC with rn=XZR).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Adcs32AndNgc) {
+  // ADCS W0, W1, W2: carry-in=1, w1=5, w2=0xFFFFFFFF -> w0=5 (wraps), C=1.
+  static const uint32_t adcs32[] = {0x3A020020u};  // ADCS W0, W1, W2
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFULL;
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  state_.cpu.insn_addr = ToGuestAddr(adcs32);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(adcs32) + sizeof(adcs32)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{5});  // upper 32 zero-extended
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+
+  // NGC X0, X2 = SBC X0, XZR, X2. carry-in=1: 0 - 5 - 0 = -5.
+  static const uint32_t ngc[] = {0xDA0203E0u};  // NGC X0, X2
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[2] = 5;
+  state_.cpu.insn_addr = ToGuestAddr(ngc);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(ngc) + sizeof(ngc)));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFBULL});  // -5
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, AddReg64) {
@@ -1714,13 +1816,15 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluRegionExecutes) {
 // EmitMaterializeNZCV sequence — PseudoReadFlags + AND + store — must survive
 // GenCode's CheckMachineIR). A following ADC bails, ending the region.
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiFlagSetterThenBailRegion) {
-  // MOVZ X0,#10; SUBS X1,X0,#3; ADC X2,X1,X0 (bails).
-  static const uint32_t code[] = {MovzX(0, 10), SubsImmX(1, 0, 3), 0x9A000022u /*ADC X2,X1,X0*/};
+  // MOVZ X0,#10; SUBS X1,X0,#3; CRC32B W0,W1,W0 (bails: DataProc2Src is not
+  // translated by the optimizing frontend). ADC is now translated, so it is no
+  // longer a valid bail sentinel here.
+  static const uint32_t code[] = {MovzX(0, 10), SubsImmX(1, 0, 3), 0x1AC04020u /*CRC32B W0,W1,W0*/};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  // MOVZ + SUBS translate, the ADC bails -> partial region of 2.
+  // MOVZ + SUBS translate, the CRC32 bails -> partial region of 2.
   EXPECT_EQ(n, 2u);
 }
 

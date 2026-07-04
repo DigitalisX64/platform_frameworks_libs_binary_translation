@@ -47317,6 +47317,104 @@ TEST_F(Arm64LiteTranslateRegionTest, AdcsCarryOutOnSaturatedAddend) {
   EXPECT_FALSE((state_.cpu.flags & CPUState::kFlagCarry) != 0);
 }
 
+// JIT (lite) coverage for ADC/ADCS/SBC/SBCS. Before this cycle AddSubWithCarry
+// bailed to the interpreter; these exercise the emitted Btw/Cmc/Adc(Sbb) path
+// via Run() (a bail would make Run() return false).
+TEST_F(Arm64LiteTranslateRegionTest, AdcSbcJit) {
+  // ADC X0, X1, X2, carry-in=1: 5 + 10 + 1 = 16. ADC does not set flags.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 10;
+  state_.cpu.x[0] = 0xDEAD;
+  static const uint32_t adc[] = {0x9A020020U};  // adc x0, x1, x2
+  EXPECT_TRUE(Run(adc, ToGuestAddr(adc) + sizeof(adc)));
+  EXPECT_EQ(state_.cpu.x[0], 16ULL);
+  EXPECT_EQ(state_.cpu.flags, CPUState::kFlagCarry);  // unchanged (ADC, no S)
+
+  // ADC X0, X1, X2, carry-in=0: 5 + 10 + 0 = 15.
+  state_.cpu.flags = 0;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 10;
+  EXPECT_TRUE(Run(adc, ToGuestAddr(adc) + sizeof(adc)));
+  EXPECT_EQ(state_.cpu.x[0], 15ULL);
+
+  // SBC X0, X1, X2, carry-in=1: 100 - 30 - (1-1) = 70.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 100;
+  state_.cpu.x[2] = 30;
+  static const uint32_t sbc[] = {0xDA020020U};  // sbc x0, x1, x2
+  EXPECT_TRUE(Run(sbc, ToGuestAddr(sbc) + sizeof(sbc)));
+  EXPECT_EQ(state_.cpu.x[0], 70ULL);
+
+  // SBC X0, X1, X2, carry-in=0: 100 - 30 - (1-0) = 69.
+  state_.cpu.flags = 0;
+  state_.cpu.x[1] = 100;
+  state_.cpu.x[2] = 30;
+  EXPECT_TRUE(Run(sbc, ToGuestAddr(sbc) + sizeof(sbc)));
+  EXPECT_EQ(state_.cpu.x[0], 69ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AdcsSbcsFlagsJit) {
+  // ADCS X0, X1, X2: saturated-addend carry-out (the RSA/TLS bignum case).
+  // carry-in=1, x1=5, x2=all-ones -> x0=5, carry-out=1, Z=0.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  static const uint32_t adcs[] = {0xBA020020U};  // adcs x0, x1, x2
+  EXPECT_TRUE(Run(adcs, ToGuestAddr(adcs) + sizeof(adcs)));
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry) << "carry-out lost";
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagZero);
+
+  // carry-in=1, x1=0, x2=all-ones -> x0=0, carry-out=1, Z=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+  EXPECT_TRUE(Run(adcs, ToGuestAddr(adcs) + sizeof(adcs)));
+  EXPECT_EQ(state_.cpu.x[0], 0ULL);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagZero);
+
+  // SBCS X0, X1, X2, carry-in=1, no borrow: 100 - 30 = 70, ARM C=1 (no borrow).
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 100;
+  state_.cpu.x[2] = 30;
+  static const uint32_t sbcs[] = {0xFA020020U};  // sbcs x0, x1, x2
+  EXPECT_TRUE(Run(sbcs, ToGuestAddr(sbcs) + sizeof(sbcs)));
+  EXPECT_EQ(state_.cpu.x[0], 70ULL);
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);  // no borrow -> C=1
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagNegative);
+
+  // SBCS X0, X1, X2, carry-in=1, borrow: 30 - 100 = -70, ARM C=0 (borrow), N=1.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 30;
+  state_.cpu.x[2] = 100;
+  EXPECT_TRUE(Run(sbcs, ToGuestAddr(sbcs) + sizeof(sbcs)));
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(-70LL));
+  EXPECT_FALSE(state_.cpu.flags & CPUState::kFlagCarry);  // borrow -> C=0
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagNegative);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, Adcs32BitAndNgcJit) {
+  // 32-bit ADCS W0, W1, W2: carry-in=1, w1=5, w2=0xFFFFFFFF -> w0=5 (wraps),
+  // carry-out=1, result zero-extended to 64.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[1] = 5;
+  state_.cpu.x[2] = 0xFFFFFFFFULL;
+  state_.cpu.x[0] = 0xDEADBEEFDEADBEEFULL;
+  static const uint32_t adcs32[] = {0x3A020020U};  // adcs w0, w1, w2
+  EXPECT_TRUE(Run(adcs32, ToGuestAddr(adcs32) + sizeof(adcs32)));
+  EXPECT_EQ(state_.cpu.x[0], 5ULL);  // upper 32 zero-extended
+  EXPECT_TRUE(state_.cpu.flags & CPUState::kFlagCarry);
+
+  // NGC X0, X2 = SBC X0, XZR, X2 (rn=31). carry-in=1: 0 - 5 - 0 = -5.
+  state_.cpu.flags = CPUState::kFlagCarry;
+  state_.cpu.x[2] = 5;
+  static const uint32_t ngc[] = {0xDA0203E0U};  // ngc x0, x2  (sbc x0, xzr, x2)
+  EXPECT_TRUE(Run(ngc, ToGuestAddr(ngc) + sizeof(ngc)));
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(-5LL));
+}
+
 // LD3/LD4 single-structure (one lane) use the odd opcode<0> bit and were
 // decoded to Undefined (TikTok hit `ld4 {...}[0]`). Each register receives one
 // de-interleaved element at the given lane.

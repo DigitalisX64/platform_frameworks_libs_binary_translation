@@ -80,6 +80,8 @@
         "SarlRegReg",
         "SarqRegImm",
         "SarqRegReg",
+        "SbblRegReg",
+        "SbbqRegReg",
         "ShlbRegImm",
         "ShldlRegRegImm",
         "ShllRegImm",

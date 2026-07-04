@@ -1198,10 +1198,60 @@ class HeavyOptimizerFrontend {
     }
   }
 
+  // ADC/ADCS/SBC/SBCS (add/subtract with the guest carry flag). Mirrors
+  // lite_translator.h::AddSubWithCarry: the guest carry (ARM NZCV C =
+  // cpu.flags bit 8) is loaded into x86 CF, then one x86 ADC/SBB does the
+  // carry op.
+  //   ADC — ARM C maps directly to x86 CF: BT bit 8 sets CF, then ADC.
+  //   SBC — x86 SBB computes src1 - src2 - CF = src1 + ~src2 + (1 - CF), while
+  //         ARM SBC wants src1 + ~src2 + C, so SBB needs CF = !C (CMC after the
+  //         BT). On output x86 SBB's CF is the borrow; EmitMaterializeNZCV
+  //         (is_sub=true) inverts it back to ARM's "carry = no borrow".
+  // res is a fresh temp; the whole MOV/BT/CMC/ADC(SBB) chain stays in one basic
+  // block so the host FLAGS never cross a BB boundary. MOV does not touch
+  // FLAGS, so the carry loaded by BT survives to the ADC/SBB.
   Register AddSubWithCarry(Register src1, Register src2, bool is_64bit, bool is_sub, bool set_flags) {
-    UndefinedReturningReg();
-    UNUSED_ARGS(src1, src2, is_64bit, is_sub, set_flags);
-    return AllocTempReg();
+    if (!success()) {
+      return AllocTempReg();
+    }
+    // res = src1 (32-bit MOV for sf=0 so the later 32-bit ADC/SBB zero-extends).
+    Register res = is_64bit ? Copy(src1) : std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+    // Load the guest carry into x86 CF. MovwRegOp matches the 16-bit flags-read
+    // opcode RemoveLoopGuestContextAccesses recognizes; only bit 8 is tested, so
+    // the untouched upper bits of the loaded word do not matter.
+    const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+    Register armflags =
+        std::get<0>(Gen<x86_64::MovwRegOp>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}));
+    Gen<x86_64::BtqRegImm>(armflags, static_cast<int8_t>(8));  // CF = bit 8 = ARM carry.
+    if (is_sub) {
+      Gen<x86_64::Cmc>(GetFlagsRegister());  // SBB wants CF = !(ARM carry).
+    }
+    if (is_64bit) {
+      if (is_sub) {
+        auto [r, flags] = Gen<x86_64::SbbqRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+        if (set_flags) {
+          EmitMaterializeNZCV(flags, /*is_sub=*/true);
+        }
+        return r;
+      }
+      auto [r, flags] = Gen<x86_64::AdcqRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+      if (set_flags) {
+        EmitMaterializeNZCV(flags, /*is_sub=*/false);
+      }
+      return r;
+    }
+    if (is_sub) {
+      auto [r, flags] = Gen<x86_64::SbblRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+      if (set_flags) {
+        EmitMaterializeNZCV(flags, /*is_sub=*/true);
+      }
+      return r;
+    }
+    auto [r, flags] = Gen<x86_64::AdclRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+    if (set_flags) {
+      EmitMaterializeNZCV(flags, /*is_sub=*/false);
+    }
+    return r;
   }
 
   // RBIT/REV16/REV32/REV/CLZ/CLS. REV16/REV32/REV are byte-reversed with SWAR
