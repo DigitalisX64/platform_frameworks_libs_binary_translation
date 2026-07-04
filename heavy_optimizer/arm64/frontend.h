@@ -4272,6 +4272,161 @@ class HeavyOptimizerFrontend {
         }
         return;
       }
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrun: {
+        // Non-rounding saturating shift-right narrow (vector, 16/32-bit
+        // source).  Mirrors lite_translator.h::AdvSimdShiftByImm's saturating
+        // narrow path: shift each wide lane right (arithmetic for a signed
+        // source, logical for unsigned) -> clamp to the destination range ->
+        // PSHUFB-gather the low half of each lane into the packed low 64.
+        //   SQSHRN  (signed->signed):        PSRA{W,D} + PMINS/PMAXS clamp.
+        //   UQSHRN  (unsigned->unsigned):    PSRL{W,D} + PMINU clamp.
+        //   SQSHRUN (signed->unsigned):      PSRA{W,D} + PMAXS-vs-0 + PMINS.
+        // src=64 needs PSRAQ (AVX-512F-VL) for the signed shift and a manual
+        // hi32-nonzero rewrite for the unsigned clamp — both of which the lite
+        // tier also bails, so bail here.  The scalar forms and the rounding
+        // siblings (SQRSHRN/UQRSHRN/SQRSHRUN) fall to lite via the default
+        // bail below (a later cycle mirrors them).
+        if (immh & 0b1000) {  // RESERVED for narrowing shifts.
+          UndefinedReturningVoid();
+          return;
+        }
+        if (args.scalar) {  // Scalar saturating narrow -> lite handles it.
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t src_bits;
+        if (immh & 0b0100) {
+          src_bits = 64;
+        } else if (immh & 0b0010) {
+          src_bits = 32;
+        } else {  // immh == 0b0001
+          src_bits = 16;
+        }
+        if (src_bits == 64) {  // needs PSRAQ / manual clamp -> bail to lite.
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_saturating_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn);
+        const bool is_signed_to_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrun);
+        // Signed source (SQSHRN/SQSHRUN) uses an arithmetic right shift;
+        // unsigned source (UQSHRN) uses a logical right shift.
+        const bool uses_signed_shift =
+            is_saturating_signed || is_signed_to_unsigned;
+        const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
+        const int8_t cnt = static_cast<int8_t>(narrow_rshift);
+
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (uses_signed_shift) {
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else {
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          }
+        }
+
+        // Materialize a broadcast constant (`pattern` in both qwords) into a
+        // fresh SIMD reg — the clamp bounds below need this.
+        auto broadcast = [&](uint64_t pattern) -> FpRegister {
+          FpRegister x = AllocTempSimdReg();
+          Register gr =
+              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
+          builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+          return x;
+        };
+
+        if (is_saturating_signed) {
+          // Clamp each src-lane to the signed dst range:
+          //   dst 8 : [-128, 127]   as signed 16 = [0xFF80, 0x007F].
+          //   dst 16: [-32768,32767] as signed 32 = [0xFFFF8000, 0x00007FFF].
+          uint64_t sat_max_pattern, sat_min_pattern;
+          if (src_bits == 16) {
+            sat_max_pattern = 0x007F007F007F007FULL;
+            sat_min_pattern = 0xFF80FF80FF80FF80ULL;
+          } else {
+            sat_max_pattern = 0x00007FFF00007FFFULL;
+            sat_min_pattern = 0xFFFF8000FFFF8000ULL;
+          }
+          FpRegister xsatmax = broadcast(sat_max_pattern);
+          FpRegister xsatmin = broadcast(sat_min_pattern);
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+            builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+            builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
+          }
+        } else if (is_signed_to_unsigned) {
+          // SQSHRUN: clamp the post-shift signed value to the unsigned dst
+          // range [0, 2^dst_bits - 1].  PMAXS-vs-zero pins negatives at 0;
+          // after that every lane is non-negative, so a signed PMINS against
+          // the positive dst-max is equivalent to unsigned-min.
+          const uint64_t sat_max_pattern =
+              (src_bits == 16) ? 0x00FF00FF00FF00FFULL   // dst 8: 0xFF
+                               : 0x0000FFFF0000FFFFULL;  // dst 16: 0xFFFF
+          FpRegister xsatmax = broadcast(sat_max_pattern);
+          FpRegister xzero = AllocZeroedSimdReg();
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xzero.machine_reg());
+            builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xzero.machine_reg());
+            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          }
+        } else {  // UQSHRN: unsigned-min clamp to (1 << dst_bits) - 1.
+          const uint64_t sat_pattern =
+              (src_bits == 16) ? 0x00FF00FF00FF00FFULL
+                               : 0x0000FFFF0000FFFFULL;
+          FpRegister xsat = broadcast(sat_pattern);
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xsat.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xsat.machine_reg());
+          }
+        }
+
+        // PSHUFB narrow gather: the low-8 selector entries gather each wide
+        // lane's low half into the packed low 64; the high-8 entries (0x80)
+        // zero the upper 64.  Same layout as the SHRN/RSHRN path above.
+        const int64_t mask_lo =
+            (src_bits == 16) ? static_cast<int64_t>(0x0E0C0A0806040200LL)
+                             : static_cast<int64_t>(0x0D0C090805040100LL);
+        FpRegister xmask = AllocTempSimdReg();
+        Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(mask_lo));
+        builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
+        Register gmhi = std::get<0>(
+            Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
+        builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+        if (!args.q) {
+          // Q=0: narrowed lanes in the low 64; SetVRegFull zeroes Vd[127:64].
+          SetVRegFull(args.rd, xn, /*q=*/false);
+        } else {
+          // Q=1 ("...2" form): place narrowed lanes in Vd[127:64], preserve
+          // Vd[63:0].
+          const int32_t vd_off =
+              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          FpRegister xd = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          FpRegister xdlow = AllocZeroedSimdReg();
+          builder_.Gen<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
+          builder_.GenSetSimd<16>(vd_off, xdlow.machine_reg());
+        }
+        return;
+      }
       default:
         UndefinedReturningVoid();
         return;
