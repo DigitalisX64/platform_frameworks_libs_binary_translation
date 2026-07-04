@@ -6033,6 +6033,523 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ExtVec16BIndex0) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x8899AABBCCDDEEFFULL);
 }
 
+// ZIP1/ZIP2, UZP1/UZP2, TRN1/TRN2 vector permute — heavy-tier exec tests.
+// Encodings and inputs/expected values mirror the verified lite exec tests
+// (lite_translate_region_exec_tests.cc); each exercises a distinct heavy
+// lowering path (PUNPCK, PACKUS, SHUFPS, PSHUFB+POR, PSHUFD+PUNPCKLDQ).
+// v1 = Vn, v2 = Vm, v0 = Vd (poisoned 0xAA to catch missing writes/upper-zero).
+constexpr uint32_t kZip1Vec16B = 0x4e023820u;
+constexpr uint32_t kZip2Vec16B = 0x4e027820u;
+constexpr uint32_t kZip1Vec8H  = 0x4e423820u;
+constexpr uint32_t kZip1Vec4S  = 0x4e823820u;
+constexpr uint32_t kZip2Vec4S  = 0x4e827820u;
+constexpr uint32_t kZip1Vec2D  = 0x4ec23820u;
+constexpr uint32_t kZip2Vec2D  = 0x4ec27820u;
+constexpr uint32_t kZip1Vec8B  = 0x0e023820u;
+constexpr uint32_t kZip2Vec8B  = 0x0e027820u;
+constexpr uint32_t kUzp1Vec16B = 0x4e021820u;
+constexpr uint32_t kUzp2Vec16B = 0x4e025820u;
+constexpr uint32_t kUzp1Vec8H  = 0x4e421820u;
+constexpr uint32_t kUzp1Vec4S  = 0x4e821820u;
+constexpr uint32_t kUzp2Vec4S  = 0x4e825820u;
+constexpr uint32_t kUzp1Vec2D  = 0x4ec21820u;
+constexpr uint32_t kUzp1Vec8B  = 0x0e021820u;
+constexpr uint32_t kUzp1Vec2S  = 0x0e821820u;
+constexpr uint32_t kTrn1Vec16B = 0x4e022820u;
+constexpr uint32_t kTrn2Vec16B = 0x4e026820u;
+constexpr uint32_t kTrn1Vec8H  = 0x4e422820u;
+constexpr uint32_t kTrn2Vec8H  = 0x4e426820u;
+constexpr uint32_t kTrn1Vec4S  = 0x4e822820u;
+constexpr uint32_t kTrn2Vec4S  = 0x4e826820u;
+constexpr uint32_t kTrn1Vec2D  = 0x4ec22820u;
+constexpr uint32_t kTrn1Vec8B  = 0x0e022820u;
+constexpr uint32_t kTrn1Vec2S  = 0x0e822820u;
+
+// ---- ZIP ----
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip2Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[8 + i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[8 + i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x0908,0x0B0A,0x0D0C,0x0F0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x1918,0x1B1A,0x1D1C,0x1F1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], vn[1]);
+  EXPECT_EQ(r[3], vm[1]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip2Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[2]);
+  EXPECT_EQ(r[1], vm[2]);
+  EXPECT_EQ(r[2], vn[3]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kZip1Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111111111111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kZip2Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x2222222222222222ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xBBBBBBBBBBBBBBBBULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[i]) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip2Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[4 + i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[4 + i]) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+// ---- UZP ----
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vn[2 * i]) << "vn byte " << i;
+    EXPECT_EQ(r[8 + i], vm[2 * i]) << "vm byte " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vn[2 * i + 1]) << "vn byte " << i;
+    EXPECT_EQ(r[8 + i], vm[2 * i + 1]) << "vm byte " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec8H) {
+  // High-bit halfwords pin PACKUSDW: each masked dword is in 0..0xFFFF so
+  // saturation must be a no-op.
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vn[2 * i]) << "vn halfword " << i;
+    EXPECT_EQ(r[4 + i], vm[2 * i]) << "vm halfword " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vm[0]);
+  EXPECT_EQ(r[3], vm[2]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vn[3]);
+  EXPECT_EQ(r[2], vm[1]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kUzp1Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111111111111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec8B) {
+  // Upper 8 bytes of vn/vm are garbage and MUST NOT leak into the result.
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vn[4]);
+  EXPECT_EQ(r[3], vn[6]);
+  EXPECT_EQ(r[4], vm[0]);
+  EXPECT_EQ(r[5], vm[2]);
+  EXPECT_EQ(r[6], vm[4]);
+  EXPECT_EQ(r[7], vm[6]);
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec2S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0x12345678u, 0x9ABCDEF0u};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec2S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+// ---- TRN ----
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn2Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i + 1]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i + 1]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn2Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn2Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i + 1]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i + 1]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], vn[2]);
+  EXPECT_EQ(r[3], vm[2]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn2Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vm[1]);
+  EXPECT_EQ(r[2], vn[3]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kTrn1Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111111111111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], vn[2]);
+  EXPECT_EQ(r[3], vm[2]);
+  EXPECT_EQ(r[4], vn[4]);
+  EXPECT_EQ(r[5], vm[4]);
+  EXPECT_EQ(r[6], vn[6]);
+  EXPECT_EQ(r[7], vm[6]);
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec2S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0x12345678u, 0x9ABCDEF0u};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec2S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+
 // UMOV / SMOV / INS (element). Vn (v1) throughout for the register-move tests:
 //   lo = 0xF0E1D2C3B4A59687  -> b0=0x87 b1=0x96 b2=0xA5 b3=0xB4 b4=0xC3
 //                              b5=0xD2 b6=0xE1 b7=0xF0

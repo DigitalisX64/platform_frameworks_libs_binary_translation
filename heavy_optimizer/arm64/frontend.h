@@ -4608,9 +4608,224 @@ class HeavyOptimizerFrontend {
     SetVRegFull(rd, xn, /*q=*/true);
   }
 
+  // ZIP1/ZIP2, UZP1/UZP2, TRN1/TRN2 vector permute — heavy-tier mirror of
+  // lite_translator.h::AdvSimdPermute. Register-domain-pure, straight-line SSE:
+  //   ZIP  -> PUNPCKL/H{bw,wd,dq,qdq} (interleave lower/upper halves)
+  //   UZP  -> PACKUSWB/PACKUSDW (byte/halfword) or SHUFPS (word); .2D == ZIP.2D
+  //   TRN  -> PSHUFB + POR with materialized per-byte masks (byte/halfword) or
+  //           PSHUFD + PUNPCKLDQ (word); .2D == ZIP.2D
+  // opcode (3 bits, from Decoder::DecodeAdvSimd): 001=UZP1 010=TRN1 011=ZIP1
+  // 101=UZP2 110=TRN2 111=ZIP2 (same encoding the lite tier consumes).
+  // SetVRegFull(q=false) zeroes Vd[127:64], so no manual upper-zero tail is
+  // needed (unlike the lite path). Q=0 .2D is reserved and bails; unknown
+  // opcodes bail. The emulator host always has SSE4.1 (matching the sibling
+  // USHLL/widening handlers, which use PACKUSDW/PMOVZX unguarded), so the
+  // UZP .8H PACKUSDW form is not host-gated here.
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size, uint8_t opcode, bool q) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, size, opcode, q);
+    if (!success()) {
+      return;
+    }
+    const bool is_zip = (opcode == 0b011 || opcode == 0b111);
+    const bool is_uzp = (opcode == 0b001 || opcode == 0b101);
+    const bool is_trn = (opcode == 0b010 || opcode == 0b110);
+    if (!is_zip && !is_uzp && !is_trn) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (size > 0b11) {
+      UndefinedReturningVoid();
+      return;
+    }
+    // Q=0 .2D is reserved by the ARM ARM (encoding restricted).
+    if (!q && size == 0b11) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rn * 16);
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+
+    if (is_zip) {
+      const bool is_zip2 = (opcode == 0b111);
+      if (!q && is_zip2) {
+        // Shift each source right by 4 bytes so the (originally upper-half)
+        // bytes 4..7 land at positions 0..3; PUNPCKL then picks them up.
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
+      }
+      if (q && is_zip2) {
+        switch (size) {
+          case 0b00: builder_.Gen<x86_64::PunpckhbwXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PunpckhwdXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b10: builder_.Gen<x86_64::PunpckhdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b11: builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+        }
+      } else {
+        switch (size) {
+          case 0b00: builder_.Gen<x86_64::PunpcklbwXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PunpcklwdXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b10: builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b11: builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+        }
+      }
+    } else if (is_uzp) {
+      const bool is_uzp2 = (opcode == 0b101);
+      if (!q) {
+        // Combine the lower 8 bytes of Vn and Vm into xn = [vn_lo | vm_lo] so
+        // subsequent PACKUS/SHUFPS consumes a single source; the Q=0 tail then
+        // discards the duplicated high half.
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+      switch (size) {
+        case 0b00: {  // .16B (q=1) or .8B (q=0). PACKUSWB.
+          if (is_uzp2) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          } else {
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          }
+          if (q) {
+            if (is_uzp2) {
+              builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            } else {
+              builder_.Gen<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            }
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          break;
+        }
+        case 0b01: {  // .8H (q=1) or .4H (q=0). PACKUSDW (SSE4.1).
+          if (is_uzp2) {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+          } else {
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+          }
+          if (q) {
+            if (is_uzp2) {
+              builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+            } else {
+              builder_.Gen<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
+              builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+            }
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          break;
+        }
+        case 0b10: {  // .4S (q=1) or .2S (q=0). SHUFPS.
+          const int8_t imm =
+              is_uzp2 ? static_cast<int8_t>(0xDD) : static_cast<int8_t>(0x88);
+          if (q) {
+            builder_.Gen<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xm.machine_reg(), imm);
+          } else {
+            // xn already holds [vn_lo | vm_lo] from PUNPCKLQDQ above.
+            builder_.Gen<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
+          }
+          break;
+        }
+        case 0b11: {  // .2D (q=1 only; q=0 caught above).
+          // UZP1.2D == ZIP1.2D, UZP2.2D == ZIP2.2D (2-lane coincidence).
+          if (is_uzp2) {
+            builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+      }
+    } else {  // is_trn
+      const bool is_trn2 = (opcode == 0b110);
+      switch (size) {
+        case 0b00:
+        case 0b01: {
+          // .16B/.8B and .8H/.4H use PSHUFB + POR with precomputed per-byte
+          // masks (0x80 mask byte renders as 0 in PSHUFB). mask_n picks the
+          // wanted Vn bytes into even output positions; mask_m picks Vm bytes
+          // into odd positions; POR combines. Q=0 forms reuse the Q=1 masks —
+          // the shared Q=0 upper-zero (SetVRegFull) discards bytes 8..15.
+          int64_t mask_n_lo, mask_n_hi, mask_m_lo, mask_m_hi;
+          if (size == 0b00) {
+            if (is_trn2) {
+              mask_n_lo = static_cast<int64_t>(0x8007800580038001LL);
+              mask_n_hi = static_cast<int64_t>(0x800F800D800B8009LL);
+              mask_m_lo = static_cast<int64_t>(0x0780058003800180LL);
+              mask_m_hi = static_cast<int64_t>(0x0F800D800B800980LL);
+            } else {
+              mask_n_lo = static_cast<int64_t>(0x8006800480028000LL);
+              mask_n_hi = static_cast<int64_t>(0x800E800C800A8008LL);
+              mask_m_lo = static_cast<int64_t>(0x0680048002800080LL);
+              mask_m_hi = static_cast<int64_t>(0x0E800C800A800880LL);
+            }
+          } else {  // size == 0b01: halfword granularity.
+            if (is_trn2) {
+              mask_n_lo = static_cast<int64_t>(0x8080070680800302LL);
+              mask_n_hi = static_cast<int64_t>(0x80800F0E80800B0ALL);
+              mask_m_lo = static_cast<int64_t>(0x0706808003028080LL);
+              mask_m_hi = static_cast<int64_t>(0x0F0E80800B0A8080LL);
+            } else {
+              mask_n_lo = static_cast<int64_t>(0x8080050480800100LL);
+              mask_n_hi = static_cast<int64_t>(0x80800D0C80800908LL);
+              mask_m_lo = static_cast<int64_t>(0x0504808001008080LL);
+              mask_m_hi = static_cast<int64_t>(0x0D0C808009088080LL);
+            }
+          }
+          FpRegister mask_n = AllocTempSimdReg();
+          FpRegister mask_m = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovqXRegReg>(mask_n.machine_reg(),
+                                            GetImm(static_cast<uint64_t>(mask_n_lo)));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(mask_n.machine_reg(),
+                                                 GetImm(static_cast<uint64_t>(mask_n_hi)), int8_t{1});
+          builder_.Gen<x86_64::MovqXRegReg>(mask_m.machine_reg(),
+                                            GetImm(static_cast<uint64_t>(mask_m_lo)));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(mask_m.machine_reg(),
+                                                 GetImm(static_cast<uint64_t>(mask_m_hi)), int8_t{1});
+          builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), mask_n.machine_reg());
+          builder_.Gen<x86_64::PshufbXRegXReg>(xm.machine_reg(), mask_m.machine_reg());
+          builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        }
+        case 0b10: {  // .4S (q=1) or .2S (q=0).
+          if (!q) {
+            // TRN1.2S == ZIP1.2S = [s1[0], s2[0]]; TRN2.2S == ZIP2.2S =
+            // [s1[1], s2[1]] (PSRLDQ-4 prelude pulls lane 1 down to 0).
+            if (is_trn2) {
+              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
+              builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
+            }
+            builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            // PSHUFD imm 0x88 (even) / 0xDD (odd) collapses each source's
+            // wanted dwords into both halves; PUNPCKLDQ interleaves the lows:
+            //   res = [s1[0], s2[0], s1[2], s2[2]] = TRN1.4S (0x88), etc.
+            const int8_t imm = is_trn2 ? static_cast<int8_t>(0xDD)
+                                       : static_cast<int8_t>(0x88);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+            builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+        case 0b11: {  // .2D (q=1 only; q=0 caught above).
+          // TRN1.2D == ZIP1.2D, TRN2.2D == ZIP2.2D (2-lane coincidence).
+          if (is_trn2) {
+            builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+      }
+    }
+
+    SetVRegFull(rd, xn, q);
   }
 
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len, uint8_t op, bool q) {
