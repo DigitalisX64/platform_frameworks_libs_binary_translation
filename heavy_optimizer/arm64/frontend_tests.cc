@@ -3235,6 +3235,31 @@ constexpr uint32_t ShrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8
 constexpr uint32_t RshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
   return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10001, rd, rn);
 }
+// SQSHRN/SQSHRN2 (signed saturating narrow): U=0, opcode=10010.
+constexpr uint32_t SqshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10010, rd, rn);
+}
+// UQSHRN/UQSHRN2 (unsigned saturating narrow): U=1, opcode=10010.
+constexpr uint32_t UqshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10010, rd, rn);
+}
+// SQSHRUN/SQSHRUN2 (signed saturating narrow to unsigned): U=1, opcode=10000.
+constexpr uint32_t SqshrunVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10000, rd, rn);
+}
+// SQRSHRN/SQRSHRN2 (signed rounding saturating narrow): U=0, opcode=10011.
+constexpr uint32_t SqrshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/false, immh, immb, /*opcode=*/0b10011, rd, rn);
+}
+// UQRSHRN/UQRSHRN2 (unsigned rounding saturating narrow): U=1, opcode=10011.
+constexpr uint32_t UqrshrnVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10011, rd, rn);
+}
+// SQRSHRUN/SQRSHRUN2 (signed rounding saturating narrow to unsigned): U=1,
+// opcode=10001.
+constexpr uint32_t SqrshrunVec(bool q, uint8_t immh, uint8_t immb, uint8_t rd, uint8_t rn) {
+  return AdvSimdShiftImm(q, /*u=*/true, immh, immb, /*opcode=*/0b10001, rd, rn);
+}
 // SQXTN/SQXTN2: U=0, opcode=10100.
 constexpr uint32_t SqxtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10100, rd, rn);
@@ -3274,6 +3299,34 @@ constexpr uint32_t CmhiVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t
 // CMHS (vector, register, unsigned >=): U=1, opcode=00111.
 constexpr uint32_t CmhsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00111, rd, rn, rm);
+}
+
+// AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
+constexpr uint32_t AdvSimdThreeDiff(
+    bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E200000u | (static_cast<uint32_t>(q) << 30) | (static_cast<uint32_t>(u) << 29) |
+         (static_cast<uint32_t>(size) << 22) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(opcode) << 12) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+// {S,U}MULL/{,2}: opcode=1100 (U picks sign).  {S,U}MLAL: opcode=1000.
+// {S,U}MLSL: opcode=1010.
+constexpr uint32_t UmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b1100, rd, rn, rm);
+}
+constexpr uint32_t SmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1100, rd, rn, rm);
+}
+constexpr uint32_t UmlalVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b1000, rd, rn, rm);
+}
+constexpr uint32_t SmlalVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1000, rd, rn, rm);
+}
+constexpr uint32_t UmlslVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b1010, rd, rn, rm);
+}
+constexpr uint32_t SmlslVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1010, rd, rn, rm);
 }
 
 // Helpers to write/read the scalar lane of a guest V register and to read its
@@ -6008,6 +6061,847 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ExtVec16BIndex0) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x8899AABBCCDDEEFFULL);
 }
 
+// ZIP1/ZIP2, UZP1/UZP2, TRN1/TRN2 vector permute — heavy-tier exec tests.
+// Encodings and inputs/expected values mirror the verified lite exec tests
+// (lite_translate_region_exec_tests.cc); each exercises a distinct heavy
+// lowering path (PUNPCK, PACKUS, SHUFPS, PSHUFB+POR, PSHUFD+PUNPCKLDQ).
+// v1 = Vn, v2 = Vm, v0 = Vd (poisoned 0xAA to catch missing writes/upper-zero).
+constexpr uint32_t kZip1Vec16B = 0x4e023820u;
+constexpr uint32_t kZip2Vec16B = 0x4e027820u;
+constexpr uint32_t kZip1Vec8H  = 0x4e423820u;
+constexpr uint32_t kZip1Vec4S  = 0x4e823820u;
+constexpr uint32_t kZip2Vec4S  = 0x4e827820u;
+constexpr uint32_t kZip1Vec2D  = 0x4ec23820u;
+constexpr uint32_t kZip2Vec2D  = 0x4ec27820u;
+constexpr uint32_t kZip1Vec8B  = 0x0e023820u;
+constexpr uint32_t kZip2Vec8B  = 0x0e027820u;
+constexpr uint32_t kUzp1Vec16B = 0x4e021820u;
+constexpr uint32_t kUzp2Vec16B = 0x4e025820u;
+constexpr uint32_t kUzp1Vec8H  = 0x4e421820u;
+constexpr uint32_t kUzp1Vec4S  = 0x4e821820u;
+constexpr uint32_t kUzp2Vec4S  = 0x4e825820u;
+constexpr uint32_t kUzp1Vec2D  = 0x4ec21820u;
+constexpr uint32_t kUzp1Vec8B  = 0x0e021820u;
+constexpr uint32_t kUzp1Vec2S  = 0x0e821820u;
+constexpr uint32_t kTrn1Vec16B = 0x4e022820u;
+constexpr uint32_t kTrn2Vec16B = 0x4e026820u;
+constexpr uint32_t kTrn1Vec8H  = 0x4e422820u;
+constexpr uint32_t kTrn2Vec8H  = 0x4e426820u;
+constexpr uint32_t kTrn1Vec4S  = 0x4e822820u;
+constexpr uint32_t kTrn2Vec4S  = 0x4e826820u;
+constexpr uint32_t kTrn1Vec2D  = 0x4ec22820u;
+constexpr uint32_t kTrn1Vec8B  = 0x0e022820u;
+constexpr uint32_t kTrn1Vec2S  = 0x0e822820u;
+
+// ---- ZIP ----
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip2Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[8 + i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[8 + i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x0908,0x0B0A,0x0D0C,0x0F0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x1918,0x1B1A,0x1D1C,0x1F1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[i]) << "lane " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], vn[1]);
+  EXPECT_EQ(r[3], vm[1]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip2Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[2]);
+  EXPECT_EQ(r[1], vm[2]);
+  EXPECT_EQ(r[2], vn[3]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kZip1Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111111111111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kZip2Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x2222222222222222ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xBBBBBBBBBBBBBBBBULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip1Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip1Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[i]) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Zip2Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kZip2Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[4 + i]) << "lane " << i;
+    EXPECT_EQ(r[2 * i + 1], vm[4 + i]) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+// ---- UZP ----
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vn[2 * i]) << "vn byte " << i;
+    EXPECT_EQ(r[8 + i], vm[2 * i]) << "vm byte " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], vn[2 * i + 1]) << "vn byte " << i;
+    EXPECT_EQ(r[8 + i], vm[2 * i + 1]) << "vm byte " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec8H) {
+  // High-bit halfwords pin PACKUSDW: each masked dword is in 0..0xFFFF so
+  // saturation must be a no-op.
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[i], vn[2 * i]) << "vn halfword " << i;
+    EXPECT_EQ(r[4 + i], vm[2 * i]) << "vm halfword " << i;
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vm[0]);
+  EXPECT_EQ(r[3], vm[2]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp2Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vn[3]);
+  EXPECT_EQ(r[2], vm[1]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kUzp1Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111111111111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec8B) {
+  // Upper 8 bytes of vn/vm are garbage and MUST NOT leak into the result.
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vn[2]);
+  EXPECT_EQ(r[2], vn[4]);
+  EXPECT_EQ(r[3], vn[6]);
+  EXPECT_EQ(r[4], vm[0]);
+  EXPECT_EQ(r[5], vm[2]);
+  EXPECT_EQ(r[6], vm[4]);
+  EXPECT_EQ(r[7], vm[6]);
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uzp1Vec2S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0x12345678u, 0x9ABCDEF0u};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kUzp1Vec2S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+// ---- TRN ----
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn2Vec16B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn2Vec16B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i + 1]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i + 1]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn2Vec8H) {
+  uint16_t vn[8] = {0x0100,0x0302,0x0504,0x0706,0x8908,0x8B0A,0xFD0C,0xFF0E};
+  uint16_t vm[8] = {0x1110,0x1312,0x1514,0x1716,0x9918,0x9B1A,0xED1C,0xEF1E};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn2Vec8H};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(r[2 * i], vn[2 * i + 1]) << "lane " << (2 * i);
+    EXPECT_EQ(r[2 * i + 1], vm[2 * i + 1]) << "lane " << (2 * i + 1);
+  }
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], vn[2]);
+  EXPECT_EQ(r[3], vm[2]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn2Vec4S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn2Vec4S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[1]);
+  EXPECT_EQ(r[1], vm[1]);
+  EXPECT_EQ(r[2], vn[3]);
+  EXPECT_EQ(r[3], vm[3]);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec2D) {
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 2, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);
+  static const uint32_t code[] = {kTrn1Vec2D};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111111111111111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xAAAAAAAAAAAAAAAAULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec8B) {
+  uint8_t vn[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                    0xFF,0xFE,0xFD,0xFC,0xFB,0xFA,0xF9,0xF8};
+  uint8_t vm[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                    0xEF,0xEE,0xED,0xEC,0xEB,0xEA,0xE9,0xE8};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec8B};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], vn[2]);
+  EXPECT_EQ(r[3], vm[2]);
+  EXPECT_EQ(r[4], vn[4]);
+  EXPECT_EQ(r[5], vm[4]);
+  EXPECT_EQ(r[6], vn[6]);
+  EXPECT_EQ(r[7], vm[6]);
+  for (int i = 8; i < 16; ++i) EXPECT_EQ(r[i], 0u) << "upper byte " << i;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Trn1Vec2S) {
+  uint32_t vn[4] = {0x11111111u, 0x22222222u, 0xDEADBEEFu, 0xCAFEBABEu};
+  uint32_t vm[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0x12345678u, 0x9ABCDEF0u};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kTrn1Vec2S};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], vn[0]);
+  EXPECT_EQ(r[1], vm[0]);
+  EXPECT_EQ(r[2], 0u);
+  EXPECT_EQ(r[3], 0u);
+}
+
+// AdvSimdTableLookup heavy-tier exec tests — TBL/TBX (8B/16B forms, 1..4 table
+// registers). Encodings/inputs/expected values mirror the validated lite
+// exec tests verbatim (JIT-vs-interpreter proven there).
+//   Encoding: bits[31]=0, bits[30]=Q, bits[29:24]=001110, bits[23:22]=00,
+//   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:13]=len, bit12=op, bits[11:10]=00,
+//   bits[9:5]=Rn, bits[4:0]=Rd. Q=0 → 8B form, Q=1 → 16B form.
+//   len ∈ {0,1,2,3} → 1..4 table registers; op: 0=TBL, 1=TBX.
+constexpr uint32_t TblTbxEnc(uint8_t q, uint8_t rd, uint8_t rn, uint8_t rm,
+                             uint8_t len, uint8_t op) {
+  return (static_cast<uint32_t>(q) << 30) | 0x0E000000u |
+         (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(len) << 13) |
+         (static_cast<uint32_t>(op) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B — identity permutation selects Vn unchanged.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16BIdentity) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xA0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(i);
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 2, 0, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+}
+
+// TBL — out-of-range index gives 0 (NOT a wrapped lookup).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16BOutOfRangeZeros) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x10 + i);
+  }
+  for (int i = 0; i < 8; ++i)  idx_bytes[i] = static_cast<uint8_t>(i);
+  for (int i = 8; i < 16; ++i) idx_bytes[i] = static_cast<uint8_t>(16 + i);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 2, 0, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i << " (out-of-range must be 0)";
+  }
+}
+
+// TBL — high-bit indices (128..255) yield 0 (native PSHUFB behaviour).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16BHighBitIndexZeros) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(0x80 | i);
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 2, 0, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(&state_.cpu.v[0])[i], 0u) << "byte " << i;
+  }
+}
+
+// TBL Vd.8B (Q=0): only low 8 bytes computed; upper 8 zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl8BUpperZero) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xE0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(i);
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(0, 0, 1, 2, 0, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i << " (upper must be 0)";
+  }
+}
+
+// TBX — out-of-range index preserves Vd (the key TBX-vs-TBL difference).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbx16BPreservesVdOnOOR) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  uint8_t vd_initial[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x40 + i);
+    vd_initial[i]  = static_cast<uint8_t>(0x90 + i);
+  }
+  for (int i = 0; i < 8; ++i)  idx_bytes[i] = static_cast<uint8_t>(i);
+  for (int i = 8; i < 16; ++i) idx_bytes[i] = static_cast<uint8_t>(16 + i);
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 2, 0, 1)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], table_bytes[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], vd_initial[i]) << "byte " << i << " (TBX preserves Vd)";
+  }
+}
+
+// TBX Vd.8B (Q=0): preserved bytes in low 8 honour Vd; upper 8 always 0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbx8BUpperZeroDespiteVd) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  uint8_t vd_initial[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0x50 + i);
+    vd_initial[i]  = static_cast<uint8_t>(0xA0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(0xFF);
+  }
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {TblTbxEnc(0, 0, 1, 2, 0, 1)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(out[i], vd_initial[i]) << "byte " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(out[i], 0u) << "byte " << i;
+  }
+}
+
+// TBL 2-reg table: indices 0..15 → Vn, 16..31 → V(n+1).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16B2RegSpan) {
+  uint8_t t0[16], t1[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i]  = static_cast<uint8_t>(0x20 + i);
+    t1[i]  = static_cast<uint8_t>(0x60 + i);
+    idx[i] = static_cast<uint8_t>(2 * i);
+  }
+  std::memcpy(&state_.cpu.v[1], t0,  16);
+  std::memcpy(&state_.cpu.v[2], t1,  16);
+  std::memcpy(&state_.cpu.v[3], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 3, 1, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    int j = 2 * i;
+    uint8_t expected = (j < 16) ? t0[j] : t1[j - 16];
+    EXPECT_EQ(out[i], expected) << "byte " << i << " idx=" << j;
+  }
+}
+
+// TBL 3-reg table: transitions around register boundaries (15/16, 31/32).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16B3RegBoundaries) {
+  uint8_t t0[16], t1[16], t2[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i] = static_cast<uint8_t>(0x10 + i);
+    t1[i] = static_cast<uint8_t>(0x50 + i);
+    t2[i] = static_cast<uint8_t>(0x90 + i);
+  }
+  uint8_t test_idx[16] = {14, 15, 16, 17, 30, 31, 32, 33,
+                          47, 48, 50, 60, 0, 16, 32, 47};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[1], t0,  16);
+  std::memcpy(&state_.cpu.v[2], t1,  16);
+  std::memcpy(&state_.cpu.v[3], t2,  16);
+  std::memcpy(&state_.cpu.v[4], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 4, 2, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  auto lookup = [&](int j) -> uint8_t {
+    if (j < 16)      return t0[j];
+    else if (j < 32) return t1[j - 16];
+    else if (j < 48) return t2[j - 32];
+    else             return 0;
+  };
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], lookup(test_idx[i])) << "byte " << i;
+  }
+}
+
+// TBL 4-reg table: all four registers plus upper-OOR (64..127) zero case.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16B4RegFull) {
+  uint8_t t[4][16], idx[16];
+  for (int r = 0; r < 4; ++r) {
+    for (int i = 0; i < 16; ++i) {
+      t[r][i] = static_cast<uint8_t>((r << 4) | i);
+    }
+  }
+  uint8_t test_idx[16] = {0, 16, 32, 48, 15, 31, 47, 63,
+                          64, 100, 1, 17, 33, 49, 60, 70};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[1], t[0], 16);
+  std::memcpy(&state_.cpu.v[2], t[1], 16);
+  std::memcpy(&state_.cpu.v[3], t[2], 16);
+  std::memcpy(&state_.cpu.v[4], t[3], 16);
+  std::memcpy(&state_.cpu.v[5], idx, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 5, 3, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t expected = (test_idx[i] < 64) ? test_idx[i] : 0u;
+    EXPECT_EQ(out[i], expected) << "byte " << i;
+  }
+}
+
+// TBX 2-reg: in-range bytes get the lookup; OOR bytes preserve Vd.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbx16B2RegMixed) {
+  uint8_t t0[16], t1[16], vd_initial[16], idx[16];
+  for (int i = 0; i < 16; ++i) {
+    t0[i]         = static_cast<uint8_t>(0x30 + i);
+    t1[i]         = static_cast<uint8_t>(0x70 + i);
+    vd_initial[i] = static_cast<uint8_t>(0xB0 + i);
+  }
+  uint8_t test_idx[16] = {0, 1, 16, 17, 32, 200, 33, 100,
+                          15, 31, 14, 30, 64, 0, 50, 31};
+  std::memcpy(idx, test_idx, 16);
+  std::memcpy(&state_.cpu.v[0], vd_initial, 16);
+  std::memcpy(&state_.cpu.v[1], t0, 16);
+  std::memcpy(&state_.cpu.v[2], t1, 16);
+  std::memcpy(&state_.cpu.v[3], idx, 16);
+  static const uint32_t code[] = {TblTbxEnc(1, 0, 1, 3, 1, 1)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[0], 16);
+  auto lookup = [&](int j, int byte_i) -> uint8_t {
+    if (j < 16)      return t0[j];
+    else if (j < 32) return t1[j - 16];
+    else             return vd_initial[byte_i];
+  };
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], lookup(test_idx[i], i)) << "byte " << i;
+  }
+}
+
+// TBL with Vd == Vn (in-place table): table read before Vd written.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16BInPlaceVdEqualsVn) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>(15 - i);
+  }
+  std::memcpy(&state_.cpu.v[5], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[2], idx_bytes, 16);
+  static const uint32_t code[] = {TblTbxEnc(1, 5, 5, 2, 0, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[5], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[15 - i]) << "byte " << i;
+  }
+}
+
+// TBL with Vd == Vm (in-place index): index read before Vd written.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Tbl16BInPlaceVdEqualsVm) {
+  uint8_t table_bytes[16];
+  uint8_t idx_bytes[16];
+  for (int i = 0; i < 16; ++i) {
+    table_bytes[i] = static_cast<uint8_t>(0xD0 + i);
+    idx_bytes[i]   = static_cast<uint8_t>((i * 3) & 0x0F);
+  }
+  std::memcpy(&state_.cpu.v[1], table_bytes, 16);
+  std::memcpy(&state_.cpu.v[7], idx_bytes, 16);
+  static const uint32_t code[] = {TblTbxEnc(1, 7, 1, 7, 0, 0)};
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  uint8_t out[16];
+  std::memcpy(out, &state_.cpu.v[7], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(out[i], table_bytes[idx_bytes[i]]) << "byte " << i;
+  }
+}
+
 // UMOV / SMOV / INS (element). Vn (v1) throughout for the register-move tests:
 //   lo = 0xF0E1D2C3B4A59687  -> b0=0x87 b1=0x96 b2=0xA5 b3=0xB4 b4=0xC3
 //                              b5=0xD2 b6=0xE1 b7=0xF0
@@ -6904,6 +7798,142 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ShrnVecReservedBails) {
   EXPECT_EQ(n, 0u);
 }
 
+// SQSHRN v0.8b, v1.8h, #4 (immh=0001, immb=4, Q=0): signed saturating narrow
+// 16->8 with arithmetic right shift + PMINSW/PMAXSW clamp to [-128,127].
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqshrnVec8B) {
+  static const uint32_t code[] = {SqshrnVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0300 7FFF 8000 FFF0 ; lanes 4-7: 0800 F800 0000 FFFF.
+  SetV128(&state_, 1, 0xFFF080007FFF0300ULL, 0xFFFF0000F8000800ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (sarw lane, 4) clamped [-128,127], low byte per lane:
+  //   48->30, 2047->7F(sat), -2048->80(sat min), -1->FF, 128->7F(sat),
+  //   -128->80, 0->00, -1->FF.
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF00807FFF807F30ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// UQSHRN v0.4h, v1.4s, #12 (immh=0010, immb=4, Q=0): unsigned saturating narrow
+// 32->16 with logical right shift + PMINUD clamp to 0xFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqshrnVec4H) {
+  static const uint32_t code[] = {UqshrnVec(/*q=*/false, /*immh=*/0b0010, /*immb=*/4, 0, 1)};
+  // Vn.4s words: 0x00012345 0xFFFFFFFF 0x0FFFF000 0x00007000. shift=12.
+  SetV128(&state_, 1, 0xFFFFFFFF00012345ULL, 0x000070000FFFF000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (word>>12) clamped 0xFFFF, low 16 per lane: 0x12, 0xFFFFF->0xFFFF(sat),
+  //   0xFFFF, 0x07.
+  EXPECT_EQ(VLo64(&state_, 0), 0x0007FFFFFFFF0012ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// SQSHRUN2 v0.16b, v1.8h, #4 (immh=0001, immb=4, Q=1): signed->unsigned
+// saturating narrow 16->8 into the upper half; PMAXSW-vs-0 pins negatives to 0,
+// PMINSW caps positives at 0xFF; Vd[63:0] preserved.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Sqshrun2Vec16B) {
+  static const uint32_t code[] = {SqshrunVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0300 F800 7FFF 0FF0 ; lanes 4-7: FFFF 0100 1000 0000.
+  SetV128(&state_, 1, 0x0FF07FFFF8000300ULL, 0x000010000100FFFFULL);
+  // Vd low 64 preserved; upper is overwritten by the narrowed lanes.
+  SetV128(&state_, 0, 0x1111222233334444ULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (sarw lane, 4) clamped [0,255], low byte per lane:
+  //   48->30, -128->00, 2047->FF(sat), 255->FF, -1->00, 16->10, 256->FF(sat),
+  //   0->00.
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111222233334444ULL);       // Vd[63:0] preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00FF1000FFFF0030ULL);
+}
+
+// SQSHRN v0.2s, v1.2d, #28 (immh=0100, immb=4, Q=0): src=64 needs PSRAQ
+// (AVX-512F-VL) which baseline SSE lacks — heavy bails to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqshrnVecSrc64Bails) {
+  static const uint32_t code[] = {SqshrnVec(/*q=*/false, /*immh=*/0b0100, /*immb=*/4, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SQRSHRN v0.8b, v1.8h, #4 (immh=0001, immb=4, Q=0): signed rounding saturating
+// narrow 16->8. PADDSW pre-add of (1<<3)=8 (saturating), PSRAW #4, PMINSW/PMAXSW
+// clamp to [-128,127].
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrshrnVec8B) {
+  static const uint32_t code[] = {SqrshrnVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0078 07F8 7FFF 0088 ; lanes 4-7: FFF8 FF88 8000 0000.
+  SetV128(&state_, 1, 0x00887FFF07F80078ULL, 0x00008000FF88FFF8ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ((lane + 8) >>4 signed) clamped [-128,127], low byte per lane:
+  //   120->8, 2040->127->7F, 32767(PADDSW-sat->32767)->2047->7F, 136->9,
+  //   -8->0, -120->-7->F9, -32760->-2048->-128->80, 0->0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x0080F900097F7F08ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// UQRSHRN v0.4h, v1.4s, #12 (immh=0010, immb=4, Q=0): unsigned rounding
+// saturating narrow 32->16. PMINUD pre-clamp to (0xFFFFFFFF-0x800), PADDD
+// +0x800, PSRLD #12, PMINUD clamp to 0xFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqrshrnVec4H) {
+  static const uint32_t code[] = {UqrshrnVec(/*q=*/false, /*immh=*/0b0010, /*immb=*/4, 0, 1)};
+  // Vn.4s words: 0x00001800 0xFFFFFFFF | 0x00002800 0x00000700. shift=12.
+  SetV128(&state_, 1, 0xFFFFFFFF00001800ULL, 0x0000070000002800ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ((word + 0x800) >>12 unsigned) clamped 0xFFFF, low 16 per lane:
+  //   0x1800->2, 0xFFFFFFFF(preclamp+add->0xFFFFFFFF)>>12=0xFFFFF->0xFFFF,
+  //   0x2800->3, 0x0700->0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000003FFFF0002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zero
+}
+
+// SQRSHRUN2 v0.16b, v1.8h, #4 (immh=0001, immb=4, Q=1): signed->unsigned
+// rounding saturating narrow 16->8 into the upper half. Carry-bit identity
+// ((x+8)>>4 == (x>>4)+bit3(x)) avoids premature saturation; PMAXSW-vs-0 then
+// PMINSW cap to [0,255]; Vd[63:0] preserved.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Sqrshrun2Vec16B) {
+  static const uint32_t code[] = {SqrshrunVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // Vn.8h lanes 0-3: 0078 FF88 07FF 0FF8 ; lanes 4-7: FFFF 0100 0808 0000.
+  SetV128(&state_, 1, 0x0FF807FFFF880078ULL, 0x000008080100FFFFULL);
+  // Vd low 64 preserved; upper is overwritten by the narrowed lanes.
+  SetV128(&state_, 0, 0x1111222233334444ULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // ((lane + 8) >>4 signed) clamped [0,255], low byte per lane:
+  //   120->8, -120->-7->0, 2047->128->80, 4088->256->255->FF,
+  //   -1->0->0, 256->16->10, 2056->129->81, 0->0.
+  EXPECT_EQ(VLo64(&state_, 0), 0x1111222233334444ULL);       // Vd[63:0] preserved
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00811000FF800008ULL);
+}
+
+// SQRSHRN v0.2s, v1.2d, #28 (immh=0100, immb=4, Q=0): src=64 needs PSRAQ which
+// baseline SSE lacks — heavy bails to lite (same as the non-rounding sibling).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrshrnVecSrc64Bails) {
+  static const uint32_t code[] = {SqrshrnVec(/*q=*/false, /*immh=*/0b0100, /*immb=*/4, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
 // SQXTN v0.8b, v1.8h (size=00, Q=0): signed saturating narrow (PACKSSWB).
 TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnVec8B) {
   static const uint32_t code[] = {SqxtnVec(0b00, /*q=*/false, 0, 1)};
@@ -7266,6 +8296,206 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, CmhiVec2DBails) {
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
   EXPECT_EQ(n, 0u);
+}
+
+// AdvSimdThreeDiff widening multiply-accumulate (heavy tier). Result always
+// fills 128 bits (8H/4S/2D). Signed vs unsigned diverge on high-bit inputs;
+// the "2" (Q=1) forms take the upper 64 of Vn/Vm; MLAL/MLSL wrap (no
+// saturation). Expected values match lite_translator.h::AdvSimdThreeDiff.
+
+// UMULL .8H: 8x (unsigned byte * byte) -> 16-bit lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmullVec8H) {
+  static const uint32_t code[] = {UmullVec(0b00, /*q=*/false, 0, 1, 2)};
+  // Vn.8B={2,3,0xFF,0x10,0,1,4,5} Vm.8B={4,5,2,0x10,7,9,3,2}
+  SetV128(&state_, 1, 0x0504010010FF0302ULL, 0xEEEEEEEEEEEEEEEEULL);  // upper ignored
+  SetV128(&state_, 2, 0x0203090710020504ULL, 0xDDDDDDDDDDDDDDDDULL);  // upper ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={8,15,510,256,0,9,12,10}
+  EXPECT_EQ(VLo64(&state_, 0), 0x010001FE000F0008ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000A000C00090000ULL);
+}
+
+// SMULL .8H: signed byte products (distinguishes from UMULL via 0xFF/0x80).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmullVec8H) {
+  static const uint32_t code[] = {SmullVec(0b00, /*q=*/false, 0, 1, 2)};
+  // Vn.8B={0xFF,0x80,0x7F,0x02,0x00,0xFE,0x10,0x01}
+  SetV128(&state_, 1, 0x0110FE00027F80FFULL, 0xEEEEEEEEEEEEEEEEULL);
+  // Vm.8B={0x02,0x02,0x02,0x03,0x05,0xFF,0x10,0x7F}
+  SetV128(&state_, 2, 0x7F10FF0503020202ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={-2,-256,254,6,0,2,256,127}
+  EXPECT_EQ(VLo64(&state_, 0), 0x000600FEFF00FFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x007F010000020000ULL);
+}
+
+// UMULL .4S: 4x (unsigned halfword * halfword) -> 32-bit lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmullVec4S) {
+  static const uint32_t code[] = {UmullVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vn.4H={0xFFFF,0x1234,0x0002,0x0100} Vm.4H={0xFFFF,0x0002,0x0003,0x0010}
+  SetV128(&state_, 1, 0x010000021234FFFFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x001000030002FFFFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={0xFFFE0001,0x2468,6,0x1000}
+  EXPECT_EQ(VLo64(&state_, 0), 0x00002468FFFE0001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000100000000006ULL);
+}
+
+// SMULL .4S: signed halfword products (0xFFFF=-1, 0x8000=INT16_MIN).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmullVec4S) {
+  static const uint32_t code[] = {SmullVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vn.4H={0xFFFF,0x8000,0x7FFF,0x0002} Vm.4H={2,2,2,3}
+  SetV128(&state_, 1, 0x00027FFF8000FFFFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0003000200020002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={-2,-65536,65534,6}
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF0000FFFFFFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000000060000FFFEULL);
+}
+
+// UMULL .2D: 2x (unsigned word * word) -> 64-bit lanes (PMULUDQ path).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmullVec2D) {
+  static const uint32_t code[] = {UmullVec(0b10, /*q=*/false, 0, 1, 2)};
+  // Vn.2S={0xFFFFFFFF,0x00010000} Vm.2S={0xFFFFFFFF,0x00000003}
+  SetV128(&state_, 1, 0x00010000FFFFFFFFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x00000003FFFFFFFFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={0xFFFFFFFE00000001, 0x30000}
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFE00000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000030000ULL);
+}
+
+// SMULL .2D: signed word products (INT32_MIN, -1) (PMULDQ path).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmullVec2D) {
+  static const uint32_t code[] = {SmullVec(0b10, /*q=*/false, 0, 1, 2)};
+  // Vn.2S={0xFFFFFFFF(-1),0x80000000} Vm.2S={2,2}
+  SetV128(&state_, 1, 0x80000000FFFFFFFFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0000000200000002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={-2, -4294967296}
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFF00000000ULL);
+}
+
+// UMULL2 .8H: Q=1 takes bytes 8..15 of Vn/Vm; low halves must be ignored.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Umull2Vec8H) {
+  static const uint32_t code[] = {UmullVec(0b00, /*q=*/true, 0, 1, 2)};
+  // Vn.16B hi={1,2,3,4,5,6,7,8} Vm.16B hi={2,2,2,2,2,2,2,2}
+  SetV128(&state_, 1, 0xDEADBEEFDEADBEEFULL, 0x0807060504030201ULL);
+  SetV128(&state_, 2, 0xCAFECAFECAFECAFEULL, 0x0202020202020202ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={2,4,6,8,10,12,14,16}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0008000600040002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0010000E000C000AULL);
+}
+
+// SMULL2 .4S: Q=1 + signed halfword products from the upper half.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Smull2Vec4S) {
+  static const uint32_t code[] = {SmullVec(0b01, /*q=*/true, 0, 1, 2)};
+  // Vn.8H hi={0xFFFF,0x0003,0x8000,0x0002} Vm.8H hi={2,2,2,2}
+  SetV128(&state_, 1, 0xDEADBEEFDEADBEEFULL, 0x000280000003FFFFULL);
+  SetV128(&state_, 2, 0x1111111111111111ULL, 0x0002000200020002ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={-2,6,-65536,4}
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000006FFFFFFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000004FFFF0000ULL);
+}
+
+// UMLAL .4S: accumulate into Vd (32-bit wrap, no saturation).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmlalVec4S) {
+  static const uint32_t code[] = {UmlalVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vd.4S={10,20,0xFFFFFFFF,100} Vn.4H={3,4,5,6} Vm.4H={2,2,2,2}
+  SetV128(&state_, 0, 0x000000140000000AULL, 0x00000064FFFFFFFFULL);
+  SetV128(&state_, 1, 0x0006000500040003ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0002000200020002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={6,8,10,12}; Vd+={16,28,9(wrap),112}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000001C00000010ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000007000000009ULL);
+}
+
+// SMLAL .8H: signed accumulate (16-bit wrap).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmlalVec8H) {
+  static const uint32_t code[] = {SmlalVec(0b00, /*q=*/false, 0, 1, 2)};
+  // Vd.8H={0x10,0x20,0xFFFF,0,1,2,3,4}
+  SetV128(&state_, 0, 0x0000FFFF00200010ULL, 0x0004000300020001ULL);
+  // Vn.8B={0xFF,0x02,0x80,0x03,0x04,0x05,0x06,0x07}
+  SetV128(&state_, 1, 0x07060504038002FFULL, 0xEEEEEEEEEEEEEEEEULL);
+  // Vm.8B={0x02,0x03,0x02,0x04,0x01,0x01,0x01,0x01}
+  SetV128(&state_, 2, 0x0101010104020302ULL, 0xDDDDDDDDDDDDDDDDULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={-2,6,-256,12,4,5,6,7}; Vd+={0x000E,0x0026,0xFEFF,0x000C,5,7,9,0x0B}
+  EXPECT_EQ(VLo64(&state_, 0), 0x000CFEFF0026000EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000B000900070005ULL);
+}
+
+// SMLSL .4S: signed subtract-accumulate (Vd -= products).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmlslVec4S) {
+  static const uint32_t code[] = {SmlslVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vd.4S={100,50,0,10} Vn.4H={0xFFFF,3,5,0x7FFF} Vm.4H={2,2,2,2}
+  SetV128(&state_, 0, 0x0000003200000064ULL, 0x0000000A00000000ULL);
+  SetV128(&state_, 1, 0x7FFF00050003FFFFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0002000200020002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={-2,6,10,65534}; Vd-={102,44,-10,-65524}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000002C00000066ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFF000CFFFFFFF6ULL);
+}
+
+// UMLSL .2D: unsigned subtract-accumulate (PMULUDQ + PSUBQ, 64-bit wrap).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmlslVec2D) {
+  static const uint32_t code[] = {UmlslVec(0b10, /*q=*/false, 0, 1, 2)};
+  // Vd.2D={0x0000000200000003,5} Vn.2S={0xFFFFFFFF,2} Vm.2S={2,3}
+  SetV128(&state_, 0, 0x0000000200000003ULL, 0x0000000000000005ULL);
+  SetV128(&state_, 1, 0x00000002FFFFFFFFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0000000300000002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products={0x1FFFFFFFE,6}; Vd-={5, -1(wrap)}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000005ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);
 }
 
 }  // namespace

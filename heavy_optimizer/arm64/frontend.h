@@ -2998,9 +2998,113 @@ class HeavyOptimizerFrontend {
     SetVRegFull(args.rd, vn, args.q);
   }
 
+  // Heavy-tier mirror of the register-domain-pure widening multiply-accumulate
+  // subset of lite_translator.h::AdvSimdThreeDiff:
+  //   {S,U}MULL{,2}, {S,U}MLAL{,2}, {S,U}MLSL{,2}
+  // at input sizes 8/16/32 (size 00/01/10) and both Q halves. The widening
+  // recipe matches lite exactly: widen both narrow sources (PMOVSX/PMOVZX per
+  // sign), lane-wise multiply (PMULLW / PMULLD / PMULDQ|PMULUDQ), then for the
+  // accumulate forms load Vd and PADD/PSUB at the wide lane width. The result
+  // always fills 128 bits (8H/4S/2D), so SetVRegFull q=true regardless of Q.
+  // Q=1 ("2") forms widen the upper 64 of Vn/Vm — bring bytes 8..15 down with
+  // PSRLDQ before widening. Every other ThreeDiff opcode (widening add/sub,
+  // ABDL/ABAL, ADDHN/SUBHN, PMULL, SQDMULL family) still bails to the lite
+  // tier — emit NOTHING before a bail.
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    using Op = Decoder::AdvSimdThreeDiffOpcode;
+    const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
+    const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
+    const bool is_mlsl = (args.opcode == Op::kSmlsl || args.opcode == Op::kUmlsl);
+    if ((!is_mull && !is_mlal && !is_mlsl) || args.size > 0b10) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_signed = (args.opcode == Op::kSmull ||
+                            args.opcode == Op::kSmlal ||
+                            args.opcode == Op::kSmlsl);
+    const int32_t vn_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const int32_t vm_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    if (args.q) {
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+    }
+    switch (args.size) {
+      case 0b00:
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        }
+        builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        break;
+      case 0b01:
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        }
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        break;
+      case 0b10:
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmuludqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        break;
+    }
+
+    if (is_mull) {
+      SetVRegFull(args.rd, xn, /*q=*/true);
+      return;
+    }
+
+    const int32_t vd_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+    FpRegister xd = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+    switch (args.size) {
+      case 0b00:
+        if (is_mlal) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+        break;
+      case 0b01:
+        if (is_mlal) {
+          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+        break;
+      case 0b10:
+        if (is_mlal) {
+          builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+        break;
+    }
+    SetVRegFull(args.rd, xd, /*q=*/true);
   }
 
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
@@ -4272,6 +4376,267 @@ class HeavyOptimizerFrontend {
         }
         return;
       }
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqshrun:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kUqrshrn:
+      case Decoder::AdvSimdShiftImmOpcode::kSqrshrun: {
+        // (Rounding and non-rounding) saturating shift-right narrow (vector,
+        // 16/32-bit source).  Mirrors lite_translator.h::AdvSimdShiftByImm's
+        // saturating narrow path: (rounding only) add the per-lane rounding
+        // bias -> shift each wide lane right (arithmetic for a signed source,
+        // logical for unsigned) -> clamp to the destination range ->
+        // PSHUFB-gather the low half of each lane into the packed low 64.
+        //   SQSHRN/SQRSHRN   (signed->signed):     PSRA{W,D} + PMINS/PMAXS clamp.
+        //   UQSHRN/UQRSHRN   (unsigned->unsigned): PSRL{W,D} + PMINU clamp.
+        //   SQSHRUN/SQRSHRUN (signed->unsigned):   PSRA{W,D} + PMAXS-vs-0 + PMINS.
+        // Rounding bias:
+        //   SQRSHRN: signed-saturating pre-add of (1<<(shift-1)) — PADDSW for
+        //     src16, PMINSD-preclamp+PADDD for src32 (no integer PADDSD).
+        //   UQRSHRN: unsigned-saturating pre-add — PADDUSW for src16,
+        //     PMINUD-preclamp+PADDD for src32.
+        //   SQRSHRUN: the carry-bit identity (x+(1<<(s-1)))>>s == (x>>s) +
+        //     bit(s-1 of x) for arithmetic >> — compute the carry pre-shift
+        //     (PSLL then PSRL to bit 0), add it after the shift; avoids a
+        //     premature signed saturation that would drop 1 LSB at the boundary.
+        // src=64 needs PSRAQ (AVX-512F-VL) for the signed shift and a manual
+        // hi32-nonzero rewrite for the unsigned clamp; UQRSHRN src=64 needs a
+        // saturating PADDQ — all of which the lite tier also bails, so bail
+        // here.  The scalar forms fall to lite via the bail below.
+        if (immh & 0b1000) {  // RESERVED for narrowing shifts.
+          UndefinedReturningVoid();
+          return;
+        }
+        if (args.scalar) {  // Scalar saturating narrow -> lite handles it.
+          UndefinedReturningVoid();
+          return;
+        }
+        uint8_t src_bits;
+        if (immh & 0b0100) {
+          src_bits = 64;
+        } else if (immh & 0b0010) {
+          src_bits = 32;
+        } else {  // immh == 0b0001
+          src_bits = 16;
+        }
+        if (src_bits == 64) {  // needs PSRAQ / manual clamp -> bail to lite.
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_rounding =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrun);
+        const bool is_saturating_signed =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrn);
+        const bool is_saturating_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqshrn) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kUqrshrn);
+        const bool is_signed_to_unsigned =
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqshrun) ||
+            (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSqrshrun);
+        // Signed source (SQSHRN/SQSHRUN + rounding) uses an arithmetic right
+        // shift; unsigned source (UQSHRN/UQRSHRN) uses a logical right shift.
+        const bool uses_signed_shift =
+            is_saturating_signed || is_signed_to_unsigned;
+        const uint8_t narrow_rshift = static_cast<uint8_t>(src_bits - immh_immb);
+        const int8_t cnt = static_cast<int8_t>(narrow_rshift);
+
+        // Materialize a broadcast constant (`pattern` in both qwords) into a
+        // fresh SIMD reg — the rounding bias and the clamp bounds need this.
+        auto broadcast = [&](uint64_t pattern) -> FpRegister {
+          FpRegister x = AllocTempSimdReg();
+          Register gr =
+              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
+          builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+          return x;
+        };
+
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+
+        // xcarry holds the SQRSHRUN pre-shift rounding carry (0/1 per lane);
+        // computed while xn is intact, added back after the arithmetic shift.
+        FpRegister xcarry;
+        if (is_rounding) {
+          const uint64_t round_lane = uint64_t{1} << (narrow_rshift - 1);
+          const uint64_t round_pattern =
+              (src_bits == 16) ? round_lane * uint64_t{0x0001000100010001ULL}
+                               : round_lane * uint64_t{0x0000000100000001ULL};
+          if (is_saturating_unsigned) {
+            FpRegister xround = broadcast(round_pattern);
+            if (src_bits == 16) {
+              // PADDUSW: unsigned-saturating word add (SSE2).
+              builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(),
+                                                    xround.machine_reg());
+            } else {
+              // No unsigned-saturating PADDUSD in baseline SSE; pre-clamp xn to
+              // (0xFFFFFFFF - round_lane) so the plain PADDD cannot overflow
+              // past UINT32_MAX. Lanes hitting the pre-clamp settle at exactly
+              // UINT32_MAX, which the post-shift PMINUD then narrows correctly.
+              const uint32_t clamp_lane =
+                  0xFFFFFFFFu - static_cast<uint32_t>(round_lane);
+              const uint64_t clamp_pattern =
+                  (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+              FpRegister xclamp = broadcast(clamp_pattern);
+              builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(),
+                                                   xclamp.machine_reg());
+              builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
+                                                  xround.machine_reg());
+            }
+          } else if (is_signed_to_unsigned) {
+            // SQRSHRUN carry-bit identity: isolate bit (cnt-1) of each lane into
+            // bit 0 (shift it to the top, then logically back). No wide add ->
+            // no premature saturation.
+            xcarry = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xcarry.machine_reg(),
+                                                 xn.machine_reg());
+            if (src_bits == 16) {
+              builder_.Gen<x86_64::PsllwXRegImm>(
+                  xcarry.machine_reg(), static_cast<int8_t>(16 - narrow_rshift));
+              builder_.Gen<x86_64::PsrlwXRegImm>(xcarry.machine_reg(), int8_t{15});
+            } else {
+              builder_.Gen<x86_64::PslldXRegImm>(
+                  xcarry.machine_reg(), static_cast<int8_t>(32 - narrow_rshift));
+              builder_.Gen<x86_64::PsrldXRegImm>(xcarry.machine_reg(), int8_t{31});
+            }
+          } else {  // SQRSHRN (signed->signed).
+            FpRegister xround = broadcast(round_pattern);
+            if (src_bits == 16) {
+              // PADDSW: signed-saturating word add (SSE2).
+              builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(),
+                                                   xround.machine_reg());
+            } else {
+              // No integer PADDSD in baseline SSE; pre-clamp xn to
+              // (0x7FFFFFFF - round_lane) so the plain PADDD cannot overflow
+              // positively. The round constant is positive, so no negative
+              // underflow is possible. Lanes hitting the pre-clamp settle at
+              // exactly INT32_MAX after the add, which the post-shift
+              // PMINSD-vs-signed-max then drives to the saturated dst value.
+              const uint32_t clamp_lane =
+                  0x7FFFFFFFu - static_cast<uint32_t>(round_lane);
+              const uint64_t clamp_pattern =
+                  (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
+              FpRegister xclamp = broadcast(clamp_pattern);
+              builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(),
+                                                   xclamp.machine_reg());
+              builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
+                                                  xround.machine_reg());
+            }
+          }
+        }
+
+        if (uses_signed_shift) {
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          }
+        } else {
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          } else {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          }
+        }
+
+        if (is_rounding && is_signed_to_unsigned) {
+          // SQRSHRUN: add the pre-shift rounding carry. Post-shift magnitudes
+          // are small (|x>>cnt| <= INT*_MAX>>1), so a plain PADD cannot overflow
+          // before the unsigned clamp below.
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(),
+                                                xcarry.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
+                                                xcarry.machine_reg());
+          }
+        }
+
+        if (is_saturating_signed) {
+          // Clamp each src-lane to the signed dst range:
+          //   dst 8 : [-128, 127]   as signed 16 = [0xFF80, 0x007F].
+          //   dst 16: [-32768,32767] as signed 32 = [0xFFFF8000, 0x00007FFF].
+          uint64_t sat_max_pattern, sat_min_pattern;
+          if (src_bits == 16) {
+            sat_max_pattern = 0x007F007F007F007FULL;
+            sat_min_pattern = 0xFF80FF80FF80FF80ULL;
+          } else {
+            sat_max_pattern = 0x00007FFF00007FFFULL;
+            sat_min_pattern = 0xFFFF8000FFFF8000ULL;
+          }
+          FpRegister xsatmax = broadcast(sat_max_pattern);
+          FpRegister xsatmin = broadcast(sat_min_pattern);
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+            builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+            builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
+          }
+        } else if (is_signed_to_unsigned) {
+          // SQSHRUN: clamp the post-shift signed value to the unsigned dst
+          // range [0, 2^dst_bits - 1].  PMAXS-vs-zero pins negatives at 0;
+          // after that every lane is non-negative, so a signed PMINS against
+          // the positive dst-max is equivalent to unsigned-min.
+          const uint64_t sat_max_pattern =
+              (src_bits == 16) ? 0x00FF00FF00FF00FFULL   // dst 8: 0xFF
+                               : 0x0000FFFF0000FFFFULL;  // dst 16: 0xFFFF
+          FpRegister xsatmax = broadcast(sat_max_pattern);
+          FpRegister xzero = AllocZeroedSimdReg();
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xzero.machine_reg());
+            builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xzero.machine_reg());
+            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          }
+        } else {  // UQSHRN: unsigned-min clamp to (1 << dst_bits) - 1.
+          const uint64_t sat_pattern =
+              (src_bits == 16) ? 0x00FF00FF00FF00FFULL
+                               : 0x0000FFFF0000FFFFULL;
+          FpRegister xsat = broadcast(sat_pattern);
+          if (src_bits == 16) {
+            builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xsat.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xsat.machine_reg());
+          }
+        }
+
+        // PSHUFB narrow gather: the low-8 selector entries gather each wide
+        // lane's low half into the packed low 64; the high-8 entries (0x80)
+        // zero the upper 64.  Same layout as the SHRN/RSHRN path above.
+        const int64_t mask_lo =
+            (src_bits == 16) ? static_cast<int64_t>(0x0E0C0A0806040200LL)
+                             : static_cast<int64_t>(0x0D0C090805040100LL);
+        FpRegister xmask = AllocTempSimdReg();
+        Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(mask_lo));
+        builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
+        Register gmhi = std::get<0>(
+            Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
+        builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+        if (!args.q) {
+          // Q=0: narrowed lanes in the low 64; SetVRegFull zeroes Vd[127:64].
+          SetVRegFull(args.rd, xn, /*q=*/false);
+        } else {
+          // Q=1 ("...2" form): place narrowed lanes in Vd[127:64], preserve
+          // Vd[63:0].
+          const int32_t vd_off =
+              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          FpRegister xd = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          FpRegister xdlow = AllocZeroedSimdReg();
+          builder_.Gen<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
+          builder_.GenSetSimd<16>(vd_off, xdlow.machine_reg());
+        }
+        return;
+      }
       default:
         UndefinedReturningVoid();
         return;
@@ -4347,14 +4712,302 @@ class HeavyOptimizerFrontend {
     SetVRegFull(rd, xn, /*q=*/true);
   }
 
+  // ZIP1/ZIP2, UZP1/UZP2, TRN1/TRN2 vector permute — heavy-tier mirror of
+  // lite_translator.h::AdvSimdPermute. Register-domain-pure, straight-line SSE:
+  //   ZIP  -> PUNPCKL/H{bw,wd,dq,qdq} (interleave lower/upper halves)
+  //   UZP  -> PACKUSWB/PACKUSDW (byte/halfword) or SHUFPS (word); .2D == ZIP.2D
+  //   TRN  -> PSHUFB + POR with materialized per-byte masks (byte/halfword) or
+  //           PSHUFD + PUNPCKLDQ (word); .2D == ZIP.2D
+  // opcode (3 bits, from Decoder::DecodeAdvSimd): 001=UZP1 010=TRN1 011=ZIP1
+  // 101=UZP2 110=TRN2 111=ZIP2 (same encoding the lite tier consumes).
+  // SetVRegFull(q=false) zeroes Vd[127:64], so no manual upper-zero tail is
+  // needed (unlike the lite path). Q=0 .2D is reserved and bails; unknown
+  // opcodes bail. The emulator host always has SSE4.1 (matching the sibling
+  // USHLL/widening handlers, which use PACKUSDW/PMOVZX unguarded), so the
+  // UZP .8H PACKUSDW form is not host-gated here.
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size, uint8_t opcode, bool q) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, size, opcode, q);
+    if (!success()) {
+      return;
+    }
+    const bool is_zip = (opcode == 0b011 || opcode == 0b111);
+    const bool is_uzp = (opcode == 0b001 || opcode == 0b101);
+    const bool is_trn = (opcode == 0b010 || opcode == 0b110);
+    if (!is_zip && !is_uzp && !is_trn) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (size > 0b11) {
+      UndefinedReturningVoid();
+      return;
+    }
+    // Q=0 .2D is reserved by the ARM ARM (encoding restricted).
+    if (!q && size == 0b11) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rn * 16);
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+
+    if (is_zip) {
+      const bool is_zip2 = (opcode == 0b111);
+      if (!q && is_zip2) {
+        // Shift each source right by 4 bytes so the (originally upper-half)
+        // bytes 4..7 land at positions 0..3; PUNPCKL then picks them up.
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
+      }
+      if (q && is_zip2) {
+        switch (size) {
+          case 0b00: builder_.Gen<x86_64::PunpckhbwXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PunpckhwdXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b10: builder_.Gen<x86_64::PunpckhdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b11: builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+        }
+      } else {
+        switch (size) {
+          case 0b00: builder_.Gen<x86_64::PunpcklbwXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PunpcklwdXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b10: builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+          case 0b11: builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+        }
+      }
+    } else if (is_uzp) {
+      const bool is_uzp2 = (opcode == 0b101);
+      if (!q) {
+        // Combine the lower 8 bytes of Vn and Vm into xn = [vn_lo | vm_lo] so
+        // subsequent PACKUS/SHUFPS consumes a single source; the Q=0 tail then
+        // discards the duplicated high half.
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+      switch (size) {
+        case 0b00: {  // .16B (q=1) or .8B (q=0). PACKUSWB.
+          if (is_uzp2) {
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          } else {
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          }
+          if (q) {
+            if (is_uzp2) {
+              builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            } else {
+              builder_.Gen<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            }
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          break;
+        }
+        case 0b01: {  // .8H (q=1) or .4H (q=0). PACKUSDW (SSE4.1).
+          if (is_uzp2) {
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+          } else {
+            builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
+            builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+          }
+          if (q) {
+            if (is_uzp2) {
+              builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+            } else {
+              builder_.Gen<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
+              builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+            }
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          }
+          break;
+        }
+        case 0b10: {  // .4S (q=1) or .2S (q=0). SHUFPS.
+          const int8_t imm =
+              is_uzp2 ? static_cast<int8_t>(0xDD) : static_cast<int8_t>(0x88);
+          if (q) {
+            builder_.Gen<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xm.machine_reg(), imm);
+          } else {
+            // xn already holds [vn_lo | vm_lo] from PUNPCKLQDQ above.
+            builder_.Gen<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
+          }
+          break;
+        }
+        case 0b11: {  // .2D (q=1 only; q=0 caught above).
+          // UZP1.2D == ZIP1.2D, UZP2.2D == ZIP2.2D (2-lane coincidence).
+          if (is_uzp2) {
+            builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+      }
+    } else {  // is_trn
+      const bool is_trn2 = (opcode == 0b110);
+      switch (size) {
+        case 0b00:
+        case 0b01: {
+          // .16B/.8B and .8H/.4H use PSHUFB + POR with precomputed per-byte
+          // masks (0x80 mask byte renders as 0 in PSHUFB). mask_n picks the
+          // wanted Vn bytes into even output positions; mask_m picks Vm bytes
+          // into odd positions; POR combines. Q=0 forms reuse the Q=1 masks —
+          // the shared Q=0 upper-zero (SetVRegFull) discards bytes 8..15.
+          int64_t mask_n_lo, mask_n_hi, mask_m_lo, mask_m_hi;
+          if (size == 0b00) {
+            if (is_trn2) {
+              mask_n_lo = static_cast<int64_t>(0x8007800580038001LL);
+              mask_n_hi = static_cast<int64_t>(0x800F800D800B8009LL);
+              mask_m_lo = static_cast<int64_t>(0x0780058003800180LL);
+              mask_m_hi = static_cast<int64_t>(0x0F800D800B800980LL);
+            } else {
+              mask_n_lo = static_cast<int64_t>(0x8006800480028000LL);
+              mask_n_hi = static_cast<int64_t>(0x800E800C800A8008LL);
+              mask_m_lo = static_cast<int64_t>(0x0680048002800080LL);
+              mask_m_hi = static_cast<int64_t>(0x0E800C800A800880LL);
+            }
+          } else {  // size == 0b01: halfword granularity.
+            if (is_trn2) {
+              mask_n_lo = static_cast<int64_t>(0x8080070680800302LL);
+              mask_n_hi = static_cast<int64_t>(0x80800F0E80800B0ALL);
+              mask_m_lo = static_cast<int64_t>(0x0706808003028080LL);
+              mask_m_hi = static_cast<int64_t>(0x0F0E80800B0A8080LL);
+            } else {
+              mask_n_lo = static_cast<int64_t>(0x8080050480800100LL);
+              mask_n_hi = static_cast<int64_t>(0x80800D0C80800908LL);
+              mask_m_lo = static_cast<int64_t>(0x0504808001008080LL);
+              mask_m_hi = static_cast<int64_t>(0x0D0C808009088080LL);
+            }
+          }
+          FpRegister mask_n = AllocTempSimdReg();
+          FpRegister mask_m = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovqXRegReg>(mask_n.machine_reg(),
+                                            GetImm(static_cast<uint64_t>(mask_n_lo)));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(mask_n.machine_reg(),
+                                                 GetImm(static_cast<uint64_t>(mask_n_hi)), int8_t{1});
+          builder_.Gen<x86_64::MovqXRegReg>(mask_m.machine_reg(),
+                                            GetImm(static_cast<uint64_t>(mask_m_lo)));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(mask_m.machine_reg(),
+                                                 GetImm(static_cast<uint64_t>(mask_m_hi)), int8_t{1});
+          builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), mask_n.machine_reg());
+          builder_.Gen<x86_64::PshufbXRegXReg>(xm.machine_reg(), mask_m.machine_reg());
+          builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        }
+        case 0b10: {  // .4S (q=1) or .2S (q=0).
+          if (!q) {
+            // TRN1.2S == ZIP1.2S = [s1[0], s2[0]]; TRN2.2S == ZIP2.2S =
+            // [s1[1], s2[1]] (PSRLDQ-4 prelude pulls lane 1 down to 0).
+            if (is_trn2) {
+              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
+              builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
+            }
+            builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            // PSHUFD imm 0x88 (even) / 0xDD (odd) collapses each source's
+            // wanted dwords into both halves; PUNPCKLDQ interleaves the lows:
+            //   res = [s1[0], s2[0], s1[2], s2[2]] = TRN1.4S (0x88), etc.
+            const int8_t imm = is_trn2 ? static_cast<int8_t>(0xDD)
+                                       : static_cast<int8_t>(0x88);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+            builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+        case 0b11: {  // .2D (q=1 only; q=0 caught above).
+          // TRN1.2D == ZIP1.2D, TRN2.2D == ZIP2.2D (2-lane coincidence).
+          if (is_trn2) {
+            builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+      }
+    }
+
+    SetVRegFull(rd, xn, q);
   }
 
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len, uint8_t op, bool q) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, len, op, q);
+    if (!success()) {
+      return;
+    }
+    // TBL/TBX: per-byte gather across 1..4 consecutive table registers, mirroring
+    // the lite lowering (register-domain-pure, no BB-splits). For each table reg r,
+    // shift the index vector down by r*16 (bytewise) so PSHUFB picks lane (idx-r*16)
+    // when it is in [0,15]; an in-range mask built via PSUBUSB/PCMPEQB gates the
+    // result and forms the running "any table hit" mask. TBL zeroes misses; TBX
+    // blends the original Vd back into the miss lanes.
+    const uint8_t table_regs = static_cast<uint8_t>(len + 1);  // 1..4
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rd * 16);
+
+    FpRegister xmm_idx        = AllocTempSimdReg();
+    FpRegister xmm_acc        = AllocTempSimdReg();
+    FpRegister xmm_in_range   = AllocTempSimdReg();
+    FpRegister xmm_const15    = AllocTempSimdReg();
+    FpRegister xmm_zero       = AllocTempSimdReg();
+    FpRegister xmm_tmp_idx    = AllocTempSimdReg();
+    FpRegister xmm_tmp_mask   = AllocTempSimdReg();
+    FpRegister xmm_tmp_lookup = AllocTempSimdReg();
+
+    // Load the index vector once. Vm is the per-byte selector.
+    builder_.GenGetSimd<16>(xmm_idx.machine_reg(), vm_off);
+    // acc = 0, in_range = 0, zero = 0. MOVQ from a zero GP reg zero-extends to a
+    // full 128-bit zero and is a proper full-def (a self-PXOR would read an
+    // undefined vreg and trip the lifetime analysis in this tier).
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_acc.machine_reg(), GetImm(uint64_t{0}));
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_in_range.machine_reg(), GetImm(uint64_t{0}));
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_zero.machine_reg(), GetImm(uint64_t{0}));
+    // const15 = byte-broadcast(0x0F).
+    builder_.Gen<x86_64::MovqXRegReg>(xmm_const15.machine_reg(),
+                                      GetImm(uint64_t{0x0F0F0F0F0F0F0F0FULL}));
+    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm_const15.machine_reg(), xmm_const15.machine_reg());
+
+    for (uint8_t r = 0; r < table_regs; ++r) {
+      const int32_t vn_off_r =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + ((rn + r) & 31) * 16);
+
+      // shifted_idx_r = Vm - r*16 (bytewise wrap). For r=0 this is just Vm.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_idx.machine_reg());
+      if (r != 0) {
+        const uint64_t broadcast =
+            uint64_t{0x0101010101010101ULL} * static_cast<uint64_t>(r * 16);
+        builder_.Gen<x86_64::MovqXRegReg>(xmm_tmp_mask.machine_reg(), GetImm(broadcast));
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm_tmp_mask.machine_reg(),
+                                                 xmm_tmp_mask.machine_reg());
+        builder_.Gen<x86_64::PsubbXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_tmp_mask.machine_reg());
+      }
+
+      // in_range_r = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0).
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_idx.machine_reg());
+      builder_.Gen<x86_64::PsubusbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_const15.machine_reg());
+      builder_.Gen<x86_64::PcmpeqbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_zero.machine_reg());
+
+      // looked_up_r = PSHUFB(V[(rn+r)%32], shifted_idx_r), masked by in_range.
+      builder_.GenGetSimd<16>(xmm_tmp_lookup.machine_reg(), vn_off_r);
+      builder_.Gen<x86_64::PshufbXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_idx.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_mask.machine_reg());
+
+      builder_.Gen<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_lookup.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xmm_in_range.machine_reg(), xmm_tmp_mask.machine_reg());
+    }
+
+    if (op /* TBX */) {
+      // result = acc | (Vd & ~in_range_all).
+      builder_.GenGetSimd<16>(xmm_tmp_lookup.machine_reg(), vd_off);
+      // xmm_tmp_mask := ~in_range_all & Vd
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_in_range.machine_reg());
+      builder_.Gen<x86_64::PandnXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_lookup.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_mask.machine_reg());
+    }
+
+    // SetVRegFull zeroes Vd[127:64] when q=false (D-register semantics).
+    SetVRegFull(rd, xmm_acc, q);
   }
 
   void AdvSimdMultiStruct(uint8_t rt,
