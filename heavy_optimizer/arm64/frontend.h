@@ -3267,6 +3267,89 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // CLZ / CLS V.<T>, V.<T> — per-lane count-leading-zeros / count-leading-
+      // sign-bits. size=00 .8B/.16B (N=8), size=01 .4H/.8H (N=16), size=10
+      // .2S/.4S (N=32); size=11 reserved. Mirrors lite kClz/kCls but uses LZCNT
+      // (branchless: LZCNT_32(0)==32) instead of the lite tier's BSR + zero
+      // branch. Each lane is scalarized: PEXTR{b,w,d} zero-extends the element
+      // into a GP reg, LZCNTL counts leading zeros over 32 bits, and SUBL folds
+      // the width correction — CLZ_N = LZCNT_32(x) - (32-N). CLS first maps
+      // negative lanes to ~x (vector PCMPGT sign mask + PXOR, exactly the lite
+      // preprocess) so CLS = CLZ_N(y) - 1 = LZCNT_32(y) - (33-N); the y==0 lane
+      // (all-same-bits input) then yields N-1 with no branch. Bails to lite if
+      // the host lacks LZCNT.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kClz:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCls: {
+        if (args.size == 0b11 || !host_platform::kHasLZCNT) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_cls = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kCls);
+        const int lane_bits = 8 << args.size;             // 8, 16, 32
+        const int bytes_per_lane = 1 << args.size;        // 1, 2, 4
+        const int lanes_per_vec = (args.q ? 16 : 8) / bytes_per_lane;
+        // CLZ_N = LZCNT_32 - (32-lane_bits); CLS subtracts one more.
+        const int32_t correction =
+            static_cast<int32_t>(32 - lane_bits) + (is_cls ? 1 : 0);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xd = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (is_cls) {
+          // y = (x < 0) ? ~x : x per lane: xsign = (0 > xn) all-ones mask, then
+          // xn ^= xsign collapses negative lanes to ~x, positive lanes unchanged.
+          FpRegister xsign = AllocZeroedSimdReg();
+          switch (args.size) {
+            case 0b00:
+              builder_.Gen<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+              break;
+            case 0b01:
+              builder_.Gen<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+              break;
+            default:  // 0b10
+              builder_.Gen<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+              break;
+          }
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xsign.machine_reg());
+        }
+        for (int i = 0; i < lanes_per_vec; ++i) {
+          Register lane;
+          switch (args.size) {
+            case 0b00:
+              lane = std::get<0>(
+                  Gen<x86_64::PextrbRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(i)));
+              break;
+            case 0b01:
+              lane = std::get<0>(
+                  Gen<x86_64::PextrwRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(i)));
+              break;
+            default:  // 0b10
+              lane = std::get<0>(
+                  Gen<x86_64::PextrdRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(i)));
+              break;
+          }
+          Register cnt = std::get<0>(Gen<x86_64::LzcntlRegReg>(lane));
+          if (correction != 0) {
+            cnt = std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(cnt, correction));
+          }
+          switch (args.size) {
+            case 0b00:
+              builder_.Gen<x86_64::PinsrbXRegRegImm>(xd.machine_reg(), cnt,
+                                                     static_cast<int8_t>(i));
+              break;
+            case 0b01:
+              builder_.Gen<x86_64::PinsrwXRegRegImm>(xd.machine_reg(), cnt,
+                                                     static_cast<int8_t>(i));
+              break;
+            default:  // 0b10
+              builder_.Gen<x86_64::PinsrdXRegRegImm>(xd.machine_reg(), cnt,
+                                                     static_cast<int8_t>(i));
+              break;
+          }
+        }
+        SetVRegFull(args.rd, xd, args.q);
+        return;
+      }
+
       default:
         UndefinedReturningVoid();
         return;

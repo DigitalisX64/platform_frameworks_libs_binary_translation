@@ -3049,6 +3049,14 @@ constexpr uint32_t Rev16Vec(bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t Rev64Vec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b00000, rd, rn);
 }
+// CLZ: U=1, opcode=00100.
+constexpr uint32_t ClzVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b00100, rd, rn);
+}
+// CLS: U=0, opcode=00100.
+constexpr uint32_t ClsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b00100, rd, rn);
+}
 // REV32: U=1, opcode=00000.
 constexpr uint32_t Rev32Vec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b00000, rd, rn);
@@ -6030,11 +6038,67 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Sqxtn2Vec4S) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x7FFFFFFF80000000ULL);  // narrowed into high
 }
 
-// A two-reg-misc opcode we do NOT yet mirror (CLZ) must still bail cleanly.
-TEST_F(Arm64HeavyOptimizerFrontendTest, ClzVecBails) {
-  // clz v0.4s, v1.4s : U=0, opcode=00100, size=10, Q=1.
-  static const uint32_t code[] = {AdvSimdTwoRegMisc(/*q=*/true, /*u=*/false, /*size=*/0b10,
-                                                    /*opcode=*/0b00100, 0, 1)};
+// CLZ v0.4s, v1.4s (size=10, Q=1): per-lane 32-bit count-leading-zeros.
+// lanes [1, 0x8000, 0x80000000, 0] -> CLZ [31, 16, 0, 32].
+TEST_F(Arm64HeavyOptimizerFrontendTest, ClzVec4S) {
+  static const uint32_t code[] = {ClzVec(0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0000800000000001ULL, 0x0000000080000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000100000001FULL);      // [31, 16]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000002000000000ULL);  // [0, 32]
+}
+
+// CLZ v0.8b, v1.8b (size=00, Q=0): per-byte count-leading-zeros; upper 64 zeroed.
+// bytes [01,80,FF,00,10,08,40,7F] -> CLZ [7,0,0,8,3,4,1,1].
+TEST_F(Arm64HeavyOptimizerFrontendTest, ClzVec8B) {
+  static const uint32_t code[] = {ClzVec(0b00, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x7F40081000FF8001ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0101040308000007ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zeroed
+}
+
+// CLS v0.8h, v1.8h (size=01, Q=1): per-halfword count-leading-sign-bits.
+// lanes [0001,FFFF,8000,4000, 0000,7FFF,C000,2000] -> CLS [14,15,0,0, 15,0,1,1].
+TEST_F(Arm64HeavyOptimizerFrontendTest, ClsVec8H) {
+  static const uint32_t code[] = {ClsVec(0b01, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x40008000FFFF0001ULL, 0x2000C0007FFF0000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000000F000EULL);      // [14,15,0,0]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000100010000000FULL);  // [15,0,1,1]
+}
+
+// CLS v0.2s, v1.2s (size=10, Q=0): 32-bit count-leading-sign-bits; upper zeroed.
+// lanes [00000001, FFFFFFF0] -> CLS [30, 27].
+TEST_F(Arm64HeavyOptimizerFrontendTest, ClsVec2S) {
+  static const uint32_t code[] = {ClsVec(0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFF000000001ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000001B0000001EULL);      // [30, 27]
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zeroed
+}
+
+// A two-reg-misc opcode we do NOT yet mirror (SADDLP) must still bail cleanly.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVecBails) {
+  // saddlp v0.8h, v1.16b : U=0, opcode=00010, size=00, Q=1.
+  static const uint32_t code[] = {AdvSimdTwoRegMisc(/*q=*/true, /*u=*/false, /*size=*/0b00,
+                                                    /*opcode=*/0b00010, 0, 1)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
