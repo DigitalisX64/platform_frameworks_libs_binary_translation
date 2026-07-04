@@ -2322,9 +2322,200 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // Heavy-tier mirror of the register-domain-pure AdvSIMD two-reg-misc opcodes
+  // the lite translator already lowers: REV16, CNT, NOT/RBIT, NEG, ABS. All are
+  // packed SSE sequences with no host FLAGS and no memory operand beyond the
+  // guest v[] load/store, so they map straight onto the MachineIR builder the
+  // same way AdvSimdThreeSame does. Every other opcode bails to the lite tier
+  // (UndefinedReturningVoid) — emit NOTHING before a bail. Q=0 upper-half zeroing
+  // is handled by SetVRegFull. The lowerings match lite_translator.h exactly.
   void AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+
+    switch (args.opcode) {
+      // REV16 V.<T>, V.<T> (size=00 only): reverse byte order within each 16-bit
+      // lane via (Vn << 8) | (Vn >> 8) per halfword. PSLLW/PSRLW shift the 16-bit
+      // lanes; OR recombines the swapped bytes without a PSHUFB mask table.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kRev16: {
+        if (args.size != 0b00) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xt = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrlwXRegImm>(xt.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xt.machine_reg());
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // CNT V.16B / V.8B (size=00): per-byte population count via the
+      // Mula-Wojcik nibble-LUT (two PSHUFB lookups on the low/high nibbles,
+      // summed with PADDB). Table = popcount-per-nibble; mask = 0x0F broadcast.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kCnt: {
+        if (args.size != 0b00) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xtable_lo = AllocTempSimdReg();
+        FpRegister xtable_hi = AllocTempSimdReg();
+        FpRegister xmask = AllocTempSimdReg();
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xt_hi = AllocTempSimdReg();
+        // Build the popcount nibble table {0,1,1,2,...,4} into xtable_lo.
+        Register tlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0302020102010100LL}));
+        builder_.Gen<x86_64::MovqXRegReg>(xtable_lo.machine_reg(), tlo);
+        Register thi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0403030203020201LL}));
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(xtable_lo.machine_reg(), thi, int8_t{1});
+        // PSHUFB is destructive; keep a second copy of the table.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xtable_hi.machine_reg(), xtable_lo.machine_reg());
+        // Build the 0x0F low-nibble mask, broadcast to all 16 bytes.
+        Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0F0F0F0F0F0F0F0FLL}));
+        builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmask.machine_reg(), xmask.machine_reg());
+        // Split Vn into low and high nibbles.
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xt_hi.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PsrlwXRegImm>(xt_hi.machine_reg(), int8_t{4});
+        builder_.Gen<x86_64::PandXRegXReg>(xt_hi.machine_reg(), xmask.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+        // Vd = PSHUFB(table, low_nibbles) + PSHUFB(table, high_nibbles).
+        builder_.Gen<x86_64::PshufbXRegXReg>(xtable_lo.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PshufbXRegXReg>(xtable_hi.machine_reg(), xt_hi.machine_reg());
+        builder_.Gen<x86_64::PaddbXRegXReg>(xtable_lo.machine_reg(), xtable_hi.machine_reg());
+        SetVRegFull(args.rd, xtable_lo, args.q);
+        return;
+      }
+
+      // NOT V.16B / V.8B (size=00): per-lane bitwise complement Vd = ~Vn.
+      // RBIT V.16B / V.8B (size=01): per-byte bit reversal via two PSHUFB
+      // nibble-LUTs (reverse_bits(b) = (reverse4(L)<<4) | reverse4(H)), the two
+      // results occupying disjoint nibble positions and combined with POR.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNot: {
+        if (args.size == 0b00) {
+          FpRegister xn = AllocTempSimdReg();
+          FpRegister allones = AllocZeroedSimdReg();
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(allones.machine_reg(), allones.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), allones.machine_reg());
+          SetVRegFull(args.rd, xn, args.q);
+          return;
+        }
+        if (args.size == 0b01) {
+          FpRegister xlow_table = AllocTempSimdReg();
+          FpRegister xhigh_table = AllocTempSimdReg();
+          FpRegister xmask = AllocTempSimdReg();
+          FpRegister xn = AllocTempSimdReg();
+          FpRegister xn_hi = AllocTempSimdReg();
+          // low_table[i]  = reverse4(i)       (result in low nibble)
+          Register lt_lo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0E060A020C040800LL}));
+          builder_.Gen<x86_64::MovqXRegReg>(xlow_table.machine_reg(), lt_lo);
+          Register lt_hi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0F070B030D050901LL}));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(xlow_table.machine_reg(), lt_hi, int8_t{1});
+          // high_table[i] = reverse4(i) << 4  (result in high nibble)
+          Register ht_lo =
+              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0xE060A020C0408000ULL)));
+          builder_.Gen<x86_64::MovqXRegReg>(xhigh_table.machine_reg(), ht_lo);
+          Register ht_hi =
+              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0xF070B030D0509010ULL)));
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(xhigh_table.machine_reg(), ht_hi, int8_t{1});
+          // Build the 0x0F broadcast mask.
+          Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0F0F0F0F0F0F0F0FLL}));
+          builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmask.machine_reg(), xmask.machine_reg());
+          // t_lo = low nibbles, t_hi = high nibbles.
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{4});
+          builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xmask.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+          // Vd = PSHUFB(high_table, t_lo) | PSHUFB(low_table, t_hi).
+          builder_.Gen<x86_64::PshufbXRegXReg>(xhigh_table.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PshufbXRegXReg>(xlow_table.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PorXRegXReg>(xhigh_table.machine_reg(), xlow_table.machine_reg());
+          SetVRegFull(args.rd, xhigh_table, args.q);
+          return;
+        }
+        UndefinedReturningVoid();
+        return;
+      }
+
+      // NEG V.<T>, V.<T>: per-lane integer negation Vd = 0 - Vn (PSUBB/W/D/Q).
+      // size=11 with Q=0 (.1D) is reserved and bails.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kNeg: {
+        if (args.size == 0b11 && !args.q) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PsubbXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PsubwXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            break;
+          case 0b10:
+            builder_.Gen<x86_64::PsubdXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            break;
+          default:  // 0b11 (.2D, Q=1)
+            builder_.Gen<x86_64::PsubqXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            break;
+        }
+        SetVRegFull(args.rd, xz, args.q);
+        return;
+      }
+
+      // ABS V.<T>, V.<T>: per-lane integer absolute value via
+      // (Vn ^ sign_mask) - sign_mask, sign_mask = PCMPGT(0, Vn) = -1 if Vn<0.
+      // size=11 (.2D) needs PCMPGTQ (not allowlisted) and bails.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
+        if (args.size == 0b11) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister mask = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PcmpgtbXRegXReg>(mask.machine_reg(), xn.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PcmpgtwXRegXReg>(mask.machine_reg(), xn.machine_reg());
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PcmpgtdXRegXReg>(mask.machine_reg(), xn.machine_reg());
+            break;
+        }
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PsubbXRegXReg>(xn.machine_reg(), mask.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), mask.machine_reg());
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), mask.machine_reg());
+            break;
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      default:
+        UndefinedReturningVoid();
+        return;
+    }
   }
 
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
