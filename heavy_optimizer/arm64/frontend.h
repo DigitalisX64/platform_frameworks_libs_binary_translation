@@ -2998,9 +2998,113 @@ class HeavyOptimizerFrontend {
     SetVRegFull(args.rd, vn, args.q);
   }
 
+  // Heavy-tier mirror of the register-domain-pure widening multiply-accumulate
+  // subset of lite_translator.h::AdvSimdThreeDiff:
+  //   {S,U}MULL{,2}, {S,U}MLAL{,2}, {S,U}MLSL{,2}
+  // at input sizes 8/16/32 (size 00/01/10) and both Q halves. The widening
+  // recipe matches lite exactly: widen both narrow sources (PMOVSX/PMOVZX per
+  // sign), lane-wise multiply (PMULLW / PMULLD / PMULDQ|PMULUDQ), then for the
+  // accumulate forms load Vd and PADD/PSUB at the wide lane width. The result
+  // always fills 128 bits (8H/4S/2D), so SetVRegFull q=true regardless of Q.
+  // Q=1 ("2") forms widen the upper 64 of Vn/Vm — bring bytes 8..15 down with
+  // PSRLDQ before widening. Every other ThreeDiff opcode (widening add/sub,
+  // ABDL/ABAL, ADDHN/SUBHN, PMULL, SQDMULL family) still bails to the lite
+  // tier — emit NOTHING before a bail.
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    using Op = Decoder::AdvSimdThreeDiffOpcode;
+    const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
+    const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
+    const bool is_mlsl = (args.opcode == Op::kSmlsl || args.opcode == Op::kUmlsl);
+    if ((!is_mull && !is_mlal && !is_mlsl) || args.size > 0b10) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_signed = (args.opcode == Op::kSmull ||
+                            args.opcode == Op::kSmlal ||
+                            args.opcode == Op::kSmlsl);
+    const int32_t vn_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const int32_t vm_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    if (args.q) {
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+    }
+    switch (args.size) {
+      case 0b00:
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        }
+        builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        break;
+      case 0b01:
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        }
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        break;
+      case 0b10:
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmuludqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        break;
+    }
+
+    if (is_mull) {
+      SetVRegFull(args.rd, xn, /*q=*/true);
+      return;
+    }
+
+    const int32_t vd_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+    FpRegister xd = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+    switch (args.size) {
+      case 0b00:
+        if (is_mlal) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+        break;
+      case 0b01:
+        if (is_mlal) {
+          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+        break;
+      case 0b10:
+        if (is_mlal) {
+          builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+        break;
+    }
+    SetVRegFull(args.rd, xd, /*q=*/true);
   }
 
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
