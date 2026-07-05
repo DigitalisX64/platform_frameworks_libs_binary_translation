@@ -5720,6 +5720,101 @@ TEST_F(Arm64LiteTranslateRegionTest, SimdLoadPair128Bit) {
   }
 }
 
+// LDP/STP D<rt1>, D<rt2>, [Xn, #imm7*8] and S-pair (#imm7*4). imm is the raw
+// signed imm7 field. Ground truth (clang --target=aarch64-linux-gnu):
+//   stp d0,d1,[x2] = 0x6d000440   ldp d2,d3,[x2] = 0x6d400c42
+//   stp s0,s1,[x2] = 0x2d000440   ldp s2,s3,[x2] = 0x2d400c42
+constexpr uint32_t StpDSigned(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x6D000000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+constexpr uint32_t LdpDSigned(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x6D400000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+constexpr uint32_t StpSSigned(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x2D000000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+constexpr uint32_t LdpSSigned(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x2D400000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) |
+         (static_cast<uint32_t>(rt2) << 10) | (static_cast<uint32_t>(rn) << 5) | rt1;
+}
+static_assert(StpDSigned(0, 1, 2, 0) == 0x6d000440u);
+static_assert(LdpDSigned(2, 3, 2, 0) == 0x6d400c42u);
+static_assert(StpSSigned(0, 1, 2, 0) == 0x2d000440u);
+static_assert(LdpSSigned(2, 3, 2, 0) == 0x2d400c42u);
+
+TEST_F(Arm64LiteTranslateRegionTest, SimdStoreLoadPairD64) {
+  // STP D0,D1,[X2] writes two 8-byte slots; LDP D2,D3,[X2] reads them back and
+  // must zero-extend each register's upper 64 bits (callee-saved d8-d15 spill).
+  alignas(16) static uint8_t buffer[16];
+  memset(buffer, 0, sizeof(buffer));
+  memset(&state_.cpu.v[0], 0xAB, 16);  // upper 64 of v0/v1 must be ignored on store
+  memset(&state_.cpu.v[1], 0xCD, 16);
+  const uint64_t d0 = 0x1122334455667788ULL;
+  const uint64_t d1 = 0x99AABBCCDDEEFF00ULL;
+  memcpy(&state_.cpu.v[0], &d0, 8);
+  memcpy(&state_.cpu.v[1], &d1, 8);
+
+  static const uint32_t scode[] = {StpDSigned(0, 1, 2, 0)};
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(scode, ToGuestAddr(scode) + sizeof(scode)));
+  uint64_t out[2];
+  memcpy(out, buffer, 16);
+  EXPECT_EQ(out[0], d0);
+  EXPECT_EQ(out[1], d1);
+
+  // LDP into v2/v3, poisoned upper halves must be cleared.
+  memset(&state_.cpu.v[2], 0xAB, 16);
+  memset(&state_.cpu.v[3], 0xAB, 16);
+  static const uint32_t lcode[] = {LdpDSigned(2, 3, 2, 0)};
+  EXPECT_TRUE(Run(lcode, ToGuestAddr(lcode) + sizeof(lcode)));
+  uint64_t v2[2], v3[2];
+  memcpy(v2, &state_.cpu.v[2], 16);
+  memcpy(v3, &state_.cpu.v[3], 16);
+  EXPECT_EQ(v2[0], d0);
+  EXPECT_EQ(v2[1], uint64_t{0});
+  EXPECT_EQ(v3[0], d1);
+  EXPECT_EQ(v3[1], uint64_t{0});
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, SimdStoreLoadPairS32) {
+  // STP S0,S1,[X2]; LDP S2,S3,[X2]. LDP S zero-extends each register's upper 96.
+  alignas(16) static uint8_t buffer[8];
+  memset(buffer, 0, sizeof(buffer));
+  memset(&state_.cpu.v[0], 0xAB, 16);
+  memset(&state_.cpu.v[1], 0xCD, 16);
+  const uint32_t s0 = 0xAABBCCDDu;
+  const uint32_t s1 = 0x11223344u;
+  memcpy(&state_.cpu.v[0], &s0, 4);
+  memcpy(&state_.cpu.v[1], &s1, 4);
+
+  static const uint32_t scode[] = {StpSSigned(0, 1, 2, 0)};
+  state_.cpu.x[2] = ToGuestAddr(buffer);
+  EXPECT_TRUE(Run(scode, ToGuestAddr(scode) + sizeof(scode)));
+  uint32_t out[2];
+  memcpy(out, buffer, 8);
+  EXPECT_EQ(out[0], s0);
+  EXPECT_EQ(out[1], s1);
+
+  memset(&state_.cpu.v[2], 0xAB, 16);
+  memset(&state_.cpu.v[3], 0xAB, 16);
+  static const uint32_t lcode[] = {LdpSSigned(2, 3, 2, 0)};
+  EXPECT_TRUE(Run(lcode, ToGuestAddr(lcode) + sizeof(lcode)));
+  uint32_t v2[4], v3[4];
+  memcpy(v2, &state_.cpu.v[2], 16);
+  memcpy(v3, &state_.cpu.v[3], 16);
+  EXPECT_EQ(v2[0], s0);
+  EXPECT_EQ(v2[1], uint32_t{0});
+  EXPECT_EQ(v2[2], uint32_t{0});
+  EXPECT_EQ(v2[3], uint32_t{0});
+  EXPECT_EQ(v3[0], s1);
+  EXPECT_EQ(v3[1], uint32_t{0});
+  EXPECT_EQ(v3[2], uint32_t{0});
+  EXPECT_EQ(v3[3], uint32_t{0});
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, SimdLoadRegOffset128Bit) {
   // LDR Q0, [X1, X2]: 128-bit load using a register offset.
   alignas(16) static uint8_t buffer[32];
