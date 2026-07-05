@@ -5853,9 +5853,149 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(args);
   }
 
+  // AdvSIMD scalar three-same.  Only the saturating-doubling-multiply-high
+  // scalar forms (SQDMULH / SQRDMULH, H and S lanes) are lowered here; every
+  // other scalar three-same opcode bails to lite via UndefinedReturningVoid.
+  //
+  // Lowering is a single-lane application of the vector .4H/.8H and .2S/.4S
+  // SQDMULH/SQRDMULH recipes in AdvSimdThreeSame (opcode 0b10110).  The
+  // operands are loaded full-width and scrubbed to lane 0 (PSLLDQ+PSRLDQ keep
+  // the low 16 / 32 bits and zero everything above), so the packed recipe
+  // processes only the scalar lane while lanes 1.. stay 0 (a corner-free 0
+  // result).  SetVRegFull q=false then writes the scalar result with
+  // Vd[127:lane] = 0.
+  //   * size=01 (H): SQDMULH via PMULHW+PMULLW combine; SQRDMULH via PMULHRSW
+  //     (SSSE3); both with the INT16_MIN*INT16_MIN corner fixup.
+  //   * size=10 (S): two PMULDQ + PSLLQ double + optional 2^31 round + PSHUFD
+  //     0xDD lift + INT32_MIN*INT32_MIN corner fixup (SSE4.1).
+  //   * size=00/11 are unallocated for this opcode -> bail.
   void AdvSimdScalarThreeSame(const Decoder::AdvSimdScalarThreeSameArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    if (args.opcode != Decoder::AdvSimdScalarThreeSameOpcode::kSqdmulhScalar &&
+        args.opcode != Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (args.size != 0b01 && args.size != 0b10) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_round =
+        (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar);
+    const int32_t vn_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const int32_t vm_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+    if (args.size == 0b01) {
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      // Scrub to lane 0: keep the low 16 bits, zero bytes [15:2].
+      builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+      builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), int8_t{14});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{14});
+      if (is_round) {
+        if (!host_platform::kHasSSSE3) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn_corner = AllocTempSimdReg();
+        FpRegister xm_corner = AllocTempSimdReg();
+        FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+        builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+        builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+        SetVRegFull(args.rd, xn, /*q=*/false);
+        return;
+      }
+      // SQDMULH .H via PMULHW + PMULLW combine + corner fixup (SSE2).
+      FpRegister xn_lo = AllocTempSimdReg();
+      FpRegister xn_corner = AllocTempSimdReg();
+      FpRegister xm_corner = AllocTempSimdReg();
+      FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
+      builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
+      builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
+      builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
+      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+      SetVRegFull(args.rd, xn, /*q=*/false);
+      return;
+    }
+    // size == 0b10 (S form): PMULDQ widen (SSE4.1) + PSLLQ double + optional
+    // round + corner fixup; PSHUFD 0xDD lifts each product's upper 32 bits.
+    if (!host_platform::kHasSSE4_1) {
+      UndefinedReturningVoid();
+      return;
+    }
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    FpRegister x_const = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqd idiom
+    FpRegister corner = AllocTempSimdReg();
+    FpRegister xp_lo = AllocTempSimdReg();
+    FpRegister xp_hi = AllocTempSimdReg();
+    FpRegister xm_hi = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    // Scrub to lane 0: keep the low 32 bits, zero bytes [15:4].
+    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+    builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), int8_t{12});
+    builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{12});
+    // x_const = INT32_MIN broadcast across 4 dwords.
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
+    // Corner: lane 0 where Vn.s[0] == INT32_MIN AND Vm.s[0] == INT32_MIN.
+    builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
+    // Two PMULDQs reconstruct the signed 32x32 -> 64 products (even lanes in
+    // xp_lo, odd lanes in xp_hi).
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+    builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
+    builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
+    // Double each 64-bit signed product.
+    builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
+    builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
+    if (is_round) {
+      // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+      builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
+      builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
+      builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+      builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
+    }
+    // Extract the upper 32 bits of each 64-bit lane and interleave.
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
+    builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
+    // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
+    builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
+    SetVRegFull(args.rd, xp_lo, /*q=*/false);
   }
 
   void AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {

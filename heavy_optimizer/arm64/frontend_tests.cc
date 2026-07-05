@@ -4344,6 +4344,26 @@ static_assert(SqdmulhVec(0b10, /*q=*/true, 0, 1, 2) == 0x4ea2b420u);   // sqdmul
 static_assert(SqrdmulhVec(0b10, /*q=*/true, 0, 1, 2) == 0x6ea2b420u);  // sqrdmulh v0.4s,v1,v2
 static_assert(SqdmulhVec(0b10, /*q=*/false, 0, 1, 2) == 0x0ea2b420u);  // sqdmulh v0.2s,v1,v2
 
+// AdvSIMD scalar three-same: 01 U 11110 size 1 Rm opcode(5) 1 Rn Rd.
+constexpr uint32_t AdvSimdScalarThreeSame(
+    bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x5E200400u | (static_cast<uint32_t>(u) << 29) |
+         (static_cast<uint32_t>(size) << 22) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(opcode) << 11) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+// SQDMULH / SQRDMULH (scalar, H/S): opcode=0b10110, U selects the rounding
+// variant. Encodings assembler-verified.
+constexpr uint32_t SqdmulhScalar(uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(/*u=*/false, size, /*opcode=*/0b10110, rd, rn, rm);
+}
+constexpr uint32_t SqrdmulhScalar(uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(/*u=*/true, size, /*opcode=*/0b10110, rd, rn, rm);
+}
+static_assert(SqdmulhScalar(0b01, 0, 1, 2) == 0x5e62b420u);   // sqdmulh h0,h1,h2
+static_assert(SqrdmulhScalar(0b01, 0, 1, 2) == 0x7e62b420u);  // sqrdmulh h0,h1,h2
+static_assert(SqdmulhScalar(0b10, 0, 1, 2) == 0x5ea2b420u);   // sqdmulh s0,s1,s2
+static_assert(SqrdmulhScalar(0b10, 0, 1, 2) == 0x7ea2b420u);  // sqrdmulh s0,s1,s2
+
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
     bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -7021,6 +7041,79 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec2SUpperZero) {
 // SQDMULH .2D (size=11) is reserved by the decoder and must bail (0 insns).
 TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec2DBails) {
   static const uint32_t code[] = {SqdmulhVec(0b11, /*q=*/true, 0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// Scalar SQDMULH/SQRDMULH (H/S): only lane 0 participates; upper lanes of Vn/Vm
+// are garbage and must be scrubbed, and Vd[127:esize] must read back 0.
+// Expected values computed from the ARM semantics reference (NOT the codegen):
+// H a=0x8000 b=0x8000 -> corner-saturated 0x7FFF; H SQRDMULH a=0x7FFF b=2 -> 2;
+// S a=0x80000000 b=0x80000000 -> corner 0x7FFFFFFF; S SQRDMULH a=0x7FFFFFFF b=2
+// -> 2.
+
+// SQDMULH scalar H, INT16_MIN*INT16_MIN corner -> INT16_MAX (0x7FFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhScalarHCorner) {
+  static const uint32_t code[] = {SqdmulhScalar(0b01, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1111222233338000ULL, 0xAAAAAAAAAAAAAAAAULL);  // Vn.h[0]=0x8000
+  SetV128(&state_, 2, 0x4444555566668000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vm.h[0]=0x8000
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000007FFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SQRDMULH scalar H rounding path (PMULHRSW): a=0x7FFF, b=2 -> 2.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhScalarH) {
+  static const uint32_t code[] = {SqrdmulhScalar(0b01, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1111222233337FFFULL, 0xAAAAAAAAAAAAAAAAULL);  // Vn.h[0]=0x7FFF
+  SetV128(&state_, 2, 0x4444555566660002ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vm.h[0]=0x0002
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SQDMULH scalar S, INT32_MIN*INT32_MIN corner -> INT32_MAX (0x7FFFFFFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhScalarSCorner) {
+  static const uint32_t code[] = {SqdmulhScalar(0b10, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA80000000ULL, 0xCCCCCCCCCCCCCCCCULL);  // Vn.s[0]=0x80000000
+  SetV128(&state_, 2, 0xBBBBBBBB80000000ULL, 0xDDDDDDDDDDDDDDDDULL);  // Vm.s[0]=0x80000000
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SQRDMULH scalar S rounding path (+2^31): a=0x7FFFFFFF, b=2 -> 2.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhScalarS) {
+  static const uint32_t code[] = {SqrdmulhScalar(0b10, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA7FFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);  // Vn.s[0]=0x7FFFFFFF
+  SetV128(&state_, 2, 0xBBBBBBBB00000002ULL, 0xDDDDDDDDDDDDDDDDULL);  // Vm.s[0]=0x00000002
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQDMULH B (size=00) is unallocated for this opcode and must bail.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhScalarBBails) {
+  static const uint32_t code[] = {SqdmulhScalar(0b00, 0, 1, 2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
