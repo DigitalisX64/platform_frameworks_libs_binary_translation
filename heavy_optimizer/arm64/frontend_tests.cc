@@ -4311,6 +4311,24 @@ static_assert(SmaxVec(0b00, /*q=*/true, 0, 1, 2) == 0x4e226420u);  // smax v0.16
 static_assert(SminVec(0b01, /*q=*/true, 0, 1, 2) == 0x4e626c20u);  // smin v0.8h,v1,v2
 static_assert(UmaxVec(0b10, /*q=*/true, 0, 1, 2) == 0x6ea26420u);  // umax v0.4s,v1,v2
 static_assert(UminVec(0b00, /*q=*/true, 0, 1, 2) == 0x6e226c20u);  // umin v0.16b,v1,v2
+// SABD/UABD (abs diff): U=0/1, opcode=01110. SABA/UABA (abs diff accumulate):
+// U=0/1, opcode=01111.
+constexpr uint32_t SabdVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b01110, rd, rn, rm);
+}
+constexpr uint32_t UabdVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b01110, rd, rn, rm);
+}
+constexpr uint32_t SabaVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b01111, rd, rn, rm);
+}
+constexpr uint32_t UabaVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b01111, rd, rn, rm);
+}
+static_assert(SabdVec(0b00, /*q=*/true, 0, 1, 2) == 0x4e227420u);  // sabd v0.16b,v1,v2
+static_assert(UabdVec(0b01, /*q=*/true, 0, 1, 2) == 0x6e627420u);  // uabd v0.8h,v1,v2
+static_assert(SabaVec(0b10, /*q=*/true, 0, 1, 2) == 0x4ea27c20u);  // saba v0.4s,v1,v2
+static_assert(UabaVec(0b00, /*q=*/true, 0, 1, 2) == 0x6e227c20u);  // uaba v0.16b,v1,v2
 
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
@@ -6819,6 +6837,92 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxVec2SUpperZero) {
 // to lite (which routes it to the interpreter).
 TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxVec2DBails) {
   static const uint32_t code[] = {SmaxVec(0b11, /*q=*/true, 0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SABD .16B (size=00, Q=1): per-byte signed absolute difference. Needs SSE4.1
+// (PMAXSB/PMINSB). Recipe is max(a,b) - min(a,b) on the signed interpretation.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SabdVec16B) {
+  static const uint32_t code[] = {SabdVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7F8001FF10F00005ULL, 0x807F00FE01020304ULL);  // Vn
+  SetV128(&state_, 2, 0x01FF7F80F0100500ULL, 0x7F80FF0004030201ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7E7F7E7F20200505ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFF010203010103ULL);
+}
+
+// UABD .8H (size=01, Q=1): per-halfword unsigned absolute difference. Needs
+// SSE4.1 (PMAXUW/PMINUW).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UabdVec8H) {
+  static const uint32_t code[] = {UabdVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFF000180007FFFULL, 0x123456789ABCDEF0ULL);  // Vn
+  SetV128(&state_, 2, 0x0001FFFF7FFF8000ULL, 0x0000111122223333ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFEFFFE00010001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x12344567789AABBDULL);
+}
+
+// SABA .4S (size=10, Q=1): per-dword signed abs-diff accumulated into Vd. Needs
+// SSE4.1 (PMAXSD/PMINSD). Vd is read and PADDD'd with the abs-diff.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SabaVec4S) {
+  static const uint32_t code[] = {SabaVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7FFFFFFF80000000ULL, 0x0000000A00000064ULL);  // Vn
+  SetV128(&state_, 2, 0x0000000100000005ULL, 0xFFFFFFFF00000032ULL);  // Vm
+  SetV128(&state_, 0, 0x0000000100000002ULL, 0x0000000300000004ULL);  // Vd accum
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFF80000007ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000E00000036ULL);
+}
+
+// UABA .16B (size=00, Q=1): per-byte unsigned abs-diff accumulated into Vd. SSE2
+// (PMAXUB/PMINUB + PADDB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UabaVec16B) {
+  static const uint32_t code[] = {UabaVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFF00807F01FE1020ULL, 0x0102030405060708ULL);  // Vn
+  SetV128(&state_, 2, 0x00FF7F80FE012010ULL, 0x0807060504030201ULL);  // Vm
+  SetV128(&state_, 0, 0x0101010101010101ULL, 0x1010101010101010ULL);  // Vd accum
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000202FEFE1111ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x1715131111131517ULL);
+}
+
+// SABD .2S (size=10, Q=0): per-dword signed abs-diff, upper 64 bits zeroed.
+// Exercises the INT_MIN-vs-INT_MAX wrap where a naive PSUB+sign-mask abs fails
+// but max-minus-min is correct.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SabdVec2SUpperZero) {
+  static const uint32_t code[] = {SabdVec(0b10, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7FFFFFFF80000000ULL, 0xAAAAAAAABBBBBBBBULL);  // Vn
+  SetV128(&state_, 2, 0x00000001FFFFFFFFULL, 0xCCCCCCCCDDDDDDDDULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFE7FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SABD .2D (size=11) has no packed SSE min/max qword op and must bail to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SabdVec2DBails) {
+  static const uint32_t code[] = {SabdVec(0b11, /*q=*/true, 0, 1, 2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(

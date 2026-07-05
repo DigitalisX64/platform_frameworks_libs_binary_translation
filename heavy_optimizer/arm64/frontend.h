@@ -3341,6 +3341,103 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // SABD/UABD (absolute difference) and SABA/UABA (absolute difference then
+    // accumulate into Vd): per-lane |Vn - Vm|. Mirrors lite_translator.h's
+    // kSabd/kUabd/kSaba/kUaba block exactly. ARM computes the difference in
+    // extended precision then truncates the absolute value; a naive PSUB +
+    // sign-mask abs mismatches on the INT_MIN-vs-INT_MAX wrap. The correct
+    // modular-arithmetic recipe is per-lane max(a,b) - min(a,b) on the
+    // signed (SABD/SABA) or unsigned (UABD/UABA) interpretation, so it reuses
+    // the same PMAXS/PMINS/PMAXU/PMINU packed ops as the min/max block above,
+    // then PSUB (and PADD into Vd for the *ABA accumulate). The .2D (size=11)
+    // form is reserved by the ARM ARM and bails. Per-size SSE4.1 gate matches
+    // the min/max block (PMAXSB/PMINSB/PMAXSD/PMINSD/PMAXUW/PMINUW/PMAXUD/
+    // PMINUD need SSE4.1; PMAXSW/PMINSW/PMAXUB/PMINUB are SSE2).
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSabd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUabd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSaba ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUaba) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSabd ||
+                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kSaba);
+      const bool is_accum = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSaba ||
+                             args.opcode == Decoder::AdvSimdThreeSameOpcode::kUaba);
+      const bool needs_sse4_1 = (is_signed && args.size == 0b00) ||
+                                (is_signed && args.size == 0b10) ||
+                                (!is_signed && args.size == 0b01) ||
+                                (!is_signed && args.size == 0b10);
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xmax = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      // xmax = max(Vn, Vm); xn = min(Vn, Vm); xmax -= xn == |Vn - Vm|.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      switch (args.size) {
+        case 0b00:  // .16B / .8B
+          if (is_signed) {
+            builder_.Gen<x86_64::PmaxsbXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxubXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PsubbXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+          break;
+        case 0b01:  // .8H / .4H
+          if (is_signed) {
+            builder_.Gen<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+          break;
+        default:  // 0b10: .4S / .2S
+          if (is_signed) {
+            builder_.Gen<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+          break;
+      }
+      if (is_accum) {
+        // Accumulate the abs-diff (xmax) into Vd at the element width.
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PaddbXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+            break;
+        }
+        // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+        SetVRegFull(args.rd, xd, args.q);
+      } else {
+        // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+        SetVRegFull(args.rd, xmax, args.q);
+      }
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
