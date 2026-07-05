@@ -2905,6 +2905,255 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Ld2WrapV31) {
   }
 }
 
+// AdvSIMD load/store SINGLE structure: LD1R (replicate), single-element LD1 /
+// ST1 (one lane), num_regs == 1. Encoding: 0 Q 001101 P L R Rm opcode S size
+// Rn Rt. opcode / S / size / Q pack the element size and lane index per the ARM
+// ARM; the encoder passes these fields raw and the static_asserts pin them to
+// LLVM-assembler ground truth (clang-assembled + llvm-objdump'd).
+constexpr uint32_t AdvSimdSingleEnc(bool q, bool postindex, bool is_load, bool r,
+                                    uint8_t rm, uint8_t opcode, bool s_bit, uint8_t size,
+                                    uint8_t rn, uint8_t rt) {
+  return 0x0D000000u | (static_cast<uint32_t>(q) << 30) |
+         (static_cast<uint32_t>(postindex) << 23) | (static_cast<uint32_t>(is_load) << 22) |
+         (static_cast<uint32_t>(r) << 21) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(opcode) << 13) | (static_cast<uint32_t>(s_bit) << 12) |
+         (static_cast<uint32_t>(size) << 10) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+// Ground truth (llvm-objdump of clang-assembled LD1R/LD1/ST1 single-structure):
+//   ld1r  {v3.4s},  [x1]        4d40c823
+//   ld1r  {v3.4s},  [x10], #4   4ddfc943
+//   ld1r  {v0.8b},  [x1]        0d40c020
+//   ld1r  {v0.2d},  [x1]        4d40cc20
+//   ld1r  {v5.8h},  [x1], x3    4dc3c425
+//   ld1   {v0.s}[2],[x1]        4d408020
+//   ld1   {v0.b}[5],[x1]        0d401420
+//   ld1   {v31.s}[0],[x1]       0d40803f
+//   ld1   {v0.h}[3],[x1], #2    0ddf5820
+//   st1   {v0.s}[3],[x1]        4d009020
+//   st1   {v0.d}[1],[x1]        4d008420
+//   st1   {v3.s}[1],[x10], x2   0d829143
+//   st1   {v0.b}[10],[x1]       4d000820
+static_assert(AdvSimdSingleEnc(true, false, true, false, 0, 0b110, false, 0b10, 1, 3) ==
+              0x4d40c823u);
+static_assert(AdvSimdSingleEnc(true, true, true, false, 31, 0b110, false, 0b10, 10, 3) ==
+              0x4ddfc943u);
+static_assert(AdvSimdSingleEnc(false, false, true, false, 0, 0b110, false, 0b00, 1, 0) ==
+              0x0d40c020u);
+static_assert(AdvSimdSingleEnc(true, false, true, false, 0, 0b110, false, 0b11, 1, 0) ==
+              0x4d40cc20u);
+static_assert(AdvSimdSingleEnc(true, true, true, false, 3, 0b110, false, 0b01, 1, 5) ==
+              0x4dc3c425u);
+static_assert(AdvSimdSingleEnc(true, false, true, false, 0, 0b100, false, 0b00, 1, 0) ==
+              0x4d408020u);
+static_assert(AdvSimdSingleEnc(false, false, true, false, 0, 0b000, true, 0b01, 1, 0) ==
+              0x0d401420u);
+static_assert(AdvSimdSingleEnc(false, false, true, false, 0, 0b100, false, 0b00, 1, 31) ==
+              0x0d40803fu);
+static_assert(AdvSimdSingleEnc(false, true, true, false, 31, 0b010, true, 0b10, 1, 0) ==
+              0x0ddf5820u);
+static_assert(AdvSimdSingleEnc(true, false, false, false, 0, 0b100, true, 0b00, 1, 0) ==
+              0x4d009020u);
+static_assert(AdvSimdSingleEnc(true, false, false, false, 0, 0b100, false, 0b01, 1, 0) ==
+              0x4d008420u);
+static_assert(AdvSimdSingleEnc(false, true, false, false, 2, 0b100, true, 0b00, 10, 3) ==
+              0x0d829143u);
+static_assert(AdvSimdSingleEnc(true, false, false, false, 0, 0b000, false, 0b10, 1, 0) ==
+              0x4d000820u);
+
+// LD1R {v3.4s}, [x1]: broadcast the 4-byte element at [x1] to all 4 S lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1r_4s) {
+  alignas(16) static const uint32_t buf[1] = {0xDEADBEEFu};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, false, true, false, 0, 0b110, false, 0b10, 1, 3)};
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[3], 16);
+  for (int l = 0; l < 4; l++) EXPECT_EQ(r[l], 0xDEADBEEFu);
+}
+
+// LD1R {v0.8b}, [x1] (Q=0): broadcast a byte to all 8 low lanes, upper 64 = 0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1r_8b_Q0ZeroesUpper) {
+  static const uint8_t buf[1] = {0x5A};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(false, false, true, false, 0, 0b110, false, 0b00, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int l = 0; l < 8; l++) EXPECT_EQ(r[l], 0x5A);
+  for (int l = 8; l < 16; l++) EXPECT_EQ(r[l], 0);
+}
+
+// LD1R {v0.2d}, [x1]: broadcast an 8-byte element to both D lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1r_2d) {
+  alignas(16) static const uint64_t buf[1] = {0x0123456789ABCDEFULL};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, false, true, false, 0, 0b110, false, 0b11, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x0123456789ABCDEFULL);
+  EXPECT_EQ(r[1], 0x0123456789ABCDEFULL);
+}
+
+// LD1R {v3.4s}, [x10], #4: replicate then immediate post-index advances x10 by
+// esize (4). This is exactly the calculate_gnu_hash_neon tail.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1r_4s_PostIndexImm) {
+  alignas(16) static const uint32_t buf[1] = {0x11223344u};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, true, true, false, 31, 0b110, false, 0b10, 10, 3)};
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  const GuestAddr base = ToGuestAddr(&buf[0]);
+  state_.cpu.x[10] = base;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[3], 16);
+  for (int l = 0; l < 4; l++) EXPECT_EQ(r[l], 0x11223344u);
+  EXPECT_EQ(state_.cpu.x[10], base + 4);
+}
+
+// LD1R {v5.8h}, [x1], x3: replicate a halfword to 8 lanes, register post-index.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1r_8h_PostIndexReg) {
+  alignas(16) static const uint16_t buf[1] = {0xBEEF};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, true, true, false, 3, 0b110, false, 0b01, 1, 5)};
+  std::memset(&state_.cpu.v[5], 0xAB, 16);
+  const GuestAddr base = ToGuestAddr(&buf[0]);
+  state_.cpu.x[1] = base;
+  state_.cpu.x[3] = 64;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[5], 16);
+  for (int l = 0; l < 8; l++) EXPECT_EQ(r[l], 0xBEEF);
+  EXPECT_EQ(state_.cpu.x[1], base + 64);
+}
+
+// LD1 {v0.s}[2], [x1]: load one S element into lane 2, other lanes preserved.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1_Single_s_Lane2) {
+  alignas(16) static const uint32_t buf[1] = {0xCAFEF00Du};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, false, true, false, 0, 0b100, false, 0b00, 1, 0)};
+  const uint32_t init[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  std::memcpy(&state_.cpu.v[0], init, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], init[0]);
+  EXPECT_EQ(r[1], init[1]);
+  EXPECT_EQ(r[2], 0xCAFEF00Du);
+  EXPECT_EQ(r[3], init[3]);
+}
+
+// LD1 {v0.b}[5], [x1]: load one byte into lane 5, other lanes preserved.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1_Single_b_Lane5) {
+  static const uint8_t buf[1] = {0x7E};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(false, false, true, false, 0, 0b000, true, 0b01, 1, 0)};
+  uint8_t init[16];
+  for (int i = 0; i < 16; i++) init[i] = static_cast<uint8_t>(0x10 + i);
+  std::memcpy(&state_.cpu.v[0], init, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int l = 0; l < 16; l++) {
+    EXPECT_EQ(r[l], l == 5 ? uint8_t{0x7E} : init[l]);
+  }
+}
+
+// LD1 {v31.s}[0], [x1]: high register (v31), lane 0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1_Single_s_V31) {
+  alignas(16) static const uint32_t buf[1] = {0xABCD1234u};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(false, false, true, false, 0, 0b100, false, 0b00, 1, 31)};
+  const uint32_t init[4] = {0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
+  std::memcpy(&state_.cpu.v[31], init, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint32_t r[4];
+  std::memcpy(r, &state_.cpu.v[31], 16);
+  EXPECT_EQ(r[0], 0xABCD1234u);
+  EXPECT_EQ(r[1], init[1]);
+  EXPECT_EQ(r[2], init[2]);
+  EXPECT_EQ(r[3], init[3]);
+}
+
+// LD1 {v0.h}[3], [x1], #2: load one halfword into lane 3, imm post-index by 2.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ld1_Single_h_Lane3_PostIndexImm) {
+  alignas(16) static const uint16_t buf[1] = {0x9ABC};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(false, true, true, false, 31, 0b010, true, 0b10, 1, 0)};
+  uint16_t init[8];
+  for (int i = 0; i < 8; i++) init[i] = static_cast<uint16_t>(0x100 + i);
+  std::memcpy(&state_.cpu.v[0], init, 16);
+  const GuestAddr base = ToGuestAddr(&buf[0]);
+  state_.cpu.x[1] = base;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int l = 0; l < 8; l++) {
+    EXPECT_EQ(r[l], l == 3 ? uint16_t{0x9ABC} : init[l]);
+  }
+  EXPECT_EQ(state_.cpu.x[1], base + 2);
+}
+
+// ST1 {v0.s}[3], [x1]: store lane 3 (one S element) to memory.
+TEST_F(Arm64HeavyOptimizerFrontendTest, St1_Single_s_Lane3) {
+  alignas(16) static uint32_t buf[1] = {0};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, false, false, false, 0, 0b100, true, 0b00, 1, 0)};
+  const uint32_t v[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0xC0FFEE00u};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xC0FFEE00u);
+}
+
+// ST1 {v0.d}[1], [x1]: store the high D lane.
+TEST_F(Arm64HeavyOptimizerFrontendTest, St1_Single_d_Lane1) {
+  alignas(16) static uint64_t buf[1] = {0};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(true, false, false, false, 0, 0b100, false, 0b01, 1, 0)};
+  const uint64_t v[2] = {0x1111222233334444ULL, 0xDEADBEEFCAFEF00DULL};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xDEADBEEFCAFEF00DULL);
+}
+
+// ST1 {v3.s}[1], [x10], x2: store lane 1, register post-index by x2.
+TEST_F(Arm64HeavyOptimizerFrontendTest, St1_Single_s_Lane1_PostIndexReg) {
+  alignas(16) static uint32_t buf[1] = {0};
+  static const uint32_t code[] = {
+      AdvSimdSingleEnc(false, true, false, false, 2, 0b100, true, 0b00, 10, 3)};
+  const uint32_t v[4] = {0xAAAAAAAAu, 0xBADDCAFEu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+  std::memcpy(&state_.cpu.v[3], v, 16);
+  const GuestAddr base = ToGuestAddr(&buf[0]);
+  state_.cpu.x[10] = base;
+  state_.cpu.x[2] = 128;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xBADDCAFEu);
+  EXPECT_EQ(state_.cpu.x[10], base + 128);
+}
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, LdrX64) {
   static uint64_t buf[2] = {0x1122334455667788ULL, 0};
   static const uint32_t code[] = {LdrXuoff(0, 1, 0)};
@@ -9405,6 +9654,163 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmlslVec2D) {
   // {SAT->INT64_MIN, 70}
   EXPECT_EQ(VLo64(&state_, 0), 0x8000000000000000ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000046ULL);
+}
+
+// LDR/STR (SIMD&FP, register offset):
+//   size(31:30) 111 V=1(26) 00 opc(23:22) 1(21) Rm(20:16) option(15:13) S(12)
+//   10(11:10) Rn(9:5) Rt(4:0).
+// opc selects the operation and the 128-bit form (128-bit load opc=11 / store
+// opc=10; non-128 load opc=01 / store opc=00); size selects the transfer width
+// (128->00, 64->11, 32->10). option is the extend (LSL/UXTX=011, UXTW=010,
+// SXTW=110) and S enables the log2(bytes) shift. Encodings verified against the
+// LLVM assembler (disassembly inline).
+constexpr uint32_t SimdLdStRegOffEnc(uint8_t size_field,
+                                     uint8_t opc,
+                                     uint8_t rm,
+                                     uint8_t option,
+                                     uint8_t s_bit,
+                                     uint8_t rn,
+                                     uint8_t rt) {
+  return (uint32_t{size_field} << 30) | (0b111u << 27) | (1u << 26) | (uint32_t{opc} << 22) |
+         (1u << 21) | (uint32_t{rm} << 16) | (uint32_t{option} << 13) | (uint32_t{s_bit} << 12) |
+         (0b10u << 10) | (uint32_t{rn} << 5) | uint32_t{rt};
+}
+// 128-bit (Q): size=00, load opc=11 / store opc=10.
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 21, 0b011, 0, 13, 0) == 0x3cf569a0u);  // ldr q0,[x13,x21]
+static_assert(SimdLdStRegOffEnc(0b00, 0b10, 3, 0b011, 0, 0, 0) == 0x3ca36800u);    // str q0,[x0,x3]
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 0) == 0x3ce26820u);    // ldr q0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b00, 0b10, 2, 0b011, 0, 1, 0) == 0x3ca26820u);    // str q0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 1, 1, 0) == 0x3ce27820u);    // ldr q0,[x1,x2,lsl#4]
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 31) == 0x3ce2683fu);   // ldr q31,[x1,x2]
+// 64-bit (D): size=11, load opc=01 / store opc=00.
+static_assert(SimdLdStRegOffEnc(0b11, 0b01, 2, 0b011, 0, 1, 0) == 0xfc626820u);    // ldr d0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b11, 0b00, 2, 0b011, 0, 1, 0) == 0xfc226820u);    // str d0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b11, 0b01, 6, 0b010, 1, 5, 3) == 0xfc6658a3u);    // ldr d3,[x5,w6,uxtw#3]
+// 32-bit (S): size=10, load opc=01 / store opc=00.
+static_assert(SimdLdStRegOffEnc(0b10, 0b01, 2, 0b011, 0, 1, 0) == 0xbc626820u);    // ldr s0,[x1,x2]
+
+// ldr q0, [x1, x2]: 128-bit register-offset load; x2=16 selects buf[2..3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQRegOffset) {
+  alignas(16) static const uint64_t buf[4] = {0x1111111122222222ULL, 0x3333333344444444ULL,
+                                              0x5555555566666666ULL, 0x7777777788888888ULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 16;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], buf[2]);
+  EXPECT_EQ(r[1], buf[3]);
+}
+
+// str q0, [x1, x2]: 128-bit register-offset store; x2=16 writes buf[2..3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrQRegOffset) {
+  alignas(16) static uint64_t buf[4] = {0, 0, 0, 0};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b10, 2, 0b011, 0, 1, 0)};
+  const uint64_t v[2] = {0xCAFEF00DDEADBEEFULL, 0x0123456789ABCDEFULL};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 16;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0ULL);  // untouched
+  EXPECT_EQ(buf[1], 0ULL);
+  EXPECT_EQ(buf[2], v[0]);
+  EXPECT_EQ(buf[3], v[1]);
+}
+
+// ldr d0, [x1, x2]: 64-bit register-offset load zero-extends the upper 64 of v0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrDRegOffsetZeroesUpper) {
+  alignas(16) static const uint64_t buf[2] = {0x1122334455667788ULL, 0xdeadbeefdeadbeefULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b11, 0b01, 2, 0b011, 0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], buf[0]);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// str d0, [x1, x2]: 64-bit register-offset store writes only the low 8 bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrDRegOffset) {
+  alignas(16) static uint64_t buf[2] = {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b11, 0b00, 2, 0b011, 0, 1, 0)};
+  const uint64_t v[2] = {0x0011223344556677ULL, 0x8899AABBCCDDEEFFULL};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], v[0]);                       // low 8 written
+  EXPECT_EQ(buf[1], 0xFFFFFFFFFFFFFFFFULL);      // high 8 untouched
+}
+
+// ldr s0, [x1, x2]: 32-bit register-offset load zero-extends the upper 96 of v0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrSRegOffsetZeroesUpper) {
+  alignas(16) static const uint32_t buf[4] = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b10, 0b01, 2, 0b011, 0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x11223344u});
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// ldr q0, [x1, x2, lsl #4]: the S bit scales x2 by 16, so x2=1 -> addr = x1 + 16.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQRegOffsetLslShift) {
+  alignas(16) static const uint64_t buf[4] = {0x1111111111111111ULL, 0x2222222222222222ULL,
+                                              0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 1, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 1;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], buf[2]);
+  EXPECT_EQ(r[1], buf[3]);
+}
+
+// ldr d3, [x5, w6, uxtw #3]: UXTW takes only the low 32 bits of x6 and scales by
+// 8. x6=0xFFFFFFFF00000002 -> index 2 -> addr = x5 + 16 -> buf[2].
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrDRegOffsetUxtw) {
+  alignas(16) static const uint64_t buf[4] = {0xDEAD0000ULL, 0xBEEF1111ULL, 0xF00D2222ULL,
+                                              0xCAFE3333ULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b11, 0b01, 6, 0b010, 1, 5, 3)};
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  state_.cpu.x[5] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[6] = 0xFFFFFFFF00000002ULL;  // only low 32 (=2) used by UXTW
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[3], 16);
+  EXPECT_EQ(r[0], buf[2]);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// ldr q31, [x1, x2]: high vector register.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQ31RegOffset) {
+  alignas(16) static const uint64_t buf[2] = {0x1234567890ABCDEFULL, 0xFEDCBA0987654321ULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 31)};
+  std::memset(&state_.cpu.v[31], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[31], 16);
+  EXPECT_EQ(r[0], buf[0]);
+  EXPECT_EQ(r[1], buf[1]);
 }
 
 }  // namespace
