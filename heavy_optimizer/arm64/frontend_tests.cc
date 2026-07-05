@@ -6190,24 +6190,88 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MulVec2DBails) {
   EXPECT_EQ(n, 0u);
 }
 
-// ADD .2D (64-bit elements) must bail: Paddq is not in the backend allowlist.
-TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec2DBails) {
+// ADD .2D (Q=1): two 64-bit lanes via Paddq; low lane exercises 64-bit wrap.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec2D) {
   static const uint32_t code[] = {AddVec(0b11, /*q=*/true, 0, 1, 2)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0x00000000FFFFFFFFULL);
+  SetV128(&state_, 2, 0x0000000000000002ULL, 0x0000000000000001ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000001ULL);   // wraps within the lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000100000000ULL);
 }
 
-// SUB .16B (byte elements) must bail: Psubb is not in the backend allowlist.
-TEST_F(Arm64HeavyOptimizerFrontendTest, SubVec16BBails) {
+// ADD .16B (Q=1): per-byte add via Paddb; low LSB byte exercises byte wrap.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec16B) {
+  static const uint32_t code[] = {AddVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x01020304050607FFULL, 0x1112131415161718ULL);
+  SetV128(&state_, 2, 0x1010101010101002ULL, 0x2020202020202020ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1112131415161701ULL);   // 0xFF+0x02 -> 0x01, no carry-out
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x3132333435363738ULL);
+}
+
+// ADD .8B (Q=0): D-form upper-zero check for Paddb.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddVec8BUpperZero) {
+  static const uint32_t code[] = {AddVec(0b00, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0102030405060708ULL, 0x9999999999999999ULL);
+  SetV128(&state_, 2, 0x1010101010101010ULL, 0x8888888888888888ULL);
+  SetV128(&state_, 0, 0xEEEEEEEEEEEEEEEEULL, 0xFFFFFFFFFFFFFFFFULL);  // poison upper
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1112131415161718ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// SUB .16B (Q=1): per-byte sub via Psubb; low LSB byte exercises byte borrow.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubVec16B) {
   static const uint32_t code[] = {SubVec(0b00, /*q=*/true, 0, 1, 2)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetV128(&state_, 1, 0x1112131415161700ULL, 0x3132333435363738ULL);
+  SetV128(&state_, 2, 0x1010101010101001ULL, 0x2020202020202020ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x01020304050607FFULL);   // 0x00-0x01 -> 0xFF, no borrow-out
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x1112131415161718ULL);
+}
+
+// SUB .8H (Q=1): per-halfword sub via Psubw; low lane exercises halfword borrow.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubVec8H) {
+  static const uint32_t code[] = {SubVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x000A000B000C0000ULL, 0x0014001300120011ULL);
+  SetV128(&state_, 2, 0x0001000200030001ULL, 0x0004000300020001ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000900090009FFFFULL);   // 0x0000-0x0001 -> 0xFFFF
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0010001000100010ULL);
+}
+
+// SUB .2D (Q=1): two 64-bit lanes via Psubq; low lane exercises 64-bit borrow.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SubVec2D) {
+  static const uint32_t code[] = {SubVec(0b11, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000000ULL, 0x0000000100000000ULL);
+  SetV128(&state_, 2, 0x0000000000000001ULL, 0x0000000000000001ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);   // 0 - 1 wraps within the lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);
 }
 
 // SQADD (a saturating three-same op) must bail to the lite translator.

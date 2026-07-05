@@ -2691,8 +2691,8 @@ class HeavyOptimizerFrontend {
   //
   // Element size comes from args.size (00=byte, 01=half, 10=word, 11=double).
   // The available packed ops constrain which sizes are handled:
-  //   ADD: Paddw (16), Paddd (32). 8-bit (Paddb) and 64-bit (Paddq) bail.
-  //   SUB: Psubd (32). 8/16/64-bit (Psubb/Psubw/Psubq) bail.
+  //   ADD: Paddb (8), Paddw (16), Paddd (32), Paddq (64) — all sizes handled.
+  //   SUB: Psubb (8), Psubw (16), Psubd (32), Psubq (64) — all sizes handled.
   //   MUL: Pmullw (16), Pmulld (32). 8-bit and 64-bit have no packed op; bail.
   //   AND/ORR/EOR: Pand/Por/Pxor are element-size-independent (one op covers
   //     all). ORR with rn==rm is the AdvSIMD MOV (vector) alias and lowers the
@@ -3046,16 +3046,12 @@ class HeavyOptimizerFrontend {
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kAdd:
-        if (args.size != 0b01 && args.size != 0b10) {
-          UndefinedReturningVoid();
-          return;
-        }
-        break;
       case Decoder::AdvSimdThreeSameOpcode::kSub:
-        if (args.size != 0b10) {
-          UndefinedReturningVoid();
-          return;
-        }
+        // ADD -> Padd{b,w,d,q}; SUB -> Psub{b,w,d,q}. All four element sizes
+        // (8/16/32/64) have a direct SSE2 packed op, so every size is handled
+        // (mirrors lite_translator.h). The reserved .1D shape (size=11, Q=0) is
+        // UNALLOCATED; like lite we don't special-case it — SetVRegFull's Q=0
+        // merge just zero-extends the low 64 bits.
         break;
       case Decoder::AdvSimdThreeSameOpcode::kMul:
         if (args.size != 0b01 && args.size != 0b10) {
@@ -3091,14 +3087,26 @@ class HeavyOptimizerFrontend {
     // Run the packed op in place on vn (vn := vn OP vm).
     switch (args.opcode) {
       case Decoder::AdvSimdThreeSameOpcode::kAdd:
-        if (args.size == 0b01) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PaddbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b01) {
           builder_.Gen<x86_64::PaddwXRegXReg>(vn.machine_reg(), vm.machine_reg());
-        } else {
+        } else if (args.size == 0b10) {
           builder_.Gen<x86_64::PadddXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PaddqXRegXReg>(vn.machine_reg(), vm.machine_reg());
         }
         break;
       case Decoder::AdvSimdThreeSameOpcode::kSub:
-        builder_.Gen<x86_64::PsubdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PsubbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else if (args.size == 0b10) {
+          builder_.Gen<x86_64::PsubdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubqXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        }
         break;
       case Decoder::AdvSimdThreeSameOpcode::kMul:
         if (args.size == 0b01) {
