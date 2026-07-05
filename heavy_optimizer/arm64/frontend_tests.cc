@@ -4018,6 +4018,26 @@ static_assert(MaxminvVec(true, false, 0b10, /*q=*/true, 0, 1) == 0x6eb0a820u);  
 static_assert(MaxminvVec(false, false, 0b00, /*q=*/true, 0, 1) == 0x6e31a820u);  // uminv b0, v1.16b
 static_assert(MaxminvVec(false, false, 0b01, /*q=*/true, 0, 1) == 0x6e71a820u);  // uminv h0, v1.8h
 static_assert(MaxminvVec(false, false, 0b10, /*q=*/true, 0, 1) == 0x6eb1a820u);  // uminv s0, v1.4s
+// SADDLP/UADDLP/SADALP/UADALP Vd.<Ta>, Vn.<Tb>: two-reg-misc, opcode=00010
+// (add-long-pairwise) or 00110 (accumulate); U=0 signed / U=1 unsigned.
+constexpr uint32_t AddlpVec(bool is_signed, bool is_accum, uint8_t size, bool q,
+                            uint8_t rd, uint8_t rn) {
+  const uint8_t opcode = is_accum ? 0b00110 : 0b00010;
+  return AdvSimdTwoRegMisc(q, /*u=*/!is_signed, size, opcode, rd, rn);
+}
+static_assert(AddlpVec(true, false, 0b00, /*q=*/false, 0, 1) == 0x0e202820u);  // saddlp v0.4h,v1.8b
+static_assert(AddlpVec(true, false, 0b00, /*q=*/true, 0, 1) == 0x4e202820u);   // saddlp v0.8h,v1.16b
+static_assert(AddlpVec(true, false, 0b01, /*q=*/false, 0, 1) == 0x0e602820u);  // saddlp v0.2s,v1.4h
+static_assert(AddlpVec(true, false, 0b10, /*q=*/true, 0, 1) == 0x4ea02820u);   // saddlp v0.2d,v1.4s
+static_assert(AddlpVec(true, false, 0b10, /*q=*/false, 0, 1) == 0x0ea02820u);  // saddlp v0.1d,v1.2s
+static_assert(AddlpVec(false, false, 0b00, /*q=*/false, 0, 1) == 0x2e202820u); // uaddlp v0.4h,v1.8b
+static_assert(AddlpVec(false, false, 0b00, /*q=*/true, 0, 1) == 0x6e202820u);  // uaddlp v0.8h,v1.16b
+static_assert(AddlpVec(false, false, 0b01, /*q=*/false, 0, 1) == 0x2e602820u); // uaddlp v0.2s,v1.4h
+static_assert(AddlpVec(false, false, 0b10, /*q=*/true, 0, 1) == 0x6ea02820u);  // uaddlp v0.2d,v1.4s
+static_assert(AddlpVec(true, true, 0b00, /*q=*/false, 0, 1) == 0x0e206820u);   // sadalp v0.4h,v1.8b
+static_assert(AddlpVec(true, true, 0b01, /*q=*/false, 0, 1) == 0x0e606820u);   // sadalp v0.2s,v1.4h
+static_assert(AddlpVec(false, true, 0b00, /*q=*/true, 0, 1) == 0x6e206820u);   // uadalp v0.8h,v1.16b
+static_assert(AddlpVec(false, true, 0b10, /*q=*/true, 0, 1) == 0x6ea06820u);   // uadalp v0.2d,v1.4s
 // XTN/XTN2: U=0, opcode=10010.
 constexpr uint32_t XtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10010, rd, rn);
@@ -8354,6 +8374,148 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, UminvVec4S) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
 }
 
+// ---- SADDLP/UADDLP/SADALP/UADALP pairwise long add / accumulate (heavy). ----
+
+// UADDLP v0.4h, v1.8b (Q=0): unsigned pair-sum of bytes
+// {0xFF,0x01,0x80,0x80,0x10,0x20,0x00,0xFF} -> {0x100,0x100,0x30,0xFF}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlpVec4H) {
+  static const uint32_t code[] = {AddlpVec(false, false, 0b00, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFF002010808001FFULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00FF003001000100ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SADDLP v0.4h, v1.8b (Q=0): SAME input, signed pair-sum
+// {(-1)+1, (-128)+(-128), 16+32, 0+(-1)} = {0, -256, 48, -1}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVec4H) {
+  static const uint32_t code[] = {AddlpVec(true, false, 0b00, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFF002010808001FFULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF0030FF000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADDLP v0.8h, v1.16b (Q=1): full-128 unsigned pair-sum. Low half as above;
+// high bytes {1,2,3,4,5,6,7,8} -> {3,7,0xB,0xF}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlpVec8H) {
+  static const uint32_t code[] = {AddlpVec(false, false, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFF002010808001FFULL, 0x0807060504030201ULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00FF003001000100ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000F000B00070003ULL);
+}
+
+// UADDLP v0.2s, v1.4h (Q=0): unsigned pair-sum of halfwords
+// {0xFFFF,0x0001,0x8000,0x8000} -> {0x10000, 0x10000}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlpVec2S) {
+  static const uint32_t code[] = {AddlpVec(false, false, 0b01, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x800080000001FFFFULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0001000000010000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SADDLP v0.2s, v1.4h (Q=0): SAME input, signed pair-sum (PMADDWD path)
+// {(-1)+1, (-32768)+(-32768)} = {0, -65536}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVec2S) {
+  static const uint32_t code[] = {AddlpVec(true, false, 0b01, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x800080000001FFFFULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADDLP v0.2d, v1.4s (Q=1): unsigned pair-sum of words
+// {0xFFFFFFFF,0x1,0x80000000,0x80000000} -> {0x100000000, 0x100000000}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlpVec2D) {
+  static const uint32_t code[] = {AddlpVec(false, false, 0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x00000001FFFFFFFFULL, 0x8000000080000000ULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000100000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000100000000ULL);
+}
+
+// SADDLP v0.2d, v1.4s (Q=1): SAME input, signed pair-sum (PMOVSXDQ path)
+// {(-1)+1, (-2^31)+(-2^31)} = {0, -2^32}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVec2D) {
+  static const uint32_t code[] = {AddlpVec(true, false, 0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x00000001FFFFFFFFULL, 0x8000000080000000ULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFF00000000ULL);
+}
+
+// SADDLP v0.1d, v1.2s (Q=0): signed pair-sum of 2 words, high garbage lane
+// must be masked. {(-2^31)+(-1)} = -2147483649 = 0xFFFFFFFF7FFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVec1D) {
+  static const uint32_t code[] = {AddlpVec(true, false, 0b10, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFF80000000ULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFF7FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SADALP v0.2s, v1.4h (Q=0): signed pair-sum {2+3, (-1)+(-2)} = {5, -3},
+// accumulated into Vd {0x10, 0x100} -> {0x15, 0xFD}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SadalpVec2S) {
+  static const uint32_t code[] = {AddlpVec(true, true, 0b01, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFFFEFFFF00030002ULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0x0000010000000010ULL, 0xDDDDDDDDDDDDDDDDULL);  // acc + poison hi
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000FD00000015ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADALP v0.2d, v1.4s (Q=1): unsigned pair-sum {2+3, 4+5} = {5, 9},
+// accumulated into Vd {0x100, 0x1000} -> {0x105, 0x1009}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UadalpVec2D) {
+  static const uint32_t code[] = {AddlpVec(false, true, 0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0000000300000002ULL, 0x0000000500000004ULL);
+  SetV128(&state_, 0, 0x0000000000000100ULL, 0x0000000000001000ULL);  // acc
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000105ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000001009ULL);
+}
+
 // ---- AdvSIMD two-reg-misc widening/narrowing (heavy mirror). ----
 
 // XTN v0.8b, v1.8h (size=00, Q=0): truncate 8 halfwords to their low bytes.
@@ -9266,16 +9428,19 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, ClsVec2S) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // Q=0 upper zeroed
 }
 
-// A two-reg-misc opcode we do NOT yet mirror (SADDLP) must still bail cleanly.
-TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVecBails) {
-  // saddlp v0.8h, v1.16b : U=0, opcode=00010, size=00, Q=1.
-  static const uint32_t code[] = {AdvSimdTwoRegMisc(/*q=*/true, /*u=*/false, /*size=*/0b00,
-                                                    /*opcode=*/0b00010, 0, 1)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+// SADDLP v0.8h, v1.16b (Q=1): full-128 signed byte->half pair-sum. Low bytes
+// {0xFF,0x01,0x80,0x80,0x10,0x20,0x00,0xFF} -> {0, -256, 48, -1}; high bytes
+// {0x7F,0x7F,0x01,0xFF,0x00,0x80,0x40,0x40} -> {254, 0, -128, 128}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlpVec8H) {
+  static const uint32_t code[] = {AddlpVec(true, false, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFF002010808001FFULL, 0x40408000FF017F7FULL);
+  SetV128(&state_, 0, 0xCCCCCCCCCCCCCCCCULL, 0xDDDDDDDDDDDDDDDDULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF0030FF000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0080FF80000000FEULL);
 }
 
 // ---- AdvSIMD two-reg-misc compare-against-zero (heavy mirror, wave 2). ----

@@ -4591,6 +4591,134 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // SADDLP / UADDLP / SADALP / UADALP Vd.<Ta>, Vn.<Tb> — pairwise long
+      // add / add-accumulate. Each adjacent pair of esize-wide source lanes is
+      // widened (sign/zero) to 2*esize and summed; SADALP/UADALP accumulate the
+      // pairwise sums into the existing Vd. Mirrors the validated lite lowering
+      // (lite_translator.h::AdvSimdTwoRegMisc kSaddlp path) line-by-line:
+      //   byte->half   signed:   PSLLW/PSRAW extract+sign-extend the low byte,
+      //                          PSRAW the high byte, PADDW.
+      //   byte->half   unsigned: 0x00FF mask (PCMPEQW+PSRLW 8) low byte, PSRLW 8
+      //                          high byte, PADDW.
+      //   half->word   signed:   PMADDWD against a per-half 0x0001 (exact signed
+      //                          pair sum -> 32 bits per dword).
+      //   half->word   unsigned: 0x0000FFFF mask (PCMPEQD+PSRLD 16) low half,
+      //                          PSRLD 16 high half, PADDD.
+      //   word->dword  signed:   PMOVSXDQ low/high dword pairs, PUNPCKL/HQDQ to
+      //                          re-pair, PADDQ.
+      //   word->dword  unsigned: 0xFFFFFFFF-per-qword mask (PCMPEQD+PSRLQ 32)
+      //                          low dword, PSRLQ 32 high dword, PADDQ.
+      // Accumulate forms PADD into Vd; Q=0 zeroes the upper 64 bits (mask_low64).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSadalp:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUadalp: {
+        if (args.size == 0b11) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlp) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp);
+        const bool is_accum =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUadalp);
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xres = AllocTempSimdReg();
+        // xtmp seeds the all-ones masks via a self-compare, so it needs a def
+        // (AllocZeroedSimdReg) before the PCMPEQ; the Movdqa branches overwrite
+        // it harmlessly.
+        FpRegister xtmp = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00: {  // byte -> half
+            if (is_signed) {
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsllwXRegImm>(xres.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PsrawXRegImm>(xres.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrawXRegImm>(xtmp.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PaddwXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{8});  // 0x00FF
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PaddwXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            }
+            break;
+          }
+          case 0b01: {  // half -> word
+            if (is_signed) {
+              builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{15});  // 0x0001
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PmaddwdXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});  // 0x0000FFFF
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});
+              builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            }
+            break;
+          }
+          case 0b10: {  // word -> dword
+            if (is_signed) {
+              FpRegister xhi = AllocTempSimdReg();
+              builder_.Gen<x86_64::PmovsxdqXRegXReg>(xres.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrldqXRegImm>(xhi.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PmovsxdqXRegXReg>(xhi.machine_reg(), xhi.machine_reg());
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xres.machine_reg());
+              builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xtmp.machine_reg(), xhi.machine_reg());
+              builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xres.machine_reg(), xhi.machine_reg());
+              builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::PsrlqXRegImm>(xtmp.machine_reg(), int8_t{32});  // lo dword mask
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+              builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrlqXRegImm>(xtmp.machine_reg(), int8_t{32});
+              builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            }
+            break;
+          }
+          default:
+            UndefinedReturningVoid();
+            return;
+        }
+        if (is_accum) {
+          FpRegister xd = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          switch (args.size) {
+            case 0b00:
+              builder_.Gen<x86_64::PaddwXRegXReg>(xres.machine_reg(), xd.machine_reg());
+              break;
+            case 0b01:
+              builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xd.machine_reg());
+              break;
+            default:
+              builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xd.machine_reg());
+              break;
+          }
+        }
+        if (!args.q) {
+          // mask_low64: zero the upper 64 bits (D-register semantics).
+          builder_.Gen<x86_64::PslldqXRegImm>(xres.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PsrldqXRegImm>(xres.machine_reg(), int8_t{8});
+        }
+        builder_.GenSetSimd<16>(vd_off, xres.machine_reg());
+        return;
+      }
+
       default:
         UndefinedReturningVoid();
         return;

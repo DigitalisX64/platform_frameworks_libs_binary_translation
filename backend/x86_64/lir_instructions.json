@@ -219,6 +219,7 @@
         "PinsrdXRegRegImm",
         "PinsrqXRegRegImm",
         "PinsrwXRegRegImm",
+        "PmaddwdXRegXReg",
         "PmaxsbXRegXReg",
         "PmaxsdXRegXReg",
         "PmaxswXRegXReg",
