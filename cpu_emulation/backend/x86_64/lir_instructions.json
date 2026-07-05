@@ -53,6 +53,7 @@
         "CmpqRegImm",
         "CmpqRegReg",
         "Crc32qRegReg",
+        "Cvtdq2psXRegXReg",
         "Cvtsd2ssXRegXReg",
         "Cvtsi2sdlXRegReg",
         "Cvtsi2sdqXRegReg",

@@ -1723,8 +1723,32 @@ class HeavyOptimizerFrontend {
       EmitFcvtz(args, is_double);
       return;
     }
-    // Everything else (rmode==01 V.D[1] FMOV, rounding FP->int conversions)
-    // bails to the lite tier.
+    // Rounding FP -> int conversions FCVTNS/NU (rmode 00, round-to-nearest
+    // ties-even), FCVTPS/PU (rmode 01, toward +inf) and FCVTMS/MU (rmode 10,
+    // toward -inf). ARM ties-away FCVTAS/AU (op 100/101) has no x86 round mode
+    // and still bails. Route through EmitFcvtz with the matching x86 ROUND imm8
+    // so the shared saturation/NaN ladder handles out-of-range/NaN.
+    if ((args.op == 0b000 || args.op == 0b001) &&
+        (args.rmode == 0b00 || args.rmode == 0b01 || args.rmode == 0b10)) {
+      const int8_t round_imm = (args.rmode == 0b00) ? int8_t{0x08}    // RNE + suppress-inexact
+                               : (args.rmode == 0b01) ? int8_t{0x0A}  // toward +inf
+                                                      : int8_t{0x09};  // toward -inf
+      EmitFcvtz(args, is_double, round_imm);
+      return;
+    }
+    // FCVTAS (op 100) / FCVTAU (op 101): FP->int, round-to-nearest ties-away
+    // (rmode 00). x86 has no ties-away round mode; EmitFcvtz's ties_away path
+    // adds copysign(0.5, x) before the truncating saturation ladder. FP32 (S)
+    // only — FP64 (D) bails to lite (mirrors the FP32-only vector FCVTAS/AU).
+    if ((args.op == 0b100 || args.op == 0b101) && args.rmode == 0b00) {
+      if (is_double) {
+        UndefinedReturningVoid();
+        return;
+      }
+      EmitFcvtz(args, is_double, /*round_imm=*/-1, /*ties_away=*/true);
+      return;
+    }
+    // Everything else (rmode==01 V.D[1] FMOV) bails to lite.
     UndefinedReturningVoid();
   }
 
@@ -1979,7 +2003,20 @@ class HeavyOptimizerFrontend {
   // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
   // BB-split lowering (a shared `result` GP vreg merged via PseudoCopy). Mirrors
   // lite_translator.h::FpIntConversion's FCVTZS/FCVTZU paths.
-  void EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double);
+  //
+  // The rounding scalar conversions FCVTNS/NU (rmode 00), FCVTPS/PU (rmode 01)
+  // and FCVTMS/MU (rmode 10) reuse this same saturation/NaN ladder: pass
+  // `round_imm >= 0` (an x86 ROUND imm8 for RNE / +inf / -inf) and the source
+  // is ROUND-ed to an integer-valued FP first (NaN/±Inf/sign-of-zero pass
+  // through unchanged), so the truncating cvtt then yields the rounded integer
+  // with the ARM out-of-range/NaN semantics preserved. FCVTAS/AU (ties-away,
+  // op 100/101) have no x86 round mode; pass `ties_away = true` (FP32 only) to
+  // add a copysign(0.5, x) addend — gated to 0 when |x| >= 2^23, where a 0.5
+  // addend would round the wrong way — before the same truncating ladder.
+  void EmitFcvtz(const Decoder::FpIntConvArgs& args,
+                 bool is_double,
+                 int8_t round_imm = -1,
+                 bool ties_away = false);
 
   //
   // Advanced SIMD (Args-struct forms).
@@ -3235,6 +3272,169 @@ class HeavyOptimizerFrontend {
       }
       // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // Integer vector S{MAX,MIN}/U{MAX,MIN} (opcode 01100 max / 01101 min; U
+    // selects signed/unsigned): lane-wise signed or unsigned min/max. x86 has
+    // direct lane-width-matched PMAXS/PMINS/PMAXU/PMINU for 8/16/32-bit lanes;
+    // the .2D (size=11) form has no SSE-era 64-bit min/max (PMAXSQ/… need
+    // AVX-512F-VL) and bails to lite. Mirrors lite_translator.h's SMAX/… block
+    // exactly, including the per-size SSE4.1 gate (PMAXSB/PMINSB/PMAXSD/PMINSD/
+    // PMAXUW/PMINUW/PMAXUD/PMINUD need SSE4.1; PMAXSW/PMINSW/PMAXUB/PMINUB are
+    // SSE2). The result lands in xn; SetVRegFull's Q=0 merge zeroes Vd[127:64].
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmin ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmax ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmin) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+                           args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmax);
+      const bool is_signed = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmin);
+      const bool needs_sse4_1 = (is_signed && args.size == 0b00) ||
+                                (is_signed && args.size == 0b10) ||
+                                (!is_signed && args.size == 0b01) ||
+                                (!is_signed && args.size == 0b10);
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      switch (args.size) {
+        case 0b00:  // .16B / .8B
+          if (is_signed) {
+            if (is_max) builder_.Gen<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            if (is_max) builder_.Gen<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        case 0b01:  // .8H / .4H
+          if (is_signed) {
+            if (is_max) builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            if (is_max) builder_.Gen<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        default:  // 0b10: .4S / .2S
+          if (is_signed) {
+            if (is_max) builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            if (is_max) builder_.Gen<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+      }
+      // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // SABD/UABD (absolute difference) and SABA/UABA (absolute difference then
+    // accumulate into Vd): per-lane |Vn - Vm|. Mirrors lite_translator.h's
+    // kSabd/kUabd/kSaba/kUaba block exactly. ARM computes the difference in
+    // extended precision then truncates the absolute value; a naive PSUB +
+    // sign-mask abs mismatches on the INT_MIN-vs-INT_MAX wrap. The correct
+    // modular-arithmetic recipe is per-lane max(a,b) - min(a,b) on the
+    // signed (SABD/SABA) or unsigned (UABD/UABA) interpretation, so it reuses
+    // the same PMAXS/PMINS/PMAXU/PMINU packed ops as the min/max block above,
+    // then PSUB (and PADD into Vd for the *ABA accumulate). The .2D (size=11)
+    // form is reserved by the ARM ARM and bails. Per-size SSE4.1 gate matches
+    // the min/max block (PMAXSB/PMINSB/PMAXSD/PMINSD/PMAXUW/PMINUW/PMAXUD/
+    // PMINUD need SSE4.1; PMAXSW/PMINSW/PMAXUB/PMINUB are SSE2).
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSabd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUabd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSaba ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUaba) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSabd ||
+                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kSaba);
+      const bool is_accum = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSaba ||
+                             args.opcode == Decoder::AdvSimdThreeSameOpcode::kUaba);
+      const bool needs_sse4_1 = (is_signed && args.size == 0b00) ||
+                                (is_signed && args.size == 0b10) ||
+                                (!is_signed && args.size == 0b01) ||
+                                (!is_signed && args.size == 0b10);
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xmax = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      // xmax = max(Vn, Vm); xn = min(Vn, Vm); xmax -= xn == |Vn - Vm|.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      switch (args.size) {
+        case 0b00:  // .16B / .8B
+          if (is_signed) {
+            builder_.Gen<x86_64::PmaxsbXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxubXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PsubbXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+          break;
+        case 0b01:  // .8H / .4H
+          if (is_signed) {
+            builder_.Gen<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+          break;
+        default:  // 0b10: .4S / .2S
+          if (is_signed) {
+            builder_.Gen<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+          break;
+      }
+      if (is_accum) {
+        // Accumulate the abs-diff (xmax) into Vd at the element width.
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+        switch (args.size) {
+          case 0b00:
+            builder_.Gen<x86_64::PaddbXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+            break;
+          case 0b01:
+            builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+            break;
+          default:  // 0b10
+            builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+            break;
+        }
+        // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+        SetVRegFull(args.rd, xd, args.q);
+      } else {
+        // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+        SetVRegFull(args.rd, xmax, args.q);
+      }
       return;
     }
 
@@ -5345,6 +5545,48 @@ class HeavyOptimizerFrontend {
           builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
           SetVRegFull(args.rd, x_dst, args.q);
         }
+        return;
+      }
+
+      // SCVTF / UCVTF V Vd.<T>, Vn.<T> (FP32 .2S/.4S) — integer to
+      // floating-point convert (the inverse direction of FCVTZS/FCVTZU V).
+      // Branchless mirror of the validated lite lowering
+      // (lite_translator.h::AdvSimdTwoRegMisc kScvtfV/kUcvtfV, FP32 path):
+      //   SCVTF: a single CVTDQ2PS — x86 signed int32 -> FP32 matches ARM.
+      //   UCVTF: CVTDQ2PS treats the input as signed, so lanes with bit31 set
+      //          come out negative; recover the unsigned value by adding 2^32
+      //          (FP32 bits 0x4F800000) per lane wherever bit31 was set
+      //          (PSRAD 31 mask), which is exact for the [2^31, 2^32) range.
+      // The FP64 .2D form (branchy per-lane in lite) and FP16 bail to
+      // lite→interp, mirroring the lite FP32-only fast path.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
+        if (args.is_fp16 || (args.size & 1) == 1) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (!is_unsigned) {
+          // SCVTF V: signed int32 -> FP32 is native.
+          builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          SetVRegFull(args.rd, xn, args.q);
+          return;
+        }
+        // UCVTF V: CVTDQ2PS + per-lane 2^32 addend for MSB-set lanes.
+        FpRegister msb = AllocTempSimdReg();
+        FpRegister addend = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});  // 0 or all-1s
+        builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
+        Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F800000)));  // 2^32
+        builder_.Gen<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());  // 2^32 where MSB set
+        builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
+        SetVRegFull(args.rd, xn, args.q);
         return;
       }
 
