@@ -3810,6 +3810,19 @@ constexpr uint32_t FmovImmD(uint8_t rd, uint8_t imm8) {
   return 0x1E601000 | (static_cast<uint32_t>(imm8) << 13) | rd;
 }
 
+// FCSEL Sd|Dd, Sn, Sm, cond:  0001_1110_ftype_1_Rm_cond_11_Rn_Rd.
+// Base: 0x1E200C00 (S) / 0x1E600C00 (D).
+constexpr uint32_t FcselScalar(uint32_t base, uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return base | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(cond) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FcselS(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return FcselScalar(0x1E200C00, rd, rn, rm, cond);
+}
+constexpr uint32_t FcselD(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+  return FcselScalar(0x1E600C00, rd, rn, rm, cond);
+}
+
 // --- AdvSIMD three-same INTEGER encoders. ---
 // Standard three-same encoding (bit21=1):
 //   0 Q U 01110 size(2) 1 Rm(5) opcode(5) 1 Rn(5) Rd(5)
@@ -4570,6 +4583,136 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FmovImmDNegTwo) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -2.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FCSEL Sd|Dd, Sn, Sm, cond. The heavy tier lowers this branchlessly (0/-1
+// mask + PAND/PANDN/POR). Each region seeds NZCV with a real compare (mirrors
+// the CSEL tests above), then selects, and asserts the chosen operand plus the
+// architectural zeroing of V[rd]'s upper bytes.
+
+// EQ taken: X0==5, CMP X0,#5 -> Z=1 -> Vd = Vn. Vd's upper bytes must zero.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselSEqTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),             // Z=1
+      FcselS(0, 1, 2, kCondEQ),  // EQ -> Vn (1.25f)
+  };
+  SetVf32(&state_, 1, 1.25f);
+  SetVf32(&state_, 2, 2.5f);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.25f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// EQ not taken: CMP X0,#6 -> Z=0 -> Vd = Vm.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselSEqNotTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 6),             // Z=0
+      FcselS(0, 1, 2, kCondEQ),  // EQ false -> Vm (2.5f)
+  };
+  SetVf32(&state_, 1, 1.25f);
+  SetVf32(&state_, 2, 2.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// LT taken (D): 3 - 5 -> N=1, V=0 -> LT (N!=V) holds -> Vn.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselDLtTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 3),
+      CmpImmX(0, 5),             // N=1, V=0
+      FcselD(0, 1, 2, kCondLT),  // LT -> Vn (3.14159)
+  };
+  SetVf64(&state_, 1, 3.14159);
+  SetVf64(&state_, 2, 2.71828);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 3.14159);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// GE not taken (D): N=1, V=0 -> GE (N==V) fails -> Vm.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselDGeNotTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 3),
+      CmpImmX(0, 5),             // N=1, V=0
+      FcselD(0, 1, 2, kCondGE),  // GE false -> Vm (2.71828)
+  };
+  SetVf64(&state_, 1, 3.14159);
+  SetVf64(&state_, 2, 2.71828);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 2.71828);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// HI taken (D): 10 - 5 -> C=1 (no borrow), Z=0 -> HI (C&&!Z) holds -> Vn.
+// Exercises the compound-condition predicate path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselDHiTaken) {
+  static const uint32_t code[] = {
+      MovzX(0, 10),
+      CmpImmX(0, 5),             // C=1, Z=0
+      FcselD(0, 1, 2, kCondHI),  // HI -> Vn (100.5)
+  };
+  SetVf64(&state_, 1, 100.5);
+  SetVf64(&state_, 2, -0.25);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 100.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// AL (cond 0xE) is unconditional and always selects Vn regardless of flags.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselSAlwaysVn) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 6),             // Z=0 (would fail a real condition)
+      FcselS(0, 1, 2, kCondAL),  // AL -> Vn (-7.5f) unconditionally
+  };
+  SetVf32(&state_, 1, -7.5f);
+  SetVf32(&state_, 2, 2.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), -7.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FCSEL is a bitwise select, not a numeric one: selecting -0.0 over +0.0 must
+// preserve the sign bit (they compare numerically equal). EQ taken -> Vn=-0.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcselDBitExactNegZero) {
+  static const uint32_t code[] = {
+      MovzX(0, 5),
+      CmpImmX(0, 5),             // Z=1
+      FcselD(0, 1, 2, kCondEQ),  // EQ -> Vn (-0.0)
+  };
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xABABABABABABABABULL);  // -0.0 + poison
+  SetVf64(&state_, 2, 0.0);                                            // +0.0
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x8000000000000000ULL);  // sign bit preserved
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 

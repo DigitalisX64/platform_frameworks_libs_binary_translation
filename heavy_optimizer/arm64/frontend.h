@@ -1537,12 +1537,57 @@ class HeavyOptimizerFrontend {
   // Floating-point scalar.
   //
 
-  // FCSEL: predicate-select between two scalar V regs. Not wired into the
-  // optimizing tier yet (needs basic-block manipulation + scalar select);
-  // bail to the lite translator/interpreter.
+  // FCSEL Sd|Dd, Sn|Dn, Sm|Dm, cond:
+  //   V[rd] = ZeroExtend(ConditionHolds(cond) ? V[rn] : V[rm]).
+  // Lowered branchlessly (no basic-block manipulation, unlike the lite tier's
+  // Jcc form) so the whole scalar select stays inside one machine BB: build a
+  // full-width 0/-1 mask from the ARM condition predicate and blend the two
+  // scalars with PAND/PANDN/POR. Mirrors the interpreter's FpCondSelect
+  // (read the chosen source, zero-extend into V[rd]) semantically.
+  //
+  //   pred    = EmitArmCondPredicate(cond)   // 0/1, 1 iff cond holds
+  //   mask_gp = 0 - pred                      // cond ? 0xFFFF..FFFF : 0
+  //   mask    = MOVQ(mask_gp)                 // low 64 bits carry the mask
+  //   vn &= mask ;  mask = ~mask & vm ;  vn |= mask   // vn = cond ? Vn : Vm
+  //   SetVRegScalar(rd, vn)                   // zero-extends the low lane
+  //
+  // GetVRegScalar returns a fresh MOVSD-loaded temp (upper lanes zero), so the
+  // two operands can be mutated in place. Only the low scalar lane needs a
+  // correct mask (SetVRegScalar re-zeroes the upper bytes), so a low-64 mask
+  // covers both S and D. ftype 0b11 (FP16) and reserved 0b10 bail to the lite
+  // tier, whose intrinsics cover them (matches FpDataProc3's FP16 bail).
   void FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ftype, Decoder::Condition cond) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(rd, rn, rm, ftype, cond);
+    if (!success()) {
+      return;
+    }
+    if (ftype != 0b00 && ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (ftype == 0b01);
+
+    FpRegister vn = GetVRegScalar(rn, is_double);  // condition-TRUE operand
+    FpRegister vm = GetVRegScalar(rm, is_double);  // condition-FALSE operand
+
+    // AL/NV are unconditional on FCSEL and always select the TRUE operand.
+    if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
+      SetVRegScalar(rd, vn, is_double);
+      return;
+    }
+
+    Register pred = EmitArmCondPredicate(cond);  // 0/1
+    // mask_gp = 0 - pred (no Neg op in the heavy IR; mirrors CSNEG's negate).
+    Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+    Register mask_gp = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(zero, pred));
+    FpRegister mask = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), mask_gp);
+
+    // vn = (Vn & mask) | (Vm & ~mask). PANDN(dst, src) = ~dst & src.
+    builder_.Gen<x86_64::PandXRegXReg>(vn.machine_reg(), mask.machine_reg());
+    builder_.Gen<x86_64::PandnXRegXReg>(mask.machine_reg(), vm.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(vn.machine_reg(), mask.machine_reg());
+
+    SetVRegScalar(rd, vn, is_double);
   }
 
   // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point). The FCvt* intrinsics + cvtsi2ss
