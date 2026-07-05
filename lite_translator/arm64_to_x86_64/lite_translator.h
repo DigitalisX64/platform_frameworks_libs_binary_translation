@@ -2838,6 +2838,49 @@ class LiteTranslator {
       }
       return;
     }
+    // Handle 64-bit (D) and 32-bit (S) pairs (LDP/STP d/s registers). The two
+    // elements sit at [addr] and [addr + element_size]. A load zero-extends the
+    // unused upper lanes (MOVSD zeroes bits 127:64, MOVSS zeroes bits 127:32),
+    // then the full 16-byte v[] slot is committed via MOVDQU so the guest
+    // register's upper bits read as zero.
+    if (args.size == Decoder::SimdLoadStoreSize::k64bit ||
+        args.size == Decoder::SimdLoadStoreSize::k32bit) {
+      SimdRegister xmm1 = AllocTempSimdReg();
+      SimdRegister xmm2 = AllocTempSimdReg();
+      if (xmm1 == no_simd_register || xmm2 == no_simd_register) {
+        Undefined(); return;
+      }
+      int32_t vreg1_off = offsetof(ThreadState, cpu.v[0]) + args.rt1 * 16;
+      int32_t vreg2_off = offsetof(ThreadState, cpu.v[0]) + args.rt2 * 16;
+      const int32_t element_size =
+          (args.size == Decoder::SimdLoadStoreSize::k64bit) ? 8 : 4;
+      if (args.size == Decoder::SimdLoadStoreSize::k64bit) {
+        if (args.is_store) {
+          as_.Movsd(xmm1, {.base = Assembler::rbp, .disp = vreg1_off});
+          as_.Movsd(xmm2, {.base = Assembler::rbp, .disp = vreg2_off});
+          as_.Movsd({.base = addr, .disp = 0}, xmm1);
+          as_.Movsd({.base = addr, .disp = element_size}, xmm2);
+        } else {
+          as_.Movsd(xmm1, {.base = addr, .disp = 0});  // zero-extends upper 64
+          as_.Movsd(xmm2, {.base = addr, .disp = element_size});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vreg1_off}, xmm1);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vreg2_off}, xmm2);
+        }
+      } else {  // k32bit
+        if (args.is_store) {
+          as_.Movss(xmm1, {.base = Assembler::rbp, .disp = vreg1_off});
+          as_.Movss(xmm2, {.base = Assembler::rbp, .disp = vreg2_off});
+          as_.Movss({.base = addr, .disp = 0}, xmm1);
+          as_.Movss({.base = addr, .disp = element_size}, xmm2);
+        } else {
+          as_.Movss(xmm1, {.base = addr, .disp = 0});  // zero-extends upper 96
+          as_.Movss(xmm2, {.base = addr, .disp = element_size});
+          as_.Movdqu({.base = Assembler::rbp, .disp = vreg1_off}, xmm1);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vreg2_off}, xmm2);
+        }
+      }
+      return;
+    }
     Undefined();
   }
 

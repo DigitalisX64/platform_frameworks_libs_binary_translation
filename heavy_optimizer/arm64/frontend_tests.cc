@@ -2343,6 +2343,32 @@ constexpr uint32_t StpQ(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
   return 0xAD000000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
 }
 
+// LDP/STP Dt1, Dt2, [Xn, #imm] (imm7 scaled by 8) and St1, St2 (imm7 scaled by
+// 4). imm is the raw signed 7-bit imm7 field (like LdpQ/StpQ above).
+constexpr uint32_t LdpD(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x6D400000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t StpD(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x6D000000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t LdpS(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x2D400000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+constexpr uint32_t StpS(uint8_t rt1, uint8_t rt2, uint8_t rn, int8_t imm) {
+  return 0x2D000000 | ((static_cast<uint32_t>(imm) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+// Ground truth: clang --target=aarch64-linux-gnu + llvm-objdump.
+static_assert(StpD(0, 1, 2, 0) == 0x6d000440u);     // stp d0, d1, [x2]
+static_assert(LdpD(2, 3, 2, 0) == 0x6d400c42u);     // ldp d2, d3, [x2]
+static_assert(StpD(8, 9, 31, 0) == 0x6d0027e8u);    // stp d8, d9, [sp]
+static_assert(LdpD(14, 15, 31, 0) == 0x6d403feeu);  // ldp d14, d15, [sp]
+static_assert(StpD(10, 11, 2, 2) == 0x6d012c4au);   // stp d10, d11, [x2, #16]
+static_assert(LdpD(12, 13, 2, -2) == 0x6d7f344cu);  // ldp d12, d13, [x2, #-16]
+static_assert(StpS(0, 1, 2, 0) == 0x2d000440u);     // stp s0, s1, [x2]
+static_assert(LdpS(2, 3, 2, 0) == 0x2d400c42u);     // ldp s2, s3, [x2]
+static_assert(StpS(4, 5, 2, 2) == 0x2d011444u);     // stp s4, s5, [x2, #8]
+static_assert(LdpS(6, 7, 2, -2) == 0x2d7f1c46u);    // ldp s6, s7, [x2, #-8] (imm7=-2, S-scale 4)
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQ128) {
   alignas(16) static const uint64_t buf[2] = {0x1122334455667788ULL, 0x99AABBCCDDEEFF00ULL};
   static const uint32_t code[] = {LdrQuoff(0, 1, 0)};
@@ -2423,6 +2449,71 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, StpLdpQ128) {
   EXPECT_EQ(r2[1], v0[1]);
   EXPECT_EQ(r3[0], v1[0]);
   EXPECT_EQ(r3[1], v1[1]);
+}
+
+// STP/LDP of a 64-bit D-pair — the callee-saved FP save/restore in nearly every
+// function prologue/epilogue. STP writes two 8-byte slots; LDP reads them back
+// and must zero-extend each register's upper 64 bits.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StpLdpD64) {
+  alignas(16) static uint64_t buf[2] = {0, 0};
+  const uint64_t d0 = 0x1122334455667788ULL;
+  const uint64_t d1 = 0x99AABBCCDDEEFF00ULL;
+  std::memset(&state_.cpu.v[0], 0xAB, 16);  // upper 64 of v0 must be ignored
+  std::memset(&state_.cpu.v[1], 0xCD, 16);
+  std::memcpy(&state_.cpu.v[0], &d0, 8);
+  std::memcpy(&state_.cpu.v[1], &d1, 8);
+  static const uint32_t scode[] = {StpD(0, 1, 2, 0)};
+  state_.cpu.x[2] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(scode);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(scode) + sizeof(scode)));
+  EXPECT_EQ(buf[0], d0);
+  EXPECT_EQ(buf[1], d1);
+  // LDP back into v2/v3, poisoned upper halves must be cleared.
+  std::memset(&state_.cpu.v[2], 0xAB, 16);
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  static const uint32_t lcode[] = {LdpD(2, 3, 2, 0)};
+  state_.cpu.insn_addr = ToGuestAddr(lcode);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(lcode) + sizeof(lcode)));
+  uint64_t r2[2], r3[2];
+  std::memcpy(r2, &state_.cpu.v[2], 16);
+  std::memcpy(r3, &state_.cpu.v[3], 16);
+  EXPECT_EQ(r2[0], d0);
+  EXPECT_EQ(r2[1], uint64_t{0});  // LDP D zero-extends to 128
+  EXPECT_EQ(r3[0], d1);
+  EXPECT_EQ(r3[1], uint64_t{0});
+}
+
+// STP/LDP of a 32-bit S-pair. LDP S zero-extends each register's upper 96 bits.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StpLdpS32) {
+  alignas(16) static uint32_t buf[2] = {0, 0};
+  const uint32_t s0 = 0xAABBCCDDu;
+  const uint32_t s1 = 0x11223344u;
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  std::memset(&state_.cpu.v[1], 0xCD, 16);
+  std::memcpy(&state_.cpu.v[0], &s0, 4);
+  std::memcpy(&state_.cpu.v[1], &s1, 4);
+  static const uint32_t scode[] = {StpS(0, 1, 2, 0)};
+  state_.cpu.x[2] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(scode);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(scode) + sizeof(scode)));
+  EXPECT_EQ(buf[0], s0);
+  EXPECT_EQ(buf[1], s1);
+  std::memset(&state_.cpu.v[2], 0xAB, 16);
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  static const uint32_t lcode[] = {LdpS(2, 3, 2, 0)};
+  state_.cpu.insn_addr = ToGuestAddr(lcode);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(lcode) + sizeof(lcode)));
+  uint32_t r2[4], r3[4];
+  std::memcpy(r2, &state_.cpu.v[2], 16);
+  std::memcpy(r3, &state_.cpu.v[3], 16);
+  EXPECT_EQ(r2[0], s0);
+  EXPECT_EQ(r2[1], uint32_t{0});
+  EXPECT_EQ(r2[2], uint32_t{0});
+  EXPECT_EQ(r2[3], uint32_t{0});
+  EXPECT_EQ(r3[0], s1);
+  EXPECT_EQ(r3[1], uint32_t{0});
+  EXPECT_EQ(r3[2], uint32_t{0});
+  EXPECT_EQ(r3[3], uint32_t{0});
 }
 
 // AdvSIMD load/store multiple structures (LD1/ST1 contiguous form):
