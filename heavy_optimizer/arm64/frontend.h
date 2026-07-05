@@ -3562,6 +3562,207 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // SHADD/UHADD (halving add: (a+b)>>1), SRHADD/URHADD (rounding halving add:
+    // (a+b+1)>>1), and SHSUB/UHSUB (halving sub: (a-b)>>1), signed or unsigned.
+    // Mirrors lite_translator.h's kShadd/kUhadd/kSrhadd/kUrhadd/kShsub/kUhsub
+    // blocks. ARM ARM C7.2 reserves the .2D (size=11) form -> bail.
+    //   * Halfword/word ADD forms use the bitwise identities (proven from
+    //     a+b = (a^b) + 2*(a&b) and a|b = (a^b) + (a&b)):
+    //       (a+b)>>1   = (a&b) + ((a^b)>>1)   [SHADD/UHADD]
+    //       (a+b+1)>>1 = (a|b) - ((a^b)>>1)   [SRHADD/URHADD]
+    //     Arithmetic shift (PSRAW/PSRAD) for signed, logical (PSRLW/PSRLD) for
+    //     unsigned. All SSE2, no widening.
+    //   * Byte ADD forms and every SUB form widen each 64-bit half to the next
+    //     lane width (PMOVSXBW/PMOVZXBW etc., SSE4.1), do PADDW/PSUBW, shift
+    //     right by 1, and PACK back with signed/unsigned saturation. The +1 of
+    //     the rounding-add byte form is materialized by PCMPEQW ones + PSUBW
+    //     (PAVGB is not an allowlisted heavy LIR op). SUB unsigned masks the low
+    //     sub-lane before PACK so a modular a<b result does not saturate up.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUhadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrhadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUrhadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kShsub ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUhsub) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShadd) ||
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrhadd) ||
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShsub);
+      const bool is_round =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrhadd) ||
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kUrhadd);
+      const bool is_sub =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShsub) ||
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kUhsub);
+      // Byte-widened path needs SSE4.1 (PMOVSX/PMOVZX + PACKUSDW at size=01).
+      const bool needs_widen = is_sub || (args.size == 0b00);
+      if (needs_widen && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+
+      // Halfword/word ADD forms: bitwise identity, no widening.
+      if (!is_sub && args.size != 0b00) {
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xm = AllocTempSimdReg();
+        FpRegister xtmp = AllocTempSimdReg();  // (a&b) for floor, (a^b) is in xn
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+        if (is_round) {
+          // (a|b) - ((a^b)>>1): xtmp = a|b, xn = (a^b)>>1, xtmp -= xn.
+          builder_.Gen<x86_64::PorXRegXReg>(xtmp.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (args.size == 0b01) {
+            if (is_signed) builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+            else builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+            builder_.Gen<x86_64::PsubwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          } else {  // size == 0b10
+            if (is_signed) builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+            else builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+            builder_.Gen<x86_64::PsubdXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          }
+        } else {
+          // (a&b) + ((a^b)>>1): xtmp = a&b, xn = (a^b)>>1, xtmp += xn.
+          builder_.Gen<x86_64::PandXRegXReg>(xtmp.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (args.size == 0b01) {
+            if (is_signed) builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+            else builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+            builder_.Gen<x86_64::PaddwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          } else {  // size == 0b10
+            if (is_signed) builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+            else builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+            builder_.Gen<x86_64::PadddXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          }
+        }
+        SetVRegFull(args.rd, xtmp, args.q);
+        return;
+      }
+
+      // Byte ADD forms and all SUB forms: widen each 64-bit half, op, shift, pack.
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xn_hi = AllocTempSimdReg();
+      FpRegister xm_hi = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
+
+      if (args.size == 0b00) {
+        // 8->16 widen.
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        }
+        if (is_sub) {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          if (is_round) {
+            // +1 per word: xm/xm_hi are dead; clobber to all-ones and PSUBW.
+            builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          }
+        }
+        if (is_signed) {
+          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          if (is_sub) {
+            // Mask low byte per word so PACKUSWB does not saturate the modular
+            // a<b result (in [0x7F80, 0x7FFF]) up to 0xFF.
+            builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          }
+          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // SUB size=01 (halfword): 16->32 widen, PSUBD, shift, PACKSSDW/PACKUSDW.
+      if (args.size == 0b01) {
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsradXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrldXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          // Mask low 16 bits per dword before PACKUSDW.
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // SUB size=10 (word): 32->64 widen, PSUBQ, PSRLQ 1, gather low dwords via
+      // PSHUFD 0x88 + PUNPCKLQDQ. PSRLQ is logical, but the bit-63 difference vs
+      // an arithmetic shift is discarded by the low-dword gather, so PMOVSXDQ vs
+      // PMOVZXDQ alone distinguishes signed/unsigned.
+      if (is_signed) {
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+      }
+      builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PsubqXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+      builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{1});
+      builder_.Gen<x86_64::PsrlqXRegImm>(xn_hi.machine_reg(), int8_t{1});
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                              static_cast<int8_t>(0x88));
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(xn_hi.machine_reg(), xn_hi.machine_reg(),
+                                              static_cast<int8_t>(0x88));
+      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
