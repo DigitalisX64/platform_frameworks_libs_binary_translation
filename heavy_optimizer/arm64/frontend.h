@@ -3012,9 +3012,14 @@ class HeavyOptimizerFrontend {
   // (8H/4S/2D), so SetVRegFull q=true regardless of Q. Q=1 ("2") forms take
   // the upper 64 of the narrow sources — bring bytes 8..15 down with PSRLDQ
   // before widening (the W-forms' Vn is already a 128-bit wide vector and is
-  // loaded full, never shifted). Every other ThreeDiff opcode (ABDL/ABAL,
-  // ADDHN/SUBHN, PMULL, SQDMULL family) still bails to the lite tier — emit
-  // NOTHING before a bail.
+  // loaded full, never shifted).
+  //
+  // Also mirrors the narrowing-high subset:
+  //   ADDHN/SUBHN/RADDHN/RSUBHN — add/sub the two wide-lane sources, then take
+  //   the HIGH half of each lane as the narrow result (rounding variants add a
+  //   half-ulp bias first). Committed via SetVRegNarrow (Q=0 zero-extend / Q2
+  //   merge into Vd.high). The remaining ThreeDiff opcodes (ABDL/ABAL, PMULL,
+  //   SQDMULL family) still bail to the lite tier — emit NOTHING before a bail.
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
     if (!success()) {
       return;
@@ -3104,6 +3109,91 @@ class HeavyOptimizerFrontend {
           break;
       }
       SetVRegFull(args.rd, xn, /*q=*/true);
+      return;
+    }
+
+    // ADDHN/SUBHN/RADDHN/RSUBHN — add/sub the two wide-lane sources, then take
+    // the HIGH half of each lane as the narrow result. size 00/01/10 selects
+    // source lane 16/32/64 -> narrow dst 8/16/32. Rounding variants add a
+    // half-ulp bias (1 << (esize-1) of the SOURCE lane, i.e. bit just below the
+    // >>esize truncation point) before the shift. size=00: PADDW/PSUBW, >>8,
+    // PACKUSWB gathers the 8 high-bytes to the low 64. size=01: PADDD/PSUBD,
+    // >>16, PACKUSDW. size=10: PADDQ/PSUBQ, >>32, PSHUFD 0b00001000 gathers
+    // dwords {0,2} to the low 64 (no 64->32 pack). The narrow result is
+    // committed via SetVRegNarrow (Q=0 zero-extend / Q2 merge into Vd.high).
+    // Mirrors lite_translator.h::AdvSimdThreeDiff's ADDHN/SUBHN block.
+    if (args.opcode == Op::kAddhn || args.opcode == Op::kSubhn ||
+        args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn) {
+      if (args.size > 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_sub = (args.opcode == Op::kSubhn || args.opcode == Op::kRsubhn);
+      const bool is_round = (args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn);
+      const int32_t vn_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t vm_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_o);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
+
+      // Materialize a broadcast constant (`pattern` in both qwords) for the
+      // rounding bias.
+      auto broadcast = [&](uint64_t pattern) -> FpRegister {
+        FpRegister x = AllocTempSimdReg();
+        Register gr =
+            std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
+        builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+        return x;
+      };
+
+      if (args.size == 0b10) {
+        if (is_sub) {
+          builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        if (is_round) {
+          FpRegister xr = broadcast(uint64_t{0x0000000080000000ULL});
+          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        }
+        builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{32});
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                int8_t{0b00001000});
+        SetVRegNarrow(args.rd, xn, args.q);
+        return;
+      }
+      if (args.size == 0b00) {
+        if (is_sub) {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        if (is_round) {
+          FpRegister xr = broadcast(uint64_t{0x0080008000800080ULL});
+          builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        }
+        builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+      } else {  // size == 0b01
+        if (is_sub) {
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        if (is_round) {
+          FpRegister xr = broadcast(uint64_t{0x0000800000008000ULL});
+          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        }
+        builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+      }
+      SetVRegNarrow(args.rd, xn, args.q);
       return;
     }
 
