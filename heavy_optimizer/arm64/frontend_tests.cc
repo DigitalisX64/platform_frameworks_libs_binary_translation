@@ -3964,6 +3964,34 @@ constexpr uint32_t NegVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t AbsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b01011, rd, rn);
 }
+// ADDV Vd, Vn.<T> (AdvSIMD across lanes): 0 Q 0 01110 size 11000 11011 10 Rn Rd.
+// Base (all fields zero, size=00, rd=rn=0) = 0x0E31B800.
+constexpr uint32_t AddvVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return 0x0E31B800u | (static_cast<uint32_t>(q) << 30) |
+         (static_cast<uint32_t>(size) << 22) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(AddvVec(0b00, /*q=*/true, 0, 1) == 0x4e31b820u);   // addv b0, v1.16b
+static_assert(AddvVec(0b00, /*q=*/false, 0, 1) == 0x0e31b820u);  // addv b0, v1.8b
+static_assert(AddvVec(0b01, /*q=*/true, 0, 1) == 0x4e71b820u);   // addv h0, v1.8h
+static_assert(AddvVec(0b01, /*q=*/false, 0, 1) == 0x0e71b820u);  // addv h0, v1.4h
+static_assert(AddvVec(0b10, /*q=*/true, 0, 1) == 0x4eb1b820u);   // addv s0, v1.4s
+// SADDLV/UADDLV Vd, Vn.<T>: 0 Q U 01110 size 11000 00011 10 Rn Rd.
+// U=0 -> SADDLV (signed), U=1 -> UADDLV. Base (size=00, rd=rn=0) = 0x0E303800.
+constexpr uint32_t AddlvVec(bool is_signed, uint8_t size, bool q, uint8_t rd, uint8_t rn) {
+  return 0x0E303800u | (static_cast<uint32_t>(q) << 30) |
+         (static_cast<uint32_t>(!is_signed) << 29) | (static_cast<uint32_t>(size) << 22) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(AddlvVec(false, 0b00, /*q=*/false, 0, 1) == 0x2e303820u);  // uaddlv h0, v1.8b
+static_assert(AddlvVec(false, 0b00, /*q=*/true, 0, 1) == 0x6e303820u);   // uaddlv h0, v1.16b
+static_assert(AddlvVec(false, 0b01, /*q=*/false, 0, 1) == 0x2e703820u);  // uaddlv s0, v1.4h
+static_assert(AddlvVec(false, 0b01, /*q=*/true, 0, 1) == 0x6e703820u);   // uaddlv s0, v1.8h
+static_assert(AddlvVec(false, 0b10, /*q=*/true, 0, 1) == 0x6eb03820u);   // uaddlv d0, v1.4s
+static_assert(AddlvVec(true, 0b00, /*q=*/false, 0, 1) == 0x0e303820u);   // saddlv h0, v1.8b
+static_assert(AddlvVec(true, 0b00, /*q=*/true, 0, 1) == 0x4e303820u);    // saddlv h0, v1.16b
+static_assert(AddlvVec(true, 0b01, /*q=*/false, 0, 1) == 0x0e703820u);   // saddlv s0, v1.4h
+static_assert(AddlvVec(true, 0b01, /*q=*/true, 0, 1) == 0x4e703820u);    // saddlv s0, v1.8h
+static_assert(AddlvVec(true, 0b10, /*q=*/true, 0, 1) == 0x4eb03820u);    // saddlv d0, v1.4s
 // XTN/XTN2: U=0, opcode=10010.
 constexpr uint32_t XtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10010, rd, rn);
@@ -8074,6 +8102,119 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, AbsVec4S) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000200000005ULL);   // [5,2]
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x8000000000000001ULL);  // [1,INT_MIN preserved]
+}
+
+// ---- AdvSIMD across-lanes reductions (heavy mirror): ADDV / SADDLV / UADDLV. ----
+
+// ADDV b0, v1.16b: sum all 16 bytes (bytes 1..16 -> 136 = 0x88) into the low
+// byte, every other byte of Vd zeroed. Exercises the PSADBW + high-qword fold.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddvVec16B) {
+  static const uint32_t code[] = {AddvVec(0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0102030405060708ULL, 0x090A0B0C0D0E0F10ULL);  // bytes 1..16
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000088ULL);  // 136
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// ADDV s0, v1.4s: sum 4 dwords (1+2+3+4 = 10) into the low dword.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AddvVec4S) {
+  static const uint32_t code[] = {AddvVec(0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0000000200000001ULL, 0x0000000400000003ULL);  // dwords 1,2,3,4
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000000AULL);  // 10
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADDLV h0, v1.16b: zero-extend 16 bytes and sum. Low qword bytes all 1 (sum 8),
+// high qword bytes all 2 (sum 16) -> 24; verifies both qword partial sums fold in.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlvVec16B) {
+  static const uint32_t code[] = {AddlvVec(false, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0101010101010101ULL, 0x0202020202020202ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000018ULL);  // 24
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADDLV s0, v1.4h (Q=0): zero-extend 4 low halfwords (1+2+3+4 = 10) to 32-bit.
+// Upper 64 of Vn is don't-care and must be ignored.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlvVec4H) {
+  static const uint32_t code[] = {AddlvVec(false, 0b01, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x0004000300020001ULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000000AULL);  // 10
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADDLV d0, v1.4s: zero-extend 4 dwords (each 0xFFFFFFFF) and sum to a 64-bit
+// result 4*0xFFFFFFFF = 0x3FFFFFFFC. Exercises the .4S->D widen + qword fold.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlvVec4S) {
+  static const uint32_t code[] = {AddlvVec(false, 0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000003FFFFFFFCULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SADDLV h0, v1.8b (Q=0): sign-extend 8 low bytes {-1,-2,-3,-4,0,0,0,0} and sum
+// to -10 = 0xFFF6 (16-bit). Catches a zero-extend regression (would go positive).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlvVec8B) {
+  static const uint32_t code[] = {AddlvVec(true, 0b00, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x00000000FCFDFEFFULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFF6ULL);  // -10 as u16
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SADDLV h0, v1.16b (Q=1): byte -1 at lane0, byte -2 at lane8, rest 0 -> -3 =
+// 0xFFFD. Exercises the dual-half PMOVSXBW widen + PADDW path for .16B.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlvVec16B) {
+  static const uint32_t code[] = {AddlvVec(true, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x00000000000000FFULL, 0x00000000000000FEULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFDULL);  // -3 as u16
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UADDLV s0, v1.8h (Q=1): zero-extend 8 halfwords (each 0xFFFF) and sum to
+// 8*65535 = 524280 = 0x7FFF8. Exercises the dual-half PMOVZXWD widen for .8H.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlvVec8H) {
+  static const uint32_t code[] = {AddlvVec(false, 0b01, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000007FFF8ULL);  // 524280
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
 }
 
 // ---- AdvSIMD two-reg-misc widening/narrowing (heavy mirror). ----

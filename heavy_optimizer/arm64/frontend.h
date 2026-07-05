@@ -4290,6 +4290,176 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // ADDV Vd, Vn.<T> — sum all source lanes; the single esize-wide result
+      // is written to Vd's low lane with every other byte of Vd zeroed. Mirrors
+      // the validated lite lowering: PSADBW (byte), cascading PHADDW (halfword)
+      // and PHADDD (word) reductions, then a PSLLDQ/PSRLDQ shuttle keeps only
+      // the low result lane. size=10 Q=0 (.2S) is reserved; size=11 bails.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kAddv: {
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00: {
+            FpRegister xz = AllocZeroedSimdReg();
+            // xn := [sum(bytes 0..7), 0..., sum(bytes 8..15), 0...] (16-bit
+            // sums in qword-lane positions).
+            builder_.Gen<x86_64::PsadbwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            if (args.q) {
+              // .16B: fold the high-qword sum into the low qword.
+              FpRegister xt = AllocTempSimdReg();
+              builder_.Gen<x86_64::PshufdXRegXRegImm>(xt.machine_reg(),
+                                                      xn.machine_reg(),
+                                                      static_cast<int8_t>(0xEE));
+              builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+            }
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{15});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{15});
+            break;
+          }
+          case 0b01: {
+            // .4H: 2 cascading PHADDW; .8H: 3.
+            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            if (args.q) {
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            }
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) {  // .2S reserved for ADDV.
+              UndefinedReturningVoid();
+              return;
+            }
+            // .4S: 2 cascading PHADDD.
+            builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+            break;
+          }
+          default:
+            UndefinedReturningVoid();
+            return;
+        }
+        builder_.GenSetSimd<16>(vd_off, xn.machine_reg());
+        return;
+      }
+
+      // SADDLV / UADDLV Vd, Vn.<T> — across-lanes long sum. Each source element
+      // is widened to 2*esize before summing; the single 2*esize-wide result is
+      // written to Vd's low lane with all other bytes zeroed. Mirrors the
+      // validated lite lowering. UADDLV at .8B/.16B reuses the PSADBW byte-sum;
+      // SADDLV and all halfword/word inputs widen first via PMOVSX/PMOVZX, then
+      // reduce with PHADDW/PHADDD (or PADDQ folds for the .4S->D case).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUaddlv: {
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv);
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        switch (args.size) {
+          case 0b00: {
+            // Bytes -> 16-bit sum.
+            if (!is_signed) {
+              FpRegister xz = AllocZeroedSimdReg();
+              builder_.Gen<x86_64::PsadbwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+              if (args.q) {
+                FpRegister xt = AllocTempSimdReg();
+                builder_.Gen<x86_64::PshufdXRegXRegImm>(xt.machine_reg(),
+                                                        xn.machine_reg(),
+                                                        static_cast<int8_t>(0xEE));
+                builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              }
+            } else if (args.q) {
+              // SADDLV .16B: widen low/high 8 bytes separately, lane-add, then
+              // 3 PHADDW collapses.
+              FpRegister xt = AllocTempSimdReg();
+              builder_.Gen<x86_64::PmovsxbwXRegXReg>(xt.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            } else {
+              // SADDLV .8B: widen low 8 bytes; 3 PHADDW collapses.
+              builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            }
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+            break;
+          }
+          case 0b01: {
+            // Halfwords -> 32-bit sum.
+            if (args.q) {
+              FpRegister xt = AllocTempSimdReg();
+              if (is_signed) {
+                builder_.Gen<x86_64::PmovsxwdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+                builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+                builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              } else {
+                builder_.Gen<x86_64::PmovzxwdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+                builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+                builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              }
+              builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            } else {
+              if (is_signed) {
+                builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              } else {
+                builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              }
+              builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            }
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) {  // .2S reserved.
+              UndefinedReturningVoid();
+              return;
+            }
+            // .4S -> 64-bit sum: widen 4 dwords -> 4 qwords across two regs,
+            // lane-add, fold hi-qword to lo-qword.
+            FpRegister xt = AllocTempSimdReg();
+            if (is_signed) {
+              builder_.Gen<x86_64::PmovsxdqXRegXReg>(xt.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PmovzxdqXRegXReg>(xt.machine_reg(), xn.machine_reg());
+              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+              builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            }
+            builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xt.machine_reg(), xn.machine_reg(),
+                                                    static_cast<int8_t>(0xEE));
+            builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+            break;
+          }
+          default:
+            UndefinedReturningVoid();
+            return;
+        }
+        builder_.GenSetSimd<16>(vd_off, xn.machine_reg());
+        return;
+      }
+
       default:
         UndefinedReturningVoid();
         return;
