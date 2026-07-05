@@ -5354,7 +5354,8 @@ class HeavyOptimizerFrontend {
   // zero-extends the upper 64 bits (D-register semantics). The interleaving
   // LD2/LD3/LD4 / ST2/ST3/ST4 de-interleave forms still bail to the lite tier
   // (their element-wise PINSR/PEXTR-from-memory has no heavy LIR op yet).
-  // Mirrors lite_translator.h::AdvSimdMultiStruct (non-interleaved path).
+  // Mirrors lite_translator.h::AdvSimdMultiStruct (both the interleaved
+  // LDn/STn de-/interleave path and the non-interleaved contiguous LD1/ST1).
   void AdvSimdMultiStruct(uint8_t rt,
                           uint8_t rn,
                           uint8_t num_regs,
@@ -5367,17 +5368,125 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    UNUSED_ARGS(size);  // The element size only matters for the interleaved form;
-                        // the contiguous transfer is bulk-vector, strided by Q.
+    const int32_t vec_bytes = q ? 16 : 8;
+
+    // De-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4 (multiple-structure
+    // form). Mirrors the lite translator's element-wise lowering: memory holds
+    // num_regs * (vec_bytes/esize) elements laid out structure-major — element e
+    // in memory belongs to register (e % num_regs), lane (e / num_regs). Because
+    // the heavy tier has NO memory-operand PINSR/PEXTR (only the register forms),
+    // each element is routed through a GP temp:
+    //   load : MOV{zx,}* mem->gp (+recovery) then PINSR gp->lane; the destination
+    //          register starts from a zeroed XMM so Q=0 zeroes the upper 64 bits.
+    //   store: PEXTR lane->gp then MOV* gp->mem (+recovery).
+    // The v[] register accesses stay full-width (GenGetSimd<16>/GenSetSimd<16>) so
+    // the optimizer's 16-byte store/load forwarding on a v[] slot is never split
+    // by a narrow sub-lane access (see the UMOV/INS-element note above); only the
+    // guest-memory side is narrow. Exact for every (num_regs, esize, Q) combo.
     if (is_interleaved) {
-      UndefinedReturningVoid();
+      if (num_regs < 2 || num_regs > 4) {
+        UndefinedReturningVoid();
+        return;
+      }
+      if (size > 3) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const int esize = 1 << size;
+      const int num_lanes = vec_bytes / esize;
+
+      Register ibase_orig = (rn == 31) ? GetSp() : GetReg(rn);
+      Register ibase = ApplyTbi(ibase_orig);
+
+      for (uint8_t r = 0; r < num_regs; r++) {
+        const uint8_t vreg = (rt + r) & 31;
+        const int32_t vt_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + vreg * 16);
+        if (is_store) {
+          FpRegister xmm = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
+          for (int l = 0; l < num_lanes; l++) {
+            const int32_t mem_off = static_cast<int32_t>((l * num_regs + r) * esize);
+            const int8_t lane = static_cast<int8_t>(l);
+            Register elem;
+            switch (esize) {
+              case 1:
+                elem = std::get<0>(Gen<x86_64::PextrbRegXRegImm>(xmm.machine_reg(), lane));
+                Gen<x86_64::MovbOpReg>({.base = ibase, .disp = mem_off}, elem);
+                break;
+              case 2:
+                elem = std::get<0>(Gen<x86_64::PextrwRegXRegImm>(xmm.machine_reg(), lane));
+                Gen<x86_64::MovwOpReg>({.base = ibase, .disp = mem_off}, elem);
+                break;
+              case 4:
+                elem = std::get<0>(Gen<x86_64::PextrdRegXRegImm>(xmm.machine_reg(), lane));
+                Gen<x86_64::MovlOpReg>({.base = ibase, .disp = mem_off}, elem);
+                break;
+              default:  // esize == 8
+                elem = std::get<0>(Gen<x86_64::PextrqRegXRegImm>(xmm.machine_reg(), lane));
+                Gen<x86_64::MovqOpReg>({.base = ibase, .disp = mem_off}, elem);
+                break;
+            }
+            GenRecoveryBlockForLastInsn();
+          }
+        } else {
+          FpRegister xmm = AllocZeroedSimdReg();
+          for (int l = 0; l < num_lanes; l++) {
+            const int32_t mem_off = static_cast<int32_t>((l * num_regs + r) * esize);
+            const int8_t lane = static_cast<int8_t>(l);
+            Register elem;
+            switch (esize) {
+              case 1:
+                elem = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = ibase, .disp = mem_off}));
+                GenRecoveryBlockForLastInsn();
+                builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
+                break;
+              case 2:
+                elem = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = ibase, .disp = mem_off}));
+                GenRecoveryBlockForLastInsn();
+                builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
+                break;
+              case 4:
+                elem = std::get<0>(Gen<x86_64::MovlRegOp>({.base = ibase, .disp = mem_off}));
+                GenRecoveryBlockForLastInsn();
+                builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
+                break;
+              default:  // esize == 8
+                elem = std::get<0>(Gen<x86_64::MovqRegOp>({.base = ibase, .disp = mem_off}));
+                GenRecoveryBlockForLastInsn();
+                builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
+                break;
+            }
+          }
+          builder_.GenSetSimd<16>(vt_off, xmm.machine_reg());
+        }
+      }
+
+      if (postindex) {
+        // Writeback preserves the original (un-TBI-masked) top byte, so re-read
+        // the base register rather than reusing the masked access address.
+        Register reread_base = (rn == 31) ? GetSp() : GetReg(rn);
+        Register new_base = Copy(reread_base);
+        if (rm == 31) {
+          new_base = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(
+              new_base, static_cast<int32_t>(num_regs) * vec_bytes));
+        } else {
+          Register rm_val = GetReg(rm);
+          new_base = std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(new_base, rm_val));
+        }
+        if (rn == 31) {
+          SetSp(new_base);
+        } else {
+          SetReg(rn, new_base);
+        }
+      }
       return;
     }
+
     if (num_regs < 1 || num_regs > 4) {
       UndefinedReturningVoid();
       return;
     }
-    const int32_t vec_bytes = q ? 16 : 8;
 
     Register base_orig = (rn == 31) ? GetSp() : GetReg(rn);
     Register base = ApplyTbi(base_orig);
