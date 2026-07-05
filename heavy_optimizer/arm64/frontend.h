@@ -2697,6 +2697,8 @@ class HeavyOptimizerFrontend {
   //   AND/ORR/EOR: Pand/Por/Pxor are element-size-independent (one op covers
   //     all). ORR with rn==rm is the AdvSIMD MOV (vector) alias and lowers the
   //     same way.
+  //   BSL/BIT/BIF: bitwise-select — element-size-independent Pxor/Pand/Pandn
+  //     sequences that read Vd; handled in a self-contained pre-switch block.
   //   CMEQ: Pcmpeqb (8), Pcmpeqw (16), Pcmpeqd (32). 64-bit (Pcmpeqq) bails.
   //   CMGT (signed): Pcmpgtb (8), Pcmpgtw (16), Pcmpgtd (32). 64-bit bails.
   //   CMGE (signed >=): NOT(Pcmpgt(Vm, Vn)); CMHI/CMHS (unsigned >, >=):
@@ -3090,6 +3092,45 @@ class HeavyOptimizerFrontend {
       }
       // Q=0 (.4H/.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, xd, args.q);
+      return;
+    }
+
+    // Integer vector bitwise-select BSL / BIT / BIF (opcode 0b00011, U=1; the
+    // size field selects which of the three). These are element-size-independent
+    // bit ops that all READ Vd, so they are handled here (like MLA/MLS) rather
+    // than in the shared vn-only switch. Sequences mirror lite_translator.h
+    // exactly (Pxor/Pand/Pandn are all already allowlisted; no new LIR ops):
+    //   BSL  Vd = (Vd & Vn) | (~Vd & Vm) == ((Vn ^ Vm) & Vd) ^ Vm
+    //   BIT  Vd = (Vm & Vn) | (~Vm & Vd) == ((Vn ^ Vd) & Vm) ^ Vd  ("if true")
+    //   BIF  Vd = (Vm & Vd) | (~Vm & Vn) == Vd ^ (~Vm & (Vn ^ Vd))  ("if false")
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBsl ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kBit ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kBif) {
+      const int32_t vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      FpRegister res = xn;  // BSL/BIT accumulate into xn; BIF stores xd.
+      if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBsl) {
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn^Vm
+        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xd.machine_reg());  // &Vd
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // ^Vm
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBit) {
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // Vn^Vd
+        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // &Vm
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // ^Vd
+      } else {  // kBif: fold the NOT into PANDN (~xm & xn).
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());   // Vn^Vd
+        builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());  // ~Vm & (Vn^Vd)
+        builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xm.machine_reg());   // Vd ^ ...
+        res = xd;
+      }
+      // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, res, args.q);
       return;
     }
 

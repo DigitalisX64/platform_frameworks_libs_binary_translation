@@ -3872,6 +3872,17 @@ constexpr uint32_t OrrVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
 constexpr uint32_t EorVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/true, /*size=*/0b00, /*opcode=*/0b00011, rd, rn, rm);
 }
+// Bitwise-select group (opcode=00011, U=1); op selected by size:
+//   BSL: size=01.   BIT: size=10.   BIF: size=11.
+constexpr uint32_t BslVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, /*size=*/0b01, /*opcode=*/0b00011, rd, rn, rm);
+}
+constexpr uint32_t BitVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, /*size=*/0b10, /*opcode=*/0b00011, rd, rn, rm);
+}
+constexpr uint32_t BifVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, /*size=*/0b11, /*opcode=*/0b00011, rd, rn, rm);
+}
 // FP three-same vector. The 'size' field carries {op_high, sz}: op_high (bit23)
 // selects max(0)/min(1); sz (bit22) selects FP32(0)/FP64(1). FMAX/FMIN use
 // opcode=11110, FMAXNM/FMINNM use opcode=11000, all U=0.
@@ -6113,6 +6124,80 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, EorVec16B) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0xFF00FF00FF00FF00ULL ^ 0xFFFFFFFFFFFFFFFFULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0F0F0F0F0F0F0F0FULL ^ 0x00FF00FF00FF00FFULL);
+}
+
+// BSL .16B (Q=1): Vd is the select mask — result bit = Vd ? Vn : Vm.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BslVec16B) {
+  static const uint32_t code[] = {BslVec(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAAAULL, 0x00000000FFFFFFFFULL);  // Vn
+  SetV128(&state_, 2, 0x5555555555555555ULL, 0xFFFFFFFF00000000ULL);  // Vm
+  SetV128(&state_, 0, 0xFF00FF00FF00FF00ULL, 0x0F0F0F0F0F0F0F0FULL);  // Vd = mask
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (Vd & Vn) | (~Vd & Vm)
+  EXPECT_EQ(VLo64(&state_, 0), 0xAA55AA55AA55AA55ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xF0F0F0F00F0F0F0FULL);
+}
+
+// BIT .16B (Q=1): "insert if true" — where Vm=1 take Vn, else keep Vd.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BitVec16B) {
+  static const uint32_t code[] = {BitVec(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAAAULL, 0x1234567812345678ULL);  // Vn
+  SetV128(&state_, 2, 0xFF00FF00FF00FF00ULL, 0x00000000FFFFFFFFULL);  // Vm = mask
+  SetV128(&state_, 0, 0x5555555555555555ULL, 0xCCCCCCCCCCCCCCCCULL);  // Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (Vm & Vn) | (~Vm & Vd)
+  EXPECT_EQ(VLo64(&state_, 0), 0xAA55AA55AA55AA55ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xCCCCCCCC12345678ULL);
+}
+
+// BIF .16B (Q=1): "insert if false" — where Vm=0 take Vn, else keep Vd. Exercises
+// the PANDN fold and the res=xd store path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BifVec16B) {
+  static const uint32_t code[] = {BifVec(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAAAULL, 0x1234567812345678ULL);  // Vn
+  SetV128(&state_, 2, 0xFF00FF00FF00FF00ULL, 0x00000000FFFFFFFFULL);  // Vm = mask
+  SetV128(&state_, 0, 0x5555555555555555ULL, 0xCCCCCCCCCCCCCCCCULL);  // Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // (Vm & Vd) | (~Vm & Vn)
+  EXPECT_EQ(VLo64(&state_, 0), 0x55AA55AA55AA55AAULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x12345678CCCCCCCCULL);
+}
+
+// BSL .8B (Q=0): D-form upper-zero check for the res=xn store path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BslVec8BUpperZero) {
+  static const uint32_t code[] = {BslVec(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAAAULL, 0x1111111111111111ULL);  // Vn
+  SetV128(&state_, 2, 0x5555555555555555ULL, 0x2222222222222222ULL);  // Vm
+  SetV128(&state_, 0, 0xFF00FF00FF00FF00ULL, 0xCDCDCDCDCDCDCDCDULL);  // Vd = mask, poison upper
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xAA55AA55AA55AA55ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// BIF .8B (Q=0): D-form upper-zero check for the res=xd store path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BifVec8BUpperZero) {
+  static const uint32_t code[] = {BifVec(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAAAULL, 0x1111111111111111ULL);  // Vn
+  SetV128(&state_, 2, 0xFF00FF00FF00FF00ULL, 0x2222222222222222ULL);  // Vm = mask
+  SetV128(&state_, 0, 0x5555555555555555ULL, 0xCDCDCDCDCDCDCDCDULL);  // Vd, poison upper
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x55AA55AA55AA55AAULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 // MUL .4S (Q=1): four 32-bit lane products via PMULLD.
