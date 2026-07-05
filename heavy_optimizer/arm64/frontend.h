@@ -3468,6 +3468,132 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // SABDL/UABDL (absolute-difference-long) and SABAL/UABAL (abs-diff-long
+    // accumulate). Widen both narrow sources (Q selects the low/high 64 of
+    // Vn/Vm), then abs(a - b) at the widened lane width:
+    //   size=00/01: max(a,b) - min(a,b) via PMAXS*/PMINS* (signed) or
+    //               PMAXU*/PMINU* (unsigned), then PSUB.
+    //   size=10   : no 64-bit SSE lane-wise max/min, so diff = a - b (PSUBQ
+    //               after the sign/zero-widening), then a Pcmpgtq-against-zero
+    //               signed-abs: mask = (0 > diff); abs = (diff ^ mask) - mask.
+    // ABAL then accumulates the abs-diff into Vd. The result always fills 128
+    // bits (8H/4S/2D). Mirrors lite_translator.h::AdvSimdThreeDiff's
+    // SABDL/UABDL/SABAL/UABAL block size-by-size.
+    if (args.opcode == Op::kSabdl || args.opcode == Op::kUabdl ||
+        args.opcode == Op::kSabal || args.opcode == Op::kUabal) {
+      if (args.size > 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed =
+          (args.opcode == Op::kSabdl || args.opcode == Op::kSabal);
+      const bool is_abal =
+          (args.opcode == Op::kSabal || args.opcode == Op::kUabal);
+      const int32_t vn_off_ab =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t vm_off_ab =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      const int32_t vd_off_ab =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off_ab);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off_ab);
+      // Q=1 ("2" form) selects the upper 64 of the narrow sources.
+      if (args.q) {
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      }
+      // Widen both narrow sources to the wide lane width.
+      switch (args.size) {
+        case 0b00:
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          }
+          break;
+        case 0b01:
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          }
+          break;
+        case 0b10:
+          if (is_signed) {
+            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          }
+          break;
+      }
+
+      if (args.size == 0b10) {
+        // 32->64: diff = a - b at 64-bit lane width, then signed-abs via
+        // Pcmpgtq against zero. Correct for both signs because the widening
+        // already injected the correct sign/zero extension.
+        builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        FpRegister mask = AllocZeroedSimdReg();
+        builder_.Gen<x86_64::PcmpgtqXRegXReg>(mask.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+        builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), mask.machine_reg());
+        if (is_abal) {
+          FpRegister xd = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off_ab);
+          builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          SetVRegFull(args.rd, xd, /*q=*/true);
+        } else {
+          SetVRegFull(args.rd, xn, /*q=*/true);
+        }
+        return;
+      }
+
+      // 8->16 / 16->32: abs diff = max(a,b) - min(a,b). Copy Vn into xmax
+      // (max clobbers its dst), leaving xn to hold the min.
+      FpRegister xmax = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      if (args.size == 0b00) {
+        if (is_signed) {
+          builder_.Gen<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        builder_.Gen<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      } else {  // size == 0b01
+        if (is_signed) {
+          builder_.Gen<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        builder_.Gen<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      }
+      if (is_abal) {
+        FpRegister xd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xd.machine_reg(), vd_off_ab);
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+        }
+        SetVRegFull(args.rd, xd, /*q=*/true);
+      } else {
+        SetVRegFull(args.rd, xmax, /*q=*/true);
+      }
+      return;
+    }
+
     // ADDHN/SUBHN/RADDHN/RSUBHN — add/sub the two wide-lane sources, then take
     // the HIGH half of each lane as the narrow result. size 00/01/10 selects
     // source lane 16/32/64 -> narrow dst 8/16/32. Rounding variants add a
