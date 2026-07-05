@@ -4047,6 +4047,19 @@ static_assert(MaxminvVec(true, false, 0b10, /*q=*/true, 0, 1) == 0x6eb0a820u);  
 static_assert(MaxminvVec(false, false, 0b00, /*q=*/true, 0, 1) == 0x6e31a820u);  // uminv b0, v1.16b
 static_assert(MaxminvVec(false, false, 0b01, /*q=*/true, 0, 1) == 0x6e71a820u);  // uminv h0, v1.8h
 static_assert(MaxminvVec(false, false, 0b10, /*q=*/true, 0, 1) == 0x6eb1a820u);  // uminv s0, v1.4s
+// FMAXV/FMINV/FMAXNMV/FMINNMV Sd, Vn.4S (FP32 across-lanes):
+// 0 Q(1) U(1) 01110 sz(bit23=1 for min) 0 11000 opcode 10 Rn Rd.
+// opcode = 01111 (FMAXV/FMINV) or 01100 (FMAXNMV/FMINNMV).
+constexpr uint32_t FmaxvVec(bool is_max, bool is_nm, uint8_t rd, uint8_t rn) {
+  const uint32_t opcode = is_nm ? 0b01100u : 0b01111u;
+  const uint32_t bit23 = is_max ? 0u : 1u;  // size high bit selects min.
+  return 0x6E300800u | (bit23 << 23) | (opcode << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(FmaxvVec(true, false, 0, 1) == 0x6e30f820u);   // fmaxv s0, v1.4s
+static_assert(FmaxvVec(false, false, 0, 1) == 0x6eb0f820u);  // fminv s0, v1.4s
+static_assert(FmaxvVec(true, true, 0, 1) == 0x6e30c820u);    // fmaxnmv s0, v1.4s
+static_assert(FmaxvVec(false, true, 0, 1) == 0x6eb0c820u);   // fminnmv s0, v1.4s
 // SADDLP/UADDLP/SADALP/UADALP Vd.<Ta>, Vn.<Tb>: two-reg-misc, opcode=00010
 // (add-long-pairwise) or 00110 (accumulate); U=0 signed / U=1 unsigned.
 constexpr uint32_t AddlpVec(bool is_signed, bool is_accum, uint8_t size, bool q,
@@ -8755,6 +8768,81 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, UminvVec4S) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000003ULL);  // 3
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// ---- FMAXV/FMINV/FMAXNMV/FMINNMV FP32 across-lanes reduction (heavy). ----
+// Lane packing (.4S): VLo64 = {lane1:lane0}, VUpperHi64 = {lane3:lane2}.
+// Test vector lanes = {3.0, 1.0, -2.0, 5.0}:
+//   3.0 = 0x40400000, 1.0 = 0x3F800000, -2.0 = 0xC0000000, 5.0 = 0x40A00000.
+
+// FMAXV s0, v1.4s: NaN-propagating max of {3,1,-2,5} = 5.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVec4S) {
+  static const uint32_t code[] = {FmaxvVec(/*is_max=*/true, /*is_nm=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x3F80000040400000ULL, 0x40A00000C0000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040A00000ULL);  // 5.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// FMINV s0, v1.4s: NaN-propagating min of {3,1,-2,5} = -2.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminvVec4S) {
+  static const uint32_t code[] = {FmaxvVec(/*is_max=*/false, /*is_nm=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x3F80000040400000ULL, 0x40A00000C0000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000C0000000ULL);  // -2.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// FMAXNMV s0, v1.4s: NaN-suppressing max of {3,1,NaN,5} = 5.0 (NaN ignored).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmvVec4S) {
+  static const uint32_t code[] = {FmaxvVec(/*is_max=*/true, /*is_nm=*/true, 0, 1)};
+  // lane2 = 0x7FC00000 (qNaN), lane3 = 5.0.
+  SetV128(&state_, 1, 0x3F80000040400000ULL, 0x40A000007FC00000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040A00000ULL);  // 5.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// FMINNMV s0, v1.4s: NaN-suppressing min of {3,1,NaN,-2} = -2.0 (NaN ignored).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmvVec4S) {
+  static const uint32_t code[] = {FmaxvVec(/*is_max=*/false, /*is_nm=*/true, 0, 1)};
+  // lane2 = 0x7FC00000 (qNaN), lane3 = -2.0.
+  SetV128(&state_, 1, 0x3F80000040400000ULL, 0xC00000007FC00000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000C0000000ULL);  // -2.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// FMAXV s0, v1.4s with a NaN lane: NaN-propagating max of {3,1,NaN,5} -> NaN.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVec4SNanPropagates) {
+  static const uint32_t code[] = {FmaxvVec(/*is_max=*/true, /*is_nm=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x3F80000040400000ULL, 0x40A000007FC00000ULL);  // lane2 = qNaN
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  const uint32_t res = static_cast<uint32_t>(VLo64(&state_, 0));
+  EXPECT_EQ(res & 0x7F800000u, 0x7F800000u);  // exponent all ones
+  EXPECT_NE(res & 0x007FFFFFu, 0u);            // nonzero mantissa -> NaN
+  EXPECT_EQ(VLo64(&state_, 0) >> 32, 0x0ULL);  // upper 96 bits zeroed
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
 }
 

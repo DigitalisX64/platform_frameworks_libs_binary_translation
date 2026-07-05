@@ -4966,6 +4966,93 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // FMAXV / FMINV / FMAXNMV / FMINNMV Sd, Vn.4S — floating-point across-lanes
+      // reduction. Reduce the 4 FP32 lanes to a single scalar written to Sd's low
+      // lane with the upper 96 bits zeroed. Two pairwise steps (PSHUFD 0x4E then
+      // 0xB1) each fold lanes together via the same NaN-handling min/max idioms the
+      // vector three-same FMAX/FMIN path uses (lines ~1828):
+      //   FMAXV/FMINV       — NaN-propagating: tmp=b; MAX/MIN tmp,a; MAX/MIN a,b;
+      //                        POR a,tmp. (x86 MAX/MINPS returns src on NaN, so the
+      //                        two-sided op + POR keeps a NaN exponent if either
+      //                        input was NaN and makes +-0 order-independent.)
+      //   FMAXNMV/FMINNMV   — NaN-suppressing: substitute each NaN lane with the
+      //                        other operand via a CMPUNORDPS self-compare mask,
+      //                        then MAX/MIN. Mirrors the interpreter FmaxScalar /
+      //                        FmaxnmScalar reduction. Only the FP32 .4S form is
+      //                        lowered here; the Armv8.2 FP16 (.8H) form needs an
+      //                        F16C round-trip absent from the backend, so it bails.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv: {
+        if (args.is_fp16) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv);
+        const bool is_nm =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xt = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        // Fold b (=xt) into a (=xn) with FP32 packed NaN-aware min/max.
+        auto EmitPairFp = [&](FpRegister a, FpRegister b) {
+          if (!is_nm) {
+            FpRegister tmp = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), b.machine_reg());
+            if (is_max) {
+              builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), a.machine_reg());
+              builder_.Gen<x86_64::MaxpsXRegXReg>(a.machine_reg(), b.machine_reg());
+            } else {
+              builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), a.machine_reg());
+              builder_.Gen<x86_64::MinpsXRegXReg>(a.machine_reg(), b.machine_reg());
+            }
+            builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), tmp.machine_reg());
+          } else {
+            FpRegister mask_a = AllocTempSimdReg();
+            FpRegister mask_b = AllocTempSimdReg();
+            FpRegister an_sub = AllocTempSimdReg();
+            FpRegister bn_sub = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), a.machine_reg());
+            builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), b.machine_reg());
+            builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
+            builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
+            builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+            builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), b.machine_reg());
+            builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+            builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), a.machine_reg());
+            builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), a.machine_reg());
+            builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), b.machine_reg());
+            builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
+            builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
+            if (is_max) {
+              builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
+            } else {
+              builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
+            }
+            builder_.Gen<x86_64::MovdqaXRegXReg>(a.machine_reg(), mask_a.machine_reg());
+          }
+        };
+        // Step 1: fold lanes {2,3} into {0,1}. PSHUFD 0x4E swaps the 64-bit halves.
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+            xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
+        EmitPairFp(xn, xt);
+        // Step 2: fold lane 1 into lane 0. PSHUFD 0xB1 swaps adjacent dwords.
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+            xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
+        EmitPairFp(xn, xt);
+        // Keep only the low 32-bit result lane; zero the upper 96 bits.
+        builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+        builder_.GenSetSimd<16>(vd_off, xn.machine_reg());
+        return;
+      }
+
       // SADDLP / UADDLP / SADALP / UADALP Vd.<Ta>, Vn.<Tb> — pairwise long
       // add / add-accumulate. Each adjacent pair of esize-wide source lanes is
       // widened (sign/zero) to 2*esize and summed; SADALP/UADALP accumulate the
