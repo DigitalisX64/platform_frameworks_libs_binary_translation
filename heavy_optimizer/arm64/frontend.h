@@ -2145,9 +2145,58 @@ class HeavyOptimizerFrontend {
     }
   }
 
+  // LDR/STR (SIMD&FP, register offset): 128/64/32-bit (Q/D/S). Compute the
+  // register-offset address (offset extend + shift + base add) with the same
+  // EmitRegOffsetAddr helper the GP register-offset load/store uses, apply TBI,
+  // then reuse SimdLoadStoreImm's mem<->xmm<->v[] path at disp=0. A load's
+  // MOVSD/MOVSS zero-extends the unused lanes and the full 16-byte v[] slot is
+  // committed; the memory access uses the unaligned MOVDQU/MOVSD/MOVSS forms and
+  // a recovery block. 8/16-bit (B/H) bail to the lite tier (which covers all
+  // sizes), matching SimdLoadStoreImm. Mirrors lite_translator.h::SimdLoadStoreReg.
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args, Register base, Register offset) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args, base, offset);
+    if (!success()) {
+      return;
+    }
+    if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
+        args.size != Decoder::SimdLoadStoreSize::k64bit &&
+        args.size != Decoder::SimdLoadStoreSize::k128bit) {
+      UndefinedReturningVoid();
+      return;
+    }
+    Register addr = EmitRegOffsetAddr(base, offset, args.extend_type, args.shift_amount);
+    Register masked = ApplyTbi(addr);
+    const int32_t vreg_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt * 16);
+    FpRegister xmm = AllocTempSimdReg();
+    if (args.is_store) {
+      builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
+      switch (args.size) {
+        case Decoder::SimdLoadStoreSize::k128bit:
+          builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
+          break;
+        case Decoder::SimdLoadStoreSize::k64bit:
+          builder_.Gen<x86_64::MovsdOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
+          break;
+        default:  // k32bit
+          builder_.Gen<x86_64::MovssOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
+          break;
+      }
+      GenRecoveryBlockForLastInsn();
+    } else {
+      switch (args.size) {
+        case Decoder::SimdLoadStoreSize::k128bit:
+          xmm = FpRegister{std::get<0>(Gen<x86_64::MovdquXRegOp>({.base = masked, .disp = 0}))};
+          break;
+        case Decoder::SimdLoadStoreSize::k64bit:
+          // MOVSD reg<-mem zero-extends the upper 64 bits of the XMM.
+          xmm = FpRegister{std::get<0>(Gen<x86_64::MovsdXRegOp>({.base = masked, .disp = 0}))};
+          break;
+        default:  // k32bit; MOVSS reg<-mem zero-extends the upper 96 bits.
+          xmm = FpRegister{std::get<0>(Gen<x86_64::MovssXRegOp>({.base = masked, .disp = 0}))};
+          break;
+      }
+      GenRecoveryBlockForLastInsn();
+      builder_.GenSetSimd<16>(vreg_off, xmm.machine_reg());
+    }
   }
 
   // AdvSIMD copy. DUP (general), INS (general), UMOV, SMOV, and INS (element)

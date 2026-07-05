@@ -9656,6 +9656,163 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmlslVec2D) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000046ULL);
 }
 
+// LDR/STR (SIMD&FP, register offset):
+//   size(31:30) 111 V=1(26) 00 opc(23:22) 1(21) Rm(20:16) option(15:13) S(12)
+//   10(11:10) Rn(9:5) Rt(4:0).
+// opc selects the operation and the 128-bit form (128-bit load opc=11 / store
+// opc=10; non-128 load opc=01 / store opc=00); size selects the transfer width
+// (128->00, 64->11, 32->10). option is the extend (LSL/UXTX=011, UXTW=010,
+// SXTW=110) and S enables the log2(bytes) shift. Encodings verified against the
+// LLVM assembler (disassembly inline).
+constexpr uint32_t SimdLdStRegOffEnc(uint8_t size_field,
+                                     uint8_t opc,
+                                     uint8_t rm,
+                                     uint8_t option,
+                                     uint8_t s_bit,
+                                     uint8_t rn,
+                                     uint8_t rt) {
+  return (uint32_t{size_field} << 30) | (0b111u << 27) | (1u << 26) | (uint32_t{opc} << 22) |
+         (1u << 21) | (uint32_t{rm} << 16) | (uint32_t{option} << 13) | (uint32_t{s_bit} << 12) |
+         (0b10u << 10) | (uint32_t{rn} << 5) | uint32_t{rt};
+}
+// 128-bit (Q): size=00, load opc=11 / store opc=10.
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 21, 0b011, 0, 13, 0) == 0x3cf569a0u);  // ldr q0,[x13,x21]
+static_assert(SimdLdStRegOffEnc(0b00, 0b10, 3, 0b011, 0, 0, 0) == 0x3ca36800u);    // str q0,[x0,x3]
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 0) == 0x3ce26820u);    // ldr q0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b00, 0b10, 2, 0b011, 0, 1, 0) == 0x3ca26820u);    // str q0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 1, 1, 0) == 0x3ce27820u);    // ldr q0,[x1,x2,lsl#4]
+static_assert(SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 31) == 0x3ce2683fu);   // ldr q31,[x1,x2]
+// 64-bit (D): size=11, load opc=01 / store opc=00.
+static_assert(SimdLdStRegOffEnc(0b11, 0b01, 2, 0b011, 0, 1, 0) == 0xfc626820u);    // ldr d0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b11, 0b00, 2, 0b011, 0, 1, 0) == 0xfc226820u);    // str d0,[x1,x2]
+static_assert(SimdLdStRegOffEnc(0b11, 0b01, 6, 0b010, 1, 5, 3) == 0xfc6658a3u);    // ldr d3,[x5,w6,uxtw#3]
+// 32-bit (S): size=10, load opc=01 / store opc=00.
+static_assert(SimdLdStRegOffEnc(0b10, 0b01, 2, 0b011, 0, 1, 0) == 0xbc626820u);    // ldr s0,[x1,x2]
+
+// ldr q0, [x1, x2]: 128-bit register-offset load; x2=16 selects buf[2..3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQRegOffset) {
+  alignas(16) static const uint64_t buf[4] = {0x1111111122222222ULL, 0x3333333344444444ULL,
+                                              0x5555555566666666ULL, 0x7777777788888888ULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 16;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], buf[2]);
+  EXPECT_EQ(r[1], buf[3]);
+}
+
+// str q0, [x1, x2]: 128-bit register-offset store; x2=16 writes buf[2..3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrQRegOffset) {
+  alignas(16) static uint64_t buf[4] = {0, 0, 0, 0};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b10, 2, 0b011, 0, 1, 0)};
+  const uint64_t v[2] = {0xCAFEF00DDEADBEEFULL, 0x0123456789ABCDEFULL};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 16;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0ULL);  // untouched
+  EXPECT_EQ(buf[1], 0ULL);
+  EXPECT_EQ(buf[2], v[0]);
+  EXPECT_EQ(buf[3], v[1]);
+}
+
+// ldr d0, [x1, x2]: 64-bit register-offset load zero-extends the upper 64 of v0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrDRegOffsetZeroesUpper) {
+  alignas(16) static const uint64_t buf[2] = {0x1122334455667788ULL, 0xdeadbeefdeadbeefULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b11, 0b01, 2, 0b011, 0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], buf[0]);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// str d0, [x1, x2]: 64-bit register-offset store writes only the low 8 bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrDRegOffset) {
+  alignas(16) static uint64_t buf[2] = {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b11, 0b00, 2, 0b011, 0, 1, 0)};
+  const uint64_t v[2] = {0x0011223344556677ULL, 0x8899AABBCCDDEEFFULL};
+  std::memcpy(&state_.cpu.v[0], v, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], v[0]);                       // low 8 written
+  EXPECT_EQ(buf[1], 0xFFFFFFFFFFFFFFFFULL);      // high 8 untouched
+}
+
+// ldr s0, [x1, x2]: 32-bit register-offset load zero-extends the upper 96 of v0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrSRegOffsetZeroesUpper) {
+  alignas(16) static const uint32_t buf[4] = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b10, 0b01, 2, 0b011, 0, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], uint64_t{0x11223344u});
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// ldr q0, [x1, x2, lsl #4]: the S bit scales x2 by 16, so x2=1 -> addr = x1 + 16.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQRegOffsetLslShift) {
+  alignas(16) static const uint64_t buf[4] = {0x1111111111111111ULL, 0x2222222222222222ULL,
+                                              0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 1, 1, 0)};
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 1;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], buf[2]);
+  EXPECT_EQ(r[1], buf[3]);
+}
+
+// ldr d3, [x5, w6, uxtw #3]: UXTW takes only the low 32 bits of x6 and scales by
+// 8. x6=0xFFFFFFFF00000002 -> index 2 -> addr = x5 + 16 -> buf[2].
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrDRegOffsetUxtw) {
+  alignas(16) static const uint64_t buf[4] = {0xDEAD0000ULL, 0xBEEF1111ULL, 0xF00D2222ULL,
+                                              0xCAFE3333ULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b11, 0b01, 6, 0b010, 1, 5, 3)};
+  std::memset(&state_.cpu.v[3], 0xAB, 16);
+  state_.cpu.x[5] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[6] = 0xFFFFFFFF00000002ULL;  // only low 32 (=2) used by UXTW
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[3], 16);
+  EXPECT_EQ(r[0], buf[2]);
+  EXPECT_EQ(r[1], 0ULL);
+}
+
+// ldr q31, [x1, x2]: high vector register.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQ31RegOffset) {
+  alignas(16) static const uint64_t buf[2] = {0x1234567890ABCDEFULL, 0xFEDCBA0987654321ULL};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b00, 0b11, 2, 0b011, 0, 1, 31)};
+  std::memset(&state_.cpu.v[31], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 0;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[31], 16);
+  EXPECT_EQ(r[0], buf[0]);
+  EXPECT_EQ(r[1], buf[1]);
+}
+
 }  // namespace
 
 }  // namespace berberis
