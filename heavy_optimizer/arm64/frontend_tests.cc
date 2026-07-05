@@ -3328,6 +3328,32 @@ constexpr uint32_t UmlslVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_
 constexpr uint32_t SmlslVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1010, rd, rn, rm);
 }
+// Widening add/sub: {S,U}ADDL opcode=0000, {S,U}SUBL opcode=0010,
+// {S,U}ADDW opcode=0001, {S,U}SUBW opcode=0011 (U picks sign).
+constexpr uint32_t SaddlVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b0000, rd, rn, rm);
+}
+constexpr uint32_t UaddlVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0000, rd, rn, rm);
+}
+constexpr uint32_t SsublVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b0010, rd, rn, rm);
+}
+constexpr uint32_t UsublVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0010, rd, rn, rm);
+}
+constexpr uint32_t SaddwVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b0001, rd, rn, rm);
+}
+constexpr uint32_t UaddwVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0001, rd, rn, rm);
+}
+constexpr uint32_t SsubwVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b0011, rd, rn, rm);
+}
+constexpr uint32_t UsubwVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0011, rd, rn, rm);
+}
 
 // Helpers to write/read the scalar lane of a guest V register and to read its
 // upper bytes (which an ARM scalar-FP write must zero).
@@ -8496,6 +8522,160 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, UmlslVec2D) {
   // products={0x1FFFFFFFE,6}; Vd-={5, -1(wrap)}
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000005ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// AdvSimdThreeDiff widening add/sub (heavy tier). Result always fills 128 bits
+// (8H/4S/2D). The L-forms widen both narrow sources; the W-forms take Vn as an
+// already-wide 128-bit vector and widen only Vm. Q=1 ("2") selects the upper 64
+// of the narrow sources. Expected values match lite_translator.h::AdvSimdThreeDiff.
+
+// UADDL .8H: 8x (uint8 + uint8) -> 16-bit lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlVec8H) {
+  static const uint32_t code[] = {UaddlVec(0b00, /*q=*/false, 0, 1, 2)};
+  // Vn.8B={0xFF,0x01,0x80,0x10,0x00,0x7F,0x02,0x05}
+  SetV128(&state_, 1, 0x05027F00108001FFULL, 0xEEEEEEEEEEEEEEEEULL);
+  // Vm.8B={0x01,0x02,0x80,0xF0,0xFF,0x01,0x03,0x0A}
+  SetV128(&state_, 2, 0x0A0301FFF0800201ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // sums={0x100,0x003,0x100,0x100,0x0FF,0x080,0x005,0x00F}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0100010000030100ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000F0005008000FFULL);
+}
+
+// SADDL .8H: signed byte add-long (0xFF=-1, 0x80=-128).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddlVec8H) {
+  static const uint32_t code[] = {SaddlVec(0b00, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x05027F00108001FFULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0A0301FFF0800201ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // sums(signed)={0,3,-256,0,-1,128,5,15}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000FF0000030000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000F00050080FFFFULL);
+}
+
+// USUBL .4S: 4x (uint16 - uint16) -> 32-bit lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UsublVec4S) {
+  static const uint32_t code[] = {UsublVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vn.4H={0x0001,0x8000,0xFFFF,0x1234}
+  SetV128(&state_, 1, 0x1234FFFF80000001ULL, 0xEEEEEEEEEEEEEEEEULL);
+  // Vm.4H={0x0002,0x0001,0x0001,0x1234}
+  SetV128(&state_, 2, 0x1234000100010002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // diffs(unsigned)={-1,0x7FFF,0xFFFE,0}
+  EXPECT_EQ(VLo64(&state_, 0), 0x00007FFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000000000000FFFEULL);
+}
+
+// SSUBL .4S: signed halfword sub-long (0x8000=INT16_MIN).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SsublVec4S) {
+  static const uint32_t code[] = {SsublVec(0b01, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1234FFFF80000001ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x1234000100010002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // diffs(signed)={-1,-32769,-2,0}
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF7FFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFEULL);
+}
+
+// UADDL2 .2D: unsigned word add-long, upper 64 of Vn/Vm (Q=1) -> 64-bit lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uaddl2Vec2D) {
+  static const uint32_t code[] = {UaddlVec(0b10, /*q=*/true, 0, 1, 2)};
+  // Vn.4S upper={0xFFFFFFFF,0x00000003}; lower ignored.
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x00000003FFFFFFFFULL);
+  // Vm.4S upper={0x00000002,0xFFFFFFFF}; lower ignored.
+  SetV128(&state_, 2, 0x2222222222222222ULL, 0xFFFFFFFF00000002ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // sums={0x1_00000001, 0x1_00000002}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000100000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000100000002ULL);
+}
+
+// SADDW .8H: Vn is a full .8H (128-bit) + SignExtend(Vm.8B).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SaddwVec8H) {
+  static const uint32_t code[] = {SaddwVec(0b00, /*q=*/false, 0, 1, 2)};
+  // Vn.8H={0x0100,0x0003,0x0100,0x0100,0x00FF,0x0080,0x0005,0x000F}
+  SetV128(&state_, 1, 0x0100010000030100ULL, 0x000F0005008000FFULL);
+  // Vm.8B(signed)={1,-1,2,-128,16,1,-1,10}
+  SetV128(&state_, 2, 0x0AFF01108002FF01ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // sums={0x101,0x002,0x102,0x080,0x10F,0x081,0x004,0x019}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0080010200020101ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x001900040081010FULL);
+}
+
+// SSUBW .4S: Vn is a full .4S (128-bit) - SignExtend(Vm.4H).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SsubwVec4S) {
+  static const uint32_t code[] = {SsubwVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vn.4S={0x00001000,0xFFFFFFFF,0x00000000,0x80000000}
+  SetV128(&state_, 1, 0xFFFFFFFF00001000ULL, 0x8000000000000000ULL);
+  // Vm.4H(signed)={1,-1,-32768,32767}
+  SetV128(&state_, 2, 0x7FFF8000FFFF0001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // diffs={0xFFF,0,0x8000,0x7FFF8001}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000FFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x7FFF800100008000ULL);
+}
+
+// UADDW2 .4S: Vn full .4S + ZeroExtend(upper Vm.8H) (Q=1).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Uaddw2Vec4S) {
+  static const uint32_t code[] = {UaddwVec(0b01, /*q=*/true, 0, 1, 2)};
+  // Vn.4S={0x00010000,0x00000001,0xFFFFFFFE,0x12345678}
+  SetV128(&state_, 1, 0x0000000100010000ULL, 0x12345678FFFFFFFEULL);
+  // Vm.8H upper={0x0002,0xFFFF,0x0001,0x1000}; lower ignored.
+  SetV128(&state_, 2, 0x2222222222222222ULL, 0x10000001FFFF0002ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // sums={0x00010002,0x00010000,0xFFFFFFFF,0x12346678}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0001000000010002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x12346678FFFFFFFFULL);
+}
+
+// USUBW .8H: Vn full .8H - ZeroExtend(Vm.8B).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UsubwVec8H) {
+  static const uint32_t code[] = {UsubwVec(0b00, /*q=*/false, 0, 1, 2)};
+  // Vn.8H={0x0100,0x0003,0x0100,0x0100,0x00FF,0x0080,0x0005,0x000F}
+  SetV128(&state_, 1, 0x0100010000030100ULL, 0x000F0005008000FFULL);
+  // Vm.8B(unsigned)={1,255,2,128,16,1,255,10}
+  SetV128(&state_, 2, 0x0AFF01108002FF01ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // diffs={0x0FF,0xFF04,0x0FE,0x080,0x0EF,0x07F,0xFF06,0x005}
+  EXPECT_EQ(VLo64(&state_, 0), 0x008000FEFF0400FFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0005FF06007F00EFULL);
 }
 
 }  // namespace

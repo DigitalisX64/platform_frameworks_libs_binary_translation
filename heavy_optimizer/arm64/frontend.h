@@ -2998,23 +2998,115 @@ class HeavyOptimizerFrontend {
     SetVRegFull(args.rd, vn, args.q);
   }
 
-  // Heavy-tier mirror of the register-domain-pure widening multiply-accumulate
-  // subset of lite_translator.h::AdvSimdThreeDiff:
-  //   {S,U}MULL{,2}, {S,U}MLAL{,2}, {S,U}MLSL{,2}
+  // Heavy-tier mirror of the register-domain-pure subset of
+  // lite_translator.h::AdvSimdThreeDiff:
+  //   {S,U}MULL{,2}, {S,U}MLAL{,2}, {S,U}MLSL{,2}   (widening multiply-accumulate)
+  //   {S,U}ADDL{,2}, {S,U}SUBL{,2}                  (widening add/sub, both narrow)
+  //   {S,U}ADDW{,2}, {S,U}SUBW{,2}                  (widening add/sub, Vn wide)
   // at input sizes 8/16/32 (size 00/01/10) and both Q halves. The widening
-  // recipe matches lite exactly: widen both narrow sources (PMOVSX/PMOVZX per
-  // sign), lane-wise multiply (PMULLW / PMULLD / PMULDQ|PMULUDQ), then for the
-  // accumulate forms load Vd and PADD/PSUB at the wide lane width. The result
-  // always fills 128 bits (8H/4S/2D), so SetVRegFull q=true regardless of Q.
-  // Q=1 ("2") forms widen the upper 64 of Vn/Vm — bring bytes 8..15 down with
-  // PSRLDQ before widening. Every other ThreeDiff opcode (widening add/sub,
-  // ABDL/ABAL, ADDHN/SUBHN, PMULL, SQDMULL family) still bails to the lite
-  // tier — emit NOTHING before a bail.
+  // recipe matches lite exactly: widen the narrow sources (PMOVSX/PMOVZX per
+  // sign), then for the multiply subset lane-wise multiply
+  // (PMULLW / PMULLD / PMULDQ|PMULUDQ) — MLAL/MLSL load Vd and PADD/PSUB the
+  // product — and for the add/sub subset PADD/PSUB the widened operands
+  // directly at the wide lane width. The result always fills 128 bits
+  // (8H/4S/2D), so SetVRegFull q=true regardless of Q. Q=1 ("2") forms take
+  // the upper 64 of the narrow sources — bring bytes 8..15 down with PSRLDQ
+  // before widening (the W-forms' Vn is already a 128-bit wide vector and is
+  // loaded full, never shifted). Every other ThreeDiff opcode (ABDL/ABAL,
+  // ADDHN/SUBHN, PMULL, SQDMULL family) still bails to the lite tier — emit
+  // NOTHING before a bail.
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
     if (!success()) {
       return;
     }
     using Op = Decoder::AdvSimdThreeDiffOpcode;
+
+    // Widening add/sub subset: {S,U}ADDL/{S,U}SUBL (both sources narrow) and
+    // {S,U}ADDW/{S,U}SUBW (Vn already a wide-lane 128-bit vector). Handle first;
+    // fall through to the multiply-accumulate subset otherwise.
+    const bool is_addl = (args.opcode == Op::kSaddl || args.opcode == Op::kUaddl);
+    const bool is_subl = (args.opcode == Op::kSsubl || args.opcode == Op::kUsubl);
+    const bool is_addw = (args.opcode == Op::kSaddw || args.opcode == Op::kUaddw);
+    const bool is_subw = (args.opcode == Op::kSsubw || args.opcode == Op::kUsubw);
+    if (is_addl || is_subl || is_addw || is_subw) {
+      if (args.size > 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool addsub_signed = (args.opcode == Op::kSaddl ||
+                                  args.opcode == Op::kSsubl ||
+                                  args.opcode == Op::kSaddw ||
+                                  args.opcode == Op::kSsubw);
+      const bool is_add = (is_addl || is_addw);
+      const bool n_is_wide = (is_addw || is_subw);
+      const int32_t vn_off_as =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t vm_off_as =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off_as);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off_as);
+      // Q=1 selects the upper 64 of the *narrow* sources; the W-forms' Vn is
+      // already wide, so only shift it for the L-forms.
+      if (args.q) {
+        if (!n_is_wide) {
+          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        }
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      }
+      // Widen Vn (skip for W-forms — Vn is already a wide-lane vector).
+      if (!n_is_wide) {
+        switch (args.size) {
+          case 0b00:
+            if (addsub_signed) builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            else builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            break;
+          case 0b01:
+            if (addsub_signed) builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            else builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            break;
+          case 0b10:
+            if (addsub_signed) builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            else builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            break;
+        }
+      }
+      // Widen Vm (always narrow).
+      switch (args.size) {
+        case 0b00:
+          if (addsub_signed) builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          else builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          break;
+        case 0b01:
+          if (addsub_signed) builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          else builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          break;
+        case 0b10:
+          if (addsub_signed) builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          else builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          break;
+      }
+      // xn = Vn +/- Vm at the wide lane width.
+      switch (args.size) {
+        case 0b00:
+          if (is_add) builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b01:
+          if (is_add) builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b10:
+          if (is_add) builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+      }
+      SetVRegFull(args.rd, xn, /*q=*/true);
+      return;
+    }
+
     const bool is_mull = (args.opcode == Op::kSmull || args.opcode == Op::kUmull);
     const bool is_mlal = (args.opcode == Op::kSmlal || args.opcode == Op::kUmlal);
     const bool is_mlsl = (args.opcode == Op::kSmlsl || args.opcode == Op::kUmlsl);
