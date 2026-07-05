@@ -3871,26 +3871,6 @@ constexpr uint32_t SqsubVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_
 constexpr uint32_t UqsubVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00101, rd, rn, rm);
 }
-// Halving add/sub group. SHADD/UHADD (opcode=00000), SRHADD/URHADD
-// (opcode=00010), SHSUB/UHSUB (opcode=00100); U selects signed/unsigned.
-constexpr uint32_t ShaddVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
-  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b00000, rd, rn, rm);
-}
-constexpr uint32_t UhaddVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
-  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00000, rd, rn, rm);
-}
-constexpr uint32_t SrhaddVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
-  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b00010, rd, rn, rm);
-}
-constexpr uint32_t UrhaddVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
-  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00010, rd, rn, rm);
-}
-constexpr uint32_t ShsubVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
-  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b00100, rd, rn, rm);
-}
-constexpr uint32_t UhsubVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
-  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00100, rd, rn, rm);
-}
 // Logic group (opcode=00011); op selected by U and size:
 //   AND: U=0, size=00.   ORR: U=0, size=10.   EOR: U=1, size=00.
 constexpr uint32_t AndVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
