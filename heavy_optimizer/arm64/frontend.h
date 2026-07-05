@@ -1560,34 +1560,18 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    if (ftype != 0b00 && ftype != 0b01) {
-      UndefinedReturningVoid();
-      return;
-    }
-    const bool is_double = (ftype == 0b01);
-
-    FpRegister vn = GetVRegScalar(rn, is_double);  // condition-TRUE operand
-    FpRegister vm = GetVRegScalar(rm, is_double);  // condition-FALSE operand
-
-    // AL/NV are unconditional on FCSEL and always select the TRUE operand.
-    if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
-      SetVRegScalar(rd, vn, is_double);
-      return;
-    }
-
-    Register pred = EmitArmCondPredicate(cond);  // 0/1
-    // mask_gp = 0 - pred (no Neg op in the heavy IR; mirrors CSNEG's negate).
-    Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
-    Register mask_gp = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(zero, pred));
-    FpRegister mask = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), mask_gp);
-
-    // vn = (Vn & mask) | (Vm & ~mask). PANDN(dst, src) = ~dst & src.
-    builder_.Gen<x86_64::PandXRegXReg>(vn.machine_reg(), mask.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(mask.machine_reg(), vm.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(vn.machine_reg(), mask.machine_reg());
-
-    SetVRegScalar(rd, vn, is_double);
+    // Bail to the lite tier. The branchless mask-blend lowering (from the
+    // FCSEL heavy commit) miscompiled inside real regions — it passed every
+    // isolated per-op exec test but deterministically crashed the Chromium
+    // renderer (bisected to that commit; heavy-off rendered cleanly). The
+    // arithmetic and the EmitArmCondPredicate mask look correct in isolation,
+    // so the fault is a region-level interaction the single-region tests don't
+    // exercise; until it's reproduced and fixed with a region-level
+    // differential test, FCSEL stays a heavy bail (correct-but-slow — the
+    // interpreter and lite tier handle it). Do NOT re-enable a heavy FCSEL
+    // lowering without a region-interaction test that reproduces the crash.
+    UndefinedReturningVoid();
+    UNUSED_ARGS(rd, rn, rm, ftype, cond);
   }
 
   // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point). The FCvt* intrinsics + cvtsi2ss
