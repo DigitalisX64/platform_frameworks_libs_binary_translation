@@ -5348,6 +5348,48 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // SCVTF / UCVTF V Vd.<T>, Vn.<T> (FP32 .2S/.4S) — integer to
+      // floating-point convert (the inverse direction of FCVTZS/FCVTZU V).
+      // Branchless mirror of the validated lite lowering
+      // (lite_translator.h::AdvSimdTwoRegMisc kScvtfV/kUcvtfV, FP32 path):
+      //   SCVTF: a single CVTDQ2PS — x86 signed int32 -> FP32 matches ARM.
+      //   UCVTF: CVTDQ2PS treats the input as signed, so lanes with bit31 set
+      //          come out negative; recover the unsigned value by adding 2^32
+      //          (FP32 bits 0x4F800000) per lane wherever bit31 was set
+      //          (PSRAD 31 mask), which is exact for the [2^31, 2^32) range.
+      // The FP64 .2D form (branchy per-lane in lite) and FP16 bail to
+      // lite→interp, mirroring the lite FP32-only fast path.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kScvtfV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV: {
+        if (args.is_fp16 || (args.size & 1) == 1) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_unsigned =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUcvtfV);
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (!is_unsigned) {
+          // SCVTF V: signed int32 -> FP32 is native.
+          builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          SetVRegFull(args.rd, xn, args.q);
+          return;
+        }
+        // UCVTF V: CVTDQ2PS + per-lane 2^32 addend for MSB-set lanes.
+        FpRegister msb = AllocTempSimdReg();
+        FpRegister addend = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});  // 0 or all-1s
+        builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
+        Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F800000)));  // 2^32
+        builder_.Gen<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());  // 2^32 where MSB set
+        builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
       // SADDLP / UADDLP / SADALP / UADALP Vd.<Ta>, Vn.<Tb> — pairwise long
       // add / add-accumulate. Each adjacent pair of esize-wide source lanes is
       // widened (sign/zero) to 2*esize and summed; SADALP/UADALP accumulate the

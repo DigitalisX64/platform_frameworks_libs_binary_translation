@@ -4108,6 +4108,16 @@ static_assert(FcvtmuVec(true, 0, 1) == 0x6e21b820u);   // fcvtmu v0.4s, v1.4s
 static_assert(FcvtasVec(true, 0, 1) == 0x4e21c820u);   // fcvtas v0.4s, v1.4s
 static_assert(FcvtasVec(false, 0, 1) == 0x0e21c820u);  // fcvtas v0.2s, v1.2s
 static_assert(FcvtauVec(true, 0, 1) == 0x6e21c820u);   // fcvtau v0.4s, v1.4s
+// SCVTF/UCVTF V Vd.<T>, Vn.<T> (FP32 .2S/.4S): int->FP, two-reg-misc,
+// opcode=11101, size=00 (bit23=0 selects int->FP; bit23=1 is FRECPE/FRSQRTE);
+// U=0 signed / U=1 unsigned.
+constexpr uint32_t ScvtfVec(bool is_unsigned, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/is_unsigned, /*size=*/0b00, /*opcode=*/0b11101, rd, rn);
+}
+static_assert(ScvtfVec(false, true, 0, 1) == 0x4e21d820u);   // scvtf v0.4s, v1.4s
+static_assert(ScvtfVec(false, false, 0, 1) == 0x0e21d820u);  // scvtf v0.2s, v1.2s
+static_assert(ScvtfVec(true, true, 0, 1) == 0x6e21d820u);    // ucvtf v0.4s, v1.4s
+static_assert(ScvtfVec(true, false, 0, 1) == 0x2e21d820u);   // ucvtf v0.2s, v1.2s
 // SADDLP/UADDLP/SADALP/UADALP Vd.<Ta>, Vn.<Tb>: two-reg-misc, opcode=00010
 // (add-long-pairwise) or 00110 (accumulate); U=0 signed / U=1 unsigned.
 constexpr uint32_t AddlpVec(bool is_signed, bool is_accum, uint8_t size, bool q,
@@ -8971,6 +8981,62 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuVec4SSaturate) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000000ULL);   // {0, 0}
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000005FFFFFFFFULL);  // {UINT32_MAX, 5}
+}
+
+// ---- Vector SCVTF/UCVTF int->FP converts (heavy). ----
+
+// SCVTF v0.4s, v1.4s: int32 {2, -2, 100, -100} -> FP32 {2.0, -2.0, 100.0, -100.0}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfVec4S) {
+  static const uint32_t code[] = {ScvtfVec(/*is_unsigned=*/false, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFE00000002ULL, 0xFFFFFF9C00000064ULL);  // {2,-2},{100,-100}
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000000040000000ULL);       // {2.0, -2.0}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC2C8000042C80000ULL);  // {100.0, -100.0}
+}
+
+// SCVTF v0.2s, v1.2s: only lanes 0,1 converted; upper 64 bits zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfVec2S) {
+  static const uint32_t code[] = {ScvtfVec(/*is_unsigned=*/false, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFFFFFFFE00000002ULL, 0xBBBBBBBBBBBBBBBBULL);  // {2,-2}, junk
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000000040000000ULL);       // {2.0, -2.0}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // .2S upper zeroed
+}
+
+// UCVTF v0.4s, v1.4s: u32 {2, 2^31, 100, 0xFFFFFFFF} -> {2.0, 2^31, 100.0, 2^32}.
+// Lanes with bit31 set (2^31, 0xFFFFFFFF) exercise the +2^32 addend path;
+// 0xFFFFFFFF rounds to 2^32 (0x4F800000) under round-to-nearest-even.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfVec4S) {
+  static const uint32_t code[] = {ScvtfVec(/*is_unsigned=*/true, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x8000000000000002ULL, 0xFFFFFFFF00000064ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4F00000040000000ULL);       // {2.0, 2^31}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4F80000042C80000ULL);  // {100.0, 2^32}
+}
+
+// UCVTF v0.2s, v1.2s: bit31-set lane + upper-zero check.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfVec2S) {
+  static const uint32_t code[] = {ScvtfVec(/*is_unsigned=*/true, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x8000000000000002ULL, 0xBBBBBBBBBBBBBBBBULL);  // {2, 2^31}, junk
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4F00000040000000ULL);       // {2.0, 2^31}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // .2S upper zeroed
 }
 
 // ---- Vector round-mode FP->int converts FCVTN*/FCVTP*/FCVTM*/FCVTA* (heavy). ----
