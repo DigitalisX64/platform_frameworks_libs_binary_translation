@@ -3992,6 +3992,32 @@ static_assert(AddlvVec(true, 0b00, /*q=*/true, 0, 1) == 0x4e303820u);    // sadd
 static_assert(AddlvVec(true, 0b01, /*q=*/false, 0, 1) == 0x0e703820u);   // saddlv s0, v1.4h
 static_assert(AddlvVec(true, 0b01, /*q=*/true, 0, 1) == 0x4e703820u);    // saddlv s0, v1.8h
 static_assert(AddlvVec(true, 0b10, /*q=*/true, 0, 1) == 0x4eb03820u);    // saddlv d0, v1.4s
+// SMAXV/SMINV/UMAXV/UMINV Vd, Vn.<T>: 0 Q U 01110 size 11000 opcode 10 Rn Rd.
+// opcode = 01010 (max) or 11010 (min); U = 0 (signed) / 1 (unsigned).
+// Base (max, signed, size=00, rd=rn=0) = 0x0E30A800.
+constexpr uint32_t MaxminvVec(bool is_max, bool is_signed, uint8_t size, bool q,
+                              uint8_t rd, uint8_t rn) {
+  const uint32_t opcode = is_max ? 0b01010u : 0b11010u;
+  return 0x0E300800u | (static_cast<uint32_t>(q) << 30) |
+         (static_cast<uint32_t>(!is_signed) << 29) |
+         (static_cast<uint32_t>(size) << 22) | (opcode << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(MaxminvVec(true, true, 0b00, /*q=*/true, 0, 1) == 0x4e30a820u);    // smaxv b0, v1.16b
+static_assert(MaxminvVec(true, true, 0b00, /*q=*/false, 0, 1) == 0x0e30a820u);   // smaxv b0, v1.8b
+static_assert(MaxminvVec(true, true, 0b01, /*q=*/true, 0, 1) == 0x4e70a820u);    // smaxv h0, v1.8h
+static_assert(MaxminvVec(true, true, 0b01, /*q=*/false, 0, 1) == 0x0e70a820u);   // smaxv h0, v1.4h
+static_assert(MaxminvVec(true, true, 0b10, /*q=*/true, 0, 1) == 0x4eb0a820u);    // smaxv s0, v1.4s
+static_assert(MaxminvVec(false, true, 0b00, /*q=*/true, 0, 1) == 0x4e31a820u);   // sminv b0, v1.16b
+static_assert(MaxminvVec(false, true, 0b01, /*q=*/true, 0, 1) == 0x4e71a820u);   // sminv h0, v1.8h
+static_assert(MaxminvVec(false, true, 0b10, /*q=*/true, 0, 1) == 0x4eb1a820u);   // sminv s0, v1.4s
+static_assert(MaxminvVec(true, false, 0b00, /*q=*/true, 0, 1) == 0x6e30a820u);   // umaxv b0, v1.16b
+static_assert(MaxminvVec(true, false, 0b00, /*q=*/false, 0, 1) == 0x2e30a820u);  // umaxv b0, v1.8b
+static_assert(MaxminvVec(true, false, 0b01, /*q=*/true, 0, 1) == 0x6e70a820u);   // umaxv h0, v1.8h
+static_assert(MaxminvVec(true, false, 0b10, /*q=*/true, 0, 1) == 0x6eb0a820u);   // umaxv s0, v1.4s
+static_assert(MaxminvVec(false, false, 0b00, /*q=*/true, 0, 1) == 0x6e31a820u);  // uminv b0, v1.16b
+static_assert(MaxminvVec(false, false, 0b01, /*q=*/true, 0, 1) == 0x6e71a820u);  // uminv h0, v1.8h
+static_assert(MaxminvVec(false, false, 0b10, /*q=*/true, 0, 1) == 0x6eb1a820u);  // uminv s0, v1.4s
 // XTN/XTN2: U=0, opcode=10010.
 constexpr uint32_t XtnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/false, size, /*opcode=*/0b10010, rd, rn);
@@ -8214,6 +8240,117 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, UaddlvVec8H) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x000000000007FFF8ULL);  // 524280
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// ---- AdvSIMD across-lanes max/min reductions (heavy mirror):
+//      SMAXV / SMINV / UMAXV / UMINV. ----
+//
+// Byte tests share one source with a signed/unsigned-distinguishing lane set:
+//   bytes = {0x7F, 0x80, 1, 2, 3, 4, 5, 6, 0x40..0x47}
+//   signed:   max=+127 (0x7F)  min=-128 (0x80)
+//   unsigned: max=128  (0x80)  min=1    (0x01)
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxvVec16B) {
+  static const uint32_t code[] = {MaxminvVec(true, true, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x060504030201807FULL, 0x4746454443424140ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000007FULL);  // signed max +127
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SminvVec16B) {
+  static const uint32_t code[] = {MaxminvVec(false, true, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x060504030201807FULL, 0x4746454443424140ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000080ULL);  // signed min -128
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmaxvVec16B) {
+  static const uint32_t code[] = {MaxminvVec(true, false, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x060504030201807FULL, 0x4746454443424140ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000080ULL);  // unsigned max 128
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UminvVec16B) {
+  static const uint32_t code[] = {MaxminvVec(false, false, 0b00, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x060504030201807FULL, 0x4746454443424140ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000001ULL);  // unsigned min 1
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UMAXV h0, v1.8h: unsigned max of {0x7FFF,0x8000,2,3,4,5,6,7} = 0x8000 (32768,
+// unsigned) — a signed reduction would pick 0x7FFF (32767).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmaxvVec8H) {
+  static const uint32_t code[] = {MaxminvVec(true, false, 0b01, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0003000280007FFFULL, 0x0007000600050004ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000008000ULL);  // 32768
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SMAXV h0, v1.4h (Q=0): signed max of the low 4 halfwords
+// {-32767, 5, 28672, -1} = 28672 (0x7000). Upper 64 of Vn is don't-care and
+// must be neutralized by the low-qword replication.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxvVec4H) {
+  static const uint32_t code[] = {MaxminvVec(true, true, 0b01, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0xFFFF700000058001ULL, 0xAAAAAAAAAAAAAAAAULL);  // hi = poison
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000007000ULL);  // 28672
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SMAXV s0, v1.4s: signed max of {INT32_MIN, 5, INT32_MAX, -1} = INT32_MAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxvVec4S) {
+  static const uint32_t code[] = {MaxminvVec(true, true, 0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0000000580000000ULL, 0xFFFFFFFF7FFFFFFFULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);  // INT32_MAX
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// UMINV s0, v1.4s: unsigned min of {16, 5, 3, 0xFFFFFFFF} = 3.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UminvVec4S) {
+  static const uint32_t code[] = {MaxminvVec(false, false, 0b10, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x0000000500000010ULL, 0xFFFFFFFF00000003ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000003ULL);  // 3
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
 }
 

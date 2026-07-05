@@ -4460,6 +4460,137 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // SMAXV / SMINV / UMAXV / UMINV Vd, Vn.<T> — across-lanes integer
+      // max/min reduce. Scan all source lanes; write the single scalar
+      // max/min to Vd's low lane with all other bytes zeroed. The result
+      // width equals esize (unlike SADDLV/UADDLV which widens to 2*esize).
+      // Mirrors the validated lite lowering: for Q=0 the low qword is
+      // replicated across both halves (PSHUFD 0x44) so the don't-care upper
+      // half can't poison the reduction (max(x,x)=x is idempotent), then a
+      // cascading PMAX/PMIN against a shuffle-of-xn halves the surviving lane
+      // count each step; a final PSLLDQ/PSRLDQ shuttle keeps only the low lane.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUminv: {
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUmaxv);
+        const bool is_signed =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSminv);
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xt = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        if (!args.q) {
+          // Replicate low qword to high qword: { dw0, dw1, dw0, dw1 } via
+          // _MM_SHUFFLE(1,0,1,0) = 0x44. Neutralizes the don't-care upper half.
+          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+              xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x44));
+        }
+        auto EmitPmaxPmin = [&](unsigned width_bits) {
+          switch (width_bits) {
+            case 8:
+              if (is_signed) {
+                if (is_max)
+                  builder_.Gen<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                else
+                  builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              } else {
+                if (is_max)
+                  builder_.Gen<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                else
+                  builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              }
+              break;
+            case 16:
+              if (is_signed) {
+                if (is_max)
+                  builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                else
+                  builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              } else {
+                if (is_max)
+                  builder_.Gen<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                else
+                  builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              }
+              break;
+            case 32:
+              if (is_signed) {
+                if (is_max)
+                  builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                else
+                  builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              } else {
+                if (is_max)
+                  builder_.Gen<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                else
+                  builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              }
+              break;
+          }
+        };
+        switch (args.size) {
+          case 0b00: {
+            // Bytes: 16 -> 8 -> 4 -> 2 -> 1 surviving lanes per step.
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
+            EmitPmaxPmin(8);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
+            EmitPmaxPmin(8);
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{2});
+            EmitPmaxPmin(8);
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{1});
+            EmitPmaxPmin(8);
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{15});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{15});
+            break;
+          }
+          case 0b01: {
+            // Halfwords: 8 -> 4 -> 2 -> 1 surviving lanes per step.
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
+            EmitPmaxPmin(16);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
+            EmitPmaxPmin(16);
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{2});
+            EmitPmaxPmin(16);
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+            break;
+          }
+          case 0b10: {
+            if (!args.q) {  // .2S reserved.
+              UndefinedReturningVoid();
+              return;
+            }
+            // Dwords: 4 -> 2 -> 1 surviving lanes per step.
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
+            EmitPmaxPmin(32);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
+            EmitPmaxPmin(32);
+            builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+            break;
+          }
+          default:
+            UndefinedReturningVoid();
+            return;
+        }
+        builder_.GenSetSimd<16>(vd_off, xn.machine_reg());
+        return;
+      }
+
       default:
         UndefinedReturningVoid();
         return;
