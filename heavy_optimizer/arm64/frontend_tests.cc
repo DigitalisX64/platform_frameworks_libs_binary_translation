@@ -3368,6 +3368,17 @@ constexpr uint32_t SubhnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_
 constexpr uint32_t RsubhnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0110, rd, rn, rm);
 }
+// Saturating doubling widening: SQDMULL opcode=1101, SQDMLAL opcode=1001,
+// SQDMLSL opcode=1011 (all U=0).
+constexpr uint32_t SqdmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1101, rd, rn, rm);
+}
+constexpr uint32_t SqdmlalVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1001, rd, rn, rm);
+}
+constexpr uint32_t SqdmlslVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1011, rd, rn, rm);
+}
 
 // Helpers to write/read the scalar lane of a guest V register and to read its
 // upper bytes (which an ARM scalar-FP write must zero).
@@ -8796,6 +8807,124 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, RsubhnVec8B) {
   // (diff+0x80)>>8={0x02,0x02,0x01,0x80,0x01,0x12,0x00,0x01}
   EXPECT_EQ(VLo64(&state_, 0), 0x0100120180010202ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQDMULL .4S <- .4H: signed saturating doubling multiply long. The
+// (-32768)*(-32768) lane doubles to 2^31 and saturates to INT32_MAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmullVec4S) {
+  static const uint32_t code[] = {SqdmullVec(0b01, /*q=*/false, 0, 1, 2)};
+  // Vn.4H={3,-4,-32768,100}  Vm.4H={5,7,-32768,-100}
+  SetV128(&state_, 1, 0x00648000FFFC0003ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0xFF9C800000070005ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // 2*prod={30,-56,SAT->0x7FFFFFFF,-20000}
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFC80000001EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFB1E07FFFFFFFULL);
+}
+
+// SQDMLAL .4S: signed saturating doubling multiply-accumulate. The
+// 5+INT32_MAX lane overflows on the add and saturates to INT32_MAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmlalVec4S) {
+  static const uint32_t code[] = {SqdmlalVec(0b01, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x00648000FFFC0003ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0xFF9C800000070005ULL, 0xDDDDDDDDDDDDDDDDULL);
+  // Vd.4S={10,100,5,0x7FFFFF00}; P={30,-56,0x7FFFFFFF,-20000}
+  SetV128(&state_, 0, 0x000000640000000AULL, 0x7FFFFF0000000005ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // {40,44,SAT->0x7FFFFFFF,0x7FFFB0E0}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000002C00000028ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x7FFFB0E07FFFFFFFULL);
+}
+
+// SQDMLSL .4S: signed saturating doubling multiply-subtract. The
+// INT32_MIN-INT32_MAX lane underflows on the sub and saturates to INT32_MIN.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmlslVec4S) {
+  static const uint32_t code[] = {SqdmlslVec(0b01, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x00648000FFFC0003ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0xFF9C800000070005ULL, 0xDDDDDDDDDDDDDDDDULL);
+  // Vd.4S={100,10,INT32_MIN,0x80000100}; P={30,-56,0x7FFFFFFF,-20000}
+  SetV128(&state_, 0, 0x0000000A00000064ULL, 0x8000010080000000ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // {70,66,SAT->0x80000000,0x80004F20}
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000004200000046ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x80004F2080000000ULL);
+}
+
+// SQDMULL2 .4S: Q=1 takes the upper 64 bits (bytes 8..15) of Vn/Vm as .4H.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Sqdmull2Vec4S) {
+  static const uint32_t code[] = {SqdmullVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1111111111111111ULL, 0x00648000FFFC0003ULL);
+  SetV128(&state_, 2, 0x2222222222222222ULL, 0xFF9C800000070005ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // same result as SqdmullVec4S (upper-half sources)
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFC80000001EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFB1E07FFFFFFFULL);
+}
+
+// SQDMULL .2D <- .2S: 64-bit manual saturation. The INT32_MIN*INT32_MIN lane
+// doubles to 2^63 and saturates to INT64_MAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmullVec2D) {
+  static const uint32_t code[] = {SqdmullVec(0b10, /*q=*/false, 0, 1, 2)};
+  // Vn.2S={3,INT32_MIN}  Vm.2S={5,INT32_MIN}
+  SetV128(&state_, 1, 0x8000000000000003ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x8000000000000005ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // {30, SAT->INT64_MAX}
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000001EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x7FFFFFFFFFFFFFFFULL);
+}
+
+// SQDMLAL .2D: 64-bit saturating accumulate. INT64_MAX + 2^32 overflows on the
+// add and saturates to INT64_MAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmlalVec2D) {
+  static const uint32_t code[] = {SqdmlalVec(0b10, /*q=*/false, 0, 1, 2)};
+  // Vn.2S={2^30,3}  Vm.2S={2,5}; P={2^32,30}
+  SetV128(&state_, 1, 0x0000000340000000ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0000000500000002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  // Vd.2D={INT64_MAX,100}
+  SetV128(&state_, 0, 0x7FFFFFFFFFFFFFFFULL, 0x0000000000000064ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // {SAT->INT64_MAX, 130}
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000082ULL);
+}
+
+// SQDMLSL .2D: 64-bit saturating subtract. INT64_MIN - 2^32 underflows on the
+// sub and saturates to INT64_MIN.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmlslVec2D) {
+  static const uint32_t code[] = {SqdmlslVec(0b10, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000340000000ULL, 0xEEEEEEEEEEEEEEEEULL);
+  SetV128(&state_, 2, 0x0000000500000002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  // Vd.2D={INT64_MIN,100}; P={2^32,30}
+  SetV128(&state_, 0, 0x8000000000000000ULL, 0x0000000000000064ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // {SAT->INT64_MIN, 70}
+  EXPECT_EQ(VLo64(&state_, 0), 0x8000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000046ULL);
 }
 
 }  // namespace

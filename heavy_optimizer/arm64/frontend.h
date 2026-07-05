@@ -3018,8 +3018,15 @@ class HeavyOptimizerFrontend {
   //   ADDHN/SUBHN/RADDHN/RSUBHN — add/sub the two wide-lane sources, then take
   //   the HIGH half of each lane as the narrow result (rounding variants add a
   //   half-ulp bias first). Committed via SetVRegNarrow (Q=0 zero-extend / Q2
-  //   merge into Vd.high). The remaining ThreeDiff opcodes (ABDL/ABAL, PMULL,
-  //   SQDMULL family) still bail to the lite tier — emit NOTHING before a bail.
+  //   merge into Vd.high).
+  //
+  // Also mirrors the saturating-doubling widening subset:
+  //   SQDMULL/SQDMLAL/SQDMLSL — signed saturating doubling multiply long, with
+  //   the accumulate/subtract forms saturating again on the add. size 01
+  //   (.4H->.4S, manual 32-bit saturation) and size 10 (.2S->.2D, manual 64-bit
+  //   saturation); size 00/11 are decoder-rejected. The remaining ThreeDiff
+  //   opcodes (ABDL/ABAL, PMULL) still bail to the lite tier — emit NOTHING
+  //   before a bail.
   void AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArgs& args) {
     if (!success()) {
       return;
@@ -3194,6 +3201,150 @@ class HeavyOptimizerFrontend {
         builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
       }
       SetVRegNarrow(args.rd, xn, args.q);
+      return;
+    }
+
+    // SQDMULL/SQDMLAL/SQDMLSL — signed saturating doubling multiply long (+
+    // saturating accumulate/subtract). Line-by-line mirror of
+    // lite_translator.h::AdvSimdThreeDiff's SQDMULL block. Only size=01
+    // (.4H->.4S) and size=10 (.2S->.2D) are defined (size 00/11 are
+    // decoder-rejected). The exact lane products are doubled with manual
+    // saturation of the single INT_MIN^2 overflow lane (product == 2^30 / 2^62
+    // -> SMAX), then the accumulate forms apply a second signed-saturating
+    // add/sub via the (a^P)&(a^res) sign-bit overflow-detection idiom. The
+    // "long" result always fills 128 bits, so SetVRegFull q=true regardless of
+    // the Q ("2") bit, which only selects the upper half of the narrow sources.
+    if (args.opcode == Op::kSqdmull || args.opcode == Op::kSqdmlal ||
+        args.opcode == Op::kSqdmlsl) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_acc = (args.opcode != Op::kSqdmull);
+      const bool is_sub = (args.opcode == Op::kSqdmlsl);
+      const int32_t vn_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t vm_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      const int32_t vd_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+      // Materialize a broadcast constant (`pattern` in both qwords).
+      auto broadcast = [&](uint64_t pattern) -> FpRegister {
+        FpRegister x = AllocTempSimdReg();
+        Register gr =
+            std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
+        builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+        return x;
+      };
+
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_o);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
+      // Q=1 ("2") forms take the upper 64 bits of the narrow sources.
+      if (args.q) {
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      }
+
+      // Compute the doubled, saturated product P into xP (128 bits: 4S or 2D).
+      FpRegister xP = broadcast(args.size == 0b01 ? uint64_t{0x4000000040000000ULL}
+                                                  : uint64_t{0x4000000000000000ULL});
+      if (args.size == 0b01) {
+        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        // xP starts as INT16_MIN^2 (0x40000000 per lane); mark == lanes.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xP.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
+        FpRegister xsat = broadcast(uint64_t{0x7FFFFFFF7FFFFFFFULL});
+        builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());   // SMAX in sat lanes
+        builder_.Gen<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());    // doubled in non-sat
+        builder_.Gen<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());    // xP = P
+      } else {  // size == 0b10
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        // xP starts as INT32_MIN^2 (2^62 per qword); mark == lanes.
+        builder_.Gen<x86_64::PcmpeqqXRegXReg>(xP.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
+        FpRegister xsat = broadcast(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+        builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
+        builder_.Gen<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
+      }
+
+      if (!is_acc) {
+        SetVRegFull(args.rd, xP, /*q=*/true);
+        return;
+      }
+
+      // Signed saturating accumulate: result = SignedSat(Vd +/- P). a = Vd.
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_o);
+      FpRegister xres = AllocTempSimdReg();
+      FpRegister xof = AllocTempSimdReg();
+      FpRegister xtmp = AllocTempSimdReg();
+      if (args.size == 0b01) {
+        if (is_sub) {
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xP.machine_reg());   // diff = a - P
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());     // a ^ P
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
+          builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+        } else {
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xP.machine_reg());   // sum = a + P
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());   // a ^ sum
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
+          builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+        }
+        builder_.Gen<x86_64::PsradXRegImm>(xof.machine_reg(), int8_t{31});  // overflow lanes
+        builder_.Gen<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});   // a's sign (0 / -1)
+        FpRegister xmaxc = broadcast(uint64_t{0x7FFFFFFF7FFFFFFFULL});
+        builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xmaxc.machine_reg());   // sat = (a>>31)^INT32_MAX
+        builder_.Gen<x86_64::PandXRegXReg>(xd.machine_reg(), xof.machine_reg());     // sat in overflow lanes
+        builder_.Gen<x86_64::PandnXRegXReg>(xof.machine_reg(), xres.machine_reg());  // result in non-overflow
+        builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), xof.machine_reg());
+        SetVRegFull(args.rd, xd, /*q=*/true);
+        return;
+      }
+      // size == 0b10 accumulate (64-bit signed saturating).
+      FpRegister xzero = AllocZeroedSimdReg();
+      if (is_sub) {
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+        builder_.Gen<x86_64::PsubqXRegXReg>(xres.machine_reg(), xP.machine_reg());   // diff = a - P
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());     // a ^ P
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
+        builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+      } else {
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+        builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xP.machine_reg());   // sum = a + P
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());   // a ^ sum
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
+        builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+      }
+      // overflow_mask (xtmp) = all-ones per qword where xof < 0 (sign set).
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
+      builder_.Gen<x86_64::PcmpgtqXRegXReg>(xtmp.machine_reg(), xof.machine_reg());
+      // sat = sign(a) ^ INT64_MAX  (INT64_MIN if a<0, else INT64_MAX).
+      builder_.Gen<x86_64::PcmpgtqXRegXReg>(xzero.machine_reg(), xd.machine_reg());  // all-ones where a<0
+      FpRegister xmaxc = broadcast(uint64_t{0x7FFFFFFFFFFFFFFFULL});
+      builder_.Gen<x86_64::PxorXRegXReg>(xzero.machine_reg(), xmaxc.machine_reg());  // xzero = sat value
+      builder_.Gen<x86_64::PandXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());   // sat in overflow lanes
+      builder_.Gen<x86_64::PandnXRegXReg>(xtmp.machine_reg(), xres.machine_reg());   // result in non-overflow
+      builder_.Gen<x86_64::PorXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());
+      SetVRegFull(args.rd, xzero, /*q=*/true);
       return;
     }
 
