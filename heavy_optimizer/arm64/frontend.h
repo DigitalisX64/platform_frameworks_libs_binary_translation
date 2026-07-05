@@ -3275,6 +3275,72 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // Integer vector S{MAX,MIN}/U{MAX,MIN} (opcode 01100 max / 01101 min; U
+    // selects signed/unsigned): lane-wise signed or unsigned min/max. x86 has
+    // direct lane-width-matched PMAXS/PMINS/PMAXU/PMINU for 8/16/32-bit lanes;
+    // the .2D (size=11) form has no SSE-era 64-bit min/max (PMAXSQ/… need
+    // AVX-512F-VL) and bails to lite. Mirrors lite_translator.h's SMAX/… block
+    // exactly, including the per-size SSE4.1 gate (PMAXSB/PMINSB/PMAXSD/PMINSD/
+    // PMAXUW/PMINUW/PMAXUD/PMINUD need SSE4.1; PMAXSW/PMINSW/PMAXUB/PMINUB are
+    // SSE2). The result lands in xn; SetVRegFull's Q=0 merge zeroes Vd[127:64].
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmin ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmax ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmin) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+                           args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmax);
+      const bool is_signed = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmax ||
+                              args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmin);
+      const bool needs_sse4_1 = (is_signed && args.size == 0b00) ||
+                                (is_signed && args.size == 0b10) ||
+                                (!is_signed && args.size == 0b01) ||
+                                (!is_signed && args.size == 0b10);
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      switch (args.size) {
+        case 0b00:  // .16B / .8B
+          if (is_signed) {
+            if (is_max) builder_.Gen<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            if (is_max) builder_.Gen<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        case 0b01:  // .8H / .4H
+          if (is_signed) {
+            if (is_max) builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            if (is_max) builder_.Gen<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        default:  // 0b10: .4S / .2S
+          if (is_signed) {
+            if (is_max) builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            if (is_max) builder_.Gen<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+            else builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+      }
+      // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {

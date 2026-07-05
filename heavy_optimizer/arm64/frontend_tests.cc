@@ -4294,6 +4294,23 @@ constexpr uint32_t CmhiVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t
 constexpr uint32_t CmhsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b00111, rd, rn, rm);
 }
+// SMAX/SMIN (signed): U=0, opcode=01100/01101. UMAX/UMIN (unsigned): U=1.
+constexpr uint32_t SmaxVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b01100, rd, rn, rm);
+}
+constexpr uint32_t SminVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b01101, rd, rn, rm);
+}
+constexpr uint32_t UmaxVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b01100, rd, rn, rm);
+}
+constexpr uint32_t UminVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b01101, rd, rn, rm);
+}
+static_assert(SmaxVec(0b00, /*q=*/true, 0, 1, 2) == 0x4e226420u);  // smax v0.16b,v1,v2
+static_assert(SminVec(0b01, /*q=*/true, 0, 1, 2) == 0x4e626c20u);  // smin v0.8h,v1,v2
+static_assert(UmaxVec(0b10, /*q=*/true, 0, 1, 2) == 0x6ea26420u);  // umax v0.4s,v1,v2
+static_assert(UminVec(0b00, /*q=*/true, 0, 1, 2) == 0x6e226c20u);  // umin v0.16b,v1,v2
 
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
@@ -6721,6 +6738,87 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddVec2SUpperZero) {
 // tier and must bail to lite (which routes it to the interpreter).
 TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddVec2DBails) {
   static const uint32_t code[] = {SqaddVec(0b11, /*q=*/true, 0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SMAX .16B (size=00, Q=1): per-byte signed max. Needs SSE4.1 (PMAXSB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxVec16B) {
+  static const uint32_t code[] = {SmaxVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7F8001FF10F00005ULL, 0x807F00FE01020304ULL);  // Vn
+  SetV128(&state_, 2, 0x01FF7F80F0100500ULL, 0x7F80FF0004030201ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFF7FFF10100505ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x7F7F000004030304ULL);
+}
+
+// SMIN .8H (size=01, Q=1): per-halfword signed min. SSE2 (PMINSW).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SminVec8H) {
+  static const uint32_t code[] = {SminVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7FFF80000001FFFFULL, 0x123456789ABCDEF0ULL);  // Vn
+  SetV128(&state_, 2, 0x0001FFFF7FFF8000ULL, 0x0000111122223333ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0001800000018000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000011119ABCDEF0ULL);
+}
+
+// UMAX .4S (size=10, Q=1): per-dword unsigned max. Needs SSE4.1 (PMAXUD).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UmaxVec4S) {
+  static const uint32_t code[] = {UmaxVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFFFFFF00000001ULL, 0x8000000012345678ULL);  // Vn
+  SetV128(&state_, 2, 0x0000000200000000ULL, 0x7FFFFFFF12345679ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFF00000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x8000000012345679ULL);
+}
+
+// UMIN .16B (size=00, Q=1): per-byte unsigned min. SSE2 (PMINUB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UminVec16B) {
+  static const uint32_t code[] = {UminVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFF00807F01FE1020ULL, 0x0102030405060708ULL);  // Vn
+  SetV128(&state_, 2, 0x00FF7F80FE012010ULL, 0x0807060504030201ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00007F7F01011010ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0102030404030201ULL);
+}
+
+// SMAX .2S (size=10, Q=0): per-dword signed max, upper 64 bits zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxVec2SUpperZero) {
+  static const uint32_t code[] = {SmaxVec(0b10, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7FFFFFFF80000000ULL, 0xAAAAAAAABBBBBBBBULL);  // Vn
+  SetV128(&state_, 2, 0x00000001FFFFFFFFULL, 0xCCCCCCCCDDDDDDDDULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SMAX .2D (size=11, 64-bit) has no packed SSE min/max qword op and must bail
+// to lite (which routes it to the interpreter).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SmaxVec2DBails) {
+  static const uint32_t code[] = {SmaxVec(0b11, /*q=*/true, 0, 1, 2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
