@@ -2697,6 +2697,8 @@ class HeavyOptimizerFrontend {
   //   AND/ORR/EOR: Pand/Por/Pxor are element-size-independent (one op covers
   //     all). ORR with rn==rm is the AdvSIMD MOV (vector) alias and lowers the
   //     same way.
+  //   BSL/BIT/BIF: bitwise-select — element-size-independent Pxor/Pand/Pandn
+  //     sequences that read Vd; handled in a self-contained pre-switch block.
   //   CMEQ: Pcmpeqb (8), Pcmpeqw (16), Pcmpeqd (32). 64-bit (Pcmpeqq) bails.
   //   CMGT (signed): Pcmpgtb (8), Pcmpgtw (16), Pcmpgtd (32). 64-bit bails.
   //   CMGE (signed >=): NOT(Pcmpgt(Vm, Vn)); CMHI/CMHS (unsigned >, >=):
@@ -3038,6 +3040,457 @@ class HeavyOptimizerFrontend {
       }
       builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
       // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // Integer vector MLA/MLS (multiply-accumulate / multiply-subtract):
+    //   MLA: Vd[lane] += Vn[lane] * Vm[lane]
+    //   MLS: Vd[lane] -= Vn[lane] * Vm[lane]
+    // at .8H/.4H (size=01, PMULLW) and .4S/.2S (size=10, PMULLD). Unlike ADD/SUB
+    // above, these READ Vd as the accumulator, so they are handled here rather
+    // than in the shared vn-only switch: compute the low-half product Vn*Vm, then
+    // PADD (MLA) / PSUB (MLS) it into Vd. Mirrors lite_translator.h's non-byte
+    // path exactly (the low 16/32 bits of the product are what ARM keeps). The
+    // .16B/.8B (size=00) byte form needs the widen+PMULLW+PACKUSWB recipe and the
+    // reserved .2D (size=11) form has no packed 64-bit multiply — both bail to the
+    // lite tier, exactly like the heavy kMul path.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMla ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kMls) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_mls = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMls);
+      const int32_t vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      // Low-half product Vn*Vm into xn.
+      if (args.size == 0b01) {
+        builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+      // Accumulate into / subtract from Vd at the element width.
+      if (is_mls) {
+        if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+      } else {
+        if (args.size == 0b01) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+      }
+      // Q=0 (.4H/.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xd, args.q);
+      return;
+    }
+
+    // Integer vector bitwise-select BSL / BIT / BIF (opcode 0b00011, U=1; the
+    // size field selects which of the three). These are element-size-independent
+    // bit ops that all READ Vd, so they are handled here (like MLA/MLS) rather
+    // than in the shared vn-only switch. Sequences mirror lite_translator.h
+    // exactly (Pxor/Pand/Pandn are all already allowlisted; no new LIR ops):
+    //   BSL  Vd = (Vd & Vn) | (~Vd & Vm) == ((Vn ^ Vm) & Vd) ^ Vm
+    //   BIT  Vd = (Vm & Vn) | (~Vm & Vd) == ((Vn ^ Vd) & Vm) ^ Vd  ("if true")
+    //   BIF  Vd = (Vm & Vd) | (~Vm & Vn) == Vd ^ (~Vm & (Vn ^ Vd))  ("if false")
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBsl ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kBit ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kBif) {
+      const int32_t vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      FpRegister res = xn;  // BSL/BIT accumulate into xn; BIF stores xd.
+      if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBsl) {
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn^Vm
+        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xd.machine_reg());  // &Vd
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // ^Vm
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBit) {
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // Vn^Vd
+        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // &Vm
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // ^Vd
+      } else {  // kBif: fold the NOT into PANDN (~xm & xn).
+        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());   // Vn^Vd
+        builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());  // ~Vm & (Vn^Vd)
+        builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xm.machine_reg());   // Vd ^ ...
+        res = xd;
+      }
+      // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, res, args.q);
+      return;
+    }
+
+    // Integer vector saturating add/sub SQADD/UQADD/SQSUB/UQSUB (opcode 00001 for
+    // add, 00101 for sub; U selects signed/unsigned). The 8-bit (size=00) and
+    // 16-bit (size=01) forms have direct SSE2 saturating packed ops; the 32-bit
+    // (size=10) forms have no native saturating dword op, so they are emulated
+    // exactly as lite_translator.h does (wrap-add/sub + overflow detect +
+    // saturate). These read only Vn/Vm (never Vd) but need multiple temps and a
+    // per-op emulation sequence, so they are handled here rather than in the
+    // shared vn-only switch. The reserved .2D (size=11, 64-bit) form has no
+    // packed 64-bit saturating path in either tier and bails to lite (which in
+    // turn routes it to the interpreter) — mirroring lite's `size==0b11` bail.
+    // The result always lands in xn; SetVRegFull's Q=0 merge zeroes Vd[127:64].
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqsub ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqsub) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqadd) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PaddsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit signed saturating add. sum = a + b (wrap); overflow iff
+          // ~(a^b) & (a^sum) has its MSB set; sat = (a<0)?INT_MIN:INT_MAX;
+          // result = sum ^ ((sum ^ sat) & ovf_mask).
+          FpRegister t_sum = AllocTempSimdReg();
+          FpRegister t_ovf = AllocTempSimdReg();
+          FpRegister t_sat = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+          builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // ~(a^b)
+          builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+          builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // a<0?-1:0
+          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+        }
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqadd) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PaddusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit unsigned saturating add. sum = a + b (wrap); overflow iff
+          // sum < a (unsigned), detected via PMAXUD: max(a,sum)==sum iff no
+          // overflow; saturate overflowed lanes to UINT32_MAX.
+          FpRegister t_save_a = AllocTempSimdReg();
+          FpRegister t_ones = AllocZeroedSimdReg();  // def before the self-compare
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());       // sum
+          builder_.Gen<x86_64::PmaxudXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());  // -1 if no ovf
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_ones.machine_reg(), t_ones.machine_reg());  // -1
+          builder_.Gen<x86_64::PxorXRegXReg>(t_save_a.machine_reg(), t_ones.machine_reg());   // -1 if ovf
+          builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), t_save_a.machine_reg());        // saturate
+        }
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqsub) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PsubsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit signed saturating sub. diff = a - b (wrap); overflow iff
+          // (a^b) & (a^diff) has its MSB set; sat = (a<0)?INT_MIN:INT_MAX;
+          // result = diff ^ ((diff ^ sat) & ovf_mask).
+          FpRegister t_diff = AllocTempSimdReg();
+          FpRegister t_ovf = AllocTempSimdReg();
+          FpRegister t_sat = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // a^b
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg());  // a^diff
+          builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+          builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // a<0?-1:0
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());   // -1
+          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+        }
+      } else {  // kUqsub
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PsubusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubuswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit unsigned saturating sub. result = (a>=b) ? a-b : 0. Mask:
+          // PMINUD(a,b)==b iff a>=b; AND the wrap-diff with it to zero underflow.
+          FpRegister t_mask = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_mask.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PminudXRegXReg>(t_mask.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // -1 if a>=b
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());        // a-b
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_mask.machine_reg());     // zero underflow
+        }
+      }
+      // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // Integer vector halving add SHADD/UHADD — per-lane (a + b) >> 1 with no
+    // overflow, signed (SHADD) or unsigned (UHADD). ARM ARM C7.2 reserves .2D
+    // (size=11). Codegen mirrors lite_translator.h size-by-size: byte (size=00)
+    // widens each 8-byte half to 16-bit lanes (PADDW never overflows), shifts
+    // right by 1 (arith/logical) and packs; halfword/word use the bitwise
+    // identity (a + b) >> 1 = (a & b) + ((a ^ b) >> 1). Register-domain-pure but
+    // needs several temps, so it's handled here, not the shared vn-only switch.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUhadd) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShadd);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (args.size == 0b00) {
+        FpRegister xn_hi = AllocTempSimdReg();
+        FpRegister xm_hi = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        }
+        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        if (is_signed) {
+          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+      // Halfword/word: (a & b) + ((a ^ b) >> 1).
+      FpRegister xand = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xand.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xand.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (args.size == 0b01) {
+        if (is_signed) builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+        else builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xand.machine_reg());
+      } else {  // size == 0b10.
+        if (is_signed) builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+        else builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xand.machine_reg());
+      }
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // Integer vector rounding halving add SRHADD/URHADD — per-lane (a + b + 1)
+    // >> 1, signed (SRHADD) or unsigned (URHADD). ARM ARM C7.2 reserves .2D.
+    // URHADD byte/half is exact SSE2 PAVGB/PAVGW; SRHADD byte widens and adds 1
+    // via all-ones PSUBW; the remaining forms use the bitwise identity
+    // (a + b + 1) >> 1 = (a | b) - ((a ^ b) >> 1). Mirrors lite_translator.h.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrhadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUrhadd) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrhadd);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (!is_signed && (args.size == 0b00 || args.size == 0b01)) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PavgbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PavgwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        }
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+      if (args.size == 0b00) {
+        // SRHADD byte (signed): widen, PADDW, +1 via all-ones PSUBW, PSRAW, pack.
+        FpRegister xn_hi = AllocTempSimdReg();
+        FpRegister xm_hi = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        // xm/xm_hi dead; clobber xm to all-ones per word so PSUBW adds 1.
+        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+      // SRHADD half/word, URHADD word: (a | b) - ((a ^ b) >> 1).
+      FpRegister xxor = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xxor.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xxor.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (args.size == 0b01) {
+        if (is_signed) builder_.Gen<x86_64::PsrawXRegImm>(xxor.machine_reg(), int8_t{1});
+        else builder_.Gen<x86_64::PsrlwXRegImm>(xxor.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xxor.machine_reg());
+      } else {  // size == 0b10.
+        if (is_signed) builder_.Gen<x86_64::PsradXRegImm>(xxor.machine_reg(), int8_t{1});
+        else builder_.Gen<x86_64::PsrldXRegImm>(xxor.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xxor.machine_reg());
+      }
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // Integer vector halving sub SHSUB/UHSUB — per-lane (a - b) >> 1 (floor),
+    // signed (SHSUB) or unsigned (UHSUB). ARM ARM C7.2 reserves .2D. Each width
+    // widens both 8-byte halves, PSUB at the wide lane, shifts right by 1 and
+    // packs; the unsigned byte/half forms mask to the low element bits before
+    // the unsigned pack so a - b (a < b) does not saturate. The word form widens
+    // to int64, PSUBQ, PSRLQ, then gathers low dwords via PSHUFD+PUNPCKLQDQ.
+    // Mirrors lite_translator.h size-by-size.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShsub ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUhsub) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kShsub);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xn_hi = AllocTempSimdReg();
+      FpRegister xm_hi = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
+      if (args.size == 0b00) {
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          // Mask to the low byte per int16 so PACKUSWB does not saturate.
+          builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        }
+      } else if (args.size == 0b01) {
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsradXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+          builder_.Gen<x86_64::PsrldXRegImm>(xn_hi.machine_reg(), int8_t{1});
+          // Mask to the low halfword per int32 so PACKUSDW does not saturate.
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        }
+      } else {  // size == 0b10 (word).
+        if (is_signed) {
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        }
+        builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsubqXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{1});
+        builder_.Gen<x86_64::PsrlqXRegImm>(xn_hi.machine_reg(), int8_t{1});
+        // Gather the low dword of each int64 lane into the low qword, then merge.
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x88));
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn_hi.machine_reg(), xn_hi.machine_reg(), static_cast<int8_t>(0x88));
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+      }
       SetVRegFull(args.rd, xn, args.q);
       return;
     }
