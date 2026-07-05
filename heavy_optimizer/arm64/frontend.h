@@ -3440,9 +3440,158 @@ class HeavyOptimizerFrontend {
     SetVRegFull(args.rd, xd, /*q=*/true);
   }
 
+  // Heavy-tier mirror of the lite AdvSimdSingleStruct lowering
+  // (lite_translator.h). Covers the same subset the lite tier does: LD1R
+  // (replicate one element to every lane), single-element LD1 (load one lane),
+  // and single-element ST1 (store one lane), all with num_regs == 1 — critical
+  // for the dynamic linker's calculate_gnu_hash_neon tail (`ld1r v3.4s, [x10],
+  // #4`), which otherwise bails heavy->lite on every symbol resolve. Every
+  // element move routes mem<->lane through a GP temp (the heavy tier has no
+  // memory-operand PINSR/PEXTR, only the register forms), each guest-memory
+  // access carries a recovery block, and the v[] slot is always accessed
+  // full-width (GenGetSimd<16>/GenSetSimd<16>) so the optimizer's 16-byte
+  // slot store/load forwarding is never split by a narrow sub-lane access
+  // (see the UMOV/INS-element note above). LD1R starts from a zeroed XMM and
+  // only fills the active lanes, so Q=0 upper-half zeroing is automatic.
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    using Op = Decoder::AdvSimdSingleStructOp;
+    const bool is_replicate = (args.op == Op::kLd1r);
+    const bool is_single_load = (args.op == Op::kLd1);
+    const bool is_single_store = (args.op == Op::kSt1);
+    if (!is_replicate && !is_single_load && !is_single_store) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (args.num_regs != 1 || args.size > 3) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const int esize = 1 << args.size;  // 1/2/4/8 bytes (B/H/S/D).
+    const int32_t vec_bytes = args.q ? 16 : 8;
+    const int32_t vt_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt * 16);
+
+    Register base_orig = (args.rn == 31) ? GetSp() : GetReg(args.rn);
+    Register base = ApplyTbi(base_orig);
+
+    if (is_single_store) {
+      // ST1 lane: full-width v[rt] load, PEXTR lane->gp, MOV* gp->mem (+recovery).
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
+      const int8_t lane = static_cast<int8_t>(args.index);
+      Register elem;
+      switch (esize) {
+        case 1:
+          elem = std::get<0>(Gen<x86_64::PextrbRegXRegImm>(xmm.machine_reg(), lane));
+          Gen<x86_64::MovbOpReg>({.base = base, .disp = 0}, elem);
+          break;
+        case 2:
+          elem = std::get<0>(Gen<x86_64::PextrwRegXRegImm>(xmm.machine_reg(), lane));
+          Gen<x86_64::MovwOpReg>({.base = base, .disp = 0}, elem);
+          break;
+        case 4:
+          elem = std::get<0>(Gen<x86_64::PextrdRegXRegImm>(xmm.machine_reg(), lane));
+          Gen<x86_64::MovlOpReg>({.base = base, .disp = 0}, elem);
+          break;
+        default:  // esize == 8
+          elem = std::get<0>(Gen<x86_64::PextrqRegXRegImm>(xmm.machine_reg(), lane));
+          Gen<x86_64::MovqOpReg>({.base = base, .disp = 0}, elem);
+          break;
+      }
+      GenRecoveryBlockForLastInsn();
+    } else if (is_replicate) {
+      // LD1R: load one element mem->gp (+recovery), then PINSR it into every
+      // lane. Starting from a zeroed XMM leaves the upper 64 bits zero for Q=0.
+      const int num_lanes = vec_bytes / esize;
+      FpRegister xmm = AllocZeroedSimdReg();
+      Register elem;
+      switch (esize) {
+        case 1:
+          elem = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = base, .disp = 0}));
+          break;
+        case 2:
+          elem = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = base, .disp = 0}));
+          break;
+        case 4:
+          elem = std::get<0>(Gen<x86_64::MovlRegOp>({.base = base, .disp = 0}));
+          break;
+        default:  // esize == 8
+          elem = std::get<0>(Gen<x86_64::MovqRegOp>({.base = base, .disp = 0}));
+          break;
+      }
+      GenRecoveryBlockForLastInsn();
+      for (int l = 0; l < num_lanes; l++) {
+        const int8_t lane = static_cast<int8_t>(l);
+        switch (esize) {
+          case 1:
+            builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
+            break;
+          case 2:
+            builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
+            break;
+          case 4:
+            builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
+            break;
+          default:  // esize == 8
+            builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
+            break;
+        }
+      }
+      builder_.GenSetSimd<16>(vt_off, xmm.machine_reg());
+    } else {
+      // LD1 single lane: load full-width v[rt], PINSR the loaded element into
+      // lane[index] (preserving the other lanes), store back full-width.
+      FpRegister xmm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
+      const int8_t lane = static_cast<int8_t>(args.index);
+      Register elem;
+      switch (esize) {
+        case 1:
+          elem = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = base, .disp = 0}));
+          GenRecoveryBlockForLastInsn();
+          builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
+          break;
+        case 2:
+          elem = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = base, .disp = 0}));
+          GenRecoveryBlockForLastInsn();
+          builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
+          break;
+        case 4:
+          elem = std::get<0>(Gen<x86_64::MovlRegOp>({.base = base, .disp = 0}));
+          GenRecoveryBlockForLastInsn();
+          builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
+          break;
+        default:  // esize == 8
+          elem = std::get<0>(Gen<x86_64::MovqRegOp>({.base = base, .disp = 0}));
+          GenRecoveryBlockForLastInsn();
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
+          break;
+      }
+      builder_.GenSetSimd<16>(vt_off, xmm.machine_reg());
+    }
+
+    if (args.postindex) {
+      // Writeback preserves the original (un-TBI-masked) top byte, so re-read
+      // the base register rather than reusing the masked access address.
+      Register reread_base = (args.rn == 31) ? GetSp() : GetReg(args.rn);
+      Register new_base = Copy(reread_base);
+      if (args.rm == 31) {
+        // Immediate post-index: total bytes accessed = num_regs * esize.
+        new_base = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(
+            new_base, static_cast<int32_t>(args.num_regs) * esize));
+      } else {
+        Register rm_val = GetReg(args.rm);
+        new_base = std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(new_base, rm_val));
+      }
+      if (args.rn == 31) {
+        SetSp(new_base);
+      } else {
+        SetReg(args.rn, new_base);
+      }
+    }
   }
 
   // Heavy-tier mirror of the register-domain-pure AdvSIMD two-reg-misc opcodes
