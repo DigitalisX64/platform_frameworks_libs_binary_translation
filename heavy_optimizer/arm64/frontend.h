@@ -3042,6 +3042,57 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // Integer vector MLA/MLS (multiply-accumulate / multiply-subtract):
+    //   MLA: Vd[lane] += Vn[lane] * Vm[lane]
+    //   MLS: Vd[lane] -= Vn[lane] * Vm[lane]
+    // at .8H/.4H (size=01, PMULLW) and .4S/.2S (size=10, PMULLD). Unlike ADD/SUB
+    // above, these READ Vd as the accumulator, so they are handled here rather
+    // than in the shared vn-only switch: compute the low-half product Vn*Vm, then
+    // PADD (MLA) / PSUB (MLS) it into Vd. Mirrors lite_translator.h's non-byte
+    // path exactly (the low 16/32 bits of the product are what ARM keeps). The
+    // .16B/.8B (size=00) byte form needs the widen+PMULLW+PACKUSWB recipe and the
+    // reserved .2D (size=11) form has no packed 64-bit multiply — both bail to the
+    // lite tier, exactly like the heavy kMul path.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMla ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kMls) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_mls = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMls);
+      const int32_t vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      // Low-half product Vn*Vm into xn.
+      if (args.size == 0b01) {
+        builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+      // Accumulate into / subtract from Vd at the element width.
+      if (is_mls) {
+        if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+      } else {
+        if (args.size == 0b01) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+      }
+      // Q=0 (.4H/.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xd, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {

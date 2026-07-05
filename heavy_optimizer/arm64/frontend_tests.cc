@@ -3845,6 +3845,14 @@ constexpr uint32_t SubVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t 
 constexpr uint32_t MulVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b10011, rd, rn, rm);
 }
+// MLA (vector): U=0, opcode=10010.
+constexpr uint32_t MlaVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b10010, rd, rn, rm);
+}
+// MLS (vector): U=1, opcode=10010.
+constexpr uint32_t MlsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b10010, rd, rn, rm);
+}
 // CMEQ (vector, register): U=1, opcode=10001.
 constexpr uint32_t CmeqVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b10001, rd, rn, rm);
@@ -6272,6 +6280,104 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SubVec2D) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);   // 0 - 1 wraps within the lane
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);
+}
+
+// MLA .4S (Q=1): Vd += Vn*Vm per 32-bit lane via Pmulld + Paddd.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlaVec4S) {
+  static const uint32_t code[] = {MlaVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000300000002ULL, 0x0000000500000004ULL);
+  SetV128(&state_, 2, 0x0000000700000006ULL, 0x0000000900000008ULL);
+  SetV128(&state_, 0, 0x0000000000000010ULL, 0x0000010000000100ULL);  // accumulator
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lane0: 0x10 + 2*6=12 -> 0x1C; lane1: 0 + 3*7=21 -> 0x15
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000150000001CULL);
+  // lane2: 0x100 + 4*8=32 -> 0x120; lane3: 0x100 + 5*9=45 -> 0x12D
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000012D00000120ULL);
+}
+
+// MLA .8H (Q=1): eight 16-bit lane accumulates via Pmullw + Paddw (low 16 bits).
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlaVec8H) {
+  static const uint32_t code[] = {MlaVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0004000300020001ULL, 0x0008000700060005ULL);
+  SetV128(&state_, 2, 0x0002000200020002ULL, 0x0002000200020002ULL);
+  SetV128(&state_, 0, 0x0001000100010001ULL, 0x0001000100010001ULL);  // accumulator
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products 2,4,6,8 / 10,12,14,16 plus 1 each
+  EXPECT_EQ(VLo64(&state_, 0), 0x0009000700050003ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0011000F000D000BULL);
+}
+
+// MLS .4S (Q=1): Vd -= Vn*Vm per 32-bit lane via Pmulld + Psubd.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlsVec4S) {
+  static const uint32_t code[] = {MlsVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000300000002ULL, 0x0000000500000004ULL);
+  SetV128(&state_, 2, 0x0000000700000006ULL, 0x0000000900000008ULL);
+  SetV128(&state_, 0, 0x0000010000000100ULL, 0x0000020000000200ULL);  // accumulator
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lane0: 0x100 - 12 -> 0xF4; lane1: 0x100 - 21 -> 0xEB
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000EB000000F4ULL);
+  // lane2: 0x200 - 32 -> 0x1E0; lane3: 0x200 - 45 -> 0x1D3
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000001D3000001E0ULL);
+}
+
+// MLS .8H (Q=1): halfword subtract-accumulate; low lane exercises 16-bit borrow.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlsVec8H) {
+  static const uint32_t code[] = {MlsVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0004000300020001ULL, 0x0008000700060005ULL);
+  SetV128(&state_, 2, 0x0002000200020002ULL, 0x0002000200020002ULL);
+  SetV128(&state_, 0, 0x0000000000000000ULL, 0x0020002000200020ULL);  // accumulator
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // products 2,4,6,8; low lanes 0-{2,4,6,8} wrap to 0xFFFE/FFFC/FFFA/FFF8
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFF8FFFAFFFCFFFEULL);
+  // high lanes 0x20 - {10,12,14,16} -> 0x16,0x14,0x12,0x10
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0010001200140016ULL);
+}
+
+// MLA .2S (Q=0): D-form upper-zero check for the accumulate path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlaVec2SUpperZero) {
+  static const uint32_t code[] = {MlaVec(0b10, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000300000002ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x0000000700000006ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0x0000010000000100ULL, 0xCDCDCDCDCDCDCDCDULL);  // poison upper
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lane0: 0x100 + 12 -> 0x10C; lane1: 0x100 + 21 -> 0x115
+  EXPECT_EQ(VLo64(&state_, 0), 0x000001150000010CULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// MLA .2D (64-bit elements) must bail: there is no packed 64-bit multiply.
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlaVec2DBails) {
+  static const uint32_t code[] = {MlaVec(0b11, /*q=*/true, 0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// MLS .16B (byte elements) must bail: no packed byte multiply (like heavy kMul).
+TEST_F(Arm64HeavyOptimizerFrontendTest, MlsVec16BBails) {
+  static const uint32_t code[] = {MlsVec(0b00, /*q=*/true, 0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 // SQADD (a saturating three-same op) must bail to the lite translator.
