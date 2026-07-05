@@ -4330,6 +4330,20 @@ static_assert(UabdVec(0b01, /*q=*/true, 0, 1, 2) == 0x6e627420u);  // uabd v0.8h
 static_assert(SabaVec(0b10, /*q=*/true, 0, 1, 2) == 0x4ea27c20u);  // saba v0.4s,v1,v2
 static_assert(UabaVec(0b00, /*q=*/true, 0, 1, 2) == 0x6e227c20u);  // uaba v0.16b,v1,v2
 
+// SQDMULH (opcode 0b10110, U=0) / SQRDMULH (opcode 0b10110, U=1): saturating
+// doubling multiply-high, rounding variant. Encodings assembler-verified.
+constexpr uint32_t SqdmulhVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b10110, rd, rn, rm);
+}
+constexpr uint32_t SqrdmulhVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, size, /*opcode=*/0b10110, rd, rn, rm);
+}
+static_assert(SqdmulhVec(0b01, /*q=*/true, 0, 1, 2) == 0x4e62b420u);   // sqdmulh v0.8h,v1,v2
+static_assert(SqrdmulhVec(0b01, /*q=*/true, 0, 1, 2) == 0x6e62b420u);  // sqrdmulh v0.8h,v1,v2
+static_assert(SqdmulhVec(0b10, /*q=*/true, 0, 1, 2) == 0x4ea2b420u);   // sqdmulh v0.4s,v1,v2
+static_assert(SqrdmulhVec(0b10, /*q=*/true, 0, 1, 2) == 0x6ea2b420u);  // sqrdmulh v0.4s,v1,v2
+static_assert(SqdmulhVec(0b10, /*q=*/false, 0, 1, 2) == 0x0ea2b420u);  // sqdmulh v0.2s,v1,v2
+
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
     bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -6923,6 +6937,90 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SabdVec2SUpperZero) {
 // SABD .2D (size=11) has no packed SSE min/max qword op and must bail to lite.
 TEST_F(Arm64HeavyOptimizerFrontendTest, SabdVec2DBails) {
   static const uint32_t code[] = {SabdVec(0b11, /*q=*/true, 0, 1, 2)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SQDMULH .8H (size=01, Q=1): per-halfword saturating doubling multiply-high.
+// Includes the INT16_MIN*INT16_MIN corner (lane -0x8000*-0x8000 -> 0x7FFF).
+// Expected values computed against the ARM semantics reference.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec8H) {
+  static const uint32_t code[] = {SqdmulhVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000140007FFFULL, 0x0102030400020003ULL);  // Vn
+  SetV128(&state_, 2, 0x80007FFF40000002ULL, 0x7FFF400000010002ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFF000020000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0101018200000000ULL);
+}
+
+// SQRDMULH .8H (size=01, Q=1): rounding variant (PMULHRSW + corner fixup).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhVec8H) {
+  static const uint32_t code[] = {SqrdmulhVec(0b01, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000140007FFFULL, 0x0102030400020003ULL);  // Vn
+  SetV128(&state_, 2, 0x80007FFF40000002ULL, 0x7FFF400000010002ULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFF000120000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0102018200000000ULL);
+}
+
+// SQDMULH .4S (size=10, Q=1): per-dword form (PMULDQ widen). Needs SSE4.1.
+// Includes the INT32_MIN*INT32_MIN corner (-0x80000000^2 -> 0x7FFFFFFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec4S) {
+  static const uint32_t code[] = {SqdmulhVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x800000017FFFFFFFULL, 0x0000000A00000064ULL);  // Vn
+  SetV128(&state_, 2, 0x800000027FFFFFFFULL, 0x00000005FFFFFFFFULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFD7FFFFFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000FFFFFFFFULL);
+}
+
+// SQRDMULH .4S (size=10, Q=1): rounding variant (+2^31 per lane).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhVec4S) {
+  static const uint32_t code[] = {SqrdmulhVec(0b10, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x800000017FFFFFFFULL, 0x0000000A00000064ULL);  // Vn
+  SetV128(&state_, 2, 0x800000027FFFFFFFULL, 0x00000005FFFFFFFFULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFD7FFFFFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// SQDMULH .2S (size=10, Q=0): lower 64 bits only; upper 64 zeroed by the Q=0
+// D-form merge.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec2SUpperZero) {
+  static const uint32_t code[] = {SqdmulhVec(0b10, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x800000017FFFFFFFULL, 0x0000000A00000064ULL);  // Vn
+  SetV128(&state_, 2, 0x800000027FFFFFFFULL, 0x00000005FFFFFFFFULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFD7FFFFFFEULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SQDMULH .2D (size=11) is reserved by the decoder and must bail (0 insns).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec2DBails) {
+  static const uint32_t code[] = {SqdmulhVec(0b11, /*q=*/true, 0, 1, 2)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
