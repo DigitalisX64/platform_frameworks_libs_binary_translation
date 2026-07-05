@@ -205,6 +205,8 @@
         "PaddwXRegXReg",
         "PandXRegXReg",
         "PandnXRegXReg",
+        "PavgbXRegXReg",
+        "PavgwXRegXReg",
         "PcmpeqbXRegXReg",
         "PcmpeqdXRegXReg",
         "PcmpeqqXRegXReg",
