@@ -6049,9 +6049,107 @@ class HeavyOptimizerFrontend {
     }
   }
 
+  // AdvSIMD scalar two-register misc.  Only the single-lane FP->integer
+  // round-toward-zero converts FCVTZS / FCVTZU (S form / FP32) are lowered
+  // here; every other scalar two-reg-misc opcode bails to lite via
+  // UndefinedReturningVoid.
+  //
+  // Lowering is a single-lane application of the vector .2S/.4S FCVTZS/FCVTZU
+  // recipes in AdvSimdTwoRegMisc (kFcvtzsV / kFcvtzuV).  The source is loaded
+  // full-width and scrubbed to lane 0 (PSLLDQ+PSRLDQ keep the low 32 bits and
+  // zero everything above), so lanes 1..3 become +0.0f and convert to 0.  This
+  // is required for correctness: SetVRegFull q=false writes the low 64 bits via
+  // MOVSD, so lane 1 (Vd[63:32]) survives — scrubbing forces it to 0 as the
+  // scalar S result requires (Vd[31:0]=result, Vd[127:32]=0).
+  //   * FCVTZS/FCVTZU with sz(bit0 of size)=0 (S / FP32): the vector recipe.
+  //   * sz=1 (D / FP64) is branchy per-lane in lite -> bail.
+  //   * every other scalar two-reg-misc opcode -> bail.
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    const bool is_unsigned =
+        (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu);
+    if ((args.opcode != Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs &&
+         args.opcode != Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu) ||
+        (args.size & 1) != 0) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const int32_t vn_off =
+        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    if (!is_unsigned) {
+      // FCVTZS scalar (S): mirror the kFcvtzsV FP32 recipe on a lane-0-scrubbed
+      // source (CVTTPS2DQ + NaN->0 + positive-overflow->INT32_MAX fix-up).
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister x_dst = AllocTempSimdReg();
+      FpRegister x_mask = AllocTempSimdReg();
+      FpRegister x_eqmin = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      // Scrub to lane 0: keep the low 32 bits, zero bytes [15:4].
+      builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+      // 1. Primary truncating conversion.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      // 2. NaN lanes -> 0.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      // 3. INT32_MIN (0x80000000) per lane.
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+      // 4. result == INT32_MIN ?
+      builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+      // 5. src non-negative ? PSRAD 31 -> 0 if non-neg, all-1s if neg.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+      // 6. Flip INT_MIN -> INT_MAX in positive-overflow lanes.
+      builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      SetVRegFull(args.rd, x_dst, /*q=*/false);
+      return;
+    }
+    // FCVTZU scalar (S): mirror the kFcvtzuV FP32 recipe on a lane-0-scrubbed
+    // source (subtract-2^31 offset trick + saturate too-big/Inf to UINT32_MAX).
+    FpRegister x_dst = AllocTempSimdReg();
+    FpRegister x_pow31 = AllocTempSimdReg();
+    FpRegister x_needs_off = AllocTempSimdReg();
+    FpRegister x_scratch = AllocZeroedSimdReg();
+    builder_.GenGetSimd<16>(x_dst.machine_reg(), vn_off);
+    // Scrub to lane 0: keep the low 32 bits, zero bytes [15:4].
+    builder_.Gen<x86_64::PslldqXRegImm>(x_dst.machine_reg(), int8_t{12});
+    builder_.Gen<x86_64::PsrldqXRegImm>(x_dst.machine_reg(), int8_t{12});
+    // 1. Clamp neg/NaN to 0 via MAXPS with the zeroed scratch.
+    builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+    // 2. Broadcast 2^31 = 0x4F000000 to all four FP32 lanes.
+    Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
+    builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(
+        x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
+    // 3. needs_offset = (2^31 <= src_clamped).
+    builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+    builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+    // 4. offset_amount = 2^31 where needs_offset.
+    builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+    // 5. src_for_cvt = src_clamped - offset_amount.
+    builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+    // 6. too_big = (2^31 <= src_for_cvt).
+    builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+    builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+    // 7. CVTTPS2DQ.
+    builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+    // 8. Build 0x80000000 per lane; AND needs_offset; OR into result.
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+    builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+    builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+    // 9. Saturate too-big lanes to 0xFFFFFFFF.
+    builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+    SetVRegFull(args.rd, x_dst, /*q=*/false);
   }
 
   // AdvSIMD scalar three-same.  Only the saturating-doubling-multiply-high

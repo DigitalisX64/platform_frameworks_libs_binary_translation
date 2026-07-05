@@ -4394,6 +4394,18 @@ static_assert(SqrdmulhScalar(0b01, 0, 1, 2) == 0x7e62b420u);  // sqrdmulh h0,h1,
 static_assert(SqdmulhScalar(0b10, 0, 1, 2) == 0x5ea2b420u);   // sqdmulh s0,s1,s2
 static_assert(SqrdmulhScalar(0b10, 0, 1, 2) == 0x7ea2b420u);  // sqrdmulh s0,s1,s2
 
+// AdvSIMD scalar two-register misc: 01 U 11110 sz(1) 1 00001 opcode(5) 10 Rn Rd
+// (sz occupies bit22; the "1 00001" pattern occupies bits[23:17] with bit23=1).
+// Scalar FCVTZS/FCVTZU are opcode=0b11011; sz=0 selects S(FP32), sz=1 D(FP64).
+constexpr uint32_t FcvtzScalar(bool is_unsigned, bool is_double, uint8_t rd, uint8_t rn) {
+  return 0x5ea1b800u | (static_cast<uint32_t>(is_unsigned) << 29) |
+         (static_cast<uint32_t>(is_double) << 22) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(FcvtzScalar(false, false, 0, 1) == 0x5ea1b820u);  // fcvtzs s0, s1
+static_assert(FcvtzScalar(true, false, 0, 1) == 0x7ea1b820u);   // fcvtzu s0, s1
+static_assert(FcvtzScalar(false, true, 0, 1) == 0x5ee1b820u);   // fcvtzs d0, d1
+static_assert(FcvtzScalar(true, true, 0, 1) == 0x7ee1b820u);    // fcvtzu d0, d1
+
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
     bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -7274,6 +7286,136 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhScalarS) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000002ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZS scalar S (round toward zero, signed).  Vn.s[0] = 2.75f -> 2.  The
+// upper source lanes are poisoned to prove the lane-0 scrub (they must not
+// leak into Vd[63:32]).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsScalarSInRange) {
+  static const uint32_t code[] = {FcvtzScalar(false, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAA40300000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=2.75f
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZS scalar S: Vn.s[0] = -3.0f -> -3 (0xFFFFFFFD).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsScalarSNeg) {
+  static const uint32_t code[] = {FcvtzScalar(false, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAAC0400000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=-3.0f
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFDULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZS scalar S: NaN -> 0 (x86 CVTTPS2DQ would give 0x80000000).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsScalarSNan) {
+  static const uint32_t code[] = {FcvtzScalar(false, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAA7FC00000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=NaN
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZS scalar S: +Inf -> INT32_MAX (0x7FFFFFFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsScalarSPosOverflow) {
+  static const uint32_t code[] = {FcvtzScalar(false, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAA7F800000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=+Inf
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZS scalar S: -Inf -> INT32_MIN (0x80000000).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsScalarSNegOverflow) {
+  static const uint32_t code[] = {FcvtzScalar(false, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAAFF800000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=-Inf
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000080000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZU scalar S (round toward zero, unsigned): Vn.s[0] = 3.0f -> 3.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuScalarSInRange) {
+  static const uint32_t code[] = {FcvtzScalar(true, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAA40400000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=3.0f
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000003ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZU scalar S: negative input clamps to 0 (MAXPS(src,0)).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuScalarSNeg) {
+  static const uint32_t code[] = {FcvtzScalar(true, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAABF800000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=-1.0f
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZU scalar S: 3e9f is in the unsigned range (>2^31) -> 0xB2D05E00.  Tests
+// the subtract-2^31 offset path.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuScalarSBigInRange) {
+  static const uint32_t code[] = {FcvtzScalar(true, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAA4F32D05EULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=3e9f
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000B2D05E00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZU scalar S: +Inf saturates to UINT32_MAX (0xFFFFFFFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuScalarSSatMax) {
+  static const uint32_t code[] = {FcvtzScalar(true, false, 0, 1)};
+  SetV128(&state_, 1, 0xAAAAAAAA7F800000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=+Inf
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// FCVTZS/FCVTZU scalar D (FP64) is branchy per-lane in lite -> heavy bails.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzScalarDBails) {
+  static const uint32_t code[] = {FcvtzScalar(false, true, 0, 1)};  // fcvtzs d0, d1
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 // Scalar SQDMULH B (size=00) is unallocated for this opcode and must bail.
