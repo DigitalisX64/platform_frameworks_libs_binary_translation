@@ -245,6 +245,8 @@
         "PmovzxdqXRegXReg",
         "PmovzxwdXRegXReg",
         "PmuldqXRegXReg",
+        "PmulhrswXRegXReg",
+        "PmulhwXRegXReg",
         "PmulldXRegXReg",
         "PmullwXRegXReg",
         "PmuludqXRegXReg",
