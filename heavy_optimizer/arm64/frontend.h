@@ -3134,6 +3134,126 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // Integer vector saturating add/sub SQADD/UQADD/SQSUB/UQSUB (opcode 00001 for
+    // add, 00101 for sub; U selects signed/unsigned). The 8-bit (size=00) and
+    // 16-bit (size=01) forms have direct SSE2 saturating packed ops; the 32-bit
+    // (size=10) forms have no native saturating dword op, so they are emulated
+    // exactly as lite_translator.h does (wrap-add/sub + overflow detect +
+    // saturate). These read only Vn/Vm (never Vd) but need multiple temps and a
+    // per-op emulation sequence, so they are handled here rather than in the
+    // shared vn-only switch. The reserved .2D (size=11, 64-bit) form has no
+    // packed 64-bit saturating path in either tier and bails to lite (which in
+    // turn routes it to the interpreter) — mirroring lite's `size==0b11` bail.
+    // The result always lands in xn; SetVRegFull's Q=0 merge zeroes Vd[127:64].
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqadd ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqsub ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqsub) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqadd) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PaddsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit signed saturating add. sum = a + b (wrap); overflow iff
+          // ~(a^b) & (a^sum) has its MSB set; sat = (a<0)?INT_MIN:INT_MAX;
+          // result = sum ^ ((sum ^ sat) & ovf_mask).
+          FpRegister t_sum = AllocTempSimdReg();
+          FpRegister t_ovf = AllocTempSimdReg();
+          FpRegister t_sat = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+          builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // ~(a^b)
+          builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+          builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // a<0?-1:0
+          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+        }
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqadd) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PaddusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit unsigned saturating add. sum = a + b (wrap); overflow iff
+          // sum < a (unsigned), detected via PMAXUD: max(a,sum)==sum iff no
+          // overflow; saturate overflowed lanes to UINT32_MAX.
+          FpRegister t_save_a = AllocTempSimdReg();
+          FpRegister t_ones = AllocZeroedSimdReg();  // def before the self-compare
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());       // sum
+          builder_.Gen<x86_64::PmaxudXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());  // -1 if no ovf
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_ones.machine_reg(), t_ones.machine_reg());  // -1
+          builder_.Gen<x86_64::PxorXRegXReg>(t_save_a.machine_reg(), t_ones.machine_reg());   // -1 if ovf
+          builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), t_save_a.machine_reg());        // saturate
+        }
+      } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqsub) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PsubsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit signed saturating sub. diff = a - b (wrap); overflow iff
+          // (a^b) & (a^diff) has its MSB set; sat = (a<0)?INT_MIN:INT_MAX;
+          // result = diff ^ ((diff ^ sat) & ovf_mask).
+          FpRegister t_diff = AllocTempSimdReg();
+          FpRegister t_ovf = AllocTempSimdReg();
+          FpRegister t_sat = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PsubdXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // a^b
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg());  // a^diff
+          builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+          builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // a<0?-1:0
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());   // -1
+          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+        }
+      } else {  // kUqsub
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PsubusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else if (args.size == 0b01) {
+          builder_.Gen<x86_64::PsubuswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        } else {
+          // 32-bit unsigned saturating sub. result = (a>=b) ? a-b : 0. Mask:
+          // PMINUD(a,b)==b iff a>=b; AND the wrap-diff with it to zero underflow.
+          FpRegister t_mask = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t_mask.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PminudXRegXReg>(t_mask.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // -1 if a>=b
+          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());        // a-b
+          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_mask.machine_reg());     // zero underflow
+        }
+      }
+      // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
