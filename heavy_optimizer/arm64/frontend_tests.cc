@@ -4945,6 +4945,8 @@ static_assert(FcvtScalar(false, 0b00, 0b10, 0b000, 1, 0) == 0x1e300020u);  // fc
 static_assert(FcvtScalar(false, 0b00, 0b00, 0b001, 1, 0) == 0x1e210020u);  // fcvtnu w0, s1
 static_assert(FcvtScalar(false, 0b00, 0b01, 0b001, 1, 0) == 0x1e290020u);  // fcvtpu w0, s1
 static_assert(FcvtScalar(true, 0b01, 0b10, 0b001, 1, 0) == 0x9e710020u);   // fcvtmu x0, d1
+static_assert(FcvtScalar(false, 0b00, 0b00, 0b100, 1, 0) == 0x1e240020u);  // fcvtas w0, s1
+static_assert(FcvtScalar(false, 0b00, 0b00, 0b101, 1, 0) == 0x1e250020u);  // fcvtau w0, s1
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtnsWFromS) {
   static const uint32_t code[] = {0x1e200020u};  // fcvtns w0, s1 (round-to-nearest ties-even)
@@ -5036,6 +5038,81 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtpsWFromSPosOverflow) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(uint32_t{0x7FFFFFFFu}));  // INT32_MAX
+}
+
+// FCVTAS/FCVTAU: round-to-nearest, ties AWAY from zero (distinct from fcvtns'
+// ties-to-even). x86 has no ties-away mode; the heavy path adds copysign(0.5,x)
+// gated off at |x| >= 2^23, then truncates.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromSTieAway) {
+  static const uint32_t code[] = {0x1e240020u};  // fcvtas w0, s1
+  SetVf32(&state_, 1, 2.5f);                      // ties away -> 3 (fcvtns would give 2)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 3u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromSNegTieAway) {
+  static const uint32_t code[] = {0x1e240020u};  // fcvtas w0, s1
+  SetVf32(&state_, 1, -2.5f);                     // ties away -> -3 (W-write zero-extends)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(uint32_t{static_cast<uint32_t>(-3)}));
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromSHalf) {
+  static const uint32_t code[] = {0x1e240020u};  // fcvtas w0, s1
+  SetVf32(&state_, 1, 0.5f);                      // ties away -> 1
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 1u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtauWFromSTieAway) {
+  static const uint32_t code[] = {0x1e250020u};  // fcvtau w0, s1
+  SetVf32(&state_, 1, 2.5f);                      // ties away -> 3
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 3u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtauWFromSNegSat) {
+  static const uint32_t code[] = {0x1e250020u};  // fcvtau w0, s1
+  SetVf32(&state_, 1, -0.5f);                     // ties away -> -1 -> unsigned saturate to 0
+  state_.cpu.x[0] = 0xdeadbeefULL;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromSNan) {
+  static const uint32_t code[] = {0x1e240020u};  // fcvtas w0, s1
+  SetV128(&state_, 1, 0x7FC00000ULL, 0ULL);      // lane 0 = FP32 qNaN
+  state_.cpu.x[0] = 0xdeadbeefULL;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0u);  // NaN -> 0 (addend gated off, saturation ladder fires)
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromSLargeGated) {
+  static const uint32_t code[] = {0x1e240020u};  // fcvtas w0, s1
+  SetVf32(&state_, 1, 8388609.0f);               // 2^23+1: already integer, addend gated -> 8388609
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 8388609u);
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuXFromSInRange) {

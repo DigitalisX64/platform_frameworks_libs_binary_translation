@@ -913,14 +913,47 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
 // each UCOMI/TEST is consumed by the PseudoCondBranch in its own block.
 void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                        bool is_double,
-                                       int8_t round_imm) {
+                                       int8_t round_imm,
+                                       bool ties_away) {
   if (!success()) {
     return;
   }
-  const bool is_unsigned = (args.op == 0b001);
+  // Unsigned forms: FCVTZU/FCVTNU/FCVTPU/FCVTMU (op 001) and FCVTAU (op 101).
+  const bool is_unsigned = (args.op == 0b001 || args.op == 0b101);
   auto* ir = builder_.ir();
 
   FpRegister xmm = GetVRegScalar(args.rn, is_double);
+
+  // FCVTAS/FCVTAU (ties-away): add copysign(0.5, x), gated to 0 when |x| >= 2^23
+  // (already an integer, where a 0.5 addend would round the wrong way), then let
+  // the truncating cvtt + saturation ladder below finish. FP32 only (the caller
+  // bails D). NaN/±Inf pass through: |NaN|,|Inf| exceed 2^23, so their addend is
+  // gated to 0 and the downstream NaN/overflow branches still fire. Mirrors the
+  // vector kFcvtasV/kFcvtauV path and the lite FRINTA trick. Round into a private
+  // temp so the guest v[] slot is untouched.
+  if (ties_away) {
+    FpRegister sign = AllocZeroedSimdReg();
+    FpRegister absx = AllocZeroedSimdReg();
+    FpRegister half = AllocTempSimdReg();
+    FpRegister thresh = AllocTempSimdReg();
+    // sign = x & 0x80000000, addend = sign | 0.5f = copysign(0.5, x).
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+    builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+    builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), xmm.machine_reg());
+    builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+    builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+    // |x| = x & 0x7FFFFFFF; gate the addend to 0 where |x| >= 2^23.
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+    builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+    builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), xmm.machine_reg());
+    builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
+    builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+    FpRegister rounded = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(rounded.machine_reg(), xmm.machine_reg());
+    builder_.Gen<x86_64::AddpsXRegXReg>(rounded.machine_reg(), sign.machine_reg());
+    xmm = rounded;
+  }
 
   // Rounding FP->int conversions (FCVTNS/NU/PS/PU/MS/MU) prepend an x86 ROUND
   // that makes the finite input an integer-valued FP (NaN/±Inf/sign-of-zero

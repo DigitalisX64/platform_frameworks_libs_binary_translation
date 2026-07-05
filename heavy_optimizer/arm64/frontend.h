@@ -1736,7 +1736,19 @@ class HeavyOptimizerFrontend {
       EmitFcvtz(args, is_double, round_imm);
       return;
     }
-    // Everything else (rmode==01 V.D[1] FMOV, ties-away FCVTAS/AU) bails to lite.
+    // FCVTAS (op 100) / FCVTAU (op 101): FP->int, round-to-nearest ties-away
+    // (rmode 00). x86 has no ties-away round mode; EmitFcvtz's ties_away path
+    // adds copysign(0.5, x) before the truncating saturation ladder. FP32 (S)
+    // only — FP64 (D) bails to lite (mirrors the FP32-only vector FCVTAS/AU).
+    if ((args.op == 0b100 || args.op == 0b101) && args.rmode == 0b00) {
+      if (is_double) {
+        UndefinedReturningVoid();
+        return;
+      }
+      EmitFcvtz(args, is_double, /*round_imm=*/-1, /*ties_away=*/true);
+      return;
+    }
+    // Everything else (rmode==01 V.D[1] FMOV) bails to lite.
     UndefinedReturningVoid();
   }
 
@@ -1997,9 +2009,14 @@ class HeavyOptimizerFrontend {
   // `round_imm >= 0` (an x86 ROUND imm8 for RNE / +inf / -inf) and the source
   // is ROUND-ed to an integer-valued FP first (NaN/±Inf/sign-of-zero pass
   // through unchanged), so the truncating cvtt then yields the rounded integer
-  // with the ARM out-of-range/NaN semantics preserved. FCVTAS/AU (ties-away)
-  // have no x86 round mode and still bail to lite.
-  void EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double, int8_t round_imm = -1);
+  // with the ARM out-of-range/NaN semantics preserved. FCVTAS/AU (ties-away,
+  // op 100/101) have no x86 round mode; pass `ties_away = true` (FP32 only) to
+  // add a copysign(0.5, x) addend — gated to 0 when |x| >= 2^23, where a 0.5
+  // addend would round the wrong way — before the same truncating ladder.
+  void EmitFcvtz(const Decoder::FpIntConvArgs& args,
+                 bool is_double,
+                 int8_t round_imm = -1,
+                 bool ties_away = false);
 
   //
   // Advanced SIMD (Args-struct forms).
