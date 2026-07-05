@@ -911,7 +911,9 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
 // FCVTZU paths. A single `result` GP vreg is merged across the fix-up branches
 // via PseudoCopy (mirrors ConditionalSelect); FLAGS never cross a basic block —
 // each UCOMI/TEST is consumed by the PseudoCondBranch in its own block.
-void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double) {
+void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
+                                       bool is_double,
+                                       int8_t round_imm) {
   if (!success()) {
     return;
   }
@@ -919,6 +921,26 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args, bool 
   auto* ir = builder_.ir();
 
   FpRegister xmm = GetVRegScalar(args.rn, is_double);
+
+  // Rounding FP->int conversions (FCVTNS/NU/PS/PU/MS/MU) prepend an x86 ROUND
+  // that makes the finite input an integer-valued FP (NaN/±Inf/sign-of-zero
+  // pass through unchanged); the truncating cvtt + saturation ladder below then
+  // produces the correctly-rounded ARM result. FCVTZS/FCVTZU pass round_imm < 0
+  // (no rounding — cvtt already truncates). Round in a private temp so the guest
+  // v[] slot is untouched. FP32 uses ROUNDPS (only lane 0 is consumed by cvtt);
+  // FP64 uses scalar ROUNDSD.
+  if (round_imm >= 0) {
+    FpRegister rounded = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(rounded.machine_reg(), xmm.machine_reg());
+    if (is_double) {
+      builder_.Gen<x86_64::RoundsdXRegXRegImm>(
+          rounded.machine_reg(), rounded.machine_reg(), round_imm);
+    } else {
+      builder_.Gen<x86_64::RoundpsXRegXRegImm>(
+          rounded.machine_reg(), rounded.machine_reg(), round_imm);
+    }
+    xmm = rounded;
+  }
 
   // xmm self-compare: PF=1 iff NaN.
   auto ucomi_self = [&]() -> Register {

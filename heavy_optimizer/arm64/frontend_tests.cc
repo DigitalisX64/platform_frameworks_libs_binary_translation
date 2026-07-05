@@ -4926,6 +4926,118 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuXFromDSatMax) {
   EXPECT_EQ(state_.cpu.x[0], 0xFFFFFFFFFFFFFFFFULL);  // UINT64_MAX
 }
 
+// Scalar rounding FP->int conversions (FCVTNS/PS/MS + unsigned). Encoding:
+// sf 0 0 11110 type 1 rmode opcode 000000 Rn Rd; rmode = 00 (RNE) / 01 (+inf)
+// / 10 (-inf), opcode = 000 (signed) / 001 (unsigned).
+constexpr uint32_t FcvtScalar(bool sf,
+                              uint8_t type,
+                              uint8_t rmode,
+                              uint8_t opcode,
+                              uint8_t rn,
+                              uint8_t rd) {
+  return 0x1e200000u | (static_cast<uint32_t>(sf) << 31) | (static_cast<uint32_t>(type) << 22) |
+         (static_cast<uint32_t>(rmode) << 19) | (static_cast<uint32_t>(opcode) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(FcvtScalar(false, 0b00, 0b00, 0b000, 1, 0) == 0x1e200020u);  // fcvtns w0, s1
+static_assert(FcvtScalar(true, 0b01, 0b01, 0b000, 1, 0) == 0x9e680020u);   // fcvtps x0, d1
+static_assert(FcvtScalar(false, 0b00, 0b10, 0b000, 1, 0) == 0x1e300020u);  // fcvtms w0, s1
+static_assert(FcvtScalar(false, 0b00, 0b00, 0b001, 1, 0) == 0x1e210020u);  // fcvtnu w0, s1
+static_assert(FcvtScalar(false, 0b00, 0b01, 0b001, 1, 0) == 0x1e290020u);  // fcvtpu w0, s1
+static_assert(FcvtScalar(true, 0b01, 0b10, 0b001, 1, 0) == 0x9e710020u);   // fcvtmu x0, d1
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtnsWFromS) {
+  static const uint32_t code[] = {0x1e200020u};  // fcvtns w0, s1 (round-to-nearest ties-even)
+  SetVf32(&state_, 1, 2.5f);                      // ties to even -> 2
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 2u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtnsWFromSTiesUp) {
+  static const uint32_t code[] = {0x1e200020u};  // fcvtns w0, s1
+  SetVf32(&state_, 1, 3.5f);                      // ties to even -> 4
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 4u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtpsXFromD) {
+  static const uint32_t code[] = {0x9e680020u};  // fcvtps x0, d1 (toward +inf)
+  SetVf64(&state_, 1, 12.1);                       // ceil -> 13
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 13u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtpsXFromDNeg) {
+  static const uint32_t code[] = {0x9e680020u};  // fcvtps x0, d1
+  SetVf64(&state_, 1, -12.9);                      // ceil(-12.9) -> -12
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(int64_t{-12}));
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtmsWFromS) {
+  static const uint32_t code[] = {0x1e300020u};  // fcvtms w0, s1 (toward -inf)
+  SetVf32(&state_, 1, -12.1f);                     // floor -> -13
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(uint32_t{static_cast<uint32_t>(-13)}));
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtpuWFromS) {
+  static const uint32_t code[] = {0x1e290020u};  // fcvtpu w0, s1 (toward +inf, unsigned)
+  SetVf32(&state_, 1, 12.1f);                      // ceil -> 13
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 13u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtmuWFromSNegSat) {
+  static const uint32_t code[] = {FcvtScalar(false, 0b00, 0b10, 0b001, 1, 0)};  // fcvtmu w0, s1
+  SetVf32(&state_, 1, -0.5f);                      // floor(-0.5) = -1 -> unsigned saturate to 0
+  state_.cpu.x[0] = 0xdeadbeefULL;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtnsWFromSNan) {
+  static const uint32_t code[] = {0x1e200020u};  // fcvtns w0, s1
+  SetV128(&state_, 1, 0x7FC00000ULL, 0ULL);      // lane 0 = FP32 qNaN
+  state_.cpu.x[0] = 0xdeadbeefULL;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0u);  // NaN -> 0 (saturation ladder still fires after ROUND)
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtpsWFromSPosOverflow) {
+  static const uint32_t code[] = {FcvtScalar(false, 0b00, 0b01, 0b000, 1, 0)};  // fcvtps w0, s1
+  SetVf32(&state_, 1, 1e30f);                     // >> INT32_MAX
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(uint32_t{0x7FFFFFFFu}));  // INT32_MAX
+}
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuXFromSInRange) {
   static const uint32_t code[] = {0x9e390020u};  // fcvtzu x0, s1
   SetVf32(&state_, 1, 1.0e19f);                   // in [2^63, 2^64): offset trick

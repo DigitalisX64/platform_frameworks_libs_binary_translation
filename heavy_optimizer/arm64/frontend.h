@@ -1723,8 +1723,20 @@ class HeavyOptimizerFrontend {
       EmitFcvtz(args, is_double);
       return;
     }
-    // Everything else (rmode==01 V.D[1] FMOV, rounding FP->int conversions)
-    // bails to the lite tier.
+    // Rounding FP -> int conversions FCVTNS/NU (rmode 00, round-to-nearest
+    // ties-even), FCVTPS/PU (rmode 01, toward +inf) and FCVTMS/MU (rmode 10,
+    // toward -inf). ARM ties-away FCVTAS/AU (op 100/101) has no x86 round mode
+    // and still bails. Route through EmitFcvtz with the matching x86 ROUND imm8
+    // so the shared saturation/NaN ladder handles out-of-range/NaN.
+    if ((args.op == 0b000 || args.op == 0b001) &&
+        (args.rmode == 0b00 || args.rmode == 0b01 || args.rmode == 0b10)) {
+      const int8_t round_imm = (args.rmode == 0b00) ? int8_t{0x08}    // RNE + suppress-inexact
+                               : (args.rmode == 0b01) ? int8_t{0x0A}  // toward +inf
+                                                      : int8_t{0x09};  // toward -inf
+      EmitFcvtz(args, is_double, round_imm);
+      return;
+    }
+    // Everything else (rmode==01 V.D[1] FMOV, ties-away FCVTAS/AU) bails to lite.
     UndefinedReturningVoid();
   }
 
@@ -1979,7 +1991,15 @@ class HeavyOptimizerFrontend {
   // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
   // BB-split lowering (a shared `result` GP vreg merged via PseudoCopy). Mirrors
   // lite_translator.h::FpIntConversion's FCVTZS/FCVTZU paths.
-  void EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double);
+  //
+  // The rounding scalar conversions FCVTNS/NU (rmode 00), FCVTPS/PU (rmode 01)
+  // and FCVTMS/MU (rmode 10) reuse this same saturation/NaN ladder: pass
+  // `round_imm >= 0` (an x86 ROUND imm8 for RNE / +inf / -inf) and the source
+  // is ROUND-ed to an integer-valued FP first (NaN/±Inf/sign-of-zero pass
+  // through unchanged), so the truncating cvtt then yields the rounded integer
+  // with the ARM out-of-range/NaN semantics preserved. FCVTAS/AU (ties-away)
+  // have no x86 round mode and still bail to lite.
+  void EmitFcvtz(const Decoder::FpIntConvArgs& args, bool is_double, int8_t round_imm = -1);
 
   //
   // Advanced SIMD (Args-struct forms).
