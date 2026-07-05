@@ -5053,6 +5053,99 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // FCVTZS V Vd.<T>, Vn.<T> (FP32 .2S/.4S) — floating-point convert to
+      // signed integer, round toward zero. Branchless mirror of the validated
+      // lite lowering (lite_translator.h::AdvSimdTwoRegMisc kFcvtzsV, FP32
+      // path): CVTTPS2DQ does the truncating conversion, then a packed
+      // saturation fix-up folds in the ARM out-of-range semantics that x86
+      // CVTTPS2DQ gets wrong — NaN lanes must become 0 (x86 yields
+      // 0x80000000), and positive-overflow lanes must become INT32_MAX (x86
+      // yields the 0x80000000 "integer indefinite"). The FP64 .2D form (branchy
+      // per-lane in lite) and the Armv8.2 FP16 form bail to lite→interp.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzsV: {
+        if (args.is_fp16 || args.size != 0b10) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister x_dst = AllocTempSimdReg();
+        FpRegister x_mask = AllocTempSimdReg();
+        FpRegister x_eqmin = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        // 1. Primary truncating conversion.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+        // 2. NaN lanes -> 0.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+        builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+        // 3. INT32_MIN (0x80000000) per lane.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+        builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+        // 4. result == INT32_MIN ?
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+        // 5. src non-negative ? PSRAD 31 -> 0 if non-neg, all-1s if neg.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+        builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+        // 6. Flip INT_MIN -> INT_MAX in positive-overflow lanes.
+        builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+        SetVRegFull(args.rd, x_dst, args.q);
+        return;
+      }
+
+      // FCVTZU V Vd.<T>, Vn.<T> (FP32 .2S/.4S) — floating-point convert to
+      // unsigned integer, round toward zero. Branchless mirror of the lite
+      // lowering (kFcvtzuV, FP32 path). x86 has no packed FP->u32, so the
+      // classic "subtract 2^31" offset trick brings [2^31, 2^32) into signed
+      // CVTTPS2DQ range, restores bit 31, and saturates too-big/Inf lanes to
+      // UINT32_MAX; MAXPS(src, 0) collapses NaN/negative to 0. FP64 .2D / FP16
+      // bail to lite.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtzuV: {
+        if (args.is_fp16 || args.size != 0b10) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister x_dst = AllocTempSimdReg();       // src -> result
+        FpRegister x_pow31 = AllocTempSimdReg();
+        FpRegister x_needs_off = AllocTempSimdReg();
+        // Zeroed scratch (AllocZeroedSimdReg gives it a defining write, avoiding
+        // a PXOR-self read of an undefined register). Reused after step 1.
+        FpRegister x_scratch = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(x_dst.machine_reg(), vn_off);
+        // 1. Clamp neg/NaN to 0 via MAXPS with the zeroed scratch.
+        builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+        // 2. Broadcast 2^31 = 0x4F000000 to all four FP32 lanes.
+        Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
+        builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+            x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
+        // 3. needs_offset = (2^31 <= src_clamped).
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+        builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+        // 4. offset_amount = 2^31 where needs_offset.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+        // 5. src_for_cvt = src_clamped - offset_amount.
+        builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+        // 6. too_big = (2^31 <= src_for_cvt).
+        builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+        builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+        // 7. CVTTPS2DQ.
+        builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+        // 8. Build 0x80000000 per lane; AND needs_offset; OR into result.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+        builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+        builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+        builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+        // 9. Saturate too-big lanes to 0xFFFFFFFF.
+        builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+        SetVRegFull(args.rd, x_dst, args.q);
+        return;
+      }
+
       // SADDLP / UADDLP / SADALP / UADALP Vd.<Ta>, Vn.<Tb> — pairwise long
       // add / add-accumulate. Each adjacent pair of esize-wide source lanes is
       // widened (sign/zero) to 2*esize and summed; SADALP/UADALP accumulate the

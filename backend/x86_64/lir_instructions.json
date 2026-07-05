@@ -59,6 +59,7 @@
         "Cvtsi2sslXRegReg",
         "Cvtsi2ssqXRegReg",
         "Cvtss2sdXRegXReg",
+        "Cvttps2dqXRegXReg",
         "Cvttsd2silRegXReg",
         "Cvttsd2siqRegXReg",
         "Cvttss2silRegXReg",

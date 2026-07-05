@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -4060,6 +4061,15 @@ static_assert(FmaxvVec(true, false, 0, 1) == 0x6e30f820u);   // fmaxv s0, v1.4s
 static_assert(FmaxvVec(false, false, 0, 1) == 0x6eb0f820u);  // fminv s0, v1.4s
 static_assert(FmaxvVec(true, true, 0, 1) == 0x6e30c820u);    // fmaxnmv s0, v1.4s
 static_assert(FmaxvVec(false, true, 0, 1) == 0x6eb0c820u);   // fminnmv s0, v1.4s
+// FCVTZS/FCVTZU V Vd.<T>, Vn.<T> (FP32): two-reg-misc, opcode=11011, size=10
+// (bit23=1 selects round-toward-zero); U=0 signed / U=1 unsigned.
+constexpr uint32_t FcvtzVec(bool is_unsigned, bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/is_unsigned, /*size=*/0b10, /*opcode=*/0b11011, rd, rn);
+}
+static_assert(FcvtzVec(false, true, 0, 1) == 0x4ea1b820u);   // fcvtzs v0.4s, v1.4s
+static_assert(FcvtzVec(false, false, 0, 1) == 0x0ea1b820u);  // fcvtzs v0.2s, v1.2s
+static_assert(FcvtzVec(true, true, 0, 1) == 0x6ea1b820u);    // fcvtzu v0.4s, v1.4s
+static_assert(FcvtzVec(true, false, 0, 1) == 0x2ea1b820u);   // fcvtzu v0.2s, v1.2s
 // SADDLP/UADDLP/SADALP/UADALP Vd.<Ta>, Vn.<Tb>: two-reg-misc, opcode=00010
 // (add-long-pairwise) or 00110 (accumulate); U=0 signed / U=1 unsigned.
 constexpr uint32_t AddlpVec(bool is_signed, bool is_accum, uint8_t size, bool q,
@@ -4372,6 +4382,13 @@ uint64_t VLo64(const ThreadState* s, unsigned reg) {
   uint64_t lo;
   std::memcpy(&lo, reinterpret_cast<const uint8_t*>(&s->cpu.v[reg]), sizeof(lo));
   return lo;
+}
+// Pack two FP32 values into one 64-bit half (little-endian: lo in bits 0..31).
+uint64_t Pack2xF32(float lo, float hi) {
+  uint32_t a, b;
+  std::memcpy(&a, &lo, sizeof(a));
+  std::memcpy(&b, &hi, sizeof(b));
+  return static_cast<uint64_t>(a) | (static_cast<uint64_t>(b) << 32);
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, FaddS) {
@@ -8844,6 +8861,78 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVec4SNanPropagates) {
   EXPECT_NE(res & 0x007FFFFFu, 0u);            // nonzero mantissa -> NaN
   EXPECT_EQ(VLo64(&state_, 0) >> 32, 0x0ULL);  // upper 96 bits zeroed
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// ---- FCVTZS/FCVTZU V (vector FP32 -> int, round toward zero) heavy. ----
+
+// FCVTZS v0.4s, v1.4s: truncate {2.7, -2.7, 100.9, -100.9} -> {2, -2, 100, -100}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsVec4S) {
+  static const uint32_t code[] = {FcvtzVec(/*is_unsigned=*/false, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(2.7f, -2.7f), Pack2xF32(100.9f, -100.9f));
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFE00000002ULL);   // {2, -2}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFF9C00000064ULL);  // {100, -100}
+}
+
+// FCVTZS v0.2s, v1.2s: only lanes 0,1 converted; upper 64 bits zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsVec2S) {
+  static const uint32_t code[] = {FcvtzVec(/*is_unsigned=*/false, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(2.7f, -2.7f), Pack2xF32(100.9f, -100.9f));
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFE00000002ULL);   // {2, -2}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // .2S upper zeroed
+}
+
+// FCVTZS saturation: NaN -> 0, +overflow -> INT32_MAX, -overflow -> INT32_MIN.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsVec4SSaturate) {
+  static const uint32_t code[] = {FcvtzVec(/*is_unsigned=*/false, /*q=*/true, 0, 1)};
+  // lane0 = qNaN, lane1 = +1e20 (> INT32_MAX), lane2 = -1e20 (< INT32_MIN),
+  // lane3 = 5.0.
+  SetV128(&state_, 1, Pack2xF32(std::numeric_limits<float>::quiet_NaN(), 1e20f),
+          Pack2xF32(-1e20f, 5.0f));
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFF00000000ULL);   // {0, INT32_MAX}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000580000000ULL);  // {INT32_MIN, 5}
+}
+
+// FCVTZU v0.4s, v1.4s: {2.0, 100.0, 1.5*2^31, -1.0} -> {2, 100, 0xC0000000, 0}.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuVec4S) {
+  static const uint32_t code[] = {FcvtzVec(/*is_unsigned=*/true, /*q=*/true, 0, 1)};
+  // 1.5*2^31 = 3221225472 = 0xC0000000 (exactly representable in FP32).
+  SetV128(&state_, 1, Pack2xF32(2.0f, 100.0f), Pack2xF32(3221225472.0f, -1.0f));
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000006400000002ULL);   // {2, 100}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000000C0000000ULL);  // {0xC0000000, 0}
+}
+
+// FCVTZU saturation: negative -> 0, NaN -> 0, > 2^32 -> UINT32_MAX.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuVec4SSaturate) {
+  static const uint32_t code[] = {FcvtzVec(/*is_unsigned=*/true, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(-1.0f, std::numeric_limits<float>::quiet_NaN()),
+          Pack2xF32(1e20f, 5.0f));
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000000ULL);   // {0, 0}
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000005FFFFFFFFULL);  // {UINT32_MAX, 5}
 }
 
 // ---- SADDLP/UADDLP/SADALP/UADALP pairwise long add / accumulate (heavy). ----
