@@ -4406,6 +4406,18 @@ static_assert(FcvtzScalar(true, false, 0, 1) == 0x7ea1b820u);   // fcvtzu s0, s1
 static_assert(FcvtzScalar(false, true, 0, 1) == 0x5ee1b820u);   // fcvtzs d0, d1
 static_assert(FcvtzScalar(true, true, 0, 1) == 0x7ee1b820u);    // fcvtzu d0, d1
 
+// AdvSIMD scalar two-register misc SCVTF/UCVTF (int->float): opcode=0b11101,
+// bit23=0 so size ∈ {00,01}; sz=bit22 selects S(0)/D(1); U=bit29 selects
+// signed(0)/unsigned(1).  llvm-mc-21 encoding checks below.
+constexpr uint32_t CvtfScalar(bool is_unsigned, bool is_double, uint8_t rd, uint8_t rn) {
+  return 0x5e21d800u | (static_cast<uint32_t>(is_unsigned) << 29) |
+         (static_cast<uint32_t>(is_double) << 22) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(CvtfScalar(false, false, 0, 1) == 0x5e21d820u);  // scvtf s0, s1
+static_assert(CvtfScalar(true, false, 0, 1) == 0x7e21d820u);   // ucvtf s0, s1
+static_assert(CvtfScalar(false, true, 0, 1) == 0x5e61d820u);   // scvtf d0, d1
+static_assert(CvtfScalar(true, true, 0, 1) == 0x7e61d820u);    // ucvtf d0, d1
+
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
     bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -7411,6 +7423,72 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuScalarSSatMax) {
 // FCVTZS/FCVTZU scalar D (FP64) is branchy per-lane in lite -> heavy bails.
 TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzScalarDBails) {
   static const uint32_t code[] = {FcvtzScalar(false, true, 0, 1)};  // fcvtzs d0, d1
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
+}
+
+// SCVTF scalar S (signed int32 -> FP32).  Vn.s[0] = 5 -> 5.0f (0x40A00000).
+// The upper source lanes are poisoned (0xAAAAAAAA / high half) to prove the
+// lane-0 scrub does not leak into Vd[63:32].
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfScalarSInRange) {
+  static const uint32_t code[] = {CvtfScalar(false, false, 0, 1)};  // scvtf s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA00000005ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=5
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040A00000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SCVTF scalar S: Vn.s[0] = -1 (0xFFFFFFFF) -> -1.0f (0xBF800000).
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfScalarSNeg) {
+  static const uint32_t code[] = {CvtfScalar(false, false, 0, 1)};  // scvtf s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAAFFFFFFFFULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=-1
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000BF800000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// UCVTF scalar S (unsigned int32 -> FP32): Vn.s[0] = 5 -> 5.0f (0x40A00000).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfScalarSInRange) {
+  static const uint32_t code[] = {CvtfScalar(true, false, 0, 1)};  // ucvtf s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA00000005ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=5
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040A00000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// UCVTF scalar S: Vn.s[0] = 0x80000000 (unsigned 2^31) -> 2^31 (0x4F000000).
+// Exercises the MSB-set 2^32-addend path (signed CVTDQ2PS gives -2^31; adding
+// 2^32 restores the unsigned value).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfScalarSBig) {
+  static const uint32_t code[] = {CvtfScalar(true, false, 0, 1)};  // ucvtf s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA80000000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=2^31
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000004F000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// SCVTF/UCVTF scalar D (FP64) is branchy per-lane in lite -> heavy bails.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CvtfScalarDBails) {
+  static const uint32_t code[] = {CvtfScalar(false, true, 0, 1)};  // scvtf d0, d1
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(

@@ -6049,35 +6049,73 @@ class HeavyOptimizerFrontend {
     }
   }
 
-  // AdvSIMD scalar two-register misc.  Only the single-lane FP->integer
-  // round-toward-zero converts FCVTZS / FCVTZU (S form / FP32) are lowered
-  // here; every other scalar two-reg-misc opcode bails to lite via
-  // UndefinedReturningVoid.
+  // AdvSIMD scalar two-register misc.  The single-lane FP<->integer converts
+  // FCVTZS / FCVTZU (float->int, round toward zero) and SCVTF / UCVTF
+  // (int->float), all S form / FP32, are lowered here; every other scalar
+  // two-reg-misc opcode bails to lite via UndefinedReturningVoid.
   //
-  // Lowering is a single-lane application of the vector .2S/.4S FCVTZS/FCVTZU
-  // recipes in AdvSimdTwoRegMisc (kFcvtzsV / kFcvtzuV).  The source is loaded
-  // full-width and scrubbed to lane 0 (PSLLDQ+PSRLDQ keep the low 32 bits and
-  // zero everything above), so lanes 1..3 become +0.0f and convert to 0.  This
-  // is required for correctness: SetVRegFull q=false writes the low 64 bits via
-  // MOVSD, so lane 1 (Vd[63:32]) survives — scrubbing forces it to 0 as the
-  // scalar S result requires (Vd[31:0]=result, Vd[127:32]=0).
-  //   * FCVTZS/FCVTZU with sz(bit0 of size)=0 (S / FP32): the vector recipe.
+  // Lowering is a single-lane application of the corresponding vector .2S/.4S
+  // recipes in AdvSimdTwoRegMisc (kFcvtzsV / kFcvtzuV / kScvtfV / kUcvtfV).  The
+  // source is loaded full-width and scrubbed to lane 0 (PSLLDQ+PSRLDQ keep the
+  // low 32 bits and zero everything above), so lanes 1..3 become 0 and convert
+  // to 0.  This is required for correctness: SetVRegFull q=false writes the low
+  // 64 bits via MOVSD, so lane 1 (Vd[63:32]) survives — scrubbing forces it to
+  // 0 as the scalar S result requires (Vd[31:0]=result, Vd[127:32]=0).  For the
+  // int->float SCVTF/UCVTF forms the scrubbed lanes are integer 0, converting to
+  // +0.0f = 0x00000000, which is exactly the required zero fill.
+  //   * FCVTZS/FCVTZU/SCVTF/UCVTF with sz(bit0 of size)=0 (S/FP32): vector recipe.
   //   * sz=1 (D / FP64) is branchy per-lane in lite -> bail.
   //   * every other scalar two-reg-misc opcode -> bail.
   void AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScalarTwoRegMiscArgs& args) {
     if (!success()) {
       return;
     }
-    const bool is_unsigned =
+    const bool is_fcvtzs =
+        (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs);
+    const bool is_fcvtzu =
         (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu);
-    if ((args.opcode != Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs &&
-         args.opcode != Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzu) ||
+    const bool is_scvtf =
+        (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kScvtf);
+    const bool is_ucvtf =
+        (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kUcvtf);
+    if ((!is_fcvtzs && !is_fcvtzu && !is_scvtf && !is_ucvtf) ||
         (args.size & 1) != 0) {
       UndefinedReturningVoid();
       return;
     }
     const int32_t vn_off =
         static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    // SCVTF / UCVTF scalar (S): int32 -> FP32.  Mirror the kScvtfV/kUcvtfV FP32
+    // recipe on a lane-0-scrubbed source.
+    if (is_scvtf || is_ucvtf) {
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      // Scrub to lane 0: keep the low 32 bits (the scalar int), zero bytes [15:4].
+      builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+      if (is_scvtf) {
+        // SCVTF: signed int32 -> FP32 is native.
+        builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        SetVRegFull(args.rd, xn, /*q=*/false);
+        return;
+      }
+      // UCVTF: CVTDQ2PS + per-lane 2^32 addend for MSB-set lanes.
+      FpRegister msb = AllocTempSimdReg();
+      FpRegister addend = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});  // 0 or all-1s
+      builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
+      Register gp =
+          std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F800000)));  // 2^32
+      builder_.Gen<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
+      builder_.Gen<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());
+      builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
+      SetVRegFull(args.rd, xn, /*q=*/false);
+      return;
+    }
+    const bool is_unsigned = is_fcvtzu;
     if (!is_unsigned) {
       // FCVTZS scalar (S): mirror the kFcvtzsV FP32 recipe on a lane-0-scrubbed
       // source (CVTTPS2DQ + NaN->0 + positive-overflow->INT32_MAX fix-up).
