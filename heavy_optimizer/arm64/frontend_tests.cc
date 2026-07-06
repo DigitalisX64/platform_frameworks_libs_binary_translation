@@ -3833,6 +3833,12 @@ constexpr uint32_t SubVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t 
 constexpr uint32_t MulVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b10011, rd, rn, rm);
 }
+// PMUL (vector, polynomial): U=1, opcode=10011, size=00.
+constexpr uint32_t PmulVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeSame(q, /*u=*/true, /*size=*/0b00, /*opcode=*/0b10011, rd, rn, rm);
+}
+static_assert(PmulVec(/*q=*/true, 0, 1, 2) == 0x6e229c20u);   // pmul v0.16b,v1.16b,v2.16b
+static_assert(PmulVec(/*q=*/false, 0, 1, 2) == 0x2e229c20u);  // pmul v0.8b,v1.8b,v2.8b
 // MLA (vector): U=0, opcode=10010.
 constexpr uint32_t MlaVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeSame(q, /*u=*/false, size, /*opcode=*/0b10010, rd, rn, rm);
@@ -6979,6 +6985,37 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SabdVec16B) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x7E7F7E7F20200505ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFF010203010103ULL);
+}
+
+// PMUL .16B (size=00, Q=1): per-byte polynomial (carry-less GF(2)) multiply,
+// low 8 bits. Both 64-bit halves active. Expected values computed by the
+// reference carry-less byte multiply (0xFF*0xFF -> 0x55, etc.).
+TEST_F(Arm64HeavyOptimizerFrontendTest, PmulVec16B) {
+  static const uint32_t code[] = {PmulVec(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFF807F0102030405ULL, 0x1122334455667788ULL);  // Vn
+  SetV128(&state_, 2, 0xFF01FF80F0110503ULL, 0x8899AABBCCDDEEFFULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x5580D580E033140FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x08121E2C3C2E2A78ULL);
+}
+
+// PMUL .8B (size=00, Q=0): D-form — only the low 64 bits are computed and
+// Vd[127:64] is zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, PmulVec8B) {
+  static const uint32_t code[] = {PmulVec(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFF807F0102030405ULL, 0x1122334455667788ULL);  // Vn
+  SetV128(&state_, 2, 0xFF01FF80F0110503ULL, 0x8899AABBCCDDEEFFULL);  // Vm
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);  // poison Vd
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x5580D580E033140FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);  // upper 64 bits zeroed
 }
 
 // UABD .8H (size=01, Q=1): per-halfword unsigned absolute difference. Needs

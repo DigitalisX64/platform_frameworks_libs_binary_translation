@@ -2735,6 +2735,67 @@ class HeavyOptimizerFrontend {
     const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
     const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
 
+    // PMUL polynomial multiply (vector, byte lanes). ARM ARM C7.2.219: per-lane
+    // carry-less (GF(2)[x]) multiply keeping the low 8 bits. The decoder pins
+    // size=00 (.8B/.16B); other sizes are reserved. Mirror of
+    // lite_translator.h::AdvSimdThreeSame kPmul's per-bit unrolled SSE2 recipe
+    // (no PCLMULQDQ dependency):
+    //   acc = 0; bit = 0x01 (byte-replicated)
+    //   for i in 0..7:
+    //     shifted_a = (a << i) per byte, byte-masked with (0xFF<<i)&0xFF
+    //     selector  = ((b & bit) PCMPEQB bit)   -> 0xFF per byte where bit i set
+    //     acc      ^= shifted_a & selector
+    //     bit      += bit   (PADDB doubles 0x01->0x02->...->0x80, no overflow)
+    // PSLLW shifts whole 16-bit lanes, so the low byte's high bits spill into the
+    // adjacent byte; the PAND with shift_mask = -bit re-zeros those spilled bits
+    // in every byte. Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kPmul) {
+      if (args.size != 0b00) {
+        UndefinedReturningVoid();  // decoder pins size=00; defensive bail.
+        return;
+      }
+      FpRegister xa = AllocTempSimdReg();
+      FpRegister xb = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xa.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xb.machine_reg(), vm_off);
+      // acc/zero pre-zeroed (AllocZeroedSimdReg avoids a use-before-def
+      // self-PXOR on a fresh temp — see lifetime.h reg_class_ CHECK).
+      FpRegister xacc = AllocZeroedSimdReg();
+      FpRegister xzero = AllocZeroedSimdReg();
+      // bit = 0x01 replicated across all 16 bytes (MOVQ zero-extends, then
+      // PUNPCKLQDQ broadcasts the low 64 into the high 64).
+      FpRegister xbit = AllocTempSimdReg();
+      Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0101010101010101LL}));
+      builder_.Gen<x86_64::MovqXRegReg>(xbit.machine_reg(), gp);
+      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
+      FpRegister xshift = AllocTempSimdReg();
+      FpRegister xsel = AllocTempSimdReg();
+      for (int i = 0; i < 8; ++i) {
+        // shifted_a = (a << i) per byte, byte-masked.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xshift.machine_reg(), xa.machine_reg());
+        if (i != 0) {
+          builder_.Gen<x86_64::PsllwXRegImm>(xshift.machine_reg(), static_cast<int8_t>(i));
+          // shift_mask = -bit per byte = (0xFF<<i)&0xFF.
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xzero.machine_reg());
+          builder_.Gen<x86_64::PsubbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
+        }
+        // selector = (b & bit) PCMPEQB bit -> 0xFF per byte where bit i set.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xb.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+        builder_.Gen<x86_64::PcmpeqbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+        // acc ^= shifted_a & selector.
+        builder_.Gen<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xacc.machine_reg(), xshift.machine_reg());
+        // Double bit for the next iteration (skip after the last bit).
+        if (i != 7) {
+          builder_.Gen<x86_64::PaddbXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
+        }
+      }
+      SetVRegFull(args.rd, xacc, args.q);
+      return;
+    }
+
     // CMGE/CMHI/CMHS (signed >= / unsigned > / unsigned >=) — handled here as
     // self-contained sequences because their result does not always land in vn
     // (the accumulator the shared switch below assumes) and the unsigned forms
