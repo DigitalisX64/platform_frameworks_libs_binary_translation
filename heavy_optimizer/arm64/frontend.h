@@ -2735,6 +2735,67 @@ class HeavyOptimizerFrontend {
     const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
     const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
 
+    // PMUL polynomial multiply (vector, byte lanes). ARM ARM C7.2.219: per-lane
+    // carry-less (GF(2)[x]) multiply keeping the low 8 bits. The decoder pins
+    // size=00 (.8B/.16B); other sizes are reserved. Mirror of
+    // lite_translator.h::AdvSimdThreeSame kPmul's per-bit unrolled SSE2 recipe
+    // (no PCLMULQDQ dependency):
+    //   acc = 0; bit = 0x01 (byte-replicated)
+    //   for i in 0..7:
+    //     shifted_a = (a << i) per byte, byte-masked with (0xFF<<i)&0xFF
+    //     selector  = ((b & bit) PCMPEQB bit)   -> 0xFF per byte where bit i set
+    //     acc      ^= shifted_a & selector
+    //     bit      += bit   (PADDB doubles 0x01->0x02->...->0x80, no overflow)
+    // PSLLW shifts whole 16-bit lanes, so the low byte's high bits spill into the
+    // adjacent byte; the PAND with shift_mask = -bit re-zeros those spilled bits
+    // in every byte. Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kPmul) {
+      if (args.size != 0b00) {
+        UndefinedReturningVoid();  // decoder pins size=00; defensive bail.
+        return;
+      }
+      FpRegister xa = AllocTempSimdReg();
+      FpRegister xb = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xa.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xb.machine_reg(), vm_off);
+      // acc/zero pre-zeroed (AllocZeroedSimdReg avoids a use-before-def
+      // self-PXOR on a fresh temp — see lifetime.h reg_class_ CHECK).
+      FpRegister xacc = AllocZeroedSimdReg();
+      FpRegister xzero = AllocZeroedSimdReg();
+      // bit = 0x01 replicated across all 16 bytes (MOVQ zero-extends, then
+      // PUNPCKLQDQ broadcasts the low 64 into the high 64).
+      FpRegister xbit = AllocTempSimdReg();
+      Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0101010101010101LL}));
+      builder_.Gen<x86_64::MovqXRegReg>(xbit.machine_reg(), gp);
+      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
+      FpRegister xshift = AllocTempSimdReg();
+      FpRegister xsel = AllocTempSimdReg();
+      for (int i = 0; i < 8; ++i) {
+        // shifted_a = (a << i) per byte, byte-masked.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xshift.machine_reg(), xa.machine_reg());
+        if (i != 0) {
+          builder_.Gen<x86_64::PsllwXRegImm>(xshift.machine_reg(), static_cast<int8_t>(i));
+          // shift_mask = -bit per byte = (0xFF<<i)&0xFF.
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xzero.machine_reg());
+          builder_.Gen<x86_64::PsubbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
+        }
+        // selector = (b & bit) PCMPEQB bit -> 0xFF per byte where bit i set.
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xb.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+        builder_.Gen<x86_64::PcmpeqbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+        // acc ^= shifted_a & selector.
+        builder_.Gen<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xacc.machine_reg(), xshift.machine_reg());
+        // Double bit for the next iteration (skip after the last bit).
+        if (i != 7) {
+          builder_.Gen<x86_64::PaddbXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
+        }
+      }
+      SetVRegFull(args.rd, xacc, args.q);
+      return;
+    }
+
     // CMGE/CMHI/CMHS (signed >= / unsigned > / unsigned >=) — handled here as
     // self-contained sequences because their result does not always land in vn
     // (the accumulator the shared switch below assumes) and the unsigned forms
@@ -6181,6 +6242,86 @@ class HeavyOptimizerFrontend {
         }
       }
       SetVRegNarrow(args.rd, x, /*q=*/false);
+      return;
+    }
+    // Scalar SQABS/SQNEG Vd, Vn — single-lane saturating signed absolute
+    // value / negate. Mirrors the vector kSqabs/kSqneg SSE recipe
+    // (lite_translator.h) on a lane-0-scrubbed source: scrub Vn so lanes 1..
+    // become the integer 0 (SQABS(0)=SQNEG(0)=0, never the saturating input),
+    // apply the packed abs/neg + INT_MIN->INT_MAX saturation, then commit with
+    // SetVRegFull q=false (MOVSD low-64, upper 64 zeroed). size=00/01/10
+    // (B/H/S); size=11 (D) needs PCMPGTQ/PCMPEQQ 64-bit lanes and bails to lite
+    // — the same boundary as the vector .2D form. Matches interpreter
+    // AdvSimdScalarTwoRegMisc kSqabs/kSqneg.
+    if (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqabs ||
+        args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();  // D-width: bail to lite (64-bit-lane saturation).
+        return;
+      }
+      const bool is_neg =
+          (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg);
+      const int32_t vn_off_sq =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off_sq);
+      // Scrub to lane 0: keep the low (1<<size) bytes, zero everything above,
+      // so lanes 1.. hold the integer 0.
+      const int8_t scrub = static_cast<int8_t>(16 - (1 << args.size));  // 15,14,12
+      builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), scrub);
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), scrub);
+      FpRegister xres = AllocTempSimdReg();
+      // xtmp is defined below by MovD (INT_MIN broadcast) — no self-op on a
+      // fresh temp; the branches use AllocZeroedSimdReg for their zero source
+      // to avoid the lifetime-analysis use-before-def on a self-PXOR.
+      FpRegister xtmp = AllocTempSimdReg();
+      if (is_neg) {
+        // SQNEG: res = 0 - xn (packed).  xres starts at zero (copied from a
+        // zeroed reg so the def is a MOVDQA, not a use-before-def self-PXOR).
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(),
+                                             AllocZeroedSimdReg().machine_reg());
+        switch (args.size) {
+          case 0b00: builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+          default:   builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+        }
+      } else {
+        // SQABS: sign = PCMPGT(0, xn); res = (xn ^ sign) - sign = |xn|.
+        FpRegister xsign = AllocZeroedSimdReg();
+        switch (args.size) {
+          case 0b00: builder_.Gen<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+          default:   builder_.Gen<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+        }
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xsign.machine_reg());
+        switch (args.size) {
+          case 0b00: builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+          default:   builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+        }
+      }
+      // Saturation: INT_MIN lanes still hold INT_MIN (0x80..0) after abs/neg;
+      // XOR with an all-1s mask on those lanes turns INT_MIN -> INT_MAX. A
+      // 32-bit broadcast pattern covers all three widths (the INT_MIN bit
+      // repeats every 32 bits at byte/half/word granularity). xtmp is dead
+      // here (sign mask consumed for SQABS; never set for SQNEG).
+      int32_t int_min_bcast;
+      switch (args.size) {
+        case 0b00: int_min_bcast = static_cast<int32_t>(0x80808080u); break;
+        case 0b01: int_min_bcast = static_cast<int32_t>(0x80008000u); break;
+        default:   int_min_bcast = static_cast<int32_t>(0x80000000u); break;
+      }
+      Register gp_min = std::get<0>(Gen<x86_64::MovlRegImm>(int_min_bcast));
+      builder_.Gen<x86_64::MovdXRegReg>(xtmp.machine_reg(), gp_min);
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(xtmp.machine_reg(), xtmp.machine_reg(), int8_t{0x00});
+      switch (args.size) {
+        case 0b00: builder_.Gen<x86_64::PcmpeqbXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+        case 0b01: builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+        default:   builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+      }
+      builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+      SetVRegFull(args.rd, xres, /*q=*/false);
       return;
     }
     const bool is_fcvtzs =
