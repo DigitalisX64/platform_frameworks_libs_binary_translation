@@ -4436,6 +4436,22 @@ static_assert(SqxtnScalar(true, 0b10, 0b10100, 0, 1) == 0x7ea14820u);   // uqxtn
 static_assert(SqxtnScalar(true, 0b00, 0b10010, 0, 1) == 0x7e212820u);   // sqxtun b0, h1
 static_assert(SqxtnScalar(true, 0b10, 0b10010, 0, 1) == 0x7ea12820u);   // sqxtun s0, d1
 
+// AdvSIMD scalar two-reg misc SQABS (U=0) / SQNEG (U=1), opcode=00111:
+// 01 U 11110 size 10000 00111 10 Rn Rd.  size: 00=B,01=H,10=S,11=D.
+// Encodings confirmed with clang --target=aarch64 + llvm-objdump.
+constexpr uint32_t SqabsScalar(bool is_neg, uint8_t size, uint8_t rd, uint8_t rn) {
+  return 0x5e207800u | (static_cast<uint32_t>(is_neg) << 29) |
+         (static_cast<uint32_t>(size) << 22) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(SqabsScalar(false, 0b00, 0, 1) == 0x5e207820u);  // sqabs b0, b1
+static_assert(SqabsScalar(false, 0b01, 0, 1) == 0x5e607820u);  // sqabs h0, h1
+static_assert(SqabsScalar(false, 0b10, 0, 1) == 0x5ea07820u);  // sqabs s0, s1
+static_assert(SqabsScalar(false, 0b11, 0, 1) == 0x5ee07820u);  // sqabs d0, d1
+static_assert(SqabsScalar(true,  0b00, 0, 1) == 0x7e207820u);  // sqneg b0, b1
+static_assert(SqabsScalar(true,  0b01, 0, 1) == 0x7e607820u);  // sqneg h0, h1
+static_assert(SqabsScalar(true,  0b10, 0, 1) == 0x7ea07820u);  // sqneg s0, s1
+static_assert(SqabsScalar(true,  0b11, 0, 1) == 0x7ee07820u);  // sqneg d0, d1
+
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
     bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -7618,6 +7634,109 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtunScalarBInRange) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(VLo64(&state_, 0), 0x00000000000000C8ULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQABS S (size=10): |5| = 5.  Upper source lanes poisoned to prove the
+// lane-0 scrub does not leak into Vd.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqabsScalarSPos) {
+  static const uint32_t code[] = {SqabsScalar(false, 0b10, 0, 1)};  // sqabs s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA00000005ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=5
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000005ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQABS S: |-7| (0xFFFFFFF9) = 7.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqabsScalarSNeg) {
+  static const uint32_t code[] = {SqabsScalar(false, 0b10, 0, 1)};  // sqabs s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAAFFFFFFF9ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=-7
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000007ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQABS S saturation: |INT32_MIN| overflows -> INT32_MAX (0x7FFFFFFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqabsScalarSSat) {
+  static const uint32_t code[] = {SqabsScalar(false, 0b10, 0, 1)};  // sqabs s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA80000000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=INT32_MIN
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQNEG S: -(5) = -5 (0xFFFFFFFB).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqnegScalarSPos) {
+  static const uint32_t code[] = {SqabsScalar(true, 0b10, 0, 1)};  // sqneg s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA00000005ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=5
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFBULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQNEG S saturation: -(INT32_MIN) overflows -> INT32_MAX (0x7FFFFFFF).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqnegScalarSSat) {
+  static const uint32_t code[] = {SqabsScalar(true, 0b10, 0, 1)};  // sqneg s0, s1
+  SetV128(&state_, 1, 0xAAAAAAAA80000000ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.s[0]=INT32_MIN
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQABS B (size=00) saturation: |INT8_MIN| (0x80) -> INT8_MAX (0x7F),
+// stored in the low byte with the upper bytes zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqabsScalarBSat) {
+  static const uint32_t code[] = {SqabsScalar(false, 0b00, 0, 1)};  // sqabs b0, b1
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAA80ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.b[0]=0x80
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000007FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQNEG H (size=01): -(3) = -3 (0xFFFD) in the low halfword.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqnegScalarHNeg) {
+  static const uint32_t code[] = {SqabsScalar(true, 0b01, 0, 1)};  // sqneg h0, h1
+  SetV128(&state_, 1, 0xAAAAAAAAAAAA0003ULL, 0xBBBBBBBBBBBBBBBBULL);  // Vn.h[0]=3
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFDULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQABS/SQNEG D (size=11) needs 64-bit-lane saturation -> heavy bails.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqabsScalarDBails) {
+  static const uint32_t code[] = {SqabsScalar(false, 0b11, 0, 1)};  // sqabs d0, d1
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 // Scalar SQDMULH B (size=00) is unallocated for this opcode and must bail.

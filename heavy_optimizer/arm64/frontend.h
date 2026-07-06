@@ -6183,6 +6183,86 @@ class HeavyOptimizerFrontend {
       SetVRegNarrow(args.rd, x, /*q=*/false);
       return;
     }
+    // Scalar SQABS/SQNEG Vd, Vn — single-lane saturating signed absolute
+    // value / negate. Mirrors the vector kSqabs/kSqneg SSE recipe
+    // (lite_translator.h) on a lane-0-scrubbed source: scrub Vn so lanes 1..
+    // become the integer 0 (SQABS(0)=SQNEG(0)=0, never the saturating input),
+    // apply the packed abs/neg + INT_MIN->INT_MAX saturation, then commit with
+    // SetVRegFull q=false (MOVSD low-64, upper 64 zeroed). size=00/01/10
+    // (B/H/S); size=11 (D) needs PCMPGTQ/PCMPEQQ 64-bit lanes and bails to lite
+    // — the same boundary as the vector .2D form. Matches interpreter
+    // AdvSimdScalarTwoRegMisc kSqabs/kSqneg.
+    if (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqabs ||
+        args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();  // D-width: bail to lite (64-bit-lane saturation).
+        return;
+      }
+      const bool is_neg =
+          (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg);
+      const int32_t vn_off_sq =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off_sq);
+      // Scrub to lane 0: keep the low (1<<size) bytes, zero everything above,
+      // so lanes 1.. hold the integer 0.
+      const int8_t scrub = static_cast<int8_t>(16 - (1 << args.size));  // 15,14,12
+      builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), scrub);
+      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), scrub);
+      FpRegister xres = AllocTempSimdReg();
+      // xtmp is defined below by MovD (INT_MIN broadcast) — no self-op on a
+      // fresh temp; the branches use AllocZeroedSimdReg for their zero source
+      // to avoid the lifetime-analysis use-before-def on a self-PXOR.
+      FpRegister xtmp = AllocTempSimdReg();
+      if (is_neg) {
+        // SQNEG: res = 0 - xn (packed).  xres starts at zero (copied from a
+        // zeroed reg so the def is a MOVDQA, not a use-before-def self-PXOR).
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(),
+                                             AllocZeroedSimdReg().machine_reg());
+        switch (args.size) {
+          case 0b00: builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+          default:   builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+        }
+      } else {
+        // SQABS: sign = PCMPGT(0, xn); res = (xn ^ sign) - sign = |xn|.
+        FpRegister xsign = AllocZeroedSimdReg();
+        switch (args.size) {
+          case 0b00: builder_.Gen<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+          default:   builder_.Gen<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+        }
+        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xsign.machine_reg());
+        switch (args.size) {
+          case 0b00: builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+          case 0b01: builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+          default:   builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+        }
+      }
+      // Saturation: INT_MIN lanes still hold INT_MIN (0x80..0) after abs/neg;
+      // XOR with an all-1s mask on those lanes turns INT_MIN -> INT_MAX. A
+      // 32-bit broadcast pattern covers all three widths (the INT_MIN bit
+      // repeats every 32 bits at byte/half/word granularity). xtmp is dead
+      // here (sign mask consumed for SQABS; never set for SQNEG).
+      int32_t int_min_bcast;
+      switch (args.size) {
+        case 0b00: int_min_bcast = static_cast<int32_t>(0x80808080u); break;
+        case 0b01: int_min_bcast = static_cast<int32_t>(0x80008000u); break;
+        default:   int_min_bcast = static_cast<int32_t>(0x80000000u); break;
+      }
+      Register gp_min = std::get<0>(Gen<x86_64::MovlRegImm>(int_min_bcast));
+      builder_.Gen<x86_64::MovdXRegReg>(xtmp.machine_reg(), gp_min);
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(xtmp.machine_reg(), xtmp.machine_reg(), int8_t{0x00});
+      switch (args.size) {
+        case 0b00: builder_.Gen<x86_64::PcmpeqbXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+        case 0b01: builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+        default:   builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+      }
+      builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+      SetVRegFull(args.rd, xres, /*q=*/false);
+      return;
+    }
     const bool is_fcvtzs =
         (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs);
     const bool is_fcvtzu =
