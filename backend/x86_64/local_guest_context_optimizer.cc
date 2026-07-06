@@ -88,25 +88,61 @@ void LocalGuestContextOptimizer::RemoveLocalGuestContextAccesses(
 
     size_t general_reg_count = 0;
     size_t simd_reg_count = 0;
+    // region digitalis
+    // The subset of offsets that can ever hold a live mapping (only optimized
+    // offsets are ever recorded in mem_reg_map_). Iterating just these keeps the
+    // per-instruction def-invalidation below cheap (bounded by the reg limits)
+    // instead of scanning all of CPUState.
+    ArenaVector<size_t> optimized_offset_list(machine_ir_->arena());
+    // endregion digitalis
     for (auto [offset, unused_counter] : sorted_offsets) {
       // TODO(b/232598137): Account for f and v register classes.
       // Simd regs.
       if (IsSimdOffset(offset)) {
         if (simd_reg_count++ < params.simd_reg_limit) {
           optimized_offsets[offset] = true;
+          // region digitalis
+          optimized_offset_list.push_back(offset);
+          // endregion digitalis
         }
         continue;
       }
       // General regs and flags.
       if (general_reg_count++ < params.general_reg_limit) {
         optimized_offsets[offset] = true;
+        // region digitalis
+        optimized_offset_list.push_back(offset);
+        // endregion digitalis
       }
     }
 
     for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); insn_it++) {
+      auto* insn = AsMachineInsnX86_64(*insn_it);
+      // region digitalis
+      // Invalidate any cached offset whose register is redefined by this insn.
+      // A destructive 2-address op (e.g. `psubd xn, xm`, kUseDef on xn) mutates
+      // xn in place; if a prior Get cached xn as holding some guest offset, that
+      // cache is now stale and must not be forwarded to a later Get of the same
+      // offset. Runs BEFORE this insn's own Get records its dst, so a Get does
+      // not self-invalidate the mapping it is about to establish. This preserves
+      // riscv64 behaviour (its frontend never redefines a context-load register
+      // while it is mapped, so the invalidation never fires there).
+      for (int i = 0; i < insn->NumRegOperands(); i++) {
+        if (!insn->RegKindAt(i).IsDef()) {
+          continue;
+        }
+        MachineReg def_reg = insn->RegAt(i);
+        for (size_t off : optimized_offset_list) {
+          auto& entry = mem_reg_map_[off];
+          if (entry.has_value() && std::holds_alternative<MachineReg>(entry.value().value) &&
+              std::get<MachineReg>(entry.value().value) == def_reg) {
+            entry = std::nullopt;
+          }
+        }
+      }
+      // endregion digitalis
       // Skip insn if it accesses regs with low priority
       if (machine_ir_->IsCPUStateGet(*insn_it) || machine_ir_->IsCPUStatePut(*insn_it)) {
-        auto* insn = AsMachineInsnX86_64(*insn_it);
         if (!optimized_offsets.at(insn->disp())) {
           continue;
         }
