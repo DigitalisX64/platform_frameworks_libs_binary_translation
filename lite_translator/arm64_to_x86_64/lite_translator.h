@@ -20650,6 +20650,45 @@ class LiteTranslator {
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
           return;
         }
+        // SHL .8B / .16B byte form JIT via PSLLW + per-byte AND mask.
+        //
+        // x86 has no packed byte shift.  Shift the 16-bit words left by n
+        // (PSLLW), which computes each byte's `<< n` but leaks the low
+        // byte's high bits into the neighbouring high byte.  AND each byte
+        // with (0xFF << n) & 0xFF strips those spilled bits (which are the
+        // low n bits of each byte), yielding the per-byte `(Vn[i] << n) &
+        // 0xFF` that ARM SHL specifies.  n = immh:immb - 8 = immb ∈ [0, 7].
+        //
+        // Scalar B SHL is not encoded (scalar SHL is D-form only — the
+        // decoder forces immh bit 3), so is_byte && args.scalar can't
+        // co-occur; bail defensively.
+        if (is_byte && args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t n = args.immb;  // 0..7
+          SimdRegister xn = AllocTempSimdReg();
+          if (xn == no_simd_register) { success_ = false; return; }
+          SimdRegister xmask = AllocTempSimdReg();
+          if (xmask == no_simd_register) { success_ = false; return; }
+          Register tmp = AllocTempReg();
+          if (tmp == no_register) { success_ = false; return; }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          if (n != 0) {
+            as_.Psllw(xn, static_cast<int8_t>(n));
+          }
+          const uint8_t mbyte = static_cast<uint8_t>((0xFFu << n) & 0xFFu);
+          const uint64_t mword = 0x0101010101010101ULL * mbyte;
+          as_.Movq(tmp, static_cast<int64_t>(mword));
+          as_.Movq(xmask, tmp);               // low 64 = mword, high 64 = 0
+          as_.Pinsrq(xmask, tmp, int8_t{1});  // high 64 = mword
+          as_.Pand(xn, xmask);
+          if (!args.q) {
+            // Zero upper 64 bits of Vd (D-register semantics).
+            as_.Pslldq(xn, int8_t{8});
+            as_.Psrldq(xn, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
         if (is_byte) { success_ = false; return; }
         const bool is_left = (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl);
         uint8_t esize_bits;

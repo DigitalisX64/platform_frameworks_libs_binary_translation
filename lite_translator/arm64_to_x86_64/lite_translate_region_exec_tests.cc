@@ -34123,6 +34123,60 @@ TEST_F(Arm64LiteTranslateRegionTest, ShlVec2D) {
   }
 }
 
+// SHL (byte, by immediate) vector JIT — PSLLW + per-byte AND mask.
+// x86 has no packed byte shift; verify each byte is (Vn[i] << n) & 0xFF and
+// that cross-byte spillover from the neighbouring low byte is masked off.
+constexpr uint32_t kShlVec16B_3 = 0x4f0b5420;  // shl v0.16b, v1.16b, #3
+constexpr uint32_t kShlVec8B_5  = 0x0f0d5420;  // shl v0.8b,  v1.8b,  #5
+constexpr uint32_t kShlVec16B_0 = 0x4f085420;  // shl v0.16b, v1.16b, #0
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec16BByImm3Jit) {
+  uint8_t in[16] = {0x00, 0x01, 0x7F, 0x80, 0xFF, 0x12, 0x34, 0x56,
+                    0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kShlVec16B_3};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    uint8_t want = static_cast<uint8_t>(in[i] << 3);
+    EXPECT_EQ(r[i], want) << "lane " << i << " in=0x" << std::hex
+                          << static_cast<int>(in[i]);
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec8BByImm5UpperZeroJit) {
+  uint8_t in[16] = {0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF,
+                    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kShlVec8B_5};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(r[i], static_cast<uint8_t>(in[i] << 5)) << "lane " << i;
+  }
+  for (int i = 8; i < 16; ++i) {
+    EXPECT_EQ(r[i], 0u) << "upper lane " << i << " not zeroed";
+  }
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, ShlVec16BByImm0IdentityJit) {
+  uint8_t in[16] = {0x00, 0x01, 0x7F, 0x80, 0xFF, 0x12, 0x34, 0x56,
+                    0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF};
+  std::memcpy(&state_.cpu.v[1], in, 16);
+  std::memset(&state_.cpu.v[0], 0xAA, 16);
+  static const uint32_t code[] = {kShlVec16B_0};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint8_t r[16];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(r[i], in[i]) << "lane " << i;
+  }
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, UshrVec8H) {
   uint16_t in[8] = {0x0000, 0xFFFF, 0x0008, 0x8000, 0x1234, 0xABCD, 0x00FF, 0x0F0F};
   std::memcpy(&state_.cpu.v[1], in, 16);

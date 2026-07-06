@@ -401,6 +401,31 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (L << 21) | (M << 20) | (Rm << 16) | (sel.opc << 12) | (H << 11) |
            (rn << 5) | rd;
   }
+
+  // SHL Vd.T, Vn.T, #shift (AdvSIMD shift-by-immediate, U=0 opcode=01010).
+  // Covers every size class the heavy tier lowers: byte immh=0001 (this
+  // cycle's new PSLLW + per-byte-AND arm), half immh=001x, word immh=01xx,
+  // double immh=1xxx. shift ∈ [0, esize-1] via immh:immb - esize. rd samples
+  // rd==rn to stress destructive clobber.
+  uint32_t GenNeonShlByImm() {
+    uint32_t q = Rnd() & 1;
+    uint32_t esize_sel = Rnd() % 4;  // 0=byte 1=half 2=word 3=double
+    uint32_t immh, immb;
+    if (esize_sel == 0) {  // byte: esize 8, immh=0001, shift 0..7
+      immh = 0b0001;
+      immb = Rnd() % 8;
+    } else {
+      uint32_t esize = 8u << esize_sel;              // 16, 32, 64
+      uint32_t immh_immb = esize + (Rnd() % esize);  // [esize, 2*esize-1]
+      immh = (immh_immb >> 3) & 0xF;
+      immb = immh_immb & 0x7;
+    }
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);
+    return (q << 30) | (0u << 29) | (0b01111u << 24) | (0u << 23) |
+           (immh << 19) | (immb << 16) | (0b01010u << 11) | (1u << 10) |
+           (rn << 5) | rd;
+  }
 };
 
 // -------------------------------------------------------------------------
@@ -519,6 +544,27 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxMull) {
   EXPECT_GT(compared, 300) << "heavy accepted too few widening by-element encodings";
 }
 
+// Single-instruction SHL-by-immediate across every size class the heavy tier
+// lowers (byte via PSLLW + per-byte AND mask, half/word/double via
+// PSLL{W,D,Q}). Byte was the only SHL arm still bailing before this cycle.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonShlByImm) {
+  Seed(0x5417B00B12345678ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonShlByImm()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few SHL-by-immediate encodings";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -601,6 +647,25 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_mull_umlsl) << "widening generator no longer produces UMLSL";
   EXPECT_TRUE(saw_mull_q1) << "widening generator no longer produces the *2 high-half select";
   EXPECT_TRUE(saw_mull_word) << "widening generator no longer produces word sources";
+
+  bool saw_shl_byte = false, saw_shl_half = false, saw_shl_word = false;
+  bool saw_shl_dbl = false, saw_shl_alias = false;
+  Seed(0x5417C0DE0BADF00DULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonShlByImm();
+    uint32_t immh = (insn >> 19) & 0xF;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (immh == 0b0001) saw_shl_byte = true;               // .8B/.16B (new arm)
+    else if ((immh & 0b1110) == 0b0010) saw_shl_half = true;  // 0010/0011
+    else if ((immh & 0b1100) == 0b0100) saw_shl_word = true;  // 0100..0111
+    else if (immh & 0b1000) saw_shl_dbl = true;              // 1xxx
+    if (rd == rn) saw_shl_alias = true;
+  }
+  EXPECT_TRUE(saw_shl_byte) << "SHL generator no longer produces byte lanes";
+  EXPECT_TRUE(saw_shl_half) << "SHL generator no longer produces halfword lanes";
+  EXPECT_TRUE(saw_shl_word) << "SHL generator no longer produces word lanes";
+  EXPECT_TRUE(saw_shl_dbl) << "SHL generator no longer produces doubleword lanes";
+  EXPECT_TRUE(saw_shl_alias) << "SHL generator no longer produces rd==rn (clobber class)";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
