@@ -7046,8 +7046,30 @@ class HeavyOptimizerFrontend {
       case Decoder::AdvSimdShiftImmOpcode::kUshr:
       case Decoder::AdvSimdShiftImmOpcode::kSshr: {
         // esize from immh: bit3->64, bit2->32, bit1->16, bit0->8 (byte, no
-        // x86 packed shift -> bail to lite, which widens via PMOVSX/PACKSS).
+        // x86 packed shift). SHL byte JITs here via PSLLW + per-byte AND
+        // mask; SSHR/USHR byte still bail to lite (PMOVSX/PACKSS widen).
         if (immh == 0b0001) {  // byte lane
+          if (args.opcode == Decoder::AdvSimdShiftImmOpcode::kShl) {
+            // Byte SHL by n (n = immh:immb - 8, range 0..7). x86 has no
+            // packed byte shift, so shift the 16-bit words left by n
+            // (PSLLW), then AND each byte with (0xFF << n) & 0xFF to drop
+            // the bits that spilled across the byte boundary from the
+            // neighbouring low byte. Mirrors the lite byte-SHL lowering.
+            const uint8_t n = static_cast<uint8_t>(immh_immb - 8);
+            FpRegister xn = AllocTempSimdReg();
+            builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(n));
+            const uint8_t mbyte = static_cast<uint8_t>((0xFFu << n) & 0xFFu);
+            const uint64_t mword = 0x0101010101010101ULL * mbyte;
+            FpRegister mask = AllocTempSimdReg();
+            Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(mword)));
+            builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
+            // Broadcast the low 64-bit mask to the high 64 bits.
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(mask.machine_reg(), mask.machine_reg(), int8_t{0x44});
+            builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+            SetVRegFull(args.rd, xn, args.q);
+            return;
+          }
           UndefinedReturningVoid();
           return;
         }
