@@ -407,7 +407,7 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameRegion) {
 // producing them fails loudly rather than making the fuzzer vacuous.
 TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   bool saw_alias_rd_rn = false, saw_alias_rd_rm = false, saw_add_2d = false;
-  bool saw_addp_2d = false, saw_pairwise_minmax = false;
+  bool saw_addp_2d = false, saw_pairwise_minmax = false, saw_plain_minmax = false;
   Seed(0xC0FFEE0011223344ULL);
   for (int i = 0; i < 40000; i++) {
     uint32_t insn = GenNeonThreeSame();
@@ -418,12 +418,14 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
     if (opcode == 0x10 && size == 3) saw_add_2d = true;  // ADD/SUB .2D
     if (opcode == 0x17 && size == 3 && q == 1) saw_addp_2d = true;  // ADDP .2D
     if (opcode == 0x14 || opcode == 0x15) saw_pairwise_minmax = true;  // S/U MAXP/MINP
+    if (opcode == 0x0C || opcode == 0x0D) saw_plain_minmax = true;  // S/U MAX/MIN
   }
   EXPECT_TRUE(saw_alias_rd_rn) << "three-same generator no longer produces rd==rn (clobber class)";
   EXPECT_TRUE(saw_alias_rd_rm) << "three-same generator no longer produces rd==rm (clobber class)";
   EXPECT_TRUE(saw_add_2d) << "three-same generator no longer produces ADD/SUB .2D";
   EXPECT_TRUE(saw_addp_2d) << "three-same generator no longer produces ADDP .2D";
   EXPECT_TRUE(saw_pairwise_minmax) << "three-same generator no longer produces pairwise min/max";
+  EXPECT_TRUE(saw_plain_minmax) << "three-same generator no longer produces plain min/max";
 
   bool saw_div = false, saw_var_shift = false;
   Seed(0xD00D1E0055667788ULL);
