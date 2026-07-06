@@ -4117,6 +4117,67 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // BIC / ORN (vector bitwise AND-NOT / OR-NOT) — mirror of lite_translator.h.
+    // Element-size-independent bit ops that read only Vn/Vm, but need the PANDN /
+    // ones-materialize sequences rather than a single in-place op, so they live
+    // here rather than the shared vn-only switch below.
+    //   BIC  Vd = Vn AND NOT Vm.  x86 PANDN(dst, src) = ~dst & src, so
+    //        PANDN(xm, xn) lands ~Vm & Vn in xm.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBic) {
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());
+      SetVRegFull(args.rd, xm, args.q);
+      return;
+    }
+    //   ORN  Vd = Vn OR NOT Vm.  Materialize all-ones via self-PCMPEQD on a
+    //        pre-zeroed vreg (AllocZeroedSimdReg establishes a def before the
+    //        self-compare), XOR into xm to get ~Vm, then OR with xn.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kOrn) {
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister ones = AllocZeroedSimdReg();  // def before the self-compare
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // CMTST (test bits) — mirror of lite_translator.h. Vd = (Vn & Vm) != 0 ?
+    // all-ones : 0 per lane. PAND, compare the AND result against zero (yielding
+    // all-ones where the lane IS zero), then invert so the non-zero lanes are
+    // set. Byte/halfword/word use PCMPEQ{B,W,D} (SSE2); the .2D (size=11) form
+    // uses PCMPEQQ (SSE4.1) — bail cleanly if absent, matching lite.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmtst) {
+      if (args.size == 0b11 && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn & Vm
+      FpRegister z = AllocZeroedSimdReg();  // zero, proper def for the self-compare below
+      switch (args.size) {
+        case 0b00: builder_.Gen<x86_64::PcmpeqbXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
+        case 0b01: builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
+        case 0b10: builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
+        default:   builder_.Gen<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
+      }
+      // z is now dead as the zero comparand; clobber it to all-ones (it already
+      // has a def, so the self-PCMPEQD is legal) and XOR to invert the mask.
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(z.machine_reg(), z.machine_reg());  // z = -1
+      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), z.machine_reg());
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {

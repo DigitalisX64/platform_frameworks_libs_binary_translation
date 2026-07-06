@@ -301,6 +301,8 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
       uint8_t opcode;
       bool allow_2d;
     } kOpc[] = {
+        {0x03, true},   // logical group: AND/BIC/ORR/ORN (U=0, size 00/01/10/11)
+                        //                EOR/BSL/BIT/BIF (U=1, size 00/01/10/11)
         {0x06, false},  // CMGT
         {0x07, false},  // CMGE
         {0x0C, false},  // SMAX
@@ -408,17 +410,22 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameRegion) {
 TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   bool saw_alias_rd_rn = false, saw_alias_rd_rm = false, saw_add_2d = false;
   bool saw_addp_2d = false, saw_pairwise_minmax = false, saw_plain_minmax = false;
+  bool saw_bic = false, saw_orn = false, saw_cmtst = false;
   Seed(0xC0FFEE0011223344ULL);
   for (int i = 0; i < 40000; i++) {
     uint32_t insn = GenNeonThreeSame();
     uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
     uint32_t opcode = (insn >> 11) & 0x1F, size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    uint32_t u = (insn >> 29) & 1;
     if (rd == rn) saw_alias_rd_rn = true;
     if (rd == rm) saw_alias_rd_rm = true;
     if (opcode == 0x10 && size == 3) saw_add_2d = true;  // ADD/SUB .2D
     if (opcode == 0x17 && size == 3 && q == 1) saw_addp_2d = true;  // ADDP .2D
     if (opcode == 0x14 || opcode == 0x15) saw_pairwise_minmax = true;  // S/U MAXP/MINP
     if (opcode == 0x0C || opcode == 0x0D) saw_plain_minmax = true;  // S/U MAX/MIN
+    if (opcode == 0x03 && u == 0 && size == 1) saw_bic = true;  // BIC
+    if (opcode == 0x03 && u == 0 && size == 3) saw_orn = true;  // ORN
+    if (opcode == 0x11 && u == 0) saw_cmtst = true;             // CMTST
   }
   EXPECT_TRUE(saw_alias_rd_rn) << "three-same generator no longer produces rd==rn (clobber class)";
   EXPECT_TRUE(saw_alias_rd_rm) << "three-same generator no longer produces rd==rm (clobber class)";
@@ -426,6 +433,9 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_addp_2d) << "three-same generator no longer produces ADDP .2D";
   EXPECT_TRUE(saw_pairwise_minmax) << "three-same generator no longer produces pairwise min/max";
   EXPECT_TRUE(saw_plain_minmax) << "three-same generator no longer produces plain min/max";
+  EXPECT_TRUE(saw_bic) << "three-same generator no longer produces BIC";
+  EXPECT_TRUE(saw_orn) << "three-same generator no longer produces ORN";
+  EXPECT_TRUE(saw_cmtst) << "three-same generator no longer produces CMTST";
 
   bool saw_div = false, saw_var_shift = false;
   Seed(0xD00D1E0055667788ULL);
