@@ -309,12 +309,17 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
         {0x11, false},  // CMTST (U=0) / CMEQ (U=1)
         {0x12, false},  // MLA (U=1) / MLS ; keep byte/half/word
         {0x13, false},  // MUL (U=0) / PMUL (U=1, size=00)
+        {0x14, false},  // SMAXP (U=0) / UMAXP (U=1) ; byte/half/word (.2D bails)
+        {0x15, false},  // SMINP (U=0) / UMINP (U=1)
+        {0x17, true},   // ADDP (U=0 only); allow .2D (size=11, Q=1)
     };
     const auto& sel = kOpc[Rnd() % (sizeof(kOpc) / sizeof(kOpc[0]))];
     uint32_t q = Rnd() & 1, u = Rnd() & 1;
     uint32_t size = sel.allow_2d ? (Rnd() % 4) : (Rnd() % 3);
     // PMUL (opcode 0x13, U=1) is size=00 only.
     if (sel.opcode == 0x13 && u == 1) size = 0;
+    // ADDP (opcode 0x17) is U=0 only; U=1 is decoder-Undefined.
+    if (sel.opcode == 0x17) u = 0;
     uint32_t rn = Rnd() % 8, rm = Rnd() % 8;
     uint32_t r = Rnd() % 3;
     uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));  // alias rn / rm / free
@@ -402,18 +407,23 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameRegion) {
 // producing them fails loudly rather than making the fuzzer vacuous.
 TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   bool saw_alias_rd_rn = false, saw_alias_rd_rm = false, saw_add_2d = false;
+  bool saw_addp_2d = false, saw_pairwise_minmax = false;
   Seed(0xC0FFEE0011223344ULL);
   for (int i = 0; i < 40000; i++) {
     uint32_t insn = GenNeonThreeSame();
     uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
-    uint32_t opcode = (insn >> 11) & 0x1F, size = (insn >> 22) & 3;
+    uint32_t opcode = (insn >> 11) & 0x1F, size = (insn >> 22) & 3, q = (insn >> 30) & 1;
     if (rd == rn) saw_alias_rd_rn = true;
     if (rd == rm) saw_alias_rd_rm = true;
     if (opcode == 0x10 && size == 3) saw_add_2d = true;  // ADD/SUB .2D
+    if (opcode == 0x17 && size == 3 && q == 1) saw_addp_2d = true;  // ADDP .2D
+    if (opcode == 0x14 || opcode == 0x15) saw_pairwise_minmax = true;  // S/U MAXP/MINP
   }
   EXPECT_TRUE(saw_alias_rd_rn) << "three-same generator no longer produces rd==rn (clobber class)";
   EXPECT_TRUE(saw_alias_rd_rm) << "three-same generator no longer produces rd==rm (clobber class)";
   EXPECT_TRUE(saw_add_2d) << "three-same generator no longer produces ADD/SUB .2D";
+  EXPECT_TRUE(saw_addp_2d) << "three-same generator no longer produces ADDP .2D";
+  EXPECT_TRUE(saw_pairwise_minmax) << "three-same generator no longer produces pairwise min/max";
 
   bool saw_div = false, saw_var_shift = false;
   Seed(0xD00D1E0055667788ULL);
