@@ -77,10 +77,12 @@ cc_test_library {
         "libberberis_decoder_arm64_headers",
         "libberberis_guest_state_arm64_headers",
         "libberberis_heavy_optimizer_arm64_headers",
+        "libberberis_interpreter_arm64_headers",
         "libberberis_intrinsics_riscv64_headers",
         "libberberis_runtime_primitives_headers",
     ],
     srcs: [
         "frontend_tests.cc",
+        "heavy_differential_fuzz_tests.cc",
     ],
 }

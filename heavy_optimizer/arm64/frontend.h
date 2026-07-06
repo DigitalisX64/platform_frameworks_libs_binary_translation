@@ -3824,6 +3824,232 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // ADDP (pairwise add) vector — mirror of lite_translator.h's kAddp. Vd =
+    // pair(Vn) || pair(Vm) where pair(X)[i] = X[2i] + X[2i+1]. 8H/4S map to
+    // PHADDW/PHADDD directly (SSSE3 — ARM's concat-then-pair layout); 4H/2S use
+    // the same op then PSHUFD 0x08 to gather the two low pair-lanes into the low
+    // 64 bits; byte lanes emulate via PSRLW-8 + PADDB (even bytes hold the pair
+    // sums) then truncate each halfword's low byte and PACKUSWB; .2D (size=11
+    // Q=1) has no PHADDQ, so PSHUFD 0xEE + PADDQ + PUNPCKLQDQ. .1D (size=11 Q=0)
+    // is ARM-reserved. SetVRegFull's Q=0 merge zeroes Vd[127:64].
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kAddp) {
+      // Halfword/word forms need PHADDW/PHADDD (SSSE3); byte and .2D are SSE2.
+      if ((args.size == 0b01 || args.size == 0b10) && !host_platform::kHasSSSE3) {
+        UndefinedReturningVoid();
+        return;
+      }
+      if (args.size == 0b11 && !args.q) {  // .1D reserved
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      switch (args.size) {
+        case 0b00: {
+          FpRegister tmp_n = AllocTempSimdReg();
+          FpRegister tmp_m = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(tmp_n.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(tmp_m.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PsrlwXRegImm>(tmp_n.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PsrlwXRegImm>(tmp_m.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PaddbXRegXReg>(xn.machine_reg(), tmp_n.machine_reg());
+          builder_.Gen<x86_64::PaddbXRegXReg>(xm.machine_reg(), tmp_m.machine_reg());
+          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
+          builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+          if (args.q) {
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xm.machine_reg(), xm.machine_reg());
+            builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          }
+          break;
+        }
+        case 0b01:
+          builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (!args.q) {
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                    int8_t{0x08});
+          }
+          break;
+        case 0b10:
+          builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (!args.q) {
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                    int8_t{0x08});
+          }
+          break;
+        case 0b11: {  // .2D (Q=1); .1D already bailed above.
+          FpRegister tmp = AllocTempSimdReg();
+          builder_.Gen<x86_64::PshufdXRegXRegImm>(tmp.machine_reg(), xn.machine_reg(),
+                                                  static_cast<int8_t>(0xEE));
+          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), tmp.machine_reg());
+          builder_.Gen<x86_64::PshufdXRegXRegImm>(tmp.machine_reg(), xm.machine_reg(),
+                                                  static_cast<int8_t>(0xEE));
+          builder_.Gen<x86_64::PaddqXRegXReg>(xm.machine_reg(), tmp.machine_reg());
+          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        }
+      }
+      SetVRegFull(args.rd, xn, args.q);
+      return;
+    }
+
+    // SMAXP/SMINP/UMAXP/UMINP (pairwise signed/unsigned max/min) — mirror of
+    // lite_translator.h. Vd = pair(Vn) || pair(Vm), pair(X)[i] = op(X[2i],
+    // X[2i+1]). No horizontal-pairwise min/max exists in SSE; gather even/odd
+    // lanes (PSHUFB for byte/halfword, PSHUFD 0x88/0xDD for dword), lane-wise
+    // PMAX/PMIN, then concatenate the Vn and Vm partials. size=11 (.2D) needs
+    // 64-bit packed min/max (AVX-512) — bail to lite/interpreter.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmaxp ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kSminp ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmaxp ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kUminp) {
+      if (args.size == 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_max =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmaxp ||
+           args.opcode == Decoder::AdvSimdThreeSameOpcode::kUmaxp);
+      const bool is_signed =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSmaxp ||
+           args.opcode == Decoder::AdvSimdThreeSameOpcode::kSminp);
+      // Feature gate mirrors lite: PMAXSB/PMINSB/PMAXSD/PMINSD/PMAXUW/PMINUW/
+      // PMAXUD/PMINUD -> SSE4.1; PMAXSW/PMINSW/PMAXUB/PMINUB -> SSE2. Byte and
+      // halfword even/odd gathers need PSHUFB (SSSE3).
+      const bool needs_sse4_1 =
+          (is_signed && args.size == 0b00) ||
+          (is_signed && args.size == 0b10) ||
+          (!is_signed && args.size == 0b01) ||
+          (!is_signed && args.size == 0b10);
+      if (needs_sse4_1 && !host_platform::kHasSSE4_1) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool needs_ssse3 = (args.size == 0b00 || args.size == 0b01);
+      if (needs_ssse3 && !host_platform::kHasSSSE3) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      auto pmax_pmin = [&](FpRegister dst, FpRegister src) {
+        switch (args.size) {
+          case 0b00:
+            if (is_signed) {
+              if (is_max) builder_.Gen<x86_64::PmaxsbXRegXReg>(dst.machine_reg(), src.machine_reg());
+              else builder_.Gen<x86_64::PminsbXRegXReg>(dst.machine_reg(), src.machine_reg());
+            } else {
+              if (is_max) builder_.Gen<x86_64::PmaxubXRegXReg>(dst.machine_reg(), src.machine_reg());
+              else builder_.Gen<x86_64::PminubXRegXReg>(dst.machine_reg(), src.machine_reg());
+            }
+            break;
+          case 0b01:
+            if (is_signed) {
+              if (is_max) builder_.Gen<x86_64::PmaxswXRegXReg>(dst.machine_reg(), src.machine_reg());
+              else builder_.Gen<x86_64::PminswXRegXReg>(dst.machine_reg(), src.machine_reg());
+            } else {
+              if (is_max) builder_.Gen<x86_64::PmaxuwXRegXReg>(dst.machine_reg(), src.machine_reg());
+              else builder_.Gen<x86_64::PminuwXRegXReg>(dst.machine_reg(), src.machine_reg());
+            }
+            break;
+          case 0b10:
+            if (is_signed) {
+              if (is_max) builder_.Gen<x86_64::PmaxsdXRegXReg>(dst.machine_reg(), src.machine_reg());
+              else builder_.Gen<x86_64::PminsdXRegXReg>(dst.machine_reg(), src.machine_reg());
+            } else {
+              if (is_max) builder_.Gen<x86_64::PmaxudXRegXReg>(dst.machine_reg(), src.machine_reg());
+              else builder_.Gen<x86_64::PminudXRegXReg>(dst.machine_reg(), src.machine_reg());
+            }
+            break;
+        }
+      };
+      if (args.size == 0b00 || args.size == 0b01) {
+        // Byte/halfword: build PSHUFB even/odd gather masks from immediates
+        // (upper qword 0x80 => PSHUFB writes zero there), gather each operand's
+        // even and odd lanes into the low 8 bytes, PMAX/PMIN them to form the
+        // 8-byte partial pair(Vn) / pair(Vm), then concatenate.
+        FpRegister even_mask = AllocTempSimdReg();
+        FpRegister odd_mask = AllocTempSimdReg();
+        FpRegister evens_n = AllocTempSimdReg();
+        FpRegister odds_n = AllocTempSimdReg();
+        FpRegister evens_m = AllocTempSimdReg();
+        FpRegister odds_m = AllocTempSimdReg();
+        int64_t even_lo, even_hi, odd_lo, odd_hi;
+        if (args.size == 0b00) {
+          even_lo = static_cast<int64_t>(0x0E0C0A0806040200LL);
+          even_hi = static_cast<int64_t>(0x8080808080808080ULL);
+          odd_lo = static_cast<int64_t>(0x0F0D0B0907050301LL);
+          odd_hi = static_cast<int64_t>(0x8080808080808080ULL);
+        } else {
+          even_lo = static_cast<int64_t>(0x0D0C090805040100LL);
+          even_hi = static_cast<int64_t>(0x8080808080808080ULL);
+          odd_lo = static_cast<int64_t>(0x0F0E0B0A07060302LL);
+          odd_hi = static_cast<int64_t>(0x8080808080808080ULL);
+        }
+        Register elo = std::get<0>(Gen<x86_64::MovqRegImm>(even_lo));
+        builder_.Gen<x86_64::MovqXRegReg>(even_mask.machine_reg(), elo);
+        Register ehi = std::get<0>(Gen<x86_64::MovqRegImm>(even_hi));
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(even_mask.machine_reg(), ehi, int8_t{1});
+        Register olo = std::get<0>(Gen<x86_64::MovqRegImm>(odd_lo));
+        builder_.Gen<x86_64::MovqXRegReg>(odd_mask.machine_reg(), olo);
+        Register ohi = std::get<0>(Gen<x86_64::MovqRegImm>(odd_hi));
+        builder_.Gen<x86_64::PinsrqXRegRegImm>(odd_mask.machine_reg(), ohi, int8_t{1});
+
+        builder_.Gen<x86_64::MovdqaXRegXReg>(evens_n.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PshufbXRegXReg>(evens_n.machine_reg(), even_mask.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(odds_n.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PshufbXRegXReg>(odds_n.machine_reg(), odd_mask.machine_reg());
+        pmax_pmin(evens_n, odds_n);  // low 8 bytes hold pair(Vn)
+
+        builder_.Gen<x86_64::MovdqaXRegXReg>(evens_m.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PshufbXRegXReg>(evens_m.machine_reg(), even_mask.machine_reg());
+        builder_.Gen<x86_64::MovdqaXRegXReg>(odds_m.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PshufbXRegXReg>(odds_m.machine_reg(), odd_mask.machine_reg());
+        pmax_pmin(evens_m, odds_m);  // low 8 bytes hold pair(Vm)
+
+        if (args.q) {
+          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PunpckldqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
+        }
+        SetVRegFull(args.rd, evens_n, args.q);
+        return;
+      }
+      // size == 0b10 (.4S / .2S): dword pairwise via PSHUFD even/odd lift.
+      // 0x88 => {d0,d2,d0,d2}; 0xDD => {d1,d3,d1,d3}; PMAX/PMIN yields pair(X)
+      // replicated in both halves. Q=1 concatenates the low qwords; Q=0 packs
+      // dwords 0 and 2 into positions 0,1 with a final PSHUFD 0x08.
+      FpRegister evens_n = AllocTempSimdReg();
+      FpRegister odds_n = AllocTempSimdReg();
+      FpRegister evens_m = AllocTempSimdReg();
+      FpRegister odds_m = AllocTempSimdReg();
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(evens_n.machine_reg(), xn.machine_reg(),
+                                              static_cast<int8_t>(0x88));
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(odds_n.machine_reg(), xn.machine_reg(),
+                                              static_cast<int8_t>(0xDD));
+      pmax_pmin(evens_n, odds_n);
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(evens_m.machine_reg(), xm.machine_reg(),
+                                              static_cast<int8_t>(0x88));
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(odds_m.machine_reg(), xm.machine_reg(),
+                                              static_cast<int8_t>(0xDD));
+      pmax_pmin(evens_m, odds_m);
+      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
+      if (!args.q) {
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(evens_n.machine_reg(), evens_n.machine_reg(),
+                                                int8_t{0x08});
+      }
+      SetVRegFull(args.rd, evens_n, args.q);
+      return;
+    }
+
     // Validate the (opcode, size) pair up front and emit nothing on bail. After
     // this switch every reachable case has a single allowlisted packed op.
     switch (args.opcode) {
