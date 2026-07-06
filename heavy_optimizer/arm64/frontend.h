@@ -7878,6 +7878,123 @@ class HeavyOptimizerFrontend {
       return;
     }
     using Op = Decoder::AdvSimdVecXIdxOpcode;
+
+    // Widening MUL/MAC by element: SMULL/UMULL/SMLAL/UMLAL/SMLSL/UMLSL.
+    // Heavy-tier mirror of lite_translator.h's widening by-element arms
+    // (size=01: .4h/.8h -> .4s; size=10: .2s/.4s -> .2d). The destination is
+    // always 128-bit regardless of Q — widening forms do NOT zero the upper
+    // half, so SetVRegFull(rd, res, /*q=*/true) stores the full register.
+    //   *MULL : Vd  = widen(Vn.selected) * widen(broadcast(Vm.lane[index]))
+    //   *MLAL : Vd += widen(Vn.selected) * widen(broadcast(Vm.lane[index]))
+    //   *MLSL : Vd -= widen(Vn.selected) * widen(broadcast(Vm.lane[index]))
+    // Q=0 selects the low source half (Vn bytes 0..7); Q=1 selects the high
+    // half (Vn bytes 8..15) — brought into the low quad by PSRLDQ 8 before the
+    // register-form PMOVSX/PMOVZX widen (the lite tier uses a memory-operand
+    // PMOVSX at vn_off+(q?8:0); heavy has no such op, so shift-then-widen).
+    // Both signed 16x16 and unsigned 16x16 products fit in 32 bits, so PMULLD's
+    // signed low-32 result is correct for both forms at size=01; size=10 uses
+    // PMULDQ (signed) / PMULUDQ (unsigned) for the 32x32 -> 64 products.
+    //
+    // Verified encodings (ARM ARM C7.2):
+    //   smull  v0.4s, v1.4h, v2.h[0] = 0x0F42A020
+    //   umull  v0.4s, v1.4h, v2.h[0] = 0x2F42A020
+    //   smlal  v0.4s, v1.4h, v2.h[0] = 0x0F422020
+    //   smlsl  v0.4s, v1.4h, v2.h[0] = 0x0F426020
+    //   smull  v0.2d, v1.2s, v2.s[0] = 0x0F82A020
+    //   umlal  v0.2d, v1.2s, v2.s[0] = 0x2F822020
+    if (args.opcode == Op::kSmullIdx || args.opcode == Op::kUmullIdx ||
+        args.opcode == Op::kSmlalIdx || args.opcode == Op::kUmlalIdx ||
+        args.opcode == Op::kSmlslIdx || args.opcode == Op::kUmlslIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool w_signed = (args.opcode == Op::kSmullIdx ||
+                             args.opcode == Op::kSmlalIdx ||
+                             args.opcode == Op::kSmlslIdx);
+      const bool w_accum = (args.opcode == Op::kSmlalIdx ||
+                            args.opcode == Op::kUmlalIdx ||
+                            args.opcode == Op::kSmlslIdx ||
+                            args.opcode == Op::kUmlslIdx);
+      const bool w_sub = (args.opcode == Op::kSmlslIdx ||
+                          args.opcode == Op::kUmlslIdx);
+
+      const int32_t w_vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t w_vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      const int32_t w_vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+      FpRegister wm = AllocTempSimdReg();
+      FpRegister wn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(wm.machine_reg(), w_vm_off);
+      builder_.GenGetSimd<16>(wn.machine_reg(), w_vn_off);
+      // Bring Vn's selected source half (Q=1 -> bytes 8..15) into the low quad.
+      if (args.q) {
+        builder_.Gen<x86_64::PsrldqXRegImm>(wn.machine_reg(), int8_t{8});
+      }
+
+      if (args.size == 0b01) {
+        // Broadcast Vm.h[index] across all 8 halfword lanes.
+        if (args.index >= 4) {
+          builder_.Gen<x86_64::PsrldqXRegImm>(wm.machine_reg(), int8_t{8});
+        }
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        builder_.Gen<x86_64::PshuflwXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), imm);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), int8_t{0x44});
+        // Widen low 4 halfwords of each source to 4 x 32-bit lanes.
+        if (w_signed) {
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(wm.machine_reg(), wm.machine_reg());
+          builder_.Gen<x86_64::PmovsxwdXRegXReg>(wn.machine_reg(), wn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(wm.machine_reg(), wm.machine_reg());
+          builder_.Gen<x86_64::PmovzxwdXRegXReg>(wn.machine_reg(), wn.machine_reg());
+        }
+        builder_.Gen<x86_64::PmulldXRegXReg>(wn.machine_reg(), wm.machine_reg());
+        FpRegister w_result = wn;
+        if (w_accum) {
+          FpRegister wd = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(wd.machine_reg(), w_vd_off);
+          if (w_sub) {
+            builder_.Gen<x86_64::PsubdXRegXReg>(wd.machine_reg(), wn.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PadddXRegXReg>(wd.machine_reg(), wn.machine_reg());
+          }
+          w_result = wd;
+        }
+        SetVRegFull(args.rd, w_result, /*q=*/true);
+        return;
+      }
+
+      // size=10: word sources -> .2d. Broadcast Vm.s[index] across all 4 dword
+      // lanes; PMULDQ/PMULUDQ read dword positions 0 and 2, so the broadcast
+      // suffices (no widen of Vm). Widen Vn's low 2 dwords to 2 qword lanes.
+      {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), imm);
+      }
+      if (w_signed) {
+        builder_.Gen<x86_64::PmovsxdqXRegXReg>(wn.machine_reg(), wn.machine_reg());
+        builder_.Gen<x86_64::PmuldqXRegXReg>(wn.machine_reg(), wm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PmovzxdqXRegXReg>(wn.machine_reg(), wn.machine_reg());
+        builder_.Gen<x86_64::PmuludqXRegXReg>(wn.machine_reg(), wm.machine_reg());
+      }
+      FpRegister w_result = wn;
+      if (w_accum) {
+        FpRegister wd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(wd.machine_reg(), w_vd_off);
+        if (w_sub) {
+          builder_.Gen<x86_64::PsubqXRegXReg>(wd.machine_reg(), wn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PaddqXRegXReg>(wd.machine_reg(), wn.machine_reg());
+        }
+        w_result = wd;
+      }
+      SetVRegFull(args.rd, w_result, /*q=*/true);
+      return;
+    }
+
     if (args.opcode != Op::kMul && args.opcode != Op::kMla &&
         args.opcode != Op::kMls) {
       UndefinedReturningVoid();
