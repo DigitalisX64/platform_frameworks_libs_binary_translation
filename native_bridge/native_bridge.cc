@@ -399,25 +399,42 @@ native_bridge_namespace_t* NdktNativeBridge::CreateNamespace(
                                                   parent_ns->host_namespace);
 
   // region digitalis
-  // Append ARM64 system library paths to the guest namespace so the guest linker
-  // can find proxy libraries (libandroid.so, libvulkan.so, etc.) that live in
-  // /system/lib64/arm64/. The guest namespace linking mechanism doesn't work
-  // reliably because the guest linker config only has a single "default" namespace
-  // while the framework expects multiple exported namespaces (system, com_android_art, etc.).
   std::string guest_default_path;
+  std::string guest_permitted;
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // Do NOT add /system/lib64/arm64 to an app's (isolated) namespace search or
+  // permitted paths. Real Android keeps app classloader namespaces isolated from
+  // the system namespace: the app can only load its own libs plus the NDK public
+  // libraries reached through the namespace *link* (shared instances that resolve
+  // their own symbols in the system namespace). Adding the system path let the app
+  // namespace load its own copies of non-public system libraries (libutils,
+  // libc++, libandroid_runtime, ...). Because those copies then live in the app's
+  // symbol scope, an app library's *strong* replaceable symbol — most importantly
+  // Unity's GLOBAL `operator new` in libunity.so — interposes for them. A system
+  // library calling `operator new` was thus routed into the app's not-yet-
+  // initialized allocator and crashed (Honkai: Star Rail SIGILL on libunity's
+  // encrypted lazy-init path). Proxy/public libraries the app legitimately needs
+  // (libandroid.so, libvulkan.so, libEGL.so, ...) still resolve via the framework's
+  // linkNamespaces() link to the guest "default" namespace, which has the ARM64
+  // system search path, so this only removes the incorrect direct-load fallback.
+  guest_default_path = (default_library_path != nullptr) ? default_library_path : "";
+  guest_permitted = (permitted_when_isolated_path != nullptr) ? permitted_when_isolated_path : "";
+#else
+  // Non-arm64 guests keep the original behaviour (append the guest system search
+  // path) — this fix is validated for the arm64 guest only.
   if (default_library_path != nullptr) {
     guest_default_path = default_library_path;
     guest_default_path += ":/system/lib64/arm64/bootstrap:/system/lib64/arm64";
   } else {
     guest_default_path = "/system/lib64/arm64/bootstrap:/system/lib64/arm64";
   }
-  std::string guest_permitted;
   if (permitted_when_isolated_path != nullptr) {
     guest_permitted = permitted_when_isolated_path;
     guest_permitted += ":/system/lib64/arm64/bootstrap:/system/lib64/arm64";
   } else {
     guest_permitted = "/system/lib64/arm64/bootstrap:/system/lib64/arm64";
   }
+#endif
   DIGITALIS_LOG("createNamespace guest: name=%s default_path=%s permitted=%s",
                 name, guest_default_path.c_str(), guest_permitted.c_str());
   // endregion
