@@ -4418,6 +4418,24 @@ static_assert(CvtfScalar(true, false, 0, 1) == 0x7e21d820u);   // ucvtf s0, s1
 static_assert(CvtfScalar(false, true, 0, 1) == 0x5e61d820u);   // scvtf d0, d1
 static_assert(CvtfScalar(true, true, 0, 1) == 0x7e61d820u);    // ucvtf d0, d1
 
+// AdvSIMD scalar two-register misc saturating extract-narrow SQXTN/UQXTN/SQXTUN:
+// 01 U 11110 size 1 0000 opcode(5) 10 Rn Rd. size selects the dst lane width
+// (00=B from H, 01=H from S, 10=S from D). SQXTN/UQXTN opcode=0b10100 (U=0/1),
+// SQXTUN opcode=0b10010 (U=1). llvm-mc-21 encoding checks below.
+constexpr uint32_t SqxtnScalar(bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn) {
+  return 0x5e200800u | (static_cast<uint32_t>(u) << 29) |
+         (static_cast<uint32_t>(size) << 22) | (static_cast<uint32_t>(opcode) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(SqxtnScalar(false, 0b00, 0b10100, 0, 1) == 0x5e214820u);  // sqxtn  b0, h1
+static_assert(SqxtnScalar(false, 0b01, 0b10100, 0, 1) == 0x5e614820u);  // sqxtn  h0, s1
+static_assert(SqxtnScalar(false, 0b10, 0b10100, 0, 1) == 0x5ea14820u);  // sqxtn  s0, d1
+static_assert(SqxtnScalar(true, 0b00, 0b10100, 0, 1) == 0x7e214820u);   // uqxtn  b0, h1
+static_assert(SqxtnScalar(true, 0b01, 0b10100, 0, 1) == 0x7e614820u);   // uqxtn  h0, s1
+static_assert(SqxtnScalar(true, 0b10, 0b10100, 0, 1) == 0x7ea14820u);   // uqxtn  s0, d1
+static_assert(SqxtnScalar(true, 0b00, 0b10010, 0, 1) == 0x7e212820u);   // sqxtun b0, h1
+static_assert(SqxtnScalar(true, 0b10, 0b10010, 0, 1) == 0x7ea12820u);   // sqxtun s0, d1
+
 // AdvSIMD three different: 0 Q U 01110 size 1 Rm opcode(4) 00 Rn Rd.
 constexpr uint32_t AdvSimdThreeDiff(
     bool q, bool u, uint8_t size, uint8_t opcode, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -7494,6 +7512,112 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, CvtfScalarDBails) {
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
   EXPECT_EQ(n, 0u);
+}
+
+// Scalar SQXTN S (size=10, D->S): in-range 64-bit signed value narrows exactly.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnScalarSInRange) {
+  static const uint32_t code[] = {SqxtnScalar(false, 0b10, 0b10100, 0, 1)};  // sqxtn s0, d1
+  SetV128(&state_, 1, 0x0000000012345678ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000012345678ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQXTN S: +2^32 > INT32_MAX -> 0x7FFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnScalarSPosOverflow) {
+  static const uint32_t code[] = {SqxtnScalar(false, 0b10, 0b10100, 0, 1)};  // sqxtn s0, d1
+  SetV128(&state_, 1, 0x0000000100000000ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQXTN S: -2^32 < INT32_MIN -> 0x80000000.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnScalarSNegOverflow) {
+  static const uint32_t code[] = {SqxtnScalar(false, 0b10, 0b10100, 0, 1)};  // sqxtn s0, d1
+  SetV128(&state_, 1, 0xFFFFFFFF00000000ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000080000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQXTN B (size=00, H->B): 0x1234 signed > 127 -> 0x7F. Upper source
+// lanes are poisoned to prove the lane-0 scrub does not leak.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtnScalarBSat) {
+  static const uint32_t code[] = {SqxtnScalar(false, 0b00, 0b10100, 0, 1)};  // sqxtn b0, h1
+  SetV128(&state_, 1, 0xAAAAAAAAAAAA1234ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000007FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar UQXTN S (size=10, D->S unsigned): value > UINT32_MAX -> 0xFFFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqxtnScalarSSat) {
+  static const uint32_t code[] = {SqxtnScalar(true, 0b10, 0b10100, 0, 1)};  // uqxtn s0, d1
+  SetV128(&state_, 1, 0x0000000123456789ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar UQXTN H (size=01, S->H unsigned): value > UINT16_MAX -> 0xFFFF. Upper
+// source lanes poisoned.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqxtnScalarHSat) {
+  static const uint32_t code[] = {SqxtnScalar(true, 0b01, 0b10100, 0, 1)};  // uqxtn h0, s1
+  SetV128(&state_, 1, 0xBBBBBBBB0001FFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQXTUN S (size=10, D->S signed->unsigned): negative source -> 0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtunScalarSNeg) {
+  static const uint32_t code[] = {SqxtnScalar(true, 0b10, 0b10010, 0, 1)};  // sqxtun s0, d1
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// Scalar SQXTUN B (size=00, H->B signed->unsigned): 200 in [0,255] -> 0xC8.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqxtunScalarBInRange) {
+  static const uint32_t code[] = {SqxtnScalar(true, 0b00, 0b10010, 0, 1)};  // sqxtun b0, h1
+  SetV128(&state_, 1, 0xCCCCCCCCCCCC00C8ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000000000C8ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
 }
 
 // Scalar SQDMULH B (size=00) is unallocated for this opcode and must bail.

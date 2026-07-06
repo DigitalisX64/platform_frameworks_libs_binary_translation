@@ -6070,6 +6070,119 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
+    // Scalar saturating extract-narrow SQXTN/UQXTN/SQXTUN Vd.<Tb>, Vn.<Ta> —
+    // single-lane collapse of the vector kSqxtn/kUqxtn/kSqxtun recipe (see
+    // AdvSimdTwoRegMisc). size=00 (H->B), 01 (S->H), 10 (D->S); size=11 is
+    // decoder-rejected. Scrub the source to lane 0 (keep the low 2<<size source
+    // bytes, zero the rest) so the packed vector recipe processes only the
+    // scalar element while lanes 1.. stay 0 (saturate(0)=0), then commit with
+    // SetVRegNarrow q=false (MOVSD low-64, upper 64 zeroed) for the scalar
+    // Vd[127:esize]=0 result. Mirrors interpreter kSqxtn/kUqxtn/kSqxtun.
+    if (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtn ||
+        args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kUqxtn ||
+        args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun) {
+      const auto opc = args.opcode;
+      const int32_t vn_off_narrow =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      FpRegister x = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(x.machine_reg(), vn_off_narrow);
+      // Scrub to lane 0: keep the low (2<<size) source bytes, zero everything
+      // above (PSLLDQ N + PSRLDQ N, N = 16 - src_bytes).
+      const int8_t scrub = static_cast<int8_t>(16 - (2 << args.size));  // 14,12,8
+      builder_.Gen<x86_64::PslldqXRegImm>(x.machine_reg(), scrub);
+      builder_.Gen<x86_64::PsrldqXRegImm>(x.machine_reg(), scrub);
+      if (args.size == 0b10) {
+        // 64->32: no 64->32 x86 pack, so clamp each 64-bit lane into the
+        // destination range with PCMPGTQ/PCMPEQQ masked blends and gather the
+        // two low dwords with PSHUFD — bit-exact mirror of the vector size=10
+        // path. The scrubbed lane 1 is 0 -> clamp(0)=0 -> gathered dword=0.
+        auto set_const = [&](FpRegister r, int64_t v) {
+          Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(v));
+          builder_.Gen<x86_64::MovqXRegReg>(r.machine_reg(), gp);
+          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
+        };
+        // x = (x & ~mask) | (val & mask), via x ^= (x ^ val) & mask.
+        auto blend = [&](FpRegister val, FpRegister mask) {
+          FpRegister t = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
+          builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), t.machine_reg());
+        };
+        if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtn) {
+          FpRegister c = AllocTempSimdReg();
+          FpRegister m = AllocTempSimdReg();
+          set_const(c, int64_t{0x000000007FFFFFFFLL});  // INT32_MAX
+          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > MAX
+          blend(c, m);
+          set_const(c, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
+          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
+          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < MIN
+          blend(c, m);
+        } else if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun) {
+          FpRegister c = AllocTempSimdReg();
+          FpRegister m = AllocTempSimdReg();
+          set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
+          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > UMAX
+          blend(c, m);
+          FpRegister z = AllocZeroedSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), z.machine_reg());
+          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < 0
+          builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), x.machine_reg());     // neg -> 0
+          builder_.Gen<x86_64::MovdqaXRegXReg>(x.machine_reg(), m.machine_reg());
+        } else {  // kUqxtn: unsigned uint64 -> clamp to UINT32_MAX
+          FpRegister c = AllocTempSimdReg();
+          FpRegister m = AllocTempSimdReg();
+          set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
+          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+          builder_.Gen<x86_64::PsrlqXRegImm>(m.machine_reg(), int8_t{32});  // high 32 bits
+          FpRegister z = AllocZeroedSimdReg();
+          builder_.Gen<x86_64::PcmpeqqXRegXReg>(m.machine_reg(), z.machine_reg());  // high32==0
+          FpRegister t = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), c.machine_reg());
+          builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), t.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), m.machine_reg());
+        }
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(),
+                                                int8_t{0b00001000});
+        SetVRegNarrow(args.rd, x, /*q=*/false);
+        return;
+      }
+      // 8<-16 / 16<-32: x86 narrowing packs against a zeroed high source.
+      FpRegister xz = AllocZeroedSimdReg();
+      if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kUqxtn) {
+        FpRegister xm = AllocTempSimdReg();
+        Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(
+            args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
+                              : int64_t{0x0000FFFF0000FFFFLL}));
+        builder_.Gen<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PminuwXRegXReg>(x.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PackuswbXRegXReg>(x.machine_reg(), xz.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PminudXRegXReg>(x.machine_reg(), xm.machine_reg());
+          builder_.Gen<x86_64::PackusdwXRegXReg>(x.machine_reg(), xz.machine_reg());
+        }
+      } else if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun) {
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PackuswbXRegXReg>(x.machine_reg(), xz.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PackusdwXRegXReg>(x.machine_reg(), xz.machine_reg());
+        }
+      } else {  // kSqxtn
+        if (args.size == 0b00) {
+          builder_.Gen<x86_64::PacksswbXRegXReg>(x.machine_reg(), xz.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PackssdwXRegXReg>(x.machine_reg(), xz.machine_reg());
+        }
+      }
+      SetVRegNarrow(args.rd, x, /*q=*/false);
+      return;
+    }
     const bool is_fcvtzs =
         (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtzs);
     const bool is_fcvtzu =
