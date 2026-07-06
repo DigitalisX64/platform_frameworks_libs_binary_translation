@@ -328,6 +328,42 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) |
            (rm << 16) | (static_cast<uint32_t>(sel.opcode) << 11) | (1u << 10) | (rn << 5) | rd;
   }
+
+  // AdvSIMD vector x indexed element, integer MUL/MLA/MLS by element — the
+  // subset the heavy tier lowers (halfword size=01 index 0..7, word size=10
+  // index 0..3). rd may alias rn or the indexed Vm to sample destructive
+  // clobber. Encoding: 0 Q U 01111 size L M Rm opcode H 0 Rn Rd, with
+  //   MUL: U=0 opcode=1000, MLA: U=1 opcode=0000, MLS: U=1 opcode=0100.
+  uint32_t GenNeonVecXIdxMul() {
+    static const struct {
+      uint32_t u;
+      uint32_t opc;
+    } kOpc[] = {{0, 0b1000}, {1, 0b0000}, {1, 0b0100}};
+    const auto& sel = kOpc[Rnd() % 3];
+    uint32_t q = Rnd() & 1;
+    uint32_t size = 1 + (Rnd() & 1);  // 01 (H) or 10 (S)
+    uint32_t vm = Rnd() % 8;          // <16 keeps halfword Rm valid; M=0 for word
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M, Rm;
+    if (size == 1) {  // halfword: index 0..7 = H:L:M, Vm 0..15
+      uint32_t index = Rnd() % 8;
+      H = index >> 2;
+      L = (index >> 1) & 1;
+      M = index & 1;
+      Rm = vm;
+    } else {  // word: index 0..3 = H:L, Vm = M:Rm
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+      M = 0;
+      Rm = vm;
+    }
+    return (q << 30) | (sel.u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (sel.opc << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
 };
 
 // -------------------------------------------------------------------------
@@ -404,6 +440,26 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameRegion) {
   EXPECT_GT(compared, 100) << "heavy accepted too few three-same regions";
 }
 
+// Single-instruction AdvSIMD vector x indexed-element MUL/MLA/MLS by element,
+// rd aliasing rn / the indexed Vm sampled.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxMul) {
+  Seed(0x1DCE1DCE13572468ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonVecXIdxMul()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few by-element MUL/MLA/MLS encodings";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -447,6 +503,24 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   }
   EXPECT_TRUE(saw_div) << "integer generator no longer produces SDIV/UDIV";
   EXPECT_TRUE(saw_var_shift) << "integer generator no longer produces variable shifts";
+
+  bool saw_idx_mul = false, saw_idx_mla = false, saw_idx_mls = false;
+  bool saw_idx_half = false, saw_idx_word = false;
+  Seed(0xBEEF1DEA0F0F0F0FULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxMul();
+    uint32_t u = (insn >> 29) & 1, opcode = (insn >> 12) & 0xF, size = (insn >> 22) & 3;
+    if (u == 0 && opcode == 0b1000) saw_idx_mul = true;  // MUL
+    if (u == 1 && opcode == 0b0000) saw_idx_mla = true;  // MLA
+    if (u == 1 && opcode == 0b0100) saw_idx_mls = true;  // MLS
+    if (size == 1) saw_idx_half = true;
+    if (size == 2) saw_idx_word = true;
+  }
+  EXPECT_TRUE(saw_idx_mul) << "by-element generator no longer produces MUL";
+  EXPECT_TRUE(saw_idx_mla) << "by-element generator no longer produces MLA";
+  EXPECT_TRUE(saw_idx_mls) << "by-element generator no longer produces MLS";
+  EXPECT_TRUE(saw_idx_half) << "by-element generator no longer produces halfword";
+  EXPECT_TRUE(saw_idx_word) << "by-element generator no longer produces word";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness

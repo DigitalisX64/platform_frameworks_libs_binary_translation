@@ -7862,9 +7862,89 @@ class HeavyOptimizerFrontend {
     }
   }
 
+  // Heavy-tier mirror of lite_translator.h::AdvSimdVecXIndexedElement's
+  // integer MUL/MLA/MLS by-element block (halfword .4h/.8h size=01, word
+  // .2s/.4s size=10):
+  //   MUL: Vd = Vn * broadcast(Vm.lane[index])
+  //   MLA: Vd = Vd + Vn * broadcast(Vm.lane[index])
+  //   MLS: Vd = Vd - Vn * broadcast(Vm.lane[index])
+  // No saturation, no widening — the bottom esize bits of each host product
+  // match the architectural result modulo 2^esize. Broadcast is Pshuflw+Pshufd
+  // (halfword; Psrldq 8 first if index>=4) or Pshufd (word). Q=0 upper-64
+  // discard via SetVRegFull(rd, res, q). All other by-element opcodes still
+  // bail to the lite tier — emit NOTHING before a bail.
   void AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    using Op = Decoder::AdvSimdVecXIdxOpcode;
+    if (args.opcode != Op::kMul && args.opcode != Op::kMla &&
+        args.opcode != Op::kMls) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (args.size != 0b01 && args.size != 0b10) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_halfword = (args.size == 0b01);
+
+    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+
+    // Broadcast Vm.lane[index] across every destination lane.
+    if (is_halfword) {
+      if (args.index >= 4) {
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      }
+      const uint8_t i = args.index & 0b11;
+      const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+      builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
+    } else {
+      const uint8_t i = args.index & 0b11;
+      const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+      builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    }
+
+    FpRegister result = xn;
+    if (args.opcode == Op::kMul) {
+      if (is_halfword) {
+        builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+    } else {
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      if (is_halfword) {
+        builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      }
+      if (args.opcode == Op::kMla) {
+        if (is_halfword) {
+          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+      } else {
+        if (is_halfword) {
+          builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        } else {
+          builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        }
+      }
+      result = xd;
+    }
+
+    SetVRegFull(args.rd, result, args.q);
   }
 
   void AdvSimdScalarXIndexedElement(const Decoder::AdvSimdScalarXIdxArgs& args) {
