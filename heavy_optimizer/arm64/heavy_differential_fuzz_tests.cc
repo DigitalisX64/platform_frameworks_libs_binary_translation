@@ -681,6 +681,35 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (0b10000u << 17) | (v.opcode << 12) | (0b10u << 10) | (rn << 5) | rd;
   }
 
+  // Scalar FP data-processing (1 source): FRINT{N,M,P,Z,X,I} (round to integral
+  // float) and FCVT between FP32 and FP64. Encoding:
+  //   (0b11110<<24)|(ftype<<22)|(1<<21)|(opcode<<15)|(0b10000<<10)|(Rn<<5)|Rd
+  // (verified vs aarch64-linux-gnu-as: frintx s1,s1=0x1e274021,
+  //  fcvt d0,s0=0x1e22c000, fcvt s0,d0=0x1e624000). Heavy JITs the FRINT set at
+  // S/D via ROUNDPS(lane0)/ROUNDSD, and FCVT S<->D via CVTSS2SD/CVTSD2SS. FRINTA
+  // (0b001100, ties-to-away, needs the copysign(0.5) sequence) and FSQRT
+  // (0b000011, no SQRT op in this tier) bail to lite and are declined. rd samples
+  // rd==rn.
+  uint32_t GenScalarFrintFcvt() {
+    uint32_t opcode, ftype;
+    switch (Rnd() % 10) {
+      case 0: opcode = 0b001000; ftype = Rnd() & 1; break;  // FRINTN (S or D)
+      case 1: opcode = 0b001001; ftype = Rnd() & 1; break;  // FRINTP
+      case 2: opcode = 0b001010; ftype = Rnd() & 1; break;  // FRINTM
+      case 3: opcode = 0b001011; ftype = Rnd() & 1; break;  // FRINTZ
+      case 4: opcode = 0b001110; ftype = Rnd() & 1; break;  // FRINTX
+      case 5: opcode = 0b001111; ftype = Rnd() & 1; break;  // FRINTI
+      case 6: opcode = 0b000101; ftype = 0b00; break;       // FCVT Dd, Sn (single->double)
+      case 7: opcode = 0b000100; ftype = 0b01; break;       // FCVT Sd, Dn (double->single)
+      case 8: opcode = 0b001100; ftype = Rnd() & 1; break;  // FRINTA (heavy declines)
+      default: opcode = 0b000011; ftype = Rnd() & 1; break; // FSQRT (heavy declines)
+    }
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // sample destructive rd==rn
+    return (0b11110u << 24) | (ftype << 22) | (1u << 21) | (opcode << 15) |
+           (0b10000u << 10) | (rn << 5) | rd;
+  }
+
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
   // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
   // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
@@ -1031,6 +1060,34 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonFrintV) {
   EXPECT_GT(compared, 300) << "heavy accepted too few vector FRINT";
 }
 
+// Scalar FRINT{N,M,P,Z,X,I} (S/D) and FCVT between FP32 and FP64. Heavy now
+// lowers the FRINT set as a single ROUNDPS-on-lane-0 (S) / ROUNDSD (D) with the
+// matching rounding imm (no int saturation — the result stays FP), and FCVT
+// S<->D as one CVTSS2SD / CVTSD2SS into a zeroed dst — was: bail to lite. FRINTA
+// (ties-to-away) and FSQRT still bail and are declined. Inputs (RandomFcvtaFp
+// VReg) seed every FP32 lane from the corner set — NaN/+-inf (propagate
+// unchanged), 2^31/2^32 magnitudes (already integral), +-N.5 half-integers (the
+// nearest-even boundary for FRINTN), and finite fractions; the low 64 bits also
+// serve as the double operand for the D-form. HEAVY==interp on full state.
+TEST_F(Arm64HeavyDifferentialFuzz, ScalarFrintFcvt) {
+  Seed(0xF817E5F817E50044ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenScalarFrintFcvt()};
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFcvtaFpVReg();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few scalar FRINT/FCVT";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -1268,6 +1325,27 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_frint_fp32) << "vector FRINT generator no longer produces FP32 (heavy-JIT) form";
   EXPECT_TRUE(saw_frint_2d) << "vector FRINT generator no longer produces .2D (declined) form";
   EXPECT_TRUE(saw_frint_alias) << "vector FRINT generator no longer produces rd==rn";
+
+  bool saw_sfrint = false, saw_sfcvt_sd = false, saw_sfcvt_ds = false;
+  bool saw_sfrint_d = false, saw_sdeclined = false, saw_sfrint_alias = false;
+  Seed(0xF817E5F817E50055ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenScalarFrintFcvt();
+    uint32_t ftype = (insn >> 22) & 3, opcode = (insn >> 15) & 0x3F;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode >= 0b001000 && opcode <= 0b001111 && opcode != 0b001100) saw_sfrint = true;  // FRINT{N,M,P,Z,X,I}
+    if (opcode == 0b000101 && ftype == 0b00) saw_sfcvt_sd = true;  // FCVT Dd,Sn
+    if (opcode == 0b000100 && ftype == 0b01) saw_sfcvt_ds = true;  // FCVT Sd,Dn
+    if (opcode >= 0b001000 && opcode <= 0b001111 && opcode != 0b001100 && ftype == 0b01) saw_sfrint_d = true;  // D-form FRINT
+    if (opcode == 0b001100 || opcode == 0b000011) saw_sdeclined = true;  // FRINTA/FSQRT declined
+    if (rd == rn) saw_sfrint_alias = true;
+  }
+  EXPECT_TRUE(saw_sfrint) << "scalar FRINT/FCVT generator no longer produces FRINT{N..I}";
+  EXPECT_TRUE(saw_sfcvt_sd) << "scalar FRINT/FCVT generator no longer produces FCVT Dd,Sn";
+  EXPECT_TRUE(saw_sfcvt_ds) << "scalar FRINT/FCVT generator no longer produces FCVT Sd,Dn";
+  EXPECT_TRUE(saw_sfrint_d) << "scalar FRINT/FCVT generator no longer produces the D-form (ROUNDSD) path";
+  EXPECT_TRUE(saw_sdeclined) << "scalar FRINT/FCVT generator no longer produces the FRINTA/FSQRT declined forms";
+  EXPECT_TRUE(saw_sfrint_alias) << "scalar FRINT/FCVT generator no longer produces rd==rn";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
