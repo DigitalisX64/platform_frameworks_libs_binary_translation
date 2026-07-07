@@ -402,6 +402,38 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (rn << 5) | rd;
   }
 
+  // Saturating doubling widening MUL/MAC by element: SQDMULL/SQDMLAL/SQDMLSL.
+  //   SQDMULL opc=1011 | SQDMLAL opc=0011 | SQDMLSL opc=0111 (U=0, signed only)
+  // size 01 (.4h/.8h -> .4s) or 10 (.2s/.4s -> .2d); Q selects the source half.
+  // Same index/Vm layout as GenNeonVecXIdxMull.
+  uint32_t GenNeonVecXIdxSqdmull() {
+    static const uint32_t kOpc[] = {0b1011, 0b0011, 0b0111};
+    const uint32_t opc = kOpc[Rnd() % 3];
+    uint32_t q = Rnd() & 1;
+    uint32_t size = 1 + (Rnd() & 1);  // 01 (H) or 10 (S)
+    uint32_t vm = Rnd() % 8;          // <16 keeps halfword Rm valid; M=0 for word
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M, Rm;
+    if (size == 1) {  // halfword: index 0..7 = H:L:M, Vm 0..15
+      uint32_t index = Rnd() % 8;
+      H = index >> 2;
+      L = (index >> 1) & 1;
+      M = index & 1;
+      Rm = vm;
+    } else {  // word: index 0..3 = H:L, Vm = M:Rm
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+      M = 0;
+      Rm = vm;
+    }
+    return (q << 30) | (0u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (opc << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
+
   // SHL Vd.T, Vn.T, #shift (AdvSIMD shift-by-immediate, U=0 opcode=01010).
   // Covers every size class the heavy tier lowers: byte immh=0001 (this
   // cycle's new PSLLW + per-byte-AND arm), half immh=001x, word immh=01xx,
@@ -425,6 +457,70 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     return (q << 30) | (0u << 29) | (0b01111u << 24) | (0u << 23) |
            (immh << 19) | (immb << 16) | (0b01010u << 11) | (1u << 10) |
            (rn << 5) | rd;
+  }
+
+  // SUQADD/USQADD Vd.T, Vn.T (AdvSIMD two-register misc, opcode=00011).
+  //   SUQADD U=0 (signed sat acc of unsigned) | USQADD U=1 (unsigned sat acc of
+  //   signed). size 00 (.8B/.16B), 01 (.4H/.8H), 10 (.2S/.4S) are heavy-lowered;
+  //   size 11 (.1D/.2D) bails to lite and is excluded here. rd samples rd==rn to
+  //   stress the destructive read-modify-write accumulate.
+  uint32_t GenNeonSuqadd() {
+    uint32_t u = Rnd() & 1;      // 0=SUQADD, 1=USQADD
+    uint32_t size = Rnd() % 3;   // 00 (B), 01 (H), 10 (S)
+    uint32_t q = Rnd() & 1;
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) |
+           (0b10000u << 17) | (0b00011u << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
+
+  // AdvSIMD three-same FP fused multiply-accumulate FMLA/FMLS (.2S/.4S FP32,
+  // .2D FP64). Encoding: Q 0 01110 <fmls> <double> 1 Rm 11001 1 Rn Rd, where
+  // bit23 selects FMLS(1)/FMLA(0) and bit22 selects double(1)/single(0). .1D
+  // (double && !Q) is reserved, so Q is forced to 1 for the double form. The
+  // FP16 forms live in a different encoding block and are not produced here.
+  // rd may alias rn/rm to sample the destructive accumulate. The companion
+  // test seeds finite floats so the interpreter reference and x86 FMA agree
+  // bit-for-bit (random NaN payloads propagate differently on ARM vs x86 FMA).
+  uint32_t GenNeonFmla() {
+    uint32_t is_fmls = Rnd() & 1;
+    uint32_t is_double = Rnd() & 1;
+    uint32_t q = is_double ? 1u : (Rnd() & 1);  // .1D reserved
+    uint32_t rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));
+    return (q << 30) | (0b01110u << 24) | (is_fmls << 23) | (is_double << 22) |
+           (1u << 21) | (rm << 16) | (0b11001u << 11) | (1u << 10) | (rn << 5) | rd;
+  }
+
+  // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
+  // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
+  // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
+  unsigned __int128 RandomFiniteFpVReg(bool is_double) {
+    auto small_f32 = [&]() -> uint32_t {
+      // magnitude < 1024, ~4 fractional bits, random sign — product of two
+      // stays < 2^20 so FMA never overflows to inf.
+      float f = static_cast<float>(static_cast<int32_t>(Rnd() % 32768) - 16384) /
+                16.0f;
+      uint32_t bits;
+      memcpy(&bits, &f, 4);
+      return bits;
+    };
+    auto small_f64 = [&]() -> uint64_t {
+      double d = static_cast<double>(static_cast<int64_t>(Rnd64() % 33554432) -
+                                     16777216) /
+                 16.0;
+      uint64_t bits;
+      memcpy(&bits, &d, 8);
+      return bits;
+    };
+    if (is_double) {
+      unsigned __int128 lo = small_f64(), hi = small_f64();
+      return (hi << 64) | lo;
+    }
+    uint64_t l0 = small_f32(), l1 = small_f32(), l2 = small_f32(), l3 = small_f32();
+    unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
+    return (hi << 64) | lo;
   }
 };
 
@@ -544,6 +640,29 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxMull) {
   EXPECT_GT(compared, 300) << "heavy accepted too few widening by-element encodings";
 }
 
+// Single-instruction saturating doubling widening by-element:
+// SQDMULL/SQDMLAL/SQDMLSL. Exercises the doubling-overflow saturation corner
+// (Vn.lane == Vm.lane == INT_MIN) and the SQDMLAL/SQDMLSL signed saturating
+// accumulate, at both size=01 (PMOVSXWD+PMULLD, PCMPEQD corner) and size=10
+// (PMOVSXDQ+PMULDQ, PCMPEQQ corner + PCMPGTQ accumulate), Q=1 high-half select.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmull) {
+  Seed(0x59D115A7C0DE1234ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonVecXIdxSqdmull()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULL by-element encodings";
+}
+
 // Single-instruction SHL-by-immediate across every size class the heavy tier
 // lowers (byte via PSLLW + per-byte AND mask, half/word/double via
 // PSLL{W,D,Q}). Byte was the only SHL arm still bailing before this cycle.
@@ -563,6 +682,56 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonShlByImm) {
     }
   }
   EXPECT_GT(compared, 300) << "heavy accepted too few SHL-by-immediate encodings";
+}
+
+// Single-instruction SUQADD/USQADD across byte/halfword/word lanes. Exercises
+// the mixed-sign saturating accumulate: byte/halfword widen+PACK{US,SS} path and
+// the word 64-bit widen + PCMPGTQ-clamp path, including the destructive rd==rn
+// accumulate. All three sizes bailed to lite before this cycle.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonSuqadd) {
+  Seed(0x5A7DFACE0BADCAFEULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonSuqadd()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few SUQADD/USQADD encodings";
+}
+
+// FP fused multiply-accumulate FMLA/FMLS (.2S/.4S FP32, .2D FP64). The heavy
+// tier now lowers these to x86 FMA3 packed VF(N)MADD231P{S,D} (was: bail to
+// lite). Inputs are seeded with finite floats (RandomFiniteFpVReg) so the
+// interpreter's fused result and the x86 FMA result agree bit-for-bit — with
+// random NaN payloads the ARM-vs-x86 FMA NaN-propagation rules diverge and the
+// full-state compare would false-positive. Exercises FMLA/FMLS × single/double
+// × Q and the destructive rd==rn / rd==rm accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonFmla) {
+  Seed(0xF31AACC00FEEDBADULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t insn = GenNeonFmla();
+    uint32_t code[1] = {insn};
+    const bool is_double = ((insn >> 22) & 1) != 0;
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFiniteFpVReg(is_double);
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few FMLA/FMLS encodings";
 }
 
 // Acceptance: the generators reach the register-aliasing and multi-instruction
@@ -648,6 +817,25 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_mull_q1) << "widening generator no longer produces the *2 high-half select";
   EXPECT_TRUE(saw_mull_word) << "widening generator no longer produces word sources";
 
+  bool saw_sq_mull = false, saw_sq_mlal = false, saw_sq_mlsl = false;
+  bool saw_sq_q1 = false, saw_sq_word = false;
+  Seed(0x59D115A700FEDCBAULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxSqdmull();
+    uint32_t opcode = (insn >> 12) & 0xF;
+    uint32_t size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    if (opcode == 0b1011) saw_sq_mull = true;  // SQDMULL
+    if (opcode == 0b0011) saw_sq_mlal = true;  // SQDMLAL
+    if (opcode == 0b0111) saw_sq_mlsl = true;  // SQDMLSL
+    if (q == 1) saw_sq_q1 = true;              // *2 high-half select
+    if (size == 2) saw_sq_word = true;         // word source -> .2d
+  }
+  EXPECT_TRUE(saw_sq_mull) << "SQDMULL generator no longer produces SQDMULL";
+  EXPECT_TRUE(saw_sq_mlal) << "SQDMULL generator no longer produces SQDMLAL";
+  EXPECT_TRUE(saw_sq_mlsl) << "SQDMULL generator no longer produces SQDMLSL";
+  EXPECT_TRUE(saw_sq_q1) << "SQDMULL generator no longer produces the *2 high-half select";
+  EXPECT_TRUE(saw_sq_word) << "SQDMULL generator no longer produces word sources";
+
   bool saw_shl_byte = false, saw_shl_half = false, saw_shl_word = false;
   bool saw_shl_dbl = false, saw_shl_alias = false;
   Seed(0x5417C0DE0BADF00DULL);
@@ -666,6 +854,46 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_shl_word) << "SHL generator no longer produces word lanes";
   EXPECT_TRUE(saw_shl_dbl) << "SHL generator no longer produces doubleword lanes";
   EXPECT_TRUE(saw_shl_alias) << "SHL generator no longer produces rd==rn (clobber class)";
+
+  bool saw_suqadd = false, saw_usqadd = false, saw_sq_byte = false;
+  bool saw_sq_half = false, saw_sq_word2 = false, saw_sq_alias = false;
+  Seed(0x5A7DADD00FF1CEE5ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonSuqadd();
+    uint32_t u = (insn >> 29) & 1, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 0) saw_suqadd = true;  // SUQADD
+    if (u == 1) saw_usqadd = true;  // USQADD
+    if (size == 0) saw_sq_byte = true;
+    if (size == 1) saw_sq_half = true;
+    if (size == 2) saw_sq_word2 = true;
+    if (rd == rn) saw_sq_alias = true;
+  }
+  EXPECT_TRUE(saw_suqadd) << "sat-accumulate generator no longer produces SUQADD";
+  EXPECT_TRUE(saw_usqadd) << "sat-accumulate generator no longer produces USQADD";
+  EXPECT_TRUE(saw_sq_byte) << "sat-accumulate generator no longer produces byte lanes";
+  EXPECT_TRUE(saw_sq_half) << "sat-accumulate generator no longer produces halfword lanes";
+  EXPECT_TRUE(saw_sq_word2) << "sat-accumulate generator no longer produces word lanes";
+  EXPECT_TRUE(saw_sq_alias) << "sat-accumulate generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_fmla = false, saw_fmls = false, saw_fma_single = false;
+  bool saw_fma_double = false, saw_fma_alias = false;
+  Seed(0x0FAA110022003300ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonFmla();
+    uint32_t is_fmls = (insn >> 23) & 1, is_double = (insn >> 22) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (!is_fmls) saw_fmla = true;
+    if (is_fmls) saw_fmls = true;
+    if (!is_double) saw_fma_single = true;
+    if (is_double) saw_fma_double = true;
+    if (rd == rn) saw_fma_alias = true;
+  }
+  EXPECT_TRUE(saw_fmla) << "FMA generator no longer produces FMLA";
+  EXPECT_TRUE(saw_fmls) << "FMA generator no longer produces FMLS";
+  EXPECT_TRUE(saw_fma_single) << "FMA generator no longer produces single-precision";
+  EXPECT_TRUE(saw_fma_double) << "FMA generator no longer produces double-precision";
+  EXPECT_TRUE(saw_fma_alias) << "FMA generator no longer produces rd==rn (accumulate clobber)";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
