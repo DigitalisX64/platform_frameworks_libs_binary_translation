@@ -7466,7 +7466,44 @@ class HeavyOptimizerFrontend {
             SetVRegFull(args.rd, xn, args.q);
             return;
           }
-          UndefinedReturningVoid();
+          // SSHR/USHR byte lane: SSE has no packed byte shift. Widen each
+          // 64-bit half of Vn to 16-bit words (PMOVSXBW sign-extend for
+          // SSHR, PMOVZXBW zero-extend for USHR), shift the words
+          // (PSRAW/PSRLW), then narrow back to bytes (PACKSSWB/PACKUSWB).
+          // byte_cnt = 2*8 - immh:immb in [1, 8]; at cnt==8 PSRAW on a
+          // sign-extended byte yields byte-wide sign-fill and PSRLW yields
+          // 0, matching ARM SSHR/USHR at shift==esize. Mirrors the lite
+          // byte-form lowering (lite_translator.h::AdvSimdShiftByImm). The
+          // PACK of both halves places low-lane bytes in Vd[63:0] and
+          // high-lane bytes in Vd[127:64] for .16B; for .8B (q=0)
+          // SetVRegFull zeroes Vd[127:64]. Scalar byte SSHR/USHR is not
+          // ARM-encoded (scalar forms exist only at D) -> bail to lite.
+          if (args.scalar) {
+            UndefinedReturningVoid();
+            return;
+          }
+          const bool is_signed_byte =
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr);
+          const int8_t byte_cnt = static_cast<int8_t>(16 - immh_immb);
+          FpRegister xn = AllocTempSimdReg();
+          FpRegister xn_hi = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+          if (is_signed_byte) {
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          }
+          SetVRegFull(args.rd, xn, args.q);
           return;
         }
         uint8_t esize_bits;
