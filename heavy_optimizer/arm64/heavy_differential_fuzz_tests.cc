@@ -473,6 +473,55 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) |
            (0b10000u << 17) | (0b00011u << 12) | (0b10u << 10) | (rn << 5) | rd;
   }
+
+  // AdvSIMD three-same FP fused multiply-accumulate FMLA/FMLS (.2S/.4S FP32,
+  // .2D FP64). Encoding: Q 0 01110 <fmls> <double> 1 Rm 11001 1 Rn Rd, where
+  // bit23 selects FMLS(1)/FMLA(0) and bit22 selects double(1)/single(0). .1D
+  // (double && !Q) is reserved, so Q is forced to 1 for the double form. The
+  // FP16 forms live in a different encoding block and are not produced here.
+  // rd may alias rn/rm to sample the destructive accumulate. The companion
+  // test seeds finite floats so the interpreter reference and x86 FMA agree
+  // bit-for-bit (random NaN payloads propagate differently on ARM vs x86 FMA).
+  uint32_t GenNeonFmla() {
+    uint32_t is_fmls = Rnd() & 1;
+    uint32_t is_double = Rnd() & 1;
+    uint32_t q = is_double ? 1u : (Rnd() & 1);  // .1D reserved
+    uint32_t rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));
+    return (q << 30) | (0b01110u << 24) | (is_fmls << 23) | (is_double << 22) |
+           (1u << 21) | (rm << 16) | (0b11001u << 11) | (1u << 10) | (rn << 5) | rd;
+  }
+
+  // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
+  // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
+  // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
+  unsigned __int128 RandomFiniteFpVReg(bool is_double) {
+    auto small_f32 = [&]() -> uint32_t {
+      // magnitude < 1024, ~4 fractional bits, random sign — product of two
+      // stays < 2^20 so FMA never overflows to inf.
+      float f = static_cast<float>(static_cast<int32_t>(Rnd() % 32768) - 16384) /
+                16.0f;
+      uint32_t bits;
+      memcpy(&bits, &f, 4);
+      return bits;
+    };
+    auto small_f64 = [&]() -> uint64_t {
+      double d = static_cast<double>(static_cast<int64_t>(Rnd64() % 33554432) -
+                                     16777216) /
+                 16.0;
+      uint64_t bits;
+      memcpy(&bits, &d, 8);
+      return bits;
+    };
+    if (is_double) {
+      unsigned __int128 lo = small_f64(), hi = small_f64();
+      return (hi << 64) | lo;
+    }
+    uint64_t l0 = small_f32(), l1 = small_f32(), l2 = small_f32(), l3 = small_f32();
+    unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
+    return (hi << 64) | lo;
+  }
 };
 
 // -------------------------------------------------------------------------
@@ -657,6 +706,34 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonSuqadd) {
   EXPECT_GT(compared, 300) << "heavy accepted too few SUQADD/USQADD encodings";
 }
 
+// FP fused multiply-accumulate FMLA/FMLS (.2S/.4S FP32, .2D FP64). The heavy
+// tier now lowers these to x86 FMA3 packed VF(N)MADD231P{S,D} (was: bail to
+// lite). Inputs are seeded with finite floats (RandomFiniteFpVReg) so the
+// interpreter's fused result and the x86 FMA result agree bit-for-bit — with
+// random NaN payloads the ARM-vs-x86 FMA NaN-propagation rules diverge and the
+// full-state compare would false-positive. Exercises FMLA/FMLS × single/double
+// × Q and the destructive rd==rn / rd==rm accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonFmla) {
+  Seed(0xF31AACC00FEEDBADULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t insn = GenNeonFmla();
+    uint32_t code[1] = {insn};
+    const bool is_double = ((insn >> 22) & 1) != 0;
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFiniteFpVReg(is_double);
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few FMLA/FMLS encodings";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -798,6 +875,25 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_sq_half) << "sat-accumulate generator no longer produces halfword lanes";
   EXPECT_TRUE(saw_sq_word2) << "sat-accumulate generator no longer produces word lanes";
   EXPECT_TRUE(saw_sq_alias) << "sat-accumulate generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_fmla = false, saw_fmls = false, saw_fma_single = false;
+  bool saw_fma_double = false, saw_fma_alias = false;
+  Seed(0x0FAA110022003300ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonFmla();
+    uint32_t is_fmls = (insn >> 23) & 1, is_double = (insn >> 22) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (!is_fmls) saw_fmla = true;
+    if (is_fmls) saw_fmls = true;
+    if (!is_double) saw_fma_single = true;
+    if (is_double) saw_fma_double = true;
+    if (rd == rn) saw_fma_alias = true;
+  }
+  EXPECT_TRUE(saw_fmla) << "FMA generator no longer produces FMLA";
+  EXPECT_TRUE(saw_fmls) << "FMA generator no longer produces FMLS";
+  EXPECT_TRUE(saw_fma_single) << "FMA generator no longer produces single-precision";
+  EXPECT_TRUE(saw_fma_double) << "FMA generator no longer produces double-precision";
+  EXPECT_TRUE(saw_fma_alias) << "FMA generator no longer produces rd==rn (accumulate clobber)";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness

@@ -3034,6 +3034,54 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP vector FMLA/FMLS (.2S/.4S FP32, .2D FP64) — fused multiply-accumulate,
+    // single rounding. ARM ARM: FMLA Vd = Vd + Vn*Vm, FMLS Vd = Vd - Vn*Vm, both
+    // fused (one rounding). x86 FMA3 packed VFMADD231P{S,D}/VFNMADD231P{S,D}
+    // reproduce the single-rounded result lane-for-lane (231 form: dst =
+    // src1*src2 (+/-) dst, RMW dst). Mirrors lite_translator.h's non-FP16 path:
+    // FP16 (is_fp16) needs an F16C round-trip absent from the heavy Gen inputs and
+    // bails to lite; the decoder rejects the reserved sz=1&&!Q (.1D) shape, so only
+    // .2S/.4S/.2D reach here. Requires host FMA — bail if absent.
+    if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlaV ||
+        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV) {
+      if (args.is_fp16 || !host_platform::kHasFMA) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_double = (args.size & 1);
+      const bool is_fmls =
+          (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV);
+      const int32_t vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xm = AllocTempSimdReg();
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      if (is_fmls) {
+        // Vd = Vd + (-Vn)*Vm -- single fused rounding.
+        if (is_double) {
+          builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+              xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(
+              xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+        }
+      } else {
+        if (is_double) {
+          builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+              xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::Vfmadd231psXRegXRegXReg>(
+              xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+        }
+      }
+      // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+      SetVRegFull(args.rd, xd, args.q);
+      return;
+    }
+
     // FP vector FCMEQ/FCMGE/FCMGT (.2S/.4S FP32, .2D FP64) produce a per-lane
     // all-ones/zero mask. Mirrors lite_translator.h's non-FP16 path: the SSE
     // legacy-encoded CMP{EQ,LT,LE}P{S,D} predicates are ordered, returning FALSE
