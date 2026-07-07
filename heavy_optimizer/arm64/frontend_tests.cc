@@ -5289,6 +5289,78 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuXFromSInRange) {
 }
 
 // ---------------------------------------------------------------------------
+// SCVTF / UCVTF / FCVTZS / FCVTZU (scalar FP <-> fixed-point). fbits scales the
+// result by 2^±fbits (SCVTF/UCVTF divide the FP by 2^fbits; FCVTZS/FCVTZU
+// pre-multiply the FP source by 2^fbits before the truncating cvtt). Each chosen
+// value is a discriminator: an unscaled (broken) lowering yields the wrong
+// answer (e.g. scvtf s0,w1,#4 with w1=40 must be 2.5, not 40.0).
+// ---------------------------------------------------------------------------
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfFixedSFromW) {
+  static const uint32_t code[] = {0x1e02f020u};  // scvtf s0, w1, #4
+  state_.cpu.x[1] = 40u;                          // 40 / 2^4 = 2.5
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfFixedDFromX) {
+  static const uint32_t code[] = {0x9e43e020u};  // ucvtf d0, x1, #8
+  state_.cpu.x[1] = 384u;                         // 384 / 2^8 = 1.5
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfFixedDFromW) {
+  static const uint32_t code[] = {0x1e42f420u};  // scvtf d0, w1, #3
+  state_.cpu.x[1] = 20u;                          // 20 / 2^3 = 2.5
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 2.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsFixedWFromS) {
+  static const uint32_t code[] = {0x1e18f020u};  // fcvtzs w0, s1, #4
+  SetVf32(&state_, 1, 1.5f);                      // trunc(1.5 * 2^4) = 24
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 24u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuFixedXFromD) {
+  static const uint32_t code[] = {0x9e59e020u};  // fcvtzu x0, d1, #8
+  SetVf64(&state_, 1, 2.5);                       // trunc(2.5 * 2^8) = 640
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 640u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsFixedXFromDNeg) {
+  static const uint32_t code[] = {0x9e58f820u};  // fcvtzs x0, d1, #2
+  SetVf64(&state_, 1, -3.25);                     // trunc(-3.25 * 2^2) = -13
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(int64_t{-13}));
+}
+
+// ---------------------------------------------------------------------------
 // FMADD / FMSUB / FNMADD / FNMSUB (FP data-processing, 3 source). All computed
 // via the fused x86 FMA3 231-form ops (single rounding, matching ARM).
 // ---------------------------------------------------------------------------

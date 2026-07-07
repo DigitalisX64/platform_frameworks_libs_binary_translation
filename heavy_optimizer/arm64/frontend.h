@@ -1574,12 +1574,53 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(rd, rn, rm, ftype, cond);
   }
 
-  // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point). The FCvt* intrinsics + cvtsi2ss
-  // SSE ops are not in the ARM64 backend gen inputs (their macro-assembler defs
-  // live only in riscv64_to_x86_64/macro_def.json), so bail.
+  // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point): GP integer <-> scalar FP with a
+  // 2^±fbits scale. Bridges into the shared unscaled EmitScvtfUcvtf / EmitFcvtz
+  // helpers with the fbits scale inserted (SCVTF/UCVTF scale the FP result by
+  // 2^-fbits; FCVTZS/FCVTZU pre-multiply the FP source by 2^+fbits). The scale is
+  // an exact power-of-2 multiply, so the helpers' single-rounding CVTSI2 and
+  // truncating-cvtt + saturation/NaN ladder carry through verbatim. Mirrors
+  // lite_translator.h::FpFixedPointConversion. FP16 (ftype 0b1x) bails to lite.
   void FpFixedPointConversion(const Decoder::FpFixedPointArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    using Op = Decoder::FpFixedPointOp;
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const uint8_t fbits = args.fbits;
+    if (fbits == 0 || fbits > (args.sf ? 64u : 32u)) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+    // Only op/sf/ftype/rd/rn are read by the helpers; `op` uses the
+    // FpIntConversion encoding (SCVTF=010, UCVTF=011, FCVTZS=000, FCVTZU=001).
+    Decoder::FpIntConvArgs iargs{};
+    iargs.rd = args.rd;
+    iargs.rn = args.rn;
+    iargs.sf = args.sf;
+    iargs.ftype = args.ftype;
+    switch (args.op) {
+      case Op::kScvtf:
+        iargs.op = 0b010;
+        EmitScvtfUcvtf(iargs, is_double, fbits);
+        return;
+      case Op::kUcvtf:
+        iargs.op = 0b011;
+        EmitScvtfUcvtf(iargs, is_double, fbits);
+        return;
+      case Op::kFcvtzs:
+        iargs.op = 0b000;
+        EmitFcvtz(iargs, is_double, /*round_imm=*/-1, /*ties_away=*/false, fbits);
+        return;
+      case Op::kFcvtzu:
+        iargs.op = 0b001;
+        EmitFcvtz(iargs, is_double, /*round_imm=*/-1, /*ties_away=*/false, fbits);
+        return;
+    }
   }
 
   // FMADD/FMSUB/FNMADD/FNMSUB (FP data-processing, 3 source) at S/D. Lowered to
@@ -2055,7 +2096,11 @@ class HeavyOptimizerFrontend {
   // because the sf==1 unsigned form needs a basic-block split (values >= 2^63 use
   // the round-to-odd halve/convert/double fix-up). Mirrors
   // lite_translator.h::FpIntConversion's SCVTF/UCVTF path.
-  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double);
+  // `fbits != 0` selects the fixed-point form (SCVTF/UCVTF fixed): the FP result
+  // is scaled by 2^-fbits (an exact power-of-2 multiply that only biases the
+  // exponent, so CVTSI2's single rounding carries through). `fbits == 0` is the
+  // plain integer form. Mirrors lite_translator.h::FpFixedPointConversion.
+  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double, uint8_t fbits = 0);
 
   // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): FP -> integer
   // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
@@ -2071,10 +2116,16 @@ class HeavyOptimizerFrontend {
   // op 100/101) have no x86 round mode; pass `ties_away = true` (FP32 only) to
   // add a copysign(0.5, x) addend — gated to 0 when |x| >= 2^23, where a 0.5
   // addend would round the wrong way — before the same truncating ladder.
+  // `fbits != 0` selects the fixed-point form (FCVTZS/FCVTZU fixed): the FP
+  // source is pre-multiplied by 2^+fbits (exact power-of-2 scale) before the
+  // truncating cvtt + saturation ladder. `fbits == 0` is the plain integer form.
+  // Fixed-point never combines with the rounding/ties-away paths (round_imm < 0,
+  // ties_away false). Mirrors lite_translator.h::FpFixedPointConversion.
   void EmitFcvtz(const Decoder::FpIntConvArgs& args,
                  bool is_double,
                  int8_t round_imm = -1,
-                 bool ties_away = false);
+                 bool ties_away = false,
+                 uint8_t fbits = 0);
 
   //
   // Advanced SIMD (Args-struct forms).
