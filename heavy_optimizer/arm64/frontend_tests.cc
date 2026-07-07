@@ -4536,6 +4536,15 @@ constexpr uint32_t SubhnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_
 constexpr uint32_t RsubhnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0110, rd, rn, rm);
 }
+// Polynomial multiply long: PMULL/PMULL2 opcode=1110, U=0.  size=00 is the
+// .8H poly8 widening form; size=11 is PMULL64 (.1Q from two .1D lanes).
+constexpr uint32_t PmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1110, rd, rn, rm);
+}
+static_assert(PmullVec(0b00, false, 0, 1, 2) == 0x0E22E020u);  // pmull  v0.8h,v1.8b,v2.8b
+static_assert(PmullVec(0b00, true, 0, 1, 2) == 0x4E22E020u);   // pmull2 v0.8h,v1.16b,v2.16b
+static_assert(PmullVec(0b11, false, 0, 1, 2) == 0x0EE2E020u);  // pmull  v0.1q,v1.1d,v2.1d
+static_assert(PmullVec(0b11, true, 0, 1, 2) == 0x4EE2E020u);   // pmull2 v0.1q,v1.2d,v2.2d
 // Saturating doubling widening: SQDMULL opcode=1101, SQDMLAL opcode=1001,
 // SQDMLSL opcode=1011 (all U=0).
 constexpr uint32_t SqdmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -12054,6 +12063,66 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Smull2Vec4S) {
   // products={-2,6,-65536,4}
   EXPECT_EQ(VLo64(&state_, 0), 0x00000006FFFFFFFEULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000004FFFF0000ULL);
+}
+
+// PMULL64 (.1Q from Vn.D[0] x Vm.D[0]) — single PCLMULQDQ, imm 0x00.
+// clmul(0x1000000000000001, 0x1000000000000001) = (x^60+1)^2 = x^120+1 in
+// GF(2): bit 120 -> high qword bit 56 (0x0100000000000000), bit 0 -> low = 1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull64) {
+  static const uint32_t code[] = {PmullVec(0b11, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1000000000000001ULL, 0xDEADBEEFDEADBEEFULL);  // D[1] ignored
+  SetV128(&state_, 2, 0x1000000000000001ULL, 0xBBBBBBBBBBBBBBBBULL);  // D[1] ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0100000000000000ULL);
+}
+
+// PMULL2 64 (.1Q from Vn.D[1] x Vm.D[1]) — PCLMULQDQ imm 0x11 (high x high).
+// Same operands as above in the HIGH qwords; D[0] must be ignored.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull2_64UsesHighHalf) {
+  static const uint32_t code[] = {PmullVec(0b11, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xDEADBEEFDEADBEEFULL, 0x1000000000000001ULL);  // D[0] ignored
+  SetV128(&state_, 2, 0xBBBBBBBBBBBBBBBBULL, 0x1000000000000001ULL);  // D[0] ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0100000000000000ULL);
+}
+
+// PMULL .8H poly8 widening (8 independent 8-bit carryless products -> 16-bit
+// lanes). Same operands/expected as the validated lite Pmull8hPoly8 test.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull8hPoly8) {
+  static const uint32_t code[] = {PmullVec(0b00, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAA07108001FFCA53ULL, 0xDEADBEEFDEADBEEFULL);  // high ignored
+  SetV128(&state_, 2, 0x5507108002FF53CAULL, 0xBBBBBBBBBBBBBBBBULL);  // high ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000255553F7E3F7EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x2222001501004000ULL);
+}
+
+// PMULL2 .8H poly8 — same products but from the HIGH 8 bytes of Vn/Vm.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull2_8hPoly8UsesHighHalf) {
+  static const uint32_t code[] = {PmullVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xDEADBEEFDEADBEEFULL, 0xAA07108001FFCA53ULL);  // low ignored
+  SetV128(&state_, 2, 0xBBBBBBBBBBBBBBBBULL, 0x5507108002FF53CAULL);  // low ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000255553F7E3F7EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x2222001501004000ULL);
 }
 
 // UMLAL .4S: accumulate into Vd (32-bit wrap, no saturation).

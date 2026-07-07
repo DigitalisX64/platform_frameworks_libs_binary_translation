@@ -4541,6 +4541,74 @@ class HeavyOptimizerFrontend {
     }
     using Op = Decoder::AdvSimdThreeDiffOpcode;
 
+    // PMULL/PMULL2 — polynomial multiply long over GF(2). Line-by-line mirror
+    // of lite_translator.h::AdvSimdThreeDiff's kPmull block.
+    //   size=11 (PMULL64): a single PCLMULQDQ (x86 CLMUL is an exact GF(2)
+    //     carry-less multiply, semantically identical to ARM PMULL64). Q=0
+    //     multiplies the low qwords (imm 0x00 = Pclmullqlqdq); Q=1/PMULL2
+    //     multiplies the high qwords (imm 0x11 = Pclmulhqhqdq).
+    //   size=00 (PMULL .8H, poly8 widening): 8 independent 8-bit polynomial
+    //     products widened to 16-bit. Widen the low 8 bytes (Q=1/PMULL2 takes
+    //     bytes 8..15) to 16-bit lanes (PMOVZXBW), then run the per-bit carry-
+    //     less shift-and-XOR loop in 16-bit lanes. Each lane holds a value <256
+    //     and the degree-14 product fits in 16 bits, so the PSLLW shifts never
+    //     spill across lanes (no per-lane masking needed). The bit-i selector is
+    //     PSLLW(b, 15-i) then PSRAW 15, broadcasting bit i to the whole lane.
+    //   size in {01,10} is reserved for PMULL and bails.
+    // The "long" result always fills 128 bits, so SetVRegFull q=true regardless
+    // of the Q ("2") variant.
+    if (args.opcode == Op::kPmull) {
+      const int32_t vn_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t vm_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      if (args.size == 0b11) {
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xm = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_o);
+        builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
+        const int8_t imm = args.q ? int8_t{0x11} : int8_t{0x00};
+        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(
+            xn.machine_reg(), xm.machine_reg(), imm);
+        SetVRegFull(args.rd, xn, /*q=*/true);
+        return;
+      }
+      if (args.size == 0b00) {  // PMULL/PMULL2 .8H (poly8 widening)
+        const int32_t extra = args.q ? 8 : 0;
+        FpRegister za = AllocTempSimdReg();
+        FpRegister zb = AllocTempSimdReg();
+        FpRegister acc = AllocZeroedSimdReg();  // PXOR acc,acc
+        FpRegister shifted = AllocTempSimdReg();
+        FpRegister sel = AllocTempSimdReg();
+        // MOVSD zero-extends bits [127:64]; PMOVZXBW then widens 8 bytes -> 8
+        // 16-bit lanes (Q=1 loads bytes 8..15 via the +8 offset).
+        builder_.GenGetSimd<8>(za.machine_reg(), vn_o + extra);
+        builder_.GenGetSimd<8>(zb.machine_reg(), vm_o + extra);
+        builder_.Gen<x86_64::PmovzxbwXRegXReg>(za.machine_reg(), za.machine_reg());
+        builder_.Gen<x86_64::PmovzxbwXRegXReg>(zb.machine_reg(), zb.machine_reg());
+        for (int i = 0; i < 8; ++i) {
+          builder_.Gen<x86_64::MovdqaXRegXReg>(shifted.machine_reg(), za.machine_reg());
+          if (i != 0) {
+            builder_.Gen<x86_64::PsllwXRegImm>(shifted.machine_reg(),
+                                               static_cast<int8_t>(i));
+          }
+          // sel = 0xFFFF per lane where bit i of zb is set.
+          builder_.Gen<x86_64::MovdqaXRegXReg>(sel.machine_reg(), zb.machine_reg());
+          if (15 - i != 0) {
+            builder_.Gen<x86_64::PsllwXRegImm>(sel.machine_reg(),
+                                               static_cast<int8_t>(15 - i));
+          }
+          builder_.Gen<x86_64::PsrawXRegImm>(sel.machine_reg(), int8_t{15});
+          builder_.Gen<x86_64::PandXRegXReg>(shifted.machine_reg(), sel.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(acc.machine_reg(), shifted.machine_reg());
+        }
+        SetVRegFull(args.rd, acc, /*q=*/true);
+        return;
+      }
+      UndefinedReturningVoid();  // size in {01,10} reserved
+      return;
+    }
+
     // Widening add/sub subset: {S,U}ADDL/{S,U}SUBL (both sources narrow) and
     // {S,U}ADDW/{S,U}SUBW (Vn already a wide-lane 128-bit vector). Handle first;
     // fall through to the multiply-accumulate subset otherwise.
