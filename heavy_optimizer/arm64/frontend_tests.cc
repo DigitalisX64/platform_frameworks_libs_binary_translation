@@ -3800,8 +3800,11 @@ constexpr uint32_t FabsS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E20C000, rd, 
 constexpr uint32_t FabsD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E60C000, rd, rn); }
 constexpr uint32_t FnegS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E214000, rd, rn); }
 constexpr uint32_t FnegD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E614000, rd, rn); }
-// FSQRT Sd,Sn (opcode=000011) — must bail in the optimizing tier.
+// FSQRT Sd,Sn / Dd,Dn (opcode=000011) — lowered via SQRTSS/SQRTSD.
 constexpr uint32_t FsqrtS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E21C000, rd, rn); }
+constexpr uint32_t FsqrtD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E61C000, rd, rn); }
+static_assert(FsqrtS(0, 1) == 0x1E21C020u);  // fsqrt s0, s1
+static_assert(FsqrtD(0, 1) == 0x1E61C020u);  // fsqrt d0, d1
 // FRINTA Sd,Sn / Dd,Dn (opcode=001100, round to nearest, ties away from zero).
 constexpr uint32_t FrintaS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E264000, rd, rn); }
 constexpr uint32_t FrintaD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E664000, rd, rn); }
@@ -6177,15 +6180,44 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulDNegOperand) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
-// FSQRT (a 1-source FP op the optimizing tier does NOT handle) must bail.
-TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtBails) {
+// FSQRT Sd,Sn: SQRTSS is the exact IEEE-754 square root (RNE), matching ARM
+// FSQRT under the default FPCR rounding mode. sqrt(4.0f) == 2.0f exactly; the
+// upper 96 bits of Vd must be zeroed by the scalar (upper-zeroing) store.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtS) {
   static const uint32_t code[] = {FsqrtS(0, 1)};
   SetVf32(&state_, 1, 4.0f);
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FSQRT Sd,Sn non-perfect-square: sqrt(2.0f) rounds to nearest-even.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtSInexact) {
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  SetVf32(&state_, 1, 2.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.4142135f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FSQRT Dd,Dn: SQRTSD, FP64. sqrt(2.0) rounds to nearest-even.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtD) {
+  static const uint32_t code[] = {FsqrtD(0, 1)};
+  SetVf64(&state_, 1, 2.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.4142135623730951);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 //

@@ -1803,9 +1803,9 @@ class HeavyOptimizerFrontend {
   // the same v[] slot would funnel an XMM vreg into a GP operand and fail
   // register-class intersection.
   //
-  // FSQRT, FRINT*, FCVT (precision change), BFCVT, FP16, and ftype=10 bail:
-  // their SSE ops (Sqrt*, Round*, Cvt*) are not allowlisted for the ARM64
-  // backend.
+  // FSQRT, FRINT*, FCVT (precision change) are lowered below (SQRTSS/SQRTSD,
+  // ROUNDSS/ROUNDSD, CVTSS2SD/CVTSD2SS). BFCVT, FCVT-to-half (F16C), FP16, and
+  // ftype=10 still bail: their SSE ops are not allowlisted for the ARM64 backend.
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
     if (!success()) {
       return;
@@ -1820,9 +1820,9 @@ class HeavyOptimizerFrontend {
     // into lane 0 of a zeroed dst, then a scalar (upper-zeroing) store. The
     // result precision is the OPPOSITE of the source ftype, so the write uses
     // the complemented is_double. Mirrors lite_translator.h::FpDataProc1's
-    // CVTSS2SD/CVTSD2SS arms. FCVT-to-half (0b000111) needs F16C, BFCVT
-    // (0b000110) needs the NaN-fixup narrow, and FSQRT (0b000011) needs a SQRT
-    // op absent from this tier's gen inputs — all bail to the lite tier.
+    // CVTSS2SD/CVTSD2SS arms. FCVT-to-half (0b000111) needs F16C and BFCVT
+    // (0b000110) needs the NaN-fixup narrow — both still bail to the lite tier.
+    // FSQRT (0b000011) is lowered just below via SQRTSS/SQRTSD.
     if (!is_double && args.opcode == 0b000101) {  // FCVT Dd, Sn (single -> double)
       FpRegister src = GetVRegScalar(args.rn, /*is_double=*/false);
       FpRegister dst = AllocZeroedSimdReg();
@@ -1835,6 +1835,23 @@ class HeavyOptimizerFrontend {
       FpRegister dst = AllocZeroedSimdReg();
       builder_.Gen<x86_64::Cvtsd2ssXRegXReg>(dst.machine_reg(), src.machine_reg());
       SetVRegScalar(args.rd, dst, /*is_double=*/false);
+      return;
+    }
+
+    // FSQRT Sd/Dd, Sn/Dn (opcode 0b000011): a single SQRTSS (FP32) / SQRTSD
+    // (FP64). x86 SQRTSS/SQRTSD compute the exact IEEE-754 square root with
+    // round-to-nearest-even, matching ARM FSQRT under the default FPCR rounding
+    // mode, and propagate NaN/-Inf per the Intel SDM identically to ARM. Mirrors
+    // lite_translator.h::FpDataProc1's Sqrtss/Sqrtsd arms. Only lane 0 is read
+    // and SetVRegScalar commits only lane 0, so the scalar op is exact.
+    if (args.opcode == 0b000011) {
+      FpRegister val = GetVRegScalar(args.rn, is_double);
+      if (is_double) {
+        builder_.Gen<x86_64::SqrtsdXRegXReg>(val.machine_reg(), val.machine_reg());
+      } else {
+        builder_.Gen<x86_64::SqrtssXRegXReg>(val.machine_reg(), val.machine_reg());
+      }
+      SetVRegScalar(args.rd, val, is_double);
       return;
     }
 

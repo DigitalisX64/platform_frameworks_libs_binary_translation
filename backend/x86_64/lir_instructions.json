@@ -99,6 +99,8 @@
         "ShrlRegReg",
         "ShrqRegImm",
         "ShrqRegReg",
+        "SqrtsdXRegXReg",
+        "SqrtssXRegXReg",
         "SubpdXRegXReg",
         "SubpsXRegXReg",
         "SubsdXRegXReg",
