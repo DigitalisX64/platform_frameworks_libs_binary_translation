@@ -493,6 +493,37 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (1u << 21) | (rm << 16) | (0b11001u << 11) | (1u << 10) | (rn << 5) | rd;
   }
 
+  // AdvSIMD vector x indexed-element FP FMUL/FMLA/FMLS (.2S/.4S FP32 size=10,
+  // .2D FP64 size=11). U=0; opcode FMUL=1001, FMLA=0001, FMLS=0101. FP32 index
+  // = H:L (0..3), Vm = M:Rm; FP64 index = H (0..1), L=0, Vm = M:Rm. .2D is
+  // reserved with Q=0, so Q is forced to 1 for the double form. FMULX (U=1) and
+  // FP16 (size=00) still bail to lite and are not produced here. rd samples
+  // rd==rn / rd==Vm to stress the destructive accumulate.
+  uint32_t GenNeonVecXIdxFmul() {
+    static const uint32_t kOpc[] = {0b1001, 0b0001, 0b0101};  // FMUL, FMLA, FMLS
+    const uint32_t opc = kOpc[Rnd() % 3];
+    uint32_t is_double = Rnd() & 1;
+    uint32_t size = is_double ? 0b11u : 0b10u;
+    uint32_t q = is_double ? 1u : (Rnd() & 1);  // .2D reserved with Q=0
+    uint32_t vm = Rnd() % 8;                     // M=0, Rm=vm (<8)
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M = 0, Rm = vm;
+    if (is_double) {  // FP64: index 0..1 = H, L must be 0
+      uint32_t index = Rnd() % 2;
+      H = index;
+      L = 0;
+    } else {  // FP32: index 0..3 = H:L
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+    }
+    return (q << 30) | (0u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (opc << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
+
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
   // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
   // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
@@ -734,6 +765,34 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonFmla) {
   EXPECT_GT(compared, 300) << "heavy accepted too few FMLA/FMLS encodings";
 }
 
+// FP by-element FMUL/FMLA/FMLS (.2S/.4S FP32, .2D FP64). The heavy tier now
+// broadcasts Vm.lane[index] with PSHUFD and lowers to packed MULP{S,D} (FMUL)
+// or x86 FMA3 VF(N)MADD231P{S,D} (FMLA/FMLS, single rounding) — was: bail to
+// lite. Inputs are seeded with finite floats (RandomFiniteFpVReg) so the
+// interpreter's result and the x86 result agree bit-for-bit (random NaN
+// payloads propagate differently on ARM vs x86). Exercises FMUL/FMLA/FMLS ×
+// single/double × Q × index and the destructive rd==rn / rd==Vm accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxFmul) {
+  Seed(0xF3B1DECC1DE50FF1ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t insn = GenNeonVecXIdxFmul();
+    uint32_t code[1] = {insn};
+    const bool is_double = ((insn >> 22) & 1) != 0;
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFiniteFpVReg(is_double);
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few by-element FMUL/FMLA/FMLS";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -894,6 +953,27 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_fma_single) << "FMA generator no longer produces single-precision";
   EXPECT_TRUE(saw_fma_double) << "FMA generator no longer produces double-precision";
   EXPECT_TRUE(saw_fma_alias) << "FMA generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_ifmul = false, saw_ifmla = false, saw_ifmls = false;
+  bool saw_ifp_single = false, saw_ifp_double = false, saw_ifp_alias = false;
+  Seed(0x1DF9C0DE5EEDBEEFULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxFmul();
+    uint32_t opcode = (insn >> 12) & 0xF, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode == 0b1001) saw_ifmul = true;  // FMUL
+    if (opcode == 0b0001) saw_ifmla = true;  // FMLA
+    if (opcode == 0b0101) saw_ifmls = true;  // FMLS
+    if (size == 2) saw_ifp_single = true;    // FP32
+    if (size == 3) saw_ifp_double = true;    // FP64
+    if (rd == rn) saw_ifp_alias = true;
+  }
+  EXPECT_TRUE(saw_ifmul) << "by-element FP generator no longer produces FMUL";
+  EXPECT_TRUE(saw_ifmla) << "by-element FP generator no longer produces FMLA";
+  EXPECT_TRUE(saw_ifmls) << "by-element FP generator no longer produces FMLS";
+  EXPECT_TRUE(saw_ifp_single) << "by-element FP generator no longer produces FP32";
+  EXPECT_TRUE(saw_ifp_double) << "by-element FP generator no longer produces FP64";
+  EXPECT_TRUE(saw_ifp_alias) << "by-element FP generator no longer produces rd==rn (accumulate clobber)";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness

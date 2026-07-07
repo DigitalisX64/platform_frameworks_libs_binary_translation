@@ -8395,6 +8395,97 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FP by-element FMUL/FMLA/FMLS (.2S/.4S FP32 size=10, .2D FP64 size=11).
+    // Heavy-tier mirror of lite_translator.h's vector FP by-element FP32/FP64
+    // arm (the FMUL/FMLA/FMLS half of it): broadcast Vm.lane[index] across all
+    // lanes with PSHUFD, then packed multiply (FMUL) or packed fused
+    // multiply-accumulate (FMLA/FMLS, single rounding via VFMADD231P/VFNMADD231P
+    // -- the same 231 RMW form and one-rounding guarantee as the three-same
+    // FMLA/FMLS heavy arm above).
+    //   FMUL: Vd = Vn * broadcast(Vm.lane[index])
+    //   FMLA: Vd = Vd + Vn * broadcast(Vm.lane[index])   (fused, one rounding)
+    //   FMLS: Vd = Vd - Vn * broadcast(Vm.lane[index])   (fused, one rounding)
+    // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge. FMULX (the
+    // (+/-0 * +/-inf) -> +/-2.0 saturation shape) and FP16 (size=00, an F16C
+    // round-trip absent from the heavy Gen inputs) still bail to lite -- emit
+    // NOTHING before the bail. FMLA/FMLS require host FMA; bail if absent.
+    //
+    // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
+    //   fmul v0.2s, v1.2s, v2.s[0] = 0x0F829020
+    //   fmul v0.4s, v1.4s, v2.s[3] = 0x4FA29820
+    //   fmla v0.4s, v1.4s, v2.s[1] = 0x4FA21020
+    //   fmls v0.2d, v1.2d, v2.d[1] = 0x4FC25820
+    //   fmla v5.2d, v5.2d, v3.d[0] = 0x4FC310A5 (rd==rn)
+    if (args.opcode == Op::kFmul || args.opcode == Op::kFmla ||
+        args.opcode == Op::kFmls) {
+      if (args.size != 0b10 && args.size != 0b11) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool fp_is_double = (args.size == 0b11);
+      const bool needs_fma = (args.opcode == Op::kFmla || args.opcode == Op::kFmls);
+      if (needs_fma && !host_platform::kHasFMA) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const int32_t fp_vn_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t fp_vm_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      const int32_t fp_vd_off =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+
+      FpRegister fxn = AllocTempSimdReg();
+      FpRegister fxm = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(fxn.machine_reg(), fp_vn_off);
+      builder_.GenGetSimd<16>(fxm.machine_reg(), fp_vm_off);
+
+      // Broadcast Vm.lane[index] across all lanes.
+      if (fp_is_double) {
+        // FP64: index 0 -> 0x44 (copies low qword), index 1 -> 0xEE (high qword).
+        const int8_t imm =
+            (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(fxm.machine_reg(), fxm.machine_reg(), imm);
+      } else {
+        const uint8_t i = args.index & 0b11;
+        const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(fxm.machine_reg(), fxm.machine_reg(), imm);
+      }
+
+      FpRegister fp_result = fxn;
+      if (args.opcode == Op::kFmul) {
+        if (fp_is_double) {
+          builder_.Gen<x86_64::MulpdXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::MulpsXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
+        }
+      } else {
+        FpRegister fxd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(fxd.machine_reg(), fp_vd_off);
+        if (args.opcode == Op::kFmla) {
+          if (fp_is_double) {
+            builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+                fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::Vfmadd231psXRegXRegXReg>(
+                fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
+          }
+        } else {
+          // FMLS: Vd = Vd + (-Vn)*Vm -- single fused rounding.
+          if (fp_is_double) {
+            builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+                fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
+          } else {
+            builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(
+                fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
+          }
+        }
+        fp_result = fxd;
+      }
+      SetVRegFull(args.rd, fp_result, args.q);
+      return;
+    }
+
     if (args.opcode != Op::kMul && args.opcode != Op::kMla &&
         args.opcode != Op::kMls) {
       UndefinedReturningVoid();
