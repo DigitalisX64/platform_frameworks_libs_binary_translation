@@ -5522,6 +5522,163 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // SUQADD / USQADD Vd.<T>, Vn.<T> — per-lane saturating accumulate of
+      // mixed signedness:
+      //   SUQADD Vd, Vn: Vd[i] = SignedSat( int(Vd[i]) + uint(Vn[i]) )
+      //   USQADD Vd, Vn: Vd[i] = UnsignedSat( uint(Vd[i]) + int(Vn[i]) )
+      // x86 has no mixed-sign saturating add, but an N-bit signed plus an N-bit
+      // unsigned always fits in N+1 bits, so widen each operand with its own
+      // signedness, add in the wider lane, and narrow with the pack matching the
+      // destination signedness (PACKUS* for USQADD, PACKSS* for SUQADD — PACKUS
+      // clamps negatives to 0 and over-range to max = UnsignedSat exactly).
+      // Mirrors the branchless lite kSuqadd/kUsqadd byte/halfword path. size=10
+      // (.2S/.4S) widens the 32-bit lanes to 64-bit (PMOVSXDQ/PMOVZXDQ), adds
+      // in PADDQ, and clamps each 64-bit sum to the int32/uint32 range with
+      // PCMPGTQ blends (the same masked-blend idiom as the kSqxtn size=10 arm),
+      // then gathers the low dwords (PSHUFD/PUNPCKLQDQ). size=11 (.1D/.2D) needs
+      // 65-bit saturation and bails to lite.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kSuqadd:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd: {
+        const bool usqadd = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd);
+        const int32_t vd_off =
+            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        if (args.size == 0b00 || args.size == 0b01) {
+          FpRegister xd = AllocTempSimdReg();
+          FpRegister xn = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          // Widen the low 8 bytes of `r` in place with the given signedness.
+          auto widen_lo = [&](FpRegister r, bool is_signed) {
+            if (args.size == 0b00) {
+              if (is_signed) {
+                builder_.Gen<x86_64::PmovsxbwXRegXReg>(r.machine_reg(), r.machine_reg());
+              } else {
+                builder_.Gen<x86_64::PmovzxbwXRegXReg>(r.machine_reg(), r.machine_reg());
+              }
+            } else {
+              if (is_signed) {
+                builder_.Gen<x86_64::PmovsxwdXRegXReg>(r.machine_reg(), r.machine_reg());
+              } else {
+                builder_.Gen<x86_64::PmovzxwdXRegXReg>(r.machine_reg(), r.machine_reg());
+              }
+            }
+          };
+          auto add_wide = [&](FpRegister a, FpRegister b) {
+            if (args.size == 0b00) {
+              builder_.Gen<x86_64::PaddwXRegXReg>(a.machine_reg(), b.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PadddXRegXReg>(a.machine_reg(), b.machine_reg());
+            }
+          };
+          // Vd carries the destination flavour (SUQADD signed / USQADD unsigned);
+          // Vn carries the opposite signedness.
+          FpRegister dlo = AllocTempSimdReg();
+          FpRegister nlo = AllocTempSimdReg();
+          builder_.Gen<x86_64::MovdqaXRegXReg>(dlo.machine_reg(), xd.machine_reg());
+          builder_.Gen<x86_64::MovdqaXRegXReg>(nlo.machine_reg(), xn.machine_reg());
+          widen_lo(dlo, /*is_signed=*/!usqadd);
+          widen_lo(nlo, /*is_signed=*/usqadd);
+          add_wide(dlo, nlo);  // dlo = widened lane sums (low half)
+          FpRegister hi = args.q ? AllocTempSimdReg() : AllocZeroedSimdReg();
+          if (args.q) {
+            builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+            FpRegister nhi = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(hi.machine_reg(), xd.machine_reg());
+            builder_.Gen<x86_64::MovdqaXRegXReg>(nhi.machine_reg(), xn.machine_reg());
+            widen_lo(hi, /*is_signed=*/!usqadd);
+            widen_lo(nhi, /*is_signed=*/usqadd);
+            add_wide(hi, nhi);  // hi = widened lane sums (high half)
+          }
+          // Narrow with the destination-signedness saturating pack.
+          if (args.size == 0b00) {
+            if (usqadd) {
+              builder_.Gen<x86_64::PackuswbXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PacksswbXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            }
+          } else {
+            if (usqadd) {
+              builder_.Gen<x86_64::PackusdwXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PackssdwXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            }
+          }
+          SetVRegFull(args.rd, dlo, args.q);
+          return;
+        }
+        if (args.size == 0b10) {
+          FpRegister xd = AllocTempSimdReg();
+          FpRegister xn = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          const int64_t hi_bound = usqadd ? int64_t{0x00000000FFFFFFFFLL}   // UINT32_MAX
+                                          : int64_t{0x000000007FFFFFFFLL};  // INT32_MAX
+          const int64_t lo_bound = usqadd
+                                       ? int64_t{0}
+                                       : static_cast<int64_t>(0xFFFFFFFF80000000ULL);  // INT32_MIN
+          auto set_const = [&](FpRegister r, int64_t v) {
+            Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(v));
+            builder_.Gen<x86_64::MovqXRegReg>(r.machine_reg(), gp);
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
+          };
+          // dst = (mask ? val : dst) via dst ^= (dst ^ val) & mask.
+          auto blend = [&](FpRegister dst, FpRegister val, FpRegister mask) {
+            FpRegister t = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), dst.machine_reg());
+            builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
+            builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
+            builder_.Gen<x86_64::PxorXRegXReg>(dst.machine_reg(), t.machine_reg());
+          };
+          // Widen the low 2 dwords of (d,n) to 64-bit lanes, add, clamp to the
+          // destination range, and gather the two clamped low dwords into the
+          // low 64 bits (PSHUFD 0b00001000). Consumes d and n; returns d.
+          auto process_half = [&](FpRegister d, FpRegister n) -> FpRegister {
+            if (usqadd) {
+              builder_.Gen<x86_64::PmovzxdqXRegXReg>(d.machine_reg(), d.machine_reg());
+              builder_.Gen<x86_64::PmovsxdqXRegXReg>(n.machine_reg(), n.machine_reg());
+            } else {
+              builder_.Gen<x86_64::PmovsxdqXRegXReg>(d.machine_reg(), d.machine_reg());
+              builder_.Gen<x86_64::PmovzxdqXRegXReg>(n.machine_reg(), n.machine_reg());
+            }
+            builder_.Gen<x86_64::PaddqXRegXReg>(d.machine_reg(), n.machine_reg());
+            FpRegister c = AllocTempSimdReg();
+            FpRegister m = AllocTempSimdReg();
+            // clamp above: where d > hi_bound, take hi_bound.
+            set_const(c, hi_bound);
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), d.machine_reg());
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());
+            blend(d, c, m);
+            // clamp below: where lo_bound > d, take lo_bound.
+            set_const(c, lo_bound);
+            builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
+            builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), d.machine_reg());
+            blend(d, c, m);
+            builder_.Gen<x86_64::PshufdXRegXRegImm>(d.machine_reg(), d.machine_reg(),
+                                                    int8_t{0b00001000});
+            return d;
+          };
+          if (args.q) {
+            FpRegister xdh = AllocTempSimdReg();
+            FpRegister xnh = AllocTempSimdReg();
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xdh.machine_reg(), xd.machine_reg());
+            builder_.Gen<x86_64::MovdqaXRegXReg>(xnh.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PsrldqXRegImm>(xdh.machine_reg(), int8_t{8});
+            builder_.Gen<x86_64::PsrldqXRegImm>(xnh.machine_reg(), int8_t{8});
+            FpRegister lo = process_half(xd, xn);
+            FpRegister hi = process_half(xdh, xnh);
+            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(lo.machine_reg(), hi.machine_reg());
+            SetVRegFull(args.rd, lo, /*q=*/true);
+          } else {
+            FpRegister lo = process_half(xd, xn);
+            SetVRegFull(args.rd, lo, /*q=*/false);
+          }
+          return;
+        }
+        UndefinedReturningVoid();  // size=11 (.1D/.2D): 65-bit saturation, bail to lite
+        return;
+      }
+
       // CLZ / CLS V.<T>, V.<T> — per-lane count-leading-zeros / count-leading-
       // sign-bits. size=00 .8B/.16B (N=8), size=01 .4H/.8H (N=16), size=10
       // .2S/.4S (N=32); size=11 reserved. Mirrors lite kClz/kCls but uses LZCNT
