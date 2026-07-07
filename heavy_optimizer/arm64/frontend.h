@@ -8402,22 +8402,27 @@ class HeavyOptimizerFrontend {
     // multiply-accumulate (FMLA/FMLS, single rounding via VFMADD231P/VFNMADD231P
     // -- the same 231 RMW form and one-rounding guarantee as the three-same
     // FMLA/FMLS heavy arm above).
-    //   FMUL: Vd = Vn * broadcast(Vm.lane[index])
+    //   FMUL:  Vd = Vn * broadcast(Vm.lane[index])
+    //   FMULX: FMUL except (+/-0 * +/-inf) lanes return +/-2.0 (sign =
+    //          sign(a) XOR sign(b)) instead of NaN -- the saturation blend
+    //          lifted from lite_translator.h below.
     //   FMLA: Vd = Vd + Vn * broadcast(Vm.lane[index])   (fused, one rounding)
     //   FMLS: Vd = Vd - Vn * broadcast(Vm.lane[index])   (fused, one rounding)
-    // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge. FMULX (the
-    // (+/-0 * +/-inf) -> +/-2.0 saturation shape) and FP16 (size=00, an F16C
-    // round-trip absent from the heavy Gen inputs) still bail to lite -- emit
-    // NOTHING before the bail. FMLA/FMLS require host FMA; bail if absent.
+    // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge. FP16
+    // (size=00, an F16C round-trip absent from the heavy Gen inputs) still
+    // bails to lite -- emit NOTHING before the bail. FMLA/FMLS require host
+    // FMA; bail if absent (FMULX does not).
     //
     // Verified encodings (aarch64-linux-gnu-as -march=armv8.2-a):
-    //   fmul v0.2s, v1.2s, v2.s[0] = 0x0F829020
-    //   fmul v0.4s, v1.4s, v2.s[3] = 0x4FA29820
-    //   fmla v0.4s, v1.4s, v2.s[1] = 0x4FA21020
-    //   fmls v0.2d, v1.2d, v2.d[1] = 0x4FC25820
-    //   fmla v5.2d, v5.2d, v3.d[0] = 0x4FC310A5 (rd==rn)
-    if (args.opcode == Op::kFmul || args.opcode == Op::kFmla ||
-        args.opcode == Op::kFmls) {
+    //   fmul  v0.2s, v1.2s, v2.s[0] = 0x0F829020
+    //   fmul  v0.4s, v1.4s, v2.s[3] = 0x4FA29820
+    //   fmla  v0.4s, v1.4s, v2.s[1] = 0x4FA21020
+    //   fmls  v0.2d, v1.2d, v2.d[1] = 0x4FC25820
+    //   fmla  v5.2d, v5.2d, v3.d[0] = 0x4FC310A5 (rd==rn)
+    //   fmulx v0.2s, v1.2s, v2.s[0] = 0x2F829020 (U=1)
+    //   fmulx v0.2d, v1.2d, v2.d[1] = 0x6FC29820
+    if (args.opcode == Op::kFmul || args.opcode == Op::kFmulx ||
+        args.opcode == Op::kFmla || args.opcode == Op::kFmls) {
       if (args.size != 0b10 && args.size != 0b11) {
         UndefinedReturningVoid();
         return;
@@ -8459,6 +8464,70 @@ class HeavyOptimizerFrontend {
         } else {
           builder_.Gen<x86_64::MulpsXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
         }
+      } else if (args.opcode == Op::kFmulx) {
+        // FMULX = FMUL except (+/-0 * +/-inf) lanes return +/-2.0 (sign =
+        // sign(a) XOR sign(broadcast_b)).  Line-by-line lift of
+        // lite_translator.h's by-element FMULX saturation blend on top of the
+        // already-broadcast Vm lane (fxm):
+        //   mul         = a * broadcast_b
+        //   mul_unord   = cmpunord(mul, mul)        (-1/lane if mul is NaN)
+        //   input_unord = cmpunord(a, broadcast_b)  (-1/lane if a or b NaN)
+        //   special     = mul_unord AND NOT input_unord  (exactly +-0*+-inf)
+        //   two_signed  = ((a XOR broadcast_b) AND sign_mask) OR bits(+2.0)
+        //   result      = (mul AND NOT special) OR (two_signed AND special)
+        FpRegister mul = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), fxn.machine_reg());
+        if (fp_is_double) {
+          builder_.Gen<x86_64::MulpdXRegXReg>(mul.machine_reg(), fxm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::MulpsXRegXReg>(mul.machine_reg(), fxm.machine_reg());
+        }
+        // mul_unord = cmpunord(mul, mul).
+        FpRegister mul_unord = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
+        if (fp_is_double) {
+          builder_.Gen<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+        }
+        // special = input_unord = cmpunord(a, broadcast_b), then
+        // special = mul_unord AND NOT input_unord (Pandn writes (NOT dst) AND src).
+        FpRegister special = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(special.machine_reg(), fxn.machine_reg());
+        if (fp_is_double) {
+          builder_.Gen<x86_64::CmpunordpdXRegXReg>(special.machine_reg(), fxm.machine_reg());
+        } else {
+          builder_.Gen<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), fxm.machine_reg());
+        }
+        builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
+        // two_signed: reuse fxn as (a XOR broadcast_b); reuse mul_unord as the
+        // per-lane sign mask (all-ones << 31/63).  Bitwise XOR == XORPS/XORPD.
+        builder_.Gen<x86_64::PxorXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+        if (fp_is_double) {
+          builder_.Gen<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
+        } else {
+          builder_.Gen<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
+        }
+        builder_.Gen<x86_64::PandXRegXReg>(fxn.machine_reg(), mul_unord.machine_reg());
+        // Broadcast bits of +2.0 into all lanes (FP64: 0x4000000000000000 per
+        // qword; FP32: 0x40000000 per dword = 0x4000000040000000 per qword).
+        FpRegister two = AllocTempSimdReg();
+        {
+          const uint64_t pat = fp_is_double ? uint64_t{0x4000000000000000ULL}
+                                            : uint64_t{0x4000000040000000ULL};
+          Register gr =
+              std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pat)));
+          builder_.Gen<x86_64::MovqXRegReg>(two.machine_reg(), gr);
+          builder_.Gen<x86_64::PinsrqXRegRegImm>(two.machine_reg(), gr, int8_t{1});
+        }
+        builder_.Gen<x86_64::PorXRegXReg>(fxn.machine_reg(), two.machine_reg());
+        // fxn now holds +/-2.0 per lane.  Blend:
+        //   result = (mul AND NOT special) OR (+/-2.0 AND special).
+        builder_.Gen<x86_64::PandXRegXReg>(fxn.machine_reg(), special.machine_reg());
+        builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
+        builder_.Gen<x86_64::PorXRegXReg>(special.machine_reg(), fxn.machine_reg());
+        fp_result = special;
       } else {
         FpRegister fxd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(fxd.machine_reg(), fp_vd_off);

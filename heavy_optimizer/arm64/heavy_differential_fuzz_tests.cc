@@ -524,6 +524,78 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (rn << 5) | rd;
   }
 
+  // FMULX (by element): U=1, opcode=1001, size=10 (.2S/.4S) or 11 (.2D). Same
+  // encoding shape as GenNeonVecXIdxFmul's FMUL arm but with the U bit set. The
+  // saturation path only fires on (+-0 * +-inf); the paired test seeds those
+  // special lanes explicitly (RandomFmulxFpVReg).
+  uint32_t GenNeonVecXIdxFmulx() {
+    uint32_t is_double = Rnd() & 1;
+    uint32_t size = is_double ? 0b11u : 0b10u;
+    uint32_t q = is_double ? 1u : (Rnd() & 1);  // .2D reserved with Q=0
+    uint32_t vm = Rnd() % 8;                     // M=0, Rm=vm (<8)
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M = 0, Rm = vm;
+    if (is_double) {  // FP64: index 0..1 = H, L must be 0
+      H = Rnd() % 2;
+      L = 0;
+    } else {  // FP32: index 0..3 = H:L
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+    }
+    return (q << 30) | (1u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (0b1001u << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
+
+  // A random 128-bit V-register whose lanes are drawn from {+0, -0, +inf, -inf,
+  // small-finite} — but NEVER NaN. This exercises FMULX's (+-0 * +-inf)->+-2.0
+  // saturation lanes while keeping the ARM-vs-x86 result bit-identical: the only
+  // way a*b produces a NaN from these inputs is exactly the +-0*+-inf case,
+  // which both tiers turn into +-2.0, so no random NaN payload ever diverges.
+  unsigned __int128 RandomFmulxFpVReg(bool is_double) {
+    auto pick32 = [&]() -> uint32_t {
+      switch (Rnd() % 5) {
+        case 0: return 0x00000000u;  // +0
+        case 1: return 0x80000000u;  // -0
+        case 2: return 0x7F800000u;  // +inf
+        case 3: return 0xFF800000u;  // -inf
+        default: {
+          float f = static_cast<float>(static_cast<int32_t>(Rnd() % 32768) - 16384) /
+                    16.0f;
+          uint32_t bits;
+          memcpy(&bits, &f, 4);
+          return bits;
+        }
+      }
+    };
+    auto pick64 = [&]() -> uint64_t {
+      switch (Rnd() % 5) {
+        case 0: return 0x0000000000000000ULL;  // +0
+        case 1: return 0x8000000000000000ULL;  // -0
+        case 2: return 0x7FF0000000000000ULL;  // +inf
+        case 3: return 0xFFF0000000000000ULL;  // -inf
+        default: {
+          double d = static_cast<double>(
+                         static_cast<int64_t>(Rnd64() % 33554432) - 16777216) /
+                     16.0;
+          uint64_t bits;
+          memcpy(&bits, &d, 8);
+          return bits;
+        }
+      }
+    };
+    if (is_double) {
+      unsigned __int128 lo = pick64(), hi = pick64();
+      return (hi << 64) | lo;
+    }
+    uint64_t l0 = pick32(), l1 = pick32(), l2 = pick32(), l3 = pick32();
+    unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
+    return (hi << 64) | lo;
+  }
+
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
   // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
   // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
@@ -793,6 +865,34 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxFmul) {
   EXPECT_GT(compared, 300) << "heavy accepted too few by-element FMUL/FMLA/FMLS";
 }
 
+// FP by-element FMULX (.2S/.4S FP32, .2D FP64). The heavy tier now lowers FMULX
+// as FMUL plus the (+-0 * +-inf)->+-2.0 saturation blend (PSHUFD broadcast,
+// MULP{S,D}, CMPUNORDP{S,D} special-lane detection, sign-mask + bits(+2.0)
+// select) — was: bail to lite. Inputs are drawn from {+-0, +-inf, small-finite}
+// (RandomFmulxFpVReg, never NaN) so the saturation lanes actually fire while the
+// ARM-vs-x86 result stays bit-identical. Exercises FMULX × single/double × Q ×
+// index and the destructive rd==rn / rd==Vm accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxFmulx) {
+  Seed(0x2A17FEEDF00DBA11ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t insn = GenNeonVecXIdxFmulx();
+    uint32_t code[1] = {insn};
+    const bool is_double = ((insn >> 22) & 1) != 0;
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFmulxFpVReg(is_double);
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few by-element FMULX";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -974,6 +1074,23 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_ifp_single) << "by-element FP generator no longer produces FP32";
   EXPECT_TRUE(saw_ifp_double) << "by-element FP generator no longer produces FP64";
   EXPECT_TRUE(saw_ifp_alias) << "by-element FP generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_fmulx_u = false, saw_fmulx_single = false, saw_fmulx_double = false;
+  bool saw_fmulx_alias = false;
+  Seed(0x5A7C0FFEE0DDBA11ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxFmulx();
+    uint32_t u = (insn >> 29) & 1, opcode = (insn >> 12) & 0xF, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 1 && opcode == 0b1001) saw_fmulx_u = true;  // FMULX (U=1)
+    if (size == 2) saw_fmulx_single = true;              // FP32
+    if (size == 3) saw_fmulx_double = true;              // FP64
+    if (rd == rn) saw_fmulx_alias = true;
+  }
+  EXPECT_TRUE(saw_fmulx_u) << "by-element FMULX generator no longer sets U=1/opcode=1001";
+  EXPECT_TRUE(saw_fmulx_single) << "by-element FMULX generator no longer produces FP32";
+  EXPECT_TRUE(saw_fmulx_double) << "by-element FMULX generator no longer produces FP64";
+  EXPECT_TRUE(saw_fmulx_alias) << "by-element FMULX generator no longer produces rd==rn (accumulate clobber)";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
