@@ -804,7 +804,8 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
 // The scalar result is committed with SetVRegScalar (upper V[] bytes zeroed).
 void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
                                             bool is_double,
-                                            uint8_t fbits) {
+                                            uint8_t fbits,
+                                            bool src_from_simd) {
   if (!success()) {
     return;
   }
@@ -829,13 +830,23 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     SetVRegScalar(args.rd, xmm, is_double);
   };
 
-  // rn == 31 is WZR/XZR -> 0; static_cast<FP>(0) == +0.0 (scaled 0 is still 0).
-  if (args.rn == 31) {
+  // rn == 31 is WZR/XZR -> 0 for the GP-source form; static_cast<FP>(0) == +0.0
+  // (scaled 0 is still 0). For the scalar-SIMD source form V31 is a real
+  // register, so skip this special case.
+  if (!src_from_simd && args.rn == 31) {
     finish(AllocZeroedSimdReg());
     return;
   }
 
-  Register src = GetReg(args.rn);
+  // Source integer: X[rn] (GP form) or the low 64-bit lane of V[rn] (scalar-SIMD
+  // `.d` form; MOVQ pulls the int64 into a GP so the same CVTSI2SD ladder runs).
+  Register src;
+  if (src_from_simd) {
+    FpRegister xn = GetVRegScalar(args.rn, is_double);
+    src = std::get<0>(Gen<x86_64::MovqRegXReg>(xn.machine_reg()));
+  } else {
+    src = GetReg(args.rn);
+  }
 
   // SCVTF (any sf): straight-line signed convert.
   if (!is_unsigned) {
@@ -935,10 +946,20 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                        bool is_double,
                                        int8_t round_imm,
                                        bool ties_away,
-                                       uint8_t fbits) {
+                                       uint8_t fbits,
+                                       bool dest_to_simd) {
   if (!success()) {
     return;
   }
+  // Commit the integer result: X[rd] (GP form, rd==31 discards) or the low
+  // 64-bit lane of V[rd] with Vd[127:64] zeroed (scalar-SIMD `.d` form).
+  auto commit = [&](Register result) {
+    if (dest_to_simd) {
+      SetVRegScalarFromGp(args.rd, result, is_double);
+    } else if (args.rd != 31) {
+      SetReg(args.rd, result);
+    }
+  };
   // Unsigned forms: FCVTZU/FCVTNU/FCVTPU/FCVTMU (op 001) and FCVTAU (op 101).
   const bool is_unsigned = (args.op == 0b001 || args.op == 0b101);
   auto* ir = builder_.ir();
@@ -1105,9 +1126,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.Gen<PseudoBranch>(done_bb);
 
     builder_.StartBasicBlock(done_bb);
-    if (args.rd != 31) {
-      SetReg(args.rd, result);
-    }
+    commit(result);
     return;
   }
 
@@ -1225,9 +1244,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
   builder_.Gen<PseudoBranch>(done_bb);
 
   builder_.StartBasicBlock(done_bb);
-  if (args.rd != 31) {
-    SetReg(args.rd, result);
-  }
+  commit(result);
 }
 
 // LDXR/STXR/LDAXR/STLXR (exclusive) and LDAR/STLR (acquire/release). Mirrors
