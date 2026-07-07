@@ -648,6 +648,39 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     return (hi << 64) | lo;
   }
 
+  // AdvSIMD vector two-reg-misc FRINTN/FRINTM/FRINTP/FRINTZ/FRINTX/FRINTI
+  // (FP32 .2S/.4S): round float to integral float with a fixed rounding mode.
+  // Encoding:
+  //   (Q<<30)|(U<<29)|(0b01110<<24)|(size<<22)|(0b10000<<17)|(opcode<<12)
+  //   |(0b10<<10)|(Rn<<5)|Rd
+  // Six FP32 variants (verified vs aarch64-linux-gnu-as):
+  //   FRINTN U0 op0x18 sz00 (0x4e218820), FRINTM U0 op0x19 sz00 (0x4e219820),
+  //   FRINTP U0 op0x18 sz10 (0x4ea18820), FRINTZ U0 op0x19 sz10 (0x4ea19820),
+  //   FRINTX U1 op0x19 sz00 (0x6e219820), FRINTI U1 op0x19 sz10 (0x6ea19820).
+  // Heavy JITs the FP32 form as a single ROUNDPS; a .2D form (sz low bit=1, which
+  // requires Q=1) bails to lite and is declined. rd samples rd==rn; Q samples
+  // .2S/.4S.
+  uint32_t GenNeonFrintV() {
+    struct V { uint32_t u, opcode, size; };
+    static const V kVariants[6] = {
+        {0, 0x18, 0b00},  // FRINTN (nearest-even)
+        {0, 0x19, 0b00},  // FRINTM (toward -inf)
+        {0, 0x18, 0b10},  // FRINTP (toward +inf)
+        {0, 0x19, 0b10},  // FRINTZ (toward zero)
+        {1, 0x19, 0b00},  // FRINTX (use FPCR, signals inexact)
+        {1, 0x19, 0b10},  // FRINTI (use FPCR)
+    };
+    const V& v = kVariants[Rnd() % 6];
+    uint32_t size = v.size;
+    uint32_t q = Rnd() & 1;
+    // ~1 in 5: promote to a .2D form (sz low bit set, Q=1) which heavy declines.
+    if ((Rnd() % 5) == 0) { size |= 1u; q = 1; }
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // sample destructive rd==rn
+    return (q << 30) | (v.u << 29) | (0b01110u << 24) | (size << 22) |
+           (0b10000u << 17) | (v.opcode << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
+
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
   // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
   // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
@@ -971,6 +1004,33 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonScalarFcvta) {
   EXPECT_GT(compared, 300) << "heavy accepted too few scalar FCVTAS/FCVTAU";
 }
 
+// Vector FRINTN/FRINTM/FRINTP/FRINTZ/FRINTX/FRINTI (FP32 .2S/.4S): round float
+// to integral float. Heavy now lowers the FP32 form as a single SSE4.1 ROUNDPS
+// with the matching rounding imm (no int saturation fix-up — the result stays
+// FP) — was: bail to lite. The .2D form bails and is declined. Inputs
+// (RandomFcvtaFpVReg) seed every FP32 lane from the corner set — NaN/+-inf
+// (propagate unchanged), 2^31/2^32 magnitudes (already integral), +-N.5
+// half-integers (the nearest-even boundary for FRINTN), and finite fractions —
+// so each rounding mode's boundary fires and HEAVY==interp on full state.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonFrintV) {
+  Seed(0xF817E5F817E50022ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonFrintV()};
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFcvtaFpVReg();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few vector FRINT";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -1188,6 +1248,26 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_fcvta_s) << "scalar FCVTA generator no longer produces S (heavy-JIT) form";
   EXPECT_TRUE(saw_fcvta_d) << "scalar FCVTA generator no longer produces D (declined) form";
   EXPECT_TRUE(saw_fcvta_alias) << "scalar FCVTA generator no longer produces rd==rn";
+
+  bool saw_frintn = false, saw_frinti = false, saw_frint_fp32 = false;
+  bool saw_frint_2d = false, saw_frint_alias = false;
+  Seed(0xF817E5F817E50033ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonFrintV();
+    uint32_t u = (insn >> 29) & 1, opcode = (insn >> 12) & 0x1F;
+    uint32_t size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 0 && opcode == 0x18 && (size & 1) == 0) saw_frintn = true;  // FRINTN/P
+    if (u == 1 && opcode == 0x19) saw_frinti = true;                     // FRINTX/I
+    if ((size & 1) == 0) saw_frint_fp32 = true;   // FP32 (heavy JITs)
+    if ((size & 1) == 1) saw_frint_2d = true;     // .2D (declined)
+    if (rd == rn) saw_frint_alias = true;
+  }
+  EXPECT_TRUE(saw_frintn) << "vector FRINT generator no longer produces FRINTN/FRINTP";
+  EXPECT_TRUE(saw_frinti) << "vector FRINT generator no longer produces FRINTX/FRINTI";
+  EXPECT_TRUE(saw_frint_fp32) << "vector FRINT generator no longer produces FP32 (heavy-JIT) form";
+  EXPECT_TRUE(saw_frint_2d) << "vector FRINT generator no longer produces .2D (declined) form";
+  EXPECT_TRUE(saw_frint_alias) << "vector FRINT generator no longer produces rd==rn";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness

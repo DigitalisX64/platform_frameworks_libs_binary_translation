@@ -6535,6 +6535,46 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // FRINTN / FRINTM / FRINTP / FRINTZ / FRINTX / FRINTI V Vd.<T>, Vn.<T>
+      // (FP32 .2S/.4S) — round floating-point to integral floating-point with a
+      // fixed rounding mode. The result stays in FP, so unlike the FCVT*
+      // converts there is no int saturation fix-up: a single SSE4.1 ROUNDPS
+      // with the matching imm handles every finite/NaN/Inf/signed-zero lane.
+      // Branchless mirror of the validated lite lowering
+      // (lite_translator.h::AdvSimdTwoRegMisc kFrintnV.. path):
+      //   FRINTN -> imm=0x00 (nearest-even), FRINTM -> 0x01 (toward -inf),
+      //   FRINTP -> 0x02 (toward +inf), FRINTZ -> 0x03 (toward zero),
+      //   FRINTX/FRINTI -> 0x04 (use MXCSR; default RNE matches ARM's FPCR).
+      // FP64 .2D needs ROUNDPD (not allowlisted in the heavy backend) and FP16
+      // needs the F16C round-trip, so both bail to lite→interp, mirroring the
+      // lite FP32-only fast path used by the sibling FCVT* V converts.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintxV:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintiV: {
+        if (args.is_fp16 || (args.size & 1) == 1) {
+          UndefinedReturningVoid();
+          return;
+        }
+        int8_t round_imm;
+        switch (args.opcode) {
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintnV: round_imm = int8_t{0x00}; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintmV: round_imm = int8_t{0x01}; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintpV: round_imm = int8_t{0x02}; break;
+          case Decoder::AdvSimdTwoRegMiscOpcode::kFrintzV: round_imm = int8_t{0x03}; break;
+          // FRINTX / FRINTI follow the current FPCR rounding mode; treat MXCSR
+          // (default RNE) as the canonical mode via the ROUND* "use MXCSR" bit.
+          default: round_imm = int8_t{0x04}; break;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), round_imm);
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
       // SADDLP / UADDLP / SADALP / UADALP Vd.<Ta>, Vn.<Tb> — pairwise long
       // add / add-accumulate. Each adjacent pair of esize-wide source lanes is
       // widened (sign/zero) to 2*esize and summed; SADALP/UADALP accumulate the
