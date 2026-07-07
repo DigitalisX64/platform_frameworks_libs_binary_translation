@@ -3979,6 +3979,12 @@ constexpr uint32_t ClsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t Rev32Vec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b00000, rd, rn);
 }
+// FRINTA V (FP32, ties-away): a=0, U=1, opcode=11000, sz=0 -> size field 0b00.
+constexpr uint32_t FrintaVec(bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, /*size=*/0b00, /*opcode=*/0b11000, rd, rn);
+}
+static_assert(FrintaVec(/*q=*/true, 0, 1) == 0x6E218820u);   // frinta v0.4s, v1.4s
+static_assert(FrintaVec(/*q=*/false, 0, 1) == 0x2E218820u);  // frinta v0.2s, v1.2s
 // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index:
 //   0 Q 101110 00 0 Rm 0 imm4 0 Rn Rd
 constexpr uint32_t ExtVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm4) {
@@ -4931,6 +4937,47 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDOddIntegerAboveThreshold) {
   ASSERT_TRUE(ok);
   EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 4503599627370497.0);  // unchanged
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Vector FRINTA .4S: all four FP32 lanes rounded ties-away independently.
+// Lanes exercise pos/neg ties (2.5->3, -2.5->-3) and non-ties (0.4->0, 0.6->1).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVec4S) {
+  static const uint32_t code[] = {FrintaVec(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(2.5f, -2.5f), Pack2xF32(0.4f, 0.6f));
+  SetV128(&state_, 0, 0xDEADBEEFDEADBEEFull, 0xDEADBEEFDEADBEEFull);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(3.0f, -3.0f));
+  EXPECT_EQ(VUpperHi64(&state_, 0), Pack2xF32(0.0f, 1.0f));
+}
+
+// Vector FRINTA .2S: 64-bit form must zero the upper 64 bits of Vd (Q=0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVec2S) {
+  static const uint32_t code[] = {FrintaVec(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(3.5f, -0.5f), 0xDEADBEEFDEADBEEFull);
+  SetV128(&state_, 0, 0xDEADBEEFDEADBEEFull, 0xDEADBEEFDEADBEEFull);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(4.0f, -1.0f));  // 3.5->4 (tie away), -0.5->-1
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);                 // Q=0 zeroes upper 64
+}
+
+// Vector FRINTA .4S magnitude-gate: 2^23+1 (odd integer, FP step >= 1) must be
+// left untouched in every lane (the 0.5 addend is gated off).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVec4SOddIntegerAboveThreshold) {
+  static const uint32_t code[] = {FrintaVec(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(8388609.0f, -8388609.0f), Pack2xF32(1.5f, 8388609.0f));
+  SetV128(&state_, 0, 0xDEADBEEFDEADBEEFull, 0xDEADBEEFDEADBEEFull);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(8388609.0f, -8388609.0f));  // unchanged
+  EXPECT_EQ(VUpperHi64(&state_, 0), Pack2xF32(2.0f, 8388609.0f));    // 1.5->2, gated
 }
 
 // FMOV Sd, #1.0 (imm8 = 0x70 encodes +1.0 in single precision).

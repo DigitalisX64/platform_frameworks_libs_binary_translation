@@ -6746,6 +6746,53 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // FRINTA V Vd.<T>, Vn.<T> (FP32 .2S/.4S) — round float to integral float,
+      // ties away from zero. x86 has no ROUNDPS immediate for ties-away, so
+      // mirror the validated lite vector lowering
+      // (lite_translator.h::AdvSimdTwoRegMisc kFrintaV FP32 path): per lane add
+      // copysign(0.5, x) then ROUNDPS toward zero (imm 0x03), gating the addend
+      // to 0 where |x| >= 2^23 (already an integer, where a 0.5 addend would
+      // round the wrong way; NaN/±Inf bits also exceed the threshold, so their
+      // addend is gated off and ROUND-toward-zero preserves them per the Intel
+      // SDM). The magnitude compare is a signed PCMPGTD on |bits(x)| (top bit
+      // cleared, so signed == unsigned). Unlike the scalar FRINTA the 0.5 and
+      // threshold constants must be broadcast across all 4 lanes (PSHUFD imm
+      // 0x00). sign/absx use AllocZeroedSimdReg (self-PCMPEQ targets). FP64 .2D
+      // needs PCMPGTQ + ROUNDPD (ROUNDPD not allowlisted in the heavy backend)
+      // and FP16 needs the F16C round-trip, so both bail to lite→interp,
+      // matching the sibling FRINT V and FCVTA V handlers.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV: {
+        if (args.is_fp16 || (args.size & 1) == 1) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister sign = AllocZeroedSimdReg();
+        FpRegister absx = AllocZeroedSimdReg();
+        FpRegister half = AllocTempSimdReg();
+        FpRegister thresh = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        // addend = copysign(0.5f, x) = (x & 0x80000000) | 0.5f, per lane.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+        // gate = (|x| < 2^23) ? all-ones : 0, via thresh > |x| (signed PCMPGTD).
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+        builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(thresh.machine_reg(), thresh.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+        builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
       // SADDLP / UADDLP / SADALP / UADALP Vd.<Ta>, Vn.<Tb> — pairwise long
       // add / add-accumulate. Each adjacent pair of esize-wide source lanes is
       // widened (sign/zero) to 2*esize and summed; SADALP/UADALP accumulate the
