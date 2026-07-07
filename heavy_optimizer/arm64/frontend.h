@@ -2179,7 +2179,15 @@ class HeavyOptimizerFrontend {
   // is scaled by 2^-fbits (an exact power-of-2 multiply that only biases the
   // exponent, so CVTSI2's single rounding carries through). `fbits == 0` is the
   // plain integer form. Mirrors lite_translator.h::FpFixedPointConversion.
-  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double, uint8_t fbits = 0);
+  // `src_from_simd` (used by the scalar-SIMD `.d` SCVTF/UCVTF Dd,Dn forms):
+  // read the source integer from V[rn]'s low 64-bit lane (via MOVQ) instead of
+  // the general register X[rn]; also disables the rn==31/XZR special case (V31
+  // is a valid SIMD source, not zero). The result still commits to V[rd] via
+  // SetVRegScalar.
+  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
+                      bool is_double,
+                      uint8_t fbits = 0,
+                      bool src_from_simd = false);
 
   // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): FP -> integer
   // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
@@ -2200,11 +2208,16 @@ class HeavyOptimizerFrontend {
   // truncating cvtt + saturation ladder. `fbits == 0` is the plain integer form.
   // Fixed-point never combines with the rounding/ties-away paths (round_imm < 0,
   // ties_away false). Mirrors lite_translator.h::FpFixedPointConversion.
+  // `dest_to_simd` (used by the scalar-SIMD `.d` FCVTZS/FCVTZU Dd,Dn forms):
+  // commit the integer result to V[rd]'s low 64-bit lane (via
+  // SetVRegScalarFromGp, zeroing Vd[127:64]) instead of the general register
+  // X[rd]; rd==31 is then V31, a valid destination, not discarded.
   void EmitFcvtz(const Decoder::FpIntConvArgs& args,
                  bool is_double,
                  int8_t round_imm = -1,
                  bool ties_away = false,
-                 uint8_t fbits = 0);
+                 uint8_t fbits = 0,
+                 bool dest_to_simd = false);
 
   //
   // Advanced SIMD (Args-struct forms).
@@ -5644,6 +5657,81 @@ class HeavyOptimizerFrontend {
         return;
       }
 
+      // FCMEQ/FCMGT/FCMGE/FCMLT/FCMLE Vd.<T>, Vn.<T>, #0.0 — per-lane FP compare
+      // against zero (.2S/.4S FP32, .2D FP64). Mirrors lite_translator.h's
+      // non-FP16 path: SSE legacy CMP{EQ,LT,LE}P{S,D} are ordered — they write
+      // FALSE (zero) on any NaN operand, matching ARM's unordered-is-false rule.
+      // Result lane is all-ones on TRUE, zero on FALSE.
+      //   FCMEQ: Vn == 0 -> CMPEQP* xn, xz            (result in xn)
+      //   FCMLT: Vn <  0 -> CMPLTP* xn, xz            (result in xn)
+      //   FCMLE: Vn <= 0 -> CMPLEP* xn, xz            (result in xn)
+      //   FCMGT: Vn >  0 <=> 0 < Vn -> CMPLTP* xz, xn (result in xz)
+      //   FCMGE: Vn >= 0 <=> 0 <= Vn -> CMPLEP* xz, xn (result in xz)
+      // size encodes bit23:bit22; FP forms always have bit23=1 -> size&0b10.
+      // .2D (size=0b11) needs Q=1 (.1D reserved). FP16 lives in a different
+      // encoding slot and bails to lite (interpreter handles it).
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmeqZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmgtZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmgeZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmleZero:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFcmltZero: {
+        if (args.is_fp16 || (args.size & 0b10) == 0) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool is_double = (args.size == 0b11);
+        if (is_double && !args.q) {  // .1D reserved
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xz = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        using Op = Decoder::AdvSimdTwoRegMiscOpcode;
+        FpRegister res = xn;
+        switch (args.opcode) {
+          case Op::kFcmeqZero:
+            if (is_double)
+              builder_.Gen<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            else
+              builder_.Gen<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            break;
+          case Op::kFcmltZero:
+            if (is_double)
+              builder_.Gen<x86_64::CmpltpdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            else
+              builder_.Gen<x86_64::CmpltpsXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            break;
+          case Op::kFcmleZero:
+            if (is_double)
+              builder_.Gen<x86_64::CmplepdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            else
+              builder_.Gen<x86_64::CmplepsXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            break;
+          case Op::kFcmgtZero:
+            // Vn > 0 <=> 0 < Vn; mask lands in xz.
+            if (is_double)
+              builder_.Gen<x86_64::CmpltpdXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            else
+              builder_.Gen<x86_64::CmpltpsXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            res = xz;
+            break;
+          case Op::kFcmgeZero:
+            // Vn >= 0 <=> 0 <= Vn; mask lands in xz.
+            if (is_double)
+              builder_.Gen<x86_64::CmplepdXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            else
+              builder_.Gen<x86_64::CmplepsXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            res = xz;
+            break;
+          default:
+            UndefinedReturningVoid();
+            return;
+        }
+        SetVRegFull(args.rd, res, args.q);
+        return;
+      }
+
       // XTN/XTN2 Vd.<Tb>, Vn.<Ta> — truncating narrow: keep the low half of each
       // element. size=00 (8H->8B) / size=01 (4S->4H): mask off the high half of
       // every lane, then PACKUSWB/PACKUSDW into the low 64 (the mask guarantees
@@ -7327,6 +7415,29 @@ class HeavyOptimizerFrontend {
         (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kScvtf);
     const bool is_ucvtf =
         (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kUcvtf);
+    // FP64 (`.d`, size&1 == 1) scalar converts: x86 has no packed FP64<->int64
+    // op (CVTTPD2QQ / CVTUQQ2PD are AVX-512), so the `.d` forms can't use the
+    // packed FP32 lane recipe below. Route them through the GP-register scalar
+    // helpers instead — the same EmitScvtfUcvtf / EmitFcvtz used by the
+    // FpIntConversion GP path — reading/writing the SIMD lane via the
+    // src_from_simd / dest_to_simd flags. Mirrors lite_translator.h::
+    // AdvSimdScalarTwoRegMisc's `.d` lowering (Cvtsi2sdq / Cvttsd2siq + the
+    // ARM saturation/NaN ladder, sf=1 int64).
+    if ((args.size & 1) != 0 && (is_scvtf || is_ucvtf || is_fcvtzs || is_fcvtzu)) {
+      Decoder::FpIntConvArgs fargs{};
+      fargs.rd = args.rd;
+      fargs.rn = args.rn;
+      fargs.sf = true;  // `.d` integer operand is 64-bit
+      if (is_scvtf || is_ucvtf) {
+        fargs.op = is_ucvtf ? uint8_t{0b011} : uint8_t{0b010};
+        EmitScvtfUcvtf(fargs, /*is_double=*/true, /*fbits=*/0, /*src_from_simd=*/true);
+      } else {
+        fargs.op = is_fcvtzu ? uint8_t{0b001} : uint8_t{0b000};
+        EmitFcvtz(fargs, /*is_double=*/true, /*round_imm=*/-1, /*ties_away=*/false,
+                  /*fbits=*/0, /*dest_to_simd=*/true);
+      }
+      return;
+    }
     if ((!is_fcvtzs && !is_fcvtzu && !is_scvtf && !is_ucvtf) ||
         (args.size & 1) != 0) {
       UndefinedReturningVoid();
