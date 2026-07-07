@@ -8716,6 +8716,14 @@ class Interpreter {
       return;
     }
 
+    // For Q=0, the architecture zeroes the upper 64 bits of Vd (D-register
+    // semantics) for every FP by-element form — the FP32/FP64 branches above
+    // fill only the low lanes, so apply the zeroing here (the FP16 branch
+    // already zeroed, making this idempotent for it). Matches the lite and
+    // heavy JIT paths (SetVRegFull(rd, res, q)).
+    if (!args.q) {
+      memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
+    }
     state_->cpu.v[args.rd] = result;
   }
 
