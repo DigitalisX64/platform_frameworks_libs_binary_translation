@@ -596,6 +596,58 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     return (hi << 64) | lo;
   }
 
+  // AdvSIMD scalar two-reg-misc FCVTAS / FCVTAU (S/D): float -> integer,
+  // round-to-nearest ties-away. Encoding:
+  //   (1<<30)|(U<<29)|(0b11110<<24)|(size<<22)|(1<<21)|(0b11100<<12)|(0b10<<10)
+  //   |(Rn<<5)|Rd,  U: 0=FCVTAS 1=FCVTAU; size: 0=S(FP32) 1=D(FP64).
+  // Heavy JITs the FP32 (S) form; the FP64 (D) form bails to lite and is
+  // declined by the differential (so ~half the produced insns are declined,
+  // which the compared>threshold guard tolerates). rd samples rd==rn.
+  uint32_t GenNeonScalarFcvta() {
+    uint32_t is_unsigned = Rnd() & 1;   // 0=FCVTAS, 1=FCVTAU
+    uint32_t size = Rnd() & 1;          // 0=S (heavy JITs), 1=D (declined)
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // sample destructive rd==rn
+    return (1u << 30) | (is_unsigned << 29) | (0b11110u << 24) | (size << 22) |
+           (1u << 21) | (0b11100u << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
+
+  // A random 128-bit V-register whose FP32 lane 0 (the only lane a scalar
+  // FCVTAS/FCVTAU reads) is drawn from the corner set: NaN (-> 0), +-inf,
+  // +-2^31 / 2^32 (signed/unsigned overflow saturation), +-N.5 half-integers
+  // (the ties-away rounding case), and ordinary fractional finite values. The
+  // upper lanes are seeded too but ignored by the scalar op.
+  unsigned __int128 RandomFcvtaFpVReg() {
+    auto pick32 = [&]() -> uint32_t {
+      switch (Rnd() % 9) {
+        case 0: return 0x7FC00000u;  // NaN -> 0
+        case 1: return 0x7F800000u;  // +inf
+        case 2: return 0xFF800000u;  // -inf
+        case 3: return 0x4F000000u;  // 2^31 (INT32 positive overflow)
+        case 4: return 0x4F800000u;  // 2^32 (UINT32 overflow)
+        case 5: return 0xCF000000u;  // -2^31
+        case 6: {  // +-N.5 half-integer (ties-away boundary), |N| < 2048
+          int32_t n = static_cast<int32_t>(Rnd() % 4096) - 2048;
+          float f = static_cast<float>(n) + 0.5f;
+          uint32_t bits;
+          memcpy(&bits, &f, 4);
+          return bits;
+        }
+        default: {
+          float f = static_cast<float>(static_cast<int32_t>(Rnd() % 262144) -
+                                       131072) /
+                    8.0f;
+          uint32_t bits;
+          memcpy(&bits, &f, 4);
+          return bits;
+        }
+      }
+    };
+    uint64_t l0 = pick32(), l1 = pick32(), l2 = pick32(), l3 = pick32();
+    unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
+    return (hi << 64) | lo;
+  }
+
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
   // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
   // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
@@ -893,6 +945,32 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxFmulx) {
   EXPECT_GT(compared, 300) << "heavy accepted too few by-element FMULX";
 }
 
+// Scalar FCVTAS / FCVTAU (S): float -> integer, round-to-nearest ties-away. The
+// heavy tier now lowers the FP32 (S) form as the FRINTA copysign(0.5) trick +
+// the FCVTZS (signed) / FCVTZU (unsigned) saturation/NaN fix-up on a
+// lane-0-scrubbed source — was: bail to lite. The FP64 (D) form still bails and
+// is declined. Inputs (RandomFcvtaFpVReg) seed the corner set — NaN, +-inf,
+// signed/unsigned overflow, +-N.5 half-integers (ties-away), finite fractions —
+// so the saturation and tie paths actually fire, HEAVY==interp on full state.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonScalarFcvta) {
+  Seed(0xFC77A5FC77A50011ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonScalarFcvta()};
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFcvtaFpVReg();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few scalar FCVTAS/FCVTAU";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -1091,6 +1169,25 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_fmulx_single) << "by-element FMULX generator no longer produces FP32";
   EXPECT_TRUE(saw_fmulx_double) << "by-element FMULX generator no longer produces FP64";
   EXPECT_TRUE(saw_fmulx_alias) << "by-element FMULX generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_fcvtas = false, saw_fcvtau = false, saw_fcvta_s = false;
+  bool saw_fcvta_d = false, saw_fcvta_alias = false;
+  Seed(0xFCA7A5FCA7A50022ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonScalarFcvta();
+    uint32_t u = (insn >> 29) & 1, size = (insn >> 22) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 0) saw_fcvtas = true;   // FCVTAS
+    if (u == 1) saw_fcvtau = true;   // FCVTAU
+    if (size == 0) saw_fcvta_s = true;   // S (heavy JITs)
+    if (size == 1) saw_fcvta_d = true;   // D (declined)
+    if (rd == rn) saw_fcvta_alias = true;
+  }
+  EXPECT_TRUE(saw_fcvtas) << "scalar FCVTA generator no longer produces FCVTAS";
+  EXPECT_TRUE(saw_fcvtau) << "scalar FCVTA generator no longer produces FCVTAU";
+  EXPECT_TRUE(saw_fcvta_s) << "scalar FCVTA generator no longer produces S (heavy-JIT) form";
+  EXPECT_TRUE(saw_fcvta_d) << "scalar FCVTA generator no longer produces D (declined) form";
+  EXPECT_TRUE(saw_fcvta_alias) << "scalar FCVTA generator no longer produces rd==rn";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
