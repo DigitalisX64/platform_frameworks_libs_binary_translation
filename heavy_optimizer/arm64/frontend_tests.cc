@@ -10727,6 +10727,73 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SshrVec4H) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // D-form upper zero
 }
 
+// SSHR v0.16b, v1.16b, #3 (q=1, immh=0001, immb=5): arith right-shift 16 bytes.
+// Exercises the byte-lane path (PMOVSXBW + PSRAW + PACKSSWB) across both
+// 64-bit halves — previously bailed to lite.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshrVec16B) {
+  static const uint32_t code[] = {SshrVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/5, 0, 1)};
+  // lo bytes: 80(-128) 7F(127) FF(-1) 08(8) 40(64) C0(-64) 01(1) FE(-2).
+  // hi bytes: 10 20 30 40 50 60 70 88(-120).
+  SetV128(&state_, 1, 0xFE01C04008FF7F80ULL, 0x8870605040302010ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lo: F0 0F FF 01 08 F8 00 FF ; hi: 02 04 06 08 0A 0C 0E F1.
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF00F80801FF0FF0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xF10E0C0A08060402ULL);
+}
+
+// USHR v0.16b, v1.16b, #2 (q=1, immh=0001, immb=6): logical right-shift 16
+// bytes (PMOVZXBW + PSRLW + PACKUSWB across both halves).
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshrVec16B) {
+  static const uint32_t code[] = {UshrVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/6, 0, 1)};
+  // lo bytes: 80(128) FF(255) 04 03 40(64) C0(192) 01 FC(252).
+  // hi bytes: 08 10 20 40 80(128) F0(240) 05 07.
+  SetV128(&state_, 1, 0xFC01C0400304FF80ULL, 0x0705F08040201008ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // lo: 20 3F 01 00 10 30 00 3F ; hi: 02 04 08 10 20 3C 01 01.
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F00301000013F20ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x01013C2010080402ULL);
+}
+
+// SSHR v0.8b, v1.8b, #1 (q=0, immh=0001, immb=7): .8B arith right-shift, upper
+// 64 bits of Vd must be zeroed (D-form).
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshrVec8B) {
+  static const uint32_t code[] = {SshrVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/7, 0, 1)};
+  // lo bytes: 80(-128) 7F(127) FE(-2) 02 FF(-1) 10(16) 10(16) 81(-127).
+  SetV128(&state_, 1, 0x811010FF02FE7F80ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // C0 3F FF 01 FF 08 08 C0.
+  EXPECT_EQ(VLo64(&state_, 0), 0xC00808FF01FF3FC0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // D-form upper zero
+}
+
+// USHR v0.8b, v1.8b, #4 (q=0, immh=0001, immb=4): .8B logical right-shift,
+// upper 64 bits of Vd zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshrVec8B) {
+  static const uint32_t code[] = {UshrVec(/*q=*/false, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
+  // lo bytes: F0(240) FF(255) 80(128) 10(16) 01 A0(160) 0F 88(136).
+  SetV128(&state_, 1, 0x880FA0011080FFF0ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // 0F 0F 08 01 00 0A 00 08.
+  EXPECT_EQ(VLo64(&state_, 0), 0x08000A0001080F0FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // D-form upper zero
+}
+
 // SSRA v0.4s, v1.4s, #4 (q=1, immh=0111, immb=4): Vd += SSHR(Vn, 4) per word.
 TEST_F(Arm64HeavyOptimizerFrontendTest, SsraVec4S) {
   static const uint32_t code[] = {SsraVec(/*q=*/true, /*immh=*/0b0111, /*immb=*/4, 0, 1)};

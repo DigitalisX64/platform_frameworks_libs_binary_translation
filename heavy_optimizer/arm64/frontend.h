@@ -1775,6 +1775,64 @@ class HeavyOptimizerFrontend {
     }
     const bool is_double = (args.ftype == 0b01);
 
+    // FCVT between FP32 and FP64: a single CVTSS2SD (Dd,Sn) / CVTSD2SS (Sd,Dn)
+    // into lane 0 of a zeroed dst, then a scalar (upper-zeroing) store. The
+    // result precision is the OPPOSITE of the source ftype, so the write uses
+    // the complemented is_double. Mirrors lite_translator.h::FpDataProc1's
+    // CVTSS2SD/CVTSD2SS arms. FCVT-to-half (0b000111) needs F16C, BFCVT
+    // (0b000110) needs the NaN-fixup narrow, and FSQRT (0b000011) needs a SQRT
+    // op absent from this tier's gen inputs — all bail to the lite tier.
+    if (!is_double && args.opcode == 0b000101) {  // FCVT Dd, Sn (single -> double)
+      FpRegister src = GetVRegScalar(args.rn, /*is_double=*/false);
+      FpRegister dst = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::Cvtss2sdXRegXReg>(dst.machine_reg(), src.machine_reg());
+      SetVRegScalar(args.rd, dst, /*is_double=*/true);
+      return;
+    }
+    if (is_double && args.opcode == 0b000100) {  // FCVT Sd, Dn (double -> single)
+      FpRegister src = GetVRegScalar(args.rn, /*is_double=*/true);
+      FpRegister dst = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::Cvtsd2ssXRegXReg>(dst.machine_reg(), src.machine_reg());
+      SetVRegScalar(args.rd, dst, /*is_double=*/false);
+      return;
+    }
+
+    // FRINT{N,M,P,Z,X,I} (round float to integral float): a single ROUNDSD (D)
+    // / ROUNDPS-on-lane-0 (S — the backend has no scalar ROUNDSS, but SetVReg
+    // Scalar commits only lane 0 so the packed round is safe) with the matching
+    // rounding-mode immediate. FRINT keeps its result in the FP register, so —
+    // unlike the FCVT* integer converts — there is no saturation fix-up; one
+    // ROUND handles every finite/NaN/±Inf/signed-zero value. FRINTA (ties-to-
+    // away, 0b001100) has no native ROUND* imm; it needs the copysign(0.5)+
+    // truncate sequence with a magnitude gate, so it bails to lite. Mirrors
+    // lite_translator.h::FpDataProc1's FP32/FP64 FRINT switch (FRINTN->0x00,
+    // FRINTP->0x02, FRINTM->0x01, FRINTZ->0x03, FRINTX->0x00, FRINTI->0x08).
+    {
+      int8_t round_imm = 0;
+      bool is_frint = true;
+      switch (args.opcode) {
+        case 0b001000: round_imm = int8_t{0x00}; break;  // FRINTN (nearest-even)
+        case 0b001001: round_imm = int8_t{0x02}; break;  // FRINTP (toward +inf)
+        case 0b001010: round_imm = int8_t{0x01}; break;  // FRINTM (toward -inf)
+        case 0b001011: round_imm = int8_t{0x03}; break;  // FRINTZ (toward zero)
+        case 0b001110: round_imm = int8_t{0x00}; break;  // FRINTX (FPCR; RNE)
+        case 0b001111: round_imm = int8_t{0x08}; break;  // FRINTI (SAE+RNE)
+        default: is_frint = false; break;
+      }
+      if (is_frint) {
+        FpRegister val = GetVRegScalar(args.rn, is_double);
+        if (is_double) {
+          builder_.Gen<x86_64::RoundsdXRegXRegImm>(
+              val.machine_reg(), val.machine_reg(), round_imm);
+        } else {
+          builder_.Gen<x86_64::RoundpsXRegXRegImm>(
+              val.machine_reg(), val.machine_reg(), round_imm);
+        }
+        SetVRegScalar(args.rd, val, is_double);
+        return;
+      }
+    }
+
     // FMOV / FABS / FNEG only. Anything else bails.
     if (args.opcode != 0b000000 && args.opcode != 0b000001 && args.opcode != 0b000010) {
       UndefinedReturningVoid();
@@ -7408,7 +7466,44 @@ class HeavyOptimizerFrontend {
             SetVRegFull(args.rd, xn, args.q);
             return;
           }
-          UndefinedReturningVoid();
+          // SSHR/USHR byte lane: SSE has no packed byte shift. Widen each
+          // 64-bit half of Vn to 16-bit words (PMOVSXBW sign-extend for
+          // SSHR, PMOVZXBW zero-extend for USHR), shift the words
+          // (PSRAW/PSRLW), then narrow back to bytes (PACKSSWB/PACKUSWB).
+          // byte_cnt = 2*8 - immh:immb in [1, 8]; at cnt==8 PSRAW on a
+          // sign-extended byte yields byte-wide sign-fill and PSRLW yields
+          // 0, matching ARM SSHR/USHR at shift==esize. Mirrors the lite
+          // byte-form lowering (lite_translator.h::AdvSimdShiftByImm). The
+          // PACK of both halves places low-lane bytes in Vd[63:0] and
+          // high-lane bytes in Vd[127:64] for .16B; for .8B (q=0)
+          // SetVRegFull zeroes Vd[127:64]. Scalar byte SSHR/USHR is not
+          // ARM-encoded (scalar forms exist only at D) -> bail to lite.
+          if (args.scalar) {
+            UndefinedReturningVoid();
+            return;
+          }
+          const bool is_signed_byte =
+              (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr);
+          const int8_t byte_cnt = static_cast<int8_t>(16 - immh_immb);
+          FpRegister xn = AllocTempSimdReg();
+          FpRegister xn_hi = AllocTempSimdReg();
+          builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+          builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+          builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+          if (is_signed_byte) {
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+            builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          } else {
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), byte_cnt);
+            builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          }
+          SetVRegFull(args.rd, xn, args.q);
           return;
         }
         uint8_t esize_bits;
