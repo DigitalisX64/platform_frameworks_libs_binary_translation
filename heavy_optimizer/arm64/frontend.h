@@ -1844,8 +1844,8 @@ class HeavyOptimizerFrontend {
     // rounding-mode immediate. FRINT keeps its result in the FP register, so —
     // unlike the FCVT* integer converts — there is no saturation fix-up; one
     // ROUND handles every finite/NaN/±Inf/signed-zero value. FRINTA (ties-to-
-    // away, 0b001100) has no native ROUND* imm; it needs the copysign(0.5)+
-    // truncate sequence with a magnitude gate, so it bails to lite. Mirrors
+    // away, 0b001100) has no native ROUND* imm; it is handled just below via the
+    // copysign(0.5)+truncate sequence with a magnitude gate. Mirrors
     // lite_translator.h::FpDataProc1's FP32/FP64 FRINT switch (FRINTN->0x00,
     // FRINTP->0x02, FRINTM->0x01, FRINTZ->0x03, FRINTX->0x00, FRINTI->0x08).
     {
@@ -1872,6 +1872,68 @@ class HeavyOptimizerFrontend {
         SetVRegScalar(args.rd, val, is_double);
         return;
       }
+    }
+
+    // FRINTA Sd/Dd, Sn/Dn (round to nearest, ties away from zero, opcode
+    // 0b001100): x86 has no ROUND* immediate for ties-away, so mirror
+    // lite_translator.h::FpDataProc1's copysign(0.5)+truncate trick, using the
+    // branchless SIMD magnitude gate from the FCVTAS/FCVTAU ties-away path in
+    // frontend.cc. Add copysign(0.5, x) then truncate toward zero (ROUND imm
+    // 0x03), gating the addend to 0 where |x| >= 2^23 (FP32) / 2^52 (FP64): at
+    // that magnitude x is already an integer and a 0.5 addend would round the
+    // wrong way. NaN/±Inf bits also exceed the threshold, so the addend is gated
+    // off and ROUND-toward-zero preserves them per the Intel SDM. The magnitude
+    // compare is a signed PCMPGT on |bits(x)| (top bit cleared, so signed ==
+    // unsigned). sign/absx use AllocZeroedSimdReg because they are self-PCMPEQ
+    // targets (a fresh AllocTempSimdReg vreg would trip the lifetime use-before-
+    // def CHECK).
+    if (args.opcode == 0b001100) {
+      FpRegister val = GetVRegScalar(args.rn, is_double);
+      FpRegister sign = AllocZeroedSimdReg();
+      FpRegister absx = AllocZeroedSimdReg();
+      FpRegister half = AllocTempSimdReg();
+      FpRegister thresh = AllocTempSimdReg();
+      if (is_double) {
+        // addend = copysign(0.5d, x) = (x & sign_bit) | bits(0.5d).
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});  // 0x8000...0
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovqXRegReg>(half.machine_reg(),
+                                          GetImm(uint64_t{0x3FE0000000000000}));  // 0.5d
+        builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+        // gate = (|x| < 2^52) ? all-ones : 0, via thresh > |x|.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PsrlqXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFF...F
+        builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovqXRegReg>(thresh.machine_reg(),
+                                          GetImm(uint64_t{0x4330000000000000}));  // 2^52
+        builder_.Gen<x86_64::PcmpgtqXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+        builder_.Gen<x86_64::AddpdXRegXReg>(val.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::RoundsdXRegXRegImm>(
+            val.machine_reg(), val.machine_reg(), int8_t{0x03});
+      } else {
+        // addend = copysign(0.5f, x) = (x & sign_bit) | bits(0.5f).
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(),
+                                          GetImm(uint64_t{0x3F000000}));  // 0.5f
+        builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+        // gate = (|x| < 2^23) ? all-ones : 0, via thresh > |x|.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+        builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(),
+                                          GetImm(uint64_t{0x4B000000}));  // 2^23
+        builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+        builder_.Gen<x86_64::AddpsXRegXReg>(val.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::RoundpsXRegXRegImm>(
+            val.machine_reg(), val.machine_reg(), int8_t{0x03});
+      }
+      SetVRegScalar(args.rd, val, is_double);
+      return;
     }
 
     // FMOV / FABS / FNEG only. Anything else bails.

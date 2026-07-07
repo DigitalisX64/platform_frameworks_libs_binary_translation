@@ -3802,6 +3802,11 @@ constexpr uint32_t FnegS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E214000, rd, 
 constexpr uint32_t FnegD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E614000, rd, rn); }
 // FSQRT Sd,Sn (opcode=000011) — must bail in the optimizing tier.
 constexpr uint32_t FsqrtS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E21C000, rd, rn); }
+// FRINTA Sd,Sn / Dd,Dn (opcode=001100, round to nearest, ties away from zero).
+constexpr uint32_t FrintaS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E264000, rd, rn); }
+constexpr uint32_t FrintaD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E664000, rd, rn); }
+static_assert(FrintaS(0, 1) == 0x1E264020u);  // frinta s0, s1
+static_assert(FrintaD(0, 1) == 0x1E664020u);  // frinta d0, d1
 
 // FMOV (scalar, immediate): 0001_1110_ftype_1_imm8_100_00000_Rd.
 constexpr uint32_t FmovImmS(uint8_t rd, uint8_t imm8) {
@@ -4828,6 +4833,103 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FnegD) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -3.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FRINTA (round to nearest, ties AWAY from zero). x86 has no ROUND* imm for
+// ties-away, so the heavy tier uses copysign(0.5)+truncate with a branchless
+// magnitude gate (add 0.5 only where |x| < 2^23 / 2^52). Mirrors the lite
+// scalar FRINTA cases.
+//
+// Halfway tie: FRINTA(2.5) -> 3.0 (away), NOT 2.0 (RNE).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSTiesAwayPos) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, 2.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 3.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSTiesAwayNeg) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, -2.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), -3.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Non-tie: FRINTA(0.4) -> 0.0, FRINTA(0.6) -> 1.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSNonTie) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, 0.4f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 0.0f);
+  SetVf32(&state_, 1, 0.6f);
+  ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Magnitude-gate edge: 2^23+1 is already an integer with FP step >= 1, so the
+// 0.5 addend must be gated off (else RNE would bump the odd value to even).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSOddIntegerAboveThreshold) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, 8388609.0f);  // 2^23 + 1, exactly representable
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 8388609.0f);  // unchanged (NOT 8388610.0f)
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FRINTA(0.5d) -> 1.0d (ties away).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDTiesAway) {
+  static const uint32_t code[] = {FrintaD(0, 1)};
+  SetVf64(&state_, 1, 0.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDNegTiesAway) {
+  static const uint32_t code[] = {FrintaD(0, 1)};
+  SetVf64(&state_, 1, -3.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -4.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FP64 magnitude-gate edge: 2^52+1 must be left untouched.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDOddIntegerAboveThreshold) {
+  static const uint32_t code[] = {FrintaD(0, 1)};
+  SetVf64(&state_, 1, 4503599627370497.0);  // 2^52 + 1, exactly representable
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 4503599627370497.0);  // unchanged
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
