@@ -3800,8 +3800,16 @@ constexpr uint32_t FabsS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E20C000, rd, 
 constexpr uint32_t FabsD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E60C000, rd, rn); }
 constexpr uint32_t FnegS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E214000, rd, rn); }
 constexpr uint32_t FnegD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E614000, rd, rn); }
-// FSQRT Sd,Sn (opcode=000011) — must bail in the optimizing tier.
+// FSQRT Sd,Sn / Dd,Dn (opcode=000011) — lowered via SQRTSS/SQRTSD.
 constexpr uint32_t FsqrtS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E21C000, rd, rn); }
+constexpr uint32_t FsqrtD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E61C000, rd, rn); }
+static_assert(FsqrtS(0, 1) == 0x1E21C020u);  // fsqrt s0, s1
+static_assert(FsqrtD(0, 1) == 0x1E61C020u);  // fsqrt d0, d1
+// FRINTA Sd,Sn / Dd,Dn (opcode=001100, round to nearest, ties away from zero).
+constexpr uint32_t FrintaS(uint8_t rd, uint8_t rn) { return FpDP1(0x1E264000, rd, rn); }
+constexpr uint32_t FrintaD(uint8_t rd, uint8_t rn) { return FpDP1(0x1E664000, rd, rn); }
+static_assert(FrintaS(0, 1) == 0x1E264020u);  // frinta s0, s1
+static_assert(FrintaD(0, 1) == 0x1E664020u);  // frinta d0, d1
 
 // FMOV (scalar, immediate): 0001_1110_ftype_1_imm8_100_00000_Rd.
 constexpr uint32_t FmovImmS(uint8_t rd, uint8_t imm8) {
@@ -3974,6 +3982,12 @@ constexpr uint32_t ClsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t Rev32Vec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b00000, rd, rn);
 }
+// FRINTA V (FP32, ties-away): a=0, U=1, opcode=11000, sz=0 -> size field 0b00.
+constexpr uint32_t FrintaVec(bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, /*size=*/0b00, /*opcode=*/0b11000, rd, rn);
+}
+static_assert(FrintaVec(/*q=*/true, 0, 1) == 0x6E218820u);   // frinta v0.4s, v1.4s
+static_assert(FrintaVec(/*q=*/false, 0, 1) == 0x2E218820u);  // frinta v0.2s, v1.2s
 // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index:
 //   0 Q 101110 00 0 Rm 0 imm4 0 Rn Rd
 constexpr uint32_t ExtVec(bool q, uint8_t rd, uint8_t rn, uint8_t rm, uint8_t imm4) {
@@ -4525,6 +4539,15 @@ constexpr uint32_t SubhnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_
 constexpr uint32_t RsubhnVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
   return AdvSimdThreeDiff(q, /*u=*/true, size, /*opcode=*/0b0110, rd, rn, rm);
 }
+// Polynomial multiply long: PMULL/PMULL2 opcode=1110, U=0.  size=00 is the
+// .8H poly8 widening form; size=11 is PMULL64 (.1Q from two .1D lanes).
+constexpr uint32_t PmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdThreeDiff(q, /*u=*/false, size, /*opcode=*/0b1110, rd, rn, rm);
+}
+static_assert(PmullVec(0b00, false, 0, 1, 2) == 0x0E22E020u);  // pmull  v0.8h,v1.8b,v2.8b
+static_assert(PmullVec(0b00, true, 0, 1, 2) == 0x4E22E020u);   // pmull2 v0.8h,v1.16b,v2.16b
+static_assert(PmullVec(0b11, false, 0, 1, 2) == 0x0EE2E020u);  // pmull  v0.1q,v1.1d,v2.1d
+static_assert(PmullVec(0b11, true, 0, 1, 2) == 0x4EE2E020u);   // pmull2 v0.1q,v1.2d,v2.2d
 // Saturating doubling widening: SQDMULL opcode=1101, SQDMLAL opcode=1001,
 // SQDMLSL opcode=1011 (all U=0).
 constexpr uint32_t SqdmullVec(uint8_t size, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -4829,6 +4852,144 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FnegD) {
   ASSERT_TRUE(ok);
   EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -3.5);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FRINTA (round to nearest, ties AWAY from zero). x86 has no ROUND* imm for
+// ties-away, so the heavy tier uses copysign(0.5)+truncate with a branchless
+// magnitude gate (add 0.5 only where |x| < 2^23 / 2^52). Mirrors the lite
+// scalar FRINTA cases.
+//
+// Halfway tie: FRINTA(2.5) -> 3.0 (away), NOT 2.0 (RNE).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSTiesAwayPos) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, 2.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 3.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSTiesAwayNeg) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, -2.5f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), -3.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Non-tie: FRINTA(0.4) -> 0.0, FRINTA(0.6) -> 1.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSNonTie) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, 0.4f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 0.0f);
+  SetVf32(&state_, 1, 0.6f);
+  ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Magnitude-gate edge: 2^23+1 is already an integer with FP step >= 1, so the
+// 0.5 addend must be gated off (else RNE would bump the odd value to even).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaSOddIntegerAboveThreshold) {
+  static const uint32_t code[] = {FrintaS(0, 1)};
+  SetVf32(&state_, 1, 8388609.0f);  // 2^23 + 1, exactly representable
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 8388609.0f);  // unchanged (NOT 8388610.0f)
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FRINTA(0.5d) -> 1.0d (ties away).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDTiesAway) {
+  static const uint32_t code[] = {FrintaD(0, 1)};
+  SetVf64(&state_, 1, 0.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDNegTiesAway) {
+  static const uint32_t code[] = {FrintaD(0, 1)};
+  SetVf64(&state_, 1, -3.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -4.0);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FP64 magnitude-gate edge: 2^52+1 must be left untouched.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaDOddIntegerAboveThreshold) {
+  static const uint32_t code[] = {FrintaD(0, 1)};
+  SetVf64(&state_, 1, 4503599627370497.0);  // 2^52 + 1, exactly representable
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 4503599627370497.0);  // unchanged
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Vector FRINTA .4S: all four FP32 lanes rounded ties-away independently.
+// Lanes exercise pos/neg ties (2.5->3, -2.5->-3) and non-ties (0.4->0, 0.6->1).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVec4S) {
+  static const uint32_t code[] = {FrintaVec(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(2.5f, -2.5f), Pack2xF32(0.4f, 0.6f));
+  SetV128(&state_, 0, 0xDEADBEEFDEADBEEFull, 0xDEADBEEFDEADBEEFull);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(3.0f, -3.0f));
+  EXPECT_EQ(VUpperHi64(&state_, 0), Pack2xF32(0.0f, 1.0f));
+}
+
+// Vector FRINTA .2S: 64-bit form must zero the upper 64 bits of Vd (Q=0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVec2S) {
+  static const uint32_t code[] = {FrintaVec(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(3.5f, -0.5f), 0xDEADBEEFDEADBEEFull);
+  SetV128(&state_, 0, 0xDEADBEEFDEADBEEFull, 0xDEADBEEFDEADBEEFull);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(4.0f, -1.0f));  // 3.5->4 (tie away), -0.5->-1
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);                 // Q=0 zeroes upper 64
+}
+
+// Vector FRINTA .4S magnitude-gate: 2^23+1 (odd integer, FP step >= 1) must be
+// left untouched in every lane (the 0.5 addend is gated off).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVec4SOddIntegerAboveThreshold) {
+  static const uint32_t code[] = {FrintaVec(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, Pack2xF32(8388609.0f, -8388609.0f), Pack2xF32(1.5f, 8388609.0f));
+  SetV128(&state_, 0, 0xDEADBEEFDEADBEEFull, 0xDEADBEEFDEADBEEFull);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(8388609.0f, -8388609.0f));  // unchanged
+  EXPECT_EQ(VUpperHi64(&state_, 0), Pack2xF32(2.0f, 8388609.0f));    // 1.5->2, gated
 }
 
 // FMOV Sd, #1.0 (imm8 = 0x70 encodes +1.0 in single precision).
@@ -5286,6 +5447,78 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuXFromSInRange) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(1.0e19f));
+}
+
+// ---------------------------------------------------------------------------
+// SCVTF / UCVTF / FCVTZS / FCVTZU (scalar FP <-> fixed-point). fbits scales the
+// result by 2^±fbits (SCVTF/UCVTF divide the FP by 2^fbits; FCVTZS/FCVTZU
+// pre-multiply the FP source by 2^fbits before the truncating cvtt). Each chosen
+// value is a discriminator: an unscaled (broken) lowering yields the wrong
+// answer (e.g. scvtf s0,w1,#4 with w1=40 must be 2.5, not 40.0).
+// ---------------------------------------------------------------------------
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfFixedSFromW) {
+  static const uint32_t code[] = {0x1e02f020u};  // scvtf s0, w1, #4
+  state_.cpu.x[1] = 40u;                          // 40 / 2^4 = 2.5
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.5f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UcvtfFixedDFromX) {
+  static const uint32_t code[] = {0x9e43e020u};  // ucvtf d0, x1, #8
+  state_.cpu.x[1] = 384u;                         // 384 / 2^8 = 1.5
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, ScvtfFixedDFromW) {
+  static const uint32_t code[] = {0x1e42f420u};  // scvtf d0, w1, #3
+  state_.cpu.x[1] = 20u;                          // 20 / 2^3 = 2.5
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 2.5);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsFixedWFromS) {
+  static const uint32_t code[] = {0x1e18f020u};  // fcvtzs w0, s1, #4
+  SetVf32(&state_, 1, 1.5f);                      // trunc(1.5 * 2^4) = 24
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 24u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuFixedXFromD) {
+  static const uint32_t code[] = {0x9e59e020u};  // fcvtzu x0, d1, #8
+  SetVf64(&state_, 1, 2.5);                       // trunc(2.5 * 2^8) = 640
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 640u);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzsFixedXFromDNeg) {
+  static const uint32_t code[] = {0x9e58f820u};  // fcvtzs x0, d1, #2
+  SetVf64(&state_, 1, -3.25);                     // trunc(-3.25 * 2^2) = -13
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(int64_t{-13}));
 }
 
 // ---------------------------------------------------------------------------
@@ -5947,15 +6180,44 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FnmulDNegOperand) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
-// FSQRT (a 1-source FP op the optimizing tier does NOT handle) must bail.
-TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtBails) {
+// FSQRT Sd,Sn: SQRTSS is the exact IEEE-754 square root (RNE), matching ARM
+// FSQRT under the default FPCR rounding mode. sqrt(4.0f) == 2.0f exactly; the
+// upper 96 bits of Vd must be zeroed by the scalar (upper-zeroing) store.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtS) {
   static const uint32_t code[] = {FsqrtS(0, 1)};
   SetVf32(&state_, 1, 4.0f);
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 2.0f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FSQRT Sd,Sn non-perfect-square: sqrt(2.0f) rounds to nearest-even.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtSInexact) {
+  static const uint32_t code[] = {FsqrtS(0, 1)};
+  SetVf32(&state_, 1, 2.0f);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_FLOAT_EQ(GetVf32(&state_, 0), 1.4142135f);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FSQRT Dd,Dn: SQRTSD, FP64. sqrt(2.0) rounds to nearest-even.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtD) {
+  static const uint32_t code[] = {FsqrtD(0, 1)};
+  SetVf64(&state_, 1, 2.0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), 1.4142135623730951);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 //
@@ -11833,6 +12095,66 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Smull2Vec4S) {
   // products={-2,6,-65536,4}
   EXPECT_EQ(VLo64(&state_, 0), 0x00000006FFFFFFFEULL);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x00000004FFFF0000ULL);
+}
+
+// PMULL64 (.1Q from Vn.D[0] x Vm.D[0]) — single PCLMULQDQ, imm 0x00.
+// clmul(0x1000000000000001, 0x1000000000000001) = (x^60+1)^2 = x^120+1 in
+// GF(2): bit 120 -> high qword bit 56 (0x0100000000000000), bit 0 -> low = 1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull64) {
+  static const uint32_t code[] = {PmullVec(0b11, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1000000000000001ULL, 0xDEADBEEFDEADBEEFULL);  // D[1] ignored
+  SetV128(&state_, 2, 0x1000000000000001ULL, 0xBBBBBBBBBBBBBBBBULL);  // D[1] ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0100000000000000ULL);
+}
+
+// PMULL2 64 (.1Q from Vn.D[1] x Vm.D[1]) — PCLMULQDQ imm 0x11 (high x high).
+// Same operands as above in the HIGH qwords; D[0] must be ignored.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull2_64UsesHighHalf) {
+  static const uint32_t code[] = {PmullVec(0b11, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xDEADBEEFDEADBEEFULL, 0x1000000000000001ULL);  // D[0] ignored
+  SetV128(&state_, 2, 0xBBBBBBBBBBBBBBBBULL, 0x1000000000000001ULL);  // D[0] ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0100000000000000ULL);
+}
+
+// PMULL .8H poly8 widening (8 independent 8-bit carryless products -> 16-bit
+// lanes). Same operands/expected as the validated lite Pmull8hPoly8 test.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull8hPoly8) {
+  static const uint32_t code[] = {PmullVec(0b00, /*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAA07108001FFCA53ULL, 0xDEADBEEFDEADBEEFULL);  // high ignored
+  SetV128(&state_, 2, 0x5507108002FF53CAULL, 0xBBBBBBBBBBBBBBBBULL);  // high ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000255553F7E3F7EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x2222001501004000ULL);
+}
+
+// PMULL2 .8H poly8 — same products but from the HIGH 8 bytes of Vn/Vm.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Pmull2_8hPoly8UsesHighHalf) {
+  static const uint32_t code[] = {PmullVec(0b00, /*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xDEADBEEFDEADBEEFULL, 0xAA07108001FFCA53ULL);  // low ignored
+  SetV128(&state_, 2, 0xBBBBBBBBBBBBBBBBULL, 0x5507108002FF53CAULL);  // low ignored
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000255553F7E3F7EULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x2222001501004000ULL);
 }
 
 // UMLAL .4S: accumulate into Vd (32-bit wrap, no saturation).

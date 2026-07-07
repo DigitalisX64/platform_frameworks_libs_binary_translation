@@ -1574,12 +1574,53 @@ class HeavyOptimizerFrontend {
     UNUSED_ARGS(rd, rn, rm, ftype, cond);
   }
 
-  // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point). The FCvt* intrinsics + cvtsi2ss
-  // SSE ops are not in the ARM64 backend gen inputs (their macro-assembler defs
-  // live only in riscv64_to_x86_64/macro_def.json), so bail.
+  // FCVTZS/FCVTZU/SCVTF/UCVTF (fixed-point): GP integer <-> scalar FP with a
+  // 2^±fbits scale. Bridges into the shared unscaled EmitScvtfUcvtf / EmitFcvtz
+  // helpers with the fbits scale inserted (SCVTF/UCVTF scale the FP result by
+  // 2^-fbits; FCVTZS/FCVTZU pre-multiply the FP source by 2^+fbits). The scale is
+  // an exact power-of-2 multiply, so the helpers' single-rounding CVTSI2 and
+  // truncating-cvtt + saturation/NaN ladder carry through verbatim. Mirrors
+  // lite_translator.h::FpFixedPointConversion. FP16 (ftype 0b1x) bails to lite.
   void FpFixedPointConversion(const Decoder::FpFixedPointArgs& args) {
-    UndefinedReturningVoid();
-    UNUSED_ARGS(args);
+    if (!success()) {
+      return;
+    }
+    using Op = Decoder::FpFixedPointOp;
+    if (args.ftype != 0b00 && args.ftype != 0b01) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const uint8_t fbits = args.fbits;
+    if (fbits == 0 || fbits > (args.sf ? 64u : 32u)) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.ftype == 0b01);
+    // Only op/sf/ftype/rd/rn are read by the helpers; `op` uses the
+    // FpIntConversion encoding (SCVTF=010, UCVTF=011, FCVTZS=000, FCVTZU=001).
+    Decoder::FpIntConvArgs iargs{};
+    iargs.rd = args.rd;
+    iargs.rn = args.rn;
+    iargs.sf = args.sf;
+    iargs.ftype = args.ftype;
+    switch (args.op) {
+      case Op::kScvtf:
+        iargs.op = 0b010;
+        EmitScvtfUcvtf(iargs, is_double, fbits);
+        return;
+      case Op::kUcvtf:
+        iargs.op = 0b011;
+        EmitScvtfUcvtf(iargs, is_double, fbits);
+        return;
+      case Op::kFcvtzs:
+        iargs.op = 0b000;
+        EmitFcvtz(iargs, is_double, /*round_imm=*/-1, /*ties_away=*/false, fbits);
+        return;
+      case Op::kFcvtzu:
+        iargs.op = 0b001;
+        EmitFcvtz(iargs, is_double, /*round_imm=*/-1, /*ties_away=*/false, fbits);
+        return;
+    }
   }
 
   // FMADD/FMSUB/FNMADD/FNMSUB (FP data-processing, 3 source) at S/D. Lowered to
@@ -1762,9 +1803,9 @@ class HeavyOptimizerFrontend {
   // the same v[] slot would funnel an XMM vreg into a GP operand and fail
   // register-class intersection.
   //
-  // FSQRT, FRINT*, FCVT (precision change), BFCVT, FP16, and ftype=10 bail:
-  // their SSE ops (Sqrt*, Round*, Cvt*) are not allowlisted for the ARM64
-  // backend.
+  // FSQRT, FRINT*, FCVT (precision change) are lowered below (SQRTSS/SQRTSD,
+  // ROUNDSS/ROUNDSD, CVTSS2SD/CVTSD2SS). BFCVT, FCVT-to-half (F16C), FP16, and
+  // ftype=10 still bail: their SSE ops are not allowlisted for the ARM64 backend.
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
     if (!success()) {
       return;
@@ -1779,9 +1820,9 @@ class HeavyOptimizerFrontend {
     // into lane 0 of a zeroed dst, then a scalar (upper-zeroing) store. The
     // result precision is the OPPOSITE of the source ftype, so the write uses
     // the complemented is_double. Mirrors lite_translator.h::FpDataProc1's
-    // CVTSS2SD/CVTSD2SS arms. FCVT-to-half (0b000111) needs F16C, BFCVT
-    // (0b000110) needs the NaN-fixup narrow, and FSQRT (0b000011) needs a SQRT
-    // op absent from this tier's gen inputs — all bail to the lite tier.
+    // CVTSS2SD/CVTSD2SS arms. FCVT-to-half (0b000111) needs F16C and BFCVT
+    // (0b000110) needs the NaN-fixup narrow — both still bail to the lite tier.
+    // FSQRT (0b000011) is lowered just below via SQRTSS/SQRTSD.
     if (!is_double && args.opcode == 0b000101) {  // FCVT Dd, Sn (single -> double)
       FpRegister src = GetVRegScalar(args.rn, /*is_double=*/false);
       FpRegister dst = AllocZeroedSimdReg();
@@ -1797,14 +1838,31 @@ class HeavyOptimizerFrontend {
       return;
     }
 
+    // FSQRT Sd/Dd, Sn/Dn (opcode 0b000011): a single SQRTSS (FP32) / SQRTSD
+    // (FP64). x86 SQRTSS/SQRTSD compute the exact IEEE-754 square root with
+    // round-to-nearest-even, matching ARM FSQRT under the default FPCR rounding
+    // mode, and propagate NaN/-Inf per the Intel SDM identically to ARM. Mirrors
+    // lite_translator.h::FpDataProc1's Sqrtss/Sqrtsd arms. Only lane 0 is read
+    // and SetVRegScalar commits only lane 0, so the scalar op is exact.
+    if (args.opcode == 0b000011) {
+      FpRegister val = GetVRegScalar(args.rn, is_double);
+      if (is_double) {
+        builder_.Gen<x86_64::SqrtsdXRegXReg>(val.machine_reg(), val.machine_reg());
+      } else {
+        builder_.Gen<x86_64::SqrtssXRegXReg>(val.machine_reg(), val.machine_reg());
+      }
+      SetVRegScalar(args.rd, val, is_double);
+      return;
+    }
+
     // FRINT{N,M,P,Z,X,I} (round float to integral float): a single ROUNDSD (D)
     // / ROUNDPS-on-lane-0 (S — the backend has no scalar ROUNDSS, but SetVReg
     // Scalar commits only lane 0 so the packed round is safe) with the matching
     // rounding-mode immediate. FRINT keeps its result in the FP register, so —
     // unlike the FCVT* integer converts — there is no saturation fix-up; one
     // ROUND handles every finite/NaN/±Inf/signed-zero value. FRINTA (ties-to-
-    // away, 0b001100) has no native ROUND* imm; it needs the copysign(0.5)+
-    // truncate sequence with a magnitude gate, so it bails to lite. Mirrors
+    // away, 0b001100) has no native ROUND* imm; it is handled just below via the
+    // copysign(0.5)+truncate sequence with a magnitude gate. Mirrors
     // lite_translator.h::FpDataProc1's FP32/FP64 FRINT switch (FRINTN->0x00,
     // FRINTP->0x02, FRINTM->0x01, FRINTZ->0x03, FRINTX->0x00, FRINTI->0x08).
     {
@@ -1831,6 +1889,68 @@ class HeavyOptimizerFrontend {
         SetVRegScalar(args.rd, val, is_double);
         return;
       }
+    }
+
+    // FRINTA Sd/Dd, Sn/Dn (round to nearest, ties away from zero, opcode
+    // 0b001100): x86 has no ROUND* immediate for ties-away, so mirror
+    // lite_translator.h::FpDataProc1's copysign(0.5)+truncate trick, using the
+    // branchless SIMD magnitude gate from the FCVTAS/FCVTAU ties-away path in
+    // frontend.cc. Add copysign(0.5, x) then truncate toward zero (ROUND imm
+    // 0x03), gating the addend to 0 where |x| >= 2^23 (FP32) / 2^52 (FP64): at
+    // that magnitude x is already an integer and a 0.5 addend would round the
+    // wrong way. NaN/±Inf bits also exceed the threshold, so the addend is gated
+    // off and ROUND-toward-zero preserves them per the Intel SDM. The magnitude
+    // compare is a signed PCMPGT on |bits(x)| (top bit cleared, so signed ==
+    // unsigned). sign/absx use AllocZeroedSimdReg because they are self-PCMPEQ
+    // targets (a fresh AllocTempSimdReg vreg would trip the lifetime use-before-
+    // def CHECK).
+    if (args.opcode == 0b001100) {
+      FpRegister val = GetVRegScalar(args.rn, is_double);
+      FpRegister sign = AllocZeroedSimdReg();
+      FpRegister absx = AllocZeroedSimdReg();
+      FpRegister half = AllocTempSimdReg();
+      FpRegister thresh = AllocTempSimdReg();
+      if (is_double) {
+        // addend = copysign(0.5d, x) = (x & sign_bit) | bits(0.5d).
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});  // 0x8000...0
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovqXRegReg>(half.machine_reg(),
+                                          GetImm(uint64_t{0x3FE0000000000000}));  // 0.5d
+        builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+        // gate = (|x| < 2^52) ? all-ones : 0, via thresh > |x|.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PsrlqXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFF...F
+        builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovqXRegReg>(thresh.machine_reg(),
+                                          GetImm(uint64_t{0x4330000000000000}));  // 2^52
+        builder_.Gen<x86_64::PcmpgtqXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+        builder_.Gen<x86_64::AddpdXRegXReg>(val.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::RoundsdXRegXRegImm>(
+            val.machine_reg(), val.machine_reg(), int8_t{0x03});
+      } else {
+        // addend = copysign(0.5f, x) = (x & sign_bit) | bits(0.5f).
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(),
+                                          GetImm(uint64_t{0x3F000000}));  // 0.5f
+        builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+        // gate = (|x| < 2^23) ? all-ones : 0, via thresh > |x|.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+        builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(),
+                                          GetImm(uint64_t{0x4B000000}));  // 2^23
+        builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+        builder_.Gen<x86_64::AddpsXRegXReg>(val.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::RoundpsXRegXRegImm>(
+            val.machine_reg(), val.machine_reg(), int8_t{0x03});
+      }
+      SetVRegScalar(args.rd, val, is_double);
+      return;
     }
 
     // FMOV / FABS / FNEG only. Anything else bails.
@@ -2055,7 +2175,11 @@ class HeavyOptimizerFrontend {
   // because the sf==1 unsigned form needs a basic-block split (values >= 2^63 use
   // the round-to-odd halve/convert/double fix-up). Mirrors
   // lite_translator.h::FpIntConversion's SCVTF/UCVTF path.
-  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double);
+  // `fbits != 0` selects the fixed-point form (SCVTF/UCVTF fixed): the FP result
+  // is scaled by 2^-fbits (an exact power-of-2 multiply that only biases the
+  // exponent, so CVTSI2's single rounding carries through). `fbits == 0` is the
+  // plain integer form. Mirrors lite_translator.h::FpFixedPointConversion.
+  void EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args, bool is_double, uint8_t fbits = 0);
 
   // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): FP -> integer
   // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
@@ -2071,10 +2195,16 @@ class HeavyOptimizerFrontend {
   // op 100/101) have no x86 round mode; pass `ties_away = true` (FP32 only) to
   // add a copysign(0.5, x) addend — gated to 0 when |x| >= 2^23, where a 0.5
   // addend would round the wrong way — before the same truncating ladder.
+  // `fbits != 0` selects the fixed-point form (FCVTZS/FCVTZU fixed): the FP
+  // source is pre-multiplied by 2^+fbits (exact power-of-2 scale) before the
+  // truncating cvtt + saturation ladder. `fbits == 0` is the plain integer form.
+  // Fixed-point never combines with the rounding/ties-away paths (round_imm < 0,
+  // ties_away false). Mirrors lite_translator.h::FpFixedPointConversion.
   void EmitFcvtz(const Decoder::FpIntConvArgs& args,
                  bool is_double,
                  int8_t round_imm = -1,
-                 bool ties_away = false);
+                 bool ties_away = false,
+                 uint8_t fbits = 0);
 
   //
   // Advanced SIMD (Args-struct forms).
@@ -4428,6 +4558,74 @@ class HeavyOptimizerFrontend {
     }
     using Op = Decoder::AdvSimdThreeDiffOpcode;
 
+    // PMULL/PMULL2 — polynomial multiply long over GF(2). Line-by-line mirror
+    // of lite_translator.h::AdvSimdThreeDiff's kPmull block.
+    //   size=11 (PMULL64): a single PCLMULQDQ (x86 CLMUL is an exact GF(2)
+    //     carry-less multiply, semantically identical to ARM PMULL64). Q=0
+    //     multiplies the low qwords (imm 0x00 = Pclmullqlqdq); Q=1/PMULL2
+    //     multiplies the high qwords (imm 0x11 = Pclmulhqhqdq).
+    //   size=00 (PMULL .8H, poly8 widening): 8 independent 8-bit polynomial
+    //     products widened to 16-bit. Widen the low 8 bytes (Q=1/PMULL2 takes
+    //     bytes 8..15) to 16-bit lanes (PMOVZXBW), then run the per-bit carry-
+    //     less shift-and-XOR loop in 16-bit lanes. Each lane holds a value <256
+    //     and the degree-14 product fits in 16 bits, so the PSLLW shifts never
+    //     spill across lanes (no per-lane masking needed). The bit-i selector is
+    //     PSLLW(b, 15-i) then PSRAW 15, broadcasting bit i to the whole lane.
+    //   size in {01,10} is reserved for PMULL and bails.
+    // The "long" result always fills 128 bits, so SetVRegFull q=true regardless
+    // of the Q ("2") variant.
+    if (args.opcode == Op::kPmull) {
+      const int32_t vn_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+      const int32_t vm_o =
+          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+      if (args.size == 0b11) {
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister xm = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_o);
+        builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
+        const int8_t imm = args.q ? int8_t{0x11} : int8_t{0x00};
+        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(
+            xn.machine_reg(), xm.machine_reg(), imm);
+        SetVRegFull(args.rd, xn, /*q=*/true);
+        return;
+      }
+      if (args.size == 0b00) {  // PMULL/PMULL2 .8H (poly8 widening)
+        const int32_t extra = args.q ? 8 : 0;
+        FpRegister za = AllocTempSimdReg();
+        FpRegister zb = AllocTempSimdReg();
+        FpRegister acc = AllocZeroedSimdReg();  // PXOR acc,acc
+        FpRegister shifted = AllocTempSimdReg();
+        FpRegister sel = AllocTempSimdReg();
+        // MOVSD zero-extends bits [127:64]; PMOVZXBW then widens 8 bytes -> 8
+        // 16-bit lanes (Q=1 loads bytes 8..15 via the +8 offset).
+        builder_.GenGetSimd<8>(za.machine_reg(), vn_o + extra);
+        builder_.GenGetSimd<8>(zb.machine_reg(), vm_o + extra);
+        builder_.Gen<x86_64::PmovzxbwXRegXReg>(za.machine_reg(), za.machine_reg());
+        builder_.Gen<x86_64::PmovzxbwXRegXReg>(zb.machine_reg(), zb.machine_reg());
+        for (int i = 0; i < 8; ++i) {
+          builder_.Gen<x86_64::MovdqaXRegXReg>(shifted.machine_reg(), za.machine_reg());
+          if (i != 0) {
+            builder_.Gen<x86_64::PsllwXRegImm>(shifted.machine_reg(),
+                                               static_cast<int8_t>(i));
+          }
+          // sel = 0xFFFF per lane where bit i of zb is set.
+          builder_.Gen<x86_64::MovdqaXRegXReg>(sel.machine_reg(), zb.machine_reg());
+          if (15 - i != 0) {
+            builder_.Gen<x86_64::PsllwXRegImm>(sel.machine_reg(),
+                                               static_cast<int8_t>(15 - i));
+          }
+          builder_.Gen<x86_64::PsrawXRegImm>(sel.machine_reg(), int8_t{15});
+          builder_.Gen<x86_64::PandXRegXReg>(shifted.machine_reg(), sel.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(acc.machine_reg(), shifted.machine_reg());
+        }
+        SetVRegFull(args.rd, acc, /*q=*/true);
+        return;
+      }
+      UndefinedReturningVoid();  // size in {01,10} reserved
+      return;
+    }
+
     // Widening add/sub subset: {S,U}ADDL/{S,U}SUBL (both sources narrow) and
     // {S,U}ADDW/{S,U}SUBW (Vn already a wide-lane 128-bit vector). Handle first;
     // fall through to the multiply-accumulate subset otherwise.
@@ -6629,6 +6827,53 @@ class HeavyOptimizerFrontend {
         FpRegister xn = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
         builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), round_imm);
+        SetVRegFull(args.rd, xn, args.q);
+        return;
+      }
+
+      // FRINTA V Vd.<T>, Vn.<T> (FP32 .2S/.4S) — round float to integral float,
+      // ties away from zero. x86 has no ROUNDPS immediate for ties-away, so
+      // mirror the validated lite vector lowering
+      // (lite_translator.h::AdvSimdTwoRegMisc kFrintaV FP32 path): per lane add
+      // copysign(0.5, x) then ROUNDPS toward zero (imm 0x03), gating the addend
+      // to 0 where |x| >= 2^23 (already an integer, where a 0.5 addend would
+      // round the wrong way; NaN/±Inf bits also exceed the threshold, so their
+      // addend is gated off and ROUND-toward-zero preserves them per the Intel
+      // SDM). The magnitude compare is a signed PCMPGTD on |bits(x)| (top bit
+      // cleared, so signed == unsigned). Unlike the scalar FRINTA the 0.5 and
+      // threshold constants must be broadcast across all 4 lanes (PSHUFD imm
+      // 0x00). sign/absx use AllocZeroedSimdReg (self-PCMPEQ targets). FP64 .2D
+      // needs PCMPGTQ + ROUNDPD (ROUNDPD not allowlisted in the heavy backend)
+      // and FP16 needs the F16C round-trip, so both bail to lite→interp,
+      // matching the sibling FRINT V and FCVTA V handlers.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFrintaV: {
+        if (args.is_fp16 || (args.size & 1) == 1) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xn = AllocTempSimdReg();
+        FpRegister sign = AllocZeroedSimdReg();
+        FpRegister absx = AllocZeroedSimdReg();
+        FpRegister half = AllocTempSimdReg();
+        FpRegister thresh = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+        // addend = copysign(0.5f, x) = (x & 0x80000000) | 0.5f, per lane.
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+        // gate = (|x| < 2^23) ? all-ones : 0, via thresh > |x| (signed PCMPGTD).
+        builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+        builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(thresh.machine_reg(), thresh.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+        builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+        builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), sign.machine_reg());
+        builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});
         SetVRegFull(args.rd, xn, args.q);
         return;
       }

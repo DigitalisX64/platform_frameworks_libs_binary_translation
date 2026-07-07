@@ -803,15 +803,35 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
 //     bit-for-bit. Two paths write a shared merge XMM.
 // The scalar result is committed with SetVRegScalar (upper V[] bytes zeroed).
 void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
-                                            bool is_double) {
+                                            bool is_double,
+                                            uint8_t fbits) {
   if (!success()) {
     return;
   }
   const bool is_unsigned = (args.op == 0b011);
 
-  // rn == 31 is WZR/XZR -> 0; static_cast<FP>(0) == +0.0.
+  // Fixed-point SCVTF/UCVTF (fbits != 0): scale the FP result by 2^-fbits before
+  // storing to V[rd]. Exact power-of-2 multiply; fbits == 0 is a no-op (plain
+  // integer form). Applied on every result path via this closure.
+  auto finish = [&](FpRegister xmm) {
+    if (fbits != 0) {
+      FpRegister xscale = AllocTempSimdReg();
+      if (is_double) {
+        const uint64_t scale_bits = static_cast<uint64_t>(1023u - fbits) << 52;
+        builder_.Gen<x86_64::MovqXRegReg>(xscale.machine_reg(), GetImm(scale_bits));
+        builder_.Gen<x86_64::MulsdXRegXReg>(xmm.machine_reg(), xscale.machine_reg());
+      } else {
+        const uint32_t scale_bits = static_cast<uint32_t>(127u - fbits) << 23;
+        builder_.Gen<x86_64::MovdXRegReg>(xscale.machine_reg(), GetImm(uint64_t{scale_bits}));
+        builder_.Gen<x86_64::MulssXRegXReg>(xmm.machine_reg(), xscale.machine_reg());
+      }
+    }
+    SetVRegScalar(args.rd, xmm, is_double);
+  };
+
+  // rn == 31 is WZR/XZR -> 0; static_cast<FP>(0) == +0.0 (scaled 0 is still 0).
   if (args.rn == 31) {
-    SetVRegScalar(args.rd, AllocZeroedSimdReg(), is_double);
+    finish(AllocZeroedSimdReg());
     return;
   }
 
@@ -833,7 +853,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
         builder_.Gen<x86_64::Cvtsi2sslXRegReg>(xmm.machine_reg(), src);
       }
     }
-    SetVRegScalar(args.rd, xmm, is_double);
+    finish(xmm);
     return;
   }
 
@@ -846,7 +866,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     } else {
       builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), zx);
     }
-    SetVRegScalar(args.rd, xmm, is_double);
+    finish(xmm);
     return;
   }
 
@@ -901,7 +921,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
   builder_.Gen<PseudoBranch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
-  SetVRegScalar(args.rd, result, is_double);
+  finish(result);
 }
 
 // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): scalar FP -> GP
@@ -914,7 +934,8 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
 void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                        bool is_double,
                                        int8_t round_imm,
-                                       bool ties_away) {
+                                       bool ties_away,
+                                       uint8_t fbits) {
   if (!success()) {
     return;
   }
@@ -923,6 +944,28 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
   auto* ir = builder_.ir();
 
   FpRegister xmm = GetVRegScalar(args.rn, is_double);
+
+  // Fixed-point FCVTZS/FCVTZU (fbits != 0): pre-multiply the FP source by
+  // 2^+fbits (exact power-of-2 scale) in a private temp, leaving the guest v[]
+  // slot untouched. The truncating cvtt + sign/NaN saturation ladder below then
+  // operates on the scaled value, matching lite. Fixed-point never combines with
+  // the rounding/ties-away paths (round_imm < 0, ties_away false), so this runs
+  // first and independently.
+  if (fbits != 0) {
+    FpRegister scaled = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(scaled.machine_reg(), xmm.machine_reg());
+    FpRegister xscale = AllocTempSimdReg();
+    if (is_double) {
+      const uint64_t scale_bits = static_cast<uint64_t>(1023u + fbits) << 52;
+      builder_.Gen<x86_64::MovqXRegReg>(xscale.machine_reg(), GetImm(scale_bits));
+      builder_.Gen<x86_64::MulsdXRegXReg>(scaled.machine_reg(), xscale.machine_reg());
+    } else {
+      const uint32_t scale_bits = static_cast<uint32_t>(127u + fbits) << 23;
+      builder_.Gen<x86_64::MovdXRegReg>(xscale.machine_reg(), GetImm(uint64_t{scale_bits}));
+      builder_.Gen<x86_64::MulssXRegXReg>(scaled.machine_reg(), xscale.machine_reg());
+    }
+    xmm = scaled;
+  }
 
   // FCVTAS/FCVTAU (ties-away): add copysign(0.5, x), gated to 0 when |x| >= 2^23
   // (already an integer, where a 0.5 addend would round the wrong way), then let
