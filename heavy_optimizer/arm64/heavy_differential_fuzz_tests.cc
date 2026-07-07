@@ -493,6 +493,194 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (1u << 21) | (rm << 16) | (0b11001u << 11) | (1u << 10) | (rn << 5) | rd;
   }
 
+  // AdvSIMD vector x indexed-element FP FMUL/FMLA/FMLS (.2S/.4S FP32 size=10,
+  // .2D FP64 size=11). U=0; opcode FMUL=1001, FMLA=0001, FMLS=0101. FP32 index
+  // = H:L (0..3), Vm = M:Rm; FP64 index = H (0..1), L=0, Vm = M:Rm. .2D is
+  // reserved with Q=0, so Q is forced to 1 for the double form. FMULX (U=1) and
+  // FP16 (size=00) still bail to lite and are not produced here. rd samples
+  // rd==rn / rd==Vm to stress the destructive accumulate.
+  uint32_t GenNeonVecXIdxFmul() {
+    static const uint32_t kOpc[] = {0b1001, 0b0001, 0b0101};  // FMUL, FMLA, FMLS
+    const uint32_t opc = kOpc[Rnd() % 3];
+    uint32_t is_double = Rnd() & 1;
+    uint32_t size = is_double ? 0b11u : 0b10u;
+    uint32_t q = is_double ? 1u : (Rnd() & 1);  // .2D reserved with Q=0
+    uint32_t vm = Rnd() % 8;                     // M=0, Rm=vm (<8)
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M = 0, Rm = vm;
+    if (is_double) {  // FP64: index 0..1 = H, L must be 0
+      uint32_t index = Rnd() % 2;
+      H = index;
+      L = 0;
+    } else {  // FP32: index 0..3 = H:L
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+    }
+    return (q << 30) | (0u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (opc << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
+
+  // FMULX (by element): U=1, opcode=1001, size=10 (.2S/.4S) or 11 (.2D). Same
+  // encoding shape as GenNeonVecXIdxFmul's FMUL arm but with the U bit set. The
+  // saturation path only fires on (+-0 * +-inf); the paired test seeds those
+  // special lanes explicitly (RandomFmulxFpVReg).
+  uint32_t GenNeonVecXIdxFmulx() {
+    uint32_t is_double = Rnd() & 1;
+    uint32_t size = is_double ? 0b11u : 0b10u;
+    uint32_t q = is_double ? 1u : (Rnd() & 1);  // .2D reserved with Q=0
+    uint32_t vm = Rnd() % 8;                     // M=0, Rm=vm (<8)
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M = 0, Rm = vm;
+    if (is_double) {  // FP64: index 0..1 = H, L must be 0
+      H = Rnd() % 2;
+      L = 0;
+    } else {  // FP32: index 0..3 = H:L
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+    }
+    return (q << 30) | (1u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (0b1001u << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
+
+  // A random 128-bit V-register whose lanes are drawn from {+0, -0, +inf, -inf,
+  // small-finite} — but NEVER NaN. This exercises FMULX's (+-0 * +-inf)->+-2.0
+  // saturation lanes while keeping the ARM-vs-x86 result bit-identical: the only
+  // way a*b produces a NaN from these inputs is exactly the +-0*+-inf case,
+  // which both tiers turn into +-2.0, so no random NaN payload ever diverges.
+  unsigned __int128 RandomFmulxFpVReg(bool is_double) {
+    auto pick32 = [&]() -> uint32_t {
+      switch (Rnd() % 5) {
+        case 0: return 0x00000000u;  // +0
+        case 1: return 0x80000000u;  // -0
+        case 2: return 0x7F800000u;  // +inf
+        case 3: return 0xFF800000u;  // -inf
+        default: {
+          float f = static_cast<float>(static_cast<int32_t>(Rnd() % 32768) - 16384) /
+                    16.0f;
+          uint32_t bits;
+          memcpy(&bits, &f, 4);
+          return bits;
+        }
+      }
+    };
+    auto pick64 = [&]() -> uint64_t {
+      switch (Rnd() % 5) {
+        case 0: return 0x0000000000000000ULL;  // +0
+        case 1: return 0x8000000000000000ULL;  // -0
+        case 2: return 0x7FF0000000000000ULL;  // +inf
+        case 3: return 0xFFF0000000000000ULL;  // -inf
+        default: {
+          double d = static_cast<double>(
+                         static_cast<int64_t>(Rnd64() % 33554432) - 16777216) /
+                     16.0;
+          uint64_t bits;
+          memcpy(&bits, &d, 8);
+          return bits;
+        }
+      }
+    };
+    if (is_double) {
+      unsigned __int128 lo = pick64(), hi = pick64();
+      return (hi << 64) | lo;
+    }
+    uint64_t l0 = pick32(), l1 = pick32(), l2 = pick32(), l3 = pick32();
+    unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
+    return (hi << 64) | lo;
+  }
+
+  // AdvSIMD scalar two-reg-misc FCVTAS / FCVTAU (S/D): float -> integer,
+  // round-to-nearest ties-away. Encoding:
+  //   (1<<30)|(U<<29)|(0b11110<<24)|(size<<22)|(1<<21)|(0b11100<<12)|(0b10<<10)
+  //   |(Rn<<5)|Rd,  U: 0=FCVTAS 1=FCVTAU; size: 0=S(FP32) 1=D(FP64).
+  // Heavy JITs the FP32 (S) form; the FP64 (D) form bails to lite and is
+  // declined by the differential (so ~half the produced insns are declined,
+  // which the compared>threshold guard tolerates). rd samples rd==rn.
+  uint32_t GenNeonScalarFcvta() {
+    uint32_t is_unsigned = Rnd() & 1;   // 0=FCVTAS, 1=FCVTAU
+    uint32_t size = Rnd() & 1;          // 0=S (heavy JITs), 1=D (declined)
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // sample destructive rd==rn
+    return (1u << 30) | (is_unsigned << 29) | (0b11110u << 24) | (size << 22) |
+           (1u << 21) | (0b11100u << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
+
+  // A random 128-bit V-register whose FP32 lane 0 (the only lane a scalar
+  // FCVTAS/FCVTAU reads) is drawn from the corner set: NaN (-> 0), +-inf,
+  // +-2^31 / 2^32 (signed/unsigned overflow saturation), +-N.5 half-integers
+  // (the ties-away rounding case), and ordinary fractional finite values. The
+  // upper lanes are seeded too but ignored by the scalar op.
+  unsigned __int128 RandomFcvtaFpVReg() {
+    auto pick32 = [&]() -> uint32_t {
+      switch (Rnd() % 9) {
+        case 0: return 0x7FC00000u;  // NaN -> 0
+        case 1: return 0x7F800000u;  // +inf
+        case 2: return 0xFF800000u;  // -inf
+        case 3: return 0x4F000000u;  // 2^31 (INT32 positive overflow)
+        case 4: return 0x4F800000u;  // 2^32 (UINT32 overflow)
+        case 5: return 0xCF000000u;  // -2^31
+        case 6: {  // +-N.5 half-integer (ties-away boundary), |N| < 2048
+          int32_t n = static_cast<int32_t>(Rnd() % 4096) - 2048;
+          float f = static_cast<float>(n) + 0.5f;
+          uint32_t bits;
+          memcpy(&bits, &f, 4);
+          return bits;
+        }
+        default: {
+          float f = static_cast<float>(static_cast<int32_t>(Rnd() % 262144) -
+                                       131072) /
+                    8.0f;
+          uint32_t bits;
+          memcpy(&bits, &f, 4);
+          return bits;
+        }
+      }
+    };
+    uint64_t l0 = pick32(), l1 = pick32(), l2 = pick32(), l3 = pick32();
+    unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
+    return (hi << 64) | lo;
+  }
+
+  // AdvSIMD vector two-reg-misc FRINTN/FRINTM/FRINTP/FRINTZ/FRINTX/FRINTI
+  // (FP32 .2S/.4S): round float to integral float with a fixed rounding mode.
+  // Encoding:
+  //   (Q<<30)|(U<<29)|(0b01110<<24)|(size<<22)|(0b10000<<17)|(opcode<<12)
+  //   |(0b10<<10)|(Rn<<5)|Rd
+  // Six FP32 variants (verified vs aarch64-linux-gnu-as):
+  //   FRINTN U0 op0x18 sz00 (0x4e218820), FRINTM U0 op0x19 sz00 (0x4e219820),
+  //   FRINTP U0 op0x18 sz10 (0x4ea18820), FRINTZ U0 op0x19 sz10 (0x4ea19820),
+  //   FRINTX U1 op0x19 sz00 (0x6e219820), FRINTI U1 op0x19 sz10 (0x6ea19820).
+  // Heavy JITs the FP32 form as a single ROUNDPS; a .2D form (sz low bit=1, which
+  // requires Q=1) bails to lite and is declined. rd samples rd==rn; Q samples
+  // .2S/.4S.
+  uint32_t GenNeonFrintV() {
+    struct V { uint32_t u, opcode, size; };
+    static const V kVariants[6] = {
+        {0, 0x18, 0b00},  // FRINTN (nearest-even)
+        {0, 0x19, 0b00},  // FRINTM (toward -inf)
+        {0, 0x18, 0b10},  // FRINTP (toward +inf)
+        {0, 0x19, 0b10},  // FRINTZ (toward zero)
+        {1, 0x19, 0b00},  // FRINTX (use FPCR, signals inexact)
+        {1, 0x19, 0b10},  // FRINTI (use FPCR)
+    };
+    const V& v = kVariants[Rnd() % 6];
+    uint32_t size = v.size;
+    uint32_t q = Rnd() & 1;
+    // ~1 in 5: promote to a .2D form (sz low bit set, Q=1) which heavy declines.
+    if ((Rnd() % 5) == 0) { size |= 1u; q = 1; }
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // sample destructive rd==rn
+    return (q << 30) | (v.u << 29) | (0b01110u << 24) | (size << 22) |
+           (0b10000u << 17) | (v.opcode << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
+
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
   // small-magnitude) FP lanes so FMA can never manufacture a NaN and the
   // ARM-vs-x86 NaN-propagation divergence never fires. FP32: 4 lanes; FP64: 2.
@@ -734,6 +922,115 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonFmla) {
   EXPECT_GT(compared, 300) << "heavy accepted too few FMLA/FMLS encodings";
 }
 
+// FP by-element FMUL/FMLA/FMLS (.2S/.4S FP32, .2D FP64). The heavy tier now
+// broadcasts Vm.lane[index] with PSHUFD and lowers to packed MULP{S,D} (FMUL)
+// or x86 FMA3 VF(N)MADD231P{S,D} (FMLA/FMLS, single rounding) — was: bail to
+// lite. Inputs are seeded with finite floats (RandomFiniteFpVReg) so the
+// interpreter's result and the x86 result agree bit-for-bit (random NaN
+// payloads propagate differently on ARM vs x86). Exercises FMUL/FMLA/FMLS ×
+// single/double × Q × index and the destructive rd==rn / rd==Vm accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxFmul) {
+  Seed(0xF3B1DECC1DE50FF1ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t insn = GenNeonVecXIdxFmul();
+    uint32_t code[1] = {insn};
+    const bool is_double = ((insn >> 22) & 1) != 0;
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFiniteFpVReg(is_double);
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few by-element FMUL/FMLA/FMLS";
+}
+
+// FP by-element FMULX (.2S/.4S FP32, .2D FP64). The heavy tier now lowers FMULX
+// as FMUL plus the (+-0 * +-inf)->+-2.0 saturation blend (PSHUFD broadcast,
+// MULP{S,D}, CMPUNORDP{S,D} special-lane detection, sign-mask + bits(+2.0)
+// select) — was: bail to lite. Inputs are drawn from {+-0, +-inf, small-finite}
+// (RandomFmulxFpVReg, never NaN) so the saturation lanes actually fire while the
+// ARM-vs-x86 result stays bit-identical. Exercises FMULX × single/double × Q ×
+// index and the destructive rd==rn / rd==Vm accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxFmulx) {
+  Seed(0x2A17FEEDF00DBA11ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t insn = GenNeonVecXIdxFmulx();
+    uint32_t code[1] = {insn};
+    const bool is_double = ((insn >> 22) & 1) != 0;
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFmulxFpVReg(is_double);
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few by-element FMULX";
+}
+
+// Scalar FCVTAS / FCVTAU (S): float -> integer, round-to-nearest ties-away. The
+// heavy tier now lowers the FP32 (S) form as the FRINTA copysign(0.5) trick +
+// the FCVTZS (signed) / FCVTZU (unsigned) saturation/NaN fix-up on a
+// lane-0-scrubbed source — was: bail to lite. The FP64 (D) form still bails and
+// is declined. Inputs (RandomFcvtaFpVReg) seed the corner set — NaN, +-inf,
+// signed/unsigned overflow, +-N.5 half-integers (ties-away), finite fractions —
+// so the saturation and tie paths actually fire, HEAVY==interp on full state.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonScalarFcvta) {
+  Seed(0xFC77A5FC77A50011ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonScalarFcvta()};
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFcvtaFpVReg();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few scalar FCVTAS/FCVTAU";
+}
+
+// Vector FRINTN/FRINTM/FRINTP/FRINTZ/FRINTX/FRINTI (FP32 .2S/.4S): round float
+// to integral float. Heavy now lowers the FP32 form as a single SSE4.1 ROUNDPS
+// with the matching rounding imm (no int saturation fix-up — the result stays
+// FP) — was: bail to lite. The .2D form bails and is declined. Inputs
+// (RandomFcvtaFpVReg) seed every FP32 lane from the corner set — NaN/+-inf
+// (propagate unchanged), 2^31/2^32 magnitudes (already integral), +-N.5
+// half-integers (the nearest-even boundary for FRINTN), and finite fractions —
+// so each rounding mode's boundary fires and HEAVY==interp on full state.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonFrintV) {
+  Seed(0xF817E5F817E50022ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonFrintV()};
+    InitState in = RandomInit();
+    for (int i = 0; i < 32; i++) in.v[i] = RandomFcvtaFpVReg();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few vector FRINT";
+}
+
 // Acceptance: the generators reach the register-aliasing and multi-instruction
 // shapes the harness exists to stress, so a future refactor that silently stops
 // producing them fails loudly rather than making the fuzzer vacuous.
@@ -894,6 +1191,83 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_fma_single) << "FMA generator no longer produces single-precision";
   EXPECT_TRUE(saw_fma_double) << "FMA generator no longer produces double-precision";
   EXPECT_TRUE(saw_fma_alias) << "FMA generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_ifmul = false, saw_ifmla = false, saw_ifmls = false;
+  bool saw_ifp_single = false, saw_ifp_double = false, saw_ifp_alias = false;
+  Seed(0x1DF9C0DE5EEDBEEFULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxFmul();
+    uint32_t opcode = (insn >> 12) & 0xF, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode == 0b1001) saw_ifmul = true;  // FMUL
+    if (opcode == 0b0001) saw_ifmla = true;  // FMLA
+    if (opcode == 0b0101) saw_ifmls = true;  // FMLS
+    if (size == 2) saw_ifp_single = true;    // FP32
+    if (size == 3) saw_ifp_double = true;    // FP64
+    if (rd == rn) saw_ifp_alias = true;
+  }
+  EXPECT_TRUE(saw_ifmul) << "by-element FP generator no longer produces FMUL";
+  EXPECT_TRUE(saw_ifmla) << "by-element FP generator no longer produces FMLA";
+  EXPECT_TRUE(saw_ifmls) << "by-element FP generator no longer produces FMLS";
+  EXPECT_TRUE(saw_ifp_single) << "by-element FP generator no longer produces FP32";
+  EXPECT_TRUE(saw_ifp_double) << "by-element FP generator no longer produces FP64";
+  EXPECT_TRUE(saw_ifp_alias) << "by-element FP generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_fmulx_u = false, saw_fmulx_single = false, saw_fmulx_double = false;
+  bool saw_fmulx_alias = false;
+  Seed(0x5A7C0FFEE0DDBA11ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxFmulx();
+    uint32_t u = (insn >> 29) & 1, opcode = (insn >> 12) & 0xF, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 1 && opcode == 0b1001) saw_fmulx_u = true;  // FMULX (U=1)
+    if (size == 2) saw_fmulx_single = true;              // FP32
+    if (size == 3) saw_fmulx_double = true;              // FP64
+    if (rd == rn) saw_fmulx_alias = true;
+  }
+  EXPECT_TRUE(saw_fmulx_u) << "by-element FMULX generator no longer sets U=1/opcode=1001";
+  EXPECT_TRUE(saw_fmulx_single) << "by-element FMULX generator no longer produces FP32";
+  EXPECT_TRUE(saw_fmulx_double) << "by-element FMULX generator no longer produces FP64";
+  EXPECT_TRUE(saw_fmulx_alias) << "by-element FMULX generator no longer produces rd==rn (accumulate clobber)";
+
+  bool saw_fcvtas = false, saw_fcvtau = false, saw_fcvta_s = false;
+  bool saw_fcvta_d = false, saw_fcvta_alias = false;
+  Seed(0xFCA7A5FCA7A50022ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonScalarFcvta();
+    uint32_t u = (insn >> 29) & 1, size = (insn >> 22) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 0) saw_fcvtas = true;   // FCVTAS
+    if (u == 1) saw_fcvtau = true;   // FCVTAU
+    if (size == 0) saw_fcvta_s = true;   // S (heavy JITs)
+    if (size == 1) saw_fcvta_d = true;   // D (declined)
+    if (rd == rn) saw_fcvta_alias = true;
+  }
+  EXPECT_TRUE(saw_fcvtas) << "scalar FCVTA generator no longer produces FCVTAS";
+  EXPECT_TRUE(saw_fcvtau) << "scalar FCVTA generator no longer produces FCVTAU";
+  EXPECT_TRUE(saw_fcvta_s) << "scalar FCVTA generator no longer produces S (heavy-JIT) form";
+  EXPECT_TRUE(saw_fcvta_d) << "scalar FCVTA generator no longer produces D (declined) form";
+  EXPECT_TRUE(saw_fcvta_alias) << "scalar FCVTA generator no longer produces rd==rn";
+
+  bool saw_frintn = false, saw_frinti = false, saw_frint_fp32 = false;
+  bool saw_frint_2d = false, saw_frint_alias = false;
+  Seed(0xF817E5F817E50033ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonFrintV();
+    uint32_t u = (insn >> 29) & 1, opcode = (insn >> 12) & 0x1F;
+    uint32_t size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (u == 0 && opcode == 0x18 && (size & 1) == 0) saw_frintn = true;  // FRINTN/P
+    if (u == 1 && opcode == 0x19) saw_frinti = true;                     // FRINTX/I
+    if ((size & 1) == 0) saw_frint_fp32 = true;   // FP32 (heavy JITs)
+    if ((size & 1) == 1) saw_frint_2d = true;     // .2D (declined)
+    if (rd == rn) saw_frint_alias = true;
+  }
+  EXPECT_TRUE(saw_frintn) << "vector FRINT generator no longer produces FRINTN/FRINTP";
+  EXPECT_TRUE(saw_frinti) << "vector FRINT generator no longer produces FRINTX/FRINTI";
+  EXPECT_TRUE(saw_frint_fp32) << "vector FRINT generator no longer produces FP32 (heavy-JIT) form";
+  EXPECT_TRUE(saw_frint_2d) << "vector FRINT generator no longer produces .2D (declined) form";
+  EXPECT_TRUE(saw_frint_alias) << "vector FRINT generator no longer produces rd==rn";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
