@@ -402,6 +402,38 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (rn << 5) | rd;
   }
 
+  // Saturating doubling widening MUL/MAC by element: SQDMULL/SQDMLAL/SQDMLSL.
+  //   SQDMULL opc=1011 | SQDMLAL opc=0011 | SQDMLSL opc=0111 (U=0, signed only)
+  // size 01 (.4h/.8h -> .4s) or 10 (.2s/.4s -> .2d); Q selects the source half.
+  // Same index/Vm layout as GenNeonVecXIdxMull.
+  uint32_t GenNeonVecXIdxSqdmull() {
+    static const uint32_t kOpc[] = {0b1011, 0b0011, 0b0111};
+    const uint32_t opc = kOpc[Rnd() % 3];
+    uint32_t q = Rnd() & 1;
+    uint32_t size = 1 + (Rnd() & 1);  // 01 (H) or 10 (S)
+    uint32_t vm = Rnd() % 8;          // <16 keeps halfword Rm valid; M=0 for word
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M, Rm;
+    if (size == 1) {  // halfword: index 0..7 = H:L:M, Vm 0..15
+      uint32_t index = Rnd() % 8;
+      H = index >> 2;
+      L = (index >> 1) & 1;
+      M = index & 1;
+      Rm = vm;
+    } else {  // word: index 0..3 = H:L, Vm = M:Rm
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+      M = 0;
+      Rm = vm;
+    }
+    return (q << 30) | (0u << 29) | (0b01111u << 24) | (size << 22) |
+           (L << 21) | (M << 20) | (Rm << 16) | (opc << 12) | (H << 11) |
+           (rn << 5) | rd;
+  }
+
   // SHL Vd.T, Vn.T, #shift (AdvSIMD shift-by-immediate, U=0 opcode=01010).
   // Covers every size class the heavy tier lowers: byte immh=0001 (this
   // cycle's new PSLLW + per-byte-AND arm), half immh=001x, word immh=01xx,
@@ -544,6 +576,29 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxMull) {
   EXPECT_GT(compared, 300) << "heavy accepted too few widening by-element encodings";
 }
 
+// Single-instruction saturating doubling widening by-element:
+// SQDMULL/SQDMLAL/SQDMLSL. Exercises the doubling-overflow saturation corner
+// (Vn.lane == Vm.lane == INT_MIN) and the SQDMLAL/SQDMLSL signed saturating
+// accumulate, at both size=01 (PMOVSXWD+PMULLD, PCMPEQD corner) and size=10
+// (PMOVSXDQ+PMULDQ, PCMPEQQ corner + PCMPGTQ accumulate), Q=1 high-half select.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmull) {
+  Seed(0x59D115A7C0DE1234ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonVecXIdxSqdmull()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULL by-element encodings";
+}
+
 // Single-instruction SHL-by-immediate across every size class the heavy tier
 // lowers (byte via PSLLW + per-byte AND mask, half/word/double via
 // PSLL{W,D,Q}). Byte was the only SHL arm still bailing before this cycle.
@@ -647,6 +702,25 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_mull_umlsl) << "widening generator no longer produces UMLSL";
   EXPECT_TRUE(saw_mull_q1) << "widening generator no longer produces the *2 high-half select";
   EXPECT_TRUE(saw_mull_word) << "widening generator no longer produces word sources";
+
+  bool saw_sq_mull = false, saw_sq_mlal = false, saw_sq_mlsl = false;
+  bool saw_sq_q1 = false, saw_sq_word = false;
+  Seed(0x59D115A700FEDCBAULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenNeonVecXIdxSqdmull();
+    uint32_t opcode = (insn >> 12) & 0xF;
+    uint32_t size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    if (opcode == 0b1011) saw_sq_mull = true;  // SQDMULL
+    if (opcode == 0b0011) saw_sq_mlal = true;  // SQDMLAL
+    if (opcode == 0b0111) saw_sq_mlsl = true;  // SQDMLSL
+    if (q == 1) saw_sq_q1 = true;              // *2 high-half select
+    if (size == 2) saw_sq_word = true;         // word source -> .2d
+  }
+  EXPECT_TRUE(saw_sq_mull) << "SQDMULL generator no longer produces SQDMULL";
+  EXPECT_TRUE(saw_sq_mlal) << "SQDMULL generator no longer produces SQDMLAL";
+  EXPECT_TRUE(saw_sq_mlsl) << "SQDMULL generator no longer produces SQDMLSL";
+  EXPECT_TRUE(saw_sq_q1) << "SQDMULL generator no longer produces the *2 high-half select";
+  EXPECT_TRUE(saw_sq_word) << "SQDMULL generator no longer produces word sources";
 
   bool saw_shl_byte = false, saw_shl_half = false, saw_shl_word = false;
   bool saw_shl_dbl = false, saw_shl_alias = false;
