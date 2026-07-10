@@ -250,7 +250,7 @@ TEST(Arm64MmapBssZeroTest, BackwardSearchFindsEmbeddedElfHeader) {
 // a file page cross-contaminate. This is uncommon in practice (normally only the
 // final data segment carries .bss), but it is craftable, and the assertions
 // below pin the CURRENT (buggy) behavior so a future fix will surface here.
-TEST(Arm64MmapBssZeroTest, TwoBssSegmentsSharingPageMisattributeZeroing) {
+TEST(Arm64MmapBssZeroTest, TwoBssSegmentsSharingPageZeroesOnlyOwnBss) {
   const size_t page = PageSize();
   ASSERT_GE(page, 4096u);
 
@@ -273,16 +273,14 @@ TEST(Arm64MmapBssZeroTest, TwoBssSegmentsSharingPageMisattributeZeroing) {
   ASSERT_NE(got, MAP_FAILED);
   ASSERT_EQ(got, base);
 
-  // Segment B's real content occupies [1000, 1500). Correct behavior would keep
-  // ALL of [0, 1500) intact and zero only [1500, page). Instead:
-  EXPECT_TRUE(BytesAllEqual(base, 0, 1000, kSentinel))
-      << "bytes before segment B's content (segment A's page tail) survive";
-  // Segment A's bss zeroing bleeds into segment B's mapping here (THE BUG):
-  EXPECT_TRUE(BytesAllEqual(base, 1000, 1200, 0))
-      << "MIS-ATTRIBUTION: segment A's bss zeroing corrupts segment B content "
-         "[1000,1200); a correct implementation would keep this as sentinel";
-  EXPECT_TRUE(BytesAllEqual(base, 1200, 1500, kSentinel))
-      << "the rest of segment B's content survives";
+  // Segment B's real content occupies [1000, 1500). Segment A also matches
+  // this mapping's (offset, rounded length) — the two are indistinguishable
+  // from the mmap parameters alone — but A's would-be bss window [1000, 1200)
+  // overlaps B's file extent, so the overlap guard must skip A's zeroing
+  // rather than corrupt B's file-backed bytes. Only B's own bss is zeroed.
+  EXPECT_TRUE(BytesAllEqual(base, 0, 1500, kSentinel))
+      << "all file-backed content in the mapping survives (segment A's "
+         "same-page bss zeroing must be skipped, not mis-attributed)";
   EXPECT_TRUE(BytesAllEqual(base, 1500, page, 0))
       << "segment B's own bss is correctly zeroed";
 
