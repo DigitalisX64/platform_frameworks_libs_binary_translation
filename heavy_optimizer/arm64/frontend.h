@@ -43,12 +43,14 @@ namespace berberis {
 // region machinery (StartRegion / GenJump / ExitGeneratedCode / ResolveJumps /
 // Finalize / StartInsn) is adapted from heavy_optimizer/riscv64/frontend.{h,cc}.
 //
-// Integer/branch/load-store instructions are translated to native x86_64.
-// Scalar floating-point arithmetic (FADD/FSUB/FMUL/FDIV for S and D) is lowered
-// through the guest-agnostic intrinsic layer (inline_intrinsic.h +
-// machine_ir_intrinsic_binding.json), and FMOV/FABS/FNEG/FSQRT/FMOV-imm are
-// emitted directly. Anything not handled calls Undefined() (sets success_ =
-// false) so the two-gear runtime falls back to the lite translator/interpreter.
+// Integer/branch/load-store instructions, scalar FP, and a broad NEON/SIMD
+// subset (three-same, two-reg-misc, shifts, copies/permutes, indexed-element,
+// atomics/exclusives, conversions) are translated to native x86_64. Scalar FP
+// arithmetic (FADD/FSUB/FMUL/FDIV for S and D) is lowered through the
+// guest-agnostic intrinsic layer (inline_intrinsic.h +
+// machine_ir_intrinsic_binding.json); most other handlers emit MachineIR
+// directly. Anything not handled calls Undefined() (sets success_ = false) so
+// the two-gear runtime falls back to the lite translator/interpreter.
 // New instructions are added here as the optimizing tier grows.
 class HeavyOptimizerFrontend {
  public:
