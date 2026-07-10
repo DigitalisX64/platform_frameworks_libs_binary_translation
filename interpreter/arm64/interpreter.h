@@ -1201,12 +1201,7 @@ class Interpreter {
     }
 
     // Q=0 zeros the upper 64 bits of the destination vector.
-    if (!args.q) {
-      uint64_t lo;
-      memcpy(&lo, &result, 8);
-      result = 0;
-      memcpy(&result, &lo, 8);
-    }
+    ClearUpperIfNotQ(&result, args.q);
     state_->cpu.v[args.rd] = result;
   }
 
@@ -1309,12 +1304,7 @@ class Interpreter {
     }
 
     // Q=0 zeros the upper 64 bits of the destination vector.
-    if (!args.q) {
-      uint64_t lo;
-      memcpy(&lo, &result, 8);
-      result = 0;
-      memcpy(&result, &lo, 8);
-    }
+    ClearUpperIfNotQ(&result, args.q);
     state_->cpu.v[args.rd] = result;
   }
 
@@ -1375,12 +1365,7 @@ class Interpreter {
     }
 
     // Q=0 zeros the upper 64 bits of the destination vector.
-    if (!args.q) {
-      uint64_t lo;
-      memcpy(&lo, &result, 8);
-      result = 0;
-      memcpy(&result, &lo, 8);
-    }
+    ClearUpperIfNotQ(&result, args.q);
     state_->cpu.v[args.rd] = result;
   }
 
@@ -3200,12 +3185,7 @@ class Interpreter {
           memcpy(reinterpret_cast<uint8_t*>(&val) + lane * esize, &elem, esize);
         }
         // Clear upper 64 bits if Q=0.
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &val, 8);
-          val = 0;
-          memcpy(&val, &lo, 8);
-        }
+        ClearUpperIfNotQ(&val, args.q);
         state_->cpu.v[vreg] = val;
       }
 
@@ -3361,9 +3341,7 @@ class Interpreter {
       result = ExpandSimdModifiedImm(args.op, cmode, args.abc, args.defgh, args.q);
     }
     // Q==0 operates on the lower 64 bits; the upper 64 bits of Vd are zeroed.
-    if (!args.q) {
-      result = static_cast<__uint128_t>(static_cast<uint64_t>(result));
-    }
+    ClearUpperIfNotQ(&result, args.q);
     state_->cpu.v[args.rd] = result;
   }
 
@@ -4453,79 +4431,38 @@ class Interpreter {
       // --- Logic operations (ignore size for element iteration, operate on whole vector) ---
       case Decoder::AdvSimdThreeSameOpcode::kAnd:
         result = src_n & src_m;
-        if (!args.q) {
-          // Zero upper 64 bits for 64-bit vector.
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kBic:
         result = src_n & ~src_m;
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kOrr:
         result = src_n | src_m;
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kOrn:
         result = src_n | ~src_m;
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kEor:
         result = src_n ^ src_m;
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kBsl:
         // BSL: Vd = (Vd & Vn) | (~Vd & Vm) — bitwise select using Vd as mask.
         result = (dst & src_n) | (~dst & src_m);
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kBit:
         // BIT: Vd = (Vm & Vn) | (~Vm & Vd) — insert bits where Vm is 1.
         result = (src_m & src_n) | (~src_m & dst);
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       case Decoder::AdvSimdThreeSameOpcode::kBif:
         // BIF: Vd = (Vm & Vd) | (~Vm & Vn) — insert bits where Vm is 0.
         result = (src_m & dst) | (~src_m & src_n);
-        if (!args.q) {
-          uint64_t lo;
-          memcpy(&lo, &result, 8);
-          result = 0;
-          memcpy(&result, &lo, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
 
       // --- Arithmetic: element-wise ADD/SUB ---
@@ -4563,8 +4500,8 @@ class Interpreter {
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
               uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
               uint8_t bits = es * 8;
-              int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-              int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+              int64_t sa = SignExtendElem(a, bits);
+              int64_t sb = SignExtendElem(b, bits);
               return (sa > sb) ? mask : 0;
             });
         break;
@@ -4582,8 +4519,8 @@ class Interpreter {
             [](uint64_t a, uint64_t b, uint8_t es) -> uint64_t {
               uint64_t mask = (es >= 8) ? ~0ULL : ((1ULL << (es * 8)) - 1);
               uint8_t bits = es * 8;
-              int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-              int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+              int64_t sa = SignExtendElem(a, bits);
+              int64_t sb = SignExtendElem(b, bits);
               return (sa >= sb) ? mask : 0;
             });
         break;
@@ -4650,8 +4587,8 @@ class Interpreter {
           memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
           memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
           memcpy(&d, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
-          int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-          int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+          int64_t sa = SignExtendElem(a, bits);
+          int64_t sb = SignExtendElem(b, bits);
           int64_t diff = sa - sb;
           uint64_t abs_diff = static_cast<uint64_t>(diff < 0 ? -diff : diff);
           uint64_t r = (d + abs_diff) & emask;
@@ -4770,7 +4707,7 @@ class Interpreter {
                 return (static_cast<uint32_t>(shift) >= bits) ? 0 : (a << shift);
               } else {
                 // Signed shift right: sign-extend a, then shift.
-                int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
+                int64_t sa = SignExtendElem(a, bits);
                 uint32_t rshift = static_cast<uint32_t>(-shift);
                 return static_cast<uint64_t>(
                     (rshift >= bits) ? (sa >> (bits - 1)) : (sa >> rshift));
@@ -4822,7 +4759,7 @@ class Interpreter {
               // Sign- or zero-extend the element into a wide signed accumulator.
               __int128 v;
               if (is_signed) {
-                v = static_cast<__int128>(static_cast<int64_t>(a << (64 - bits)) >> (64 - bits));
+                v = static_cast<__int128>(SignExtendElem(a, bits));
               } else {
                 v = static_cast<__int128>(a & (bits >= 64 ? ~0ULL : ((1ULL << bits) - 1)));
               }
@@ -5055,9 +4992,7 @@ class Interpreter {
           uint64_t out_u = static_cast<uint64_t>(out);
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &out_u, esize);
         }
-        if (!args.q) {
-          memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
-        }
+        ClearUpperIfNotQ(&result, args.q);
         break;
       }
       case Decoder::AdvSimdThreeSameOpcode::kMla: {
@@ -6098,7 +6033,7 @@ class Interpreter {
         uint64_t elem = 0;
         memcpy(&elem, &src, esize);
         int64_t signed_val =
-            static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+            SignExtendElem(elem, bits);
         bool is_neg =
             (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg);
         int64_t out;
@@ -6638,8 +6573,7 @@ class Interpreter {
         int64_t res = static_cast<int64_t>(product >> bits_local);
         const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
         const int64_t smin = -(int64_t{1} << (bits_local - 1));
-        if (res > smax) res = smax;
-        else if (res < smin) res = smin;
+        res = SatClampSigned(res, smin, smax);
         const uint64_t mask = (uint64_t{1} << bits_local) - 1;
         state_->cpu.v[args.rd] =
             static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
@@ -6674,13 +6608,11 @@ class Interpreter {
         int64_t addend = static_cast<int64_t>(product >> bits_local);
         const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
         const int64_t smin = -(int64_t{1} << (bits_local - 1));
-        if (addend > smax) addend = smax;
-        else if (addend < smin) addend = smin;
+        addend = SatClampSigned(addend, smin, smax);
         const bool is_sub =
             (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmlshScalar);
         int64_t res = is_sub ? sd - addend : sd + addend;
-        if (res > smax) res = smax;
-        else if (res < smin) res = smin;
+        res = SatClampSigned(res, smin, smax);
         const uint64_t mask = (uint64_t{1} << bits_local) - 1;
         state_->cpu.v[args.rd] =
             static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
@@ -6931,12 +6863,7 @@ class Interpreter {
         if (args.size == 0b00) {
           // NOT (bitwise NOT): U=1, size=00.
           result = ~src;
-          if (!args.q) {
-            uint64_t lo;
-            memcpy(&lo, &result, 8);
-            result = 0;
-            memcpy(&result, &lo, 8);
-          }
+          ClearUpperIfNotQ(&result, args.q);
         } else if (args.size == 0b01) {
           // RBIT (reverse bits per byte): U=1, size=01.
           for (uint8_t i = 0; i < vec_len; i++) {
@@ -6997,7 +6924,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           uint64_t y = static_cast<uint64_t>(signed_val < 0 ? ~signed_val : signed_val) & emask;
           uint64_t cls;
           if (y == 0) {
@@ -7018,7 +6945,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           uint64_t abs_val = static_cast<uint64_t>(signed_val < 0 ? -signed_val : signed_val) & emask;
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &abs_val, esize);
         }
@@ -7055,7 +6982,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           int64_t out;
           if (signed_val == int_min) {
             out = int_max;  // saturate (single saturating input per ARM ARM)
@@ -7105,7 +7032,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           bool cond;
           switch (args.opcode) {
             case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero: cond = (signed_val >  0); break;
@@ -7390,8 +7317,8 @@ class Interpreter {
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
           bool elem_wins;
           if (is_signed) {
-            int64_t s_elem = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
-            int64_t s_acc = static_cast<int64_t>(acc << (64 - bits)) >> (64 - bits);
+            int64_t s_elem = SignExtendElem(elem, bits);
+            int64_t s_acc = SignExtendElem(acc, bits);
             elem_wins = is_max ? (s_elem > s_acc) : (s_elem < s_acc);
           } else {
             elem_wins = is_max ? (elem > acc) : (elem < acc);
@@ -7924,7 +7851,7 @@ class Interpreter {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
           if (is_signed) {
-            int64_t s = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+            int64_t s = SignExtendElem(elem, bits);
             acc += s;
           } else {
             acc += elem;
@@ -7957,7 +7884,7 @@ class Interpreter {
           if (is_unsigned_sat) {
             // Vd unsigned, Vn signed.
             __int128_t s_src =
-                static_cast<__int128_t>(static_cast<int64_t>(src_elem << (64 - bits)) >> (64 - bits));
+                static_cast<__int128_t>(SignExtendElem(src_elem, bits));
             sum = static_cast<__int128_t>(dst_elem) + s_src;
             __int128_t max_u = (bits >= 64) ? ((static_cast<__int128_t>(1) << 64) - 1)
                                             : ((static_cast<__int128_t>(1) << bits) - 1);
@@ -7966,7 +7893,7 @@ class Interpreter {
           } else {
             // Vd signed, Vn unsigned.
             __int128_t s_dst =
-                static_cast<__int128_t>(static_cast<int64_t>(dst_elem << (64 - bits)) >> (64 - bits));
+                static_cast<__int128_t>(SignExtendElem(dst_elem, bits));
             sum = s_dst + static_cast<__int128_t>(src_elem);
             __int128_t max_s = (static_cast<__int128_t>(1) << (bits - 1)) - 1;
             __int128_t min_s = -(static_cast<__int128_t>(1) << (bits - 1));
@@ -8003,8 +7930,8 @@ class Interpreter {
           memcpy(&b, reinterpret_cast<const uint8_t*>(&src) + i * 2 * esize + esize, esize);
           uint64_t sum;
           if (is_signed) {
-            int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-            int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+            int64_t sa = SignExtendElem(a, bits);
+            int64_t sb = SignExtendElem(b, bits);
             sum = static_cast<uint64_t>(sa + sb) & ElementMask(out_esize);
           } else {
             sum = (a + b) & ElementMask(out_esize);
@@ -8051,7 +7978,7 @@ class Interpreter {
           uint64_t out;
           if (is_signed) {
             // Sign-extend src to int64
-            int64_t s = static_cast<int64_t>(raw << (64 - src_esize * 8)) >> (64 - src_esize * 8);
+            int64_t s = SignExtendElem(raw, src_esize * 8);
             int64_t smax = static_cast<int64_t>(dst_smax);
             int64_t smin = -smax - 1;
             if (s > smax) s = smax;
@@ -8084,7 +8011,7 @@ class Interpreter {
           uint64_t raw = 0;
           memcpy(&raw, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
           // Sign-extend the source to int64_t.
-          int64_t s = static_cast<int64_t>(raw << (64 - src_esize * 8)) >> (64 - src_esize * 8);
+          int64_t s = SignExtendElem(raw, src_esize * 8);
           uint64_t out;
           if (s < 0) {
             out = 0;
@@ -8277,9 +8204,7 @@ class Interpreter {
 
       // For Q=0, the architecture zeroes the upper 64 bits of Vd
       // (D-register semantics) — matches the JIT lite_translator path.
-      if (!args.q) {
-        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
-      }
+      ClearUpperIfNotQ(&result, args.q);
       state_->cpu.v[args.rd] = result;
       return;
     }
@@ -8329,9 +8254,7 @@ class Interpreter {
             return high;
           });
 
-      if (!args.q) {
-        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
-      }
+      ClearUpperIfNotQ(&result, args.q);
       state_->cpu.v[args.rd] = result;
       return;
     }
@@ -8401,9 +8324,7 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &out_u, esize);
       }
 
-      if (!args.q) {
-        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
-      }
+      ClearUpperIfNotQ(&result, args.q);
       state_->cpu.v[args.rd] = result;
       return;
     }
@@ -8625,9 +8546,7 @@ class Interpreter {
         memcpy(reinterpret_cast<uint8_t*>(&result) + i * 2, &hr, 2);
       }
       // For Q=0, clear the upper half of the destination register.
-      if (!args.q) {
-        memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
-      }
+      ClearUpperIfNotQ(&result, args.q);
     } else if (args.size == 0b10) {
       // 32-bit float elements.
       uint8_t num_elements = args.q ? 4 : 2;
@@ -8721,9 +8640,7 @@ class Interpreter {
     // fill only the low lanes, so apply the zeroing here (the FP16 branch
     // already zeroed, making this idempotent for it). Matches the lite and
     // heavy JIT paths (SetVRegFull(rd, res, q)).
-    if (!args.q) {
-      memset(reinterpret_cast<uint8_t*>(&result) + 8, 0, 8);
-    }
+    ClearUpperIfNotQ(&result, args.q);
     state_->cpu.v[args.rd] = result;
   }
 
@@ -8769,12 +8686,10 @@ class Interpreter {
       int64_t addend = static_cast<int64_t>(product >> bits_local);
       const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
       const int64_t smin = -(int64_t{1} << (bits_local - 1));
-      if (addend > smax) addend = smax;
-      else if (addend < smin) addend = smin;
+      addend = SatClampSigned(addend, smin, smax);
       const bool is_sub = (args.opcode == Op::kSqrdmlshScalarIdx);
       int64_t res = is_sub ? sd - addend : sd + addend;
-      if (res > smax) res = smax;
-      else if (res < smin) res = smin;
+      res = SatClampSigned(res, smin, smax);
       const uint64_t mask = (uint64_t{1} << bits_local) - 1;
       state_->cpu.v[args.rd] =
           static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
@@ -8943,7 +8858,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           int64_t shifted = (rshift >= bits) ? (signed_val >> (bits - 1)) : (signed_val >> rshift);
           uint64_t r = static_cast<uint64_t>(shifted) & emask;
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
@@ -8980,7 +8895,7 @@ class Interpreter {
           uint64_t elem = 0, dst_elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
           memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           int64_t shifted = (rshift >= bits) ? (signed_val >> (bits - 1)) : (signed_val >> rshift);
           uint64_t r = (dst_elem + static_cast<uint64_t>(shifted)) & emask;
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * esize, &r, esize);
@@ -9077,7 +8992,7 @@ class Interpreter {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + src_offset + i * src_esize, src_esize);
           // Sign-extend.
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t signed_val = SignExtendElem(elem, src_bits);
           uint64_t r = (static_cast<uint64_t>(signed_val) << shl_amount) & dst_mask;
           memcpy(reinterpret_cast<uint8_t*>(&result) + i * dst_esize, &r, dst_esize);
         }
@@ -9108,7 +9023,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           if (rshift >= bits) {
             // When shift equals element width, rounding bit is the MSB.
             int64_t r = (signed_val < 0) ? -1 : 0;
@@ -9153,7 +9068,7 @@ class Interpreter {
           uint64_t elem = 0, dst_elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
           memcpy(&dst_elem, reinterpret_cast<const uint8_t*>(&dst) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           int64_t shifted;
           if (rshift >= bits) {
             shifted = (signed_val < 0) ? -1 : 0;
@@ -9195,7 +9110,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           __int128_t wide = static_cast<__int128_t>(signed_val) << shift;
           int64_t clamped;
           if (wide > signed_max) clamped = signed_max;
@@ -9227,7 +9142,7 @@ class Interpreter {
         for (uint8_t i = 0; i < num_elements; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * esize, esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - bits)) >> (64 - bits);
+          int64_t signed_val = SignExtendElem(elem, bits);
           uint64_t r;
           if (signed_val < 0) {
             r = 0;
@@ -9287,12 +9202,11 @@ class Interpreter {
         for (uint8_t i = 0; i < src_count; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t signed_val = SignExtendElem(elem, src_bits);
           int64_t shifted = (narrow_rshift >= src_bits)
                                 ? (signed_val >> (src_bits - 1))
                                 : (signed_val >> narrow_rshift);
-          if (shifted > sat_max) shifted = sat_max;
-          else if (shifted < sat_min) shifted = sat_min;
+          shifted = SatClampSigned(shifted, sat_min, sat_max);
           uint64_t r = static_cast<uint64_t>(shifted) & narrow_mask;
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
         }
@@ -9347,14 +9261,11 @@ class Interpreter {
         for (uint8_t i = 0; i < src_count; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t signed_val = SignExtendElem(elem, src_bits);
           int64_t shifted = (narrow_rshift >= src_bits)
                                 ? (signed_val >> (src_bits - 1))
                                 : (signed_val >> narrow_rshift);
-          uint64_t clamped;
-          if (shifted < 0) clamped = 0;
-          else if (static_cast<uint64_t>(shifted) > sat_max) clamped = sat_max;
-          else clamped = static_cast<uint64_t>(shifted);
+          uint64_t clamped = SatClampUnsigned(shifted, sat_max);
           uint64_t r = clamped & sat_max;
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
         }
@@ -9377,13 +9288,10 @@ class Interpreter {
         for (uint8_t i = 0; i < src_count; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t signed_val = SignExtendElem(elem, src_bits);
           __int128_t wide = static_cast<__int128_t>(signed_val) + (__int128_t{1} << (narrow_rshift - 1));
           int64_t shifted = static_cast<int64_t>(wide >> narrow_rshift);
-          uint64_t clamped;
-          if (shifted < 0) clamped = 0;
-          else if (static_cast<uint64_t>(shifted) > sat_max) clamped = sat_max;
-          else clamped = static_cast<uint64_t>(shifted);
+          uint64_t clamped = SatClampUnsigned(shifted, sat_max);
           uint64_t r = clamped & sat_max;
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
         }
@@ -9407,11 +9315,10 @@ class Interpreter {
         for (uint8_t i = 0; i < src_count; i++) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&src) + i * src_esize, src_esize);
-          int64_t signed_val = static_cast<int64_t>(elem << (64 - src_bits)) >> (64 - src_bits);
+          int64_t signed_val = SignExtendElem(elem, src_bits);
           __int128_t wide = static_cast<__int128_t>(signed_val) + (__int128_t{1} << (narrow_rshift - 1));
           int64_t shifted = static_cast<int64_t>(wide >> narrow_rshift);
-          if (shifted > sat_max) shifted = sat_max;
-          else if (shifted < sat_min) shifted = sat_min;
+          shifted = SatClampSigned(shifted, sat_min, sat_max);
           uint64_t r = static_cast<uint64_t>(shifted) & narrow_mask;
           memcpy(reinterpret_cast<uint8_t*>(&result) + dst_offset + i * esize, &r, esize);
         }
@@ -9713,6 +9620,32 @@ class Interpreter {
     return (esize >= 8) ? ~0ULL : ((1ULL << (esize * 8)) - 1);
   }
 
+  // Zero the upper 64 bits of a vector value when Q=0 (D-register semantics).
+  static void ClearUpperIfNotQ(__uint128_t* value, bool q) {
+    if (!q) {
+      *value = static_cast<uint64_t>(*value);
+    }
+  }
+
+  // Sign-extend the low `bits` bits of x to int64_t.
+  static int64_t SignExtendElem(uint64_t x, unsigned bits) {
+    return static_cast<int64_t>(x << (64 - bits)) >> (64 - bits);
+  }
+
+  // Clamp a signed value to the inclusive [min, max] range.
+  static int64_t SatClampSigned(int64_t value, int64_t min, int64_t max) {
+    if (value > max) return max;
+    if (value < min) return min;
+    return value;
+  }
+
+  // Clamp a signed value to the unsigned [0, max] range (negatives saturate to 0).
+  static uint64_t SatClampUnsigned(int64_t value, uint64_t max) {
+    if (value < 0) return 0;
+    if (static_cast<uint64_t>(value) > max) return max;
+    return static_cast<uint64_t>(value);
+  }
+
   // Helper: apply an unsigned element-wise operation across the vector.
   template <typename Op>
   void AdvSimdThreeSameElementWise(__uint128_t src_n, __uint128_t src_m,
@@ -9742,8 +9675,8 @@ class Interpreter {
       memcpy(&a, reinterpret_cast<const uint8_t*>(&src_n) + i * esize, esize);
       memcpy(&b, reinterpret_cast<const uint8_t*>(&src_m) + i * esize, esize);
       // Sign-extend to int64_t.
-      int64_t sa = static_cast<int64_t>(a << (64 - bits)) >> (64 - bits);
-      int64_t sb = static_cast<int64_t>(b << (64 - bits)) >> (64 - bits);
+      int64_t sa = SignExtendElem(a, bits);
+      int64_t sb = SignExtendElem(b, bits);
       int64_t sr = op(sa, sb);
       uint64_t r = static_cast<uint64_t>(sr) & mask;
       memcpy(reinterpret_cast<uint8_t*>(result) + i * esize, &r, esize);
