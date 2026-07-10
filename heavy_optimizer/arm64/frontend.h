@@ -38,6 +38,40 @@
 
 namespace berberis {
 
+// Why a heavy-optimizer region bailed to the lite tier. A bail is correct (lite
+// re-translates the region) but slower; silent bails on common instructions have
+// previously required a manual multi-app sweep to localize. Threaded through the
+// Undefined() choke point so a berberis.tracing capture yields a bail histogram.
+// Only the interesting classes are annotated at their call sites; the bulk keeps
+// the kUnimplemented default and is still bucketable offline via the logged
+// instruction encoding.
+enum class BailReason {
+  kUnimplemented = 0,  // instruction/form not yet lowered in the heavy tier (default)
+  kUnsupportedSize,    // operand/access size the heavy path doesn't emit yet
+  kUnsupportedFpType,  // ftype/precision guard (e.g. FP16, or a reserved ftype)
+  kDefensive,          // validated-away illegal/reserved encoding (never a real gap)
+  kOther,              // deliberately uncategorized
+  kCount,
+};
+
+[[nodiscard]] inline const char* BailReasonName(BailReason reason) {
+  switch (reason) {
+    case BailReason::kUnimplemented:
+      return "unimplemented";
+    case BailReason::kUnsupportedSize:
+      return "unsupported-size";
+    case BailReason::kUnsupportedFpType:
+      return "unsupported-fptype";
+    case BailReason::kDefensive:
+      return "defensive";
+    case BailReason::kOther:
+      return "other";
+    case BailReason::kCount:
+      return "?";
+  }
+  return "?";
+}
+
 // ARM64 optimizing-tier frontend: translates the ARM64 decoder's
 // SemanticsPlayer callbacks into guest-agnostic x86_64 MachineIR. The generic
 // region machinery (StartRegion / GenJump / ExitGeneratedCode / ResolveJumps /
@@ -135,7 +169,7 @@ class HeavyOptimizerFrontend {
 
   [[nodiscard]] bool success() const { return success_; }
 
-  void Undefined();
+  void Undefined(BailReason reason = BailReason::kUnimplemented);
   void Nop() {}
 
   // DMB/DSB full barrier: lowers to MFENCE (x86 TSO lacks StoreLoad ordering).
@@ -1589,7 +1623,7 @@ class HeavyOptimizerFrontend {
     }
     using Op = Decoder::FpFixedPointOp;
     if (args.ftype != 0b00 && args.ftype != 0b01) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedFpType);
       return;
     }
     const uint8_t fbits = args.fbits;
@@ -1643,7 +1677,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     if (ftype != 0b00 && ftype != 0b01) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedFpType);
       return;
     }
     if (!host_platform::kHasFMA) {
@@ -1701,7 +1735,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     if (ftype != 0b00 && ftype != 0b01) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedFpType);
       return;
     }
     if (ftype == 0b00) {
@@ -1731,7 +1765,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     if (args.ftype != 0b00 && args.ftype != 0b01) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedFpType);
       return;
     }
     const bool is_double = (args.ftype == 0b01);
@@ -1813,7 +1847,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     if (args.ftype != 0b00 && args.ftype != 0b01) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedFpType);
       return;
     }
     const bool is_double = (args.ftype == 0b01);
@@ -2007,7 +2041,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     if (args.ftype != 0b00 && args.ftype != 0b01) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedFpType);
       return;
     }
     if (args.opcode > 0b1000) {
@@ -2342,7 +2376,7 @@ class HeavyOptimizerFrontend {
     if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
         args.size != Decoder::SimdLoadStoreSize::k64bit &&
         args.size != Decoder::SimdLoadStoreSize::k128bit) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedSize);
       return;
     }
     Register masked = ApplyTbi(base);
@@ -2480,7 +2514,7 @@ class HeavyOptimizerFrontend {
     if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
         args.size != Decoder::SimdLoadStoreSize::k64bit &&
         args.size != Decoder::SimdLoadStoreSize::k128bit) {
-      UndefinedReturningVoid();
+      UndefinedReturningVoid(BailReason::kUnsupportedSize);
       return;
     }
     Register addr = EmitRegOffsetAddr(base, offset, args.extend_type, args.shift_amount);
@@ -9857,6 +9891,10 @@ class HeavyOptimizerFrontend {
   }
 
  private:
+  // Out-of-line so the trace/atomic machinery never inlines into the many bail
+  // sites. Called from Undefined() only when Tracing::IsOn().
+  void RecordBail(BailReason reason);
+
   // ThreadState offsets (computed directly; arm64 guest_state has no
   // GetThreadStateRegOffset helper like riscv64).
   static int32_t GetThreadStateRegOffset(uint8_t reg);
@@ -9944,8 +9982,8 @@ class HeavyOptimizerFrontend {
   // a preceding x86 ALU op left in `flags_vreg`. Bit-exact with
   // lite_translator.h::EmitStoreArmNZCV:
   //   PseudoReadFlags (LAHF + SETO) -> raw has N@15, Z@14, C@8, V@0
-  //   AND 0xC101                    -> keep only N, Z, C, V
-  //   if is_sub: XOR 0x0100         -> ARM borrow is inverted (ARM C = !x86 CF)
+  //   AND kFlagsNZCVMask            -> keep only N, Z, C, V
+  //   if is_sub: XOR kFlagCarry     -> ARM borrow is inverted (ARM C = !x86 CF)
   //   MOVW [rbp + cpu.flags], raw   -> 16-bit store of the packed NZCV
   // cpu.flags is a uint16_t and the 2 bytes after it are alignment padding
   // before cpu.cached_fpcr, but the 16-bit store mirrors lite exactly and never
@@ -9953,9 +9991,9 @@ class HeavyOptimizerFrontend {
   void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
     Register raw = AllocTempReg();
     builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, raw, flags_vreg);
-    raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(0xC101)));
+    raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
     if (is_sub) {
-      raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(0x0100)));
+      raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
     }
     builder_.Gen<x86_64::MovwOpReg>(
         {.base = x86_64::kMachineRegRBP,
@@ -10284,8 +10322,12 @@ class HeavyOptimizerFrontend {
 
   // Set success_ = false and end the region path. Returning helpers add the
   // bail-out and keep the callbacks' return values type-correct.
-  void UndefinedReturningVoid() { Undefined(); }
-  void UndefinedReturningReg() { Undefined(); }
+  void UndefinedReturningVoid(BailReason reason = BailReason::kUnimplemented) {
+    Undefined(reason);
+  }
+  void UndefinedReturningReg(BailReason reason = BailReason::kUnimplemented) {
+    Undefined(reason);
+  }
 
   void GenJump(GuestAddr target);
   void ExitGeneratedCode(GuestAddr target);

@@ -16,18 +16,67 @@
 
 #include "frontend.h"
 
+#include <atomic>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "berberis/assembler/x86_64.h"
 #include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
+#include "berberis/base/config_globals.h"
+#include "berberis/base/tracing.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 
 namespace berberis {
+
+namespace {
+
+// Process-global heavy-tier bail histogram. Relaxed atomics: best-effort
+// diagnostic counters, not a synchronization point. Only mutated under
+// Tracing::IsOn(), so production builds never touch it.
+struct HeavyBailStats {
+  std::atomic<uint64_t> total{0};
+  std::atomic<uint64_t> by_reason[static_cast<size_t>(BailReason::kCount)] = {};
+};
+HeavyBailStats g_heavy_bail_stats;
+
+// Dump the histogram to the trace every N bails; 0 (default) disables periodic
+// dumps. Mirrors GetGearUpMinInsns' ConfigStr pattern.
+size_t GetHeavyBailDumpEvery() {
+  static const size_t value = []() -> size_t {
+    static ConfigStr config("BERBERIS_HEAVY_BAIL_DUMP_EVERY", "berberis.heavy_bail_dump_every");
+    const char* str = config.get();
+    if (str) {
+      char* end = nullptr;
+      unsigned long parsed = strtoul(str, &end, 10);
+      if (end != str && (*end == '\0' || *end == '\n')) {
+        return static_cast<size_t>(parsed);
+      }
+    }
+    return 0;  // disabled
+  }();
+  return value;
+}
+
+void DumpHeavyBailStats() {
+  TRACE("heavy-bail histogram: total=%" PRIu64,
+        g_heavy_bail_stats.total.load(std::memory_order_relaxed));
+  for (size_t i = 0; i < static_cast<size_t>(BailReason::kCount); ++i) {
+    uint64_t n = g_heavy_bail_stats.by_reason[i].load(std::memory_order_relaxed);
+    if (n != 0) {
+      // NOTE: FormatBuffer (TRACE's formatter) does not support the '-' width
+      // flag; keep the format to plain specifiers.
+      TRACE("heavy-bail   %s=%" PRIu64, BailReasonName(static_cast<BailReason>(i)), n);
+    }
+  }
+}
+
+}  // namespace
 
 using Register = HeavyOptimizerFrontend::Register;
 
@@ -144,54 +193,54 @@ Register HeavyOptimizerFrontend::EmitArmCondPredicate(Decoder::Condition cond) {
 
   switch (cond) {
     case Decoder::Condition::kEq:  // Z==1
-      return bit_to_low(14);
+      return bit_to_low(kFlagZeroBit);
     case Decoder::Condition::kNe:  // Z==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(14), int32_t{1}));
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagZeroBit), int32_t{1}));
     case Decoder::Condition::kCs:  // C==1
-      return bit_to_low(8);
+      return bit_to_low(kFlagCarryBit);
     case Decoder::Condition::kCc:  // C==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(8), int32_t{1}));
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagCarryBit), int32_t{1}));
     case Decoder::Condition::kMi:  // N==1
-      return bit_to_low(15);
+      return bit_to_low(kFlagNegativeBit);
     case Decoder::Condition::kPl:  // N==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(15), int32_t{1}));
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagNegativeBit), int32_t{1}));
     case Decoder::Condition::kVs:  // V==1
-      return bit_to_low(0);
+      return bit_to_low(kFlagOverflowBit);
     case Decoder::Condition::kVc:  // V==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(0), int32_t{1}));
+      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagOverflowBit), int32_t{1}));
     case Decoder::Condition::kHi: {  // C==1 && Z==0
-      Register c = bit_to_low(8);
-      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(14), int32_t{1}));
+      Register c = bit_to_low(kFlagCarryBit);
+      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagZeroBit), int32_t{1}));
       return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(c, not_z));
     }
     case Decoder::Condition::kLs: {  // C==0 || Z==1
-      Register not_c = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(8), int32_t{1}));
-      Register z = bit_to_low(14);
+      Register not_c = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagCarryBit), int32_t{1}));
+      Register z = bit_to_low(kFlagZeroBit);
       return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(not_c, z));
     }
     case Decoder::Condition::kGe: {  // N==V  -> !(N^V)
-      Register n = bit_to_low(15);
-      Register v = bit_to_low(0);
+      Register n = bit_to_low(kFlagNegativeBit);
+      Register v = bit_to_low(kFlagOverflowBit);
       Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
       return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(n_xor_v, int32_t{1}));
     }
     case Decoder::Condition::kLt: {  // N!=V  -> N^V
-      Register n = bit_to_low(15);
-      Register v = bit_to_low(0);
+      Register n = bit_to_low(kFlagNegativeBit);
+      Register v = bit_to_low(kFlagOverflowBit);
       return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
     }
     case Decoder::Condition::kGt: {  // Z==0 && N==V
-      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(14), int32_t{1}));
-      Register n = bit_to_low(15);
-      Register v = bit_to_low(0);
+      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagZeroBit), int32_t{1}));
+      Register n = bit_to_low(kFlagNegativeBit);
+      Register v = bit_to_low(kFlagOverflowBit);
       Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
       Register n_eq_v = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(n_xor_v, int32_t{1}));
       return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(not_z, n_eq_v));
     }
     case Decoder::Condition::kLe: {  // Z==1 || N!=V
-      Register z = bit_to_low(14);
-      Register n = bit_to_low(15);
-      Register v = bit_to_low(0);
+      Register z = bit_to_low(kFlagZeroBit);
+      Register n = bit_to_low(kFlagNegativeBit);
+      Register v = bit_to_low(kFlagOverflowBit);
       Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
       return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(z, n_xor_v));
     }
@@ -547,16 +596,16 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
   auto emit_immediate_path = [&]() {
     uint16_t flags_val = 0;
     if (nzcv & 0x8) {
-      flags_val |= (1 << 15);  // N
+      flags_val |= CPUState::kFlagNegative;
     }
     if (nzcv & 0x4) {
-      flags_val |= (1 << 14);  // Z
+      flags_val |= CPUState::kFlagZero;
     }
     if (nzcv & 0x2) {
-      flags_val |= (1 << 8);  // C
+      flags_val |= CPUState::kFlagCarry;
     }
     if (nzcv & 0x1) {
-      flags_val |= (1 << 0);  // V
+      flags_val |= CPUState::kFlagOverflow;
     }
     Register imm_reg = GetImm(flags_val);
     builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm_reg);
@@ -676,10 +725,10 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
   builder_.Gen<PseudoCondBranch>(
       x86_64::Assembler::Condition::kNotZero, lt_bb, gt_bb, cf);
 
-  store_leaf(0x0101, uo_bb);  // unordered: C,V
-  store_leaf(0x4100, eq_bb);  // equal:     Z,C
-  store_leaf(0x8000, lt_bb);  // less:      N
-  store_leaf(0x0100, gt_bb);  // greater:   C
+  store_leaf(kFlagsFpUnordered, uo_bb);
+  store_leaf(kFlagsFpEqual, eq_bb);
+  store_leaf(kFlagsFpLess, lt_bb);
+  store_leaf(kFlagsFpGreater, gt_bb);
 
   builder_.StartBasicBlock(merge_bb);
 }
@@ -730,16 +779,16 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
   auto emit_immediate_path = [&]() {
     uint16_t flags_val = 0;
     if (args.nzcv & 0x8) {
-      flags_val |= (1 << 15);  // N
+      flags_val |= CPUState::kFlagNegative;
     }
     if (args.nzcv & 0x4) {
-      flags_val |= (1 << 14);  // Z
+      flags_val |= CPUState::kFlagZero;
     }
     if (args.nzcv & 0x2) {
-      flags_val |= (1 << 8);  // C
+      flags_val |= CPUState::kFlagCarry;
     }
     if (args.nzcv & 0x1) {
-      flags_val |= (1 << 0);  // V
+      flags_val |= CPUState::kFlagOverflow;
     }
     Register imm = GetImm(flags_val);
     builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
@@ -1572,7 +1621,25 @@ void HeavyOptimizerFrontend::DataMemoryBarrier() {
   builder_.Gen<x86_64::Mfence>();
 }
 
-void HeavyOptimizerFrontend::Undefined() {
+void HeavyOptimizerFrontend::RecordBail(BailReason reason) {
+  const GuestAddr pc = GetInsnAddr();
+  // The frontend doesn't retain the 32-bit word; read it back from guest memory
+  // so the trace line carries the encoding for offline per-opcode bucketing.
+  const uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+
+  g_heavy_bail_stats.by_reason[static_cast<size_t>(reason)].fetch_add(1,
+                                                                      std::memory_order_relaxed);
+  const uint64_t total = g_heavy_bail_stats.total.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  TRACE("heavy-bail pc=0x%lx insn=0x%08x reason=%s", pc, insn, BailReasonName(reason));
+
+  const size_t dump_every = GetHeavyBailDumpEvery();
+  if (dump_every != 0 && (total % dump_every) == 0) {
+    DumpHeavyBailStats();
+  }
+}
+
+void HeavyOptimizerFrontend::Undefined(BailReason reason) {
   // Idempotent: a single guest instruction can trigger several listener calls
   // (e.g. a pre/post-index access calls AddImm then Load/Store). If more than one
   // bails, only the first may append the region-exit terminator — a second exit
@@ -1581,6 +1648,13 @@ void HeavyOptimizerFrontend::Undefined() {
     return;
   }
   success_ = false;
+
+  // Bail-reason instrumentation, gated on the trace fd: a production build with
+  // no berberis.tracing property pays only this branch.
+  if (Tracing::IsOn()) {
+    RecordBail(reason);
+  }
+
   ExitGeneratedCode(GetInsnAddr());
   // We don't require the region to end here as control flow may jump around the
   // undefined instruction, so handle it as an unconditional branch.
