@@ -147,7 +147,30 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
             size_t seg_bss_size = phdrs[i].p_memsz - phdrs[i].p_filesz;
             size_t bytes_to_zero = std::min(mapped_length - bss_start, seg_bss_size);
             if (bytes_to_zero > 0 && bss_start < mapped_length) {
-              memset(static_cast<char*>(result) + bss_start, 0, bytes_to_zero);
+              // When two .bss-bearing PT_LOADs share a file page, the checks
+              // above can accept segment i against the OTHER segment's
+              // mapping (offset and rounded length are identical for both),
+              // and zeroing segment i's virtual bss range would then corrupt
+              // the sibling's file-backed bytes. The signals available here
+              // cannot distinguish the two mappings, so be conservative: if
+              // the would-be-zeroed window overlaps any other PT_LOAD's file
+              // extent, skip the safety-net zeroing rather than risk
+              // corrupting real content.
+              off64_t zero_file_start = offset + (off64_t)bss_start;
+              off64_t zero_file_end = zero_file_start + (off64_t)bytes_to_zero;
+              bool overlaps_other_segment = false;
+              for (int j = 0; j < ehdr.e_phnum; j++) {
+                if (j == i || phdrs[j].p_type != PT_LOAD || phdrs[j].p_filesz == 0) continue;
+                off64_t j_start = elf_base + (off64_t)phdrs[j].p_offset;
+                off64_t j_end = j_start + (off64_t)phdrs[j].p_filesz;
+                if (j_start < zero_file_end && zero_file_start < j_end) {
+                  overlaps_other_segment = true;
+                  break;
+                }
+              }
+              if (!overlaps_other_segment) {
+                memset(static_cast<char*>(result) + bss_start, 0, bytes_to_zero);
+              }
             }
           }
         }
