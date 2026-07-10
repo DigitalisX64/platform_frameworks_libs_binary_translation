@@ -49,6 +49,17 @@ namespace berberis {
 
 namespace {
 
+// AArch64 uses the generic syscall ABI (asm-generic/unistd.h); these numbers are
+// the arm64 guest's, NOT the host's. The host runs as x86_64, so its __NR_*
+// differ — e.g. guest futex is 98 while host x86_64 __NR_futex is 202 — and must
+// never be used to match guest_nr here. Named so the hot-syscall special-cases
+// below read by name (mirrors kGuestO* in open_emulation.cc).
+constexpr long kGuestNrFutex = 98;           // asm-generic __NR_futex
+constexpr long kGuestNrClockGettime = 113;   // asm-generic __NR_clock_gettime
+constexpr long kGuestNrUname = 160;          // asm-generic __NR_uname
+constexpr long kGuestNrGettimeofday = 169;   // asm-generic __NR_gettimeofday
+constexpr long kGuestNrSeccomp = 277;        // asm-generic __NR_seccomp
+
 int FstatatForGuest(int dirfd, const char* path, struct stat* buf, int flags) {
   const char* real_path = nullptr;
   if ((flags & AT_SYMLINK_NOFOLLOW) == 0) {
@@ -186,7 +197,7 @@ void RunGuestSyscall(ThreadState* state) {
   // does for newfstatat (flat-mapped guest addresses; arm64/x86_64 timespec and
   // timeval layouts are identical under LP64). A null/absent guest pointer falls
   // through to the normal kernel path, which returns EFAULT rather than crashing.
-  if (guest_nr == 113 && state->cpu.x[1] != 0) {  // __NR_clock_gettime
+  if (guest_nr == kGuestNrClockGettime && state->cpu.x[1] != 0) {
     struct timespec ts;
     int r = clock_gettime(static_cast<clockid_t>(state->cpu.x[0]), &ts);
     if (r == 0) {
@@ -200,7 +211,7 @@ void RunGuestSyscall(ThreadState* state) {
     }
     return;
   }
-  if (guest_nr == 169 && state->cpu.x[0] != 0) {  // __NR_gettimeofday
+  if (guest_nr == kGuestNrGettimeofday && state->cpu.x[0] != 0) {
     struct timeval tv;
     struct timezone tz;
     int r = gettimeofday(&tv, &tz);
@@ -227,7 +238,7 @@ void RunGuestSyscall(ThreadState* state) {
   // "x86_64" machine string from an arm64 process as a translation signal. The
   // other utsname fields describe the shared kernel accurately and pass through.
   // utsname is char[]-only and laid out identically for arm64/x86_64 under LP64.
-  if (guest_nr == 160 && state->cpu.x[0] != 0) {  // __NR_uname
+  if (guest_nr == kGuestNrUname && state->cpu.x[0] != 0) {
     struct utsname uts;
     int r = uname(&uts);
     if (r == 0) {
@@ -267,7 +278,7 @@ void RunGuestSyscall(ThreadState* state) {
   // likewise instantly SIGSYS the translator, so it is neutered too. The query
   // operations (SECCOMP_GET_ACTION_AVAIL / SECCOMP_GET_NOTIF_SIZES) install
   // nothing and fall through to the host.
-  if (guest_nr == 277) {  // __NR_seccomp
+  if (guest_nr == kGuestNrSeccomp) {
     unsigned int operation = static_cast<unsigned int>(state->cpu.x[0]);
     if (operation == SECCOMP_SET_MODE_FILTER || operation == SECCOMP_SET_MODE_STRICT) {
       TRACE(
@@ -296,7 +307,7 @@ void RunGuestSyscall(ThreadState* state) {
   // upper=0, actual has upper=garbage), substitute the actual value so the kernel
   // comparison succeeds and the thread properly sleeps.
   long futex_arg3 = state->cpu.x[2];
-  if (guest_nr == 98) {  // __NR_futex
+  if (guest_nr == kGuestNrFutex) {
     long uaddr = state->cpu.x[0];
     int futex_op = static_cast<int>(state->cpu.x[1]) & FUTEX_CMD_MASK;
     if ((futex_op == FUTEX_WAIT || futex_op == FUTEX_WAIT_BITSET) && uaddr != 0) {
@@ -313,7 +324,7 @@ void RunGuestSyscall(ThreadState* state) {
   long result = RunGuestSyscallImpl(guest_nr,
                                     state->cpu.x[0],
                                     state->cpu.x[1],
-                                    (guest_nr == 98) ? futex_arg3 : state->cpu.x[2],
+                                    (guest_nr == kGuestNrFutex) ? futex_arg3 : state->cpu.x[2],
                                     state->cpu.x[3],
                                     state->cpu.x[4],
                                     state->cpu.x[5]);
