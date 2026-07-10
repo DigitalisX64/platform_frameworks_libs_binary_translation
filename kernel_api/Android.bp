@@ -178,6 +178,7 @@ cc_test_library {
     defaults: ["berberis_test_library_defaults_64"],
     srcs: [
         "arm64/futex_eintr_test.cc",
+        "arm64/mmap_bss_zero_test.cc",
         "arm64/seccomp_neuter_test.cc",
     ],
     header_libs: [
