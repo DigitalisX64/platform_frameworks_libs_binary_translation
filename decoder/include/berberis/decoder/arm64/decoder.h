@@ -2816,6 +2816,60 @@ class Decoder {
     insn_consumer_->LoadLiteral(args);
   }
 
+  // Flags derived from the load/store opc(2) field (bits[23:22]), shared by
+  // the four general integer load/store forms: unsigned-offset, unscaled,
+  // post/pre-index, and register-offset. All four encode the operation in
+  // opc identically, and the flags depend ONLY on opc, never on size. size
+  // selects the access width and — together with opc==0b10 — the PRFM
+  // prefetch encoding, which IsPrfmEncoding() filters out at each call site
+  // before these flags are consulted.
+  //
+  //   opc | operation      | is_store | is_signed | is_64bit_target
+  //   ----+----------------+----------+-----------+----------------
+  //   00  | STR            |  true    |  false    |  false
+  //   01  | LDR (unsigned) |  false   |  false    |  false
+  //   10  | LDRS ->64-bit  |  false   |  true     |  true
+  //   11  | LDRS ->32-bit  |  false   |  true     |  false
+  //
+  // Full 16-entry (size,opc) routing (size = bits[31:30]):
+  //   size=00/01/10, opc=00 -> STR          (flags row 00)
+  //   size=00/01/10, opc=01 -> LDR          (flags row 01)
+  //   size=00/01/10, opc=10 -> LDRS ->64    (flags row 10)
+  //   size=00/01/10, opc=11 -> LDRS ->32    (flags row 11)
+  //   size=11,       opc=00 -> STR (64-bit) (flags row 00)
+  //   size=11,       opc=01 -> LDR (64-bit) (flags row 01)
+  //   size=11,       opc=10 -> PRFM         (NOP, via IsPrfmEncoding)
+  //   size=11,       opc=11 -> LDRS ->32    (flags row 11)
+  struct LoadStoreOpcFlags {
+    bool is_store;
+    bool is_signed;         // For loads: sign-extend the value.
+    bool is_64bit_target;   // For signed loads: extend to 64-bit.
+  };
+
+  static LoadStoreOpcFlags DecodeLoadStoreOpcFlags(uint8_t opc) {
+    switch (opc) {
+      case 0b00:
+        return {.is_store = true, .is_signed = false, .is_64bit_target = false};
+      case 0b01:
+        return {.is_store = false, .is_signed = false, .is_64bit_target = false};
+      case 0b10:
+        return {.is_store = false, .is_signed = true, .is_64bit_target = true};
+      default:  // 0b11
+        return {.is_store = false, .is_signed = true, .is_64bit_target = false};
+    }
+  }
+
+  // PRFM/PRFUM (prefetch) shares the general load/store encodings with
+  // size==0b11, opc==0b10. Prefetch has no architectural side effects we
+  // emulate; without this guard it would decode as an LDRS into Rt (where Rt
+  // is the prefetch-type code, typically 0), silently clobbering the
+  // destination register — observed clobbering X0 in libsuperpack-jni.so's
+  // Brotli/SP2 decompressor on Facebook startup. NOP it. (Pre/post-index has
+  // no prefetch form, so DecodeLoadStoreImmPostPreIndex does not check this.)
+  static bool IsPrfmEncoding(uint8_t size, uint8_t opc) {
+    return size == 0b11 && opc == 0b10;
+  }
+
   void DecodeLoadStoreUnsignedImm() {
     uint8_t size = GetBits<30, 2>();
     uint8_t opc = GetBits<22, 2>();
@@ -2823,38 +2877,12 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // PRFM (immediate) is size=0b11, opc=0b10. The
-    // previous check (opc=0b11) never fired and let PRFM execute as
-    // LDRSW Xt, [Xn, #imm12] with Rt=0 (the prefetch type), silently
-    // clobbering X0 with eight bytes from [Xn + imm12]. NOP it.
-    if (size == 0b11 && opc == 0b10) {
+    if (IsPrfmEncoding(size, opc)) {
       insn_consumer_->Nop();
       return;
     }
 
-    bool is_store = ((opc & 0b01) == 0) && ((opc & 0b10) == 0);
-    bool is_signed = (opc & 0b10) != 0;
-    bool is_64bit_target = (opc & 0b01) != 0;
-
-    // opc encoding:
-    // 00 = STR
-    // 01 = LDR
-    // 10 = LDRS (sign-extend to 64-bit)  [size=11 -> PRFM, handled above]
-    // 11 = LDRS (sign-extend to 32-bit)
-    if (opc == 0b00) {
-      is_store = true;
-    } else if (opc == 0b01) {
-      is_store = false;
-      is_signed = false;
-    } else if (opc == 0b10) {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = true;
-    } else {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = false;
-    }
+    LoadStoreOpcFlags flags = DecodeLoadStoreOpcFlags(opc);
 
     // Scale offset by access size.
     int32_t offset = static_cast<int32_t>(imm12 << size);
@@ -2864,9 +2892,9 @@ class Decoder {
         .rn = rn,
         .offset = offset,
         .size = LoadStoreSize{size},
-        .is_store = is_store,
-        .is_signed = is_signed,
-        .is_64bit_target = is_64bit_target,
+        .is_store = flags.is_store,
+        .is_signed = flags.is_signed,
+        .is_64bit_target = flags.is_64bit_target,
     };
     insn_consumer_->LoadStoreImm(args);
   }
@@ -2880,27 +2908,7 @@ class Decoder {
 
     int32_t offset = SignExtend<9>(imm9);
 
-    bool is_store;
-    bool is_signed;
-    bool is_64bit_target;
-
-    if (opc == 0b00) {
-      is_store = true;
-      is_signed = false;
-      is_64bit_target = false;
-    } else if (opc == 0b01) {
-      is_store = false;
-      is_signed = false;
-      is_64bit_target = false;
-    } else if (opc == 0b10) {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = true;
-    } else {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = false;
-    }
+    LoadStoreOpcFlags flags = DecodeLoadStoreOpcFlags(opc);
 
     // For pre/post index, we encode using LoadStoreImm and the interpreter handles the writeback.
     // But for now, we treat them as simple offset (TODO: proper pre/post-index support).
@@ -2909,9 +2917,9 @@ class Decoder {
         .rn = rn,
         .offset = offset,
         .size = LoadStoreSize{size},
-        .is_store = is_store,
-        .is_signed = is_signed,
-        .is_64bit_target = is_64bit_target,
+        .is_store = flags.is_store,
+        .is_signed = flags.is_signed,
+        .is_64bit_target = flags.is_64bit_target,
     };
 
     if (is_preindex) {
@@ -2928,46 +2936,23 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // PRFUM (prefetch unscaled) shares this encoding with
-    // size=0b11, opc=0b10. NOP it; otherwise it would be decoded as LDURSW
-    // into Rt (prefetch type code), clobbering the destination register.
-    if (size == 0b11 && opc == 0b10) {
+    if (IsPrfmEncoding(size, opc)) {
       insn_consumer_->Nop();
       return;
     }
 
     int32_t offset = SignExtend<9>(imm9);
 
-    bool is_store;
-    bool is_signed;
-    bool is_64bit_target;
-
-    if (opc == 0b00) {
-      is_store = true;
-      is_signed = false;
-      is_64bit_target = false;
-    } else if (opc == 0b01) {
-      is_store = false;
-      is_signed = false;
-      is_64bit_target = false;
-    } else if (opc == 0b10) {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = true;
-    } else {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = false;
-    }
+    LoadStoreOpcFlags flags = DecodeLoadStoreOpcFlags(opc);
 
     const LoadStoreImmArgs args = {
         .rt = rt,
         .rn = rn,
         .offset = offset,
         .size = LoadStoreSize{size},
-        .is_store = is_store,
-        .is_signed = is_signed,
-        .is_64bit_target = is_64bit_target,
+        .is_store = flags.is_store,
+        .is_signed = flags.is_signed,
+        .is_64bit_target = flags.is_64bit_target,
     };
     insn_consumer_->LoadStoreImm(args);
   }
@@ -2981,39 +2966,12 @@ class Decoder {
     uint8_t rn = GetBits<5, 5>();
     uint8_t rt = GetBits<0, 5>();
 
-    // PRFM (register) shares this encoding with
-    // size=0b11, opc=0b10. Without this guard, the decoder treats the
-    // prefetch as an LDRSW into Rt (where Rt is the prefetch type code,
-    // typically 0 = pldl1keep), silently clobbering X0 with eight bytes
-    // from [Xn, Xm]. Observed as bad x0 (e.g. 0x000000XX_00070001) in
-    // libsuperpack-jni.so's Brotli/SP2 decompressor on Facebook startup.
-    // PRFM has no architectural side effects we need to emulate; NOP it.
-    if (size == 0b11 && opc == 0b10) {
+    if (IsPrfmEncoding(size, opc)) {
       insn_consumer_->Nop();
       return;
     }
 
-    bool is_store;
-    bool is_signed;
-    bool is_64bit_target;
-
-    if (opc == 0b00) {
-      is_store = true;
-      is_signed = false;
-      is_64bit_target = false;
-    } else if (opc == 0b01) {
-      is_store = false;
-      is_signed = false;
-      is_64bit_target = false;
-    } else if (opc == 0b10) {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = true;
-    } else {
-      is_store = false;
-      is_signed = true;
-      is_64bit_target = false;
-    }
+    LoadStoreOpcFlags flags = DecodeLoadStoreOpcFlags(opc);
 
     uint8_t shift_amount = s_bit ? size : 0;
 
@@ -3037,9 +2995,9 @@ class Decoder {
         .extend_type = option,
         .shift_amount = shift_amount,
         .size = LoadStoreSize{size},
-        .is_store = is_store,
-        .is_signed = is_signed,
-        .is_64bit_target = is_64bit_target,
+        .is_store = flags.is_store,
+        .is_signed = flags.is_signed,
+        .is_64bit_target = flags.is_64bit_target,
     };
     insn_consumer_->LoadStoreReg(args);
   }
