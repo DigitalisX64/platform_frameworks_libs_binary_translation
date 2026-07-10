@@ -245,10 +245,10 @@ void LiteTranslator::ConditionalCompare(bool is_neg, bool is_64bit, Register rn,
     // ARM64 nzcv immediate: bit3=N, bit2=Z, bit1=C, bit0=V
     // Map to x86_64 flag positions: N=bit15, Z=bit14, C=bit8, V=bit0
     uint16_t flags_val = 0;
-    if (nzcv & 0x8) flags_val |= (1 << 15);  // N
-    if (nzcv & 0x4) flags_val |= (1 << 14);  // Z
-    if (nzcv & 0x2) flags_val |= (1 << 8);   // C
-    if (nzcv & 0x1) flags_val |= (1 << 0);   // V
+    if (nzcv & 0x8) flags_val |= CPUState::kFlagNegative;
+    if (nzcv & 0x4) flags_val |= CPUState::kFlagZero;
+    if (nzcv & 0x2) flags_val |= CPUState::kFlagCarry;
+    if (nzcv & 0x1) flags_val |= CPUState::kFlagOverflow;
     Register imm_reg = AllocTempReg();
     as_.Movl(imm_reg, static_cast<int32_t>(flags_val));
     as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, imm_reg);

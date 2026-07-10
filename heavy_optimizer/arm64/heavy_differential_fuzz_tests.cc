@@ -77,7 +77,7 @@ namespace berberis {
 namespace {
 
 // ARM64 NZCV lives in CPUState.flags at N@15 Z@14 C@8 V@0.
-constexpr uint16_t kNZCVMask = 0xC101;
+constexpr uint16_t kNZCVMask = kFlagsNZCVMask;
 
 // Widen the sweep when the exhaustive-mode env knob is set (shared with the lite
 // fuzzer's digitalis/scripts/differential-fuzz.sh). Off => 1 (CI, ~seconds).
