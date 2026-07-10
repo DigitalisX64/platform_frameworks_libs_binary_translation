@@ -427,6 +427,7 @@ cc_test_host {
                 "libberberis_digitalis_extra_proxy_arm64_unit_tests",
                 "libberberis_decoder_arm64_unit_tests",
                 "libberberis_interpreter_arm64_unit_tests",
+                "libberberis_runtime_arm64_unit_tests",
             ],
         },
     },
