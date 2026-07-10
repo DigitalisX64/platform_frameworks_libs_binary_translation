@@ -130,6 +130,24 @@ cc_test_library {
     ],
 }
 
+// region digitalis
+cc_test_library {
+    name: "libberberis_interpreter_arm64_unit_tests",
+    defaults: ["berberis_test_library_defaults_64"],
+    srcs: ["arm64/interpreter_only_families_test.cc"],
+    header_libs: [
+        "berberis_test_utils_headers",
+        "libberberis_base_headers",
+        "libberberis_decoder_arm64_headers",
+        "libberberis_guest_os_primitives_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_interpreter_arm64_headers",
+        "libberberis_kernel_api_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+}
+// endregion
+
 cc_test {
     name: "berberis_interpreter_riscv64_to_arm64_insn_tests_static",
     defaults: ["berberis_all_hosts_defaults_64"],
