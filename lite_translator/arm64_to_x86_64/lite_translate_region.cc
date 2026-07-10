@@ -73,10 +73,6 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     if (translator.IsGpRegPoolLow()) {
       break;
     }
-    // register guest PC label for backward branch inlining.
-    // Each guest PC gets an x86_64 label so backward branches (loops) can
-    // emit a local jump instead of exiting the region.
-    translator.RegisterGuestPcLabel(translator.GetInsnAddr());
     uint8_t insn_size = decoder.Decode(ToHostAddr<const uint16_t>(translator.GetInsnAddr()));
     if (!translator.success()) {
       // JIT break profiling
