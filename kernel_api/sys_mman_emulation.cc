@@ -23,10 +23,9 @@
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <elf.h>
 #include <unistd.h>
-
-#include <android/log.h>
 #endif
 // endregion
 
@@ -35,14 +34,6 @@
 #include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_state/guest_addr.h"
-// region digitalis - access guest CPU state to log mprotect caller
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-#include <sys/syscall.h>
-#include "berberis/guest_os_primitives/guest_thread.h"
-#include "berberis/guest_os_primitives/guest_thread_manager.h"
-#include "berberis/guest_state/guest_state.h"
-#endif
-// endregion
 
 namespace berberis {
 
@@ -76,20 +67,7 @@ void UpdateGuestProt(int guest_prot, void* addr, size_t length) {
 // If other thread starts translation after actual mmap/mprotect/munmap but before xbit update,
 // it might pick up an already obsolete code.
 
-// region digitalis - mmap diagnostic counters
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-static uint64_t g_mmap_count = 0;
-static uint64_t g_mmap_fail_count = 0;
-static uint64_t g_mprotect_count = 0;
-#endif
-// endregion
-
 void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) {
-  // region digitalis - log mmap calls
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-  uint64_t n = ++g_mmap_count;
-#endif
-  // endregion
   void* result = mmap64(addr, length, ToHostProt(prot), flags, fd, offset);
   if (result != MAP_FAILED) {
     UpdateGuestProt(prot, result, length);
@@ -170,55 +148,11 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
             size_t bytes_to_zero = std::min(mapped_length - bss_start, seg_bss_size);
             if (bytes_to_zero > 0 && bss_start < mapped_length) {
               memset(static_cast<char*>(result) + bss_start, 0, bytes_to_zero);
-              static uint64_t bss_zero_count = 0;
-              if (++bss_zero_count <= 20) {
-                __android_log_print(ANDROID_LOG_INFO, "berberis",
-                    "bss-zero#%lu: %p+0x%lx len=0x%lx (seg off=0x%lx filesz=0x%lx memsz=0x%lx elf_base=0x%lx)",
-                    (unsigned long)bss_zero_count,
-                    result, (unsigned long)bss_start, (unsigned long)bytes_to_zero,
-                    (unsigned long)phdrs[i].p_offset,
-                    (unsigned long)phdrs[i].p_filesz, (unsigned long)phdrs[i].p_memsz,
-                    (unsigned long)elf_base);
-              }
             }
           }
         }
       }
     }
-  }
-#endif
-
-  // log all executable mmaps and first 30
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-  if (n <= 30 || n % 500 == 0 || (prot & 4)) {
-    __android_log_print(ANDROID_LOG_DEBUG, "berberis",
-        "mmap#%lu addr=%p→%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx",
-        (unsigned long)n, addr, result, (unsigned long)length, prot, flags, fd, (unsigned long)offset);
-  }
-#endif
-
-  // log failures with guest caller pin (LR/FP/TID)
-  // FB Katana logcat shows a periodic mmap-EINVAL storm with flags=0 and
-  // doubling lengths. To pin the guest caller, log x30 (guest LR = return
-  // address) and x29 (guest FP, whose first qword is the caller's frame).
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-  if (result == MAP_FAILED) {
-    int saved_errno = errno;
-    ++g_mmap_fail_count;
-    uint64_t lr = 0, fp = 0;
-    GuestThread* gt = GetCurrentGuestThread();
-    if (gt != nullptr && gt->state() != nullptr) {
-      lr = gt->state()->cpu.x[30];
-      fp = gt->state()->cpu.x[29];
-    }
-    pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
-    __android_log_print(ANDROID_LOG_ERROR, "berberis",
-        "mmap FAILED #%lu errno=%d addr=%p len=0x%lx prot=%d flags=0x%x fd=%d off=0x%lx lr=0x%llx fp=0x%llx tid=%d (total_fail=%lu)",
-        (unsigned long)n, saved_errno, addr, (unsigned long)length, prot, flags, fd,
-        (unsigned long)offset,
-        (unsigned long long)lr, (unsigned long long)fp, tid,
-        (unsigned long)g_mmap_fail_count);
-    errno = saved_errno;
   }
 #endif
   // endregion
@@ -231,28 +165,6 @@ int MunmapForGuest(void* addr, size_t length) {
 }
 
 int MprotectForGuest(void* addr, size_t length, int prot) {
-  // region digitalis - log mprotect calls + identify caller for atexit-page spin
-  // Bionic's AtexitArray::set_writable() issues a mprotect pair (PROT_READ ↔
-  // PROT_READ|PROT_WRITE) on every __cxa_atexit call. On FB Katana, a tight
-  // loop saturates a CPU with this pattern. To pin the guest caller, we log
-  // x30 (guest LR = return address into the caller) and x29 (guest FP, so
-  // its first qword is the caller's saved x29 / x30 frame chain).
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-  uint64_t n = ++g_mprotect_count;
-  uint64_t lr = 0, fp = 0;
-  GuestThread* gt = GetCurrentGuestThread();
-  if (gt != nullptr && gt->state() != nullptr) {
-    lr = gt->state()->cpu.x[30];
-    fp = gt->state()->cpu.x[29];
-  }
-  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
-  TRACE("mprotect#%llu addr=%p len=%zu prot=0x%x lr=0x%llx fp=0x%llx tid=%d",
-        static_cast<unsigned long long>(n), addr, length, prot,
-        static_cast<unsigned long long>(lr),
-        static_cast<unsigned long long>(fp),
-        tid);
-#endif
-  // endregion
   // In b/218772975 the app is scanning "/proc/self/maps" and tries to mprotect
   // mappings for some libraries found there (for unknown reason) effectively removing
   // execution permission. GuestMapShadow is pre-populated with such mappings, so we
