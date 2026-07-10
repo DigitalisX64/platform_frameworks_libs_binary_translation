@@ -34,8 +34,8 @@ cc_library_headers {
 
 // The ARM64 optimizing frontend lowers the ARM64 decoder's SemanticsPlayer
 // callbacks into guest-agnostic x86_64 MachineIR (mirroring
-// heavy_optimizer/riscv64/Android.bp). Integer/branch/load-store and scalar-FP
-// arithmetic (FADD/FSUB/FMUL/FDIV) translate for real; remaining FP/SIMD bails
+// heavy_optimizer/riscv64/Android.bp). Integer/branch/load-store, scalar FP,
+// and a broad NEON/SIMD subset translate for real; anything unhandled bails
 // to the lite translator/interpreter.
 //
 // inline_intrinsic.h / call_intrinsic.h drive the guest-agnostic

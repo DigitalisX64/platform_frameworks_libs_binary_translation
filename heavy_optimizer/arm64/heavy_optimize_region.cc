@@ -39,9 +39,9 @@ namespace berberis {
 // then lowers the resulting x86_64 MachineIR with x86_64::GenCode. Mirrors
 // heavy_optimizer/riscv64/heavy_optimize_region.cc.
 //
-// Currently only MoveWide / MoveWideKeep translate; any other instruction makes
-// the frontend bail (success_ = false), so the loop stops and the caller falls
-// back to the lite translator / interpreter.
+// Any instruction the frontend does not lower makes it bail (success_ = false),
+// so the loop stops and the caller falls back to the lite translator /
+// interpreter for that region.
 std::tuple<GuestAddr, bool, size_t> HeavyOptimizeRegion(GuestAddr pc,
                                                         MachineCode* machine_code,
                                                         const HeavyOptimizeParams& params,

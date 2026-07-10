@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef BERBERIS_LITE_TRANSLATOR_RISCV64_ALLOCATOR_H_
-#define BERBERIS_LITE_TRANSLATOR_RISCV64_ALLOCATOR_H_
+#ifndef BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_ALLOCATOR_H_
+#define BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_ALLOCATOR_H_
 
 #include <algorithm>  // std::max
 #include <optional>
@@ -110,4 +110,4 @@ class Allocator {
 
 }  // namespace berberis
 
-#endif  // BERBERIS_LITE_TRANSLATOR_RISCV64_ALLOCATOR_H_
+#endif  // BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_ALLOCATOR_H_
