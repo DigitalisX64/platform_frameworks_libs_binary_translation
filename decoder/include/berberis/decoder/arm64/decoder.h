@@ -26,6 +26,17 @@
 
 namespace berberis {
 
+// AArch64 system-register encoding used by DecodeSystem (ARM ARM C5.2, the
+// S<op0>_<op1>_<Cn>_<Cm>_<op2> name): (op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2,
+// matching the key DecodeSystem builds. SystemReg enumerators are computed from
+// this so an encoding can never drift from its (op0,op1,CRn,CRm,op2) tuple by a
+// hand-typed hex slip (a prior hand-typed swap sent MRS DCZID_EL0 to the
+// CTR_EL0 handler).
+constexpr uint16_t SysRegEncoding(unsigned op0, unsigned op1, unsigned crn, unsigned crm,
+                                  unsigned op2) {
+  return static_cast<uint16_t>((op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2);
+}
+
 // Decode() method takes a sequence of bytes and decodes it into the instruction opcode and fields.
 // The InsnConsumer's method corresponding to the decoded opcode is called with the decoded fields
 // as an argument. Returned is the instruction size (always 4 for ARM64).
@@ -472,44 +483,38 @@ class Decoder {
   // System register encodings (for MRS/MSR).
   //
   enum class SystemReg : uint16_t {
-    kTpidrEl0 = 0xDE82,   // TPIDR_EL0: op0=3, op1=3, CRn=13, CRm=0, op2=2
-    kNzcv = 0xDA10,       // NZCV: op0=3, op1=3, CRn=4, CRm=2, op2=0
-    kFpcr = 0xDA20,       // FPCR: op0=3, op1=3, CRn=4, CRm=4, op2=0
-    kFpsr = 0xDA21,       // FPSR: op0=3, op1=3, CRn=4, CRm=4, op2=1
-    // Sysreg encoding (computed by DecodeSystem): (op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2.
+    // Values are computed from the op-field decomposition via SysRegEncoding() so an
+    // encoding can never diverge from its (op0,op1,CRn,CRm,op2) tuple.
+    kTpidrEl0 = SysRegEncoding(3, 3, 13, 0, 2),  // TPIDR_EL0
+    kNzcv = SysRegEncoding(3, 3, 4, 2, 0),       // NZCV
+    kFpcr = SysRegEncoding(3, 3, 4, 4, 0),       // FPCR
+    kFpsr = SysRegEncoding(3, 3, 4, 4, 1),       // FPSR
     // ARM ARM C5.2.6: CTR_EL0 is op2=1, DCZID_EL0 is op2=7 (NOT both op2=7).
-    // The prior values (kCtrEl0=0xD807, kDczidEl0=0xD80F) routed mrs DCZID_EL0
+    // A prior hand-typed swap (kCtrEl0=0xD807, kDczidEl0=0xD80F) routed mrs DCZID_EL0
     // to the CTR_EL0 handler, returning 0x8444c004 instead of 0x10 — which
     // made bionic's __dl___memset_aarch64+0xb8 cmp x5,#0x4 succeed and the
     // DC-ZVA fallback loop take, leaving most of any large memset's buffer
-    // unzeroed.  Symptom: VkCapsViewer bucket-array corruption (handoff-284).
-    kCtrEl0 = 0xD801,     // CTR_EL0:   op0=3, op1=3, CRn=0, CRm=0, op2=1
-    kDczidEl0 = 0xD807,   // DCZID_EL0: op0=3, op1=3, CRn=0, CRm=0, op2=7
-    // MIDR_EL1: op0=3, op1=0, CRn=0, CRm=0, op2=0
-    //   sysreg = (3<<14)|(0<<11)|(0<<7)|(0<<3)|0 = 0xC000
-    // Read by code that decides whether to use vectorised fast paths;
+    // unzeroed.  Symptom: VkCapsViewer bucket-array corruption.
+    kCtrEl0 = SysRegEncoding(3, 3, 0, 0, 1),    // CTR_EL0
+    kDczidEl0 = SysRegEncoding(3, 3, 0, 0, 7),  // DCZID_EL0
+    // MIDR_EL1. Read by code that decides whether to use vectorised fast paths;
     // returning a real ARM CPU id (Cortex-A53 here) keeps Bionic and
     // third-party compression libs (Facebook superpack, etc.) on the
     // expected fast paths instead of the SIGILL-handler-driven probe
     // fallbacks that can spin in detection loops.
-    kMidrEl1 = 0xC000,
-    // RNDR / RNDRRS (FEAT_RNG): op0=3, op1=3, CRn=2, CRm=4, op2=0/1.
-    //   RNDR   = (3<<14)|(3<<11)|(2<<7)|(4<<3)|0 = 0xD920
-    //   RNDRRS = ... | 1                         = 0xD921
-    // Read by getentropy/ASLR seeding; the interpreter wires these to a host
-    // RNG and reports success (NZCV cleared), rather than faulting.
-    kRndr = 0xD920,
-    kRndrrs = 0xD921,
-    // Generic timer (FEAT_AdvSIMD-independent), all op0=3, op1=3, CRn=14, CRm=0:
-    //   CNTFRQ_EL0 op2=0 → 0xDF00 (counter frequency)
-    //   CNTPCT_EL0 op2=1 → 0xDF01 (physical count)
-    //   CNTVCT_EL0 op2=2 → 0xDF02 (virtual count)
-    // Read by timing/benchmark code (e.g. Unity, game engines) for a cheap
-    // monotonic clock; the interpreter backs the counters with the host
-    // monotonic clock and reports a matching frequency.
-    kCntfrqEl0 = 0xDF00,
-    kCntpctEl0 = 0xDF01,
-    kCntvctEl0 = 0xDF02,
+    kMidrEl1 = SysRegEncoding(3, 0, 0, 0, 0),  // MIDR_EL1
+    // RNDR / RNDRRS (FEAT_RNG). Read by getentropy/ASLR seeding; the interpreter
+    // wires these to a host RNG and reports success (NZCV cleared), rather than
+    // faulting.
+    kRndr = SysRegEncoding(3, 3, 2, 4, 0),    // RNDR
+    kRndrrs = SysRegEncoding(3, 3, 2, 4, 1),  // RNDRRS
+    // Generic timer (all op0=3, op1=3, CRn=14, CRm=0). Read by timing/benchmark
+    // code (e.g. Unity, game engines) for a cheap monotonic clock; the interpreter
+    // backs the counters with the host monotonic clock and reports a matching
+    // frequency.
+    kCntfrqEl0 = SysRegEncoding(3, 3, 14, 0, 0),  // CNTFRQ_EL0 (counter frequency)
+    kCntpctEl0 = SysRegEncoding(3, 3, 14, 0, 1),  // CNTPCT_EL0 (physical count)
+    kCntvctEl0 = SysRegEncoding(3, 3, 14, 0, 2),  // CNTVCT_EL0 (virtual count)
   };
 
   //
