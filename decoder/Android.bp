@@ -33,4 +33,16 @@ cc_library_headers {
     host_supported: true,
     export_include_dirs: ["include"],
 }
+
+cc_test_library {
+    name: "libberberis_decoder_arm64_unit_tests",
+    defaults: ["berberis_test_library_defaults_64"],
+    srcs: [
+        "arm64_test/decoder_test.cc",
+    ],
+    header_libs: [
+        "libberberis_base_headers",
+        "libberberis_decoder_arm64_headers",
+    ],
+}
 // endregion
