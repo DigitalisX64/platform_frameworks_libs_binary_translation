@@ -61,6 +61,8 @@
 #include "berberis/proxy_loader/proxy_library_builder.h"
 #include "berberis/runtime_primitives/host_code.h"
 
+#include "register_extra_trampolines.h"
+
 namespace berberis {
 namespace {
 
@@ -156,17 +158,9 @@ const KnownTrampoline kDigitalisExtraLibwebviewchromiumPlatSupportTrampolines[] 
     //   ~GraphicBufferImpl();  (D2: base-object destructor)
     {"_ZN7android17GraphicBufferImplD2Ev", GetTrampolineFunc<auto(void*)->void>(), nullptr},
 };
-constexpr size_t kCount =
-    sizeof(kDigitalisExtraLibwebviewchromiumPlatSupportTrampolines) /
-    sizeof(kDigitalisExtraLibwebviewchromiumPlatSupportTrampolines[0]);
 
-__attribute__((constructor(101))) void
-RegisterDigitalisExtraLibwebviewchromiumPlatSupportTrampolines() {
-  ProxyLibraryBuilder::RegisterExtraTrampolines(
-      "libwebviewchromium_plat_support.so",
-      kDigitalisExtraLibwebviewchromiumPlatSupportTrampolines,
-      kCount);
-}
+REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libwebviewchromium_plat_support.so",
+                                     kDigitalisExtraLibwebviewchromiumPlatSupportTrampolines)
 
 }  // namespace
 }  // namespace berberis

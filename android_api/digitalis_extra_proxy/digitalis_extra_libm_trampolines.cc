@@ -51,6 +51,8 @@
 #include "berberis/guest_abi/function_wrappers.h"
 #include "berberis/proxy_loader/proxy_library_builder.h"
 
+#include "register_extra_trampolines.h"
+
 namespace berberis {
 namespace {
 
@@ -172,13 +174,8 @@ const KnownTrampoline kDigitalisExtraLibmTrampolines[] = {
      GetTrampolineFunc<auto(float, float) -> float>(),
      reinterpret_cast<void*>(DigitalisPowfFinite)},
 };
-constexpr size_t kDigitalisExtraLibmTrampolinesCount =
-    sizeof(kDigitalisExtraLibmTrampolines) / sizeof(kDigitalisExtraLibmTrampolines[0]);
 
-__attribute__((constructor(101))) void RegisterDigitalisExtraLibmTrampolines() {
-  ProxyLibraryBuilder::RegisterExtraTrampolines(
-      "libm.so", kDigitalisExtraLibmTrampolines, kDigitalisExtraLibmTrampolinesCount);
-}
+REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libm.so", kDigitalisExtraLibmTrampolines)
 
 }  // namespace
 }  // namespace berberis

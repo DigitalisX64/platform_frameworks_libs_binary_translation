@@ -47,6 +47,8 @@
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/proxy_loader/proxy_library_builder.h"
 
+#include "register_extra_trampolines.h"
+
 namespace berberis {
 namespace {
 
@@ -251,14 +253,9 @@ const KnownTrampoline kDigitalisExtraLibnativehelperTrampolines[] = {
     {"jniGetNioBufferBaseArrayOffset", DoCustomTrampoline_jniGetNioBufferBaseArrayOffset, nullptr},
     {"jniRegisterNativeMethods", DoCustomTrampoline_jniRegisterNativeMethods, nullptr},
 };
-constexpr size_t kCount =
-    sizeof(kDigitalisExtraLibnativehelperTrampolines) /
-    sizeof(kDigitalisExtraLibnativehelperTrampolines[0]);
 
-__attribute__((constructor(101))) void RegisterDigitalisExtraLibnativehelperTrampolines() {
-  ProxyLibraryBuilder::RegisterExtraTrampolines(
-      "libnativehelper.so", kDigitalisExtraLibnativehelperTrampolines, kCount);
-}
+REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libnativehelper.so",
+                                     kDigitalisExtraLibnativehelperTrampolines)
 
 }  // namespace
 }  // namespace berberis
