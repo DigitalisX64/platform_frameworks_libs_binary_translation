@@ -52,6 +52,8 @@
 #include "berberis/proxy_loader/proxy_library_builder.h"
 #include "berberis/runtime_primitives/host_code.h"
 
+#include "register_extra_trampolines.h"
+
 #include "camera2ndk_shared_capture_callbacks.h"
 
 namespace berberis {
@@ -109,15 +111,8 @@ const KnownTrampoline kDigitalisExtraLibcamera2ndkTrampolines[] = {
     {"ACameraCaptureSessionShared_logicalCamera_startStreaming",
      DoCustomTrampoline_ACameraCaptureSessionShared_logicalCamera_startStreaming, nullptr},
 };
-constexpr size_t kDigitalisExtraLibcamera2ndkTrampolinesCount =
-    sizeof(kDigitalisExtraLibcamera2ndkTrampolines) /
-    sizeof(kDigitalisExtraLibcamera2ndkTrampolines[0]);
 
-__attribute__((constructor(101))) void RegisterDigitalisExtraLibcamera2ndkTrampolines() {
-  ProxyLibraryBuilder::RegisterExtraTrampolines("libcamera2ndk.so",
-                                                kDigitalisExtraLibcamera2ndkTrampolines,
-                                                kDigitalisExtraLibcamera2ndkTrampolinesCount);
-}
+REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libcamera2ndk.so", kDigitalisExtraLibcamera2ndkTrampolines)
 
 }  // namespace
 }  // namespace berberis

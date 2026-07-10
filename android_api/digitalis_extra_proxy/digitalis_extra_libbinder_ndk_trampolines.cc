@@ -49,6 +49,8 @@
 #include "berberis/proxy_loader/proxy_library_builder.h"
 #include "berberis/runtime_primitives/host_code.h"
 
+#include "register_extra_trampolines.h"
+
 namespace berberis {
 namespace {
 
@@ -76,15 +78,8 @@ const KnownTrampoline kDigitalisExtraLibbinderNdkTrampolines[] = {
     {"AServiceManager_registerForServiceNotifications",
      DoCustomTrampoline_AServiceManager_registerForServiceNotifications, nullptr},
 };
-constexpr size_t kDigitalisExtraLibbinderNdkTrampolinesCount =
-    sizeof(kDigitalisExtraLibbinderNdkTrampolines) /
-    sizeof(kDigitalisExtraLibbinderNdkTrampolines[0]);
 
-__attribute__((constructor(101))) void RegisterDigitalisExtraLibbinderNdkTrampolines() {
-  ProxyLibraryBuilder::RegisterExtraTrampolines("libbinder_ndk.so",
-                                                kDigitalisExtraLibbinderNdkTrampolines,
-                                                kDigitalisExtraLibbinderNdkTrampolinesCount);
-}
+REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libbinder_ndk.so", kDigitalisExtraLibbinderNdkTrampolines)
 
 }  // namespace
 }  // namespace berberis

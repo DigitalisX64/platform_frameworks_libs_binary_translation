@@ -39,6 +39,8 @@
 #include "berberis/guest_abi/function_wrappers.h"
 #include "berberis/proxy_loader/proxy_library_builder.h"
 
+#include "register_extra_trampolines.h"
+
 namespace berberis {
 namespace {
 
@@ -118,19 +120,8 @@ const KnownTrampoline kDigitalisExtraLibcTrampolines[] = {
      GetTrampolineFunc<auto(void*, size_t, int32_t, int32_t, int32_t, int64_t) -> void*>(),
      nullptr},
 };
-constexpr size_t kDigitalisExtraLibcTrampolinesCount =
-    sizeof(kDigitalisExtraLibcTrampolines) / sizeof(kDigitalisExtraLibcTrampolines[0]);
 
-// Register the extras *before* the upstream library init runs. Upstream
-// libc_translation.cc declares its constructor without a priority (= 65535),
-// while the proxy library init constructor uses priority 0 inside
-// stubs_arm64.cpp; gcc runs constructors in priority order (lower = earlier).
-// Using priority 101 here puts us before the late default-priority code but
-// after the early proxy-library prep work in priorities 0–100.
-__attribute__((constructor(101))) void RegisterDigitalisExtraLibcTrampolines() {
-  ProxyLibraryBuilder::RegisterExtraTrampolines(
-      "libc.so", kDigitalisExtraLibcTrampolines, kDigitalisExtraLibcTrampolinesCount);
-}
+REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libc.so", kDigitalisExtraLibcTrampolines)
 
 }  // namespace
 }  // namespace berberis
