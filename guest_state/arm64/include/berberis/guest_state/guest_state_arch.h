@@ -65,6 +65,56 @@ inline constexpr unsigned kNumGuestRegs = std::size(CPUState{}.x);
 inline constexpr unsigned kNumGuestSimdRegs = std::size(CPUState{}.v);
 
 inline constexpr unsigned kGuestCacheLineSize = 64;
+
+// ---- ARM64 NZCV flag-word layout ------------------------------------------
+// CPUState::flags stores NZCV in a host-aligned layout chosen so x86_64 LAHF
+// (AH: CF@8, ZF@14, SF@15) + SETO (bit 0) splat them into place (see
+// CPUState::FlagMask). These derived constants give the lite translator, the
+// heavy optimizer, and the differential fuzzers one source of truth for that
+// layout instead of re-hardcoding 0xC101 and bit indices 15/14/8/0 at every
+// flag-materialization site. All derived from CPUState::kFlag* so they track
+// the host layout; the static_asserts pin the x86_64 values.
+
+// Bit index of a single-bit flag mask (e.g. 1<<15 -> 15).
+constexpr int8_t FlagBitIndex(uint32_t single_bit_mask) {
+  int8_t i = 0;
+  for (; (single_bit_mask >> i) > 1u; ++i) {
+  }
+  return i;
+}
+
+inline constexpr int8_t kFlagNegativeBit = FlagBitIndex(CPUState::kFlagNegative);
+inline constexpr int8_t kFlagZeroBit = FlagBitIndex(CPUState::kFlagZero);
+inline constexpr int8_t kFlagCarryBit = FlagBitIndex(CPUState::kFlagCarry);
+inline constexpr int8_t kFlagOverflowBit = FlagBitIndex(CPUState::kFlagOverflow);
+
+// Mask selecting the four NZCV bits within cpu.flags (== 0xC101 on x86_64).
+inline constexpr uint16_t kFlagsNZCVMask =
+    static_cast<uint16_t>(CPUState::kFlagNegative | CPUState::kFlagZero | CPUState::kFlagCarry |
+                          CPUState::kFlagOverflow);
+
+// ARM FCMP result encodings (ARM ARM C6.2.70) as cpu.flags words:
+//   greater   N0 Z0 C1 V0 -> C
+//   less      N1 Z0 C0 V0 -> N
+//   equal     N0 Z1 C1 V0 -> Z,C
+//   unordered N0 Z0 C1 V1 -> C,V
+inline constexpr uint16_t kFlagsFpGreater = CPUState::kFlagCarry;
+inline constexpr uint16_t kFlagsFpLess = CPUState::kFlagNegative;
+inline constexpr uint16_t kFlagsFpEqual = CPUState::kFlagZero | CPUState::kFlagCarry;
+inline constexpr uint16_t kFlagsFpUnordered = CPUState::kFlagCarry | CPUState::kFlagOverflow;
+
+#if defined(__x86_64__)
+static_assert(kFlagsNZCVMask == 0xC101);
+static_assert(kFlagNegativeBit == 15 && (1 << kFlagNegativeBit) == CPUState::kFlagNegative);
+static_assert(kFlagZeroBit == 14 && (1 << kFlagZeroBit) == CPUState::kFlagZero);
+static_assert(kFlagCarryBit == 8 && (1 << kFlagCarryBit) == CPUState::kFlagCarry);
+static_assert(kFlagOverflowBit == 0 && (1 << kFlagOverflowBit) == CPUState::kFlagOverflow);
+static_assert(kFlagsFpGreater == 0x0100);
+static_assert(kFlagsFpLess == 0x8000);
+static_assert(kFlagsFpEqual == 0x4100);
+static_assert(kFlagsFpUnordered == 0x0101);
+#endif
+
 }  // namespace berberis
 
 #endif  // BERBERIS_GUEST_STATE_GUEST_STATE_ARCH_H_

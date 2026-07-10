@@ -3016,48 +3016,48 @@ class LiteTranslator {
 
     switch (cond) {
       case Decoder::Condition::kEq:
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kNe:
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kCs:
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kCc:
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kMi:
-        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Btl(flags_reg, kFlagNegativeBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kPl:
-        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Btl(flags_reg, kFlagNegativeBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kVs:
-        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Btl(flags_reg, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kVc:
-        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Btl(flags_reg, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kHi:
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *done);
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kLs: {
         Assembler::Label* true_path = as_.MakeLabel();
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *true_path);
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kNotCarry, *done);
         as_.Bind(true_path);
         break;
@@ -3066,9 +3066,9 @@ class LiteTranslator {
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       }
@@ -3076,34 +3076,34 @@ class LiteTranslator {
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       }
       case Decoder::Condition::kGt: {
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *done);
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       }
       case Decoder::Condition::kLe: {
         Assembler::Label* true_path = as_.MakeLabel();
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *true_path);
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, *done);
         as_.Bind(true_path);
         break;
@@ -13672,10 +13672,10 @@ class LiteTranslator {
     // ARM NZCV layout matches CPUState::kFlag{Negative,Zero,Carry,Overflow}:
     //   N = bit 15, Z = bit 14, C = bit 8, V = bit 0.
     const int32_t imm_flags =
-        ((args.nzcv & 0b1000) ? 0x8000 : 0) |
-        ((args.nzcv & 0b0100) ? 0x4000 : 0) |
-        ((args.nzcv & 0b0010) ? 0x0100 : 0) |
-        ((args.nzcv & 0b0001) ? 0x0001 : 0);
+        ((args.nzcv & 0b1000) ? CPUState::kFlagNegative : 0) |
+        ((args.nzcv & 0b0100) ? CPUState::kFlagZero : 0) |
+        ((args.nzcv & 0b0010) ? CPUState::kFlagCarry : 0) |
+        ((args.nzcv & 0b0001) ? CPUState::kFlagOverflow : 0);
 
     // Step 1: snapshot flags for the condition test.
     as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = flags_off});
@@ -13690,48 +13690,48 @@ class LiteTranslator {
     // `done` if the condition is FALSE).
     switch (args.cond) {
       case Decoder::Condition::kEq:
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kNe:
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kCs:
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kCc:
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kMi:
-        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Btl(flags_reg, kFlagNegativeBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kPl:
-        as_.Btl(flags_reg, static_cast<int8_t>(15));
+        as_.Btl(flags_reg, kFlagNegativeBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kVs:
-        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Btl(flags_reg, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       case Decoder::Condition::kVc:
-        as_.Btl(flags_reg, static_cast<int8_t>(0));
+        as_.Btl(flags_reg, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kHi:
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *done);
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       case Decoder::Condition::kLs: {
         Assembler::Label* true_path = as_.MakeLabel();
-        as_.Btl(flags_reg, static_cast<int8_t>(8));
+        as_.Btl(flags_reg, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *true_path);
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kNotCarry, *done);
         as_.Bind(true_path);
         break;
@@ -13740,9 +13740,9 @@ class LiteTranslator {
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       }
@@ -13750,34 +13750,34 @@ class LiteTranslator {
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, *done);
         break;
       }
       case Decoder::Condition::kGt: {
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *done);
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, *done);
         break;
       }
       case Decoder::Condition::kLe: {
         Assembler::Label* true_path = as_.MakeLabel();
-        as_.Btl(flags_reg, static_cast<int8_t>(14));
+        as_.Btl(flags_reg, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *true_path);
         Register tmp = AllocTempReg();
         if (tmp == no_register) { success_ = false; return; }
         as_.Movl(tmp, flags_reg);
-        as_.Shrl(tmp, static_cast<int8_t>(15));
+        as_.Shrl(tmp, kFlagNegativeBit);
         as_.Xorl(tmp, flags_reg);
-        as_.Btl(tmp, static_cast<int8_t>(0));
+        as_.Btl(tmp, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, *done);
         as_.Bind(true_path);
         break;
@@ -24947,13 +24947,13 @@ class LiteTranslator {
   // For SUB, ARM64 C = !x86_CF (ARM64 uses inverted borrow), so we XOR bit 8.
   // use AL for overflow (avoids clobbering rcx in allocator pool).
   // LAHF stores SF|ZF|CF to AH (bits 8-15). SETCC OF stores to AL (bits 0-7).
-  // AND 0xC101 keeps N(bit15), Z(bit14), C(bit8), V(bit0). No rcx save/restore needed.
+  // AND kFlagsNZCVMask keeps N(bit15), Z(bit14), C(bit8), V(bit0). No rcx save/restore needed.
   void EmitStoreArmNZCV(bool is_sub) {
     as_.Lahf();
     as_.Setcc(Condition::kOverflow, Assembler::rax);
-    as_.Andl(Assembler::rax, static_cast<int32_t>(0xC101));
+    as_.Andl(Assembler::rax, static_cast<int32_t>(kFlagsNZCVMask));
     if (is_sub) {
-      as_.Xorl(Assembler::rax, static_cast<int32_t>(0x0100));
+      as_.Xorl(Assembler::rax, static_cast<int32_t>(CPUState::kFlagCarry));  // invert ARM borrow
     }
     int32_t flags_offset = offsetof(ThreadState, cpu.flags);
     as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, Assembler::rax);
@@ -24981,55 +24981,55 @@ class LiteTranslator {
       as_.Movzxwl(flags_reg, {.base = Assembler::rbp, .disp = f});
       Register tmp = AllocTempReg();
       as_.Movl(tmp, flags_reg);
-      as_.Shrl(tmp, static_cast<int8_t>(15));  // N -> bit 0
+      as_.Shrl(tmp, kFlagNegativeBit);  // N -> bit 0
       as_.Xorl(tmp, flags_reg);                // bit 0 = N ^ V
-      as_.Btl(tmp, static_cast<int8_t>(0));    // CF = N ^ V
+      as_.Btl(tmp, kFlagOverflowBit);    // CF = N ^ V
       as_.Jcc(jump_when, not_met);
     };
     switch (cond) {
       case Decoder::Condition::kEq:  // Z==1
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(14));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagZeroBit);
         as_.Jcc(Condition::kNotCarry, not_met);
         break;
       case Decoder::Condition::kNe:  // Z==0
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(14));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, not_met);
         break;
       case Decoder::Condition::kCs:  // C==1
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(8));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, not_met);
         break;
       case Decoder::Condition::kCc:  // C==0
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(8));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagCarryBit);
         as_.Jcc(Condition::kCarry, not_met);
         break;
       case Decoder::Condition::kMi:  // N==1
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(15));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagNegativeBit);
         as_.Jcc(Condition::kNotCarry, not_met);
         break;
       case Decoder::Condition::kPl:  // N==0
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(15));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagNegativeBit);
         as_.Jcc(Condition::kCarry, not_met);
         break;
       case Decoder::Condition::kVs:  // V==1
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(0));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagOverflowBit);
         as_.Jcc(Condition::kNotCarry, not_met);
         break;
       case Decoder::Condition::kVc:  // V==0
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(0));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagOverflowBit);
         as_.Jcc(Condition::kCarry, not_met);
         break;
       case Decoder::Condition::kHi:  // C==1 && Z==0
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(8));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, not_met);  // C==0 -> not met
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(14));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, not_met);     // Z==1 -> not met
         break;
       case Decoder::Condition::kLs: {  // C==0 || Z==1
         Assembler::Label* met = as_.MakeLabel();
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(8));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagCarryBit);
         as_.Jcc(Condition::kNotCarry, *met);     // C==0 -> met
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(14));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagZeroBit);
         as_.Jcc(Condition::kNotCarry, not_met);  // C==1 && Z==0 -> not met
         as_.Bind(met);
         break;
@@ -25041,13 +25041,13 @@ class LiteTranslator {
         emit_n_xor_v(Condition::kNotCarry);      // N==V -> not met
         break;
       case Decoder::Condition::kGt:  // Z==0 && N==V
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(14));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, not_met);     // Z==1 -> not met
         emit_n_xor_v(Condition::kCarry);         // N!=V -> not met
         break;
       case Decoder::Condition::kLe: {  // Z==1 || N!=V
         Assembler::Label* met = as_.MakeLabel();
-        as_.Btw({.base = Assembler::rbp, .disp = f}, static_cast<int8_t>(14));
+        as_.Btw({.base = Assembler::rbp, .disp = f}, kFlagZeroBit);
         as_.Jcc(Condition::kCarry, *met);        // Z==1 -> met
         emit_n_xor_v(Condition::kNotCarry);      // Z==0 && N==V -> not met
         as_.Bind(met);
@@ -25078,22 +25078,22 @@ class LiteTranslator {
     Assembler::Label* lt_label = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
 
-    as_.Movl(Assembler::rax, static_cast<int32_t>(0x0100));  // gt (default)
+    as_.Movl(Assembler::rax, static_cast<int32_t>(kFlagsFpGreater));  // gt (default)
     as_.Jcc(Condition::kParityEven, *uo_label);  // PF=1 -> unordered (NaN)
     as_.Jcc(Condition::kEqual, *eq_label);       // ZF=1 (PF=0) -> equal
     as_.Jcc(Condition::kBelow, *lt_label);       // CF=1 -> less
     as_.Jmp(*done);                              // else gt
 
     as_.Bind(lt_label);
-    as_.Movl(Assembler::rax, static_cast<int32_t>(0x8000));
+    as_.Movl(Assembler::rax, static_cast<int32_t>(kFlagsFpLess));
     as_.Jmp(*done);
 
     as_.Bind(eq_label);
-    as_.Movl(Assembler::rax, static_cast<int32_t>(0x4100));
+    as_.Movl(Assembler::rax, static_cast<int32_t>(kFlagsFpEqual));
     as_.Jmp(*done);
 
     as_.Bind(uo_label);
-    as_.Movl(Assembler::rax, static_cast<int32_t>(0x0101));
+    as_.Movl(Assembler::rax, static_cast<int32_t>(kFlagsFpUnordered));
 
     as_.Bind(done);
     int32_t flags_offset = offsetof(ThreadState, cpu.flags);
