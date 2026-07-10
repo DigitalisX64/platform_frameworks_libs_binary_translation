@@ -756,6 +756,13 @@ TEST(Arm64DecoderTest, TwoRegMisc) {
       {0x6ea0b862, "neg v2.4s,v3.4s", Dec::AdvSimdTwoRegMiscOpcode::kNeg, 2, 3},
       {0x4ea0b8a4, "abs v4.4s,v5.4s", Dec::AdvSimdTwoRegMiscOpcode::kAbs, 4, 5},
   };
+  // Across-lanes (bits[21:17]=11000, bit20=1) dispatches through the same
+  // AdvSimdTwoRegMisc callback; these rows pin the across-lanes table entry
+  // (encodings verified by heavy frontend_tests.cc static_asserts).
+  const struct { uint32_t enc; const char* asmtext; } across_rows[] = {
+      {0x4eb1b820, "addv s0,v1.4s"},
+      {0x2e303820, "uaddlv h0,v1.8b"},
+  };
   for (const auto& r : rows) {
     Recorder rec = Decode(r.enc);
     SCOPED_TRACE(r.asmtext);
@@ -763,6 +770,11 @@ TEST(Arm64DecoderTest, TwoRegMisc) {
     EXPECT_EQ(rec.opcode, static_cast<int>(r.opcode));
     EXPECT_EQ(rec.rd, r.rd);
     EXPECT_EQ(rec.rn, r.rn);
+  }
+  for (const auto& r : across_rows) {
+    Recorder rec = Decode(r.enc);
+    SCOPED_TRACE(r.asmtext);
+    EXPECT_STREQ(rec.name, "AdvSimdTwoRegMisc");
   }
 }
 

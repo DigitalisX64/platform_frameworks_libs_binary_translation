@@ -3043,509 +3043,335 @@ class Decoder {
   //
   // SIMD & FP - top-level decode for op0 = x111.
   //
+  // ---------------------------------------------------------------------------
+  // SIMD / floating-point dispatch table.
+  //
+  // The SIMD/FP encoding space is the most overlap-dense corner of the A64
+  // grammar: dozens of sub-encodings share long common prefixes and are told
+  // apart only by scattered discriminator bits.  Historically this was a long
+  // linear `if (<bit tests>) { ...; return; }` chain whose correctness rested
+  // on insertion ORDER (looser guards had to sit after the specific ones they
+  // would otherwise swallow).  Reordering — or inserting a new branch in the
+  // wrong place — silently mis-routed instructions with no crash.
+  //
+  // This is now a (mask, value) dispatch table.  Each entry pins exactly the
+  // bits its encoding fixes; the handler body is unchanged.  The masks are
+  // TIGHTENED to each instruction's true ARM ARM encoding so that no two
+  // entries can match the same word, which makes insertion order irrelevant.
+  // A debug-build self-check (below) proves pairwise disjointness once, so a
+  // future overlapping entry aborts immediately during testing instead of
+  // silently mis-decoding in the field.  See SimdFpKey / DecodeSimdFp.
+  //
+  // Two entries carry an `extra_match` predicate for the AdvSIMD
+  // shift-by-immediate forms, whose "immh (bits[22:19]) != 0" condition is not
+  // a single mask/value pattern; those two are disjoint from the rest via that
+  // predicate and are excluded from the static disjointness self-check.
+  // ---------------------------------------------------------------------------
+  struct SimdFpKey {
+    uint32_t mask;
+    uint32_t value;
+    // Constrain bits [start, start+size) to equal `val`.  Mirrors the
+    // GetBits<start, size>() == val tests of the original guard chain.
+    constexpr SimdFpKey Eq(uint32_t start, uint32_t size, uint32_t val) const {
+      const uint32_t field_mask =
+          ((size >= 32u) ? ~uint32_t{0} : ((uint32_t{1} << size) - 1u)) << start;
+      return SimdFpKey{mask | field_mask,
+                       (value & ~field_mask) | ((val << start) & field_mask)};
+    }
+  };
+
+  struct SimdFpEntry {
+    uint32_t mask;
+    uint32_t value;
+    bool (Decoder::*extra_match)() const;  // pure predicate, or nullptr
+    void (Decoder::*handler)();
+  };
+
+  static constexpr SimdFpEntry Entry(SimdFpKey key,
+                                     void (Decoder::*handler)(),
+                                     bool (Decoder::*extra_match)() const = nullptr) {
+    return SimdFpEntry{key.mask, key.value, extra_match, handler};
+  }
+
+  // AdvSIMD (scalar/vector) shift-by-immediate requires immh (bits[22:19]) != 0;
+  // immh==0000 is the modified-immediate / reserved encoding.  Not a single
+  // mask/value pattern, so it rides as an extra predicate on those two entries.
+  bool SimdFpImmhNonZero() const { return GetBits<19, 4>() != 0; }
+
   void DecodeSimdFp() {
+    // Entries are ordered to mirror the historical guard chain for auditability,
+    // but the masks are disjoint (see the debug self-check), so first-match ==
+    // only-match and the ordering carries no correctness weight.
+    //
+    // Tightenings applied vs. the old guard chain (each a genuinely fixed
+    // encoding bit per the ARM ARM, so no defined instruction is dropped):
+    //   * Scalar-FP group (FpFixedPointConversion, FpDataProc1/2, FpIntConversion,
+    //     FpMovImmediate, FpCompare, FpConditionalCompare, FpCondSelect): add
+    //     bit30=0.  Scalar FP is `M 0 S 11110 ...`; bit30 is a fixed 0 there,
+    //     whereas the scalar-SIMD forms (which share bits[28:24]=11110) have
+    //     bit30=1.  This is the discriminator the old comments named.
+    //   * AdvSIMD two-register-misc: pin bits[21:17]=10000 (its true fixed
+    //     field) instead of the old loose `bit21=1 && bit17=0`.
+    //   * AdvSIMD copy: pin bits[23:22]=00 (copy is `0 Q op 01110 000 ...`).
+    //   * FCMA split into FCMLA (bits[15:13]=110) and FCADD (bits[15:13]=111,
+    //     bit11=0), both -> DecodeAdvSimdFcma; disjoint from BF16 three-same.
+    //   * I8MM split into USDOT / (S,U)MMLA / USMMLA by bits[13:11] (and U for
+    //     the two U-fixed forms), replacing the internal fall-through dispatch.
+    //   * EXT/TBL split by bit29 (EXT) vs bit29=0 && bit11=0 (TBL); the old
+    //     TBL bit11=1 "reserved" arm was dead code (permute claimed it first).
+    static constexpr SimdFpEntry kSimdFpTable[] = {
+        // ---- AdvSIMD modified immediate (bits[28:24]=01111) ----
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01111).Eq(19, 5, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdModifiedImm),
+
+        // ---- Scalar SIMD family (bit30=1, bits[28:24]=11110) ----
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(24, 5, 0b11110).Eq(17, 5, 0b10000).Eq(10, 2, 0b10),
+              &Decoder::DecodeAdvSimdScalarTwoRegMisc),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(29, 1, 0).Eq(24, 5, 0b11110).Eq(21, 3, 0b000).Eq(15, 1, 0).Eq(11, 4, 0b0000).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdScalarCopy),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(24, 5, 0b11110).Eq(17, 5, 0b11000).Eq(10, 2, 0b10),
+              &Decoder::DecodeAdvSimdScalarPairwise),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdScalarThreeSame),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(24, 5, 0b11110).Eq(22, 1, 1).Eq(21, 1, 0).Eq(15, 1, 0).Eq(14, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdScalarFp16ThreeSame),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(29, 1, 0).Eq(24, 5, 0b11110).Eq(22, 2, 0).Eq(21, 1, 0).Eq(15, 1, 0).Eq(10, 2, 0b00),
+              &Decoder::DecodeCryptoSha3Reg),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(29, 1, 0).Eq(24, 5, 0b11110).Eq(22, 2, 0).Eq(17, 5, 0b10100).Eq(16, 1, 0).Eq(14, 2, 0).Eq(10, 2, 0b10),
+              &Decoder::DecodeCryptoSha2Reg),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(29, 1, 1).Eq(24, 5, 0b11110).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 0).Eq(13, 1, 0).Eq(12, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdScalarRdmThreeSame),
+
+        // ---- Scalar FP family (bit30=0, bits[28:24]=11110) ----
+        // FpFixedPointConversion & FpIntConversion leave bit31 (sf) free.
+        Entry(SimdFpKey{}.Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 0),
+              &Decoder::DecodeFpFixedPointConversion),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 5, 0b10000),
+              &Decoder::DecodeFpDataProc1),
+        Entry(SimdFpKey{}.Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 6, 0b000000),
+              &Decoder::DecodeFpIntConversion),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 3, 0b100).Eq(5, 5, 0b00000),
+              &Decoder::DecodeFpMovImmediate),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 2, 0b10),
+              &Decoder::DecodeFpDataProc2),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 4, 0b1000),
+              &Decoder::DecodeFpCompare),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 2, 0b01),
+              &Decoder::DecodeFpConditionalCompare),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(24, 5, 0b11110).Eq(21, 1, 1).Eq(10, 2, 0b11),
+              &Decoder::DecodeFpCondSelect),
+
+        // ---- bits[28:24]=11111 group ----
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 0).Eq(29, 1, 0).Eq(24, 5, 0b11111),
+              &Decoder::DecodeFpDataProc3),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(24, 5, 0b11111).Eq(10, 1, 0),
+              &Decoder::DecodeAdvSimdScalarXIndexedElement),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(24, 5, 0b11111).Eq(23, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdScalarShiftByImm, &Decoder::SimdFpImmhNonZero),
+
+        // ---- Vector SIMD family (bits[28:24]=01110) ----
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(21, 1, 1).Eq(10, 2, 0b00),
+              &Decoder::DecodeAdvSimdThreeDiff),
+        // BFloat16 three-same-extra: bits[15:13]=111, bit11=1, size(bit22)=1.
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(29, 1, 1).Eq(24, 5, 0b01110).Eq(22, 1, 1).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 1).Eq(13, 1, 1).Eq(11, 1, 1).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdBf16ThreeSame),
+        // FCMA split: FCMLA (bit13=0) and FCADD (bit13=1, bit11=0).
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 1).Eq(13, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdFcma),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 1).Eq(13, 1, 1).Eq(11, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdFcma),
+        // DotProd (SDOT/UDOT): bits[15:10]=100101.
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0b10).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 0).Eq(13, 1, 0).Eq(12, 1, 1).Eq(11, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdDotProductVec),
+        // I8MM split by bits[13:11]: USDOT (011, U=0), (S/U)MMLA (100), USMMLA (101, U=0).
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(29, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0b10).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 0).Eq(11, 3, 0b011).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdI8mmUsdot),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0b10).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 0).Eq(11, 3, 0b100).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdI8mmMmla),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(29, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0b10).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 0).Eq(11, 3, 0b101).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdI8mmUsmmla),
+        // RDM three-same (SQRDMLAH/SQRDMLSH vector): U=1, bits[15:12]=1000.
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(29, 1, 1).Eq(21, 1, 0).Eq(15, 1, 1).Eq(14, 1, 0).Eq(13, 1, 0).Eq(12, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdRdmThreeSame),
+        // FP16 three-same: size(bit22)=1, bits[15:14]=00.
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(22, 1, 1).Eq(21, 1, 0).Eq(14, 2, 0b00).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdFp16ThreeSame),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(21, 1, 1).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdThreeSame),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(29, 1, 0).Eq(24, 5, 0b01110).Eq(21, 1, 0).Eq(15, 1, 0).Eq(10, 2, 0b10),
+              &Decoder::DecodeAdvSimdPermute),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(30, 1, 1).Eq(29, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0).Eq(17, 5, 0b10100).Eq(14, 3, 0b001).Eq(10, 2, 0b10),
+              &Decoder::DecodeCryptoAes),
+        // FP16 two-reg-misc: size(bit22)=1, bits[21:17]=11100.
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(22, 1, 1).Eq(17, 5, 0b11100).Eq(10, 2, 0b10),
+              &Decoder::DecodeAdvSimdFp16TwoRegMisc),
+        // Two-reg-misc: bits[21:17]=10000 (its fixed field).
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(17, 5, 0b10000).Eq(10, 2, 0b10),
+              &Decoder::DecodeAdvSimdTwoRegMisc),
+        // Across-lanes: bits[21:17]=11000 (bit20=1 distinguishes it from
+        // two-reg-misc; the shared handler splits on bit20 internally).
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(17, 5, 0b11000).Eq(10, 2, 0b10),
+              &Decoder::DecodeAdvSimdTwoRegMisc),
+        // Copy: bits[23:21]=000, bit15=0, bit10=1.
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0).Eq(21, 1, 0).Eq(15, 1, 0).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdCopy),
+
+        // ---- Vector x-indexed / shift (bits[28:24]=01111) ----
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01111).Eq(10, 1, 0),
+              &Decoder::DecodeAdvSimdVecXIndexedElement),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(24, 5, 0b01111).Eq(10, 1, 1),
+              &Decoder::DecodeAdvSimdShiftByImm, &Decoder::SimdFpImmhNonZero),
+
+        // ---- EXT / TBL split by bit29 (bits[28:24]=01110, bits[23:22]=00) ----
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(29, 1, 1).Eq(24, 5, 0b01110).Eq(22, 2, 0).Eq(21, 1, 0).Eq(15, 1, 0).Eq(10, 1, 0),
+              &Decoder::DecodeAdvSimdExtTbl),
+        Entry(SimdFpKey{}.Eq(31, 1, 0).Eq(29, 1, 0).Eq(24, 5, 0b01110).Eq(22, 2, 0).Eq(21, 1, 0).Eq(15, 1, 0).Eq(11, 1, 0).Eq(10, 1, 0),
+              &Decoder::DecodeAdvSimdExtTbl),
+
+        // ---- Crypto bit31=1 group (SHA512 / SHA3 / SM4), bits[30:24]=1001110 ----
+        Entry(SimdFpKey{}.Eq(31, 1, 1).Eq(24, 7, 0b1001110),
+              &Decoder::DecodeSimdFpCryptoBit31),
+    };
+
+#ifndef NDEBUG
+    // Prove pairwise disjointness once: no two (non-predicate) entries may
+    // agree on all their shared constrained bits, else some word could match
+    // both and dispatch would be order-dependent.  Deterministic (independent
+    // of the decoded word), so this either always passes or always aborts —
+    // an overlapping future entry trips it on the first decode under test.
+    [[maybe_unused]] static const bool kSimdFpTableDisjoint = [] {
+      const unsigned n = sizeof(kSimdFpTable) / sizeof(kSimdFpTable[0]);
+      for (unsigned i = 0; i < n; ++i) {
+        if (kSimdFpTable[i].extra_match != nullptr) {
+          continue;
+        }
+        for (unsigned j = i + 1; j < n; ++j) {
+          if (kSimdFpTable[j].extra_match != nullptr) {
+            continue;
+          }
+          const uint32_t common = kSimdFpTable[i].mask & kSimdFpTable[j].mask;
+          CHECK_NE(kSimdFpTable[i].value & common, kSimdFpTable[j].value & common);
+        }
+      }
+      return true;
+    }();
+#endif
+
+    for (const auto& entry : kSimdFpTable) {
+      if ((code_ & entry.mask) != entry.value) {
+        continue;
+      }
+      if (entry.extra_match != nullptr && !(this->*entry.extra_match)()) {
+        continue;
+      }
+      (this->*entry.handler)();
+      return;
+    }
+    Undefined();
+  }
+
+  // --- SIMD/FP handler bodies lifted out of the former guard chain ------------
+  // These wrap the encodings that previously had their body inline in
+  // DecodeSimdFp, so the dispatch table can name a single handler per entry.
+
+  // Cryptographic three-register SHA (SHA1C/P/M/SU0, SHA256H/H2/SU1).
+  void DecodeCryptoSha3Reg() {
+    insn_consumer_->CryptoSha3Reg(GetBits<0, 5>(),    // rd
+                                  GetBits<5, 5>(),    // rn
+                                  GetBits<16, 5>(),   // rm
+                                  GetBits<12, 3>());  // opcode
+  }
+
+  // Cryptographic two-register SHA (SHA1H, SHA1SU1, SHA256SU0).
+  void DecodeCryptoSha2Reg() {
+    insn_consumer_->CryptoSha2Reg(GetBits<0, 5>(),    // rd
+                                  GetBits<5, 5>(),    // rn
+                                  GetBits<12, 2>());  // opcode
+  }
+
+  // I8MM USDOT (vector): Vn unsigned, Vm signed.
+  void DecodeAdvSimdI8mmUsdot() {
+    const DotProductArgs args = {
+        .opcode = DotProductOpcode::kUsdot,
+        .rd = GetBits<0, 5>(),
+        .rn = GetBits<5, 5>(),
+        .rm = GetBits<16, 5>(),
+        .index = 0,
+        .q = GetBits<30, 1>(),
+    };
+    insn_consumer_->AdvSimdDotProduct(args);
+  }
+
+  // I8MM SMMLA (U=0) / UMMLA (U=1).
+  void DecodeAdvSimdI8mmMmla() {
+    const MatMulArgs args = {
+        .opcode = GetBits<29, 1>() ? MatMulOpcode::kUmmla : MatMulOpcode::kSmmla,
+        .rd = GetBits<0, 5>(),
+        .rn = GetBits<5, 5>(),
+        .rm = GetBits<16, 5>(),
+    };
+    insn_consumer_->AdvSimdMatMul(args);
+  }
+
+  // I8MM USMMLA: Vn unsigned, Vm signed.
+  void DecodeAdvSimdI8mmUsmmla() {
+    const MatMulArgs args = {
+        .opcode = MatMulOpcode::kUsmmla,
+        .rd = GetBits<0, 5>(),
+        .rn = GetBits<5, 5>(),
+        .rm = GetBits<16, 5>(),
+    };
+    insn_consumer_->AdvSimdMatMul(args);
+  }
+
+  // AdvSIMD permute (UZP1, TRN1, ZIP1, UZP2, TRN2, ZIP2).
+  void DecodeAdvSimdPermute() {
+    insn_consumer_->AdvSimdPermute(GetBits<0, 5>(),    // rd
+                                   GetBits<5, 5>(),    // rn
+                                   GetBits<16, 5>(),   // rm
+                                   GetBits<22, 2>(),   // size
+                                   GetBits<12, 3>(),   // opcode
+                                   GetBits<30, 1>());  // q
+  }
+
+  // Cryptographic AES (AESE, AESD, AESMC, AESIMC).
+  void DecodeCryptoAes() {
+    insn_consumer_->CryptoAes(GetBits<0, 5>(),    // rd
+                              GetBits<5, 5>(),    // rn
+                              GetBits<12, 2>());  // 00=AESE,01=AESD,10=AESMC,11=AESIMC
+  }
+
+  // AdvSIMD extract (EXT) and table lookup (TBL/TBX).  The dispatch table
+  // splits these by bit29 (EXT: bit29=1; TBL: bit29=0, bit11=0), so bit29 alone
+  // selects the sub-form here.  The bit11 guard on the TBL arm is retained
+  // defensively; the TBL table entry already forces bit11=0.
+  void DecodeAdvSimdExtTbl() {
+    if (GetBits<29, 1>()) {
+      // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index
+      insn_consumer_->AdvSimdExtract(GetBits<0, 5>(),    // rd
+                                     GetBits<5, 5>(),    // rn
+                                     GetBits<16, 5>(),   // rm
+                                     GetBits<11, 4>(),   // imm4 (byte index)
+                                     GetBits<30, 1>());  // q
+    } else {
+      // TBL/TBX Vd.<T>, {Vn.16B ...}, Vm.<T>
+      if (GetBits<11, 1>()) { Undefined(); return; }
+      insn_consumer_->AdvSimdTableLookup(GetBits<0, 5>(),    // rd
+                                         GetBits<5, 5>(),    // rn
+                                         GetBits<16, 5>(),   // rm
+                                         GetBits<13, 2>(),   // len (0..3 -> 1..4 regs)
+                                         GetBits<12, 1>(),   // op (0=TBL, 1=TBX)
+                                         GetBits<30, 1>());  // q
+    }
+  }
+
+  // Crypto bit31=1 group (bits[30:24]=1001110): SHA-512, SHA3, SM4.  These are
+  // a small nested decode tree rather than a flat set, so they stay as one
+  // handler that runs the three sub-blocks in their original order and falls
+  // through to Undefined().  bit31 / bits[30:24] are guaranteed by the table
+  // entry; the redundant guards below are kept verbatim from the original.
+  void DecodeSimdFpCryptoBit31() {
     bool bit31 = GetBits<31, 1>();
-
-    // AdvSIMD modified immediate: bit31=0, bits[28:24]=01111, bits[23:19]=00000, bit10=1
-    if (!bit31 && GetBits<24, 5>() == 0b01111 && GetBits<19, 5>() == 0 && GetBits<10, 1>()) {
-      DecodeAdvSimdModifiedImm();
-      return;
-    }
-
-    // AdvSIMD scalar two-reg misc: bit31=0, bit30=1, bits[28:24]=11110, bits[21:17]=10000, bits[11:10]=10
-    // Must be checked BEFORE FpDataProc1/FpIntConversion/FpDataProc2 because all share bits[28:24]=11110,
-    // but scalar SIMD has bit30=1 while scalar FP has bit30=0.
-    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
-        GetBits<17, 5>() == 0b10000 && GetBits<10, 2>() == 0b10) {
-      DecodeAdvSimdScalarTwoRegMisc();
-      return;
-    }
-
-    // AdvSIMD scalar copy (DUP scalar / MOV Vd, Vn[index]):
-    //   bit31=0, bit30=1, op=bit29=0, bits[28:24]=11110, bits[23:21]=000,
-    //   bit15=0, imm4=bits[14:11]=0000, bit10=1
-    // Distinct from scalar two-reg misc (bits[21:17]=10000, bits[11:10]=10).
-    // Distinct from FP scalar ops (those have bit30=0).
-    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b11110 && GetBits<21, 3>() == 0b000 &&
-        !GetBits<15, 1>() && GetBits<11, 4>() == 0b0000 && GetBits<10, 1>()) {
-      DecodeAdvSimdScalarCopy();
-      return;
-    }
-
-    // AdvSIMD scalar pairwise:
-    //   bit31=0, bit30=1, bits[28:24]=11110, bits[21:17]=11000, bits[11:10]=10
-    // Must be checked BEFORE scalar three same (which only requires bit21=1).
-    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
-        GetBits<17, 5>() == 0b11000 && GetBits<10, 2>() == 0b10) {
-      DecodeAdvSimdScalarPairwise();
-      return;
-    }
-
-    // AdvSIMD scalar three same:
-    //   bit31=0, bit30=1, bits[28:24]=11110, bit21=1, bit10=1
-    // Must be checked AFTER scalar two-reg misc (which requires
-    // bits[20:17]=0000) to avoid mis-routing — for scalar three same we
-    // require Rm != 0 conceptually, but the safer way is just ordering
-    // and demanding bits[14:11] (opcode field) is non-zero in a way
-    // that doesn't match two-reg-misc opcode shape.
-    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
-        GetBits<21, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdScalarThreeSame();
-      return;
-    }
-
-    // Armv8.2-FP16 scalar three-same.
-    // Encoding (per ARM ARM C7.2 "Advanced SIMD scalar three same (FP16)"):
-    //   0 1 U 1 1 1 1 0 a 1 0 Rm 0 0 opcode_3 1 Rn Rd
-    // i.e. bit31=0, bit30=1, bit29=U, bits[28:24]=11110, bit23=a, bit22=1,
-    //      bit21=0, bits[15:14]=00, bits[13:11]=opcode_3, bit10=1.
-    // Must precede the FpFixedPointConversion check below, which would
-    // otherwise misroute this encoding (FpFixedPointConversion only gates
-    // on bits[28:24]=11110 && !bit21 — it doesn't constrain bit30, even
-    // though its own encoding requires bit30=0).
-    // Distinct from std scalar three-same (bit21=1 there, =0 here) and
-    // from scalar copy (bits[23:21]=000 there; bits[23:21]=`a 1 0` here).
-    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11110 &&
-        GetBits<22, 1>() && !GetBits<21, 1>() &&
-        !GetBits<15, 1>() && !GetBits<14, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdScalarFp16ThreeSame();
-      return;
-    }
-
-    // Cryptographic three-register SHA (SHA1C/SHA1P/SHA1M/SHA1SU0,
-    // SHA256H/SHA256H2/SHA256SU1):
-    //   bit31=0, bit30=1, bit29=0, bits[28:24]=11110, bits[23:22]=00,
-    //   bit21=0, bits[20:16]=Rm, bit15=0, bits[14:12]=opcode, bits[11:10]=00
-    // Must be checked BEFORE FpFixedPointConversion (which catches !bit21
-    // for the bits[28:24]=11110 group and would silently mis-route SHA).
-    // opcode: 000=SHA1C, 001=SHA1P, 010=SHA1M, 011=SHA1SU0,
-    //         100=SHA256H, 101=SHA256H2, 110=SHA256SU1, 111=Undefined.
-    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b11110 && GetBits<22, 2>() == 0 &&
-        !GetBits<21, 1>() && !GetBits<15, 1>() && GetBits<10, 2>() == 0b00) {
-      insn_consumer_->CryptoSha3Reg(
-          GetBits<0, 5>(),    // rd
-          GetBits<5, 5>(),    // rn
-          GetBits<16, 5>(),   // rm
-          GetBits<12, 3>());  // opcode
-      return;
-    }
-
-    // Cryptographic two-register SHA (SHA1H, SHA1SU1, SHA256SU0):
-    //   bit31=0, bit30=1, bit29=0, bits[28:24]=11110, bits[23:22]=00,
-    //   bits[21:17]=10100, bit16=0, bits[15:14]=00, bits[13:12]=opcode,
-    //   bits[11:10]=10
-    // Must be checked BEFORE FpDataProc2 (which also matches bits[28:24]=11110,
-    // bit21=1, bits[11:10]=10 — but with bit30=0).
-    // opcode: 00=SHA1H, 01=SHA1SU1, 10=SHA256SU0 (interp-only), 11=Undefined.
-    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b11110 && GetBits<22, 2>() == 0 &&
-        GetBits<17, 5>() == 0b10100 && !GetBits<16, 1>() &&
-        GetBits<14, 2>() == 0 && GetBits<10, 2>() == 0b10) {
-      insn_consumer_->CryptoSha2Reg(
-          GetBits<0, 5>(),    // rd
-          GetBits<5, 5>(),    // rn
-          GetBits<12, 2>());  // opcode
-      return;
-    }
-
-    // AdvSIMD Armv8.1-RDM scalar three-same-extra: SQRDMLAH / SQRDMLSH
-    // (scalar, non-indexed).  Sibling of the vector three-same-extra
-    // dispatch above; differs only in bits[30:24] (scalar marker = 1 11110
-    // vs vector = Q 01110).
-    //   bit31=0, bit30=1, bit29=1 (U=1), bits[28:24]=11110, bit21=0.
-    //   bit15=1, bit14=0, bit13=0, bit12=0, bit10=1.
-    //   bit11 = 0 (SQRDMLAH) / 1 (SQRDMLSH).
-    //   size ∈ {01 (H), 10 (S)}; size=00/11 reserved per ARM ARM
-    //   C7.2.299 / .301.
-    //
-    // Must precede FpFixedPointConversion below — that arm gates only on
-    // bits[28:24]=11110 && !bit21 (it doesn't constrain bit30), so the
-    // scalar three-same-extra encoding would otherwise be silently
-    // misrouted to FpFixedPointConversion's internal opcode dispatch
-    // (which interprets the Rm bits as rmode/opcode and either
-    // mis-emits SCVTF/UCVTF/FCVTZS/FCVTZU semantics or Undefined()s,
-    // depending on Rm).  No overlap with the FP16 scalar three-same arm
-    // (bit22=1 there; here size hi-bit can be 0).  No overlap with the
-    // standard scalar three-same arm above (bit21=1 there; here bit21=0).
-    // No overlap with CryptoSha (bit29=0 there; here bit29=1).
-    if (!bit31 && GetBits<30, 1>() && GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b11110 && !GetBits<21, 1>() &&
-        GetBits<15, 1>() && !GetBits<14, 1>() && !GetBits<13, 1>() &&
-        !GetBits<12, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdScalarRdmThreeSame();
-      return;
-    }
-
-    // FP <-> fixed-point conversion: bits[28:24]=11110, bit21=0
-    // Must be checked BEFORE all bit21=1 FP checks.
-    // Encoding: sf 0 S 11110 ftype 0 rmode opcode scale Rn Rd
-    if (GetBits<24, 5>() == 0b11110 && !GetBits<21, 1>()) {
-      DecodeFpFixedPointConversion();
-      return;
-    }
-
-    // Floating-point data-processing (1 source): bits[28:24]=11110, bit21=1, bits[14:10]=10000
-    // Must be checked BEFORE FpIntConversion because both share bits[28:24]=11110 and bit21=1,
-    // but FpDataProc1 has bits[14:10]=10000 while FpIntConversion has bits[15:10]=000000.
-    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() &&
-        GetBits<10, 5>() == 0b10000) {
-      DecodeFpDataProc1();
-      return;
-    }
-
-    // Floating-point <-> integer conversion: bits[28:24]=11110, bit21=1, bits[15:10]=000000
-    // bit31=sf can be 0 or 1 (GP register size).
-    if (GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 6>() == 0b000000) {
-      DecodeFpIntConversion();
-      return;
-    }
-
-    // FMOV (scalar, immediate): bit31=0, bits[28:24]=11110, bit21=1, bits[12:10]=100, bits[9:5]=00000
-    // Encoding: 0 0 0 11110 ftype 1 imm8 100 00000 Rd
-    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() &&
-        GetBits<10, 3>() == 0b100 && GetBits<5, 5>() == 0b00000) {
-      DecodeFpMovImmediate();
-      return;
-    }
-
-    // Floating-point data-processing (2 source): bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=10
-    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b10) {
-      DecodeFpDataProc2();
-      return;
-    }
-
-    // Floating-point compare: bit31=0, bits[28:24]=11110, bit21=1, bits[13:10]=1000
-    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 4>() == 0b1000) {
-      DecodeFpCompare();
-      return;
-    }
-
-    // Floating-point conditional compare: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=01
-    // Encoding: 0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv  (op: 0=FCCMP, 1=FCCMPE)
-    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b01) {
-      DecodeFpConditionalCompare();
-      return;
-    }
-
-    // FCSEL: bit31=0, bits[28:24]=11110, bit21=1, bits[11:10]=11
-    if (!bit31 && GetBits<24, 5>() == 0b11110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b11) {
-      DecodeFpCondSelect();
-      return;
-    }
-
-    // Floating-point data-processing (3 source): bit31=0, bit30=0, bit29=0,
-    // bits[28:24]=11111.  FMADD, FMSUB, FNMADD, FNMSUB.
-    // require bit30=0 (M) and bit29=0 (S) per ARM ARM
-    // encoding "M=0 S=0 11111 ftype o1 0 Rm o0 Ra Rn Rd".  Without these
-    // constraints the prefix also catches the "AdvSIMD scalar x indexed
-    // element" family (bit30=1, bits[28:24]=11111) — e.g. FMULX scalar
-    // by-element (U=1, opcode=1001) was silently mis-routed into
-    // FpDataProc3 as garbage FMADD/FMSUB, producing wrong math without
-    // any SIGILL.  Tightening here routes the scalar-x-indexed encodings
-    // to the final Undefined() (no implementation yet) so the failure
-    // mode is a diagnostic SIGILL rather than corrupted arithmetic.
-    if (!bit31 && !GetBits<30, 1>() && !GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b11111) {
-      DecodeFpDataProc3();
-      return;
-    }
-
-    // AdvSIMD scalar x indexed element (ARM ARM C4.1.71):
-    //   bit31=0, bit30=1, bits[28:24]=11111, bit10=0.
-    // Sibling of vector-x-indexed (bits[28:24]=01111, dispatched below at
-    // the AdvSimd*VecXIndexedElement path).  Distinguished from
-    // FpDataProc3 (above) by bit30=1.
-    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11111 &&
-        !GetBits<10, 1>()) {
-      DecodeAdvSimdScalarXIndexedElement();
-      return;
-    }
-
-    // AdvSIMD scalar shift by immediate (ARM ARM C4.1.6.10):
-    //   bit31=0, bit30=1, bits[28:24]=11111, bit23=0, bit10=1, immh!=0.
-    // Sibling of vector AdvSimdShiftByImm (bits[28:24]=01111, also bit10=1),
-    // and of AdvSimdScalarXIndexedElement (same bits[28:24]=11111 but bit10=0).
-    // The encoding is bit-identical to the vector shift-by-immediate apart
-    // from bits[28:24] (and the absence of a Q bit — scalar always produces
-    // exactly one element).  By constructing AdvSimdShiftImmArgs with
-    // q=false and routing through the existing AdvSimdShiftByImm consumer,
-    // the interpreter naturally executes a single-lane shift (num_elements
-    // = vec_len / esize = 8 / 8 = 1 for D-form).  The dispatched
-    // implementations are intentionally limited this cycle to the shift
-    // ops where this num_elements=1 identity holds without additional
-    // post-masking (see DecodeAdvSimdScalarShiftByImm body).
-    if (!bit31 && GetBits<30, 1>() && GetBits<24, 5>() == 0b11111 &&
-        !GetBits<23, 1>() && GetBits<10, 1>() && GetBits<19, 4>() != 0) {
-      DecodeAdvSimdScalarShiftByImm();
-      return;
-    }
-
-    // AdvSIMD three different: bit31=0, bits[28:24]=01110, bit21=1, bits[11:10]=00
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && GetBits<10, 2>() == 0b00) {
-      DecodeAdvSimdThreeDiff();
-      return;
-    }
-
-    // AdvSIMD BFloat16 three-same-extra (Armv8.6-BF16): BFDOT, BFMMLA,
-    // BFMLALB, BFMLALT (vector forms).
-    //   bit31=0, bit29=1, bits[28:24]=01110, bits[23:22] ∈ {01, 11},
-    //   bit21=0, bit15=1, bit14=1, bit13=1, bit11=1, bit10=1.
-    // Inner dispatch (DecodeAdvSimdBf16ThreeSame) picks per-size:
-    //   size=01: bit12=1 -> BFDOT (vector); bit12=0 -> BFMMLA (Q=1 only).
-    //   size=11: bit12=1 -> BFMLALB (bit30=0) / BFMLALT (bit30=1).
-    // Must precede the FCMA dispatch below since they share bit15=1,
-    // bit14=1, bit10=1 with bit21=0; for size=01 the FCMA inner decode
-    // would reject the encoding (FCMA needs size>=10), and for size=11
-    // FCMA's FCADD path requires bit11=0 (BFMLAL has bit11=1) so it
-    // would reject as Undefined.  Either way, without this carve-out
-    // BF16 ops silently SIGILL.
-    if (!bit31 && GetBits<29, 1>() && GetBits<24, 5>() == 0b01110 &&
-        (GetBits<22, 2>() == 0b01 || GetBits<22, 2>() == 0b11) &&
-        !GetBits<21, 1>() &&
-        GetBits<15, 1>() && GetBits<14, 1>() && GetBits<13, 1>() &&
-        GetBits<11, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdBf16ThreeSame();
-      return;
-    }
-
-    // Advanced SIMD complex floating-point (Armv8.3-FCMA): FCADD / FCMLA.
-    //   bit31=0, bits[28:24]=01110, bit21=0, bit15=1, bit14=1, bit10=1.
-    // Must precede three-same / permute / copy / two-reg-misc to avoid
-    // mis-routing the FCMA encoding bits.  Three-same itself requires
-    // bit21=1, so there's no overlap there; but the other AdvSIMD shapes
-    // that have bit21=0 all require bit15=0 or bit14=0 or bit10=0, so
-    // pinning bit15=1, bit14=1, bit10=1 carves the FCMA subspace cleanly.
-    // Other three-same-extra opcodes (SDOT, UDOT, SQRDMLAH, SQRDMLSH,
-    // USDOT, BF*) all have bit14=0 in their opcode field, so the
-    // bit14=1 guard keeps this branch FCMA-only.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<21, 1>() &&
-        GetBits<15, 1>() && GetBits<14, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdFcma();
-      return;
-    }
-
-    // hello-dotprod
-    // AdvSIMD integer dot product (Armv8.4-DotProd): SDOT / UDOT (vector).
-    //   bit31=0, bits[28:24]=01110, bits[23:21]=100 (so bits[23:22]=10
-    //   and bit21=0), bits[15:10]=100101 (bit15=1, bit14=0, bit13=0,
-    //   bit12=1, bit11=0, bit10=1).  bit30=Q, bit29=U (0=SDOT, 1=UDOT).
-    // Verified from clang --target=aarch64 -march=armv8.4-a+dotprod:
-    //   sdot v0.4s,v1.16b,v2.16b = 0x4e829420 — bit23=1, bit22=0.
-    // Must precede the generic three-same / permute / copy / two-reg-misc
-    // decoders that share the bits[28:24]=01110 prefix.  Three-same proper
-    // requires bit21=1, so there's no overlap; permute / copy require
-    // bit15=0; two-reg-misc requires bit21=1; FCMA (above) requires
-    // bit14=1; BF16 three-same-extra (above) requires bits[23:22] ∈ {01,
-    // 11} — DotProd uses bits[23:22]=10, so no conflict.  Without this
-    // carve-out SDOT/UDOT silently fall through and SIGILL the guest.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0b10 &&
-        !GetBits<21, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
-        !GetBits<13, 1>() && GetBits<12, 1>() && !GetBits<11, 1>() &&
-        GetBits<10, 1>()) {
-      DecodeAdvSimdDotProductVec();
-      return;
-    }
-
-    // I8MM (FEAT_I8MM): USDOT (vector) and the integer
-    // matrix-multiply-accumulate SMMLA/UMMLA/USMMLA. Same prefix as DotProd
-    // (bits[28:24]=01110, bits[23:22]=10, bit21=0, bit15=1, bit14=0, bit10=1);
-    // bits[13:11] select the op:
-    //   011 -> USDOT vector (U=0; Vn unsigned, Vm signed)
-    //   100 -> SMMLA (U=0) / UMMLA (U=1)
-    //   101 -> USMMLA (U=0; Vn unsigned, Vm signed)
-    // All are .4S (Q=1) only.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0b10 &&
-        !GetBits<21, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
-        GetBits<10, 1>()) {
-      uint8_t b13_11 = GetBits<11, 3>();  // bits[13:11]
-      bool u = GetBits<29, 1>();
-      if (b13_11 == 0b011 && !u) {  // USDOT vector
-        const DotProductArgs args = {
-            .opcode = DotProductOpcode::kUsdot,
-            .rd = GetBits<0, 5>(),
-            .rn = GetBits<5, 5>(),
-            .rm = GetBits<16, 5>(),
-            .index = 0,
-            .q = GetBits<30, 1>(),
-        };
-        insn_consumer_->AdvSimdDotProduct(args);
-        return;
-      }
-      if (b13_11 == 0b100) {  // SMMLA / UMMLA
-        const MatMulArgs args = {
-            .opcode = u ? MatMulOpcode::kUmmla : MatMulOpcode::kSmmla,
-            .rd = GetBits<0, 5>(),
-            .rn = GetBits<5, 5>(),
-            .rm = GetBits<16, 5>(),
-        };
-        insn_consumer_->AdvSimdMatMul(args);
-        return;
-      }
-      if (b13_11 == 0b101 && !u) {  // USMMLA
-        const MatMulArgs args = {
-            .opcode = MatMulOpcode::kUsmmla,
-            .rd = GetBits<0, 5>(),
-            .rn = GetBits<5, 5>(),
-            .rm = GetBits<16, 5>(),
-        };
-        insn_consumer_->AdvSimdMatMul(args);
-        return;
-      }
-    }
-
-    // AdvSIMD Armv8.1-RDM three-same vector: SQRDMLAH / SQRDMLSH (NOT the
-    // by-element form — that's already wired through AdvSimdVecXIdxOpcode).
-    //   bit31=0, bits[28:24]=01110, bit21=0, U=bit29=1, bit15=1, bit14=0,
-    //   bit13=0, bit12=0, bit10=1.  bit11 = 0 (SQRDMLAH) / 1 (SQRDMLSH).
-    //   size ∈ {01, 10}; size=00/11 reserved per ARM ARM C7.2.298/.300.
-    //
-    // Disambiguation versus the other three-same-extra arms above:
-    //   FCMA  (bit14=1) — no overlap, FCMA needs bit14=1 here we need bit14=0.
-    //   BF16  (bit13=1, bit11=1) — no overlap, we need bit13=0.
-    //   DotProd (bit12=1, bit11=0) — no overlap, we need bit12=0.
-    // Standard three-same (bit21=1) is mutually exclusive on bit21.  FP16
-    // three-same (bit22=1, bit15=0) is mutually exclusive on bit15.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<21, 1>() &&
-        GetBits<29, 1>() && GetBits<15, 1>() && !GetBits<14, 1>() &&
-        !GetBits<13, 1>() && !GetBits<12, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdRdmThreeSame();
-      return;
-    }
-
-    // Armv8.2-FP16 NEON vector three-same.
-    // Encoding (per ARM ARM C7.2 "Advanced SIMD three same (FP16)"):
-    //   0 Q U 0 1 1 1 0 a 1 0 Rm 0 0 opcode 1 Rn Rd
-    // i.e. bit31=0, bits[28:24]=01110, bit23=a, bit22=1, bit21=0,
-    //      bits[15:14]=00, bit10=1, bits[13:11]=3-bit opcode.
-    // Verified against `clang --target=aarch64 -march=armv8.2-a+fp16`:
-    //   FADD v0.4h,v1.4h,v2.4h = 0x0e421420 -> bit23=0, bit22=1, bit21=0,
-    //                                          bits[15:14]=00, bit13:11=010, bit10=1.
-    //   FSUB v0.4h,v1.4h,v2.4h = 0x0ec21420 -> bit23=1 (a=1), bit22=1, ...
-    // Must precede AdvSimdCopy (bit21=0, bit15=0, bit10=1) which it overlaps
-    // on bit21/bit15/bit10; bit22 distinguishes (Copy has bit22=0, FP16
-    // three-same has bit22=1).  Standard three-same below requires bit21=1
-    // so there's no overlap with that.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 1>() && !GetBits<21, 1>() &&
-        GetBits<14, 2>() == 0b00 && GetBits<10, 1>()) {
-      DecodeAdvSimdFp16ThreeSame();
-      return;
-    }
-
-    // AdvSIMD three same: bit31=0, bits[28:24]=01110, bit21=1, bit10=1
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdThreeSame();
-      return;
-    }
-
-    // AdvSIMD permute (UZP1, TRN1, ZIP1, UZP2, TRN2, ZIP2):
-    // bit31=0, bit29=0, bits[28:24]=01110, bit21=0, bit15=0, bits[11:10]=10.
-    // The bit29=0 check disambiguates from EXT (bit29=1), which otherwise
-    // collides for odd imm4 (bit 11 of EXT's imm4 = 1 yields bits[10:11]=10).
-    // Must be checked BEFORE two-reg misc since both share bits[11:10]=10 but
-    // permute has bit21=0 while two-reg misc has bit21=1 (bits[21:17]=10000).
-    if (!bit31 && !GetBits<29, 1>() && GetBits<24, 5>() == 0b01110 &&
-        !GetBits<21, 1>() && !GetBits<15, 1>() && GetBits<10, 2>() == 0b10) {
-      uint8_t opcode = GetBits<12, 3>();
-      insn_consumer_->AdvSimdPermute(
-          GetBits<0, 5>(),   // rd
-          GetBits<5, 5>(),   // rn
-          GetBits<16, 5>(),  // rm
-          GetBits<22, 2>(),  // size
-          opcode,            // permute opcode (001=UZP1,010=TRN1,011=ZIP1,101=UZP2,110=TRN2,111=ZIP2)
-          GetBits<30, 1>()); // q
-      return;
-    }
-
-    // Cryptographic AES (AESE, AESD, AESMC, AESIMC):
-    //   bit31=0, bit30=1, bit29=0, bits[28:24]=01110, bits[23:22]=00,
-    //   bits[21:17]=10100, bits[16:14]=001, bits[11:10]=10
-    // opcode field bits[16:12] = 00100=AESE, 00101=AESD, 00110=AESMC, 00111=AESIMC.
-    // Must be checked BEFORE AdvSIMD two-reg-misc which also matches
-    // bits[24:5]=01110, bit17=0, bits[11:10]=10 but does not handle these.
-    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0 &&
-        GetBits<17, 5>() == 0b10100 && GetBits<14, 3>() == 0b001 &&
-        GetBits<10, 2>() == 0b10) {
-      insn_consumer_->CryptoAes(
-          GetBits<0, 5>(),    // rd
-          GetBits<5, 5>(),    // rn
-          GetBits<12, 2>());  // 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC
-      return;
-    }
-
-    // Armv8.2-FP16 NEON vector two-register miscellaneous.
-    // Encoding: 0 Q U 0 1 1 1 0 a 1 1 1 1 1 0 opcode 1 0 Rn Rd
-    //   bit31=0, bits[28:24]=01110, bit23=a (free), bit22=1, bits[21:17]=11100,
-    //   bits[11:10]=10.
-    // The std two-reg-misc form (below) sets bits[21:17]=10000; carve out the
-    // FP16 form first so it doesn't fall into the std handler where args.size
-    // would mis-route bit22=1 to FP64 element semantics.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 1>() &&
-        GetBits<17, 5>() == 0b11100 && GetBits<10, 2>() == 0b10) {
-      DecodeAdvSimdFp16TwoRegMisc();
-      return;
-    }
-
-    // AdvSIMD two-reg misc: bit31=0, bits[28:24]=01110, bit21=1, bit17=0, bits[11:10]=10
-    // The bit21=1 check is load-bearing: EXT (bit21=0) with an odd imm4 also has
-    // bits[11:10]=10 and bit17 derived from Rm, so without it EXT is swallowed
-    // here and never reaches its handler below.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<21, 1>() && !GetBits<17, 1>() &&
-        GetBits<10, 2>() == 0b10) {
-      DecodeAdvSimdTwoRegMisc();
-      return;
-    }
-
-    // AdvSIMD copy (DUP, INS, SMOV, UMOV): bit31=0, bits[28:24]=01110, bit21=0, bit15=0, bit10=1
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && !GetBits<21, 1>() && !GetBits<15, 1>() && GetBits<10, 1>()) {
-      DecodeAdvSimdCopy();
-      return;
-    }
-
-    // AdvSIMD vector x indexed element: bit31=0, bits[28:24]=01111, bit10=0
-    if (!bit31 && GetBits<24, 5>() == 0b01111 && !GetBits<10, 1>()) {
-      DecodeAdvSimdVecXIndexedElement();
-      return;
-    }
-
-    // AdvSIMD shift by immediate: bit31=0, bits[28:24]=01111, bit10=1, immh!=0000
-    if (!bit31 && GetBits<24, 5>() == 0b01111 && GetBits<10, 1>() && GetBits<19, 4>() != 0) {
-      DecodeAdvSimdShiftByImm();
-      return;
-    }
-
-    // AdvSIMD extract (EXT) and AdvSIMD table lookup (TBL/TBX) share most of
-    // their encoding prefix. They differ on bit29 (op2 in the encoding tree):
-    //   EXT: bit29=1   (i.e. bits[29:24]=101110)
-    //   TBL: bit29=0   (i.e. bits[29:24]=001110)
-    // plus the imm4/len/op subfields differ. We dispatch on bit29.
-    if (!bit31 && GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0 &&
-        !GetBits<21, 1>() && !GetBits<15, 1>() && !GetBits<10, 1>()) {
-      if (GetBits<29, 1>()) {
-        // EXT Vd.<T>, Vn.<T>, Vm.<T>, #index
-        insn_consumer_->AdvSimdExtract(
-            GetBits<0, 5>(),   // rd
-            GetBits<5, 5>(),   // rn
-            GetBits<16, 5>(),  // rm
-            GetBits<11, 4>(),  // imm4 (byte index)
-            GetBits<30, 1>()); // q
-      } else {
-        // TBL/TBX Vd.<T>, {Vn.16B [, V(n+1).16B [, V(n+2).16B [, V(n+3).16B]]]}, Vm.<T>
-        // len = bits[14:13]+1 table registers; op = bit12 (0=TBL, 1=TBX).
-        // bit11 must be 0 for TBL/TBX; any other value is reserved.
-        if (GetBits<11, 1>()) { Undefined(); return; }
-        insn_consumer_->AdvSimdTableLookup(
-            GetBits<0, 5>(),   // rd
-            GetBits<5, 5>(),   // rn (first table register; spans len consecutive)
-            GetBits<16, 5>(),  // rm (index vector)
-            GetBits<13, 2>(),  // len (0..3 → 1..4 table registers)
-            GetBits<12, 1>(),  // op (0=TBL, 1=TBX)
-            GetBits<30, 1>()); // q
-      }
-      return;
-    }
 
     // SHA-512 (FEAT_SHA512) — bit31=1 group, outside the AdvSIMD family.
     // Common prefix: bits[30:24]=1001110, bits[15:12]=1000.
