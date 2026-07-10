@@ -2314,7 +2314,7 @@ class HeavyOptimizerFrontend {
     const uint64_t lo = static_cast<uint64_t>(value);
     // Q==0 operates on the low 64 bits and zeroes the upper 64 of V[rd].
     const uint64_t hi = args.q ? static_cast<uint64_t>(value >> 64) : 0;
-    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+    const int32_t off = GetVRegOffset(args.rd);
 
     // Build the 128-bit immediate constant into a PXOR-zeroed XMM. For Q==0 the
     // high half is left zero by construction.
@@ -2381,7 +2381,7 @@ class HeavyOptimizerFrontend {
     }
     Register masked = ApplyTbi(base);
     const int32_t off = static_cast<int32_t>(args.offset);
-    const int32_t vreg_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt * 16);
+    const int32_t vreg_off = GetVRegOffset(args.rt);
     FpRegister xmm = AllocTempSimdReg();
     if (args.is_store) {
       builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
@@ -2437,8 +2437,8 @@ class HeavyOptimizerFrontend {
         return;
     }
     Register masked = ApplyTbi(addr);
-    const int32_t v1_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt1 * 16);
-    const int32_t v2_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt2 * 16);
+    const int32_t v1_off = GetVRegOffset(args.rt1);
+    const int32_t v2_off = GetVRegOffset(args.rt2);
     if (args.is_store) {
       FpRegister xmm1 = AllocTempSimdReg();
       FpRegister xmm2 = AllocTempSimdReg();
@@ -2519,7 +2519,7 @@ class HeavyOptimizerFrontend {
     }
     Register addr = EmitRegOffsetAddr(base, offset, args.extend_type, args.shift_amount);
     Register masked = ApplyTbi(addr);
-    const int32_t vreg_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt * 16);
+    const int32_t vreg_off = GetVRegOffset(args.rt);
     FpRegister xmm = AllocTempSimdReg();
     if (args.is_store) {
       builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
@@ -2601,7 +2601,7 @@ class HeavyOptimizerFrontend {
         UndefinedReturningVoid();  // reserved imm5
         return;
       }
-      const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      const int32_t off = GetVRegOffset(args.rd);
       FpRegister xmm = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xmm.machine_reg(), off);
       Register src = (args.rn < 31) ? GetReg(args.rn)
@@ -2656,7 +2656,7 @@ class HeavyOptimizerFrontend {
         return;
       }
       const int32_t vn_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
 
       // UMOV Vn.<T>[index] -> Rd (unsigned). Canonical (esize, Q) pairs: B/H/S
       // with Q=0 (Wd), D with Q=1 (Xd). PEXTR zero-extends the extracted
@@ -2761,7 +2761,7 @@ class HeavyOptimizerFrontend {
           break;
       }
       const int32_t vd_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
       FpRegister xd = AllocTempSimdReg();
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
@@ -2840,7 +2840,7 @@ class HeavyOptimizerFrontend {
         return;
       }
       const int32_t vn_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       FpRegister xmm = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xmm.machine_reg(), vn_off);
       if (esize == 1 || esize == 2) {
@@ -2892,7 +2892,7 @@ class HeavyOptimizerFrontend {
       src = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
     }
 
-    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+    const int32_t off = GetVRegOffset(args.rd);
 
     if (esize_bits == 0x08) {  // D (Q==1 only): 2D broadcast.
       FpRegister xmm = AllocTempSimdReg();
@@ -2969,8 +2969,8 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
-    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+    const int32_t vn_off = GetVRegOffset(args.rn);
+    const int32_t vm_off = GetVRegOffset(args.rm);
 
     // PMUL polynomial multiply (vector, byte lanes). ARM ARM C7.2.219: per-lane
     // carry-less (GF(2)[x]) multiply keeping the low 8 bits. The decoder pins
@@ -3101,8 +3101,7 @@ class HeavyOptimizerFrontend {
           break;
       }
       if (invert) {
-        FpRegister ones = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+        FpRegister ones = AllocOnesSimdReg();
         builder_.Gen<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
       }
       SetVRegFull(args.rd, res, args.q);
@@ -3289,7 +3288,7 @@ class HeavyOptimizerFrontend {
       const bool is_fmls =
           (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV);
       const int32_t vd_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
       FpRegister xd = AllocTempSimdReg();
@@ -3396,10 +3395,7 @@ class HeavyOptimizerFrontend {
       } else {
         builder_.Gen<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
-      // AllocZeroedSimdReg establishes a def before the all-ones self-compare
-      // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
-      FpRegister mask = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(mask.machine_reg(), mask.machine_reg());
+      FpRegister mask = AllocOnesSimdReg();
       if (is_double) {
         builder_.Gen<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
       } else {
@@ -3430,7 +3426,7 @@ class HeavyOptimizerFrontend {
       }
       const bool is_mls = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMls);
       const int32_t vd_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
       FpRegister xd = AllocTempSimdReg();
@@ -3474,7 +3470,7 @@ class HeavyOptimizerFrontend {
         args.opcode == Decoder::AdvSimdThreeSameOpcode::kBit ||
         args.opcode == Decoder::AdvSimdThreeSameOpcode::kBif) {
       const int32_t vd_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
       FpRegister xd = AllocTempSimdReg();
@@ -3885,7 +3881,7 @@ class HeavyOptimizerFrontend {
       if (is_accum) {
         // Accumulate the abs-diff (xmax) into Vd at the element width.
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         switch (args.size) {
@@ -4625,9 +4621,9 @@ class HeavyOptimizerFrontend {
     // of the Q ("2") variant.
     if (args.opcode == Op::kPmull) {
       const int32_t vn_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t vm_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
       if (args.size == 0b11) {
         FpRegister xn = AllocTempSimdReg();
         FpRegister xm = AllocTempSimdReg();
@@ -4694,9 +4690,9 @@ class HeavyOptimizerFrontend {
       const bool is_add = (is_addl || is_addw);
       const bool n_is_wide = (is_addw || is_subw);
       const int32_t vn_off_as =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t vm_off_as =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
 
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
@@ -4783,11 +4779,11 @@ class HeavyOptimizerFrontend {
       const bool is_abal =
           (args.opcode == Op::kSabal || args.opcode == Op::kUabal);
       const int32_t vn_off_ab =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t vm_off_ab =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
       const int32_t vd_off_ab =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
 
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
@@ -4906,9 +4902,9 @@ class HeavyOptimizerFrontend {
       const bool is_sub = (args.opcode == Op::kSubhn || args.opcode == Op::kRsubhn);
       const bool is_round = (args.opcode == Op::kRaddhn || args.opcode == Op::kRsubhn);
       const int32_t vn_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t vm_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_o);
@@ -4991,11 +4987,11 @@ class HeavyOptimizerFrontend {
       const bool is_acc = (args.opcode != Op::kSqdmull);
       const bool is_sub = (args.opcode == Op::kSqdmlsl);
       const int32_t vn_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t vm_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
       const int32_t vd_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
 
       // Materialize a broadcast constant (`pattern` in both qwords).
       auto broadcast = [&](uint64_t pattern) -> FpRegister {
@@ -5127,9 +5123,9 @@ class HeavyOptimizerFrontend {
                             args.opcode == Op::kSmlal ||
                             args.opcode == Op::kSmlsl);
     const int32_t vn_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+        GetVRegOffset(args.rn);
     const int32_t vm_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+        GetVRegOffset(args.rm);
 
     FpRegister xn = AllocTempSimdReg();
     FpRegister xm = AllocTempSimdReg();
@@ -5179,7 +5175,7 @@ class HeavyOptimizerFrontend {
     }
 
     const int32_t vd_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+        GetVRegOffset(args.rd);
     FpRegister xd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
     switch (args.size) {
@@ -5240,7 +5236,7 @@ class HeavyOptimizerFrontend {
     const int esize = 1 << args.size;  // 1/2/4/8 bytes (B/H/S/D).
     const int32_t vec_bytes = args.q ? 16 : 8;
     const int32_t vt_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rt * 16);
+        GetVRegOffset(args.rt);
 
     Register base_orig = (args.rn == 31) ? GetSp() : GetReg(args.rn);
     Register base = ApplyTbi(base_orig);
@@ -5373,7 +5369,7 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+    const int32_t vn_off = GetVRegOffset(args.rn);
 
     switch (args.opcode) {
       // REV16 V.<T>, V.<T> (size=00 only): reverse byte order within each 16-bit
@@ -5685,8 +5681,7 @@ class HeavyOptimizerFrontend {
             break;
         }
         if (invert) {
-          FpRegister ones = AllocZeroedSimdReg();
-          builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+          FpRegister ones = AllocOnesSimdReg();
           builder_.Gen<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
         }
         SetVRegFull(args.rd, res, args.q);
@@ -5969,7 +5964,7 @@ class HeavyOptimizerFrontend {
       case Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd: {
         const bool usqadd = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUsqadd);
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         if (args.size == 0b00 || args.size == 0b01) {
           FpRegister xd = AllocTempSimdReg();
           FpRegister xn = AllocTempSimdReg();
@@ -6197,7 +6192,7 @@ class HeavyOptimizerFrontend {
       // the low result lane. size=10 Q=0 (.2S) is reserved; size=11 bails.
       case Decoder::AdvSimdTwoRegMiscOpcode::kAddv: {
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xn = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
         switch (args.size) {
@@ -6260,7 +6255,7 @@ class HeavyOptimizerFrontend {
         const bool is_signed =
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSaddlv);
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xn = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
         switch (args.size) {
@@ -6380,7 +6375,7 @@ class HeavyOptimizerFrontend {
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSmaxv) ||
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSminv);
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xn = AllocTempSimdReg();
         FpRegister xt = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
@@ -6521,7 +6516,7 @@ class HeavyOptimizerFrontend {
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv) ||
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xn = AllocTempSimdReg();
         FpRegister xt = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
@@ -7035,7 +7030,7 @@ class HeavyOptimizerFrontend {
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kSadalp) ||
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kUadalp);
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xn = AllocTempSimdReg();
         FpRegister xres = AllocTempSimdReg();
         // xtmp seeds the all-ones masks via a self-compare, so it needs a def
@@ -7170,7 +7165,7 @@ class HeavyOptimizerFrontend {
         args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun) {
       const auto opc = args.opcode;
       const int32_t vn_off_narrow =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       FpRegister x = AllocTempSimdReg();
       builder_.GenGetSimd<16>(x.machine_reg(), vn_off_narrow);
       // Scrub to lane 0: keep the low (2<<size) source bytes, zero everything
@@ -7288,7 +7283,7 @@ class HeavyOptimizerFrontend {
       const bool is_neg =
           (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqneg);
       const int32_t vn_off_sq =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off_sq);
       // Scrub to lane 0: keep the low (1<<size) bytes, zero everything above,
@@ -7367,7 +7362,7 @@ class HeavyOptimizerFrontend {
       const bool is_unsigned =
           (args.opcode == Decoder::AdvSimdScalarTwoRegMiscOpcode::kFcvtau);
       const int32_t vn_off_a =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       FpRegister xn = AllocTempSimdReg();
       FpRegister copysign = AllocZeroedSimdReg();
       FpRegister half = AllocTempSimdReg();
@@ -7480,7 +7475,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     const int32_t vn_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+        GetVRegOffset(args.rn);
     // SCVTF / UCVTF scalar (S): int32 -> FP32.  Mirror the kScvtfV/kUcvtfV FP32
     // recipe on a lane-0-scrubbed source.
     if (is_scvtf || is_ucvtf) {
@@ -7618,9 +7613,9 @@ class HeavyOptimizerFrontend {
     const bool is_round =
         (args.opcode == Decoder::AdvSimdScalarThreeSameOpcode::kSqrdmulhScalar);
     const int32_t vn_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+        GetVRegOffset(args.rn);
     const int32_t vm_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+        GetVRegOffset(args.rm);
     if (args.size == 0b01) {
       FpRegister xn = AllocTempSimdReg();
       FpRegister xm = AllocTempSimdReg();
@@ -7772,7 +7767,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     const int32_t vn_off =
-        static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+        GetVRegOffset(args.rn);
     const uint16_t immh_immb = static_cast<uint16_t>((immh << 3) | args.immb);
 
     switch (args.opcode) {
@@ -7985,7 +7980,7 @@ class HeavyOptimizerFrontend {
             static_cast<uint8_t>(2 * esize_bits - immh_immb);
         const int8_t cnt = static_cast<int8_t>(shift_count);
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         FpRegister xn = AllocTempSimdReg();
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
@@ -8110,7 +8105,7 @@ class HeavyOptimizerFrontend {
         if (is_accumulate) {
           FpRegister xd = AllocTempSimdReg();
           const int32_t vd_off =
-              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+              GetVRegOffset(args.rd);
           // Load orig Vd before the writeback; rd==rn safe (independent temps).
           builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
           if (esize_bits == 16) {
@@ -8164,7 +8159,7 @@ class HeavyOptimizerFrontend {
         // Load Vd up front; rd==rn is safe because xn/xd are independent temps
         // and the writeback (SetVRegFull) happens last.
         const int32_t vd_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+            GetVRegOffset(args.rd);
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         if (is_sli) {
           // Vd = (Vd keep low `shift` bits) | (Vn << shift).
@@ -8431,7 +8426,7 @@ class HeavyOptimizerFrontend {
         } else {
           // SHRN2: place the narrowed lanes in Vd[127:64], preserving Vd[63:0].
           const int32_t vd_off =
-              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+              GetVRegOffset(args.rd);
           FpRegister xd = AllocTempSimdReg();
           builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
           FpRegister xdlow = AllocZeroedSimdReg();
@@ -8692,7 +8687,7 @@ class HeavyOptimizerFrontend {
           // Q=1 ("...2" form): place narrowed lanes in Vd[127:64], preserve
           // Vd[63:0].
           const int32_t vd_off =
-              static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+              GetVRegOffset(args.rd);
           FpRegister xd = AllocTempSimdReg();
           builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
           FpRegister xdlow = AllocZeroedSimdReg();
@@ -8762,11 +8757,11 @@ class HeavyOptimizerFrontend {
       const bool is_acc = (args.opcode != Op::kSqdmullIdx);
       const bool is_sub = (args.opcode == Op::kSqdmlslIdx);
       const int32_t vn_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t vm_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
       const int32_t vd_o =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
 
       // Materialize a broadcast constant (`pattern` in both qwords).
       auto broadcast = [&](uint64_t pattern) -> FpRegister {
@@ -8939,9 +8934,9 @@ class HeavyOptimizerFrontend {
       const bool w_sub = (args.opcode == Op::kSmlslIdx ||
                           args.opcode == Op::kUmlslIdx);
 
-      const int32_t w_vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
-      const int32_t w_vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
-      const int32_t w_vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+      const int32_t w_vn_off = GetVRegOffset(args.rn);
+      const int32_t w_vm_off = GetVRegOffset(args.rm);
+      const int32_t w_vd_off = GetVRegOffset(args.rd);
 
       FpRegister wm = AllocTempSimdReg();
       FpRegister wn = AllocTempSimdReg();
@@ -9054,11 +9049,11 @@ class HeavyOptimizerFrontend {
         return;
       }
       const int32_t fp_vn_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
+          GetVRegOffset(args.rn);
       const int32_t fp_vm_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
+          GetVRegOffset(args.rm);
       const int32_t fp_vd_off =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+          GetVRegOffset(args.rd);
 
       FpRegister fxn = AllocTempSimdReg();
       FpRegister fxm = AllocTempSimdReg();
@@ -9186,9 +9181,9 @@ class HeavyOptimizerFrontend {
     }
     const bool is_halfword = (args.size == 0b01);
 
-    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rn * 16);
-    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rm * 16);
-    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + args.rd * 16);
+    const int32_t vn_off = GetVRegOffset(args.rn);
+    const int32_t vm_off = GetVRegOffset(args.rm);
+    const int32_t vd_off = GetVRegOffset(args.rd);
 
     FpRegister xn = AllocTempSimdReg();
     FpRegister xm = AllocTempSimdReg();
@@ -9265,8 +9260,8 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rn * 16);
-    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    const int32_t vn_off = GetVRegOffset(rn);
+    const int32_t vm_off = GetVRegOffset(rm);
     if (!q) {
       // 64-bit form: 8-byte window, index 0..7 (imm4[3] set is UNDEFINED).
       if (index >= 8) {
@@ -9341,8 +9336,8 @@ class HeavyOptimizerFrontend {
       UndefinedReturningVoid();
       return;
     }
-    const int32_t vn_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rn * 16);
-    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
+    const int32_t vn_off = GetVRegOffset(rn);
+    const int32_t vm_off = GetVRegOffset(rm);
     FpRegister xn = AllocTempSimdReg();
     FpRegister xm = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
@@ -9539,8 +9534,8 @@ class HeavyOptimizerFrontend {
     // result and forms the running "any table hit" mask. TBL zeroes misses; TBX
     // blends the original Vd back into the miss lanes.
     const uint8_t table_regs = static_cast<uint8_t>(len + 1);  // 1..4
-    const int32_t vm_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rm * 16);
-    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rd * 16);
+    const int32_t vm_off = GetVRegOffset(rm);
+    const int32_t vd_off = GetVRegOffset(rd);
 
     FpRegister xmm_idx        = AllocTempSimdReg();
     FpRegister xmm_acc        = AllocTempSimdReg();
@@ -9566,7 +9561,7 @@ class HeavyOptimizerFrontend {
 
     for (uint8_t r = 0; r < table_regs; ++r) {
       const int32_t vn_off_r =
-          static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + ((rn + r) & 31) * 16);
+          GetVRegOffset(((rn + r) & 31));
 
       // shifted_idx_r = Vm - r*16 (bytewise wrap). For r=0 this is just Vm.
       builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_idx.machine_reg());
@@ -9664,7 +9659,7 @@ class HeavyOptimizerFrontend {
       for (uint8_t r = 0; r < num_regs; r++) {
         const uint8_t vreg = (rt + r) & 31;
         const int32_t vt_off =
-            static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + vreg * 16);
+            GetVRegOffset(vreg);
         if (is_store) {
           FpRegister xmm = AllocTempSimdReg();
           builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
@@ -9756,7 +9751,7 @@ class HeavyOptimizerFrontend {
 
     for (uint8_t r = 0; r < num_regs; r++) {
       const uint8_t vreg = (rt + r) & 31;
-      const int32_t vt_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + vreg * 16);
+      const int32_t vt_off = GetVRegOffset(vreg);
       const int32_t mem_off = static_cast<int32_t>(r) * vec_bytes;
       if (is_store) {
         FpRegister xmm = AllocTempSimdReg();
@@ -9899,6 +9894,13 @@ class HeavyOptimizerFrontend {
   // GetThreadStateRegOffset helper like riscv64).
   static int32_t GetThreadStateRegOffset(uint8_t reg);
   static int32_t GetThreadStateSpOffset();
+
+  // Byte offset of guest V[reg] within ThreadState, i.e. the displacement used
+  // by every GenGetSimd/GenSetSimd/MOVDQA against RBP. Equals
+  // offsetof(ThreadState, cpu.v[0]) + reg * 16 (each v[] slot is 16 bytes).
+  static int32_t GetVRegOffset(unsigned reg) {
+    return static_cast<int32_t>(GetThreadStateSimdRegOffset(static_cast<int>(reg)));
+  }
 
   // Syntax sugar mirroring riscv64's Gen<> adapter. It threads guest temp
   // registers through PseudoCopy for SSA form and dispatches to the
@@ -10102,7 +10104,7 @@ class HeavyOptimizerFrontend {
   // leaving a stale memory read. For S the extra 4 bytes loaded are harmless:
   // the scalar SSE op (ADDSS/MULSS/...) operates on lane 0 only.
   [[nodiscard]] FpRegister GetVRegScalar(uint8_t reg, bool /*is_double*/) {
-    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    const int32_t off = GetVRegOffset(reg);
     return FpRegister{
         std::get<0>(Gen<x86_64::MovsdXRegOp>({.base = x86_64::kMachineRegRBP, .disp = off}))};
   }
@@ -10116,6 +10118,18 @@ class HeavyOptimizerFrontend {
     builder_.Gen<PseudoDefReg>(zero.machine_reg());
     builder_.Gen<x86_64::PxorXRegXReg>(zero.machine_reg(), zero.machine_reg());
     return zero;
+  }
+
+  // Allocate an XMM preset to all-ones (every bit set), the common source for
+  // sign/mask/-1 constants. Must start from AllocZeroedSimdReg(): a self-Pcmpeq
+  // on a fresh undefined vreg is a use-before-def for the lifetime analysis
+  // (reg_class_ CHECK), so the zeroing def makes the self-read legal. The
+  // Pcmpeq width is irrelevant to the result (all-ones regardless of element
+  // size); PCMPEQD is used as the single canonical form.
+  [[nodiscard]] FpRegister AllocOnesSimdReg() {
+    FpRegister ones = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+    return ones;
   }
 
   // Write the scalar `value` (in lane 0) to guest V[reg] and ZERO the upper
@@ -10134,7 +10148,7 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    const int32_t off = GetVRegOffset(reg);
     FpRegister merged = AllocZeroedSimdReg();
     if (is_double) {
       builder_.Gen<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
@@ -10152,7 +10166,7 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    const int32_t off = GetVRegOffset(reg);
     FpRegister merged = AllocZeroedSimdReg();
     if (is_double) {
       // MOVQ xmm, r64 zero-extends into the XMM (upper 64 cleared).
@@ -10179,7 +10193,7 @@ class HeavyOptimizerFrontend {
     if (!success()) {
       return;
     }
-    const int32_t off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + reg * 16);
+    const int32_t off = GetVRegOffset(reg);
     if (q) {
       builder_.GenSetSimd<16>(off, value.machine_reg());
       return;
@@ -10202,7 +10216,7 @@ class HeavyOptimizerFrontend {
       SetVRegFull(rd, narrowed, /*q=*/false);
       return;
     }
-    const int32_t vd_off = static_cast<int32_t>(offsetof(ThreadState, cpu.v[0]) + rd * 16);
+    const int32_t vd_off = GetVRegOffset(rd);
     builder_.Gen<x86_64::PslldqXRegImm>(narrowed.machine_reg(), int8_t{8});
     FpRegister xd = AllocTempSimdReg();
     FpRegister xd_low = AllocZeroedSimdReg();
