@@ -353,6 +353,218 @@ class Arm64DifferentialFuzz : public ::testing::Test {
     return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) |
            (rm << 16) | (opcode << 11) | (1u << 10) | (rn << 5) | rd;
   }
+
+  // AdvSIMD two-register miscellaneous (INTEGER forms only):
+  //   0 Q U 01110 size 10000 opcode 10 Rn Rd.
+  // Sweeps the integer / bitwise / compare / narrowing opcode set the decoder
+  // routes through DecodeAdvSimdTwoRegMisc with bit20=0 (the true two-reg-misc
+  // space, NOT the bit20=1 across-lanes reductions, which have a distinct
+  // reg-mapping shape). rd aliases rn ~half the time to sample the destructive
+  // in-place lowering (x86 SSE is 2-operand while the ARM op is not).
+  //
+  // Note: today the LITE tier JITs only CMEQ #0 (kCmeqZero, the linker's
+  // calculate_gnu_hash_neon path) in this class; every other opcode bails to the
+  // interpreter and is kDeclined (skipped) by the differential -- so the sweep
+  // guards that one JIT'd op now and auto-covers the rest as the lite handler
+  // grows. The compared>threshold guard is set accordingly low below.
+  //
+  // FP two-register-misc forms are intentionally EXCLUDED: the FP-result ops
+  // (FABS/FNEG/FRINT*/FSQRT/FCVTN/FCVTL/FRECPE/FRSQRTE/SCVTF/UCVTF) can diverge
+  // JIT-vs-interp on NaN payloads / rounding-mode edges exactly like the excluded
+  // FP three-same class, and the FP->int converts (FCVTZS.., FCVTAS..) are pinned
+  // by the ScalarFpConversion generator and the heavy FCVTA/FRINT generators. The
+  // integer set here is bit-exact under fully-random input, so any divergence is
+  // a real miscompile.
+  uint32_t GenAdvSimdTwoRegMisc() {
+    // opcode; fixed_u (-1 = sweep U); smax (sweep size in [0, smax]); fixed_size
+    // (-1 = sweep). When the chosen size is 0b11 (.2D) Q is forced to 1 -- the
+    // .1D form (size=11, Q=0) is unallocated for these.
+    static const struct {
+      uint8_t opcode;
+      int8_t fixed_u;
+      int8_t smax;
+      int8_t fixed_size;
+    } kEnc[] = {
+        {0b00000, -1, 1, -1},  // REV64 (U=0) / REV32 (U=1); size 00/01 valid for both
+        {0b00001,  0, 0,  0},  // REV16 (U=0, size=00)
+        {0b00010, -1, 2, -1},  // SADDLP / UADDLP
+        {0b00011, -1, 2, -1},  // SUQADD / USQADD (bit20=0)
+        {0b00100, -1, 2, -1},  // CLS / CLZ
+        {0b00101,  0, 0,  0},  // CNT  (U=0, size=00)
+        {0b00101,  1, 0,  0},  // NOT  (U=1, size=00)
+        {0b00101,  1, 1,  1},  // RBIT (U=1, size=01)
+        {0b00110, -1, 2, -1},  // SADALP / UADALP
+        {0b00111, -1, 3, -1},  // SQABS / SQNEG (.2D=>Q=1)
+        {0b01000, -1, 3, -1},  // CMGT #0 / CMGE #0 (integer)
+        {0b01001, -1, 3, -1},  // CMEQ #0 / CMLE #0 (integer)
+        {0b01010,  0, 3, -1},  // CMLT #0 (U=0 only, integer)
+        {0b01011, -1, 3, -1},  // ABS / NEG
+        {0b10010, -1, 2, -1},  // XTN / SQXTUN
+        {0b10100, -1, 2, -1},  // SQXTN / UQXTN
+    };
+    const auto& e = kEnc[Rnd() % (sizeof(kEnc) / sizeof(kEnc[0]))];
+    uint32_t u = (e.fixed_u < 0) ? (Rnd() & 1) : static_cast<uint32_t>(e.fixed_u);
+    uint32_t size = (e.fixed_size < 0) ? (Rnd() % (e.smax + 1))
+                                       : static_cast<uint32_t>(e.fixed_size);
+    uint32_t q = (size == 3) ? 1u : (Rnd() & 1);  // .2D needs Q=1
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // ~50% in-place (rd==rn)
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) |
+           (static_cast<uint32_t>(e.opcode) << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
+
+  // AdvSIMD scalar three-same (INTEGER forms only):
+  //   01 U 11110 size 1 Rm opcode 1 Rn Rd  (bit30=1, the 01011110 prefix).
+  // Single-lane integer ops; rd aliases rn or rm to sample the destructive
+  // lowering. The lite tier JITs the whole integer set (ADD/SUB, CMxx, S/U SHL,
+  // the S/U-Q saturating add/sub/shift ladder, SQDMULH/SQRDMULH), so the accept
+  // rate is high.
+  //
+  // FP scalar-three-same (FABD/FMULX/FCMxx/FACxx/FRECPS/FRSQRTS, opcodes
+  // 11010/11011/11100/11101/11111) are EXCLUDED for the same NaN-payload reason
+  // as the FP three-same class.
+  uint32_t GenAdvSimdScalarThreeSame() {
+    // opcode; size_mode: 0 = all B/H/S/D (sweep 0..3), 1 = H/S only (01/10),
+    // 2 = D only (size=11).
+    static const struct {
+      uint8_t opcode;
+      uint8_t size_mode;
+    } kEnc[] = {
+        {0b00001, 0},  // SQADD / UQADD   (B/H/S/D)
+        {0b00101, 0},  // SQSUB / UQSUB   (B/H/S/D)
+        {0b01001, 0},  // SQSHL / UQSHL   (B/H/S/D)
+        {0b01011, 0},  // SQRSHL / UQRSHL (B/H/S/D)
+        {0b01010, 2},  // SRSHL / URSHL   (D only)
+        {0b10110, 1},  // SQDMULH / SQRDMULH (H/S only)
+        {0b00110, 2},  // CMGT / CMHI     (D only)
+        {0b00111, 2},  // CMGE / CMHS     (D only)
+        {0b01000, 2},  // SSHL / USHL     (D only)
+        {0b10000, 2},  // ADD / SUB       (D only)
+        {0b10001, 2},  // CMTST / CMEQ    (D only)
+    };
+    const auto& e = kEnc[Rnd() % (sizeof(kEnc) / sizeof(kEnc[0]))];
+    uint32_t u = Rnd() & 1;
+    uint32_t size;
+    switch (e.size_mode) {
+      case 1: size = 1 + (Rnd() & 1); break;  // 01 or 10
+      case 2: size = 3; break;                // 11 (D)
+      default: size = Rnd() % 4; break;       // 00..11
+    }
+    uint32_t rm = Rnd() % 8, rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));  // alias rn / rm / free
+    return (0b01u << 30) | (u << 29) | (0b11110u << 24) | (size << 22) | (1u << 21) |
+           (rm << 16) | (static_cast<uint32_t>(e.opcode) << 11) | (1u << 10) |
+           (rn << 5) | rd;
+  }
+
+  // AdvSIMD three-different (INTEGER widening / narrowing):
+  //   0 Q U 01110 size Rm opcode 00 Rn Rd  (bit21=1, bits[11:10]=00).
+  // SADDL/…/SMULL/UMULL, ADDHN/SUBHN narrowing-high, SQDMULL/SQDMLAL/SQDMLSL
+  // saturating-doubling, PMULL polynomial. Q selects the source half (the "2"
+  // forms read the upper 64 bits). All integer => bit-exact; rd aliases rn/rm to
+  // sample destructive lowering. The lite tier JITs the widening-MUL family
+  // ({S,U}MULL/MLAL/MLSL) at all sizes; the rest bail (kDeclined).
+  uint32_t GenAdvSimdThreeDiff() {
+    // opcode; umode (-1 = sweep U, 0 = force U=0); size_mode:
+    //   0 = {00,01,10} (widening / narrowing-high),
+    //   1 = {01,10}    (SQDMULL/SQDMLAL/SQDMLSL: size=00 reserved),
+    //   2 = {00,11}    (PMULL: 8-bit and PMULL64; 01/10 unallocated).
+    static const struct {
+      uint8_t opcode;
+      int8_t umode;
+      uint8_t size_mode;
+    } kEnc[] = {
+        {0b0000, -1, 0},  // SADDL / UADDL
+        {0b0001, -1, 0},  // SADDW / UADDW
+        {0b0010, -1, 0},  // SSUBL / USUBL
+        {0b0011, -1, 0},  // SSUBW / USUBW
+        {0b0100, -1, 0},  // ADDHN / RADDHN
+        {0b0101, -1, 0},  // SABAL / UABAL
+        {0b0110, -1, 0},  // SUBHN / RSUBHN
+        {0b0111, -1, 0},  // SABDL / UABDL
+        {0b1000, -1, 0},  // SMLAL / UMLAL
+        {0b1001,  0, 1},  // SQDMLAL (U=0)
+        {0b1010, -1, 0},  // SMLSL / UMLSL
+        {0b1011,  0, 1},  // SQDMLSL (U=0)
+        {0b1100, -1, 0},  // SMULL / UMULL
+        {0b1101,  0, 1},  // SQDMULL (U=0)
+        {0b1110,  0, 2},  // PMULL / PMULL2 (U=0)
+    };
+    const auto& e = kEnc[Rnd() % (sizeof(kEnc) / sizeof(kEnc[0]))];
+    uint32_t u = (e.umode < 0) ? (Rnd() & 1) : 0u;
+    uint32_t size;
+    switch (e.size_mode) {
+      case 1: size = 1 + (Rnd() & 1); break;       // 01 or 10
+      case 2: size = (Rnd() & 1) ? 3 : 0; break;   // 00 or 11 (PMULL64)
+      default: size = Rnd() % 3; break;            // 00 / 01 / 10
+    }
+    uint32_t q = Rnd() & 1;
+    uint32_t rm = Rnd() % 8, rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));  // alias rn / rm / free
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) |
+           (rm << 16) | (static_cast<uint32_t>(e.opcode) << 12) | (rn << 5) | rd;
+  }
+
+  // AdvSIMD vector x indexed element (INTEGER by-element):
+  //   0 Q U 01111 size L M Rm opcode H 0 Rn Rd  (bit10=0).
+  // MUL/MLA/MLS, SQDMULH/SQRDMULH, SQRDMLAH/SQRDMLSH, widening SMULL/UMULL/
+  // SMLAL/UMLAL/SMLSL/UMLSL, and saturating-doubling SQDMULL/SQDMLAL/SQDMLSL, by
+  // a broadcast lane of Vm. size=01 (halfword) uses Vm=Rm[3:0] (V0..V15) with
+  // index=H:L:M (0..7); size=10 (word) uses Vm=M:Rm[3:0] with index=H:L (0..3).
+  // rd aliases rn / the indexed Vm to sample destructive lowering. The FP
+  // by-element forms (FMUL/FMLA/FMLS/FMULX) and the dot-product / BF16 carve-outs
+  // are EXCLUDED (FP NaN payloads + special dispatch); the heavy fuzzer covers
+  // the FP forms with finite-only seeds.
+  uint32_t GenAdvSimdVecXIndexedElement() {
+    static const struct {
+      int8_t u;
+      uint8_t opcode;
+    } kEnc[] = {
+        {0, 0b1000},  // MUL      (U=0)
+        {1, 0b0000},  // MLA      (U=1)
+        {1, 0b0100},  // MLS      (U=1)
+        {0, 0b1100},  // SQDMULH  (U=0)
+        {0, 0b1101},  // SQRDMULH (U=0)
+        {1, 0b1101},  // SQRDMLAH (U=1)
+        {1, 0b1111},  // SQRDMLSH (U=1)
+        {0, 0b1010},  // SMULL    (U=0)
+        {1, 0b1010},  // UMULL    (U=1)
+        {0, 0b0010},  // SMLAL    (U=0)
+        {1, 0b0010},  // UMLAL    (U=1)
+        {0, 0b0110},  // SMLSL    (U=0)
+        {1, 0b0110},  // UMLSL    (U=1)
+        {0, 0b1011},  // SQDMULL  (U=0)
+        {0, 0b0011},  // SQDMLAL  (U=0)
+        {0, 0b0111},  // SQDMLSL  (U=0)
+    };
+    const auto& e = kEnc[Rnd() % (sizeof(kEnc) / sizeof(kEnc[0]))];
+    uint32_t u = static_cast<uint32_t>(e.u);
+    uint32_t q = Rnd() & 1;
+    uint32_t size = 1 + (Rnd() & 1);  // 01 (H) or 10 (S) -- all of these bail at 00/11
+    uint32_t vm = Rnd() % 8;          // <16 keeps halfword Rm valid; M=0 for word
+    uint32_t rn = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 8));
+    uint32_t H, L, M, Rm;
+    if (size == 1) {  // halfword: index 0..7 = H:L:M, Vm = Rm[3:0]
+      uint32_t index = Rnd() % 8;
+      H = index >> 2;
+      L = (index >> 1) & 1;
+      M = index & 1;
+      Rm = vm;
+    } else {  // word: index 0..3 = H:L, Vm = M:Rm[3:0]
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+      M = 0;
+      Rm = vm;
+    }
+    return (q << 30) | (u << 29) | (0b01111u << 24) | (size << 22) | (L << 21) |
+           (M << 20) | (Rm << 16) | (static_cast<uint32_t>(e.opcode) << 12) |
+           (H << 11) | (rn << 5) | rd;
+  }
 };
 
 // -------------------------------------------------------------------------
@@ -443,6 +655,162 @@ TEST_F(Arm64DifferentialFuzz, NeonThreeSame) {
     }
   }
   EXPECT_GT(compared, 500) << "JIT accepted too few three-same encodings";
+}
+
+// Single-instruction AdvSIMD two-register miscellaneous (integer forms). Today
+// the lite tier JITs only CMEQ #0 in this class (linker gnu-hash path); the rest
+// bail to the interpreter (kDeclined). The threshold is set low to match, and
+// rises automatically for free as the lite two-reg-misc handler grows.
+TEST_F(Arm64DifferentialFuzz, AdvSimdTwoRegMisc) {
+  Seed(0x2E600F1512345678ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenAdvSimdTwoRegMisc()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 30) << "JIT accepted too few two-reg-misc encodings";
+}
+
+// Single-instruction AdvSIMD scalar three-same (integer forms). rd aliasing
+// rn/rm sampled; the lite tier JITs the whole integer scalar ladder.
+TEST_F(Arm64DifferentialFuzz, AdvSimdScalarThreeSame) {
+  Seed(0x5CA1A53A5A4E5A3EULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenAdvSimdScalarThreeSame()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 200) << "JIT accepted too few scalar three-same encodings";
+}
+
+// Single-instruction AdvSIMD three-different (integer widening/narrowing). rd
+// aliasing rn/rm sampled; the lite tier JITs the widening-MUL family at all
+// sizes (the rest bail).
+TEST_F(Arm64DifferentialFuzz, AdvSimdThreeDiff) {
+  Seed(0x3D1FF00D2468ACE0ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenAdvSimdThreeDiff()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 200) << "JIT accepted too few three-different encodings";
+}
+
+// Single-instruction AdvSIMD vector x indexed-element (integer by-element). rd
+// aliasing rn / the indexed Vm sampled; the lite tier JITs the integer MUL/MLA/
+// MLS by-element forms (widening / saturating variants bail).
+TEST_F(Arm64DifferentialFuzz, AdvSimdVecXIndexedElement) {
+  Seed(0x1DE7EC7ED00DFEEDULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenAdvSimdVecXIndexedElement()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 200) << "JIT accepted too few by-element encodings";
+}
+
+// Coverage: the four new generators reach the register-aliasing and key
+// opcode/size shapes they exist to stress, so a future refactor that silently
+// stops producing one of them fails loudly rather than making a fuzzer vacuous.
+TEST_F(Arm64DifferentialFuzz, NewFamilyGeneratorCoverage) {
+  bool trm_cmeqz = false, trm_rev = false, trm_2d = false, trm_alias = false;
+  Seed(0x2E600F1500C0FFEEULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenAdvSimdTwoRegMisc();
+    uint32_t opcode = (insn >> 12) & 0x1F, u = (insn >> 29) & 1;
+    uint32_t size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode == 0b01001 && u == 0) trm_cmeqz = true;         // CMEQ #0 (JIT'd)
+    if (opcode == 0b00000) trm_rev = true;                     // REV64/REV32
+    if (size == 3 && q == 1) trm_2d = true;                    // .2D form
+    if (rd == rn) trm_alias = true;
+  }
+  EXPECT_TRUE(trm_cmeqz) << "two-reg-misc generator no longer produces CMEQ #0";
+  EXPECT_TRUE(trm_rev) << "two-reg-misc generator no longer produces REV64/REV32";
+  EXPECT_TRUE(trm_2d) << "two-reg-misc generator no longer produces the .2D form";
+  EXPECT_TRUE(trm_alias) << "two-reg-misc generator no longer produces rd==rn";
+
+  bool s3_add = false, s3_sat = false, s3_dmulh = false, s3_alias = false;
+  Seed(0x5CA1A53A0BADF00DULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenAdvSimdScalarThreeSame();
+    uint32_t opcode = (insn >> 11) & 0x1F;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
+    if (opcode == 0b10000) s3_add = true;                      // ADD/SUB
+    if (opcode == 0b00001 || opcode == 0b00101) s3_sat = true; // SQADD/SQSUB
+    if (opcode == 0b10110) s3_dmulh = true;                    // SQDMULH/SQRDMULH
+    if (rd == rn || rd == rm) s3_alias = true;
+  }
+  EXPECT_TRUE(s3_add) << "scalar three-same generator no longer produces ADD/SUB";
+  EXPECT_TRUE(s3_sat) << "scalar three-same generator no longer produces SQADD/SQSUB";
+  EXPECT_TRUE(s3_dmulh) << "scalar three-same generator no longer produces SQDMULH/SQRDMULH";
+  EXPECT_TRUE(s3_alias) << "scalar three-same generator no longer produces rd==rn/rd==rm";
+
+  bool td_smull = false, td_pmull = false, td_sqdmull = false, td_alias = false;
+  Seed(0x3D1FF00D0F0F0F0FULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenAdvSimdThreeDiff();
+    uint32_t opcode = (insn >> 12) & 0xF, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode == 0b1100) td_smull = true;                     // SMULL/UMULL
+    if (opcode == 0b1110 && u == 0 && size == 3) td_pmull = true;  // PMULL64
+    if (opcode == 0b1101 && u == 0) td_sqdmull = true;         // SQDMULL
+    if (rd == rn) td_alias = true;
+  }
+  EXPECT_TRUE(td_smull) << "three-different generator no longer produces SMULL/UMULL";
+  EXPECT_TRUE(td_pmull) << "three-different generator no longer produces PMULL64";
+  EXPECT_TRUE(td_sqdmull) << "three-different generator no longer produces SQDMULL";
+  EXPECT_TRUE(td_alias) << "three-different generator no longer produces rd==rn";
+
+  bool vx_mul = false, vx_mull = false, vx_half = false, vx_word = false, vx_alias = false;
+  Seed(0x1DE7EC7E13572468ULL);
+  for (int i = 0; i < 40000; i++) {
+    uint32_t insn = GenAdvSimdVecXIndexedElement();
+    uint32_t opcode = (insn >> 12) & 0xF, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode == 0b1000 && u == 0) vx_mul = true;             // MUL
+    if (opcode == 0b1010) vx_mull = true;                      // SMULL/UMULL (widening)
+    if (size == 1) vx_half = true;
+    if (size == 2) vx_word = true;
+    if (rd == rn) vx_alias = true;
+  }
+  EXPECT_TRUE(vx_mul) << "by-element generator no longer produces MUL";
+  EXPECT_TRUE(vx_mull) << "by-element generator no longer produces widening MULL";
+  EXPECT_TRUE(vx_half) << "by-element generator no longer produces halfword";
+  EXPECT_TRUE(vx_word) << "by-element generator no longer produces word";
+  EXPECT_TRUE(vx_alias) << "by-element generator no longer produces rd==rn";
 }
 
 // -------------------------------------------------------------------------

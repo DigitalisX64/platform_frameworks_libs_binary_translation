@@ -739,6 +739,114 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     unsigned __int128 lo = (l1 << 32) | l0, hi = (l3 << 32) | l2;
     return (hi << 64) | lo;
   }
+
+  // AdvSIMD three-same INTEGER across the FULL opcode ladder (0x00..0x17): the
+  // halving/rounding-halving add-sub family (SHADD/SRHADD/SHSUB), the saturating
+  // add/sub/shift ladder (SQADD/SQSUB/SQSHL/SQRSHL and rounding SRSHL/SQRSHL),
+  // the compare family (CMGT/CMGE/CMHI/CMHS/CMTST/CMEQ), min/max and pairwise
+  // min/max (SMAX/SMIN/SMAXP/SMINP), logical (AND/BIC/ORR/ORN/EOR/BSL/BIT/BIF),
+  // MUL/PMUL/MLA/MLS, SQDMULH/SQRDMULH, SABD/SABA and ADD/SUB/ADDP. The existing
+  // GenNeonThreeSame is a narrower curated set of already-lowered opcodes; this
+  // sweeps the whole ladder so a heavy miscompile in a less-common opcode (or a
+  // heavy accept of a reserved-size form) is caught. rd aliases rn/rm to sample
+  // the destructive lowering.
+  //
+  // FP three-same (opcode & 0b11000 == 0b11000, i.e. FADD/FMAX/FMLA/… at
+  // 0x18..0x1F) is EXCLUDED: with random NaN/Inf lanes ARM materializes the
+  // default NaN while x86 SSE propagates a host payload -- implementation-defined,
+  // not a miscompile (identical rationale to the lite fuzzer's FP exclusion).
+  uint32_t GenNeonThreeSameBroad() {
+    // opcode; smax = sweep size in [0, smax]. Per-opcode reserved-size rules are
+    // applied as fix-ups below (SQDMULH H/S-only, PMUL size=00, ADDP U=0).
+    static const struct {
+      uint8_t opcode;
+      uint8_t smax;
+    } kOpc[] = {
+        {0x00, 2},  // SHADD/UHADD
+        {0x01, 3},  // SQADD/UQADD
+        {0x02, 2},  // SRHADD/URHADD
+        {0x03, 3},  // logical: AND/BIC/ORR/ORN (U=0), EOR/BSL/BIT/BIF (U=1)
+        {0x04, 2},  // SHSUB/UHSUB
+        {0x05, 3},  // SQSUB/UQSUB
+        {0x06, 3},  // CMGT/CMHI
+        {0x07, 3},  // CMGE/CMHS
+        {0x08, 3},  // SSHL/USHL
+        {0x09, 3},  // SQSHL/UQSHL
+        {0x0A, 3},  // SRSHL/URSHL
+        {0x0B, 3},  // SQRSHL/UQRSHL
+        {0x0C, 2},  // SMAX/UMAX
+        {0x0D, 2},  // SMIN/UMIN
+        {0x0E, 2},  // SABD/UABD (size=11 reserved)
+        {0x0F, 2},  // SABA/UABA (size=11 reserved)
+        {0x10, 3},  // ADD/SUB
+        {0x11, 3},  // CMTST/CMEQ
+        {0x12, 2},  // MLA/MLS
+        {0x13, 2},  // MUL (U=0) / PMUL (U=1, size=00)
+        {0x14, 2},  // SMAXP/UMAXP
+        {0x15, 2},  // SMINP/UMINP
+        {0x16, 2},  // SQDMULH/SQRDMULH (size 00/11 reserved -> clamped below)
+        {0x17, 3},  // ADDP (U=0 only)
+    };
+    const auto& sel = kOpc[Rnd() % (sizeof(kOpc) / sizeof(kOpc[0]))];
+    uint32_t q = Rnd() & 1, u = Rnd() & 1;
+    uint32_t size = Rnd() % (sel.smax + 1);
+    if (sel.opcode == 0x16) size = 1 + (Rnd() & 1);  // SQDMULH/SQRDMULH: 01/10 only
+    if (sel.opcode == 0x13 && u == 1) size = 0;       // PMUL is size=00 only
+    if (sel.opcode == 0x17) u = 0;                    // ADDP is U=0 only
+    uint32_t rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));  // alias rn / rm / free
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) |
+           (rm << 16) | (static_cast<uint32_t>(sel.opcode) << 11) | (1u << 10) |
+           (rn << 5) | rd;
+  }
+
+  // AdvSIMD two-register miscellaneous INTEGER forms:
+  //   0 Q U 01110 size 10000 opcode 10 Rn Rd  (bit20=0: the two-reg-misc space,
+  // not the bit20=1 across-lanes reductions). The heavy tier lowers a broad slice
+  // of this class (REV16/32/64, ABS/NEG, CLS/CLZ, CNT/NOT, S/U-ADDLP, S/U-ADALP,
+  // SUQADD/USQADD, XTN/SQXTUN/SQXTN/UQXTN, the integer CMxx #0 compares), so the
+  // accept rate is high; SQABS/SQNEG/RBIT bail (kDeclined). rd aliases rn ~half
+  // the time to sample the destructive in-place lowering.
+  //
+  // FP two-reg-misc forms are EXCLUDED for the same NaN-payload / rounding-mode
+  // reason as the FP three-same class; the FP->int and FRINT forms are pinned by
+  // the dedicated GenNeonScalarFcvta / GenNeonFrintV / GenScalarFrintFcvt
+  // generators with corner-value seeds.
+  uint32_t GenNeonTwoRegMisc() {
+    static const struct {
+      uint8_t opcode;
+      int8_t fixed_u;    // -1 = sweep U
+      int8_t smax;       // sweep size in [0, smax]
+      int8_t fixed_size; // -1 = sweep
+    } kEnc[] = {
+        {0b00000, -1, 1, -1},  // REV64 (U=0) / REV32 (U=1); size 00/01
+        {0b00001,  0, 0,  0},  // REV16 (U=0, size=00)
+        {0b00010, -1, 2, -1},  // SADDLP / UADDLP
+        {0b00011, -1, 2, -1},  // SUQADD / USQADD (bit20=0)
+        {0b00100, -1, 2, -1},  // CLS / CLZ
+        {0b00101,  0, 0,  0},  // CNT  (U=0, size=00)
+        {0b00101,  1, 0,  0},  // NOT  (U=1, size=00)
+        {0b00101,  1, 1,  1},  // RBIT (U=1, size=01)
+        {0b00110, -1, 2, -1},  // SADALP / UADALP
+        {0b00111, -1, 3, -1},  // SQABS / SQNEG (.2D=>Q=1)
+        {0b01000, -1, 3, -1},  // CMGT #0 / CMGE #0 (integer)
+        {0b01001, -1, 3, -1},  // CMEQ #0 / CMLE #0 (integer)
+        {0b01010,  0, 3, -1},  // CMLT #0 (U=0 only, integer)
+        {0b01011, -1, 3, -1},  // ABS / NEG
+        {0b10010, -1, 2, -1},  // XTN / SQXTUN
+        {0b10100, -1, 2, -1},  // SQXTN / UQXTN
+    };
+    const auto& e = kEnc[Rnd() % (sizeof(kEnc) / sizeof(kEnc[0]))];
+    uint32_t u = (e.fixed_u < 0) ? (Rnd() & 1) : static_cast<uint32_t>(e.fixed_u);
+    uint32_t size = (e.fixed_size < 0) ? (Rnd() % (e.smax + 1))
+                                       : static_cast<uint32_t>(e.fixed_size);
+    uint32_t q = (size == 3) ? 1u : (Rnd() & 1);  // .2D needs Q=1
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // ~50% in-place (rd==rn)
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) |
+           (static_cast<uint32_t>(e.opcode) << 12) | (0b10u << 10) | (rn << 5) | rd;
+  }
 };
 
 // -------------------------------------------------------------------------
@@ -813,6 +921,94 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameRegion) {
     }
   }
   EXPECT_GT(compared, 100) << "heavy accepted too few three-same regions";
+}
+
+// Single-instruction AdvSIMD three-same integer across the FULL opcode ladder
+// (0x00..0x17). Broader than NeonThreeSame's curated set: catches a heavy
+// miscompile (or a wrong accept of a reserved-size form) anywhere in the ladder.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameBroad) {
+  Seed(0x3B0AD5A311223344ULL);
+  const int kIters = 6000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonThreeSameBroad()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 200) << "heavy accepted too few broad three-same encodings";
+}
+
+// Multi-instruction broad three-same regions: vector data-flow between
+// consecutive ladder ops stresses the heavy SIMD register mapping across the
+// full opcode set (the region analogue of NeonThreeSameBroad).
+TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSameBroadRegion) {
+  Seed(0x3B0AD5A355667788ULL);
+  const int kIters = 4000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    int n = 2 + (Rnd() % 3);  // 2..4 instructions
+    uint32_t code[4];
+    for (int i = 0; i < n; i++) code[i] = GenNeonThreeSameBroad();
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 100) << "heavy accepted too few broad three-same regions";
+}
+
+// Single-instruction AdvSIMD two-register-misc integer forms. The heavy tier
+// lowers a broad slice (REV/ABS/NEG/CLS/CLZ/CNT/NOT/ADDLP/ADALP/SUQADD/XTN/
+// SQXTUN/SQXTN/UQXTN/CMxx#0); SQABS/SQNEG/RBIT bail. rd==rn sampled.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonTwoRegMisc) {
+  Seed(0x2E600F15C0DE1234ULL);
+  const int kIters = 6000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonTwoRegMisc()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 200) << "heavy accepted too few two-reg-misc encodings";
+}
+
+// Multi-instruction two-reg-misc integer regions: chains ladder ops so a value a
+// prior op cached in an XMM is still needed by a later one -- the destructive
+// in-place lowering clobber shape, in the two-reg-misc class.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonTwoRegMiscRegion) {
+  Seed(0x2E600F1555667788ULL);
+  const int kIters = 4000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    int n = 2 + (Rnd() % 3);  // 2..4 instructions
+    uint32_t code[4];
+    for (int i = 0; i < n; i++) code[i] = GenNeonTwoRegMisc();
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 100) << "heavy accepted too few two-reg-misc regions";
 }
 
 // Single-instruction AdvSIMD vector x indexed-element MUL/MLA/MLS by element,
@@ -1346,6 +1542,54 @@ TEST_F(Arm64HeavyDifferentialFuzz, GeneratorCoverage) {
   EXPECT_TRUE(saw_sfrint_d) << "scalar FRINT/FCVT generator no longer produces the D-form (ROUNDSD) path";
   EXPECT_TRUE(saw_sdeclined) << "scalar FRINT/FCVT generator no longer produces the FRINTA/FSQRT declined forms";
   EXPECT_TRUE(saw_sfrint_alias) << "scalar FRINT/FCVT generator no longer produces rd==rn";
+
+  bool bd_shadd = false, bd_sat = false, bd_shift = false, bd_minmax = false;
+  bool bd_addp_2d = false, bd_pmul = false, bd_dmulh_hs = false, bd_alias = false;
+  Seed(0x3B0AD5A300FEDCBAULL);
+  for (int i = 0; i < 60000; i++) {
+    uint32_t insn = GenNeonThreeSameBroad();
+    uint32_t opcode = (insn >> 11) & 0x1F, u = (insn >> 29) & 1;
+    uint32_t size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
+    if (opcode == 0x00) bd_shadd = true;                       // SHADD/UHADD
+    if (opcode == 0x01 || opcode == 0x05) bd_sat = true;       // SQADD/SQSUB
+    if (opcode >= 0x08 && opcode <= 0x0B) bd_shift = true;     // S/U SHL ladder
+    if (opcode == 0x0C || opcode == 0x0D) bd_minmax = true;    // SMAX/SMIN
+    if (opcode == 0x17 && u == 0 && size == 3 && q == 1) bd_addp_2d = true;  // ADDP .2D
+    if (opcode == 0x13 && u == 1 && size == 0) bd_pmul = true; // PMUL
+    if (opcode == 0x16 && (size == 1 || size == 2)) bd_dmulh_hs = true;  // SQDMULH H/S
+    if (rd == rn || rd == rm) bd_alias = true;
+  }
+  EXPECT_TRUE(bd_shadd) << "broad three-same generator no longer produces SHADD/UHADD";
+  EXPECT_TRUE(bd_sat) << "broad three-same generator no longer produces SQADD/SQSUB";
+  EXPECT_TRUE(bd_shift) << "broad three-same generator no longer produces the S/U SHL ladder";
+  EXPECT_TRUE(bd_minmax) << "broad three-same generator no longer produces SMAX/SMIN";
+  EXPECT_TRUE(bd_addp_2d) << "broad three-same generator no longer produces ADDP .2D";
+  EXPECT_TRUE(bd_pmul) << "broad three-same generator no longer produces PMUL (size=00)";
+  EXPECT_TRUE(bd_dmulh_hs) << "broad three-same generator no longer produces SQDMULH H/S";
+  EXPECT_TRUE(bd_alias) << "broad three-same generator no longer produces rd==rn/rd==rm";
+
+  bool trm_cmeqz = false, trm_rev = false, trm_abs = false, trm_narrow = false;
+  bool trm_2d = false, trm_alias = false;
+  Seed(0x2E600F1500C0FFEEULL);
+  for (int i = 0; i < 60000; i++) {
+    uint32_t insn = GenNeonTwoRegMisc();
+    uint32_t opcode = (insn >> 12) & 0x1F, u = (insn >> 29) & 1;
+    uint32_t size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    uint32_t rd = insn & 0x1F, rn = (insn >> 5) & 0x1F;
+    if (opcode == 0b01001 && u == 0) trm_cmeqz = true;         // CMEQ #0 (integer)
+    if (opcode == 0b00000) trm_rev = true;                     // REV64/REV32
+    if (opcode == 0b01011) trm_abs = true;                     // ABS/NEG
+    if (opcode == 0b10010 || opcode == 0b10100) trm_narrow = true;  // XTN/SQXTN/UQXTN
+    if (size == 3 && q == 1) trm_2d = true;                    // .2D form
+    if (rd == rn) trm_alias = true;
+  }
+  EXPECT_TRUE(trm_cmeqz) << "two-reg-misc generator no longer produces CMEQ #0";
+  EXPECT_TRUE(trm_rev) << "two-reg-misc generator no longer produces REV64/REV32";
+  EXPECT_TRUE(trm_abs) << "two-reg-misc generator no longer produces ABS/NEG";
+  EXPECT_TRUE(trm_narrow) << "two-reg-misc generator no longer produces the narrowing forms";
+  EXPECT_TRUE(trm_2d) << "two-reg-misc generator no longer produces the .2D form";
+  EXPECT_TRUE(trm_alias) << "two-reg-misc generator no longer produces rd==rn";
 }
 
 // Regression pin for the store/load-forwarding stale-vreg bug that this harness
