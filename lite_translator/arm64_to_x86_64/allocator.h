@@ -53,6 +53,29 @@ inline constexpr x86_64::Assembler::Register kAllocatableRegisters<x86_64::Assem
      x86_64::Assembler::r15,
      x86_64::Assembler::rdx};
 
+// Enforce the invariants the comment above and the rest of the lite translator rely on:
+//   * exactly 13 allocatable GP registers (temp-vs-permanent accounting in Alloc/AllocTemp
+//     assumes this count);
+//   * rax, rbp, rsp are NOT in the pool — rax holds the guest PC, rbp the ThreadState pointer,
+//     and rsp is the host stack; handing any of them out would corrupt dispatch;
+//   * rcx sits at index 1 so it is consumed early for permanent guest-register mappings rather
+//     than as a temp, per the save/restore-around-shifts note above.
+static_assert(std::size(kAllocatableRegisters<x86_64::Assembler::Register>) == 13,
+              "lite translator GP pool must have exactly 13 registers");
+static_assert(kAllocatableRegisters<x86_64::Assembler::Register>[1] == x86_64::Assembler::rcx,
+              "rcx must stay at index 1 (used early for permanent mappings, not as a temp)");
+static_assert(
+    [] {
+      for (auto reg : kAllocatableRegisters<x86_64::Assembler::Register>) {
+        if (reg == x86_64::Assembler::rax || reg == x86_64::Assembler::rbp ||
+            reg == x86_64::Assembler::rsp) {
+          return false;
+        }
+      }
+      return true;
+    }(),
+    "allocatable GP pool must exclude rax (guest PC), rbp (ThreadState ptr), and rsp (host stack)");
+
 template <>
 inline constexpr x86_64::Assembler::XMMRegister
     kAllocatableRegisters<x86_64::Assembler::XMMRegister>[] = {x86_64::Assembler::xmm0,
