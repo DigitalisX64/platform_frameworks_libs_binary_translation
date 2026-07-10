@@ -3512,23 +3512,6 @@ class Decoder {
       return;
     }
 
-    // Cryptographic AES (AESE, AESD, AESMC, AESIMC):
-    //   bit31=0, bit30=1, bit29=0, bits[28:24]=01110, bits[23:22]=00,
-    //   bits[21:17]=10100, bits[16:14]=001, bits[11:10]=10
-    // opcode field bits[16:12] = 00100=AESE, 00101=AESD, 00110=AESMC, 00111=AESIMC.
-    // Must be checked BEFORE AdvSIMD two-reg-misc which also matches
-    // bits[24:5]=01110, bit17=0, bits[11:10]=10 but does not handle these.
-    if (!bit31 && GetBits<30, 1>() && !GetBits<29, 1>() &&
-        GetBits<24, 5>() == 0b01110 && GetBits<22, 2>() == 0 &&
-        GetBits<17, 5>() == 0b10100 && GetBits<14, 3>() == 0b001 &&
-        GetBits<10, 2>() == 0b10) {
-      insn_consumer_->CryptoAes(
-          GetBits<0, 5>(),    // rd
-          GetBits<5, 5>(),    // rn
-          GetBits<12, 2>());  // 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC
-      return;
-    }
-
     // Armv8.2-FP16 NEON vector two-register miscellaneous.
     // Encoding: 0 Q U 0 1 1 1 0 a 1 1 1 1 1 0 opcode 1 0 Rn Rd
     //   bit31=0, bits[28:24]=01110, bit23=a (free), bit22=1, bits[21:17]=11100,

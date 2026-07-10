@@ -279,11 +279,9 @@ class SemanticsPlayer {
     Register result = listener_->AddSubShiftedReg(args.is_sub, args.set_flags, args.is_64bit,
                                                   src1, src2, args.shift_type,
                                                   args.shift_amount);
-    if (args.set_flags) {
-      SetRegOrIgnore(args.dst, result);
-    } else {
-      SetRegOrIgnore(args.dst, result);
-    }
+    // Unlike the immediate/extended-register forms, the shifted-register form
+    // never writes SP: Rd is the ZR form for both flag-setting and plain ops.
+    SetRegOrIgnore(args.dst, result);
   }
 
   void AddSubExtendedReg(const typename Decoder::AddSubExtendedRegArgs& args) {

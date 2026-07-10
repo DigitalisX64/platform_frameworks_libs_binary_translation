@@ -522,7 +522,7 @@ class Interpreter {
       case Decoder::SystemReg::kFpcr:
         return state_->cpu.cached_fpcr;
       case Decoder::SystemReg::kFpsr:
-        // Plan §L1 — host MXCSR cumulative exception
+        // FPSR exception-flag mirroring: host MXCSR cumulative exception
         // bits set by any FP op (interpreter OR JIT-emitted) reflect into
         // emulated_fpsr at MRS-read time. MXCSR bits are sticky on x86
         // (just like FPSR is on ARM), so this lazy mirror is sufficient
@@ -605,13 +605,13 @@ class Interpreter {
         // (bit 15, output flush) and MXCSR DAZ (bit 6, input flush). Other
         // FPCR fields (DN, AHP, exception enables, FZ16) have no clean x86
         // analog; exception enables are intentionally left masked so host FP
-        // never raises SIGFPE. This is the foundation for §L1 — per-op
-        // MXCSR->FPSR cumulative-flag mirroring is a follow-up.
+        // never raises SIGFPE. The MXCSR->FPSR cumulative-flag mirroring
+        // below builds on this.
         ProgramHostMxcsrFromFpcr(static_cast<uint32_t>(value));
         break;
       case Decoder::SystemReg::kFpsr:
         state_->cpu.emulated_fpsr = static_cast<uint32_t>(value);
-        // Plan §L1 — clear host MXCSR cumulative exception
+        // Clear host MXCSR cumulative exception
         // bits when guest writes FPSR. Without this, future MRS-reads would
         // re-merge stale MXCSR bits that the guest believed it had cleared.
         ClearHostMxcsrExceptions();
@@ -9623,7 +9623,7 @@ class Interpreter {
 
  private:
   // Program host x86 MXCSR rounding mode + FTZ/DAZ from an ARM FPCR value.
-  // Plan §L1 (FP exception flags) infrastructure: writing FPCR via MSR must
+  // FPSR exception-flag infrastructure: writing FPCR via MSR must
   // program MXCSR rounding mode + DAZ/FTZ. Called from the kFpcr MSR case.
   //
   //   ARM FPCR[23:22] RMode: 00=RNE, 01=RP(+inf), 10=RM(-inf), 11=RZ
@@ -9661,7 +9661,7 @@ class Interpreter {
   }
 
   // Clear the host x86 MXCSR cumulative exception flags (bits 0-5: IE/DE/ZE/
-  // OE/UE/PE). Plan §L1: called from the kFpsr MSR write case so that a
+  // OE/UE/PE). Called from the kFpsr MSR write case so that a
   // guest-side FPSR clear also resets the host sticky bits — otherwise the
   // next MRS read would re-mirror stale exceptions the guest believed
   // cleared.
@@ -9675,8 +9675,8 @@ class Interpreter {
   }
 
   // Read host x86 MXCSR cumulative exception flags, map them to ARM FPSR
-  // bit positions, and OR (cumulatively) into emulated_fpsr. Plan §L1:
-  // called from the kFpsr MRS read case (lazy mirror). MXCSR sticky bits
+  // bit positions, and OR (cumulatively) into emulated_fpsr.
+  // Called from the kFpsr MRS read case (lazy mirror). MXCSR sticky bits
   // accumulate across all host FP ops — both interpreter and JIT-emitted —
   // so this single readback at MRS time captures the full cumulative
   // exception state without per-op JIT instrumentation.
@@ -10398,38 +10398,6 @@ class Interpreter {
       FaultyLoadResult fl = FaultyLoad(host_addr, bytes);
       if (fl.is_fault) { HandleMemoryFault(reinterpret_cast<uint64_t>(host_addr)); return; }
       state_->cpu.v[rt] = static_cast<__uint128_t>(fl.value);
-      return;
-    }
-    state_->cpu.v[rt] = 0;  // zero-extend upper bits
-    switch (size) {
-      case Decoder::SimdLoadStoreSize::k8bit: {
-        uint8_t val;
-        memcpy(&val, host_addr, 1);
-        state_->cpu.v[rt] = val;
-        break;
-      }
-      case Decoder::SimdLoadStoreSize::k16bit: {
-        uint16_t val;
-        memcpy(&val, host_addr, 2);
-        state_->cpu.v[rt] = val;
-        break;
-      }
-      case Decoder::SimdLoadStoreSize::k32bit: {
-        uint32_t val;
-        memcpy(&val, host_addr, 4);
-        state_->cpu.v[rt] = val;
-        break;
-      }
-      case Decoder::SimdLoadStoreSize::k64bit: {
-        uint64_t val;
-        memcpy(&val, host_addr, 8);
-        state_->cpu.v[rt] = val;
-        break;
-      }
-      case Decoder::SimdLoadStoreSize::k128bit: {
-        memcpy(&state_->cpu.v[rt], host_addr, 16);
-        break;
-      }
     }
   }
 
