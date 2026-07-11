@@ -39,6 +39,16 @@ struct KnownVariable {
 void DoBadThunk();
 void DoBadTrampoline(HostCode callee, ThreadState* state);
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// arm64-only loud, non-fatal replacement for DoBadTrampoline. Installed by
+// InterceptSymbol at the DoBadTrampoline fall-through sites so an uncovered bad
+// symbol degrades to a greppable trace + zeroed x0 instead of a SIGABRT. See
+// the definition in proxy_library_builder.cc.
+void DoGracefulBadTrampoline(HostCode callee, ThreadState* state);
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+// endregion
+
 class ProxyLibraryBuilder {
  public:
   ProxyLibraryBuilder() = default;
