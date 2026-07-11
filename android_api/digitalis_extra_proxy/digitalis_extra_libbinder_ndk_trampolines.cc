@@ -34,9 +34,12 @@
 //       (proxied) AIBinder_* functions, so verbatim pass-through is correct —
 //       the same convention every other AIBinder* parameter in the table uses.
 //
-//   _Z25AIBinder_toPlatformBinderP8AIBinder - NOT covered: returns a C++
+//   _Z25AIBinder_toPlatformBinderP8AIBinder - contract-stubbed: returns a C++
 //       android::sp<IBinder> by value (no NDK-stable C signature); internal
-//       NDK<->platform-binder interop. See digitalis/docs/proxy-coverage-gaps.md.
+//       NDK<->platform-binder interop. A guest cannot use a host sp<IBinder>, so
+//       the stub returns an empty (null) sp via the AAPCS64 sret register (x8)
+//       instead of aborting. See DoStub_AIBinder_toPlatformBinder in
+//       digitalis_extra_stubs.h and digitalis/docs/proxy-coverage-gaps.md.
 //
 // Host functions are reached via the dlsym'd `callee` (not by name) so this
 // static lib adds no libbinder_ndk link dependency to libberberis_arm64.so.
@@ -49,6 +52,7 @@
 #include "berberis/proxy_loader/proxy_library_builder.h"
 #include "berberis/runtime_primitives/host_code.h"
 
+#include "digitalis_extra_stubs.h"
 #include "register_extra_trampolines.h"
 
 namespace berberis {
@@ -77,6 +81,7 @@ const KnownTrampoline kDigitalisExtraLibbinderNdkTrampolines[] = {
      GetTrampolineFunc<auto(void*)->void>(), nullptr},
     {"AServiceManager_registerForServiceNotifications",
      DoCustomTrampoline_AServiceManager_registerForServiceNotifications, nullptr},
+    {"_Z25AIBinder_toPlatformBinderP8AIBinder", DoStub_AIBinder_toPlatformBinder, nullptr},
 };
 
 REGISTER_DIGITALIS_EXTRA_TRAMPOLINES("libbinder_ndk.so", kDigitalisExtraLibbinderNdkTrampolines)
