@@ -416,6 +416,9 @@ cc_test_host {
                 // optimizing backend's code emitter (guest-independent data).
                 "libberberis_macro_assembler_riscv64_to_x86_64",
                 "libberberis_guest_abi_arm64",
+                // arm64 proxy loader: defines DoGracefulBadTrampoline, exercised
+                // by libberberis_digitalis_extra_proxy_arm64_unit_tests.
+                "libberberis_proxy_loader_arm64",
             ],
             whole_static_libs: [
                 "libberberis_tests_main",

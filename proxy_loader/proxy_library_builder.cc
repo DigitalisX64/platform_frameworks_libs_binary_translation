@@ -36,6 +36,15 @@
 #include "berberis/guest_state/guest_state_opaque.h"
 #include "berberis/runtime_primitives/host_function_wrapper_impl.h"
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// Full CPUState definition — DoGracefulBadTrampoline writes the guest return
+// register (x0) directly. arm64-guarded so the guest-agnostic proxy loader
+// (riscv64/arm) keeps only the opaque forward declaration.
+#include "berberis/guest_state/guest_state.h"
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+// endregion
+
 namespace berberis {
 
 void DoBadThunk() {
@@ -49,6 +58,29 @@ void DoBadTrampoline(HostCode callee, ThreadState* state) {
                    name ? name : "[unknown name]",
                    ToHostAddr<void>(GetLinkRegister(GetCPUState(*state))));
 }
+
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// LOUD, non-fatal replacement for DoBadTrampoline used ONLY on the arm64 guest.
+// A DoBadTrampoline symbol that is actually reached — which should never happen
+// for the unreachable framework-internal bulk, since every NDK-stable bad symbol
+// is covered or contract-stubbed (see digitalis/docs/proxy-coverage-gaps.md and
+// the enumerator in digitalis/scripts/) — degrades to a greppable warning and a
+// zeroed integer return instead of a SIGABRT. riscv64/arm keep the fatal
+// DoBadTrampoline above (the upstream bug-detector). This is a last-resort
+// backstop, not a fix: it names the symbol and returns 0; a symbol whose caller
+// dereferences a returned pointer may still fault downstream. The guarantee it
+// backs is "no NDK API call aborts".
+void DoGracefulBadTrampoline(HostCode callee, ThreadState* state) {
+  CHECK(state);
+  const char* name = static_cast<const char*>(callee);
+  TRACE("berberis: BAD-TRAMPOLINE '%s' called from %p — returning 0 (graceful, arm64)",
+        name ? name : "[unknown name]",
+        ToHostAddr<void>(GetLinkRegister(GetCPUState(*state))));
+  GetCPUState(*state).x[0] = 0;
+}
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+// endregion
 
 // region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
@@ -192,7 +224,15 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
         // endregion
         // HACK: DoBadTrampoline needs function name passed as callee!
+        // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+        MakeTrampolineCallable(guest_addr, false, DoGracefulBadTrampoline, name, name);
+#else
+        // endregion
         MakeTrampolineCallable(guest_addr, false, DoBadTrampoline, name, name);
+        // region digitalis
+#endif
+        // endregion
       } else {
         MakeTrampolineCallable(guest_addr, false, function.marshal_and_call, thunk, name);
       }
@@ -216,7 +256,8 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
       thunk = reinterpret_cast<void*>(DoBadThunk);
     }
     if (extra->marshal_and_call == DoBadTrampoline) {
-      MakeTrampolineCallable(guest_addr, false, DoBadTrampoline, name, name);
+      // Already inside the arm64-only block: a bad extra entry degrades loudly.
+      MakeTrampolineCallable(guest_addr, false, DoGracefulBadTrampoline, name, name);
     } else {
       MakeTrampolineCallable(guest_addr, false, extra->marshal_and_call, thunk, name);
     }
