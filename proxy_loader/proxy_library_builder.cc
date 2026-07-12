@@ -92,7 +92,15 @@ struct ExtraRegistry {
   size_t count;
 };
 
-constexpr size_t kMaxExtraRegistries = 8;
+// One slot per RegisterExtraTrampolines call (one per proxied library, and a
+// file may register several — e.g. libGLESv2.so + libGLESv3.so). This MUST stay
+// safely above the number of REGISTER_DIGITALIS_EXTRA_TRAMPOLINES sites under
+// android_api/digitalis_extra_proxy/; overflow is silently dropped below, and a
+// dropped registration un-covers that library's symbols (they fall through to
+// DoGracefulBadTrampoline and return 0), corrupting any app that calls them —
+// tier-independently, and non-deterministically by constructor init order.
+// There are currently 9 registration sites; keep generous headroom.
+constexpr size_t kMaxExtraRegistries = 32;
 ExtraRegistry g_extra_registries[kMaxExtraRegistries];
 size_t g_num_extra_registries = 0;
 
