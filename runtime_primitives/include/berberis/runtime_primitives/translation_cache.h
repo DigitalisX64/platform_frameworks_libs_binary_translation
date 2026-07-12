@@ -161,7 +161,13 @@ class TranslationCache {
   GuestAddr SlowLookupGuestCodeEntryPCByHostPC(HostCode pc);
 
   // Invalidate region of entries.
-  void InvalidateGuestRange(GuestAddr start, GuestAddr end);
+  // Returns true iff it invalidated any already-translated (executable) or
+  // being-wrapped entry — i.e. code a running thread might still be executing,
+  // for which callers must flush the guest code cache. Freshly-written code
+  // with no translation in range returns false, letting the caller skip the
+  // very expensive FlushGuestCodeCache (which forces every guest thread to the
+  // dispatcher) — critical for large IC IVAU flush loops over decrypted code.
+  bool InvalidateGuestRange(GuestAddr start, GuestAddr end);
 
   // Schedules gear shift translation for all lite-translated regions that are within range from
   // target.
