@@ -258,7 +258,7 @@ void TranslationCache::InvalidateEntriesBeingTranslatedUnsafe() {
   translating_.clear();
 }
 
-void TranslationCache::InvalidateGuestRange(GuestAddr start, GuestAddr end) {
+bool TranslationCache::InvalidateGuestRange(GuestAddr start, GuestAddr end) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   // Also invalidate all entries being translated, since they may possibly overlap with the
@@ -275,6 +275,12 @@ void TranslationCache::InvalidateGuestRange(GuestAddr start, GuestAddr end) {
   } else {
     first = guest_entries_.upper_bound(start - max_guest_size_);
   }
+
+  // Tracks whether we invalidated any entry that a running thread might still be
+  // executing (already-translated or being-wrapped). Only then must the caller
+  // flush the guest code cache; a range with no such entry (e.g. freshly-written
+  // code not yet translated) lets the caller skip that very expensive step.
+  bool invalidated_executable = false;
 
   while (first != guest_entries_.end()) {
     auto curr = first++;
@@ -296,12 +302,15 @@ void TranslationCache::InvalidateGuestRange(GuestAddr start, GuestAddr end) {
     } else if (current == kEntryWrapping) {
       // Wrapping entry range is known in advance, so we don't have it in translating_.
       entry->host_code->store(kEntryInvalidating);
+      invalidated_executable = true;
       // Wrapping but invalidated entry is handled in SetWrappedAndUnlock.
     } else {
       entry->host_code->store(kEntryNotTranslated);
       guest_entries_.erase(curr);
+      invalidated_executable = true;
     }
   }
+  return invalidated_executable;
 }
 
 void TranslationCache::TriggerGearShift(GuestAddr target, size_t range) {

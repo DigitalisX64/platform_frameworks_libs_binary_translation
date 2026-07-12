@@ -26,9 +26,18 @@ namespace berberis {
 // Invalidate regions overlapping with the range. Could be pretty slow.
 void InvalidateGuestRange(GuestAddr start, GuestAddr end) {
   TranslationCache* cache = TranslationCache::GetInstance();
-  cache->InvalidateGuestRange(start, end);
-  // TODO(b/28081995): Specify region to avoid flushing too much.
-  FlushGuestCodeCache();
+  // Only flush the guest code cache if an already-translated region was
+  // actually invalidated. FlushGuestCodeCache forces EVERY guest thread to the
+  // dispatcher (its own comment: "really, really, REALLY bad for performance"),
+  // so calling it for a range with nothing translated — e.g. every 64-byte line
+  // of a large IC IVAU flush over freshly-decrypted, not-yet-translated code
+  // (mihoyo anti-tamper) — repeatedly stalls all threads into an ANR. A range
+  // with no executable entry cannot leave any thread running stale code, so
+  // skipping the flush there is correct.
+  if (cache->InvalidateGuestRange(start, end)) {
+    // TODO(b/28081995): Specify region to avoid flushing too much.
+    FlushGuestCodeCache();
+  }
 }
 
 }  // namespace berberis
