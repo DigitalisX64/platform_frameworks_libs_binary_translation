@@ -19,6 +19,16 @@
 
 #include "berberis/guest_os_primitives/guest_signal.h"
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <csignal>
+
+#include "berberis/base/gettid.h"
+#endif
+// endregion
 #include "berberis/base/host_signal.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_abi/guest_call.h"
@@ -78,6 +88,34 @@ void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_si
   CHECK_NE(sa->guest_sa_sigaction, Guest_SIG_DFL);
   CHECK_NE(sa->guest_sa_sigaction, Guest_SIG_IGN);
   CHECK_NE(sa->guest_sa_sigaction, Guest_SIG_ERR);
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // An ARM64 signal handler entry PC must be 4-byte aligned; a misaligned
+  // handler cannot execute — real hardware raises a PC-alignment fault and, for
+  // a synchronous fatal signal masked in its own handler, terminates the
+  // process. Some hardened/anti-tamper libraries deliberately register random,
+  // misaligned handlers as tamper traps that are never meant to fire; delivering
+  // to one here makes the interpreter fetch 4-byte-misaligned garbage, raise
+  // SIGILL, deliver that to another misaligned handler, and livelock forever
+  // (the app "hangs at a black screen", pinning a CPU). Match hardware: take the
+  // signal's default action (terminate) instead of jumping into garbage.
+  if ((static_cast<uint64_t>(sa->guest_sa_sigaction) & 3) != 0) {
+    TRACE("berberis: guest signal %d handler=%p is misaligned (invalid ARM64 PC); "
+          "taking default action (terminate) instead of livelocking",
+          info->si_signo,
+          ToHostAddr<void>(sa->guest_sa_sigaction));
+    // Reset to the host default disposition and re-raise so the host kernel
+    // performs the default action for this signal (terminate + tombstone).
+    struct sigaction dfl {};
+    dfl.sa_handler = SIG_DFL;
+    sigaction(info->si_signo, &dfl, nullptr);
+    syscall(__NR_tgkill, GetpidSyscall(), GettidSyscall(), info->si_signo);
+    // The re-raised signal fires once the ScopedSignalBlocker at the top of this
+    // function unblocks it on return; nothing below should run.
+    return;
+  }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+  // endregion
   // Run guest signal handler. Assume this is
   //   void (*sa_sigaction)(int, siginfo_t*, void*);
   // If this is actually
