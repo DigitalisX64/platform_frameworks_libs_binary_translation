@@ -1680,10 +1680,100 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       return;
     }
 
+    case Decoder::AtomicOp::kLdsmax:
+    case Decoder::AtomicOp::kLdsmin:
+    case Decoder::AtomicOp::kLdumax:
+    case Decoder::AtomicOp::kLdumin: {
+      // LSE atomic min/max: old=[Xn]; [Xn] = {max,min}(old, Xs); Xt = old. Same
+      // CMPXCHG retry loop as LDCLR/LDSET/LDEOR, with a select diamond inside the
+      // loop to compute the new value. 32/64-bit only; byte/half bail to lite.
+      if (args.size != 2 && args.size != 3) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed = (args.op == Decoder::AtomicOp::kLdsmax ||
+                              args.op == Decoder::AtomicOp::kLdsmin);
+      const bool is_max = (args.op == Decoder::AtomicOp::kLdsmax ||
+                           args.op == Decoder::AtomicOp::kLdumax);
+      const bool is_64 = (args.size == 3);
+      Register operand = (args.rs != 31) ? GetReg(args.rs) : GetImm(0);
+
+      auto* ir = builder_.ir();
+      MachineBasicBlock* loop_bb = ir->NewBasicBlock();
+      MachineBasicBlock* pick_old_bb = ir->NewBasicBlock();
+      MachineBasicBlock* pick_op_bb = ir->NewBasicBlock();
+      MachineBasicBlock* cmpxchg_bb = ir->NewBasicBlock();
+      MachineBasicBlock* exit_bb = ir->NewBasicBlock();
+      ir->AddEdge(builder_.bb(), loop_bb);
+      builder_.Gen<PseudoBranch>(loop_bb);
+
+      builder_.StartBasicBlock(loop_bb);
+      Register old = is_64
+          ? std::get<0>(Gen<x86_64::MovqRegOp>({.base = base}))
+          : std::get<0>(Gen<x86_64::MovlRegOp>({.base = base}));
+      // Extend both operands to 64 bits at the guest size so the Cmpq ordering
+      // is correct (64-bit: no-op; 32-bit signed: sign-extend; unsigned: zero-
+      // extend). MovlRegOp already zero-extended `old`; extend a copy for compare.
+      Register ext_old = old;
+      Register ext_op = operand;
+      if (!is_64) {
+        if (is_signed) {
+          ext_old = std::get<0>(Gen<x86_64::MovsxlqRegReg>(old));
+          ext_op = std::get<0>(Gen<x86_64::MovsxlqRegReg>(operand));
+        } else {
+          ext_old = std::get<0>(Gen<x86_64::MovlRegReg>(old));
+          ext_op = std::get<0>(Gen<x86_64::MovlRegReg>(operand));
+        }
+      }
+      Register cmp_flags = std::get<0>(Gen<x86_64::CmpqRegReg>(ext_old, ext_op));
+      // Keep old when old {>=,<=} op (max/min). Signed uses G/L, unsigned A/B.
+      x86_64::Assembler::Condition keep_old =
+          is_max ? (is_signed ? x86_64::Assembler::Condition::kGreaterEqual
+                              : x86_64::Assembler::Condition::kAboveEqual)
+                 : (is_signed ? x86_64::Assembler::Condition::kLessEqual
+                              : x86_64::Assembler::Condition::kBelowEqual);
+      Register new_val = AllocTempReg();
+      ir->AddEdge(loop_bb, pick_old_bb);
+      ir->AddEdge(loop_bb, pick_op_bb);
+      builder_.Gen<PseudoCondBranch>(keep_old, pick_old_bb, pick_op_bb, cmp_flags);
+
+      builder_.StartBasicBlock(pick_old_bb);
+      builder_.Gen<PseudoCopy>(new_val, old, 8);
+      ir->AddEdge(pick_old_bb, cmpxchg_bb);
+      builder_.Gen<PseudoBranch>(cmpxchg_bb);
+
+      builder_.StartBasicBlock(pick_op_bb);
+      builder_.Gen<PseudoCopy>(new_val, operand, 8);
+      ir->AddEdge(pick_op_bb, cmpxchg_bb);
+      builder_.Gen<PseudoBranch>(cmpxchg_bb);
+
+      builder_.StartBasicBlock(cmpxchg_bb);
+      Register expected = Copy(old);
+      Register cmpxchg_flags;
+      Register unused_rax;
+      if (is_64) {
+        std::tie(unused_rax, cmpxchg_flags) =
+            Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, new_val);
+      } else {
+        std::tie(unused_rax, cmpxchg_flags) =
+            Gen<x86_64::LockCmpXchglRegOpReg>(expected, {.base = base}, new_val);
+      }
+      UNUSED_ARGS(unused_rax);
+      ir->AddEdge(cmpxchg_bb, loop_bb);
+      ir->AddEdge(cmpxchg_bb, exit_bb);
+      builder_.Gen<PseudoCondBranch>(
+          x86_64::Assembler::Condition::kNotZero, loop_bb, exit_bb, cmpxchg_flags);
+
+      builder_.StartBasicBlock(exit_bb);
+      if (args.rt != 31) {
+        SetReg(args.rt, old);
+      }
+      return;
+    }
+
     default:
-      // Remaining LSE atomics (LDSMAX/MIN, LDUMAX/MIN), CASP, and the LDXP/STXP
-      // pair forms are not yet mirrored into the heavy tier; bail to the lite
-      // translator (correct, just slower).
+      // CASP and the LDXP/STXP pair forms are not yet mirrored into the heavy
+      // tier; bail to the lite translator (correct, just slower).
       UndefinedReturningVoid();
       return;
   }

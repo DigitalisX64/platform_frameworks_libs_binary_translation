@@ -9248,6 +9248,69 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Ldset32ZeroExtends) {
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000FF00FFULL});  // old Wt zero-extended
 }
 
+// LSE min/max via the CMPXCHG loop + select diamond. Encoders: base F8204000
+// (LDSMAX) / F8205000 (LDSMIN) / F8206000 (LDUMAX) / F8207000 (LDUMIN).
+// LDSMAX X1, X0, [X2]: [mem]=max_signed([mem],Xs). mem=-1, Xs=1 -> signed max=1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmax64Signed) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFFFFFFFFFFULL;  // -1 signed
+  static const uint32_t code[] = {0xF8214040u};  // ldsmax x1, x0, [x2]
+  state_.cpu.x[1] = 0x0000000000000001ULL;         // Xs = 1
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x0000000000000001ULL});         // max(-1, 1) = 1
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFFULL});  // old -> Xt
+}
+
+// LDUMAX with the same bits: unsigned max keeps the large value (distinguishes
+// the unsigned path from the signed test above).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldumax64Unsigned) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFFFFFFFFFFULL;  // UINT64_MAX unsigned
+  static const uint32_t code[] = {0xF8216040u};  // ldumax x1, x0, [x2]
+  state_.cpu.x[1] = 0x0000000000000001ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // max(MAX, 1) = MAX
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+// LDSMIN X1, X0, [X2]: signed min. mem=5, Xs=-1 -> min=-1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmin64Signed) {
+  alignas(8) static uint64_t buf = 0x0000000000000005ULL;
+  static const uint32_t code[] = {0xF8215040u};  // ldsmin x1, x0, [x2]
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;         // Xs = -1
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // min(5, -1) = -1
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000000005ULL});  // old -> Xt
+}
+
+// LDUMIN with the same bits: unsigned min keeps the small value.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldumin64Unsigned) {
+  alignas(8) static uint64_t buf = 0x0000000000000005ULL;
+  static const uint32_t code[] = {0xF8217040u};  // ldumin x1, x0, [x2]
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;         // UINT64_MAX
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x0000000000000005ULL});         // min(5, MAX) = 5
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000000005ULL});
+}
+
+// LDSMAX (32-bit signed): only low 32 compared/written; old Wt zero-extended.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmax32Signed) {
+  alignas(8) static uint64_t buf = 0xAAAAAAAAFFFFFFFFULL;  // low32 = -1 signed
+  static const uint32_t code[] = {0xB8214040u};  // ldsmax w1, w0, [x2]
+  state_.cpu.x[1] = 0x0000000000000001ULL;         // Ws = 1
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xAAAAAAAA00000001ULL});         // low32 max(-1,1)=1; high32 kept
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x00000000FFFFFFFFULL});  // old Wt zero-extended
+}
+
 // LDADD (64-bit): [Xn] += Xs; old value to Xt.
 TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd64) {
   alignas(8) static uint64_t buf = 0x0000000000000100ULL;
