@@ -52,6 +52,7 @@ cc_library_static {
         "digitalis_extra_libnativehelper_trampolines.cc",
         "digitalis_extra_libbinder_ndk_trampolines.cc",
         "digitalis_extra_libcamera2ndk_trampolines.cc",
+        "digitalis_extra_libegl_trampolines.cc",
         "digitalis_extra_libglesv2_trampolines.cc",
         "digitalis_extra_libnativewindow_trampolines.cc",
         "digitalis_extra_libwebviewchromium_plat_support_trampolines.cc",

@@ -42,4 +42,15 @@
         (lib_name), (table), sizeof(table) / sizeof((table)[0]));            \
   }
 
+// Same as above but for OVERRIDES of symbols whose primary table entry already
+// has a working trampoline. The override's marshal function receives a
+// `const ChainedTrampoline*` as its HostCode callee (the primary's resolved
+// {marshal_and_call, thunk}) so it can run the upstream behavior first and only
+// post-process guest state. See RegisterExtraTrampolineOverrides.
+#define REGISTER_DIGITALIS_EXTRA_TRAMPOLINE_OVERRIDES(lib_name, table)        \
+  __attribute__((constructor(101))) static void RegisterDigitalisOverride_##table() { \
+    ::berberis::ProxyLibraryBuilder::RegisterExtraTrampolineOverrides(        \
+        (lib_name), (table), sizeof(table) / sizeof((table)[0]));            \
+  }
+
 #endif  // BERBERIS_ANDROID_API_DIGITALIS_EXTRA_PROXY_REGISTER_EXTRA_TRAMPOLINES_H_
