@@ -6591,6 +6591,57 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec16B) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);  // all equal (0 == 0)
 }
 
+// AES via host AES-NI. Expected values are the interpreter's (from-scratch,
+// FIPS-197) reference outputs for the same vectors.
+TEST_F(Arm64HeavyOptimizerFrontendTest, AeseNI) {
+  static const uint32_t code[] = {0x4E284820u};  // aese v0.16b, v1.16b
+  SetV128(&state_, 0, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL);
+  SetV128(&state_, 1, 0x0f0f0f0f0f0f0f0fULL, 0x0f0f0f0f0f0f0f0fULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xfe7c6f2b636b6776ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xf201ab7b30d777c5ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, AesdNI) {
+  static const uint32_t code[] = {0x4E285820u};  // aesd v0.16b, v1.16b
+  SetV128(&state_, 0, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL);
+  SetV128(&state_, 1, 0x0f0f0f0f0f0f0f0fULL, 0x0f0f0f0f0f0f0f0fULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3009d79ebf366afbULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x8140a5d552f3a338ULL);
+}
+
+// AESMC exercises the standalone-MixColumns identity AESENC(AESDECLAST(Vn,0),0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, AesmcNI) {
+  static const uint32_t code[] = {0x4E286820u};  // aesmc v0.16b, v1.16b
+  SetV128(&state_, 1, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL);
+  SetV128(&state_, 0, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0104030605000702ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x090c0b0e0d080f0aULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, AesimcNI) {
+  static const uint32_t code[] = {0x4E287820u};  // aesimc v0.16b, v1.16b
+  SetV128(&state_, 1, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL);
+  SetV128(&state_, 0, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x090c0b0e0d080f0aULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0104030605000702ULL);
+}
+
 // SDOT .4S (Q=1): 4 signed byte products summed per lane, accumulated into Vd.
 // Vn bytes all 2, Vm bytes all 3 -> each lane += 4*(2*3)=24; Vd starts non-zero
 // to prove accumulation.

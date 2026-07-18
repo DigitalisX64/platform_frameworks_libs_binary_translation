@@ -72,9 +72,51 @@
     Undefined();
   }
 
+  // AESE/AESD/AESMC/AESIMC via host AES-NI. The ARM ops map to AES-NI as:
+  //   AESE  Vd = ShiftRows(SubBytes(Vd^Vn))       = AESENCLAST(Vd^Vn, 0)
+  //   AESD  Vd = InvShiftRows(InvSubBytes(Vd^Vn)) = AESDECLAST(Vd^Vn, 0)
+  //   AESMC Vd = MixColumns(Vn)                   = AESENC(AESDECLAST(Vn, 0), 0)
+  //        (SubBytes/InvSubBytes and ShiftRows/InvShiftRows cancel, leaving Mix.)
+  //   AESIMC Vd = InvMixColumns(Vn)               = AESIMC(Vn)
+  // opcode: 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC. Bail to the interpreter if the
+  // host lacks AES-NI.
   void CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
-    UNUSED(rd, rn, opcode);
-    Undefined();  // interpreter fallback
+    if (!host_platform::kHasAES) { Undefined(); return; }
+    const int32_t vd_off = VRegOffset(rd);
+    const int32_t vn_off = VRegOffset(rn);
+    SimdRegister xd = AllocTempSimdReg();
+    SimdRegister xzero = AllocTempSimdReg();
+    if (!success()) { return; }
+    as_.Pxor(xzero, xzero);  // zero round key / round constant
+    switch (opcode) {
+      case 0b00:    // AESE
+      case 0b01: {  // AESD
+        SimdRegister xn = AllocTempSimdReg();
+        if (!success()) { return; }
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Pxor(xd, xn);
+        if (opcode == 0b00) {
+          as_.Aesenclast(xd, xzero);
+        } else {
+          as_.Aesdeclast(xd, xzero);
+        }
+        break;
+      }
+      case 0b10:    // AESMC = AESENC(AESDECLAST(Vn, 0), 0)
+        as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Aesdeclast(xd, xzero);
+        as_.Aesenc(xd, xzero);
+        break;
+      default: {    // 0b11 AESIMC = AESIMC(Vn)
+        SimdRegister xn = AllocTempSimdReg();
+        if (!success()) { return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        as_.Aesimc(xd, xn);
+        break;
+      }
+    }
+    as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
   }
 
   void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {

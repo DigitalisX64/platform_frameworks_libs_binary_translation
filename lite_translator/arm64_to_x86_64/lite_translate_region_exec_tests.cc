@@ -41825,6 +41825,61 @@ constexpr uint32_t DotProdIdx(uint8_t q, uint8_t u, uint8_t index,
       | uint32_t{static_cast<uint8_t>(rd & 0x1fu)};
 }
 
+// AES via host AES-NI. Expected values are the interpreter's (from-scratch,
+// FIPS-197) reference outputs for the same vectors, so JIT == interpreter proves
+// the AES-NI mapping.
+TEST_F(Arm64LiteTranslateRegionTest, AeseNI) {
+  uint64_t vd[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+  uint64_t vn[2] = {0x0f0f0f0f0f0f0f0fULL, 0x0f0f0f0f0f0f0f0fULL};
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  static const uint32_t code[] = {0x4E284820u};  // aese v0.16b, v1.16b
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xfe7c6f2b636b6776ULL);
+  EXPECT_EQ(r[1], 0xf201ab7b30d777c5ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AesdNI) {
+  uint64_t vd[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+  uint64_t vn[2] = {0x0f0f0f0f0f0f0f0fULL, 0x0f0f0f0f0f0f0f0fULL};
+  std::memcpy(&state_.cpu.v[0], vd, 16);
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  static const uint32_t code[] = {0x4E285820u};  // aesd v0.16b, v1.16b
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x3009d79ebf366afbULL);
+  EXPECT_EQ(r[1], 0x8140a5d552f3a338ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AesmcNI) {
+  uint64_t vn[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+  uint64_t vd_poison[2] = {~0ULL, ~0ULL};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd_poison, 16);
+  static const uint32_t code[] = {0x4E286820u};  // aesmc v0.16b, v1.16b
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x0104030605000702ULL);
+  EXPECT_EQ(r[1], 0x090c0b0e0d080f0aULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, AesimcNI) {
+  uint64_t vn[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+  uint64_t vd_poison[2] = {~0ULL, ~0ULL};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[0], vd_poison, 16);
+  static const uint32_t code[] = {0x4E287820u};  // aesimc v0.16b, v1.16b
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint64_t r[2];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x090c0b0e0d080f0aULL);
+  EXPECT_EQ(r[1], 0x0104030605000702ULL);
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, SdotVec4S) {
   // SDOT V0.4S, V1.16B, V2.16B — signed dot, Q=1, four 32-bit accumulator lanes.
   int8_t n[16] = {  1,   2,   3,   4,    5,  6,  7,  8,
