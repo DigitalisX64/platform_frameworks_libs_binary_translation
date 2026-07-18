@@ -8696,6 +8696,74 @@ class Interpreter {
       return;
     }
 
+    // SQDMULH / SQRDMULH scalar by-element (H/S). Signed saturating doubling
+    // multiply returning the high half; SQRDMULH rounds. Same single-lane
+    // recipe as the scalar three-same form but reads Vm.lane[index].
+    if (args.opcode == Op::kSqdmulhScalarIdx ||
+        args.opcode == Op::kSqrdmulhScalarIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      const uint8_t esize_q = uint8_t{1} << args.size;  // 2 or 4
+      const uint8_t bits_local = esize_q * 8;           // 16 or 32
+      const int shift_to_64 = 64 - bits_local;
+      __uint128_t src_n_q = state_->cpu.v[args.rn];
+      __uint128_t src_m_q = state_->cpu.v[args.rm];
+      uint64_t n_u = 0, m_u = 0;
+      memcpy(&n_u, reinterpret_cast<const uint8_t*>(&src_n_q), esize_q);
+      memcpy(&m_u,
+             reinterpret_cast<const uint8_t*>(&src_m_q) + args.index * esize_q,
+             esize_q);
+      const int64_t sa = static_cast<int64_t>(n_u << shift_to_64) >> shift_to_64;
+      const int64_t sb = static_cast<int64_t>(m_u << shift_to_64) >> shift_to_64;
+      const __int128 round = (args.opcode == Op::kSqrdmulhScalarIdx)
+                                 ? (static_cast<__int128>(1) << (bits_local - 1))
+                                 : __int128{0};
+      const __int128 product = (static_cast<__int128>(2) * sa * sb) + round;
+      int64_t res = static_cast<int64_t>(product >> bits_local);
+      const int64_t smax = (int64_t{1} << (bits_local - 1)) - 1;
+      const int64_t smin = -(int64_t{1} << (bits_local - 1));
+      res = SatClampSigned(res, smin, smax);
+      const uint64_t mask = (uint64_t{1} << bits_local) - 1;
+      state_->cpu.v[args.rd] =
+          static_cast<__uint128_t>(static_cast<uint64_t>(res) & mask);
+      return;
+    }
+
+    // SQDMULL scalar by-element (H->S or S->D). Signed saturating doubling
+    // multiply long: the doubled product widened to 2x the element width; only
+    // (INT_MIN_in, INT_MIN_in) saturates (to INT_MAX_out). Mirrors the
+    // three-different SQDMULL, single lane, reading Vm.lane[index].
+    if (args.opcode == Op::kSqdmullScalarIdx) {
+      if (args.size != 0b01 && args.size != 0b10) {
+        Undefined();
+        return;
+      }
+      const uint8_t in_esize = uint8_t{1} << args.size;  // 2 (H) or 4 (S)
+      const uint8_t out_esize = static_cast<uint8_t>(in_esize * 2);  // 4 or 8
+      const int in_shift = 64 - in_esize * 8;
+      __uint128_t src_n_l = state_->cpu.v[args.rn];
+      __uint128_t src_m_l = state_->cpu.v[args.rm];
+      uint64_t n_u = 0, m_u = 0;
+      memcpy(&n_u, reinterpret_cast<const uint8_t*>(&src_n_l), in_esize);
+      memcpy(&m_u,
+             reinterpret_cast<const uint8_t*>(&src_m_l) + args.index * in_esize,
+             in_esize);
+      const int64_t sn = static_cast<int64_t>(n_u << in_shift) >> in_shift;
+      const int64_t sm = static_cast<int64_t>(m_u << in_shift) >> in_shift;
+      const int64_t int_min_in = -(int64_t{1} << (in_esize * 8 - 1));
+      const int64_t int_max_out =
+          (out_esize == 8) ? INT64_MAX : ((int64_t{1} << (out_esize * 8 - 1)) - 1);
+      const int64_t doubled =
+          (sn == int_min_in && sm == int_min_in) ? int_max_out : (2 * sn * sm);
+      const uint64_t out_mask =
+          (out_esize == 8) ? ~uint64_t{0} : ((uint64_t{1} << (out_esize * 8)) - 1);
+      state_->cpu.v[args.rd] =
+          static_cast<__uint128_t>(static_cast<uint64_t>(doubled) & out_mask);
+      return;
+    }
+
     if (args.size != 0b00 && args.size != 0b10 && args.size != 0b11) {
       Undefined();
       return;

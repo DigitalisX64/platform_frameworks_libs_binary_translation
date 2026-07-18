@@ -670,6 +670,74 @@ TEST_F(Arm64InterpreterOnlyTest, Sqrdmulh_scalar_s_sat) {
     EXPECT_VREG(0, 0x000000007fffffffULL, 0x0000000000000000ULL);
 }
 
+// Scalar by-element signed saturating doubling multiply. These encodings used
+// to raise SIGILL (decoder Undefined); they now interpret.
+
+// sqdmulh s0, s1, v2.s[0]: (2 * 2^30 * 2^30) >> 32 == 2^29.
+TEST_F(Arm64InterpreterOnlyTest, SqdmulhScalarIdx_s) {
+    SetVReg(1, 0x0000000040000000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x0000000040000000ULL, 0x0000000000000000ULL);
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5f82c020U);  // sqdmulh s0, s1, v2.s[0]
+    EXPECT_VREG(0, 0x0000000020000000ULL, 0x0000000000000000ULL);
+}
+
+// sqdmulh s0, s1, v2.s[1]: selects lane 1 of Vm (lane 0 is zero, so a wrong
+// lane would give 0). Proves the index math.
+TEST_F(Arm64InterpreterOnlyTest, SqdmulhScalarIdx_s_lane1) {
+    SetVReg(1, 0x0000000040000000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x4000000000000000ULL, 0x0000000000000000ULL);  // v2.s[1]=0x40000000
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5fa2c020U);  // sqdmulh s0, s1, v2.s[1]
+    EXPECT_VREG(0, 0x0000000020000000ULL, 0x0000000000000000ULL);
+}
+
+// sqrdmulh s0, s1, v2.s[0] with INT32_MIN operands: rounded high half saturates.
+TEST_F(Arm64InterpreterOnlyTest, SqrdmulhScalarIdx_s_sat) {
+    SetVReg(1, 0x0000000080000000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x0000000080000000ULL, 0x0000000000000000ULL);
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5f82d020U);  // sqrdmulh s0, s1, v2.s[0]
+    EXPECT_VREG(0, 0x000000007fffffffULL, 0x0000000000000000ULL);
+}
+
+// sqdmull d0, s1, v2.s[0]: widening 2*2^30*2^30 == 2^61 into the 64-bit lane.
+TEST_F(Arm64InterpreterOnlyTest, SqdmullScalarIdx_s_to_d) {
+    SetVReg(1, 0x0000000040000000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x0000000040000000ULL, 0x0000000000000000ULL);
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5f82b020U);  // sqdmull d0, s1, v2.s[0]
+    EXPECT_VREG(0, 0x2000000000000000ULL, 0x0000000000000000ULL);
+}
+
+// sqdmull d0, s1, v2.s[0] with INT32_MIN operands: only (INT_MIN,INT_MIN)
+// saturates, to INT64_MAX.
+TEST_F(Arm64InterpreterOnlyTest, SqdmullScalarIdx_s_to_d_sat) {
+    SetVReg(1, 0x0000000080000000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x0000000080000000ULL, 0x0000000000000000ULL);
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5f82b020U);  // sqdmull d0, s1, v2.s[0]
+    EXPECT_VREG(0, 0x7fffffffffffffffULL, 0x0000000000000000ULL);
+}
+
+// sqdmulh h0, h1, v2.h[0]: H form, (2 * 2^14 * 2^14) >> 16 == 2^13.
+TEST_F(Arm64InterpreterOnlyTest, SqdmulhScalarIdx_h) {
+    SetVReg(1, 0x0000000000004000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x0000000000004000ULL, 0x0000000000000000ULL);
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5f42c020U);  // sqdmulh h0, h1, v2.h[0]
+    EXPECT_VREG(0, 0x0000000000002000ULL, 0x0000000000000000ULL);
+}
+
+// sqdmull s0, h1, v2.h[3]: H->S widening with a high lane index.
+TEST_F(Arm64InterpreterOnlyTest, SqdmullScalarIdx_h_to_s_lane3) {
+    SetVReg(1, 0x0000000000004000ULL, 0x0000000000000000ULL);
+    SetVReg(2, 0x4000000000000000ULL, 0x0000000000000000ULL);  // v2.h[3]=0x4000
+    SetVReg(0, 0xffffffffffffffffULL, 0xffffffffffffffffULL);
+    Interpret(0x5f72b020U);  // sqdmull s0, h1, v2.h[3]
+    EXPECT_VREG(0, 0x0000000020000000ULL, 0x0000000000000000ULL);
+}
+
 // aese v0.16b, v1.16b
 TEST_F(Arm64InterpreterOnlyTest, Aese) {
     SetVReg(0, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL);
