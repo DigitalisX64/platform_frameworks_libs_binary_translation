@@ -231,6 +231,34 @@ constexpr uint32_t SdivW(uint8_t rd, uint8_t rn, uint8_t rm) {
 constexpr uint32_t UmulhX(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x9BC07C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
 }
+// CRC32C (Castagnoli) accumulate. Accumulator Wn and result Wd are 32-bit; the
+// data operand is Wm (b/h/w) or Xm (x). Encodings verified with the aarch64
+// assembler (armv8-a+crc).
+//   CRC32CX Wd, Wn, Xm   CRC32CB/CH/CW Wd, Wn, Wm
+constexpr uint32_t Crc32cxWWX(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x9AC05C00 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t Crc32cbWWW(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x1AC05000 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t Crc32chWWW(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x1AC05400 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+constexpr uint32_t Crc32cwWWW(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x1AC05800 | (static_cast<uint32_t>(rm) << 16) | (rn << 5) | rd;
+}
+// Reference CRC32C (Castagnoli, reflected polynomial 0x82F63B78) used to
+// compute expected values without hand-coding hex. Validated in the tests
+// below against the canonical CRC32C("123456789") == 0xE3069283.
+inline uint32_t Crc32cRef(uint32_t crc, const uint8_t* data, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    crc ^= data[i];
+    for (int k = 0; k < 8; ++k) {
+      crc = (crc >> 1) ^ (0x82F63B78u & (~(crc & 1u) + 1u));
+    }
+  }
+  return crc;
+}
 // SBFM/BFM/UBFM Xd, Xn, #immr, #imms (64-bit, N=1).
 constexpr uint32_t SbfmX(uint8_t rd, uint8_t rn, uint8_t immr, uint8_t imms) {
   return 0x93400000 | (static_cast<uint32_t>(immr) << 16) |
@@ -1358,6 +1386,74 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Sdiv64) {
   GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
   ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
   EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(int64_t{-100} / 7));  // -14
+}
+
+// Confirms the reference CRC32C matches the canonical published vector, so the
+// expected values computed from it in the heavy tests below are trustworthy.
+// Crc32cRef models the raw hardware CRC32C accumulate (the ARM CRC32C / x86
+// CRC32 instruction: no initial preset, no final inversion). The canonical
+// CRC-32C/ISCSI checksum of "123456789" (0xE3069283) applies init=0xFFFFFFFF
+// and a final XOR of 0xFFFFFFFF, i.e. ~Crc32cRef(0xFFFFFFFF, msg).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Crc32cReferenceMatchesCanonicalVector) {
+  const uint8_t kCheck[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+  EXPECT_EQ(~Crc32cRef(0xFFFFFFFFu, kCheck, sizeof(kCheck)), uint32_t{0xE3069283});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Crc32cx64BitData) {
+  static const uint32_t code[] = {Crc32cxWWX(0, 1, 2)};
+  state_.cpu.x[1] = 0;                     // Wn accumulator
+  state_.cpu.x[2] = 0x0123456789ABCDEFULL;  // Xm data
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  // The 64-bit data is consumed as 8 little-endian bytes (x86 CRC32 and ARM
+  // CRC32CX process the operand identically).
+  const uint8_t data[8] = {0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01};
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{Crc32cRef(0, data, 8)});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Crc32cxNonZeroAccumulator) {
+  static const uint32_t code[] = {Crc32cxWWX(0, 1, 2)};
+  state_.cpu.x[1] = 0xDEADBEEF;             // Wn accumulator (non-zero)
+  state_.cpu.x[2] = 0xFFFFFFFFFFFFFFFFULL;  // Xm data
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  const uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{Crc32cRef(0xDEADBEEF, data, 8)});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Crc32cbByteData) {
+  static const uint32_t code[] = {Crc32cbWWW(0, 1, 2)};
+  state_.cpu.x[1] = 0x12345678;  // Wn accumulator
+  state_.cpu.x[2] = 0xAABBCCEF;  // only the low byte (0xEF) is consumed
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  const uint8_t data[1] = {0xEF};
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{Crc32cRef(0x12345678, data, 1)});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Crc32chHalfwordData) {
+  static const uint32_t code[] = {Crc32chWWW(0, 1, 2)};
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0xAABBCDEF;  // low halfword (0xCDEF) consumed, LE bytes
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  const uint8_t data[2] = {0xEF, 0xCD};
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{Crc32cRef(0, data, 2)});
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, Crc32cwWordData) {
+  static const uint32_t code[] = {Crc32cwWWW(0, 1, 2)};
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[2] = 0x89ABCDEF;  // low word consumed, LE bytes
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  GuestAddr stop_pc = ToGuestAddr(code) + sizeof(code);
+  const uint8_t data[4] = {0xEF, 0xCD, 0xAB, 0x89};
+  ASSERT_TRUE(RunOneInstruction(&state_, stop_pc));
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{Crc32cRef(0, data, 4)});
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, Sdiv64ByZeroReturnsZero) {
