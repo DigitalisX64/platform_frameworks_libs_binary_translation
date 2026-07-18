@@ -120,6 +120,58 @@ const KnownTrampoline* FindExtraTrampoline(const char* library_name, const char*
   return nullptr;
 }
 
+// Overrides of symbols whose primary entry has a WORKING trampoline (see
+// RegisterExtraTrampolineOverrides in the header). Kept separate from
+// g_extra_registries so plain extras can never accidentally shadow a healthy
+// upstream trampoline.
+ExtraRegistry g_override_registries[kMaxExtraRegistries];
+size_t g_num_override_registries = 0;
+
+const KnownTrampoline* FindExtraTrampolineOverride(const char* library_name, const char* name) {
+  for (size_t i = 0; i < g_num_override_registries; ++i) {
+    const auto& reg = g_override_registries[i];
+    if (strcmp(reg.library_name, library_name) != 0) {
+      continue;
+    }
+    for (size_t j = 0; j < reg.count; ++j) {
+      if (strcmp(reg.trampolines[j].name, name) == 0) {
+        return &reg.trampolines[j];
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Storage for the {primary marshal, primary thunk} chains handed to override
+// trampolines as their callee. One slot per overridden symbol per proxy-library
+// load; proxy libraries load once per process, so a small fixed pool suffices.
+// Slots are never freed — the installed trampoline references them for the
+// process lifetime.
+constexpr size_t kMaxChainedOverrides = 16;
+ChainedTrampoline g_chained_overrides[kMaxChainedOverrides];
+size_t g_num_chained_overrides = 0;
+
+ChainedTrampoline* AllocChainedOverride(TrampolineFunc marshal_and_call, void* thunk) {
+  // Reuse an identical chain: a symbol can be re-intercepted once per guest
+  // linker namespace (Chromium creates many), always with the same resolved
+  // primary, and must not consume a fresh slot each time.
+  for (size_t i = 0; i < g_num_chained_overrides; ++i) {
+    if (g_chained_overrides[i].marshal_and_call == marshal_and_call &&
+        g_chained_overrides[i].thunk == thunk) {
+      return &g_chained_overrides[i];
+    }
+  }
+  if (g_num_chained_overrides >= kMaxChainedOverrides) {
+    TRACE("ProxyLibraryBuilder: chained-override pool full (%zu); override dropped",
+          g_num_chained_overrides);
+    return nullptr;
+  }
+  ChainedTrampoline* chain = &g_chained_overrides[g_num_chained_overrides++];
+  chain->marshal_and_call = marshal_and_call;
+  chain->thunk = thunk;
+  return chain;
+}
+
 // Current protection (PROT_* mask) of the mapping containing `addr`, or -1 if
 // unknown. Parses /proc/self/maps; only called on the cold variable-interception
 // path, so the scan cost is irrelevant.
@@ -189,6 +241,21 @@ void ProxyLibraryBuilder::RegisterExtraTrampolines(const char* library_name,
   }
   g_extra_registries[g_num_extra_registries++] = {library_name, trampolines, count};
 }
+
+void ProxyLibraryBuilder::RegisterExtraTrampolineOverrides(const char* library_name,
+                                                           const KnownTrampoline* trampolines,
+                                                           size_t count) {
+  if (g_num_override_registries >= kMaxExtraRegistries) {
+    TRACE("ProxyLibraryBuilder: override registry full (%zu/%zu); dropping registration "
+          "for \"%s\" (%zu trampolines)",
+          g_num_override_registries,
+          kMaxExtraRegistries,
+          library_name,
+          count);
+    return;
+  }
+  g_override_registries[g_num_override_registries++] = {library_name, trampolines, count};
+}
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
 // endregion
 
@@ -242,6 +309,28 @@ void ProxyLibraryBuilder::InterceptSymbol(GuestAddr guest_addr, const char* name
 #endif
         // endregion
       } else {
+        // region digitalis - a Digitalis-side override registered via
+        // RegisterExtraTrampolineOverrides replaces this healthy primary
+        // trampoline while keeping it callable: the override runs with a
+        // ChainedTrampoline callee holding the primary's resolved
+        // {marshal_and_call, thunk}, so it can execute the upstream behavior
+        // first and only post-process guest state (e.g. libEGL's
+        // eglGetProcAddress adds wrapping for ANGLE extension procs the
+        // upstream table cannot marshal). arm64-only, like the extras registry.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+        if (const KnownTrampoline* override_entry =
+                FindExtraTrampolineOverride(library_name_, name);
+            override_entry != nullptr) {
+          if (ChainedTrampoline* chain =
+                  AllocChainedOverride(function.marshal_and_call, thunk);
+              chain != nullptr) {
+            MakeTrampolineCallable(
+                guest_addr, false, override_entry->marshal_and_call, chain, name);
+            return;
+          }
+        }
+#endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
+        // endregion
         MakeTrampolineCallable(guest_addr, false, function.marshal_and_call, thunk, name);
       }
       return;

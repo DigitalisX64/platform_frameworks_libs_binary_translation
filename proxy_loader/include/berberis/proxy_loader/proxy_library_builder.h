@@ -46,6 +46,16 @@ void DoBadTrampoline(HostCode callee, ThreadState* state);
 // symbol degrades to a greppable trace + zeroed x0 instead of a SIGABRT. See
 // the definition in proxy_library_builder.cc.
 void DoGracefulBadTrampoline(HostCode callee, ThreadState* state);
+
+// Callee payload for an extra-trampoline OVERRIDE of a symbol that has a
+// working primary trampoline (see RegisterExtraTrampolineOverrides). The
+// override's marshal function receives a pointer to this struct as its
+// HostCode callee and can run the primary first:
+//   chain->marshal_and_call(chain->thunk, state);
+struct ChainedTrampoline {
+  TrampolineFunc marshal_and_call;
+  void* thunk;
+};
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
 // endregion
 
@@ -95,6 +105,22 @@ class ProxyLibraryBuilder {
   static void RegisterExtraTrampolines(const char* library_name,
                                        const KnownTrampoline* trampolines,
                                        size_t count);
+
+  // Register KnownTrampoline entries that OVERRIDE a symbol whose primary
+  // table entry already carries a working (non-DoBadTrampoline) trampoline.
+  // Unlike RegisterExtraTrampolines (a fallback for symbols the primary table
+  // misses or marks bad), an override replaces the primary's marshal function
+  // while keeping it reachable: InterceptSymbol installs the override with a
+  // ChainedTrampoline as its callee, holding the primary's resolved
+  // {marshal_and_call, thunk}. The override runs the primary via the chain and
+  // then post-processes guest state — e.g. the libEGL eglGetProcAddress
+  // override reuses the upstream wrap table and only adds handling for
+  // host-present procs the upstream table cannot marshal.
+  //
+  // Same lifetime/thread-safety contract as RegisterExtraTrampolines.
+  static void RegisterExtraTrampolineOverrides(const char* library_name,
+                                               const KnownTrampoline* trampolines,
+                                               size_t count);
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
   // endregion
 
