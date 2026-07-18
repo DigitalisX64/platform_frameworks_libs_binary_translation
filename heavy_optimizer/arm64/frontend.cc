@@ -2755,6 +2755,34 @@ Register HeavyOptimizerFrontend::DataProc2Src(Decoder::DataProc2SrcOpcode opcode
       return EmitUDiv(is_64bit, src1, src2);
     case Decoder::DataProc2SrcOpcode::kSdiv:
       return EmitSDiv(is_64bit, src1, src2);
+    // CRC32C* (Castagnoli) via the host SSE4.2 CRC32 instruction, which uses
+    // the same polynomial as ARM's CRC32C ops. The accumulator is Wn
+    // (zero-extended) and the data is Wm (b/h/w) or Xm (x). Mirrors
+    // lite_translator_integer_ctrl.inc. The IEEE CRC32* ops use a different
+    // polynomial and stay on the interpreter (they fall through to the default
+    // bail below). Bail to lite if the host lacks SSE4.2.
+    case Decoder::DataProc2SrcOpcode::kCrc32cb:
+    case Decoder::DataProc2SrcOpcode::kCrc32ch:
+    case Decoder::DataProc2SrcOpcode::kCrc32cw:
+    case Decoder::DataProc2SrcOpcode::kCrc32cx: {
+      if (!host_platform::kHasSSE4_2) {
+        UndefinedReturningReg();
+        return AllocTempReg();
+      }
+      // Wn accumulator, zero-extended into a fresh 32-bit vreg (upper bits
+      // cleared so the CRC32 result also zero-extends into Xd).
+      Register acc = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+      switch (opcode) {
+        case Decoder::DataProc2SrcOpcode::kCrc32cb:
+          return std::get<0>(Gen<x86_64::Crc32cbRegReg, kNoSSA>(acc, src2));
+        case Decoder::DataProc2SrcOpcode::kCrc32ch:
+          return std::get<0>(Gen<x86_64::Crc32chRegReg, kNoSSA>(acc, src2));
+        case Decoder::DataProc2SrcOpcode::kCrc32cw:
+          return std::get<0>(Gen<x86_64::Crc32cwRegReg, kNoSSA>(acc, src2));
+        default:
+          return std::get<0>(Gen<x86_64::Crc32cxRegReg, kNoSSA>(acc, src2));
+      }
+    }
     default:
       UndefinedReturningReg();
       return AllocTempReg();
