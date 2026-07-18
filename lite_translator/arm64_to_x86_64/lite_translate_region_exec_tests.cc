@@ -6808,6 +6808,25 @@ constexpr uint32_t CaspX(uint8_t rs, uint8_t rt, uint8_t rn) {
   return 0x48207C00 | (static_cast<uint32_t>(rs) << 16) |
          (static_cast<uint32_t>(rn) << 5) | rt;
 }
+// LDXP/STXP (load/store-exclusive pair). Rt and Rt2 are independent register
+// fields (need not be consecutive). Encodings verified with the aarch64
+// assembler. LDXP fixes the Rs field to 0b11111 (unused).
+constexpr uint32_t LdxpW(uint8_t rt, uint8_t rt2, uint8_t rn) {
+  return 0x887F0000 | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t LdxpX(uint8_t rt, uint8_t rt2, uint8_t rn) {
+  return 0xC87F0000 | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t StxpW(uint8_t rs, uint8_t rt, uint8_t rt2, uint8_t rn) {
+  return 0x88200000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rt2) << 10) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
+constexpr uint32_t StxpX(uint8_t rs, uint8_t rt, uint8_t rt2, uint8_t rn) {
+  return 0xC8200000 | (static_cast<uint32_t>(rs) << 16) |
+         (static_cast<uint32_t>(rt2) << 10) | (static_cast<uint32_t>(rn) << 5) | rt;
+}
 
 constexpr uint32_t kDmbIsh = 0xD5033BBF;  // dmb ish
 constexpr uint32_t kDsbIsh = 0xD5033B9F;  // dsb ish
@@ -7495,6 +7514,143 @@ TEST_F(Arm64LiteTranslateRegionTest, CaspPairRtHiIsXzrWritesZeroHighX) {
   EXPECT_EQ(pair_mem.hi, 0x0000000000000000ULL);
   EXPECT_EQ(state_.cpu.x[4], 0x1111111111111111ULL);
   EXPECT_EQ(state_.cpu.x[5], 0x2222222222222222ULL);
+}
+
+// LDXP 32-bit pair: loads [Xn] into Wt and [Xn+4] into Wt2 (each zero-extended)
+// and arms the exclusive monitor.
+TEST_F(Arm64LiteTranslateRegionTest, LdxpLoadsPairW) {
+  alignas(16) static uint64_t target;
+  target = (uint64_t{0x22222222ULL} << 32) | uint64_t{0x11111111ULL};
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  state_.cpu.reservation_address = 0;
+  static const uint32_t code[] = {LdxpW(/*rt=*/0, /*rt2=*/1, /*rn=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0x11111111ULL);  // [Xn]  -> Wt
+  EXPECT_EQ(state_.cpu.x[1], 0x22222222ULL);  // [Xn+4] -> Wt2
+  EXPECT_EQ(state_.cpu.reservation_address, ToGuestAddr(&target));
+}
+
+// LDXP 64-bit pair: loads [Xn] into Xt and [Xn+8] into Xt2, arms the monitor.
+TEST_F(Arm64LiteTranslateRegionTest, LdxpLoadsPairX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0xCAFEBABEF00DFEEDULL;
+  pair_mem.hi = 0x0123456789ABCDEFULL;
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  state_.cpu.reservation_address = 0;
+  static const uint32_t code[] = {LdxpX(/*rt=*/0, /*rt2=*/1, /*rn=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[0], 0xCAFEBABEF00DFEEDULL);
+  EXPECT_EQ(state_.cpu.x[1], 0x0123456789ABCDEFULL);
+  EXPECT_EQ(state_.cpu.reservation_address, ToGuestAddr(&pair_mem));
+}
+
+// LDXP then STXP with no intervening write: the LL/SC round-trip succeeds
+// (Rs = 0) and stores the new 32-bit pair.
+TEST_F(Arm64LiteTranslateRegionTest, StxpSuccessRoundTripW) {
+  alignas(16) static uint64_t target;
+  target = (uint64_t{0x22222222ULL} << 32) | uint64_t{0x11111111ULL};
+  state_.cpu.x[2] = ToGuestAddr(&target);
+  state_.cpu.x[4] = 0xAAAAAAAAULL;  // new.lo
+  state_.cpu.x[5] = 0xBBBBBBBBULL;  // new.hi
+  static const uint32_t code[] = {
+      LdxpW(/*rt=*/0, /*rt2=*/1, /*rn=*/2),
+      StxpW(/*rs=*/3, /*rt=*/4, /*rt2=*/5, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 0ULL);  // success
+  EXPECT_EQ(target, (uint64_t{0xBBBBBBBBULL} << 32) | uint64_t{0xAAAAAAAAULL});
+}
+
+// LDXP then STXP 64-bit pair with no intervening write: succeeds, stores both
+// 64-bit halves (CMPXCHG16B path).
+TEST_F(Arm64LiteTranslateRegionTest, StxpSuccessRoundTripX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0xCAFEBABEF00DFEEDULL;
+  pair_mem.hi = 0x0123456789ABCDEFULL;
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  state_.cpu.x[4] = 0xFEEDFACECAFEBABEULL;  // new.lo
+  state_.cpu.x[5] = 0xDEADBEEF12345678ULL;  // new.hi
+  static const uint32_t code[] = {
+      LdxpX(/*rt=*/0, /*rt2=*/1, /*rn=*/2),
+      StxpX(/*rs=*/3, /*rt=*/4, /*rt2=*/5, /*rn=*/2),
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 0ULL);  // success
+  EXPECT_EQ(pair_mem.lo, 0xFEEDFACECAFEBABEULL);
+  EXPECT_EQ(pair_mem.hi, 0xDEADBEEF12345678ULL);
+}
+
+// STXP with no live reservation (reservation_address != base) fails (Rs = 1)
+// and leaves memory untouched.
+TEST_F(Arm64LiteTranslateRegionTest, StxpFailsWithoutReservationX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0x1111111111111111ULL;
+  pair_mem.hi = 0x2222222222222222ULL;
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  state_.cpu.x[4] = 0xDEADBEEFDEADBEEFULL;
+  state_.cpu.x[5] = 0xFACEFACEFACEFACEULL;
+  state_.cpu.reservation_address = 0;  // no live reservation
+  static const uint32_t code[] = {StxpX(/*rs=*/3, /*rt=*/4, /*rt2=*/5, /*rn=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 1ULL);  // failure
+  EXPECT_EQ(pair_mem.lo, 0x1111111111111111ULL);
+  EXPECT_EQ(pair_mem.hi, 0x2222222222222222ULL);
+}
+
+// STXP whose reservation address matches but whose reserved value is stale (a
+// concurrent write happened since LDXP): the exact-monitor CMPXCHG16B fails, so
+// the store does not happen and Rs = 1.
+TEST_F(Arm64LiteTranslateRegionTest, StxpFailsOnStaleValueX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0x1111111111111111ULL;
+  pair_mem.hi = 0x2222222222222222ULL;
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  state_.cpu.x[4] = 0xDEADBEEFDEADBEEFULL;
+  state_.cpu.x[5] = 0xFACEFACEFACEFACEULL;
+  state_.cpu.reservation_address = ToGuestAddr(&pair_mem);
+  // Reserved value differs from current memory -> CAS must fail.
+  state_.cpu.reservation_value =
+      (static_cast<__uint128_t>(0xDEADDEADDEADDEADULL) << 64) |
+      0xBEEFBEEFBEEFBEEFULL;
+  static const uint32_t code[] = {StxpX(/*rs=*/3, /*rt=*/4, /*rt2=*/5, /*rn=*/2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 1ULL);  // failure
+  EXPECT_EQ(pair_mem.lo, 0x1111111111111111ULL);
+  EXPECT_EQ(pair_mem.hi, 0x2222222222222222ULL);
+}
+
+// The acquire/release forms (LDAXP/STLXP) route through the same handler; a
+// round-trip must still succeed (the LOCK prefix already provides ordering).
+TEST_F(Arm64LiteTranslateRegionTest, LdaxpStlxpRoundTripX) {
+  alignas(16) static struct {
+    uint64_t lo;
+    uint64_t hi;
+  } pair_mem;
+  pair_mem.lo = 0xAAAAAAAAAAAAAAAAULL;
+  pair_mem.hi = 0xBBBBBBBBBBBBBBBBULL;
+  state_.cpu.x[2] = ToGuestAddr(&pair_mem);
+  state_.cpu.x[4] = 0x1234567812345678ULL;
+  state_.cpu.x[5] = 0x9ABCDEF09ABCDEF0ULL;
+  static const uint32_t code[] = {
+      LdxpX(/*rt=*/0, /*rt2=*/1, /*rn=*/2) | (1u << 15),   // LDAXP (o0=1)
+      StxpX(/*rs=*/3, /*rt=*/4, /*rt2=*/5, /*rn=*/2) | (1u << 15),  // STLXP
+  };
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(state_.cpu.x[3], 0ULL);
+  EXPECT_EQ(pair_mem.lo, 0x1234567812345678ULL);
+  EXPECT_EQ(pair_mem.hi, 0x9ABCDEF09ABCDEF0ULL);
 }
 
 // Barrier instructions in the middle of a JIT region must compile through

@@ -936,6 +936,245 @@
         break;
       }
 
+      // LDXP/LDAXP (load-exclusive pair). Loads Rt:Rt2 atomically and arms the
+      // exclusive monitor (reservation_address = base, reservation_value = the
+      // full pair). size=2 -> 32-bit pair (8 bytes), size=3 -> 64-bit pair
+      // (16 bytes). Mirrors interpreter.h's kLdxp. x86 TSO gives acquire order
+      // for free, so LDAXP needs no extra fence.
+      case Decoder::AtomicOp::kLdxp: {
+        const int32_t resv_addr_off = offsetof(ThreadState, cpu.reservation_address);
+        const int32_t resv_val_off = offsetof(ThreadState, cpu.reservation_value);
+        if (args.size == 2) {
+          // 32-bit pair: a single aligned 64-bit load is atomic on x86.
+          Register pair = AllocTempReg();
+          if (!success()) return;
+          AssemblerBase::Label* recovery_label = as_.MakeLabel();
+          as_.SetRecoveryPoint(recovery_label);
+          as_.Movq(pair, mem);
+          AssemblerBase::Label* cont = as_.MakeLabel();
+          as_.Jmp(*cont);
+          as_.Bind(recovery_label);
+          ExitGeneratedCode(GetInsnAddr());
+          as_.Bind(cont);
+          // Reservation: address = base, value = the 64-bit pair.
+          as_.Movq({.base = Assembler::rbp, .disp = resv_addr_off}, base);
+          as_.Movq({.base = Assembler::rbp, .disp = resv_val_off}, pair);
+          // Rt = low 32 (zero-extended), Rt2 = high 32 (zero-extended).
+          if (args.rt < 31) {
+            Register lo = AllocTempReg();
+            if (!success()) return;
+            as_.Movl(lo, pair);  // Movl to a register zero-extends to 64.
+            SetReg(args.rt, lo);
+          }
+          if (args.rt2 < 31) {
+            Register hi = AllocTempReg();
+            if (!success()) return;
+            as_.Movq(hi, pair);
+            as_.Shrq(hi, int8_t{32});
+            SetReg(args.rt2, hi);
+          }
+        } else if (args.size == 3) {
+          // 64-bit pair: atomic 128-bit read via LOCK CMPXCHG16B with
+          // expected==desired==0 (writes 0 only when *addr==0, i.e. a no-op) --
+          // the same trick the interpreter uses. It clobbers RAX/RBX/RCX/RDX;
+          // RBX/RCX/RDX are in the allocator pool and may hold permanent guest
+          // mappings, so save them on the host stack and pin `base` first (post-
+          // ApplyTbi `base` is typically RDX itself). RAX is reserved.
+          Register base_save = AllocTempReg();
+          if (!success()) return;
+          Register old_lo = AllocTempReg();
+          if (!success()) return;
+          Register old_hi = AllocTempReg();
+          if (!success()) return;
+          as_.Movq(base_save, base);
+          Assembler::Operand mem_save{.base = base_save, .disp = 0};
+
+          as_.Push(Assembler::rbx);
+          as_.Push(Assembler::rcx);
+          as_.Push(Assembler::rdx);
+          // expected = desired = 0 -> RDX:RAX = RCX:RBX = 0.
+          as_.Xorl(Assembler::rax, Assembler::rax);
+          as_.Xorl(Assembler::rdx, Assembler::rdx);
+          as_.Xorl(Assembler::rbx, Assembler::rbx);
+          as_.Xorl(Assembler::rcx, Assembler::rcx);
+
+          AssemblerBase::Label* recovery_label = as_.MakeLabel();
+          as_.SetRecoveryPoint(recovery_label);
+          as_.LockCmpXchg16b(mem_save);
+          AssemblerBase::Label* cont = as_.MakeLabel();
+          as_.Jmp(*cont);
+          as_.Bind(recovery_label);
+          as_.Pop(Assembler::rdx);
+          as_.Pop(Assembler::rcx);
+          as_.Pop(Assembler::rbx);
+          ExitGeneratedCode(GetInsnAddr());
+          as_.Bind(cont);
+          // Old value is in RAX:RDX. Stash to stable temps before restoring RDX.
+          as_.Movq(old_lo, Assembler::rax);
+          as_.Movq(old_hi, Assembler::rdx);
+          as_.Pop(Assembler::rdx);
+          as_.Pop(Assembler::rcx);
+          as_.Pop(Assembler::rbx);
+          // Reservation: address = base (pinned), value = full 128-bit pair.
+          as_.Movq({.base = Assembler::rbp, .disp = resv_addr_off}, base_save);
+          as_.Movq({.base = Assembler::rbp, .disp = resv_val_off}, old_lo);
+          as_.Movq({.base = Assembler::rbp, .disp = resv_val_off + 8}, old_hi);
+          if (args.rt < 31) SetReg(args.rt, old_lo);
+          if (args.rt2 < 31) SetReg(args.rt2, old_hi);
+        } else {
+          Undefined();
+          return;
+        }
+        break;
+      }
+
+      // STXP/STLXP (store-exclusive pair). Stores Rt:Rt2 atomically iff the
+      // exclusive monitor still holds the value LDXP read (an exact compare-and-
+      // swap against reservation_value); reports success(0)/failure(1) in Rs and
+      // clears the reservation. Mirrors interpreter.h's kStxp. The LOCK prefix is
+      // a full barrier, so STLXP needs no extra fence.
+      case Decoder::AtomicOp::kStxp: {
+        const int32_t resv_addr_off = offsetof(ThreadState, cpu.reservation_address);
+        const int32_t resv_val_off = offsetof(ThreadState, cpu.reservation_value);
+        if (args.size == 2) {
+          // 32-bit pair: new = (Rt2_lo32 << 32) | Rt_lo32; single 64-bit CAS
+          // against the reserved 64-bit value.
+          Register new_val = AllocTempReg();
+          if (!success()) return;
+          if (args.rt < 31) {
+            as_.Movl(new_val, GetReg(args.rt));  // low 32, zero-extended
+          } else {
+            as_.Xorl(new_val, new_val);
+          }
+          if (args.rt2 < 31) {
+            Register hi_tmp = AllocTempReg();
+            if (!success()) return;
+            as_.Movl(hi_tmp, GetReg(args.rt2));
+            as_.Shlq(hi_tmp, int8_t{32});
+            as_.Orq(new_val, hi_tmp);
+          }
+          Register expected_val = AllocTempReg();
+          if (!success()) return;
+          as_.Movq(expected_val, {.base = Assembler::rbp, .disp = resv_val_off});
+          Register resv_addr = AllocTempReg();
+          if (!success()) return;
+          as_.Movq(resv_addr, {.base = Assembler::rbp, .disp = resv_addr_off});
+          // Clear reservation.
+          as_.Movq({.base = Assembler::rbp, .disp = resv_addr_off},
+                   static_cast<int32_t>(0));
+          AssemblerBase::Label* fail_label = as_.MakeLabel();
+          as_.Cmpq(resv_addr, base);
+          as_.Jcc(Condition::kNotEqual, *fail_label);
+
+          as_.Movq(Assembler::rax, expected_val);
+          AssemblerBase::Label* recovery_label = as_.MakeLabel();
+          as_.SetRecoveryPoint(recovery_label);
+          as_.LockCmpXchgq(mem, new_val);
+          AssemblerBase::Label* recovery_cont = as_.MakeLabel();
+          as_.Jmp(*recovery_cont);
+          as_.Bind(recovery_label);
+          ExitGeneratedCode(GetInsnAddr());
+          as_.Bind(recovery_cont);
+          // CMPXCHG sets ZF on success. Rs = 0 on success, 1 on failure.
+          if (args.rs < 31) {
+            Register status = AllocTempReg();
+            if (!success()) return;
+            as_.Movq(status, static_cast<int64_t>(1));
+            AssemblerBase::Label* done_label = as_.MakeLabel();
+            as_.Jcc(Condition::kNotEqual, *done_label);
+            as_.Xorl(status, status);
+            as_.Bind(done_label);
+            SetReg(args.rs, status);
+          }
+          AssemblerBase::Label* end_label = as_.MakeLabel();
+          as_.Jmp(*end_label);
+          as_.Bind(fail_label);
+          if (args.rs < 31) {
+            Register fail_status = AllocTempReg();
+            if (!success()) return;
+            as_.Movq(fail_status, static_cast<int64_t>(1));
+            SetReg(args.rs, fail_status);
+          }
+          as_.Bind(end_label);
+        } else if (args.size == 3) {
+          // 64-bit pair via LOCK CMPXCHG16B: expected = reservation_value
+          // (RDX:RAX), desired = Rt:Rt2 (RCX:RBX). Same register discipline as
+          // CASP size=3. Guard on reservation_address == base; on mismatch the
+          // store fails without touching memory.
+          const uint8_t rt_lo = args.rt;
+          const uint8_t rt_hi = args.rt2;
+          Register base_save = AllocTempReg();
+          if (!success()) return;
+          Register des_lo = AllocTempReg();
+          if (!success()) return;
+          Register des_hi = AllocTempReg();
+          if (!success()) return;
+          Register resv_addr = AllocTempReg();
+          if (!success()) return;
+          Register status = AllocTempReg();
+          if (!success()) return;
+
+          as_.Movq(base_save, base);
+          Assembler::Operand mem_save{.base = base_save, .disp = 0};
+          if (rt_lo < 31) {
+            as_.Movq(des_lo, GetReg(rt_lo));
+          } else {
+            as_.Xorl(des_lo, des_lo);
+          }
+          if (rt_hi < 31) {
+            as_.Movq(des_hi, GetReg(rt_hi));
+          } else {
+            as_.Xorl(des_hi, des_hi);
+          }
+          as_.Movq(resv_addr, {.base = Assembler::rbp, .disp = resv_addr_off});
+          // Clear reservation and default status to failure (1).
+          as_.Movq({.base = Assembler::rbp, .disp = resv_addr_off},
+                   static_cast<int32_t>(0));
+          as_.Movq(status, static_cast<int64_t>(1));
+
+          AssemblerBase::Label* fail_label = as_.MakeLabel();
+          as_.Cmpq(resv_addr, base_save);
+          as_.Jcc(Condition::kNotEqual, *fail_label);
+
+          as_.Push(Assembler::rbx);
+          as_.Push(Assembler::rcx);
+          as_.Push(Assembler::rdx);
+          // expected = reservation_value -> RDX:RAX; desired -> RCX:RBX.
+          as_.Movq(Assembler::rax, {.base = Assembler::rbp, .disp = resv_val_off});
+          as_.Movq(Assembler::rdx, {.base = Assembler::rbp, .disp = resv_val_off + 8});
+          as_.Movq(Assembler::rbx, des_lo);
+          as_.Movq(Assembler::rcx, des_hi);
+
+          AssemblerBase::Label* recovery_label = as_.MakeLabel();
+          as_.SetRecoveryPoint(recovery_label);
+          as_.LockCmpXchg16b(mem_save);
+          AssemblerBase::Label* cont = as_.MakeLabel();
+          as_.Jmp(*cont);
+          as_.Bind(recovery_label);
+          as_.Pop(Assembler::rdx);
+          as_.Pop(Assembler::rcx);
+          as_.Pop(Assembler::rbx);
+          ExitGeneratedCode(GetInsnAddr());
+          as_.Bind(cont);
+          // ZF = 1 on success. Compute status (0/1) before restoring RDX so the
+          // pops don't disturb the flags-derived value.
+          AssemblerBase::Label* store_ok = as_.MakeLabel();
+          as_.Jcc(Condition::kNotEqual, *store_ok);  // ZF=0 -> keep status=1
+          as_.Xorl(status, status);                  // success -> status=0
+          as_.Bind(store_ok);
+          as_.Pop(Assembler::rdx);
+          as_.Pop(Assembler::rcx);
+          as_.Pop(Assembler::rbx);
+
+          as_.Bind(fail_label);
+          if (args.rs < 31) SetReg(args.rs, status);
+        } else {
+          Undefined();
+          return;
+        }
+        break;
+      }
+
       default:
         Undefined();
         break;
