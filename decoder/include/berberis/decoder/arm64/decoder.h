@@ -1840,6 +1840,20 @@ class Decoder {
     //     SQRDMLSH <V>d, <V>n, <Vm>.<T>[i] = 01 1 11111 size L M Rm 1111 H 0 Rn Rd
     kSqrdmlahScalarIdx,
     kSqrdmlshScalarIdx,
+    // Scalar by-element signed saturating doubling multiply (H/S only). These
+    // were previously unallocated -> SIGILL; the interpreter now implements
+    // them (the JITs bail to the interpreter). U=0.
+    //   kSqdmulhScalarIdx  (opcode=1100): Vd = SignedSat((2*Vn*Vm[i]) >> bits).
+    //   kSqrdmulhScalarIdx (opcode=1101): rounded high half (+ 1<<(bits-1)).
+    //   kSqdmullScalarIdx  (opcode=1011): widening Vd = SignedSat(2*Vn*Vm[i])
+    //                                      into the 2x-wide element.
+    //   Verified (aarch64-linux-gnu-as -march=armv8.2-a+fp16):
+    //     sqdmulh  s0, s1, v2.s[0] = 0x5f82c020
+    //     sqrdmulh s0, s1, v2.s[0] = 0x5f82d020
+    //     sqdmull  d0, s1, v2.s[0] = 0x5f82b020
+    kSqdmulhScalarIdx,
+    kSqrdmulhScalarIdx,
+    kSqdmullScalarIdx,
   };
 
   struct AdvSimdScalarXIdxArgs {
@@ -6573,9 +6587,18 @@ class Decoder {
     } else if (u && opcode == 0b1111) {
       if (size != 0b01 && size != 0b10) { Undefined(); return; }
       op = AdvSimdScalarXIdxOpcode::kSqrdmlshScalarIdx;
+    // Scalar by-element signed saturating doubling multiply (U=0, H/S only).
+    } else if (!u && opcode == 0b1100) {
+      if (size != 0b01 && size != 0b10) { Undefined(); return; }
+      op = AdvSimdScalarXIdxOpcode::kSqdmulhScalarIdx;
+    } else if (!u && opcode == 0b1101) {
+      if (size != 0b01 && size != 0b10) { Undefined(); return; }
+      op = AdvSimdScalarXIdxOpcode::kSqrdmulhScalarIdx;
+    } else if (!u && opcode == 0b1011) {
+      if (size != 0b01 && size != 0b10) { Undefined(); return; }
+      op = AdvSimdScalarXIdxOpcode::kSqdmullScalarIdx;
     } else {
-      // Remaining opcodes (SQDMULL/SQDMULH/SQRDMULH) are not implemented —
-      // raise SIGILL.
+      // Genuinely unallocated encodings — raise SIGILL.
       Undefined();
       return;
     }
@@ -6625,7 +6648,11 @@ class Decoder {
     //     sqrdmlsh h0, h1, v15.h[3] = 0x7f7ff020
     } else if (size == 0b01 &&
                (op == AdvSimdScalarXIdxOpcode::kSqrdmlahScalarIdx ||
-                op == AdvSimdScalarXIdxOpcode::kSqrdmlshScalarIdx)) {
+                op == AdvSimdScalarXIdxOpcode::kSqrdmlshScalarIdx ||
+                op == AdvSimdScalarXIdxOpcode::kSqdmulhScalarIdx ||
+                op == AdvSimdScalarXIdxOpcode::kSqrdmulhScalarIdx ||
+                op == AdvSimdScalarXIdxOpcode::kSqdmullScalarIdx)) {
+      // H form: 8 lanes in Vm.8H, index = H:L:M, Vm restricted to V0..V15.
       rm = Rm4;
       index = static_cast<uint8_t>((H << 2) | (L << 1) | M);
     } else {
