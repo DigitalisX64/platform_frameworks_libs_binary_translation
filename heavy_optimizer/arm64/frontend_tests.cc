@@ -9311,6 +9311,39 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmax32Signed) {
   EXPECT_EQ(state_.cpu.x[0], uint64_t{0x00000000FFFFFFFFULL});  // old Wt zero-extended
 }
 
+// CASP (32-bit pair) via packed 64-bit LOCK CMPXCHG. Rs:Rs+1 (W4,W5) = expected,
+// Rt:Rt+1 (W6,W7) = new. Match -> swap; the old pair returns to Rs:Rs+1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Casp32Match) {
+  alignas(8) static uint64_t buf = (uint64_t{0x22222222ULL} << 32) | 0x11111111ULL;
+  static const uint32_t code[] = {0x08247C46u};  // casp w4, w5, w6, w7, [x2]
+  state_.cpu.x[4] = 0x11111111ULL;  // expected.lo (matches)
+  state_.cpu.x[5] = 0x22222222ULL;  // expected.hi (matches)
+  state_.cpu.x[6] = 0xAAAAAAAAULL;  // new.lo
+  state_.cpu.x[7] = 0xBBBBBBBBULL;  // new.hi
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, (uint64_t{0xBBBBBBBBULL} << 32) | 0xAAAAAAAAULL);
+  EXPECT_EQ(state_.cpu.x[4], uint64_t{0x11111111ULL});  // old.lo zero-extended
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0x22222222ULL});  // old.hi zero-extended
+}
+
+// CASP mismatch: memory unchanged; Rs:Rs+1 get the actual prior pair.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Casp32Mismatch) {
+  alignas(8) static uint64_t buf = (uint64_t{0xCAFEBABEULL} << 32) | 0xDEADBEEFULL;
+  static const uint32_t code[] = {0x08247C46u};  // casp w4, w5, w6, w7, [x2]
+  state_.cpu.x[4] = 0x12345678ULL;  // expected.lo (does NOT match)
+  state_.cpu.x[5] = 0x9ABCDEF0ULL;  // expected.hi (does NOT match)
+  state_.cpu.x[6] = 0xAAAAAAAAULL;
+  state_.cpu.x[7] = 0xBBBBBBBBULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, (uint64_t{0xCAFEBABEULL} << 32) | 0xDEADBEEFULL);  // unchanged
+  EXPECT_EQ(state_.cpu.x[4], uint64_t{0xDEADBEEFULL});  // actual old.lo
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0xCAFEBABEULL});  // actual old.hi
+}
+
 // LDADD (64-bit): [Xn] += Xs; old value to Xt.
 TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd64) {
   alignas(8) static uint64_t buf = 0x0000000000000100ULL;

@@ -1771,9 +1771,51 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       return;
     }
 
+    case Decoder::AtomicOp::kCasp: {
+      // CASP: compare-and-swap pair. Rs:Rs+1 = expected, Rt:Rt+1 = new; the old
+      // pair is written back to Rs:Rs+1. size=2 packs each 32-bit pair into a
+      // 64-bit value and uses LOCK CMPXCHGq. size=3 (128-bit DWCAS) needs LOCK
+      // CMPXCHG16B, which is not exposed as a simple machine-IR op here, so it
+      // bails to lite (which lowers it). Mirrors lite for the size=2 path.
+      if (args.size != 2) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const uint8_t rs_lo = args.rs;
+      const uint8_t rs_hi = static_cast<uint8_t>(args.rs + 1);
+      const uint8_t rt_lo = args.rt;
+      const uint8_t rt_hi = static_cast<uint8_t>(args.rt + 1);
+
+      // Pack (hi << 32) | zext(lo) for both expected and desired.
+      auto pack = [&](uint8_t lo, uint8_t hi) -> Register {
+        Register v = (lo != 31)
+            ? std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(lo)))
+            : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+        if (hi != 31) {
+          Register h = std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(hi)));
+          h = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(h, int8_t{32}));
+          v = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(v, h));
+        }
+        return v;
+      };
+      Register expected = pack(rs_lo, rs_hi);
+      Register desired = pack(rt_lo, rt_hi);
+      Register old =
+          std::get<0>(Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, desired));
+      GenRecoveryBlockForLastInsn();
+      // Unpack the old pair back to Rs:Rs+1 (each half zero-extended).
+      if (rs_lo != 31) {
+        SetReg(rs_lo, std::get<0>(Gen<x86_64::MovlRegReg>(old)));
+      }
+      if (rs_hi != 31) {
+        SetReg(rs_hi, std::get<0>(Gen<x86_64::ShrqRegImm>(Copy(old), int8_t{32})));
+      }
+      return;
+    }
+
     default:
-      // CASP and the LDXP/STXP pair forms are not yet mirrored into the heavy
-      // tier; bail to the lite translator (correct, just slower).
+      // The LDXP/STXP pair forms are not yet mirrored into the heavy tier; bail
+      // to the lite translator (correct, just slower).
       UndefinedReturningVoid();
       return;
   }
