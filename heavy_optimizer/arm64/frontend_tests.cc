@@ -6668,6 +6668,70 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SdotIndexed4S) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000001800000018ULL);
 }
 
+// FCADD #90 .2s (Q=0): Vd = Vn + rot90(Vm); D-form zeroes the upper 64. Complex
+// pairs are [re, im] in adjacent FP32 lanes. Vn=(1,2), Vm=(3,4) -> (1-4, 2+3) =
+// (-3, 5). FP32: 1.0=0x3F800000 2.0=0x40000000 3.0=0x40400000 4.0=0x40800000
+// 5.0=0x40A00000 -3.0=0xC0400000.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcadd90Vec2S) {
+  static const uint32_t code[] = {0x2E82E420u};  // fcadd v0.2s, v1.2s, v2.2s, #90
+  SetV128(&state_, 1, 0x400000003F800000ULL, 0x1111111111111111ULL);  // (1,2)
+  SetV128(&state_, 2, 0x4080000040400000ULL, 0x2222222222222222ULL);  // (3,4)
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x40A00000C0400000ULL);   // (-3, 5)
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // upper zeroed
+}
+
+// FCADD #270 .4s (Q=1): Vn=[(1,2),(10,20)], Vm=[(3,4),(5,6)]; rot270 gives
+// (re+im, im-re) -> [(5,-1),(16,15)]. 10.0=0x41200000 20.0=0x41A00000
+// 6.0=0x40C00000 -1.0=0xBF800000 16.0=0x41800000 15.0=0x41700000.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcadd270Vec4S) {
+  static const uint32_t code[] = {0x6E82F420u};  // fcadd v0.4s, v1.4s, v2.4s, #270
+  SetV128(&state_, 1, 0x400000003F800000ULL, 0x41A0000041200000ULL);  // (1,2),(10,20)
+  SetV128(&state_, 2, 0x4080000040400000ULL, 0x40C0000040A00000ULL);  // (3,4),(5,6)
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xBF80000040A00000ULL);   // (5, -1)
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4170000041800000ULL);  // (16, 15)
+}
+
+// FCMLA #0 .4s: Vd += Vn_re * Vm (per pair). Vn=(2,3) both pairs, Vm=(5,7),
+// Vd=(1,1) -> (1+2*5, 1+2*7) = (11,15). 7.0=0x40E00000 11.0=0x41300000.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcmla0Vec4S) {
+  static const uint32_t code[] = {0x6E82C420u};  // fcmla v0.4s, v1.4s, v2.4s, #0
+  SetV128(&state_, 1, 0x4040000040000000ULL, 0x4040000040000000ULL);  // (2,3),(2,3)
+  SetV128(&state_, 2, 0x40E0000040A00000ULL, 0x40E0000040A00000ULL);  // (5,7),(5,7)
+  SetV128(&state_, 0, 0x3F8000003F800000ULL, 0x3F8000003F800000ULL);  // (1,1),(1,1)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4170000041300000ULL);   // (11, 15)
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4170000041300000ULL);
+}
+
+// FCMLA #90 .4s: Vd += rot90 term = (-Vn_im*Vm_im, Vn_im*Vm_re). Vn=(2,3),
+// Vm=(5,7), Vd=(1,1) -> (1-3*7, 1+3*5) = (-20,16). -20.0=0xC1A00000
+// 16.0=0x41800000.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcmla90Vec4S) {
+  static const uint32_t code[] = {0x6E82CC20u};  // fcmla v0.4s, v1.4s, v2.4s, #90
+  SetV128(&state_, 1, 0x4040000040000000ULL, 0x4040000040000000ULL);  // (2,3),(2,3)
+  SetV128(&state_, 2, 0x40E0000040A00000ULL, 0x40E0000040A00000ULL);  // (5,7),(5,7)
+  SetV128(&state_, 0, 0x3F8000003F800000ULL, 0x3F8000003F800000ULL);  // (1,1),(1,1)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x41800000C1A00000ULL);   // (-20, 16)
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x41800000C1A00000ULL);
+}
+
 // CMGT .4S (Q=1): per-lane signed greater-than via PCMPGTD.
 TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtVec4S) {
   static const uint32_t code[] = {0x4EA23420u};  // cmgt v0.4s, v1.4s, v2.4s

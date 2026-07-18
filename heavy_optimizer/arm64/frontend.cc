@@ -3793,9 +3793,97 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
   SetVRegScalar(args.rd, result, is_double);
 }
 
+// FCADD / FCMLA (complex vector arithmetic), FP32 (.2s/.4s) only. FP16 (size=01)
+// and FP64 (size=11) fall back to the lite tier, which handles them. Mirrors
+// lite_translator_simd_fp_misc.inc's FP32 AdvSimdFcma: build a per-lane sign mask,
+// transform Vm (real/imag swap + selective negation per the rotation), then for
+// FCADD add to Vn and for FCMLA add Vd + broadcast(Vn)*Vm_xformed.
 void HeavyOptimizerFrontend::AdvSimdFcma(const Decoder::FcmaArgs& args) {
-  UndefinedReturningVoid();
-  UNUSED_ARGS(args);
+  if (!success()) {
+    return;
+  }
+  if (args.size != 0b10) {
+    UndefinedReturningVoid();
+    return;
+  }
+  const int32_t vn_off = GetVRegOffset(args.rn);
+  const int32_t vm_off = GetVRegOffset(args.rm);
+  const int32_t vd_off = GetVRegOffset(args.rd);
+  const bool is_fcmla = (args.opcode == Decoder::FcmaOpcode::kFcmla);
+
+  FpRegister xn = AllocTempSimdReg();
+  builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+  FpRegister xm = AllocTempSimdReg();
+  builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+
+  // Sign-bit mask [0x80000000]*4. A self-Pcmpeq must start from a zeroed reg to
+  // avoid a use-before-def lifetime check on a fresh temp.
+  FpRegister sign = AllocZeroedSimdReg();
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+  builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
+
+  // Negate exactly the lanes selected by a [-1] mask shifted into either the
+  // real (lanes 0,2) or imag (lanes 1,3) 32-bit slots, then XOR into Vm.
+  auto negate_lanes = [&](bool negate_real) {
+    FpRegister lane = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
+    if (negate_real) {
+      builder_.Gen<x86_64::PsrlqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 0,2
+    } else {
+      builder_.Gen<x86_64::PsllqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 1,3
+    }
+    builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+  };
+
+  FpRegister result;
+  if (!is_fcmla) {
+    // FCADD: swap real/imag of Vm; rot==0 (#90) negates real, rot==1 (#270)
+    // negates imag; then Vn + Vm_xformed.
+    builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+        xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
+    negate_lanes(/*negate_real=*/args.rot == 0);
+    builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    result = xn;
+  } else {
+    // FCMLA: result = Vd + broadcast(Vn) * Vm_xformed.
+    FpRegister xd = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+    switch (args.rot) {
+      case 0:
+        break;
+      case 1:  // swap + negate real
+        builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+            xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
+        negate_lanes(/*negate_real=*/true);
+        break;
+      case 2:  // negate both lanes
+        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+        break;
+      default:  // rot == 3: swap + negate imag
+        builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+            xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
+        negate_lanes(/*negate_real=*/false);
+        break;
+    }
+    // Broadcast n_re (rot 0/2, PSHUFD 0xA0) or n_im (rot 1/3, PSHUFD 0xF5).
+    const int8_t bcast = (args.rot == 0 || args.rot == 2) ? static_cast<int8_t>(0xA0)
+                                                          : static_cast<int8_t>(0xF5);
+    FpRegister n_bcast =
+        FpRegister{std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), bcast))};
+    builder_.Gen<x86_64::MulpsXRegXReg>(n_bcast.machine_reg(), xm.machine_reg());
+    builder_.Gen<x86_64::AddpsXRegXReg>(xd.machine_reg(), n_bcast.machine_reg());
+    result = xd;
+  }
+
+  // Q=0 (.2s): zero the upper 64 bits of Vd (D-form).
+  if (!args.q) {
+    FpRegister lane = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
+    builder_.Gen<x86_64::PsrldqXRegImm>(lane.machine_reg(), int8_t{8});
+    builder_.Gen<x86_64::PandXRegXReg>(result.machine_reg(), lane.machine_reg());
+  }
+  builder_.GenSetSimd<16>(vd_off, result.machine_reg());
 }
 
 void HeavyOptimizerFrontend::AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
