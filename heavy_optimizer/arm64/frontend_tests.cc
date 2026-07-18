@@ -6591,6 +6591,83 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec16B) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);  // all equal (0 == 0)
 }
 
+// SDOT .4S (Q=1): 4 signed byte products summed per lane, accumulated into Vd.
+// Vn bytes all 2, Vm bytes all 3 -> each lane += 4*(2*3)=24; Vd starts non-zero
+// to prove accumulation.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SdotVec4S) {
+  static const uint32_t code[] = {0x4E829420u};  // sdot v0.4s, v1.16b, v2.16b
+  SetV128(&state_, 1, 0x0202020202020202ULL, 0x0202020202020202ULL);
+  SetV128(&state_, 2, 0x0303030303030303ULL, 0x0303030303030303ULL);
+  SetV128(&state_, 0, 0x0000000A00000005ULL, 0x0000001E00000014ULL);  // [5,10,20,30]
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  // [5+24, 10+24, 20+24, 30+24] = [29,34,44,54].
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000220000001DULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000000360000002CULL);
+}
+
+// UDOT .4S: unsigned bytes. Vn bytes 0xFF = 255 (unsigned) -> lane = 4*(255*2)=2040.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UdotVec4S_unsigned) {
+  static const uint32_t code[] = {0x6E829420u};  // udot v0.4s, v1.16b, v2.16b
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
+  SetV128(&state_, 2, 0x0202020202020202ULL, 0x0202020202020202ULL);
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000007F8000007F8ULL);   // 2040 per lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x000007F8000007F8ULL);
+}
+
+// SDOT .4S: same 0xFF bytes but signed = -1 -> lane = 4*(-1*2) = -8. Distinguishes
+// the signed path from the unsigned test above.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SdotVec4S_signed_negative) {
+  static const uint32_t code[] = {0x4E829420u};  // sdot v0.4s, v1.16b, v2.16b
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
+  SetV128(&state_, 2, 0x0202020202020202ULL, 0x0202020202020202ULL);
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFF8FFFFFFF8ULL);   // -8 per lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFF8FFFFFFF8ULL);
+}
+
+// SDOT .2S (Q=0): 2 lanes; the D-form must zero the upper 64 bits of Vd.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SdotVec2S_ZeroesUpper) {
+  static const uint32_t code[] = {0x0E829420u};  // sdot v0.2s, v1.8b, v2.8b
+  SetV128(&state_, 1, 0x0202020202020202ULL, 0x1111111111111111ULL);  // hi ignored
+  SetV128(&state_, 2, 0x0303030303030303ULL, 0x2222222222222222ULL);
+  // Low 64 is the .2s accumulator (start 0); only the upper 64 is poison, which
+  // the D-form must zero.
+  SetV128(&state_, 0, 0x0000000000000000ULL, 0xBBBBBBBBBBBBBBBBULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000001800000018ULL);   // 24 per lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // upper zeroed
+}
+
+// SDOT by element: Vm.4b[1] (bytes 4..7) drives all 4 output lanes. Byte group 0
+// is zero, so a wrong index would give 0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SdotIndexed4S) {
+  static const uint32_t code[] = {0x4FA2E020u};  // sdot v0.4s, v1.16b, v2.4b[1]
+  SetV128(&state_, 1, 0x0202020202020202ULL, 0x0202020202020202ULL);
+  SetV128(&state_, 2, 0x0303030300000000ULL, 0ULL);  // 4b[1]={3,3,3,3}, 4b[0]=0
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000001800000018ULL);   // 4*(2*3)=24 per lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000001800000018ULL);
+}
+
 // CMGT .4S (Q=1): per-lane signed greater-than via PCMPGTD.
 TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtVec4S) {
   static const uint32_t code[] = {0x4EA23420u};  // cmgt v0.4s, v1.4s, v2.4s

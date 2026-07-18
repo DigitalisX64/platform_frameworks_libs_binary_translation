@@ -3813,9 +3813,81 @@ void HeavyOptimizerFrontend::AdvSimdMatMul(const Decoder::MatMulArgs& args) {
   UNUSED_ARGS(args);
 }
 
+// SDOT/UDOT (and the I8MM mixed-sign USDOT/SUDOT) 8-bit dot product. Each output
+// int32 lane is the sum of 4 signed/unsigned byte products accumulated into Vd.
+// Mirrors lite_translator_simd_fp_misc.inc's AdvSimdDotProduct: widen bytes to
+// int16 (PMOVSXBW/PMOVZXBW; an unsigned byte stays < 32768 so PMADDWD's signed
+// 16x16 multiply gives correct mixed-sign products), PMADDWD to pair-multiply-add,
+// PHADDD to fold adjacent pairs into the 4 (or 2) lanes, then accumulate into Vd.
 void HeavyOptimizerFrontend::AdvSimdDotProduct(const Decoder::DotProductArgs& args) {
-  UndefinedReturningVoid();
-  UNUSED_ARGS(args);
+  if (!success()) {
+    return;
+  }
+  using Op = Decoder::DotProductOpcode;
+  const bool n_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                         args.opcode == Op::kSudotIdx);
+  const bool m_signed = (args.opcode == Op::kSdot || args.opcode == Op::kSdotIdx ||
+                         args.opcode == Op::kUsdot || args.opcode == Op::kUsdotIdx);
+  const bool is_indexed = (args.opcode == Op::kSdotIdx || args.opcode == Op::kUdotIdx ||
+                           args.opcode == Op::kUsdotIdx || args.opcode == Op::kSudotIdx);
+  const int32_t vn_off = GetVRegOffset(args.rn);
+  const int32_t vm_off = GetVRegOffset(args.rm);
+  const int32_t vd_off = GetVRegOffset(args.rd);
+
+  FpRegister vn = AllocTempSimdReg();
+  builder_.GenGetSimd<16>(vn.machine_reg(), vn_off);
+  FpRegister vm = AllocTempSimdReg();
+  builder_.GenGetSimd<16>(vm.machine_reg(), vm_off);
+
+  // Widen the low 8 bytes of `src` to 8x int16.
+  auto widen = [&](FpRegister src, bool is_signed) -> FpRegister {
+    if (is_signed) {
+      return FpRegister{std::get<0>(Gen<x86_64::PmovsxbwXRegXReg>(src.machine_reg()))};
+    }
+    return FpRegister{std::get<0>(Gen<x86_64::PmovzxbwXRegXReg>(src.machine_reg()))};
+  };
+  // Move the high 8 bytes of `src` into the low 8 bytes of a fresh reg (PSHUFD
+  // 0x0E puts the high 64 bits into the low 64).
+  auto high_half = [&](FpRegister src) -> FpRegister {
+    return FpRegister{std::get<0>(
+        Gen<x86_64::PshufdXRegXRegImm>(src.machine_reg(), static_cast<int8_t>(0x0E)))};
+  };
+
+  // Widened Vm low operand. The indexed form broadcasts dword `index` (PSHUFD
+  // with imm = index replicated into all four 2-bit selectors) before widening.
+  FpRegister m_lo;
+  if (is_indexed) {
+    FpRegister m_bcast = FpRegister{std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(
+        vm.machine_reg(), static_cast<int8_t>(args.index * 0x55)))};
+    m_lo = widen(m_bcast, m_signed);
+  } else {
+    m_lo = widen(vm, m_signed);
+  }
+  FpRegister n_lo = widen(vn, n_signed);
+  builder_.Gen<x86_64::PmaddwdXRegXReg>(n_lo.machine_reg(), m_lo.machine_reg());
+
+  if (args.q) {
+    FpRegister n_hi = widen(high_half(vn), n_signed);
+    FpRegister m_hi = is_indexed ? m_lo : widen(high_half(vm), m_signed);
+    builder_.Gen<x86_64::PmaddwdXRegXReg>(n_hi.machine_reg(), m_hi.machine_reg());
+    // Fold adjacent int32 pairs: lanes become [n_lo01, n_lo23, n_hi01, n_hi23].
+    builder_.Gen<x86_64::PhadddXRegXReg>(n_lo.machine_reg(), n_hi.machine_reg());
+    FpRegister vd = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
+    builder_.Gen<x86_64::PadddXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
+    builder_.GenSetSimd<16>(vd_off, n_lo.machine_reg());
+  } else {
+    // .2s: only 2 lanes. PHADDD n_lo,n_lo folds the low half into [p01, p23, ..].
+    builder_.Gen<x86_64::PhadddXRegXReg>(n_lo.machine_reg(), n_lo.machine_reg());
+    FpRegister vd = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
+    builder_.Gen<x86_64::PadddXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
+    // D-form zeroes the upper 64 bits of Vd; PUNPCKLQDQ with a zeroed reg keeps
+    // the low 64 (the 2 result lanes) and clears the high 64.
+    FpRegister zero = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
+    builder_.GenSetSimd<16>(vd_off, n_lo.machine_reg());
+  }
 }
 
 // AdvSIMD modified immediate: MOVI / MVNI / vector FMOV (replace forms) and
