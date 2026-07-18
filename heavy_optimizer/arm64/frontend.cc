@@ -11541,9 +11541,55 @@ void HeavyOptimizerFrontend::Sm3partw2(uint8_t rd, uint8_t rn, uint8_t rm) {
   UNUSED_ARGS(rd, rn, rm);
 }
 
+// AESE/AESD/AESMC/AESIMC via host AES-NI (mirrors lite_translator_crypto.inc):
+//   AESE  Vd = AESENCLAST(Vd^Vn, 0)   AESD   Vd = AESDECLAST(Vd^Vn, 0)
+//   AESMC Vd = AESENC(AESDECLAST(Vn, 0), 0)   (standalone MixColumns identity)
+//   AESIMC Vd = AESIMC(Vn)
+// opcode: 00=AESE, 01=AESD, 10=AESMC, 11=AESIMC. Bail to lite if no host AES-NI.
 void HeavyOptimizerFrontend::CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
-  UndefinedReturningVoid();
-  UNUSED_ARGS(rd, rn, opcode);
+  if (!success()) {
+    return;
+  }
+  if (!host_platform::kHasAES) {
+    UndefinedReturningVoid();
+    return;
+  }
+  const int32_t vd_off = GetVRegOffset(rd);
+  const int32_t vn_off = GetVRegOffset(rn);
+  FpRegister zero = AllocZeroedSimdReg();  // zero round key / round constant
+  FpRegister result;
+  switch (opcode) {
+    case 0b00:      // AESE
+    case 0b01: {    // AESD
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      if (opcode == 0b00) {
+        builder_.Gen<x86_64::AesenclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
+      } else {
+        builder_.Gen<x86_64::AesdeclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
+      }
+      result = xd;
+      break;
+    }
+    case 0b10: {    // AESMC = AESENC(AESDECLAST(Vn, 0), 0)
+      FpRegister xd = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xd.machine_reg(), vn_off);
+      builder_.Gen<x86_64::AesdeclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
+      builder_.Gen<x86_64::AesencXRegXReg>(xd.machine_reg(), zero.machine_reg());
+      result = xd;
+      break;
+    }
+    default: {      // 0b11 AESIMC = AESIMC(Vn)
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+      result = FpRegister{std::get<0>(Gen<x86_64::AesimcXRegXReg>(xn.machine_reg()))};
+      break;
+    }
+  }
+  builder_.GenSetSimd<16>(vd_off, result.machine_reg());
 }
 
 void HeavyOptimizerFrontend::CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
