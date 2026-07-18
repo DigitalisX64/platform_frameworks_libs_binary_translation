@@ -9198,6 +9198,56 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Swp32ZeroExtends) {
   EXPECT_EQ(state_.cpu.x[1], uint64_t{0x89ABCDEF});  // old value zero-extended
 }
 
+// LSE bitwise fetch-and-op via the heavy CMPXCHG retry loop. Encoders: base
+// F8203000 (LDSET) / F8201000 (LDCLR) / F8202000 (LDEOR); W form uses B8...
+// LDSET X1, X0, [X2]: [mem] |= Xs; old -> Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldset64) {
+  alignas(8) static uint64_t buf = 0x00FF00FF00FF00FFULL;
+  static const uint32_t code[] = {0xF8213040u};  // ldset x1, x0, [x2]
+  state_.cpu.x[1] = 0xFF00FF00FF00FF00ULL;         // Xs (mask)
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // old | Xs
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x00FF00FF00FF00FFULL});  // old -> Xt
+}
+
+// LDCLR X1, X0, [X2]: [mem] &= ~Xs; old -> Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldclr64) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFFFFFFFFFFULL;
+  static const uint32_t code[] = {0xF8211040u};  // ldclr x1, x0, [x2]
+  state_.cpu.x[1] = 0xFF00FF00FF00FF00ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x00FF00FF00FF00FFULL});          // old & ~Xs
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFFULL});  // old -> Xt
+}
+
+// LDEOR X1, X0, [X2]: [mem] ^= Xs; old -> Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldeor64) {
+  alignas(8) static uint64_t buf = 0x0F0F0F0F0F0F0F0FULL;
+  static const uint32_t code[] = {0xF8212040u};  // ldeor x1, x0, [x2]
+  state_.cpu.x[1] = 0xFFFFFFFF00000000ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xF0F0F0F00F0F0F0FULL});          // old ^ Xs
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0F0F0F0F0F0F0F0FULL});  // old -> Xt
+}
+
+// LDSET (32-bit): only low 32 written; old value in Wt zero-extended to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldset32ZeroExtends) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFF00FF00FFULL;  // low32 = 0x00FF00FF
+  static const uint32_t code[] = {0xB8213040u};  // ldset w1, w0, [x2]
+  state_.cpu.x[1] = 0x00000000FF00FF00ULL;         // Ws low32 = 0xFF00FF00
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // low32 |= Ws; high32 untouched
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000FF00FFULL});  // old Wt zero-extended
+}
+
 // LDADD (64-bit): [Xn] += Xs; old value to Xt.
 TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd64) {
   alignas(8) static uint64_t buf = 0x0000000000000100ULL;
