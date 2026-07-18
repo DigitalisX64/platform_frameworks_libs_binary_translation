@@ -9198,6 +9198,152 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Swp32ZeroExtends) {
   EXPECT_EQ(state_.cpu.x[1], uint64_t{0x89ABCDEF});  // old value zero-extended
 }
 
+// LSE bitwise fetch-and-op via the heavy CMPXCHG retry loop. Encoders: base
+// F8203000 (LDSET) / F8201000 (LDCLR) / F8202000 (LDEOR); W form uses B8...
+// LDSET X1, X0, [X2]: [mem] |= Xs; old -> Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldset64) {
+  alignas(8) static uint64_t buf = 0x00FF00FF00FF00FFULL;
+  static const uint32_t code[] = {0xF8213040u};  // ldset x1, x0, [x2]
+  state_.cpu.x[1] = 0xFF00FF00FF00FF00ULL;         // Xs (mask)
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // old | Xs
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x00FF00FF00FF00FFULL});  // old -> Xt
+}
+
+// LDCLR X1, X0, [X2]: [mem] &= ~Xs; old -> Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldclr64) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFFFFFFFFFFULL;
+  static const uint32_t code[] = {0xF8211040u};  // ldclr x1, x0, [x2]
+  state_.cpu.x[1] = 0xFF00FF00FF00FF00ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x00FF00FF00FF00FFULL});          // old & ~Xs
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFFULL});  // old -> Xt
+}
+
+// LDEOR X1, X0, [X2]: [mem] ^= Xs; old -> Xt.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldeor64) {
+  alignas(8) static uint64_t buf = 0x0F0F0F0F0F0F0F0FULL;
+  static const uint32_t code[] = {0xF8212040u};  // ldeor x1, x0, [x2]
+  state_.cpu.x[1] = 0xFFFFFFFF00000000ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xF0F0F0F00F0F0F0FULL});          // old ^ Xs
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0F0F0F0F0F0F0F0FULL});  // old -> Xt
+}
+
+// LDSET (32-bit): only low 32 written; old value in Wt zero-extended to 64.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldset32ZeroExtends) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFF00FF00FFULL;  // low32 = 0x00FF00FF
+  static const uint32_t code[] = {0xB8213040u};  // ldset w1, w0, [x2]
+  state_.cpu.x[1] = 0x00000000FF00FF00ULL;         // Ws low32 = 0xFF00FF00
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // low32 |= Ws; high32 untouched
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000FF00FFULL});  // old Wt zero-extended
+}
+
+// LSE min/max via the CMPXCHG loop + select diamond. Encoders: base F8204000
+// (LDSMAX) / F8205000 (LDSMIN) / F8206000 (LDUMAX) / F8207000 (LDUMIN).
+// LDSMAX X1, X0, [X2]: [mem]=max_signed([mem],Xs). mem=-1, Xs=1 -> signed max=1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmax64Signed) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFFFFFFFFFFULL;  // -1 signed
+  static const uint32_t code[] = {0xF8214040u};  // ldsmax x1, x0, [x2]
+  state_.cpu.x[1] = 0x0000000000000001ULL;         // Xs = 1
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x0000000000000001ULL});         // max(-1, 1) = 1
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFFULL});  // old -> Xt
+}
+
+// LDUMAX with the same bits: unsigned max keeps the large value (distinguishes
+// the unsigned path from the signed test above).
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldumax64Unsigned) {
+  alignas(8) static uint64_t buf = 0xFFFFFFFFFFFFFFFFULL;  // UINT64_MAX unsigned
+  static const uint32_t code[] = {0xF8216040u};  // ldumax x1, x0, [x2]
+  state_.cpu.x[1] = 0x0000000000000001ULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // max(MAX, 1) = MAX
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0xFFFFFFFFFFFFFFFFULL});
+}
+
+// LDSMIN X1, X0, [X2]: signed min. mem=5, Xs=-1 -> min=-1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmin64Signed) {
+  alignas(8) static uint64_t buf = 0x0000000000000005ULL;
+  static const uint32_t code[] = {0xF8215040u};  // ldsmin x1, x0, [x2]
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;         // Xs = -1
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xFFFFFFFFFFFFFFFFULL});          // min(5, -1) = -1
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000000005ULL});  // old -> Xt
+}
+
+// LDUMIN with the same bits: unsigned min keeps the small value.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldumin64Unsigned) {
+  alignas(8) static uint64_t buf = 0x0000000000000005ULL;
+  static const uint32_t code[] = {0xF8217040u};  // ldumin x1, x0, [x2]
+  state_.cpu.x[1] = 0xFFFFFFFFFFFFFFFFULL;         // UINT64_MAX
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0x0000000000000005ULL});         // min(5, MAX) = 5
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x0000000000000005ULL});
+}
+
+// LDSMAX (32-bit signed): only low 32 compared/written; old Wt zero-extended.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Ldsmax32Signed) {
+  alignas(8) static uint64_t buf = 0xAAAAAAAAFFFFFFFFULL;  // low32 = -1 signed
+  static const uint32_t code[] = {0xB8214040u};  // ldsmax w1, w0, [x2]
+  state_.cpu.x[1] = 0x0000000000000001ULL;         // Ws = 1
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, uint64_t{0xAAAAAAAA00000001ULL});         // low32 max(-1,1)=1; high32 kept
+  EXPECT_EQ(state_.cpu.x[0], uint64_t{0x00000000FFFFFFFFULL});  // old Wt zero-extended
+}
+
+// CASP (32-bit pair) via packed 64-bit LOCK CMPXCHG. Rs:Rs+1 (W4,W5) = expected,
+// Rt:Rt+1 (W6,W7) = new. Match -> swap; the old pair returns to Rs:Rs+1.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Casp32Match) {
+  alignas(8) static uint64_t buf = (uint64_t{0x22222222ULL} << 32) | 0x11111111ULL;
+  static const uint32_t code[] = {0x08247C46u};  // casp w4, w5, w6, w7, [x2]
+  state_.cpu.x[4] = 0x11111111ULL;  // expected.lo (matches)
+  state_.cpu.x[5] = 0x22222222ULL;  // expected.hi (matches)
+  state_.cpu.x[6] = 0xAAAAAAAAULL;  // new.lo
+  state_.cpu.x[7] = 0xBBBBBBBBULL;  // new.hi
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, (uint64_t{0xBBBBBBBBULL} << 32) | 0xAAAAAAAAULL);
+  EXPECT_EQ(state_.cpu.x[4], uint64_t{0x11111111ULL});  // old.lo zero-extended
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0x22222222ULL});  // old.hi zero-extended
+}
+
+// CASP mismatch: memory unchanged; Rs:Rs+1 get the actual prior pair.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Casp32Mismatch) {
+  alignas(8) static uint64_t buf = (uint64_t{0xCAFEBABEULL} << 32) | 0xDEADBEEFULL;
+  static const uint32_t code[] = {0x08247C46u};  // casp w4, w5, w6, w7, [x2]
+  state_.cpu.x[4] = 0x12345678ULL;  // expected.lo (does NOT match)
+  state_.cpu.x[5] = 0x9ABCDEF0ULL;  // expected.hi (does NOT match)
+  state_.cpu.x[6] = 0xAAAAAAAAULL;
+  state_.cpu.x[7] = 0xBBBBBBBBULL;
+  state_.cpu.x[2] = ToGuestAddr(&buf);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf, (uint64_t{0xCAFEBABEULL} << 32) | 0xDEADBEEFULL);  // unchanged
+  EXPECT_EQ(state_.cpu.x[4], uint64_t{0xDEADBEEFULL});  // actual old.lo
+  EXPECT_EQ(state_.cpu.x[5], uint64_t{0xCAFEBABEULL});  // actual old.hi
+}
+
 // LDADD (64-bit): [Xn] += Xs; old value to Xt.
 TEST_F(Arm64HeavyOptimizerFrontendTest, Ldadd64) {
   alignas(8) static uint64_t buf = 0x0000000000000100ULL;

@@ -1607,10 +1607,215 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       return;
     }
 
+    case Decoder::AtomicOp::kLdclr:
+    case Decoder::AtomicOp::kLdset:
+    case Decoder::AtomicOp::kLdeor: {
+      // LSE bitwise fetch-and-{clear,set,xor}: old=[Xn]; [Xn] = old OP Xs;
+      // Xt = old. x86 has no single fetch-and-bitwise, so emit a LOCK CMPXCHG
+      // retry loop. Mirrors lite_translator's kLdclr/kLdset/kLdeor. The loop
+      // re-reads [mem] fresh each iteration, so no value is carried across the
+      // back-edge (only the loop-invariant mask enters the loop). 32/64-bit only;
+      // byte/halfword bail to lite (no zero-extending sized-load LIR op here).
+      if (args.size != 2 && args.size != 3) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_64 = (args.size == 3);
+      Register mask = (args.rs != 31) ? GetReg(args.rs) : GetImm(0);
+      // LDCLR clears the bits in Xs, i.e. AND with ~Xs. Precompute ~Xs once
+      // (loop-invariant).
+      Register applied = mask;
+      if (args.op == Decoder::AtomicOp::kLdclr) {
+        applied = std::get<0>(Gen<x86_64::NotqReg, kNoSSA>(Copy(mask)));
+      }
+
+      auto* ir = builder_.ir();
+      MachineBasicBlock* loop_bb = ir->NewBasicBlock();
+      MachineBasicBlock* exit_bb = ir->NewBasicBlock();
+      ir->AddEdge(builder_.bb(), loop_bb);
+      builder_.Gen<PseudoBranch>(loop_bb);
+
+      builder_.StartBasicBlock(loop_bb);
+      // Relaxed load of the current memory value (the CMPXCHG provides the
+      // atomicity/ordering; a mismatch just retries).
+      Register old = is_64
+          ? std::get<0>(Gen<x86_64::MovqRegOp>({.base = base}))
+          : std::get<0>(Gen<x86_64::MovlRegOp>({.base = base}));
+      Register new_val = Copy(old);
+      switch (args.op) {
+        case Decoder::AtomicOp::kLdclr:
+          new_val = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(new_val, applied));
+          break;
+        case Decoder::AtomicOp::kLdset:
+          new_val = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(new_val, applied));
+          break;
+        default:  // kLdeor
+          new_val = std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(new_val, applied));
+          break;
+      }
+      // CMPXCHG(expected=old, [mem], new_val). On a miss RAX is reloaded from
+      // [mem] and ZF=0 -> loop; on a match ZF=1 -> exit. Pass a copy of `old` so
+      // the original loaded value survives to the exit block for Xt.
+      Register expected = Copy(old);
+      Register cmpxchg_flags;
+      Register unused_rax;
+      if (is_64) {
+        std::tie(unused_rax, cmpxchg_flags) =
+            Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, new_val);
+      } else {
+        std::tie(unused_rax, cmpxchg_flags) =
+            Gen<x86_64::LockCmpXchglRegOpReg>(expected, {.base = base}, new_val);
+      }
+      UNUSED_ARGS(unused_rax);
+      ir->AddEdge(loop_bb, loop_bb);
+      ir->AddEdge(loop_bb, exit_bb);
+      builder_.Gen<PseudoCondBranch>(
+          x86_64::Assembler::Condition::kNotZero, loop_bb, exit_bb, cmpxchg_flags);
+
+      builder_.StartBasicBlock(exit_bb);
+      if (args.rt != 31) {
+        // MovlRegOp already zero-extended the 32-bit form to 64 bits (ARM Wt).
+        SetReg(args.rt, old);
+      }
+      return;
+    }
+
+    case Decoder::AtomicOp::kLdsmax:
+    case Decoder::AtomicOp::kLdsmin:
+    case Decoder::AtomicOp::kLdumax:
+    case Decoder::AtomicOp::kLdumin: {
+      // LSE atomic min/max: old=[Xn]; [Xn] = {max,min}(old, Xs); Xt = old. Same
+      // CMPXCHG retry loop as LDCLR/LDSET/LDEOR, with a select diamond inside the
+      // loop to compute the new value. 32/64-bit only; byte/half bail to lite.
+      if (args.size != 2 && args.size != 3) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const bool is_signed = (args.op == Decoder::AtomicOp::kLdsmax ||
+                              args.op == Decoder::AtomicOp::kLdsmin);
+      const bool is_max = (args.op == Decoder::AtomicOp::kLdsmax ||
+                           args.op == Decoder::AtomicOp::kLdumax);
+      const bool is_64 = (args.size == 3);
+      Register operand = (args.rs != 31) ? GetReg(args.rs) : GetImm(0);
+
+      auto* ir = builder_.ir();
+      MachineBasicBlock* loop_bb = ir->NewBasicBlock();
+      MachineBasicBlock* pick_old_bb = ir->NewBasicBlock();
+      MachineBasicBlock* pick_op_bb = ir->NewBasicBlock();
+      MachineBasicBlock* cmpxchg_bb = ir->NewBasicBlock();
+      MachineBasicBlock* exit_bb = ir->NewBasicBlock();
+      ir->AddEdge(builder_.bb(), loop_bb);
+      builder_.Gen<PseudoBranch>(loop_bb);
+
+      builder_.StartBasicBlock(loop_bb);
+      Register old = is_64
+          ? std::get<0>(Gen<x86_64::MovqRegOp>({.base = base}))
+          : std::get<0>(Gen<x86_64::MovlRegOp>({.base = base}));
+      // Extend both operands to 64 bits at the guest size so the Cmpq ordering
+      // is correct (64-bit: no-op; 32-bit signed: sign-extend; unsigned: zero-
+      // extend). MovlRegOp already zero-extended `old`; extend a copy for compare.
+      Register ext_old = old;
+      Register ext_op = operand;
+      if (!is_64) {
+        if (is_signed) {
+          ext_old = std::get<0>(Gen<x86_64::MovsxlqRegReg>(old));
+          ext_op = std::get<0>(Gen<x86_64::MovsxlqRegReg>(operand));
+        } else {
+          ext_old = std::get<0>(Gen<x86_64::MovlRegReg>(old));
+          ext_op = std::get<0>(Gen<x86_64::MovlRegReg>(operand));
+        }
+      }
+      Register cmp_flags = std::get<0>(Gen<x86_64::CmpqRegReg>(ext_old, ext_op));
+      // Keep old when old {>=,<=} op (max/min). Signed uses G/L, unsigned A/B.
+      x86_64::Assembler::Condition keep_old =
+          is_max ? (is_signed ? x86_64::Assembler::Condition::kGreaterEqual
+                              : x86_64::Assembler::Condition::kAboveEqual)
+                 : (is_signed ? x86_64::Assembler::Condition::kLessEqual
+                              : x86_64::Assembler::Condition::kBelowEqual);
+      Register new_val = AllocTempReg();
+      ir->AddEdge(loop_bb, pick_old_bb);
+      ir->AddEdge(loop_bb, pick_op_bb);
+      builder_.Gen<PseudoCondBranch>(keep_old, pick_old_bb, pick_op_bb, cmp_flags);
+
+      builder_.StartBasicBlock(pick_old_bb);
+      builder_.Gen<PseudoCopy>(new_val, old, 8);
+      ir->AddEdge(pick_old_bb, cmpxchg_bb);
+      builder_.Gen<PseudoBranch>(cmpxchg_bb);
+
+      builder_.StartBasicBlock(pick_op_bb);
+      builder_.Gen<PseudoCopy>(new_val, operand, 8);
+      ir->AddEdge(pick_op_bb, cmpxchg_bb);
+      builder_.Gen<PseudoBranch>(cmpxchg_bb);
+
+      builder_.StartBasicBlock(cmpxchg_bb);
+      Register expected = Copy(old);
+      Register cmpxchg_flags;
+      Register unused_rax;
+      if (is_64) {
+        std::tie(unused_rax, cmpxchg_flags) =
+            Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, new_val);
+      } else {
+        std::tie(unused_rax, cmpxchg_flags) =
+            Gen<x86_64::LockCmpXchglRegOpReg>(expected, {.base = base}, new_val);
+      }
+      UNUSED_ARGS(unused_rax);
+      ir->AddEdge(cmpxchg_bb, loop_bb);
+      ir->AddEdge(cmpxchg_bb, exit_bb);
+      builder_.Gen<PseudoCondBranch>(
+          x86_64::Assembler::Condition::kNotZero, loop_bb, exit_bb, cmpxchg_flags);
+
+      builder_.StartBasicBlock(exit_bb);
+      if (args.rt != 31) {
+        SetReg(args.rt, old);
+      }
+      return;
+    }
+
+    case Decoder::AtomicOp::kCasp: {
+      // CASP: compare-and-swap pair. Rs:Rs+1 = expected, Rt:Rt+1 = new; the old
+      // pair is written back to Rs:Rs+1. size=2 packs each 32-bit pair into a
+      // 64-bit value and uses LOCK CMPXCHGq. size=3 (128-bit DWCAS) needs LOCK
+      // CMPXCHG16B, which is not exposed as a simple machine-IR op here, so it
+      // bails to lite (which lowers it). Mirrors lite for the size=2 path.
+      if (args.size != 2) {
+        UndefinedReturningVoid();
+        return;
+      }
+      const uint8_t rs_lo = args.rs;
+      const uint8_t rs_hi = static_cast<uint8_t>(args.rs + 1);
+      const uint8_t rt_lo = args.rt;
+      const uint8_t rt_hi = static_cast<uint8_t>(args.rt + 1);
+
+      // Pack (hi << 32) | zext(lo) for both expected and desired.
+      auto pack = [&](uint8_t lo, uint8_t hi) -> Register {
+        Register v = (lo != 31)
+            ? std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(lo)))
+            : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
+        if (hi != 31) {
+          Register h = std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(hi)));
+          h = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(h, int8_t{32}));
+          v = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(v, h));
+        }
+        return v;
+      };
+      Register expected = pack(rs_lo, rs_hi);
+      Register desired = pack(rt_lo, rt_hi);
+      Register old =
+          std::get<0>(Gen<x86_64::LockCmpXchgqRegOpReg>(expected, {.base = base}, desired));
+      GenRecoveryBlockForLastInsn();
+      // Unpack the old pair back to Rs:Rs+1 (each half zero-extended).
+      if (rs_lo != 31) {
+        SetReg(rs_lo, std::get<0>(Gen<x86_64::MovlRegReg>(old)));
+      }
+      if (rs_hi != 31) {
+        SetReg(rs_hi, std::get<0>(Gen<x86_64::ShrqRegImm>(Copy(old), int8_t{32})));
+      }
+      return;
+    }
+
     default:
-      // Remaining LSE atomics (LDCLR/LDSET/LDEOR, LDSMAX/MIN, LDUMAX/MIN),
-      // CASP, and the LDXP/STXP pair forms are not yet mirrored into the heavy
-      // tier; bail to the lite translator (correct, just slower).
+      // The LDXP/STXP pair forms are not yet mirrored into the heavy tier; bail
+      // to the lite translator (correct, just slower).
       UndefinedReturningVoid();
       return;
   }
