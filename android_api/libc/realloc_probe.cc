@@ -59,7 +59,11 @@ namespace {
 
 std::atomic<uint64_t> g_realloc_count{0};
 
-void LogReallocCall(uint64_t n, void* ptr, size_t size) {
+// Takes the already-read header qwords rather than re-peeking [ptr-16]: the
+// only caller has them in hand, and re-reading would reintroduce the very
+// GWP-ASan guard-page fault the page check in __wrap_realloc exists to avoid
+// (mirrors free_probe.cc's LogFreeCall, which is likewise passed the values).
+void LogReallocCall(uint64_t n, void* ptr, size_t size, uint64_t hdr16, uint64_t hdr8) {
   uint64_t lr = 0;
   uint64_t fp = 0;
   berberis::GuestThread* gt = berberis::GetCurrentGuestThread();
@@ -68,13 +72,6 @@ void LogReallocCall(uint64_t n, void* ptr, size_t size) {
     fp = gt->state()->cpu.x[29];
   }
   pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
-  uint64_t hdr8 = 0;
-  uint64_t hdr16 = 0;
-  if (ptr != nullptr) {
-    const uint8_t* p = static_cast<const uint8_t*>(ptr);
-    memcpy(&hdr8, p - 8, sizeof(hdr8));
-    memcpy(&hdr16, p - 16, sizeof(hdr16));
-  }
   __android_log_print(
       ANDROID_LOG_ERROR, "berberis",
       "realloc_probe #%llu ptr=%p size=%zu lr=0x%llx fp=0x%llx tid=%d "
@@ -95,6 +92,8 @@ extern "C" void* __wrap_realloc(void* ptr, size_t size) {
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   uint64_t n = g_realloc_count.fetch_add(1, std::memory_order_relaxed) + 1;
   bool non_heap = false;
+  uint64_t hdr8 = 0;
+  uint64_t hdr16 = 0;
   // GWP-ASan safety (mirrors free_probe.cc): GWP-ASan, the platform sampling
   // allocator (~1/1000 mallocs), places an allocation flush against a guard
   // page for underflow detection, so the user pointer is page-aligned and the
@@ -108,8 +107,6 @@ extern "C" void* __wrap_realloc(void* ptr, size_t size) {
   // guard that free_probe.cc already carries; realloc lacked it.
   if (ptr != nullptr && (reinterpret_cast<uintptr_t>(ptr) & 0xfffUL) >= 16) {
     const uint8_t* p = static_cast<const uint8_t*>(ptr);
-    uint64_t hdr8 = 0;
-    uint64_t hdr16 = 0;
     memcpy(&hdr8, p - 8, sizeof(hdr8));
     memcpy(&hdr16, p - 16, sizeof(hdr16));
     non_heap = (hdr8 == 0 && hdr16 == 0);
@@ -119,7 +116,7 @@ extern "C" void* __wrap_realloc(void* ptr, size_t size) {
     // Scudo abort path (the band-aid actively rerouting a non-heap realloc).
     // Do NOT log ordinary reallocs — a per-call log floods every translated
     // app's logcat at startup.
-    LogReallocCall(n, ptr, size);
+    LogReallocCall(n, ptr, size, hdr16, hdr8);
     // Qt shared-null / non-heap pointer.  Returning calloc(size, 1) gives
     // the caller a fresh writable buffer pre-zeroed to the same byte
     // pattern the shared null had, matching the COW semantics Qt expects.
