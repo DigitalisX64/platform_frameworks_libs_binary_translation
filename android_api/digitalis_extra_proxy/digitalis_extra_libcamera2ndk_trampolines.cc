@@ -41,7 +41,8 @@
 // camera2ndk_shared_capture_callbacks_test.cc (run under berberis_arm64_host_tests).
 // The shared-camera session itself cannot be opened on the Digitalis emulator
 // (SYSTEM_CAMERA permission + no HAL shared-session support), so end-to-end
-// exercise is impossible there; see digitalis/docs/proxy-coverage-gaps.md.
+// exercise is impossible there; the host recorder test below is the
+// ground-truth verification instead.
 //
 // Host functions are reached via the dlsym'd `callee` (not by name) so this
 // static lib adds no libcamera2ndk link dependency to libberberis_arm64.so.

@@ -39,7 +39,7 @@
 //       NDK<->platform-binder interop. A guest cannot use a host sp<IBinder>, so
 //       the stub returns an empty (null) sp via the AAPCS64 sret register (x8)
 //       instead of aborting. See DoStub_AIBinder_toPlatformBinder in
-//       digitalis_extra_stubs.h and digitalis/docs/proxy-coverage-gaps.md.
+//       digitalis_extra_stubs.h.
 //
 // Host functions are reached via the dlsym'd `callee` (not by name) so this
 // static lib adds no libbinder_ndk link dependency to libberberis_arm64.so.

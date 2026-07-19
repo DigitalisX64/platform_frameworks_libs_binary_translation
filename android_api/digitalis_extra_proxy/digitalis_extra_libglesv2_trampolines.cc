@@ -20,7 +20,7 @@
 // implement that extension, so the host entrypoint returns NULL and there is
 // nothing to wrap. Returning NULL (the documented "unavailable" contract value)
 // instead of aborting closes the gap without a GFXStream change. Registered for
-// both libGLESv2.so and libGLESv3.so. See digitalis/docs/proxy-coverage-gaps.md.
+// both libGLESv2.so and libGLESv3.so.
 
 #if defined(__x86_64__)
 

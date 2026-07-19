@@ -65,7 +65,7 @@ cc_library_static {
 // Host-side ground-truth verification of the libcamera2ndk shared-camera V2
 // capture-callback marshalling (camera2ndk_shared_capture_callbacks.h). The
 // shared-camera API is untestable on the Digitalis emulator (see
-// digitalis/docs/proxy-coverage-gaps.md), so the per-field WrapGuestFunction
+// a shared-session AIDL HAL), so the per-field WrapGuestFunction
 // marshalling is verified here against the NDK header signatures by firing each
 // wrapped callback through the guest runtime. Linked into berberis_arm64_host_tests.
 cc_test_library {

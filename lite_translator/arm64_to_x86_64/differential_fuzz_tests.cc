@@ -41,7 +41,7 @@
 //   * CI mode (default): fixed seeds, bounded iteration counts, runs in seconds
 //     inside berberis_arm64_host_tests.
 //   * Exhaustive mode: env var BERBERIS_DIFFERENTIAL_FUZZ_EXHAUSTIVE widens the
-//     sweep (driver: digitalis/scripts/differential-fuzz.sh). The shift-imm
+//     sweep (long-sweep driver script). The shift-imm
 //     exhaustive sweep that pinned the SCVTF lane-drop is the model.
 //
 // A single-instruction region fully captures a JIT handler's codegen for the
@@ -80,7 +80,7 @@ namespace {
 constexpr uint16_t kNZCVMask = kFlagsNZCVMask;
 
 // Widen the sweep when the exhaustive-mode env knob is set (see
-// digitalis/scripts/differential-fuzz.sh). Off => 1 (CI, ~seconds).
+// long-sweep driver script). Off => 1 (CI, ~seconds).
 int FuzzScale() {
   const char* e = getenv("BERBERIS_DIFFERENTIAL_FUZZ_EXHAUSTIVE");
   if (e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) {
