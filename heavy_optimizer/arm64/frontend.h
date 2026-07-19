@@ -829,6 +829,18 @@ class HeavyOptimizerFrontend {
     return ones;
   }
 
+  // Packed-single FMULX saturation blend: FMUL except (+-0 * +-inf) lanes return
+  // +-2.0 (sign = sign(a) XOR sign(b)) instead of NaN. Op-for-op mirror of the
+  // scalar/by-element FP32 FMULX blends. Destroys `a`; returns the result reg.
+  [[nodiscard]] FpRegister EmitFmulxF32Packed(FpRegister a, FpRegister b);
+
+  // Packed-single pairwise-style min/max with ARM's +-0 tie and NaN rules:
+  // FMAXP/FMINP (is_nm=false) propagate NaN; FMAXNMP/FMINNMP (is_nm=true)
+  // suppress it; the +-0 tie is fixed by an explicit AND(max)/OR(min) blend over
+  // lanes where both inputs are zero. Destroys xa/xb; returns the result reg.
+  [[nodiscard]] FpRegister EmitFpPairwiseMinMaxF32Packed(FpRegister xa, FpRegister xb,
+                                                         bool is_max, bool is_nm);
+
   void SetVRegScalar(uint8_t reg, FpRegister value, bool is_double);
 
   void SetVRegScalarFromGp(uint8_t reg, Register value, bool is_double);

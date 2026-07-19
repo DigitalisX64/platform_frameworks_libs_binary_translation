@@ -15534,6 +15534,34 @@ constexpr uint32_t FrsqrtsVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x4EC03C00u | (static_cast<uint32_t>(rm) << 16) |
          (static_cast<uint32_t>(rn) << 5) | rd;
 }
+constexpr uint32_t FmaxVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E403400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x4E403400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EC03400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E400400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0EC00400u | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+// Encoding check (rd=0,rn=1,rm=2): FmaxVec4H==0x0E423420, FmaxVec8H==0x4E423420,
+// FminVec4H==0x0EC23420, FmaxnmVec4H==0x0E420420, FminnmVec4H==0x0EC20420 —
+// all confirmed with llvm objdump (-march=armv8.2-a+fp16).
+static_assert(FmaxVec4H(0, 1, 2) == 0x0E423420u);
+static_assert(FmaxVec8H(0, 1, 2) == 0x4E423420u);
+static_assert(FminVec4H(0, 1, 2) == 0x0EC23420u);
+static_assert(FmaxnmVec4H(0, 1, 2) == 0x0E420420u);
+static_assert(FminnmVec4H(0, 1, 2) == 0x0EC20420u);
 
 static void StoreVec8H(CPUState& cpu, unsigned idx, const uint16_t lanes[8]) {
   std::memcpy(&cpu.v[idx], lanes, 16);
@@ -15710,6 +15738,154 @@ TEST_F(Arm64LiteTranslateRegionTest, FrsqrtsVec8HTwoPassRegular) {
   EXPECT_EQ(r[5], kHalf_1_0);  // (3 - 0.5*2)/2 = 1
   EXPECT_EQ(r[6], kHalf_1_0);  // (3 - 4*0.25)/2 = 1
   EXPECT_EQ(r[7], kHalf_1_0);  // (3 - 2*0.5)/2 = 1
+}
+
+// FMAX .4H — the +/-0 tie must return +0h (0x0000), NOT -0h (0x8000).  The old
+// F16C path used MAXPS directly (OR-of-signs) and returned -0h; the negate-trick
+// fix returns +0h in both operand orders.  Lane3 confirms NaN still propagates.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec4HZeroTieAndNan) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_1_0, kHalf_qNaN,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_neg0, kHalf_pos0, kHalf_2_0, kHalf_1_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmaxVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_pos0);  // FMAX(+0,-0) = +0
+  EXPECT_EQ(r[1], kHalf_pos0);  // FMAX(-0,+0) = +0
+  EXPECT_EQ(r[2], kHalf_2_0);   // FMAX(1.0,2.0) = 2.0
+  EXPECT_EQ(r[3], kHalf_qNaN);  // FMAX(NaN,1.0) = NaN (propagate)
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);  // Q=0 upper zeroed
+}
+
+// FMAXNM .4H — +/-0 tie returns +0h; NaN suppressed to the other operand.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmVec4HZeroTieAndNanSuppressed) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_qNaN, kHalf_1_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_neg0, kHalf_pos0, kHalf_3_0, kHalf_qNaN,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmaxnmVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_pos0);  // FMAXNM(+0,-0) = +0
+  EXPECT_EQ(r[1], kHalf_pos0);  // FMAXNM(-0,+0) = +0
+  EXPECT_EQ(r[2], kHalf_3_0);   // FMAXNM(NaN,3.0) = 3.0
+  EXPECT_EQ(r[3], kHalf_1_0);   // FMAXNM(1.0,NaN) = 1.0
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMIN .4H — regression guard: the +/-0 tie stays -0h (OR-of-signs, unchanged).
+TEST_F(Arm64LiteTranslateRegionTest, FminVec4HZeroTie) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_2_0, kHalf_qNaN,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_neg0, kHalf_pos0, kHalf_1_0, kHalf_1_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FminVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_neg0);  // FMIN(+0,-0) = -0
+  EXPECT_EQ(r[1], kHalf_neg0);  // FMIN(-0,+0) = -0
+  EXPECT_EQ(r[2], kHalf_1_0);   // FMIN(2.0,1.0) = 1.0
+  EXPECT_EQ(r[3], kHalf_qNaN);  // FMIN(NaN,1.0) = NaN
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMINNM .4H — the order-swapped tie was ALSO wrong before (single MINPS
+// returned +0 for FMINNM(-0,+0)); the minab|minba|OR fix returns -0h.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmVec4HZeroTieOrderSwapped) {
+  const uint16_t n_lanes[8] = {kHalf_neg0, kHalf_pos0, kHalf_qNaN, kHalf_2_0,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  const uint16_t m_lanes[8] = {kHalf_pos0, kHalf_neg0, kHalf_3_0, kHalf_qNaN,
+                                0x5555, 0x5555, 0x5555, 0x5555};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FminnmVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_neg0);  // FMINNM(-0,+0) = -0  (was +0 before fix)
+  EXPECT_EQ(r[1], kHalf_neg0);  // FMINNM(+0,-0) = -0
+  EXPECT_EQ(r[2], kHalf_3_0);   // FMINNM(NaN,3.0) = 3.0
+  EXPECT_EQ(r[3], kHalf_2_0);   // FMINNM(2.0,NaN) = 2.0
+  for (int i = 4; i < 8; i++) EXPECT_EQ(r[i], 0u);
+}
+
+// FMAX .8H — exercise the high-half path: +/-0 ties in both 64-bit halves.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxVec8HZeroTieBothHalves) {
+  const uint16_t n_lanes[8] = {kHalf_pos0, kHalf_1_0, kHalf_neg0, kHalf_2_0,
+                                kHalf_neg0, kHalf_3_0, kHalf_pos0, kHalf_qNaN};
+  const uint16_t m_lanes[8] = {kHalf_neg0, kHalf_2_0, kHalf_pos0, kHalf_1_0,
+                                kHalf_pos0, kHalf_1_0, kHalf_neg0, kHalf_1_0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n_lanes);
+  StoreVec8H(state_.cpu, 2, m_lanes);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmaxVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_pos0);  // FMAX(+0,-0)
+  EXPECT_EQ(r[1], kHalf_2_0);
+  EXPECT_EQ(r[2], kHalf_pos0);  // FMAX(-0,+0)
+  EXPECT_EQ(r[3], kHalf_2_0);
+  EXPECT_EQ(r[4], kHalf_pos0);  // FMAX(-0,+0)  (high half)
+  EXPECT_EQ(r[5], kHalf_3_0);
+  EXPECT_EQ(r[6], kHalf_pos0);  // FMAX(+0,-0)  (high half)
+  EXPECT_EQ(r[7], kHalf_qNaN);  // FMAX(NaN,1.0) = NaN
+}
+
+// FP16 scalar int<->FP conversions (Armv8.2-FP16, ftype=0b11). These previously
+// raised "Undefined arm64 instruction" (unscaled forms) or silently miscompiled
+// as FP64 (fixed-point forms); the interpreter now handles them. fp16->int widens
+// h->FP32 exactly then runs the FP32->int ladder; int->fp16 goes int->FP32(RNE)
+// then RNE-narrows to fp16. Expected values confirmed against hardware F16C.
+// (The lite/heavy JITs bail these to this interpreter path.)
+TEST_F(Arm64LiteTranslateRegionTest, Fp16ScalarIntConvertInterpreter) {
+  struct Case { uint32_t insn; uint16_t h; uint64_t in_x; bool int_out; uint64_t xd; uint16_t hd; };
+  const Case cases[] = {
+    {0x1ef800a6u, 0x4180, 0, true, 2u, 0},                 // fcvtzs w6,h5 ; 2.75 -> 2
+    {0x1ee400a6u, 0x4100, 0, true, 3u, 0},                 // fcvtas w6,h5 ; 2.5 ties-away -> 3
+    {0x1ef000a6u, 0xC100, 0, true, 0xFFFFFFFDull, 0},      // fcvtms w6,h5 ; floor(-2.5) -> -3
+    {0x1ef800a6u, 0x7C00, 0, true, 0x7FFFFFFFull, 0},      // fcvtzs w6,h5 ; +Inf -> INT32_MAX
+    {0x1ef800a6u, 0xFC00, 0, true, 0x80000000ull, 0},      // fcvtzs w6,h5 ; -Inf -> INT32_MIN
+    {0x1ef800a6u, 0x7E00, 0, true, 0u, 0},                 // fcvtzs w6,h5 ; NaN -> 0
+    {0x9ef800a6u, 0x4300, 0, true, 3u, 0},                 // fcvtzs x6,h5 ; 3.5 -> 3 (64-bit)
+    {0x1ed8fca6u, 0x4300, 0, true, 7u, 0},                 // fcvtzs w6,h5,#1 ; trunc(3.5*2) -> 7
+    {0x1ee200a6u, 0,      4097, false, 0, 0x6C00},         // scvtf h6,w5 ; 4097 -> 4096.0h (RNE)
+    {0x1ec2f8a6u, 0,      10,   false, 0, 0x4100},         // scvtf h6,w5,#2 ; 10/4 -> 2.5h
+  };
+  for (const auto& c : cases) {
+    uint32_t code[1] = {c.insn};
+    for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+    state_.cpu.x[5] = c.in_x;
+    memcpy(&state_.cpu.v[5], &c.h, 2);
+    state_.cpu.x[6] = 0xDEADBEEFDEADBEEFull;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    if (c.int_out) {
+      EXPECT_EQ(state_.cpu.x[6], c.xd) << "insn=0x" << std::hex << c.insn;
+    } else {
+      uint16_t g; memcpy(&g, &state_.cpu.v[5 + 1], 2);
+      EXPECT_EQ(g, c.hd) << "insn=0x" << std::hex << c.insn;
+    }
+  }
 }
 
 // FP16 vector FMULX .4H / .8H — F16C round-trip JIT.
@@ -17472,6 +17648,64 @@ TEST_F(Arm64LiteTranslateRegionTest, Crc32cMatchesInterpreter) {
     EXPECT_EQ(jit, interp) << "CRC32C insn=0x" << std::hex << c.insn
                            << " acc=0x" << c.acc << " data=0x" << c.data;
   }
+}
+
+// IEEE CRC32B/H/W/X (poly 0x04C11DB7) JIT via PCLMULQDQ reflected Barrett.
+// Validated against the interpreter (the proven software reflected-CRC32), which
+// also exercises the new PCLMULQDQ-based lowering end-to-end. Encodings verified
+// with the aarch64 assembler (armv8-a+crc).
+TEST_F(Arm64LiteTranslateRegionTest, Crc32IeeeMatchesInterpreter) {
+  if (!host_platform::kHasCLMUL) {
+    GTEST_SKIP() << "host lacks PCLMULQDQ";
+  }
+  struct Case { uint32_t insn; uint64_t acc; uint64_t data; };
+  const Case cases[] = {
+      {0x1AC24020u, 0x00000000u, 0x000000ABu},        // CRC32B  acc=0
+      {0x1AC24020u, 0xFFFFFFFFu, 0x000000ABu},        // CRC32B  acc=~0
+      {0x1AC24020u, 0x12345678u, 0x000000CDu},        // CRC32B
+      {0x1AC24420u, 0x00000000u, 0x0000BEEFu},        // CRC32H  acc=0
+      {0x1AC24420u, 0xFFFFFFFFu, 0x0000BEEFu},        // CRC32H  acc=~0
+      {0x1AC24420u, 0xABCDEF01u, 0x00001234u},        // CRC32H
+      {0x1AC24820u, 0x00000000u, 0xDEADBEEFu},        // CRC32W  acc=0
+      {0x1AC24820u, 0xFFFFFFFFu, 0xDEADBEEFu},        // CRC32W  acc=~0
+      {0x1AC24820u, 0x0F0F0F0Fu, 0x12345678u},        // CRC32W
+      {0x9AC24C20u, 0x00000000u, 0x0123456789ABCDEFu},// CRC32X  acc=0
+      {0x9AC24C20u, 0xFFFFFFFFu, 0x0123456789ABCDEFu},// CRC32X  acc=~0
+      {0x9AC24C20u, 0xCAFEBABEu, 0xFEEDFACE12345678u},// CRC32X
+  };
+  for (const Case& c : cases) {
+    const uint32_t code[1] = {c.insn};
+    state_.cpu.x[1] = c.acc;
+    state_.cpu.x[2] = c.data;
+    state_.cpu.x[0] = 0;
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    uint32_t jit = static_cast<uint32_t>(state_.cpu.x[0]);
+    state_.cpu.x[1] = c.acc;
+    state_.cpu.x[2] = c.data;
+    state_.cpu.x[0] = 0;
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    uint32_t interp = static_cast<uint32_t>(state_.cpu.x[0]);
+    EXPECT_EQ(jit, interp) << "CRC32 insn=0x" << std::hex << c.insn
+                           << " acc=0x" << c.acc << " data=0x" << c.data;
+  }
+  // Multi-step chain (feeds each CRC32X result as the next accumulator) — catches
+  // a wrong fold constant that a single step could mask.
+  static const uint32_t chain[] = {0x9AC24C20u};  // CRC32X w0, w1, x2
+  uint64_t acc = 0xFFFFFFFFu;
+  const uint64_t feed[] = {0x1122334455667788u, 0xDEADBEEFCAFEBABEu,
+                           0x0u, 0xFFFFFFFFFFFFFFFFu, 0x123456789ABCDEF0u};
+  for (uint64_t v : feed) {
+    state_.cpu.x[1] = acc; state_.cpu.x[2] = v; state_.cpu.x[0] = 0;
+    EXPECT_TRUE(Run(chain, ToGuestAddr(chain) + sizeof(chain)));
+    uint64_t jit = state_.cpu.x[0];
+    state_.cpu.x[1] = acc; state_.cpu.x[2] = v; state_.cpu.x[0] = 0;
+    state_.cpu.insn_addr = ToGuestAddr(chain);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.x[0]) << "CRC32X chain v=0x" << std::hex << v;
+    acc = state_.cpu.x[0];
+  }
+  EXPECT_EQ(static_cast<uint32_t>(acc), 0xD116E4ACu);  // Python-computed chain end
 }
 
 // SHLL/SHLL2 (shift left long by element size) JIT.

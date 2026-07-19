@@ -3367,6 +3367,74 @@ Register HeavyOptimizerFrontend::DataProc2Src(Decoder::DataProc2SrcOpcode opcode
           return std::get<0>(Gen<x86_64::Crc32cxRegReg, kNoSSA>(acc, src2));
       }
     }
+    // IEEE CRC32B/H/W/X — poly 0x04C11DB7 (reflected 0xEDB88320). The host SSE4.2
+    // CRC32 computes the *Castagnoli* poly (CRC32C* above) and cannot serve
+    // these; lower them with a carry-less multiply (PCLMULQDQ) reflected Barrett
+    // reduction. Accumulator is Wn (low 32); data is Wm (b/h/w) or Xm (x). Line-
+    // by-line mirror of lite_translator_integer_ctrl.inc. Reflected fold/Barrett
+    // constants (rev33 of x^k mod P, of P, of mu=floor(x^64/P); == zlib's):
+    //   K64=0x163CD6124 K32=0x1DB710640 K16=0x10000 K8=0x1000000
+    //   MU=0x1F7011641  POLYR=0x1DB710641
+    // Bail to lite if the host lacks PCLMULQDQ.
+    case Decoder::DataProc2SrcOpcode::kCrc32b:
+    case Decoder::DataProc2SrcOpcode::kCrc32h:
+    case Decoder::DataProc2SrcOpcode::kCrc32w:
+    case Decoder::DataProc2SrcOpcode::kCrc32x: {
+      if (!host_platform::kHasCLMUL) {
+        UndefinedReturningReg();
+        return AllocTempReg();
+      }
+      FpRegister xt = AllocTempSimdReg();  // fold accumulator (proc)
+      FpRegister xk = AllocTempSimdReg();  // constant loader
+      Register acc = std::get<0>(Gen<x86_64::MovlRegReg>(src1));  // zext Wn
+      if (opcode == Decoder::DataProc2SrcOpcode::kCrc32x) {
+        Register t = std::get<0>(Gen<x86_64::XorqRegReg>(acc, src2));  // T=acc^Xm
+        Register tlo = std::get<0>(Gen<x86_64::MovlRegReg>(t));
+        Register thi = std::get<0>(Gen<x86_64::ShrqRegImm>(t, int8_t{32}));
+        FpRegister xh = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdXRegReg>(xt.machine_reg(), tlo);
+        builder_.Gen<x86_64::MovdXRegReg>(xh.machine_reg(), thi);
+        builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x163CD6124}));
+        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xt.machine_reg(), xk.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1DB710640}));
+        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xh.machine_reg(), xk.machine_reg(), int8_t{0x00});
+        builder_.Gen<x86_64::PxorXRegXReg>(xt.machine_reg(), xh.machine_reg());
+      } else {
+        Register masked = std::get<0>(Gen<x86_64::MovlRegReg>(src2));  // zext Wm
+        uint64_t kc;
+        switch (opcode) {
+          case Decoder::DataProc2SrcOpcode::kCrc32h:
+            masked = std::get<0>(Gen<x86_64::AndqRegImm>(masked, int32_t{0xFFFF}));
+            kc = 0x10000; break;
+          case Decoder::DataProc2SrcOpcode::kCrc32b:
+            masked = std::get<0>(Gen<x86_64::AndqRegImm>(masked, int32_t{0xFF}));
+            kc = 0x1000000; break;
+          default: /* kCrc32w */
+            kc = 0x1DB710640; break;
+        }
+        Register t = std::get<0>(Gen<x86_64::XorqRegReg>(acc, masked));  // T
+        builder_.Gen<x86_64::MovdXRegReg>(xt.machine_reg(), t);
+        builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(kc));
+        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xt.machine_reg(), xk.machine_reg(), int8_t{0x00});
+      }
+      // Reflected Barrett reduction of the 64-bit fold value (xt.q0) -> 32-bit.
+      // 32-bit MOVD round-trips realize the R&M32 / t1&M32 masks. A fresh xb
+      // holds the Barrett running value so xt is only read, never rewritten.
+      FpRegister xb = AllocTempSimdReg();
+      Register r = std::get<0>(Gen<x86_64::MovqRegXReg>(xt.machine_reg()));  // R=proc
+      Register rlo = std::get<0>(Gen<x86_64::MovlRegReg>(r));                // R&M32
+      builder_.Gen<x86_64::MovdXRegReg>(xb.machine_reg(), rlo);
+      builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1F7011641}));  // MU
+      builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xb.machine_reg(), xk.machine_reg(), int8_t{0x00});
+      Register t1 = std::get<0>(Gen<x86_64::MovdRegXReg>(xb.machine_reg()));  // t1&M32
+      builder_.Gen<x86_64::MovdXRegReg>(xb.machine_reg(), t1);
+      builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1DB710641}));  // POLYR
+      builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xb.machine_reg(), xk.machine_reg(), int8_t{0x00});
+      Register t2 = std::get<0>(Gen<x86_64::MovqRegXReg>(xb.machine_reg()));  // t2 (64-bit)
+      Register xored = std::get<0>(Gen<x86_64::XorqRegReg>(r, t2));
+      Register crc = std::get<0>(Gen<x86_64::ShrqRegImm>(xored, int8_t{32}));
+      return std::get<0>(Gen<x86_64::MovlRegReg>(crc));  // Wd (zero-extends into Xd)
+    }
     default:
       UndefinedReturningReg();
       return AllocTempReg();
@@ -3895,7 +3963,7 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
   if (!success()) {
     return;
   }
-  if (ftype != 0b00 && ftype != 0b01) {
+  if (ftype != 0b00 && ftype != 0b01 && ftype != 0b11) {
     UndefinedReturningVoid(BailReason::kUnsupportedFpType);
     return;
   }
@@ -3903,14 +3971,38 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
     UndefinedReturningVoid();
     return;
   }
+  if (ftype == 0b11 && !host_platform::kHasF16C) {
+    UndefinedReturningVoid(BailReason::kUnsupportedFpType);
+    return;
+  }
   const bool is_double = (ftype == 0b01);
-  FpRegister xmm_n = GetVRegScalar(rn, is_double);
-  FpRegister xmm_m = GetVRegScalar(rm, is_double);
-  FpRegister xmm_a = GetVRegScalar(ra, is_double);
+  const bool is_half = (ftype == 0b11);
+  // FP16 FMA (FMADD/FMSUB/FNMADD/FNMSUB Hd) is correctly-rounded by fusing in
+  // FP64 and narrowing once: FP64's 53 significand bits exceed 2*11+1, so
+  // fp16->FP64 fuse then RNE-narrow to fp16 avoids the double-rounding a naive
+  // FP32 round-trip would suffer. This mirrors the lite tier's is_half recipe and
+  // the interpreter's ftype==0b11 fma() branch. Widen each operand fp16->FP32
+  // (F16C) -> FP64; lane 1 carries FP64 +0.0 through the SD FMA so the FP64->FP32
+  // narrow yields +0.0 upper lanes for the clean fp16 store.
+  FpRegister xmm_n, xmm_m, xmm_a;
+  if (is_half) {
+    xmm_n = EmitWidenHalfToF32(rn);
+    builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xmm_n.machine_reg(), xmm_n.machine_reg());
+    xmm_m = EmitWidenHalfToF32(rm);
+    builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xmm_m.machine_reg(), xmm_m.machine_reg());
+    xmm_a = EmitWidenHalfToF32(ra);
+    builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xmm_a.machine_reg(), xmm_a.machine_reg());
+  } else {
+    xmm_n = GetVRegScalar(rn, is_double);
+    xmm_m = GetVRegScalar(rm, is_double);
+    xmm_a = GetVRegScalar(ra, is_double);
+  }
+  // FP16 fuses in the SD (FP64) form, exactly as the lite tier does.
+  const bool use_double_fma = is_double || is_half;
   FpRegister acc = AllocTempSimdReg();
   builder_.Gen<x86_64::MovdqaXRegXReg>(acc.machine_reg(), xmm_a.machine_reg());
   if (!o1 && !o0) {  // FMADD
-    if (is_double) {
+    if (use_double_fma) {
       builder_.Gen<x86_64::Vfmadd231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
@@ -3918,7 +4010,7 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   } else if (!o1 && o0) {  // FMSUB
-    if (is_double) {
+    if (use_double_fma) {
       builder_.Gen<x86_64::Vfnmadd231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
@@ -3926,7 +4018,7 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   } else if (o1 && !o0) {  // FNMADD
-    if (is_double) {
+    if (use_double_fma) {
       builder_.Gen<x86_64::Vfnmsub231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
@@ -3934,13 +4026,19 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   } else {  // FNMSUB
-    if (is_double) {
+    if (use_double_fma) {
       builder_.Gen<x86_64::Vfmsub231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
       builder_.Gen<x86_64::Vfmsub231ssXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
+  }
+  if (is_half) {
+    // Narrow FP64 -> FP32 (lane 1 = +0.0 preserved by the SD FMA) -> fp16, store.
+    builder_.Gen<x86_64::Cvtpd2psXRegXReg>(acc.machine_reg(), acc.machine_reg());
+    EmitNarrowF32ToHalfAndStore(rd, acc);
+    return;
   }
   SetVRegScalar(rd, acc, is_double);
 }
@@ -6086,13 +6184,14 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmV ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmV) {
     if (args.is_fp16) {
-      // FP16 .4H/.8H via F16C round-trip. NaN-propagating FMAX/FMIN use the
-      // MAX|MAX|POR (resp. MIN) idiom; NaN-suppressing FMAXNM/FMINNM substitute
-      // each NaN lane with the other operand then a single MAX/MIN. Mirrors lite's
-      // FP16 FMAX/FMIN/FMAXNM/FMINNM path *exactly* (MAXPS/MINPS directly, no
-      // negate-trick) — the ±0 signed-zero tie on FMAX/FMAXNM matches lite (which
-      // FP-three-same differential fuzzing excludes); a coordinated lite+heavy
-      // negate-trick fix verified against the interpreter is a follow-up.
+      // FP16 .4H/.8H via F16C round-trip. The widen makes this the FP32
+      // lowering on the widened halves, so it reuses the FP32/FP64 path's
+      // +-0-tie handling below: ARM FMAX/FMAXNM = -FMIN(-a,-b), so negating
+      // inputs+output makes MAX reuse the FMIN lowering and get ARM's
+      // AND-of-signs (most-positive) on the +-0 tie instead of x86 MAXPS's
+      // OR-of-signs. NaN-suppressing FMAXNM/FMINNM substitute each NaN lane
+      // with the other operand, then minab|minba|OR (matches the FP32 nm path
+      // so the +-0 tie is order-independent). FMIN/FMINNM need no negation.
       if (!host_platform::kHasF16C) {
         UndefinedReturningVoid();
         return;
@@ -6105,21 +6204,36 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       FpRegister lo_m = no_fp_register, hi_m = no_fp_register;
       EmitWidenHalfVec(vn_off, args.q, &lo_n, &hi_n);
       EmitWidenHalfVec(vm_off, args.q, &lo_m, &hi_m);
+      // FMAX negate-trick: per-lane FP32 sign mask (all-ones << 31), XORed into
+      // the widened inputs now and back out of the result after the MIN.
+      FpRegister sign_mask = no_fp_register;
+      if (is_max) {
+        sign_mask = AllocOnesSimdReg();
+        builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+        builder_.Gen<x86_64::PxorXRegXReg>(lo_n.machine_reg(), sign_mask.machine_reg());
+        builder_.Gen<x86_64::PxorXRegXReg>(lo_m.machine_reg(), sign_mask.machine_reg());
+        if (args.q) {
+          builder_.Gen<x86_64::PxorXRegXReg>(hi_n.machine_reg(), sign_mask.machine_reg());
+          builder_.Gen<x86_64::PxorXRegXReg>(hi_m.machine_reg(), sign_mask.machine_reg());
+        }
+      }
+      // Always MIN now (FMAX reaches here with negated operands).
       auto minmax = [&](FpRegister d, FpRegister s) {
-        if (is_max) builder_.Gen<x86_64::MaxpsXRegXReg>(d.machine_reg(), s.machine_reg());
-        else        builder_.Gen<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
+        builder_.Gen<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
       };
-      // Returns the reg holding the min/max of the pair (a, b). Destroys a/b.
+      // Returns the reg holding the (negated-for-max) min of the pair.
       auto do_half = [&](FpRegister a, FpRegister b) -> FpRegister {
         if (!is_nm) {
+          // NaN-propagating: minab|minba|OR.
           FpRegister tmp = AllocTempSimdReg();
           builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), b.machine_reg());
-          minmax(tmp, a);      // max/min(b, a)
-          minmax(a, b);        // max/min(a, b)
+          minmax(tmp, a);      // min(b, a)
+          minmax(a, b);        // min(a, b)
           builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), tmp.machine_reg());
           return a;
         }
-        // NaN-suppressing: a' = select(isnan(a), b, a); b' = select(isnan(b), a, b).
+        // NaN-suppressing: a' = select(isnan(a), b, a); b' = select(isnan(b), a, b),
+        // then minab|minba|OR so the +-0 tie is order-independent (OR-of-signs).
         FpRegister ma = AllocTempSimdReg(), mb = AllocTempSimdReg();
         FpRegister as = AllocTempSimdReg(), bs = AllocTempSimdReg();
         builder_.Gen<x86_64::MovdqaXRegXReg>(ma.machine_reg(), a.machine_reg());
@@ -6134,11 +6248,21 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         builder_.Gen<x86_64::PandnXRegXReg>(mb.machine_reg(), b.machine_reg());  // ~mb & b
         builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), as.machine_reg());   // a'
         builder_.Gen<x86_64::PorXRegXReg>(mb.machine_reg(), bs.machine_reg());   // b'
-        minmax(ma, mb);
+        FpRegister t_nm = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mb.machine_reg());
+        minmax(t_nm, ma);   // min(b', a')
+        minmax(ma, mb);     // min(a', b')
+        builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), t_nm.machine_reg());
         return ma;
       };
       FpRegister rlo = do_half(lo_n, lo_m);
       FpRegister rhi = args.q ? do_half(hi_n, hi_m) : no_fp_register;
+      if (is_max) {
+        builder_.Gen<x86_64::PxorXRegXReg>(rlo.machine_reg(), sign_mask.machine_reg());
+        if (args.q) {
+          builder_.Gen<x86_64::PxorXRegXReg>(rhi.machine_reg(), sign_mask.machine_reg());
+        }
+      }
       EmitNarrowHalfVecAndStore(args.rd, rlo, rhi, args.q);
       return;
     }
@@ -6309,6 +6433,83 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     return;
   }
 
+  // FP16 vector FMULX (.4H/.8H) via the F16C round-trip. FP32/FP64 vector FMULX
+  // is NOT lowered in this tier (it bails to lite->interp) — only the FP16 half
+  // is added, guarded on is_fp16. Widen each operand's halves to FP32, apply the
+  // packed-single FMULX saturation blend (+-0*+-inf -> +-2.0), narrow once. A
+  // single FP16 multiply single-rounds through FP32 and +-2.0 is representable.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmulxV) {
+    if (!args.is_fp16 || !host_platform::kHasF16C) {
+      UndefinedReturningVoid();
+      return;
+    }
+    FpRegister lo_n = no_fp_register, hi_n = no_fp_register;
+    FpRegister lo_m = no_fp_register, hi_m = no_fp_register;
+    EmitWidenHalfVec(vn_off, args.q, &lo_n, &hi_n);
+    EmitWidenHalfVec(vm_off, args.q, &lo_m, &hi_m);
+    FpRegister rlo = EmitFmulxF32Packed(lo_n, lo_m);
+    FpRegister rhi = args.q ? EmitFmulxF32Packed(hi_n, hi_m) : no_fp_register;
+    EmitNarrowHalfVecAndStore(args.rd, rlo, rhi, args.q);
+    return;
+  }
+
+  // FP16 vector pairwise FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP (.4H/.8H) via the F16C
+  // round-trip. Result lane k reduces the pair (cat[2k], cat[2k+1]) of the
+  // concatenation cat = Vn:Vm — Vd's low half comes from Vn's adjacent pairs, its
+  // high half from Vm's. FP32/FP64 vector pairwise is not lowered here (bails to
+  // lite->interp); only the FP16 half is added, guarded on is_fp16. FADDP folds
+  // with HADDPS; min/max forms gather even/odd cat elements with SHUFPS (0x88/
+  // 0xDD, same as UZP1/UZP2) and apply the +-0-correct NaN-aware min/max.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddpV ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxpV ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminpV ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmpV ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmpV) {
+    if (!args.is_fp16 || !host_platform::kHasF16C) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_add = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddpV);
+    const bool is_max = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxpV ||
+                         args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmpV);
+    const bool is_nm = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxnmpV ||
+                        args.opcode == Decoder::AdvSimdThreeSameOpcode::kFminnmpV);
+    FpRegister lo_n = no_fp_register, hi_n = no_fp_register;
+    FpRegister lo_m = no_fp_register, hi_m = no_fp_register;
+    EmitWidenHalfVec(vn_off, args.q, &lo_n, &hi_n);
+    EmitWidenHalfVec(vm_off, args.q, &lo_m, &hi_m);
+    // Reduce one output group of 4 lanes formed by cat = X(lower 4):Y(upper 4).
+    auto reduce_group = [&](FpRegister x, FpRegister y) -> FpRegister {
+      if (is_add) {
+        // HADDPS(r, y) = [x0+x1, x2+x3, y0+y1, y2+y3].
+        FpRegister r = AllocTempSimdReg();
+        builder_.Gen<x86_64::MovdqaXRegXReg>(r.machine_reg(), x.machine_reg());
+        builder_.Gen<x86_64::HaddpsXRegXReg>(r.machine_reg(), y.machine_reg());
+        return r;
+      }
+      // evens = [x0,x2,y0,y2] (SHUFPS 0x88); odds = [x1,x3,y1,y3] (SHUFPS 0xDD).
+      FpRegister evens = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(evens.machine_reg(), x.machine_reg());
+      builder_.Gen<x86_64::ShufpsXRegXRegImm>(evens.machine_reg(), y.machine_reg(),
+                                              static_cast<int8_t>(0x88));
+      FpRegister odds = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(odds.machine_reg(), x.machine_reg());
+      builder_.Gen<x86_64::ShufpsXRegXRegImm>(odds.machine_reg(), y.machine_reg(),
+                                              static_cast<int8_t>(0xDD));
+      return EmitFpPairwiseMinMaxF32Packed(evens, odds, is_max, is_nm);
+    };
+    FpRegister rlo, rhi;
+    if (!args.q) {
+      rlo = reduce_group(lo_n, lo_m);
+      rhi = no_fp_register;
+    } else {
+      rlo = reduce_group(lo_n, hi_n);
+      rhi = reduce_group(lo_m, hi_m);
+    }
+    EmitNarrowHalfVecAndStore(args.rd, rlo, rhi, args.q);
+    return;
+  }
+
   // FP vector FMLA/FMLS (.2S/.4S FP32, .2D FP64) — fused multiply-accumulate,
   // single rounding. ARM ARM: FMLA Vd = Vd + Vn*Vm, FMLS Vd = Vd - Vn*Vm, both
   // fused (one rounding). x86 FMA3 packed VFMADD231P{S,D}/VFNMADD231P{S,D}
@@ -6319,13 +6520,70 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // .2S/.4S/.2D reach here. Requires host FMA — bail if absent.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlaV ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV) {
-    if (args.is_fp16 || !host_platform::kHasFMA) {
+    if (!host_platform::kHasFMA) {
       UndefinedReturningVoid();
       return;
     }
-    const bool is_double = (args.size & 1);
     const bool is_fmls =
         (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmlsV);
+    if (args.is_fp16) {
+      // FP16 .4H/.8H FMLA/FMLS: correctly-rounded by fusing each pair of widened
+      // lanes in FP64 (two 2-lane passes per 4-lane quad) then RNE-narrowing to
+      // fp16 — FP64's 53 significand bits exceed 2*11+1, avoiding the double-
+      // rounding a plain FP32 round-trip could suffer. Mirrors the lite tier's
+      // is_fp16 recipe and the interpreter's FP64 fma(). Bails without F16C.
+      if (!host_platform::kHasF16C) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister lo_n = no_fp_register, hi_n = no_fp_register;
+      FpRegister lo_m = no_fp_register, hi_m = no_fp_register;
+      FpRegister lo_d = no_fp_register, hi_d = no_fp_register;
+      EmitWidenHalfVec(vn_off, args.q, &lo_n, &hi_n);
+      EmitWidenHalfVec(vm_off, args.q, &lo_m, &hi_m);
+      EmitWidenHalfVec(GetVRegOffset(args.rd), args.q, &lo_d, &hi_d);
+      // Fuse one 4-FP32-lane quad in FP64 across two 2-lane passes; returns the 4
+      // FP32 results. Destroys xn/xm/xd (PSRLDQ walks them to the high pair).
+      auto fma_quad = [&](FpRegister xn, FpRegister xm, FpRegister xd) -> FpRegister {
+        FpRegister xn_pd = AllocTempSimdReg();
+        FpRegister xm_pd = AllocTempSimdReg();
+        FpRegister xd_pd = AllocTempSimdReg();
+        FpRegister xres = AllocTempSimdReg();
+        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xn_pd.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xm_pd.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xd_pd.machine_reg(), xd.machine_reg());
+        if (is_fmls) {
+          builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+              xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
+        } else {
+          builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+              xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
+        }
+        builder_.Gen<x86_64::Cvtpd2psXRegXReg>(xres.machine_reg(), xd_pd.machine_reg());
+        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xn_pd.machine_reg(), xn.machine_reg());
+        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xm_pd.machine_reg(), xm.machine_reg());
+        builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xd_pd.machine_reg(), xd.machine_reg());
+        if (is_fmls) {
+          builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+              xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
+        } else {
+          builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+              xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
+        }
+        builder_.Gen<x86_64::Cvtpd2psXRegXReg>(xn.machine_reg(), xd_pd.machine_reg());
+        builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xn.machine_reg());
+        return xres;
+      };
+      FpRegister rlo = fma_quad(lo_n, lo_m, lo_d);
+      FpRegister rhi = args.q ? fma_quad(hi_n, hi_m, hi_d) : no_fp_register;
+      EmitNarrowHalfVecAndStore(args.rd, rlo, rhi, args.q);
+      return;
+    }
+    const bool is_double = (args.size & 1);
     const int32_t vd_off =
         GetVRegOffset(args.rd);
     FpRegister xn = AllocTempSimdReg();
@@ -10532,6 +10790,106 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       return;
     }
 
+    // FCVTXN / FCVTXN2 Vd.2S/4S, Vn.2D (size=01): narrow 2 FP64 -> 2 FP32 with the
+    // ARMv8 "round to odd" mode. Round-to-odd = round-toward-zero, then force the
+    // result mantissa LSB to 1 whenever the conversion discarded any bits (this is the
+    // double-rounding-safe rounding FCVTXN mandates). Computed with pure SSE, no MXCSR
+    // (a mode flip is unsafe in a reordering backend): n = CVTPD2PS(x) (RNE), back =
+    // CVTPS2PD(n) (exact). A lane is FINITE-inexact where (x==x) AND (back!=x). For
+    // such a lane, step n one ULP toward zero iff RNE overshot (|back|>|x|) -- that
+    // recovers the round-toward-zero neighbor -- then OR the LSB. NaN passes through
+    // CVTPD2PS's qNaN untouched (bit-exact to the interpreter's
+    // sign|0x7FC00000|(mant>>29)); +/-Inf, +/-0 and exact lanes are not inexact so are
+    // untouched; a finite overflow makes RNE round to +/-Inf, which the overshoot step
+    // decrements to +/-FP32_MAX -- exactly ARM's clamped RtO result. The two FP64 lane
+    // masks are collapsed to n's two low 32-bit lanes with PSHUFD 0x08. Verified
+    // bit-exact vs interpreter FpDoubleToFloatRtO over 20M fuzz cases. size!=01 is not
+    // an FCVTXN encoding and bails. Q=0 stores Vd.low (upper zeroed); Q=1 (FCVTXN2)
+    // stores Vd.high preserving the low 64 -- both via SetVRegNarrow.
+    case Decoder::AdvSimdTwoRegMiscOpcode::kFcvtxn: {
+      if (args.size != 0b01) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister xn = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);  // x = 2 doubles
+
+      // n = CVTPD2PS(x) (RNE);  back = CVTPS2PD(n) (exact widen).
+      FpRegister n = AllocTempSimdReg();
+      builder_.Gen<x86_64::Cvtpd2psXRegXReg>(n.machine_reg(), xn.machine_reg());
+      FpRegister back = AllocTempSimdReg();
+      builder_.Gen<x86_64::Cvtps2pdXRegXReg>(back.machine_reg(), n.machine_reg());
+
+      // force64 = (NOT (back==x)) AND (x==x)  -> finite-AND-inexact, per 64-bit lane.
+      FpRegister force = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(force.machine_reg(), back.machine_reg());
+      builder_.Gen<x86_64::CmpeqpdXRegXReg>(force.machine_reg(), xn.machine_reg());  // back==x
+      FpRegister ord = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(ord.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::CmpeqpdXRegXReg>(ord.machine_reg(), xn.machine_reg());  // x==x
+      builder_.Gen<x86_64::PandnXRegXReg>(force.machine_reg(), ord.machine_reg());  // ~force & ord
+
+      // over64 = |x| < |back|  (RNE rounded away from zero), per 64-bit lane.
+      FpRegister absm = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absm.machine_reg(), absm.machine_reg());
+      builder_.Gen<x86_64::PsrlqXRegImm>(absm.machine_reg(), int8_t{1});  // 0x7FFF..F/qword
+      FpRegister over = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(over.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(over.machine_reg(), absm.machine_reg());  // |x|
+      FpRegister aback = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(aback.machine_reg(), back.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(aback.machine_reg(), absm.machine_reg());  // |back|
+      builder_.Gen<x86_64::CmpltpdXRegXReg>(over.machine_reg(), aback.machine_reg());  // |x|<|back|
+
+      // Collapse both 64-bit lane masks to 32-bit dword masks aligned with n's two low
+      // floats: PSHUFD 0x08 moves src dwords {0,2} into dwords {0,1}.
+      FpRegister force32 = FpRegister{
+          std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(force.machine_reg(), int8_t{0x08}))};
+      FpRegister over32 = FpRegister{
+          std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(over.machine_reg(), int8_t{0x08}))};
+
+      // Per-dword constant masks from an all-ones reg (self-Pcmpeq off a zeroed reg to
+      // satisfy the use-before-def lifetime check).
+      FpRegister ones = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+      FpRegister signm = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(signm.machine_reg(), ones.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(signm.machine_reg(), int8_t{31});  // 0x80000000/dword
+      FpRegister magm = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(magm.machine_reg(), ones.machine_reg());
+      builder_.Gen<x86_64::PsrldXRegImm>(magm.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
+      FpRegister onem = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(onem.machine_reg(), ones.machine_reg());
+      builder_.Gen<x86_64::PsrldXRegImm>(onem.machine_reg(), int8_t{31});  // 0x00000001/dword
+
+      // sign = n & 0x80000000 ; mag = n & 0x7FFFFFFF.
+      FpRegister sign = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(sign.machine_reg(), n.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), signm.machine_reg());
+      FpRegister mag = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(mag.machine_reg(), n.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(mag.machine_reg(), magm.machine_reg());
+
+      // dec = (over & force) & 1 -> step to the round-toward-zero neighbor.
+      FpRegister dec = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(dec.machine_reg(), over32.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(dec.machine_reg(), force32.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(dec.machine_reg(), onem.machine_reg());
+      builder_.Gen<x86_64::PsubdXRegXReg>(mag.machine_reg(), dec.machine_reg());
+
+      // orb = force & 1 -> round-to-odd (force LSB on inexact finite lanes).
+      FpRegister orb = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(orb.machine_reg(), force32.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(orb.machine_reg(), onem.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(mag.machine_reg(), orb.machine_reg());
+
+      // result = sign | mag (reconstructs n exactly for untouched lanes).
+      builder_.Gen<x86_64::PorXRegXReg>(mag.machine_reg(), sign.machine_reg());
+
+      SetVRegNarrow(args.rd, mag, args.q);
+      return;
+    }
+
     // FRECPE / FRSQRTE (vector, FP32 .2S/.4S size=10, FP64 .2D size=11). ARM
     // only requires ~8 bits of estimate precision; the interpreter and lite both
     // compute the FULL-precision reciprocal (1/x) / reciprocal-sqrt (1/sqrt(x)),
@@ -11591,7 +11949,17 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
   if (args.opcode == ScOp::kFabd || args.opcode == ScOp::kFmulx ||
       args.opcode == ScOp::kFrecps || args.opcode == ScOp::kFrsqrts) {
     if (args.is_fp16) {
-      UndefinedReturningVoid();
+      // FP16 scalar: only FMULX is covered here via the F16C round-trip (widen
+      // Vn.h[0]/Vm.h[0] to FP32 lane 0 with upper lanes +0.0, apply the packed
+      // FMULX blend, narrow once). FABD/FRECPS/FRSQRTS FP16 still bail to lite.
+      if (args.opcode != ScOp::kFmulx || !host_platform::kHasF16C) {
+        UndefinedReturningVoid();
+        return;
+      }
+      FpRegister n = EmitWidenHalfToF32(args.rn);
+      FpRegister m = EmitWidenHalfToF32(args.rm);
+      FpRegister r = EmitFmulxF32Packed(n, m);
+      EmitNarrowF32ToHalfAndStore(args.rd, r);
       return;
     }
     if ((args.opcode == ScOp::kFrecps || args.opcode == ScOp::kFrsqrts) &&
@@ -11945,14 +12313,144 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
   SetVRegFull(args.rd, xp_lo, /*q=*/false);
 }
 
+HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitFmulxF32Packed(
+    FpRegister a, FpRegister b) {
+  // mul = a * b.
+  FpRegister mul = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), a.machine_reg());
+  builder_.Gen<x86_64::MulpsXRegXReg>(mul.machine_reg(), b.machine_reg());
+  // mul_unord = cmpunord(mul, mul) : -1/lane where mul is NaN.
+  FpRegister mul_unord = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
+  builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+  // special = (NOT input_unord) AND mul_unord : lanes that are exactly +-0*+-inf
+  // (product NaN but neither input NaN). Pandn writes (NOT dst) AND src.
+  FpRegister special = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdqaXRegXReg>(special.machine_reg(), a.machine_reg());
+  builder_.Gen<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), b.machine_reg());
+  builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
+  // two_signed = ((a XOR b) AND signmask) OR bits(+2.0). Reuse a as (a XOR b),
+  // mul_unord as the per-lane sign mask (all-ones << 31).
+  builder_.Gen<x86_64::PxorXRegXReg>(a.machine_reg(), b.machine_reg());
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+  builder_.Gen<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
+  builder_.Gen<x86_64::PandXRegXReg>(a.machine_reg(), mul_unord.machine_reg());
+  // +2.0 broadcast to all 4 dwords (0x40000000 per dword).
+  FpRegister two = AllocTempSimdReg();
+  Register gr = GetImm(uint64_t{0x4000000040000000ULL});
+  builder_.Gen<x86_64::MovqXRegReg>(two.machine_reg(), gr);
+  builder_.Gen<x86_64::PunpcklqdqXRegXReg>(two.machine_reg(), two.machine_reg());
+  builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), two.machine_reg());  // a = +-2.0 per lane
+  // result = (mul AND NOT special) OR (+-2.0 AND special).
+  builder_.Gen<x86_64::PandXRegXReg>(a.machine_reg(), special.machine_reg());
+  builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
+  builder_.Gen<x86_64::PorXRegXReg>(special.machine_reg(), a.machine_reg());
+  return special;
+}
+
+HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitFpPairwiseMinMaxF32Packed(
+    FpRegister xa, FpRegister xb, bool is_max, bool is_nm) {
+  auto gen_min = [&](FpRegister d, FpRegister s) {
+    builder_.Gen<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
+  };
+  auto gen_max = [&](FpRegister d, FpRegister s) {
+    builder_.Gen<x86_64::MaxpsXRegXReg>(d.machine_reg(), s.machine_reg());
+  };
+  auto gen_cmpeq0 = [&](FpRegister d, FpRegister z) {
+    builder_.Gen<x86_64::CmpeqpsXRegXReg>(d.machine_reg(), z.machine_reg());
+  };
+  auto gen_cmpunord = [&](FpRegister d, FpRegister s) {
+    builder_.Gen<x86_64::CmpunordpsXRegXReg>(d.machine_reg(), s.machine_reg());
+  };
+  // Corrective value for the +-0 tie: AND(a,b) for max, OR(a,b) for min.
+  FpRegister corr = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdqaXRegXReg>(corr.machine_reg(), xa.machine_reg());
+  if (is_max) builder_.Gen<x86_64::PandXRegXReg>(corr.machine_reg(), xb.machine_reg());
+  else        builder_.Gen<x86_64::PorXRegXReg>(corr.machine_reg(), xb.machine_reg());
+  // "both zero" mask (IEEE -0 == +0, so this catches both sign forms).
+  FpRegister zero = AllocZeroedSimdReg();
+  FpRegister eqa = AllocTempSimdReg();
+  FpRegister eqb = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdqaXRegXReg>(eqa.machine_reg(), xa.machine_reg());
+  gen_cmpeq0(eqa, zero);
+  builder_.Gen<x86_64::MovdqaXRegXReg>(eqb.machine_reg(), xb.machine_reg());
+  gen_cmpeq0(eqb, zero);
+  builder_.Gen<x86_64::PandXRegXReg>(eqa.machine_reg(), eqb.machine_reg());
+  if (!is_nm) {
+    // NaN-propagating: tmp = b; (Max|Min)(tmp,a); (Max|Min)(a,b); POR(a,tmp).
+    FpRegister tmp = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xb.machine_reg());
+    if (is_max) { gen_max(tmp, xa); gen_max(xa, xb); }
+    else        { gen_min(tmp, xa); gen_min(xa, xb); }
+    builder_.Gen<x86_64::PorXRegXReg>(xa.machine_reg(), tmp.machine_reg());
+  } else {
+    // NaN-suppressing: substitute each NaN lane with the other operand, then Max|Min.
+    FpRegister ma = AllocTempSimdReg();
+    FpRegister mb = AllocTempSimdReg();
+    FpRegister sa = AllocTempSimdReg();
+    FpRegister sb = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(ma.machine_reg(), xa.machine_reg());
+    gen_cmpunord(ma, ma);
+    builder_.Gen<x86_64::MovdqaXRegXReg>(mb.machine_reg(), xb.machine_reg());
+    gen_cmpunord(mb, mb);
+    builder_.Gen<x86_64::MovdqaXRegXReg>(sa.machine_reg(), ma.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(sa.machine_reg(), xb.machine_reg());   // ma & b
+    builder_.Gen<x86_64::MovdqaXRegXReg>(sb.machine_reg(), mb.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(sb.machine_reg(), xa.machine_reg());   // mb & a
+    builder_.Gen<x86_64::PandnXRegXReg>(ma.machine_reg(), xa.machine_reg());  // ~ma & a
+    builder_.Gen<x86_64::PandnXRegXReg>(mb.machine_reg(), xb.machine_reg());  // ~mb & b
+    builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), sa.machine_reg());    // a'
+    builder_.Gen<x86_64::PorXRegXReg>(mb.machine_reg(), sb.machine_reg());    // b'
+    if (is_max) gen_max(ma, mb); else gen_min(ma, mb);
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xa.machine_reg(), ma.machine_reg());
+  }
+  // +-0 blend: corr = (eqa & corr) | (~eqa & xa).
+  builder_.Gen<x86_64::PandXRegXReg>(corr.machine_reg(), eqa.machine_reg());
+  builder_.Gen<x86_64::PandnXRegXReg>(eqa.machine_reg(), xa.machine_reg());
+  builder_.Gen<x86_64::PorXRegXReg>(corr.machine_reg(), eqa.machine_reg());
+  return corr;
+}
+
 void HeavyOptimizerFrontend::AdvSimdScalarPairwise(const Decoder::AdvSimdScalarPairwiseArgs& args) {
   if (!success()) {
     return;
   }
   using Op = Decoder::AdvSimdScalarPairwiseOpcode;
-  // FP16 pairwise needs an F16C round-trip absent from the heavy Gen inputs.
+  // FP16 scalar pairwise FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP (H): reduce Vn.h[0]
+  // and Vn.h[1] via the F16C round-trip. Widen both halves to FP32 lane 0 (upper
+  // lanes +0.0), fold, narrow once. (kAddp is the integer D-form and never sets
+  // is_fp16.) Bit-identical to the interpreter's per-precision reduce.
   if (args.is_fp16) {
-    UndefinedReturningVoid();
+    if (!host_platform::kHasF16C) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_faddp = (args.opcode == Op::kFaddpScalar);
+    const bool is_max = (args.opcode == Op::kFmaxpScalar || args.opcode == Op::kFmaxnmpScalar);
+    const bool is_min = (args.opcode == Op::kFminpScalar || args.opcode == Op::kFminnmpScalar);
+    const bool is_nm = (args.opcode == Op::kFmaxnmpScalar || args.opcode == Op::kFminnmpScalar);
+    if (!is_faddp && !is_max && !is_min) {
+      UndefinedReturningVoid();
+      return;
+    }
+    // Widen Vn.h[0] -> xa lane 0, Vn.h[1] -> xb lane 0 (upper lanes +0.0).
+    FpRegister lo = no_fp_register, hi = no_fp_register;
+    EmitWidenHalfVec(GetVRegOffset(args.rn), /*q=*/false, &lo, &hi);  // lo = [h0,h1,h2,h3]
+    FpRegister xa = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::MovssXRegXReg>(xa.machine_reg(), lo.machine_reg());  // [h0,+0,+0,+0]
+    FpRegister t = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), lo.machine_reg());
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(t.machine_reg(), t.machine_reg(), int8_t{0x01});
+    FpRegister xb = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::MovssXRegXReg>(xb.machine_reg(), t.machine_reg());  // [h1,+0,+0,+0]
+    FpRegister result;
+    if (is_faddp) {
+      builder_.Gen<x86_64::AddpsXRegXReg>(xa.machine_reg(), xb.machine_reg());
+      result = xa;
+    } else {
+      result = EmitFpPairwiseMinMaxF32Packed(xa, xb, is_max, is_nm);
+    }
+    EmitNarrowF32ToHalfAndStore(args.rd, result);
     return;
   }
   const bool is_addp = (args.opcode == Op::kAddp);

@@ -1891,12 +1891,22 @@
           return;
         }
         if (!host_platform::kHasF16C) { Undefined(); return; }
+        // The F16C widen makes this the FP32 lowering on the widened halves,
+        // so it reuses the FP32/FP64 path's +-0-tie handling above: ARM
+        // FMAX/FMAXNM = -FMIN(-a,-b), so negating inputs+output makes MAX reuse
+        // the FMIN lowering and get ARM's AND-of-signs (most-positive) on the
+        // +-0 tie instead of x86 MAXPS's OR-of-signs. FMIN/FMINNM need no
+        // negation. The per-lane FP32 sign mask is 0x80000000 (bit31).
+        SimdRegister sign_mask = no_simd_register;
+        if (is_max) {
+          sign_mask = AllocTempSimdReg();
+          if (sign_mask == no_simd_register) { success_ = false; return; }
+          as_.Pcmpeqd(sign_mask, sign_mask);
+          as_.Pslld(sign_mask, static_cast<int8_t>(31));
+        }
+        // Always FMIN now (FMAX reaches here with negated operands).
         auto minmax_op = [&](SimdRegister dst, SimdRegister src) {
-          if (is_max) {
-            as_.Maxps(dst, src);
-          } else {
-            as_.Minps(dst, src);
-          }
+          as_.Minps(dst, src);
         };
         if (!args.q) {
           // .4H: 4 FP16 lanes in low 64 bits of each operand.
@@ -1907,7 +1917,9 @@
           as_.Vcvtph2ps(xn, xn);
           as_.Movq(xm, {.base = Assembler::rbp, .disp = vm_off});
           as_.Vcvtph2ps(xm, xm);
+          if (is_max) { as_.Pxor(xn, sign_mask); as_.Pxor(xm, sign_mask); }
           if (!is_nm) {
+            // FMAX / FMIN — NaN-propagating: minab|minba|OR.
             SimdRegister tmp = AllocTempSimdReg();
             if (!success()) { return; }
             as_.Movdqa(tmp, xm);
@@ -1915,6 +1927,9 @@
             minmax_op(xn, xm);
             as_.Por(xn, tmp);
           } else {
+            // FMAXNM / FMINNM — substitute NaN lanes with the other operand,
+            // then minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's
+            // FMINNM rule) rather than x86's "return 2nd source on tie".
             SimdRegister t_mask_a = AllocTempSimdReg();
             SimdRegister t_mask_b = AllocTempSimdReg();
             SimdRegister t_an_sub = AllocTempSimdReg();
@@ -1932,9 +1947,15 @@
             as_.Pandn(t_mask_b, xm);               // ~mask_b & b
             as_.Por(t_mask_a, t_an_sub);           // a' in t_mask_a
             as_.Por(t_mask_b, t_bn_sub);           // b' in t_mask_b
-            minmax_op(t_mask_a, t_mask_b);         // result in t_mask_a
+            SimdRegister t_nm = AllocTempSimdReg();
+            if (!success()) { return; }
+            as_.Movdqa(t_nm, t_mask_b);
+            minmax_op(t_nm, t_mask_a);             // min(b', a')
+            minmax_op(t_mask_a, t_mask_b);         // min(a', b')
+            as_.Por(t_mask_a, t_nm);
             as_.Movdqa(xn, t_mask_a);
           }
+          if (is_max) as_.Pxor(xn, sign_mask);
           as_.Vcvtps2ph(xn, xn, int8_t{0});
           // Vcvtps2ph auto-zeroes upper 64 bits.
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
@@ -1956,8 +1977,12 @@
         as_.Vcvtph2ps(xm, xm);
         as_.Psrldq(xm_hi, int8_t{8});
         as_.Vcvtph2ps(xm_hi, xm_hi);
+        if (is_max) {
+          as_.Pxor(xn, sign_mask);    as_.Pxor(xm, sign_mask);
+          as_.Pxor(xn_hi, sign_mask); as_.Pxor(xm_hi, sign_mask);
+        }
         if (!is_nm) {
-          // FMAX / FMIN — NaN-propagating via maxab|maxba|OR; one scratch.
+          // FMAX / FMIN — NaN-propagating via minab|minba|OR; one scratch.
           SimdRegister tmp = AllocTempSimdReg();
           if (!success()) { return; }
           // Low half.
@@ -1971,11 +1996,12 @@
           minmax_op(xn_hi, xm_hi);
           as_.Por(xn_hi, tmp);
         } else {
-          // FMAXNM / FMINNM — NaN-suppressing; four scratch temps per half.
+          // FMAXNM / FMINNM — NaN-suppressing; five scratch temps, reused per half.
           SimdRegister t_mask_a = AllocTempSimdReg();
           SimdRegister t_mask_b = AllocTempSimdReg();
           SimdRegister t_an_sub = AllocTempSimdReg();
           SimdRegister t_bn_sub = AllocTempSimdReg();
+          SimdRegister t_nm = AllocTempSimdReg();
           if (!success()) { return; }
           // Low half: process xn (a) and xm (b), result back into xn.
           as_.Movdqa(t_mask_a, xn);
@@ -1990,9 +2016,12 @@
           as_.Pandn(t_mask_b, xm);
           as_.Por(t_mask_a, t_an_sub);
           as_.Por(t_mask_b, t_bn_sub);
+          as_.Movdqa(t_nm, t_mask_b);
+          minmax_op(t_nm, t_mask_a);
           minmax_op(t_mask_a, t_mask_b);
+          as_.Por(t_mask_a, t_nm);
           as_.Movdqa(xn, t_mask_a);
-          // High half: reuse the four temps for xn_hi (a) and xm_hi (b).
+          // High half: reuse the temps for xn_hi (a) and xm_hi (b).
           as_.Movdqa(t_mask_a, xn_hi);
           as_.Cmpunordps(t_mask_a, t_mask_a);
           as_.Movdqa(t_mask_b, xm_hi);
@@ -2005,9 +2034,13 @@
           as_.Pandn(t_mask_b, xm_hi);
           as_.Por(t_mask_a, t_an_sub);
           as_.Por(t_mask_b, t_bn_sub);
+          as_.Movdqa(t_nm, t_mask_b);
+          minmax_op(t_nm, t_mask_a);
           minmax_op(t_mask_a, t_mask_b);
+          as_.Por(t_mask_a, t_nm);
           as_.Movdqa(xn_hi, t_mask_a);
         }
+        if (is_max) { as_.Pxor(xn, sign_mask); as_.Pxor(xn_hi, sign_mask); }
         as_.Vcvtps2ph(xn, xn, int8_t{0});
         as_.Vcvtps2ph(xn_hi, xn_hi, int8_t{0});
         as_.Pslldq(xn_hi, int8_t{8});
