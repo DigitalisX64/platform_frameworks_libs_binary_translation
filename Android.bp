@@ -428,6 +428,7 @@ cc_test_host {
                 "libberberis_kernel_api_arm64_unit_tests",
                 "libberberis_guest_os_primitives_arm64_unit_tests",
                 "libberberis_digitalis_extra_proxy_arm64_unit_tests",
+                "libberberis_proxy_libc_arm64_unit_tests",
                 "libberberis_decoder_arm64_unit_tests",
                 "libberberis_interpreter_arm64_unit_tests",
                 "libberberis_runtime_arm64_unit_tests",

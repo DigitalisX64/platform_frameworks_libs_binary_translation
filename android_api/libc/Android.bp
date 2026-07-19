@@ -53,3 +53,26 @@ cc_library_shared {
     },
 }
 // endregion
+
+// region digitalis - host unit tests for the shared Scudo-header probe guard
+// (scudo_header_probe.h) that free_probe.cc / realloc_probe.cc rely on. Linked
+// into berberis_arm64_host_tests. Verifies the GWP-ASan guard-page skip against
+// a real PROT_NONE guard page so the free/realloc wrappers can't reintroduce the
+// underflow fault.
+cc_test_library {
+    name: "libberberis_proxy_libc_arm64_unit_tests",
+    defaults: [
+        "berberis_arm64_defaults",
+    ],
+    host_supported: true,
+    header_libs: [
+        "berberis_test_utils_headers",
+    ],
+    srcs: [
+        "scudo_header_probe_test.cc",
+    ],
+    shared: {
+        enabled: false,
+    },
+}
+// endregion
