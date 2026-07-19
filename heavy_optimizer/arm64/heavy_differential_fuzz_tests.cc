@@ -459,6 +459,33 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (rn << 5) | rd;
   }
 
+  // Byte-lane (.8B/.16B) SLI/SRI (insert) and SRSHR/URSHR/SRSRA/URSRA (rounding
+  // right shift + accumulate) shift-by-immediate.  All six now lower in the
+  // heavy tier (byte insert via PSLLW/PSRLW + per-byte mask + PANDN/POR; byte
+  // rounding via PMOVSX/PMOVZX widen + word-shift round-bit + PACK{SS,US}WB,
+  // plus PADDB for the accumulate forms).  immh is forced to byte (0b0001);
+  // immb in [0,7] covers SLI shift 0..7 and every right-shift cnt 1..8.  rd
+  // samples rd==rn to stress the destructive insert/accumulate.
+  uint32_t GenNeonByteShiftInsertRounding() {
+    static const struct { uint32_t u; uint32_t opcode; } kForms[] = {
+        {1, 0b01010},  // SLI
+        {1, 0b01000},  // SRI
+        {0, 0b00100},  // SRSHR
+        {1, 0b00100},  // URSHR
+        {0, 0b00110},  // SRSRA
+        {1, 0b00110},  // URSRA
+    };
+    const auto& f = kForms[Rnd() % 6];
+    uint32_t q = Rnd() & 1;
+    uint32_t immh = 0b0001;
+    uint32_t immb = Rnd() % 8;
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);
+    return (q << 30) | (f.u << 29) | (0b01111u << 24) | (0u << 23) |
+           (immh << 19) | (immb << 16) | (f.opcode << 11) | (1u << 10) |
+           (rn << 5) | rd;
+  }
+
   // SUQADD/USQADD Vd.T, Vn.T (AdvSIMD two-register misc, opcode=00011).
   //   SUQADD U=0 (signed sat acc of unsigned) | USQADD U=1 (unsigned sat acc of
   //   signed). size 00 (.8B/.16B), 01 (.4H/.8H), 10 (.2S/.4S) are heavy-lowered;
@@ -1113,6 +1140,28 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonShlByImm) {
     }
   }
   EXPECT_GT(compared, 300) << "heavy accepted too few SHL-by-immediate encodings";
+}
+
+// Byte-lane (.8B/.16B) SLI/SRI insert and SRSHR/URSHR/SRSRA/URSRA rounding
+// shift-by-immediate, full-state differential vs the interpreter.  These byte
+// forms (except URSHR) bailed to lite before this cycle; the heavy tier now
+// lowers them.  Includes the destructive rd==rn insert/accumulate.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonByteShiftInsertRounding) {
+  Seed(0xB17E5417C0FFEE00ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonByteShiftInsertRounding()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few byte insert/rounding shift encodings";
 }
 
 // Single-instruction SUQADD/USQADD across byte/halfword/word lanes. Exercises

@@ -3057,6 +3057,61 @@ TEST_F(Arm64LiteTranslateRegionTest, AdvSimdShiftByImmDifferential) {
   }
 }
 
+// Byte-lane (.8B/.16B) SLI/SRI (insert) and SRSHR/URSHR/SRSRA/URSRA (rounding)
+// shift-by-immediate: JIT codegen pinned to derived expected values (the
+// AdvSimdShiftByImmDifferential sweep already covers JIT-vs-interp; this pins
+// the exact semantics independently).  Distinguishing cases: the insert mask
+// keeps the poisoned dst bits; signed rounding of -1 collapses to 0 while
+// unsigned rounding of 0xFF rounds up; signed accumulate is arithmetic
+// (SRSHR(-128,1) = -64); shift boundaries #0 / #8; and .8B upper-64 zeroing.
+// Encodings assembler-verified (aarch64-linux-gnu clang -c).
+TEST_F(Arm64LiteTranslateRegionTest, AdvSimdByteShiftInsertRoundingJitVsExpected) {
+  struct C { uint32_t enc; const char* name; uint8_t vn; uint8_t vd; uint8_t want; int lanes; };
+  const C cases[] = {
+      // SLI keeps Vd's low `shift` bits: Vn 0x05<<3 = 0x28, Vd 0xFF low3 = 0x07 -> 0x2F.
+      {0x6f0b5420, "sli.16b#3",   0x05, 0xFF, 0x2F, 16},
+      {0x2f0b5420, "sli.8b#3",    0x05, 0xFF, 0x2F, 8},
+      // SRI keeps Vd's high `shift` bits: Vn 0xA0>>3 = 0x14, Vd 0xFF high3 = 0xE0 -> 0xF4.
+      {0x6f0d4420, "sri.16b#3",   0xA0, 0xFF, 0xF4, 16},
+      {0x2f0d4420, "sri.8b#3",    0xA0, 0xFF, 0xF4, 8},
+      // SRSHR of -1: (-1 + 4) >> 3 = 0.  Contrast URSHR of 0xFF: (255 + 4) >> 3 = 32.
+      {0x4f0d2420, "srshr.16b#3", 0xFF, 0x00, 0x00, 16},
+      {0x6f0d2420, "urshr.16b#3", 0xFF, 0x00, 0x20, 16},
+      // SRSRA signed accumulate: SRSHR(-128,1) = (-128+1)>>1 arith = -64 (0xC0);
+      // Vd 0x10 + 0xC0 = 0xD0 (mod 256).
+      {0x4f0f3420, "srsra.16b#1", 0x80, 0x10, 0xD0, 16},
+      {0x0f0f3420, "srsra.8b#1",  0x80, 0x10, 0xD0, 8},
+      // URSRA accumulate: URSHR(0xFF,3) = 32 (0x20); Vd 0x10 + 0x20 = 0x30.
+      {0x6f0d3420, "ursra.16b#3", 0xFF, 0x10, 0x30, 16},
+      {0x2f0d3420, "ursra.8b#3",  0xFF, 0x10, 0x30, 8},
+      // Boundaries: SRI #8 leaves Vd unchanged; SLI #0 copies Vn; SRSHR #8 -> 0.
+      {0x6f084420, "sri.16b#8",   0x3C, 0x5A, 0x5A, 16},
+      {0x6f085420, "sli.16b#0",   0x3C, 0xFF, 0x3C, 16},
+      {0x4f082420, "srshr.16b#8", 0xFF, 0x00, 0x00, 16},
+  };
+  for (const C& c : cases) {
+    for (int i = 0; i < 32; i++) state_.cpu.v[i] = 0;
+    uint8_t vn[16], vd[16];
+    memset(vn, c.vn, 16);
+    memset(vd, c.vd, 16);
+    memcpy(&state_.cpu.v[1], vn, 16);
+    memcpy(&state_.cpu.v[0], vd, 16);
+    const uint32_t code[1] = {c.enc};
+    ASSERT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)))
+        << c.name << ": JIT declined the byte form";
+    uint8_t got[16];
+    memcpy(got, &state_.cpu.v[0], 16);
+    for (int i = 0; i < c.lanes; i++) {
+      EXPECT_EQ(got[i], c.want)
+          << c.name << " lane " << i << " got=0x" << std::hex << (int)got[i]
+          << " want=0x" << (int)c.want;
+    }
+    for (int i = c.lanes; i < 16; i++) {
+      EXPECT_EQ(got[i], 0u) << c.name << " upper lane " << i << " not zeroed";
+    }
+  }
+}
+
 // Exhaustive scalar FP<->integer conversion (FpIntConversion) JIT-vs-interpreter
 // differential.  Covers FCVTZS/FCVTZU (truncate), FCVTNS/NU/PS/PU/MS/MU (round
 // modes), FCVTAS/AU (ties-away), SCVTF/UCVTF (int->FP), and FMOV GP<->FP across
