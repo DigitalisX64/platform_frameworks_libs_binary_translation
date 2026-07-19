@@ -80,7 +80,7 @@ namespace {
 constexpr uint16_t kNZCVMask = kFlagsNZCVMask;
 
 // Widen the sweep when the exhaustive-mode env knob is set (shared with the lite
-// fuzzer's digitalis/scripts/differential-fuzz.sh). Off => 1 (CI, ~seconds).
+// fuzzer's long-sweep driver script). Off => 1 (CI, ~seconds).
 int FuzzScale() {
   const char* e = getenv("BERBERIS_DIFFERENTIAL_FUZZ_EXHAUSTIVE");
   if (e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) {
@@ -708,6 +708,24 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
     uint32_t rd = (Rnd() & 1) ? rn : (Rnd() % 8);  // sample destructive rd==rn
     return (0b11110u << 24) | (ftype << 22) | (1u << 21) | (opcode << 15) |
            (0b10000u << 10) | (rn << 5) | rd;
+  }
+
+  // FCSEL Sd|Dd, Sn, Sm, cond (scalar FP conditional select):
+  //   0001_1110_ftype_1_Rm_cond_11_Rn_Rd  (S base 0x1E200C00, D base 0x1E600C00).
+  // A pure bitwise select of the chosen source's low lane, so random (even
+  // NaN/Inf) V lanes are safe -- there is no FP arithmetic to diverge on. cond
+  // samples the whole 0..15 range (AL/NV are the unconditional select-Vn path).
+  // rd aliases rn/rm to sample the destructive in-place form the heavy blend
+  // must not corrupt (it mutates the guest-context GET result of Vn in place).
+  uint32_t GenFcsel(uint32_t kMaxV) {
+    uint32_t ftype = (Rnd() & 1) ? 0b01 : 0b00;  // D or S (FP16/reserved bail)
+    uint32_t rn = Rnd() % kMaxV;
+    uint32_t rm = Rnd() % kMaxV;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % kMaxV));
+    uint32_t cond = Rnd() & 0xF;
+    return (0b11110u << 24) | (ftype << 22) | (1u << 21) | (rm << 16) | (cond << 12) |
+           (0b11u << 10) | (rn << 5) | rd;
   }
 
   // A random 128-bit V-register value carrying finite (non-NaN, non-inf,
@@ -1614,6 +1632,78 @@ TEST_F(Arm64HeavyDifferentialFuzz, StaleForwardedVRegRegression) {
   EXPECT_NE(r, kDiverge) << desc;
   EXPECT_EQ((uint64_t)state_.cpu.v[0], 0x00000000ffffffffULL)
       << "CMHI must read the original v0, not the SUB result";
+}
+
+// Single FCSEL: sanity that the heavy tier accepts scalar FP conditional select
+// and matches the interpreter for a random NZCV / random V-register state.
+TEST_F(Arm64HeavyDifferentialFuzz, FcselSingle) {
+  Seed(0xFC5E10001111ABCDULL);
+  const int kIters = 4000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenFcsel(8)};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few FCSEL encodings";
+}
+
+// Pure-FCSEL regions (2..6 selects over V0..V7 with rd aliasing rn/rm). This is
+// the region-structural analogue that reproduced the original miscompile: the
+// blend's destructive ops overwrite a GET'd guest V-reg still read by a later
+// select, so a stale-forwarded vreg diverges heavy from interp. The private-temp
+// blend keeps the GET results pristine; this pins that they stay so.
+TEST_F(Arm64HeavyDifferentialFuzz, FcselRegion) {
+  Seed(0xFC5E12340000BEEFULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    int n = 2 + (Rnd() % 5);  // 2..6 selects
+    uint32_t code[6];
+    for (int i = 0; i < n; i++) code[i] = GenFcsel(8);
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 200) << "heavy accepted too few FCSEL regions";
+}
+
+// FCSEL interleaved with integer data-proc (flag-setters + 13 mapped GP regs =
+// register pressure) and scalar FRINT/FCVT (FP temps). Exercises the "register
+// pressure / instruction interleaving / flags liveness" region interactions the
+// original bail commit blamed, cross-checking the select against the interpreter
+// in the presence of surrounding NZCV writers and spill-forcing pressure.
+TEST_F(Arm64HeavyDifferentialFuzz, FcselMixedRegion) {
+  Seed(0xFC5E5A5A99887766ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    int n = 3 + (Rnd() % 4);  // 3..6 instructions
+    uint32_t code[6];
+    for (int i = 0; i < n; i++) {
+      switch (Rnd() % 3) {
+        case 0: code[i] = GenFcsel(8); break;
+        case 1: code[i] = GenIntDataProc(13); break;  // flags + GP pressure
+        default: code[i] = GenScalarFrintFcvt(); break;
+      }
+    }
+    // Guarantee at least one FCSEL so the region is on-topic.
+    code[Rnd() % n] = GenFcsel(8);
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 100) << "heavy accepted too few mixed FCSEL regions";
 }
 
 }  // namespace

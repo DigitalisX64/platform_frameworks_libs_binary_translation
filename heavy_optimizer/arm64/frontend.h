@@ -743,6 +743,32 @@ class HeavyOptimizerFrontend {
         std::get<0>(Gen<x86_64::MovsdXRegOp>({.base = x86_64::kMachineRegRBP, .disp = off}))};
   }
 
+  // Widen a scalar FP16 in V[reg] bits[15:0] to an FP32 in lane 0 of a fresh XMM,
+  // forcing lanes 1..3 to +0.0. GetVRegScalar's 64-bit MOVSD may leave garbage in
+  // bits[63:16], so PAND with [0x0000FFFF,0,0,0] isolates the half BEFORE
+  // VCVTPH2PS (which reads each 16-bit lane independently). Keeping lanes 1..3 at
+  // +0.0 makes the later VCVTPS2PH narrow yield [half,0,0,0] so SetVRegScalar's
+  // MOVSS lane-0 copy is clean. Bit-exact with the lite tier's Pxor+Pinsrw widen.
+  // Caller must have already checked host_platform::kHasF16C.
+  [[nodiscard]] FpRegister EmitWidenHalfToF32(uint8_t reg) {
+    FpRegister raw = GetVRegScalar(reg, /*is_double=*/false);  // MOVSD: [half,junk,0,0]
+    FpRegister mask = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdXRegReg>(mask.machine_reg(), GetImm(uint64_t{0x0000FFFF}));
+    builder_.Gen<x86_64::PandXRegXReg>(raw.machine_reg(), mask.machine_reg());  // [half,0,0,0]
+    builder_.Gen<x86_64::Vcvtph2psXRegXReg>(raw.machine_reg(), raw.machine_reg());  // [f32,+0,+0,+0]
+    return raw;
+  }
+
+  // Narrow the FP32 in lane 0 of `val` (lanes 1..3 must be +0.0) to FP16 and
+  // commit to V[reg] scalar with upper bytes zeroed. VCVTPS2PH RNE (imm=0) is the
+  // single rounding; +0.0 upper lanes narrow to 0x0000 so bits[31:16] of lane 0
+  // are zero when SetVRegScalar copies it. Caller must have checked F16C.
+  void EmitNarrowF32ToHalfAndStore(uint8_t reg, FpRegister val) {
+    builder_.Gen<x86_64::Vcvtps2phXRegXRegImm>(val.machine_reg(), val.machine_reg(),
+                                               int8_t{0});
+    SetVRegScalar(reg, val, /*is_double=*/false);
+  }
+
   // Allocate a freshly-zeroed XMM. PXOR is dependency-breaking (zeroes
   // regardless of prior contents), but its operand is use_def, so a PseudoDefReg
   // first gives the vreg a lifetime for the data-flow analysis (mirrors the
@@ -806,6 +832,18 @@ class HeavyOptimizerFrontend {
     uint64_t exp = ((1 - b) << 10) | ((b ? 0xFFull : 0ull) << 2) | ((imm8 >> 4) & 0x3ull);
     uint64_t mantissa = static_cast<uint64_t>(imm8 & 0xFull) << 48;
     return (sign << 63) | (exp << 52) | mantissa;
+  }
+  // VFPExpandImm for half precision (E=5, F=10): FMOV Hd,#imm. Pure function of
+  // imm8, computed at translation time. Mirrors lite_translator_fp_scalar.inc's
+  // FpMovImmediate half expansion (which the lite tier currently bails on; the
+  // interpreter implements it, so all tiers stay correct).
+  static uint16_t VFPExpandImm16(uint8_t imm8) {
+    uint16_t sign = (imm8 >> 7) & 1;
+    uint16_t b = (imm8 >> 6) & 1;
+    uint16_t exp = static_cast<uint16_t>(((1 - b) << 4) | ((b ? 0x3u : 0u) << 2) |
+                                         ((imm8 >> 4) & 0x3u));  // 5 bits
+    uint16_t mantissa = static_cast<uint16_t>(imm8 & 0xFu) << 6;  // 10 bits
+    return static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
   }
 
   static __uint128_t ExpandSimdModifiedImmJit(uint8_t op, uint8_t cmode, uint8_t abc,
