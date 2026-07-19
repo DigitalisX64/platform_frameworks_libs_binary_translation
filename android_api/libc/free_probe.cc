@@ -49,7 +49,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
+
+#include "scudo_header_probe.h"
 
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 #include <atomic>
@@ -134,41 +135,22 @@ extern "C" void __wrap_free(void* ptr) {
 
   uint64_t n = g_free_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  // GWP-ASan safety: GWP-ASan (the kernel's sampling allocator, ~1/1000 mallocs)
-  // places an allocation flush against a guard page for underflow detection, so
-  // the user pointer is page-aligned and the 16 bytes at [ptr-16] live in an
-  // unmapped guard page. Peeking the header there faults (SEGV_ACCERR, "Buffer
-  // Underflow"), an intermittent crash for any heavy-allocation app. A real Scudo
-  // chunk's header is never within 16 bytes of a page start, so when ptr is that
-  // close to a page boundary, skip the peek and free normally — it is a real
-  // (GWP-ASan-guarded) heap pointer, never a static shared-null.
-  if ((reinterpret_cast<uintptr_t>(ptr) & 0xfffUL) < 16) {
-    void* evicted = QuarantineSwap(ptr);
-    if (evicted != nullptr) {
-      __real_free(evicted);
-    }
-    return;
-  }
-
-  // Peek the 16-byte window preceding ptr.  A real Scudo chunk has a
-  // non-zero packed header at [-8..-1] (Scudo Standalone) plus origin
-  // metadata at [-16..-9].  An all-zero window means the caller passed a
-  // pointer that was never returned from malloc (e.g., a Qt static shared
-  // null living in .bss).
-  const uint8_t* p = static_cast<const uint8_t*>(ptr);
-  uint64_t hdr8 = 0;
-  uint64_t hdr16 = 0;
-  memcpy(&hdr8, p - 8, sizeof(hdr8));
-  memcpy(&hdr16, p - 16, sizeof(hdr16));
-
-  bool non_heap = (hdr8 == 0 && hdr16 == 0);
-  if (non_heap) {
+  // Inspect the 16-byte window preceding ptr. A real Scudo chunk has a non-zero
+  // packed header at [-8..-1] (Scudo Standalone) plus origin metadata at
+  // [-16..-9]; an all-zero window means the caller passed a pointer that was
+  // never returned from malloc (e.g., a Qt static shared null living in .bss).
+  // The peek is skipped when ptr is within 16 bytes of a page start — a
+  // GWP-ASan-guarded heap pointer whose [ptr-16] would fault on the guard page.
+  // Shared with realloc_probe.cc so the guard cannot drift; see
+  // scudo_header_probe.h.
+  berberis::ProbeHeader h = berberis::InspectProbeHeader(ptr);
+  if (h.peeked && h.non_heap) {
     // Load-bearing: the band-aid is actively dropping a free of a pointer
     // with no Scudo chunk header (a static .bss/.rodata "shared null" on the
     // deallocation path).  Surface that loudly — it is a rare anomaly, not a
     // normal free.  Ordinary heap frees are forwarded silently below; do NOT
     // log them (a per-free log floods every translated app's logcat).
-    LogFreeCall("SKIP-non-heap", n, ptr, hdr16, hdr8);
+    LogFreeCall("SKIP-non-heap", n, ptr, h.hdr16, h.hdr8);
     g_free_skipped.fetch_add(1, std::memory_order_relaxed);
     return;
   }
