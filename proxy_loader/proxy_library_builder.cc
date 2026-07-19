@@ -64,8 +64,8 @@ void DoBadTrampoline(HostCode callee, ThreadState* state) {
 // LOUD, non-fatal replacement for DoBadTrampoline used ONLY on the arm64 guest.
 // A DoBadTrampoline symbol that is actually reached — which should never happen
 // for the unreachable framework-internal bulk, since every NDK-stable bad symbol
-// is covered or contract-stubbed (see digitalis/docs/proxy-coverage-gaps.md and
-// the enumerator in digitalis/scripts/) — degrades to a greppable warning and a
+// is covered or contract-stubbed (machine-audited by the Digitalis project's
+// bad-symbol enumerator) — degrades to a greppable warning and a
 // zeroed integer return instead of a SIGABRT. riscv64/arm keep the fatal
 // DoBadTrampoline above (the upstream bug-detector). This is a last-resort
 // backstop, not a fix: it names the symbol and returns 0; a symbol whose caller

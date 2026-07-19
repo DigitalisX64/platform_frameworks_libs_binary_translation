@@ -176,7 +176,7 @@ void DoCustomTrampoline_jniRegisterNativeMethods(HostCode callee, ProcessState* 
 // length forms, and %z size_t. Floating-point specifiers (%f/%g/%e) are NOT handled
 // by FormatBufferImpl (the shared guest-trace formatter) and are not emitted by
 // libnativehelper's exception callers; a %f stops formatting at that point with the
-// preceding text preserved. Documented in digitalis/docs/proxy-coverage-gaps.md.
+// preceding text preserved (callers use integer/string formats only).
 using Sig_ThrowExceptionFmt = int(JNIEnv*, const char*, const char*, ...);
 
 // Bridges GuestVAListParams to FormatBufferImpl's argument-extraction contract.

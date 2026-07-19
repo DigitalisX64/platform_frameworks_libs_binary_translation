@@ -21,7 +21,7 @@
 //
 // The shared-camera API itself cannot be exercised end-to-end on the Digitalis
 // emulator (SYSTEM_CAMERA permission + no HAL shared-session support — see
-// digitalis/docs/proxy-coverage-gaps.md), so this is the ground-truth check
+// a shared-session AIDL HAL), so this is the ground-truth check
 // for the only risky part of the trampolines: that each of the callback
 // function pointers is wrapped with the exact signature declared in
 // <camera/NdkCameraCaptureSession.h> and therefore receives the host->guest

@@ -20,7 +20,7 @@
 // forwarded without per-op interpretation; no known app calls it. The stub is a
 // crash-free no-op (install no interceptor) instead of aborting. See
 // DoStub_ANativeWindow_setPerformInterceptor in digitalis_extra_stubs.h and
-// digitalis/docs/proxy-coverage-gaps.md.
+// a per-op va_list dispatcher would be needed for live interception.
 
 #if defined(__x86_64__)
 
