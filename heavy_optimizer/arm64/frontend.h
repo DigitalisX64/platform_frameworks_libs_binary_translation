@@ -769,6 +769,43 @@ class HeavyOptimizerFrontend {
     SetVRegScalar(reg, val, /*is_double=*/false);
   }
 
+  // Widen the FP16 lanes of the 16-byte guest V slot at `voff` to FP32 for a heavy
+  // vector FP16 op. The low 4 halves (lanes 0..3) land as 4 FP32 in `*lo`; for q (.8H)
+  // the high 4 halves (lanes 4..7) land as 4 FP32 in `*hi` (PSRLDQ 8 brings them down
+  // first). Both are fresh temps. `*hi` is untouched when !q. GenGetSimd defines the
+  // reg (no use-before-def). Caller must have checked host_platform::kHasF16C.
+  void EmitWidenHalfVec(int32_t voff, bool q, FpRegister* lo, FpRegister* hi) {
+    FpRegister xlo = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xlo.machine_reg(), voff);
+    if (q) {
+      FpRegister xhi = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xlo.machine_reg());
+      builder_.Gen<x86_64::PsrldqXRegImm>(xhi.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::Vcvtph2psXRegXReg>(xhi.machine_reg(), xhi.machine_reg());
+      *hi = xhi;
+    }
+    // VCVTPH2PS reads only the low 64 bits (4 halves) of its source; lanes 4..7 in the
+    // 128-bit load are ignored, so no pre-mask is needed for the low group.
+    builder_.Gen<x86_64::Vcvtph2psXRegXReg>(xlo.machine_reg(), xlo.machine_reg());
+    *lo = xlo;
+  }
+
+  // Narrow FP32 arithmetic results back to FP16 and commit to V[rd]. `lo` holds the 4
+  // result FP32 for lanes 0..3; for q, `hi` holds lanes 4..7. VCVTPS2PH RNE (imm=0) is
+  // the single rounding (exact for one FP16 op — FP32 mantissa strictly contains FP16's);
+  // it packs 4 halves into the low 64 of its dst and zeroes the upper 64. For .8H the
+  // high group is shifted into the upper 64 (PSLLDQ 8) and OR'd in. SetVRegFull zeroes
+  // Vd[127:64] for q=0. Caller must have checked host_platform::kHasF16C.
+  void EmitNarrowHalfVecAndStore(uint8_t rd, FpRegister lo, FpRegister hi, bool q) {
+    builder_.Gen<x86_64::Vcvtps2phXRegXRegImm>(lo.machine_reg(), lo.machine_reg(), int8_t{0});
+    if (q) {
+      builder_.Gen<x86_64::Vcvtps2phXRegXRegImm>(hi.machine_reg(), hi.machine_reg(), int8_t{0});
+      builder_.Gen<x86_64::PslldqXRegImm>(hi.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PorXRegXReg>(lo.machine_reg(), hi.machine_reg());
+    }
+    SetVRegFull(rd, lo, q);
+  }
+
   // Allocate a freshly-zeroed XMM. PXOR is dependency-breaking (zeroes
   // regardless of prior contents), but its operand is use_def, so a PseudoDefReg
   // first gives the vreg a lifetime for the data-flow analysis (mirrors the

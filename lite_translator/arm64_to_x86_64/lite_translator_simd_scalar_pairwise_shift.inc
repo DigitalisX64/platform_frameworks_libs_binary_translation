@@ -909,6 +909,92 @@
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
           return;
         }
+        // SLI .8B / .16B byte form JIT via PSLLW + per-byte insert mask.
+        //
+        // x86 has no packed byte shift.  Shift the 16-bit words left by n
+        // (PSLLW), then keep only bits [n,7] of each byte via PAND with the
+        // broadcast mask (0xFF << n) & 0xFF — this both drops the bits that
+        // spilled across the byte boundary into the neighbouring high byte and
+        // clears the shifted-in low n bits.  The destination supplies the low n
+        // bits: PANDN(mask, Vd) = ~mask & Vd keeps Vd[n-1:0], and POR merges.
+        // n = immh:immb - 8 = immb in [0, 7].  At n==0 the mask is 0xFF, so the
+        // result is Vn and Vd contributes nothing — ARM SLI #0 = copy.
+        //
+        // Scalar B SLI is not ARM-encoded (scalar SLI is D-form only); bail.
+        if (is_byte && args.opcode == Decoder::AdvSimdShiftImmOpcode::kSli) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t n = args.immb;  // 0..7
+          SimdRegister xn = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xd = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xmask = AllocTempSimdReg();
+          if (!success()) { return; }
+          Register tmp = AllocTempReg();
+          if (tmp == no_register) { success_ = false; return; }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          if (n != 0) {
+            as_.Psllw(xn, static_cast<int8_t>(n));
+          }
+          const uint8_t mbyte = static_cast<uint8_t>((0xFFu << n) & 0xFFu);
+          const uint64_t mword = 0x0101010101010101ULL * mbyte;
+          as_.Movq(tmp, static_cast<int64_t>(mword));
+          as_.Movq(xmask, tmp);               // low 64 = mword, high 64 = 0
+          as_.Pinsrq(xmask, tmp, int8_t{1});  // high 64 = mword
+          as_.Pand(xn, xmask);                // shifted bits [n,7] per byte
+          as_.Pandn(xmask, xd);               // xmask = ~mask & Vd = Vd[n-1:0]
+          as_.Por(xn, xmask);
+          if (!args.q) {
+            // Zero upper 64 bits of Vd (D-register semantics).
+            as_.Pslldq(xn, int8_t{8});
+            as_.Psrldq(xn, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
+        // SRI .8B / .16B byte form JIT via PSRLW + per-byte insert mask.
+        //
+        // Unsigned-shift sibling of the SLI byte form.  PSRLW logical-right-
+        // shifts the 16-bit words by cnt, then PAND with the broadcast mask
+        // (0xFF >> cnt) keeps only bits [0, 7-cnt] of each byte (dropping the
+        // bits that spilled down from the neighbouring high byte).  The
+        // destination supplies the top cnt bits: PANDN(mask, Vd) = ~mask & Vd
+        // keeps Vd[7:8-cnt], POR merges.  cnt = 2*8 - immh:immb = 8 - immb in
+        // [1, 8].  At cnt==8 the mask is 0 (shifted contributes nothing,
+        // ~mask = all-ones keeps all of Vd) — ARM SRI at shift==esize leaves
+        // Vd unchanged.
+        //
+        // Scalar B SRI is not ARM-encoded (scalar SRI is D-form only); bail.
+        if (is_byte && args.opcode == Decoder::AdvSimdShiftImmOpcode::kSri) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t cnt_v = static_cast<uint8_t>(8 - args.immb);  // 1..8
+          SimdRegister xn = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xd = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xmask = AllocTempSimdReg();
+          if (!success()) { return; }
+          Register tmp = AllocTempReg();
+          if (tmp == no_register) { success_ = false; return; }
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+          as_.Psrlw(xn, static_cast<int8_t>(cnt_v));
+          const uint8_t mbyte = static_cast<uint8_t>(0xFFu >> cnt_v);
+          const uint64_t mword = 0x0101010101010101ULL * mbyte;
+          as_.Movq(tmp, static_cast<int64_t>(mword));
+          as_.Movq(xmask, tmp);
+          as_.Pinsrq(xmask, tmp, int8_t{1});
+          as_.Pand(xn, xmask);   // shifted bits [0,7-cnt] per byte
+          as_.Pandn(xmask, xd);  // xmask = ~mask & Vd = Vd[7:8-cnt]
+          as_.Por(xn, xmask);
+          if (!args.q) {
+            as_.Pslldq(xn, int8_t{8});
+            as_.Psrldq(xn, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+          return;
+        }
         if (is_byte) { success_ = false; return; }
         uint8_t esize_bits;
         if (immh & 0b1000) {
@@ -1236,6 +1322,173 @@
             as_.Psrldq(xn_lo, int8_t{8});
           }
           as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
+          return;
+        }
+        // SRSHR .8B / .16B byte form JIT via
+        // PMOVSXBW + PSRAW + round-bit isolate + PADDW + PACKSSWB.
+        //
+        // Signed sibling of the URSHR byte form above.  SRSHR(x,cnt) =
+        // (x >>a cnt) + ((x >> (cnt-1)) & 1), computed at i16 word width on
+        // PMOVSXBW-sign-extended bytes.  The round bit is derived with PSRLW
+        // (bit (cnt-1) of the byte -> bit 0 of the word, then a PSLLW(15)/
+        // PSRLW(15) bit-0 bracket), independent of the sign-extension bits.
+        // The arith-shifted i16 stays in [-64, 64] (max |SRSHR(byte,cnt)| ~=
+        // byte/2), so PACKSSWB never saturates.  cnt = 8 - immb in [1, 8]; at
+        // cnt==8 PSRAW sign-fills and the round bit is the MSB, giving the
+        // ARM-correct 0 per byte (e.g. -1 -> 0).
+        //
+        // Scalar B SRSHR is not ARM-encoded (scalar SRSHR is D-form only); bail.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrshr) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister round_lo = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xn_hi = no_simd_register;
+          SimdRegister round_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) { success_ = false; return; }
+            round_hi = AllocTempSimdReg();
+            if (round_hi == no_simd_register) { success_ = false; return; }
+          }
+          as_.Pmovsxbw(xn_lo, {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovsxbw(xn_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          as_.Movdqa(round_lo, xn_lo);
+          if (args.q) { as_.Movdqa(round_hi, xn_hi); }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          const int8_t cnt_minus_1 = static_cast<int8_t>(byte_shift_count - 1);
+          as_.Psrlw(round_lo, cnt_minus_1);
+          if (args.q) { as_.Psrlw(round_hi, cnt_minus_1); }
+          as_.Psllw(round_lo, int8_t{15});
+          if (args.q) { as_.Psllw(round_hi, int8_t{15}); }
+          as_.Psrlw(round_lo, int8_t{15});
+          if (args.q) { as_.Psrlw(round_hi, int8_t{15}); }
+          as_.Psraw(xn_lo, cnt);
+          if (args.q) { as_.Psraw(xn_hi, cnt); }
+          as_.Paddw(xn_lo, round_lo);
+          if (args.q) {
+            as_.Paddw(xn_hi, round_hi);
+            as_.Packsswb(xn_lo, xn_hi);
+          } else {
+            as_.Packsswb(xn_lo, xn_lo);
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn_lo);
+          return;
+        }
+        // SRSRA .8B / .16B byte form JIT: SRSHR byte pipeline (above) then
+        // PADDB the rounded bytes into Vd (native mod-256 accumulate).
+        // Scalar B SRSRA is not ARM-encoded; bail.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kSrsra) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister round_lo = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xd = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xn_hi = no_simd_register;
+          SimdRegister round_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) { success_ = false; return; }
+            round_hi = AllocTempSimdReg();
+            if (round_hi == no_simd_register) { success_ = false; return; }
+          }
+          as_.Pmovsxbw(xn_lo, {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovsxbw(xn_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          as_.Movdqa(round_lo, xn_lo);
+          if (args.q) { as_.Movdqa(round_hi, xn_hi); }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          const int8_t cnt_minus_1 = static_cast<int8_t>(byte_shift_count - 1);
+          as_.Psrlw(round_lo, cnt_minus_1);
+          if (args.q) { as_.Psrlw(round_hi, cnt_minus_1); }
+          as_.Psllw(round_lo, int8_t{15});
+          if (args.q) { as_.Psllw(round_hi, int8_t{15}); }
+          as_.Psrlw(round_lo, int8_t{15});
+          if (args.q) { as_.Psrlw(round_hi, int8_t{15}); }
+          as_.Psraw(xn_lo, cnt);
+          if (args.q) { as_.Psraw(xn_hi, cnt); }
+          as_.Paddw(xn_lo, round_lo);
+          if (args.q) {
+            as_.Paddw(xn_hi, round_hi);
+            as_.Packsswb(xn_lo, xn_hi);
+            as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          } else {
+            as_.Packsswb(xn_lo, xn_lo);
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+            as_.Movq(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
+          return;
+        }
+        // URSRA .8B / .16B byte form JIT: URSHR byte pipeline (see the URSHR
+        // byte form above) then PADDB the rounded bytes into Vd (mod-256
+        // accumulate).  Scalar B URSRA is not ARM-encoded; bail.
+        if (is_byte &&
+            args.opcode == Decoder::AdvSimdShiftImmOpcode::kUrsra) {
+          if (args.scalar) { success_ = false; return; }
+          const uint8_t byte_shift_count =
+              static_cast<uint8_t>(8 - args.immb);
+          SimdRegister xn_lo = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister round_lo = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xd = AllocTempSimdReg();
+          if (!success()) { return; }
+          SimdRegister xn_hi = no_simd_register;
+          SimdRegister round_hi = no_simd_register;
+          if (args.q) {
+            xn_hi = AllocTempSimdReg();
+            if (xn_hi == no_simd_register) { success_ = false; return; }
+            round_hi = AllocTempSimdReg();
+            if (round_hi == no_simd_register) { success_ = false; return; }
+          }
+          as_.Pmovzxbw(xn_lo, {.base = Assembler::rbp, .disp = vn_off});
+          if (args.q) {
+            as_.Pmovzxbw(xn_hi, {.base = Assembler::rbp, .disp = vn_off + 8});
+          }
+          as_.Movdqa(round_lo, xn_lo);
+          if (args.q) { as_.Movdqa(round_hi, xn_hi); }
+          const int8_t cnt = static_cast<int8_t>(byte_shift_count);
+          const int8_t cnt_minus_1 = static_cast<int8_t>(byte_shift_count - 1);
+          as_.Psrlw(round_lo, cnt_minus_1);
+          if (args.q) { as_.Psrlw(round_hi, cnt_minus_1); }
+          as_.Psllw(round_lo, int8_t{15});
+          if (args.q) { as_.Psllw(round_hi, int8_t{15}); }
+          as_.Psrlw(round_lo, int8_t{15});
+          if (args.q) { as_.Psrlw(round_hi, int8_t{15}); }
+          as_.Psrlw(xn_lo, cnt);
+          if (args.q) { as_.Psrlw(xn_hi, cnt); }
+          as_.Paddw(xn_lo, round_lo);
+          if (args.q) {
+            as_.Paddw(xn_hi, round_hi);
+            as_.Packuswb(xn_lo, xn_hi);
+            as_.Movdqu(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          } else {
+            as_.Packuswb(xn_lo, xn_lo);
+            as_.Pslldq(xn_lo, int8_t{8});
+            as_.Psrldq(xn_lo, int8_t{8});
+            as_.Movq(xd, {.base = Assembler::rbp, .disp = vd_off});
+            as_.Paddb(xd, xn_lo);
+          }
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
           return;
         }
         if (is_byte) { success_ = false; return; }

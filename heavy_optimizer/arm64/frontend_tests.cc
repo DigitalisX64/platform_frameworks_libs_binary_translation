@@ -4137,6 +4137,95 @@ constexpr uint32_t SqabsVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
 constexpr uint32_t SqnegVec(uint8_t size, bool q, uint8_t rd, uint8_t rn) {
   return AdvSimdTwoRegMisc(q, /*u=*/true, size, /*opcode=*/0b00111, rd, rn);
 }
+// Armv8.2-FP16 vector three-same: 0 Q U 01110 a 1 0 Rm 00 opc3 1 Rn Rd.
+// Base (all fields 0) = bits[28:24]=01110 | bit22 | bit10 = 0x0E400400.
+constexpr uint32_t AdvSimdFp16ThreeSame(bool q, bool u, bool a, uint8_t opc3,
+                                        uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x0E400400u | (static_cast<uint32_t>(q) << 30) | (static_cast<uint32_t>(u) << 29) |
+         (static_cast<uint32_t>(a) << 23) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(opc3) << 11) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FaddVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,0,0,0b010,d,n,m); }
+constexpr uint32_t FsubVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,0,1,0b010,d,n,m); }
+constexpr uint32_t FmulVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,1,0,0b011,d,n,m); }
+constexpr uint32_t FdivVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,1,0,0b111,d,n,m); }
+constexpr uint32_t FmaxVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,0,0,0b110,d,n,m); }
+constexpr uint32_t FminVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,0,1,0b110,d,n,m); }
+constexpr uint32_t FmaxnmVecH(bool q, uint8_t d, uint8_t n, uint8_t m) { return AdvSimdFp16ThreeSame(q,0,0,0b000,d,n,m); }
+constexpr uint32_t FminnmVecH(bool q, uint8_t d, uint8_t n, uint8_t m) { return AdvSimdFp16ThreeSame(q,0,1,0b000,d,n,m); }
+constexpr uint32_t FabdVecH(bool q, uint8_t d, uint8_t n, uint8_t m)   { return AdvSimdFp16ThreeSame(q,1,1,0b010,d,n,m); }
+constexpr uint32_t FcmeqVecH(bool q, uint8_t d, uint8_t n, uint8_t m)  { return AdvSimdFp16ThreeSame(q,0,0,0b100,d,n,m); }
+constexpr uint32_t FcmgeVecH(bool q, uint8_t d, uint8_t n, uint8_t m)  { return AdvSimdFp16ThreeSame(q,1,0,0b100,d,n,m); }
+constexpr uint32_t FcmgtVecH(bool q, uint8_t d, uint8_t n, uint8_t m)  { return AdvSimdFp16ThreeSame(q,1,1,0b100,d,n,m); }
+constexpr uint32_t FacgeVecH(bool q, uint8_t d, uint8_t n, uint8_t m)  { return AdvSimdFp16ThreeSame(q,1,0,0b101,d,n,m); }
+constexpr uint32_t FacgtVecH(bool q, uint8_t d, uint8_t n, uint8_t m)  { return AdvSimdFp16ThreeSame(q,1,1,0b101,d,n,m); }
+static_assert(FaddVecH(false,0,1,2)  == 0x0E421420u);  // fadd v0.4h,v1.4h,v2.4h
+static_assert(FaddVecH(true,0,1,2)   == 0x4E421420u);  // fadd v0.8h,v1.8h,v2.8h
+static_assert(FsubVecH(false,0,1,2)  == 0x0EC21420u);
+static_assert(FmulVecH(false,0,1,2)  == 0x2E421C20u);
+static_assert(FdivVecH(true,0,1,2)   == 0x6E423C20u);
+static_assert(FmaxVecH(false,0,1,2)  == 0x0E423420u);
+static_assert(FminVecH(false,0,1,2)  == 0x0EC23420u);
+static_assert(FmaxnmVecH(false,0,1,2)== 0x0E420420u);
+static_assert(FminnmVecH(false,0,1,2)== 0x0EC20420u);
+static_assert(FabdVecH(false,0,1,2)  == 0x2EC21420u);
+static_assert(FcmeqVecH(true,0,1,2)  == 0x4E422420u);
+static_assert(FcmgeVecH(false,0,1,2) == 0x2E422420u);
+static_assert(FcmgtVecH(true,0,1,2)  == 0x6EC22420u);
+static_assert(FacgeVecH(false,0,1,2) == 0x2E422C20u);
+static_assert(FacgtVecH(false,0,1,2) == 0x2EC22C20u);
+
+// Armv8.2-FP16 vector two-reg misc: 0 Q U 01110 a 11110 opc5 10 Rn Rd.
+// Base (all fields 0, assembler-verified) = bits[28:24]=01110 | bits[22:19]=1111 |
+// bit11 = 0x0E780800.
+constexpr uint32_t AdvSimdFp16TwoRegMisc(bool q, bool u, bool a, uint8_t opc5,
+                                         uint8_t rd, uint8_t rn) {
+  return 0x0E780800u | (static_cast<uint32_t>(q) << 30) | (static_cast<uint32_t>(u) << 29) |
+         (static_cast<uint32_t>(a) << 23) | (static_cast<uint32_t>(opc5) << 12) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FabsVecH(bool q, uint8_t d, uint8_t n)      { return AdvSimdFp16TwoRegMisc(q,0,1,0b01111,d,n); }
+constexpr uint32_t FnegVecH(bool q, uint8_t d, uint8_t n)      { return AdvSimdFp16TwoRegMisc(q,1,1,0b01111,d,n); }
+constexpr uint32_t FsqrtVecH(bool q, uint8_t d, uint8_t n)     { return AdvSimdFp16TwoRegMisc(q,1,1,0b11111,d,n); }
+constexpr uint32_t FrintnVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,0,0,0b11000,d,n); }
+constexpr uint32_t FrintmVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,0,0,0b11001,d,n); }
+constexpr uint32_t FrintpVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,0,1,0b11000,d,n); }
+constexpr uint32_t FrintzVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,0,1,0b11001,d,n); }
+constexpr uint32_t FrintxVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,1,0,0b11001,d,n); }
+constexpr uint32_t FrintiVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,1,1,0b11001,d,n); }
+constexpr uint32_t FrintaVecH(bool q, uint8_t d, uint8_t n)    { return AdvSimdFp16TwoRegMisc(q,1,0,0b11000,d,n); }
+constexpr uint32_t FcmgtZeroVecH(bool q, uint8_t d, uint8_t n) { return AdvSimdFp16TwoRegMisc(q,0,1,0b01100,d,n); }
+constexpr uint32_t FcmeqZeroVecH(bool q, uint8_t d, uint8_t n) { return AdvSimdFp16TwoRegMisc(q,0,1,0b01101,d,n); }
+constexpr uint32_t FcmltZeroVecH(bool q, uint8_t d, uint8_t n) { return AdvSimdFp16TwoRegMisc(q,0,1,0b01110,d,n); }
+constexpr uint32_t FcmgeZeroVecH(bool q, uint8_t d, uint8_t n) { return AdvSimdFp16TwoRegMisc(q,1,1,0b01100,d,n); }
+constexpr uint32_t FcmleZeroVecH(bool q, uint8_t d, uint8_t n) { return AdvSimdFp16TwoRegMisc(q,1,1,0b01101,d,n); }
+static_assert(FabsVecH(false,0,1)     == 0x0EF8F820u);  // fabs v0.4h,v1.4h
+static_assert(FnegVecH(false,0,1)     == 0x2EF8F820u);
+static_assert(FsqrtVecH(false,0,1)    == 0x2EF9F820u);
+static_assert(FrintnVecH(false,0,1)   == 0x0E798820u);
+static_assert(FrintmVecH(true,0,1)    == 0x4E799820u);
+static_assert(FrintpVecH(false,0,1)   == 0x0EF98820u);
+static_assert(FrintzVecH(false,0,1)   == 0x0EF99820u);
+static_assert(FrintaVecH(false,0,1)   == 0x2E798820u);
+static_assert(FrintxVecH(false,0,1)   == 0x2E799820u);
+static_assert(FrintiVecH(false,0,1)   == 0x2EF99820u);
+static_assert(FcmeqZeroVecH(false,0,1)== 0x0EF8D820u);  // fcmeq v0.4h,v1.4h,#0.0
+static_assert(FcmgtZeroVecH(false,0,1)== 0x0EF8C820u);
+static_assert(FcmgeZeroVecH(false,0,1)== 0x2EF8C820u);
+static_assert(FcmltZeroVecH(false,0,1)== 0x0EF8E820u);
+static_assert(FcmleZeroVecH(false,0,1)== 0x2EF8D820u);
+
+// URECPE (U=0) / URSQRTE (U=1), opcode=11100, size=10 (32-bit lanes only).
+constexpr uint32_t UrecpeVec(bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/false, /*size=*/0b10, /*opcode=*/0b11100, rd, rn);
+}
+constexpr uint32_t UrsqrteVec(bool q, uint8_t rd, uint8_t rn) {
+  return AdvSimdTwoRegMisc(q, /*u=*/true, /*size=*/0b10, /*opcode=*/0b11100, rd, rn);
+}
+static_assert(UrecpeVec(true, 0, 1) == 0x4EA1C820u);   // urecpe v0.4s, v1.4s
+static_assert(UrsqrteVec(true, 0, 1) == 0x6EA1C820u);  // ursqrte v0.4s, v1.4s
+static_assert(UrecpeVec(false, 0, 1) == 0x0EA1C820u);  // urecpe v0.2s, v1.2s
+static_assert(UrsqrteVec(false, 0, 1) == 0x2EA1C820u); // ursqrte v0.2s, v1.2s
 // FP three-same abs-compares FACGE (opcode=11101, op_high=0, U=1) /
 // FACGT (opcode=11101, op_high=1, U=1). size = {op_high, sz=dbl}.
 constexpr uint32_t FacgeVec(bool dbl, bool q, uint8_t rd, uint8_t rn, uint8_t rm) {
@@ -4614,6 +4703,83 @@ static_assert(SqdmulhScalar(0b01, 0, 1, 2) == 0x5e62b420u);   // sqdmulh h0,h1,h
 static_assert(SqrdmulhScalar(0b01, 0, 1, 2) == 0x7e62b420u);  // sqrdmulh h0,h1,h2
 static_assert(SqdmulhScalar(0b10, 0, 1, 2) == 0x5ea2b420u);   // sqdmulh s0,s1,s2
 static_assert(SqrdmulhScalar(0b10, 0, 1, 2) == 0x7ea2b420u);  // sqrdmulh s0,s1,s2
+
+// Scalar saturating add/sub / shifts. opcode: SQADD/UQADD=0b00001,
+// SQSUB/UQSUB=0b00101, SSHL/USHL=0b01000, SRSHL/URSHL=0b01010.
+constexpr uint32_t SqaddScalar(uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, size, 0b00001, rd, rn, rm);
+}
+constexpr uint32_t UqaddScalar(uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(true, size, 0b00001, rd, rn, rm);
+}
+constexpr uint32_t SqsubScalar(uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, size, 0b00101, rd, rn, rm);
+}
+constexpr uint32_t UqsubScalar(uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(true, size, 0b00101, rd, rn, rm);
+}
+constexpr uint32_t SshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, 0b11, 0b01000, rd, rn, rm);
+}
+constexpr uint32_t UshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(true, 0b11, 0b01000, rd, rn, rm);
+}
+constexpr uint32_t SrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, 0b11, 0b01010, rd, rn, rm);
+}
+constexpr uint32_t UrshlScalarD(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(true, 0b11, 0b01010, rd, rn, rm);
+}
+static_assert(SqaddScalar(0b00, 0, 1, 2) == 0x5e220c20u);  // sqadd b0,b1,b2
+static_assert(SqaddScalar(0b01, 0, 1, 2) == 0x5e620c20u);  // sqadd h0,h1,h2
+static_assert(SqaddScalar(0b10, 0, 1, 2) == 0x5ea20c20u);  // sqadd s0,s1,s2
+static_assert(SqaddScalar(0b11, 0, 1, 2) == 0x5ee20c20u);  // sqadd d0,d1,d2
+static_assert(UqaddScalar(0b00, 0, 1, 2) == 0x7e220c20u);  // uqadd b0,b1,b2
+static_assert(UqaddScalar(0b11, 0, 1, 2) == 0x7ee20c20u);  // uqadd d0,d1,d2
+static_assert(SqsubScalar(0b10, 0, 1, 2) == 0x5ea22c20u);  // sqsub s0,s1,s2
+static_assert(SqsubScalar(0b11, 0, 1, 2) == 0x5ee22c20u);  // sqsub d0,d1,d2
+static_assert(UqsubScalar(0b10, 0, 1, 2) == 0x7ea22c20u);  // uqsub s0,s1,s2
+static_assert(UqsubScalar(0b11, 0, 1, 2) == 0x7ee22c20u);  // uqsub d0,d1,d2
+static_assert(SshlScalarD(0, 1, 2)  == 0x5ee24420u);  // sshl  d0,d1,d2
+static_assert(UshlScalarD(0, 1, 2)  == 0x7ee24420u);  // ushl  d0,d1,d2
+static_assert(SrshlScalarD(0, 1, 2) == 0x5ee25420u);  // srshl d0,d1,d2
+static_assert(UrshlScalarD(0, 1, 2) == 0x7ee25420u);  // urshl d0,d1,d2
+
+// FP scalar three-same (S/D). FMULX/FRECPS opcode=0b11011/0b11111 size 0b00(S)/
+// 0b01(D); FRSQRTS opcode=0b11111 size 0b10(S)/0b11(D); FABD opcode=0b11010
+// size 0b10(S)/0b11(D).
+constexpr uint32_t FmulxScalar(bool is_d, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, is_d ? 0b01 : 0b00, 0b11011, rd, rn, rm);
+}
+constexpr uint32_t FrecpsScalar(bool is_d, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, is_d ? 0b01 : 0b00, 0b11111, rd, rn, rm);
+}
+constexpr uint32_t FrsqrtsScalar(bool is_d, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(false, is_d ? 0b11 : 0b10, 0b11111, rd, rn, rm);
+}
+constexpr uint32_t FabdScalar(bool is_d, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return AdvSimdScalarThreeSame(true, is_d ? 0b11 : 0b10, 0b11010, rd, rn, rm);
+}
+static_assert(FmulxScalar(false, 0, 1, 2) == 0x5e22dc20u);   // fmulx s0,s1,s2
+static_assert(FmulxScalar(true,  0, 1, 2) == 0x5e62dc20u);   // fmulx d0,d1,d2
+static_assert(FrecpsScalar(false, 0, 1, 2) == 0x5e22fc20u);  // frecps s0,s1,s2
+static_assert(FrecpsScalar(true,  0, 1, 2) == 0x5e62fc20u);  // frecps d0,d1,d2
+static_assert(FrsqrtsScalar(false, 0, 1, 2) == 0x5ea2fc20u); // frsqrts s0,s1,s2
+static_assert(FrsqrtsScalar(true,  0, 1, 2) == 0x5ee2fc20u); // frsqrts d0,d1,d2
+static_assert(FabdScalar(false, 0, 1, 2) == 0x7ea2d420u);    // fabd s0,s1,s2
+static_assert(FabdScalar(true,  0, 1, 2) == 0x7ee2d420u);    // fabd d0,d1,d2
+
+// SQRDMLAH/SQRDMLSH scalar (three-same-extra, H/S). base 0x7E008400,
+// size 0b01(H)/0b10(S), sub bit at bit11.
+constexpr uint32_t SqrdmlScalar(bool is_sub, uint8_t size, uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x7E008400u | (static_cast<uint32_t>(size) << 22) |
+         (static_cast<uint32_t>(is_sub) << 11) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(SqrdmlScalar(false, 0b01, 0, 1, 2) == 0x7e428420u);  // sqrdmlah h0,h1,h2
+static_assert(SqrdmlScalar(false, 0b10, 0, 1, 2) == 0x7e828420u);  // sqrdmlah s0,s1,s2
+static_assert(SqrdmlScalar(true,  0b01, 0, 1, 2) == 0x7e428c20u);  // sqrdmlsh h0,h1,h2
+static_assert(SqrdmlScalar(true,  0b10, 0, 1, 2) == 0x7e828c20u);  // sqrdmlsh s0,s1,s2
 
 // AdvSIMD scalar two-register misc: 01 U 11110 sz(1) 1 00001 opcode(5) 10 Rn Rd
 // (sz occupies bit22; the "1 00001" pattern occupies bits[23:17] with bit23=1).
@@ -5785,6 +5951,24 @@ static_assert(FcvtScalar(true, 0b01, 0b10, 0b001, 1, 0) == 0x9e710020u);   // fc
 static_assert(FcvtScalar(false, 0b00, 0b00, 0b100, 1, 0) == 0x1e240020u);  // fcvtas w0, s1
 static_assert(FcvtScalar(false, 0b00, 0b00, 0b101, 1, 0) == 0x1e250020u);  // fcvtau w0, s1
 
+// FMOV between GP and V.D[1] (top half). ftype=10, rmode=01, op=110 (to GP) /
+// op=111 (from GP). Assembler-verified.
+constexpr uint32_t FmovXFromVd1(uint8_t rd, uint8_t rn) {  // fmov Xd, Vn.D[1]
+  return FcvtScalar(true, 0b10, 0b01, 0b110, rn, rd);
+}
+constexpr uint32_t FmovVd1FromX(uint8_t rd, uint8_t rn) {  // fmov Vd.D[1], Xn
+  return FcvtScalar(true, 0b10, 0b01, 0b111, rn, rd);
+}
+static_assert(FmovXFromVd1(0, 1) == 0x9eae0020u);   // fmov x0, v1.d[1]
+static_assert(FmovXFromVd1(3, 4) == 0x9eae0083u);   // fmov x3, v4.d[1]
+static_assert(FmovVd1FromX(0, 1) == 0x9eaf0020u);   // fmov v0.d[1], x1
+static_assert(FmovVd1FromX(0, 2) == 0x9eaf0040u);   // fmov v0.d[1], x2
+
+// BFCVT Hd, Sn (FP32 -> BF16). Assembler-verified.
+constexpr uint32_t Bfcvt(uint8_t rd, uint8_t rn) { return FpDP1(0x1E634000, rd, rn); }
+static_assert(Bfcvt(0, 1) == 0x1e634020u);
+static_assert(Bfcvt(5, 6) == 0x1e6340c5u);
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtnsWFromS) {
   static const uint32_t code[] = {0x1e200020u};  // fcvtns w0, s1 (round-to-nearest ties-even)
   SetVf32(&state_, 1, 2.5f);                      // ties to even -> 2
@@ -5950,6 +6134,199 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromSLargeGated) {
   RunRegion(&state_, code, end_pc, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(state_.cpu.x[0], 8388609u);
+}
+
+// --- FCVTAS/FCVTAU FP64 (ties-away, GP dest) ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromDTieAway) {
+  static const uint32_t code[] = {0x1e640020u};  // fcvtas w0, d1
+  SetVf64(&state_, 1, 2.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 3u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromDHalf) {
+  static const uint32_t code[] = {0x1e640020u};  // fcvtas w0, d1
+  SetVf64(&state_, 1, 0.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 1u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasXFromDOnePointFive) {
+  static const uint32_t code[] = {0x9e640020u};  // fcvtas x0, d1
+  SetVf64(&state_, 1, 1.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 2u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasXFromDNegHalf) {
+  static const uint32_t code[] = {0x9e640020u};  // fcvtas x0, d1
+  SetVf64(&state_, 1, -0.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(int64_t{-1}));
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasWFromDNegTwoPointFive) {
+  static const uint32_t code[] = {0x1e640020u};  // fcvtas w0, d1
+  SetVf64(&state_, 1, -2.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(uint32_t{static_cast<uint32_t>(-3)}));
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasXFromDLargeGated) {
+  static const uint32_t code[] = {0x9e640020u};  // fcvtas x0, d1
+  SetVf64(&state_, 1, 4503599627370497.0);         // 2^52 + 1 (already integer)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 4503599627370497ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasXFromDPosOverflow) {
+  static const uint32_t code[] = {0x9e640020u};  // fcvtas x0, d1
+  SetVf64(&state_, 1, 1e300);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], static_cast<uint64_t>(INT64_MAX));
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtasXFromDNan) {
+  static const uint32_t code[] = {0x9e640020u};  // fcvtas x0, d1
+  SetV128(&state_, 1, 0x7FF8000000000000ull, 0ull);  // FP64 qNaN in lane 0
+  state_.cpu.x[0] = 0xdeadbeefull;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtauXFromDTieAway) {
+  static const uint32_t code[] = {0x9e650020u};  // fcvtau x0, d1
+  SetVf64(&state_, 1, 2.5);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 3u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtauXFromDNegSat) {
+  static const uint32_t code[] = {0x9e650020u};  // fcvtau x0, d1
+  SetVf64(&state_, 1, -0.5);
+  state_.cpu.x[0] = 0xdeadbeefull;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtauXFromDPosOverflow) {
+  static const uint32_t code[] = {0x9e650020u};  // fcvtau x0, d1
+  SetVf64(&state_, 1, 1e300);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], ~uint64_t{0});
+}
+
+// --- FMOV V.D[1] top-half moves ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovXFromVd1) {
+  static const uint32_t code[] = {0x9eae0020u};  // fmov x0, v1.d[1]
+  SetV128(&state_, 1, 0x1111111111111111ull, 0xCAFEF00DDEADBEEFull);
+  state_.cpu.x[0] = 0xdeadbeefull;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(state_.cpu.x[0], 0xCAFEF00DDEADBEEFull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovVd1FromXPreservesLow) {
+  static const uint32_t code[] = {0x9eaf0020u};  // fmov v0.d[1], x1
+  SetV128(&state_, 0, 0xABCDEF0123456789ull, 0x2222222222222222ull);
+  state_.cpu.x[1] = 0x1122334455667788ull;
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xABCDEF0123456789ull);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x1122334455667788ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmovVd1FromXzr) {
+  static const uint32_t code[] = {FmovVd1FromX(0, 31)};  // fmov v0.d[1], xzr
+  SetV128(&state_, 0, 0xABCDEF0123456789ull, 0x7777777777777777ull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xABCDEF0123456789ull);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ull);
+}
+
+// --- BFCVT scalar (FP32 -> BF16) ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, BfcvtOne) {
+  static const uint32_t code[] = {0x1e634020u};  // bfcvt h0, s1
+  SetV128(&state_, 1, 0x000000003F800000ull, 0xAAAAAAAAAAAAAAAAull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F80ull);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, BfcvtTieToEvenStays) {
+  static const uint32_t code[] = {0x1e634020u};  // bfcvt h0, s1
+  SetV128(&state_, 1, 0x000000003F808000ull, 0ull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F80ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, BfcvtTieToEvenUp) {
+  static const uint32_t code[] = {0x1e634020u};  // bfcvt h0, s1
+  SetV128(&state_, 1, 0x000000003F818000ull, 0ull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F82ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, BfcvtRoundUpNonTie) {
+  static const uint32_t code[] = {0x1e634020u};  // bfcvt h0, s1
+  SetV128(&state_, 1, 0x000000003F808001ull, 0ull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3F81ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, BfcvtSnanQuieted) {
+  static const uint32_t code[] = {0x1e634020u};  // bfcvt h0, s1
+  SetV128(&state_, 1, 0x000000007F800001ull, 0ull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FC0ull);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, BfcvtQnan) {
+  static const uint32_t code[] = {0x1e634020u};  // bfcvt h0, s1
+  SetV128(&state_, 1, 0x000000007FC00000ull, 0ull);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FC0ull);
 }
 
 TEST_F(Arm64HeavyOptimizerFrontendTest, FcvtzuXFromSInRange) {
@@ -7594,6 +7971,412 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcmpHBailsWithoutF16C) {
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
   EXPECT_EQ(n, 0u);
+}
+
+// --- AdvSimdThreeSame FP16 vector (F16C round-trip) ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FaddVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x3C003C003C003C00ULL, 0x2222222222222222ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4500440042004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FaddVecH(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC000490046004500ULL);
+  SetV128(&state_, 2, 0x3C003C003C003C00ULL, 0x3C003C003C003C00ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4500440042004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xBC00498047004600ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsubVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FsubVecH(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4500440042004000ULL, 0xBC00498047004600ULL);
+  SetV128(&state_, 2, 0x3C003C003C003C00ULL, 0x3C003C003C003C00ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4400420040003C00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC000490046004500ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmulVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4400420040003800ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x3800400038004200ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x400046003C003E00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FdivVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FdivVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4900460044004880ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x4000420040004400ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4500400040004080ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxVecH(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0xC000450042003E00ULL, 0xBC00490046003800ULL);
+  SetV128(&state_, 2, 0x3C00420040004100ULL, 0xC500400044003C00ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3C00450042004100ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xBC00490046003C00ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FminVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xC000450042003E00ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x3C00420040004100ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000420040003E00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmVecH4HNanSuppressed) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxnmVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x3C00440040007E00ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x450047007E004200ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4500470040004200ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmVecH4HNanSuppressed) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FminnmVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x3C00440040007E00ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x450047007E004200ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3C00440040004200ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FabdVecH(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC000490046004500ULL);
+  SetV128(&state_, 2, 0x400044003C004000ULL, 0x4200490047004400ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x40003C003C003C00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x450000003C003C00ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgtVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmgtVecH(/*q=*/true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x45007E003C004000ULL, 0x49003C0040004200ULL);
+  SetV128(&state_, 2, 0x45003C0040003C00ULL, 0x40003C0042004000ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFF00000000FFFFULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgeVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmgeVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7E0042003C004000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x3C00420040003C00ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000FFFF0000FFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FacgtVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FacgtVecH(/*q=*/false, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4500C0003C00C200ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 2, 0x450040003C004000ULL, 0x2222222222222222ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+// --- AdvSimdTwoRegMisc FP16 vector ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabsVecH4HNanPayload) {  // no F16C needed; sign-only
+  static const uint32_t code[] = {FabsVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x8000FD554000BE00ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00007D5540003E00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FnegVecH4HNanPayload) {  // no F16C needed
+  static const uint32_t code[] = {FnegVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x8000FD554000BE00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00007D55C0003E00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabsVecH8H) {  // no F16C; distinct high lanes
+  static const uint32_t code[] = {FabsVecH(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x8000FD554000BE00ULL, 0x4400FC013800C200ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00007D5540003E00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x44007C0138004200ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FsqrtVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FsqrtVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4080340048804400ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x3E00380042004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintpVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FrintpVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4200BE0041003E00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4200BC0042004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintmVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FrintmVecH(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4200BE0041003E00ULL, 0x4500C100B8003800ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4200C00040003C00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4500C200BC000000ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintzVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FrintzVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4200BE0041003E00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4200BC0040003C00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintnVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FrintnVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4200BE0041003E00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4200C00040004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintaVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FrintaVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4200BE0041003E00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4200C00042004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrintxVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FrintxVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4200BE0041003E00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4200C00040004000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+// --- FP16 compare-vs-zero (routes via integer kCmeqZero / kCmgtZero group) ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmeqZeroVecH4HNegZero) {  // pins the -0.0h bug fix
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmeqZeroVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x7E003C0080000000ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgtZeroVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmgtZeroVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x7E000000BC004000ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgeZeroVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmgeZeroVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x7E00BC003C000000ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmltZeroVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmltZeroVecH(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x7E0080004000BC00ULL, 0x1111111111111111ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000FFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FcmleZeroVecH8H) {  // distinct high lanes
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FcmleZeroVecH(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x7E003C00BC000000ULL, 0x4500C20040008000ULL);
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000FFFF0000FFFFULL);
+}
+
+// --- URECPE / URSQRTE (unsigned integer estimate, table lookup) ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrecpeVec4S) {
+  static const uint32_t code[] = {UrecpeVec(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0x7FFFFFFFFF800000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF800000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFFFFFF80000000ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrecpeVec2S) {
+  static const uint32_t code[] = {UrecpeVec(/*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0x1111111111111111ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF800000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrsqrteVec4S) {
+  static const uint32_t code[] = {UrsqrteVec(/*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4000000000000000ULL, 0xFF80000080000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFF800000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x80000000B4800000ULL);
+}
+
+// --- FP64 FCADD / FCMLA (.2D) ---
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcadd90Vec2D) {
+  static const uint32_t code[] = {0x6EC2E420u};  // fcadd v0.2d, v1.2d, v2.2d, #90
+  SetV128(&state_, 1, 0x4008000000000000ULL, 0x4014000000000000ULL);  // (3, 5)
+  SetV128(&state_, 2, 0x4000000000000000ULL, 0x401C000000000000ULL);  // (2, 7)
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC010000000000000ULL);       // -4.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x401C000000000000ULL);  //  7.0
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcadd270Vec2D) {
+  static const uint32_t code[] = {0x6EC2F420u};  // fcadd v0.2d, v1.2d, v2.2d, #270
+  SetV128(&state_, 1, 0x4008000000000000ULL, 0x4014000000000000ULL);
+  SetV128(&state_, 2, 0x4000000000000000ULL, 0x401C000000000000ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4024000000000000ULL);       // 10.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4008000000000000ULL);  //  3.0
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcmla0Vec2D) {
+  static const uint32_t code[] = {0x6EC2C420u};  // fcmla v0.2d, v1.2d, v2.2d, #0
+  SetV128(&state_, 1, 0x4000000000000000ULL, 0x4008000000000000ULL);  // Vn=(2,3)
+  SetV128(&state_, 2, 0x4010000000000000ULL, 0x4014000000000000ULL);  // Vm=(4,5)
+  SetV128(&state_, 0, 0x3FF0000000000000ULL, 0x3FF0000000000000ULL);  // Vd=(1,1)
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4022000000000000ULL);       //  9.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4026000000000000ULL);  // 11.0
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcmla90Vec2D) {
+  static const uint32_t code[] = {0x6EC2CC20u};  // fcmla v0.2d, v1.2d, v2.2d, #90
+  SetV128(&state_, 1, 0x4000000000000000ULL, 0x4008000000000000ULL);
+  SetV128(&state_, 2, 0x4010000000000000ULL, 0x4014000000000000ULL);
+  SetV128(&state_, 0, 0x3FF0000000000000ULL, 0x3FF0000000000000ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC02C000000000000ULL);       // -14.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x402A000000000000ULL);  //  13.0
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcmla180Vec2D) {
+  static const uint32_t code[] = {0x6EC2D420u};  // fcmla v0.2d, v1.2d, v2.2d, #180
+  SetV128(&state_, 1, 0x4000000000000000ULL, 0x4008000000000000ULL);
+  SetV128(&state_, 2, 0x4010000000000000ULL, 0x4014000000000000ULL);
+  SetV128(&state_, 0, 0x3FF0000000000000ULL, 0x3FF0000000000000ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC01C000000000000ULL);       // -7.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC022000000000000ULL);  // -9.0
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, Fcmla270Vec2D) {
+  static const uint32_t code[] = {0x6EC2DC20u};  // fcmla v0.2d, v1.2d, v2.2d, #270
+  SetV128(&state_, 1, 0x4000000000000000ULL, 0x4008000000000000ULL);
+  SetV128(&state_, 2, 0x4010000000000000ULL, 0x4014000000000000ULL);
+  SetV128(&state_, 0, 0x3FF0000000000000ULL, 0x3FF0000000000000ULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4030000000000000ULL);       //  16.0
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xC026000000000000ULL);  // -11.0
 }
 
 //
@@ -9539,6 +10322,461 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhVec2DBails) {
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
   EXPECT_EQ(n, 0u);
+}
+
+// ---- Scalar saturating add/sub (SQADD/UQADD/SQSUB/UQSUB, B/H/S/D) ----
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddScalarBSat) {
+  static const uint32_t code[] = {SqaddScalar(0b00, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAA7FULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBBBBBBBB01ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000007FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqaddScalarBSat) {
+  static const uint32_t code[] = {UqaddScalar(0b00, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAAAAFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBBBBBBBB01ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000000000FFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddScalarHSat) {
+  static const uint32_t code[] = {SqaddScalar(0b01, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAAAAA7FFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBBBBBB0001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000007FFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddScalarSSat) {
+  static const uint32_t code[] = {SqaddScalar(0b10, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA7FFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB00000001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqaddScalarSSat) {
+  static const uint32_t code[] = {UqaddScalar(0b10, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAAFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB00000001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000FFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddScalarDSat) {
+  static const uint32_t code[] = {SqaddScalar(0b11, 0, 1, 2)};
+  SetV128(&state_, 1, 0x7FFFFFFFFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7FFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqaddScalarDSat) {
+  static const uint32_t code[] = {UqaddScalar(0b11, 0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqsubScalarDSat) {
+  static const uint32_t code[] = {SqsubScalar(0b11, 0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000001ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x8000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqsubScalarSUnderflow) {
+  static const uint32_t code[] = {UqsubScalar(0b10, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA00000003ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB00000007ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UqsubScalarDInRange) {
+  static const uint32_t code[] = {UqsubScalar(0b11, 0, 1, 2)};
+  SetV128(&state_, 1, 0x000000000000000AULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000005ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x5ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqaddScalarDInRange) {
+  static const uint32_t code[] = {SqaddScalar(0b11, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000003ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000004ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x7ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// ---- Scalar shifts (D-form): SSHL/USHL/SRSHL/URSHL ----
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlScalarDNegRight) {
+  static const uint32_t code[] = {UshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0xFF00000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000FCULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0FF0000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlScalarDLeft) {
+  static const uint32_t code[] = {UshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000001ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000004ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x10ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlScalarDBigLeftZero) {
+  static const uint32_t code[] = {UshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x00000000000000FFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000040ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlScalarDBigRightZero) {
+  static const uint32_t code[] = {UshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000C0ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshlScalarDNegArith) {
+  static const uint32_t code[] = {SshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000FFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshlScalarDBigRightSignBcast) {
+  static const uint32_t code[] = {SshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000C0ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFFFFFFFFFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshlScalarDBigLeftZero) {
+  static const uint32_t code[] = {SshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000041ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrshlScalarDRoundUp) {
+  static const uint32_t code[] = {UrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000001ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000FFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrshlScalarDNoRound) {
+  static const uint32_t code[] = {UrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000002ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000FFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrshlScalarDEq64Bit63) {
+  static const uint32_t code[] = {UrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000C0ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrshlScalarDEq64Zero) {
+  static const uint32_t code[] = {UrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x7FFFFFFFFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000C0ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, UrshlScalarDBigZero) {
+  static const uint32_t code[] = {UrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000BFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SrshlScalarDRoundNegOne) {
+  static const uint32_t code[] = {SrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0xFFFFFFFFFFFFFFFFULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000FFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SrshlScalarDMinRight) {
+  static const uint32_t code[] = {SrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000FFULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SrshlScalarDBigRightZero) {
+  static const uint32_t code[] = {SrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x00000000000000C0ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SrshlScalarDLeft) {
+  static const uint32_t code[] = {SrshlScalarD(0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000005ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x0000000000000002ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x14ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// ---- Scalar FP (FABD/FMULX/FRECPS/FRSQRTS, S/D) ----
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdScalarS) {
+  static const uint32_t code[] = {FabdScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA40400000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB40A00000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FabdScalarD) {
+  static const uint32_t code[] = {FabdScalar(true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4008000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x4014000000000000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulxScalarS) {
+  static const uint32_t code[] = {FmulxScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA40000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB40400000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040C00000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulxScalarSZeroInfPos) {
+  static const uint32_t code[] = {FmulxScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA00000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB7F800000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulxScalarSZeroInfNeg) {
+  static const uint32_t code[] = {FmulxScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA80000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB7F800000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000C0000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmulxScalarDZeroInf) {
+  static const uint32_t code[] = {FmulxScalar(true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x0000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x7FF0000000000000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x4000000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrecpsScalarS) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrecpsScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA40400000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB40800000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000C1200000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrecpsScalarSZeroInf) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrecpsScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA00000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB7F800000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrecpsScalarSNaN) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrecpsScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA7FC00000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB40000000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000007FC00000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrecpsScalarD) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrecpsScalar(true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4008000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x4010000000000000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC024000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrsqrtsScalarS) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrsqrtsScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA40000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB40800000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x00000000C0200000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrsqrtsScalarSZeroInf) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrsqrtsScalar(false, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA00000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB7F800000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000003FC00000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, FrsqrtsScalarD) {
+  if (!host_platform::kHasFMA) GTEST_SKIP() << "no FMA";
+  static const uint32_t code[] = {FrsqrtsScalar(true, 0, 1, 2)};
+  SetV128(&state_, 1, 0x4000000000000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0x4010000000000000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0xC004000000000000ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+
+// ---- SQRDMLAH / SQRDMLSH (H/S) ----
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmlahScalarH) {
+  static const uint32_t code[] = {SqrdmlScalar(false, 0b01, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1111222233334000ULL, 0xAAAAAAAAAAAAAAAAULL);
+  SetV128(&state_, 2, 0x4444555566664000ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFE0001ULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000002001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmlahScalarHSat) {
+  static const uint32_t code[] = {SqrdmlScalar(false, 0b01, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1111222233338000ULL, 0xAAAAAAAAAAAAAAAAULL);
+  SetV128(&state_, 2, 0x4444555566668000ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFE0100ULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000000007FFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmlshScalarH) {
+  static const uint32_t code[] = {SqrdmlScalar(true, 0b01, 0, 1, 2)};
+  SetV128(&state_, 1, 0x1111222233334000ULL, 0xAAAAAAAAAAAAAAAAULL);
+  SetV128(&state_, 2, 0x4444555566664000ULL, 0xBBBBBBBBBBBBBBBBULL);
+  SetV128(&state_, 0, 0xDEADBEEFCAFE0001ULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x000000000000E001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
+}
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmlahScalarS) {
+  static const uint32_t code[] = {SqrdmlScalar(false, 0b10, 0, 1, 2)};
+  SetV128(&state_, 1, 0xAAAAAAAA40000000ULL, 0xCCCCCCCCCCCCCCCCULL);
+  SetV128(&state_, 2, 0xBBBBBBBB40000000ULL, 0xDDDDDDDDDDDDDDDDULL);
+  SetV128(&state_, 0, 0xDEADBEEF00000001ULL, 0x0123456789ABCDEFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false; RunRegion(&state_, code, end_pc, &ok); ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000020000001ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0ULL);
 }
 
 // Scalar SQDMULH/SQRDMULH (H/S): only lane 0 participates; upper lanes of Vn/Vm
@@ -13665,13 +14903,19 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, SriVec4SFull) {
 }
 
 // SLI .16B byte lane has no x86 packed byte shift — must bail to lite.
-TEST_F(Arm64HeavyOptimizerFrontendTest, SliVec16BBails) {
+// SLI v0.16b, v1.16b, #4 now lowers in the heavy tier (byte form). Per byte:
+// result = ((Vn << 4) & 0xF0) | (Vd & 0x0F). Vn=0x05 -> 0x50; Vd=0xFF low4=0x0F
+// -> 0x5F in every one of the 16 byte lanes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SliVec16BLowered) {
   static const uint32_t code[] = {SliVec(/*q=*/true, /*immh=*/0b0001, /*immb=*/4, 0, 1)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetV128(&state_, 1, 0x0505050505050505ULL, 0x0505050505050505ULL);
+  SetV128(&state_, 0, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x5F5F5F5F5F5F5F5FULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x5F5F5F5F5F5F5F5FULL);
 }
 
 // URSHR v0.4s, v1.4s, #4 (q=1, immh=0111, immb=4): Vd<i> = (Vn<i>+8)>>4 unsigned.

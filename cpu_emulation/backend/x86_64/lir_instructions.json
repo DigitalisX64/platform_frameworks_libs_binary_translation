@@ -309,6 +309,7 @@
         "RoundsdXRegXRegImm",
         "SetccReg",
         "Sfence",
+        "ShufpdXRegXRegImm",
         "ShufpsXRegXRegImm",
         "SublRegImm",
         "SublRegReg",
