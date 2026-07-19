@@ -1027,6 +1027,78 @@
         }
         break;
       }
+      // IEEE CRC32B/H/W/X — ISO-3309 poly 0x04C11DB7 (reflected 0xEDB88320).
+      // The host SSE4.2 CRC32 computes the *Castagnoli* poly (used by the
+      // CRC32C* block above), so it cannot serve these; lower them with a
+      // carry-less multiply (PCLMULQDQ) reflected Barrett reduction. The
+      // accumulator is Wn (low 32 bits); the data is Wm (b/h/w) or Xm (x).
+      // Reflected fold/Barrett constants (rev33 of x^k mod P, of P, and of the
+      // Barrett mu = floor(x^64/P)); these coincide with zlib's CRC32 tables:
+      //   K64 = x^64 mod P = 0x163CD6124   K32 = x^32 mod P = 0x1DB710640
+      //   K16 = x^16       = 0x000010000   K8  = x^8        = 0x001000000
+      //   MU  = floor(x^64/P) = 0x1F7011641   POLYR = rev33(P) = 0x1DB710641
+      // Bail to the interpreter if the host lacks PCLMULQDQ.
+      case Decoder::DataProc2SrcOpcode::kCrc32b:
+      case Decoder::DataProc2SrcOpcode::kCrc32h:
+      case Decoder::DataProc2SrcOpcode::kCrc32w:
+      case Decoder::DataProc2SrcOpcode::kCrc32x: {
+        if (!host_platform::kHasCLMUL) { success_ = false; return no_register; }
+        SimdRegister xt = AllocTempSimdReg();  // running value / low fold
+        SimdRegister xk = AllocTempSimdReg();  // constant loader
+        SimdRegister xh = AllocTempSimdReg();  // CRC32X high-dword fold
+        Register rt = AllocTempReg();          // combined T / Barrett R (64-bit)
+        Register rs = AllocTempReg();          // scratch (immediates, t1/t2)
+        if (!success()) { return no_register; }
+        if (opcode == Decoder::DataProc2SrcOpcode::kCrc32x) {
+          // T = Xm ^ zext32(Wn); fold low and high dwords separately.
+          as_.Movl(rt, src1);                  // acc (zero-extended Wn)
+          as_.Xorq(rt, src2);                  // T = acc ^ Xm (64-bit)
+          as_.Movd(xt, rt);                    // xt.d0 = T_lo
+          as_.Movq(rs, rt);
+          as_.Shrq(rs, int8_t{32});            // rs = T_hi
+          as_.Movd(xh, rs);                    // xh.d0 = T_hi
+          as_.Movq(rs, int64_t{0x163CD6124});  // K64
+          as_.Movq(xk, rs);
+          as_.Pclmullqlqdq(xt, xk);            // clmul(T_lo, K64)
+          as_.Movq(rs, int64_t{0x1DB710640});  // K32
+          as_.Movq(xk, rs);
+          as_.Pclmullqlqdq(xh, xk);            // clmul(T_hi, K32)
+          as_.Pxor(xt, xh);                    // proc (64-bit) in xt.q0
+        } else {
+          // W/H/B: 32-bit T = Wn ^ (Wm & mask); single fold by x^{32,16,8}.
+          int64_t kc;
+          as_.Movl(rt, src2);                  // Wm (zero-extended)
+          switch (opcode) {
+            case Decoder::DataProc2SrcOpcode::kCrc32h:
+              as_.Andl(rt, int32_t{0xFFFF}); kc = 0x000010000; break;  // K16
+            case Decoder::DataProc2SrcOpcode::kCrc32b:
+              as_.Andl(rt, int32_t{0xFF});   kc = 0x001000000; break;  // K8
+            default: /* kCrc32w */           kc = 0x1DB710640; break;  // K32
+          }
+          as_.Xorl(rt, src1);                  // T = (Wm & mask) ^ Wn
+          as_.Movd(xt, rt);                    // xt.d0 = T
+          as_.Movq(rs, kc);
+          as_.Movq(xk, rs);
+          as_.Pclmullqlqdq(xt, xk);            // proc = clmul(T, Kc)
+        }
+        // Reflected Barrett reduction of the 64-bit value in xt.q0 -> 32-bit CRC.
+        // The low-32 masks are realized by the 32-bit MOVD round-trips.
+        as_.Movq(rt, xt);                      // R = proc (64-bit)
+        as_.Movd(xt, rt);                      // xt.d0 = R & 0xFFFFFFFF
+        as_.Movq(rs, int64_t{0x1F7011641});    // MU
+        as_.Movq(xk, rs);
+        as_.Pclmullqlqdq(xt, xk);              // t1 = clmul(R&M32, MU)
+        as_.Movd(rs, xt);                      // rs = t1 & 0xFFFFFFFF
+        as_.Movd(xt, rs);                      // xt.d0 = t1 & M32
+        as_.Movq(rs, int64_t{0x1DB710641});    // POLYR
+        as_.Movq(xk, rs);
+        as_.Pclmullqlqdq(xt, xk);              // t2 = clmul(t1&M32, POLYR)
+        as_.Movq(rs, xt);                      // rs = t2 (64-bit)
+        as_.Xorq(rt, rs);                      // R ^ t2
+        as_.Shrq(rt, int8_t{32});              // (R ^ t2) >> 32
+        as_.Movl(res, rt);                     // Wd (zero-extends into Xd)
+        break;
+      }
       default:
         Undefined();
         return no_register;

@@ -3457,6 +3457,14 @@ class Interpreter {
         if (args.ftype == 0b00) {
           float result = static_cast<float>(static_cast<double>(int_val) / scale);
           memcpy(&state_->cpu.v[args.rd], &result, 4);
+        } else if (args.ftype == 0b11) {
+          // int / 2^fbits in the FP32 domain, then RNE narrow to fp16. The
+          // 2^-fbits scale is an exact power-of-two float (biases the exponent
+          // only). Was previously mis-handled as FP64 (silent 8-byte write).
+          uint32_t sb = static_cast<uint32_t>(127u - args.fbits) << 23;  // 2^-fbits
+          float sf; memcpy(&sf, &sb, 4);
+          uint16_t h = FpSingleToHalfRN(static_cast<float>(int_val) * sf);
+          memcpy(&state_->cpu.v[args.rd], &h, 2);
         } else {
           double result = static_cast<double>(int_val) / scale;
           memcpy(&state_->cpu.v[args.rd], &result, 8);
@@ -3475,6 +3483,11 @@ class Interpreter {
         if (args.ftype == 0b00) {
           float result = static_cast<float>(static_cast<double>(uint_val) / scale);
           memcpy(&state_->cpu.v[args.rd], &result, 4);
+        } else if (args.ftype == 0b11) {
+          uint32_t sb = static_cast<uint32_t>(127u - args.fbits) << 23;  // 2^-fbits
+          float sf; memcpy(&sf, &sb, 4);
+          uint16_t h = FpSingleToHalfRN(static_cast<float>(uint_val) * sf);
+          memcpy(&state_->cpu.v[args.rd], &h, 2);
         } else {
           double result = static_cast<double>(uint_val) / scale;
           memcpy(&state_->cpu.v[args.rd], &result, 8);
@@ -3488,6 +3501,9 @@ class Interpreter {
           float f;
           memcpy(&f, &state_->cpu.v[args.rn], 4);
           fp_val = static_cast<double>(f);
+        } else if (args.ftype == 0b11) {
+          uint16_t h; memcpy(&h, &state_->cpu.v[args.rn], 2);
+          fp_val = static_cast<double>(FpHalfToSingle(h));  // exact fp16 widen
         } else {
           memcpy(&fp_val, &state_->cpu.v[args.rn], 8);
         }
@@ -3508,6 +3524,9 @@ class Interpreter {
           float f;
           memcpy(&f, &state_->cpu.v[args.rn], 4);
           fp_val = static_cast<double>(f);
+        } else if (args.ftype == 0b11) {
+          uint16_t h; memcpy(&h, &state_->cpu.v[args.rn], 2);
+          fp_val = static_cast<double>(FpHalfToSingle(h));  // exact fp16 widen
         } else {
           memcpy(&fp_val, &state_->cpu.v[args.rn], 8);
         }
@@ -3731,6 +3750,11 @@ class Interpreter {
       } else if (args.ftype == 0b01) {
         double d = static_cast<double>(ival);
         memcpy(&state_->cpu.v[args.rd], &d, 8);
+      } else if (args.ftype == 0b11) {
+        // int -> FP32 (RNE), then narrow FP32 -> fp16 (RNE); matches the JIT's
+        // CVTSI2SS + VCVTPS2PH and ARM's default rounding.
+        uint16_t h = FpSingleToHalfRN(static_cast<float>(ival));
+        memcpy(&state_->cpu.v[args.rd], &h, 2);
       } else { Undefined(); }
       return;
     }
@@ -3747,6 +3771,9 @@ class Interpreter {
       } else if (args.ftype == 0b01) {
         double d = static_cast<double>(uval);
         memcpy(&state_->cpu.v[args.rd], &d, 8);
+      } else if (args.ftype == 0b11) {
+        uint16_t h = FpSingleToHalfRN(static_cast<float>(uval));
+        memcpy(&state_->cpu.v[args.rd], &h, 2);
       } else { Undefined(); }
       return;
     }
@@ -3802,6 +3829,9 @@ class Interpreter {
         dval = f;
       } else if (args.ftype == 0b01) {
         memcpy(&dval, &state_->cpu.v[args.rn], 8);
+      } else if (args.ftype == 0b11) {
+        uint16_t h; memcpy(&h, &state_->cpu.v[args.rn], 2);
+        dval = static_cast<double>(FpHalfToSingle(h));  // fp16 widen is exact
       } else { Undefined(); return; }
       // Apply rounding
       double rounded;
@@ -3832,6 +3862,9 @@ class Interpreter {
         dval = f;
       } else if (args.ftype == 0b01) {
         memcpy(&dval, &state_->cpu.v[args.rn], 8);
+      } else if (args.ftype == 0b11) {
+        uint16_t h; memcpy(&h, &state_->cpu.v[args.rn], 2);
+        dval = static_cast<double>(FpHalfToSingle(h));  // fp16 widen is exact
       } else { Undefined(); return; }
       // Round to nearest, ties away from zero
       double rounded = round(dval);
@@ -3908,6 +3941,9 @@ class Interpreter {
       } else if (args.ftype == 0b01) {
         double d; memcpy(&d, &state_->cpu.v[args.rn], 8);
         rounded = trunc(d);
+      } else if (args.ftype == 0b11) {
+        uint16_t h; memcpy(&h, &state_->cpu.v[args.rn], 2);
+        rounded = trunc(static_cast<double>(FpHalfToSingle(h)));
       } else { Undefined(); return; }
       if (args.sf) result = static_cast<uint64_t>(sat_to_int64(rounded));
       else result = static_cast<uint64_t>(static_cast<uint32_t>(sat_to_int32(rounded)));
@@ -3927,6 +3963,9 @@ class Interpreter {
       } else if (args.ftype == 0b01) {
         double d; memcpy(&d, &state_->cpu.v[args.rn], 8);
         rounded = trunc(d);
+      } else if (args.ftype == 0b11) {
+        uint16_t h; memcpy(&h, &state_->cpu.v[args.rn], 2);
+        rounded = trunc(static_cast<double>(FpHalfToSingle(h)));
       } else { Undefined(); return; }
       if (args.sf) result = sat_to_uint64(rounded);
       else result = sat_to_uint32(rounded);
@@ -10131,6 +10170,50 @@ class Interpreter {
       return sign | static_cast<uint16_t>(frac);
     }
     return sign | static_cast<uint16_t>((exp + 15) << 10) | static_cast<uint16_t>(frac >> 13);
+  }
+
+  // FP32 -> FP16 round-to-nearest-even. Distinct from FpSingleToHalf above,
+  // which truncates (round-toward-zero). This matches x86 VCVTPS2PH imm=0 and
+  // ARM's default FPCR rounding, so int->fp16 conversions (SCVTF/UCVTF, ftype=11)
+  // agree with the JIT lowering. Verified bit-identical to hardware F16C over the
+  // entire 2^32 FP32 space. The rounding carry is allowed to propagate from the
+  // mantissa into the exponent naturally (an overflow to exponent 0x1F yields the
+  // +/-Inf pattern), which is why no explicit post-round overflow fix is needed.
+  static uint16_t FpSingleToHalfRN(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    uint32_t e = (x >> 23) & 0xFF;
+    uint32_t m = x & 0x7FFFFFu;
+    if (e == 255) {  // Inf / NaN
+      return static_cast<uint16_t>(m ? (sign | 0x7E00u | (m >> 13)) : (sign | 0x7C00u));
+    }
+    int32_t big_e = static_cast<int32_t>(e) - 127 + 15;  // rebiased fp16 exponent
+    if (big_e >= 0x1F) {
+      return static_cast<uint16_t>(sign | 0x7C00u);  // overflow -> Inf
+    }
+    if (big_e <= 0) {  // subnormal fp16 or zero
+      if (big_e < -10) {
+        return static_cast<uint16_t>(sign);  // too small -> +/-0
+      }
+      m |= 0x800000u;
+      int shift = 14 - big_e;
+      uint32_t half = 1u << (shift - 1);
+      uint32_t frac = m >> shift;
+      uint32_t rem = m & ((1u << shift) - 1);
+      if (rem > half || (rem == half && (frac & 1))) {
+        frac++;  // carry into the exponent bit -> smallest normal, which is correct
+      }
+      return static_cast<uint16_t>(sign | frac);
+    }
+    uint32_t half = 1u << 12;
+    uint32_t frac = m >> 13;
+    uint32_t rem = m & 0x1FFFu;
+    uint16_t out = static_cast<uint16_t>((static_cast<uint32_t>(big_e) << 10) | frac);
+    if (rem > half || (rem == half && (frac & 1))) {
+      out++;  // carry propagates into the exponent (0x1F,0 == Inf) automatically
+    }
+    return static_cast<uint16_t>(sign | out);
   }
 
   // FMULX scalar semantics, parameterized by FP type.  Same as a * b except
