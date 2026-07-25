@@ -27,6 +27,38 @@ namespace {
 
 using OffsetCounterMap = ArenaVector<std::pair<size_t, int>>;
 
+// region digitalis
+// Bytes of the CPU-state slot a guest-context access actually touches, and
+// whether it goes through an SIMD register. The map below is keyed by offset
+// alone, so a mapping is only interchangeable with an access of the same
+// register class that touches no more bytes than the mapping recorded.
+struct ContextAccess {
+  size_t size;
+  bool is_simd;
+};
+
+ContextAccess GetContextAccess(const berberis::MachineInsn* insn) {
+  switch (insn->opcode()) {
+    case kMachineOpMovwRegMemBaseDisp:
+    case kMachineOpMovwMemBaseDispReg:
+      return {2, false};
+    case kMachineOpMovqRegMemBaseDisp:
+    case kMachineOpMovqMemBaseDispReg:
+    case kMachineOpMovqMemBaseDispImm:
+      return {8, false};
+    case kMachineOpMovsdXRegMemBaseDisp:
+    case kMachineOpMovsdMemBaseDispXReg:
+      return {8, true};
+    case kMachineOpMovdqaXRegMemBaseDisp:
+    case kMachineOpMovdqaMemBaseDispXReg:
+      return {16, true};
+    default:
+      // Not a recognized context access; IsCPUStateGet/Put gate every caller.
+      return {0, false};
+  }
+}
+// endregion digitalis
+
 class LocalGuestContextOptimizer {
  public:
   explicit LocalGuestContextOptimizer(x86_64::MachineIR* machine_ir)
@@ -40,6 +72,9 @@ class LocalGuestContextOptimizer {
   struct MappedRegUsage {
     MappedValue value;
     std::optional<MachineInsnList::iterator> last_store;
+    // region digitalis
+    ContextAccess access;
+    // endregion digitalis
   };
 
   void ReplaceGetAndUpdateMap(const MachineInsnList::iterator insn_it);
@@ -162,12 +197,26 @@ void LocalGuestContextOptimizer::ReplaceGetAndUpdateMap(const MachineInsnList::i
   auto dst = insn->RegAt(0);
   auto disp = insn->disp();
 
+  // region digitalis
+  // The map is keyed by offset alone, so a mapping recorded by a narrower
+  // access does not hold the bits a wider one needs: a 64-bit MOVSD of a guest
+  // vector register zeroes the upper half of its XMM, and forwarding that to a
+  // later 128-bit MOVDQA of the same register would read those zeroes instead
+  // of the register's real upper half. Keep the load whenever the mapping is
+  // narrower, or belongs to the other register class, and let it re-establish
+  // the mapping at its own width.
+  auto access = GetContextAccess(insn);
+  // endregion digitalis
+
   // We only need to keep this load instruction if this is the first access to
   // the guest context at disp.
-  if (!mem_reg_map_[disp].has_value()) {
-    mem_reg_map_[disp] = {dst, {}};
+  // region digitalis
+  if (!mem_reg_map_[disp].has_value() || mem_reg_map_[disp].value().access.size < access.size ||
+      mem_reg_map_[disp].value().access.is_simd != access.is_simd) {
+    mem_reg_map_[disp] = {dst, {}, access};
     return;
   }
+  // endregion digitalis
 
   auto copy_size = insn->opcode() == kMachineOpMovdqaXRegMemBaseDisp ? 16 : 8;
   if (std::holds_alternative<MachineReg>(mem_reg_map_[disp].value().value)) {
@@ -186,7 +235,15 @@ void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineInsnList& insn_li
   auto* insn = AsMachineInsnX86_64(*insn_it);
   auto disp = insn->disp();
 
-  if (mem_reg_map_[disp].has_value() && mem_reg_map_[disp].value().last_store.has_value()) {
+  // region digitalis
+  auto access = GetContextAccess(insn);
+  // A narrower store does not fully overwrite a wider one -- a 64-bit MOVSD
+  // leaves the upper half of a guest vector register slot holding what the
+  // earlier 128-bit MOVDQA wrote -- so only drop the earlier store when this
+  // one covers every byte of it.
+  if (mem_reg_map_[disp].has_value() && mem_reg_map_[disp].value().last_store.has_value() &&
+      mem_reg_map_[disp].value().access.size <= access.size) {
+    // endregion digitalis
     // Remove the last store instruction.
     auto last_store_it = mem_reg_map_[disp].value().last_store.value();
     insn_list.erase(last_store_it);
@@ -198,7 +255,9 @@ void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineInsnList& insn_li
   } else {
     new_value = insn->RegAt(1);
   }
-  mem_reg_map_[disp] = {new_value, {insn_it}};
+  // region digitalis
+  mem_reg_map_[disp] = {new_value, {insn_it}, access};
+  // endregion digitalis
 }
 
 }  // namespace

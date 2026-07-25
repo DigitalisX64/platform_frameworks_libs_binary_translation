@@ -239,13 +239,64 @@ OffsetCounterMap GetSortedOffsetCounters(MachineIR* ir, Loop* loop) {
   return offset_counter_map;
 }
 
+// region digitalis
+// A CPU-state slot accessed at more than one width cannot be hoisted into a
+// single mapped register: the pre-loop load and post-loop store are emitted at
+// the width of the FIRST access seen, so a slot read once as 64-bit MOVSD and
+// once as 128-bit MOVDQA would either load only half the register or write back
+// a half-stale one. Leave such slots in memory.
+ArenaVector<bool> FindMixedWidthOffsets(const MachineIR* ir, const Loop* loop) {
+  ArenaVector<bool> mixed(sizeof(CPUState), false, ir->arena());
+  ArenaVector<int> seen_width(sizeof(CPUState), 0, ir->arena());
+  for (auto* bb : *loop) {
+    for (auto* base_insn : bb->insn_list()) {
+      if (!ir->IsCPUStateGet(base_insn) && !ir->IsCPUStatePut(base_insn)) {
+        continue;
+      }
+      auto* insn = AsMachineInsnX86_64(base_insn);
+      // A get and the put of the same register are different opcodes, so
+      // compare the width each one moves rather than the opcode itself.
+      int width;
+      switch (insn->opcode()) {
+        case kMachineOpMovwRegMemBaseDisp:
+        case kMachineOpMovwMemBaseDispReg:
+          width = 2;
+          break;
+        case kMachineOpMovdqaXRegMemBaseDisp:
+        case kMachineOpMovdqaMemBaseDispXReg:
+          width = 16;
+          break;
+        default:
+          width = 8;
+          break;
+      }
+      auto& seen = seen_width.at(insn->disp());
+      if (seen == 0) {
+        seen = width;
+      } else if (seen != width) {
+        mixed.at(insn->disp()) = true;
+      }
+    }
+  }
+  return mixed;
+}
+// endregion digitalis
+
 void OptimizeLoop(MachineIR* machine_ir, Loop* loop, const OptimizeLoopParams& params) {
   OffsetCounterMap sorted_offsets = GetSortedOffsetCounters(machine_ir, loop);
   ArenaVector<bool> optimized_offsets(sizeof(CPUState), false, machine_ir->arena());
+  // region digitalis
+  auto mixed_width_offsets = FindMixedWidthOffsets(machine_ir, loop);
+  // endregion digitalis
 
   size_t general_reg_count = 0;
   size_t simd_reg_count = 0;
   for (auto [offset, unused_counter] : sorted_offsets) {
+    // region digitalis
+    if (mixed_width_offsets.at(offset)) {
+      continue;
+    }
+    // endregion digitalis
     // TODO(b/232598137) Account for f and v register classes.
     // Simd regs.
     if (IsSimdOffset(offset)) {

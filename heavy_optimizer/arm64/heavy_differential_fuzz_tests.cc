@@ -62,6 +62,7 @@
 #include <cstring>
 
 #include <string>
+#include <vector>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -1753,6 +1754,274 @@ TEST_F(Arm64HeavyDifferentialFuzz, FcselMixedRegion) {
     if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
   }
   EXPECT_GT(compared, 100) << "heavy accepted too few mixed FCSEL regions";
+}
+
+// Replay of a real Blowfish (bcrypt) round chain: the unrolled
+//   lsr/ubfiz -> and #0x3fc -> ldr [base, index] -> add/eor
+// pattern an ARM64 bcrypt implementation emits. Every S-box index is masked to
+// <= 0x3fc inside the region, so pointing the four table bases and SP at one
+// scratch buffer keeps all loads in bounds regardless of the incoming state.
+TEST_F(Arm64HeavyDifferentialFuzz, BlowfishRoundChain) {
+  static const uint32_t code[] = {
+      0x53067dd1, 0xd37e1dc0, 0x4a0e002e, 0xb950a3e1, 0x927e1def, 0x927e1e10,
+      0x927e1e31, 0xb86f694f, 0xb8706990, 0xb8716931, 0xb8606900, 0x0b0f020f,
+      0x4a1101ef, 0x0b0001ef, 0x4a0f016b, 0x530e7d6f, 0x53167d70, 0x53067d71,
+      0xd37e1d60, 0x4a0b002b, 0xb950a7e1, 0x927e1def, 0x927e1e10, 0x927e1e31,
+      0xb86f694f, 0xb8706990, 0xb8716931, 0xb8606900, 0x0b0f020f, 0x4a1101ef,
+      0x0b0001ef, 0x4a0f01ce, 0x530e7dcf, 0x53167dd0, 0x53067dd1, 0xd37e1dc0,
+      0x4a0e002e, 0xb950abe1, 0x927e1def, 0x927e1e10, 0x927e1e31, 0xb86f694f,
+      0xb8706990, 0xb8716931, 0xb8606900, 0x0b0f020f, 0x4a1101ef, 0x0b0001ef,
+  };
+  constexpr int kInsns = sizeof(code) / sizeof(code[0]);
+  // Scratch table: large enough for the SP-relative P-box loads (max +0x10a8).
+  static uint64_t table[0x4000 / 8];
+  Seed(0xB10F15400DDEEFFULL);
+  for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+    table[i] = Rnd64();
+  }
+  auto base = static_cast<uint64_t>(ToGuestAddr(table));
+
+  int compared = 0;
+  for (int iter = 0; iter < 200 * FuzzScale(); iter++) {
+    InitState in = RandomInit();
+    // S-box bases and the P-box frame all point into the scratch table.
+    in.x[8] = in.x[9] = in.x[10] = in.x[12] = base;
+    in.sp = base;
+    std::string desc;
+    Result r = RunDifferential(code, kInsns, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 0) << "heavy declined every Blowfish round region";
+}
+
+// NZCV must survive a long run of ARM64 instructions that do not set flags but
+// whose x86 counterparts clobber EFLAGS. The bcrypt key-expansion loop sets
+// flags with a CMP at the loop top and consumes them with a conditional branch
+// ~280 instructions later, so the flag state has to stay live across the whole
+// body.
+TEST_F(Arm64HeavyDifferentialFuzz, NzcvSurvivesLongFlagClobberRun) {
+  Seed(0x2C0FFEE5A17ULL);
+  static uint64_t table[0x1000 / 8];
+  for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+    table[i] = Rnd64();
+  }
+  auto base = static_cast<uint64_t>(ToGuestAddr(table));
+
+  for (int run_len : {8, 32, 96, 190}) {
+    std::vector<uint32_t> code;
+    // CMP x15, #0xff4  (sets NZCV)
+    code.push_back(0xf13fd1ffu);
+    // Filler that must not disturb NZCV: EOR/ADD (w-form) and an S-box load.
+    for (int i = 0; i < run_len; i++) {
+      switch (i % 4) {
+        case 0: code.push_back(0x4a1101efu); break;  // eor w15, w15, w17
+        case 1: code.push_back(0x0b0f020fu); break;  // add w15, w16, w15
+        case 2: code.push_back(0x927e1e10u); break;  // and x16, x16, #0x3fc
+        default: code.push_back(0xb8706950u); break;  // ldr w16, [x10, x16]
+      }
+    }
+    // CSET w0, lo  -- consumes the NZCV set by the CMP above.
+    code.push_back(0x1a9f27e0u);
+
+    int compared = 0;
+    for (int iter = 0; iter < 60; iter++) {
+      InitState in = RandomInit();
+      in.x[10] = base;
+      in.x[16] = Rnd64() & 0x3fc;
+      std::string desc;
+      Result r = RunDifferential(
+          code.data(), static_cast<int>(code.size()), in, /*compare_fpsr=*/false, &desc);
+      if (r == kDeclined) continue;
+      compared++;
+      if (r == kDiverge) ADD_FAILURE() << "run_len " << run_len << " iter " << iter << " " << desc;
+    }
+    EXPECT_GT(compared, 0) << "heavy declined every region at run_len " << run_len;
+  }
+}
+
+
+// Replay of the two REAL bcrypt key-expansion regions from a shipping ARM64
+// libauth.so. The guest loop body is 281 instructions, above the heavy tier's
+// 200-instruction region cap, so it splits: the CMP that sets NZCV sits at the
+// top of the first region and the conditional branch that consumes it sits at
+// the end of the second. Every S-box index is masked to <= 0x3fc in-region, so
+// pointing the table bases and SP at one scratch buffer keeps loads in bounds.
+TEST_F(Arm64HeavyDifferentialFuzz, BcryptKeyExpansionRealRegionA) {
+  static const uint32_t code[] = {
+      0xb9506bec, 0xb9506fe2, 0xf13fd1ff, 0x4a10018c, 0x4a0b004b, 0xb95073e2,
+      0x530e7d90, 0x53167d91, 0x53067d80, 0xd37e1d81, 0x4a0c004c, 0xb95077e2,
+      0x927e1e10, 0x927e1e31, 0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920,
+      0xb8616901, 0x0b100230, 0x4a000210, 0x0b010210, 0x4a10016b, 0x530e7d70,
+      0x53167d71, 0x53067d60, 0xd37e1d61, 0x4a0b004b, 0xb9507be2, 0x927e1e10,
+      0x927e1e31, 0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901,
+      0x0b100230, 0x4a000210, 0x0b010210, 0x4a10018c, 0x530e7d90, 0x53167d91,
+      0x53067d80, 0xd37e1d81, 0x4a0c004c, 0xb9507fe2, 0x927e1e10, 0x927e1e31,
+      0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230,
+      0x4a000210, 0x0b010210, 0x4a10016b, 0x530e7d70, 0x53167d71, 0x53067d60,
+      0xd37e1d61, 0x4a0b004b, 0xb95083e2, 0x927e1e10, 0x927e1e31, 0x927e1c00,
+      0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230, 0x4a000210,
+      0x0b010210, 0x4a10018c, 0x530e7d90, 0x53167d91, 0x53067d80, 0xd37e1d81,
+      0x4a0c004c, 0xb95087e2, 0x927e1e10, 0x927e1e31, 0x927e1c00, 0xb8706950,
+      0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230, 0x4a000210, 0x0b010210,
+      0x4a10016b, 0x530e7d70, 0x53167d71, 0x53067d60, 0xd37e1d61, 0x4a0b004b,
+      0xb9508be2, 0x927e1e10, 0x927e1e31, 0x927e1c00, 0xb8706950, 0xb87169b1,
+      0xb8606920, 0xb8616901, 0x0b100230, 0x4a000210, 0x0b010210, 0x4a10018c,
+      0x530e7d90, 0x53167d91, 0x53067d80, 0xd37e1d81, 0x4a0c004c, 0xb9508fe2,
+      0x927e1e10, 0x927e1e31, 0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920,
+      0xb8616901, 0x0b100230, 0x4a000210, 0x0b010210, 0x4a10016b, 0x530e7d70,
+      0x53167d71, 0x53067d60, 0xd37e1d61, 0x4a0b004b, 0xb95093e2, 0x927e1e10,
+      0x927e1e31, 0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901,
+      0x0b100230, 0x4a000210, 0x0b010210, 0x4a10018c, 0x530e7d90, 0x53167d91,
+      0x53067d80, 0xd37e1d81, 0x4a0c004c, 0xb95097e2, 0x927e1e10, 0x927e1e31,
+      0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230,
+      0x4a000210, 0x0b010210, 0x4a10016b, 0x530e7d70, 0x53167d71, 0x53067d60,
+      0xd37e1d61, 0x4a0b004b, 0xb9509be2, 0x927e1e10, 0x927e1e31, 0x927e1c00,
+      0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230, 0x4a000210,
+      0x0b010210, 0x4a10018c, 0x530e7d90, 0x53167d91, 0x53067d80, 0xd37e1d81,
+      0x4a0c004c, 0xb9509fe2, 0x927e1e10, 0x927e1e31, 0x927e1c00, 0xb8706950,
+      0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230, 0x4a000210, 0x0b010210,
+      0x4a10016b, 0x530e7d70, 0x53167d71, 0x53067d60, 0xd37e1d61, 0x4a0b004b,
+      0xb950a3e2, 0x927e1e10,
+  };
+  constexpr int kInsns = sizeof(code) / sizeof(code[0]);
+  static uint64_t table[0x4000 / 8];
+  Seed(0xBCB17A5E0001ULL);
+  for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) table[i] = Rnd64();
+  auto base = static_cast<uint64_t>(ToGuestAddr(table));
+
+  int compared = 0;
+  for (int iter = 0; iter < 100; iter++) {
+    InitState in = RandomInit();
+    in.x[8] = in.x[9] = in.x[10] = in.x[13] = base;
+    in.sp = base;
+    in.x[15] = (iter % 2) ? 0xff0 : 0x100;  // straddle the CMP boundary
+    std::string desc;
+    Result r = RunDifferential(code, kInsns, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 0) << "heavy declined the real region A";
+}
+
+
+
+
+// The bcrypt key-expansion loop writes its results back into the very tables
+// the round chain loads from (stp w,w,[x]). A miscompile of that store is
+// invisible to a register-only comparison, so this replays the real region that
+// ends in the write-back and diffs the scratch table as well as the registers.
+TEST_F(Arm64HeavyDifferentialFuzz, BcryptKeyExpansionStoreBackRegion) {
+  static const uint32_t code[] = {
+      0x927e1e31, 0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901,
+      0x0b100230, 0x4a000210, 0x0b010210, 0x4a10018c, 0x530e7d90, 0x53167d91,
+      0x53067d80, 0xd37e1d81, 0x4a0c004c, 0xb950a7e2, 0x927e1e10, 0x927e1e31,
+      0x927e1c00, 0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230,
+      0x4a000210, 0x0b010210, 0x4a100170, 0x530e7e0b, 0x53167e11, 0x53067e00,
+      0xd37e1e01, 0x4a100050, 0xb950afe2, 0x927e1d6b, 0x927e1e31, 0x927e1c00,
+      0xb86b694b, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b0b022b, 0x4a00016b,
+      0x0b01016b, 0x4a0b018b, 0x530e7d6c, 0x53167d71, 0x53067d60, 0xd37e1d61,
+      0x927e1d8c, 0x927e1e31, 0x927e1c00, 0xb86c694c, 0xb87169b1, 0xb8606920,
+      0xb8616901, 0x0b0c022c, 0x4a00018c, 0x0b01018c, 0x4a0c020c, 0x530e7d90,
+      0x53167d91, 0x53067d80, 0xd37e1d81, 0x927e1e10, 0x927e1e31, 0x927e1c00,
+      0xb8706950, 0xb87169b1, 0xb8606920, 0xb8616901, 0x0b100230, 0xb950abf1,
+      0x4a000210, 0x8b0f01a0, 0x910021ef, 0x0b010201, 0x4a0b022b, 0x4a0c0050,
+      0x4a01016b, 0x29002c10,
+  };
+  constexpr int kInsns = sizeof(code) / sizeof(code[0]);
+  constexpr size_t kTableWords = 0x4000 / 8;
+  static uint64_t table[kTableWords];
+  static uint64_t seed_table[kTableWords];
+  static uint64_t heavy_table[kTableWords];
+  Seed(0xBCB17A5E0003ULL);
+  for (size_t i = 0; i < kTableWords; i++) seed_table[i] = Rnd64();
+  auto base = static_cast<uint64_t>(ToGuestAddr(table));
+
+  int compared = 0;
+  for (int iter = 0; iter < 200; iter++) {
+    InitState in = RandomInit();
+    in.x[8] = in.x[9] = in.x[10] = in.x[13] = base;
+    in.sp = base;
+    in.x[15] = (Rnd() % 0x200) * 8;  // store target x0 = x13 + x15, in bounds
+    // x16 and x1 are live-in S-box indices: their masking AND lives in the
+    // previous region, so bound them here the way the real predecessor does.
+    in.x[16] = Rnd() & 0x3fc;
+    in.x[1] = Rnd() & 0x3fc;
+
+    GuestAddr start = ToGuestAddr(code);
+    GuestAddr code_end = start + static_cast<GuestAddr>(kInsns) * 4;
+
+    memcpy(table, seed_table, sizeof(table));
+    ApplyInit(in);
+    state_.cpu.insn_addr = start;
+    MachineCode mc;
+    auto [stop, ok, num] =
+        HeavyOptimizeRegion(start, &mc, HeavyOptimizeParams{.end_pc = code_end});
+    if (!ok || stop != code_end || num != static_cast<size_t>(kInsns)) continue;
+    TranslationCache::GetInstance()->InvalidateGuestRange(start, code_end + 4);
+    ScopedExecRegion exec(&mc);
+    TestingRunGeneratedCode(&state_, exec.get(), stop);
+    FullState heavy = Capture();
+    memcpy(heavy_table, table, sizeof(table));
+
+    memcpy(table, seed_table, sizeof(table));
+    ApplyInit(in);
+    state_.cpu.insn_addr = start;
+    int guard = 0;
+    while (state_.cpu.insn_addr >= start && state_.cpu.insn_addr < stop && guard++ < 512) {
+      InterpretInsn(&state_);
+    }
+    FullState itp = Capture();
+
+    compared++;
+    std::string desc;
+    if (!Compare(heavy, itp, /*compare_fpsr=*/false, code, kInsns, &desc)) {
+      ADD_FAILURE() << "iter " << iter << " register divergence: " << desc;
+      break;
+    }
+    if (memcmp(heavy_table, table, sizeof(table)) != 0) {
+      size_t w = 0;
+      while (w < kTableWords && heavy_table[w] == table[w]) w++;
+      ADD_FAILURE() << "iter " << iter << " MEMORY divergence at table word " << w
+                    << " (offset 0x" << std::hex << (w * 8) << std::dec
+                    << "): HEAVY=0x" << std::hex << heavy_table[w]
+                    << " INTERP=0x" << table[w] << std::dec;
+      break;
+    }
+  }
+  EXPECT_GT(compared, 0) << "heavy declined the store-back region";
+}
+
+
+
+
+
+
+// A guest vector register read at two different widths inside one region. The
+// heavy tier caches CPU-state slots per basic block, and `fmov w15, s0` reads
+// V0 with a 64-bit MOVSD -- which zeroes the upper half of the XMM it lands in
+// -- while the following `eor v1.16b, v1.16b, v0.16b` reads all 128 bits of the
+// same V0. Forwarding the narrow load to the wide read silently substituted
+// zeroes for V0's upper half, which is how a bcrypt key expansion produced a
+// wrong hash with no crash and no bail.
+TEST_F(Arm64HeavyDifferentialFuzz, VectorRegReadAtTwoWidths) {
+  static const uint32_t code[] = {
+      0x1e26000f,  // fmov w15, s0            (64-bit MOVSD get of V0)
+      0x6e201c21,  // eor  v1.16b, v1.16b, v0.16b  (128-bit get of the same V0)
+  };
+  Seed(0x5117E0F1EE7ULL);
+  int compared = 0;
+  for (int iter = 0; iter < 500; iter++) {
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 2, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 0) << "heavy declined the mixed-width vector region";
 }
 
 }  // namespace
