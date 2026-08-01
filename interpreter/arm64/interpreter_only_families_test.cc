@@ -974,5 +974,48 @@ TEST_F(Arm64InterpreterOnlyTest, Fcvtxn_scalar) {
     EXPECT_VREG(0, 0x0000000040700000ULL, 0x0000000000000000ULL);
 }
 
+// --- Top-byte-ignore -------------------------------------------------------
+//
+// ARM64 ignores address bits [63:56] on access. Android's Scudo allocator
+// relies on it: it tags heap pointers and dereferences the tagged value
+// directly. x86_64 has no equivalent (such an address is not even canonical),
+// so the interpreter must strip the tag exactly as LiteTranslator::ApplyTbi
+// does — without it, the first Scudo allocation in any statically-linked
+// binary faulted, and interpret-only could not run one at all.
+
+TEST_F(Arm64InterpreterOnlyTest, LoadThroughTaggedPointerIgnoresTopByte) {
+  uint64_t cell = 0x1122334455667788ULL;
+  // Scudo's tag shape: bit 57 set in the top byte.
+  uint64_t tagged = ToGuestAddr(&cell) | 0x0200'0000'0000'0000ULL;
+
+  state_.cpu.x[1] = tagged;
+  Interpret(0xf9400020);  // ldr x0, [x1]
+
+  EXPECT_EQ(state_.cpu.x[0], 0x1122334455667788ULL);
+}
+
+TEST_F(Arm64InterpreterOnlyTest, StoreThroughTaggedPointerIgnoresTopByte) {
+  uint64_t cell = 0;
+  uint64_t tagged = ToGuestAddr(&cell) | 0xff00'0000'0000'0000ULL;  // all tag bits
+
+  state_.cpu.x[0] = 0xdeadbeefcafef00dULL;
+  state_.cpu.x[1] = tagged;
+  Interpret(0xf9000020);  // str x0, [x1]
+
+  EXPECT_EQ(cell, 0xdeadbeefcafef00dULL);
+}
+
+TEST_F(Arm64InterpreterOnlyTest, TaggedPointerValueSurvivesInRegister) {
+  // The tag is stripped at address *use*, never written back to the register:
+  // guest code computes with tagged pointers and expects to read the tag back.
+  uint64_t cell = 0x4242424242424242ULL;
+  uint64_t tagged = ToGuestAddr(&cell) | 0x0200'0000'0000'0000ULL;
+
+  state_.cpu.x[1] = tagged;
+  Interpret(0xf9400020);  // ldr x0, [x1]
+
+  EXPECT_EQ(state_.cpu.x[1], tagged);
+}
+
 }  // namespace
 }  // namespace berberis

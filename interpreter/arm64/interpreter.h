@@ -96,6 +96,21 @@ class Interpreter {
     return result;
   }
 
+  // Top-byte-ignore. ARM64 ignores bits [63:56] of an address on access, and
+  // Android's allocator uses them: Scudo tags heap pointers (e.g. `orr xN, xM,
+  // #0x200000000000000`) and dereferences the tagged value directly. x86_64
+  // has no equivalent — such an address is not even canonical — so the tag has
+  // to be stripped before the host touches memory.
+  //
+  // Mirrors LiteTranslator::ApplyTbi (`shl 8; shr 8`), which is why the JIT
+  // tiers already ran tagged pointers correctly while the interpreter faulted
+  // on the first Scudo allocation of any statically-linked binary.
+  //
+  // Applied at address *use*, never to the register value: the guest may
+  // legitimately compute with a tagged pointer (see AddSubImmTags below), and
+  // masking on write-back would corrupt the tag it expects to read back.
+  static GuestAddr ApplyTbi(GuestAddr addr) { return addr & 0x00FF'FFFF'FFFF'FFFFULL; }
+
   // ADDG/SUBG (FEAT_MTE). The address part is Xn +/- the
   // 16-byte-scaled offset; bits[59:56] are then replaced by the logical tag
   // (start tag +/- uimm4, mod 16). Digitalis does not enforce MTE, so tag
@@ -330,7 +345,7 @@ class Interpreter {
   Register Load(Decoder::LoadStoreSize size, bool is_signed, bool is_64bit_target,
                 Register base, int32_t offset) {
     CHECK(!exception_raised_);
-    void* ptr = ToHostAddr<void>(base + offset);
+    void* ptr = ToHostAddr<void>(ApplyTbi(base + offset));
     uint8_t data_bytes;
     switch (size) {
       case Decoder::LoadStoreSize::k8bit: data_bytes = 1; break;
@@ -402,7 +417,7 @@ class Interpreter {
 
   void Store(Decoder::LoadStoreSize size, Register base, int32_t offset, Register data) {
     CHECK(!exception_raised_);
-    void* ptr = ToHostAddr<void>(base + offset);
+    void* ptr = ToHostAddr<void>(ApplyTbi(base + offset));
     uint8_t data_bytes;
     switch (size) {
       case Decoder::LoadStoreSize::k8bit: data_bytes = 1; break;
@@ -424,8 +439,8 @@ class Interpreter {
   void LoadPair(Decoder::LoadStoreSize size, Register base, int32_t offset,
                 uint8_t rt1, uint8_t rt2, uint8_t scale, bool is_signed) {
     CHECK(!exception_raised_);
-    void* ptr1 = ToHostAddr<void>(base + offset);
-    void* ptr2 = ToHostAddr<void>(base + offset + scale);
+    void* ptr1 = ToHostAddr<void>(ApplyTbi(base + offset));
+    void* ptr2 = ToHostAddr<void>(ApplyTbi(base + offset + scale));
     uint8_t data_bytes = (size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
     FaultyLoadResult fl1 = FaultyLoad(ptr1, data_bytes);
     if (fl1.is_fault) { HandleMemoryFault(base + offset); return; }
@@ -446,8 +461,8 @@ class Interpreter {
   void StorePair(Decoder::LoadStoreSize size, Register base, int32_t offset,
                  Register data1, Register data2, uint8_t scale) {
     CHECK(!exception_raised_);
-    void* ptr1 = ToHostAddr<void>(base + offset);
-    void* ptr2 = ToHostAddr<void>(base + offset + scale);
+    void* ptr1 = ToHostAddr<void>(ApplyTbi(base + offset));
+    void* ptr2 = ToHostAddr<void>(ApplyTbi(base + offset + scale));
     uint8_t data_bytes = (size == Decoder::LoadStoreSize::k64bit) ? 8 : 4;
     if (FaultyStore(ptr1, data_bytes, data1)) { HandleMemoryFault(base + offset); return; }
     if (FaultyStore(ptr2, data_bytes, data2)) { HandleMemoryFault(base + offset + scale); return; }
@@ -1028,11 +1043,11 @@ class Interpreter {
       case Decoder::MteLoadStoreOpcode::kStzg: {
         // Zero the 16-byte granule containing access_addr.
         uint64_t aligned = access_addr & ~uint64_t{0x0F};
-        if (FaultyStore(ToHostAddr<void>(aligned), 8, 0)) {
+        if (FaultyStore(ToHostAddr<void>(ApplyTbi(aligned)), 8, 0)) {
           HandleMemoryFault(aligned);
           return;
         }
-        if (FaultyStore(ToHostAddr<void>(aligned + 8), 8, 0)) {
+        if (FaultyStore(ToHostAddr<void>(ApplyTbi(aligned + 8)), 8, 0)) {
           HandleMemoryFault(aligned + 8);
           return;
         }
@@ -1042,7 +1057,7 @@ class Interpreter {
         // Zero the 32-byte granule containing access_addr.
         uint64_t aligned = access_addr & ~uint64_t{0x1F};
         for (int i = 0; i < 32; i += 8) {
-          if (FaultyStore(ToHostAddr<void>(aligned + i), 8, 0)) {
+          if (FaultyStore(ToHostAddr<void>(ApplyTbi(aligned + i)), 8, 0)) {
             HandleMemoryFault(aligned + i);
             return;
           }
@@ -3066,7 +3081,7 @@ class Interpreter {
         uint64_t addr = base_addr + r * vec_bytes;
         if (is_store) {
           __uint128_t val = state_->cpu.v[vreg];
-          void* ptr = ToHostAddr<void>(addr);
+          void* ptr = ToHostAddr<void>(ApplyTbi(addr));
           if (FaultyStore(ptr, 8, static_cast<uint64_t>(val))) {
             HandleMemoryFault(addr); return;
           }
@@ -3077,7 +3092,7 @@ class Interpreter {
             }
           }
         } else {
-          void* ptr = ToHostAddr<void>(addr);
+          void* ptr = ToHostAddr<void>(ApplyTbi(addr));
           FaultyLoadResult lo = FaultyLoad(ptr, 8);
           if (lo.is_fault) { HandleMemoryFault(addr); return; }
           if (vec_bytes > 8) {
@@ -3111,7 +3126,7 @@ class Interpreter {
                    reinterpret_cast<const uint8_t*>(&val) + e * esize, esize);
           }
         }
-        void* base_ptr = ToHostAddr<void>(base_addr);
+        void* base_ptr = ToHostAddr<void>(ApplyTbi(base_addr));
         for (uint64_t off = 0; off + 8 <= total_bytes; off += 8) {
           uint64_t chunk;
           memcpy(&chunk, buf + off, 8);
@@ -3120,7 +3135,7 @@ class Interpreter {
           }
         }
       } else {
-        void* base_ptr = ToHostAddr<void>(base_addr);
+        void* base_ptr = ToHostAddr<void>(ApplyTbi(base_addr));
         for (uint64_t off = 0; off + 8 <= total_bytes; off += 8) {
           FaultyLoadResult res = FaultyLoad(static_cast<uint8_t*>(base_ptr) + off, 8);
           if (res.is_fault) { HandleMemoryFault(base_addr + off); return; }
@@ -3172,7 +3187,7 @@ class Interpreter {
         uint8_t vreg = (args.rt + r) & 31;
         uint64_t addr = base_addr + r * esize;
 
-        FaultyLoadResult res = FaultyLoad(ToHostAddr<void>(addr), esize);
+        FaultyLoadResult res = FaultyLoad(ToHostAddr<void>(ApplyTbi(addr)), esize);
         if (res.is_fault) { HandleMemoryFault(addr); return; }
 
         // Replicate the loaded element across all lanes.
@@ -3217,11 +3232,11 @@ class Interpreter {
         if (is_store) {
           uint64_t elem = 0;
           memcpy(&elem, reinterpret_cast<const uint8_t*>(&state_->cpu.v[vreg]) + args.index * esize, esize);
-          if (FaultyStore(ToHostAddr<void>(addr), esize, elem)) {
+          if (FaultyStore(ToHostAddr<void>(ApplyTbi(addr)), esize, elem)) {
             HandleMemoryFault(addr); return;
           }
         } else {
-          FaultyLoadResult res = FaultyLoad(ToHostAddr<void>(addr), esize);
+          FaultyLoadResult res = FaultyLoad(ToHostAddr<void>(ApplyTbi(addr)), esize);
           if (res.is_fault) { HandleMemoryFault(addr); return; }
           // Write to specific lane, preserving other lanes.
           __uint128_t vec = state_->cpu.v[vreg];
@@ -3348,7 +3363,7 @@ class Interpreter {
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
     CHECK(!exception_raised_);
     uint64_t addr = base + args.offset;
-    void* host_addr = ToHostAddr<void>(addr);
+    void* host_addr = ToHostAddr<void>(ApplyTbi(addr));
 
     if (args.is_store) {
       SimdStoreToMemory(host_addr, args.rt, args.size);
@@ -3363,7 +3378,7 @@ class Interpreter {
   void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
     CHECK(!exception_raised_);
     uint64_t addr = state_->cpu.insn_addr + args.offset;
-    void* host_addr = ToHostAddr<void>(addr);
+    void* host_addr = ToHostAddr<void>(ApplyTbi(addr));
     SimdLoadFromMemory(host_addr, args.rt, args.size);
   }
 
@@ -3377,8 +3392,8 @@ class Interpreter {
       default: Undefined(); return;
     }
 
-    void* addr1 = ToHostAddr<void>(base);
-    void* addr2 = ToHostAddr<void>(base + element_size);
+    void* addr1 = ToHostAddr<void>(ApplyTbi(base));
+    void* addr2 = ToHostAddr<void>(ApplyTbi(base + element_size));
 
     if (args.is_store) {
       SimdStoreToMemory(addr1, args.rt1, args.size);
@@ -3396,7 +3411,7 @@ class Interpreter {
     // shift+add (see ApplyOffsetExtend comment above).
     uint64_t off = ApplyOffsetExtend(offset_reg, args.extend_type) << args.shift_amount;
     uint64_t addr = base + off;
-    void* host_addr = ToHostAddr<void>(addr);
+    void* host_addr = ToHostAddr<void>(ApplyTbi(addr));
 
     if (args.is_store) {
       SimdStoreToMemory(host_addr, args.rt, args.size);
@@ -3980,7 +3995,7 @@ class Interpreter {
 
   void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
     CHECK(!exception_raised_);
-    void* host_addr = ToHostAddr<void>(base);
+    void* host_addr = ToHostAddr<void>(ApplyTbi(base));
     bool need_write = (args.op != Decoder::AtomicOp::kLdxr &&
                        args.op != Decoder::AtomicOp::kLdar);
     // Atomic ops use __atomic builtins which handle their own faults via
