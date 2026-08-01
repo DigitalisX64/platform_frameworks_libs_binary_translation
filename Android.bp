@@ -432,6 +432,12 @@ cc_test_host {
                 "libberberis_decoder_arm64_unit_tests",
                 "libberberis_interpreter_arm64_unit_tests",
                 "libberberis_runtime_arm64_unit_tests",
+                // Guest-ABI argument marshalling and trampoline generation:
+                // the riscv64 twin has always been in its host suite, the
+                // arm64 one was defined but linked into nothing, so these
+                // never ran.
+                "libberberis_guest_abi_arm64_unit_tests",
+                "libberberis_cpu_state_arm64_unit_test",
             ],
         },
     },
