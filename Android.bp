@@ -396,6 +396,12 @@ cc_test_host {
         "libbase",
         "liblog",
     ],
+    // Decoder differential corpus + its undefined-coverage baseline, resolved
+    // relative to the test binary at run time.
+    data: [
+        "decoder/arm64_test/arm64_decoder_encodings.txt",
+        "decoder/arm64_test/arm64_decoder_undefined_baseline.txt",
+    ],
     arch: {
         x86_64: {
             static_libs: [

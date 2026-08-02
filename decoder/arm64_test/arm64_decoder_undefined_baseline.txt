@@ -1,0 +1,136 @@
+# Mnemonics in arm64_decoder_encodings.txt that the ARM64 decoder reports as
+# Undefined.
+#
+# Most are ISA extensions outside the implemented baseline (A64 base plus
+# AdvSIMD/NEON and crypto) -- SVE/SVE2, SME/SME2, FP8, FEAT_FHM,
+# FEAT_FAMINMAX, FEAT_THE -- where Undefined is the correct decode. They reach
+# the corpus because it is harvested from current libraries, which contain
+# runtime-dispatched code paths for CPUs that have those features.
+#
+# Three groups here are NOT extensions but genuine gaps in implemented
+# territory, verified by hand:
+#   * fmaxv / fminv / fmaxnmv --- the FP16 (half-precision) across-lane forms.
+#     The .4S forms decode and execute; the Q=0, sz=0 half-precision forms
+#     (e.g. 0x0e30f800) do not.
+#   * sqdmull / sqdmlal / sqdmlsl --- the SCALAR forms (top byte 0x5e/0x5f,
+#     e.g. 0x5e77d12e). The vector three-different forms decode.
+#   * mrs / msr --- specific system registers, not the instructions as a whole;
+#     MSR-immediate to a PSTATE field is covered by MsrImmediatePstateIsNop.
+#
+# A mnemonic that decodes to Undefined and is NOT listed here fails
+# DecoderObjdumpDiff.UndefinedCoverageBaseline: something that used to decode no
+# longer does. A listed mnemonic that starts decoding is reported, not failed --
+# delete its line in the commit that implements it.
+#
+# Regenerate the corpus with decoder/arm64_test/harvest_encodings.py.
+abs
+addha
+bfmla
+bfmlal
+bfmlsl
+bfmopa
+bfmops
+bftmopa
+bmopa
+bmops
+dcps1
+dcps2
+dcps3
+famax
+famin
+fclamp
+fcvt
+fcvtn2
+fdot
+fmaxnmv
+fmaxv
+fminv
+fmlal
+fmlal2
+fmlalb
+fmlall
+fmlalltb
+fmlalltt
+fmlalt
+fmlsl
+fmlsl2
+fmop4a
+fmopa
+fmops
+frintn
+fscale
+ftmopa
+fvdot
+hvc
+ld1b
+ld1d
+ld1h
+ld1q
+ld1w
+ldapur
+ldfadda
+ldfmaxal
+ldnt1b
+ldnt1d
+ldnt1h
+ldnt1w
+ldtnp
+ldtp
+luti2
+luti4
+mrrs
+mrs
+msr
+msrr
+rcwclr
+rcwclral
+rcwsclra
+rcwsclrl
+rcwsswp
+rcwswpl
+sclamp
+sdot
+sel
+smc
+smlall
+smlsll
+smop4a
+smopa
+smops
+sqdmlal
+sqdmlsl
+sqdmull
+sqrshr
+st1b
+st1d
+st1h
+st1q
+st1w
+stlur
+stmopa
+stnt1b
+stnt1d
+stnt1h
+stnt1w
+sttnp
+sttp
+sumlall
+sumopa
+sumops
+svdot
+sysp
+uclamp
+udf
+umlall
+umlsll
+umopa
+umops
+uqrshr
+usmlall
+usmop4a
+usmopa
+usmops
+utmopa
+uzp
+zero
+zip
