@@ -84,5 +84,6 @@ cc_test_library {
     srcs: [
         "frontend_tests.cc",
         "heavy_differential_fuzz_tests.cc",
+        "heavy_memory_differential_fuzz_tests.cc",
     ],
 }
