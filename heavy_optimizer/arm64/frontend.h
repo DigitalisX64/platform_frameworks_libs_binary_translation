@@ -568,6 +568,10 @@ class HeavyOptimizerFrontend {
 
   void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode);
 
+  // SHA-256 arithmetic helpers (defined in frontend.cc). Nested so it can reach
+  // the frontend's emit helpers while keeping the round math out of the header.
+  struct Sha256Ops;
+
   //
   // Region machinery (not part of the SemanticsListener interface).
   //

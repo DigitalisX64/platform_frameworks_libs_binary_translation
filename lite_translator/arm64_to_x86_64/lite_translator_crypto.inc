@@ -119,13 +119,166 @@
     as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xd);
   }
 
+  // SHA-256 (H/H2/SU0/SU1). The math mirrors the interpreter exactly (its
+  // differential oracle). Because the lite temp allocator never frees a temp
+  // mid-instruction, the 8-word working state for H/H2 cannot live in GP
+  // registers; it lives in ThreadState.intrinsics_scratch_area (32 bytes = 8
+  // uint32) and the round math reuses a fixed handful of GP temps via the
+  // reg-op-[mem] forms. Whole 128-bit V-register loads/stores keep every
+  // V-access at one width (no sub-lane write that a wider read could see
+  // stale). ch/maj use the NOT-free identities ch=g^(e&(f^g)),
+  // maj=(a&b)^(c&(a^b)); ROL(x,n) is ROR(x,32-n).
+  //
+  // Lowering these keeps crypto-heavy transport loops (TLS/QUIC per-packet
+  // auth) from fragmenting into per-instruction interpreter round-trips.
+  static constexpr int32_t kShaScr = offsetof(ThreadState, intrinsics_scratch_area);
+
+  // Emits `dst = ROR(mem32[disp], n)`.
+  void ShaRor(Register dst, int32_t disp, int8_t n) {
+    as_.Movl(dst, {.base = Assembler::rbp, .disp = disp});
+    if (n != 0) as_.Rorl(dst, n);
+  }
+  // acc = σ (rotr(a)^rotr(b)^third) where `third` is rotr(c) or shr; the source
+  // word is at [disp]. Uses acc and one scratch temp `t`.
+  void ShaBigSigma(Register acc, Register t, int32_t disp, int8_t r0, int8_t r1, int8_t r2) {
+    ShaRor(acc, disp, r0);
+    ShaRor(t, disp, r1);
+    as_.Xorl(acc, t);
+    ShaRor(t, disp, r2);
+    as_.Xorl(acc, t);
+  }
+  void ShaLittleSigma(Register acc, Register t, int32_t disp, int8_t r0, int8_t r1, int8_t shr) {
+    ShaRor(acc, disp, r0);
+    ShaRor(t, disp, r1);
+    as_.Xorl(acc, t);
+    as_.Movl(t, {.base = Assembler::rbp, .disp = disp});
+    as_.Shrl(t, shr);
+    as_.Xorl(acc, t);
+  }
+
   void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
-    UNUSED(rd, rn, rm, opcode);
-    Undefined();  // interpreter fallback
+    // Only SHA-256 (H/H2/SU1); SHA-1 forms (000..011) still bail.
+    if (opcode < 0b100 || opcode > 0b110) { Undefined(); return; }
+    const int32_t vd_off = VRegOffset(rd);
+    const int32_t vn_off = VRegOffset(rn);
+    const int32_t vm_off = VRegOffset(rm);
+    SimdRegister xtmp = AllocTempSimdReg();
+    Register r0 = AllocTempReg(), r1 = AllocTempReg(), r2 = AllocTempReg(),
+             r3 = AllocTempReg(), r4 = AllocTempReg();
+    if (!success() || r0 == no_register || r1 == no_register || r2 == no_register ||
+        r3 == no_register || r4 == no_register) {
+      success_ = false;
+      return;
+    }
+    auto m = [](int32_t off) { return Assembler::Operand{.base = Assembler::rbp, .disp = off}; };
+
+    if (opcode == 0b110) {
+      // SHA256SU1: nd0=d0+σ1(m2)+n1; nd1=d1+σ1(m3)+n2;
+      //            nd2=d2+σ1(nd0)+n3; nd3=d3+σ1(nd1)+m0. nd0/nd1 are consumed
+      //            by nd2/nd3, so stage d[] in scratch[0..3] and overwrite.
+      as_.Movdqu(xtmp, m(vd_off));
+      as_.Movdqu(m(kShaScr), xtmp);  // scratch[0..3] = d[]
+      // nd0 = d0 + σ1(m2) + n1.
+      ShaLittleSigma(r0, r1, vm_off + 8, 17, 19, 10);
+      as_.Addl(r0, m(kShaScr + 0));
+      as_.Addl(r0, m(vn_off + 4));
+      // nd1 = d1 + σ1(m3) + n2.
+      ShaLittleSigma(r2, r1, vm_off + 12, 17, 19, 10);
+      as_.Addl(r2, m(kShaScr + 4));
+      as_.Addl(r2, m(vn_off + 8));
+      as_.Movl(m(kShaScr + 0), r0);  // scratch[0] = nd0 (σ1 input for nd2)
+      as_.Movl(m(kShaScr + 4), r2);  // scratch[1] = nd1
+      // nd2 = d2 + σ1(nd0) + n3.
+      ShaLittleSigma(r3, r1, kShaScr + 0, 17, 19, 10);
+      as_.Addl(r3, m(kShaScr + 8));
+      as_.Addl(r3, m(vn_off + 12));
+      // nd3 = d3 + σ1(nd1) + m0.
+      ShaLittleSigma(r4, r1, kShaScr + 4, 17, 19, 10);
+      as_.Addl(r4, m(kShaScr + 12));
+      as_.Addl(r4, m(vm_off + 0));
+      as_.Movl(m(kShaScr + 8), r3);
+      as_.Movl(m(kShaScr + 12), r4);
+      as_.Movdqu(xtmp, m(kShaScr));
+      as_.Movdqu(m(vd_off), xtmp);
+      return;
+    }
+
+    // SHA256H (100): X=Vd, Y=Vn; SHA256H2 (101): X=Vn, Y=Vd.
+    const int32_t vx = (opcode == 0b100) ? vd_off : vn_off;
+    const int32_t vy = (opcode == 0b100) ? vn_off : vd_off;
+    const int32_t X = kShaScr;       // x[0..3] at X+0,4,8,12
+    const int32_t Y = kShaScr + 16;  // y[0..3] at Y+0,4,8,12
+    as_.Movdqu(xtmp, m(vx));
+    as_.Movdqu(m(X), xtmp);
+    as_.Movdqu(xtmp, m(vy));
+    as_.Movdqu(m(Y), xtmp);
+    for (int e = 0; e < 4; e++) {
+      // ch = y2 ^ (y0 & (y1 ^ y2))  -> r0.
+      as_.Movl(r0, m(Y + 4));
+      as_.Xorl(r0, m(Y + 8));
+      as_.Andl(r0, m(Y + 0));
+      as_.Xorl(r0, m(Y + 8));
+      // t = y3 + Σ1(y0) + ch + w[e]  -> r1.
+      ShaBigSigma(r1, r2, Y + 0, 6, 11, 25);
+      as_.Addl(r1, r0);
+      as_.Addl(r1, m(Y + 12));
+      as_.Addl(r1, m(vm_off + e * 4));
+      // new_x3 = t + x3  -> r0.
+      as_.Movl(r0, r1);
+      as_.Addl(r0, m(X + 12));
+      // bs0 = Σ0(x0)  -> r2.
+      ShaBigSigma(r2, r3, X + 0, 2, 13, 22);
+      // maj = (x0 & x1) ^ (x2 & (x0 ^ x1))  -> r3.
+      as_.Movl(r3, m(X + 0));
+      as_.Xorl(r3, m(X + 4));
+      as_.Andl(r3, m(X + 8));
+      as_.Movl(r4, m(X + 0));
+      as_.Andl(r4, m(X + 4));
+      as_.Xorl(r3, r4);
+      // new_y3 = t + bs0 + maj  -> r1.
+      as_.Addl(r1, r2);
+      as_.Addl(r1, r3);
+      // Rotate state (read high->low before overwriting): now r0=new_x3, r1=new_y3.
+      as_.Movl(r2, m(X + 8)); as_.Movl(m(X + 12), r2);
+      as_.Movl(r2, m(X + 4)); as_.Movl(m(X + 8), r2);
+      as_.Movl(r2, m(X + 0)); as_.Movl(m(X + 4), r2);
+      as_.Movl(m(X + 0), r1);  // x[0] = new_y3
+      as_.Movl(r2, m(Y + 8)); as_.Movl(m(Y + 12), r2);
+      as_.Movl(r2, m(Y + 4)); as_.Movl(m(Y + 8), r2);
+      as_.Movl(r2, m(Y + 0)); as_.Movl(m(Y + 4), r2);
+      as_.Movl(m(Y + 0), r0);  // y[0] = new_x3
+    }
+    as_.Movdqu(xtmp, m((opcode == 0b100) ? X : Y));
+    as_.Movdqu(m(vd_off), xtmp);
   }
 
   void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
-    UNUSED(rd, rn, opcode);
-    Undefined();  // interpreter fallback
+    // Only SHA256SU0 (opcode 10); SHA1H/SHA1SU1 (00/01) still bail.
+    if (opcode != 0b10) { Undefined(); return; }
+    const int32_t vd_off = VRegOffset(rd);
+    const int32_t vn_off = VRegOffset(rn);
+    SimdRegister xtmp = AllocTempSimdReg();
+    Register r0 = AllocTempReg(), r1 = AllocTempReg(), r2 = AllocTempReg();
+    if (!success() || r0 == no_register || r1 == no_register || r2 == no_register) {
+      success_ = false;
+      return;
+    }
+    auto m = [](int32_t off) { return Assembler::Operand{.base = Assembler::rbp, .disp = off}; };
+    // out_i = d_i + σ0(d_{i+1}); d_4 = Vn[0]. Stage d[] at scratch[0..3] and
+    // Vn[0] at scratch[4]. Each out_i is written in place at scratch[i] AFTER
+    // reading its two inputs (σ0(d_{i+1}) at [i+1], +d_i at [i]); d_i is last
+    // read here, so the in-place store is safe and stays within the 32-byte
+    // scratch area.
+    as_.Movdqu(xtmp, m(vd_off));
+    as_.Movdqu(m(kShaScr), xtmp);          // scratch[0..3] = d[]
+    as_.Movl(r2, m(vn_off + 0));
+    as_.Movl(m(kShaScr + 16), r2);         // scratch[4] = Vn[0] (== d_4)
+    for (int i = 0; i < 4; i++) {
+      ShaLittleSigma(r0, r1, kShaScr + (i + 1) * 4, 7, 18, 3);
+      as_.Addl(r0, m(kShaScr + i * 4));
+      as_.Movl(m(kShaScr + i * 4), r0);    // out_i in place
+    }
+    as_.Movdqu(xtmp, m(kShaScr));
+    as_.Movdqu(m(vd_off), xtmp);
   }
 

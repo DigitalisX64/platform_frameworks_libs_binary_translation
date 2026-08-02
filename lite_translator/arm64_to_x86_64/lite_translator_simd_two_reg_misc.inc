@@ -400,14 +400,13 @@
       //   CMGE (Vn >= 0) ->  ~PCMPGTx(0, Vn)   (XOR with all-ones)
       //   CMLE (Vn <= 0) ->  ~PCMPGTx(Vn, 0)
       // Integer signed compare only — FP16 form (args.is_fp16) bails to interp
-      // via success_=false. .2D (size=11) needs PCMPGTQ (SSE4.2) and bails too;
-      // the interpreter handles both fallbacks correctly.
+      // via success_=false. .2D (size=11) uses PCMPGTQ and is gated on SSE4.2.
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmgtZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmgeZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmleZero:
       case Decoder::AdvSimdTwoRegMiscOpcode::kCmltZero: {
         if (args.is_fp16) { success_ = false; return; }
-        if (args.size == 0b11) { success_ = false; return; }  // .2D needs PCMPGTQ
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xz = AllocTempSimdReg();
         if (!success()) { return; }
@@ -422,14 +421,14 @@
             case 0b00: as_.Pcmpgtb(xn, xz); break;
             case 0b01: as_.Pcmpgtw(xn, xz); break;
             case 0b10: as_.Pcmpgtd(xn, xz); break;
-            default: success_ = false; return;
+            default: as_.Pcmpgtq(xn, xz); break;  // 0b11 (.2D)
           }
         } else {
           switch (args.size) {
             case 0b00: as_.Pcmpgtb(xz, xn); break;
             case 0b01: as_.Pcmpgtw(xz, xn); break;
             case 0b10: as_.Pcmpgtd(xz, xn); break;
-            default: success_ = false; return;
+            default: as_.Pcmpgtq(xz, xn); break;  // 0b11 (.2D)
           }
           as_.Movdqa(xn, xz);
         }

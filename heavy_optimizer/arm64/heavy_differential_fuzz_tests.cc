@@ -2413,4 +2413,46 @@ TEST_F(Arm64HeavyDifferentialFuzz, DupScalarExhaustive) {
   EXPECT_GT(compared, 1000) << "heavy accepted too few DUP-scalar encodings";
 }
 
+
+// SHA-256 (SHA256H / SHA256H2 / SHA256SU0 / SHA256SU1) against the interpreter.
+// Bit-exact hashing is the whole point, so this is the gate that matters. The
+// inputs are fully random 128-bit V-registers (the round math has no special
+// values -- it is adds, rotates, and/xor over uint32 lanes), and every op is
+// checked at its exact encoding (ground-truth comments below).
+TEST_F(Arm64HeavyDifferentialFuzz, Sha256) {
+  Seed(0x54A256ULL);
+  const int kIters = 3000 * FuzzScale();
+  struct Form {
+    uint32_t enc_base;  // rd/rn/rm inserted at [4:0],[9:5],[20:16]
+    bool three_reg;     // true: H/H2/SU1 (has rm); false: SU0 (rd,rn only)
+  };
+  static const Form kForms[] = {
+      {0x5E004000u, true},   // sha256h   q0, q0, v0.4s   (opcode 100)
+      {0x5E005000u, true},   // sha256h2  q0, q0, v0.4s   (opcode 101)
+      {0x5E006000u, true},   // sha256su1 v0.4s,v0.4s,v0.4s(opcode 110)
+      {0x5E282800u, false},  // sha256su0 v0.4s, v0.4s     (opcode 10)
+  };
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const Form& f = kForms[Rnd() % 4];
+    const int rd = Rnd() % 32;
+    const int rn = Rnd() % 32;
+    const int rm = Rnd() % 32;
+    uint32_t enc = f.enc_base | static_cast<uint32_t>(rd) | (static_cast<uint32_t>(rn) << 5);
+    if (f.three_reg) enc |= (static_cast<uint32_t>(rm) << 16);
+    uint32_t code[1] = {enc};
+    InitState in = RandomInit();  // random V-registers
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " enc=0x" << std::hex << enc << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "Sha256: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SHA-256 encodings";
+}
+
 }  // namespace berberis

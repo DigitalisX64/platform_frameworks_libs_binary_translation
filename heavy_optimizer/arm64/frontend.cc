@@ -15476,14 +15476,138 @@ void HeavyOptimizerFrontend::CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
   builder_.GenSetSimd<16>(vd_off, result.machine_reg());
 }
 
+// SHA-256 helpers shared by CryptoSha3Reg (SHA256H/H2/SU1) and CryptoSha2Reg
+// (SHA256SU0). The math mirrors the interpreter's CryptoSha3Reg/CryptoSha2Reg
+// exactly (it is the differential oracle); the only cleverness is expressing
+// the FIPS-180-4 choose/majority without a NOT (absent from the backend LIR):
+//   ch(e,f,g)  = g ^ (e & (f ^ g))
+//   maj(a,b,c) = (a & b) ^ (c & (a ^ b))
+// and ROL(x,n) as ROR(x, 32-n) (only RORL is in the LIR).
+//
+// Lane words are moved between the V-register XMMs and GP virtual registers
+// with PEXTRD/PINSRD, so every V-register access stays 128-bit wide -- a
+// sub-lane 32-bit memory write would risk the width-blind guest-context cache
+// forwarding it to a later 128-bit read (the bcrypt-corruption class).
+//
+// These are common in real apps (TLS/QUIC record auth runs SHA-256 in a
+// per-packet loop); bailing fragments that loop into per-instruction
+// interpreter round-trips, so lowering it keeps the region -- and the second
+// gear -- intact.
+struct HeavyOptimizerFrontend::Sha256Ops {
+  HeavyOptimizerFrontend* self;
+
+  // SSA Gen<> auto-copies the use_def first operand, so each returns a fresh
+  // register and leaves the inputs intact.
+  Register Rotr(Register v, int8_t n) {
+    return std::get<0>(self->Gen<x86_64::RorlRegImm>(v, n));
+  }
+  Register ShrImm(Register v, int8_t n) {
+    return std::get<0>(self->Gen<x86_64::ShrlRegImm>(v, n));
+  }
+  Register Xor(Register a, Register b) {
+    return std::get<0>(self->Gen<x86_64::XorlRegReg>(a, b));
+  }
+  Register And(Register a, Register b) {
+    return std::get<0>(self->Gen<x86_64::AndlRegReg>(a, b));
+  }
+  Register Add(Register a, Register b) {
+    return std::get<0>(self->Gen<x86_64::AddlRegReg>(a, b));
+  }
+  Register BigSigma0(Register x) { return Xor(Xor(Rotr(x, 2), Rotr(x, 13)), Rotr(x, 22)); }
+  Register BigSigma1(Register x) { return Xor(Xor(Rotr(x, 6), Rotr(x, 11)), Rotr(x, 25)); }
+  Register LittleSigma0(Register x) { return Xor(Xor(Rotr(x, 7), Rotr(x, 18)), ShrImm(x, 3)); }
+  Register LittleSigma1(Register x) { return Xor(Xor(Rotr(x, 17), Rotr(x, 19)), ShrImm(x, 10)); }
+  Register Ch(Register e, Register f, Register g) { return Xor(g, And(e, Xor(f, g))); }
+  Register Maj(Register a, Register b, Register c) { return Xor(And(a, b), And(c, Xor(a, b))); }
+
+  Register Lane(FpRegister x, int8_t lane) {
+    return std::get<0>(self->Gen<x86_64::PextrdRegXRegImm>(x.machine_reg(), lane));
+  }
+  FpRegister Pack(Register w0, Register w1, Register w2, Register w3) {
+    FpRegister x = self->AllocTempSimdReg();
+    self->builder_.Gen<x86_64::MovdXRegReg>(x.machine_reg(), w0);
+    self->builder_.Gen<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w1, int8_t{1});
+    self->builder_.Gen<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w2, int8_t{2});
+    self->builder_.Gen<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w3, int8_t{3});
+    return x;
+  }
+};
+
 void HeavyOptimizerFrontend::CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
-  UndefinedReturningVoid();
-  UNUSED_ARGS(rd, rn, rm, opcode);
+  if (!success()) {
+    return;
+  }
+  // Only SHA-256 (H/H2/SU1) is lowered; the SHA-1 forms (000..011) still bail.
+  if (opcode < 0b100 || opcode > 0b110) {
+    UndefinedReturningVoid();
+    return;
+  }
+  Sha256Ops op{this};
+  FpRegister qd = AllocTempSimdReg();
+  FpRegister vn = AllocTempSimdReg();
+  FpRegister vm = AllocTempSimdReg();
+  builder_.GenGetSimd<16>(qd.machine_reg(), GetVRegOffset(rd));
+  builder_.GenGetSimd<16>(vn.machine_reg(), GetVRegOffset(rn));
+  builder_.GenGetSimd<16>(vm.machine_reg(), GetVRegOffset(rm));
+
+  if (opcode == 0b110) {
+    // SHA256SU1: nd0 = d0 + σ1(m2) + n1; nd1 = d1 + σ1(m3) + n2;
+    //            nd2 = d2 + σ1(nd0) + n3; nd3 = d3 + σ1(nd1) + m0.
+    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
+    Register n1 = op.Lane(vn, 1), n2 = op.Lane(vn, 2), n3 = op.Lane(vn, 3);
+    Register m0 = op.Lane(vm, 0), m2 = op.Lane(vm, 2), m3 = op.Lane(vm, 3);
+    Register nd0 = op.Add(op.Add(d0, op.LittleSigma1(m2)), n1);
+    Register nd1 = op.Add(op.Add(d1, op.LittleSigma1(m3)), n2);
+    Register nd2 = op.Add(op.Add(d2, op.LittleSigma1(nd0)), n3);
+    Register nd3 = op.Add(op.Add(d3, op.LittleSigma1(nd1)), m0);
+    SetVRegFull(rd, op.Pack(nd0, nd1, nd2, nd3), /*q=*/true);
+    return;
+  }
+
+  // SHA256H (100): X = Vd, Y = Vn; SHA256H2 (101): X = Vn, Y = Vd.
+  FpRegister xreg = (opcode == 0b100) ? qd : vn;
+  FpRegister yreg = (opcode == 0b100) ? vn : qd;
+  Register x0 = op.Lane(xreg, 0), x1 = op.Lane(xreg, 1), x2 = op.Lane(xreg, 2),
+           x3 = op.Lane(xreg, 3);
+  Register y0 = op.Lane(yreg, 0), y1 = op.Lane(yreg, 1), y2 = op.Lane(yreg, 2),
+           y3 = op.Lane(yreg, 3);
+  Register w[4] = {op.Lane(vm, 0), op.Lane(vm, 1), op.Lane(vm, 2), op.Lane(vm, 3)};
+  for (int e = 0; e < 4; e++) {
+    Register chs = op.Ch(y0, y1, y2);
+    Register maj = op.Maj(x0, x1, x2);
+    Register t = op.Add(op.Add(op.Add(y3, op.BigSigma1(y0)), chs), w[e]);
+    Register new_x3 = op.Add(t, x3);
+    Register new_y3 = op.Add(op.Add(t, op.BigSigma0(x0)), maj);
+    // Rotate: x = {new_y3, x0, x1, x2}, y = {new_x3, y0, y1, y2}.
+    x3 = x2; x2 = x1; x1 = x0; x0 = new_y3;
+    y3 = y2; y2 = y1; y1 = y0; y0 = new_x3;
+  }
+  FpRegister result = (opcode == 0b100) ? op.Pack(x0, x1, x2, x3) : op.Pack(y0, y1, y2, y3);
+  SetVRegFull(rd, result, /*q=*/true);
 }
 
 void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
-  UndefinedReturningVoid();
-  UNUSED_ARGS(rd, rn, opcode);
+  if (!success()) {
+    return;
+  }
+  // Only SHA256SU0 (opcode 10) is lowered; SHA1H/SHA1SU1 (00/01) still bail.
+  if (opcode != 0b10) {
+    UndefinedReturningVoid();
+    return;
+  }
+  Sha256Ops op{this};
+  FpRegister qd = AllocTempSimdReg();
+  FpRegister vn = AllocTempSimdReg();
+  builder_.GenGetSimd<16>(qd.machine_reg(), GetVRegOffset(rd));
+  builder_.GenGetSimd<16>(vn.machine_reg(), GetVRegOffset(rn));
+  // SHA256SU0: out_i = d_i + σ0(d_{i+1}), with d_4 taken from Vn[0].
+  Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
+  Register n0 = op.Lane(vn, 0);
+  Register o0 = op.Add(d0, op.LittleSigma0(d1));
+  Register o1 = op.Add(d1, op.LittleSigma0(d2));
+  Register o2 = op.Add(d2, op.LittleSigma0(d3));
+  Register o3 = op.Add(d3, op.LittleSigma0(n0));
+  SetVRegFull(rd, op.Pack(o0, o1, o2, o3), /*q=*/true);
 }
 
 // Compute the address for a register-offset load/store:
