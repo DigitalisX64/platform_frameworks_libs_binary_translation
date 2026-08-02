@@ -310,6 +310,38 @@
         as_.Movsxlq(res, src);
         return res;
       }
+      // General SBFX/SBFIZ. Shift the field's top bit to the register's top
+      // bit, then arithmetic-shift it down to its destination position:
+      //   A = regsize-1-imms            (field top -> bit regsize-1)
+      //   B = (A + immr) mod regsize    (top -> destination)
+      // For imms >= immr (SBFX) B lands the field at bit 0; for imms < immr
+      // (SBFIZ) the mod wraps and lands it at bit regsize-immr. One formula,
+      // both aliases, two shifts.
+      //
+      // This path is hot in practice: compilers emit `sbfx xN, xM, #0, #1`
+      // (sign-extend bit 0, the carry/bool-to-mask idiom) all over checked
+      // arithmetic and strtoull-class parsing, and without it every such
+      // instruction ended its region and round-tripped through the
+      // interpreter -- ~13 interpreter instructions of overhead per execution
+      // in the hottest loops a media player has.
+      {
+        Register res = AllocTempReg();
+        const uint8_t shl_amount = static_cast<uint8_t>(reg_size - 1 - imms);
+        const uint8_t sar_amount =
+            static_cast<uint8_t>((shl_amount + immr) & (reg_size - 1));
+        if (is_64bit) {
+          as_.Movq(res, src);
+          if (shl_amount != 0) as_.Shlq(res, static_cast<int8_t>(shl_amount));
+          if (sar_amount != 0) as_.Sarq(res, static_cast<int8_t>(sar_amount));
+        } else {
+          // 32-bit: operate on the low word; Shll/Sarl zero-extend the result
+          // to 64 bits, which matches ARM64 W-register write semantics.
+          as_.Movl(res, src);
+          if (shl_amount != 0) as_.Shll(res, static_cast<int8_t>(shl_amount));
+          if (sar_amount != 0) as_.Sarl(res, static_cast<int8_t>(sar_amount));
+        }
+        return res;
+      }
     }
 
     // general BFM (BFI / BFXIL / BFC).
@@ -659,19 +691,42 @@
     }
     if (sysreg == Decoder::SystemReg::kNzcv) {
       // MRS Xn, NZCV: read ARM64 flags into a register.
-      // ARM64 NZCV register: N=bit31, Z=bit30, C=bit29, V=bit28.
-      // Our stored flags use x86 LAHF layout. Convert on read.
+      // Stored (x86 LAHF layout): N=bit15, Z=bit14, C=bit8, V=bit0.
+      // Architectural NZCV:       N=bit31, Z=bit30, C=bit29, V=bit28.
+      // Assemble each field exactly; guest code does save/restore pairs
+      // (mrs ; ... ; msr NZCV) around flag-clobbering work, and an
+      // approximation here silently corrupts C and V for it.
       Register res = AllocTempReg();
+      Register tmp = AllocTempReg();
       if (!success()) return no_register;
       int32_t flags_offset = offsetof(ThreadState, cpu.flags);
       as_.Movzxwl(res, {.base = Assembler::rbp, .disp = flags_offset});
-      // Stored: N=bit15, Z=bit14, C=bit8, V=bit0.
-      // Target: N=bit31, Z=bit30, C=bit29, V=bit28.
-      // Shift left by 16 to move N/Z to bits 31/30.
+      // C: stored bit8 -> bit29.
+      as_.Movl(tmp, res);
+      as_.Andl(tmp, static_cast<int32_t>(0x100));
+      as_.Shll(tmp, static_cast<int8_t>(21));
+      // N/Z: stored bits 15/14 -> bits 31/30; V: stored bit0 -> bit28.
+      Register vbit = AllocTempReg();
+      if (!success()) return no_register;
+      as_.Movl(vbit, res);
+      as_.Andl(vbit, static_cast<int32_t>(0x1));
+      as_.Shll(vbit, static_cast<int8_t>(28));
+      as_.Andl(res, static_cast<int32_t>(0xC000));
       as_.Shll(res, static_cast<int8_t>(16));
-      // C was at bit8, now at bit24. Need it at bit29: shift would be complex.
-      // For simplicity, just return the shifted value; most code only tests
-      // individual flags via conditional branches, not MRS NZCV.
+      as_.Orl(res, tmp);
+      as_.Orl(res, vbit);
+      return res;
+    }
+    if (sysreg == Decoder::SystemReg::kFpcr) {
+      // MRS Xn, FPCR: read the cached FPCR value (the interpreter's MSR FPCR
+      // keeps it in sync with host MXCSR; reads never touch host state).
+      // Soft-float code reads FPCR for the rounding mode on every operation
+      // -- strtod and long-double emulation round-tripped the interpreter
+      // here on each call before this was JIT-resolved.
+      Register res = AllocTempReg();
+      if (!success()) return no_register;
+      int32_t fpcr_offset = offsetof(ThreadState, cpu.cached_fpcr);
+      as_.Movl(res, {.base = Assembler::rbp, .disp = fpcr_offset});  // 32-bit load zero-extends
       return res;
     }
     if (sysreg == Decoder::SystemReg::kCtrEl0) {
@@ -705,17 +760,29 @@
 
   void Msr(Decoder::SystemReg sysreg, Register src) {
     if (sysreg == Decoder::SystemReg::kNzcv) {
-      // MSR NZCV, Xn: write to ARM64 flags.
-      // Input: N=bit31, Z=bit30, C=bit29, V=bit28.
-      // Stored: N=bit15, Z=bit14, C=bit8, V=bit0.
+      // MSR NZCV, Xn: write to ARM64 flags. Exact inverse of the MRS
+      // conversion above:
+      //   arch N=bit31 -> stored bit15, Z=bit30 -> bit14,
+      //   arch C=bit29 -> stored bit8,  V=bit28 -> bit0.
       Register tmp = AllocTempReg();
+      Register acc = AllocTempReg();
       if (!success()) return;
-      as_.Movq(tmp, src);
-      as_.Shrq(tmp, static_cast<int8_t>(16));  // N→bit15, Z→bit14
-      // This is an approximation; exact bit remapping is complex.
-      // Most linker code doesn't use MSR NZCV directly.
+      // N/Z.
+      as_.Movl(acc, src);
+      as_.Shrl(acc, static_cast<int8_t>(16));
+      as_.Andl(acc, static_cast<int32_t>(0xC000));
+      // C.
+      as_.Movl(tmp, src);
+      as_.Shrl(tmp, static_cast<int8_t>(21));
+      as_.Andl(tmp, static_cast<int32_t>(0x100));
+      as_.Orl(acc, tmp);
+      // V.
+      as_.Movl(tmp, src);
+      as_.Shrl(tmp, static_cast<int8_t>(28));
+      as_.Andl(tmp, static_cast<int32_t>(0x1));
+      as_.Orl(acc, tmp);
       int32_t flags_offset = offsetof(ThreadState, cpu.flags);
-      as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, tmp);
+      as_.Movw({.base = Assembler::rbp, .disp = flags_offset}, acc);
       return;
     }
     if (sysreg == Decoder::SystemReg::kTpidrEl0) {

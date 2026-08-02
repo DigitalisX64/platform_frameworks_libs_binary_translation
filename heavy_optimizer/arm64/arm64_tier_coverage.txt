@@ -468,7 +468,7 @@ movi 128 128 128
 movk 128 128 128
 movz 1 1 1
 mrrs 17 0 0
-mrs 125 60 31
+mrs 125 78 31
 msr 57 27 4
 msrr 6 0 0
 msub 128 128 128
@@ -550,8 +550,8 @@ saddw2 128 128 128
 sb 1 1 1
 sbc 128 128 128
 sbcs 128 128 128
-sbfiz 128 0 128
-sbfx 128 0 128
+sbfiz 128 128 128
+sbfx 128 128 128
 sclamp 26 0 0
 scvtf 128 128 107
 sdiv 128 128 128

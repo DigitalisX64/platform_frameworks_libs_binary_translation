@@ -987,8 +987,110 @@ TEST_F(Arm64DifferentialFuzz, DupScalarExhaustive) {
 }
 
 
+// SBFM (SBFX / SBFIZ / ASR / SXTB / SXTH / SXTW), exhaustively: every
+// (sf, immr, imms) shape with randomized inputs. The general (non-alias)
+// shapes went untranslated by the lite tier for months while heavy and the
+// interpreter both handled them, so every `sbfx xN, xM, #0, #1` -- the
+// carry/bool-to-mask idiom compilers emit throughout checked arithmetic and
+// number parsing -- ended its region and round-tripped the interpreter. The
+// tier coverage table showed it the whole time (sbfx: lite 0/128); this sweep
+// pins the semantics now that the general path exists.
+TEST_F(Arm64DifferentialFuzz, SbfmExhaustive) {
+  Seed(0x5BF3ULL);
+  int compared = 0;
+  for (uint32_t sf = 0; sf < 2; sf++) {
+    const uint32_t width = sf ? 64 : 32;
+    for (uint32_t immr = 0; immr < width; immr++) {
+      for (uint32_t imms = 0; imms < width; imms++) {
+        const int rd = static_cast<int>(Rnd() % 31);
+        int rn = static_cast<int>(Rnd() % 31);
+        if (rn == rd) rn = (rn + 1) % 31;
+        uint32_t code[1] = {0x13000000u | (sf << 31) | (sf << 22) | (immr << 16) |
+                            (imms << 10) | (static_cast<uint32_t>(rn) << 5) |
+                            static_cast<uint32_t>(rd)};
+        InitState in = RandomInit();
+        std::string desc;
+        Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+        if (r == kDeclined) continue;
+        compared++;
+        if (r == kDiverge) {
+          ADD_FAILURE() << "sf=" << sf << " immr=" << immr << " imms=" << imms << " " << desc;
+          return;
+        }
+      }
+    }
+  }
+  fprintf(stderr, "SbfmExhaustive: compared=%d\n", compared);
+  // 64*64 + 32*32 = 5120 shapes; every one must now translate.
+  EXPECT_EQ(compared, 5120) << "lite declined SBFM shapes it should translate";
+}
 
 
+// MRS NZCV / MSR NZCV against the interpreter, plus the save/restore pair.
+// The lite recipes were shipped as admitted approximations: MRS parked C at
+// bit 24 and V at bit 16 (architecturally 29 and 28), and MSR stored C and V
+// into the wrong stored-flag bits entirely, so a guest's
+// `mrs x; ...; msr nzcv, x` flag save/restore silently destroyed C and V --
+// while the interpreter converts exactly. Real apps execute these: the
+// heavy tier bails on MRS NZCV, so the lite recipe is what runs on-device.
+TEST_F(Arm64DifferentialFuzz, MrsMsrNzcv) {
+  Seed(0x2CFA5ULL);
+  const int kIters = 2000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const int rd = static_cast<int>(Rnd() % 31);
+    const int which = static_cast<int>(Rnd() % 3);
+    uint32_t code[2];
+    int n;
+    if (which == 0) {
+      code[0] = 0xD53B4200u | static_cast<uint32_t>(rd);  // mrs xN, nzcv
+      n = 1;
+    } else if (which == 1) {
+      code[0] = 0xD51B4200u | static_cast<uint32_t>(rd);  // msr nzcv, xN
+      n = 1;
+    } else {
+      code[0] = 0xD53B4200u | static_cast<uint32_t>(rd);  // save
+      code[1] = 0xD51B4200u | static_cast<uint32_t>(rd);  // restore
+      n = 2;
+    }
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " which=" << which << " " << desc;
+      return;
+    }
+  }
+  fprintf(stderr, "MrsMsrNzcv: compared=%d\n", compared);
+  EXPECT_GT(compared, 1000);
+}
 
+// MRS Xn, FPCR against the interpreter: newly JIT-resolved (reads the cached
+// FPCR); the differential seeds cached_fpcr with random plausible values.
+TEST_F(Arm64DifferentialFuzz, MrsFpcr) {
+  Seed(0xF9C2ULL);
+  int compared = 0;
+  for (int iter = 0; iter < 512; iter++) {
+    const int rd = static_cast<int>(Rnd() % 31);
+    uint32_t code[1] = {0xD53B4400u | static_cast<uint32_t>(rd)};  // mrs xN, fpcr
+    InitState in = RandomInit();
+    std::string desc;
+    // cached_fpcr is not part of InitState; poke it directly around the run.
+    state_.cpu.cached_fpcr = static_cast<uint32_t>(Rnd64());
+    uint32_t fpcr = state_.cpu.cached_fpcr;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    state_.cpu.cached_fpcr = fpcr;
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      return;
+    }
+  }
+  fprintf(stderr, "MrsFpcr: compared=%d\n", compared);
+  EXPECT_GT(compared, 400);
+}
 
 }  // namespace berberis
