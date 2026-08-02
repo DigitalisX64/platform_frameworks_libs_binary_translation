@@ -16,12 +16,14 @@
 // translation is shared (interpreter == JIT) and in the JIT-compiled rasterizer,
 // which means the only way both tiers can be wrong identically is a DECODER
 // mis-dispatch (both go through Decoder<SemanticsPlayer<...>>). This test reads a
-// file of (encoding, objdump-mnemonic) pairs harvested from the real libchrome.so
-// rasterizer range and, for every encoding, records which decoder handler +
+// file of (encoding, objdump-mnemonic) pairs harvested from real shipped
+// binaries and, for every encoding, records which decoder handler +
 // sign/size/store fields Berberis picks, then flags any case where Berberis's
-// decode is INCONSISTENT with objdump's mnemonic (a mis-dispatch). The encodings
-// file path is taken from the DIGITALIS_RAST_ENC env var; when unset the test is
-// a no-op (so it never breaks CI), making this a diagnostic harness.
+// decode is INCONSISTENT with objdump's mnemonic (a mis-dispatch).
+//
+// The corpus is committed next to this test and used by default, so the check
+// runs as part of the normal host suite. DIGITALIS_RAST_ENC overrides the path
+// for a larger local sweep (harvest_encodings.py --cap 0 emits the full set).
 
 #include "gtest/gtest.h"
 
@@ -29,14 +31,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
+#include <vector>
+
+#include "android-base/file.h"
 
 #include "berberis/decoder/arm64/decoder.h"
 
 namespace berberis {
 
 namespace {
+
+// Committed test data. Soong's `data:` keeps the source-relative path, so these
+// install under <test binary dir>/decoder/arm64_test/.
+constexpr const char* kCorpusFile = "decoder/arm64_test/arm64_decoder_encodings.txt";
+constexpr const char* kUndefinedBaselineFile =
+    "decoder/arm64_test/arm64_decoder_undefined_baseline.txt";
 
 // Records the decoder's chosen handler + key discriminating fields. One instance
 // is reused per Decode() call (cleared by re-decode). Every InsnConsumer method
@@ -89,7 +101,12 @@ class Recorder {
     h = std::string("LSReg sz=") + Sz(a.size) + " sgn=" + (a.is_signed ? "1" : "0") +
         " st=" + (a.is_store ? "1" : "0") + " x=" + (a.is_64bit_target ? "1" : "0");
   }
-  void LoadLiteral(const Decoder::LoadLiteralArgs&) { h = "LoadLiteral"; }
+  // Record the sign: `ldrsw <Xt>, <label>` is a literal load, and its
+  // sign-extension is the same class of bug as the LDPSW one, so it is worth
+  // actually checking rather than accepting any LoadLiteral as correct.
+  void LoadLiteral(const Decoder::LoadLiteralArgs& a) {
+    h = std::string("LoadLiteral sgn=") + (a.is_signed ? "1" : "0");
+  }
   void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs&) { h = "LSExcl"; }
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& a) {
     h = std::string("SLSImm sz=") + SSz(a.size) + " st=" + (a.is_store ? "1" : "0");
@@ -206,6 +223,11 @@ class Recorder {
 // corrupt (signed loads, load/store-pair sign, the unscaled/unpriv variants),
 // since a full 245-mnemonic map is unnecessary and noisy.
 std::string Inconsistent(const std::string& mn, const std::string& h) {
+  // An encoding the decoder does not implement is a coverage question, not a
+  // mis-dispatch; UndefinedCoverageBaseline owns it. Without this every
+  // unimplemented extension would also be reported here as its category being
+  // "decoded as [UNDEF]", which buries the real mis-dispatches.
+  if (h == "UNDEF") return "";
   // Match a whole field token: a leading space (or string start) avoids "st=1"
   // matching inside "post=1" and "st=0" inside "post=0".
   auto has = [&](const char* s) {
@@ -247,10 +269,15 @@ std::string Inconsistent(const std::string& mn, const std::string& h) {
   };
   auto cat = [&](const char* c) { return h.rfind(c, 0) == 0; };  // h starts with category
   // narrowing rounding/saturating shift-right (AdvSimdShiftByImm)
+  // SQSHL and UQSHL are the two mnemonics in this list with BOTH a shift-by-
+  // immediate form and a three-same REGISTER form (`sqshl v0.4s, v1.4s, v2.4s`),
+  // so Simd3Same is a correct decode for them --- the three-same table below
+  // maps them to opcodes 32/33. Every other mnemonic here is immediate-only.
   if (in({"shrn", "rshrn", "sqshrn", "sqrshrn", "uqshrn", "uqrshrn", "sqshrun", "sqrshrun",
           "sshr", "ushr", "srshr", "urshr", "ssra", "usra", "srsra", "ursra", "shl", "sli",
           "sri", "sshll", "ushll", "sqshl", "uqshl", "sqshlu"}) &&
-      !cat("SimdShiftImm") && !cat("SimdSc"))
+      !cat("SimdShiftImm") && !cat("SimdSc") &&
+      !(in({"sqshl", "uqshl"}) && cat("Simd3Same")))
     return "shift-imm decoded as [" + h + "]";
   // narrowing add/sub high-half + widening add/sub (AdvSimdThreeDiff; no indexed
   // form, so strictly three-diff)
@@ -294,40 +321,129 @@ std::string Inconsistent(const std::string& mn, const std::string& h) {
         return "three-same " + base + " decoded as opcode " + std::to_string(op) +
                " (expected " + std::to_string(e.second) + ")";
   }
-  // Any objdump-decodable instruction that Berberis routes to UNDEF is a gap.
-  if (h == "UNDEF" && mn != "udf" && mn != "" && mn[0] != '<' && mn != "...") return "UNDEF vs " + mn;
+  // NOTE: "decodes to UNDEF" is deliberately NOT a mis-dispatch. On a corpus
+  // harvested from modern libraries most UNDEFs are ISA extensions outside the
+  // implemented baseline (SVE/SVE2, SME/SME2, FP8, FEAT_FHM, FEAT_FAMINMAX,
+  // FEAT_THE), where UNDEF is the correct answer. Undefined coverage is tracked
+  // separately, against a committed baseline, by UndefinedCoverageBaseline.
   return "";
 }
 
-TEST(DecoderObjdumpDiff, RasterizerRange) {
-  const char* path = std::getenv("DIGITALIS_RAST_ENC");
-  if (!path) {
-    GTEST_SKIP() << "set DIGITALIS_RAST_ENC=<enc-mnemonic file> to run";
-  }
+struct Entry {
+  uint32_t enc;
+  std::string mnemonic;
+};
+
+// Locates the committed corpus. DIGITALIS_RAST_ENC overrides it, which is how a
+// much larger local sweep is run (the committed file is capped per mnemonic to
+// stay a reviewable size; harvest_encodings.py --cap 0 produces the full set).
+std::string CorpusPath(const char* name) {
+  if (const char* env = std::getenv("DIGITALIS_RAST_ENC")) return env;
+  return android::base::GetExecutableDirectory() + "/" + name;
+}
+
+std::vector<Entry> LoadCorpus(const std::string& path) {
+  std::vector<Entry> out;
   std::ifstream f(path);
-  ASSERT_TRUE(f.good()) << "cannot open " << path;
+  if (!f.good()) return out;
   std::string line;
-  int checked = 0, mismatches = 0;
   while (std::getline(f, line)) {
+    // Skip comments and blanks. Without this the header lines parse as data and
+    // report as bogus "UNDEF vs ARM64" mismatches.
+    if (line.empty() || line[0] == '#') continue;
     std::istringstream ss(line);
     std::string enc_hex, mn;
     if (!(ss >> enc_hex >> mn)) continue;
-    uint32_t enc = static_cast<uint32_t>(std::strtoul(enc_hex.c_str(), nullptr, 16));
-    Recorder rec;
-    Recorder::Decoder dec(&rec);
-    rec.h.clear();
-    dec.Decode(reinterpret_cast<const uint16_t*>(&enc));
-    checked++;
-    std::string why = Inconsistent(mn, rec.h);
+    out.push_back({static_cast<uint32_t>(std::strtoul(enc_hex.c_str(), nullptr, 16)), mn});
+  }
+  return out;
+}
+
+std::string DecodeOf(uint32_t enc) {
+  Recorder rec;
+  Recorder::Decoder dec(&rec);
+  rec.h.clear();
+  dec.Decode(reinterpret_cast<const uint16_t*>(&enc));
+  return rec.h;
+}
+
+// Mis-dispatch gate. This is the check no JIT-vs-interpreter differential can
+// make: both tiers decode through the same Decoder, so a decoder that routes an
+// encoding to the wrong handler is invisible to them and produces identical
+// wrong answers. objdump is an independent implementation of the same ARM ARM
+// tables, so a disagreement here is a decoder bug in almost every case.
+TEST(DecoderObjdumpDiff, NoMisdispatch) {
+  auto corpus = LoadCorpus(CorpusPath(kCorpusFile));
+  ASSERT_FALSE(corpus.empty()) << "corpus not found next to the test binary";
+  int mismatches = 0;
+  for (const auto& e : corpus) {
+    std::string h = DecodeOf(e.enc);
+    std::string why = Inconsistent(e.mnemonic, h);
     if (!why.empty()) {
       mismatches++;
-      if (mismatches <= 80)
-        ADD_FAILURE() << "0x" << enc_hex << " objdump=" << mn << " berberis=[" << rec.h
-                      << "]  <-- " << why;
+      if (mismatches <= 80) {
+        ADD_FAILURE() << std::hex << "0x" << e.enc << std::dec << " objdump=" << e.mnemonic
+                      << " berberis=[" << h << "]  <-- " << why;
+      }
     }
   }
-  fprintf(stderr, "DecoderObjdumpDiff: checked=%d mismatches=%d\n", checked, mismatches);
+  fprintf(stderr, "DecoderObjdumpDiff: checked=%zu mismatches=%d\n", corpus.size(), mismatches);
   EXPECT_EQ(mismatches, 0);
+}
+
+// Undefined-coverage baseline.
+//
+// An encoding that objdump names but Berberis decodes as Undefined is a
+// coverage gap, not a mis-dispatch. On a corpus harvested from current
+// libraries most such gaps are ISA extensions Digitalis does not implement
+// (SVE/SVE2, SME/SME2, FP8, FEAT_FHM, FEAT_FAMINMAX, FEAT_THE), where Undefined
+// is exactly right. Failing on those would make the gate useless.
+//
+// So the assertion is on the SET of mnemonics that decode to Undefined, against
+// a committed baseline, and it is deliberately asymmetric:
+//   * a mnemonic that newly decodes to Undefined FAILS --- that is a decoder
+//     regression, something that used to be handled and no longer is;
+//   * a baseline mnemonic that now decodes is reported, not failed --- that is
+//     someone implementing an instruction, and the test should not block it.
+//     Prune the baseline file in the same commit.
+TEST(DecoderObjdumpDiff, UndefinedCoverageBaseline) {
+  auto corpus = LoadCorpus(CorpusPath(kCorpusFile));
+  ASSERT_FALSE(corpus.empty()) << "corpus not found next to the test binary";
+
+  // The baseline always sits next to the test binary; DIGITALIS_RAST_ENC only
+  // overrides the corpus, never the baseline.
+  std::set<std::string> baseline;
+  {
+    std::ifstream f(android::base::GetExecutableDirectory() + "/" + kUndefinedBaselineFile);
+    ASSERT_TRUE(f.good()) << "missing undefined-coverage baseline";
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      baseline.insert(line);
+    }
+  }
+
+  std::set<std::string> undefined_now;
+  for (const auto& e : corpus) {
+    if (DecodeOf(e.enc) == "UNDEF") undefined_now.insert(e.mnemonic);
+  }
+
+  std::vector<std::string> regressed, implemented;
+  for (const auto& mn : undefined_now)
+    if (!baseline.count(mn)) regressed.push_back(mn);
+  for (const auto& mn : baseline)
+    if (!undefined_now.count(mn)) implemented.push_back(mn);
+
+  for (const auto& mn : implemented) {
+    fprintf(stderr,
+            "DecoderObjdumpDiff: '%s' now decodes -- drop it from %s\n",
+            mn.c_str(),
+            kUndefinedBaselineFile);
+  }
+  std::string detail;
+  for (const auto& mn : regressed) detail += " " + mn;
+  EXPECT_TRUE(regressed.empty())
+      << "these mnemonics newly decode to Undefined (decoder coverage regression):" << detail;
 }
 
 // MSR (immediate) to a PSTATE field (CRn=0b0100) must decode to Nop, not
