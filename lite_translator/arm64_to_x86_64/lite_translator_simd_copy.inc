@@ -203,6 +203,29 @@
     //
     // PSHUFB is SSSE3 (universal on x86_64 emulator hosts), PSHUFD is
     // SSE2; no host gate needed.
+    // DUP (scalar): Vd = zero-extend(Vn.element[index]) — e.g. `mov s1,
+    // v0.s[1]`, the scalar lane-extract compilers emit constantly around
+    // horizontal reductions. Three byte-shifts: PSRLDQ brings the element to
+    // byte 0 (zero-filling from the top, but bytes above the element within
+    // the low lane may still hold neighbours), then a PSLLDQ/PSRLDQ pair
+    // clears everything above esize. All immediates, no masks, SSE2-only.
+    if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupScalar && esize != 0) {
+      SimdRegister xmm = AllocTempSimdReg();
+      if (!success()) { return; }
+      int32_t off_vn = VRegOffset(args.rn);
+      as_.Movdqu(xmm, {.base = Assembler::rbp, .disp = off_vn});
+      const int8_t elem_off = static_cast<int8_t>(index * esize);
+      if (elem_off != 0) {
+        as_.Psrldq(xmm, elem_off);
+      }
+      const int8_t clear = static_cast<int8_t>(16 - esize);
+      as_.Pslldq(xmm, clear);
+      as_.Psrldq(xmm, clear);
+      int32_t off_vd = VRegOffset(args.rd);
+      as_.Movdqu({.base = Assembler::rbp, .disp = off_vd}, xmm);
+      return;
+    }
+
     if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupElement && esize != 0) {
       if (esize == 8 && !args.q) { success_ = false; return; }
 

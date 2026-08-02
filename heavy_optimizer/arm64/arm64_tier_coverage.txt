@@ -78,8 +78,8 @@ bc.vc 1 1 1
 bc.vs 2 2 2
 bcax 35 0 0
 bfcvt 1 1 1
-bfcvtn 128 128 0
-bfcvtn2 45 45 0
+bfcvtn 128 128 128
+bfcvtn2 45 45 45
 bfdot 128 128 128
 bfi 128 128 128
 bfmla 1 0 0
@@ -156,11 +156,11 @@ cinc 128 128 128
 cinv 128 128 128
 clrex 1 1 1
 clz 128 128 128
-cmeq 128 124 112
-cmge 128 111 103
-cmgt 128 128 76
-cmhi 128 128 89
-cmhs 128 128 106
+cmeq 128 124 124
+cmge 128 111 111
+cmgt 128 128 128
+cmhi 128 128 128
+cmhs 128 128 128
 cmle 42 41 41
 cmlt 128 96 96
 cmn 128 128 128
@@ -288,7 +288,7 @@ fnmadd 128 128 128
 fnmsub 128 128 128
 fnmul 128 128 128
 frecpe 124 106 106
-frecps 128 128 0
+frecps 128 128 126
 frint32z 2 0 0
 frint64z 1 0 0
 frinta 128 128 99
@@ -299,7 +299,7 @@ frintp 128 128 114
 frintx 128 128 128
 frintz 128 128 118
 frsqrte 44 35 35
-frsqrts 50 50 0
+frsqrts 50 50 38
 fscale 1 0 0
 fsqrt 128 128 128
 fsub 128 128 128
@@ -463,7 +463,7 @@ maddpt 13 13 13
 mla 128 128 128
 mls 128 128 128
 mneg 128 128 128
-mov 128 126 126
+mov 128 128 128
 movi 128 128 128
 movk 128 128 128
 movz 1 1 1
@@ -633,7 +633,7 @@ sqneg 90 90 90
 sqrdmlah 5 5 0
 sqrdmlsh 7 7 0
 sqrdmulh 128 128 99
-sqrshl 128 128 0
+sqrshl 128 128 90
 sqrshr 8 0 0
 sqrshrn 128 128 128
 sqrshrn2 128 128 128
@@ -652,10 +652,10 @@ sqxtun 128 128 128
 sqxtun2 128 128 128
 srhadd 128 128 128
 sri 128 128 128
-srshl 128 128 0
+srshl 128 128 116
 srshr 128 128 123
 srsra 128 128 128
-sshl 128 128 1
+sshl 128 128 124
 sshll 128 128 128
 sshll2 128 128 128
 sshr 128 128 120
@@ -820,7 +820,7 @@ urshr 128 128 128
 ursqrte 1 1 1
 ursra 28 28 28
 usdot 128 128 128
-ushl 128 128 4
+ushl 128 128 114
 ushll 128 128 128
 ushll2 128 128 128
 ushr 128 128 128

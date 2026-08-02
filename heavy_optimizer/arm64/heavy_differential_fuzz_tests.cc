@@ -2025,4 +2025,392 @@ TEST_F(Arm64HeavyDifferentialFuzz, VectorRegReadAtTwoWidths) {
 }
 
 }  // namespace
+
+// FRECPS / FRSQRTS (vector) against the interpreter.
+//
+// These two carry architectural special cases that the generic corpora cannot
+// reach, because they only appear for particular VALUES rather than particular
+// encodings: a lane whose product is 0*inf must saturate to 2.0 (FRECPS) or 1.5
+// (FRSQRTS) instead of propagating the NaN the multiply produces, while a lane
+// with a NaN INPUT must become the default qNaN. Distinguishing the two is the
+// whole reason the lowering carries two cmpunord masks, so the corpus seeds
+// lanes from a pool of specials (zeros, infinities, NaNs, denormals) often
+// enough that both paths are hit, and mixes in random bits for the normal path.
+//
+// FP three-same is excluded from the generic NeonThreeSame generators, so
+// without this the heavy lowering would have no differential coverage at all.
+TEST_F(Arm64HeavyDifferentialFuzz, FrecpsFrsqrtsVector) {
+  Seed(0xF2EC95A5ULL);
+  const int kIters = 4000 * FuzzScale();
+
+  // (bit23:22, is_double) for FRECPS.4S/.2D and FRSQRTS.4S/.2D.
+  struct Form {
+    uint32_t szbits;
+    bool is_double;
+  };
+  static const Form kForms[] = {
+      {0b00, false},  // FRECPS  .2S/.4S
+      {0b01, true},   // FRECPS  .2D
+      {0b10, false},  // FRSQRTS .2S/.4S
+      {0b11, true},   // FRSQRTS .2D
+  };
+  static const uint64_t kSpecialD[] = {
+      0x0000000000000000ULL,  // +0.0
+      0x8000000000000000ULL,  // -0.0
+      0x7FF0000000000000ULL,  // +inf
+      0xFFF0000000000000ULL,  // -inf
+      0x7FF8000000000000ULL,  // qNaN
+      0x7FF0000000000001ULL,  // sNaN
+      0x3FF0000000000000ULL,  // 1.0
+      0x4000000000000000ULL,  // 2.0
+      0x0000000000000001ULL,  // smallest denormal
+      0x7FEFFFFFFFFFFFFFULL,  // max normal
+  };
+  static const uint32_t kSpecialS[] = {
+      0x00000000u, 0x80000000u, 0x7F800000u, 0xFF800000u, 0x7FC00000u,
+      0x7F800001u, 0x3F800000u, 0x40000000u, 0x00000001u, 0x7F7FFFFFu,
+  };
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const Form& f = kForms[Rnd() % 4];
+    // .1D (size=1, Q=0) is ARM-reserved.
+    const bool q = f.is_double ? true : ((Rnd() & 1) != 0);
+    const int rd = Rnd() % 32;
+    const int rn = Rnd() % 32;
+    const int rm = Rnd() % 32;
+    uint32_t code[1] = {static_cast<uint32_t>(
+        0x0E20FC00u | (q ? (1u << 30) : 0u) | (f.szbits << 22) |
+        (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) |
+        static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    // Seed Vn/Vm with specials most of the time so 0*inf and NaN-input lanes
+    // actually occur; fully random bits are overwhelmingly NaN for FP32.
+    auto seed_vreg = [&](int reg) {
+      uint64_t lo, hi;
+      if (f.is_double) {
+        lo = (Rnd() % 4) ? kSpecialD[Rnd() % 10] : Rnd64();
+        hi = (Rnd() % 4) ? kSpecialD[Rnd() % 10] : Rnd64();
+      } else {
+        auto word = [&]() -> uint64_t {
+          return (Rnd() % 4) ? kSpecialS[Rnd() % 10] : (Rnd() & 0xffffffffULL);
+        };
+        lo = word() | (word() << 32);
+        hi = word() | (word() << 32);
+      }
+      in.v[reg] = (static_cast<unsigned __int128>(hi) << 64) | lo;
+    };
+    seed_vreg(rn);
+    seed_vreg(rm);
+
+    std::string desc;
+    // FPSR is not compared: these set IOC/IDC through paths whose emulation the
+    // tiers are allowed to differ on, exactly as the other FP classes here.
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "FrecpsFrsqrtsVector: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few FRECPS/FRSQRTS encodings";
+}
+
+
+// BFCVTN / BFCVTN2 against the interpreter.
+//
+// BF16 is the top 16 bits of an FP32, so the conversion is a round-to-nearest-
+// even of the discarded half, with one exception: a NaN input must yield a
+// quiet BF16 NaN, because rounding can carry all the way into the exponent and
+// turn a NaN into an infinity. The corpus therefore leans on values where the
+// low half is exactly a tie (0x8000) with both even and odd keep-bits, on
+// 0x7F7FFFFF where the round carries out of the mantissa entirely, and on the
+// NaN/infinity encodings either side of that boundary.
+//
+// BFCVTN2 additionally has to preserve the low 64 bits of Vd, which only shows
+// up when Vd is seeded with something non-zero -- RandomInit does that, and both
+// legs start from the same Vd.
+TEST_F(Arm64HeavyDifferentialFuzz, BfcvtnVector) {
+  Seed(0xBF16C0DEULL);
+  const int kIters = 4000 * FuzzScale();
+  static const uint32_t kSpecialS[] = {
+      0x00000000u,  // +0.0
+      0x80000000u,  // -0.0
+      0x7F800000u,  // +inf
+      0xFF800000u,  // -inf
+      0x7FC00000u,  // qNaN
+      0x7F800001u,  // sNaN (rounding alone would carry it to +inf)
+      0x7F7FFFFFu,  // max normal: rounds up out of the mantissa
+      0x3F808000u,  // exact tie, keep-bit even
+      0x3F818000u,  // exact tie, keep-bit odd
+      0x00000001u,  // smallest denormal
+      0x3F800000u,  // 1.0
+      0xBF800000u,  // -1.0
+  };
+  constexpr int kNumSpecial = sizeof(kSpecialS) / sizeof(kSpecialS[0]);
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const bool q = (Rnd() & 1) != 0;  // BFCVTN2 when set
+    const int rd = Rnd() % 32;
+    const int rn = Rnd() % 32;
+    uint32_t code[1] = {static_cast<uint32_t>(0x0EA16800u | (q ? (1u << 30) : 0u) |
+                                              (static_cast<uint32_t>(rn) << 5) |
+                                              static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    auto word = [&]() -> uint64_t {
+      return (Rnd() % 3) ? kSpecialS[Rnd() % kNumSpecial] : (Rnd() & 0xffffffffULL);
+    };
+    const uint64_t lo = word() | (word() << 32);
+    const uint64_t hi = word() | (word() << 32);
+    in.v[rn] = (static_cast<unsigned __int128>(hi) << 64) | lo;
+
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "BfcvtnVector: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few BFCVTN encodings";
+}
+
+
+// SRSHL / SQRSHL (vector, .2S/.4S) against the interpreter.
+//
+// The shift operand is the SIGNED LOW BYTE of each Vm lane -- the upper 24 bits
+// are ignored -- so the corpus deliberately seeds shift lanes whose upper bits
+// are garbage. The boundary shifts are where the arms of the lowering meet:
+// +31/+32 (left shift into and past the sign bit; VPSLLVD zeroing must match
+// ARM), -31/-32/-33 (rounding right shift at and past the element width, where
+// the result collapses to 0) and -128 (the most negative byte). Saturation
+// lanes (INT32_MIN/INT32_MAX inputs with small left shifts) drive SQRSHL's
+// back-shift overflow detector.
+TEST_F(Arm64HeavyDifferentialFuzz, SrshlSqrshlVector32) {
+  Seed(0x5259A57BULL);
+  const int kIters = 4000 * FuzzScale();
+  static const int8_t kShifts[] = {0,  1,  2,  30,  31,  32,  33,  63, 127,
+                                   -1, -2, -30, -31, -32, -33, -64, -127, -128};
+  constexpr int kNumShifts = sizeof(kShifts) / sizeof(kShifts[0]);
+  static const uint32_t kValues[] = {
+      0x00000000u, 0x00000001u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu,
+      0x40000000u, 0xC0000000u, 0x00008000u, 0xAAAAAAAAu, 0x55555555u,
+  };
+  constexpr int kNumValues = sizeof(kValues) / sizeof(kValues[0]);
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const bool sat = (Rnd() & 1) != 0;  // SQRSHL vs SRSHL
+    const bool q = (Rnd() & 1) != 0;
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    if (rm == rn) rm = (rm + 1) % 32;
+    // U=0, size=10; opcode 0b01010 (SRSHL) / 0b01011 (SQRSHL) at bits[15:11],
+    // bit10 set (three-same). Corpus ground truth: 0x4e6054c6 == srshl.
+    uint32_t code[1] = {static_cast<uint32_t>(
+        0x0EA05400u | (q ? (1u << 30) : 0u) | (sat ? (1u << 11) : 0u) |
+        (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) |
+        static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    auto data_word = [&]() -> uint64_t {
+      return (Rnd() % 3) ? kValues[Rnd() % kNumValues] : (Rnd() & 0xffffffffULL);
+    };
+    auto shift_word = [&]() -> uint64_t {
+      // Boundary shift in the low byte; garbage in the upper 24 bits half the
+      // time, to prove only the low byte is honoured.
+      uint32_t sh = static_cast<uint8_t>(kShifts[Rnd() % kNumShifts]);
+      if (Rnd() & 1) sh |= (Rnd() & 0xffffff00u);
+      return sh;
+    };
+    in.v[rn] = (static_cast<unsigned __int128>(data_word() | (data_word() << 32)) << 64) |
+               (data_word() | (data_word() << 32));
+    in.v[rm] = (static_cast<unsigned __int128>(shift_word() | (shift_word() << 32)) << 64) |
+               (shift_word() | (shift_word() << 32));
+
+    std::string desc;
+    // FPSR not compared: SQRSHL sets QC on saturation through a path whose
+    // emulation the tiers are allowed to differ on, as with the other classes.
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "SrshlSqrshlVector32: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SRSHL/SQRSHL encodings";
+}
+
+
+// SSHL / USHL (vector, .2S/.4S/.2D) against the interpreter.
+//
+// Same corpus philosophy as the rounding variants above, with the 64-bit lanes
+// included: the bail histogram over real apps put USHL.2D at the top of the
+// actionable list. The 64-bit arithmetic right shift is emulated (no VPSRAVQ
+// below AVX-512) via ((v ^ m) >>l s) ^ m with m the sign smear, so the
+// boundary shifts -63/-64/-65 and -128 are the lanes most worth hammering.
+TEST_F(Arm64HeavyDifferentialFuzz, SshlUshlVector) {
+  Seed(0x55AA55E1ULL);
+  const int kIters = 4000 * FuzzScale();
+  static const int8_t kShifts[] = {0,   1,   31,  32,  33,  63,   64,  65,
+                                   127, -1,  -31, -32, -33, -63,  -64, -65,
+                                   -127, -128};
+  constexpr int kNumShifts = sizeof(kShifts) / sizeof(kShifts[0]);
+  static const uint64_t kValues[] = {
+      0x0000000000000000ULL, 0x0000000000000001ULL, 0x7FFFFFFFFFFFFFFFULL,
+      0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL, 0x4000000000000000ULL,
+      0xAAAAAAAAAAAAAAAAULL, 0x5555555555555555ULL, 0x0000000080000000ULL,
+      0x123456789ABCDEF0ULL,
+  };
+  constexpr int kNumValues = sizeof(kValues) / sizeof(kValues[0]);
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const bool is_signed = (Rnd() & 1) != 0;  // SSHL vs USHL (U bit)
+    const bool is_64 = (Rnd() & 1) != 0;
+    const bool q = is_64 ? true : ((Rnd() & 1) != 0);
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    if (rm == rn) rm = (rm + 1) % 32;
+    // Three-same opcode 0b01000 at bits[15:11], bit10 set; U at bit29.
+    // Ground truth: 0x6ee14400 == ushl v0.2d, v0.2d, v1.2d.
+    uint32_t code[1] = {static_cast<uint32_t>(
+        0x0E204400u | (q ? (1u << 30) : 0u) | (is_signed ? 0u : (1u << 29)) |
+        ((is_64 ? 0b11u : 0b10u) << 22) | (static_cast<uint32_t>(rm) << 16) |
+        (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    auto data_word = [&]() -> uint64_t {
+      return (Rnd() % 3) ? kValues[Rnd() % kNumValues] : Rnd64();
+    };
+    auto shift_lane = [&](bool wide) -> uint64_t {
+      uint64_t sh = static_cast<uint8_t>(kShifts[Rnd() % kNumShifts]);
+      // Garbage above the low byte half the time: only bits [7:0] are the
+      // architectural shift amount.
+      if (Rnd() & 1) sh |= (Rnd64() << 8) & (wide ? ~0xFFULL : 0xFFFFFF00ULL);
+      return sh;
+    };
+    if (is_64) {
+      in.v[rn] = (static_cast<unsigned __int128>(data_word()) << 64) | data_word();
+      in.v[rm] = (static_cast<unsigned __int128>(shift_lane(true)) << 64) | shift_lane(true);
+    } else {
+      auto dw = [&]() -> uint64_t {
+        return (data_word() & 0xffffffffULL) | (data_word() << 32);
+      };
+      auto sw = [&]() -> uint64_t {
+        return (shift_lane(false) & 0xffffffffULL) | (shift_lane(false) << 32);
+      };
+      in.v[rn] = (static_cast<unsigned __int128>(dw()) << 64) | dw();
+      in.v[rm] = (static_cast<unsigned __int128>(sw()) << 64) | sw();
+    }
+
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "SshlUshlVector: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SSHL/USHL encodings";
+}
+
+// CMEQ/CMGT/CMHI/CMGE/CMHS .2D against the interpreter. The unsigned forms go
+// through a sign-bias XOR before PCMPGTQ, so the corpus leans on lane pairs
+// that straddle the sign boundary -- (0x8000000000000000, 1) flips its answer
+// between the signed and unsigned orders -- plus equal lanes for the >= forms.
+TEST_F(Arm64HeavyDifferentialFuzz, CompareVector2D) {
+  Seed(0xC0DE2D2DULL);
+  const int kIters = 4000 * FuzzScale();
+  static const uint64_t kValues[] = {
+      0x0000000000000000ULL, 0x0000000000000001ULL, 0x7FFFFFFFFFFFFFFFULL,
+      0x8000000000000000ULL, 0x8000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL,
+      0x0123456789ABCDEFULL,
+  };
+  constexpr int kNumValues = sizeof(kValues) / sizeof(kValues[0]);
+  // (U bit, opcode bits[15:11]) per ARM ARM three-same:
+  // CMGT=U0/0b00110, CMGE=U0/0b00111, CMHI=U1/0b00110, CMHS=U1/0b00111,
+  // CMEQ=U1/0b10001.
+  struct Form {
+    uint32_t u;
+    uint32_t opc;
+  };
+  static const Form kForms[] = {{0, 0b00110}, {0, 0b00111}, {1, 0b00110},
+                                {1, 0b00111}, {1, 0b10001}};
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const Form& f = kForms[Rnd() % 5];
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    uint32_t code[1] = {static_cast<uint32_t>(
+        0x4EE00400u | (f.u << 29) | (f.opc << 11) | (static_cast<uint32_t>(rm) << 16) |
+        (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    auto lane = [&]() -> uint64_t {
+      return (Rnd() % 4) ? kValues[Rnd() % kNumValues] : Rnd64();
+    };
+    in.v[rn] = (static_cast<unsigned __int128>(lane()) << 64) | lane();
+    // Equal lanes a third of the time so the >= vs > distinction is exercised.
+    in.v[rm] = (Rnd() % 3 == 0) ? in.v[rn]
+                                : (static_cast<unsigned __int128>(lane()) << 64) | lane();
+
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "CompareVector2D: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few .2D compare encodings";
+}
+
+// DUP (scalar) against the interpreter, exhaustively: every valid imm5
+// (element size x index) with randomized source registers and values. The
+// space is tiny, so no sampling -- all 31 imm5 shapes per iteration.
+TEST_F(Arm64HeavyDifferentialFuzz, DupScalarExhaustive) {
+  Seed(0xD0B5CA1AULL);
+  const int kIters = 200 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    for (uint32_t imm5 = 1; imm5 < 32; imm5++) {
+      const int rd = Rnd() % 32;
+      const int rn = Rnd() % 32;
+      // 01011110000 imm5 000001 Rn Rd; ground truth 0x5e0c0401 == mov s1,v0.s[1].
+      uint32_t code[1] = {static_cast<uint32_t>(
+          0x5E000400u | (imm5 << 16) | (static_cast<uint32_t>(rn) << 5) |
+          static_cast<uint32_t>(rd))};
+      InitState in = RandomInit();
+      std::string desc;
+      Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+      if (r == kDeclined) continue;
+      compared++;
+      if (r == kDiverge) {
+        ADD_FAILURE() << "iter " << iter << " imm5=" << imm5 << " " << desc;
+        return;
+      }
+    }
+  }
+  fprintf(stderr, "DupScalarExhaustive: compared=%d\n", compared);
+  EXPECT_GT(compared, 1000) << "heavy accepted too few DUP-scalar encodings";
+}
+
 }  // namespace berberis
