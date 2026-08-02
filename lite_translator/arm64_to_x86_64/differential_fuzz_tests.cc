@@ -1093,4 +1093,42 @@ TEST_F(Arm64DifferentialFuzz, MrsFpcr) {
   EXPECT_GT(compared, 400);
 }
 
+
+// SHA-256 (SHA256H/H2/SU0/SU1) lite-vs-interpreter. Bit-exact hashing is the
+// point; inputs are fully random V-registers. The lite lowering stages the
+// working state in ThreadState scratch, so this also exercises that the scratch
+// round-trip reconstructs the exact result.
+TEST_F(Arm64DifferentialFuzz, Sha256) {
+  Seed(0x54A25611ULL);
+  const int kIters = 3000 * FuzzScale();
+  struct Form { uint32_t base; bool three; };
+  static const Form kForms[] = {
+      {0x5E004000u, true},   // sha256h   (opcode 100)
+      {0x5E005000u, true},   // sha256h2  (opcode 101)
+      {0x5E006000u, true},   // sha256su1 (opcode 110)
+      {0x5E282800u, false},  // sha256su0 (opcode 10)
+  };
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const Form& f = kForms[Rnd() % 4];
+    const int rd = static_cast<int>(Rnd() % 32);
+    const int rn = static_cast<int>(Rnd() % 32);
+    const int rm = static_cast<int>(Rnd() % 32);
+    uint32_t enc = f.base | static_cast<uint32_t>(rd) | (static_cast<uint32_t>(rn) << 5);
+    if (f.three) enc |= (static_cast<uint32_t>(rm) << 16);
+    uint32_t code[1] = {enc};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " enc=0x" << std::hex << enc << " " << desc;
+      return;
+    }
+  }
+  fprintf(stderr, "lite Sha256: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "lite accepted too few SHA-256 encodings";
+}
+
 }  // namespace berberis
