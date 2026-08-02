@@ -32,6 +32,14 @@ class ExecRegionElfBackedFactory {
   // The size is ignored here since it is property of the elf-file
   // It is only used to check that it does not exceed kExecRegionSize
   static ExecRegion Create(size_t size);
+
+  // region digitalis
+  // Non-fatal counterpart of Create, for the shared CodePool::TryResetExecRegion
+  // path. The ELF-backed region is mapped from a fixed prebuilt file rather than
+  // allocated on demand, so there is no partial-failure mode to recover from
+  // here; delegate to Create and keep the interface uniform across factories.
+  static ExecRegion TryCreate(size_t size) { return Create(size); }
+  // endregion
 };
 
 }  // namespace berberis

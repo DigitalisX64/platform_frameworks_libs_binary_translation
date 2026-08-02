@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <type_traits>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/base/arena_alloc.h"
@@ -95,7 +96,16 @@ class CodePool {
     // Note that pointer arithmetic on nullptr is undefined behavior.
     CHECK_NE(current_address_, nullptr);
     if (exec_.end() < current_address_ + size) {
-      ResetExecRegion(size);
+      // region digitalis
+      // A failed exec-region allocation must not kill the guest app: the
+      // interpreter can always run the region. Return the null code address so
+      // the caller installs an interpreted entry instead. Keep the old region
+      // attached (current_address_ still points into it) so previously
+      // installed code stays valid and a later Add can retry.
+      if (!TryResetExecRegion(size)) {
+        return kNullHostCodeAddr;
+      }
+      // endregion
     }
 
     const uint8_t* result = current_address_;
@@ -125,6 +135,36 @@ class CodePool {
     exec_ = ExecRegionFactory::Create(std::max(size, ExecRegionFactory::kExecRegionSize));
     current_address_ = exec_.begin();
   }
+
+  // region digitalis
+  // Non-fatal variant: returns false and leaves the pool untouched when the
+  // host cannot provide a new executable region (memory pressure). See the
+  // call site in Add().
+  // Detects a factory that offers a non-fatal TryCreate. Factories without one
+  // (test mocks, the ELF-backed prebuilt region) keep using Create.
+  template <typename F, typename = void>
+  struct HasTryCreate : std::false_type {};
+  template <typename F>
+  struct HasTryCreate<F, std::void_t<decltype(F::TryCreate(std::size_t{}))>> : std::true_type {};
+
+  [[nodiscard]] bool TryResetExecRegion(uint32_t size = ExecRegionFactory::kExecRegionSize) {
+    const uint32_t want = std::max(size, ExecRegionFactory::kExecRegionSize);
+    ExecRegion fresh;
+    if constexpr (HasTryCreate<ExecRegionFactory>::value) {
+      fresh = ExecRegionFactory::TryCreate(want);
+    } else {
+      fresh = ExecRegionFactory::Create(want);
+    }
+    if (fresh.begin() == nullptr) {
+      return false;
+    }
+    detached_size_ += exec_.size();
+    exec_.Detach();
+    exec_ = std::move(fresh);
+    current_address_ = exec_.begin();
+    return true;
+  }
+  // endregion
 
   size_t GetTotalSize() const { return detached_size_ + (current_address_ - exec_.begin()); }
 

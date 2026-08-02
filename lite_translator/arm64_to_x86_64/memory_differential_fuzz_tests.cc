@@ -651,4 +651,115 @@ TEST_F(Arm64MemoryDifferentialFuzz, MixedMemoryRegions) {
 
 }  // namespace
 
+
+// LDP/STP with WRITEBACK (pre-index and post-index), including SP as the base.
+//
+// Two coverage holes met here, which is why this shipped: LoadStorePair above
+// only ever emits the signed-offset form (idx=0b010), never pre-index (0b011)
+// or post-index (0b001); and every generator picks rn from Rnd()%31, so r31 --
+// which for load/store means SP, not XZR -- is never a base. Together that left
+// `stp x29,x30,[sp,#-0x20]!` / `ldp x29,x30,[sp],#0x20`, i.e. the standard
+// AArch64 function prologue and epilogue, with no differential coverage at all.
+//
+// The writeback must update the base (SP included) and the access must use the
+// pre-index address for 0b011 and the ORIGINAL base for 0b001. RunDifferential
+// compares sp and memory, so a bad writeback or a wrong access address shows up.
+uint32_t EncLoadStorePairIdx(int opc, int l, int idx, int imm7, int rt2, int rn, int rt) {
+  return (static_cast<uint32_t>(opc) << 30) | (0b101u << 27) |
+         (static_cast<uint32_t>(idx) << 23) | (static_cast<uint32_t>(l) << 22) |
+         ((static_cast<uint32_t>(imm7) & 0x7F) << 15) | (static_cast<uint32_t>(rt2) << 10) |
+         (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rt);
+}
+
+TEST_F(Arm64MemoryDifferentialFuzz, EncodersMatchKnownPairIdxEncodings) {
+  // Ground truth from a real libAemonPlayer prologue/epilogue.
+  EXPECT_EQ(EncLoadStorePairIdx(0b10, 1, 0b001, 4, 30, 31, 29), 0xA8C27BFDu);   // ldp x29,x30,[sp],#0x20
+  EXPECT_EQ(EncLoadStorePairIdx(0b10, 0, 0b011, -4, 30, 31, 29), 0xA9BE7BFDu);  // stp x29,x30,[sp,#-0x20]!
+}
+
+TEST_F(Arm64MemoryDifferentialFuzz, LoadStorePairWritebackAndSpBase) {
+  Seed(0x59B45EULL);
+  int iters = 3000 * FuzzScale();
+  int compared = 0;
+  for (int i = 0; i < iters; i++) {
+    // opc: 00 = 32-bit, 10 = 64-bit (01 = LDPSW is load-only, covered above).
+    const int opc = (Rnd() & 1) ? 0b10 : 0b00;
+    const int l = static_cast<int>(Rnd() & 1);
+    const int idx = (Rnd() & 1) ? 0b011 : 0b001;  // pre / post index
+    // Half the time use SP as the base -- the case real prologues use.
+    const bool sp_base = (Rnd() & 1) != 0;
+    int rn = sp_base ? 31 : static_cast<int>(Rnd() % 31);
+    int rt = static_cast<int>(Rnd() % 31);
+    int rt2 = static_cast<int>(Rnd() % 31);
+    // A load with rt == rt2, or writeback into a loaded register, is
+    // CONSTRAINED UNPREDICTABLE; skip those rather than compare them.
+    if (l == 1 && rt2 == rt) continue;
+    if (l == 1 && !sp_base && (rn == rt || rn == rt2)) continue;
+    const size_t scale = (opc == 0b10) ? 8 : 4;
+    const int imm7 = static_cast<int>(Rnd() % 16) - 8;
+
+    SeedScratch();
+    InitState in = RandomInit();
+    // Point the base into the scratch window, aligned, with room either way.
+    uint64_t base = (ScratchBase() + kWindowBase) & ~(static_cast<uint64_t>(scale) - 1);
+    if (sp_base) {
+      in.sp = base;
+    } else {
+      in.x[rn] = base;
+    }
+
+    uint32_t code[1] = {EncLoadStorePairIdx(opc, l, idx, imm7, rt2, rn, rt)};
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, &desc);
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << i << " sp_base=" << sp_base << " idx=" << idx << ": " << desc;
+      return;
+    }
+    if (r == kMatch) compared++;
+  }
+  fprintf(stderr, "LoadStorePairWritebackAndSpBase: compared=%d/%d\n", compared, iters);
+  EXPECT_GT(compared, 0);
+}
+
+
+// The real AArch64 function prologue as a REGION: an SP-writeback STP followed
+// by instructions that READ the updated SP.
+//
+// The single-instruction test above proves the writeback value is right, but
+// says nothing about whether later instructions in the SAME region observe it.
+// That is the region-structural question, and it is exactly the shape every
+// compiled function starts with:
+//     stp x29, x30, [sp, #-0x20]!   ; SP -= 0x20, writeback
+//     str x19, [sp, #0x10]          ; must use the NEW SP
+//     mov x29, sp                   ; ADD x29, SP, #0 -- must read the NEW SP
+TEST_F(Arm64MemoryDifferentialFuzz, FunctionPrologueRegionSpPropagation) {
+  Seed(0x9401060EULL);
+  int iters = 2000 * FuzzScale();
+  int compared = 0;
+  for (int i = 0; i < iters; i++) {
+    static const uint32_t kPrologue[] = {
+        0xA9BE7BFDu,  // stp x29, x30, [sp, #-0x20]!
+        0xF9000BF3u,  // str x19, [sp, #0x10]
+        0x910003FDu,  // mov x29, sp
+    };
+    uint32_t code[3] = {kPrologue[0], kPrologue[1], kPrologue[2]};
+
+    SeedScratch();
+    InitState in = RandomInit();
+    // SP starts in the scratch window, 16-aligned, with room below for the
+    // 0x20 pre-decrement.
+    in.sp = (ScratchBase() + kWindowBase) & ~static_cast<uint64_t>(15);
+
+    std::string desc;
+    Result r = RunDifferential(code, 3, in, &desc);
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << i << ": " << desc;
+      return;
+    }
+    if (r == kMatch) compared++;
+  }
+  fprintf(stderr, "FunctionPrologueRegionSpPropagation: compared=%d/%d\n", compared, iters);
+  EXPECT_GT(compared, 0);
+}
+
 }  // namespace berberis

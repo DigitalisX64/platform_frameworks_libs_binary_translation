@@ -30,6 +30,17 @@ class ExecRegionAnonymousFactory {
   static constexpr uint32_t kExecRegionSize = 4 * 1024 * 1024;
 
   static ExecRegion Create(size_t size);
+
+  // region digitalis
+  // Same as Create, but returns an EMPTY ExecRegion (begin() == nullptr)
+  // instead of aborting when the host cannot give us the mapping. Exec-region
+  // allocation is a best-effort optimization -- the interpreter can always run
+  // the region -- so a JIT allocation failure must never kill the guest app.
+  // Observed: a media app under memory pressure died with
+  // "mmap(size=4194304, prot=0x5, ...) failed: Out of memory" raised from
+  // MmapImplOrDie deep under TryLiteTranslateAndInstallRegion.
+  static ExecRegion TryCreate(size_t size);
+  // endregion
 };
 
 }  // namespace berberis
