@@ -139,8 +139,18 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> TryLiteTranslateAn
 
   size_t size = stop_pc - pc;
 
+
   if (success) {
-    return {true, InstallTranslated(&machine_code, pc, size, "lite"), size, kLiteTranslated};
+    // region digitalis
+    // A null install means the code pool could not get an executable region
+    // (memory pressure). Report failure so the caller installs an interpreted
+    // entry -- never kill the app over a JIT allocation.
+    HostCodePiece piece = InstallTranslated(&machine_code, pc, size, "lite");
+    if (piece.code == kNullHostCodeAddr) {
+      return {false, {}, 0, {}};
+    }
+    return {true, piece, size, kLiteTranslated};
+    // endregion
   }
 
   if (size == 0) {
@@ -155,10 +165,13 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> TryLiteTranslateAn
   CHECK(success);
   CHECK_EQ(stop_pc, params.end_pc);
 
-  return {true,
-          InstallTranslated(&another_machine_code, pc, size, "lite_range"),
-          size,
-          kLiteTranslated};
+  // region digitalis
+  HostCodePiece range_piece = InstallTranslated(&another_machine_code, pc, size, "lite_range");
+  if (range_piece.code == kNullHostCodeAddr) {
+    return {false, {}, 0, {}};
+  }
+  // endregion
+  return {true, range_piece, size, kLiteTranslated};
 }
 
 // translation profiling counters
@@ -217,7 +230,13 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndIn
   // boundaries (slower than the single lite region) — so discard and re-lite.
   if (!success) {
     if (has_in_region_backedge && size > 0) {
-      return {true, InstallTranslated(&machine_code, pc, size, "heavy"), size, kHeavyOptimized};
+      // region digitalis
+      HostCodePiece heavy_piece = InstallTranslated(&machine_code, pc, size, "heavy");
+      if (heavy_piece.code == kNullHostCodeAddr) {
+        return {false, {}, 0, {}};
+      }
+      return {true, heavy_piece, size, kHeavyOptimized};
+      // endregion
     }
     return {false, {}, 0, {}};
   }
@@ -233,7 +252,13 @@ std::tuple<bool, HostCodePiece, size_t, GuestCodeEntry::Kind> HeavyOptimizeAndIn
   if (number_of_instructions < GetGearUpMinInsns()) {
     return {false, {}, 0, {}};
   }
-  return {true, InstallTranslated(&machine_code, pc, size, "heavy"), size, kHeavyOptimized};
+  // region digitalis
+  HostCodePiece heavy_piece2 = InstallTranslated(&machine_code, pc, size, "heavy");
+  if (heavy_piece2.code == kNullHostCodeAddr) {
+    return {false, {}, 0, {}};
+  }
+  return {true, heavy_piece2, size, kHeavyOptimized};
+  // endregion
 }
 
 template <TranslationGear kGear = TranslationGear::kFirst>
