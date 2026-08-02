@@ -6745,6 +6745,239 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // built with the PCMPEQD-self ; PSRLD/PSRLQ 1 idiom. FP16 (needs an F16C
   // round-trip absent from the backend Gen inputs) bails to lite; the decoder
   // already rejects the reserved sz=1&&!Q (.1D) shape.
+  // SRSHL / SQRSHL (vector, 32-bit lanes only). Per-lane variable signed shift:
+  // the amount is the low BYTE of each Vm lane read as a signed value, left when
+  // non-negative and rounding-right when negative. SQRSHL additionally saturates
+  // the left arm.
+  //
+  // The lite tier lowers these by looping over lanes in GPRs with real branches,
+  // which is correct but slow and cannot be expressed in MachineIR without
+  // exploding the CFG. AVX2's per-lane variable shifts make a branchless
+  // lowering possible instead, so this is gated on AVX2 and on size=10; the
+  // other element widths have no variable-shift instruction below AVX512 and
+  // still fall back to lite. .2S/.4S is where this pays: of the SRSHL and SQRSHL
+  // encodings harvested from real libraries, 116/128 and 90/128 respectively are
+  // 32-bit lanes.
+  //
+  // Two x86 behaviours make the out-of-range cases fall out for free:
+  //   * VPSLLVD zeroes a lane when the (unsigned) count is >= 32, which is what
+  //     ARM wants for a left shift that pushes every bit out;
+  //   * VPSRAVD saturates the count to 31, so the rounding identity below
+  //     collapses to sign_fill + sign_bit == 0 for every |shift| >= 32, matching
+  //     ARM's "shift right by at least the element width is zero".
+  //
+  // The rounding uses the overflow-free identity
+  //     (a + (1 << (s-1))) >> s  ==  (a >> s) + ((a >> (s-1)) & 1)
+  // because computing the bias directly overflows for a == INT32_MAX, s == 1.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSrshl ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrshl) {
+    if (args.size != 0b10 || !host_platform::kHasAVX2) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_saturating = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrshl);
+
+    FpRegister xa = AllocTempSimdReg();
+    FpRegister xsh = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xa.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xsh.machine_reg(), vm_off);
+
+    // shift = sign-extend(Vm.lane[7:0]) — the ARM shift amount is the low byte
+    // of the lane, not the whole lane.
+    builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
+    builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+
+    // is_neg = shift < 0, i.e. 0 > shift.
+    FpRegister xisneg = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+
+    // Left arm: a << shift. Lanes where shift < 0 get a huge unsigned count and
+    // are zeroed by VPSLLVD; they are discarded by the select below.
+    FpRegister xleft = AllocTempSimdReg();
+    builder_.Gen<x86_64::VpsllvdXRegXRegXReg>(
+        xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+
+    if (is_saturating) {
+      // Overflow iff shifting back does not reproduce the input. This also
+      // covers shift >= 32: VPSLLVD zeroed the lane, so the back-shift differs
+      // from any non-zero input, and a zero input correctly stays zero.
+      FpRegister xback = AllocTempSimdReg();
+      builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
+          xback.machine_reg(), xleft.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xback.machine_reg(), xa.machine_reg());
+      // xback is now "no overflow" (all-ones where the round trip matched).
+
+      // saturated = (a >> 31) ^ INT32_MAX: 0 ^ MAX == INT32_MAX for a >= 0,
+      // -1 ^ MAX == INT32_MIN for a < 0.
+      FpRegister xsat = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xsat.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::PsradXRegImm>(xsat.machine_reg(), int8_t{31});
+      FpRegister xmax = AllocOnesSimdReg();
+      builder_.Gen<x86_64::PsrldXRegImm>(xmax.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+      builder_.Gen<x86_64::PxorXRegXReg>(xsat.machine_reg(), xmax.machine_reg());
+
+      // left = no_overflow ? left : saturated.
+      FpRegister xkeep = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xkeep.machine_reg(), xback.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xkeep.machine_reg(), xleft.machine_reg());
+      builder_.Gen<x86_64::PandnXRegXReg>(xback.machine_reg(), xsat.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xkeep.machine_reg(), xback.machine_reg());
+      xleft = xkeep;
+    }
+
+    // Right arm: s = -shift, then (a >> s) + ((a >> (s-1)) & 1).
+    FpRegister xs = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+    FpRegister xsm1 = AllocOnesSimdReg();  // all-ones == -1 per lane
+    builder_.Gen<x86_64::PadddXRegXReg>(xsm1.machine_reg(), xs.machine_reg());
+
+    FpRegister xhi = AllocTempSimdReg();
+    builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
+        xhi.machine_reg(), xa.machine_reg(), xs.machine_reg());
+    FpRegister xrb = AllocTempSimdReg();
+    builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
+        xrb.machine_reg(), xa.machine_reg(), xsm1.machine_reg());
+    FpRegister xone = AllocOnesSimdReg();
+    builder_.Gen<x86_64::PsrldXRegImm>(xone.machine_reg(), int8_t{31});  // 0x00000001
+    builder_.Gen<x86_64::PandXRegXReg>(xrb.machine_reg(), xone.machine_reg());
+    builder_.Gen<x86_64::PadddXRegXReg>(xhi.machine_reg(), xrb.machine_reg());
+
+    // result = is_neg ? right : left.
+    FpRegister xres = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xhi.machine_reg());
+    builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+
+    // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+    SetVRegFull(args.rd, xres, args.q);
+    return;
+  }
+
+  // FP vector FRECPS/FRSQRTS (.2S/.4S FP32, .2D FP64) — the Newton-Raphson step
+  // instructions. ARM ARM: FRECPS Vd = 2.0 - Vn*Vm, FRSQRTS Vd = (3.0 - Vn*Vm)/2,
+  // both fused (one rounding), with two architectural special cases:
+  //   * if either input is NaN the lane is the default qNaN;
+  //   * if the product would be 0*inf (i.e. the multiply itself is the only
+  //     source of a NaN), the lane saturates to 2.0 (FRECPS) or 1.5 (FRSQRTS)
+  //     rather than propagating that NaN.
+  // Detecting the second case is what the two cmpunord masks are for: the
+  // product is unordered while the inputs are not. Branchless mask ladder,
+  // op-for-op mirror of the lite tier's recipe, so the two tiers round
+  // identically. FP16 stays with lite (F16C round-trip, owned by that slice);
+  // the decoder rejects the reserved sz=1&&!Q (.1D) shape.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFrecpsV ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kFrsqrtsV) {
+    if (args.is_fp16 || !host_platform::kHasFMA) {
+      UndefinedReturningVoid();
+      return;
+    }
+    const bool is_double = (args.size & 1);
+    if (is_double && !args.q) {
+      UndefinedReturningVoid();  // .1D is ARM-reserved.
+      return;
+    }
+    const bool is_frecps = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFrecpsV);
+
+    const int64_t k_fma_bits_d = is_frecps ? int64_t{0x4000000000000000LL}    // +2.0
+                                           : int64_t{0x4008000000000000LL};   // +3.0
+    const int32_t k_fma_bits_s = is_frecps ? int32_t{0x40000000}              // +2.0
+                                           : int32_t{0x40400000};             // +3.0
+    const int64_t k_sat_bits_d = is_frecps ? int64_t{0x4000000000000000LL}    // +2.0
+                                           : int64_t{0x3FF8000000000000LL};   // +1.5
+    const int32_t k_sat_bits_s = is_frecps ? int32_t{0x40000000}              // +2.0
+                                           : int32_t{0x3FC00000};             // +1.5
+    constexpr int64_t kQnanBitsD = int64_t{0x7FF8000000000000LL};
+    constexpr int32_t kQnanBitsS = int32_t{0x7FC00000};
+    constexpr int64_t kTwoBitsD = int64_t{0x4000000000000000LL};
+    constexpr int32_t kTwoBitsS = int32_t{0x40000000};
+
+    // Broadcasts a lane-width constant across the whole register.
+    auto broadcast = [&](int64_t bits_d, int32_t bits_s) -> FpRegister {
+      FpRegister x = AllocTempSimdReg();
+      if (is_double) {
+        builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(),
+                                          GetImm(static_cast<uint64_t>(bits_d)));
+        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(x.machine_reg(), x.machine_reg());
+      } else {
+        builder_.Gen<x86_64::MovdXRegReg>(
+            x.machine_reg(), GetImm(static_cast<uint64_t>(static_cast<uint32_t>(bits_s))));
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+            x.machine_reg(), x.machine_reg(), int8_t{0});
+      }
+      return x;
+    };
+
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+
+    // input_unord = cmpunord(a, b): all-ones per lane iff either input is NaN.
+    FpRegister xiu = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xiu.machine_reg(), xn.machine_reg());
+    if (is_double) {
+      builder_.Gen<x86_64::CmpunordpdXRegXReg>(xiu.machine_reg(), xm.machine_reg());
+    } else {
+      builder_.Gen<x86_64::CmpunordpsXRegXReg>(xiu.machine_reg(), xm.machine_reg());
+    }
+
+    // mul_unord = cmpunord(a*b, a*b). Only the NaN-ness of the product is
+    // observed, never its value, so the product register is reused in place.
+    FpRegister xmul = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xmul.machine_reg(), xn.machine_reg());
+    if (is_double) {
+      builder_.Gen<x86_64::MulpdXRegXReg>(xmul.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::CmpunordpdXRegXReg>(xmul.machine_reg(), xmul.machine_reg());
+    } else {
+      builder_.Gen<x86_64::MulpsXRegXReg>(xmul.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::CmpunordpsXRegXReg>(xmul.machine_reg(), xmul.machine_reg());
+    }
+
+    // special = (NOT input_unord) AND mul_unord — the 0*inf lanes. PANDN writes
+    // (NOT dst) AND src, so input_unord stays live in xiu for the second select.
+    FpRegister xspecial = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xspecial.machine_reg(), xiu.machine_reg());
+    builder_.Gen<x86_64::PandnXRegXReg>(xspecial.machine_reg(), xmul.machine_reg());
+
+    // Normal path: K_fma - a*b in one rounding via VFNMADD231 (dst -= n*m).
+    FpRegister xres = broadcast(k_fma_bits_d, k_fma_bits_s);
+    if (is_double) {
+      builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+          xres.machine_reg(), xn.machine_reg(), xm.machine_reg());
+    } else {
+      builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(
+          xres.machine_reg(), xn.machine_reg(), xm.machine_reg());
+    }
+
+    // FRSQRTS halves the result. Dividing by exactly 2.0 only decrements the
+    // exponent, so the single-rounding invariant carries through.
+    if (!is_frecps) {
+      FpRegister xtwo = broadcast(kTwoBitsD, kTwoBitsS);
+      if (is_double) {
+        builder_.Gen<x86_64::DivpdXRegXReg>(xres.machine_reg(), xtwo.machine_reg());
+      } else {
+        builder_.Gen<x86_64::DivpsXRegXReg>(xres.machine_reg(), xtwo.machine_reg());
+      }
+    }
+
+    // select 1: special ? K_sat : fma_result.
+    FpRegister xsat = broadcast(k_sat_bits_d, k_sat_bits_s);
+    builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xspecial.machine_reg());
+    builder_.Gen<x86_64::PandnXRegXReg>(xspecial.machine_reg(), xres.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(xsat.machine_reg(), xspecial.machine_reg());
+
+    // select 2: input_unord ? qNaN : previous.
+    FpRegister xqnan = broadcast(kQnanBitsD, kQnanBitsS);
+    builder_.Gen<x86_64::PandXRegXReg>(xqnan.machine_reg(), xiu.machine_reg());
+    builder_.Gen<x86_64::PandnXRegXReg>(xiu.machine_reg(), xsat.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(xqnan.machine_reg(), xiu.machine_reg());
+
+    // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
+    SetVRegFull(args.rd, xqnan, args.q);
+    return;
+  }
+
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFabdV) {
     if (args.is_fp16) {
       // FP16 |a-b| via F16C round-trip: widen, packed FP32 SUB, sign-clear (0x7FFFFFFF
@@ -8810,6 +9043,108 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
   const int32_t vn_off = GetVRegOffset(args.rn);
 
   switch (args.opcode) {
+    // BFCVTN/BFCVTN2: narrow 4 FP32 lanes to 4 BF16 lanes. BF16 is the top 16
+    // bits of an FP32, so the conversion is a round-to-nearest-even of the
+    // discarded low half plus one architectural exception: a NaN input must
+    // produce a quiet BF16 NaN rather than whatever the rounded truncation
+    // happens to give, because rounding can carry into the exponent and turn a
+    // NaN into an infinity.
+    //
+    //   rounded  = (n + ((n >> 16) & 1) + 0x7FFF) >> 16     (RTNE)
+    //   nan_val  = (n >> 16) | 0x0040                       (quiet bit set)
+    //   nan_mask = (exp == 0xFF) & (mantissa != 0)
+    //   out      = nan_mask ? nan_val : rounded
+    //
+    // Branchless throughout, op-for-op mirror of the lite tier's recipe so both
+    // tiers round identically. Q selects which half of Vd is written: BFCVTN
+    // (Q=0) writes the low 64 bits and zeroes the rest, BFCVTN2 (Q=1) writes the
+    // high 64 bits and preserves the low half of Vd.
+    case Decoder::AdvSimdTwoRegMiscOpcode::kBfcvtn: {
+      if (args.size != 0b10) {
+        UndefinedReturningVoid();
+        return;
+      }
+      // Constants are materialized with AllocOnesSimdReg/AllocZeroedSimdReg
+      // rather than the assembler idiom of self-PCMPEQD/self-PXOR on a fresh
+      // temp: in MachineIR that reads the register before anything defines it
+      // and trips the lifetime analyzer's use-before-def check.
+      FpRegister xn = AllocTempSimdReg();
+      FpRegister xnan_val = AllocTempSimdReg();
+      FpRegister xtmp = AllocTempSimdReg();
+      FpRegister xexp = AllocTempSimdReg();
+      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+
+      // nan_val = (n >> 16) | 0x0040.
+      FpRegister xone = AllocOnesSimdReg();
+      builder_.Gen<x86_64::PsrldXRegImm>(xone.machine_reg(), int8_t{31});  // 0x00000001
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xnan_val.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PsrldXRegImm>(xnan_val.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xone.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xtmp.machine_reg(), int8_t{6});  // 0x00000040
+      builder_.Gen<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xtmp.machine_reg());
+
+      // bias = ((n >> 16) & 1) + 0x7FFF.
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PandXRegXReg>(xtmp.machine_reg(), xone.machine_reg());
+      FpRegister x7fff = AllocOnesSimdReg();
+      builder_.Gen<x86_64::PsrldXRegImm>(x7fff.machine_reg(), int8_t{17});  // 0x00007FFF
+      builder_.Gen<x86_64::PadddXRegXReg>(xtmp.machine_reg(), x7fff.machine_reg());
+
+      // rounded = (n + bias) >> 16, kept in the low 16 bits of each dword. The
+      // original lanes are needed afterwards for the NaN test, so keep a copy.
+      FpRegister xorig = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xorig.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xtmp.machine_reg());
+      builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+
+      // nan_mask = (n & 0x7F800000) == 0x7F800000  AND  (n & 0x007FFFFF) != 0.
+      FpRegister xexpmask = AllocOnesSimdReg();
+      builder_.Gen<x86_64::PsrldXRegImm>(xexpmask.machine_reg(), int8_t{24});  // 0x000000FF
+      builder_.Gen<x86_64::PslldXRegImm>(xexpmask.machine_reg(), int8_t{23});  // 0x7F800000
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xexp.machine_reg(), xorig.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xexp.machine_reg(), xexpmask.machine_reg());
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xexp.machine_reg(), xexpmask.machine_reg());
+
+      FpRegister xmantmask = AllocOnesSimdReg();
+      builder_.Gen<x86_64::PsrldXRegImm>(xmantmask.machine_reg(), int8_t{9});  // 0x007FFFFF
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xorig.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xtmp.machine_reg(), xmantmask.machine_reg());
+      FpRegister xzero = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
+      FpRegister xallones = AllocOnesSimdReg();
+      builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xallones.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xexp.machine_reg(), xtmp.machine_reg());
+
+      // out = (nan_mask & nan_val) | (~nan_mask & rounded).
+      builder_.Gen<x86_64::PandXRegXReg>(xnan_val.machine_reg(), xexp.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xexp.machine_reg());
+      builder_.Gen<x86_64::PandnXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xtmp.machine_reg());
+
+      // 4 dwords -> 4 words. PACKUSDW saturates unsigned, and every dword here
+      // holds a 16-bit value, so no lane is clamped; the result is duplicated
+      // into both 64-bit halves.
+      builder_.Gen<x86_64::PackusdwXRegXReg>(xnan_val.machine_reg(), xnan_val.machine_reg());
+
+      if (!args.q) {
+        // BFCVTN: low 64 bits of Vd, upper 64 zeroed.
+        builder_.Gen<x86_64::PslldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
+        SetVRegFull(args.rd, xnan_val, /*q=*/true);
+      } else {
+        // BFCVTN2: high 64 bits of Vd, low half preserved.
+        FpRegister xd = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
+        builder_.Gen<x86_64::PslldqXRegImm>(xd.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PslldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
+        builder_.Gen<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xd.machine_reg());
+        SetVRegFull(args.rd, xnan_val, /*q=*/true);
+      }
+      return;
+    }
+
     // REV16 V.<T>, V.<T> (size=00 only): reverse byte order within each 16-bit
     // lane via (Vn << 8) | (Vn >> 8) per halfword. PSLLW/PSRLW shift the 16-bit
     // lanes; OR recombines the swapped bytes without a PSHUFB mask table.

@@ -333,6 +333,8 @@
         "VmovapsXRegXReg",
         "VmovsdXRegXRegXReg",
         "VmovssXRegXRegXReg",
+        "VpsllvdXRegXRegXReg",
+        "VpsravdXRegXRegXReg",
         "Vzeroupper",
         "XchgbRegMemInsns",
         "XchgwRegMemInsns",
