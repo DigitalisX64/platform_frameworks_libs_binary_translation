@@ -63,10 +63,12 @@ cc_test_library {
     arch: {
         x86_64: {
             srcs: [
+                "ic_ivau_invalidation_test.cc",
                 "translator_x86_64_test.cc",
             ],
             header_libs: [
                 "berberis_test_utils_headers",
+                "libberberis_interpreter_arm64_headers",
                 "libberberis_lite_translator_headers",
             ],
         },
