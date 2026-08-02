@@ -79,11 +79,13 @@ cc_test_library {
         "libberberis_heavy_optimizer_arm64_headers",
         "libberberis_interpreter_arm64_headers",
         "libberberis_intrinsics_riscv64_headers",
+        "libberberis_lite_translator_headers",
         "libberberis_runtime_primitives_headers",
     ],
     srcs: [
         "frontend_tests.cc",
         "heavy_differential_fuzz_tests.cc",
         "heavy_memory_differential_fuzz_tests.cc",
+        "tier_coverage_test.cc",
     ],
 }

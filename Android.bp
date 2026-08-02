@@ -401,6 +401,7 @@ cc_test_host {
     data: [
         "decoder/arm64_test/arm64_decoder_encodings.txt",
         "decoder/arm64_test/arm64_decoder_undefined_baseline.txt",
+        "heavy_optimizer/arm64/arm64_tier_coverage.txt",
     ],
     arch: {
         x86_64: {
