@@ -953,4 +953,42 @@ TEST_F(Arm64DifferentialFuzz, HistoricalBugEncodingsInCorpus) {
 }
 
 }  // namespace
+
+// DUP (scalar) against the interpreter, exhaustively: every valid imm5
+// (element size x index) with randomized registers and values. The lite
+// lowering (three byte-shifts) was added alongside the heavy one -- before
+// that BOTH JIT tiers bailed and every `mov s1, v0.s[1]` ran interpreted --
+// so it gets the same differential treatment as any new lowering.
+TEST_F(Arm64DifferentialFuzz, DupScalarExhaustive) {
+  Seed(0xD0B5CA1BULL);
+  const int kIters = 200 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    for (uint32_t imm5 = 1; imm5 < 32; imm5++) {
+      const int rd = static_cast<int>(Rnd() % 32);
+      const int rn = static_cast<int>(Rnd() % 32);
+      // 01011110000 imm5 000001 Rn Rd; ground truth 0x5e0c0401 == mov s1,v0.s[1].
+      uint32_t code[1] = {static_cast<uint32_t>(
+          0x5E000400u | (imm5 << 16) | (static_cast<uint32_t>(rn) << 5) |
+          static_cast<uint32_t>(rd))};
+      InitState in = RandomInit();
+      std::string desc;
+      Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+      if (r == kDeclined) continue;
+      compared++;
+      if (r == kDiverge) {
+        ADD_FAILURE() << "iter " << iter << " imm5=" << imm5 << " " << desc;
+        return;
+      }
+    }
+  }
+  fprintf(stderr, "lite DupScalarExhaustive: compared=%d\n", compared);
+  EXPECT_GT(compared, 1000) << "lite accepted too few DUP-scalar encodings";
+}
+
+
+
+
+
+
 }  // namespace berberis

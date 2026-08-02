@@ -5929,9 +5929,47 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
     return;
   }
 
+  // DUP (scalar): Vd = zero-extend(Vn.element[index]) — e.g. `mov s1,
+  // v0.s[1]`, the scalar lane-extract compilers emit around horizontal
+  // reductions. Mirrors the lite recipe: PSRLDQ brings the element to byte 0
+  // (zero-filling from the top), then a PSLLDQ/PSRLDQ pair clears everything
+  // above esize. Stays in the XMM domain end to end.
+  if (args.opcode == Decoder::AdvSimdCopyOpcode::kDupScalar) {
+    const uint8_t imm5 = args.imm5;
+    uint8_t esize;
+    uint8_t index;
+    if (imm5 & 0b00001) {
+      esize = 1;
+      index = (imm5 >> 1) & 0xf;
+    } else if (imm5 & 0b00010) {
+      esize = 2;
+      index = (imm5 >> 2) & 0x7;
+    } else if (imm5 & 0b00100) {
+      esize = 4;
+      index = (imm5 >> 3) & 0x3;
+    } else if (imm5 & 0b01000) {
+      esize = 8;
+      index = (imm5 >> 4) & 0x1;
+    } else {
+      UndefinedReturningVoid();  // reserved imm5
+      return;
+    }
+    FpRegister xmm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xmm.machine_reg(), GetVRegOffset(args.rn));
+    const int8_t elem_off = static_cast<int8_t>(index * esize);
+    if (elem_off != 0) {
+      builder_.Gen<x86_64::PsrldqXRegImm>(xmm.machine_reg(), elem_off);
+    }
+    const int8_t clear = static_cast<int8_t>(16 - esize);
+    builder_.Gen<x86_64::PslldqXRegImm>(xmm.machine_reg(), clear);
+    builder_.Gen<x86_64::PsrldqXRegImm>(xmm.machine_reg(), clear);
+    builder_.GenSetSimd<16>(GetVRegOffset(args.rd), xmm.machine_reg());
+    return;
+  }
+
   if (args.opcode != Decoder::AdvSimdCopyOpcode::kDupGeneral) {
-    // Any remaining AdvSimdCopy opcode (e.g. kDupScalar) is not lowered by the
-    // optimizing tier; the lite translator handles it.
+    // Any remaining AdvSimdCopy opcode is not lowered by the optimizing tier;
+    // the lite translator handles it.
     UndefinedReturningVoid();
     return;
   }
@@ -6099,12 +6137,12 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // flip the per-lane sign bit of both operands (XOR with the width's sign
   // mask) to map the unsigned ordering onto the signed PCMPGT*. CMGE =
   // NOT(Vm > Vn); CMHS = NOT(biased Vm > biased Vn). The .2D (size=11) form
-  // needs PCMPGTQ (not allowlisted) and bails to the lite tier.
+  // uses PCMPGTQ and is gated on host SSE4.2.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmge ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhi ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmhs) {
-    if (args.size == 0b11) {
-      UndefinedReturningVoid();
+    if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
+      UndefinedReturningVoid();  // .2D needs PCMPGTQ.
       return;
     }
     const bool is_unsigned =
@@ -6135,9 +6173,13 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
           builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
           builder_.Gen<x86_64::PsllwXRegImm>(sign.machine_reg(), int8_t{15});
           break;
-        default:  // 0b10
+        case 0b10:
           builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
           builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
+          break;
+        default:  // 0b11
+          builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+          builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
           break;
       }
       builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
@@ -6155,8 +6197,11 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       case 0b01:
         builder_.Gen<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
         break;
-      default:  // 0b10
+      case 0b10:
         builder_.Gen<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
+        break;
+      default:  // 0b11
+        builder_.Gen<x86_64::PcmpgtqXRegXReg>(a.machine_reg(), b.machine_reg());
         break;
     }
     if (invert) {
@@ -6745,6 +6790,124 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // built with the PCMPEQD-self ; PSRLD/PSRLQ 1 idiom. FP16 (needs an F16C
   // round-trip absent from the backend Gen inputs) bails to lite; the decoder
   // already rejects the reserved sz=1&&!Q (.1D) shape.
+  // SSHL / USHL (vector, 32- and 64-bit lanes). Per-lane variable shift: the
+  // amount is the signed low BYTE of each Vm lane, left when non-negative,
+  // plain (non-rounding) right when negative -- arithmetic for SSHL, logical
+  // for USHL. The bail histogram over real apps put USHL.2D at the top of the
+  // actionable list (Chromium's V8/Blink emit it heavily), so unlike the
+  // rounding variants below this block covers the 64-bit lanes too.
+  //
+  // 32-bit lanes use VPSLLVD/VPSRLVD/VPSRAVD directly; their >= 32 count
+  // behaviour (zero for the logical forms, sign-fill for VPSRAVD, which
+  // saturates the count to 31) matches ARM exactly. 64-bit lanes use
+  // VPSLLVQ/VPSRLVQ, with two SSE tricks where AVX2 has no instruction:
+  //   * sign-extending the low byte of a qword lane has no PSRAQ-by-imm, so
+  //     sext8(b) = (b & 0xFF) ^ 0x80 - 0x80 per lane;
+  //   * SSHL's arithmetic right shift has no VPSRAVQ below AVX-512, so
+  //     sar(v, s) = ((v ^ m) >>logical s) ^ m with m = (v < 0 ? ~0 : 0) from
+  //     PCMPGTQ -- for s >= 64 the logical shift gives 0 and the XOR restores
+  //     the sign fill, exactly ARM's semantics.
+  // 8/16-bit lanes have no variable-shift instruction below AVX-512 and bail.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSshl ||
+      args.opcode == Decoder::AdvSimdThreeSameOpcode::kUshl) {
+    const bool is_64bit = (args.size == 0b11);
+    if ((args.size != 0b10 && args.size != 0b11) || !host_platform::kHasAVX2) {
+      UndefinedReturningVoid();
+      return;
+    }
+    if (is_64bit && !args.q) {
+      UndefinedReturningVoid();  // .1D is ARM-reserved.
+      return;
+    }
+    const bool is_signed = (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSshl);
+
+    FpRegister xa = AllocTempSimdReg();
+    FpRegister xsh = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xa.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xsh.machine_reg(), vm_off);
+
+    if (!is_64bit) {
+      // shift = sext8(Vm.lane[7:0]) per dword.
+      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
+      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+
+      FpRegister xisneg = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+
+      FpRegister xleft = AllocTempSimdReg();
+      builder_.Gen<x86_64::VpsllvdXRegXRegXReg>(
+          xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+
+      FpRegister xs = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+      FpRegister xright = AllocTempSimdReg();
+      if (is_signed) {
+        builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
+            xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+      } else {
+        builder_.Gen<x86_64::VpsrlvdXRegXRegXReg>(
+            xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+      }
+
+      FpRegister xres = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
+      builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
+      builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+      SetVRegFull(args.rd, xres, args.q);
+      return;
+    }
+
+    // 64-bit lanes. shift = sext8(lane & 0xFF) = ((lane & 0xFF) ^ 0x80) - 0x80.
+    Register gp80 = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x80}));
+    FpRegister x80 = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovqXRegReg>(x80.machine_reg(), gp80);
+    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(x80.machine_reg(), x80.machine_reg());
+    Register gpff = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0xFF}));
+    FpRegister xff = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovqXRegReg>(xff.machine_reg(), gpff);
+    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xff.machine_reg(), xff.machine_reg());
+
+    builder_.Gen<x86_64::PandXRegXReg>(xsh.machine_reg(), xff.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(xsh.machine_reg(), x80.machine_reg());
+    builder_.Gen<x86_64::PsubqXRegXReg>(xsh.machine_reg(), x80.machine_reg());
+
+    FpRegister xisneg = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpgtqXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+
+    FpRegister xleft = AllocTempSimdReg();
+    builder_.Gen<x86_64::VpsllvqXRegXRegXReg>(
+        xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+
+    FpRegister xs = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PsubqXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+
+    FpRegister xright = AllocTempSimdReg();
+    if (is_signed) {
+      // sar via sign-smear XOR: m = (a < 0) ? ~0 : 0.
+      FpRegister xm = AllocZeroedSimdReg();
+      builder_.Gen<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xright.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xright.machine_reg(), xm.machine_reg());
+      FpRegister xshifted = AllocTempSimdReg();
+      builder_.Gen<x86_64::VpsrlvqXRegXRegXReg>(
+          xshifted.machine_reg(), xright.machine_reg(), xs.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xshifted.machine_reg(), xm.machine_reg());
+      xright = xshifted;
+    } else {
+      builder_.Gen<x86_64::VpsrlvqXRegXRegXReg>(
+          xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+    }
+
+    FpRegister xres = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
+    builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
+    builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    SetVRegFull(args.rd, xres, /*q=*/true);
+    return;
+  }
+
   // SRSHL / SQRSHL (vector, 32-bit lanes only). Per-lane variable signed shift:
   // the amount is the low BYTE of each Vm lane read as a signed value, left when
   // non-negative and rounding-right when negative. SQRSHL additionally saturates
@@ -8154,10 +8317,13 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       break;
     case Decoder::AdvSimdThreeSameOpcode::kCmeq:
     case Decoder::AdvSimdThreeSameOpcode::kCmgt:
-      // CMEQ -> PCMPEQ{B,W,D}; CMGT (signed) -> PCMPGT{B,W,D}. The 64-bit (2D)
-      // form needs PCMPEQQ/PCMPGTQ (SSE4.1/4.2), which are not in the backend
-      // allowlist, so it bails to the lite tier.
-      if (args.size == 0b11) {
+      // CMEQ -> PCMPEQ{B,W,D,Q}; CMGT (signed) -> PCMPGT{B,W,D,Q}. The 64-bit
+      // (2D) form needs PCMPEQQ (SSE4.1) / PCMPGTQ (SSE4.2) -- gate on the
+      // host feature; the scalar D compare block below already relies on both.
+      if (args.size == 0b11 &&
+          !((args.opcode == Decoder::AdvSimdThreeSameOpcode::kCmeq)
+                ? host_platform::kHasSSE4_1
+                : host_platform::kHasSSE4_2)) {
         UndefinedReturningVoid();
         return;
       }
@@ -8217,8 +8383,10 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         builder_.Gen<x86_64::PcmpeqbXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b01) {
         builder_.Gen<x86_64::PcmpeqwXRegXReg>(vn.machine_reg(), vm.machine_reg());
-      } else {
+      } else if (args.size == 0b10) {
         builder_.Gen<x86_64::PcmpeqdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PcmpeqqXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     case Decoder::AdvSimdThreeSameOpcode::kCmgt:
@@ -8226,8 +8394,10 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         builder_.Gen<x86_64::PcmpgtbXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b01) {
         builder_.Gen<x86_64::PcmpgtwXRegXReg>(vn.machine_reg(), vm.machine_reg());
-      } else {
+      } else if (args.size == 0b10) {
         builder_.Gen<x86_64::PcmpgtdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+      } else {
+        builder_.Gen<x86_64::PcmpgtqXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     default:

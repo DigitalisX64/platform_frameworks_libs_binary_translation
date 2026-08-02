@@ -10071,13 +10071,19 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, IntSimdMultiInstructionRegion) {
 
 // CMEQ .2D (64-bit elements) must bail: PCMPEQQ is not in the backend allowlist.
 // (The B/H/S forms are now lowered via PCMPEQB/W/D — see CmeqVec4S/16B.)
-TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec2DBails) {
+// CMEQ .2D translates via PCMPEQQ (used to bail before the 64-bit compare
+// forms were lowered).
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqVec2D) {
   static const uint32_t code[] = {CmeqVec(0b11, /*q=*/true, 0, 1, 2)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetV128(&state_, 1, 0x0123456789ABCDEFULL, 0x8000000000000000ULL);
+  SetV128(&state_, 2, 0x0123456789ABCDEFULL, 0x8000000000000001ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), ~0ULL);       // equal lane
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);   // differing lane
 }
 
 // MUL .2D (64-bit elements) must bail: there is no packed 64-bit multiply.
@@ -16255,14 +16261,20 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, CmhsVec8H) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000FFFFFFFF0000ULL);  // [F,T,T,F]
 }
 
-// CMHI .2D must bail: PCMPGTQ is not in the backend allowlist.
-TEST_F(Arm64HeavyOptimizerFrontendTest, CmhiVec2DBails) {
+// CMHI .2D (unsigned >) translates via sign-biased PCMPGTQ. The lane pair
+// 0x8000000000000000 vs 1 is the discriminating case: unsigned says greater,
+// signed says less, so an unbiased PCMPGTQ would flip it.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmhiVec2D) {
   static const uint32_t code[] = {CmhiVec(0b11, /*q=*/true, 0, 1, 2)};
-  state_.cpu.insn_addr = ToGuestAddr(code);
-  MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0x0000000000000005ULL);
+  SetV128(&state_, 2, 0x0000000000000001ULL, 0x0000000000000005ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison dst
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), ~0ULL);       // 0x80.. >u 1
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);   // 5 >u 5 is false
 }
 
 // AdvSimdThreeDiff widening multiply-accumulate (heavy tier). Result always
