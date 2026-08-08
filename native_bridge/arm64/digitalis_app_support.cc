@@ -74,10 +74,25 @@ std::string ExtractInApkLibToCache(const char* libpath) {
 
   std::string out_path = cache_dir + "/" + basename;
 
-  // If a previous launch already extracted this lib, reuse it.
+  // Reuse a previously extracted copy only if it is still the copy this APK
+  // contains. The cache lives in the app's data directory, which survives an
+  // app update, while the APK is rewritten by one -- so a cache keyed on the
+  // library name alone would keep serving the previous version's code to the
+  // new version's Java, which surfaces as an UnsatisfiedLinkError for a
+  // newly added JNI method, or worse as old native code running silently
+  // against new callers.
+  //
+  // An update always writes a newer APK than any extract taken from the
+  // previous one, so requiring the cached copy to be newer than the APK is
+  // enough to catch it, and costs one stat rather than opening the archive.
   struct stat st_out;
+  struct stat st_apk;
   if (stat(out_path.c_str(), &st_out) == 0 && st_out.st_size > 0) {
-    return out_path;
+    if (stat(apk_path.c_str(), &st_apk) != 0 || st_out.st_mtime > st_apk.st_mtime) {
+      return out_path;
+    }
+    DIGITALIS_LOG("ExtractInApkLibToCache: %s is stale (apk is newer); re-extracting",
+                  out_path.c_str());
   }
 
   ZipArchiveHandle zip = nullptr;
