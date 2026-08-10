@@ -215,14 +215,6 @@ class LiteTranslator {
     simd_allocator_.FreeTemps();
   }
 
-  // early region termination on register pressure
-  // Returns true if the GP temp register pool is too low for safe instruction translation.
-  // Most instructions need 2-4 temps; below this threshold, end the region to preserve
-  // already-translated JIT code instead of failing and discarding the entire region.
-  bool IsGpRegPoolLow(uint32_t threshold = 4) const {
-    return gp_allocator_.AvailableTempCount() < threshold;
-  }
-
   // Backward-branch inlining (a per-PC label map + local jumps for in-region
   // loops) was removed: it traps the CPU in a tight loop without signal
   // checks, and an in-region back-edge variant also miscompiled codec loops.

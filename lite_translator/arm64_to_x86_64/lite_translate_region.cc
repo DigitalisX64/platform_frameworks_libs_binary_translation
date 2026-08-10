@@ -67,12 +67,13 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
   }
 
   while (translator.GetInsnAddr() < params.end_pc && !translator.is_region_end_reached()) {
-    // early region termination on register pressure
-    // When the GP register pool is nearly exhausted, end the region cleanly
-    // instead of letting AllocTempReg fail and discarding all JIT work.
-    if (translator.IsGpRegPoolLow()) {
-      break;
-    }
+    // No early termination on register pressure: the allocator reserves a
+    // fixed block of temp registers (Allocator::kReservedTempRegs) that
+    // permanent mappings can never consume, so once the mapping pool is full,
+    // guest-register accesses spill through ThreadState memory (GetReg/SetReg)
+    // and translation continues to the region's natural end. Ending the region
+    // here instead would split hot straight-line code (function prologues are
+    // the worst case) into fragments too small for the heavy tier to gear up.
     uint8_t insn_size = decoder.Decode(ToHostAddr<const uint16_t>(translator.GetInsnAddr()));
     if (!translator.success()) {
       // JIT break profiling
