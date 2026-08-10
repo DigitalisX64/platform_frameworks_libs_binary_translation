@@ -2971,6 +2971,93 @@
         }
         return;
       }
+      // FMAXV/FMINV/FMAXNMV/FMINNMV Sd, Vn.4S — reduce the four FP32 lanes to
+      // one scalar. Two log2(4) folding steps, each PSHUFD-ing the operand and
+      // combining, so the result lands in lane 0.
+      //
+      // The pair step differs by NaN policy, matching the interpreter:
+      //   FMAXV/FMINV     — NaN-propagating. MAXPS/MINPS on x86 return the
+      //                     SECOND operand whenever either input is NaN, so a
+      //                     single MAXPS would silently drop a NaN depending on
+      //                     operand order. Doing it both ways and POR-ing keeps
+      //                     a NaN exponent if either input was NaN, and makes
+      //                     +-0 order-independent.
+      //   FMAXNMV/FMINNMV — NaN-suppressing. Substitute each NaN lane with the
+      //                     other operand via a CMPUNORDPS self-compare mask
+      //                     before MAX/MIN, so a NaN only survives if both are.
+      //
+      // Only the FP32 .4S form is lowered. The Armv8.2 FP16 .8H form needs an
+      // F16C round-trip this backend does not have, and .2S (Q=0) is
+      // ARM-reserved for the across-lanes reductions; both go to the
+      // interpreter. Mirrors the heavy frontend's lowering of the same opcodes.
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFminv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv:
+      case Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv: {
+        if (args.is_fp16 || !args.q) { success_ = false; return; }
+        const bool is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv);
+        const bool is_nm =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
+        // All temps are allocated once, before the folding steps: the pair step
+        // runs twice, and allocating inside it would take a fresh register from
+        // the pool each time for no reason.
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xt = AllocTempSimdReg();
+        SimdRegister xa = AllocTempSimdReg();
+        SimdRegister xb = is_nm ? AllocTempSimdReg() : xa;
+        SimdRegister a_sub = is_nm ? AllocTempSimdReg() : xa;
+        SimdRegister b_sub = is_nm ? AllocTempSimdReg() : xa;
+        if (!success()) { return; }
+        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        // Fold b into a with packed FP32 min/max under the selected NaN rule.
+        auto emit_pair = [&](SimdRegister a, SimdRegister b) {
+          if (!is_nm) {
+            as_.Movdqa(xa, b);
+            if (is_max) {
+              as_.Maxps(xa, a);
+              as_.Maxps(a, b);
+            } else {
+              as_.Minps(xa, a);
+              as_.Minps(a, b);
+            }
+            as_.Por(a, xa);
+          } else {
+            as_.Movdqa(xa, a);
+            as_.Movdqa(xb, b);
+            as_.Cmpunordps(xa, xa);   // mask: lanes where a is NaN
+            as_.Cmpunordps(xb, xb);   // mask: lanes where b is NaN
+            as_.Movdqa(a_sub, xa);
+            as_.Pand(a_sub, b);       // a NaN -> take b
+            as_.Movdqa(b_sub, xb);
+            as_.Pand(b_sub, a);       // b NaN -> take a
+            as_.Pandn(xa, a);         // non-NaN lanes of a
+            as_.Pandn(xb, b);         // non-NaN lanes of b
+            as_.Por(xa, a_sub);
+            as_.Por(xb, b_sub);
+            if (is_max) {
+              as_.Maxps(xa, xb);
+            } else {
+              as_.Minps(xa, xb);
+            }
+            as_.Movdqa(a, xa);
+          }
+        };
+        // Step 1: fold lanes {2,3} into {0,1} (PSHUFD 0x4E swaps 64-bit halves).
+        as_.Pshufd(xt, xn, static_cast<int8_t>(0x4E));
+        emit_pair(xn, xt);
+        // Step 2: fold lane 1 into lane 0 (PSHUFD 0xB1 swaps adjacent dwords).
+        as_.Pshufd(xt, xn, static_cast<int8_t>(0xB1));
+        emit_pair(xn, xt);
+        // Scalar result: keep lane 0, zero the upper 96 bits.
+        as_.Pslldq(xn, int8_t{12});
+        as_.Psrldq(xn, int8_t{12});
+        as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
+        return;
+      }
+
       default:
         Undefined();
         return;

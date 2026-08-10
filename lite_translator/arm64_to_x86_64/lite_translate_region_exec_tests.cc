@@ -49527,6 +49527,126 @@ TEST_F(Arm64LiteTranslateRegionTest, MaplibreMaxcodeMovnW) {
   EXPECT_EQ(lite_x6, interp_x6);
 }
 
+// --- FP across-lanes reductions and vector FADDP -----------------------------
+//
+// These lower in the lite translator, so every case below asserts Run() is true:
+// a bail here is not "slower", it pins the region to the interpreter and takes
+// the second gear with it, because only a lite-translated region carries the
+// profiling counter that triggers gear-up.
+
+template <size_t N>
+static void StoreLanesToV(CPUState& cpu, unsigned idx, const float (&lanes)[N]) {
+  static_assert(N * sizeof(float) <= 16);
+  std::memset(&cpu.v[idx], 0, 16);
+  std::memcpy(&cpu.v[idx], lanes, N * sizeof(float));
+}
+
+static float LaneF(const CPUState& cpu, unsigned idx, unsigned lane) {
+  float out;
+  std::memcpy(&out, reinterpret_cast<const uint8_t*>(&cpu.v[idx]) + lane * sizeof(float),
+              sizeof(float));
+  return out;
+}
+
+// FMAXV s0, v1.4s — maximum across four FP32 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvS4S) {
+  const float lanes[4] = {1.0f, 7.0f, 3.0f, 5.0f};
+  StoreLanesToV(state_.cpu, 1, lanes);
+  static const uint32_t code[] = {0x6e30f820};  // fmaxv s0, v1.4s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LaneF(state_.cpu, 0, 0), 7.0f);
+  // Scalar result: upper 96 bits must be zeroed.
+  EXPECT_EQ(LaneF(state_.cpu, 0, 1), 0.0f);
+  EXPECT_EQ(LaneF(state_.cpu, 0, 2), 0.0f);
+  EXPECT_EQ(LaneF(state_.cpu, 0, 3), 0.0f);
+}
+
+// FMINV s0, v1.4s — minimum across four FP32 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FminvS4S) {
+  const float lanes[4] = {4.0f, 7.0f, -2.0f, 5.0f};
+  StoreLanesToV(state_.cpu, 1, lanes);
+  static const uint32_t code[] = {0x6eb0f820};  // fminv s0, v1.4s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LaneF(state_.cpu, 0, 0), -2.0f);
+}
+
+// FMAXV propagates NaN. x86 MAXPS returns its second operand when either input
+// is NaN, so a naive single-MAXPS lowering would drop the NaN for one operand
+// order and keep it for the other; this is the case that catches that.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvS4SNanPropagates) {
+  const float lanes[4] = {1.0f, std::numeric_limits<float>::quiet_NaN(), 3.0f, 5.0f};
+  StoreLanesToV(state_.cpu, 1, lanes);
+  static const uint32_t code[] = {0x6e30f820};  // fmaxv s0, v1.4s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_TRUE(std::isnan(LaneF(state_.cpu, 0, 0)));
+}
+
+// FMAXNMV suppresses NaN: a NaN lane loses to any number.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmvS4SNanSuppressed) {
+  const float lanes[4] = {1.0f, std::numeric_limits<float>::quiet_NaN(), 3.0f, 5.0f};
+  StoreLanesToV(state_.cpu, 1, lanes);
+  static const uint32_t code[] = {0x6e30c820};  // fmaxnmv s0, v1.4s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LaneF(state_.cpu, 0, 0), 5.0f);
+}
+
+// FMINNMV suppresses NaN likewise.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmvS4SNanSuppressed) {
+  const float lanes[4] = {4.0f, std::numeric_limits<float>::quiet_NaN(), -2.0f, 5.0f};
+  StoreLanesToV(state_.cpu, 1, lanes);
+  static const uint32_t code[] = {0x6eb0c820};  // fminnmv s0, v1.4s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LaneF(state_.cpu, 0, 0), -2.0f);
+}
+
+// FADDP v0.4s, v1.4s, v2.4s — pairwise add across the concatenation of the two
+// sources: [n0+n1, n2+n3, m0+m1, m2+m3]. Lane order is the whole point here, so
+// every lane is checked with distinct values.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpV4S) {
+  const float n[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  const float m[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+  StoreLanesToV(state_.cpu, 1, n);
+  StoreLanesToV(state_.cpu, 2, m);
+  static const uint32_t code[] = {0x6e22d420};  // faddp v0.4s, v1.4s, v2.4s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LaneF(state_.cpu, 0, 0), 3.0f);   // 1+2
+  EXPECT_EQ(LaneF(state_.cpu, 0, 1), 7.0f);   // 3+4
+  EXPECT_EQ(LaneF(state_.cpu, 0, 2), 11.0f);  // 5+6
+  EXPECT_EQ(LaneF(state_.cpu, 0, 3), 15.0f);  // 7+8
+}
+
+// FADDP .2S reads only the low 64 bits of each source and zeroes the upper half
+// of the destination. Lanes 2 and 3 of the sources are deliberately poisoned:
+// if the lowering forgot the gather shuffle they would appear in the result.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpV2S) {
+  const float n[4] = {1.0f, 2.0f, 100.0f, 200.0f};
+  const float m[4] = {5.0f, 6.0f, 300.0f, 400.0f};
+  StoreLanesToV(state_.cpu, 1, n);
+  StoreLanesToV(state_.cpu, 2, m);
+  static const uint32_t code[] = {0x2e22d420};  // faddp v0.2s, v1.2s, v2.2s
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(LaneF(state_.cpu, 0, 0), 3.0f);   // 1+2
+  EXPECT_EQ(LaneF(state_.cpu, 0, 1), 11.0f);  // 5+6
+  EXPECT_EQ(LaneF(state_.cpu, 0, 2), 0.0f);
+  EXPECT_EQ(LaneF(state_.cpu, 0, 3), 0.0f);
+}
+
+// FADDP .2D — the FP64 form.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpV2D) {
+  const double n[2] = {1.0, 2.0};
+  const double m[2] = {3.0, 4.0};
+  std::memset(&state_.cpu.v[1], 0, 16);
+  std::memcpy(&state_.cpu.v[1], n, sizeof(n));
+  std::memset(&state_.cpu.v[2], 0, 16);
+  std::memcpy(&state_.cpu.v[2], m, sizeof(m));
+  static const uint32_t code[] = {0x6e62d420};  // faddp v0.2d, v1.2d, v2.2d
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  double out[2];
+  std::memcpy(out, &state_.cpu.v[0], sizeof(out));
+  EXPECT_EQ(out[0], 3.0);  // 1+2
+  EXPECT_EQ(out[1], 7.0);  // 3+4
+}
+
 }  // namespace
 
 }  // namespace berberis

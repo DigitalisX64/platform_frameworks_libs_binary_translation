@@ -5632,6 +5632,42 @@
         as_.Addq(Assembler::rsp, 8);
         return;
       }
+      // FADDP Vd.<T>, Vn.<T>, Vm.<T> (vector) — add adjacent pairs across the
+      // concatenation of Vn and Vm.
+      //
+      // x86 HADDPS/HADDPD produce exactly the ARM lane order for the full-width
+      // forms: HADDPS xn, xm gives [n0+n1, n2+n3, m0+m1, m2+m3], which is the
+      // .4S result, and HADDPD gives [n0+n1, m0+m1] for .2D. No shuffle needed.
+      //
+      // .2S (Q=0) reads only the low 64 bits of each source, so the wanted
+      // result is [n0+n1, m0+m1] with the upper half zeroed. Those two values
+      // land in lanes 0 and 2 of the HADDPS result, so one PSHUFD gathers them
+      // before the .2S upper-half zeroing.
+      //
+      // The Armv8.2 FP16 form needs an F16C round-trip with a different pair
+      // layout; it goes to the interpreter.
+      case Decoder::AdvSimdThreeSameOpcode::kFaddpV: {
+        if (args.is_fp16) { success_ = false; return; }
+        const bool is_double = (args.size & 1);
+        SimdRegister xn = AllocTempSimdReg();
+        SimdRegister xm = AllocTempSimdReg();
+        if (!success()) { return; }
+        LoadVReg(xn, args.rn);
+        LoadVReg(xm, args.rm);
+        if (is_double) {
+          as_.Haddpd(xn, xm);
+        } else {
+          as_.Haddps(xn, xm);
+          if (!args.q) {
+            // Gather lanes 0 and 2 into lanes 0 and 1.
+            as_.Pshufd(xn, xn, static_cast<int8_t>(0x08));
+          }
+        }
+        if (!args.q) MaskLow64(xn);
+        StoreVReg(args.rd, xn);
+        return;
+      }
+
       default:
         Undefined();
         return;
