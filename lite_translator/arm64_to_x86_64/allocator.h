@@ -98,8 +98,30 @@ inline constexpr x86_64::Assembler::XMMRegister
 template <typename RegType>
 class Allocator {
  public:
+  // Fixed number of back-of-pool registers reserved for per-instruction temps.
+  // Permanent guest-register mappings (Alloc) grow from the front of the pool
+  // and may never intrude into this reserve, so any instruction whose temp
+  // appetite fits the reserve can be translated at ANY point in a region —
+  // register pressure makes guest-register accesses spill through ThreadState
+  // memory (see GetReg/SetReg) instead of failing the region.
+  //
+  // Sized by the worst-case temp appetite of the hottest instruction class:
+  // an SP-based LDP/STP needs exactly 6 GP temps (base + address + a TBI mask
+  // and a data/result temp per element). Measured on a 14-app prebuilt sweep,
+  // 94% of all lite-translation failures were STP/LDP starving for temps at
+  // the pressure wall; with the reserve they always fit. An instruction
+  // needing MORE than the reserve still fails cleanly under pressure and
+  // falls back to the clamp-and-retranslate path (rare: <1% of failures).
+  //
+  // Only the GP allocator ever calls Alloc() — guest V registers are not
+  // permanently mapped — so for the XMM pool this reserve is inert.
+  static constexpr uint32_t kReservedTempRegs = 6;
+
   std::optional<RegType> Alloc() {
-    if (regs_allocated_ + max_temp_regs_allocated >= kNumRegister) {
+    // std::max(temp_regs_allocated, kReservedTempRegs): temps live right now
+    // (mid-instruction) may already reach below the reserve line; never hand
+    // out a register a live temp occupies.
+    if (regs_allocated_ + std::max(temp_regs_allocated, kReservedTempRegs) >= kNumRegister) {
       return std::nullopt;
     }
     return std::optional<RegType>(kAllocatableRegisters<RegType>[regs_allocated_++]);
@@ -112,23 +134,16 @@ class Allocator {
     auto res = std::optional<RegType>(
         kAllocatableRegisters<RegType>[kNumRegister - 1 - temp_regs_allocated]);
     temp_regs_allocated++;
-    max_temp_regs_allocated = std::max(max_temp_regs_allocated, temp_regs_allocated);
     return res;
   }
 
   void FreeTemps() { temp_regs_allocated = 0; }
-
-  // Returns the number of temp registers available after FreeTemps().
-  uint32_t AvailableTempCount() const {
-    return kNumRegister - regs_allocated_;
-  }
 
  private:
   inline static const uint32_t kNumRegister = std::size(kAllocatableRegisters<RegType>);
 
   uint32_t regs_allocated_ = 0;
   uint32_t temp_regs_allocated = 0;
-  uint32_t max_temp_regs_allocated = 0;
 };
 
 }  // namespace berberis

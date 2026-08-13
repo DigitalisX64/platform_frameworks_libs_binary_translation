@@ -6737,6 +6737,78 @@ TEST_F(Arm64LiteTranslateRegionTest, StpPostIndexUpdatesBase) {
   EXPECT_EQ(state_.cpu.x[5], orig_x5 - 0x10);
 }
 
+// Function prologue/epilogue pair ops at a SATURATED permanent-mapping pool.
+// A 14-app prebuilt-APK LITE_FAIL sweep showed 94% of all lite-translation
+// failures were SP-based STP/LDP: a pair op with an SP base needs 6 GP temps
+// (base + address + a TBI mask and a data/result temp per element), and the
+// old adaptive temp reservation left only 4 at the pressure wall, so every
+// callee-save prologue/epilogue reached under pressure failed the region and
+// forced a clamp-and-retranslate split.  With the fixed temp reserve
+// (Allocator::kReservedTempRegs = 6, permanent mappings capped at 7), pair
+// ops must instead run on the GetReg/SetReg spill path and the region must
+// not split.  The 7-insn prelude fills every permanent slot; each pair op
+// below therefore runs with zero mappable registers left.
+TEST_F(Arm64LiteTranslateRegionTest, PairOpsAtSaturatedPoolSpillWithoutSplit) {
+  alignas(16) static uint64_t stack_buf[16] = {};
+  state_.cpu.sp = ToGuestAddr(&stack_buf[8]);  // 64 bytes of headroom below
+  const uint64_t orig_sp = state_.cpu.sp;
+  // Sentinels for the 7 prelude-mapped regs (verified untouched).
+  state_.cpu.x[4] = 0xdead0004ULL;
+  state_.cpu.x[5] = 0xdead0005ULL;
+  state_.cpu.x[6] = 0xdead0006ULL;
+  state_.cpu.x[7] = 0xdead0007ULL;
+  state_.cpu.x[10] = 0xdead000aULL;
+  state_.cpu.x[11] = 0xdead000bULL;
+  state_.cpu.x[12] = 0xdead000cULL;
+  // Pair payload: stored by the "prologue", reloaded by the "epilogue" into
+  // different registers so the round-trip is observable.
+  state_.cpu.x[22] = 0x2222'2222'2222'2222ULL;
+  state_.cpu.x[21] = 0x2121'2121'2121'2121ULL;
+  state_.cpu.x[20] = 0x2020'2020'2020'2020ULL;
+  state_.cpu.x[19] = 0x1919'1919'1919'1919ULL;
+  state_.cpu.x[23] = 0xDEAD'BEEFULL;
+  state_.cpu.x[24] = 0xDEAD'BEEFULL;
+  state_.cpu.x[25] = 0xDEAD'BEEFULL;
+  state_.cpu.x[26] = 0xDEAD'BEEFULL;
+  static const uint32_t code[] = {
+      // Prelude: `add xN, xN, xzr` maps 7 guest regs = every permanent slot.
+      0x8B1F0084,  // add x4,  x4,  xzr
+      0x8B1F00A5,  // add x5,  x5,  xzr
+      0x8B1F00C6,  // add x6,  x6,  xzr
+      0x8B1F00E7,  // add x7,  x7,  xzr
+      0x8B1F014A,  // add x10, x10, xzr
+      0x8B1F016B,  // add x11, x11, xzr
+      0x8B1F018C,  // add x12, x12, xzr
+      // The sweep's dominant shapes, all on the spill path now:
+      StpXPreIndex(22, 21, 31, -4),   // stp x22, x21, [sp, #-0x20]!  (push)
+      StpXSigned(20, 19, 31, 2),      // stp x20, x19, [sp, #0x10]
+      LdpX(24, 23, 31, 2),            // ldp x24, x23, [sp, #0x10]
+      LdpXPostIndex(26, 25, 31, 4),   // ldp x26, x25, [sp], #0x20    (pop)
+  };
+  // Run() fails if the region splits early (insn_addr stops short of end).
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  // SP restored by the post-index pop.
+  EXPECT_EQ(state_.cpu.sp, orig_sp);
+  // Round-trips: signed-offset reload and post-index pop.
+  EXPECT_EQ(state_.cpu.x[24], 0x2020'2020'2020'2020ULL);  // = x20
+  EXPECT_EQ(state_.cpu.x[23], 0x1919'1919'1919'1919ULL);  // = x19
+  EXPECT_EQ(state_.cpu.x[26], 0x2222'2222'2222'2222ULL);  // = x22
+  EXPECT_EQ(state_.cpu.x[25], 0x2121'2121'2121'2121ULL);  // = x21
+  // Stored frame contents at [orig_sp-0x20 .. orig_sp-0x8].
+  EXPECT_EQ(stack_buf[4], 0x2222'2222'2222'2222ULL);      // [sp, #0]  = x22
+  EXPECT_EQ(stack_buf[5], 0x2121'2121'2121'2121ULL);      // [sp, #8]  = x21
+  EXPECT_EQ(stack_buf[6], 0x2020'2020'2020'2020ULL);      // [sp, #16] = x20
+  EXPECT_EQ(stack_buf[7], 0x1919'1919'1919'1919ULL);      // [sp, #24] = x19
+  // Prelude-mapped sentinels intact.
+  EXPECT_EQ(state_.cpu.x[4],  0xdead0004ULL);
+  EXPECT_EQ(state_.cpu.x[5],  0xdead0005ULL);
+  EXPECT_EQ(state_.cpu.x[6],  0xdead0006ULL);
+  EXPECT_EQ(state_.cpu.x[7],  0xdead0007ULL);
+  EXPECT_EQ(state_.cpu.x[10], 0xdead000aULL);
+  EXPECT_EQ(state_.cpu.x[11], 0xdead000bULL);
+  EXPECT_EQ(state_.cpu.x[12], 0xdead000cULL);
+}
+
 // STP X5, X4, [X5], #0x10  (post-index where Rt1 aliases Rn).
 // ARM ARM marks this CONSTRAINED UNPREDICTABLE; on real hardware the
 // architectural choice is to write *the original* value of Rt1 (which equals
@@ -7784,13 +7856,13 @@ TEST_F(Arm64LiteTranslateRegionTest, FcvtnuXdFromMemoryPosInfSaturates) {
   EXPECT_EQ(state_.cpu.x[0], UINT64_MAX);
 }
 
-// DISABLED diagnostic: shows that when 13 prior MOVZ map all 13 GP slots,
-// IsGpRegPoolLow terminates the JIT region before reaching the FCVTNU.
-// This is the on-device scenario where the interpreter ARM-saturation fix
-// in interpreter.h catches the FCVTNU instead.  The Run()
-// framework only translates one region and does not invoke the interpreter
-// fallback, so this test cannot pass without separate interpreter coverage.
-TEST_F(Arm64LiteTranslateRegionTest, DISABLED_FcvtnuXdPosInfWithRegPressure) {
+// Register pressure must not end the region: 13 prior MOVZ exhaust the
+// permanent mapping pool (only 13 - kReservedTempRegs guest regs get mapped;
+// the rest spill through ThreadState), and the FCVTNU at the end must still
+// be reached and translated within the SAME region. This was a DISABLED
+// diagnostic while the translator terminated regions on a low pool; the
+// fixed temp reserve made pressure spill instead of split.
+TEST_F(Arm64LiteTranslateRegionTest, FcvtnuXdPosInfWithRegPressure) {
   state_.cpu.v[0] = 0;
   *reinterpret_cast<uint64_t*>(&state_.cpu.v[0]) = 0x7FF0000000000000ULL;
   static const uint32_t code[] = {
@@ -37143,45 +37215,29 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   cache->InvalidateGuestRange(code_start, code_end);
 }
 
-// Hypothesis B (deeper mapped-register state in Region A).  Same 5-insn
-// AddToMap insert sequence as above, but Region A is preceded by a 7-
-// instruction prelude that touches x4-x7 and x10-x12 (none of which are
-// used by the insert sequence proper), forcing the JIT's permanent-slot
-// allocator to map 7 extra guest regs before STORE 1 even starts decoding.
-// Combined with the production's exact three-region split topology
-// (splits at the LDR x8 reload AND one past STORE 2), this matches the
-// register-pressure profile inferred from VkCapsViewer's IsGpRegPoolLow
-// trace, where the JIT's allocator is near-full at Region A's exit.
+// Deep mapped-register state: the 5-insn AddToMap insert sequence preceded
+// by a 7-instruction prelude touching x4-x7 and x10-x12 (none used by the
+// insert sequence proper), exhausting the JIT's permanent-mapping pool
+// before STORE 1 even starts decoding (the allocator caps permanent
+// mappings at 13 - kReservedTempRegs = 7 guest regs; the prelude consumes
+// exactly all 7 slots).
 //
-// 7 (not 9) prelude regs because: each prelude insn maps 1 guest reg
-// permanently; STORE 1 maps 3 more (x8/x25/x24), totalling 10 permanent
-// slots; that leaves 3 free slots — enough for STORE 1's 2-temp address
-// computation but tight enough that IsGpRegPoolLow(threshold=4) fires
-// at the LDR x8 boundary (avail=3 < 4) and naturally terminates Region
-// A.  With 9 prelude regs the allocator overflows during STORE 1 itself
-// (AllocTemp returns no_register), making TryLiteTranslateRegion return
-// success=false instead of cleanly splitting the region — that's a JIT
-// limit, not the production bug.
+// With the fixed temp reserve, register pressure must NOT split or fail
+// the region: every guest register the insert sequence touches past the
+// prelude (x8/x25/x24/x21/x19/x9/x2) is unmapped and goes through the
+// GetReg/SetReg spill-through-ThreadState path, and the whole loop —
+// prelude, both stores, the BFI read-modify-write, and the SUBS/B.HI
+// tail — must translate as ONE region and execute 256 iterations
+// correctly.  (This test originally pinned the production VkCapsViewer
+// three-region pressure-split topology; the explicit-split variants above
+// still cover that topology via forced end_pc.)
 //
 // Each prelude insn is `add xN, xN, xzr` (encoded by hand below) — it
 // reads xN, writes xN, leaves xN's value unchanged, and does NOT touch
 // NZCV (it's ADD, not ADDS), so the b.hi at the loop tail still reads
 // only the SUBS-set flags.
-//
-// If this test FAILS while the simpler three-region split test PASSES,
-// hypothesis B is CONFIRMED — the bug is in the JIT's handling of the
-// 5-insn insert sequence when Region A entered Region B with most of the
-// permanent-slot pool already exhausted.  Each subsequent bisection of
-// which prelude regs trigger the failure pinpoints the spill/restore or
-// dispatch-state hand-off path that mishandles deep mapped state.
-//
-// If this test PASSES, hypothesis B is disproved at this depth (7 extra
-// mapped guest regs).  Next step would be hypothesis C (translating the
-// FULL surrounding AddToMap function as a single block and running it
-// 256x to see if a non-tested-here opcode propagates corruption into
-// the insert sequence's inputs) or D (cache-line / dispatch-tail effects).
 TEST_F(Arm64LiteTranslateRegionDispatchTest,
-       AddToMapBucketTwoStepInsert_ThreeRegionSplit_DeepMappedRegState) {
+       AddToMapBucketTwoStepInsert_DeepMappedRegState_SpillsSingleRegion) {
   static const uint32_t code[] = {
       // --- Prelude: pre-map x4-x7 and x10-x12 into JIT permanent slots
       //     (7 regs, each `add xN, xN, xzr` keeps xN's value unchanged) ---
@@ -37235,26 +37291,21 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
 
   GuestAddr code_start = ToGuestAddr(code);
   GuestAddr code_end = code_start + sizeof(code);
-  // Region A naturally ends after STORE 1 due to IsGpRegPoolLow (7 prelude
-  // mapped regs + x8/x25/x24 from STORE 1 = 10 mapped, 3 slots left, < 4).
-  // Pass end_pc = code_end and let IsGpRegPoolLow do the cut; verify
-  // stop_a matches the expected first split.
-  GuestAddr expected_split_1 = code_start + 32;
-  GuestAddr split_2 = code_start + 48;  // Forced split: after STORE 2.
-
   state_.cpu.insn_addr = code_start;
   auto* cache = TranslationCache::GetInstance();
 
-  // Region A: prelude + STORE 1 (terminated by IsGpRegPoolLow).
+  // The whole loop must translate as a single region: the prelude fills all
+  // 7 permanent mapping slots, and everything after runs on the spill path.
+  // Register pressure must neither fail the translation nor cut the region
+  // short of its natural end (the b.hi at code_end).
   MachineCode mc_a;
   auto [success_a, stop_a] = TryLiteTranslateRegion(
       code_start, &mc_a,
       LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
   ASSERT_TRUE(success_a);
-  ASSERT_EQ(stop_a, expected_split_1)
-      << "Region A should stop at offset 32 (LDR x8) due to IsGpRegPoolLow "
-      << "after 7 prelude mappings + 3 STORE 1 mappings; stopped at offset "
-      << (stop_a - code_start);
+  ASSERT_EQ(stop_a, code_end)
+      << "register pressure split the region at offset " << (stop_a - code_start)
+      << "; with the fixed temp reserve it must reach the natural region end";
   GuestCodeEntry* entry_a = cache->AddAndLockForTranslation(code_start, 0);
   ASSERT_NE(entry_a, nullptr);
   HostCodeAddr host_code_a = GetDefaultCodePoolInstance()->Add(&mc_a);
@@ -37263,43 +37314,9 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
                                 GuestCodeEntry::Kind::kLiteTranslated,
                                 {host_code_a, mc_a.install_size()});
 
-  // Region B: LDR x8 reload .. STORE 2 (forced end at split_2).
-  MachineCode mc_b;
-  auto [success_b, stop_b] = TryLiteTranslateRegion(
-      expected_split_1, &mc_b,
-      LiteTranslateParams{.end_pc = split_2, .allow_dispatch = true});
-  ASSERT_TRUE(success_b);
-  ASSERT_EQ(stop_b, split_2);
-  GuestCodeEntry* entry_b = cache->AddAndLockForTranslation(expected_split_1, 0);
-  ASSERT_NE(entry_b, nullptr);
-  HostCodeAddr host_code_b = GetDefaultCodePoolInstance()->Add(&mc_b);
-  cache->SetTranslatedAndUnlock(expected_split_1, entry_b,
-                                static_cast<uint32_t>(stop_b - expected_split_1),
-                                GuestCodeEntry::Kind::kLiteTranslated,
-                                {host_code_b, mc_b.install_size()});
-
-  // Region C: advance, subs, b.hi (back-edge to STORE 1 = expected_split_1
-  // boundary... actually b.hi target is offset 36 = STORE 1, which is the
-  // last insn of Region A.  Dispatch lookup at offset 36 finds Region A's
-  // entry (which starts at offset 0) -- there is NO independent cache
-  // entry at offset 36.  So the back-edge re-enters Region A from the
-  // prelude, re-running the 9 prelude insns on each iteration.  This is
-  // the production-equivalent behavior because production's prelude is
-  // outside the loop, but here we let it re-run; it's idempotent.).
-  MachineCode mc_c;
-  auto [success_c, stop_c] = TryLiteTranslateRegion(
-      split_2, &mc_c,
-      LiteTranslateParams{.end_pc = code_end, .allow_dispatch = true});
-  ASSERT_TRUE(success_c);
-  ASSERT_EQ(stop_c, code_end);
-  GuestCodeEntry* entry_c = cache->AddAndLockForTranslation(split_2, 0);
-  ASSERT_NE(entry_c, nullptr);
-  HostCodeAddr host_code_c = GetDefaultCodePoolInstance()->Add(&mc_c);
-  cache->SetTranslatedAndUnlock(split_2, entry_c,
-                                static_cast<uint32_t>(stop_c - split_2),
-                                GuestCodeEntry::Kind::kLiteTranslated,
-                                {host_code_c, mc_c.install_size()});
-
+  // The b.hi back-edge targets offset 0 (the region's own start), so the
+  // 256 loop iterations exit and re-enter this single region through the
+  // dispatch path, re-running the idempotent prelude each time.
   TestingRunGeneratedCode(&state_, AsHostCode(host_code_a), code_end);
 
   EXPECT_EQ(state_.cpu.insn_addr, code_end);
@@ -37316,8 +37333,8 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
   EXPECT_EQ(state_.cpu.x[12], 0xdead000cULL);
 
   // Bucket-array integrity: every bucket's bits[31:20] (length field) must
-  // equal 0xAAA (the BFI'd value).  If hypothesis B is correct, some
-  // buckets will have length=0 (STORE 2 dropped under deep mapped state).
+  // equal 0xAAA (the BFI'd value).  A length=0 bucket means STORE 2 was
+  // dropped by the spill path under deep mapped state.
   size_t first_length_zero = kNumSlots;
   uint32_t first_bad_bucket = 0;
   size_t count_length_zero = 0;
@@ -37333,10 +37350,10 @@ TEST_F(Arm64LiteTranslateRegionDispatchTest,
     }
   }
   EXPECT_EQ(first_length_zero, kNumSlots)
-      << "HYPOTHESIS B CONFIRMED: " << count_length_zero << "/" << kNumSlots
-      << " buckets have length=0 (STORE 2 dropped under deep mapped state); "
-      << "first at i=" << first_length_zero << " value=0x" << std::hex
-      << first_bad_bucket;
+      << "spill path dropped STORE 2 under deep mapped state: "
+      << count_length_zero << "/" << kNumSlots
+      << " buckets have length=0; first at i=" << first_length_zero
+      << " value=0x" << std::hex << first_bad_bucket;
 
   EXPECT_EQ(buckets[0], 0xfeedfaceU);
   EXPECT_EQ(buckets[kNumSlots + 1], 0xdeadbeefU);
