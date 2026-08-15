@@ -42,7 +42,31 @@ void MakeTrampolineCallable(GuestAddr pc,
                             HostCode func,
                             const char* name);
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// Digitalis named-trampoline override seam: replaces an upstream trampoline
+// registered under `name` (typically a proxied vtable method) with a Digitalis
+// implementation, recording the upstream one as the delegable "original". See
+// berberis/digitalis_extra_proxy/named_trampoline_override.h for the registry.
+// Weak: the definition lives in libberberis_digitalis_extra_proxy_arm64
+// (whole-linked into libberberis_arm64.so, so proxy libraries resolve it
+// dynamically); binaries that inline this header without linking that library
+// (e.g. host-test slices) resolve the symbol to null and skip the lookup.
+__attribute__((weak)) TrampolineFunc FindDigitalisNamedTrampolineOverride(const char* name,
+                                                                          TrampolineFunc original);
+#endif
+// endregion
+
 inline void WrapHostFunctionImpl(HostCode func, TrampolineFunc trampoline_func, const char* name) {
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (&FindDigitalisNamedTrampolineOverride != nullptr) {
+    if (TrampolineFunc replacement = FindDigitalisNamedTrampolineOverride(name, trampoline_func)) {
+      trampoline_func = replacement;
+    }
+  }
+#endif
+  // endregion
   MakeTrampolineCallable(ToGuestAddr(func), true, trampoline_func, func, name);
 }
 

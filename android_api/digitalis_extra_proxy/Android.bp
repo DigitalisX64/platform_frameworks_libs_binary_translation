@@ -29,6 +29,22 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
+// Named-trampoline override registry API (named_trampoline_override.h),
+// consumed by the per-library override files compiled into the proxy
+// cc_library_shared modules (e.g. libberberis_proxy_libOpenSLES).
+cc_library_headers {
+    name: "libberberis_digitalis_extra_proxy_headers",
+    defaults: ["berberis_defaults"],
+    host_supported: true,
+    export_include_dirs: ["include"],
+    header_libs: [
+        "libberberis_runtime_primitives_headers",
+    ],
+    export_header_lib_headers: [
+        "libberberis_runtime_primitives_headers",
+    ],
+}
+
 cc_library_static {
     name: "libberberis_digitalis_extra_proxy_arm64",
     host_supported: false,
@@ -44,9 +60,11 @@ cc_library_static {
         "libberberis_jni_headers",
         "libberberis_proxy_loader_headers",
         "libberberis_runtime_primitives_headers",
+        "libberberis_digitalis_extra_proxy_headers",
         "jni_headers",
     ],
     srcs: [
+        "named_trampoline_override.cc",
         "digitalis_extra_libc_trampolines.cc",
         "digitalis_extra_libm_trampolines.cc",
         "digitalis_extra_libnativehelper_trampolines.cc",
@@ -81,11 +99,14 @@ cc_test_library {
         "libberberis_guest_state_arm64_headers",
         "libberberis_proxy_loader_headers",
         "libberberis_runtime_primitives_headers",
+        "libberberis_digitalis_extra_proxy_headers",
         "berberis_test_utils_headers",
     ],
     srcs: [
         "camera2ndk_shared_capture_callbacks_test.cc",
         "digitalis_extra_proxy_no_crash_test.cc",
+        "named_trampoline_override.cc",
+        "named_trampoline_override_test.cc",
     ],
     shared: {
         enabled: false,

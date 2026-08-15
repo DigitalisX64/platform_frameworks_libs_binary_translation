@@ -21,6 +21,17 @@ package {
 cc_library_shared {
     name: "libberberis_proxy_libOpenMAXAL",
     defaults: ["berberis_proxy_library_defaults"],
-    srcs: [":native_bridge_proxy_libOpenMAXAL_files"],
+    srcs: [
+        ":native_bridge_proxy_libOpenMAXAL_files",
+        // region digitalis - GetInterface override marshalling the MediaPlayer
+        // interfaces the platform can hand out but upstream aborts on; the file
+        // compiles empty for non-arm64 guest arches (NATIVE_BRIDGE_GUEST_ARCH_ARM64
+        // guard).
+        "digitalis_maxal_getinterface_override.cc",
+        // endregion
+    ],
+    // region digitalis
+    header_libs: ["libberberis_digitalis_extra_proxy_headers"],
+    // endregion
     shared_libs: ["libOpenMAXAL"],
 }
