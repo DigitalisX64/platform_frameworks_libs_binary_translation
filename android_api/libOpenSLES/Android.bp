@@ -21,7 +21,17 @@ package {
 cc_library_shared {
     name: "libberberis_proxy_libOpenSLES",
     defaults: ["berberis_proxy_library_defaults"],
-    srcs: [":native_bridge_proxy_libOpenSLES_files"],
+    srcs: [
+        ":native_bridge_proxy_libOpenSLES_files",
+        // region digitalis - working replacements for the nine Register*Callback
+        // vtable trampolines upstream registers as fatal stubs; the file compiles
+        // empty for non-arm64 guest arches (NATIVE_BRIDGE_GUEST_ARCH_ARM64 guard).
+        "digitalis_sles_callback_overrides.cc",
+        // endregion
+    ],
+    // region digitalis
+    header_libs: ["libberberis_digitalis_extra_proxy_headers"],
+    // endregion
     shared_libs: ["libOpenSLES"],
     cflags: ["-Wno-deprecated-declarations"],
 }
