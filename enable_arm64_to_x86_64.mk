@@ -28,6 +28,11 @@ PRODUCT_SYSTEM_PROPERTIES += \
     ro.dalvik.vm.isa.arm64=x86_64 \
     ro.enable.native.bridge.exec=1
 
+# Skip the translator's per-translation MachineIR validation passes on the
+# shipped image; host tests (which configure no flags) always validate.
+PRODUCT_SYSTEM_PROPERTIES += \
+    ro.berberis.flags=disable-ir-check
+
 PRODUCT_SOONG_NAMESPACES += frameworks/libs/native_bridge_support/android_api/libc
 
 PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \

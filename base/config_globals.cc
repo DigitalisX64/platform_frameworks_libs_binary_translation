@@ -163,6 +163,10 @@ std::string ToString(ConfigFlag flag) {
       return "local-experiment";
     case kPlatformCustomCPUCapability:
       return "platform-custom-cpu-capability";
+    // region digitalis
+    case kDisableIrCheck:
+      return "disable-ir-check";
+    // endregion
     case kNumConfigFlags:
       break;
   }

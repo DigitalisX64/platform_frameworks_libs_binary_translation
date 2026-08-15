@@ -68,6 +68,13 @@ enum ConfigFlag {
   kLocalExperiment,
   // A convenience flag which enables a custom platform capability.
   kPlatformCustomCPUCapability,
+  // region digitalis
+  // Skip the MachineIR validation passes in GenCode. The checks stay on by
+  // default (host tests and any product that does not opt out); a product can
+  // ship ro.berberis.flags=disable-ir-check to drop the per-translation
+  // validation cost in production.
+  kDisableIrCheck,
+  // endregion
   kNumConfigFlags
 };
 
