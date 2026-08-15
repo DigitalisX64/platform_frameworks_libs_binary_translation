@@ -39,7 +39,16 @@ namespace berberis::x86_64 {
 
 void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodeParams& params) {
   LowerSSAInstructions(machine_ir);
-  CHECK_EQ(CheckMachineIR(*machine_ir), kMachineIRCheckSuccess);
+  // region digitalis
+  // MachineIR validation costs a full IR walk per translation; production
+  // images opt out via ro.berberis.flags=disable-ir-check, while host tests
+  // (no flags configured) always validate.
+  if (!IsConfigFlagSet(kDisableIrCheck)) {
+    // endregion
+    CHECK_EQ(CheckMachineIR(*machine_ir), kMachineIRCheckSuccess);
+    // region digitalis
+  }
+  // endregion
   if (IsConfigFlagSet(kVerboseTranslation) || IsConfigFlagSet(kPrintIRs)) {
     TRACE("MachineIR before optimizations {\n");
     TRACE("%s", machine_ir->GetDebugString().c_str());
@@ -79,7 +88,13 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
     x86_64::RemoveForwarderBlocks(machine_ir);
   }
 
-  CHECK_EQ(CheckMachineIR(*machine_ir), kMachineIRCheckSuccess);
+  // region digitalis
+  if (!IsConfigFlagSet(kDisableIrCheck)) {
+    // endregion
+    CHECK_EQ(CheckMachineIR(*machine_ir), kMachineIRCheckSuccess);
+    // region digitalis
+  }
+  // endregion
 
   if (IsConfigFlagSet(kVerboseTranslation) || IsConfigFlagSet(kPrintIRs)) {
     TRACE("MachineIR before emit {\n");
