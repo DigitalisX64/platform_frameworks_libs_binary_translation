@@ -40,7 +40,10 @@
           case 0b00: as_.Pcmpeqb(xn, xz); break;
           case 0b01: as_.Pcmpeqw(xn, xz); break;
           case 0b10: as_.Pcmpeqd(xn, xz); break;
-          default: Undefined(); return;
+          default:  // 0b11 (.2D): PCMPEQQ is SSE4.1.
+            if (!host_platform::kHasSSE4_1) { Undefined(); return; }
+            as_.Pcmpeqq(xn, xz);
+            break;
         }
         if (!args.q) MaskLow64(xn);
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
@@ -918,7 +921,8 @@
       // Avoids depending on SSSE3 PABSB/W/D (not currently in the assembler defs).
       // INT_MIN stays INT_MIN (matches ARM ABS semantics for the most-negative lane).
       case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
-        if (args.size == 0b11) { success_ = false; return; }  // .2D needs PCMPGTQ — bail to interp
+        // .2D (size=0b11) uses PCMPGTQ for the sign mask and is gated on SSE4.2.
+        if (args.size == 0b11 && !host_platform::kHasSSE4_2) { success_ = false; return; }
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister mask = AllocTempSimdReg();
         if (!success()) { return; }
@@ -928,14 +932,14 @@
           case 0b00: as_.Pcmpgtb(mask, xn); break;
           case 0b01: as_.Pcmpgtw(mask, xn); break;
           case 0b10: as_.Pcmpgtd(mask, xn); break;
-          default: success_ = false; return;
+          default: as_.Pcmpgtq(mask, xn); break;  // 0b11 (.2D)
         }
         as_.Pxor(xn, mask);
         switch (args.size) {
           case 0b00: as_.Psubb(xn, mask); break;
           case 0b01: as_.Psubw(xn, mask); break;
           case 0b10: as_.Psubd(xn, mask); break;
-          default: success_ = false; return;
+          default: as_.Psubq(xn, mask); break;  // 0b11 (.2D)
         }
         if (!args.q) MaskLow64(xn);
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);

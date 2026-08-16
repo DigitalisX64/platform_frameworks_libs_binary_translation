@@ -182,13 +182,10 @@
     // (`ld1r v3.4s, [x10], #4`) in the dynamic linker — without this the
     // post-loop tail bails to the interpreter on every symbol resolve.
     using Op = Decoder::AdvSimdSingleStructOp;
-    const bool is_replicate = (args.op == Op::kLd1r);
-    const bool is_single_load = (args.op == Op::kLd1);
-    const bool is_single_store = (args.op == Op::kSt1);
-    if (!is_replicate && !is_single_load && !is_single_store) {
-      Undefined(); return;
-    }
-    if (args.num_regs != 1) { Undefined(); return; }
+    const bool is_replicate = args.is_replicate;
+    const bool is_single_store = (args.op == Op::kSt1 || args.op == Op::kSt2 ||
+                                  args.op == Op::kSt3 || args.op == Op::kSt4);
+    if (args.num_regs < 1 || args.num_regs > 4) { Undefined(); return; }
 
     // size: 00=B(1), 01=H(2), 10=S(4), 11=D(8).
     const uint8_t esize = static_cast<uint8_t>(1u << args.size);
@@ -196,7 +193,6 @@
       Undefined(); return;
     }
 
-    int32_t vt_off = VRegOffset(args.rt);
 
     // Compute base address (with TBI mask).
     Register base_orig = (args.rn == 31) ? GetSp() : GetReg(args.rn);
@@ -204,36 +200,43 @@
     Register base = ApplyTbi(base_orig);
     if (base == no_register) { Undefined(); return; }
 
-    Assembler::Operand mem{.base = base, .disp = 0};
 
     if (is_single_store) {
-      // ST1 lane: load element from v[rt].lane[index] (ThreadState — no fault),
-      // then store to guest memory.
+      // ST1-ST4 lane: for each of the num_regs consecutive registers (mod 32),
+      // load its element from v[reg].lane[index] (ThreadState — no fault), then
+      // store to guest memory at consecutive element offsets. A fault on any
+      // element exits to the interpreter at this instruction; the earlier
+      // partial stores are architecturally permitted (re-execution re-stores).
       Register tmp = AllocTempReg();
       if (tmp == no_register) { Undefined(); return; }
-      int32_t lane_off = vt_off + args.index * esize;
-      switch (esize) {
-        case 1: as_.Movzxbl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
-        case 2: as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
-        case 4: as_.Movl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
-        case 8: as_.Movq(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+      for (unsigned r = 0; r < args.num_regs; ++r) {
+        const uint8_t reg = static_cast<uint8_t>((args.rt + r) & 31);
+        const int32_t lane_off = VRegOffset(reg) + args.index * esize;
+        switch (esize) {
+          case 1: as_.Movzxbl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+          case 2: as_.Movzxwl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+          case 4: as_.Movl(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+          case 8: as_.Movq(tmp, {.base = Assembler::rbp, .disp = lane_off}); break;
+        }
+        Assembler::Operand elem_mem{.base = base, .disp = static_cast<int32_t>(r * esize)};
+        AssemblerBase::Label* recovery_label = as_.MakeLabel();
+        as_.SetRecoveryPoint(recovery_label);
+        switch (esize) {
+          case 1: as_.Movb(elem_mem, tmp); break;
+          case 2: as_.Movw(elem_mem, tmp); break;
+          case 4: as_.Movl(elem_mem, tmp); break;
+          case 8: as_.Movq(elem_mem, tmp); break;
+        }
+        AssemblerBase::Label* cont = as_.MakeLabel();
+        as_.Jmp(*cont);
+        as_.Bind(recovery_label);
+        ExitGeneratedCode(GetInsnAddr());
+        as_.Bind(cont);
       }
-      AssemblerBase::Label* recovery_label = as_.MakeLabel();
-      as_.SetRecoveryPoint(recovery_label);
-      switch (esize) {
-        case 1: as_.Movb(mem, tmp); break;
-        case 2: as_.Movw(mem, tmp); break;
-        case 4: as_.Movl(mem, tmp); break;
-        case 8: as_.Movq(mem, tmp); break;
-      }
-      AssemblerBase::Label* cont = as_.MakeLabel();
-      as_.Jmp(*cont);
-      as_.Bind(recovery_label);
-      ExitGeneratedCode(GetInsnAddr());
-      as_.Bind(cont);
     } else if (is_replicate) {
-      // LD1R: load esize bytes, broadcast to all lanes, zero upper 64 bits
-      // if Q=0.
+      // LD1R-LD4R: for each of the num_regs consecutive registers (mod 32),
+      // load its own esize-byte element from consecutive memory offsets,
+      // broadcast it to all lanes, zero the upper 64 bits if Q=0.
       SimdRegister xmm = AllocTempSimdReg();
       if (!success()) { return; }
       Register tmp = AllocTempReg();
@@ -243,72 +246,84 @@
         zero_mask = AllocTempSimdReg();
         if (zero_mask == no_simd_register) { Undefined(); return; }
       }
-      AssemblerBase::Label* recovery_label = as_.MakeLabel();
-      as_.SetRecoveryPoint(recovery_label);
-      switch (esize) {
-        case 1: as_.Movzxbl(tmp, mem); break;
-        case 2: as_.Movzxwl(tmp, mem); break;
-        case 4: as_.Movl(tmp, mem); break;
-        case 8: as_.Movq(tmp, mem); break;
-      }
-      AssemblerBase::Label* cont = as_.MakeLabel();
-      as_.Jmp(*cont);
-      as_.Bind(recovery_label);
-      ExitGeneratedCode(GetInsnAddr());
-      as_.Bind(cont);
+      for (unsigned r = 0; r < args.num_regs; ++r) {
+        const uint8_t reg = static_cast<uint8_t>((args.rt + r) & 31);
+        Assembler::Operand elem_mem{.base = base, .disp = static_cast<int32_t>(r * esize)};
+        AssemblerBase::Label* recovery_label = as_.MakeLabel();
+        as_.SetRecoveryPoint(recovery_label);
+        switch (esize) {
+          case 1: as_.Movzxbl(tmp, elem_mem); break;
+          case 2: as_.Movzxwl(tmp, elem_mem); break;
+          case 4: as_.Movl(tmp, elem_mem); break;
+          case 8: as_.Movq(tmp, elem_mem); break;
+        }
+        AssemblerBase::Label* cont = as_.MakeLabel();
+        as_.Jmp(*cont);
+        as_.Bind(recovery_label);
+        ExitGeneratedCode(GetInsnAddr());
+        as_.Bind(cont);
 
-      // Broadcast `tmp` across XMM lanes.
-      switch (esize) {
-        case 1:
-          as_.Movd(xmm, tmp);
-          as_.Pxor(zero_mask, zero_mask);
-          as_.Pshufb(xmm, zero_mask);  // broadcast byte 0 to all 16 bytes
-          break;
-        case 2:
-          as_.Movd(xmm, tmp);
-          // Broadcast 16-bit element to all 4 low words, then to upper if Q=1.
-          as_.Pshuflw(xmm, xmm, static_cast<int8_t>(0));
-          if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
-          break;
-        case 4:
-          as_.Movd(xmm, tmp);
-          as_.Pshufd(xmm, xmm, static_cast<int8_t>(0));
-          break;
-        case 8:
-          as_.Movq(xmm, tmp);
-          if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
-          break;
+        // Broadcast `tmp` across XMM lanes.
+        switch (esize) {
+          case 1:
+            as_.Movd(xmm, tmp);
+            as_.Pxor(zero_mask, zero_mask);
+            as_.Pshufb(xmm, zero_mask);  // broadcast byte 0 to all 16 bytes
+            break;
+          case 2:
+            as_.Movd(xmm, tmp);
+            // Broadcast 16-bit element to all 4 low words, then to upper if Q=1.
+            as_.Pshuflw(xmm, xmm, static_cast<int8_t>(0));
+            if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
+            break;
+          case 4:
+            as_.Movd(xmm, tmp);
+            as_.Pshufd(xmm, xmm, static_cast<int8_t>(0));
+            break;
+          case 8:
+            as_.Movq(xmm, tmp);
+            if (args.q) as_.Pshufd(xmm, xmm, static_cast<int8_t>(0x44));
+            break;
+        }
+        if (!args.q) {
+          as_.Pslldq(xmm, int8_t{8});
+          as_.Psrldq(xmm, int8_t{8});
+        }
+        as_.Movdqu({.base = Assembler::rbp, .disp = VRegOffset(reg)}, xmm);
       }
-      if (!args.q) {
-        as_.Pslldq(xmm, int8_t{8});
-        as_.Psrldq(xmm, int8_t{8});
-      }
-      as_.Movdqu({.base = Assembler::rbp, .disp = vt_off}, xmm);
     } else {
-      // LD1 single-lane: load esize bytes into v[rt].lane[index], preserving
-      // other lanes by writing directly to ThreadState at the lane offset.
+      // LD1-LD4 single-lane: for each of the num_regs consecutive registers
+      // (mod 32), load esize bytes from consecutive memory offsets into
+      // v[reg].lane[index], preserving other lanes by writing directly to
+      // ThreadState at the lane offset. A fault on any element exits to the
+      // interpreter at this instruction; earlier partial lane writes are
+      // architecturally permitted (re-execution re-loads them).
       Register tmp = AllocTempReg();
       if (tmp == no_register) { Undefined(); return; }
-      AssemblerBase::Label* recovery_label = as_.MakeLabel();
-      as_.SetRecoveryPoint(recovery_label);
-      switch (esize) {
-        case 1: as_.Movzxbl(tmp, mem); break;
-        case 2: as_.Movzxwl(tmp, mem); break;
-        case 4: as_.Movl(tmp, mem); break;
-        case 8: as_.Movq(tmp, mem); break;
-      }
-      AssemblerBase::Label* cont = as_.MakeLabel();
-      as_.Jmp(*cont);
-      as_.Bind(recovery_label);
-      ExitGeneratedCode(GetInsnAddr());
-      as_.Bind(cont);
+      for (unsigned r = 0; r < args.num_regs; ++r) {
+        const uint8_t reg = static_cast<uint8_t>((args.rt + r) & 31);
+        Assembler::Operand elem_mem{.base = base, .disp = static_cast<int32_t>(r * esize)};
+        AssemblerBase::Label* recovery_label = as_.MakeLabel();
+        as_.SetRecoveryPoint(recovery_label);
+        switch (esize) {
+          case 1: as_.Movzxbl(tmp, elem_mem); break;
+          case 2: as_.Movzxwl(tmp, elem_mem); break;
+          case 4: as_.Movl(tmp, elem_mem); break;
+          case 8: as_.Movq(tmp, elem_mem); break;
+        }
+        AssemblerBase::Label* cont = as_.MakeLabel();
+        as_.Jmp(*cont);
+        as_.Bind(recovery_label);
+        ExitGeneratedCode(GetInsnAddr());
+        as_.Bind(cont);
 
-      int32_t lane_off = vt_off + args.index * esize;
-      switch (esize) {
-        case 1: as_.Movb({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
-        case 2: as_.Movw({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
-        case 4: as_.Movl({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
-        case 8: as_.Movq({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+        const int32_t lane_off = VRegOffset(reg) + args.index * esize;
+        switch (esize) {
+          case 1: as_.Movb({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+          case 2: as_.Movw({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+          case 4: as_.Movl({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+          case 8: as_.Movq({.base = Assembler::rbp, .disp = lane_off}, tmp); break;
+        }
       }
     }
 
