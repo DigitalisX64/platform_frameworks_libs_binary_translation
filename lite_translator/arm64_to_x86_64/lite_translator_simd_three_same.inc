@@ -5644,10 +5644,68 @@
       // land in lanes 0 and 2 of the HADDPS result, so one PSHUFD gathers them
       // before the .2S upper-half zeroing.
       //
-      // The Armv8.2 FP16 form needs an F16C round-trip with a different pair
-      // layout; it goes to the interpreter.
+      // The Armv8.2 FP16 form (.4H/.8H) keeps the same pair layout but needs an
+      // F16C round-trip to reach a packed-single HADDPS; see the branch below.
       case Decoder::AdvSimdThreeSameOpcode::kFaddpV: {
-        if (args.is_fp16) { success_ = false; return; }
+        if (args.is_fp16) {
+          // FP16 vector FADDP .4H / .8H via the F16C round-trip.  Widen each
+          // group of four half-lanes to FP32 with VCVTPH2PS, fold the adjacent
+          // pairs with HADDPS — whose lane order is already ARM's — and narrow
+          // once with VCVTPS2PH imm=0 (round-to-nearest-even).
+          //
+          //   .4H (Q=0): HADDPS(widen(Vn.h[0..3]), widen(Vm.h[0..3])) yields
+          //     [n0+n1, n2+n3, m0+m1, m2+m3], the complete result.
+          //   .8H (Q=1): HADDPS(widen(Vn low), widen(Vn high)) yields result
+          //     lanes 0..3 and HADDPS(widen(Vm low), widen(Vm high)) lanes
+          //     4..7; narrow both and recombine with PSLLDQ + POR.
+          //
+          // The rounding matches a native FP16 FADDP.  The sum is rounded twice
+          // — once to FP32's 24 significand bits, once to FP16's 11 — and
+          // double rounding of an addition is innocuous once the intermediate
+          // precision is at least 2*11 + 2 = 24 bits, which FP32 exactly meets,
+          // so the pair of roundings gives the same value as a single
+          // correctly-rounded FP16 add.  FP32 also brackets the whole FP16
+          // exponent range, so subnormal and overflowing sums narrow to the
+          // same FP16 result.  A widened FP16 NaN stays NaN through ADDPS and
+          // narrows back to a NaN, matching the interpreter, which runs the
+          // identical FpHalfToSingle / add / FpSingleToHalf round-trip.
+          if (!host_platform::kHasF16C) { success_ = false; return; }
+          SimdRegister xlo = AllocTempSimdReg();
+          SimdRegister xhi = AllocTempSimdReg();
+          SimdRegister xacc = args.q ? AllocTempSimdReg() : no_simd_register;
+          if (!success()) { return; }
+          // First HADDPS group: Vn's low four halves against the second half of
+          // the pair — Vm's low four for .4H, Vn's high four for .8H.
+          as_.Movq(xlo, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xlo, xlo);
+          if (!args.q) {
+            as_.Movq(xhi, {.base = Assembler::rbp, .disp = vm_off});
+          } else {
+            as_.Movdqu(xhi, {.base = Assembler::rbp, .disp = vn_off});
+            as_.Psrldq(xhi, int8_t{8});
+          }
+          as_.Vcvtph2ps(xhi, xhi);
+          as_.Haddps(xlo, xhi);
+          if (!args.q) {
+            as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+            // Vcvtps2ph already zeroes the upper 64 bits; no MaskLow64 needed.
+            as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xlo);
+            return;
+          }
+          // .8H: stash lanes 0..3, then fold Vm's two halves into lanes 4..7.
+          as_.Vcvtps2ph(xacc, xlo, int8_t{0});
+          as_.Movq(xlo, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Vcvtph2ps(xlo, xlo);
+          as_.Movdqu(xhi, {.base = Assembler::rbp, .disp = vm_off});
+          as_.Psrldq(xhi, int8_t{8});
+          as_.Vcvtph2ps(xhi, xhi);
+          as_.Haddps(xlo, xhi);
+          as_.Vcvtps2ph(xlo, xlo, int8_t{0});
+          as_.Pslldq(xlo, int8_t{8});
+          as_.Por(xacc, xlo);
+          as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xacc);
+          return;
+        }
         const bool is_double = (args.size & 1);
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xm = AllocTempSimdReg();

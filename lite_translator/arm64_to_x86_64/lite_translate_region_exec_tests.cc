@@ -12739,6 +12739,12 @@ constexpr uint32_t FmaxnmpVec4S(uint8_t rd, uint8_t rn, uint8_t rm) {
 constexpr uint32_t FaddpVec4H(uint8_t rd, uint8_t rn, uint8_t rm) {
   return 0x2E401400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
 }
+constexpr uint32_t FaddpVec8H(uint8_t rd, uint8_t rn, uint8_t rm) {
+  return 0x6E401400u | (uint32_t{rm} << 16) | (uint32_t{rn} << 5) | rd;
+}
+static_assert(FaddpVec4H(0, 1, 2) == 0x2E421420u);  // faddp v0.4h, v1.4h, v2.4h
+static_assert(FaddpVec8H(0, 1, 2) == 0x6E421420u);  // faddp v0.8h, v1.8h, v2.8h
+static_assert(FaddpVec8H(3, 4, 5) == 0x6E451483u);  // faddp v3.8h, v4.8h, v5.8h
 
 // FADDP .4S: low half from Vn pairs, high half from Vm pairs.
 TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4SBasic) {
@@ -12855,6 +12861,153 @@ TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4H) {
   EXPECT_EQ(r[1], 0x4700);  // 3+4=7.0h
   EXPECT_EQ(r[2], 0x4980);  // 5+6=11.0h
   EXPECT_EQ(r[3], 0x4B80);  // 7+8=15.0h
+}
+
+// FADDP .4H / .8H JIT — F16C round-trip (VCVTPH2PS / HADDPS / VCVTPS2PH imm=0).
+// The lowering returns success_=false without host F16C, so Run() would fail
+// there; skip, matching FcmpHOrderedEqual.
+//
+// FP16 bit patterns used below:
+//   0.0=0x0000  1.0=0x3C00  1.5=0x3E00  2.0=0x4000  3.0=0x4200  3.5=0x4300
+//   4.0=0x4400  5.0=0x4500  6.0=0x4600  7.0=0x4700  8.0=0x4800  11.0=0x4980
+//   15.0=0x4B80  0.5=0x3800  -0.5=0xB800  -1.5=0xBE00  -2.0=0xC000
+//   65504=0x7BFF (max finite)  -65504=0xFBFF  2^-24=0x0001 (min subnormal)
+//   2048=0x6800  2050=0x6801  2052=0x6802
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4HJit) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FADDP .4H JIT path uses fallback.";
+  }
+  // Lanes 4..7 of each source are ignored by the Q=0 form.
+  const uint16_t vn[8] = {0x3C00, 0x4000, 0x4200, 0x4400, 0x7C00, 0x7C00, 0x7C00, 0x7C00};
+  const uint16_t vm[8] = {0x4500, 0x4600, 0x4700, 0x4800, 0x7C00, 0x7C00, 0x7C00, 0x7C00};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};  // poison, so the Q=0 zeroing is observable
+  static const uint32_t code[] = {FaddpVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x4200);  // 1.0+2.0 = 3.0h
+  EXPECT_EQ(r[1], 0x4700);  // 3.0+4.0 = 7.0h
+  EXPECT_EQ(r[2], 0x4980);  // 5.0+6.0 = 11.0h
+  EXPECT_EQ(r[3], 0x4B80);  // 7.0+8.0 = 15.0h
+  // Q=0 zeroes Vd[127:64].
+  EXPECT_EQ(static_cast<uint64_t>(state_.cpu.v[0] >> 64), 0ULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec8HJit) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FADDP .8H JIT path uses fallback.";
+  }
+  // Result lanes 0..3 come from Vn's adjacent pairs, lanes 4..7 from Vm's.
+  const uint16_t vn[8] = {0x3C00, 0x4000, 0x4200, 0x4400,
+                          0x4500, 0x4600, 0x4700, 0x4800};
+  const uint16_t vm[8] = {0x3E00, 0x4000, 0x4400, 0x4400,
+                          0x0000, 0x3C00, 0xC000, 0x4000};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  state_.cpu.v[0] = ~__uint128_t{0};
+  static const uint32_t code[] = {FaddpVec8H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x4200);  // Vn: 1.0+2.0 = 3.0h
+  EXPECT_EQ(r[1], 0x4700);  // Vn: 3.0+4.0 = 7.0h
+  EXPECT_EQ(r[2], 0x4980);  // Vn: 5.0+6.0 = 11.0h
+  EXPECT_EQ(r[3], 0x4B80);  // Vn: 7.0+8.0 = 15.0h
+  EXPECT_EQ(r[4], 0x4300);  // Vm: 1.5+2.0 = 3.5h
+  EXPECT_EQ(r[5], 0x4800);  // Vm: 4.0+4.0 = 8.0h
+  EXPECT_EQ(r[6], 0x3C00);  // Vm: 0.0+1.0 = 1.0h
+  EXPECT_EQ(r[7], 0x0000);  // Vm: -2.0+2.0 = +0.0h
+}
+
+// Single-rounding check.  Above 2048 the FP16 spacing is 2 (exponent 11, 11-bit
+// significand), so 2048+1 and 2048+3 are exact ties.  Both sums are exactly
+// representable in FP32, so the round-trip rounds exactly once, at the
+// VCVTPS2PH narrow, and round-to-nearest-even must pick the even significand:
+// 2049 -> 2048 (0x6800, significand 0) and 2051 -> 2052 (0x6802, significand 2)
+// rather than 2050 (0x6801, significand 1).
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4HRoundToNearestEven) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FADDP .4H JIT path uses fallback.";
+  }
+  const uint16_t vn[8] = {0x6800, 0x3C00, 0x6800, 0x4200, 0, 0, 0, 0};
+  const uint16_t vm[8] = {0x6800, 0x4000, 0x6800, 0x4400, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  static const uint32_t code[] = {FaddpVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0x6800);  // 2048+1 = 2049, tie -> 2048.0h
+  EXPECT_EQ(r[1], 0x6802);  // 2048+3 = 2051, tie -> 2052.0h
+  EXPECT_EQ(r[2], 0x6801);  // 2048+2 = 2050.0h, exact
+  EXPECT_EQ(r[3], 0x6802);  // 2048+4 = 2052.0h, exact
+}
+
+// JIT vs interpreter differential across the awkward corners: negatives, the
+// minimum subnormal, and the maximum finite value (where the exact sum needs
+// more than 24 significand bits and FP32 itself rounds).  The interpreter runs
+// the same FpHalfToSingle / add / FpSingleToHalf round-trip, so the two must
+// agree bit-for-bit on the whole register.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpFp16MatchesInterpreter) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FADDP FP16 JIT path uses fallback.";
+  }
+  const uint16_t vn[8] = {0x3C00, 0xBE00, 0x0001, 0x7BFF,
+                          0x3800, 0x3800, 0xC000, 0x4200};
+  const uint16_t vm[8] = {0x3800, 0x4200, 0xFBFF, 0x0000,
+                          0x4400, 0xBE00, 0x7BFF, 0x7BFF};
+  for (uint32_t insn : {FaddpVec4H(0, 1, 2), FaddpVec8H(0, 1, 2)}) {
+    const uint32_t code[1] = {insn};
+    std::memcpy(&state_.cpu.v[1], vn, 16);
+    std::memcpy(&state_.cpu.v[2], vm, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+    __uint128_t jit = state_.cpu.v[0];
+
+    std::memcpy(&state_.cpu.v[1], vn, 16);
+    std::memcpy(&state_.cpu.v[2], vm, 16);
+    state_.cpu.v[0] = ~__uint128_t{0};
+    state_.cpu.insn_addr = ToGuestAddr(code);
+    InterpretInsn(&state_);
+    EXPECT_EQ(jit, state_.cpu.v[0]) << "insn " << std::hex << insn;
+  }
+  // Pin the .4H lane values so the differential can't pass by both paths being
+  // wrong the same way.
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  static const uint32_t code4h[] = {FaddpVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code4h, ToGuestAddr(code4h) + sizeof(code4h)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0], 0xB800);  // 1.0 + -1.5 = -0.5h
+  EXPECT_EQ(r[1], 0x7BFF);  // 2^-24 + 65504 rounds back to 65504.0h
+  EXPECT_EQ(r[2], 0x4300);  // 0.5 + 3.0 = 3.5h
+  EXPECT_EQ(r[3], 0xFBFF);  // -65504 + 0.0 = -65504.0h
+}
+
+// A widened FP16 NaN stays NaN through ADDPS and narrows back to a NaN.  The
+// payload is not pinned (only the interpreter's exact FpSingleToHalf payload
+// would be), so assert NaN-ness structurally and let the differential above
+// carry bit-exactness for finite inputs.
+TEST_F(Arm64LiteTranslateRegionTest, FaddpVec4HNaNPropagates) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FADDP .4H JIT path uses fallback.";
+  }
+  const uint16_t vn[8] = {0x7E00, 0x3C00, 0x4000, 0x4000, 0, 0, 0, 0};  // qNaN
+  const uint16_t vm[8] = {0x3C00, 0x3C00, 0x3C00, 0x3C00, 0, 0, 0, 0};
+  std::memcpy(&state_.cpu.v[1], vn, 16);
+  std::memcpy(&state_.cpu.v[2], vm, 16);
+  static const uint32_t code[] = {FaddpVec4H(0, 1, 2)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  std::memcpy(r, &state_.cpu.v[0], 16);
+  EXPECT_EQ(r[0] & 0x7C00, 0x7C00);  // exponent all ones
+  EXPECT_NE(r[0] & 0x03FF, 0);       // non-zero significand => NaN, not inf
+  EXPECT_EQ(r[1], 0x4400);           // 2.0+2.0 = 4.0h, unaffected lane
+  EXPECT_EQ(r[2], 0x4000);           // 1.0+1.0 = 2.0h
+  EXPECT_EQ(r[3], 0x4000);           // 1.0+1.0 = 2.0h
 }
 
 // FADD / FSUB / FMUL / FDIV vector three-same JIT
@@ -50056,6 +50209,303 @@ TEST_F(Arm64LiteTranslateRegionTest, FminnmvS4SNanSuppressed) {
   static const uint32_t code[] = {0x6eb0c820};  // fminnmv s0, v1.4s
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(LaneF(state_.cpu, 0, 0), -2.0f);
+}
+
+// FP16 across-lanes reductions FMAXV / FMINV / FMAXNMV / FMINNMV, .4H (Q=0)
+// and .8H (Q=1). Encodings verified with aarch64-linux-gnu-as
+// -march=armv8.2-a+fp16 and objdump. The across-lanes layout is
+// 0 Q U 01110 size 11000 opcode 10 Rn Rd, with U=0 selecting the
+// half-precision form, bit23 selecting min, opcode 01111 = FMAXV/FMINV and
+// opcode 01100 = FMAXNMV/FMINNMV. bit22 (sz) is 0 throughout.
+//   FMAXV   Hd, Vn.4H = 0x0E30F800 | (rn<<5) | rd
+//   FMAXV   Hd, Vn.8H = 0x4E30F800 | (rn<<5) | rd
+//   FMINV   Hd, Vn.4H = 0x0EB0F800 | (rn<<5) | rd
+//   FMINV   Hd, Vn.8H = 0x4EB0F800 | (rn<<5) | rd
+//   FMAXNMV Hd, Vn.4H = 0x0E30C800 | (rn<<5) | rd
+//   FMAXNMV Hd, Vn.8H = 0x4E30C800 | (rn<<5) | rd
+//   FMINNMV Hd, Vn.4H = 0x0EB0C800 | (rn<<5) | rd
+//   FMINNMV Hd, Vn.8H = 0x4EB0C800 | (rn<<5) | rd
+constexpr uint32_t FmaxvVec4H(uint8_t rd, uint8_t rn) {
+  return 0x0E30F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxvVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E30F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminvVec4H(uint8_t rd, uint8_t rn) {
+  return 0x0EB0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminvVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4EB0F800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmvVec4H(uint8_t rd, uint8_t rn) {
+  return 0x0E30C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FmaxnmvVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4E30C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmvVec4H(uint8_t rd, uint8_t rn) {
+  return 0x0EB0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+constexpr uint32_t FminnmvVec8H(uint8_t rd, uint8_t rn) {
+  return 0x4EB0C800u | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+// Disassembly of each helper at rd=0, rn=1:
+//   0e30f820 fmaxv   h0, v1.4h     4e30f820 fmaxv   h0, v1.8h
+//   0eb0f820 fminv   h0, v1.4h     4eb0f820 fminv   h0, v1.8h
+//   0e30c820 fmaxnmv h0, v1.4h     4e30c820 fmaxnmv h0, v1.8h
+//   0eb0c820 fminnmv h0, v1.4h     4eb0c820 fminnmv h0, v1.8h
+static_assert(FmaxvVec4H(0, 1) == 0x0E30F820u);
+static_assert(FmaxvVec8H(0, 1) == 0x4E30F820u);
+static_assert(FminvVec4H(0, 1) == 0x0EB0F820u);
+static_assert(FminvVec8H(0, 1) == 0x4EB0F820u);
+static_assert(FmaxnmvVec4H(0, 1) == 0x0E30C820u);
+static_assert(FmaxnmvVec8H(0, 1) == 0x4E30C820u);
+static_assert(FminnmvVec4H(0, 1) == 0x0EB0C820u);
+static_assert(FminnmvVec8H(0, 1) == 0x4EB0C820u);
+
+// FP16 bit patterns for the magnitudes these reductions need, beyond the
+// kHalf_* set defined with the FRECPS/FRSQRTS tests above. FP16 is
+// sign(1) exp(5) mant(10) with bias 15, so v = 1.m * 2^(exp-15):
+//   5.0  =  1.25 * 2^2 -> exp=17, mant=0b0100000000 -> 0x4500
+//   6.0  =  1.5  * 2^2 -> exp=17, mant=0b1000000000 -> 0x4600
+//   7.0  =  1.75 * 2^2 -> exp=17, mant=0b1100000000 -> 0x4700
+//   8.0  =  1.0  * 2^3 -> exp=18, mant=0            -> 0x4800
+//   -3.0 = -(1.5 * 2^1) -> sign=1, exp=16, mant=0b1000000000 -> 0xC200
+constexpr uint16_t kHalf_5_0 = 0x4500;
+constexpr uint16_t kHalf_6_0 = 0x4600;
+constexpr uint16_t kHalf_7_0 = 0x4700;
+constexpr uint16_t kHalf_8_0 = 0x4800;
+constexpr uint16_t kHalf_neg3_0 = 0xC200;
+
+// True when `bits` is an FP16 NaN: exponent all ones and non-zero mantissa.
+// The reduction fabricates its NaN payload (POR of both operand orders), and
+// ARM leaves the payload of a multi-NaN reduction unspecified, so the tests
+// assert NaN-ness rather than a particular encoding.
+constexpr bool IsHalfNan(uint16_t bits) {
+  return (bits & 0x7C00u) == 0x7C00u && (bits & 0x03FFu) != 0u;
+}
+
+// FMAXV h0, v1.8h — maximum across eight FP16 lanes. The winner is 8.0h,
+// which the F16C round-trip must reproduce exactly: max returns one of its
+// inputs and FP16 -> FP32 widening is exact.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvVec8HBasic) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_7_0, kHalf_3_0, kHalf_5_0,
+                         kHalf_2_0, kHalf_8_0, kHalf_neg2_0, kHalf_6_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FmaxvVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_8_0);
+  // Scalar result: upper 112 bits zeroed.
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMINV h0, v1.8h — minimum across eight FP16 lanes.
+TEST_F(Arm64LiteTranslateRegionTest, FminvVec8HBasic) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_7_0, kHalf_3_0, kHalf_5_0,
+                         kHalf_2_0, kHalf_neg3_0, kHalf_neg2_0, kHalf_6_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FminvVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_neg3_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMAXNMV h0, v1.8h — max-number across eight FP16 lanes, no NaN present.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmvVec8HBasic) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_2_0, kHalf_3_0, kHalf_4_0,
+                         kHalf_5_0, kHalf_6_0, kHalf_7_0, kHalf_8_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FmaxnmvVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_8_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMINNMV h0, v1.8h — min-number across eight FP16 lanes, no NaN present.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmvVec8HBasic) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_4_0, kHalf_7_0, kHalf_neg2_0, kHalf_5_0,
+                         kHalf_1_0, kHalf_6_0, kHalf_3_0, kHalf_8_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FminnmvVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_neg2_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMAXV propagates NaN. x86 MAXPS returns its second operand when either
+// input is NaN, so a naive single-MAXPS fold would drop the NaN for one
+// operand order; the POR of both orders is what keeps it. The NaN sits in a
+// high lane, so it also has to survive the 8->4 half-lane fold.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvVec8HNanPropagates) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_3_0, kHalf_2_0, kHalf_5_0,
+                         kHalf_4_0, kHalf_qNaN, kHalf_6_0, kHalf_7_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FmaxvVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_TRUE(IsHalfNan(r[0])) << "result 0x" << std::hex << r[0];
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMAXV .4H propagates NaN too, through the single-register widen path.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvVec4HNanPropagates) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_qNaN, kHalf_3_0, kHalf_5_0,
+                         0x5555, 0x5555, 0x5555, 0x5555};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FmaxvVec4H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_TRUE(IsHalfNan(r[0])) << "result 0x" << std::hex << r[0];
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMAXNMV suppresses NaN: a NaN lane loses to any number, so the real max
+// (7.0h) comes out. Two NaN lanes, one in each half-lane group, so the
+// CMPUNORDPS substitution has to hold across the 8->4 fold and both FP32
+// folding steps.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmvVec8HNanSuppressed) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_qNaN, kHalf_3_0, kHalf_5_0,
+                         kHalf_qNaN, kHalf_2_0, kHalf_7_0, kHalf_6_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FmaxnmvVec8H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_7_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// FMINNMV suppresses NaN likewise, on the .4H form.
+TEST_F(Arm64LiteTranslateRegionTest, FminnmvVec4HNanSuppressed) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_4_0, kHalf_qNaN, kHalf_neg2_0, kHalf_5_0,
+                         0x5555, 0x5555, 0x5555, 0x5555};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FminnmvVec4H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_neg2_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// .4H must read only the low four half-lanes. Lanes 4..7 hold 8.0h, larger
+// than anything in lanes 0..3: if the lowering widened all eight, or reused
+// the .8H path, the result would be 8.0h instead of 5.0h. Vd is pre-poisoned
+// so the upper-bits assertion is not trivially satisfied.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvVec4HIgnoresUpperLanes) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_5_0, kHalf_3_0, kHalf_2_0,
+                         kHalf_8_0, kHalf_8_0, kHalf_8_0, kHalf_8_0};
+  uint16_t d_init[8] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA,
+                        0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+  StoreVec8H(state_.cpu, 1, n);
+  StoreVec8H(state_.cpu, 0, d_init);
+  static const uint32_t code[] = {FmaxvVec4H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_5_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// Same lane-count check on the min side, and on FMAXNMV, so a Q mix-up in
+// either NaN policy is caught rather than only in the propagating one.
+TEST_F(Arm64LiteTranslateRegionTest, FminvVec4HIgnoresUpperLanes) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_4_0, kHalf_1_0, kHalf_3_0, kHalf_2_0,
+                         kHalf_neg3_0, kHalf_neg3_0, kHalf_neg3_0, kHalf_neg3_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FminvVec4H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_1_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, FmaxnmvVec4HIgnoresUpperLanes) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_6_0, kHalf_3_0, kHalf_2_0,
+                         kHalf_8_0, kHalf_8_0, kHalf_8_0, kHalf_8_0};
+  StoreVec8H(state_.cpu, 1, n);
+  static const uint32_t code[] = {FmaxnmvVec4H(0, 1)};
+  EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t r[8];
+  LoadVec8H(state_.cpu, 0, r);
+  EXPECT_EQ(r[0], kHalf_6_0);
+  for (int i = 1; i < 8; i++) EXPECT_EQ(r[i], 0u) << "lane " << i;
+}
+
+// Lite must agree with the interpreter on the .4H lane count. The decoder
+// change that admits Q=0 also reaches the interpreter's half-precision arm,
+// which previously always reduced eight lanes; this pins the two tiers
+// together on the same input. The input is deliberately NaN-free: ARM leaves
+// a multi-NaN reduction's payload unspecified and the two tiers pick
+// different ones, so a NaN here would be a false failure.
+TEST_F(Arm64LiteTranslateRegionTest, FmaxvVec4HMatchesInterpreter) {
+  if (!host_platform::kHasF16C) {
+    GTEST_SKIP() << "F16C not available; FP16 across-lanes uses the interpreter.";
+  }
+  const uint16_t n[8] = {kHalf_1_0, kHalf_5_0, kHalf_3_0, kHalf_2_0,
+                         kHalf_8_0, kHalf_8_0, kHalf_8_0, kHalf_8_0};
+  static const uint32_t code[] = {FmaxvVec4H(0, 1)};
+
+  memset(&state_.cpu, 0, sizeof(state_.cpu));
+  StoreVec8H(state_.cpu, 1, n);
+  ASSERT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
+  uint16_t lite[8];
+  LoadVec8H(state_.cpu, 0, lite);
+
+  memset(&state_.cpu, 0, sizeof(state_.cpu));
+  StoreVec8H(state_.cpu, 1, n);
+  Interpret(code[0]);
+  uint16_t interp[8];
+  LoadVec8H(state_.cpu, 0, interp);
+
+  for (int i = 0; i < 8; i++) {
+    EXPECT_EQ(lite[i], interp[i]) << "lane " << i;
+  }
+  EXPECT_EQ(lite[0], kHalf_5_0);
 }
 
 // FADDP v0.4s, v1.4s, v2.4s — pairwise add across the concatenation of the two

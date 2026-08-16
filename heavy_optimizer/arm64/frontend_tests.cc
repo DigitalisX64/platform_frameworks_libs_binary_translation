@@ -4467,6 +4467,25 @@ static_assert(FmaxvVec(true, false, 0, 1) == 0x6e30f820u);   // fmaxv s0, v1.4s
 static_assert(FmaxvVec(false, false, 0, 1) == 0x6eb0f820u);  // fminv s0, v1.4s
 static_assert(FmaxvVec(true, true, 0, 1) == 0x6e30c820u);    // fmaxnmv s0, v1.4s
 static_assert(FmaxvVec(false, true, 0, 1) == 0x6eb0c820u);   // fminnmv s0, v1.4s
+// FMAXV/FMINV/FMAXNMV/FMINNMV Hd, Vn.4H/.8H (Armv8.2-FP16 across-lanes):
+// 0 Q U(0) 01110 sz(bit23=1 for min) 0 11000 opcode 10 Rn Rd.
+// opcode = 01111 (FMAXV/FMINV) or 01100 (FMAXNMV/FMINNMV). U=0 is what selects
+// the half-precision form; unlike the FP32 (.4S) form, Q=0 is a valid encoding
+// and selects .4H.
+constexpr uint32_t FmaxvVecH(bool is_max, bool is_nm, bool q, uint8_t rd, uint8_t rn) {
+  const uint32_t opcode = is_nm ? 0b01100u : 0b01111u;
+  const uint32_t bit23 = is_max ? 0u : 1u;  // size high bit selects min.
+  return 0x0E300800u | (static_cast<uint32_t>(q) << 30) | (bit23 << 23) |
+         (opcode << 12) | (static_cast<uint32_t>(rn) << 5) | rd;
+}
+static_assert(FmaxvVecH(true, false, true, 0, 1) == 0x4e30f820u);    // fmaxv   h0, v1.8h
+static_assert(FmaxvVecH(true, false, false, 0, 1) == 0x0e30f820u);   // fmaxv   h0, v1.4h
+static_assert(FmaxvVecH(false, false, true, 0, 1) == 0x4eb0f820u);   // fminv   h0, v1.8h
+static_assert(FmaxvVecH(false, false, false, 0, 1) == 0x0eb0f820u);  // fminv   h0, v1.4h
+static_assert(FmaxvVecH(true, true, true, 0, 1) == 0x4e30c820u);     // fmaxnmv h0, v1.8h
+static_assert(FmaxvVecH(true, true, false, 0, 1) == 0x0e30c820u);    // fmaxnmv h0, v1.4h
+static_assert(FmaxvVecH(false, true, true, 0, 1) == 0x4eb0c820u);    // fminnmv h0, v1.8h
+static_assert(FmaxvVecH(false, true, false, 0, 1) == 0x0eb0c820u);   // fminnmv h0, v1.4h
 // FCVTZS/FCVTZU V Vd.<T>, Vn.<T> (FP32): two-reg-misc, opcode=11011, size=10
 // (bit23=1 selects round-toward-zero); U=0 signed / U=1 unsigned.
 constexpr uint32_t FcvtzVec(bool is_unsigned, bool q, uint8_t rd, uint8_t rn) {
@@ -14619,6 +14638,162 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVec4SNanPropagates) {
   EXPECT_NE(res & 0x007FFFFFu, 0u);            // nonzero mantissa -> NaN
   EXPECT_EQ(VLo64(&state_, 0) >> 32, 0x0ULL);  // upper 96 bits zeroed
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);
+}
+
+// ---- FMAXV/FMINV/FMAXNMV/FMINNMV FP16 across-lanes reduction (heavy, F16C). ----
+// Lane packing (.8H): VLo64 = lanes 0..3, VUpperHi64 = lanes 4..7, low half first.
+// Half constants: 1.0=0x3C00, 2.0=0x4000, 3.0=0x4200, 4.0=0x4400, 5.0=0x4500,
+// 6.0=0x4600, 7.0=0x4700, 8.0=0x4800, -2.0=0xC000, -3.0=0xC200, -4.0=0xC400,
+// -8.0=0xC800, +0.0=0x0000, -0.0=0x8000, qNaN=0x7E00.
+// The .8H vector below is {1,2,3,4, 5,6,7,-2}: max = 7.0, min = -2.0.
+
+// FMAXV h0, v1.8h: NaN-propagating max over 8 halves = 7.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/true, /*is_nm=*/false, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC000470046004500ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0x4700);  // 7.0h
+}
+
+// FMINV h0, v1.8h: NaN-propagating min over 8 halves = -2.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminvVecH8H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/false, /*is_nm=*/false, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC000470046004500ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0xC000);  // -2.0h
+}
+
+// FMAXNMV h0, v1.8h with lane5 = qNaN: the NaN lane is ignored, max = 7.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxnmvVecH8HNanSuppressed) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/true, /*is_nm=*/true, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC00047007E004500ULL);  // lane5 = qNaN
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0x4700);  // 7.0h
+}
+
+// FMINNMV h0, v1.8h with lane5 = qNaN: the NaN lane is ignored, min = -2.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmvVecH8HNanSuppressed) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/false, /*is_nm=*/true, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC00047007E004500ULL);  // lane5 = qNaN
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0xC000);  // -2.0h
+}
+
+// FMAXV h0, v1.8h with a NaN lane: NaN propagates to the reduction result. The
+// surviving payload is whatever the POR idiom leaves, so only NaN-ness is checked
+// (same contract as the FP32 FmaxvVec4SNanPropagates test).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVecH8HNanPropagates) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/true, /*is_nm=*/false, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC00047007E004500ULL);  // lane5 = qNaN
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  const uint16_t res = VHalf0(&state_, 0);
+  EXPECT_EQ(res & 0x7C00u, 0x7C00u);  // exponent all ones
+  EXPECT_NE(res & 0x03FFu, 0u);       // nonzero mantissa -> NaN
+  EXPECT_EQ(VWord0(&state_, 0) >> 16, 0u);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMINV h0, v1.8h with a NaN lane: NaN propagates through the min idiom too.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminvVecH8HNanPropagates) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/false, /*is_nm=*/false, /*q=*/true, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0xC00047007E004500ULL);  // lane5 = qNaN
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  const uint16_t res = VHalf0(&state_, 0);
+  EXPECT_EQ(res & 0x7C00u, 0x7C00u);
+  EXPECT_NE(res & 0x03FFu, 0u);
+  EXPECT_EQ(VWord0(&state_, 0) >> 16, 0u);
+  EXPECT_EQ(VWord1(&state_, 0), 0u);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// FMAXV h0, v1.4h: only lanes 0..3 {1,2,3,4} participate -> 4.0. Lanes 4..7 are all
+// 5.0..8.0, so a leak from the upper half would show up as 8.0 instead.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/true, /*is_nm=*/false, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x4400420040003C00ULL, 0x4800470046004500ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0x4400);  // 4.0h
+}
+
+// FMINV h0, v1.4h: lanes 0..3 are {1,-3,3,4} -> -3.0. Lanes 4..7 are all -8.0, so a
+// leak from the upper half would show up as -8.0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminvVecH4H) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/false, /*is_nm=*/false, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x44004200C2003C00ULL, 0xC800C800C800C800ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0xC200);  // -3.0h
+}
+
+// FMAXV h0, v1.4h over {-0,-0,-0,+0}: ARM's FPMax gives sign = AND of the input
+// signs when every operand is zero, so the result is +0.0, not -0.0. Lanes 4..7 hold
+// 4.0 to catch an upper-half leak.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVecH4HZeroSigns) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/true, /*is_nm=*/false, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x0000800080008000ULL, 0x4400440044004400ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0x0000);  // +0.0h
+}
+
+// FMINV h0, v1.4h over {+0,+0,+0,-0}: FPMin gives sign = OR of the input signs, so
+// the result is -0.0. Lanes 4..7 hold -4.0 to catch an upper-half leak.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FminvVecH4HZeroSigns) {
+  if (!host_platform::kHasF16C) GTEST_SKIP() << "no F16C";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/false, /*is_nm=*/false, /*q=*/false, 0, 1)};
+  SetV128(&state_, 1, 0x8000000000000000ULL, 0xC400C400C400C400ULL);
+  SetV128(&state_, 0, 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL);  // poison
+  bool ok = false;
+  RunRegion(&state_, code, ToGuestAddr(code) + sizeof(code), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_HALF_CLEAN(state_, 0, 0x8000);  // -0.0h
+}
+
+// Without F16C the FP16 across-lanes form has no in-tier lowering and the region
+// bails to lite (n == 0), which is correct-but-slow rather than wrong.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FmaxvVecHBailsWithoutF16C) {
+  if (host_platform::kHasF16C) GTEST_SKIP() << "F16C present; FMAXV H lowers in-tier";
+  static const uint32_t code[] = {FmaxvVecH(/*is_max=*/true, /*is_nm=*/false, /*q=*/true, 0, 1)};
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_EQ(n, 0u);
 }
 
 // ---- FCVTZS/FCVTZU V (vector FP32 -> int, round toward zero) heavy. ----
