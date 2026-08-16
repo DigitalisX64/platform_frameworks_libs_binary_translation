@@ -15579,8 +15579,7 @@ void HeavyOptimizerFrontend::CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, u
   if (!success()) {
     return;
   }
-  // Only SHA-256 (H/H2/SU1) is lowered; the SHA-1 forms (000..011) still bail.
-  if (opcode < 0b100 || opcode > 0b110) {
+  if (opcode > 0b110) {
     UndefinedReturningVoid();
     return;
   }
@@ -15591,6 +15590,47 @@ void HeavyOptimizerFrontend::CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, u
   builder_.GenGetSimd<16>(qd.machine_reg(), GetVRegOffset(rd));
   builder_.GenGetSimd<16>(vn.machine_reg(), GetVRegOffset(rn));
   builder_.GenGetSimd<16>(vm.machine_reg(), GetVRegOffset(rm));
+
+  if (opcode <= 0b010) {
+    // SHA1C (000) / SHA1P (001) / SHA1M (010): four SHA-1 rounds.
+    // {a,b,c,d} = Vd lanes, e = Sn (Vn lane 0), w[j] = Vm lanes. Per round:
+    //   f = Ch/Parity/Maj of (b,c,d);  t = ROL(a,5) + f + e + w[j];
+    //   e=d; d=c; c=ROL(b,30); b=a; a=t.   ROL(x,n) == ROR(x,32-n).
+    Register a = op.Lane(qd, 0), b = op.Lane(qd, 1), c = op.Lane(qd, 2), d = op.Lane(qd, 3);
+    Register e = op.Lane(vn, 0);
+    Register w[4] = {op.Lane(vm, 0), op.Lane(vm, 1), op.Lane(vm, 2), op.Lane(vm, 3)};
+    for (int j = 0; j < 4; j++) {
+      Register f;
+      if (opcode == 0b000) {
+        f = op.Ch(b, c, d);
+      } else if (opcode == 0b001) {
+        f = op.Xor(op.Xor(b, c), d);
+      } else {
+        f = op.Maj(b, c, d);
+      }
+      Register t = op.Add(op.Add(op.Add(op.Rotr(a, 27), f), e), w[j]);
+      e = d;
+      d = c;
+      c = op.Rotr(b, 2);
+      b = a;
+      a = t;
+    }
+    SetVRegFull(rd, op.Pack(a, b, c, d), /*q=*/true);
+    return;
+  }
+  if (opcode == 0b011) {
+    // SHA1SU0: message-schedule update, part 1 —
+    //   t0 = d2^d0^m0; t1 = d3^d1^m1; t2 = n0^d2^m2; t3 = n1^d3^m3.
+    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
+    Register n0 = op.Lane(vn, 0), n1 = op.Lane(vn, 1);
+    Register m0 = op.Lane(vm, 0), m1 = op.Lane(vm, 1), m2 = op.Lane(vm, 2), m3 = op.Lane(vm, 3);
+    Register t0 = op.Xor(op.Xor(d2, d0), m0);
+    Register t1 = op.Xor(op.Xor(d3, d1), m1);
+    Register t2 = op.Xor(op.Xor(n0, d2), m2);
+    Register t3 = op.Xor(op.Xor(n1, d3), m3);
+    SetVRegFull(rd, op.Pack(t0, t1, t2, t3), /*q=*/true);
+    return;
+  }
 
   if (opcode == 0b110) {
     // SHA256SU1: nd0 = d0 + σ1(m2) + n1; nd1 = d1 + σ1(m3) + n2;
@@ -15632,8 +15672,7 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
   if (!success()) {
     return;
   }
-  // Only SHA256SU0 (opcode 10) is lowered; SHA1H/SHA1SU1 (00/01) still bail.
-  if (opcode != 0b10) {
+  if (opcode > 0b10) {
     UndefinedReturningVoid();
     return;
   }
@@ -15642,6 +15681,27 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
   FpRegister vn = AllocTempSimdReg();
   builder_.GenGetSimd<16>(qd.machine_reg(), GetVRegOffset(rd));
   builder_.GenGetSimd<16>(vn.machine_reg(), GetVRegOffset(rn));
+  if (opcode == 0b00) {
+    // SHA1H: Sd = ROL(Sn, 30), upper 96 bits zeroed (MOVD zero-extends).
+    Register r = op.Rotr(op.Lane(vn, 0), 2);
+    FpRegister res = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdXRegReg>(res.machine_reg(), r);
+    SetVRegFull(rd, res, /*q=*/true);
+    return;
+  }
+  if (opcode == 0b01) {
+    // SHA1SU1: message-schedule update, part 2 —
+    //   t_i   = ROL(d_i ^ n_{i+1}, 1) for i = 0..2;
+    //   t3    = ROL(d3 ^ t0, 1)        (t0 is the already-rotated word).
+    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
+    Register n1 = op.Lane(vn, 1), n2 = op.Lane(vn, 2), n3 = op.Lane(vn, 3);
+    Register t0 = op.Rotr(op.Xor(d0, n1), 31);
+    Register t1 = op.Rotr(op.Xor(d1, n2), 31);
+    Register t2 = op.Rotr(op.Xor(d2, n3), 31);
+    Register t3 = op.Rotr(op.Xor(d3, t0), 31);
+    SetVRegFull(rd, op.Pack(t0, t1, t2, t3), /*q=*/true);
+    return;
+  }
   // SHA256SU0: out_i = d_i + σ0(d_{i+1}), with d_4 taken from Vn[0].
   Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
   Register n0 = op.Lane(vn, 0);
