@@ -48452,6 +48452,81 @@ TEST_F(Arm64LiteTranslateRegionTest, LdNrReplicateJit) {
 // need only SSE4.1/4.2: CMEQ #0 (PCMPEQQ), ABS (PCMPGTQ sign mask), the
 // CMGT/CMGE/CMLT/CMLE #0 family (PCMPGTQ), and SSHR .2D (already lowered via
 // the GPR SARQ fallback, pinned here alongside). Encodings objdump-verified.
+// STXR/STLXR must translate mid-region under full register-mapping pressure.
+// Real apps' LL/SC loops (pre-LSE atomics in short-video and music apps) sit
+// after long runs of live registers; the store-exclusive lowering previously
+// allocated enough simultaneous temps (expected value, reservation address,
+// status, plus spill temps for its own guest registers) to exhaust the temp
+// reserve, failing the region at the STXR — which fragmented every legacy
+// atomic loop and made it ineligible for the optimizing tier. The lowering
+// now stages the reservation compare and expected value through RAX (which
+// LOCK CMPXCHG requires anyway).
+TEST_F(Arm64LiteTranslateRegionTest, StxrUnderRegisterPressureJit) {
+  alignas(8) uint64_t mem = 0;
+  state_.cpu.x[8] = ToGuestAddr(&mem);
+  state_.cpu.x[9] = 42;
+  state_.cpu.reservation_address = ToGuestAddr(&mem);
+  state_.cpu.reservation_value = 0;
+  static const uint32_t c1[] = {0xc80a7d09U};  // stxr w10, x9, [x8]
+  { SCOPED_TRACE("c1");
+  EXPECT_TRUE(Run(c1, ToGuestAddr(c1) + sizeof(c1)));
+  EXPECT_EQ(state_.cpu.x[10], 0u);
+  EXPECT_EQ(mem, 42u);
+  }
+  static const uint32_t c2[] = {0x880afd09U};  // stlxr w10, w9, [x8]
+  state_.cpu.reservation_address = ToGuestAddr(&mem);
+  state_.cpu.reservation_value = 42;
+  { SCOPED_TRACE("c2");
+  EXPECT_TRUE(Run(c2, ToGuestAddr(c2) + sizeof(c2)));
+  }
+
+  // Variant A: bare LL/SC (ldxr; add; stxr) with no pressure, no branch.
+  alignas(8) uint64_t counter_a = 100;
+  state_.cpu.x[8] = ToGuestAddr(&counter_a);
+  static const uint32_t bare[] = {
+      0xc85f7d09U,  // ldxr x9, [x8]
+      0x91000529U,  // add x9, x9, #1
+      0xc80a7d09U,  // stxr w10, x9, [x8]
+  };
+  EXPECT_TRUE(Run(bare, ToGuestAddr(bare) + sizeof(bare)));
+  EXPECT_EQ(counter_a, 101u) << "variant A";
+  EXPECT_EQ(state_.cpu.x[10], 0u) << "variant A";
+
+  // Variant B: pressure prelude + bare LL/SC, still no branch.
+  alignas(8) uint64_t counter_b = 200;
+  state_.cpu.x[8] = ToGuestAddr(&counter_b);
+  static const uint32_t pressured[] = {
+      0xd2800140U, 0xd2800281U, 0xd28003c2U, 0xd2800503U,
+      0xd2800644U, 0xd2800785U, 0xd28008c6U, 0xd2800a07U,
+      0xd2800b4bU, 0xd2800c8cU, 0xd2800dcdU, 0xd2800f0eU,
+      0xc85f7d09U,  // ldxr x9, [x8]
+      0x91000529U,  // add x9, x9, #1
+      0xc80a7d09U,  // stxr w10, x9, [x8]
+  };
+  EXPECT_TRUE(Run(pressured, ToGuestAddr(pressured) + sizeof(pressured)));
+  EXPECT_EQ(counter_b, 201u) << "variant B";
+  EXPECT_EQ(state_.cpu.x[10], 0u) << "variant B";
+
+  // Realistic mid-region context: 12 live registers then an LL/SC loop.
+  alignas(8) uint64_t counter = 7;
+  state_.cpu.x[8] = ToGuestAddr(&counter);
+  static const uint32_t llsc[] = {
+      0xd2800140U, 0xd2800281U, 0xd28003c2U, 0xd2800503U,
+      0xd2800644U, 0xd2800785U, 0xd28008c6U, 0xd2800a07U,
+      0xd2800b4bU, 0xd2800c8cU, 0xd2800dcdU, 0xd2800f0eU,
+      0xc85f7d09U,  // ldxr x9, [x8]
+      0x91000529U,  // add x9, x9, #1
+      0xc80a7d09U,  // stxr w10, x9, [x8]
+      0xb5ffffaaU,  // cbnz x10, back to ldxr
+      0x8b010000U,  // add x0, x0, x1
+  };
+  // The conditional branch ends the lite region: the region exits at the
+  // post-loop instruction, one insn short of the array end.
+  EXPECT_TRUE(Run(llsc, ToGuestAddr(llsc) + sizeof(llsc) - 4));
+  EXPECT_EQ(counter, 8u);
+  EXPECT_EQ(state_.cpu.x[10], 0u);
+}
+
 TEST_F(Arm64LiteTranslateRegionTest, Int64LaneMiscJit) {
   auto set_lane64 = [&](int vreg, int lane, uint64_t val) {
     std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, &val, 8);

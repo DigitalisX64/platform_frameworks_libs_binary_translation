@@ -456,34 +456,34 @@
 
       case Decoder::AtomicOp::kStxr: {
         // Store-exclusive: compare-and-swap using reservation.
-        // Load expected value from reservation.
-        Register expected_val = AllocTempReg();
-        if (!success()) return;
+        //
+        // Keep the temp footprint minimal: STXR appears mid-region in LL/SC
+        // loops where most permanent register slots are already mapped, so
+        // every extra simultaneous temp here risks exhausting the temp
+        // reserve and failing the whole region at this instruction. RAX is
+        // required by LOCK CMPXCHG anyway; use it as the scratch for both
+        // the reservation-address compare and the expected value instead of
+        // dedicating a temp to each.
         int32_t resv_val_off = offsetof(ThreadState, cpu.reservation_value);
-        as_.Movq(expected_val, {.base = Assembler::rbp, .disp = resv_val_off});
-
-        // Load reservation address for comparison.
-        Register resv_addr = AllocTempReg();
-        if (!success()) return;
         int32_t resv_addr_off = offsetof(ThreadState, cpu.reservation_address);
-        as_.Movq(resv_addr, {.base = Assembler::rbp, .disp = resv_addr_off});
 
         // Get new value from rt.
         Register new_val = (args.rt < 31) ? GetReg(args.rt) : AllocTempReg();
         if (!success()) return;
         if (args.rt >= 31) as_.Xorl(new_val, new_val);
 
-        // Clear reservation.
+        // Compare the reservation address with base (via RAX), clearing the
+        // reservation in between — MOV does not touch flags, so the compare
+        // survives the clear.
+        as_.Movq(Assembler::rax, {.base = Assembler::rbp, .disp = resv_addr_off});
         as_.Movq({.base = Assembler::rbp, .disp = resv_addr_off},
                  static_cast<int32_t>(0));
-
-        // Check if reservation address matches base.
         AssemblerBase::Label* fail_label = as_.MakeLabel();
-        as_.Cmpq(resv_addr, base);
+        as_.Cmpq(Assembler::rax, base);
         as_.Jcc(Condition::kNotEqual, *fail_label);
 
-        // Move expected value into RAX for LOCK CMPXCHG.
-        as_.Movq(Assembler::rax, expected_val);
+        // Expected value into RAX for LOCK CMPXCHG.
+        as_.Movq(Assembler::rax, {.base = Assembler::rbp, .disp = resv_val_off});
 
         AssemblerBase::Label* recovery_label = as_.MakeLabel();
         as_.SetRecoveryPoint(recovery_label);
