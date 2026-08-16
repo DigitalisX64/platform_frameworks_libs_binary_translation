@@ -10521,15 +10521,58 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
     //   FMAXNMV/FMINNMV   — NaN-suppressing: substitute each NaN lane with the
     //                        other operand via a CMPUNORDPS self-compare mask,
     //                        then MAX/MIN. Mirrors the interpreter FmaxScalar /
-    //                        FmaxnmScalar reduction. Only the FP32 .4S form is
-    //                        lowered here; the Armv8.2 FP16 (.8H) form needs an
-    //                        F16C round-trip absent from the backend, so it bails.
+    //                        FmaxnmScalar reduction. The Armv8.2 FP16 (.4H/.8H)
+    //                        form is handled separately just below, through the
+    //                        F16C round-trip.
     case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
     case Decoder::AdvSimdTwoRegMiscOpcode::kFminv:
     case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv:
     case Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv: {
+      // Armv8.2-FP16 across-lanes FMAXV/FMINV/FMAXNMV/FMINNMV Hd, Vn.4H (Q=0) /
+      // Vn.8H (Q=1) via the F16C round-trip. Widen the halves to FP32, reduce
+      // there, narrow the single surviving lane once. The round-trip is exact for
+      // this family: FP16->FP32 is exact and order-preserving, min/max returns one
+      // of its inputs unmodified, so the value narrowed at the end is a value that
+      // arrived as an FP16 and round-trips bit-for-bit. NaN and the +-0 tie use the
+      // same policy idioms as the FP16 vector pairwise path, in FP32 space, via
+      // EmitFpPairwiseMinMaxF32Packed (NaN-propagating for FMAXV/FMINV, suppressing
+      // for the NM forms, and sign = sign1 AND sign2 for max / OR for min when both
+      // inputs are zero). Without F16C the region bails to lite->interp.
       if (args.is_fp16) {
-        UndefinedReturningVoid();
+        if (!host_platform::kHasF16C) {
+          UndefinedReturningVoid();
+          return;
+        }
+        const bool h_is_max =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv);
+        const bool h_is_nm =
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv) ||
+            (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
+        FpRegister lo = no_fp_register, hi = no_fp_register;
+        EmitWidenHalfVec(vn_off, args.q, &lo, &hi);
+        // .8H: lanes 4..7 fold elementwise into lanes 0..3 first (8 -> 4 FP32).
+        // .4H: only the low group exists.
+        FpRegister r =
+            args.q ? EmitFpPairwiseMinMaxF32Packed(lo, hi, h_is_max, h_is_nm) : lo;
+        // Two shuffle-and-combine steps leave the full reduction in lane 0:
+        // PSHUFD 0x4E swaps the 64-bit halves (folds lanes 2,3 into 0,1), 0xB1
+        // swaps adjacent dwords (folds lane 1 into lane 0).
+        FpRegister t0 = AllocTempSimdReg();
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+            t0.machine_reg(), r.machine_reg(), static_cast<int8_t>(0x4E));
+        r = EmitFpPairwiseMinMaxF32Packed(r, t0, h_is_max, h_is_nm);
+        FpRegister t1 = AllocTempSimdReg();
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+            t1.machine_reg(), r.machine_reg(), static_cast<int8_t>(0xB1));
+        r = EmitFpPairwiseMinMaxF32Packed(r, t1, h_is_max, h_is_nm);
+        // Keep lane 0 and zero the other three FP32 lanes before narrowing, so the
+        // scalar store writes Hd with bits[127:16] clear: VCVTPS2PH turns the three
+        // +0.0 lanes into 0x0000 halves and SetVRegScalar zeroes everything above
+        // the low 32 bits.
+        builder_.Gen<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{12});
+        builder_.Gen<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{12});
+        EmitNarrowF32ToHalfAndStore(args.rd, r);
         return;
       }
       const bool is_max =

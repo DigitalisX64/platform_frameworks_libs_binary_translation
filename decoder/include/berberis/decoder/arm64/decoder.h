@@ -1454,25 +1454,35 @@ class Decoder {
     kFcvtxn,    // FCVTXN/FCVTXN2: U=1, opcode=10110, size=01
     // across-lanes FP reductions FMAXV / FMINV /
     // FMAXNMV / FMINNMV. These share AdvSIMD two-reg-misc dispatch path
-    // but live in the across-lanes group (bit20=1) with U=1 mandatory.
+    // but live in the across-lanes group (bit20=1). U picks the element
+    // width: U=1 is the FP32 form, U=0 the Armv8.2-FP16 form, surfaced to
+    // the backends as args.is_fp16.
     // The `size` field carries "o sz" (bit23=o picks max=0 / min=1;
-    // bit22=sz picks FP32=0 / FP16=1). The decoder splits max/min via
-    // bit23 into separate enum values so the interpreter only needs to
-    // know which of the four ops it is. FP16 is left to the FP16
-    // half-precision dispatcher; this enum covers the FP32 .4S form
-    // (Q=1 mandatory).
+    // bit22=sz must be 0 — there is no FP64 across-lanes form). The
+    // decoder splits max/min via bit23 into separate enum values so the
+    // backends only need to know which of the four ops it is.
+    // Q picks the arrangement: FP32 has only .4S, so Q=0 (.2S) is
+    // unallocated; the FP16 form has .4H (Q=0) and .8H (Q=1).
     //   fmaxv   s0, v1.4s  = 0x6e30f820  (U=1, Q=1, size=00, opcode=01111)
     //   fminv   s0, v1.4s  = 0x6eb0f820  (U=1, Q=1, size=10, opcode=01111)
     //   fmaxnmv s0, v1.4s  = 0x6e30c820  (U=1, Q=1, size=00, opcode=01100)
     //   fminnmv s0, v1.4s  = 0x6eb0c820  (U=1, Q=1, size=10, opcode=01100)
+    //   fmaxv   h0, v1.4h  = 0x0e30f820  (U=0, Q=0, size=00, opcode=01111)
+    //   fmaxv   h0, v1.8h  = 0x4e30f820  (U=0, Q=1, size=00, opcode=01111)
+    //   fminv   h0, v1.4h  = 0x0eb0f820  (U=0, Q=0, size=10, opcode=01111)
+    //   fminv   h0, v1.8h  = 0x4eb0f820  (U=0, Q=1, size=10, opcode=01111)
+    //   fmaxnmv h0, v1.4h  = 0x0e30c820  (U=0, Q=0, size=00, opcode=01100)
+    //   fmaxnmv h0, v1.8h  = 0x4e30c820  (U=0, Q=1, size=00, opcode=01100)
+    //   fminnmv h0, v1.4h  = 0x0eb0c820  (U=0, Q=0, size=10, opcode=01100)
+    //   fminnmv h0, v1.8h  = 0x4eb0c820  (U=0, Q=1, size=10, opcode=01100)
     // Semantics: FMAXV/FMINV use IEEE 754-2008 max/min (any NaN -> NaN);
     // FMAXNMV/FMINNMV use max-number/min-number (NaN excluded when other
-    // input is non-NaN). Result is a scalar lane in bottom 4 bytes of Vd
-    // (upper 96 bits zeroed by the routine's `result=0` init).
-    kFmaxv,     // FMAXV   (across .4S): opcode=01111, bit23=0
-    kFminv,     // FMINV   (across .4S): opcode=01111, bit23=1
-    kFmaxnmv,   // FMAXNMV (across .4S): opcode=01100, bit23=0
-    kFminnmv,   // FMINNMV (across .4S): opcode=01100, bit23=1
+    // input is non-NaN). Result is a scalar lane in the bottom esize bytes
+    // of Vd (upper bits zeroed by the routine's `result=0` init).
+    kFmaxv,     // FMAXV   (across .4S/.4H/.8H): opcode=01111, bit23=0
+    kFminv,     // FMINV   (across .4S/.4H/.8H): opcode=01111, bit23=1
+    kFmaxnmv,   // FMAXNMV (across .4S/.4H/.8H): opcode=01100, bit23=0
+    kFminnmv,   // FMINNMV (across .4S/.4H/.8H): opcode=01100, bit23=1
   };
 
   // SHA-512 (FEAT_SHA512) ops live outside the AdvSIMD
@@ -5256,10 +5266,11 @@ class Decoder {
 
     AdvSimdTwoRegMiscOpcode op;
     // Armv8.2-FP16 across-lanes (FMAXV/FMINV/FMAXNMV/FMINNMV
-    // on .8H) shares the across-lanes dispatch path with FP32 (.4S) and is
-    // distinguished by U=0 vs FP32's U=1. The relevant cases below set this
-    // flag; it is otherwise false. The interpreter reads args.is_fp16 inside
-    // each across-lanes arm to dispatch the half-precision element path.
+    // on .4H/.8H) shares the across-lanes dispatch path with FP32 (.4S) and
+    // is distinguished by U=0 vs FP32's U=1. The relevant cases below set
+    // this flag; it is otherwise false. The backends read args.is_fp16
+    // inside each across-lanes arm to dispatch the half-precision element
+    // path.
     bool is_fp16 = false;
 
     switch (opcode) {
@@ -5399,13 +5410,17 @@ class Decoder {
       // bit20 splits opcode=01111 between
       // FABS/FNEG (bit20=0, two-reg-misc) and across-lanes
       // FMAXV/FMINV (bit20=1). bit23 picks max (0) vs min (1).
-      // U=1 selects the FP32 (.4S) form; U=0 selects the FP16 (.8H) form
-      // (interpreter dispatches on args.is_fp16). For both U values bit22
+      // U=1 selects the FP32 form; U=0 selects the Armv8.2-FP16 form
+      // (backends dispatch on args.is_fp16). For both U values bit22
       // (size[0], "sz") must be 0 — FP64 is unallocated for these encodings.
+      // Q selects the arrangement: FP32 has only .4S, so Q=0 (.2S) is
+      // unallocated; FP16 has .4H (Q=0) and .8H (Q=1). The Q test therefore
+      // runs after is_fp16 is known.
       case 0b01111:
         if (GetBits<20, 1>()) {
-          if ((size & 1) || !q) { Undefined(); return; }
+          if (size & 1) { Undefined(); return; }
           is_fp16 = !u;
+          if (!is_fp16 && !q) { Undefined(); return; }
           op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminv
                                 : AdvSimdTwoRegMiscOpcode::kFmaxv;
         } else {
@@ -5414,16 +5429,18 @@ class Decoder {
         break;
       // opcode=01100 covers two distinct encodings:
       //   bit20=1: across-lanes FMAXNMV (bit23=0) / FMINNMV (bit23=1).
-      //     bit22 (sz) must be 0; U=1 selects FP32 (.4S), U=0 selects
-      //     FP16 (.8H) — interpreter dispatches on args.is_fp16.
+      //     bit22 (sz) must be 0; U=1 selects FP32 (.4S only), U=0 selects
+      //     FP16 (.4H when Q=0, .8H when Q=1) — backends dispatch on
+      //     args.is_fp16.
       //   bit20=0: FP two-reg-misc FCMGT (zero, U=0) / FCMGE (zero, U=1).
       //     bit23=1 is required (FP form). bit22 (sz) picks FP32 (0) or
       //     FP64 (1); FP64 requires Q=1.
       // Pre-Digitalis these all routed to Undefined() (fell through to default).
       case 0b01100:
         if (GetBits<20, 1>()) {
-          if ((size & 1) || !q) { Undefined(); return; }
+          if (size & 1) { Undefined(); return; }
           is_fp16 = !u;
+          if (!is_fp16 && !q) { Undefined(); return; }
           op = GetBits<23, 1>() ? AdvSimdTwoRegMiscOpcode::kFminnmv
                                 : AdvSimdTwoRegMiscOpcode::kFmaxnmv;
         } else {
@@ -5574,8 +5591,8 @@ class Decoder {
         .q = q,
         .u = u,
         // across-lanes FP16 (FMAXV/FMINV/FMAXNMV/FMINNMV
-        // on .8H) is selected by U=0 in the across-lanes cases above; for
-        // every other dispatch path is_fp16 stays false.
+        // on .4H/.8H) is selected by U=0 in the across-lanes cases above;
+        // for every other dispatch path is_fp16 stays false.
         .is_fp16 = is_fp16,
     };
     insn_consumer_->AdvSimdTwoRegMisc(args);

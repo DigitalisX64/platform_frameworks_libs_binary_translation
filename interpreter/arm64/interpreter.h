@@ -7276,8 +7276,8 @@ class Interpreter {
 
       // across-lanes FP reductions FMAXV / FMINV /
       // FMAXNMV / FMINNMV. Reduce all lanes of an FP vector (.4S for
-      // FP32, .8H for FP16; Q=1 pinned by the decoder) to a single
-      // scalar FP element.
+      // FP32, where the decoder pins Q=1; .4H or .8H for FP16 per Q) to
+      // a single scalar FP element.
       //   FMAXV/FMINV: IEEE 754-2008 max/min — any NaN in input
       //     propagates to a NaN result.
       //   FMAXNMV/FMINNMV: max-number/min-number — a NaN is skipped
@@ -7303,13 +7303,16 @@ class Interpreter {
         bool is_nm = (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv ||
                       args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
         if (args.is_fp16) {
-          // .8H form: reduce 8 lanes of half. Promote to FP32 for the
-          // reduction (FP16 -> FP32 is exact and preserves NaN); narrow
-          // the final accumulator back to FP16.
+          // .4H (Q=0) / .8H (Q=1) form: reduce 4 or 8 half lanes. Promote
+          // to FP32 for the reduction (FP16 -> FP32 is exact and preserves
+          // NaN); narrow the final accumulator back to FP16. The lane
+          // count comes from Q directly — args.size carries "o sz" for
+          // these opcodes, not an element width.
+          const uint8_t fp16_lanes = args.q ? 8 : 4;
           uint16_t acc_h;
           memcpy(&acc_h, reinterpret_cast<const uint8_t*>(&src), 2);
           float acc = FpHalfToSingle(acc_h);
-          for (uint8_t i = 1; i < 8; i++) {
+          for (uint8_t i = 1; i < fp16_lanes; i++) {
             uint16_t a_h;
             memcpy(&a_h, reinterpret_cast<const uint8_t*>(&src) + i * 2, 2);
             float a = FpHalfToSingle(a_h);

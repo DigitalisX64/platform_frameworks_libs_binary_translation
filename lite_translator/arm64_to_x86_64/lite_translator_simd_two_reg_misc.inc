@@ -2975,9 +2975,11 @@
         }
         return;
       }
-      // FMAXV/FMINV/FMAXNMV/FMINNMV Sd, Vn.4S — reduce the four FP32 lanes to
-      // one scalar. Two log2(4) folding steps, each PSHUFD-ing the operand and
-      // combining, so the result lands in lane 0.
+      // FMAXV/FMINV/FMAXNMV/FMINNMV — across-lanes FP reduction. The FP32
+      // form is Sd, Vn.4S; the Armv8.2-FP16 form is Hd, Vn.4H (Q=0) or
+      // Hd, Vn.8H (Q=1). Everything folds in FP32 space: two log2(4) folding
+      // steps, each PSHUFD-ing the operand and combining, so the result lands
+      // in lane 0.
       //
       // The pair step differs by NaN policy, matching the interpreter:
       //   FMAXV/FMINV     — NaN-propagating. MAXPS/MINPS on x86 return the
@@ -2990,15 +2992,26 @@
       //                     other operand via a CMPUNORDPS self-compare mask
       //                     before MAX/MIN, so a NaN only survives if both are.
       //
-      // Only the FP32 .4S form is lowered. The Armv8.2 FP16 .8H form needs an
-      // F16C round-trip this backend does not have, and .2S (Q=0) is
-      // ARM-reserved for the across-lanes reductions; both go to the
-      // interpreter. Mirrors the heavy frontend's lowering of the same opcodes.
+      // The FP16 forms use the F16C round-trip (VCVTPH2PS to widen, VCVTPS2PH
+      // imm=0 to narrow). This is exact for a reduction: max/min returns one of
+      // its inputs unchanged, and FP16 -> FP32 widening is exact for every FP16
+      // encoding, so the winning FP32 lane is the exact widening of some input
+      // half and narrowing it reproduces that half bit-for-bit. NaNs survive
+      // the round-trip as NaNs — a widened FP16 NaN is an FP32 NaN, the POR /
+      // CMPUNORDPS idioms below only ever produce an all-ones FP32 exponent
+      // when an input had one, and VCVTPS2PH maps any FP32 NaN to an FP16
+      // QNaN, never to an infinity.
+      //
+      // .2S (Q=0) is ARM-reserved for the FP32 across-lanes reductions and the
+      // decoder rejects it. Mirrors the heavy frontend's lowering of the same
+      // opcodes (which routes its FP16 fold through the shared FP32 min/max
+      // helper).
       case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFminv:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv:
       case Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv: {
-        if (args.is_fp16 || !args.q) { success_ = false; return; }
+        if (!args.is_fp16 && !args.q) { success_ = false; return; }
+        if (args.is_fp16 && !host_platform::kHasF16C) { success_ = false; return; }
         const bool is_max =
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv) ||
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv);
@@ -3006,16 +3019,18 @@
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFmaxnmv) ||
             (args.opcode == Decoder::AdvSimdTwoRegMiscOpcode::kFminnmv);
         // All temps are allocated once, before the folding steps: the pair step
-        // runs twice, and allocating inside it would take a fresh register from
-        // the pool each time for no reason.
+        // runs twice (three times for .8H), and allocating inside it would take
+        // a fresh register from the pool each time for no reason.
         SimdRegister xn = AllocTempSimdReg();
         SimdRegister xt = AllocTempSimdReg();
         SimdRegister xa = AllocTempSimdReg();
         SimdRegister xb = is_nm ? AllocTempSimdReg() : xa;
         SimdRegister a_sub = is_nm ? AllocTempSimdReg() : xa;
         SimdRegister b_sub = is_nm ? AllocTempSimdReg() : xa;
+        // .8H widens its two half-lane groups into separate registers, so it
+        // needs one temp more than .4S / .4H do.
+        SimdRegister xh = (args.is_fp16 && args.q) ? AllocTempSimdReg() : xn;
         if (!success()) { return; }
-        as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
         // Fold b into a with packed FP32 min/max under the selected NaN rule.
         auto emit_pair = [&](SimdRegister a, SimdRegister b) {
           if (!is_nm) {
@@ -3049,15 +3064,46 @@
             as_.Movdqa(a, xa);
           }
         };
+        if (!args.is_fp16) {
+          as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+        } else if (!args.q) {
+          // .4H: the four half-lanes occupy the low 64 bits of Vn. VCVTPH2PS
+          // reads exactly those and produces the four FP32 lanes the fold
+          // below expects.
+          as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Vcvtph2ps(xn, xn);
+        } else {
+          // .8H: widen the low and high half-lane groups into two registers,
+          // then fold the high group into the low one with the same pair step.
+          // That lane-wise fold reduces 8 halves to 4 FP32 lanes holding
+          // max/min(lane i, lane i+4), and the two-step fold below finishes
+          // the reduction.
+          as_.Movdqu(xh, {.base = Assembler::rbp, .disp = vn_off});
+          as_.Movdqa(xn, xh);
+          as_.Vcvtph2ps(xn, xn);
+          as_.Psrldq(xh, int8_t{8});
+          as_.Vcvtph2ps(xh, xh);
+          emit_pair(xn, xh);
+        }
         // Step 1: fold lanes {2,3} into {0,1} (PSHUFD 0x4E swaps 64-bit halves).
         as_.Pshufd(xt, xn, static_cast<int8_t>(0x4E));
         emit_pair(xn, xt);
         // Step 2: fold lane 1 into lane 0 (PSHUFD 0xB1 swaps adjacent dwords).
         as_.Pshufd(xt, xn, static_cast<int8_t>(0xB1));
         emit_pair(xn, xt);
-        // Scalar result: keep lane 0, zero the upper 96 bits.
-        as_.Pslldq(xn, int8_t{12});
-        as_.Psrldq(xn, int8_t{12});
+        if (args.is_fp16) {
+          // Narrow the winner back to FP16. VCVTPS2PH packs the four FP32
+          // lanes into the low 64 bits, so the scalar result is at byte 0;
+          // shifting left then right by 14 bytes keeps those two bytes and
+          // zeroes the upper 112 bits of Hd.
+          as_.Vcvtps2ph(xn, xn, int8_t{0});
+          as_.Pslldq(xn, int8_t{14});
+          as_.Psrldq(xn, int8_t{14});
+        } else {
+          // Scalar result: keep lane 0, zero the upper 96 bits.
+          as_.Pslldq(xn, int8_t{12});
+          as_.Psrldq(xn, int8_t{12});
+        }
         as_.Movdqu({.base = Assembler::rbp, .disp = vd_off}, xn);
         return;
       }
