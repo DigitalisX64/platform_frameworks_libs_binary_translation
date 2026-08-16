@@ -48448,6 +48448,70 @@ TEST_F(Arm64LiteTranslateRegionTest, LdNrReplicateJit) {
     for (int l = 0; l < 4; l++) EXPECT_EQ(lane32(i, l), mem4[i]);
 }
 
+// 64-bit-lane integer forms that previously bailed as "AVX-512-blocked" but
+// need only SSE4.1/4.2: CMEQ #0 (PCMPEQQ), ABS (PCMPGTQ sign mask), the
+// CMGT/CMGE/CMLT/CMLE #0 family (PCMPGTQ), and SSHR .2D (already lowered via
+// the GPR SARQ fallback, pinned here alongside). Encodings objdump-verified.
+TEST_F(Arm64LiteTranslateRegionTest, Int64LaneMiscJit) {
+  auto set_lane64 = [&](int vreg, int lane, uint64_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, &val, 8);
+  };
+  auto lane64 = [&](int vreg, int lane) {
+    uint64_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, 8);
+    return v;
+  };
+
+  // cmeq v3.2d, v3.2d, #0: lane0 == 0 -> all-ones; lane1 != 0 -> zero.
+  set_lane64(3, 0, 0);
+  set_lane64(3, 1, 0x123456789ABCDEF0ULL);
+  static const uint32_t cmeqz[] = {0x4ee09863U};
+  EXPECT_TRUE(Run(cmeqz, ToGuestAddr(cmeqz) + sizeof(cmeqz)));
+  EXPECT_EQ(lane64(3, 0), ~0ULL);
+  EXPECT_EQ(lane64(3, 1), 0ULL);
+
+  // abs v2.2d, v0.2d: negative lane negated, positive unchanged; INT64_MIN
+  // stays INT64_MIN (matches ARM ABS semantics).
+  set_lane64(0, 0, static_cast<uint64_t>(-42LL));
+  set_lane64(0, 1, 0x8000000000000000ULL);  // INT64_MIN
+  static const uint32_t absd[] = {0x4ee0b802U};
+  EXPECT_TRUE(Run(absd, ToGuestAddr(absd) + sizeof(absd)));
+  EXPECT_EQ(lane64(2, 0), 42ULL);
+  EXPECT_EQ(lane64(2, 1), 0x8000000000000000ULL);
+
+  // cmgt/cmlt/cmge/cmle v0.2d, v0.2d, #0 with lanes {+5, -5}.
+  struct Case { uint32_t insn; uint64_t pos_lane; uint64_t neg_lane; };
+  static const Case kCases[] = {
+      {0x4ee08800U, ~0ULL, 0ULL},  // cmgt #0: +5 true, -5 false
+      {0x4ee0a800U, 0ULL, ~0ULL},  // cmlt #0: +5 false, -5 true
+      {0x6ee08800U, ~0ULL, 0ULL},  // cmge #0: +5 true, -5 false
+      {0x6ee09800U, 0ULL, ~0ULL},  // cmle #0: +5 false, -5 true
+  };
+  for (const Case& c : kCases) {
+    set_lane64(0, 0, 5);
+    set_lane64(0, 1, static_cast<uint64_t>(-5LL));
+    uint32_t insn[1] = {c.insn};
+    EXPECT_TRUE(Run(insn, ToGuestAddr(insn) + sizeof(insn)));
+    EXPECT_EQ(lane64(0, 0), c.pos_lane) << std::hex << c.insn;
+    EXPECT_EQ(lane64(0, 1), c.neg_lane) << std::hex << c.insn;
+  }
+
+  // sshr v0.2d, v0.2d, #10 and #64 (sign-fill boundary).
+  set_lane64(0, 0, static_cast<uint64_t>(-1024LL));
+  set_lane64(0, 1, 1024ULL);
+  static const uint32_t sshr10[] = {0x4f760400U};
+  EXPECT_TRUE(Run(sshr10, ToGuestAddr(sshr10) + sizeof(sshr10)));
+  EXPECT_EQ(lane64(0, 0), static_cast<uint64_t>(-1LL));
+  EXPECT_EQ(lane64(0, 1), 1ULL);
+
+  set_lane64(0, 0, static_cast<uint64_t>(-7LL));
+  set_lane64(0, 1, 7ULL);
+  static const uint32_t sshr64[] = {0x4f400400U};
+  EXPECT_TRUE(Run(sshr64, ToGuestAddr(sshr64) + sizeof(sshr64)));
+  EXPECT_EQ(lane64(0, 0), ~0ULL);
+  EXPECT_EQ(lane64(0, 1), 0ULL);
+}
+
 // Differential fuzzer: drive random straight-line integer sequences through the
 // multi-region lite-translator JIT (register mapping ON, the production default)
 // and diff the resulting x0..xN against a pure-interpreter run of the identical

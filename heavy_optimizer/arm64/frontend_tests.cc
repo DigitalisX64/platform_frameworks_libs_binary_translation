@@ -16184,22 +16184,25 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FcmgtZeroVec2D) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000000000000ULL);  // lane1 (-2>0) F
 }
 
-// FCMEQ/CMGT #0 .2D must bail: PCMPEQQ/PCMPGTQ are not in the backend allowlist.
-TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqZeroVec2DBails) {
+// CMEQ/CMGT #0 .2D now lower (PCMPEQQ / PCMPGTQ); the frontend must translate
+// them instead of bailing. Value-level checks live in Int64LaneMisc.
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmeqZeroVec2DTranslates) {
   static const uint32_t code[] = {CmeqZeroVec(0b11, /*q=*/true, 0, 1)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(n, 1u);
 }
-TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtZeroVec2DBails) {
+TEST_F(Arm64HeavyOptimizerFrontendTest, CmgtZeroVec2DTranslates) {
   static const uint32_t code[] = {CmgtZeroVec(0b11, /*q=*/true, 0, 1)};
   state_.cpu.insn_addr = ToGuestAddr(code);
   MachineCode mc;
   auto [stop, ok, n] = HeavyOptimizeRegion(
       ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 0u);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(n, 1u);
 }
 
 // ---- AdvSIMD three-same signed/unsigned compares (heavy mirror, wave 2). ----
@@ -17345,6 +17348,83 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, LdNSingleStructLaneAndReplicate) {
   ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(ld4r) + sizeof(ld4r)));
   for (int i = 0; i < 4; i++)
     for (int l = 0; l < 4; l++) EXPECT_EQ(lane32(i, l), mem4r[i]);
+}
+
+
+// 64-bit-lane integer forms previously bailed as "AVX-512-blocked" but SSE-
+// emulable: CMEQ #0 (PCMPEQQ), ABS + the CMGT/CMLT #0 family (PCMPGTQ), and
+// SSHR .2D via sign-mask PSRLQ/PSLLQ/POR. Encodings objdump-verified.
+TEST_F(Arm64HeavyOptimizerFrontendTest, Int64LaneMisc) {
+  auto set_lane64 = [&](int vreg, int lane, uint64_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, &val, 8);
+  };
+  auto lane64 = [&](int vreg, int lane) {
+    uint64_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, 8);
+    return v;
+  };
+
+  // cmeq v3.2d, v3.2d, #0
+  set_lane64(3, 0, 0);
+  set_lane64(3, 1, 0x123456789ABCDEF0ULL);
+  static const uint32_t cmeqz[] = {0x4ee09863U};
+  state_.cpu.insn_addr = ToGuestAddr(cmeqz);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(cmeqz) + sizeof(cmeqz)));
+  EXPECT_EQ(lane64(3, 0), ~0ULL);
+  EXPECT_EQ(lane64(3, 1), 0ULL);
+
+  // abs v2.2d, v0.2d (INT64_MIN fixed point)
+  set_lane64(0, 0, static_cast<uint64_t>(-42LL));
+  set_lane64(0, 1, 0x8000000000000000ULL);
+  static const uint32_t absd[] = {0x4ee0b802U};
+  state_.cpu.insn_addr = ToGuestAddr(absd);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(absd) + sizeof(absd)));
+  EXPECT_EQ(lane64(2, 0), 42ULL);
+  EXPECT_EQ(lane64(2, 1), 0x8000000000000000ULL);
+
+  // cmgt/cmlt v0.2d, #0
+  set_lane64(0, 0, 5);
+  set_lane64(0, 1, static_cast<uint64_t>(-5LL));
+  static const uint32_t cmgtz[] = {0x4ee08800U};
+  state_.cpu.insn_addr = ToGuestAddr(cmgtz);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(cmgtz) + sizeof(cmgtz)));
+  EXPECT_EQ(lane64(0, 0), ~0ULL);
+  EXPECT_EQ(lane64(0, 1), 0ULL);
+
+  set_lane64(0, 0, 5);
+  set_lane64(0, 1, static_cast<uint64_t>(-5LL));
+  static const uint32_t cmltz[] = {0x4ee0a800U};
+  state_.cpu.insn_addr = ToGuestAddr(cmltz);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(cmltz) + sizeof(cmltz)));
+  EXPECT_EQ(lane64(0, 0), 0ULL);
+  EXPECT_EQ(lane64(0, 1), ~0ULL);
+
+  // sshr v0.2d, #10 and the #64 sign-fill boundary; scalar sshr d0, d1, #1.
+  set_lane64(0, 0, static_cast<uint64_t>(-1024LL));
+  set_lane64(0, 1, 1024ULL);
+  static const uint32_t sshr10[] = {0x4f760400U};
+  state_.cpu.insn_addr = ToGuestAddr(sshr10);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sshr10) + sizeof(sshr10)));
+  EXPECT_EQ(lane64(0, 0), static_cast<uint64_t>(-1LL));
+  EXPECT_EQ(lane64(0, 1), 1ULL);
+
+  set_lane64(0, 0, static_cast<uint64_t>(-7LL));
+  set_lane64(0, 1, 7ULL);
+  static const uint32_t sshr64[] = {0x4f400400U};
+  state_.cpu.insn_addr = ToGuestAddr(sshr64);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sshr64) + sizeof(sshr64)));
+  EXPECT_EQ(lane64(0, 0), ~0ULL);
+  EXPECT_EQ(lane64(0, 1), 0ULL);
+
+  // sshr d0, d1, #1 (scalar-D: upper 64 of Vd zeroed).
+  set_lane64(1, 0, static_cast<uint64_t>(-8LL));
+  set_lane64(1, 1, 0xDEADBEEFDEADBEEFULL);
+  set_lane64(0, 1, 0x1111111111111111ULL);
+  static const uint32_t sshrd[] = {0x5f7f0420U};
+  state_.cpu.insn_addr = ToGuestAddr(sshrd);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(sshrd) + sizeof(sshrd)));
+  EXPECT_EQ(lane64(0, 0), static_cast<uint64_t>(-4LL));
+  EXPECT_EQ(lane64(0, 1), 0ULL);
 }
 
 }  // namespace berberis

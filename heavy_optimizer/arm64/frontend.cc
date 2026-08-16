@@ -9540,7 +9540,8 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
     // (Vn ^ sign_mask) - sign_mask, sign_mask = PCMPGT(0, Vn) = -1 if Vn<0.
     // size=11 (.2D) needs PCMPGTQ (not allowlisted) and bails.
     case Decoder::AdvSimdTwoRegMiscOpcode::kAbs: {
-      if (args.size == 0b11) {
+      // .2D (size=0b11) uses PCMPGTQ for the sign mask; gate on SSE4.2.
+      if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
         UndefinedReturningVoid();
         return;
       }
@@ -9554,8 +9555,11 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         case 0b01:
           builder_.Gen<x86_64::PcmpgtwXRegXReg>(mask.machine_reg(), xn.machine_reg());
           break;
-        default:  // 0b10
+        case 0b10:
           builder_.Gen<x86_64::PcmpgtdXRegXReg>(mask.machine_reg(), xn.machine_reg());
+          break;
+        default:  // 0b11 (.2D)
+          builder_.Gen<x86_64::PcmpgtqXRegXReg>(mask.machine_reg(), xn.machine_reg());
           break;
       }
       builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
@@ -9566,8 +9570,11 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         case 0b01:
           builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), mask.machine_reg());
           break;
-        default:  // 0b10
+        case 0b10:
           builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          break;
+        default:  // 0b11 (.2D)
+          builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), mask.machine_reg());
           break;
       }
       SetVRegFull(args.rd, xn, args.q);
@@ -9575,8 +9582,7 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
     }
 
     // CMEQ Vd.<T>, Vn.<T>, #0 — per-lane integer compare-equal against zero.
-    // PCMPEQ{B,W,D} against a zeroed register. size=11 (.2D) needs PCMPEQQ
-    // (not allowlisted) and bails, matching the lite translator.
+    // PCMPEQ{B,W,D,Q} against a zeroed register.
     case Decoder::AdvSimdTwoRegMiscOpcode::kCmeqZero: {
       if (args.is_fp16) {
         // FP16 FCMEQ Vd,Vn,#0.0 — per-16-bit-lane FP compare vs +0.0. (Without this,
@@ -9597,10 +9603,6 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         }
         return;
       }
-      if (args.size == 0b11) {
-        UndefinedReturningVoid();
-        return;
-      }
       FpRegister xn = AllocTempSimdReg();
       FpRegister xz = AllocZeroedSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
@@ -9611,8 +9613,11 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         case 0b01:
           builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
-        default:  // 0b10
+        case 0b10:
           builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          break;
+        default:  // 0b11 (.2D): PCMPEQQ (SSE4.1).
+          builder_.Gen<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
       }
       SetVRegFull(args.rd, xn, args.q);
@@ -9666,7 +9671,8 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         }
         return;
       }
-      if (args.size == 0b11) {
+      // .2D (size=0b11) uses PCMPGTQ; gate on SSE4.2.
+      if (args.size == 0b11 && !host_platform::kHasSSE4_2) {
         UndefinedReturningVoid();
         return;
       }
@@ -9690,8 +9696,11 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         case 0b01:
           builder_.Gen<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
           break;
-        default:  // 0b10
+        case 0b10:
           builder_.Gen<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
+          break;
+        default:  // 0b11 (.2D)
+          builder_.Gen<x86_64::PcmpgtqXRegXReg>(a.machine_reg(), b.machine_reg());
           break;
       }
       if (invert) {
@@ -13264,10 +13273,29 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
                   : static_cast<uint8_t>(2 * esize_bits - immh_immb);
       const bool is_arith =
           (args.opcode == Decoder::AdvSimdShiftImmOpcode::kSshr);
-      // SSHR .2D / scalar-D needs PSRAQ (AVX-512F-VL only) -> bail to lite,
-      // whose GPR fallback ships each 64-bit lane through SARQ.
+      // SSHR .2D / scalar-D has no packed 64-bit arithmetic shift below
+      // AVX-512 (PSRAQ). Emulate with the sign mask: sign = (0 > Vn) via
+      // PCMPGTQ (SSE4.2), result = PSRLQ(Vn, n) | PSLLQ(sign, 64-n); at
+      // n==64 the result is the sign mask itself (ARM's spec'd sign-fill).
       if (is_arith && esize_bits == 64) {
-        UndefinedReturningVoid();
+        if (!host_platform::kHasSSE4_2) {
+          UndefinedReturningVoid();
+          return;
+        }
+        FpRegister xv = AllocTempSimdReg();
+        FpRegister sign = AllocZeroedSimdReg();
+        builder_.GenGetSimd<16>(xv.machine_reg(), vn_off);
+        builder_.Gen<x86_64::PcmpgtqXRegXReg>(sign.machine_reg(), xv.machine_reg());
+        if (shift_count == 64) {
+          SetVRegFull(args.rd, sign, args.q);
+          return;
+        }
+        builder_.Gen<x86_64::PsrlqXRegImm>(xv.machine_reg(),
+                                           static_cast<int8_t>(shift_count));
+        builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(),
+                                           static_cast<int8_t>(64 - shift_count));
+        builder_.Gen<x86_64::PorXRegXReg>(xv.machine_reg(), sign.machine_reg());
+        SetVRegFull(args.rd, xv, args.q);
         return;
       }
       FpRegister xn = AllocTempSimdReg();
