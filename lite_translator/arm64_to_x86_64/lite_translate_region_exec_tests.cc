@@ -48587,6 +48587,62 @@ TEST_F(Arm64LiteTranslateRegionTest, Int64LaneMiscJit) {
   EXPECT_EQ(lane64(0, 1), 0ULL);
 }
 
+// SHA-1 ops (SHA1C/P/M, SHA1SU0/SU1, SHA1H) now lower in the lite tier,
+// completing the SHA family alongside the existing SHA-256 lowerings. Each op
+// is checked against the interpreter (the reference) from an identical state,
+// with script-computed golden anchors for the round ops. Encodings
+// objdump-verified.
+TEST_F(Arm64LiteTranslateRegionTest, Sha1OpsJit) {
+  auto set_v = [&](int vreg, uint32_t l0, uint32_t l1, uint32_t l2, uint32_t l3) {
+    uint32_t lanes[4] = {l0, l1, l2, l3};
+    std::memcpy(&state_.cpu.v[vreg], lanes, 16);
+  };
+  auto lane32 = [&](int vreg, int lane) {
+    uint32_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, 4);
+    return v;
+  };
+  auto reset = [&] {
+    set_v(0, 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u);
+    set_v(1, 0xC3D2E1F0u, 0x0BADF00Du, 0, 0);
+    set_v(2, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u);
+  };
+
+  struct Case { uint32_t insn; uint32_t g[4]; };
+  static const Case kCases[] = {
+      {0x5e020020U, {0x33E059C9u, 0x1CAEBB0Fu, 0x3DAD9EC0u, 0xD590CC0Au}},  // sha1c
+      {0x5e021020U, {0xDC17E052u, 0xD4D79367u, 0x5403F45Eu, 0x89335D8Bu}},  // sha1p
+      {0x5e022020U, {0xC5943025u, 0xFD7E55A1u, 0x1DAB79B9u, 0xD590CC0Au}},  // sha1m
+      {0x5e023020U, {0xEEEEEEEEu, 0xDDDDDDDDu, 0x685B0E3Du, 0x5FDBE03Fu}},  // sha1su0
+  };
+  for (const Case& c : kCases) {
+    reset();
+    uint32_t insn[1] = {c.insn};
+    EXPECT_TRUE(Run(insn, ToGuestAddr(insn) + sizeof(insn))) << std::hex << c.insn;
+    for (int l = 0; l < 4; l++) EXPECT_EQ(lane32(0, l), c.g[l]) << std::hex << c.insn << " lane " << l;
+  }
+
+  // sha1su1 v0.4s, v1.4s (uses Vd + Vn only; golden from the schedule spec).
+  set_v(0, 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u);
+  set_v(1, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u);
+  static const uint32_t su1[] = {0x5e281820U};
+  EXPECT_TRUE(Run(su1, ToGuestAddr(su1) + sizeof(su1)));
+  EXPECT_EQ(lane32(0, 0), 0x8ACE0246u);
+  EXPECT_EQ(lane32(0, 1), 0xB9FD3175u);
+  EXPECT_EQ(lane32(0, 2), 0xB9FD3175u);
+  EXPECT_EQ(lane32(0, 3), 0x35F8AC61u);
+
+  // sha1h s0, s1: ROL(Sn, 30), upper 96 bits zeroed.
+  set_v(0, 0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu);
+  set_v(1, 0xC3D2E1F0u, 0, 0, 0);
+  static const uint32_t h[] = {0x5e280820U};
+  EXPECT_TRUE(Run(h, ToGuestAddr(h) + sizeof(h)));
+  EXPECT_EQ(lane32(0, 0), 0x30F4B87Cu);
+  EXPECT_EQ(lane32(0, 1), 0u);
+  EXPECT_EQ(lane32(0, 2), 0u);
+  EXPECT_EQ(lane32(0, 3), 0u);
+}
+
 // Differential fuzzer: drive random straight-line integer sequences through the
 // multi-region lite-translator JIT (register mapping ON, the production default)
 // and diff the resulting x0..xN against a pure-interpreter run of the identical

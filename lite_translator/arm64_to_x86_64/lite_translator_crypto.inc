@@ -157,8 +157,7 @@
   }
 
   void CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t opcode) {
-    // Only SHA-256 (H/H2/SU1); SHA-1 forms (000..011) still bail.
-    if (opcode < 0b100 || opcode > 0b110) { Undefined(); return; }
+    if (opcode > 0b110) { Undefined(); return; }
     const int32_t vd_off = VRegOffset(rd);
     const int32_t vn_off = VRegOffset(rn);
     const int32_t vm_off = VRegOffset(rm);
@@ -171,6 +170,86 @@
       return;
     }
     auto m = [](int32_t off) { return Assembler::Operand{.base = Assembler::rbp, .disp = off}; };
+
+    if (opcode == 0b011) {
+      // SHA1SU0: t0 = d2^d0^m0; t1 = d3^d1^m1; t2 = n0^d2^m2; t3 = n1^d3^m3.
+      // All inputs are read before any lane of Vd is written, so aliased
+      // rd==rn / rd==rm stay correct.
+      as_.Movl(r0, m(vd_off + 8));
+      as_.Xorl(r0, m(vd_off + 0));
+      as_.Xorl(r0, m(vm_off + 0));
+      as_.Movl(r1, m(vd_off + 12));
+      as_.Xorl(r1, m(vd_off + 4));
+      as_.Xorl(r1, m(vm_off + 4));
+      as_.Movl(r2, m(vn_off + 0));
+      as_.Xorl(r2, m(vd_off + 8));
+      as_.Xorl(r2, m(vm_off + 8));
+      as_.Movl(r3, m(vn_off + 4));
+      as_.Xorl(r3, m(vd_off + 12));
+      as_.Xorl(r3, m(vm_off + 12));
+      as_.Movl(m(vd_off + 0), r0);
+      as_.Movl(m(vd_off + 4), r1);
+      as_.Movl(m(vd_off + 8), r2);
+      as_.Movl(m(vd_off + 12), r3);
+      return;
+    }
+    if (opcode <= 0b010) {
+      // SHA1C (000) / SHA1P (001) / SHA1M (010): four SHA-1 rounds.
+      // {a,b,c,d} = Vd lanes in r0..r3, e = Sn (Vn lane 0) in r4, f/t staged
+      // in one more temp plus one scratch word. Per round:
+      //   f = Ch/Parity/Maj of (b,c,d);  t = ROL(a,5) + f + e + w[j];
+      //   e=d; d=c; c=ROL(b,30); b=a; a=t.
+      Register r5 = AllocTempReg();
+      if (r5 == no_register) { success_ = false; return; }
+      as_.Movl(r0, m(vd_off + 0));
+      as_.Movl(r1, m(vd_off + 4));
+      as_.Movl(r2, m(vd_off + 8));
+      as_.Movl(r3, m(vd_off + 12));
+      as_.Movl(r4, m(vn_off + 0));
+      for (int j = 0; j < 4; j++) {
+        // f -> r5.
+        if (opcode == 0b000) {
+          // Ch: d ^ (b & (c ^ d)).
+          as_.Movl(r5, r2);
+          as_.Xorl(r5, r3);
+          as_.Andl(r5, r1);
+          as_.Xorl(r5, r3);
+        } else if (opcode == 0b001) {
+          // Parity: b ^ c ^ d.
+          as_.Movl(r5, r1);
+          as_.Xorl(r5, r2);
+          as_.Xorl(r5, r3);
+        } else {
+          // Maj: (b & c) | (d & (b | c)).
+          as_.Movl(r5, r1);
+          as_.Orl(r5, r2);
+          as_.Andl(r5, r3);
+          as_.Movl(m(kShaScr), r5);
+          as_.Movl(r5, r1);
+          as_.Andl(r5, r2);
+          as_.Orl(r5, m(kShaScr));
+        }
+        // t = f + e + w[j] + ROL(a,5) -> r5.
+        as_.Addl(r5, r4);
+        as_.Addl(r5, m(vm_off + j * 4));
+        as_.Movl(m(kShaScr), r5);
+        as_.Movl(r5, r0);
+        as_.Roll(r5, int8_t{5});
+        as_.Addl(r5, m(kShaScr));
+        // Rotate state.
+        as_.Movl(r4, r3);           // e = d
+        as_.Movl(r3, r2);           // d = c
+        as_.Movl(r2, r1);
+        as_.Roll(r2, int8_t{30});   // c = ROL(b, 30)
+        as_.Movl(r1, r0);           // b = a
+        as_.Movl(r0, r5);           // a = t
+      }
+      as_.Movl(m(vd_off + 0), r0);
+      as_.Movl(m(vd_off + 4), r1);
+      as_.Movl(m(vd_off + 8), r2);
+      as_.Movl(m(vd_off + 12), r3);
+      return;
+    }
 
     if (opcode == 0b110) {
       // SHA256SU1: nd0=d0+σ1(m2)+n1; nd1=d1+σ1(m3)+n2;
@@ -253,8 +332,7 @@
   }
 
   void CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcode) {
-    // Only SHA256SU0 (opcode 10); SHA1H/SHA1SU1 (00/01) still bail.
-    if (opcode != 0b10) { Undefined(); return; }
+    if (opcode > 0b10) { Undefined(); return; }
     const int32_t vd_off = VRegOffset(rd);
     const int32_t vn_off = VRegOffset(rn);
     SimdRegister xtmp = AllocTempSimdReg();
@@ -264,6 +342,41 @@
       return;
     }
     auto m = [](int32_t off) { return Assembler::Operand{.base = Assembler::rbp, .disp = off}; };
+
+    if (opcode == 0b00) {
+      // SHA1H: Sd = ROL(Sn, 30), upper 96 bits of Vd zeroed.
+      as_.Movl(r0, m(vn_off + 0));
+      as_.Roll(r0, int8_t{30});
+      as_.Pxor(xtmp, xtmp);
+      as_.Movdqu(m(vd_off), xtmp);
+      as_.Movl(m(vd_off + 0), r0);
+      return;
+    }
+    if (opcode == 0b01) {
+      // SHA1SU1: t_i = ROL(d_i ^ n_{i+1}, 1) for i = 0..2;
+      //          t3  = ROL(d3 ^ t0, 1)  (t0 is the already-rotated word).
+      // All Vd reads happen before any Vd write, so rd==rn stays correct.
+      as_.Movl(r0, m(vd_off + 0));
+      as_.Xorl(r0, m(vn_off + 4));
+      as_.Roll(r0, int8_t{1});
+      as_.Movl(r1, m(vd_off + 4));
+      as_.Xorl(r1, m(vn_off + 8));
+      as_.Roll(r1, int8_t{1});
+      as_.Movl(r2, m(vd_off + 8));
+      as_.Xorl(r2, m(vn_off + 12));
+      as_.Roll(r2, int8_t{1});
+      // t3 uses d3 and the rotated t0; read d3 before storing t0.
+      as_.Movl(m(kShaScr), r2);
+      as_.Movl(r2, m(vd_off + 12));
+      as_.Xorl(r2, r0);
+      as_.Roll(r2, int8_t{1});
+      as_.Movl(m(vd_off + 0), r0);
+      as_.Movl(m(vd_off + 4), r1);
+      as_.Movl(m(vd_off + 12), r2);
+      as_.Movl(r2, m(kShaScr));
+      as_.Movl(m(vd_off + 8), r2);
+      return;
+    }
     // out_i = d_i + σ0(d_{i+1}); d_4 = Vn[0]. Stage d[] at scratch[0..3] and
     // Vn[0] at scratch[4]. Each out_i is written in place at scratch[i] AFTER
     // reading its two inputs (σ0(d_{i+1}) at [i+1], +d_i at [i]); d_i is last
