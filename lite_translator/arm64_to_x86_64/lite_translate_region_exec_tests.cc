@@ -48201,6 +48201,253 @@ TEST_F(Arm64LiteTranslateRegionTest, Ld4Ld3SingleStructureLane) {
   EXPECT_EQ(w[3], 0x0D0E0F10u);
 }
 
+// ST2-ST4 / LD2-LD4 single-lane and LD2R-LD4R replicate forms lower in the
+// lite tier (previously interpreter-only; measured as the top interpreter
+// hot-spot in a JS-heavy benchmark run and present in short-video apps'
+// pixel-format shuffles). All encodings objdump-verified.
+TEST_F(Arm64LiteTranslateRegionTest, StNSingleStructureLaneJit) {
+  auto set_lane32 = [&](int vreg, int lane, uint32_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, &val, 4);
+  };
+  auto set_lane16 = [&](int vreg, int lane, uint16_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 2, &val, 2);
+  };
+  auto set_lane8 = [&](int vreg, int lane, uint8_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane, &val, 1);
+  };
+  auto set_lane64 = [&](int vreg, int lane, uint64_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, &val, 8);
+  };
+
+  // st2 {v4.s-v5.s}[0], [x6]
+  alignas(16) uint32_t mem2s[2] = {0, 0};
+  set_lane32(4, 0, 0x41424344u);
+  set_lane32(5, 0, 0x45464748u);
+  state_.cpu.x[6] = ToGuestAddr(&mem2s[0]);
+  static const uint32_t st2s[] = {0x0d2080c4U};
+  EXPECT_TRUE(Run(st2s, ToGuestAddr(st2s) + sizeof(st2s)));
+  EXPECT_EQ(mem2s[0], 0x41424344u);
+  EXPECT_EQ(mem2s[1], 0x45464748u);
+
+  // st2 {v1.s-v2.s}[2], [x2] (Q=1 high lane)
+  alignas(16) uint32_t mem2s2[2] = {0, 0};
+  set_lane32(1, 2, 0x0BADF00Du);
+  set_lane32(2, 2, 0xCAFED00Du);
+  state_.cpu.x[2] = ToGuestAddr(&mem2s2[0]);
+  static const uint32_t st2s_hi[] = {0x4d208041U};
+  EXPECT_TRUE(Run(st2s_hi, ToGuestAddr(st2s_hi) + sizeof(st2s_hi)));
+  EXPECT_EQ(mem2s2[0], 0x0BADF00Du);
+  EXPECT_EQ(mem2s2[1], 0xCAFED00Du);
+
+  // st4 {v24.h-v27.h}[0], [x8]
+  alignas(16) uint16_t mem4h[4] = {0, 0, 0, 0};
+  set_lane16(24, 0, 0x1111);
+  set_lane16(25, 0, 0x2222);
+  set_lane16(26, 0, 0x3333);
+  set_lane16(27, 0, 0x4444);
+  state_.cpu.x[8] = ToGuestAddr(&mem4h[0]);
+  static const uint32_t st4h[] = {0x0d206118U};
+  EXPECT_TRUE(Run(st4h, ToGuestAddr(st4h) + sizeof(st4h)));
+  EXPECT_EQ(mem4h[0], 0x1111);
+  EXPECT_EQ(mem4h[1], 0x2222);
+  EXPECT_EQ(mem4h[2], 0x3333);
+  EXPECT_EQ(mem4h[3], 0x4444);
+
+  // st4 {v20.b-v23.b}[3], [x10]
+  alignas(16) uint8_t mem4b[4] = {0, 0, 0, 0};
+  set_lane8(20, 3, 0xA1);
+  set_lane8(21, 3, 0xB2);
+  set_lane8(22, 3, 0xC3);
+  set_lane8(23, 3, 0xD4);
+  state_.cpu.x[10] = ToGuestAddr(&mem4b[0]);
+  static const uint32_t st4b[] = {0x0d202d54U};
+  EXPECT_TRUE(Run(st4b, ToGuestAddr(st4b) + sizeof(st4b)));
+  EXPECT_EQ(mem4b[0], 0xA1);
+  EXPECT_EQ(mem4b[1], 0xB2);
+  EXPECT_EQ(mem4b[2], 0xC3);
+  EXPECT_EQ(mem4b[3], 0xD4);
+
+  // st3 {v0.d-v2.d}[0], [x0]
+  alignas(16) uint64_t mem3d[3] = {0, 0, 0};
+  set_lane64(0, 0, 0x1122334455667788ULL);
+  set_lane64(1, 0, 0x99AABBCCDDEEFF00ULL);
+  set_lane64(2, 0, 0x0F1E2D3C4B5A6978ULL);
+  state_.cpu.x[0] = ToGuestAddr(&mem3d[0]);
+  static const uint32_t st3d[] = {0x0d00a400U};
+  EXPECT_TRUE(Run(st3d, ToGuestAddr(st3d) + sizeof(st3d)));
+  EXPECT_EQ(mem3d[0], 0x1122334455667788ULL);
+  EXPECT_EQ(mem3d[1], 0x99AABBCCDDEEFF00ULL);
+  EXPECT_EQ(mem3d[2], 0x0F1E2D3C4B5A6978ULL);
+
+  // st2 {v31.d-v0.d}[0], [x0]: the register list wraps 31 -> 0.
+  alignas(16) uint64_t memwrap[2] = {0, 0};
+  set_lane64(31, 0, 0xAAAAAAAAAAAAAAAAULL);
+  set_lane64(0, 0, 0xBBBBBBBBBBBBBBBBULL);
+  state_.cpu.x[0] = ToGuestAddr(&memwrap[0]);
+  static const uint32_t st2wrap[] = {0x0d20841fU};
+  EXPECT_TRUE(Run(st2wrap, ToGuestAddr(st2wrap) + sizeof(st2wrap)));
+  EXPECT_EQ(memwrap[0], 0xAAAAAAAAAAAAAAAAULL);
+  EXPECT_EQ(memwrap[1], 0xBBBBBBBBBBBBBBBBULL);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, StNSingleStructureLanePostIndexJit) {
+  auto set_lane32 = [&](int vreg, int lane, uint32_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, &val, 4);
+  };
+
+  // st4 {v0.s-v3.s}[0], [x1], #16
+  alignas(16) uint32_t mem4s[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 4; i++) set_lane32(i, 0, 0x10203040u + i);
+  state_.cpu.x[1] = ToGuestAddr(&mem4s[0]);
+  static const uint32_t st4post[] = {0x0dbfa020U};
+  EXPECT_TRUE(Run(st4post, ToGuestAddr(st4post) + sizeof(st4post)));
+  for (int i = 0; i < 4; i++) EXPECT_EQ(mem4s[i], 0x10203040u + i);
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(&mem4s[0]) + 16);
+
+  // st3 {v0.s-v2.s}[0], [x1], #12
+  alignas(16) uint32_t mem3s[3] = {0, 0, 0};
+  state_.cpu.x[1] = ToGuestAddr(&mem3s[0]);
+  static const uint32_t st3post[] = {0x0d9fa020U};
+  EXPECT_TRUE(Run(st3post, ToGuestAddr(st3post) + sizeof(st3post)));
+  for (int i = 0; i < 3; i++) EXPECT_EQ(mem3s[i], 0x10203040u + i);
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(&mem3s[0]) + 12);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdNSingleStructureLaneJit) {
+  auto lane32 = [&](int vreg, int lane) {
+    uint32_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, 4);
+    return v;
+  };
+  auto lane64 = [&](int vreg, int lane) {
+    uint64_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, 8);
+    return v;
+  };
+  auto lane8 = [&](int vreg, int lane) {
+    uint8_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane, 1);
+    return v;
+  };
+
+  // ld2 {v4.s-v5.s}[0], [x6]: lane 0 written, the other lanes preserved.
+  alignas(16) uint32_t mem2s[2] = {0x600D600Du, 0x0DD00DD0u};
+  state_.cpu.v[4] = state_.cpu.v[5] = static_cast<__uint128_t>(0) - 1;  // all-ones
+  state_.cpu.x[6] = ToGuestAddr(&mem2s[0]);
+  static const uint32_t ld2s[] = {0x0d6080c4U};
+  EXPECT_TRUE(Run(ld2s, ToGuestAddr(ld2s) + sizeof(ld2s)));
+  EXPECT_EQ(lane32(4, 0), 0x600D600Du);
+  EXPECT_EQ(lane32(5, 0), 0x0DD00DD0u);
+  EXPECT_EQ(lane32(4, 1), 0xFFFFFFFFu);  // untouched lanes stay
+  EXPECT_EQ(lane32(5, 3), 0xFFFFFFFFu);
+
+  // ld4 {v2.d-v5.d}[1], [x3]
+  alignas(16) uint64_t mem4d[4] = {0xD0D0D0D000000001ULL, 0xD0D0D0D000000002ULL,
+                                   0xD0D0D0D000000003ULL, 0xD0D0D0D000000004ULL};
+  for (int i = 2; i <= 5; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[3] = ToGuestAddr(&mem4d[0]);
+  static const uint32_t ld4d[] = {0x4d60a462U};
+  EXPECT_TRUE(Run(ld4d, ToGuestAddr(ld4d) + sizeof(ld4d)));
+  for (int i = 0; i < 4; i++) {
+    EXPECT_EQ(lane64(2 + i, 1), mem4d[i]);
+    EXPECT_EQ(lane64(2 + i, 0), 0u);  // low lane preserved
+  }
+
+  // ld4 {v21.b-v24.b}[12], [x2]
+  alignas(16) uint8_t mem4b[4] = {0x5A, 0x6B, 0x7C, 0x8D};
+  for (int i = 21; i <= 24; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[2] = ToGuestAddr(&mem4b[0]);
+  static const uint32_t ld4b[] = {0x4d603055U};
+  EXPECT_TRUE(Run(ld4b, ToGuestAddr(ld4b) + sizeof(ld4b)));
+  for (int i = 0; i < 4; i++) EXPECT_EQ(lane8(21 + i, 12), mem4b[i]);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdNSingleStructureLanePostIndexJit) {
+  auto lane64 = [&](int vreg, int lane) {
+    uint64_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, 8);
+    return v;
+  };
+  auto lane8 = [&](int vreg, int lane) {
+    uint8_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane, 1);
+    return v;
+  };
+
+  // ld2 {v0.d-v1.d}[1], [x1], x7  (register post-index)
+  alignas(16) uint64_t mem2d[2] = {0x1234567890ABCDEFULL, 0xFEDCBA0987654321ULL};
+  state_.cpu.v[0] = state_.cpu.v[1] = 0;
+  state_.cpu.x[1] = ToGuestAddr(&mem2d[0]);
+  state_.cpu.x[7] = 48;
+  static const uint32_t ld2post[] = {0x4de78420U};
+  EXPECT_TRUE(Run(ld2post, ToGuestAddr(ld2post) + sizeof(ld2post)));
+  EXPECT_EQ(lane64(0, 1), 0x1234567890ABCDEFULL);
+  EXPECT_EQ(lane64(1, 1), 0xFEDCBA0987654321ULL);
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(&mem2d[0]) + 48);
+
+  // ld4 {v0.b-v3.b}[0], [x1], #4
+  alignas(16) uint8_t mem4b[4] = {0x11, 0x22, 0x33, 0x44};
+  for (int i = 0; i < 4; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[1] = ToGuestAddr(&mem4b[0]);
+  static const uint32_t ld4post[] = {0x0dff2020U};
+  EXPECT_TRUE(Run(ld4post, ToGuestAddr(ld4post) + sizeof(ld4post)));
+  for (int i = 0; i < 4; i++) EXPECT_EQ(lane8(i, 0), mem4b[i]);
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(&mem4b[0]) + 4);
+}
+
+TEST_F(Arm64LiteTranslateRegionTest, LdNrReplicateJit) {
+  auto lane32 = [&](int vreg, int lane) {
+    uint32_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, 4);
+    return v;
+  };
+  auto lane8 = [&](int vreg, int lane) {
+    uint8_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane, 1);
+    return v;
+  };
+  auto upper64 = [&](int vreg) {
+    uint64_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + 8, 8);
+    return v;
+  };
+
+  // ld2r {v0.8b-v1.8b}, [x0]: each register broadcasts its own element;
+  // Q=0 zeroes the upper 64 bits.
+  alignas(16) uint8_t mem2[2] = {0xAB, 0xCD};
+  state_.cpu.v[0] = state_.cpu.v[1] = static_cast<__uint128_t>(0) - 1;
+  state_.cpu.x[0] = ToGuestAddr(&mem2[0]);
+  static const uint32_t ld2r[] = {0x0d60c000U};
+  EXPECT_TRUE(Run(ld2r, ToGuestAddr(ld2r) + sizeof(ld2r)));
+  for (int l = 0; l < 8; l++) {
+    EXPECT_EQ(lane8(0, l), 0xAB);
+    EXPECT_EQ(lane8(1, l), 0xCD);
+  }
+  EXPECT_EQ(upper64(0), 0u);
+  EXPECT_EQ(upper64(1), 0u);
+
+  // ld3r {v0.8b-v2.8b}, [x0]
+  alignas(16) uint8_t mem3[3] = {0x21, 0x43, 0x65};
+  for (int i = 0; i < 3; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&mem3[0]);
+  static const uint32_t ld3r[] = {0x0d40e000U};
+  EXPECT_TRUE(Run(ld3r, ToGuestAddr(ld3r) + sizeof(ld3r)));
+  for (int l = 0; l < 8; l++) {
+    EXPECT_EQ(lane8(0, l), 0x21);
+    EXPECT_EQ(lane8(1, l), 0x43);
+    EXPECT_EQ(lane8(2, l), 0x65);
+  }
+
+  // ld4r {v0.4s-v3.4s}, [x0]
+  alignas(16) uint32_t mem4[4] = {0x01010101u, 0x02020202u, 0x03030303u, 0x04040404u};
+  for (int i = 0; i < 4; i++) state_.cpu.v[i] = 0;
+  state_.cpu.x[0] = ToGuestAddr(&mem4[0]);
+  static const uint32_t ld4r[] = {0x4d60e800U};
+  EXPECT_TRUE(Run(ld4r, ToGuestAddr(ld4r) + sizeof(ld4r)));
+  for (int i = 0; i < 4; i++)
+    for (int l = 0; l < 4; l++) EXPECT_EQ(lane32(i, l), mem4[i]);
+}
+
 // Differential fuzzer: drive random straight-line integer sequences through the
 // multi-region lite-translator JIT (register mapping ON, the production default)
 // and diff the resulting x0..xN against a pure-interpreter run of the identical

@@ -17205,4 +17205,146 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, LdrQ31RegOffset) {
 
 }  // namespace
 
+
+// ST2-ST4 / LD2-LD4 single-lane and LD2R-LD4R replicate forms in the heavy
+// tier (mirrors the lite lowerings; previously num_regs==1 only). Encodings
+// objdump-verified.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StNSingleStructLane) {
+  auto set_lane32 = [&](int vreg, int lane, uint32_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, &val, 4);
+  };
+  auto set_lane16 = [&](int vreg, int lane, uint16_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 2, &val, 2);
+  };
+  auto set_lane64 = [&](int vreg, int lane, uint64_t val) {
+    std::memcpy(reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 8, &val, 8);
+  };
+
+  // st2 {v4.s-v5.s}[0], [x6]
+  alignas(16) uint32_t mem2s[2] = {0, 0};
+  set_lane32(4, 0, 0x41424344u);
+  set_lane32(5, 0, 0x45464748u);
+  state_.cpu.x[6] = ToGuestAddr(&mem2s[0]);
+  static const uint32_t st2s[] = {0x0d2080c4U};
+  state_.cpu.insn_addr = ToGuestAddr(st2s);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(st2s) + sizeof(st2s)));
+  EXPECT_EQ(mem2s[0], 0x41424344u);
+  EXPECT_EQ(mem2s[1], 0x45464748u);
+
+  // st4 {v24.h-v27.h}[0], [x8]
+  alignas(16) uint16_t mem4h[4] = {0, 0, 0, 0};
+  set_lane16(24, 0, 0x1111);
+  set_lane16(25, 0, 0x2222);
+  set_lane16(26, 0, 0x3333);
+  set_lane16(27, 0, 0x4444);
+  state_.cpu.x[8] = ToGuestAddr(&mem4h[0]);
+  static const uint32_t st4h[] = {0x0d206118U};
+  state_.cpu.insn_addr = ToGuestAddr(st4h);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(st4h) + sizeof(st4h)));
+  EXPECT_EQ(mem4h[0], 0x1111);
+  EXPECT_EQ(mem4h[1], 0x2222);
+  EXPECT_EQ(mem4h[2], 0x3333);
+  EXPECT_EQ(mem4h[3], 0x4444);
+
+  // st3 {v0.d-v2.d}[0], [x0]
+  alignas(16) uint64_t mem3d[3] = {0, 0, 0};
+  set_lane64(0, 0, 0x1122334455667788ULL);
+  set_lane64(1, 0, 0x99AABBCCDDEEFF00ULL);
+  set_lane64(2, 0, 0x0F1E2D3C4B5A6978ULL);
+  state_.cpu.x[0] = ToGuestAddr(&mem3d[0]);
+  static const uint32_t st3d[] = {0x0d00a400U};
+  state_.cpu.insn_addr = ToGuestAddr(st3d);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(st3d) + sizeof(st3d)));
+  EXPECT_EQ(mem3d[0], 0x1122334455667788ULL);
+  EXPECT_EQ(mem3d[1], 0x99AABBCCDDEEFF00ULL);
+  EXPECT_EQ(mem3d[2], 0x0F1E2D3C4B5A6978ULL);
+
+  // st2 {v31.d-v0.d}[0], [x0]: register list wraps 31 -> 0.
+  alignas(16) uint64_t memwrap[2] = {0, 0};
+  set_lane64(31, 0, 0xAAAAAAAAAAAAAAAAULL);
+  set_lane64(0, 0, 0xBBBBBBBBBBBBBBBBULL);
+  state_.cpu.x[0] = ToGuestAddr(&memwrap[0]);
+  static const uint32_t st2wrap[] = {0x0d20841fU};
+  state_.cpu.insn_addr = ToGuestAddr(st2wrap);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(st2wrap) + sizeof(st2wrap)));
+  EXPECT_EQ(memwrap[0], 0xAAAAAAAAAAAAAAAAULL);
+  EXPECT_EQ(memwrap[1], 0xBBBBBBBBBBBBBBBBULL);
+
+  // st4 {v0.s-v3.s}[0], [x1], #16 (immediate post-index writeback)
+  alignas(16) uint32_t mem4s[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 4; i++) set_lane32(i, 0, 0x10203040u + i);
+  state_.cpu.x[1] = ToGuestAddr(&mem4s[0]);
+  static const uint32_t st4post[] = {0x0dbfa020U};
+  state_.cpu.insn_addr = ToGuestAddr(st4post);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(st4post) + sizeof(st4post)));
+  for (int i = 0; i < 4; i++) EXPECT_EQ(mem4s[i], 0x10203040u + i);
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(&mem4s[0]) + 16);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdNSingleStructLaneAndReplicate) {
+  auto lane32 = [&](int vreg, int lane) {
+    uint32_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane * 4, 4);
+    return v;
+  };
+  auto lane8 = [&](int vreg, int lane) {
+    uint8_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + lane, 1);
+    return v;
+  };
+  auto upper64 = [&](int vreg) {
+    uint64_t v;
+    std::memcpy(&v, reinterpret_cast<uint8_t*>(&state_.cpu.v[vreg]) + 8, 8);
+    return v;
+  };
+
+  // ld2 {v4.s-v5.s}[0], [x6]: lane 0 written, other lanes preserved.
+  alignas(16) static const uint32_t mem2s[2] = {0x600D600Du, 0x0DD00DD0u};
+  std::memset(&state_.cpu.v[4], 0xFF, 16);
+  std::memset(&state_.cpu.v[5], 0xFF, 16);
+  state_.cpu.x[6] = ToGuestAddr(&mem2s[0]);
+  static const uint32_t ld2s[] = {0x0d6080c4U};
+  state_.cpu.insn_addr = ToGuestAddr(ld2s);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(ld2s) + sizeof(ld2s)));
+  EXPECT_EQ(lane32(4, 0), 0x600D600Du);
+  EXPECT_EQ(lane32(5, 0), 0x0DD00DD0u);
+  EXPECT_EQ(lane32(4, 1), 0xFFFFFFFFu);
+  EXPECT_EQ(lane32(5, 3), 0xFFFFFFFFu);
+
+  // ld4 {v21.b-v24.b}[12], [x2]
+  alignas(16) static const uint8_t mem4b[4] = {0x5A, 0x6B, 0x7C, 0x8D};
+  for (int i = 21; i <= 24; i++) std::memset(&state_.cpu.v[i], 0, 16);
+  state_.cpu.x[2] = ToGuestAddr(&mem4b[0]);
+  static const uint32_t ld4b[] = {0x4d603055U};
+  state_.cpu.insn_addr = ToGuestAddr(ld4b);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(ld4b) + sizeof(ld4b)));
+  for (int i = 0; i < 4; i++) EXPECT_EQ(lane8(21 + i, 12), mem4b[i]);
+
+  // ld2r {v0.8b-v1.8b}, [x0]: per-register broadcast, Q=0 zeroes upper half.
+  alignas(16) static const uint8_t mem2b[2] = {0xAB, 0xCD};
+  std::memset(&state_.cpu.v[0], 0xFF, 16);
+  std::memset(&state_.cpu.v[1], 0xFF, 16);
+  state_.cpu.x[0] = ToGuestAddr(&mem2b[0]);
+  static const uint32_t ld2r[] = {0x0d60c000U};
+  state_.cpu.insn_addr = ToGuestAddr(ld2r);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(ld2r) + sizeof(ld2r)));
+  for (int l = 0; l < 8; l++) {
+    EXPECT_EQ(lane8(0, l), 0xAB);
+    EXPECT_EQ(lane8(1, l), 0xCD);
+  }
+  EXPECT_EQ(upper64(0), 0u);
+  EXPECT_EQ(upper64(1), 0u);
+
+  // ld4r {v0.4s-v3.4s}, [x0]
+  alignas(16) static const uint32_t mem4r[4] = {0x01010101u, 0x02020202u, 0x03030303u,
+                                                0x04040404u};
+  for (int i = 0; i < 4; i++) std::memset(&state_.cpu.v[i], 0, 16);
+  state_.cpu.x[0] = ToGuestAddr(&mem4r[0]);
+  static const uint32_t ld4r[] = {0x4d60e800U};
+  state_.cpu.insn_addr = ToGuestAddr(ld4r);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(ld4r) + sizeof(ld4r)));
+  for (int i = 0; i < 4; i++)
+    for (int l = 0; l < 4; l++) EXPECT_EQ(lane32(i, l), mem4r[i]);
+}
+
 }  // namespace berberis
