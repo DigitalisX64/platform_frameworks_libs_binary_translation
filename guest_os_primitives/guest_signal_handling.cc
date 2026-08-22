@@ -217,12 +217,13 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
         auto& cpu = thread->state()->cpu;
         __android_log_print(ANDROID_LOG_ERROR, "berberis",
             "LowAddr fault: sig=%d si_addr=%p si_code=%d guest_pc=0x%lx "
-            "x30(lr)=0x%lx x0=0x%lx x1=0x%lx",
+            "x30(lr)=0x%lx x0=0x%lx x1=0x%lx tls=0x%lx",
             sig, info->si_addr, info->si_code,
             (unsigned long)cpu.insn_addr,
             (unsigned long)cpu.x[30],
             (unsigned long)cpu.x[0],
-            (unsigned long)cpu.x[1]);
+            (unsigned long)cpu.x[1],
+            (unsigned long)thread->state()->tls);
         __android_log_print(ANDROID_LOG_ERROR, "berberis",
             "  x2=0x%lx x3=0x%lx x4=0x%lx x5=0x%lx x6=0x%lx x7=0x%lx "
             "sp=0x%lx x29(fp)=0x%lx",
