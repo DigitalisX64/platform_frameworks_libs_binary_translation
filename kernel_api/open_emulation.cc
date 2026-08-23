@@ -153,6 +153,35 @@ int OpenatProcSelfMapsForGuest(int dirfd, int flags, mode_t mode) {
       guest_maps.append(cur_line + "\n");
       continue;
     }
+    // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    // Give the guest a coherent ARM64 view of the dynamic linker. The process
+    // has two linkers mapped: the guest ARM64 linker at
+    // "/system/bin/arm64/linker64" (the real one for guest code, translated) and
+    // the host x86_64 linker at "/apex/com.android.runtime/bin/linker64" (the
+    // process's actual ELF interpreter). App introspection hard-codes the
+    // canonical device linker paths — "/apex/com.android.runtime/bin/linker64",
+    // "/system/bin/linker64" — and finds the linker's load base by matching one
+    // of them in /proc/self/maps. On a real ARM64 device those paths ARE the
+    // ARM64 linker; here they resolve to the HOST x86_64 linker, so an app that
+    // pairs that host base with the ARM64 linker's symbol offset (which openat
+    // redirection serves) reads host machine code as a guest pointer and
+    // crashes (the MSA OAID SDK's soinfo-list anti-tamper walk did exactly this).
+    // Rewrite the guest linker's path to the canonical location apps expect, and
+    // drop the host linker's lines so introspection can't latch onto it.
+    {
+      static constexpr char kGuestArm64LinkerPath[] = "/system/bin/arm64/linker64";
+      static constexpr char kCanonicalLinkerPath[] = "/apex/com.android.runtime/bin/linker64";
+      size_t gpos = cur_line.find(kGuestArm64LinkerPath);
+      if (gpos != ArenaString::npos) {
+        cur_line.replace(gpos, sizeof(kGuestArm64LinkerPath) - 1, kCanonicalLinkerPath);
+      } else if (cur_line.find(kCanonicalLinkerPath) != ArenaString::npos) {
+        // Host x86_64 linker — hide it from the guest's view.
+        continue;
+      }
+    }
+#endif
+    // endregion
     // Split the line into guest exec / no-exec chunks.
     uintptr_t original_start = start;
     while (start < end) {
@@ -320,6 +349,31 @@ const char* TryRedirectNdkLibcxxLinkerScript(const char* path) {
         kSystemArm64LibcxxPath);
   return kSystemArm64LibcxxPath;
 }
+
+inline constexpr char kGuestLinker64SelfPath[] = "/system/bin/linker64";
+inline constexpr char kGuestLinker64RealPath[] = "/system/bin/arm64/linker64";
+
+// The guest ARM64 dynamic linker sets its own realpath to the main executable's
+// PT_INTERP string — "/system/bin/linker64" — and reports that as its name via
+// dl_iterate_phdr. On the x86_64 host image that canonical path is a symlink to
+// the HOST x86_64 linker (/apex/com.android.runtime/bin/linker64); the guest
+// ARM64 linker actually lives at /system/bin/arm64/linker64. Guest code that
+// resolves the linker's own non-exported internals by re-opening its reported
+// path to read .symtab — ByteDance's xDL (used by ShadowHook and ByteHook), and
+// any similar linker introspection — therefore opens a wrong-architecture ELF.
+// It reads the section-header table from that x86_64 file at the *guest* linker's
+// in-memory e_shoff, gets garbage, fails to locate .symtab, and cannot resolve
+// symbols like soinfo::call_constructors — so ShadowHook aborts init with
+// SHADOWHOOK_ERRNO_INIT_LINKER and native hooking is silently disabled. Redirect
+// guest opens of the canonical linker path to the real ARM64 linker file so this
+// introspection reads the correct ELF.
+const char* TryRedirectGuestLinker64(const char* path) {
+  if (path == nullptr || strcmp(path, kGuestLinker64SelfPath) != 0) {
+    return nullptr;
+  }
+  TRACE("openat: redirecting guest linker \"%s\" to %s", path, kGuestLinker64RealPath);
+  return kGuestLinker64RealPath;
+}
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
 // endregion
 
@@ -343,6 +397,9 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   if (real_path == nullptr) {
     real_path = TryRedirectNdkLibcxxLinkerScript(path);
+  }
+  if (real_path == nullptr) {
+    real_path = TryRedirectGuestLinker64(path);
   }
 #endif
 
