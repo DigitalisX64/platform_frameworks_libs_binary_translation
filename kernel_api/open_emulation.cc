@@ -320,6 +320,31 @@ const char* TryRedirectNdkLibcxxLinkerScript(const char* path) {
         kSystemArm64LibcxxPath);
   return kSystemArm64LibcxxPath;
 }
+
+inline constexpr char kGuestLinker64SelfPath[] = "/system/bin/linker64";
+inline constexpr char kGuestLinker64RealPath[] = "/system/bin/arm64/linker64";
+
+// The guest ARM64 dynamic linker sets its own realpath to the main executable's
+// PT_INTERP string — "/system/bin/linker64" — and reports that as its name via
+// dl_iterate_phdr. On the x86_64 host image that canonical path is a symlink to
+// the HOST x86_64 linker (/apex/com.android.runtime/bin/linker64); the guest
+// ARM64 linker actually lives at /system/bin/arm64/linker64. Guest code that
+// resolves the linker's own non-exported internals by re-opening its reported
+// path to read .symtab — ByteDance's xDL (used by ShadowHook and ByteHook), and
+// any similar linker introspection — therefore opens a wrong-architecture ELF.
+// It reads the section-header table from that x86_64 file at the *guest* linker's
+// in-memory e_shoff, gets garbage, fails to locate .symtab, and cannot resolve
+// symbols like soinfo::call_constructors — so ShadowHook aborts init with
+// SHADOWHOOK_ERRNO_INIT_LINKER and native hooking is silently disabled. Redirect
+// guest opens of the canonical linker path to the real ARM64 linker file so this
+// introspection reads the correct ELF.
+const char* TryRedirectGuestLinker64(const char* path) {
+  if (path == nullptr || strcmp(path, kGuestLinker64SelfPath) != 0) {
+    return nullptr;
+  }
+  TRACE("openat: redirecting guest linker \"%s\" to %s", path, kGuestLinker64RealPath);
+  return kGuestLinker64RealPath;
+}
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
 // endregion
 
@@ -343,6 +368,9 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
   if (real_path == nullptr) {
     real_path = TryRedirectNdkLibcxxLinkerScript(path);
+  }
+  if (real_path == nullptr) {
+    real_path = TryRedirectGuestLinker64(path);
   }
 #endif
 
