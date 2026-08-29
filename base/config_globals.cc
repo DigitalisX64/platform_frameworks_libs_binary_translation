@@ -177,6 +177,8 @@ std::string ToString(ConfigFlag flag) {
     // region digitalis
     case kDisableIrCheck:
       return "disable-ir-check";
+    case kGlibcHostThreadIdHandoff:
+      return "glibc-host-thread-id-handoff";
     // endregion
     case kNumConfigFlags:
       break;
