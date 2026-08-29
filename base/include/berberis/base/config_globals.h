@@ -74,6 +74,13 @@ enum ConfigFlag {
   // ship ro.berberis.flags=disable-ir-check to drop the per-translation
   // validation cost in production.
   kDisableIrCheck,
+  // Read the host bionic pthread_internal_t* for a new guest thread from
+  // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE instead of TLS_SLOT_THREAD_ID. Set this
+  // when the translator runs on a glibc host under a bionic compatibility
+  // layer: there %fs+0x08 (TLS_SLOT_THREAD_ID) is glibc's DTV pointer, so the
+  // host seeds a synthetic bionic pthread record in the guest-state slot and
+  // hands it over from there. Never set it on a real bionic host.
+  kGlibcHostThreadIdHandoff,
   // endregion
   kNumConfigFlags
 };
