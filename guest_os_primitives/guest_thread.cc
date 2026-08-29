@@ -24,6 +24,7 @@
 #endif
 
 #include "berberis/base/checks.h"
+#include "berberis/base/config_globals.h"
 #include "berberis/base/mmap.h"
 #include "berberis/base/tracing.h"
 #include "berberis/guest_state/guest_addr.h"  // ToGuestAddr
@@ -356,7 +357,17 @@ void GuestThread::InitStaticTls() {
   memcpy(static_tls_, g_static_tls_config.init_img, g_static_tls_config.size);
   void** tls =
       reinterpret_cast<void**>(reinterpret_cast<char*>(static_tls_) + g_static_tls_config.tpoff);
-  tls[g_static_tls_config.tls_slot_thread_id] = GetTls()[TLS_SLOT_THREAD_ID];
+  // region digitalis
+  // On a glibc host running the translator under a bionic compatibility layer,
+  // TLS_SLOT_THREAD_ID (%fs+0x08) is glibc's DTV pointer rather than a
+  // pthread_internal_t*. Such a host seeds a synthetic bionic pthread record in
+  // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE; take the thread id from there and let
+  // the store below replace it with the live GuestThread pointer.
+  const size_t host_thread_id_slot = IsConfigFlagSet(kGlibcHostThreadIdHandoff)
+                                         ? TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE
+                                         : TLS_SLOT_THREAD_ID;
+  tls[g_static_tls_config.tls_slot_thread_id] = GetTls()[host_thread_id_slot];
+  // endregion
   tls[g_static_tls_config.tls_slot_bionic_tls] = GetTls()[TLS_SLOT_BIONIC_TLS];
   GetTls()[TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE] = GetThreadStateStorage(*state_);
   SetTlsAddr(*state_, ToGuestAddr(tls));
