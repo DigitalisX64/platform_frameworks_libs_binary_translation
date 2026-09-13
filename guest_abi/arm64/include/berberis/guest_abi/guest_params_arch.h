@@ -34,6 +34,61 @@ class GuestVAListParams;
 
 // End of workaroud
 
+// region digitalis
+// Integer and enum results narrower than 64 bits.
+//
+// AAPCS64 leaves the unused bits of the result register unspecified, but the code
+// guest callers are actually compiled from does not treat them that way. clang and
+// gcc materialise such a result with a w-register write (`mov w0, #v`), which leaves
+// bool and unsigned values zero-extended and signed 8- and 16-bit values sign-extended
+// to 32 bits, with the upper half of x0 clear. Callers depend on it: rustc emits
+// `cbz w0` after a `jboolean ExceptionCheck()`. Writing only sizeof(T) bytes into x0
+// left the remaining bytes holding whatever x0 carried on entry -- the first argument,
+// e.g. a JNIEnv* -- so a host `false` read back as true in the guest.
+//
+// Return() hands out this slot instead of the raw byte-wide location so every write
+// produces the value a real w-register write would.
+template <typename Type, bool = std::is_enum_v<Type>>
+struct GuestNarrowResultRepr {
+  using type = Type;
+};
+
+template <typename Type>
+struct GuestNarrowResultRepr<Type, true> {
+  using type = std::underlying_type_t<Type>;
+};
+
+template <typename Type>
+inline constexpr bool kIsGuestNarrowIntegerResult =
+    (std::is_integral_v<Type> || std::is_enum_v<Type>) && sizeof(Type) < sizeof(uint64_t);
+
+template <typename Type>
+class GuestNarrowIntegerResult {
+ public:
+  using Repr = typename GuestNarrowResultRepr<Type>::type;
+
+  GuestNarrowIntegerResult& operator=(Type value) {
+    reg_ = Extend(static_cast<Repr>(value));
+    return *this;
+  }
+  GuestNarrowIntegerResult& operator=(const GuestType<Type>& value) {
+    return *this = static_cast<Type>(value);
+  }
+  operator Type() const { return static_cast<Type>(static_cast<Repr>(reg_)); }
+
+ private:
+  static constexpr uint64_t Extend(Repr value) {
+    if constexpr (std::is_signed_v<Repr>) {
+      return static_cast<uint32_t>(static_cast<int32_t>(value));
+    } else {
+      return static_cast<uint64_t>(value);
+    }
+  }
+
+  uint64_t reg_;
+};
+// endregion
+
 class GuestParamsAndReturnHelper : protected GuestAbi {
  protected:
   template <typename Type>
@@ -86,6 +141,12 @@ class GuestParamsAndReturn<ReturnType(ParamType...) noexcept(kNoexcept), GuestAb
   }
 
   auto* Return() const {
+    // region digitalis - narrow integer results fill all of x0; see GuestNarrowIntegerResult.
+    // The brace-less else keeps the upstream return below as the else-branch, unchanged.
+    if constexpr (kIsGuestNarrowIntegerResult<ReturnType>) {
+      return reinterpret_cast<GuestNarrowIntegerResult<ReturnType>*>(x_ + kReturnLocation.offset);
+    } else
+    // endregion
     return this->ParamLocationAddress<ReturnType>(x_, v_, s_, kReturnLocation);
   }
 

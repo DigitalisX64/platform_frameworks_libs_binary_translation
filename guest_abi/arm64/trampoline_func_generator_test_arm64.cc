@@ -60,6 +60,30 @@ TEST(TrampolineFuncGenerator64, InputIsTruncated) {
   EXPECT_NO_FATAL_FAILURE(func(bit_cast<void*>(&Callee::foo), &state));
 }
 
+// region digitalis
+// The shape of a proxied `jboolean JNIEnv::ExceptionCheck(JNIEnv*)`: x0 carries the env
+// pointer in and the result out. A host `false` must reach the guest as w0 == 0, or a
+// caller that tests the whole register (rustc: `cbz w0`) sees a pending exception.
+TEST(TrampolineFuncGenerator64, NarrowResultClearsIncomingArgument) {
+  struct Callee {
+    static unsigned char NoException(void*) { return 0; }
+    static unsigned char Exception(void*) { return 1; }
+  };
+
+  TrampolineFunc func = GetTrampolineFunc<unsigned char(void*)>();
+
+  ProcessState state{};
+
+  state.cpu.x[0] = 0x0000'7755'228a'd050;
+  func(bit_cast<void*>(&Callee::NoException), &state);
+  EXPECT_EQ(0u, state.cpu.x[0]);
+
+  state.cpu.x[0] = 0x0000'7755'228a'd050;
+  func(bit_cast<void*>(&Callee::Exception), &state);
+  EXPECT_EQ(1u, state.cpu.x[0]);
+}
+// endregion
+
 }  // namespace
 
 }  // namespace berberis
