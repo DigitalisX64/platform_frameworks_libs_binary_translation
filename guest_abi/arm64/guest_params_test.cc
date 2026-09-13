@@ -80,7 +80,12 @@ TEST(Params, IntRes) {
   EXPECT_EQ(456u, state.cpu.x[0]);
 }
 
-TEST(Params, SignedCharRes) {
+// region digitalis - ignored: asserts the byte-wide result write (-1 -> x0 == 0xff) that
+// left the rest of x0 holding the caller's first argument. Superseded by
+// SignedCharResSignExtendsToW0.
+// TEST(Params, SignedCharRes) {
+TEST(Params, DISABLED_SignedCharRes) {
+// endregion
   ThreadState state{};
 
   state.cpu.x[0] = 0;
@@ -102,6 +107,99 @@ TEST(Params, SignedCharRes) {
   retfv = -4;
   EXPECT_EQ(0xfcU, state.cpu.x[0]);
 }
+
+// region digitalis
+// A narrow signed result is sign-extended to 32 bits with the upper half of x0 clear,
+// exactly as the `mov w0, #v` a real callee emits.
+TEST(Params, SignedCharResSignExtendsToW0) {
+  ThreadState state{};
+
+  state.cpu.x[0] = 0;
+
+  auto&& [ret] = GuestReturnReference<signed char()>(&state);
+  auto&& [retf] = GuestReturnReference<signed char (*)()>(&state);
+  auto&& [retv] = GuestReturnReference<signed char(...)>(&state);
+  auto&& [retfv] = GuestReturnReference<signed char (*)(...)>(&state);
+
+  ret = -1;
+  EXPECT_EQ(0xffff'ffffU, state.cpu.x[0]);
+
+  retf = -2;
+  EXPECT_EQ(0xffff'fffeU, state.cpu.x[0]);
+
+  retv = -3;
+  EXPECT_EQ(0xffff'fffdU, state.cpu.x[0]);
+
+  retfv = -4;
+  EXPECT_EQ(0xffff'fffcU, state.cpu.x[0]);
+}
+
+// The result register still holds the first argument when the host callee returns.
+// Every narrow result must replace all of x0, not just its low sizeof(T) bytes.
+constexpr uint64_t kStaleFirstArgument = 0x0000'7755'228a'd050;  // a JNIEnv*, say
+
+TEST(Params, NarrowResultOverwritesStaleArgument) {
+  ThreadState state{};
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_bool] = GuestReturnReference<bool(void*)>(&state);
+  ret_bool = false;
+  EXPECT_EQ(0u, state.cpu.x[0]);
+  EXPECT_FALSE(ret_bool);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  ret_bool = true;
+  EXPECT_EQ(1u, state.cpu.x[0]);
+  EXPECT_TRUE(ret_bool);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_u8] = GuestReturnReference<unsigned char(void*)>(&state);  // jboolean
+  ret_u8 = 0;
+  EXPECT_EQ(0u, state.cpu.x[0]);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  ret_u8 = 0xff;
+  EXPECT_EQ(0xffu, state.cpu.x[0]);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_u16] = GuestReturnReference<uint16_t(void*)>(&state);  // jchar
+  ret_u16 = 0xfffe;
+  EXPECT_EQ(0xfffeu, state.cpu.x[0]);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_s16] = GuestReturnReference<int16_t(void*)>(&state);  // jshort
+  ret_s16 = -2;
+  EXPECT_EQ(0xffff'fffeu, state.cpu.x[0]);
+  EXPECT_EQ(-2, ret_s16);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_s32] = GuestReturnReference<int32_t(void*)>(&state);  // jint
+  ret_s32 = -1;
+  EXPECT_EQ(0xffff'ffffu, state.cpu.x[0]);
+  EXPECT_EQ(-1, ret_s32);
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_u32] = GuestReturnReference<uint32_t(void*)>(&state);
+  ret_u32 = 0x8000'0000u;
+  EXPECT_EQ(0x8000'0000u, state.cpu.x[0]);
+
+  enum class Small : int8_t { kMinusOne = -1, kOne = 1 };
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret_enum] = GuestReturnReference<Small(void*)>(&state);
+  ret_enum = Small::kMinusOne;
+  EXPECT_EQ(0xffff'ffffu, state.cpu.x[0]);
+  EXPECT_EQ(Small::kMinusOne, static_cast<Small>(ret_enum));
+}
+
+TEST(Params, WideResultIsUnchanged) {
+  ThreadState state{};
+
+  state.cpu.x[0] = kStaleFirstArgument;
+  auto&& [ret] = GuestReturnReference<int64_t(void*)>(&state);
+  ret = -1;
+  EXPECT_EQ(~uint64_t{0}, state.cpu.x[0]);
+}
+// endregion
 
 TEST(Params, PtrRes) {
   ThreadState state{};
