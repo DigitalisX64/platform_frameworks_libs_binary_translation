@@ -2507,6 +2507,79 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchRegisterRet) {
 }
 
 //
+// SVC. Lowered as a syscall region exit (PseudoJump kSyscall, emitted through
+// the same EmitSyscall the lite tier uses), not a bail. Running the syscall
+// itself needs a live guest thread for RunGuestSyscall, so execution through
+// the SVC is covered by runtime/arm64/translator_x86_64_test.cc; these tests pin
+// the region shape and run only paths that do not reach the syscall.
+//
+
+// SVC #imm16. The Linux AArch64 kernel ignores imm16; the number is in X8.
+constexpr uint32_t SvcInsn(uint16_t imm16) {
+  return 0xD4000001 | (static_cast<uint32_t>(imm16) << 5);
+}
+
+// The region translates through the SVC and stops right after it. The MOVZ
+// past the SVC is reached only through EmitSyscall's dispatch to pc+4, so this
+// region does not translate it.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SvcEndsRegionAsSyscallExit) {
+  static const uint32_t code[] = {
+      MovzX(8, 172),  // [0] X8 = __NR_getpid
+      SvcInsn(0),     // [1] syscall exit
+      MovzX(0, 1),    // [2] not part of this region
+  };
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(n, 2u);
+  EXPECT_EQ(stop, ToGuestAddr(code) + 8);
+}
+
+// A non-zero immediate lowers the same way.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SvcNonZeroImmediate) {
+  static const uint32_t code[] = {SvcInsn(0x80)};
+  MachineCode mc;
+  auto [stop, ok, n] = HeavyOptimizeRegion(
+      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(n, 1u);
+  EXPECT_EQ(stop, ToGuestAddr(code) + sizeof(code));
+}
+
+// When an earlier in-region branch targets the instruction after the SVC,
+// translation continues past the syscall exit in a block that only the branch
+// reaches. The lite tier always ends its region at the SVC, so this IR shape
+// is heavy-only; GenCode's CheckMachineIR must accept it, and the block must be
+// linked to the branch. X0 == 0 takes the CBZ around the syscall, so this runs
+// without a guest thread.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SvcFallThroughTargetedByInRegionBranch) {
+  static const uint32_t code[] = {
+      CbzX(0, 12),    // [0] CBZ X0 -> [3], around the syscall
+      MovzX(8, 172),  // [1]
+      SvcInsn(0),     // [2] syscall exit
+      MovzX(1, 7),    // [3] branch target, translated in a fresh block
+  };
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  MachineCode mc;
+  auto [stop, ok, n] =
+      HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(n, 4u);
+  EXPECT_EQ(stop, end_pc);
+
+  state_.cpu.x[0] = 0;
+  state_.cpu.x[1] = 0;
+  state_.cpu.x[8] = 0;
+  bool run_ok = false;
+  GuestAddr landed = RunRegion(&state_, code, end_pc, &run_ok);
+  ASSERT_TRUE(run_ok);
+  EXPECT_EQ(landed, end_pc);
+  EXPECT_EQ(state_.cpu.x[1], 7u);  // [3] ran
+  EXPECT_EQ(state_.cpu.x[8], 0u);  // [1] was skipped
+}
+
+//
 // Integer loads / stores. The base register points at a static buffer; the
 // optimizing frontend's Load/Store apply TBI then emit the size/sign-appropriate
 // host memory access and a recovery block for faults.
