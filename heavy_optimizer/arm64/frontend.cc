@@ -3053,9 +3053,38 @@ void HeavyOptimizerFrontend::StoreReg(Decoder::LoadStoreSize size,
   Store(size, addr, 0, data);
 }
 
+// SVC #imm: lowered as a region exit of kind PseudoJump::Kind::kSyscall, which
+// the backend emits through code_gen_lib's EmitSyscall, the same call
+// LiteTranslator::Svc ends its region with: store the SVC's PC to
+// cpu.insn_addr, call RunGuestSyscall(ThreadState*), then direct-dispatch to
+// pc+4 with a pending-signals check. Unlike lite there is no MXCSR-to-FPSR
+// mirror first; this tier does not accumulate FPSR at any region exit (see the
+// FPSR note above FpDataProc2). The immediate is ignored, as the Linux AArch64
+// kernel ignores it: the syscall number is X8.
+//
+// It has to be a region exit rather than a call in the middle of the region.
+// RunGuestSyscall reads X8/X0-X5 from ThreadState, writes X0, and may run a
+// guest signal handler that sees, and can rewrite, the whole guest context.
+// ContextLivenessAnalyzer treats a block with no successors as reading every
+// CPUState slot, so RemoveRedundantPut keeps every pending guest-register store
+// ahead of this exit, and RemoveLoopGuestContextAccesses writes back what it
+// hoisted on the loop-exit edge into this block. None of the guest-context
+// passes model a CallImm as reading or writing guest state, so a call inside
+// the region would get no such barrier.
+//
+// Bailing here instead keeps a hot region that ends in a syscall on the lite
+// tier, or cuts it short at the SVC with an exit to the dispatcher.
 void HeavyOptimizerFrontend::Svc(uint16_t imm) {
-  UndefinedReturningVoid();
   UNUSED_ARGS(imm);
+  if (!success()) {
+    return;
+  }
+  builder_.Gen<PseudoJump>(GetInsnAddr(), PseudoJump::Kind::kSyscall);
+  // Control never falls through to pc+4 inside this region: EmitSyscall
+  // dispatches there itself. Like an unconditional B, the region ends here
+  // unless an in-region branch targets pc+4, in which case translation
+  // continues in a fresh basic block that only that branch reaches.
+  is_uncond_branch_ = true;
 }
 
 void HeavyOptimizerFrontend::Brk(uint16_t imm) {

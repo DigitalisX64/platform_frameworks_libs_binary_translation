@@ -729,7 +729,7 @@ sumlall 1 0 0
 sumopa 5 0 0
 sumops 5 0 0
 suqadd 2 2 2
-svc 1 1 0
+svc 1 1 1
 svdot 1 0 0
 swp 5 5 5
 swpa 3 3 3
