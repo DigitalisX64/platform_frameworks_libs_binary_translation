@@ -3,7 +3,8 @@
 #
 # Most are ISA extensions outside the implemented baseline (A64 base plus
 # AdvSIMD/NEON and crypto) -- SVE/SVE2, SME/SME2, FP8, FEAT_FHM,
-# FEAT_FAMINMAX, FEAT_THE -- where Undefined is the correct decode. They reach
+# FEAT_FAMINMAX, FEAT_THE, FEAT_LSFE (the LDFADD/LDBFMAX/... floating-point
+# atomics) -- where Undefined is the correct decode. They reach
 # the corpus because it is harvested from current libraries, which contain
 # runtime-dispatched code paths for CPUs that have those features.
 #
@@ -68,8 +69,21 @@ ld1h
 ld1q
 ld1w
 ldapur
+ldbfadd
+ldbfadda
+ldbfaddal
+ldbfmax
+ldbfmaxa
+ldbfmaxnml
+ldfadd
 ldfadda
 ldfmaxal
+ldfmaxl
+ldfmaxnm
+ldfmaxnml
+ldfmin
+ldfminnm
+ldfminnml
 ldnt1b
 ldnt1d
 ldnt1h

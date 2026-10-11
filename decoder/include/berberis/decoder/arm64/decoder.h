@@ -2659,6 +2659,17 @@ class Decoder {
         DecodeSimdLoadStoreUnsignedImm();
         return;
       }
+      // bit[21] splits the bit[24]=0 group like the integer branch below:
+      // register offset (bits[11:10]=10) has bit[21]=1, and the immediate
+      // forms (unscaled, post-, pre-index) have bit[21]=0. The other two
+      // combinations are the FEAT_LSFE floating-point atomics (LDFADD,
+      // LDBFMAX, STFADD, ..., bit[21]=1 with bits[11:10]=00) and unallocated
+      // encodings. Without this check an FP atomic decoded as STUR B/H/S/D,
+      // a plain store of Vt with bits[20:12] (Rs and opc) taken as imm9.
+      if (GetBits<21, 1>() != (op4 == 0b10 ? 1 : 0)) {
+        Undefined();
+        return;
+      }
       if (op4 == 0b01) {
         DecodeSimdLoadStoreImmPostPreIndex(false);
         return;

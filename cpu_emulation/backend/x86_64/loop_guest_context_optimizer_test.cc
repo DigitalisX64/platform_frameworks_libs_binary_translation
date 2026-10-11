@@ -1274,6 +1274,57 @@ TEST(MachineIRLoopGuestContextOptimizer, RemoveGetsInIrreducibleLoop) {
 
   builder.StartBasicBlock(afterloop);
   builder.Gen<Jump>(kNullGuestAddr);
+// region digitalis
+TEST(MachineIRLoopGuestContextOptimizer, SiblingInnerloopsAreOptimizedSeparately) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  // preloop -> head -> inner1 (self loop) -> middle -> inner2 (self loop) -> latch,
+  // latch -> head (outer back edge) or -> afterloop.
+  auto* preloop = machine_ir.NewBasicBlock();
+  auto* head = machine_ir.NewBasicBlock();
+  auto* inner1 = machine_ir.NewBasicBlock();
+  auto* middle = machine_ir.NewBasicBlock();
+  auto* inner2 = machine_ir.NewBasicBlock();
+  auto* latch = machine_ir.NewBasicBlock();
+  auto* afterloop = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(preloop, head);
+  machine_ir.AddEdge(head, inner1);
+  machine_ir.AddEdge(inner1, inner1);
+  machine_ir.AddEdge(inner1, middle);
+  machine_ir.AddEdge(middle, inner2);
+  machine_ir.AddEdge(inner2, inner2);
+  machine_ir.AddEdge(inner2, latch);
+  machine_ir.AddEdge(latch, head);
+  machine_ir.AddEdge(latch, afterloop);
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+  MachineReg vreg2 = machine_ir.AllocVReg();
+
+  MachineIRBuilder builder(&machine_ir);
+
+  builder.StartBasicBlock(preloop);
+  builder.Gen<PseudoBranch>(head);
+
+  builder.StartBasicBlock(head);
+  builder.Gen<PseudoBranch>(inner1);
+
+  builder.StartBasicBlock(inner1);
+  builder.GenPut(GetThreadStateRegOffset(0), vreg1);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, inner1, middle, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(middle);
+  builder.Gen<PseudoBranch>(inner2);
+
+  builder.StartBasicBlock(inner2);
+  builder.GenPut(GetThreadStateRegOffset(1), vreg2);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, inner2, latch, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(latch);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(afterloop);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
 
   RemoveLoopGuestContextAccesses(&machine_ir);
   ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -1393,6 +1444,98 @@ TEST(MachineIRLoopGuestContextOptimizer, RemovePutsInIrreducibleLoop) {
                mapped_reg2,
                GetThreadStateRegOffset(1));
 }
+
+  // Nothing is mapped across the outer loop.
+  EXPECT_EQ(preloop->insn_list().size(), 1UL);
+  EXPECT_EQ(afterloop->insn_list().size(), 1UL);
+
+  // The first inner loop maps x0: loaded on entry from head, stored on exit to middle.
+  ASSERT_EQ(head->insn_list().size(), 2UL);
+  auto* get_insn_1 = head->insn_list().front();
+  EXPECT_EQ(get_insn_1->opcode(), kMachineOpMovqRegMemBaseDisp);
+  EXPECT_EQ(AsMachineInsnX86_64(get_insn_1)->disp(), GetThreadStateRegOffset(0));
+  auto mapped_reg_1 = get_insn_1->RegAt(0);
+  EXPECT_EQ(CheckCopyPutInsnAndObtainMappedReg(inner1->insn_list().front(), vreg1), mapped_reg_1);
+
+  // The second inner loop maps x1: loaded in middle, stored on exit to latch.
+  ASSERT_EQ(middle->insn_list().size(), 3UL);
+  auto it = middle->insn_list().begin();
+  CheckPutInsn(&machine_ir,
+               *it,
+               kMachineOpMovqMemBaseDispReg,
+               mapped_reg_1,
+               GetThreadStateRegOffset(0));
+  auto* get_insn_2 = *(++it);
+  EXPECT_EQ(get_insn_2->opcode(), kMachineOpMovqRegMemBaseDisp);
+  EXPECT_EQ(AsMachineInsnX86_64(get_insn_2)->disp(), GetThreadStateRegOffset(1));
+  auto mapped_reg_2 = get_insn_2->RegAt(0);
+  EXPECT_EQ(CheckCopyPutInsnAndObtainMappedReg(inner2->insn_list().front(), vreg2), mapped_reg_2);
+
+  ASSERT_EQ(latch->insn_list().size(), 2UL);
+  CheckPutInsn(&machine_ir,
+               latch->insn_list().front(),
+               kMachineOpMovqMemBaseDispReg,
+               mapped_reg_2,
+               GetThreadStateRegOffset(1));
+}
+
+TEST(MachineIRLoopGuestContextOptimizer, SingleInnerloopNestIsOptimizedAsAWhole) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  // preloop -> head -> inner (self loop) -> latch, latch -> head or -> afterloop.
+  auto* preloop = machine_ir.NewBasicBlock();
+  auto* head = machine_ir.NewBasicBlock();
+  auto* inner = machine_ir.NewBasicBlock();
+  auto* latch = machine_ir.NewBasicBlock();
+  auto* afterloop = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(preloop, head);
+  machine_ir.AddEdge(head, inner);
+  machine_ir.AddEdge(inner, inner);
+  machine_ir.AddEdge(inner, latch);
+  machine_ir.AddEdge(latch, head);
+  machine_ir.AddEdge(latch, afterloop);
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+
+  MachineIRBuilder builder(&machine_ir);
+
+  builder.StartBasicBlock(preloop);
+  builder.Gen<PseudoBranch>(head);
+
+  builder.StartBasicBlock(head);
+  builder.Gen<PseudoBranch>(inner);
+
+  builder.StartBasicBlock(inner);
+  builder.GenPut(GetThreadStateRegOffset(0), vreg1);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, inner, latch, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(latch);
+  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(afterloop);
+  builder.Gen<PseudoJump>(kNullGuestAddr);
+
+  RemoveLoopGuestContextAccesses(&machine_ir);
+  ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
+
+  // x0 is mapped across the whole nest: loaded before it, stored after it.
+  ASSERT_EQ(preloop->insn_list().size(), 2UL);
+  auto* get_insn = preloop->insn_list().front();
+  EXPECT_EQ(get_insn->opcode(), kMachineOpMovqRegMemBaseDisp);
+  EXPECT_EQ(AsMachineInsnX86_64(get_insn)->disp(), GetThreadStateRegOffset(0));
+  auto mapped_reg = get_insn->RegAt(0);
+  EXPECT_EQ(head->insn_list().size(), 1UL);
+  EXPECT_EQ(latch->insn_list().size(), 1UL);
+  EXPECT_EQ(CheckCopyPutInsnAndObtainMappedReg(inner->insn_list().front(), vreg1), mapped_reg);
+  ASSERT_EQ(afterloop->insn_list().size(), 2UL);
+  CheckPutInsn(&machine_ir,
+               afterloop->insn_list().front(),
+               kMachineOpMovqMemBaseDispReg,
+               mapped_reg,
+               GetThreadStateRegOffset(0));
+}
+// endregion digitalis
 
 }  // namespace
 

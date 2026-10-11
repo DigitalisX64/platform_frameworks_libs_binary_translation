@@ -2455,4 +2455,188 @@ TEST_F(Arm64HeavyDifferentialFuzz, Sha256) {
   EXPECT_GT(compared, 300) << "heavy accepted too few SHA-256 encodings";
 }
 
+
+// SSHL / USHL (vector, .4H/.8H) against the interpreter. The heavy tier splits
+// each dword into its two halfwords, extends them, and shifts them with the
+// dword VPSxLVD forms, so the boundary counts around 16 (where a halfword
+// shift empties the lane while the dword shift does not) and the sign of the
+// extended value are what this corpus leans on.
+TEST_F(Arm64HeavyDifferentialFuzz, SshlUshlVector16) {
+  Seed(0x5A16E1ULL);
+  const int kIters = 4000 * FuzzScale();
+  static const int8_t kShifts[] = {0,  1,  7,   8,   15,  16,  17,  31,  32,  127,
+                                   -1, -7, -15, -16, -17, -31, -32, -127, -128};
+  constexpr int kNumShifts = sizeof(kShifts) / sizeof(kShifts[0]);
+  static const uint16_t kValues[] = {0x0000, 0x0001, 0x7FFF, 0x8000, 0xFFFF,
+                                     0x4000, 0xAAAA, 0x5555, 0x8001, 0x1234};
+  constexpr int kNumValues = sizeof(kValues) / sizeof(kValues[0]);
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const bool is_signed = (Rnd() & 1) != 0;
+    const bool q = (Rnd() & 1) != 0;
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    if (Rnd() % 4 == 0) rm = rn;  // same register as value and count
+    // Ground truth: 0x6e624420 == ushl v0.8h, v1.8h, v2.8h.
+    uint32_t code[1] = {static_cast<uint32_t>(
+        0x0E204400u | (q ? (1u << 30) : 0u) | (is_signed ? 0u : (1u << 29)) | (0b01u << 22) |
+        (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) |
+        static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    unsigned __int128 vn = 0, vm = 0;
+    for (int lane = 0; lane < 8; lane++) {
+      uint16_t value = (Rnd() % 3) ? kValues[Rnd() % kNumValues] : static_cast<uint16_t>(Rnd());
+      // Garbage in the high byte half the time: only bits [7:0] count.
+      uint16_t count = static_cast<uint8_t>(kShifts[Rnd() % kNumShifts]);
+      if (Rnd() & 1) count |= static_cast<uint16_t>((Rnd() & 0xFF) << 8);
+      vn |= static_cast<unsigned __int128>(value) << (16 * lane);
+      vm |= static_cast<unsigned __int128>(count) << (16 * lane);
+    }
+    in.v[rn] = vn;
+    if (rm != rn) in.v[rm] = vm;
+
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "SshlUshlVector16: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few 16-bit SSHL/USHL encodings";
+}
+
+// FADDP (vector, .2S/.4S/.2D) against the interpreter, in single-instruction
+// and three-instruction regions (the .2S form gathers lanes with a PSHUFD after
+// HADDPS, so a stale upper half is the bug to catch). Inputs are finite, plus
+// signed zeros and values that overflow to infinity when added; NaN payloads
+// and inf - inf are left out because the ARM default NaN and x86's differ.
+TEST_F(Arm64HeavyDifferentialFuzz, FaddpVector) {
+  Seed(0xFADD9ULL);
+  const int kIters = 3000 * FuzzScale();
+  auto f32 = [&]() -> uint32_t {
+    static const uint32_t kSpecial[] = {0x00000000u, 0x80000000u, 0x7F7FFFFFu, 0x3F800000u,
+                                        0x00000001u, 0x80800000u};
+    if (Rnd() % 4 == 0) return kSpecial[Rnd() % 6];
+    float f = static_cast<float>(static_cast<int32_t>(Rnd() % 65536) - 32768) / 64.0f;
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    return b;
+  };
+  auto f64 = [&]() -> uint64_t {
+    static const uint64_t kSpecial[] = {0x0ULL, 0x8000000000000000ULL, 0x7FEFFFFFFFFFFFFFULL,
+                                        0x3FF0000000000000ULL, 0x1ULL};
+    if (Rnd() % 4 == 0) return kSpecial[Rnd() % 5];
+    double d = static_cast<double>(static_cast<int64_t>(Rnd64() % 4194304) - 2097152) / 128.0;
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return b;
+  };
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const int n = 1 + (Rnd() % 3);
+    uint32_t code[3];
+    // One lane width per region, so no instruction reads another width's bits
+    // as a NaN.
+    const uint32_t form = Rnd() % 3;  // 0: .2S, 1: .4S, 2: .2D
+    const uint32_t q = form == 0 ? 0 : 1;
+    const uint32_t sz = form == 2 ? 1 : 0;
+    for (int k = 0; k < n; k++) {
+      const uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+      // Ground truth: 0x6e22d420 == faddp v0.4s, v1.4s, v2.4s.
+      code[k] = 0x2E20D400u | (q << 30) | (sz << 22) | (rm << 16) | (rn << 5) | rd;
+    }
+    InitState in = RandomInit();
+    const bool is_double = sz != 0;
+    for (int i = 0; i < 8; i++) {
+      unsigned __int128 v = 0;
+      if (is_double) {
+        v = (static_cast<unsigned __int128>(f64()) << 64) | f64();
+      } else {
+        for (int lane = 0; lane < 4; lane++) {
+          v |= static_cast<unsigned __int128>(f32()) << (32 * lane);
+        }
+      }
+      in.v[i] = v;
+    }
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "FaddpVector: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few FADDP encodings";
+}
+
+// SQDMULH / SQRDMULH by element (.4H/.8H/.2S/.4S) against the interpreter.
+// Lanes are biased toward INT_MIN, INT_MAX, -1 and 1 so the doubling-overflow
+// saturation and the rounding carry are both exercised at every index.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmulh) {
+  Seed(0x5D3C1D7ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const uint32_t opc = (Rnd() & 1) ? 0b1101u : 0b1100u;  // SQRDMULH : SQDMULH
+    const uint32_t q = Rnd() & 1;
+    const uint32_t size = 1 + (Rnd() & 1);
+    const uint32_t vm = Rnd() % 16;
+    const uint32_t rn = Rnd() % 16;
+    const uint32_t r = Rnd() % 3;
+    const uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 16));
+    uint32_t H, L, M;
+    if (size == 1) {
+      uint32_t index = Rnd() % 8;
+      H = index >> 2;
+      L = (index >> 1) & 1;
+      M = index & 1;
+    } else {
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+      M = 0;
+    }
+    // Ground truth: 0x4f72d820 == sqrdmulh v0.8h, v1.8h, v2.h[7].
+    uint32_t code[1] = {(q << 30) | (0b01111u << 24) | (size << 22) | (L << 21) | (M << 20) |
+                        ((vm & 0xF) << 16) | (opc << 12) | (H << 11) | (rn << 5) | rd};
+    InitState in = RandomInit();
+    for (int i = 0; i < 16; i++) {
+      unsigned __int128 v = 0;
+      if (size == 1) {
+        static const uint16_t kH[] = {0x8000, 0x7FFF, 0xFFFF, 0x0001, 0x4000, 0xC000};
+        for (int lane = 0; lane < 8; lane++) {
+          uint16_t h = (Rnd() % 2) ? kH[Rnd() % 6] : static_cast<uint16_t>(Rnd());
+          v |= static_cast<unsigned __int128>(h) << (16 * lane);
+        }
+      } else {
+        static const uint32_t kS[] = {0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x1u,
+                                      0x40000000u, 0xC0000000u};
+        for (int lane = 0; lane < 4; lane++) {
+          uint32_t w = (Rnd() % 2) ? kS[Rnd() % 6] : static_cast<uint32_t>(Rnd64());
+          v |= static_cast<unsigned __int128>(w) << (32 * lane);
+        }
+      }
+      in.v[i] = v;
+    }
+    std::string desc;
+    Result res = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (res == kDeclined) continue;
+    compared++;
+    if (res == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " enc=0x" << std::hex << code[0] << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "NeonVecXIdxSqdmulh: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULH by-element encodings";
+}
+
 }  // namespace berberis

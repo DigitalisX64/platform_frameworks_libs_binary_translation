@@ -339,6 +339,9 @@ TEST_F(Arm64HeavyMemoryDifferentialFuzz, EncodersMatchKnownEncodings) {
   EXPECT_EQ(EncLoadStorePair(0b01, 1, 0, 1, 2, 0), 0x69400440u);           // ldpsw x0,x1,[x2]
   EXPECT_EQ(EncSimdLoadStoreImm(0b00, 0b11, 0, 1, 0), 0x3DC00020u);        // ldr q0,[x1]
   EXPECT_EQ(EncSimdLoadStoreImm(0b00, 0b10, 0, 1, 0), 0x3D800020u);        // str q0,[x1]
+  EXPECT_EQ(EncLoadStoreIdx(0b01, 0b01, -4, 0b00, 1, 2) | (1u << 26), 0x7C5FC022u);  // ldur h2,[x1,#-4]
+  EXPECT_EQ(EncLoadStoreReg(0b01, 0b00, 2, 0b011, 1, 1, 0) | (1u << 26),
+            0x7C227820u);  // str h0,[x1,x2,lsl #1]
   EXPECT_EQ(EncAtomic(0b11, 0, 0, 1, 0, 0b000, 2, 0), 0xF8210040u);        // ldadd x1,x0,[x2]
   EXPECT_EQ(EncAtomic(0b11, 0, 0, 1, 1, 0b000, 2, 0), 0xF8218040u);        // swp x1,x0,[x2]
 }
@@ -565,6 +568,59 @@ TEST_F(Arm64HeavyMemoryDifferentialFuzz, SimdLoadStoreImm) {
   }
   fprintf(stderr, "heavy SimdLoadStoreImm: compared=%d/%d\n", compared, iters);
   EXPECT_GT(compared, 0);
+}
+
+// SIMD/FP loads and stores of B and H registers, in the unsigned-offset,
+// unscaled (LDUR/STUR) and register-offset forms. A load must zero the other
+// 15 or 14 bytes of the V register, and a store must write exactly 1 or 2
+// bytes; both show up in the full-state and memory compares.
+TEST_F(Arm64HeavyMemoryDifferentialFuzz, SimdLoadStoreNarrow) {
+  Seed(0xB8A10ADULL);
+  int iters = 3000 * FuzzScale();
+  int compared = 0;
+  for (int i = 0; i < iters; i++) {
+    const int size = Rnd() & 1;  // 0: B, 1: H
+    const size_t scale = size_t{1} << size;
+    const bool store = (Rnd() & 1) != 0;
+    const int opc = store ? 0b00 : 0b01;
+    const int rt = Rnd() % 32;
+    int rn = Rnd() % 31;
+    int rm = Rnd() % 31;
+    if (rm == rn) rm = (rm + 1) % 31;
+
+    SeedScratch();
+    InitState in = RandomInit();
+    PinBase(&in, rn, scale, /*tagged=*/false);
+
+    uint32_t insn;
+    switch (Rnd() % 3) {
+      case 0:
+        insn = EncSimdLoadStoreImm(size, opc, Rnd() % 16, rn, rt);
+        break;
+      case 1:
+        // LDUR/STUR: the integer unscaled encoding with V (bit 26) set.
+        insn = EncLoadStoreIdx(size, opc, static_cast<int>(Rnd() % 32) - 16, 0b00, rn, rt) |
+               (1u << 26);
+        break;
+      default: {
+        static const int kOptions[] = {0b010, 0b011, 0b110, 0b111};
+        in.x[rm] = Rnd() % 32;
+        insn = EncLoadStoreReg(size, opc, rm, kOptions[Rnd() % 4], Rnd() & 1, rn, rt) |
+               (1u << 26);
+        break;
+      }
+    }
+    uint32_t code[1] = {insn};
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, &desc);
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << i << " enc=0x" << std::hex << insn << ": " << desc;
+      return;
+    }
+    if (r == kMatch) compared++;
+  }
+  fprintf(stderr, "heavy SimdLoadStoreNarrow: compared=%d/%d\n", compared, iters);
+  EXPECT_GT(compared, iters / 2);
 }
 
 // LSE atomics: the read-modify-write families plus SWP, across the

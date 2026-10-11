@@ -767,6 +767,37 @@ TEST(Arm64DecoderTest, TwoRegMisc) {
 }
 
 // ============================================================================
+// SIMD&FP load/store, bit[24]=0: bit[21] separates register offset (bit[21]=1,
+// bits[11:10]=10) from the immediate forms (bit[21]=0). The historical bug:
+// bit[21] was not checked, so the FEAT_LSFE floating-point atomics (bit[21]=1,
+// bits[11:10]=00) decoded as STUR of Vt, with Rs and opc taken as imm9.
+// ============================================================================
+TEST(Arm64DecoderTest, SimdLoadStore_Bit21Split) {
+  struct Row {
+    uint32_t enc;
+    const char* name;
+    const char* note;
+  };
+  const Row rows[] = {
+      {0x3c001187, "SimdLoadStoreImm", "stur b7, [x12, #1]"},
+      {0x7c5fc022, "SimdLoadStoreImm", "ldur h2, [x1, #-4]"},
+      {0x7c227820, "SimdLoadStoreReg", "str h0, [x1, x2, lsl #1]"},
+      {0x3cc10420, "SimdLoadStoreImmPostIndex", "ldr q0, [x1], #16"},
+      {0x3cc10c20, "SimdLoadStoreImmPreIndex", "ldr q0, [x1, #16]!"},
+      {0x7c200041, "Undefined", "ldfadd h0, h1, [x2] (FEAT_LSFE)"},
+      {0x3c654001, "Undefined", "ldbfmaxl h5, h1, [x0] (FEAT_LSFE)"},
+      {0xbc20805f, "Undefined", "stfadd s0, [x2] (FEAT_LSFE)"},
+      {0x3c200420, "Undefined", "unallocated: bit[21]=1, bits[11:10]=01"},
+      {0x3c000820, "Undefined", "unallocated: bit[21]=0, bits[11:10]=10"},
+  };
+  for (const auto& r : rows) {
+    Recorder rec = Decode(r.enc);
+    SCOPED_TRACE(r.note);
+    EXPECT_STREQ(rec.name, r.name);
+  }
+}
+
+// ============================================================================
 // Reserved / undefined encodings. DecodeInstruction() routes op0 (bits[28:25])
 // == 0b0000 unconditionally to Undefined(); these are the reserved-space
 // encodings (UDF and friends) that must never be mistaken for a real op.

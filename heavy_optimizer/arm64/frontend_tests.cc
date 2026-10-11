@@ -23,6 +23,11 @@
 #include <limits>
 
 #include "berberis/assembler/machine_code.h"
+#include "berberis/backend/x86_64/code_gen.h"
+#include "berberis/backend/x86_64/machine_ir.h"
+#include "berberis/base/arena_alloc.h"
+#include "berberis/decoder/arm64/decoder.h"
+#include "berberis/decoder/arm64/semantics_player.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/heavy_optimizer/arm64/heavy_optimize_region.h"
@@ -30,6 +35,8 @@
 #include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
+
+#include "frontend.h"
 
 namespace berberis {
 
@@ -666,33 +673,53 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenBailRegion) {
   EXPECT_EQ(n, 2u);
 }
 
-// A single guest instruction whose decode fires several listener callbacks where
-// a later one bails must still produce valid IR (one region exit, no trailing
-// insns) — i.e. GenCode must not abort. A SIMD LDP-Q post-index decodes to
-// SimdLoadStorePair (still bails this round) followed by an AddImm writeback;
-// once SimdLoadStorePair sets success_ = false the AddImm must emit nothing.
+// A single guest instruction whose semantics fire several listener callbacks
+// where an earlier one bails must still produce valid IR (one region exit, no
+// trailing insns) -- i.e. GenCode must not abort. A post-index access calls the
+// load/store callback and then AddImm for the writeback; once the access bails
+// (success_ = false) the AddImm and SetReg must emit nothing. Every SIMD and
+// integer post-index form now lowers, so the bail is driven through the
+// frontend directly with the same callback order SemanticsPlayer uses.
+void EmitBailThenWriteback(HeavyOptimizerFrontend* frontend) {
+  frontend->StartInsn();
+  auto base = frontend->GetReg(1);
+  frontend->Undefined();  // the access bails
+  auto new_base = frontend->AddImm(base, 2);
+  frontend->SetReg(1, new_base);
+}
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
-  // LDR H0, [X1], #2 (SIMD 16-bit post-index): SimdLoadStoreImm (bails on the
-  // H/B sizes) then the writeback callback -- a multi-callback bail.
-  static const uint32_t code[] = {0x7c402420};
-  state_.cpu.insn_addr = ToGuestAddr(code);
+  static const uint32_t code[] = {0xd503201f /*NOP*/};
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  HeavyOptimizerFrontend frontend(&machine_ir, ToGuestAddr(code));
+  EmitBailThenWriteback(&frontend);
+  EXPECT_FALSE(frontend.success());
+  frontend.Finalize(frontend.GetInsnAddr());
   MachineCode mc;
   // No abort here is the assertion (GenCode runs CheckMachineIR internally).
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_FALSE(ok);
-  EXPECT_EQ(n, 0u);
+  x86_64::GenCode(&machine_ir, &mc);
 }
 
 // MoveWide followed by a multi-callback bail (the common on-device prefix shape).
 TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenMultiCallbackBail) {
-  static const uint32_t code[] = {MovzX(0, 0x11),
-                                  0x7c402420 /*LDR H0,[X1],#2 SIMD 16-bit post-index, bails*/};
-  state_.cpu.insn_addr = ToGuestAddr(code);
+  static const uint32_t code[] = {MovzX(0, 0x11), 0xd503201f /*NOP*/};
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  HeavyOptimizerFrontend frontend(&machine_ir, ToGuestAddr(code));
+  SemanticsPlayer sem_player(&frontend);
+  Decoder decoder(&sem_player);
+  frontend.StartInsn();
+  auto size = decoder.Decode(ToHostAddr<const uint16_t>(frontend.GetInsnAddr()));
+  ASSERT_TRUE(frontend.success());
+  frontend.IncrementInsnAddr(size);
+  EmitBailThenWriteback(&frontend);
+  EXPECT_FALSE(frontend.success());
+  // The region stops after the MOVZ, which translated.
+  EXPECT_EQ(frontend.GetInsnAddr(), ToGuestAddr(code) + sizeof(code[0]));
+  frontend.Finalize(frontend.GetInsnAddr());
   MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 1u);  // the MOVZ translated; the SIMD pair load bailed without corrupting IR
+  x86_64::GenCode(&machine_ir, &mc);
 }
 
 //
@@ -17733,6 +17760,173 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Sha1Ops) {
   EXPECT_EQ(lane32(0, 1), 0u);
   EXPECT_EQ(lane32(0, 2), 0u);
   EXPECT_EQ(lane32(0, 3), 0u);
+}
+
+
+// ---- Hot lite-only forms lowered in the heavy tier: B/H SIMD&FP loads and
+// stores, FP32/FP64 vector FADDP, SQDMULH/SQRDMULH by element, and 16-bit-lane
+// SSHL/USHL. Each used to bail the whole region to lite. ----
+
+// ldur h2, [x1, #-4]: a 16-bit load zero-extends into all 128 bits of v2.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdurHZeroesUpper) {
+  alignas(16) static const uint16_t buf[4] = {0xBEEF, 0x1234, 0x5678, 0x9ABC};
+  static const uint32_t code[] = {0x7c5fc022u};  // ldur h2, [x1, #-4]
+  std::memset(&state_.cpu.v[2], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[2]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 2), uint64_t{0xBEEF});
+  EXPECT_EQ(VUpperHi64(&state_, 2), 0ULL);
+}
+
+// ldr b0, [x1, #1]: an 8-bit load zero-extends (no sign extension of 0x80).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrBZeroesUpper) {
+  alignas(16) static const uint8_t buf[4] = {0x11, 0x80, 0x22, 0x33};
+  static const uint32_t code[] = {0x3d400420u};  // ldr b0, [x1, #1]
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), uint64_t{0x80});
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// stur b7, [x12, #1]: writes exactly one byte.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SturBWritesOneByte) {
+  alignas(16) static uint8_t buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  static const uint32_t code[] = {0x3c001187u};  // stur b7, [x12, #1]
+  SetV128(&state_, 7, 0x123456789ABCDEA5ULL, 0xFFFFFFFFFFFFFFFFULL);
+  state_.cpu.x[12] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xFF);
+  EXPECT_EQ(buf[1], 0xA5);
+  EXPECT_EQ(buf[2], 0xFF);
+  EXPECT_EQ(buf[3], 0xFF);
+}
+
+// str h0, [x1, x2, lsl #1]: register offset scaled by 2; writes two bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrHRegOffsetWritesTwoBytes) {
+  alignas(16) static uint16_t buf[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b01, 0b00, 2, 0b011, 1, 1, 0)};
+  static_assert(SimdLdStRegOffEnc(0b01, 0b00, 2, 0b011, 1, 1, 0) == 0x7c227820u);
+  SetV128(&state_, 0, 0x2468ACE013571357ULL, 0x1111111111111111ULL);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 2;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xFFFF);
+  EXPECT_EQ(buf[1], 0xFFFF);
+  EXPECT_EQ(buf[2], 0x1357);
+  EXPECT_EQ(buf[3], 0xFFFF);
+}
+
+// faddp v0.4s, v1.4s, v2.4s: [n0+n1, n2+n3, m0+m1, m2+m3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddpVec4S) {
+  static const uint32_t code[] = {0x6e22d420u};
+  SetV128(&state_, 1, Pack2xF32(1.0f, 2.0f), Pack2xF32(3.5f, -0.5f));
+  SetV128(&state_, 2, Pack2xF32(10.0f, 20.0f), Pack2xF32(-1.0f, 1.0f));
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(3.0f, 3.0f));
+  EXPECT_EQ(VUpperHi64(&state_, 0), Pack2xF32(30.0f, 0.0f));
+}
+
+// faddp v0.2s, v1.2s, v2.2s: [n0+n1, m0+m1]; the upper halves of the sources
+// are ignored and Vd[127:64] is zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddpVec2SUpperZero) {
+  static const uint32_t code[] = {0x2e22d420u};
+  SetV128(&state_, 1, Pack2xF32(1.0f, 2.0f), Pack2xF32(100.0f, 200.0f));
+  SetV128(&state_, 2, Pack2xF32(10.0f, 20.0f), Pack2xF32(300.0f, 400.0f));
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(3.0f, 30.0f));
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// faddp v0.2d, v1.2d, v2.2d: [n0+n1, m0+m1].
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddpVec2D) {
+  static const uint32_t code[] = {0x6e62d420u};
+  auto bits = [](double d) {
+    uint64_t b;
+    std::memcpy(&b, &d, sizeof(b));
+    return b;
+  };
+  SetV128(&state_, 1, bits(1.5), bits(2.25));
+  SetV128(&state_, 2, bits(-4.0), bits(0.5));
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), bits(3.75));
+  EXPECT_EQ(VUpperHi64(&state_, 0), bits(-3.5));
+}
+
+// sqrdmulh v0.8h, v1.8h, v2.h[7]: Vm lane 7 is INT16_MIN, so lane 0
+// (INT16_MIN * INT16_MIN) saturates to 0x7FFF; the others round to nearest.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhIdx8HLane7) {
+  static const uint32_t code[] = {0x4f72d820u};
+  SetV128(&state_, 1, 0x7FFF000140008000ULL, 0xC00012340000FFFFULL);
+  SetV128(&state_, 2, 0x1111111111111111ULL, 0x8000111111111111ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0x8001FFFFC0007FFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4000EDCC00000001ULL);
+}
+
+// sqdmulh v0.4s, v1.4s, v2.s[3]: INT32_MIN * INT32_MIN saturates to 0x7FFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhIdx4SLane3) {
+  static const uint32_t code[] = {0x4fa2c820u};
+  SetV128(&state_, 1, 0x4000000080000000ULL, 0x7FFFFFFF00000001ULL);
+  SetV128(&state_, 2, 0x2222222222222222ULL, 0x8000000022222222ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0xC00000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x80000001FFFFFFFFULL);
+}
+
+// ushl/sshl .8h: per-halfword counts 1, -1, 16, -16, 127, 4 (high byte
+// garbage), -15, -128.
+constexpr uint64_t kShl16VnLo = 0x8001800180018001ULL;
+constexpr uint64_t kShl16VnHi = 0x800000011234FFFFULL;
+constexpr uint64_t kShl16VmLo = 0x00F0001000FF0001ULL;
+constexpr uint64_t kShl16VmHi = 0x008000F1FF04007FULL;
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlVec8H) {
+  static const uint32_t code[] = {0x6e624420u};  // ushl v0.8h, v1.8h, v2.8h
+  SetV128(&state_, 1, kShl16VnLo, kShl16VnHi);
+  SetV128(&state_, 2, kShl16VmLo, kShl16VmHi);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000023400000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshlVec8H) {
+  static const uint32_t code[] = {0x4e624420u};  // sshl v0.8h, v1.8h, v2.8h
+  SetV128(&state_, 1, kShl16VnLo, kShl16VnHi);
+  SetV128(&state_, 2, kShl16VmLo, kShl16VmHi);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF0000C0000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFF000023400000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlVec4HUpperZero) {
+  static const uint32_t code[] = {0x2e624420u};  // ushl v0.4h, v1.4h, v2.4h
+  SetV128(&state_, 1, kShl16VnLo, kShl16VnHi);
+  SetV128(&state_, 2, kShl16VmLo, kShl16VmHi);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// 8-bit lanes still have no lowering and must bail.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlVec16BBails) {
+  static const uint32_t code[] = {0x6e224420u};  // ushl v0.16b, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  EXPECT_FALSE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
 }
 
 }  // namespace berberis

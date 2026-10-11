@@ -30,6 +30,7 @@
         "AndnqRegRegReg",
         "AddpdXRegXReg",
         "AddpsXRegXReg",
+        "HaddpdXRegXReg",
         "HaddpsXRegXReg",
         "AddsdXRegXReg",
         "AddssXRegXReg",

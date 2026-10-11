@@ -717,6 +717,25 @@ class HeavyOptimizerFrontend {
     return tbi;
   }
 
+  // 8/16-bit (B/H) LDR/STR (SIMD&FP) at [masked + disp] through a GP register:
+  // a load zero-extends with MOVZX, moves into a fresh XMM with MOVD (which
+  // clears bits 127:32) and commits the full 16-byte V[rt] slot; a store reads
+  // the low lane with MOVD and writes one byte or word. The memory access is
+  // recovery-wrapped.
+  void EmitSimdLoadStoreNarrow(bool is_store,
+                               Decoder::SimdLoadStoreSize size,
+                               Register masked,
+                               int32_t disp,
+                               int32_t vreg_off);
+
+  // Vector SQDMULH/SQRDMULH (size 01 or 10) on loaded operands; the caller
+  // bails first unless SqdmulhVecSupported. Clobbers xn.
+  [[nodiscard]] static bool SqdmulhVecSupported(uint8_t size, bool is_round);
+  [[nodiscard]] FpRegister EmitSqdmulhVec(FpRegister xn, FpRegister xm, uint8_t size, bool is_round);
+
+  // Broadcast lane `index` of xm (16-bit lanes when is_halfword, else 32-bit).
+  void EmitBroadcastVmLane(FpRegister xm, bool is_halfword, uint8_t index);
+
   [[nodiscard]] Register EmitRegOffsetAddr(Register base,
                                            Register offset_reg,
                                            uint8_t extend_type,

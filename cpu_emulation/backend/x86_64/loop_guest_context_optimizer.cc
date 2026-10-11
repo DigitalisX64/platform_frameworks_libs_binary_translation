@@ -356,6 +356,21 @@ bool ContainsCall(Loop* loop) {
 
 template <typename PredicateFunction>
 void OptimizeLoopTree(MachineIR* machine_ir, LoopTreeNode* node, PredicateFunction predicate) {
+  // region digitalis
+  // A loop holding two or more sibling inner loops is not optimized as a whole:
+  // each mapped guest register would stay live in a host register through every
+  // inner loop, also those that never touch it, and the union of the siblings'
+  // working sets spills inside the hot inner loop. An image-row loop with a
+  // vector body and a scalar tail ran about 10% slower that way than with each inner
+  // loop optimized on its own. A nest with at most one inner loop keeps the
+  // outermost choice, which saves the gets and puts on every outer iteration.
+  if (node->loop() && node->NumInnerloops() > 1) {
+    for (size_t i = 0; i < node->NumInnerloops(); i++) {
+      OptimizeLoopTree(machine_ir, node->GetInnerloopNode(i), predicate);
+    }
+    return;
+  }
+  // endregion digitalis
   if (node->loop() && predicate(node)) {
     OptimizeLoop(machine_ir, node->loop());
     return;

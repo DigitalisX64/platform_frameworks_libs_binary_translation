@@ -5450,26 +5450,53 @@ void HeavyOptimizerFrontend::SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs&
   UNUSED_ARGS(args);
 }
 
+void HeavyOptimizerFrontend::EmitSimdLoadStoreNarrow(bool is_store,
+                                                     Decoder::SimdLoadStoreSize size,
+                                                     Register masked,
+                                                     int32_t disp,
+                                                     int32_t vreg_off) {
+  const bool is_byte = (size == Decoder::SimdLoadStoreSize::k8bit);
+  if (is_store) {
+    FpRegister xmm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
+    Register data = std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+    if (is_byte) {
+      Gen<x86_64::MovbOpReg>({.base = masked, .disp = disp}, data);
+    } else {
+      Gen<x86_64::MovwOpReg>({.base = masked, .disp = disp}, data);
+    }
+    GenRecoveryBlockForLastInsn();
+    return;
+  }
+  Register data = is_byte
+                      ? std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = masked, .disp = disp}))
+                      : std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = masked, .disp = disp}));
+  GenRecoveryBlockForLastInsn();
+  FpRegister xmm = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdXRegReg>(xmm.machine_reg(), data);
+  builder_.GenSetSimd<16>(vreg_off, xmm.machine_reg());
+}
+
 // LDR/STR (SIMD&FP, immediate): 128/64/32-bit (Q/D/S). A load zero-extends the
 // rest of the 128-bit V[rt] (MOVSD/MOVSS already clear the unused lanes; the
 // full 16-byte slot is then committed). The memory access uses the unaligned
 // MOVDQU/MOVSD/MOVSS forms (guest memory is not 16-byte aligned) and a recovery
 // block so a host fault is delivered to the guest signal handler. The V[rt]
 // slot is 16-byte aligned, so its access uses GenGetSimd/GenSetSimd (MOVDQA).
-// 8/16-bit (B/H) bail to the lite tier. Mirrors lite_translator.h::SimdLoadStoreImm.
+// 8/16-bit (B/H) go through a GP register (EmitSimdLoadStoreNarrow). Mirrors
+// lite_translator.h::SimdLoadStoreImm.
 void HeavyOptimizerFrontend::SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
   if (!success()) {
-    return;
-  }
-  if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
-      args.size != Decoder::SimdLoadStoreSize::k64bit &&
-      args.size != Decoder::SimdLoadStoreSize::k128bit) {
-    UndefinedReturningVoid(BailReason::kUnsupportedSize);
     return;
   }
   Register masked = ApplyTbi(base);
   const int32_t off = static_cast<int32_t>(args.offset);
   const int32_t vreg_off = GetVRegOffset(args.rt);
+  if (args.size == Decoder::SimdLoadStoreSize::k8bit ||
+      args.size == Decoder::SimdLoadStoreSize::k16bit) {
+    EmitSimdLoadStoreNarrow(args.is_store, args.size, masked, off, vreg_off);
+    return;
+  }
   FpRegister xmm = AllocTempSimdReg();
   if (args.is_store) {
     builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
@@ -5593,21 +5620,20 @@ void HeavyOptimizerFrontend::SimdLoadStorePair(const Decoder::SimdLoadStorePairA
 // then reuse SimdLoadStoreImm's mem<->xmm<->v[] path at disp=0. A load's
 // MOVSD/MOVSS zero-extends the unused lanes and the full 16-byte v[] slot is
 // committed; the memory access uses the unaligned MOVDQU/MOVSD/MOVSS forms and
-// a recovery block. 8/16-bit (B/H) bail to the lite tier (which covers all
-// sizes), matching SimdLoadStoreImm. Mirrors lite_translator.h::SimdLoadStoreReg.
+// a recovery block. 8/16-bit (B/H) go through a GP register, as in
+// SimdLoadStoreImm. Mirrors lite_translator.h::SimdLoadStoreReg.
 void HeavyOptimizerFrontend::SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args, Register base, Register offset) {
   if (!success()) {
-    return;
-  }
-  if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
-      args.size != Decoder::SimdLoadStoreSize::k64bit &&
-      args.size != Decoder::SimdLoadStoreSize::k128bit) {
-    UndefinedReturningVoid(BailReason::kUnsupportedSize);
     return;
   }
   Register addr = EmitRegOffsetAddr(base, offset, args.extend_type, args.shift_amount);
   Register masked = ApplyTbi(addr);
   const int32_t vreg_off = GetVRegOffset(args.rt);
+  if (args.size == Decoder::SimdLoadStoreSize::k8bit ||
+      args.size == Decoder::SimdLoadStoreSize::k16bit) {
+    EmitSimdLoadStoreNarrow(args.is_store, args.size, masked, 0, vreg_off);
+    return;
+  }
   FpRegister xmm = AllocTempSimdReg();
   if (args.is_store) {
     builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
@@ -6058,6 +6084,109 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
     builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
   }
   SetVRegFull(args.rd, xmm, args.q);
+}
+
+// Vector SQDMULH / SQRDMULH on loaded operands: per lane (2*xn*xm) >> esize,
+// plus 2^(esize-1) before the shift when is_round, with the INT_MIN*INT_MIN
+// corner saturated to INT_MAX. size is 01 (16-bit lanes) or 10 (32-bit
+// lanes); the caller has checked SqdmulhVecSupported. Shared by the
+// three-same form and the by-element form (after broadcasting the lane).
+// Returns the result register; xn is clobbered.
+bool HeavyOptimizerFrontend::SqdmulhVecSupported(uint8_t size, bool is_round) {
+  if (size == 0b01) {
+    return !is_round || host_platform::kHasSSSE3;
+  }
+  return size == 0b10 && host_platform::kHasSSE4_1;
+}
+
+HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitSqdmulhVec(FpRegister xn,
+                                                                          FpRegister xm,
+                                                                          uint8_t size,
+                                                                          bool is_round) {
+  if (size == 0b01) {
+    if (is_round) {
+      // SQRDMULH .4H/.8H via PMULHRSW + corner fixup (SSSE3). PMULHRSW
+      // computes ((a*b >> 14) + 1) >> 1 = round((2*a*b)/2^16) already, so
+      // only the INT16_MIN*INT16_MIN corner needs the ^0xFFFF flip.
+      FpRegister xn_corner = AllocTempSimdReg();
+      FpRegister xm_corner = AllocTempSimdReg();
+      FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+      builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+      return xn;
+    }
+    // SQDMULH .4H/.8H via PMULHW + PMULLW combine + corner fixup (SSE2).
+    // high16(2*a*b) = (high16(a*b) << 1) | (top bit of low16(a*b)).
+    FpRegister xn_lo = AllocTempSimdReg();
+    FpRegister xn_corner = AllocTempSimdReg();
+    FpRegister xm_corner = AllocTempSimdReg();
+    FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
+    builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
+    builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
+    builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
+    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
+    builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+    builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
+    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());  // INT16_MIN^0xFFFF=MAX
+    return xn;
+  }
+  // size=10 .2S/.4S: PMULDQ widen (SSE4.1) + PSLLQ double + optional round
+  // + corner fixup; PSHUFD 0xDD lifts each product's upper 32 bits.
+  FpRegister x_const = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqd idiom
+  FpRegister corner = AllocTempSimdReg();
+  FpRegister xp_lo = AllocTempSimdReg();
+  FpRegister xp_hi = AllocTempSimdReg();
+  FpRegister xm_hi = AllocTempSimdReg();
+  // x_const = INT32_MIN broadcast across 4 dwords.
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+  builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
+  // Corner: lanes where Vn.s[i] == INT32_MIN AND Vm.s[i] == INT32_MIN.
+  builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+  builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
+  // Two PMULDQs reconstruct the 4 signed 32x32 -> 64 products (even lanes
+  // in xp_lo, odd lanes in xp_hi).
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
+  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
+  builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+  builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
+  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
+  // Double each 64-bit signed product.
+  builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
+  builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
+  if (is_round) {
+    // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
+    builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
+    builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
+  }
+  // Extract the upper 32 bits of each 64-bit lane and interleave.
+  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
+  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
+  builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
+  // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
+  builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
+  return xp_lo;
 }
 
 // AdvSIMD three-same INTEGER ops that lower to a single packed SSE2/SSE4.1
@@ -6527,11 +6656,35 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     return;
   }
 
+  // FP32/FP64 vector FADDP (.2S/.4S/.2D). HADDPS xn, xm gives [n0+n1, n2+n3,
+  // m0+m1, m2+m3], the .4S result in ARM lane order, and HADDPD gives [n0+n1,
+  // m0+m1] for .2D; each lane is one IEEE add, like ADDPS in FADD above. .2S
+  // reads only the low 64 bits of each source, so its result [n0+n1, m0+m1]
+  // sits in HADDPS lanes 0 and 2 and one PSHUFD gathers it before the D-form
+  // merge zeroes Vd[127:64]. Mirrors lite_translator_simd_three_same.inc.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddpV && !args.is_fp16) {
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    if (args.size & 1) {
+      builder_.Gen<x86_64::HaddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    } else {
+      builder_.Gen<x86_64::HaddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (!args.q) {
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                static_cast<int8_t>(0x08));
+      }
+    }
+    SetVRegFull(args.rd, xn, args.q);
+    return;
+  }
+
   // FP16 vector pairwise FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP (.4H/.8H) via the F16C
   // round-trip. Result lane k reduces the pair (cat[2k], cat[2k+1]) of the
   // concatenation cat = Vn:Vm — Vd's low half comes from Vn's adjacent pairs, its
-  // high half from Vm's. FP32/FP64 vector pairwise is not lowered here (bails to
-  // lite->interp); only the FP16 half is added, guarded on is_fp16. FADDP folds
+  // high half from Vm's. FP32/FP64 FMAXP/FMINP/FMAXNMP/FMINNMP are not lowered
+  // here (bail to lite); FP32/FP64 FADDP is handled above. FADDP folds
   // with HADDPS; min/max forms gather even/odd cat elements with SHUFPS (0x88/
   // 0xDD, same as UZP1/UZP2) and apply the +-0-correct NaN-aware min/max.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddpV ||
@@ -6819,7 +6972,7 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // built with the PCMPEQD-self ; PSRLD/PSRLQ 1 idiom. FP16 (needs an F16C
   // round-trip absent from the backend Gen inputs) bails to lite; the decoder
   // already rejects the reserved sz=1&&!Q (.1D) shape.
-  // SSHL / USHL (vector, 32- and 64-bit lanes). Per-lane variable shift: the
+  // SSHL / USHL (vector, 16-, 32- and 64-bit lanes). Per-lane variable shift: the
   // amount is the signed low BYTE of each Vm lane, left when non-negative,
   // plain (non-rounding) right when negative -- arithmetic for SSHL, logical
   // for USHL. The bail histogram over real apps put USHL.2D at the top of the
@@ -6836,11 +6989,17 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   //     sar(v, s) = ((v ^ m) >>logical s) ^ m with m = (v < 0 ? ~0 : 0) from
   //     PCMPGTQ -- for s >= 64 the logical shift gives 0 and the XOR restores
   //     the sign fill, exactly ARM's semantics.
-  // 8/16-bit lanes have no variable-shift instruction below AVX-512 and bail.
+  // 16-bit lanes reuse the dword arm twice: the low halfwords, extended to
+  // dwords (zero for USHL, sign for SSHL) with their own sext8 counts, and the
+  // high halfwords likewise; a dword shift of an extended halfword gives the
+  // ARM halfword result in its low 16 bits for every count (left counts >= 16
+  // clear it; logical rights of a zero-extended value and VPSRAVD's sign fill
+  // of a sign-extended one match ARM's 16-bit right shifts), and the two
+  // halves are merged back. 8-bit lanes have no such cheap split and bail.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSshl ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kUshl) {
     const bool is_64bit = (args.size == 0b11);
-    if ((args.size != 0b10 && args.size != 0b11) || !host_platform::kHasAVX2) {
+    if (args.size == 0b00 || !host_platform::kHasAVX2) {
       UndefinedReturningVoid();
       return;
     }
@@ -6855,27 +7014,25 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xa.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xsh.machine_reg(), vm_off);
 
-    if (!is_64bit) {
-      // shift = sext8(Vm.lane[7:0]) per dword.
-      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
-      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
-
+    // Per-dword variable shift of xa by the signed counts in xsh (already
+    // sign-extended to dwords).
+    auto shift_dwords = [&](FpRegister xv, FpRegister xcount) {
       FpRegister xisneg = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xcount.machine_reg());
 
       FpRegister xleft = AllocTempSimdReg();
       builder_.Gen<x86_64::VpsllvdXRegXRegXReg>(
-          xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+          xleft.machine_reg(), xv.machine_reg(), xcount.machine_reg());
 
       FpRegister xs = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xcount.machine_reg());
       FpRegister xright = AllocTempSimdReg();
       if (is_signed) {
         builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
-            xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+            xright.machine_reg(), xv.machine_reg(), xs.machine_reg());
       } else {
         builder_.Gen<x86_64::VpsrlvdXRegXRegXReg>(
-            xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+            xright.machine_reg(), xv.machine_reg(), xs.machine_reg());
       }
 
       FpRegister xres = AllocTempSimdReg();
@@ -6883,7 +7040,46 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
       builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
       builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
-      SetVRegFull(args.rd, xres, args.q);
+      return xres;
+    };
+
+    if (args.size == 0b10) {
+      // shift = sext8(Vm.lane[7:0]) per dword.
+      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
+      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+      SetVRegFull(args.rd, shift_dwords(xa, xsh), args.q);
+      return;
+    }
+
+    if (args.size == 0b01) {
+      // Low halfwords: value extended from bits [15:0], count sext8 of bits [7:0].
+      FpRegister xlo = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xlo.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xlo.machine_reg(), int8_t{16});
+      FpRegister xclo = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xclo.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xclo.machine_reg(), int8_t{24});
+      builder_.Gen<x86_64::PsradXRegImm>(xclo.machine_reg(), int8_t{24});
+      // High halfwords: value extended from bits [31:16], count sext8 of bits [23:16].
+      FpRegister xhi = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+      if (is_signed) {
+        builder_.Gen<x86_64::PsradXRegImm>(xlo.machine_reg(), int8_t{16});
+        builder_.Gen<x86_64::PsradXRegImm>(xhi.machine_reg(), int8_t{16});
+      } else {
+        builder_.Gen<x86_64::PsrldXRegImm>(xlo.machine_reg(), int8_t{16});
+        builder_.Gen<x86_64::PsrldXRegImm>(xhi.machine_reg(), int8_t{16});
+      }
+      FpRegister xrlo = shift_dwords(xlo, xclo);
+      FpRegister xrhi = shift_dwords(xhi, xsh);
+      // Merge: low 16 bits of each dword result into their halfword slots.
+      builder_.Gen<x86_64::PslldXRegImm>(xrlo.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PsrldXRegImm>(xrlo.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PslldXRegImm>(xrhi.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PorXRegXReg>(xrlo.machine_reg(), xrhi.machine_reg());
+      SetVRegFull(args.rd, xrlo, args.q);
       return;
     }
 
@@ -7487,120 +7683,22 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // Only the 16-bit (size=01) and 32-bit (size=10) lane forms are defined; the
   // decoder reserves size 00/11, so those bail. This is a byte-for-byte mirror
   // of lite_translator.h's kSqdmulh/kSqrdmulh lowering — reads only Vn/Vm, so
-  // it lives here (like SQADD) rather than the shared vn-only switch. Result
-  // lands in xn (size=01) / xp_lo (size=10); SetVRegFull's Q=0 merge zeroes
-  // Vd[127:64].
+  // it lives here (like SQADD) rather than the shared vn-only switch. The
+  // recipe is EmitSqdmulhVec; SetVRegFull's Q=0 merge zeroes Vd[127:64].
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqdmulh ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh) {
     const bool is_round =
         (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh);
-    if (args.size == 0b01) {
-      FpRegister xn = AllocTempSimdReg();
-      FpRegister xm = AllocTempSimdReg();
-      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-      if (is_round) {
-        // SQRDMULH .4H/.8H via PMULHRSW + corner fixup (SSSE3). PMULHRSW
-        // computes ((a*b >> 14) + 1) >> 1 = round((2*a*b)/2^16) already, so
-        // only the INT16_MIN*INT16_MIN corner needs the ^0xFFFF flip.
-        if (!host_platform::kHasSSSE3) {
-          UndefinedReturningVoid();
-          return;
-        }
-        FpRegister xn_corner = AllocTempSimdReg();
-        FpRegister xm_corner = AllocTempSimdReg();
-        FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-        builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
-        builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
-        SetVRegFull(args.rd, xn, args.q);
-        return;
-      }
-      // SQDMULH .4H/.8H via PMULHW + PMULLW combine + corner fixup (SSE2).
-      // high16(2*a*b) = (high16(a*b) << 1) | (top bit of low16(a*b)).
-      FpRegister xn_lo = AllocTempSimdReg();
-      FpRegister xn_corner = AllocTempSimdReg();
-      FpRegister xm_corner = AllocTempSimdReg();
-      FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
-      builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
-      builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
-      builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
-      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());  // INT16_MIN^0xFFFF=MAX
-      SetVRegFull(args.rd, xn, args.q);
+    // size=00 and size=11 are reserved by the decoder; bail to lite/interp.
+    if (!SqdmulhVecSupported(args.size, is_round)) {
+      UndefinedReturningVoid();
       return;
     }
-    if (args.size == 0b10) {
-      // size=10 .2S/.4S: PMULDQ widen (SSE4.1) + PSLLQ double + optional round
-      // + corner fixup; PSHUFD 0xDD lifts each product's upper 32 bits.
-      if (!host_platform::kHasSSE4_1) {
-        UndefinedReturningVoid();
-        return;
-      }
-      FpRegister xn = AllocTempSimdReg();
-      FpRegister xm = AllocTempSimdReg();
-      FpRegister x_const = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqd idiom
-      FpRegister corner = AllocTempSimdReg();
-      FpRegister xp_lo = AllocTempSimdReg();
-      FpRegister xp_hi = AllocTempSimdReg();
-      FpRegister xm_hi = AllocTempSimdReg();
-      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-      // x_const = INT32_MIN broadcast across 4 dwords.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
-      // Corner: lanes where Vn.s[i] == INT32_MIN AND Vm.s[i] == INT32_MIN.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
-      // Two PMULDQs reconstruct the 4 signed 32x32 -> 64 products (even lanes
-      // in xp_lo, odd lanes in xp_hi).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
-      builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
-      // Double each 64-bit signed product.
-      builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
-      builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
-      if (is_round) {
-        // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-        builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
-        builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
-        builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-        builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
-      }
-      // Extract the upper 32 bits of each 64-bit lane and interleave.
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
-      builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
-      // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
-      builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
-      SetVRegFull(args.rd, xp_lo, args.q);
-      return;
-    }
-    // size=00 and size=11 reserved by the decoder; bail to lite/interp.
-    UndefinedReturningVoid();
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    SetVRegFull(args.rd, EmitSqdmulhVec(xn, xm, args.size, is_round), args.q);
     return;
   }
 
@@ -14304,6 +14402,23 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
   }
 }
 
+// Broadcast lane `index` of xm (16-bit lanes when is_halfword, else 32-bit)
+// across every lane: PSRLDQ 8 for a high halfword lane, then PSHUFLW + PSHUFD
+// for halfwords, or one PSHUFD for words.
+void HeavyOptimizerFrontend::EmitBroadcastVmLane(FpRegister xm, bool is_halfword, uint8_t index) {
+  const uint8_t i = index & 0b11;
+  const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+  if (is_halfword) {
+    if (index >= 4) {
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+    }
+    builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
+  } else {
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+  }
+}
+
 // Heavy-tier mirror of lite_translator.h::AdvSimdVecXIndexedElement's
 // integer MUL/MLA/MLS by-element block (halfword .4h/.8h size=01, word
 // .2s/.4s size=10):
@@ -14313,7 +14428,8 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
 // No saturation, no widening — the bottom esize bits of each host product
 // match the architectural result modulo 2^esize. Broadcast is Pshuflw+Pshufd
 // (halfword; Psrldq 8 first if index>=4) or Pshufd (word). Q=0 upper-64
-// discard via SetVRegFull(rd, res, q). All other by-element opcodes still
+// discard via SetVRegFull(rd, res, q). SQDMULH/SQRDMULH by element share
+// EmitSqdmulhVec with the three-same form. All other by-element opcodes still
 // bail to the lite tier — emit NOTHING before a bail.
 void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
   if (!success()) {
@@ -14770,6 +14886,23 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
     return;
   }
 
+  // SQDMULH/SQRDMULH by element (size=01 .4h/.8h, size=10 .2s/.4s): the
+  // three-same recipe (EmitSqdmulhVec) against the broadcast of Vm.lane[index].
+  if (args.opcode == Op::kSqdmulhIdx || args.opcode == Op::kSqrdmulhIdx) {
+    const bool is_round = (args.opcode == Op::kSqrdmulhIdx);
+    if (!SqdmulhVecSupported(args.size, is_round)) {
+      UndefinedReturningVoid();
+      return;
+    }
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), GetVRegOffset(args.rn));
+    builder_.GenGetSimd<16>(xm.machine_reg(), GetVRegOffset(args.rm));
+    EmitBroadcastVmLane(xm, args.size == 0b01, args.index);
+    SetVRegFull(args.rd, EmitSqdmulhVec(xn, xm, args.size, is_round), args.q);
+    return;
+  }
+
   if (args.opcode != Op::kMul && args.opcode != Op::kMla &&
       args.opcode != Op::kMls) {
     UndefinedReturningVoid();
@@ -14790,20 +14923,7 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
   builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
   builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
 
-  // Broadcast Vm.lane[index] across every destination lane.
-  if (is_halfword) {
-    if (args.index >= 4) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
-    }
-    const uint8_t i = args.index & 0b11;
-    const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-    builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
-  } else {
-    const uint8_t i = args.index & 0b11;
-    const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-  }
+  EmitBroadcastVmLane(xm, is_halfword, args.index);
 
   FpRegister result = xn;
   if (args.opcode == Op::kMul) {
