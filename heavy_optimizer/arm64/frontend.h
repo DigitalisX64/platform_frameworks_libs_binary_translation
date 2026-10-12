@@ -929,7 +929,7 @@ class HeavyOptimizerFrontend {
   [[nodiscard]] Register EmitArmCondPredicate(Decoder::Condition cond);
 
   // Emit a conditional branch to then_bb when `cond` is met, else_bb otherwise,
-  // by testing the EmitArmCondPredicate result.
+  // by testing the NZCV word directly (no 0/1 predicate is built).
   void EmitCondBranch(Decoder::Condition cond,
                       MachineBasicBlock* then_bb,
                       MachineBasicBlock* else_bb);

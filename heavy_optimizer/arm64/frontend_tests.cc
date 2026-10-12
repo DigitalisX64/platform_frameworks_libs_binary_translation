@@ -2318,6 +2318,53 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondAlwaysTaken) {
   EXPECT_EQ(state_.cpu.x[9], 0u);
 }
 
+// Every B.cond condition against every NZCV value, seeded straight into
+// cpu.flags, checked against the architectural ConditionHolds table. Pins the
+// direct NZCV tests EmitCondBranch emits (TEST, AND+CMP, and the (flags << 15)
+// ^ flags fold for the signed conditions).
+bool ArmConditionHolds(uint8_t cond, bool n, bool z, bool c, bool v) {
+  bool result = false;
+  switch (cond >> 1) {
+    case 0: result = z; break;              // EQ / NE
+    case 1: result = c; break;              // CS / CC
+    case 2: result = n; break;              // MI / PL
+    case 3: result = v; break;              // VS / VC
+    case 4: result = c && !z; break;        // HI / LS
+    case 5: result = n == v; break;         // GE / LT
+    case 6: result = !z && n == v; break;   // GT / LE
+  }
+  return (cond & 1) ? !result : result;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondAllConditionsAllFlags) {
+  for (uint8_t cond = kCondEQ; cond < kCondAL; ++cond) {
+    const uint32_t code[] = {
+        Bcond(cond, 8),  // [0] B.cond -> skip [1] when taken
+        MovzX(9, 1),     // [1] runs only on fall-through
+        MovzX(10, 2),    // [2]
+    };
+    GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+    MachineCode mc;
+    auto [stop, ok, n] =
+        HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+    ASSERT_TRUE(ok);
+    ScopedExecRegion exec(&mc);
+    for (uint8_t nzcv = 0; nzcv < 16; ++nzcv) {
+      bool fn = nzcv & 8, fz = nzcv & 4, fc = nzcv & 2, fv = nzcv & 1;
+      state_.cpu.x[9] = 0;
+      state_.cpu.x[10] = 0;
+      state_.cpu.flags = (fn ? CPUState::kFlagNegative : 0) | (fz ? CPUState::kFlagZero : 0) |
+                         (fc ? CPUState::kFlagCarry : 0) | (fv ? CPUState::kFlagOverflow : 0);
+      state_.cpu.insn_addr = ToGuestAddr(code);
+      TestingRunGeneratedCode(&state_, exec.get(), end_pc);
+      bool taken = state_.cpu.x[9] == 0;
+      EXPECT_EQ(taken, ArmConditionHolds(cond, fn, fz, fc, fv))
+          << "cond=" << int{cond} << " nzcv=" << int{nzcv};
+      EXPECT_EQ(state_.cpu.x[10], 2u);
+    }
+  }
+}
+
 // CBZ taken: X0 == 0 -> branch over code[2].
 TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbzTaken) {
   static const uint32_t code[] = {
