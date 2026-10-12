@@ -403,6 +403,49 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (rn << 5) | rd;
   }
 
+  // region digitalis
+  // AdvSIMD three-different, the long and wide forms: SADDL/UADDL, SADDW/UADDW,
+  // SSUBL/USUBL, SSUBW/USUBW, SABAL/UABAL, SABDL/UABDL, SMLAL/UMLAL, SMLSL/UMLSL,
+  // SMULL/UMULL, and the signed-only SQDMLAL/SQDMLSL/SQDMULL. Q=1 ("2" forms)
+  // takes the upper 64 bits of the narrow sources.
+  uint32_t GenNeonThreeDiffLong() {
+    static const uint32_t kOpc[] = {0b0000, 0b0001, 0b0010, 0b0011, 0b0101, 0b0111,
+                                    0b1000, 0b1001, 0b1010, 0b1011, 0b1100, 0b1101};
+    uint32_t opc = kOpc[Rnd() % 12];
+    bool saturating = opc == 0b1001 || opc == 0b1011 || opc == 0b1101;
+    uint32_t u = saturating ? 0 : (Rnd() & 1);
+    uint32_t size = saturating ? 1 + (Rnd() & 1) : Rnd() % 3;
+    uint32_t q = Rnd() & 1;
+    uint32_t rn = Rnd() % 8;
+    uint32_t rm = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) | (rm << 16) |
+           (opc << 12) | (rn << 5) | rd;
+  }
+
+  // SSHLL/USHLL (SXTL/UXTL at shift 0) at every element size, and the byte
+  // SSHR/USHR, all with Q sampled: the "2" forms widen the upper 64 bits.
+  uint32_t GenNeonWidenShiftByImm() {
+    uint32_t q = Rnd() & 1;
+    uint32_t u = Rnd() & 1;
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : Rnd() % 8;
+    if (Rnd() % 4 == 0) {
+      // SSHR/USHR byte: immh = 0001, shift = 16 - immh:immb in [1, 8].
+      uint32_t immh_immb = 0b1000 | (Rnd() % 8);
+      return (q << 30) | (u << 29) | (0b011110u << 23) | (immh_immb << 16) | (0b000001u << 10) |
+             (rn << 5) | rd;
+    }
+    // SSHLL/USHLL: immh = 0001 (8B), 001x (4H) or 01xx (2S); shift = immh:immb - esize.
+    uint32_t esize_log = Rnd() % 3;
+    uint32_t esize = 8u << esize_log;
+    uint32_t immh_immb = esize | (Rnd() % esize);
+    return (q << 30) | (u << 29) | (0b011110u << 23) | (immh_immb << 16) | (0b101001u << 10) |
+           (rn << 5) | rd;
+  }
+  // endregion
+
   // Saturating doubling widening MUL/MAC by element: SQDMULL/SQDMLAL/SQDMLSL.
   //   SQDMULL opc=1011 | SQDMLAL opc=0011 | SQDMLSL opc=0111 (U=0, signed only)
   // size 01 (.4h/.8h -> .4s) or 10 (.2s/.4s -> .2d); Q selects the source half.
@@ -1169,6 +1212,71 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmull) {
   }
   EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULL by-element encodings";
 }
+
+// region digitalis
+// Single-instruction AdvSIMD three-different long/wide forms, rd aliasing rn or
+// rm sampled, Q sampled: the "2" forms read the upper half of the narrow
+// sources, and a source that rd aliases must be read before rd is written.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeDiffLong) {
+  Seed(0x3D1FF10C0FFEE123ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonThreeDiffLong()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few three-different long encodings";
+}
+
+// Regions of three-different long forms and widening shifts: a widened result
+// feeds the next instruction's narrow source.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonWideningRegion) {
+  Seed(0x51DE10C4A11BEEF0ULL);
+  const int kIters = 2000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[4];
+    for (auto& insn : code) {
+      insn = (Rnd() & 1) ? GenNeonThreeDiffLong() : GenNeonWidenShiftByImm();
+    }
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 4, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few widening regions";
+}
+
+// SSHLL/USHLL and byte SSHR/USHR, Q sampled.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonWidenShiftByImm) {
+  Seed(0x55411E1D00C0FFEEULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonWidenShiftByImm()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few widening shift encodings";
+}
+// endregion
 
 // Single-instruction SHL-by-immediate across every size class the heavy tier
 // lowers (byte via PSLLW + per-byte AND mask, half/word/double via
