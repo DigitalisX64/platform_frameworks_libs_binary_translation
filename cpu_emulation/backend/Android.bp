@@ -205,6 +205,9 @@ filegroup {
         "x86_64/reg_lifetime.cc",
         "x86_64/rename_copy_uses.cc",
         "x86_64/rename_vregs.cc",
+        // region digitalis
+        "x86_64/remove_nop_reg_moves.cc",
+        // endregion
     ],
 }
 
@@ -280,6 +283,7 @@ filegroup {
         "x86_64/rename_copy_uses_test.cc",
         // region digitalis
         "x86_64/rename_copy_uses_order_test.cc",
+        "x86_64/remove_nop_reg_moves_test.cc",
         // endregion
         "x86_64/rename_vregs_test.cc",
     ],
