@@ -17,9 +17,11 @@
 #ifndef BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_H_
 #define BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_H_
 
+#include <bitset>
 #include <cstdint>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "berberis/assembler/common.h"
 #include "berberis/assembler/x86_64.h"
@@ -139,18 +141,7 @@ class LiteTranslator {
     return result;
   }
 
-  void StoreMappedRegs() {
-    if (!IsRegMappingEnabled()) {
-      return;
-    }
-    for (unsigned i = 0; i < kNumGuestRegs; i++) {
-      if (gp_maintainer_.IsModified(i)) {
-        auto mapped_reg = gp_maintainer_.GetMapped(i);
-        int32_t offset = offsetof(ThreadState, cpu.x[0]) + i * 8;
-        as_.Movq({.base = Assembler::rbp, .disp = offset}, mapped_reg);
-      }
-    }
-  }
+  void StoreMappedRegs() { StoreMappedRegs(ModifiedMappedRegs()); }
 
   //
   // Region exit methods.
@@ -159,6 +150,21 @@ class LiteTranslator {
   void ExitGeneratedCode(GuestAddr target);
   void ExitRegion(GuestAddr target);
   void ExitRegionIndirect(Register target);
+
+  // Binds recovery_label (the fault handler of the memory access just emitted)
+  // to an exit to the current guest instruction. The exit stub goes out of
+  // line, after the region's last exit (EmitRecoveryExits), so the fault-free
+  // path falls through the access instead of jumping over an inline stub after
+  // every load and store. The stub flushes the mapped registers modified so
+  // far and mirrors MXCSR if FP work happened so far: exactly what an inline
+  // ExitGeneratedCode(GetInsnAddr()) at this point would emit.
+  void AddRecoveryExit(AssemblerBase::Label* recovery_label) {
+    recovery_exits_.push_back({recovery_label, GetInsnAddr(), ModifiedMappedRegs(), fp_dirty_});
+  }
+
+  // Emits the stubs AddRecoveryExit deferred. Call once, after the region's
+  // final exit, before finalizing the assembler.
+  void EmitRecoveryExits();
 
   // Mirror host MXCSR cumulative exception bits into emulated_fpsr at ARM FPSR
   // positions. Called from every region-exit path: System V x86_64 ABI lets
@@ -221,6 +227,26 @@ class LiteTranslator {
   // Backward edges always exit the region so signals are processed.
 
   bool IsRegMappingEnabled() { return params_.enable_reg_mapping; }
+
+  std::bitset<kNumGuestRegs> ModifiedMappedRegs() {
+    std::bitset<kNumGuestRegs> modified;
+    if (IsRegMappingEnabled()) {
+      for (unsigned i = 0; i < kNumGuestRegs; i++) {
+        modified[i] = gp_maintainer_.IsModified(i);
+      }
+    }
+    return modified;
+  }
+
+  void StoreMappedRegs(const std::bitset<kNumGuestRegs>& modified) {
+    for (unsigned i = 0; i < kNumGuestRegs; i++) {
+      if (modified[i]) {
+        auto mapped_reg = gp_maintainer_.GetMapped(i);
+        int32_t offset = offsetof(ThreadState, cpu.x[0]) + i * 8;
+        as_.Movq({.base = Assembler::rbp, .disp = offset}, mapped_reg);
+      }
+    }
+  }
 
   std::tuple<Register, bool> GetMappedRegisterOrMap(int reg) {
     if (gp_maintainer_.IsMapped(reg)) {
@@ -617,6 +643,15 @@ class LiteTranslator {
   bool is_region_end_reached_;
   // see constructor comment.
   bool fp_dirty_;
+  // Fault exits deferred by AddRecoveryExit, with the state captured at the
+  // faulting access.
+  struct RecoveryExit {
+    AssemblerBase::Label* label;
+    GuestAddr pc;
+    std::bitset<kNumGuestRegs> modified;
+    bool fp_dirty;
+  };
+  std::vector<RecoveryExit> recovery_exits_;
   // guest PC label map for backward branch inlining
 };
 

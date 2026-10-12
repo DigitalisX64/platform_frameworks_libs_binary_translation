@@ -537,11 +537,7 @@
     }
 
     // Emit recovery code for memory faults.
-    AssemblerBase::Label* cont = as_.MakeLabel();
-    as_.Jmp(*cont);
-    as_.Bind(recovery_label);
-    ExitGeneratedCode(GetInsnAddr());
-    as_.Bind(cont);
+    AddRecoveryExit(recovery_label);
 
     return res;
   }
@@ -569,11 +565,7 @@
     }
 
     // Emit recovery code for memory faults.
-    AssemblerBase::Label* cont = as_.MakeLabel();
-    as_.Jmp(*cont);
-    as_.Bind(recovery_label);
-    ExitGeneratedCode(GetInsnAddr());
-    as_.Bind(cont);
+    AddRecoveryExit(recovery_label);
   }
 
   Register AddImm(Register base, int32_t offset) {

@@ -326,11 +326,7 @@
           case 3: as_.LockCmpXchgq(mem, desired); break;
         }
 
-        AssemblerBase::Label* cont = as_.MakeLabel();
-        as_.Jmp(*cont);
-        as_.Bind(recovery_label);
-        ExitGeneratedCode(GetInsnAddr());
-        as_.Bind(cont);
+        AddRecoveryExit(recovery_label);
 
         // Write old value back to Rs (from RAX).
         if (args.rs < 31) {
@@ -379,11 +375,7 @@
           case 3: as_.Xchgq(new_val, mem); break;
         }
 
-        AssemblerBase::Label* cont = as_.MakeLabel();
-        as_.Jmp(*cont);
-        as_.Bind(recovery_label);
-        ExitGeneratedCode(GetInsnAddr());
-        as_.Bind(cont);
+        AddRecoveryExit(recovery_label);
 
         // byte/halfword Xchg leaves upper bits of new_val
         // as the original guest Xs (copied via Movq above), not zero. ARM SWP
@@ -418,11 +410,7 @@
           case 3: as_.LockXaddq(mem, addend); break;
         }
 
-        AssemblerBase::Label* cont = as_.MakeLabel();
-        as_.Jmp(*cont);
-        as_.Bind(recovery_label);
-        ExitGeneratedCode(GetInsnAddr());
-        as_.Bind(cont);
+        AddRecoveryExit(recovery_label);
 
         // byte/halfword LockXadd only updates low bits of
         // addend; upper bits stay as guest Xs. ARM LDADD Wt zero-extends the
@@ -792,11 +780,7 @@
           as_.SetRecoveryPoint(recovery_label);
           as_.LockCmpXchgq(mem, desired);
 
-          AssemblerBase::Label* cont = as_.MakeLabel();
-          as_.Jmp(*cont);
-          as_.Bind(recovery_label);
-          ExitGeneratedCode(GetInsnAddr());
-          as_.Bind(cont);
+          AddRecoveryExit(recovery_label);
 
           // Unpack old: low 32 → Rs (zero-extend), high 32 → Rs+1
           // (zero-extend).  Each half is written back like ARM CAS Wt, i.e.,
@@ -951,11 +935,7 @@
           AssemblerBase::Label* recovery_label = as_.MakeLabel();
           as_.SetRecoveryPoint(recovery_label);
           as_.Movq(pair, mem);
-          AssemblerBase::Label* cont = as_.MakeLabel();
-          as_.Jmp(*cont);
-          as_.Bind(recovery_label);
-          ExitGeneratedCode(GetInsnAddr());
-          as_.Bind(cont);
+          AddRecoveryExit(recovery_label);
           // Reservation: address = base, value = the 64-bit pair.
           as_.Movq({.base = Assembler::rbp, .disp = resv_addr_off}, base);
           as_.Movq({.base = Assembler::rbp, .disp = resv_val_off}, pair);

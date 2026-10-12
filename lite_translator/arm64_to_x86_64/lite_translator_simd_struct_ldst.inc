@@ -227,11 +227,7 @@
           case 4: as_.Movl(elem_mem, tmp); break;
           case 8: as_.Movq(elem_mem, tmp); break;
         }
-        AssemblerBase::Label* cont = as_.MakeLabel();
-        as_.Jmp(*cont);
-        as_.Bind(recovery_label);
-        ExitGeneratedCode(GetInsnAddr());
-        as_.Bind(cont);
+        AddRecoveryExit(recovery_label);
       }
     } else if (is_replicate) {
       // LD1R-LD4R: for each of the num_regs consecutive registers (mod 32),
@@ -257,11 +253,7 @@
           case 4: as_.Movl(tmp, elem_mem); break;
           case 8: as_.Movq(tmp, elem_mem); break;
         }
-        AssemblerBase::Label* cont = as_.MakeLabel();
-        as_.Jmp(*cont);
-        as_.Bind(recovery_label);
-        ExitGeneratedCode(GetInsnAddr());
-        as_.Bind(cont);
+        AddRecoveryExit(recovery_label);
 
         // Broadcast `tmp` across XMM lanes.
         switch (esize) {
@@ -311,11 +303,7 @@
           case 4: as_.Movl(tmp, elem_mem); break;
           case 8: as_.Movq(tmp, elem_mem); break;
         }
-        AssemblerBase::Label* cont = as_.MakeLabel();
-        as_.Jmp(*cont);
-        as_.Bind(recovery_label);
-        ExitGeneratedCode(GetInsnAddr());
-        as_.Bind(cont);
+        AddRecoveryExit(recovery_label);
 
         const int32_t lane_off = VRegOffset(reg) + args.index * esize;
         switch (esize) {

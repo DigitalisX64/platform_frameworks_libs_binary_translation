@@ -121,6 +121,23 @@ void LiteTranslator::Svc(uint16_t imm) {
   EmitSyscall(&as_, GetInsnAddr());
 }
 
+void LiteTranslator::EmitRecoveryExits() {
+  // Each stub runs only after a fault, so it may use the capture-time state:
+  // the mappings it stores never change once made, and the MXCSR mirror is
+  // gated on the FP work done before the faulting access.
+  bool fp_dirty = fp_dirty_;
+  for (const auto& exit : recovery_exits_) {
+    as_.Bind(exit.label);
+    StoreMappedRegs(exit.modified);
+    fp_dirty_ = exit.fp_dirty;
+    EmitMxcsrToFpsrMirror();
+    as_.Movq(as_.rax, exit.pc);
+    EmitExitGeneratedCode(&as_, as_.rax);
+  }
+  fp_dirty_ = fp_dirty;
+  recovery_exits_.clear();
+}
+
 void LiteTranslator::ExitRegion(GuestAddr target) {
   StoreMappedRegs();
   EmitMxcsrToFpsrMirror();

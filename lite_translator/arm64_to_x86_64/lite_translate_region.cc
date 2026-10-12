@@ -34,6 +34,7 @@ namespace {
 
 void Finalize(LiteTranslator* translator, GuestAddr pc) {
   translator->ExitRegion(pc);
+  translator->EmitRecoveryExits();
   translator->as()->Finalize();
 }
 
