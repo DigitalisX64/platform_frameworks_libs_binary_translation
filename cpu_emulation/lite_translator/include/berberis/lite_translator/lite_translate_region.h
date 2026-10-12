@@ -32,6 +32,12 @@ struct LiteTranslateParams {
   bool allow_dispatch = true;
   bool enable_reg_mapping = true;
   bool enable_self_profiling = false;
+  // Let a branch back to the region's start loop inside the region, with a
+  // pending-signals check per iteration, instead of exiting through dispatch.
+  // Translation takes extra passes, so only regions known to be hot and
+  // staying in the lite tier set it. Ignored with enable_self_profiling: the
+  // hotness counter at the region start must count every iteration.
+  bool allow_in_region_loops = false;
   uint32_t* counter_location = nullptr;
   uint32_t counter_threshold = config::kGearSwitchThreshold;
   HostCode counter_threshold_callback =

@@ -56,6 +56,7 @@ class LiteTranslator {
       : as_(machine_code),
         success_(true),
         pc_(pc),
+        start_pc_(pc),
         params_(params),
         is_region_end_reached_(false),
         // track whether any SIMD/FP register was allocated.
@@ -223,10 +224,45 @@ class LiteTranslator {
     simd_allocator_.FreeTemps();
   }
 
-  // Backward-branch inlining (a per-PC label map + local jumps for in-region
-  // loops) was removed: it traps the CPU in a tight loop without signal
-  // checks, and an in-region back-edge variant also miscompiled codec loops.
-  // Backward edges always exit the region so signals are processed.
+  // In-region self-loops (LiteTranslateParams::allow_in_region_loops).
+  //
+  // An earlier backward-branch inlining (a per-PC label map + local jumps)
+  // was removed: it looped without signal checks, and its back-edge variant
+  // miscompiled codec loops. Two things make a back-edge safe here:
+  //  - every iteration checks pending signals and exits through dispatch when
+  //    one is pending, as every region exit does;
+  //  - the loop head sees the register state the back-edge leaves. A first
+  //    pass records the region's final guest-register mappings, modified set
+  //    and fp_dirty_; the looping pass maps and loads all those registers
+  //    before the head and marks the modified ones, so no lazy first-use load
+  //    re-reads stale ThreadState in a later iteration, and every exit and
+  //    recovery stub stores what any iteration may have changed. A back-edge
+  //    reached after a new mapping (state differing from the head's) exits.
+  struct LoopEntryState {
+    std::bitset<kNumGuestRegs> mapped;
+    std::bitset<kNumGuestRegs> modified;
+    bool fp_dirty = false;
+  };
+
+  [[nodiscard]] bool saw_self_back_edge() const { return saw_self_back_edge_; }
+
+  [[nodiscard]] LoopEntryState CaptureLoopEntryState() {
+    LoopEntryState state;
+    for (unsigned i = 0; i < kNumGuestRegs; i++) {
+      state.mapped[i] = gp_maintainer_.IsMapped(i);
+    }
+    state.modified = ModifiedMappedRegs();
+    state.fp_dirty = fp_dirty_;
+    return state;
+  }
+
+  // Emits the preload for state and binds the loop head after it. Call
+  // before translating the region's first instruction.
+  void EmitLoopHead(const LoopEntryState& state);
+
+  // Exit for a direct branch: loops to the head when target is the region
+  // start (see above), else ExitRegion.
+  void ExitRegionOrLoop(GuestAddr target);
 
   bool IsRegMappingEnabled() { return params_.enable_reg_mapping; }
 
@@ -256,6 +292,9 @@ class LiteTranslator {
     }
     if (auto alloc_result = gp_allocator_.Alloc()) {
       gp_maintainer_.Map(reg, alloc_result.value());
+      if (loop_head_ != nullptr) {
+        mapped_after_loop_head_ = true;
+      }
       return {alloc_result.value(), true};
     }
     success_ = false;
@@ -667,6 +706,7 @@ class LiteTranslator {
   Assembler as_;
   bool success_;
   GuestAddr pc_;
+  const GuestAddr start_pc_;
   Allocator<Register> gp_allocator_;
   RegisterFileMaintainer<Register, kNumGuestRegs> gp_maintainer_;
   Allocator<SimdRegister> simd_allocator_;
@@ -685,7 +725,10 @@ class LiteTranslator {
     bool fp_dirty;
   };
   std::vector<RecoveryExit> recovery_exits_;
-  // guest PC label map for backward branch inlining
+  // In-region loop state (see LoopEntryState).
+  Assembler::Label* loop_head_ = nullptr;
+  bool mapped_after_loop_head_ = false;
+  bool saw_self_back_edge_ = false;
 };
 
 }  // namespace berberis

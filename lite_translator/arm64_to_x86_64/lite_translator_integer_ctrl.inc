@@ -418,7 +418,7 @@
 
   void Branch(int32_t offset) {
     is_region_end_reached_ = true;
-    ExitRegion(GetInsnAddr() + offset);
+    ExitRegionOrLoop(GetInsnAddr() + offset);
   }
 
   void BranchCond(Decoder::Condition cond, int32_t offset);  // implemented in .cc
@@ -450,7 +450,7 @@
       // Backward branch: end region to prevent infinite loops.
       is_region_end_reached_ = true;
     }
-    ExitRegion(target);
+    ExitRegionOrLoop(target);
     as_.Bind(cont);
   }
 
@@ -476,7 +476,7 @@
       // Backward branch: end region to prevent infinite loops.
       is_region_end_reached_ = true;
     }
-    ExitRegion(target);
+    ExitRegionOrLoop(target);
     as_.Bind(cont);
   }
 

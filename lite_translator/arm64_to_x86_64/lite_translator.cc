@@ -149,6 +149,43 @@ void LiteTranslator::ExitRegion(GuestAddr target) {
   }
 }
 
+void LiteTranslator::EmitLoopHead(const LoopEntryState& state) {
+  CHECK(loop_head_ == nullptr);
+  for (unsigned i = 0; i < kNumGuestRegs; i++) {
+    if (!state.mapped[i]) {
+      continue;
+    }
+    // The first pass held all these mappings at once, at its end, with no
+    // temps live, so the pool fits them here too.
+    auto [mapped_reg, is_new_mapping] = GetMappedRegisterOrMap(i);
+    CHECK(success());
+    CHECK(is_new_mapping);
+    int32_t offset = offsetof(ThreadState, cpu.x[0]) + i * 8;
+    as_.Movq(mapped_reg, {.base = Assembler::rbp, .disp = offset});
+    if (state.modified[i]) {
+      gp_maintainer_.NoticeModified(i);
+    }
+  }
+  fp_dirty_ = state.fp_dirty;
+  loop_head_ = as_.MakeLabel();
+  as_.Bind(loop_head_);
+}
+
+void LiteTranslator::ExitRegionOrLoop(GuestAddr target) {
+  if (params_.allow_in_region_loops && target == start_pc_) {
+    saw_self_back_edge_ = true;
+    if (loop_head_ != nullptr && !mapped_after_loop_head_) {
+      // Same check as the dispatch's (EmitDirectDispatch): with a signal
+      // pending, fall through to the region exit, which returns to the
+      // dispatcher to handle it.
+      const int32_t offset = offsetof(ThreadState, pending_signals_status);
+      as_.Cmpb({.base = Assembler::rbp, .disp = offset}, kPendingSignalsPresent);
+      as_.Jcc(Condition::kNotEqual, *loop_head_);
+    }
+  }
+  ExitRegion(target);
+}
+
 void LiteTranslator::ExitRegionIndirect(Register target) {
   StoreMappedRegs();
   // skip the mirror-spill scaffolding entirely when no
@@ -200,8 +237,8 @@ void LiteTranslator::BranchCond(Decoder::Condition cond, int32_t offset) {
     // Backward branch (or self-loop): end region to prevent infinite loops.
     is_region_end_reached_ = true;
   }
-  // Taken path: always exit to branch target.
-  ExitRegion(target);
+  // Taken path: exit to the branch target, or loop to the region start.
+  ExitRegionOrLoop(target);
   // Fall-through: continue translating if forward branch (is_region_end_reached_ not set).
   as_.Bind(cont);
 }

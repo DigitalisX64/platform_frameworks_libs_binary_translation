@@ -300,7 +300,12 @@ void TranslateRegion(GuestAddr pc) {
     // stays JIT-compiled; only then interpret.
     std::tie(success, host_code_piece, size, kind) = HeavyOptimizeAndInstallRegion(pc);
     if (!success) {
-      std::tie(success, host_code_piece, size, kind) = TryLiteTranslateAndInstallRegion(pc);
+      // The region is hot and settles on the lite tier for good (no
+      // self-profiling), so let a loop back to its start run in-region.
+      LiteTranslateParams params;
+      params.allow_in_region_loops = true;
+      std::tie(success, host_code_piece, size, kind) =
+          TryLiteTranslateAndInstallRegion(pc, params);
     }
   } else {
     // First gear: lite-translate, falling back to the interpreter. In two-gear

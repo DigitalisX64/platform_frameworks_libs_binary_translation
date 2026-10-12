@@ -49,22 +49,28 @@ void GenIncrementProfileCounter(x86_64::Assembler* as, const LiteTranslateParams
   as->Jcc(x86_64::Assembler::Condition::kGreater, params.counter_threshold_callback);
 }
 
-}  // namespace
+struct PassResult {
+  bool success;
+  GuestAddr stop_pc;
+  bool saw_self_back_edge;
+  LiteTranslator::LoopEntryState loop_entry;
+};
 
-// Returns the success status and
-// - in case of success, the pc of the next instruction past the translated region
-// - in case of failure, the pc of the failed instruction
-// Specifically, returns input pc if we cannot translate even the first instruction.
-std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
-                                                   MachineCode* machine_code,
-                                                   LiteTranslateParams params) {
-  CHECK_LT(start_pc, params.end_pc);
+// One translation of the region into machine_code. With loop_entry, the
+// region starts with its preload and loop head (LiteTranslator::EmitLoopHead).
+PassResult TranslatePass(GuestAddr start_pc,
+                         MachineCode* machine_code,
+                         const LiteTranslateParams& params,
+                         const LiteTranslator::LoopEntryState* loop_entry) {
   LiteTranslator translator(machine_code, start_pc, params);
   SemanticsPlayer sem_player(&translator);
   Decoder decoder(&sem_player);
 
   if (params.enable_self_profiling) {
     GenIncrementProfileCounter(translator.as(), params);
+  }
+  if (loop_entry != nullptr) {
+    translator.EmitLoopHead(*loop_entry);
   }
 
   while (translator.GetInsnAddr() < params.end_pc && !translator.is_region_end_reached()) {
@@ -88,15 +94,54 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
                         (unsigned long)fail_pc,
                         insn);
       }
-      return {false, translator.GetInsnAddr()};
+      return {false, translator.GetInsnAddr(), false, {}};
     }
     translator.FreeTempRegs();
     translator.IncrementInsnAddr(insn_size);
   }
 
+  // A back-edge to the start always ends the region, so this is the state
+  // every back-edge leaves.
+  auto loop_state = translator.CaptureLoopEntryState();
   Finalize(&translator, translator.GetInsnAddr());
 
-  return {translator.success(), translator.GetInsnAddr()};
+  return {translator.success(), translator.GetInsnAddr(), translator.saw_self_back_edge(),
+          loop_state};
+}
+
+}  // namespace
+
+// Returns the success status and
+// - in case of success, the pc of the next instruction past the translated region
+// - in case of failure, the pc of the failed instruction
+// Specifically, returns input pc if we cannot translate even the first instruction.
+std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
+                                                   MachineCode* machine_code,
+                                                   LiteTranslateParams params) {
+  CHECK_LT(start_pc, params.end_pc);
+  if (params.allow_in_region_loops && !params.enable_self_profiling) {
+    // MachineCode cannot be reset, so the probing passes write scratch code.
+    // Pass 1 learns whether the region branches back to its start and the
+    // register state at that back-edge. Pass 2 checks that the region still
+    // translates with that state preloaded (all mappings live from the start
+    // leave fewer temps to early instructions). Only then is the looping
+    // version written to machine_code.
+    MachineCode probe_code;
+    auto probe = TranslatePass(start_pc, &probe_code, params, nullptr);
+    if (probe.success && probe.saw_self_back_edge) {
+      MachineCode check_code;
+      auto check = TranslatePass(start_pc, &check_code, params, &probe.loop_entry);
+      if (check.success && check.stop_pc == probe.stop_pc) {
+        auto looped = TranslatePass(start_pc, machine_code, params, &probe.loop_entry);
+        CHECK(looped.success);
+        CHECK_EQ(looped.stop_pc, probe.stop_pc);
+        return {true, looped.stop_pc};
+      }
+    }
+  }
+  params.allow_in_region_loops = false;
+  auto result = TranslatePass(start_pc, machine_code, params, nullptr);
+  return {result.success, result.stop_pc};
 }
 
 }  // namespace berberis
