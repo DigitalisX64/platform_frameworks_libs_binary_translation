@@ -278,6 +278,9 @@ filegroup {
         "x86_64/read_flags_optimizer_test.cc",
         "x86_64/reg_lifetime_test.cc",
         "x86_64/rename_copy_uses_test.cc",
+        // region digitalis
+        "x86_64/rename_copy_uses_order_test.cc",
+        // endregion
         "x86_64/rename_vregs_test.cc",
     ],
 }

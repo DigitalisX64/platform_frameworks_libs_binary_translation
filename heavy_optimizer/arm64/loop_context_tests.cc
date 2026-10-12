@@ -24,6 +24,8 @@ constexpr uint32_t kAddV1V1V2_4S = 0x4ea28421;     // add v1.4s, v1.4s, v2.4s
 constexpr uint32_t kAddV1V1V2_16B = 0x4e228421;    // add v1.16b, v1.16b, v2.16b
 constexpr uint32_t kFaddD3D3D1 = 0x1e612863;       // fadd d3, d3, d1
 constexpr uint32_t kPmull2V3V1V1 = 0x4e21e023;     // pmull2 v3.8h, v1.16b, v1.16b
+constexpr uint32_t kSmullV4V1V2 = 0x0e22c024;      // smull v4.8h, v1.8b, v2.8b
+constexpr uint32_t kSmull2V3V1V2 = 0x4e22c023;     // smull2 v3.8h, v1.16b, v2.16b
 constexpr uint32_t kSubsX4X4Imm1 = 0xf1000484;     // subs x4, x4, #1
 constexpr uint32_t kSubsX5X5Imm1 = 0xf10004a5;     // subs x5, x5, #1
 constexpr uint32_t kAddX6X6X7 = 0x8b0700c6;        // add x6, x6, x7
@@ -136,6 +138,54 @@ TEST_F(Arm64HeavyLoopContextTest, UpperHalfReadSeesFullWidthWrite) {
   }
   EXPECT_TRUE(state_.cpu.v[1] == ones * 2);
   EXPECT_TRUE(state_.cpu.v[3] == expected_v3);
+}
+
+// SMULL and SMULL2 widen v1 and v2 without changing them: v1 and v2 keep
+// their values across iterations while the widened copies are multiplied.
+TEST_F(Arm64HeavyLoopContextTest, WideningMultiplyLeavesSourcesIntact) {
+  static const uint32_t code[] = {
+      kAddV1V1V2_16B,  // [0] loop top: v1.16b += v2.16b
+      kSmull2V3V1V2,   // [1] v3.8h = v1.b[8..15] * v2.b[8..15]
+      kSmullV4V1V2,    // [2] v4.8h = v1.b[0..7] * v2.b[0..7]
+      kSubsX5X5Imm1,   // [3]
+      BneBy(-16),      // [4] -> [0]
+  };
+  uint8_t v1_bytes[16];
+  uint8_t v2_bytes[16];
+  for (int i = 0; i < 16; i++) {
+    v1_bytes[i] = static_cast<uint8_t>(i * 13);
+    v2_bytes[i] = static_cast<uint8_t>(i * 37 - 100);
+  }
+  memcpy(&state_.cpu.v[1], v1_bytes, sizeof(v1_bytes));
+  memcpy(&state_.cpu.v[2], v2_bytes, sizeof(v2_bytes));
+  state_.cpu.v[3] = 0;
+  state_.cpu.v[4] = 0;
+  state_.cpu.x[5] = 3;
+  Run(code);
+
+  for (int i = 0; i < 16; i++) {
+    v1_bytes[i] = static_cast<uint8_t>(v1_bytes[i] + 3 * v2_bytes[i]);
+  }
+  int16_t expected_v3[8];
+  int16_t expected_v4[8];
+  for (int i = 0; i < 8; i++) {
+    expected_v4[i] = static_cast<int16_t>(static_cast<int8_t>(v1_bytes[i]) *
+                                          static_cast<int8_t>(v2_bytes[i]));
+    expected_v3[i] = static_cast<int16_t>(static_cast<int8_t>(v1_bytes[i + 8]) *
+                                          static_cast<int8_t>(v2_bytes[i + 8]));
+  }
+  uint8_t actual_v1[16];
+  uint8_t actual_v2[16];
+  int16_t actual_v3[8];
+  int16_t actual_v4[8];
+  memcpy(actual_v1, &state_.cpu.v[1], sizeof(actual_v1));
+  memcpy(actual_v2, &state_.cpu.v[2], sizeof(actual_v2));
+  memcpy(actual_v3, &state_.cpu.v[3], sizeof(actual_v3));
+  memcpy(actual_v4, &state_.cpu.v[4], sizeof(actual_v4));
+  EXPECT_EQ(memcmp(actual_v1, v1_bytes, sizeof(actual_v1)), 0);
+  EXPECT_EQ(memcmp(actual_v2, v2_bytes, sizeof(actual_v2)), 0);
+  EXPECT_EQ(memcmp(actual_v3, expected_v3, sizeof(actual_v3)), 0);
+  EXPECT_EQ(memcmp(actual_v4, expected_v4, sizeof(actual_v4)), 0);
 }
 
 }  // namespace
