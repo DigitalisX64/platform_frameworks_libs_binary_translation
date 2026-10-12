@@ -926,6 +926,54 @@ TEST_F(Arm64HeavyDifferentialFuzz, IntDataProcRegion) {
   EXPECT_GT(compared, 200) << "heavy accepted too few integer regions";
 }
 
+// W-form ALU ops whose destination is a plain copy of Wn that a 32-bit x86 op
+// then overwrites: add/sub and logical (shifted register, flag-setting forms
+// too), add/sub (extended register), logical (immediate) and LSL (immediate).
+// The source X registers carry random upper halves, so a result whose upper
+// half is not cleared by the 32-bit write diverges from the interpreter.
+TEST_F(Arm64HeavyDifferentialFuzz, W32AluDirtyUpperHalves) {
+  Seed(0x3232D1E7A11F0E5BULL);
+  auto gen = [this]() -> uint32_t {
+    constexpr uint32_t kMaxReg = 13;
+    uint32_t rd = Rnd() % kMaxReg, rn = Rnd() % kMaxReg, rm = Rnd() % kMaxReg;
+    uint32_t op = Rnd() & 1, s = Rnd() & 1;
+    switch (Rnd() % 5) {
+      case 0:  // ADD/ADDS/SUB/SUBS Wd, Wn, Wm, LSL|LSR|ASR #imm6
+        return 0x0B000000U | (op << 30) | (s << 29) | ((Rnd() % 3) << 22) | (rm << 16) |
+               ((Rnd() % 32) << 10) | (rn << 5) | rd;
+      case 1:  // AND/ORR/EOR/ANDS (N: BIC/ORN/EON/BICS) Wd, Wn, Wm, shift #imm6
+        return 0x0A000000U | ((Rnd() % 4) << 29) | ((Rnd() % 4) << 22) | ((Rnd() & 1) << 21) |
+               (rm << 16) | ((Rnd() % 32) << 10) | (rn << 5) | rd;
+      case 2:  // ADD/ADDS/SUB/SUBS Wd, Wn, Wm, {U,S}XT{B,H,W,X} #0..4
+        return 0x0B200000U | (op << 30) | (s << 29) | (rm << 16) | ((Rnd() % 8) << 13) |
+               ((Rnd() % 5) << 10) | (rn << 5) | rd;
+      case 3:  // AND/ORR/EOR/ANDS Wd, Wn, #bitmask (32-bit element)
+        return 0x12000000U | ((Rnd() % 4) << 29) | ((Rnd() % 32) << 16) |
+               ((Rnd() % 31) << 10) | (rn << 5) | rd;
+      default: {  // LSL Wd, Wn, #shift == UBFM Wd, Wn, #(32-shift), #(31-shift)
+        uint32_t shift = 1 + Rnd() % 31;
+        return 0x53000000U | ((32 - shift) << 16) | ((31 - shift) << 10) | (rn << 5) | rd;
+      }
+    }
+  };
+  const int kIters = 3000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    int n = 1 + (Rnd() % 4);
+    uint32_t code[4];
+    for (int i = 0; i < n; i++) code[i] = gen();
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, kIters / 2) << "heavy accepted too few W-form ALU regions";
+}
+
 // Single-instruction AdvSIMD three-same integer, rd aliasing rn/rm sampled.
 TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSame) {
   Seed(0x3A3E5A3E90ABCDEFULL);

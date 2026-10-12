@@ -167,6 +167,12 @@ class HeavyOptimizerFrontend {
     return result;
   }
 
+  // The destination of a 32-bit x86 op that unconditionally writes it: that
+  // write zero-extends the result into the upper half (the ARM64 W-write), so
+  // the copy needs no MOVL of its own and the allocator may coalesce it away.
+  // A caller whose 32-bit op is conditional keeps an explicit MOVL.
+  [[nodiscard]] Register CopyForWrite32(Register value) { return Copy(value); }
+
   [[nodiscard]] bool success() const { return success_; }
 
   void Undefined(BailReason reason = BailReason::kUnimplemented);

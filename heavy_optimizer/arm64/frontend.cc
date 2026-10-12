@@ -2593,7 +2593,7 @@ Register HeavyOptimizerFrontend::LogicalImm(Decoder::LogicalImmOpcode opcode, bo
     }
   }
   // 32-bit op: the l-suffix form zero-extends the result to 64 bits.
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+  Register res = CopyForWrite32(src);
   switch (opcode) {
     case Decoder::LogicalImmOpcode::kAnd:
       return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg));
@@ -2708,7 +2708,7 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
         Register res = Copy(src);
         return std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
       }
-      Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+      Register res = CopyForWrite32(src);
       return std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
     }
     // UXTB: UBFM Wd, Wn, #0, #7.
@@ -3227,7 +3227,7 @@ Register HeavyOptimizerFrontend::LogicalShiftedReg(Decoder::LogicalShiftedRegOpc
         return AllocTempReg();
     }
   }
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+  Register res = CopyForWrite32(src1);
   switch (opcode) {
     case Decoder::LogicalShiftedRegOpcode::kAnd:
       return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, op2));
@@ -3280,7 +3280,7 @@ Register HeavyOptimizerFrontend::AddSubShiftedReg(bool is_sub,
     }
     return r;
   }
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+  Register res = CopyForWrite32(src1);
   if (is_sub) {
     auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, op2);
     if (set_flags) {
@@ -3381,7 +3381,7 @@ Register HeavyOptimizerFrontend::AddSubExtendedReg(bool is_sub,
     }
     return r;
   }
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+  Register res = CopyForWrite32(src1);
   if (is_sub) {
     auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, ext);
     if (set_flags) {
