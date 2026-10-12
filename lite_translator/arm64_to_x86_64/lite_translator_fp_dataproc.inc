@@ -62,6 +62,8 @@
 
     int32_t src_offset = VRegOffset(args.rn);
     int32_t dst_offset = VRegOffset(args.rd);
+    // FMOV, FABS and FNEG copy or patch bits through GP registers.
+    NonRaisingSimdScope non_raising(this, args.opcode <= 0b000010);
 
     if (args.ftype == 0b11) {
       // FP16 (half-precision) ops.

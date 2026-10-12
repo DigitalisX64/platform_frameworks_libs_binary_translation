@@ -589,6 +589,7 @@
 
   // FMOV (scalar, immediate): JIT - load a FP constant into SIMD register
   void FpMovImmediate(uint8_t rd, uint8_t imm8, uint8_t ftype) {
+    NonRaisingSimdScope non_raising(this);
     int32_t vreg_offset = VRegOffset(rd);
     SimdRegister xmm = AllocTempSimdReg();
     if (xmm == no_simd_register) {
@@ -634,6 +635,9 @@
     // JIT support for FMOV GP↔FP conversions
     uint8_t rmode = args.rmode;
     uint8_t opcode = args.op;
+    // The FMOV forms only move bits; conversions can raise.
+    NonRaisingSimdScope non_raising(
+        this, (rmode == 0b00 || rmode == 0b01) && (opcode == 0b110 || opcode == 0b111));
 
     // FMOV GP → FP: opcode=0b111, rmode=0b00
     if (rmode == 0b00 && opcode == 0b111) {

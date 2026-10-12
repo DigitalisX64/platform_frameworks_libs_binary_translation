@@ -33,6 +33,7 @@
   void AdvSimdMultiStruct(uint8_t rt, uint8_t rn, uint8_t num_regs, uint8_t size,
                           bool q, bool is_store, bool postindex, uint8_t rm,
                           bool is_interleaved) {
+    NonRaisingSimdScope non_raising(this);
     UNUSED(size);  // For LD1/ST1 contiguous, the element size only matters
                    // for post-index immediate math, and that is encoded by Q
                    // (16- or 8-byte stride per register) — the transfer is
@@ -177,6 +178,7 @@
   }
 
   void AdvSimdSingleStruct(const Decoder::AdvSimdSingleStructArgs& args) {
+    NonRaisingSimdScope non_raising(this);
     // JIT for LD1R / LD1 / ST1 single-element variants
     // with num_regs == 1.  Critical for `calculate_gnu_hash_neon`'s tail
     // (`ld1r v3.4s, [x10], #4`) in the dynamic linker — without this the

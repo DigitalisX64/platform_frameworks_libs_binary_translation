@@ -63,7 +63,9 @@ class LiteTranslator {
         // MXCSR -> FPSR mirror at region exit can be elided. Integer-only hot
         // loops (e.g. bionic linker CdEntryMapZip32::AddToMap hash probe) hit
         // 9+ region exits per iteration; eliding the 12-x86-insn mirror saves
-        // ~100 host insns per iteration there.
+        // ~100 host insns per iteration there. Instructions that only move
+        // SIMD/FP data (NonRaisingSimdScope) don't count, so a region of
+        // integer work plus vector loads, stores and permutes elides it too.
         fp_dirty_(false)
         {}
 
@@ -270,8 +272,11 @@ class LiteTranslator {
 
   SimdRegister AllocTempSimdReg() {
     // any SIMD/FP work in the region marks MXCSR as
-    // possibly-dirty so the mirror at region exit isn't elided.
-    fp_dirty_ = true;
+    // possibly-dirty so the mirror at region exit isn't elided, except in an
+    // instruction that only moves data (see NonRaisingSimdScope).
+    if (!in_non_raising_simd_insn_) {
+      fp_dirty_ = true;
+    }
     if (auto reg_option = simd_allocator_.AllocTemp()) {
       return reg_option.value();
     }
@@ -427,6 +432,32 @@ class LiteTranslator {
   // through AllocTempSimdReg (e.g. a future scalar FP path that directly uses
   // a fixed XMM register). Currently unused; kept for forward use.
   void MarkFpDirty() { fp_dirty_ = true; }
+
+  // Wraps the translation of an instruction whose host lowering only moves
+  // data: SIMD/FP loads and stores, lane and register moves, immediates,
+  // permutes, EXT and TBL. None of the x86 instructions these emit (moves,
+  // inserts and extracts, shuffles, integer packs/compares/logic) can set an
+  // MXCSR exception flag, so their temp SIMD registers leave the region's
+  // FP-dirty bit alone. A region that does nothing else keeps the
+  // MXCSR -> FPSR mirror elided, like an integer-only region. Instructions
+  // that can raise (FP arithmetic, compares, conversions, rounding) must not
+  // use this scope.
+  class NonRaisingSimdScope {
+   public:
+    // `active` false makes the scope a no-op, for handlers where only some
+    // encodings just move data.
+    explicit NonRaisingSimdScope(LiteTranslator* translator, bool active = true)
+        : translator_(translator), saved_(translator->in_non_raising_simd_insn_) {
+      translator_->in_non_raising_simd_insn_ = saved_ || active;
+    }
+    ~NonRaisingSimdScope() { translator_->in_non_raising_simd_insn_ = saved_; }
+    NonRaisingSimdScope(const NonRaisingSimdScope&) = delete;
+    NonRaisingSimdScope& operator=(const NonRaisingSimdScope&) = delete;
+
+   private:
+    LiteTranslator* translator_;
+    bool saved_;
+  };
   bool fp_dirty() const { return fp_dirty_; }
 
  private:
@@ -643,6 +674,8 @@ class LiteTranslator {
   bool is_region_end_reached_;
   // see constructor comment.
   bool fp_dirty_;
+  // Set while a NonRaisingSimdScope is open.
+  bool in_non_raising_simd_insn_ = false;
   // Fault exits deferred by AddRecoveryExit, with the state captured at the
   // faulting access.
   struct RecoveryExit {

@@ -585,6 +585,7 @@
   }
 
   void AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t index, bool q) {
+    NonRaisingSimdScope non_raising(this);
     // JIT for EXT Vd.<T>, Vn.<T>, Vm.<T>, #imm.
     // Concatenates Vn:Vm and extracts a vector starting at byte `index`
     // from Vn. Equivalent to:
@@ -654,6 +655,7 @@
 
   void AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t size,
                       uint8_t opcode, bool q) {
+    NonRaisingSimdScope non_raising(this);
     // ZIP / UZP / TRN vector permute JIT
     //
     // opcode encoding (3 bits, from Decoder::DecodeAdvSimd at decoder.h:2808):
@@ -998,6 +1000,7 @@
   // (Vd == Vn, Vd == Vm, Vd == V(n+1)..) read the original source bytes.
   void AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t len,
                           uint8_t op, bool q) {
+    NonRaisingSimdScope non_raising(this);
     const uint8_t table_regs = static_cast<uint8_t>(len + 1);  // 1..4
     const int32_t vm_off = VRegOffset(rm);
     const int32_t vd_off = VRegOffset(rd);

@@ -23,6 +23,7 @@
 //   AdvSimdCopy
 
   void AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
+    NonRaisingSimdScope non_raising(this);
     // Decode element size + lane index from imm5. The encoding is shared by
     // every AdvSimdCopy opcode that selects a lane (UMOV / SMOV / INS-general
     // / DUP-element). UMOV and INS-general are JIT-implemented below; the

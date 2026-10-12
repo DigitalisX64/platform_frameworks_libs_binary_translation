@@ -1195,6 +1195,7 @@
   }
 
   void SimdModifiedImm(const Decoder::SimdModifiedImmArgs& args) {
+    NonRaisingSimdScope non_raising(this);
     const uint8_t cmode = args.cmode;
     // ORR/BIC (vector, immediate) — cmode<0>==1 and cmode<3:2>!=11 — are
     // read-modify-write, unlike the MOVI/MVNI/FMOV replace forms. The immediate
@@ -1262,6 +1263,7 @@
   // passed as the base). The integer LDR (literal) JIT follows the same
   // pattern.
   void SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs& args) {
+    NonRaisingSimdScope non_raising(this);
     GuestAddr target = GetInsnAddr() + args.offset;
     Register addr = AllocTempReg();
     if (addr == no_register) { Undefined(); return; }
@@ -1272,6 +1274,7 @@
   }
 
   void SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
+    NonRaisingSimdScope non_raising(this);
     // apply TBI mask before using base as memory operand.
     base = ApplyTbi(base);
     // Handle 128-bit SIMD load/store with immediate offset (STR/LDR Q-register).
@@ -1376,6 +1379,7 @@
   }
 
   void SimdLoadStorePair(const Decoder::SimdLoadStorePairArgs& args, Register addr) {
+    NonRaisingSimdScope non_raising(this);
     // apply TBI mask before using addr as memory operand.
     addr = ApplyTbi(addr);
     // Handle 128-bit pair store/load (STP/LDP q-register).
@@ -1447,6 +1451,7 @@
 
   void SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args,
                         Register base, Register offset_reg) {
+    NonRaisingSimdScope non_raising(this);
     // Handle SIMD load/store with register offset:
     //   LDR/STR Vt, [Xn, (X|W)m{, extend{ #shift}}]
     // The offset register may need UXTW / SXTW / UXTX / SXTX extension
