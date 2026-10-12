@@ -12185,6 +12185,36 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BicVecImm) {
   EXPECT_EQ(VUpperHi64(&state_, 0), ~imm);
 }
 
+// dup v0.2d, x10; orr v0.2s, #0xab, lsl #8 (Q=0) — the D-form zeroes the upper
+// 64 bits of V0 even when the DUP's full 16-byte value reaches the ORR without
+// a round trip through memory.
+TEST_F(Arm64HeavyOptimizerFrontendTest, OrrVecImmDFormAfterFullWidthPutZeroesUpper) {
+  static const uint32_t code[] = {DupGen(/*q=*/true, /*imm5=*/0x08, 0, 10),
+                                  SimdModImm(/*q=*/false, /*op=*/0, /*cmode=*/0x3, 0xAB, 0)};
+  state_.cpu.x[10] = 0x1122334455667788ULL;
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1122334455667788ULL | 0x0000AB000000AB00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// dup v0.2d, x10; bic v0.2s, #0xab, lsl #8 (Q=0) — as above, for AND-NOT.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BicVecImmDFormAfterFullWidthPutZeroesUpper) {
+  static const uint32_t code[] = {DupGen(/*q=*/true, /*imm5=*/0x08, 0, 10),
+                                  SimdModImm(/*q=*/false, /*op=*/1, /*cmode=*/0x3, 0xAB, 0)};
+  state_.cpu.x[10] = 0xFFFFFFFFFFFFFFFFULL;
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), ~0x0000AB000000AB00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
 // dup v8.2d, x10 — 64-bit broadcast (must use MOVQ, not MOVD).
 TEST_F(Arm64HeavyOptimizerFrontendTest, DupGenV2D) {
   static const uint32_t code[] = {DupGen(/*q=*/true, /*imm5=*/0x08, 8, 10)};

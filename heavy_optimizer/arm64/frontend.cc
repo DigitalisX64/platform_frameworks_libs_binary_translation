@@ -5422,26 +5422,20 @@ void HeavyOptimizerFrontend::SimdModifiedImm(const Decoder::SimdModifiedImmArgs&
     return;
   }
 
-  // ORR/BIC: load current V[rd] (D-form must zero-extend the low 64 so the
-  // upper half ends up zeroed), then OR (set) / AND-NOT (clear) the immediate.
+  // ORR/BIC: load the full current V[rd], then OR (set) / AND-NOT (clear) the
+  // immediate. The D-form zeroes the upper 64 bits in SetVRegFull: a guest
+  // context get may be forwarded from an earlier full-width put, so the load
+  // itself does not zero them.
   FpRegister xd = AllocTempSimdReg();
-  if (args.q) {
-    builder_.GenGetSimd<16>(xd.machine_reg(), off);
-  } else {
-    // MOVSD reg<-mem zero-extends the upper 64 bits of the XMM. The MOVSD load
-    // is one of the SIMD opcodes RemoveLocalGuestContextAccesses recognizes as
-    // a guest-context GET, so a prior 16-byte store forwards correctly.
-    xd = FpRegister{std::get<0>(Gen<x86_64::MovsdXRegOp>(
-        {.base = x86_64::kMachineRegRBP, .disp = off}))};
-  }
+  builder_.GenGetSimd<16>(xd.machine_reg(), off);
   if (args.op == 0) {
     builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), ximm.machine_reg());
-    builder_.GenSetSimd<16>(off, xd.machine_reg());
+    SetVRegFull(args.rd, xd, args.q);
   } else {
     // BIC: xd = ~imm & Vd. PANDN(dst, src) computes dst = ~dst & src, so with
     // dst=ximm, src=xd we get ~imm & Vd; the result lands in ximm.
     builder_.Gen<x86_64::PandnXRegXReg>(ximm.machine_reg(), xd.machine_reg());
-    builder_.GenSetSimd<16>(off, ximm.machine_reg());
+    SetVRegFull(args.rd, ximm, args.q);
   }
 }
 
