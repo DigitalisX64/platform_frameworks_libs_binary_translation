@@ -253,9 +253,15 @@ OffsetCounterMap GetSortedOffsetCounters(MachineIR* ir, Loop* loop) {
 // the width of the FIRST access seen, so a slot read once as 64-bit MOVSD and
 // once as 128-bit MOVDQA would either load only half the register or write back
 // a half-stale one. Leave such slots in memory.
-ArenaVector<bool> FindMixedWidthOffsets(const MachineIR* ir, const Loop* loop) {
-  ArenaVector<bool> mixed(sizeof(CPUState), false, ir->arena());
+//
+// The same holds for a slot whose bytes another offset's access also covers
+// (PMULL2 reads the upper half of a vector register at its own offset): a
+// register mapped for either offset would hide the other access's write, or
+// miss it. Leave both slots in memory.
+ArenaVector<bool> FindUnmappableOffsets(const MachineIR* ir, const Loop* loop) {
+  ArenaVector<bool> unmappable(sizeof(CPUState), false, ir->arena());
   ArenaVector<int> seen_width(sizeof(CPUState), 0, ir->arena());
+  ArenaVector<int> byte_owner(sizeof(CPUState), -1, ir->arena());
   for (auto* bb : *loop) {
     for (auto* base_insn : bb->insn_list()) {
       if (!ir->IsCPUStateGet(base_insn) && !ir->IsCPUStatePut(base_insn)) {
@@ -282,11 +288,21 @@ ArenaVector<bool> FindMixedWidthOffsets(const MachineIR* ir, const Loop* loop) {
       if (seen == 0) {
         seen = width;
       } else if (seen != width) {
-        mixed.at(insn->disp()) = true;
+        unmappable.at(insn->disp()) = true;
+      }
+      int disp = static_cast<int>(insn->disp());
+      for (int byte = disp; byte < disp + width && byte < static_cast<int>(sizeof(CPUState));
+           byte++) {
+        int owner = byte_owner.at(byte);
+        if (owner >= 0 && owner != disp) {
+          unmappable.at(owner) = true;
+          unmappable.at(disp) = true;
+        }
+        byte_owner.at(byte) = disp;
       }
     }
   }
-  return mixed;
+  return unmappable;
 }
 // endregion digitalis
 
@@ -294,14 +310,14 @@ void OptimizeLoop(MachineIR* machine_ir, Loop* loop, const OptimizeLoopParams& p
   OffsetCounterMap sorted_offsets = GetSortedOffsetCounters(machine_ir, loop);
   ArenaVector<bool> optimized_offsets(sizeof(CPUState), false, machine_ir->arena());
   // region digitalis
-  auto mixed_width_offsets = FindMixedWidthOffsets(machine_ir, loop);
+  auto unmappable_offsets = FindUnmappableOffsets(machine_ir, loop);
   // endregion digitalis
 
   size_t general_reg_count = 0;
   size_t simd_reg_count = 0;
   for (auto [offset, unused_counter] : sorted_offsets) {
     // region digitalis
-    if (mixed_width_offsets.at(offset)) {
+    if (unmappable_offsets.at(offset)) {
       continue;
     }
     // endregion digitalis

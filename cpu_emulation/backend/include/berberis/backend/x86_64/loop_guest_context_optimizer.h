@@ -54,6 +54,12 @@ ArenaVector<int> CountGuestRegAccesses(const MachineIR* ir, const Loop* loop);
 using OffsetCounterMap = ArenaVector<std::pair<size_t, int>>;
 OffsetCounterMap GetSortedOffsetCounters(MachineIR* ir, Loop* loop);
 
+// region digitalis
+// Offsets the loop must keep in memory: accessed at more than one width, or
+// overlapping another accessed offset's bytes.
+ArenaVector<bool> FindUnmappableOffsets(const MachineIR* ir, const Loop* loop);
+// endregion digitalis
+
 struct OptimizeLoopParams {
   size_t general_reg_limit = 12;
   size_t simd_reg_limit = 12;

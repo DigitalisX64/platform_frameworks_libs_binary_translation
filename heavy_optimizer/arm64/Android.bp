@@ -86,6 +86,7 @@ cc_test_library {
         "frontend_tests.cc",
         "heavy_differential_fuzz_tests.cc",
         "heavy_memory_differential_fuzz_tests.cc",
+        "loop_context_tests.cc",
         "tier_coverage_test.cc",
     ],
 }
