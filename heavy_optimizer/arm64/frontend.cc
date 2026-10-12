@@ -15970,6 +15970,11 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
 // sign-extends, LSL/UXTX/SXTX use the full 64-bit value), mirroring
 // lite_translator.h::ApplyOffsetExtend. Returns a fresh register; the base is
 // not modified (so an aliased base/dest stays correct).
+//
+// A shift of 0-3 (every access but a 128-bit Q one) folds the shift and the
+// base add into one LEA, which writes a fresh register and leaves the inputs
+// and the flags alone: `lea addr, [base + offset * (1 << shift)]` instead of
+// `mov addr, offset; shl addr, shift; add addr, base`.
 Register HeavyOptimizerFrontend::EmitRegOffsetAddr(Register base,
                                                    Register offset_reg,
                                                    uint8_t extend_type,
@@ -15985,13 +15990,29 @@ Register HeavyOptimizerFrontend::EmitRegOffsetAddr(Register base,
     case 0b011:  // LSL / UXTX: full 64-bit value, no extension.
     case 0b111:  // SXTX: full 64-bit value, sign-extend is a no-op here.
     default:
+      if (shift_amount <= 3) {
+        return EmitLeaBaseIndex(base, offset_reg, shift_amount);
+      }
       addr = Copy(offset_reg);
       break;
+  }
+  if (shift_amount <= 3) {
+    return EmitLeaBaseIndex(base, addr, shift_amount);
   }
   if (shift_amount != 0) {
     addr = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(addr, static_cast<int8_t>(shift_amount)));
   }
   return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(addr, base));
+}
+
+Register HeavyOptimizerFrontend::EmitLeaBaseIndex(Register base,
+                                                  Register index,
+                                                  uint8_t shift_amount) {
+  CHECK_LE(shift_amount, 3);
+  return std::get<0>(Gen<x86_64::LeaqRegOp>(x86_64::MemoryOperand{
+      .base = base,
+      .index = index,
+      .scale = static_cast<x86_64::Assembler::ScaleFactor>(shift_amount)}));
 }
 
 // Emit `src` shifted by a constant amount (LSL/LSR/ASR/ROR) into a fresh

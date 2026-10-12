@@ -88,6 +88,14 @@ class MemX87 {
   static constexpr char kAsRegister = 'm';
 };
 
+// The address operand of LEA: an address computation, never a memory access.
+// Like MemX87 it has no value type.
+class Mem {
+ public:
+  using Type = void;
+  static constexpr char kAsRegister = 'm';
+};
+
 class VecMem32 {
  public:
   using Type = uint32_t;
@@ -224,6 +232,9 @@ inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::Mem> 
 
 template <>
 inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::MemX87> = true;
+
+template <>
+inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::Mem> = true;
 
 template <>
 inline constexpr bool kIsMemoryOperand<x86_32_or_x86_64::device_arch_info::VecMem32> = true;

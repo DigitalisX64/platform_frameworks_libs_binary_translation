@@ -302,6 +302,15 @@ uint32_t EncLoadStoreReg(int size, int opc, int rm, int option, int s, int rn, i
          (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rt);
 }
 
+// SIMD LDR/STR (register offset). LDR Q0,[X1,X2] == 0x3CE26820;
+// LDR D0,[X1,X2] == 0xFC626820.
+uint32_t EncSimdLoadStoreReg(int size, int opc, int rm, int option, int s, int rn, int rt) {
+  return (static_cast<uint32_t>(size) << 30) | (0b111100u << 24) |
+         (static_cast<uint32_t>(opc) << 22) | (1u << 21) | (static_cast<uint32_t>(rm) << 16) |
+         (static_cast<uint32_t>(option) << 13) | (static_cast<uint32_t>(s) << 12) | (0b10u << 10) |
+         (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rt);
+}
+
 // LDP/STP (signed offset). LDP X0,X1,[X2] == 0xA9400440; LDPSW == 0x69400440.
 uint32_t EncLoadStorePair(int opc, int l, int imm7, int rt2, int rn, int rt) {
   return (static_cast<uint32_t>(opc) << 30) | (0b101u << 27) | (0b010u << 23) |
@@ -330,6 +339,8 @@ uint32_t EncAtomic(int size, int a, int r, int rs, int o3, int opc, int rn, int 
 // Encoder self-check: a bad encoder would test the wrong instruction in BOTH
 // tiers and still report a match, so the encodings are pinned here.
 TEST_F(Arm64HeavyMemoryDifferentialFuzz, EncodersMatchKnownEncodings) {
+  EXPECT_EQ(EncSimdLoadStoreReg(0b00, 0b11, 2, 0b011, 0, 1, 0), 0x3CE26820u);
+  EXPECT_EQ(EncSimdLoadStoreReg(0b11, 0b01, 2, 0b011, 0, 1, 0), 0xFC626820u);
   EXPECT_EQ(EncLoadStoreImm(0b11, 0b01, 0, 1, 0), 0xF9400020u);  // ldr x0,[x1]
   EXPECT_EQ(EncLoadStoreImm(0b11, 0b00, 0, 1, 0), 0xF9000020u);  // str x0,[x1]
   EXPECT_EQ(EncLoadStoreImm(0b10, 0b10, 0, 1, 0), 0xB9800020u);  // ldrsw x0,[x1]
@@ -490,6 +501,72 @@ TEST_F(Arm64HeavyMemoryDifferentialFuzz, RegisterOffsetAddressing) {
   }
   fprintf(stderr, "heavy RegisterOffsetAddressing: compared=%d/%d\n", compared, iters);
   EXPECT_GT(compared, 0);
+}
+
+// Register-offset addresses whose index needs its extend: UXTW and SXTW read
+// only the low word of a register with garbage in the upper one, and SXTW and
+// LSL take negative indices. Also a load into the index register itself, a
+// tagged base, and the SIMD forms, whose Q size shifts by 4.
+TEST_F(Arm64HeavyMemoryDifferentialFuzz, RegisterOffsetExtendedIndex) {
+  Seed(0x5D1E7A2BULL);
+  int iters = 2000 * FuzzScale();
+  int compared = 0;
+  for (int i = 0; i < iters; i++) {
+    const bool simd = (Rnd() % 3) == 0;
+    // SIMD sizes: B, H, S, D (size 0-3, opc 0/1) and Q (size 0, opc 2/3).
+    const bool q = simd && (Rnd() & 1);
+    const int size = q ? 0 : static_cast<int>(Rnd() % 4);
+    const int opc = (q ? 2 : 0) + static_cast<int>(Rnd() % 2);
+    const int log2_bytes = q ? 4 : size;
+    int rt = Rnd() % 31;
+    int rn = Rnd() % 31;
+    int rm = Rnd() % 31;
+    if (rn == rm) continue;
+    if (!simd && rt == rn) continue;
+    // A load into the index register (rt == rm) is fine; a store of the index
+    // is too. Only the base must stay distinct, as above.
+    static const int kOptions[] = {0b010, 0b011, 0b110, 0b111};
+    const int option = kOptions[Rnd() % 4];
+    const int s = Rnd() & 1;
+    const size_t scale = size_t{1} << log2_bytes;
+
+    SeedScratch();
+    InitState in = RandomInit();
+    PinBase(&in, rn, scale, /*tagged=*/(Rnd() % 4) == 0);
+    // An index of -32..31 elements keeps the address inside the window.
+    const int64_t idx = static_cast<int64_t>(Rnd() % 64) - 32;
+    const uint64_t garbage = Rnd64() & 0xFFFF'FFFF'0000'0000ULL;
+    switch (option) {
+      case 0b010:  // UXTW: low word non-negative, upper word garbage.
+        in.x[rm] = garbage | static_cast<uint32_t>(idx < 0 ? -idx : idx);
+        break;
+      case 0b110:  // SXTW: low word may be negative, upper word garbage.
+        in.x[rm] = garbage | static_cast<uint32_t>(static_cast<int32_t>(idx));
+        break;
+      default:  // LSL/UXTX and SXTX: the whole 64-bit value.
+        in.x[rm] = static_cast<uint64_t>(idx);
+        break;
+    }
+    if (s == 0) {
+      // Unscaled: keep the byte offset aligned for the access size.
+      in.x[rm] = (option == 0b010 || option == 0b110)
+                     ? (in.x[rm] & 0xFFFF'FFFF'0000'0000ULL) |
+                           static_cast<uint32_t>(static_cast<uint32_t>(in.x[rm]) * scale)
+                     : in.x[rm] * scale;
+    }
+
+    uint32_t code[1] = {simd ? EncSimdLoadStoreReg(size, opc, rm, option, s, rn, rt)
+                             : EncLoadStoreReg(size, opc, rm, option, s, rn, rt)};
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, &desc);
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << i << ": " << desc;
+      return;
+    }
+    if (r == kMatch) compared++;
+  }
+  fprintf(stderr, "heavy RegisterOffsetExtendedIndex: compared=%d/%d\n", compared, iters);
+  EXPECT_GT(compared, iters / 2);
 }
 
 // Pre/post-index, which write the base register back as well as accessing

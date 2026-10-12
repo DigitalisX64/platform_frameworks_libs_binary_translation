@@ -736,6 +736,9 @@ class HeavyOptimizerFrontend {
   // Broadcast lane `index` of xm (16-bit lanes when is_halfword, else 32-bit).
   void EmitBroadcastVmLane(FpRegister xm, bool is_halfword, uint8_t index);
 
+  // `lea addr, [base + index * (1 << shift_amount)]` into a fresh register;
+  // shift_amount is 0-3.
+  [[nodiscard]] Register EmitLeaBaseIndex(Register base, Register index, uint8_t shift_amount);
   [[nodiscard]] Register EmitRegOffsetAddr(Register base,
                                            Register offset_reg,
                                            uint8_t extend_type,
