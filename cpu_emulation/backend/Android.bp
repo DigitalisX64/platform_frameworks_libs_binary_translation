@@ -285,6 +285,7 @@ filegroup {
         "x86_64/reg_lifetime_test.cc",
         "x86_64/rename_copy_uses_test.cc",
         // region digitalis
+        "x86_64/cond_branch_emit_test.cc",
         "x86_64/rename_copy_uses_order_test.cc",
         "x86_64/place_blocks_before_branch_targets_test.cc",
         "x86_64/remove_nop_reg_moves_test.cc",

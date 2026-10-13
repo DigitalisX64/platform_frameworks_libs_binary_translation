@@ -243,6 +243,14 @@ void CondBranch::Emit(CodeEmitter* as) const {
     // need to emit JMP as our original (that is, before reversing)
     // "then" arm falls through to the next basic block.
     as->Jcc(ToReverseCond(cond()), *else_label);
+    // region digitalis
+  } else if (else_label->IsBound() && !then_label->IsBound()) {
+    // Only the "else" arm jumps backward, as a loop back edge does. Take it
+    // with the Jcc, so the path that stays in the loop runs one jump instead
+    // of a not-taken Jcc and a JMP.
+    as->Jcc(ToReverseCond(cond()), *else_label);
+    as->Jmp(*then_label);
+    // endregion
   } else {
     // Neither our "then" nor "else" arm falls through to the next
     // basic block.  We need to emit both Jcc and Jmp.
