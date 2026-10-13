@@ -208,6 +208,7 @@ filegroup {
         // region digitalis
         "x86_64/place_blocks_before_branch_targets.cc",
         "x86_64/remove_nop_reg_moves.cc",
+        "x86_64/use_vex_three_operand_forms.cc",
         // endregion
     ],
 }
@@ -286,6 +287,7 @@ filegroup {
         "x86_64/rename_copy_uses_order_test.cc",
         "x86_64/place_blocks_before_branch_targets_test.cc",
         "x86_64/remove_nop_reg_moves_test.cc",
+        "x86_64/use_vex_three_operand_forms_test.cc",
         // endregion
         "x86_64/rename_vregs_test.cc",
     ],

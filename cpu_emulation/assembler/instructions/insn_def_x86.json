@@ -2681,6 +2681,9 @@
           "opcodes": [ "C4", "01", "01", "65" ],
           "type": "vex_rm_to_reg"
         },
+        "Vphaddd": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "02" ], "type": "vex_rm_to_reg" },
+        "Vphaddw": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "01" ], "type": "vex_rm_to_reg" },
+        "Vpmaddwd": { "feature": "AVX", "opcodes": [ "C4", "01", "01", "F5" ], "type": "optimizable_using_commutation" },
         "Vpmaxsb": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "3C" ], "type": "vex_rm_to_reg" },
         "Vpmaxsd": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "3D" ], "type": "vex_rm_to_reg" },
         "Vpmaxsw": { "feature": "AVX", "opcodes": [ "C4", "01", "01", "EE" ], "type": "optimizable_using_commutation" },
@@ -2693,6 +2696,7 @@
         "Vpminub": { "feature": "AVX", "opcodes": [ "C4", "01", "01", "DA" ], "type": "optimizable_using_commutation" },
         "Vpminud": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "3B" ], "type": "vex_rm_to_reg" },
         "Vpminuw": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "3A" ], "type": "vex_rm_to_reg" },
+        "Vpmuldq": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "28" ], "type": "vex_rm_to_reg" },
         "Vpmulhrsw": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "0B" ], "type": "vex_rm_to_reg" },
         "Vpmulhw": { "feature": "AVX", "opcodes": [ "C4", "01", "01", "E5" ], "type": "optimizable_using_commutation" },
         "Vpmulld": { "feature": "AVX", "opcodes": [ "C4", "02", "01", "40" ], "type": "vex_rm_to_reg" },
