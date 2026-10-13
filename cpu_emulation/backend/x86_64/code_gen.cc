@@ -30,6 +30,7 @@
 #include "berberis/backend/x86_64/merge_basic_blocks.h"
 #include "berberis/backend/x86_64/read_flags_optimizer.h"
 // region digitalis
+#include "berberis/backend/x86_64/place_blocks_before_branch_targets.h"
 #include "berberis/backend/x86_64/remove_nop_reg_moves.h"
 // endregion
 #include "berberis/backend/x86_64/rename_copy_uses.h"
@@ -92,6 +93,9 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
     RemoveNopRegMoves(machine_ir);
     // endregion
     x86_64::RemoveForwarderBlocks(machine_ir);
+    // region digitalis
+    PlaceBlocksBeforeBranchTargets(machine_ir);
+    // endregion
   }
 
   // region digitalis
