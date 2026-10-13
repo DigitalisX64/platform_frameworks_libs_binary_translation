@@ -181,7 +181,8 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
                          int n,
                          const InitState& in,
                          bool compare_fpsr,
-                         std::string* desc) {
+                         std::string* desc,
+                         bool interpret_after_exit = false) {
     GuestAddr start = ToGuestAddr(code);
     GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
 
@@ -205,6 +206,14 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
 
     ScopedExecRegion exec(&mc);
     TestingRunGeneratedCode(&state_, exec.get(), stop);
+    // A region exit to an untranslated address returns here. With
+    // interpret_after_exit, the interpreter runs the rest from the state the
+    // exit left, as the runtime would.
+    int exit_guard = 0;
+    while (interpret_after_exit && state_.cpu.insn_addr >= start &&
+           state_.cpu.insn_addr < stop && exit_guard++ < 256) {
+      InterpretInsn(&state_);
+    }
     FullState heavy = Capture();
 
     // Interpreter to the same stop PC.
@@ -2896,6 +2905,123 @@ TEST_F(Arm64HeavyDifferentialFuzz, FlagSettersAndConsumersRegion) {
     }
   }
   EXPECT_GT(compared, 1000) << "heavy accepted too few flag regions";
+}
+
+// A setter, then a gap of instructions that leave the flags alone (SIMD, MOVZ,
+// MOV, ADD without flags) or not (LSLV clobbers EFLAGS), then a B.cond, CSEL or
+// loop back-edge on the setter's flags. A B.cond fused across the gap tests the
+// setter's host flags, and the NZCV it stores in each successor must match.
+TEST_F(Arm64HeavyDifferentialFuzz, FlagSettersAcrossGapRegion) {
+  auto gen_setter = [&]() -> uint32_t {
+    uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t sf31 = static_cast<uint32_t>(Rnd() & 1) << 31;
+    switch (Rnd() % 5) {
+      case 0: return sf31 | 0x71000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // subs imm
+      case 1: return sf31 | 0x2B000000U | (rm << 16) | (rn << 5) | rd;               // adds reg
+      case 2: return sf31 | 0x6A000000U | (rm << 16) | (rn << 5) | rd;               // ands reg
+      case 3: return sf31 | 0x7100001FU | ((Rnd() % 8) << 10) | (rn << 5);          // cmp imm
+      default: return sf31 | 0x6B00001FU | (rm << 16) | (rn << 5);                   // cmp reg
+    }
+  };
+  auto gen_gap = [&]() -> uint32_t {
+    uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t vd = Rnd() % 32, vn = Rnd() % 32, vm = Rnd() % 32;
+    switch (Rnd() % 8) {
+      case 0: return 0x4EA08400U | (vm << 16) | (vn << 5) | vd;          // add v.4s
+      case 1: return 0x4EA01C00U | (vm << 16) | (vn << 5) | vd;          // orr v.16b
+      case 2: return 0x4E602800U | (vn << 5) | vd;                       // saddlp v.4s, v.8h
+      case 3: return 0x4EA0BC00U | (vm << 16) | (vn << 5) | vd;          // addp v.4s
+      case 4: return 0xD2800000U | ((Rnd() % 65536) << 5) | rd;          // movz
+      case 5: return 0xAA0003E0U | (rm << 16) | rd;                      // mov
+      case 6: return 0x91000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // add imm
+      default: return 0x9AC02000U | (rm << 16) | (rn << 5) | rd;         // lslv (clobbers EFLAGS)
+    }
+  };
+
+  Seed(0x36A9C0DE5EED6A70ULL);
+  const int kIters = 3000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    bool in_loop = (Rnd() % 2) == 0;
+    uint32_t code[32];
+    int n = 0;
+    int groups = 1 + static_cast<int>(Rnd() % 3);
+    for (int g = 0; g < groups; g++) {
+      code[n++] = gen_setter();
+      int gap = static_cast<int>(Rnd() % 6);
+      for (int i = 0; i < gap; i++) code[n++] = gen_gap();
+      uint32_t cond = Rnd() % 14;
+      if (Rnd() % 2) {
+        // B.cond over the next instruction.
+        code[n++] = 0x54000040U | cond;
+        code[n++] = gen_gap();
+      } else {
+        uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+        code[n++] = 0x9A800000U | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csel
+      }
+    }
+    if (in_loop) {
+      code[n++] = 0xF1000529U;  // subs x9, x9, #1
+      int gap = static_cast<int>(Rnd() % 4);
+      for (int i = 0; i < gap; i++) code[n++] = gen_gap();
+      code[n] = 0x54000001U | ((static_cast<uint32_t>(-n) & 0x7FFFF) << 5);  // b.ne top
+      n++;
+    }
+    InitState in = RandomInit();
+    in.x[9] = 1 + Rnd() % 4;
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  EXPECT_GT(compared, 1000) << "heavy accepted too few gap regions";
+}
+
+// A jump into the gap between a setter and its fused B.cond arrives without
+// the setter's host flags, so it must not reach the B.cond's PseudoCondBranch:
+// a forward CBZ over the setter, and a loop back-edge from a later setter.
+TEST_F(Arm64HeavyDifferentialFuzz, JumpIntoFusedCondBranchGap) {
+  static const uint32_t kForward[] = {
+      0xB4000062U,  // cbz x2, 1f
+      0xEB01001FU,  // cmp x0, x1
+      0x4EA28420U,  // add v0.4s, v1.4s, v2.4s
+      0xD28000A4U,  // 1: movz x4, #5
+      0x54000040U,  // b.eq 2f
+      0xD2800023U,  // movz x3, #1
+  };                // 2:
+  static const uint32_t kBackEdge[] = {
+      0xEB01001FU,  // cmp x0, x1
+      0x4EA18400U,  // 1: add v0.4s, v0.4s, v1.4s
+      0x54000060U,  // b.eq 2f
+      0xB1000400U,  // adds x0, x0, #1
+      0x17FFFFFDU,  // b 1b
+  };                // 2:
+  Seed(0x36D1A6E0F00DCAFEULL);
+  int compared = 0;
+  for (int iter = 0; iter < 400; iter++) {
+    InitState in = RandomInit();
+    std::string desc;
+    Result r;
+    if (iter % 2 == 0) {
+      in.x[2] = (Rnd() % 2) ? 0 : in.x[2] | 1;
+      if (Rnd() % 2) in.x[1] = in.x[0];
+      r = RunDifferential(kForward, 6, in, /*compare_fpsr=*/false, &desc,
+                          /*interpret_after_exit=*/true);
+    } else {
+      in.x[0] = -static_cast<uint64_t>(1 + Rnd() % 40);
+      in.x[1] = (Rnd() % 2) ? in.x[0] : 7;
+      r = RunDifferential(kBackEdge, 5, in, /*compare_fpsr=*/false, &desc,
+                          /*interpret_after_exit=*/true);
+    }
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 300) << "heavy declined the jump-into-gap regions";
 }
 
 }  // namespace berberis

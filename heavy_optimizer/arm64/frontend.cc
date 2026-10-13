@@ -16,6 +16,8 @@
 
 #include "frontend.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstddef>
@@ -461,12 +463,23 @@ std::optional<HeavyOptimizerFrontend::NZCVStoreTail> HeavyOptimizerFrontend::Tak
     return *--it;
   };
 
+  // Walk back over the gap: instructions of the guest instructions between the
+  // setter and the B.cond that leave the host flags and cpu.flags alone.
+  std::array<const MachineInsn*, kMaxNZCVGapInsns + 1> tail_insns;
+  size_t num_tail_insns = 0;
   const MachineInsn* store = previous();
-  if (store == nullptr || store->opcode() != kMachineOpMovwMemBaseDispReg ||
-      store->RegAt(0) != x86_64::kMachineRegRBP ||
-      x86_64::AsMachineInsnX86_64(store)->disp() != offsetof(ThreadState, cpu.flags)) {
+  while (store != nullptr && !IsNZCVStore(store)) {
+    if (num_tail_insns == kMaxNZCVGapInsns || !IsNZCVGapInsn(store)) {
+      return std::nullopt;
+    }
+    tail_insns[num_tail_insns++] = store;
+    store = previous();
+  }
+  if (store == nullptr) {
     return std::nullopt;
   }
+  tail_insns[num_tail_insns++] = store;
+  auto store_it = it;
   Register raw = store->RegAt(1);
 
   const MachineInsn* insn = previous();
@@ -545,9 +558,74 @@ std::optional<HeavyOptimizerFrontend::NZCVStoreTail> HeavyOptimizerFrontend::Tak
       return std::nullopt;
   }
 
+  auto read_it = std::prev(and_it);
+  // The guest instructions of the gap start right after the store or a gap
+  // instruction. Point the ones at the store (to be erased) at the
+  // PseudoReadFlags, and find where the gap starts: a jump into it cannot
+  // reach the B.cond's host flags (AddFusedCondBranchEntries).
+  GuestAddr gap_begin = GetInsnAddr();
+  auto in_tail = [&](const MachineInsnPosition& pos) {
+    if (pos.first != builder_.bb() || !pos.second.has_value()) {
+      return false;
+    }
+    const MachineInsn* insn = *pos.second.value();
+    return std::find(tail_insns.begin(), tail_insns.begin() + num_tail_insns, insn) !=
+           tail_insns.begin() + num_tail_insns;
+  };
+  for (auto target_it = branch_targets_.lower_bound(GetInsnAddr());
+       target_it != branch_targets_.begin();) {
+    --target_it;
+    if (!in_tail(target_it->second)) {
+      break;
+    }
+    if (target_it->second.second.value() == store_it) {
+      target_it->second.second = read_it;
+    }
+    gap_begin = target_it->first;
+  }
+
   Register host_flags = read->RegAt(1);
-  insns.erase(and_it, insns.end());
-  return NZCVStoreTail{raw, host_flags, is_sub, host_cond};
+  insns.erase(and_it, std::next(store_it));
+  return NZCVStoreTail{raw, host_flags, is_sub, host_cond, gap_begin};
+}
+
+bool HeavyOptimizerFrontend::IsNZCVStore(const MachineInsn* insn) {
+  return insn->opcode() == kMachineOpMovwMemBaseDispReg &&
+         insn->RegAt(0) == x86_64::kMachineRegRBP &&
+         x86_64::AsMachineInsnX86_64(insn)->disp() == offsetof(ThreadState, cpu.flags);
+}
+
+// A gap instruction must keep the host flags (no FLAGS operand: no flag setter,
+// flag reader or call), must not fault (a fault would see the stale cpu.flags
+// the erased store leaves until a successor writes it), and must not access
+// cpu.flags through the ThreadState.
+bool HeavyOptimizerFrontend::IsNZCVGapInsn(const MachineInsn* insn) {
+  if (insn->recovery_bb() != nullptr || insn->recovery_pc() != 0 ||
+      insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpCallImmArg ||
+      insn->opcode() == kMachineOpPseudoJump || insn->opcode() == kMachineOpPseudoBranch ||
+      insn->opcode() == kMachineOpPseudoCondBranch ||
+      insn->opcode() == kMachineOpPseudoIndirectJump) {
+    return false;
+  }
+  bool uses_thread_state = false;
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (insn->RegAt(i) == x86_64::kMachineRegFLAGS ||
+        insn->RegKindAt(i).RegClass()->IsSubsetOf(&x86_64::kFLAGS)) {
+      return false;
+    }
+    uses_thread_state |= insn->RegAt(i) == x86_64::kMachineRegRBP;
+  }
+  if (!uses_thread_state) {
+    return true;
+  }
+  // Any access of up to 32 bytes that could overlap the 16-bit cpu.flags.
+  const int64_t flags_disp = offsetof(ThreadState, cpu.flags);
+  auto overlaps = [&](uint32_t disp) {
+    int64_t offset = static_cast<int32_t>(disp);
+    return offset > flags_disp - 32 && offset < flags_disp + 2;
+  };
+  const auto* x86_insn = x86_64::AsMachineInsnX86_64(insn);
+  return !overlaps(x86_insn->disp()) && !overlaps(x86_insn->disp2());
 }
 
 void HeavyOptimizerFrontend::EmitNZCVStoreTail(const NZCVStoreTail& tail) {
@@ -607,6 +685,19 @@ void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
     ir->AddEdge(entry_bb, fused.then_bb);
     ir->AddEdge(entry_bb, fused.else_bb);
     branch_targets_[fused.addr] = MachineInsnPosition{entry_bb, std::nullopt};
+  }
+
+  // A jump into a gap would run the rest of the gap and reach the
+  // PseudoCondBranch without the setter's host flags. Leave it a region exit:
+  // the gap's guest code is translated again from that address.
+  for (const auto& fused : fused_cond_branches_) {
+    for (auto target_it = branch_targets_.lower_bound(fused.tail.gap_begin);
+         target_it != branch_targets_.end() && target_it->first < fused.addr;
+         ++target_it) {
+      if (jump_targets.find(target_it->first) != jump_targets.end()) {
+        target_it->second = MachineInsnPosition{};
+      }
+    }
   }
 }
 

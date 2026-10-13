@@ -947,21 +947,28 @@ class HeavyOptimizerFrontend {
                       MachineBasicBlock* else_bb);
 
   // The AND, optional XOR and store of an EmitMaterializeNZCV sequence that
-  // ends the current block, taken out so that a B.cond can test the host flags
-  // its PseudoReadFlags still sees. EmitNZCVStoreTail re-emits them in a
-  // successor.
+  // ends the current block, or is followed only by gap instructions, taken out
+  // so that a B.cond can test the host flags its PseudoReadFlags still sees.
+  // EmitNZCVStoreTail re-emits them in a successor. The guest instructions in
+  // [gap_begin, B.cond) emitted the gap.
   struct NZCVStoreTail {
     Register raw;
     Register host_flags;
     bool is_sub;
     x86_64::Assembler::Condition host_cond;
+    GuestAddr gap_begin;
   };
+  // At most this many machine instructions between the store and the B.cond.
+  static constexpr size_t kMaxNZCVGapInsns = 256;
   [[nodiscard]] std::optional<NZCVStoreTail> TakeNZCVStoreTail(Decoder::Condition cond);
+  [[nodiscard]] static bool IsNZCVStore(const MachineInsn* insn);
+  [[nodiscard]] static bool IsNZCVGapInsn(const MachineInsn* insn);
   void EmitNZCVStoreTail(const NZCVStoreTail& tail);
 
   // A B.cond that branches on its setter's host flags. Only the fall-through
   // path from the setter has those flags, so a B.cond that an in-region jump
-  // also targets gets a separate entry block (AddFusedCondBranchEntries).
+  // also targets gets a separate entry block, and a jump into the gap exits
+  // the region (AddFusedCondBranchEntries).
   struct FusedCondBranch {
     GuestAddr addr;
     Decoder::Condition cond;
