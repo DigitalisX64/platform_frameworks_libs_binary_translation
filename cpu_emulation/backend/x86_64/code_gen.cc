@@ -32,6 +32,7 @@
 // region digitalis
 #include "berberis/backend/x86_64/place_blocks_before_branch_targets.h"
 #include "berberis/backend/x86_64/remove_nop_reg_moves.h"
+#include "berberis/backend/x86_64/use_lea_for_copied_adds.h"
 #include "berberis/backend/x86_64/use_vex_three_operand_forms.h"
 // endregion
 #include "berberis/backend/x86_64/rename_copy_uses.h"
@@ -91,6 +92,7 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
     if (host_platform::kHasAVX) {
       UseVexThreeOperandForms(machine_ir);
     }
+    UseLeaForCopiedAdds(machine_ir);
     // endregion
   }
 
