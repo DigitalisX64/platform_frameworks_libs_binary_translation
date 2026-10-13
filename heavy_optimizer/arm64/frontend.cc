@@ -16074,6 +16074,12 @@ void HeavyOptimizerFrontend::CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
 // per-packet loop); bailing fragments that loop into per-instruction
 // interpreter round-trips, so lowering it keeps the region -- and the second
 // gear -- intact.
+//
+// The message-schedule updates (SHA1SU0/SU1, SHA256SU0/SU1) work on all four
+// lanes at once, so they stay in the XMM domain: the lane shifts are byte
+// shifts (PSLLDQ/PSRLDQ) or SHUFPS, the rotates are PSLLD/PSRLD pairs, and
+// no lane crosses into a GP register. Only the round functions, which are
+// serial over the lanes, take the PEXTRD/PINSRD path.
 struct HeavyOptimizerFrontend::Sha256Ops {
   HeavyOptimizerFrontend* self;
 
@@ -16081,9 +16087,6 @@ struct HeavyOptimizerFrontend::Sha256Ops {
   // register and leaves the inputs intact.
   Register Rotr(Register v, int8_t n) {
     return std::get<0>(self->Gen<x86_64::RorlRegImm>(v, n));
-  }
-  Register ShrImm(Register v, int8_t n) {
-    return std::get<0>(self->Gen<x86_64::ShrlRegImm>(v, n));
   }
   Register Xor(Register a, Register b) {
     return std::get<0>(self->Gen<x86_64::XorlRegReg>(a, b));
@@ -16096,14 +16099,45 @@ struct HeavyOptimizerFrontend::Sha256Ops {
   }
   Register BigSigma0(Register x) { return Xor(Xor(Rotr(x, 2), Rotr(x, 13)), Rotr(x, 22)); }
   Register BigSigma1(Register x) { return Xor(Xor(Rotr(x, 6), Rotr(x, 11)), Rotr(x, 25)); }
-  Register LittleSigma0(Register x) { return Xor(Xor(Rotr(x, 7), Rotr(x, 18)), ShrImm(x, 3)); }
-  Register LittleSigma1(Register x) { return Xor(Xor(Rotr(x, 17), Rotr(x, 19)), ShrImm(x, 10)); }
   Register Ch(Register e, Register f, Register g) { return Xor(g, And(e, Xor(f, g))); }
   Register Maj(Register a, Register b, Register c) { return Xor(And(a, b), And(c, Xor(a, b))); }
 
   Register Lane(FpRegister x, int8_t lane) {
     return std::get<0>(self->Gen<x86_64::PextrdRegXRegImm>(x.machine_reg(), lane));
   }
+  // Lane-parallel XMM forms; each returns a fresh register.
+  FpRegister VShl(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PslldXRegImm>(x.machine_reg(), n))};
+  }
+  FpRegister VShr(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PsrldXRegImm>(x.machine_reg(), n))};
+  }
+  // Whole-register shifts by `n` bytes towards lane 3 (up) or lane 0 (down).
+  FpRegister VBytesUp(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PslldqXRegImm>(x.machine_reg(), n))};
+  }
+  FpRegister VBytesDown(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PsrldqXRegImm>(x.machine_reg(), n))};
+  }
+  FpRegister VXor(FpRegister a, FpRegister b) {
+    return FpRegister{
+        std::get<0>(self->Gen<x86_64::PxorXRegXReg>(a.machine_reg(), b.machine_reg()))};
+  }
+  FpRegister VAdd(FpRegister a, FpRegister b) {
+    return FpRegister{
+        std::get<0>(self->Gen<x86_64::PadddXRegXReg>(a.machine_reg(), b.machine_reg()))};
+  }
+  // The two shifted halves of a rotate share no bits, so XOR joins them.
+  FpRegister VRotr(FpRegister x, int8_t n) {
+    return VXor(VShr(x, n), VShl(x, static_cast<int8_t>(32 - n)));
+  }
+  FpRegister VLittleSigma0(FpRegister x) {
+    return VXor(VXor(VRotr(x, 7), VRotr(x, 18)), VShr(x, 3));
+  }
+  FpRegister VLittleSigma1(FpRegister x) {
+    return VXor(VXor(VRotr(x, 17), VRotr(x, 19)), VShr(x, 10));
+  }
+
   FpRegister Pack(Register w0, Register w1, Register w2, Register w3) {
     FpRegister x = self->AllocTempSimdReg();
     self->builder_.Gen<x86_64::MovdXRegReg>(x.machine_reg(), w0);
@@ -16159,29 +16193,25 @@ void HeavyOptimizerFrontend::CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, u
   }
   if (opcode == 0b011) {
     // SHA1SU0: message-schedule update, part 1 —
-    //   t0 = d2^d0^m0; t1 = d3^d1^m1; t2 = n0^d2^m2; t3 = n1^d3^m3.
-    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-    Register n0 = op.Lane(vn, 0), n1 = op.Lane(vn, 1);
-    Register m0 = op.Lane(vm, 0), m1 = op.Lane(vm, 1), m2 = op.Lane(vm, 2), m3 = op.Lane(vm, 3);
-    Register t0 = op.Xor(op.Xor(d2, d0), m0);
-    Register t1 = op.Xor(op.Xor(d3, d1), m1);
-    Register t2 = op.Xor(op.Xor(n0, d2), m2);
-    Register t3 = op.Xor(op.Xor(n1, d3), m3);
-    SetVRegFull(rd, op.Pack(t0, t1, t2, t3), /*q=*/true);
+    //   t0 = d2^d0^m0; t1 = d3^d1^m1; t2 = n0^d2^m2; t3 = n1^d3^m3,
+    // i.e. {d2,d3,n0,n1} ^ d ^ m. SHUFPS 0x4E takes lanes 2,3 of its
+    // destination (d) and lanes 0,1 of its source (n).
+    FpRegister mid{std::get<0>(
+        Gen<x86_64::ShufpsXRegXRegImm>(qd.machine_reg(), vn.machine_reg(), int8_t{0x4E}))};
+    SetVRegFull(rd, op.VXor(op.VXor(mid, qd), vm), /*q=*/true);
     return;
   }
 
   if (opcode == 0b110) {
     // SHA256SU1: nd0 = d0 + σ1(m2) + n1; nd1 = d1 + σ1(m3) + n2;
     //            nd2 = d2 + σ1(nd0) + n3; nd3 = d3 + σ1(nd1) + m0.
-    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-    Register n1 = op.Lane(vn, 1), n2 = op.Lane(vn, 2), n3 = op.Lane(vn, 3);
-    Register m0 = op.Lane(vm, 0), m2 = op.Lane(vm, 2), m3 = op.Lane(vm, 3);
-    Register nd0 = op.Add(op.Add(d0, op.LittleSigma1(m2)), n1);
-    Register nd1 = op.Add(op.Add(d1, op.LittleSigma1(m3)), n2);
-    Register nd2 = op.Add(op.Add(d2, op.LittleSigma1(nd0)), n3);
-    Register nd3 = op.Add(op.Add(d3, op.LittleSigma1(nd1)), m0);
-    SetVRegFull(rd, op.Pack(nd0, nd1, nd2, nd3), /*q=*/true);
+    // With t = d + {n1,n2,n3,m0}, two half steps, using σ1(0) == 0 for the
+    // zero lanes the byte shifts bring in:
+    //   lo = t + σ1({m2,m3,0,0})    = {nd0, nd1, t2, t3};
+    //   nd = lo + σ1({0,0,nd0,nd1}) = {nd0, nd1, nd2, nd3}.
+    FpRegister t = op.VAdd(qd, op.VXor(op.VBytesDown(vn, 4), op.VBytesUp(vm, 12)));
+    FpRegister lo = op.VAdd(t, op.VLittleSigma1(op.VBytesDown(vm, 8)));
+    SetVRegFull(rd, op.VAdd(lo, op.VLittleSigma1(op.VBytesUp(lo, 8))), /*q=*/true);
     return;
   }
 
@@ -16232,23 +16262,17 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
     // SHA1SU1: message-schedule update, part 2 —
     //   t_i   = ROL(d_i ^ n_{i+1}, 1) for i = 0..2;
     //   t3    = ROL(d3 ^ t0, 1)        (t0 is the already-rotated word).
-    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-    Register n1 = op.Lane(vn, 1), n2 = op.Lane(vn, 2), n3 = op.Lane(vn, 3);
-    Register t0 = op.Rotr(op.Xor(d0, n1), 31);
-    Register t1 = op.Rotr(op.Xor(d1, n2), 31);
-    Register t2 = op.Rotr(op.Xor(d2, n3), 31);
-    Register t3 = op.Rotr(op.Xor(d3, t0), 31);
-    SetVRegFull(rd, op.Pack(t0, t1, t2, t3), /*q=*/true);
+    // r = ROL(d ^ {n1,n2,n3,0}, 1) gives t0..t2 and r3 = ROL(d3, 1). A rotate
+    // distributes over XOR, so t3 = r3 ^ ROL(t0, 1): move r0 up to lane 3
+    // (zeros elsewhere), rotate it, and XOR it in.
+    FpRegister r = op.VRotr(op.VXor(qd, op.VBytesDown(vn, 4)), 31);
+    SetVRegFull(rd, op.VXor(r, op.VRotr(op.VBytesUp(r, 12), 31)), /*q=*/true);
     return;
   }
-  // SHA256SU0: out_i = d_i + σ0(d_{i+1}), with d_4 taken from Vn[0].
-  Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-  Register n0 = op.Lane(vn, 0);
-  Register o0 = op.Add(d0, op.LittleSigma0(d1));
-  Register o1 = op.Add(d1, op.LittleSigma0(d2));
-  Register o2 = op.Add(d2, op.LittleSigma0(d3));
-  Register o3 = op.Add(d3, op.LittleSigma0(n0));
-  SetVRegFull(rd, op.Pack(o0, o1, o2, o3), /*q=*/true);
+  // SHA256SU0: out_i = d_i + σ0(d_{i+1}), with d_4 taken from Vn[0]:
+  // out = d + σ0({d1,d2,d3,n0}).
+  FpRegister next = op.VXor(op.VBytesDown(qd, 4), op.VBytesUp(vn, 12));
+  SetVRegFull(rd, op.VAdd(qd, op.VLittleSigma0(next)), /*q=*/true);
 }
 
 // Compute the address for a register-offset load/store:

@@ -2620,6 +2620,51 @@ TEST_F(Arm64HeavyDifferentialFuzz, Sha256) {
   EXPECT_GT(compared, 300) << "heavy accepted too few SHA-256 encodings";
 }
 
+// SHA-1 (SHA1C / SHA1P / SHA1M / SHA1SU0 / SHA1H / SHA1SU1) against the
+// interpreter, with fully random V-registers. The schedule updates (SU0, SU1)
+// are computed lane-parallel in the XMM domain, so rd aliasing rn or rm is
+// forced a quarter of the time each: a lowering that clobbers a source it
+// still reads only shows up when the registers alias.
+TEST_F(Arm64HeavyDifferentialFuzz, Sha1) {
+  Seed(0x5A1C0DE5ULL);
+  const int kIters = 3000 * FuzzScale();
+  struct Form {
+    uint32_t enc_base;  // rd/rn/rm inserted at [4:0],[9:5],[20:16]
+    bool three_reg;     // true: C/P/M/SU0 (has rm); false: H/SU1 (rd,rn only)
+  };
+  static const Form kForms[] = {
+      {0x5E000000u, true},   // sha1c   q0, s0, v0.4s
+      {0x5E001000u, true},   // sha1p   q0, s0, v0.4s
+      {0x5E002000u, true},   // sha1m   q0, s0, v0.4s
+      {0x5E003000u, true},   // sha1su0 v0.4s, v0.4s, v0.4s
+      {0x5E280800u, false},  // sha1h   s0, s0
+      {0x5E281800u, false},  // sha1su1 v0.4s, v0.4s
+  };
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const Form& f = kForms[Rnd() % 6];
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    if (Rnd() % 4 == 0) rn = rd;
+    if (Rnd() % 4 == 0) rm = rd;
+    uint32_t enc = f.enc_base | static_cast<uint32_t>(rd) | (static_cast<uint32_t>(rn) << 5);
+    if (f.three_reg) enc |= (static_cast<uint32_t>(rm) << 16);
+    uint32_t code[1] = {enc};
+    InitState in = RandomInit();  // random V-registers
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " enc=0x" << std::hex << enc << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "Sha1: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SHA-1 encodings";
+}
+
 
 // SSHL / USHL (vector, .4H/.8H) against the interpreter. The heavy tier splits
 // each dword into its two halfwords, extends them, and shifts them with the
