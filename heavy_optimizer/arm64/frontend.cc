@@ -25,6 +25,7 @@
 #include "berberis/assembler/x86_64.h"
 #include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
+#include "berberis/base/arena_set.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
 #include "berberis/base/config_globals.h"
@@ -405,15 +406,208 @@ void HeavyOptimizerFrontend::BranchCond(Decoder::Condition cond, int32_t offset)
   ir->AddEdge(cur_bb, then_bb);
   ir->AddEdge(cur_bb, else_bb);
 
-  EmitCondBranch(cond, then_bb, else_bb);
+  std::optional<NZCVStoreTail> tail = TakeNZCVStoreTail(cond);
+  if (tail) {
+    // StartInsn recorded this B.cond's position as the store just removed;
+    // point it at the PseudoReadFlags so the iterator stays valid. A jump to
+    // this B.cond never uses it: AddFusedCondBranchEntries gives it an entry.
+    branch_targets_[GetInsnAddr()] = builder_.GetMachineInsnPosition();
+    fused_cond_branches_.push_back({GetInsnAddr(), cond, *tail, then_bb, else_bb});
+    builder_.Gen<PseudoCondBranch>(tail->host_cond, then_bb, else_bb, tail->host_flags);
+  } else {
+    EmitCondBranch(cond, then_bb, else_bb);
+  }
 
   builder_.StartBasicBlock(then_bb);
+  if (tail) {
+    EmitNZCVStoreTail(*tail);
+  }
   GenJump(target);
 
   // Continue translating the not-taken path. A backward target is handled as an
   // in-region back-edge by GenJump+ResolveJumps (with the pending-signal
   // check), so do NOT set is_uncond_branch_/region-end here.
   builder_.StartBasicBlock(else_bb);
+  if (tail) {
+    EmitNZCVStoreTail(*tail);
+  }
+}
+
+// A B.cond right after a flag-setting instruction finds the current block
+// ending with that instruction's EmitMaterializeNZCV sequence:
+//   PseudoReadFlags raw, flags   (LAHF + SETO: reads the host flags only)
+//   AND raw, kFlagsNZCVMask
+//   XOR raw, kFlagCarry          (only for a subtraction)
+//   MOVW cpu.flags, raw
+// The host flags still hold the setter's result at the PseudoReadFlags, and
+// the packed NZCV is N = SF, Z = ZF, C = CF ^ is_sub, V = OF, so every ARM
+// condition is one x86 condition on them, except HI/LS when C = CF (x86 has no
+// single test for CF && !ZF). In that case the AND, XOR and store are removed
+// here, since they clobber the host flags, and the caller branches on the host
+// flags and re-emits them in both successors with EmitNZCVStoreTail. The
+// stored NZCV is the same on every path. A block that does not end with the
+// sequence (a setter in another block, or anything emitted after it) keeps
+// EmitCondBranch's read of cpu.flags, and so does a jump from elsewhere in the
+// region to the B.cond itself (AddFusedCondBranchEntries).
+std::optional<HeavyOptimizerFrontend::NZCVStoreTail> HeavyOptimizerFrontend::TakeNZCVStoreTail(
+    Decoder::Condition cond) {
+  using HostCond = x86_64::Assembler::Condition;
+  auto& insns = builder_.bb()->insn_list();
+  auto it = insns.end();
+  auto previous = [&]() -> const MachineInsn* {
+    if (it == insns.begin()) {
+      return nullptr;
+    }
+    return *--it;
+  };
+
+  const MachineInsn* store = previous();
+  if (store == nullptr || store->opcode() != kMachineOpMovwMemBaseDispReg ||
+      store->RegAt(0) != x86_64::kMachineRegRBP ||
+      x86_64::AsMachineInsnX86_64(store)->disp() != offsetof(ThreadState, cpu.flags)) {
+    return std::nullopt;
+  }
+  Register raw = store->RegAt(1);
+
+  const MachineInsn* insn = previous();
+  bool is_sub = false;
+  if (insn != nullptr && insn->opcode() == kMachineOpXorlRegImm) {
+    if (insn->RegAt(0) != raw || x86_64::AsMachineInsnX86_64(insn)->imm() != CPUState::kFlagCarry) {
+      return std::nullopt;
+    }
+    is_sub = true;
+    insn = previous();
+  }
+  if (insn == nullptr || insn->opcode() != kMachineOpAndlRegImm || insn->RegAt(0) != raw ||
+      x86_64::AsMachineInsnX86_64(insn)->imm() != kFlagsNZCVMask) {
+    return std::nullopt;
+  }
+  auto and_it = it;
+
+  const MachineInsn* read = previous();
+  if (read == nullptr || read->opcode() != kMachineOpPseudoReadFlags ||
+      read->RegAt(0) != raw || !static_cast<const PseudoReadFlags*>(read)->with_overflow()) {
+    return std::nullopt;
+  }
+
+  HostCond host_cond;
+  switch (cond) {
+    case Decoder::Condition::kEq:
+      host_cond = HostCond::kZero;
+      break;
+    case Decoder::Condition::kNe:
+      host_cond = HostCond::kNotZero;
+      break;
+    case Decoder::Condition::kCs:
+      host_cond = is_sub ? HostCond::kNotCarry : HostCond::kCarry;
+      break;
+    case Decoder::Condition::kCc:
+      host_cond = is_sub ? HostCond::kCarry : HostCond::kNotCarry;
+      break;
+    case Decoder::Condition::kMi:
+      host_cond = HostCond::kSign;
+      break;
+    case Decoder::Condition::kPl:
+      host_cond = HostCond::kNotSign;
+      break;
+    case Decoder::Condition::kVs:
+      host_cond = HostCond::kOverflow;
+      break;
+    case Decoder::Condition::kVc:
+      host_cond = HostCond::kNoOverflow;
+      break;
+    case Decoder::Condition::kHi:  // C==1 && Z==0: CF==0 && ZF==0 after a subtraction.
+      if (!is_sub) {
+        return std::nullopt;
+      }
+      host_cond = HostCond::kAbove;
+      break;
+    case Decoder::Condition::kLs:  // C==0 || Z==1: CF==1 || ZF==1 after a subtraction.
+      if (!is_sub) {
+        return std::nullopt;
+      }
+      host_cond = HostCond::kBelowEqual;
+      break;
+    case Decoder::Condition::kGe:
+      host_cond = HostCond::kGreaterEqual;
+      break;
+    case Decoder::Condition::kLt:
+      host_cond = HostCond::kLess;
+      break;
+    case Decoder::Condition::kGt:
+      host_cond = HostCond::kGreater;
+      break;
+    case Decoder::Condition::kLe:
+      host_cond = HostCond::kLessEqual;
+      break;
+    case Decoder::Condition::kAl:
+    case Decoder::Condition::kNv:
+      return std::nullopt;
+  }
+
+  Register host_flags = read->RegAt(1);
+  insns.erase(and_it, insns.end());
+  return NZCVStoreTail{raw, host_flags, is_sub, host_cond};
+}
+
+void HeavyOptimizerFrontend::EmitNZCVStoreTail(const NZCVStoreTail& tail) {
+  Register raw = tail.raw;
+  raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
+  if (tail.is_sub) {
+    raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
+  }
+  builder_.Gen<x86_64::MovwOpReg>(
+      {.base = x86_64::kMachineRegRBP,
+       .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
+      raw);
+}
+
+// An in-region jump to a fused B.cond arrives without the setter's host flags
+// or `raw`, so it cannot enter the setter's block at the PseudoCondBranch.
+// Give it an entry block that loads `raw` from cpu.flags (pre-inverting C for a
+// subtraction, so the successors' AND/XOR/store write back the same NZCV) and
+// branches on the stored NZCV like an unfused B.cond, into the same
+// successors. The B.cond's branch target then starts that block. Runs in
+// Finalize before ResolveJumps, which is the only user of the target positions.
+void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
+  if (fused_cond_branches_.empty()) {
+    return;
+  }
+  auto* ir = builder_.ir();
+  ArenaSet<GuestAddr> jump_targets(ir->arena());
+  for (auto* bb : ir->bb_list()) {
+    if (bb->is_recovery() || bb->insn_list().empty()) {
+      continue;
+    }
+    const MachineInsn* last_insn = bb->insn_list().back();
+    if (last_insn->opcode() != kMachineOpPseudoJump) {
+      continue;
+    }
+    auto* jump = static_cast<const PseudoJump*>(last_insn);
+    if (jump->kind() == PseudoJump::Kind::kSyscall ||
+        jump->kind() == PseudoJump::Kind::kExitGeneratedCode) {
+      continue;
+    }
+    jump_targets.insert(jump->target());
+  }
+
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+  for (const auto& fused : fused_cond_branches_) {
+    if (jump_targets.find(fused.addr) == jump_targets.end()) {
+      continue;
+    }
+    auto* entry_bb = ir->NewBasicBlock();
+    builder_.StartBasicBlock(entry_bb);
+    builder_.Gen<x86_64::MovwRegOp>(fused.tail.raw,
+                                    {.base = x86_64::kMachineRegRBP, .disp = flags_disp});
+    if (fused.tail.is_sub) {
+      Gen<x86_64::XorlRegImm, kNoSSA>(fused.tail.raw, static_cast<int32_t>(CPUState::kFlagCarry));
+    }
+    EmitCondBranch(fused.cond, fused.then_bb, fused.else_bb);
+    ir->AddEdge(entry_bb, fused.then_bb);
+    ir->AddEdge(entry_bb, fused.else_bb);
+    branch_targets_[fused.addr] = MachineInsnPosition{entry_bb, std::nullopt};
+  }
 }
 
 // CBZ (is_nonzero=false) / CBNZ (is_nonzero=true). Test the source for zero and
@@ -2469,6 +2663,8 @@ void HeavyOptimizerFrontend::Finalize(GuestAddr stop_pc) {
       !builder_.ir()->IsControlTransfer(builder_.bb()->insn_list().back())) {
     GenJump(stop_pc);
   }
+
+  AddFusedCondBranchEntries();
 
   // This loop advances the iterators in branch_targets by one. Because in
   // StartInsn(), we saved the iterator to the last insn before we generate the

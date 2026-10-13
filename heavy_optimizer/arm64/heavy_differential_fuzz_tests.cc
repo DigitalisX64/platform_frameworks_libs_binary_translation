@@ -2795,4 +2795,107 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmulh) {
   EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULH by-element encodings";
 }
 
+// A B.cond right after its setter branches on the setter's host flags, but a
+// jump from elsewhere in the region to that B.cond arrives without them and
+// must test the stored NZCV: a forward CBZ over the setter, and a loop
+// back-edge whose flags come from another setter.
+TEST_F(Arm64HeavyDifferentialFuzz, JumpIntoFusedCondBranch) {
+  static const uint32_t kForward[] = {
+      0xB4000042U,  // cbz x2, 1f
+      0xEB01001FU,  // cmp x0, x1
+      0x54000040U,  // 1: b.eq 2f
+      0xD2800023U,  // movz x3, #1
+  };                // 2:
+  static const uint32_t kBackEdge[] = {
+      0xEB01001FU,  // cmp x0, x1
+      0x54000060U,  // 1: b.eq 2f
+      0xB1000400U,  // adds x0, x0, #1
+      0x17FFFFFEU,  // b 1b
+  };                // 2:
+  Seed(0x7A26E7F05EDB4A11ULL);
+  int compared = 0;
+  for (int iter = 0; iter < 400; iter++) {
+    InitState in = RandomInit();
+    std::string desc;
+    Result r;
+    if (iter % 2 == 0) {
+      in.x[2] = (Rnd() % 2) ? 0 : in.x[2] | 1;
+      if (Rnd() % 2) in.x[1] = in.x[0];
+      r = RunDifferential(kForward, 4, in, /*compare_fpsr=*/false, &desc);
+    } else {
+      in.x[0] = -static_cast<uint64_t>(1 + Rnd() % 40);
+      in.x[1] = (Rnd() % 2) ? in.x[0] : 7;
+      r = RunDifferential(kBackEdge, 4, in, /*compare_fpsr=*/false, &desc);
+    }
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 300) << "heavy declined the jump-into-B.cond regions";
+}
+
+// Flag setters (ADDS/SUBS/ANDS/BICS/ADCS/SBCS/CMP/TST, immediate and register,
+// W and X) mixed with flag consumers (B.cond, CSEL, CSINC, CCMP, ADC) and
+// flag-clobbering x86 lowerings, inside straight-line regions and counted
+// loops. Every condition follows every setter, so a branch that reads the
+// setter's host flags instead of the stored NZCV is checked against the
+// interpreter, in the block, across blocks and around loop back-edges.
+TEST_F(Arm64HeavyDifferentialFuzz, FlagSettersAndConsumersRegion) {
+  auto gen_flag_mix = [&](int index, int n, bool in_loop) -> uint32_t {
+    uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t sf31 = static_cast<uint32_t>(Rnd() & 1) << 31;
+    uint32_t cond = Rnd() % 14;
+    switch (Rnd() % 16) {
+      case 0: return sf31 | 0x71000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // subs imm
+      case 1: return sf31 | 0x31000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // adds imm
+      case 2: return sf31 | 0x7100001FU | ((Rnd() % 8) << 10) | (rn << 5);          // cmp imm
+      case 3: return sf31 | 0x6B000000U | (rm << 16) | (rn << 5) | rd;               // subs reg
+      case 4: return sf31 | 0x2B000000U | (rm << 16) | (rn << 5) | rd;               // adds reg
+      case 5: return sf31 | 0x6A000000U | (rm << 16) | (rn << 5) | rd;               // ands reg
+      case 6: return sf31 | 0x6A200000U | (rm << 16) | (rn << 5) | rd;               // bics reg
+      case 7: return sf31 | (Rnd() % 2 ? 0x7A000000U : 0x3A000000U) | (rm << 16) | (rn << 5) | rd;  // sbcs/adcs
+      case 8: return sf31 | 0x6B00001FU | (rm << 16) | (rn << 5);                    // cmp reg
+      case 9: return sf31 | 0x1A800000U | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csel
+      case 10: return sf31 | 0x1A800400U | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csinc
+      case 11: return sf31 | 0x7A400000U | (rm << 16) | (cond << 12) | (rn << 5) | (Rnd() % 16);  // ccmp
+      case 12: return sf31 | 0x1A000000U | (rm << 16) | (rn << 5) | rd;               // adc
+      case 13: return sf31 | 0x1AC02000U | (rm << 16) | (rn << 5) | rd;               // lslv (clobbers EFLAGS)
+      default: {
+        // B.cond forward, at most to the loop's decrement or the region end.
+        int limit = in_loop ? n - 2 : n;
+        if (index + 1 >= limit) {
+          return sf31 | 0x0B000000U | (rm << 16) | (rn << 5) | rd;  // add
+        }
+        int target = index + 1 + static_cast<int>(Rnd() % (limit - index));
+        return 0x54000000U | (static_cast<uint32_t>(target - index) << 5) | cond;
+      }
+    }
+  };
+
+  Seed(0xF1A6B2A9C4D5E6F7ULL);
+  const int kIters = 6000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    bool in_loop = (Rnd() % 2) == 0;
+    int n = 4 + static_cast<int>(Rnd() % 16);
+    uint32_t code[20];
+    for (int i = 0; i < n; i++) code[i] = gen_flag_mix(i, n, in_loop);
+    if (in_loop) {
+      code[n - 2] = 0xF1000529U;                                            // subs x9, x9, #1
+      code[n - 1] = 0x54000001U | ((static_cast<uint32_t>(-(n - 1)) & 0x7FFFF) << 5);  // b.ne top
+    }
+    InitState in = RandomInit();
+    in.x[9] = 1 + Rnd() % 4;
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  EXPECT_GT(compared, 1000) << "heavy accepted too few flag regions";
+}
+
 }  // namespace berberis

@@ -19,10 +19,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_builder.h"
 #include "berberis/base/arena_map.h"
+#include "berberis/base/arena_vector.h"
 #include "berberis/base/checks.h"
 #include "berberis/decoder/arm64/decoder.h"
 #include "berberis/decoder/arm64/semantics_player.h"
@@ -102,7 +104,8 @@ class HeavyOptimizerFrontend {
         builder_(machine_ir),
         flag_register_(machine_ir->AllocVReg()),
         is_uncond_branch_(false),
-        branch_targets_(machine_ir->arena()) {
+        branch_targets_(machine_ir->arena()),
+        fused_cond_branches_(machine_ir->arena()) {
     StartRegion();
   }
 
@@ -943,6 +946,31 @@ class HeavyOptimizerFrontend {
                       MachineBasicBlock* then_bb,
                       MachineBasicBlock* else_bb);
 
+  // The AND, optional XOR and store of an EmitMaterializeNZCV sequence that
+  // ends the current block, taken out so that a B.cond can test the host flags
+  // its PseudoReadFlags still sees. EmitNZCVStoreTail re-emits them in a
+  // successor.
+  struct NZCVStoreTail {
+    Register raw;
+    Register host_flags;
+    bool is_sub;
+    x86_64::Assembler::Condition host_cond;
+  };
+  [[nodiscard]] std::optional<NZCVStoreTail> TakeNZCVStoreTail(Decoder::Condition cond);
+  void EmitNZCVStoreTail(const NZCVStoreTail& tail);
+
+  // A B.cond that branches on its setter's host flags. Only the fall-through
+  // path from the setter has those flags, so a B.cond that an in-region jump
+  // also targets gets a separate entry block (AddFusedCondBranchEntries).
+  struct FusedCondBranch {
+    GuestAddr addr;
+    Decoder::Condition cond;
+    NZCVStoreTail tail;
+    MachineBasicBlock* then_bb;
+    MachineBasicBlock* else_bb;
+  };
+  void AddFusedCondBranchEntries();
+
   // Map the x86 EFLAGS a preceding UCOMIS{S,D} left in `flags_vreg` to ARM64 FP
   // NZCV and store the packed word into ThreadState.cpu.flags. Bit-exact with
   // lite_translator.h::EmitStoreArmFpNZCV: unordered(PF)=C,V; equal(ZF)=Z,C;
@@ -1004,6 +1032,8 @@ class HeavyOptimizerFrontend {
   // branch targets the region jumps to. A target outside the current region has
   // an uninitialized position (its basic block is nullptr).
   ArenaMap<GuestAddr, MachineInsnPosition> branch_targets_;
+  // Every B.cond of the region that BranchCond fused with its setter.
+  ArenaVector<FusedCondBranch> fused_cond_branches_;
 
   template <typename... T>
   static constexpr void UNUSED_ARGS(const T&...) {}

@@ -2365,6 +2365,103 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondAllConditionsAllFlags) {
   }
 }
 
+// Every B.cond condition directly after SUBS, ADDS and ANDS (X and W forms),
+// which branches on the host flags the setter left instead of reloading
+// cpu.flags, over operands at the carry, overflow, sign and zero edges. The
+// branch must agree with ConditionHolds on the architectural NZCV, and both
+// paths must still store that NZCV in cpu.flags.
+struct FlagSetterCase {
+  uint32_t insn;  // Rd = X2, Rn = X0, Rm = X1
+  bool is_64bit;
+  enum { kSub, kAdd, kAnd } op;
+};
+
+uint16_t ExpectedNZCV(const FlagSetterCase& setter, uint64_t a, uint64_t b) {
+  const int bits = setter.is_64bit ? 64 : 32;
+  const uint64_t mask = setter.is_64bit ? ~uint64_t{0} : uint64_t{0xffff'ffff};
+  a &= mask;
+  b &= mask;
+  uint64_t result;
+  bool c = false, v = false;
+  const uint64_t sign = uint64_t{1} << (bits - 1);
+  switch (setter.op) {
+    case FlagSetterCase::kSub:
+      result = (a - b) & mask;
+      c = a >= b;
+      v = ((a ^ b) & (a ^ result) & sign) != 0;
+      break;
+    case FlagSetterCase::kAdd:
+      result = (a + b) & mask;
+      c = result < a;
+      v = (~(a ^ b) & (a ^ result) & sign) != 0;
+      break;
+    case FlagSetterCase::kAnd:
+      result = a & b;
+      break;
+  }
+  return ((result & sign) ? CPUState::kFlagNegative : 0) | (result == 0 ? CPUState::kFlagZero : 0) |
+         (c ? CPUState::kFlagCarry : 0) | (v ? CPUState::kFlagOverflow : 0);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondOnSetterHostFlags) {
+  const FlagSetterCase setters[] = {
+      {SubsRegX(2, 0, 1), true, FlagSetterCase::kSub},
+      {AddsRegX(2, 0, 1), true, FlagSetterCase::kAdd},
+      {AndsRegX(2, 0, 1), true, FlagSetterCase::kAnd},
+      {SubsRegW(2, 0, 1), false, FlagSetterCase::kSub},
+      {AddsRegW(2, 0, 1), false, FlagSetterCase::kAdd},
+  };
+  const uint64_t values[] = {0,
+                             1,
+                             5,
+                             0x7fff'ffff,
+                             0x8000'0000,
+                             0xffff'ffff,
+                             0x7fff'ffff'ffff'ffff,
+                             0x8000'0000'0000'0000,
+                             0xffff'ffff'ffff'ffff};
+  for (const auto& setter : setters) {
+    for (uint8_t cond = kCondEQ; cond < kCondAL; ++cond) {
+      const uint32_t code[] = {
+          setter.insn,     // [0] flag setter
+          Bcond(cond, 8),  // [1] B.cond -> skip [2] when taken
+          MovzX(9, 1),     // [2] runs only on fall-through
+          MovzX(10, 2),    // [3]
+      };
+      GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+      MachineCode mc;
+      auto [stop, ok, n] =
+          HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+      ASSERT_TRUE(ok);
+      ScopedExecRegion exec(&mc);
+      for (uint64_t a : values) {
+        for (uint64_t b : values) {
+          state_.cpu.x[0] = a;
+          state_.cpu.x[1] = b;
+          state_.cpu.x[9] = 0;
+          state_.cpu.x[10] = 0;
+          state_.cpu.flags = 0;
+          state_.cpu.insn_addr = ToGuestAddr(code);
+          TestingRunGeneratedCode(&state_, exec.get(), end_pc);
+          const uint16_t nzcv = ExpectedNZCV(setter, a, b);
+          EXPECT_EQ(state_.cpu.flags & kFlagsNZCVMask, nzcv)
+              << "insn=" << std::hex << setter.insn << " a=" << a << " b=" << b;
+          bool taken = state_.cpu.x[9] == 0;
+          EXPECT_EQ(taken,
+                    ArmConditionHolds(cond,
+                                      nzcv & CPUState::kFlagNegative,
+                                      nzcv & CPUState::kFlagZero,
+                                      nzcv & CPUState::kFlagCarry,
+                                      nzcv & CPUState::kFlagOverflow))
+              << "insn=" << std::hex << setter.insn << " cond=" << int{cond} << " a=" << a
+              << " b=" << b;
+          EXPECT_EQ(state_.cpu.x[10], 2u);
+        }
+      }
+    }
+  }
+}
+
 // CBZ taken: X0 == 0 -> branch over code[2].
 TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbzTaken) {
   static const uint32_t code[] = {
