@@ -7100,6 +7100,85 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmNaNSuppressesD) {
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
+// Scalar FMAX/FMIN/FMAXNM/FMINNM order signed zeros whatever the operand
+// order: the min forms return -0 and the max forms +0 for (+-0, -+0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FpMinMaxScalarSignedZeros) {
+  // FMAX/FMIN/FMAXNM/FMINNM d0, d1, d2 (ftype S); the opcode is bits 15:12.
+  constexpr uint32_t kOps[4] = {FmaxS(0, 1, 2), FminS(0, 1, 2), FmaxnmS(0, 1, 2), FminnmS(0, 1, 2)};
+  // ftype bits 23:22 and the sign bit of each width: H (F16C hosts), S, D.
+  struct Width {
+    uint32_t ftype;
+    uint64_t sign;
+  };
+  constexpr Width kWidths[3] = {{0x00c00000, 0x8000}, {0, 0x80000000u}, {0x00400000, 1ull << 63}};
+  for (const Width& w : kWidths) {
+    if (w.ftype == 0x00c00000 && !host_platform::kHasF16C) {
+      continue;
+    }
+    for (int op = 0; op < 4; op++) {
+      const bool is_max = (op % 2) == 0;
+      const uint64_t exp = is_max ? 0 : w.sign;
+      for (bool n_negative : {false, true}) {
+        static uint32_t code[1];
+        code[0] = kOps[op] | w.ftype;
+        SetV128(&state_, 1, n_negative ? w.sign : 0, 0);
+        SetV128(&state_, 2, n_negative ? 0 : w.sign, 0);
+        SetV128(&state_, 0, 0x1234, 0x5678);
+        GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+        bool ok = false;
+        RunRegion(&state_, code, end_pc, &ok);
+        ASSERT_TRUE(ok);
+        EXPECT_EQ(VLo64(&state_, 0), exp)
+            << std::hex << "insn 0x" << code[0] << " n_negative " << n_negative;
+        EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+      }
+    }
+  }
+}
+
+// FMAXV/FMINV/FMAXNMV/FMINNMV s0, v1.4s (and h0, v1.8h on F16C hosts) over
+// every sign pattern of zero lanes: the max forms return +0 unless every lane
+// is -0, the min forms -0 unless every lane is +0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FpAcrossLanesMinMaxSignedZeros) {
+  // FMAXV, FMINV, FMAXNMV, FMINNMV with rd=0, rn=1; FP32 .4S then FP16 .8H.
+  constexpr uint32_t kOps[2][4] = {{0x6e30f820, 0x6eb0f820, 0x6e30c820, 0x6eb0c820},
+                                   {0x4e30f820, 0x4eb0f820, 0x4e30c820, 0x4eb0c820}};
+  for (int half = 0; half < 2; half++) {
+    if (half && !host_platform::kHasF16C) {
+      continue;
+    }
+    const int lanes = half ? 8 : 4;
+    const int bits = half ? 16 : 32;
+    const uint64_t sign = 1ull << (bits - 1);
+    for (int op = 0; op < 4; op++) {
+      const bool is_max = (op % 2) == 0;
+      for (uint32_t pattern = 0; pattern < (1u << lanes); pattern++) {
+        uint64_t lo = 0, hi = 0;
+        for (int i = 0; i < lanes; i++) {
+          if (pattern & (1u << i)) {
+            const int pos = i * bits;
+            (pos < 64 ? lo : hi) |= sign << (pos % 64);
+          }
+        }
+        const bool all_negative = pattern == (1u << lanes) - 1;
+        const bool any_negative = pattern != 0;
+        const uint64_t exp = (is_max ? all_negative : any_negative) ? sign : 0;
+        static uint32_t code[1];
+        code[0] = kOps[half][op];
+        SetV128(&state_, 1, lo, hi);
+        SetV128(&state_, 0, 0x1234, 0x5678);
+        GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+        bool ok = false;
+        RunRegion(&state_, code, end_pc, &ok);
+        ASSERT_TRUE(ok);
+        EXPECT_EQ(VLo64(&state_, 0), exp)
+            << std::hex << "insn 0x" << code[0] << " pattern 0x" << pattern;
+        EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+      }
+    }
+  }
+}
+
 // --- Vector FMAX/FMIN/FMAXNM/FMINNM (AdvSimdThreeSame) heavy mirror. ---
 
 // FMAX v0.4s, v1.4s, v2.4s: per-lane max of four FP32 lanes.

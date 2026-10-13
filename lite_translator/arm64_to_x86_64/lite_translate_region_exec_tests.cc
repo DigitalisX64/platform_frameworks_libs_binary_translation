@@ -879,6 +879,123 @@ TEST_F(Arm64LiteTranslateRegionTest, FpMinMaxSignedZero) {
   }
 }
 
+// Scalar FMAX/FMIN/FMAXNM/FMINNM (H, S, D) on a +-0 tie, both operand orders
+// (interp AND JIT): FMAX/FMAXNM give +0 and FMIN/FMINNM give -0, and the rest
+// of the destination is zeroed. The JIT once returned x86 MAXPS/MINPS's second
+// source for the NM forms and -0 for FMAX.
+TEST_F(Arm64LiteTranslateRegionTest, FpMinMaxScalarSignedZero) {
+  // FMAX/FMIN/FMAXNM/FMINNM d0, d1, d2 (ftype S); the opcode is bits 15:12.
+  constexpr uint32_t kOps[4] = {0x1e224820, 0x1e225820, 0x1e226820, 0x1e227820};
+  // ftype bits 23:22 and the sign bit of each width: H, S, D.
+  struct Width {
+    uint32_t ftype;
+    uint64_t sign;
+  };
+  constexpr Width kWidths[3] = {{0x00c00000, 0x8000}, {0, 0x80000000}, {0x00400000, 1ull << 63}};
+  auto set_lo = [&](int i, uint64_t lo) {
+    uint64_t v[2] = {lo, 0};
+    memcpy(&state_.cpu.v[i], v, 16);
+  };
+  auto get = [&](int i, int half) {
+    uint64_t v[2];
+    memcpy(v, &state_.cpu.v[i], 16);
+    return v[half];
+  };
+  for (const Width& w : kWidths) {
+    if (w.ftype == 0x00c00000 && !host_platform::kHasF16C) {
+      continue;
+    }
+    for (int op = 0; op < 4; op++) {
+      const uint32_t enc = kOps[op] | w.ftype;
+      const bool is_max = (op % 2) == 0;
+      const uint64_t exp = is_max ? 0 : w.sign;
+      for (bool n_negative : {false, true}) {
+        auto setup = [&]() {
+          set_lo(0, 0x1234);
+          set_lo(1, n_negative ? w.sign : 0);
+          set_lo(2, n_negative ? 0 : w.sign);
+        };
+        setup();
+        Interpret(enc);
+        EXPECT_EQ(get(0, 0), exp) << std::hex << "INTERP enc=0x" << enc << " n_neg=" << n_negative;
+        setup();
+        static uint32_t code[1];
+        code[0] = enc;
+        GuestAddr start = ToGuestAddr(&code[0]);
+        MachineCode mc;
+        auto [ok, stop] = TryLiteTranslateRegion(
+            start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+        ASSERT_TRUE(ok && stop == start + 4) << std::hex << "enc=0x" << enc;
+        HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+        state_.cpu.insn_addr = start;
+        TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+        EXPECT_EQ(get(0, 0), exp) << std::hex << "JIT enc=0x" << enc << " n_neg=" << n_negative;
+        EXPECT_EQ(get(0, 1), 0u) << std::hex << "JIT enc=0x" << enc << " n_neg=" << n_negative;
+      }
+    }
+  }
+}
+
+// FMAXV/FMINV/FMAXNMV/FMINNMV s0, v1.4s and h0, v1.8h over every sign pattern
+// of zero lanes (interp AND JIT): the max forms return +0 unless every lane is
+// -0, the min forms -0 unless every lane is +0.
+TEST_F(Arm64LiteTranslateRegionTest, FpAcrossLanesMinMaxSignedZero) {
+  // FMAXV, FMINV, FMAXNMV, FMINNMV with rd=0, rn=1; FP32 .4S then FP16 .8H.
+  constexpr uint32_t kOps[2][4] = {{0x6e30f820, 0x6eb0f820, 0x6e30c820, 0x6eb0c820},
+                                   {0x4e30f820, 0x4eb0f820, 0x4e30c820, 0x4eb0c820}};
+  auto get = [&](int i, int half) {
+    uint64_t v[2];
+    memcpy(v, &state_.cpu.v[i], 16);
+    return v[half];
+  };
+  for (int half = 0; half < 2; half++) {
+    if (half && !host_platform::kHasF16C) {
+      continue;
+    }
+    const int lanes = half ? 8 : 4;
+    const int bits = half ? 16 : 32;
+    const uint64_t sign = 1ull << (bits - 1);
+    for (int op = 0; op < 4; op++) {
+      const bool is_max = (op % 2) == 0;
+      for (uint32_t pattern = 0; pattern < (1u << lanes); pattern++) {
+        uint64_t v[2] = {0, 0};
+        for (int i = 0; i < lanes; i++) {
+          if (pattern & (1u << i)) {
+            const int pos = i * bits;
+            v[pos / 64] |= sign << (pos % 64);
+          }
+        }
+        const bool all_negative = pattern == (1u << lanes) - 1;
+        const bool any_negative = pattern != 0;
+        const uint64_t exp = (is_max ? all_negative : any_negative) ? sign : 0;
+        const uint32_t enc = kOps[half][op];
+        auto setup = [&]() {
+          uint64_t poison[2] = {0x1234, 0x5678};
+          memcpy(&state_.cpu.v[0], poison, 16);
+          memcpy(&state_.cpu.v[1], v, 16);
+        };
+        setup();
+        Interpret(enc);
+        EXPECT_EQ(get(0, 0), exp) << std::hex << "INTERP enc=0x" << enc << " pattern 0x"
+                                  << pattern;
+        setup();
+        static uint32_t code[1];
+        code[0] = enc;
+        GuestAddr start = ToGuestAddr(&code[0]);
+        MachineCode mc;
+        auto [ok, stop] = TryLiteTranslateRegion(
+            start, &mc, LiteTranslateParams{.end_pc = start + 4, .allow_dispatch = false});
+        ASSERT_TRUE(ok && stop == start + 4) << std::hex << "enc=0x" << enc;
+        HostCodeAddr hc = GetDefaultCodePoolInstance()->Add(&mc);
+        state_.cpu.insn_addr = start;
+        TestingRunGeneratedCode(&state_, AsHostCode(hc), stop);
+        EXPECT_EQ(get(0, 0), exp) << std::hex << "JIT enc=0x" << enc << " pattern 0x" << pattern;
+        EXPECT_EQ(get(0, 1), 0u) << std::hex << "JIT enc=0x" << enc << " pattern 0x" << pattern;
+      }
+    }
+  }
+}
+
 // Focused ground-truth: MLA/MLS .4s with simple known values.
 //   v0={1,2,3,4}, v1={10,10,10,10}, v2={2,3,4,5}
 //   MLA: v0[i]+=v1[i]*v2[i] -> {21,32,43,54}

@@ -2983,14 +2983,18 @@
       //
       // The pair step differs by NaN policy, matching the interpreter:
       //   FMAXV/FMINV     — NaN-propagating. MAXPS/MINPS on x86 return the
-      //                     SECOND operand whenever either input is NaN, so a
-      //                     single MAXPS would silently drop a NaN depending on
-      //                     operand order. Doing it both ways and POR-ing keeps
-      //                     a NaN exponent if either input was NaN, and makes
-      //                     +-0 order-independent.
+      //                     SECOND operand whenever either input is NaN or both
+      //                     are zeros, so a single MINPS would drop a NaN or
+      //                     pick the zero's sign depending on operand order.
+      //                     Doing it both ways and POR-ing keeps a NaN exponent
+      //                     if either input was NaN, and gives -0 on a +-0 tie.
       //   FMAXNMV/FMINNMV — NaN-suppressing. Substitute each NaN lane with the
       //                     other operand via a CMPUNORDPS self-compare mask
-      //                     before MAX/MIN, so a NaN only survives if both are.
+      //                     before the two-way MIN, so a NaN only survives if
+      //                     both are.
+      //   The max forms run as -min(-a, -b): the widened lanes are negated
+      //   once before the fold and the winner once after it, which gives
+      //   ARM's +0 for max on a +-0 tie (EmitArmFpMinMax's rule).
       //
       // The FP16 forms use the F16C round-trip (VCVTPH2PS to widen, VCVTPS2PH
       // imm=0 to narrow). This is exact for a reduction: max/min returns one of
@@ -3030,18 +3034,18 @@
         // .8H widens its two half-lane groups into separate registers, so it
         // needs one temp more than .4S / .4H do.
         SimdRegister xh = (args.is_fp16 && args.q) ? AllocTempSimdReg() : xn;
+        SimdRegister sign_mask = is_max ? AllocTempSimdReg() : xn;
         if (!success()) { return; }
-        // Fold b into a with packed FP32 min/max under the selected NaN rule.
+        if (is_max) {
+          as_.Pcmpeqd(sign_mask, sign_mask);
+          as_.Pslld(sign_mask, static_cast<int8_t>(31));
+        }
+        // Fold b into a with packed FP32 min under the selected NaN rule.
         auto emit_pair = [&](SimdRegister a, SimdRegister b) {
           if (!is_nm) {
             as_.Movdqa(xa, b);
-            if (is_max) {
-              as_.Maxps(xa, a);
-              as_.Maxps(a, b);
-            } else {
-              as_.Minps(xa, a);
-              as_.Minps(a, b);
-            }
+            as_.Minps(xa, a);
+            as_.Minps(a, b);
             as_.Por(a, xa);
           } else {
             as_.Movdqa(xa, a);
@@ -3056,22 +3060,23 @@
             as_.Pandn(xb, b);         // non-NaN lanes of b
             as_.Por(xa, a_sub);
             as_.Por(xb, b_sub);
-            if (is_max) {
-              as_.Maxps(xa, xb);
-            } else {
-              as_.Minps(xa, xb);
-            }
+            as_.Movdqa(a_sub, xb);
+            as_.Minps(a_sub, xa);     // min(b', a')
+            as_.Minps(xa, xb);        // min(a', b')
+            as_.Por(xa, a_sub);
             as_.Movdqa(a, xa);
           }
         };
         if (!args.is_fp16) {
           as_.Movdqu(xn, {.base = Assembler::rbp, .disp = vn_off});
+          if (is_max) as_.Pxor(xn, sign_mask);
         } else if (!args.q) {
           // .4H: the four half-lanes occupy the low 64 bits of Vn. VCVTPH2PS
           // reads exactly those and produces the four FP32 lanes the fold
           // below expects.
           as_.Movq(xn, {.base = Assembler::rbp, .disp = vn_off});
           as_.Vcvtph2ps(xn, xn);
+          if (is_max) as_.Pxor(xn, sign_mask);
         } else {
           // .8H: widen the low and high half-lane groups into two registers,
           // then fold the high group into the low one with the same pair step.
@@ -3083,6 +3088,10 @@
           as_.Vcvtph2ps(xn, xn);
           as_.Psrldq(xh, int8_t{8});
           as_.Vcvtph2ps(xh, xh);
+          if (is_max) {
+            as_.Pxor(xn, sign_mask);
+            as_.Pxor(xh, sign_mask);
+          }
           emit_pair(xn, xh);
         }
         // Step 1: fold lanes {2,3} into {0,1} (PSHUFD 0x4E swaps 64-bit halves).
@@ -3091,6 +3100,7 @@
         // Step 2: fold lane 1 into lane 0 (PSHUFD 0xB1 swaps adjacent dwords).
         as_.Pshufd(xt, xn, static_cast<int8_t>(0xB1));
         emit_pair(xn, xt);
+        if (is_max) as_.Pxor(xn, sign_mask);
         if (args.is_fp16) {
           // Narrow the winner back to FP16. VCVTPS2PH packs the four FP32
           // lanes into the low 64 bits, so the scalar result is at byte 0;

@@ -20,7 +20,7 @@
 //
 // Family: scalar FP data-processing / compare / estimate tables.
 // Methods:
-//   FpDataProc1, FpDataProc2, FpCompare, FpConditionalCompare,
+//   FpDataProc1, EmitArmFpMinMax, FpDataProc2, FpCompare, FpConditionalCompare,
 //   BuildUnsignedEstimateTable, UnsignedEstimateTable
 
   void FpDataProc1(const Decoder::FpDataProc1Args& args) {
@@ -481,6 +481,82 @@
     }
   }
 
+  // ARM FMAX/FMIN/FMAXNM/FMINNM on every FP32 (or FP64) lane of `xn` and `xm`,
+  // leaving the result in `xn` (`xm` is clobbered). Returns false when a
+  // temporary register is unavailable (success() is then false). Shared by
+  // the vector, scalar and FP16 forms.
+  bool EmitArmFpMinMax(SimdRegister xn,
+                       SimdRegister xm,
+                       bool is_max,
+                       bool is_nm,
+                       bool is_double) {
+    // ARM FMAX/FMAXNM are computed as -FMIN(-a,-b). x86 MAXPS/MINPS return
+    // the SECOND source on a +-0 tie (OR-of-signs), which is correct only
+    // for FMIN (most-negative). Negating inputs+output makes FMAX reuse the
+    // FMIN lowering and get ARM's AND-of-signs (most-positive) for the +-0
+    // tie; because the negation is applied twice, a propagated-NaN's sign
+    // is preserved too. FMIN/FMINNM are already correct, so no negation.
+    SimdRegister sign_mask = no_simd_register;
+    if (is_max) {
+      sign_mask = AllocTempSimdReg();
+      if (sign_mask == no_simd_register) { success_ = false; return false; }
+      as_.Pcmpeqd(sign_mask, sign_mask);
+      if (is_double) as_.Psllq(sign_mask, static_cast<int8_t>(63));
+      else as_.Pslld(sign_mask, static_cast<int8_t>(31));
+      as_.Pxor(xn, sign_mask);
+      as_.Pxor(xm, sign_mask);
+    }
+    auto cmpunord = [&](SimdRegister dst, SimdRegister src) {
+      if (is_double) as_.Cmpunordpd(dst, src); else as_.Cmpunordps(dst, src);
+    };
+    // Always FMIN now (FMAX reaches here with negated operands).
+    auto minmax = [&](SimdRegister dst, SimdRegister src) {
+      if (is_double) as_.Minpd(dst, src); else as_.Minps(dst, src);
+    };
+    if (!is_nm) {
+      // FMAX / FMIN — NaN-propagating: minab|minba|OR.
+      SimdRegister tmp = AllocTempSimdReg();
+      if (!success()) { return false; }
+      as_.Movdqa(tmp, xm);
+      minmax(tmp, xn);
+      minmax(xn, xm);
+      as_.Por(xn, tmp);
+    } else {
+      // FMAXNM / FMINNM — substitute NaN-lanes with the other operand,
+      // then min/max.
+      SimdRegister t_mask_a = AllocTempSimdReg();
+      SimdRegister t_mask_b = AllocTempSimdReg();
+      SimdRegister t_an_sub = AllocTempSimdReg();
+      SimdRegister t_bn_sub = AllocTempSimdReg();
+      if (!success()) { return false; }
+      as_.Movdqa(t_mask_a, xn);
+      cmpunord(t_mask_a, t_mask_a);   // 1s where a is NaN
+      as_.Movdqa(t_mask_b, xm);
+      cmpunord(t_mask_b, t_mask_b);   // 1s where b is NaN
+      as_.Movdqa(t_an_sub, t_mask_a);
+      as_.Pand(t_an_sub, xm);          // mask_a & b
+      as_.Movdqa(t_bn_sub, t_mask_b);
+      as_.Pand(t_bn_sub, xn);          // mask_b & a
+      as_.Pandn(t_mask_a, xn);         // ~mask_a & a
+      as_.Pandn(t_mask_b, xm);         // ~mask_b & b
+      as_.Por(t_mask_a, t_an_sub);     // a' in t_mask_a
+      as_.Por(t_mask_b, t_bn_sub);     // b' in t_mask_b
+      // minab|minba|OR so the +-0 tie gets OR-of-signs (most-negative,
+      // ARM's FMINNM rule), not x86's "return 2nd source on tie". The
+      // operands are NaN-free here (NaN lanes were substituted above).
+      SimdRegister t_nm = AllocTempSimdReg();
+      if (!success()) { return false; }
+      as_.Movdqa(t_nm, t_mask_b);
+      minmax(t_nm, t_mask_a);          // min(b', a')
+      minmax(t_mask_a, t_mask_b);      // min(a', b')
+      as_.Por(t_mask_a, t_nm);
+      as_.Movdqa(xn, t_mask_a);
+    }
+    // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+    if (is_max) as_.Pxor(xn, sign_mask);
+    return true;
+  }
+
   // FP arithmetic JIT
   //
   // FP16 (ftype=0b11) lowering: F16C round-trip.
@@ -545,80 +621,24 @@
         if (is_double) as_.Subsd(xmm_n, xmm_m);
         else as_.Subss(xmm_n, xmm_m);
         break;
-      // scalar FMAX / FMIN / FMAXNM / FMINNM / FNMUL JIT.
-      //
-      // FMAX/FMIN (NaN-propagating per ARM ARM): symmetric MAX with POR.
-      //   tmp = m; MAXP{S,D} tmp, n   ; tmp lane0 = NaN if any NaN else max
-      //   MAXP{S,D} n, m              ; n lane0   = NaN if any NaN else max
-      //   POR n, tmp                  ; bitwise OR keeps NaN exponent if any NaN
-      //
-      // FMAXNM/FMINNM (NaN-suppressing per ARM ARM): substitute NaN lanes
-      // with the other operand, then MAXP{S,D}.
-      //
-      // Operates on the vector forms because the SS/SD scalar MAX/MIN
-      // mnemonics are not exposed in the Berberis x86 assembler. For S/D
-      // only lane 0 matters (Movss/Movsd writes lane 0 only); for H the
-      // upper lanes are pre-zeroed by Pxor+Pinsrw, so MAXP{S,D} lanes 1..3
-      // = max(0, 0) = 0 and the F16C narrow produces zero in FP16 lanes
-      // 1..3 — matching the AArch64 Hd zero-extend semantic.
-      case 0b0100:    // FMAX
-      case 0b0101: {  // FMIN
-        SimdRegister tmp = AllocTempSimdReg();
-        if (!success()) { return; }
-        as_.Movdqa(tmp, xmm_m);
-        const bool is_max = (args.opcode == 0b0100);
-        if (is_max) {
-          if (is_double) {
-            as_.Maxpd(tmp, xmm_n);
-            as_.Maxpd(xmm_n, xmm_m);
-          } else {
-            as_.Maxps(tmp, xmm_n);
-            as_.Maxps(xmm_n, xmm_m);
-          }
-        } else {
-          if (is_double) {
-            as_.Minpd(tmp, xmm_n);
-            as_.Minpd(xmm_n, xmm_m);
-          } else {
-            as_.Minps(tmp, xmm_n);
-            as_.Minps(xmm_n, xmm_m);
-          }
+      // scalar FMAX / FMIN / FMAXNM / FMINNM run the packed sequence of
+      // EmitArmFpMinMax (the SS/SD scalar MAX/MIN mnemonics are not exposed
+      // in the Berberis x86 assembler). For S/D only lane 0 matters
+      // (Movss/Movsd writes lane 0 only); for H the upper lanes are
+      // pre-zeroed by Pxor+Pinsrw, so lanes 1..3 stay +0 and the F16C narrow
+      // produces zero in FP16 lanes 1..3, matching the AArch64 Hd zero-extend.
+      case 0b0100:  // FMAX
+      case 0b0101:  // FMIN
+      case 0b0110:  // FMAXNM
+      case 0b0111:  // FMINNM
+        if (!EmitArmFpMinMax(xmm_n,
+                             xmm_m,
+                             /*is_max=*/args.opcode == 0b0100 || args.opcode == 0b0110,
+                             /*is_nm=*/args.opcode >= 0b0110,
+                             is_double)) {
+          return;
         }
-        as_.Por(xmm_n, tmp);
         break;
-      }
-      case 0b0110:    // FMAXNM
-      case 0b0111: {  // FMINNM
-        SimdRegister mask_a = AllocTempSimdReg();
-        SimdRegister mask_b = AllocTempSimdReg();
-        SimdRegister an_sub = AllocTempSimdReg();
-        SimdRegister bn_sub = AllocTempSimdReg();
-        if (!success()) { return; }
-        as_.Movdqa(mask_a, xmm_n);
-        if (is_double) as_.Cmpunordpd(mask_a, mask_a);
-        else as_.Cmpunordps(mask_a, mask_a);
-        as_.Movdqa(mask_b, xmm_m);
-        if (is_double) as_.Cmpunordpd(mask_b, mask_b);
-        else as_.Cmpunordps(mask_b, mask_b);
-        as_.Movdqa(an_sub, mask_a);
-        as_.Pand(an_sub, xmm_m);
-        as_.Movdqa(bn_sub, mask_b);
-        as_.Pand(bn_sub, xmm_n);
-        as_.Pandn(mask_a, xmm_n);
-        as_.Pandn(mask_b, xmm_m);
-        as_.Por(mask_a, an_sub);
-        as_.Por(mask_b, bn_sub);
-        const bool is_max = (args.opcode == 0b0110);
-        if (is_max) {
-          if (is_double) as_.Maxpd(mask_a, mask_b);
-          else as_.Maxps(mask_a, mask_b);
-        } else {
-          if (is_double) as_.Minpd(mask_a, mask_b);
-          else as_.Minps(mask_a, mask_b);
-        }
-        as_.Movdqa(xmm_n, mask_a);
-        break;
-      }
       case 0b1000: {  // FNMUL: -(n * m)
         SimdRegister sign_xmm = AllocTempSimdReg();
         if (!success()) { return; }

@@ -804,6 +804,14 @@ class HeavyOptimizerFrontend {
     SetVRegScalar(reg, val, /*is_double=*/false);
   }
 
+  // ARM FMAX/FMIN/FMAXNM/FMINNM on every FP32 (or FP64) lane of `n` and `m`; both
+  // registers are clobbered. Returns the register holding the result.
+  [[nodiscard]] FpRegister EmitArmFpMinMax(FpRegister n,
+                                           FpRegister m,
+                                           bool is_max,
+                                           bool is_nm,
+                                           bool is_double);
+
   // Widen the FP16 lanes of the 16-byte guest V slot at `voff` to FP32 for a heavy
   // vector FP16 op. The low 4 halves (lanes 0..3) land as 4 FP32 in `*lo`; for q (.8H)
   // the high 4 halves (lanes 4..7) land as 4 FP32 in `*hi` (PSRLDQ 8 brings them down

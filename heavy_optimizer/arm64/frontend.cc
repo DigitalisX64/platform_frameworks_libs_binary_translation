@@ -5049,46 +5049,16 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
       case 0b0011:    // FSUB
         builder_.Gen<x86_64::SubssXRegXReg>(n.machine_reg(), m.machine_reg());
         break;
-      case 0b0100:      // FMAX (NaN-propagating: MAXPS|MAXPS|POR)
-      case 0b0101: {    // FMIN
-        FpRegister tmp = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
-        if (args.opcode == 0b0100) {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MaxpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MinpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        }
-        builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
+      case 0b0100:    // FMAX
+      case 0b0101:    // FMIN
+      case 0b0110:    // FMAXNM
+      case 0b0111:    // FMINNM
+        result = EmitArmFpMinMax(n,
+                                 m,
+                                 /*is_max=*/args.opcode == 0b0100 || args.opcode == 0b0110,
+                                 /*is_nm=*/args.opcode >= 0b0110,
+                                 /*is_double=*/false);
         break;
-      }
-      case 0b0110:      // FMAXNM (NaN-suppressing: substitute NaN lane, then MAX/MIN)
-      case 0b0111: {    // FMINNM
-        FpRegister mask_a = AllocTempSimdReg();
-        FpRegister mask_b = AllocTempSimdReg();
-        FpRegister an_sub = AllocTempSimdReg();
-        FpRegister bn_sub = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());
-        builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-        builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
-        if (args.opcode == 0b0110) {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        }
-        result = mask_a;
-        break;
-      }
     }
     if (args.opcode == 0b1000) {
       // FNMUL: flip lane-0 FP32 sign; lanes 1..3 (=+0.0) XOR 0 stay +0.0.
@@ -5108,85 +5078,13 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
   FpRegister src1 = GetVRegScalar(args.rn, is_double);
   FpRegister src2 = GetVRegScalar(args.rm, is_double);
 
-  // FMAX/FMIN/FMAXNM/FMINNM (0b0100..0b0111). x86 MAXP{S,D}/MINP{S,D} have
-  // ARM-incompatible NaN and signed-zero semantics, so mirror the lite tier's
-  // explicit sequences. Packed ops run on the scalar-loaded registers; only
-  // lane 0 is written back by SetVRegScalar, so upper-lane garbage is
-  // irrelevant. NaN-propagating FMAX/FMIN (ARM: any NaN in -> NaN out) use the
-  // symmetric MAX|MAX|POR idiom (the POR keeps a NaN exponent if either input
-  // was NaN, and the two-sided MAX makes +-0 order-independent). NaN-
-  // suppressing FMAXNM/FMINNM (ARM: exactly one NaN -> the number) substitute
-  // each NaN lane with the other operand — via a CMPUNORDP{S,D} self-compare
-  // mask — before the MAX/MIN. Mirrors lite_translator.h's scalar path.
+  // FMAX/FMIN/FMAXNM/FMINNM (0b0100..0b0111) run the packed sequence of
+  // EmitArmFpMinMax on the scalar-loaded registers; only lane 0 is written
+  // back by SetVRegScalar, so the upper lanes are irrelevant.
   if (args.opcode >= 0b0100 && args.opcode <= 0b0111) {
     const bool is_max = (args.opcode == 0b0100 || args.opcode == 0b0110);
     const bool is_nm = (args.opcode == 0b0110 || args.opcode == 0b0111);
-    FpRegister n = src1;
-    FpRegister m = src2;
-    if (!is_nm) {
-      // NaN-propagating: tmp = m; MAXP tmp,n; MAXP n,m; POR n,tmp.
-      FpRegister tmp = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
-      if (is_max) {
-        if (is_double) {
-          builder_.Gen<x86_64::MaxpdXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MaxpdXRegXReg>(n.machine_reg(), m.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MaxpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        }
-      } else {
-        if (is_double) {
-          builder_.Gen<x86_64::MinpdXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MinpdXRegXReg>(n.machine_reg(), m.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MinpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        }
-      }
-      builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
-      SetVRegScalar(args.rd, n, is_double);
-    } else {
-      // NaN-suppressing: mask_a=isnan(n), mask_b=isnan(m). Substitute the NaN
-      // lanes with the other operand (an_sub = isnan(n) ? m; bn_sub =
-      // isnan(m) ? n), giving sub_n = select(isnan(n), m, n) and sub_m =
-      // select(isnan(m), n, m); then MAX/MIN the substituted pair.
-      FpRegister mask_a = AllocTempSimdReg();
-      FpRegister mask_b = AllocTempSimdReg();
-      FpRegister an_sub = AllocTempSimdReg();
-      FpRegister bn_sub = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-      if (is_double) {
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-      } else {
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-      }
-      builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
-      if (is_max) {
-        if (is_double) {
-          builder_.Gen<x86_64::MaxpdXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        }
-      } else {
-        if (is_double) {
-          builder_.Gen<x86_64::MinpdXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        }
-      }
-      SetVRegScalar(args.rd, mask_a, is_double);
-    }
+    SetVRegScalar(args.rd, EmitArmFpMinMax(src1, src2, is_max, is_nm, is_double), is_double);
     return;
   }
 
@@ -6602,6 +6500,92 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitSqdmulhVec(FpRegi
   return xp_lo;
 }
 
+// ARM FMAX/FMIN/FMAXNM/FMINNM per FP32/FP64 lane. x86 MINP{S,D}/MAXP{S,D}
+// return their second operand when either input is NaN or both are zeros of
+// either sign, while ARM orders -0 below +0 and FMAXNM/FMINNM return the
+// number when one input is NaN. FMAX is -FMIN(-a,-b), and the MIN is taken
+// both ways and ORed: a NaN in either keeps a NaN exponent, and a +-0 tie
+// keeps the minus sign. Shared by the vector, scalar and FP16 forms.
+HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitArmFpMinMax(FpRegister n,
+                                                                           FpRegister m,
+                                                                           bool is_max,
+                                                                           bool is_nm,
+                                                                           bool is_double) {
+  // FMAX: negate both inputs so the shared FMIN lowering computes it; the
+  // per-lane sign mask (all-ones << 31/63) is XORed in now and, after the
+  // MIN, XORed back out of the result.
+  FpRegister sign_mask = no_fp_register;
+  if (is_max) {
+    // AllocZeroedSimdReg establishes a def before the all-ones self-compare
+    // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
+    sign_mask = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
+    if (is_double) {
+      builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
+    } else {
+      builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+    }
+    builder_.Gen<x86_64::PxorXRegXReg>(n.machine_reg(), sign_mask.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(m.machine_reg(), sign_mask.machine_reg());
+  }
+  auto gen_min = [&](FpRegister dst, FpRegister src) {
+    if (is_double) {
+      builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+    } else {
+      builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+    }
+  };
+  auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
+    if (is_double) {
+      builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+    } else {
+      builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+    }
+  };
+  FpRegister result;
+  if (!is_nm) {
+    // NaN-propagating: tmp = m; MIN(tmp, n); MIN(n, m); POR(n, tmp).
+    FpRegister tmp = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
+    gen_min(tmp, n);
+    gen_min(n, m);
+    builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
+    result = n;
+  } else {
+    // NaN-suppressing: substitute each NaN lane with the other operand
+    // (a' = select(isnan(a), b, a); b' = select(isnan(b), a, b)), then MIN.
+    FpRegister mask_a = AllocTempSimdReg();
+    FpRegister mask_b = AllocTempSimdReg();
+    FpRegister an_sub = AllocTempSimdReg();
+    FpRegister bn_sub = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
+    gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
+    builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
+    gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
+    builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());  // mask_a & b
+    builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());  // mask_b & a
+    builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());  // ~mask_a & a
+    builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());  // ~mask_b & b
+    builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
+    builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
+    // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
+    // operands are NaN-free here (NaN lanes were substituted above).
+    FpRegister t_nm = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
+    gen_min(t_nm, mask_a);      // min(b', a')
+    gen_min(mask_a, mask_b);    // min(a', b')
+    builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
+    result = mask_a;
+  }
+  // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+  if (is_max) {
+    builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
+  }
+  return result;
+}
+
 // AdvSIMD three-same INTEGER ops that lower to a single packed SSE2/SSE4.1
 // instruction: ADD, SUB, AND, ORR, EOR, MUL, and CMEQ (register). Each loads
 // the full 128-bit Vn and Vm with GenGetSimd<16> (MOVDQA), runs the packed op
@@ -6783,16 +6767,8 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     return;
   }
 
-  // FP vector FMAX/FMIN/FMAXNM/FMINNM (.2S/.4S/.2D). x86 MAXP{S,D}/MINP{S,D}
-  // disagree with ARM on both NaN and signed-zero results, so mirror
-  // lite_translator.h's vector sequence exactly. Everything is computed as
-  // FMIN (FMAX = -FMIN(-a,-b)): x86 MINP{S,D} returns the SECOND source on a
-  // +-0 tie, which gives ARM's OR-of-signs (most-negative) for FMIN and, after
-  // the double negation, AND-of-signs (most-positive) for FMAX. NaN-propagating
-  // FMAX/FMIN (any NaN in -> NaN out) use the symmetric MIN|MIN|POR idiom;
-  // NaN-suppressing FMAXNM/FMINNM (exactly one NaN -> the number) substitute
-  // each NaN lane with the other operand via a CMPUNORDP{S,D} self-compare mask
-  // before the MIN. FP16 (is_fp16, needs an F16C round-trip not in the backend
+  // FP vector FMAX/FMIN/FMAXNM/FMINNM (.2S/.4S/.2D) through EmitArmFpMinMax,
+  // which mirrors lite_translator.h's vector sequence. FP16 (is_fp16, needs an F16C round-trip not in the backend
   // gen inputs) bails to lite; the decoder already filters the reserved
   // sz=1&&!Q (.1D) shape, so only .2S/.4S/.2D reach here.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
@@ -6891,78 +6867,7 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister xm = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-    // FMAX: negate both inputs so the shared FMIN lowering computes it; the
-    // per-lane sign mask (all-ones << 31/63) is XORed in now and, after the
-    // MIN, XORed back out of the result.
-    FpRegister sign_mask = no_fp_register;
-    if (is_max) {
-      // AllocZeroedSimdReg establishes a def before the all-ones self-compare
-      // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
-      sign_mask = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
-      if (is_double) {
-        builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
-      } else {
-        builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
-      }
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign_mask.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign_mask.machine_reg());
-    }
-    auto gen_min = [&](FpRegister dst, FpRegister src) {
-      if (is_double) {
-        builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
-      } else {
-        builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
-      }
-    };
-    auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
-      if (is_double) {
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
-      } else {
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
-      }
-    };
-    FpRegister result;
-    if (!is_nm) {
-      // NaN-propagating: tmp = xm; MIN(tmp, xn); MIN(xn, xm); POR(xn, tmp).
-      FpRegister tmp = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xm.machine_reg());
-      gen_min(tmp, xn);
-      gen_min(xn, xm);
-      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), tmp.machine_reg());
-      result = xn;
-    } else {
-      // NaN-suppressing: substitute each NaN lane with the other operand
-      // (a' = select(isnan(a), b, a); b' = select(isnan(b), a, b)), then MIN.
-      FpRegister mask_a = AllocTempSimdReg();
-      FpRegister mask_b = AllocTempSimdReg();
-      FpRegister an_sub = AllocTempSimdReg();
-      FpRegister bn_sub = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), xn.machine_reg());
-      gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), xm.machine_reg());
-      gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
-      builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), xm.machine_reg());  // mask_a & b
-      builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), xn.machine_reg());  // mask_b & a
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), xn.machine_reg());  // ~mask_a & a
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), xm.machine_reg());  // ~mask_b & b
-      builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
-      builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
-      // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
-      // operands are NaN-free here (NaN lanes were substituted above).
-      FpRegister t_nm = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
-      gen_min(t_nm, mask_a);      // min(b', a')
-      gen_min(mask_a, mask_b);    // min(a', b')
-      builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
-      result = mask_a;
-    }
-    // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
-    if (is_max) {
-      builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
-    }
+    FpRegister result = EmitArmFpMinMax(xn, xm, is_max, is_nm, is_double);
     // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
     SetVRegFull(args.rd, result, args.q);
     return;
@@ -11052,16 +10957,9 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
     // FMAXV / FMINV / FMAXNMV / FMINNMV Sd, Vn.4S — floating-point across-lanes
     // reduction. Reduce the 4 FP32 lanes to a single scalar written to Sd's low
     // lane with the upper 96 bits zeroed. Two pairwise steps (PSHUFD 0x4E then
-    // 0xB1) each fold lanes together via the same NaN-handling min/max idioms the
-    // vector three-same FMAX/FMIN path uses (lines ~1828):
-    //   FMAXV/FMINV       — NaN-propagating: tmp=b; MAX/MIN tmp,a; MAX/MIN a,b;
-    //                        POR a,tmp. (x86 MAX/MINPS returns src on NaN, so the
-    //                        two-sided op + POR keeps a NaN exponent if either
-    //                        input was NaN and makes +-0 order-independent.)
-    //   FMAXNMV/FMINNMV   — NaN-suppressing: substitute each NaN lane with the
-    //                        other operand via a CMPUNORDPS self-compare mask,
-    //                        then MAX/MIN. Mirrors the interpreter FmaxScalar /
-    //                        FmaxnmScalar reduction. The Armv8.2 FP16 (.4H/.8H)
+    // 0xB1) each fold lanes together through EmitArmFpMinMax, the vector
+    // three-same FMAX/FMIN/FMAXNM/FMINNM lowering, which mirrors the
+    // interpreter FmaxScalar / FmaxnmScalar reduction. The Armv8.2 FP16 (.4H/.8H)
     //                        form is handled separately just below, through the
     //                        F16C round-trip.
     case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
@@ -11126,52 +11024,14 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xn = AllocTempSimdReg();
       FpRegister xt = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      // Fold b (=xt) into a (=xn) with FP32 packed NaN-aware min/max.
-      auto EmitPairFp = [&](FpRegister a, FpRegister b) {
-        if (!is_nm) {
-          FpRegister tmp = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), b.machine_reg());
-          if (is_max) {
-            builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), a.machine_reg());
-            builder_.Gen<x86_64::MaxpsXRegXReg>(a.machine_reg(), b.machine_reg());
-          } else {
-            builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), a.machine_reg());
-            builder_.Gen<x86_64::MinpsXRegXReg>(a.machine_reg(), b.machine_reg());
-          }
-          builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), tmp.machine_reg());
-        } else {
-          FpRegister mask_a = AllocTempSimdReg();
-          FpRegister mask_b = AllocTempSimdReg();
-          FpRegister an_sub = AllocTempSimdReg();
-          FpRegister bn_sub = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), a.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), b.machine_reg());
-          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), b.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), a.machine_reg());
-          builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), a.machine_reg());
-          builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), b.machine_reg());
-          builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
-          builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
-          if (is_max) {
-            builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-          } else {
-            builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-          }
-          builder_.Gen<x86_64::MovdqaXRegXReg>(a.machine_reg(), mask_a.machine_reg());
-        }
-      };
       // Step 1: fold lanes {2,3} into {0,1}. PSHUFD 0x4E swaps the 64-bit halves.
       builder_.Gen<x86_64::PshufdXRegXRegImm>(
           xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
-      EmitPairFp(xn, xt);
+      xn = EmitArmFpMinMax(xn, xt, is_max, is_nm, /*is_double=*/false);
       // Step 2: fold lane 1 into lane 0. PSHUFD 0xB1 swaps adjacent dwords.
       builder_.Gen<x86_64::PshufdXRegXRegImm>(
           xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
-      EmitPairFp(xn, xt);
+      xn = EmitArmFpMinMax(xn, xt, is_max, is_nm, /*is_double=*/false);
       // Keep only the low 32-bit result lane; zero the upper 96 bits.
       builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
       builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
