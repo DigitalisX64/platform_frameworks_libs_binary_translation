@@ -128,6 +128,72 @@ const uint32_t* HeavyUnsignedEstimateTable(bool is_rsqrt) {
   return is_rsqrt ? kRsqrte : kRecpe;
 }
 
+// PSHUFB masks for the interleaved LD2/LD3/LD4 and ST2/ST3/ST4. The guest
+// memory of one instruction, num_regs * (Q ? 16 : 8) bytes, is moved as
+// 16-byte chunks (the last one 8 bytes when the total is not a multiple of
+// 16). Memory byte `off` belongs to register (off / esize) % num_regs, at
+// register byte (off / esize / num_regs) * esize + off % esize.
+//   load:  mask (r, j) moves the bytes of chunk j that belong to register r
+//          to their register bytes; the OR over j is register r.
+//   store: mask (r, j) moves the bytes of register r that belong to chunk j
+//          to their chunk bytes; the OR over r is chunk j.
+// Every other mask byte is 0x80, which PSHUFB turns into zero, so a Q=0
+// register's upper half comes out zero.
+constexpr int kStructMaxChunks = 4;
+constexpr int kStructMaxRegs = 4;
+struct alignas(16) StructPermuteMask {
+  uint8_t bytes[16];
+  bool used;
+};
+using StructPermuteMasks = std::array<StructPermuteMask, kStructMaxRegs * kStructMaxChunks>;
+
+int StructTotalBytes(int num_regs, bool q) {
+  return num_regs * (q ? 16 : 8);
+}
+
+StructPermuteMasks BuildStructPermuteMasks(bool is_store, int num_regs, int size, bool q) {
+  StructPermuteMasks masks{};
+  for (auto& mask : masks) {
+    std::fill(std::begin(mask.bytes), std::end(mask.bytes), uint8_t{0x80});
+  }
+  const int esize = 1 << size;
+  for (int off = 0; off < StructTotalBytes(num_regs, q); off++) {
+    const int element = off / esize;
+    const int r = element % num_regs;
+    const int reg_byte = (element / num_regs) * esize + off % esize;
+    const int j = off / 16;
+    auto& mask = masks[r * kStructMaxChunks + j];
+    if (is_store) {
+      mask.bytes[off % 16] = static_cast<uint8_t>(reg_byte);
+    } else {
+      mask.bytes[reg_byte] = static_cast<uint8_t>(off % 16);
+    }
+    mask.used = true;
+  }
+  return masks;
+}
+
+// Indexed by [is_store][num_regs - 2][size][q]; built once and never freed,
+// since translated code reads the masks by address.
+const StructPermuteMasks& GetStructPermuteMasks(bool is_store, int num_regs, int size, bool q) {
+  using Table = std::array<StructPermuteMasks, 2 * 3 * 4 * 2>;
+  static const Table* const kTable = [] {
+    auto* table = new Table;
+    for (int st = 0; st < 2; st++) {
+      for (int n = 2; n <= 4; n++) {
+        for (int s = 0; s < 4; s++) {
+          for (int qq = 0; qq < 2; qq++) {
+            (*table)[((st * 3 + (n - 2)) * 4 + s) * 2 + qq] =
+                BuildStructPermuteMasks(st != 0, n, s, qq != 0);
+          }
+        }
+      }
+    }
+    return table;
+  }();
+  return (*kTable)[(((is_store ? 1 : 0) * 3 + (num_regs - 2)) * 4 + size) * 2 + (q ? 1 : 0)];
+}
+
 }  // namespace
 
 using Register = HeavyOptimizerFrontend::Register;
@@ -15764,11 +15830,11 @@ void HeavyOptimizerFrontend::AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t 
 // access is the unaligned MOVDQU/MOVSD form wrapped in a recovery block so a
 // host fault reaches the guest signal handler; the 16-byte-aligned V[] slots
 // use GenGetSimd/GenSetSimd (MOVDQA). The Q=0 load uses MOVSD reg<-mem, which
-// zero-extends the upper 64 bits (D-register semantics). The interleaving
-// LD2/LD3/LD4 / ST2/ST3/ST4 de-interleave forms still bail to the lite tier
-// (their element-wise PINSR/PEXTR-from-memory has no heavy LIR op yet).
-// Mirrors lite_translator.h::AdvSimdMultiStruct (both the interleaved
-// LDn/STn de-/interleave path and the non-interleaved contiguous LD1/ST1).
+// zero-extends the upper 64 bits (D-register semantics). The interleaved
+// LD2/LD3/LD4 / ST2/ST3/ST4 move the same whole chunks and de-/interleave
+// them in XMM registers with PSHUFB (below). Same results as
+// lite_translator.h::AdvSimdMultiStruct, which moves the interleaved forms
+// element by element.
 void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
                                                 uint8_t rn,
                                                 uint8_t num_regs,
@@ -15784,18 +15850,17 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
   const int32_t vec_bytes = q ? 16 : 8;
 
   // De-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4 (multiple-structure
-  // form). Mirrors the lite translator's element-wise lowering: memory holds
-  // num_regs * (vec_bytes/esize) elements laid out structure-major — element e
-  // in memory belongs to register (e % num_regs), lane (e / num_regs). Because
-  // the heavy tier has NO memory-operand PINSR/PEXTR (only the register forms),
-  // each element is routed through a GP temp:
-  //   load : MOV{zx,}* mem->gp (+recovery) then PINSR gp->lane; the destination
-  //          register starts from a zeroed XMM so Q=0 zeroes the upper 64 bits.
-  //   store: PEXTR lane->gp then MOV* gp->mem (+recovery).
-  // The v[] register accesses stay full-width (GenGetSimd<16>/GenSetSimd<16>) so
-  // the optimizer's 16-byte store/load forwarding on a v[] slot is never split
-  // by a narrow sub-lane access (see the UMOV/INS-element note above); only the
-  // guest-memory side is narrow. Exact for every (num_regs, esize, Q) combo.
+  // form): memory holds num_regs * (vec_bytes/esize) elements laid out
+  // structure-major, element e in memory belonging to register (e % num_regs),
+  // lane (e / num_regs). The guest memory moves as whole 16-byte chunks
+  // (MOVDQU, or MOVSD for an 8-byte tail, each with a recovery block), and
+  // PSHUFB with the GetStructPermuteMasks masks moves the bytes between chunks
+  // and registers; POR combines the parts. A load writes no V register until
+  // every chunk is read, and a store reads every V register before it writes.
+  // The v[] register accesses stay full-width (GenGetSimd<16>/GenSetSimd<16>)
+  // so the optimizer's 16-byte store/load forwarding on a v[] slot is never
+  // split by a narrow sub-lane access (see the UMOV/INS-element note above).
+  // Exact for every (num_regs, esize, Q) combo.
   if (is_interleaved) {
     if (num_regs < 2 || num_regs > 4) {
       UndefinedReturningVoid();
@@ -15805,73 +15870,80 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
       UndefinedReturningVoid();
       return;
     }
-    const int esize = 1 << size;
-    const int num_lanes = vec_bytes / esize;
+    const int total_bytes = StructTotalBytes(num_regs, q);
+    const int num_chunks = (total_bytes + 15) / 16;
+    const auto& masks = GetStructPermuteMasks(is_store, num_regs, size, q);
 
     Register ibase_orig = (rn == 31) ? GetSp() : GetReg(rn);
     Register ibase = ApplyTbi(ibase_orig);
 
-    for (uint8_t r = 0; r < num_regs; r++) {
-      const uint8_t vreg = (rt + r) & 31;
-      const int32_t vt_off =
-          GetVRegOffset(vreg);
-      if (is_store) {
-        FpRegister xmm = AllocTempSimdReg();
-        builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
-        for (int l = 0; l < num_lanes; l++) {
-          const int32_t mem_off = static_cast<int32_t>((l * num_regs + r) * esize);
-          const int8_t lane = static_cast<int8_t>(l);
-          Register elem;
-          switch (esize) {
-            case 1:
-              elem = std::get<0>(Gen<x86_64::PextrbRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovbOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-            case 2:
-              elem = std::get<0>(Gen<x86_64::PextrwRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovwOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-            case 4:
-              elem = std::get<0>(Gen<x86_64::PextrdRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovlOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-            default:  // esize == 8
-              elem = std::get<0>(Gen<x86_64::PextrqRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovqOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-          }
-          GenRecoveryBlockForLastInsn();
-        }
+    // Returns `src` permuted by mask (r, j), or nullopt when the mask moves no
+    // byte. `src` itself is kept.
+    auto permute = [&](FpRegister src, int r, int j) -> std::optional<FpRegister> {
+      const auto& mask = masks[r * kStructMaxChunks + j];
+      if (!mask.used) {
+        return std::nullopt;
+      }
+      FpRegister part = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(part.machine_reg(), src.machine_reg());
+      Register mask_addr = GetImm(reinterpret_cast<uint64_t>(mask.bytes));
+      FpRegister xmask{std::get<0>(Gen<x86_64::MovdqaXRegOp>({.base = mask_addr, .disp = 0}))};
+      builder_.Gen<x86_64::PshufbXRegXReg>(part.machine_reg(), xmask.machine_reg());
+      return part;
+    };
+    auto combine = [&](std::optional<FpRegister>& acc, std::optional<FpRegister> part) {
+      if (!part) {
+        return;
+      }
+      if (!acc) {
+        acc = part;
       } else {
-        FpRegister xmm = AllocZeroedSimdReg();
-        for (int l = 0; l < num_lanes; l++) {
-          const int32_t mem_off = static_cast<int32_t>((l * num_regs + r) * esize);
-          const int8_t lane = static_cast<int8_t>(l);
-          Register elem;
-          switch (esize) {
-            case 1:
-              elem = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-            case 2:
-              elem = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-            case 4:
-              elem = std::get<0>(Gen<x86_64::MovlRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-            default:  // esize == 8
-              elem = std::get<0>(Gen<x86_64::MovqRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-          }
+        builder_.Gen<x86_64::PorXRegXReg>(acc->machine_reg(), part->machine_reg());
+      }
+    };
+
+    if (is_store) {
+      FpRegister vregs[kStructMaxRegs];
+      for (uint8_t r = 0; r < num_regs; r++) {
+        vregs[r] = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(vregs[r].machine_reg(), GetVRegOffset((rt + r) & 31));
+      }
+      for (int j = 0; j < num_chunks; j++) {
+        std::optional<FpRegister> chunk;
+        for (uint8_t r = 0; r < num_regs; r++) {
+          combine(chunk, permute(vregs[r], r, j));
         }
-        builder_.GenSetSimd<16>(vt_off, xmm.machine_reg());
+        CHECK(chunk.has_value());
+        const int32_t mem_off = 16 * j;
+        if (total_bytes - mem_off >= 16) {
+          builder_.Gen<x86_64::MovdquOpXReg>({.base = ibase, .disp = mem_off},
+                                             chunk->machine_reg());
+        } else {
+          builder_.Gen<x86_64::MovsdOpXReg>({.base = ibase, .disp = mem_off},
+                                            chunk->machine_reg());
+        }
+        GenRecoveryBlockForLastInsn();
+      }
+    } else {
+      FpRegister chunks[kStructMaxChunks];
+      for (int j = 0; j < num_chunks; j++) {
+        const int32_t mem_off = 16 * j;
+        // MOVSD reg<-mem loads the 8-byte tail and zeroes the upper half.
+        chunks[j] =
+            total_bytes - mem_off >= 16
+                ? FpRegister{std::get<0>(
+                      Gen<x86_64::MovdquXRegOp>({.base = ibase, .disp = mem_off}))}
+                : FpRegister{std::get<0>(
+                      Gen<x86_64::MovsdXRegOp>({.base = ibase, .disp = mem_off}))};
+        GenRecoveryBlockForLastInsn();
+      }
+      for (uint8_t r = 0; r < num_regs; r++) {
+        std::optional<FpRegister> value;
+        for (int j = 0; j < num_chunks; j++) {
+          combine(value, permute(chunks[j], r, j));
+        }
+        CHECK(value.has_value());
+        builder_.GenSetSimd<16>(GetVRegOffset((rt + r) & 31), value->machine_reg());
       }
     }
 

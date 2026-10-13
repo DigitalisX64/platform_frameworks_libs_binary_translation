@@ -22,6 +22,9 @@
 #include <iterator>
 #include <limits>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "berberis/assembler/machine_code.h"
 #include "berberis/backend/x86_64/code_gen.h"
 #include "berberis/backend/x86_64/machine_ir.h"
@@ -3430,6 +3433,79 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Ld2WrapV31) {
     EXPECT_EQ(r31[l], buf[l * 2 + 0]);
     EXPECT_EQ(r0[l], buf[l * 2 + 1]);
   }
+}
+
+// Every interleaved LDn/STn layout (n = 2..4, every element size, Q=0 and
+// Q=1) against the element order: memory element e is register (e % n), lane
+// (e / n). The data ends at a PROT_NONE page, so a load or store past the
+// structures faults, and guard bytes before the data catch a store before
+// them. The register list starts at v30, so n >= 3 wraps to v0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, InterleavedStructAllLayouts) {
+  const size_t page = sysconf(_SC_PAGESIZE);
+  auto* mem = static_cast<uint8_t*>(
+      mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  ASSERT_NE(mem, MAP_FAILED);
+  ASSERT_EQ(mprotect(mem + page, page, PROT_NONE), 0);
+  const struct {
+    uint8_t op;
+    int n;
+  } kForms[] = {{kLd2Op, 2}, {kLd3Op, 3}, {kLd4Op, 4}};
+  constexpr uint8_t kRt = 30;
+  for (auto form : kForms) {
+    for (uint8_t size = 0; size < 4; size++) {
+      for (bool q : {false, true}) {
+        if (size == 3 && !q) {
+          continue;  // Reserved encoding.
+        }
+        SCOPED_TRACE(testing::Message() << "n=" << form.n << " size=" << int{size} << " q=" << q);
+        const int esize = 1 << size;
+        const int vec_bytes = q ? 16 : 8;
+        const int total = form.n * vec_bytes;
+        uint8_t* data = mem + page - total;
+        auto mem_byte_of = [&](int r, int b) { return ((b / esize) * form.n + r) * esize + b % esize; };
+
+        for (int i = 0; i < total; i++) {
+          data[i] = static_cast<uint8_t>(i * 13 + size * 7 + form.n);
+        }
+        for (int r = 0; r < 4; r++) {
+          std::memset(&state_.cpu.v[(kRt + r) & 31], 0xA5, 16);
+        }
+        const uint32_t load[] = {AdvSimdMultiEnc(q, false, true, 0, form.op, size, 1, kRt)};
+        state_.cpu.x[1] = ToGuestAddr(data);
+        state_.cpu.insn_addr = ToGuestAddr(load);
+        ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(load) + sizeof(load)));
+        for (int r = 0; r < form.n; r++) {
+          uint8_t got[16];
+          std::memcpy(got, &state_.cpu.v[(kRt + r) & 31], 16);
+          for (int b = 0; b < 16; b++) {
+            EXPECT_EQ(got[b], b < vec_bytes ? data[mem_byte_of(r, b)] : 0) << "r=" << r << " b=" << b;
+          }
+        }
+
+        uint8_t regs[4][16];
+        for (int r = 0; r < form.n; r++) {
+          for (int b = 0; b < 16; b++) {
+            regs[r][b] = static_cast<uint8_t>(0x40 * r + b * 3 + 1);
+          }
+          std::memcpy(&state_.cpu.v[(kRt + r) & 31], regs[r], 16);
+        }
+        std::memset(data - 16, 0x5A, 16 + total);
+        const uint32_t store[] = {AdvSimdMultiEnc(q, false, false, 0, form.op, size, 1, kRt)};
+        state_.cpu.x[1] = ToGuestAddr(data);
+        state_.cpu.insn_addr = ToGuestAddr(store);
+        ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(store) + sizeof(store)));
+        for (int i = -16; i < 0; i++) {
+          EXPECT_EQ(data[i], 0x5A) << "guard " << i;
+        }
+        for (int r = 0; r < form.n; r++) {
+          for (int b = 0; b < vec_bytes; b++) {
+            EXPECT_EQ(data[mem_byte_of(r, b)], regs[r][b]) << "r=" << r << " b=" << b;
+          }
+        }
+      }
+    }
+  }
+  munmap(mem, 2 * page);
 }
 
 // AdvSIMD load/store SINGLE structure: LD1R (replicate), single-element LD1 /
