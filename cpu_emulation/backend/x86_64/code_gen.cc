@@ -75,6 +75,10 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
   if (!IsConfigFlagSet(kDisableHeavyOptimizations)) {
     MoveColdBlocksToEnd(machine_ir);
     RemoveLoopGuestContextAccesses(machine_ir);
+    // region digitalis
+    // Values the local pass cannot carry past the end of a recovery split.
+    ForwardGuestContextGetsAcrossRecoverySplits(machine_ir);
+    // endregion digitalis
   }
 
   // Required unconditionally for the correct work of AllocRegs.

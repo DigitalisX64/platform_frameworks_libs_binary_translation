@@ -175,6 +175,7 @@
         "MovqRegXReg",
         "MovqXRegMemInsns",
         "MovqXRegReg",
+        "MovqXRegXReg",
         "MovsdMemXRegInsns",
         "MovsdXRegMemInsns",
         "MovsdXRegXReg",

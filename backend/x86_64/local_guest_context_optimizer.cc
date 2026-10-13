@@ -16,6 +16,7 @@
 
 #include "berberis/backend/x86_64/local_guest_context_optimizer.h"
 
+#include <algorithm>
 #include <optional>
 #include <variant>
 
@@ -267,5 +268,268 @@ void RemoveLocalGuestContextAccesses(x86_64::MachineIR* machine_ir,
   LocalGuestContextOptimizer optimizer(machine_ir);
   optimizer.RemoveLocalGuestContextAccesses(params);
 }
+
+// region digitalis
+namespace {
+
+// The continuation of a block that a faulting guest memory access ended: the
+// target of its PseudoBranch, when the block's only other successor is the
+// recovery block and the target has no other predecessor.
+MachineBasicBlock* GetRecoveryContinuation(const MachineBasicBlock* bb) {
+  if (bb->is_recovery() || bb->insn_list().empty() ||
+      bb->insn_list().back()->opcode() != kMachineOpPseudoBranch || bb->out_edges().size() != 2) {
+    return nullptr;
+  }
+  const auto* target = static_cast<const PseudoBranch*>(bb->insn_list().back())->then_bb();
+  MachineBasicBlock* next = nullptr;
+  bool has_recovery = false;
+  for (auto* edge : bb->out_edges()) {
+    if (edge->dst() == target) {
+      next = edge->dst();
+    } else {
+      has_recovery |= edge->dst()->is_recovery();
+    }
+  }
+  if (!next || !has_recovery || next->is_recovery() || next->in_edges().size() != 1) {
+    return nullptr;
+  }
+  return next;
+}
+
+// Forwards guest-context reads within one chain of recovery-split blocks. The
+// chain is a straight line (each continuation has a single predecessor), so a
+// value recorded earlier in it reaches every later instruction unless an
+// instruction in between redefines its register or writes the slot.
+class RecoverySplitGetForwarder {
+ public:
+  RecoverySplitGetForwarder(MachineIR* machine_ir, const OptimizeLocalParams& params)
+      : machine_ir_(machine_ir),
+        params_(params),
+        map_(sizeof(CPUState), std::nullopt, machine_ir->arena()),
+        optimized_offsets_(sizeof(CPUState), false, machine_ir->arena()),
+        optimized_offset_list_(machine_ir->arena()) {}
+
+  void ForwardChain(const ArenaVector<MachineBasicBlock*>& chain);
+
+ private:
+  struct MappedValue {
+    MachineReg reg;
+    ContextAccess access;
+    // Instruction count along the chain when the value was recorded.
+    size_t position;
+    const MachineBasicBlock* bb;
+    // Recorded by this pass's own copy rather than by a get or put the local
+    // pass also sees.
+    bool forwarded;
+    // The register holds exactly `access.size` bytes of the slot with the
+    // rest zeroed, as a load from memory leaves it.
+    bool zero_extended;
+  };
+
+  void SelectOffsets(const ArenaVector<MachineBasicBlock*>& chain);
+  void InvalidateOverlapping(int64_t begin, int64_t end);
+  void InvalidateReg(MachineReg reg);
+  void ForwardInsn(const MachineBasicBlock* bb, MachineInsnList::iterator insn_it);
+
+  MachineIR* machine_ir_;
+  OptimizeLocalParams params_;
+  ArenaVector<std::optional<MappedValue>> map_;
+  ArenaVector<bool> optimized_offsets_;
+  ArenaVector<size_t> optimized_offset_list_;
+  size_t position_ = 0;
+};
+
+// Like the local pass, map only the most accessed slots of each class so the
+// forwarded values do not crowd out the allocator. Flag-sized (2-byte) slots
+// are left to the local pass: the flag fusions read cpu.flags across their
+// own entry blocks.
+void RecoverySplitGetForwarder::SelectOffsets(const ArenaVector<MachineBasicBlock*>& chain) {
+  for (size_t offset : optimized_offset_list_) {
+    optimized_offsets_[offset] = false;
+    map_[offset] = std::nullopt;
+  }
+  optimized_offset_list_.clear();
+
+  ArenaVector<int> counts(sizeof(CPUState), 0, machine_ir_->arena());
+  for (auto* bb : chain) {
+    for (auto* insn : bb->insn_list()) {
+      if ((machine_ir_->IsCPUStateGet(insn) || machine_ir_->IsCPUStatePut(insn)) &&
+          GetContextAccess(insn).size != 2) {
+        counts.at(AsMachineInsnX86_64(insn)->disp())++;
+      }
+    }
+  }
+  OffsetCounterMap sorted(machine_ir_->arena());
+  for (size_t offset = 0; offset < sizeof(CPUState); offset++) {
+    if (counts[offset] > 0) {
+      sorted.push_back({offset, counts[offset]});
+    }
+  }
+  std::stable_sort(
+      sorted.begin(), sorted.end(), [](auto a, auto b) { return a.second > b.second; });
+  size_t general_reg_count = 0;
+  size_t simd_reg_count = 0;
+  for (auto [offset, unused_count] : sorted) {
+    size_t& count = IsSimdOffset(offset) ? simd_reg_count : general_reg_count;
+    size_t limit = IsSimdOffset(offset) ? params_.simd_reg_limit : params_.general_reg_limit;
+    if (count++ < limit) {
+      optimized_offsets_[offset] = true;
+      optimized_offset_list_.push_back(offset);
+    }
+  }
+}
+
+void RecoverySplitGetForwarder::InvalidateOverlapping(int64_t begin, int64_t end) {
+  for (size_t offset : optimized_offset_list_) {
+    auto& entry = map_[offset];
+    if (entry.has_value() && static_cast<int64_t>(offset) < end &&
+        begin < static_cast<int64_t>(offset + entry.value().access.size)) {
+      entry = std::nullopt;
+    }
+  }
+}
+
+void RecoverySplitGetForwarder::InvalidateReg(MachineReg reg) {
+  for (size_t offset : optimized_offset_list_) {
+    auto& entry = map_[offset];
+    if (entry.has_value() && entry.value().reg == reg) {
+      entry = std::nullopt;
+    }
+  }
+}
+
+void RecoverySplitGetForwarder::ForwardInsn(const MachineBasicBlock* bb,
+                                            MachineInsnList::iterator insn_it) {
+  auto* insn = AsMachineInsnX86_64(*insn_it);
+  // No guest-context pass models a call as reading or writing guest state;
+  // forget everything rather than carry a value across one.
+  if (insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpCallImmArg) {
+    for (size_t offset : optimized_offset_list_) {
+      map_[offset] = std::nullopt;
+    }
+    return;
+  }
+  // A redefined register no longer holds the slot it was recorded for (this
+  // runs before a get records its own destination).
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (insn->RegKindAt(i).IsDef()) {
+      InvalidateReg(insn->RegAt(i));
+    }
+  }
+
+  if (machine_ir_->IsCPUStateGet(insn)) {
+    size_t disp = insn->disp();
+    auto access = GetContextAccess(insn);
+    if (!optimized_offsets_[disp] || access.size == 2) {
+      return;
+    }
+    MachineReg dst = insn->RegAt(0);
+    auto& entry = map_[disp];
+    if (!entry.has_value() || entry.value().access.is_simd != access.is_simd ||
+        entry.value().access.size < access.size) {
+      if (dst.IsVReg()) {
+        entry = MappedValue{dst, access, position_, bb, false, true};
+      }
+      return;
+    }
+    // Within one block the local pass forwards the value later, with a plain
+    // copy the allocator can coalesce.
+    if (entry.value().bb == bb && !entry.value().forwarded) {
+      return;
+    }
+    // A value carried further keeps its register live across the whole
+    // chain: in long straight-line regions the allocator then spills it
+    // (unbounded forwarding added hundreds of stack accesses to some hot
+    // regions). Full vectors are not carried at all: XMM registers run out
+    // first in the vector kernels the loop pass already keeps in registers.
+    // Reload instead, and carry the reloaded value on.
+    constexpr size_t kMaxForwardDistance = 32;
+    constexpr size_t kMaxForwardedSimdSize = 8;
+    if (access.is_simd && access.size > kMaxForwardedSimdSize) {
+      if (dst.IsVReg()) {
+        entry = MappedValue{dst, access, position_, bb, false, true};
+      }
+      return;
+    }
+    if (position_ - entry.value().position > kMaxForwardDistance) {
+      if (dst.IsVReg()) {
+        entry = MappedValue{dst, access, position_, bb, false, true};
+      }
+      return;
+    }
+    MachineReg src = entry.value().reg;
+    if (access.is_simd && access.size == 8 &&
+        !(entry.value().access.size == 8 && entry.value().zero_extended)) {
+      // MOVSD from memory zeroes the upper half; the recorded register may
+      // hold a full vector (or a scalar put's stale upper half).
+      *insn_it = machine_ir_->NewInsn<MovqXRegXReg>(dst, src);
+    } else {
+      *insn_it = machine_ir_->NewInsn<PseudoCopy>(dst, src, access.size);
+    }
+    // The copy now holds the slot; carrying it on keeps the source's live
+    // range short.
+    if (access.size == entry.value().access.size && dst.IsVReg()) {
+      entry = MappedValue{dst, access, position_, bb, true, true};
+    }
+    return;
+  }
+
+  if (machine_ir_->IsCPUStatePut(insn)) {
+    size_t disp = insn->disp();
+    auto access = GetContextAccess(insn);
+    InvalidateOverlapping(disp, disp + access.size);
+    if (optimized_offsets_[disp] && access.size != 2 &&
+        insn->opcode() != kMachineOpMovqMemBaseDispImm && insn->RegAt(1).IsVReg()) {
+      map_[disp] = MappedValue{insn->RegAt(1), access, position_, bb, false, false};
+    }
+    return;
+  }
+
+  // Any other access through the state pointer may write guest state in a
+  // form the map does not model: forget every slot it could touch.
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (insn->RegAt(i) == kCPUStatePointer) {
+      constexpr int64_t kMaxAccessSize = 32;
+      int64_t disp = static_cast<int32_t>(insn->disp());
+      InvalidateOverlapping(disp, disp + kMaxAccessSize);
+      int64_t disp2 = static_cast<int32_t>(insn->disp2());
+      if (disp2 != 0) {
+        InvalidateOverlapping(disp2, disp2 + kMaxAccessSize);
+      }
+      break;
+    }
+  }
+}
+
+void RecoverySplitGetForwarder::ForwardChain(const ArenaVector<MachineBasicBlock*>& chain) {
+  SelectOffsets(chain);
+  for (auto* bb : chain) {
+    for (auto insn_it = bb->insn_list().begin(); insn_it != bb->insn_list().end(); insn_it++) {
+      ForwardInsn(bb, insn_it);
+      position_++;
+    }
+  }
+}
+
+}  // namespace
+
+void ForwardGuestContextGetsAcrossRecoverySplits(x86_64::MachineIR* machine_ir,
+                                                 const OptimizeLocalParams& params) {
+  RecoverySplitGetForwarder forwarder(machine_ir, params);
+  ArenaVector<MachineBasicBlock*> chain(machine_ir->arena());
+  for (auto* bb : machine_ir->bb_list()) {
+    if (bb->in_edges().size() == 1 && GetRecoveryContinuation(bb->in_edges()[0]->src()) == bb) {
+      continue;  // Not a chain head: forwarded with its predecessor.
+    }
+    chain.clear();
+    for (auto* link = bb; link != nullptr; link = GetRecoveryContinuation(link)) {
+      chain.push_back(link);
+    }
+    if (chain.size() > 1) {
+      forwarder.ForwardChain(chain);
+    }
+  }
+}
+// endregion digitalis
 
 }  // namespace berberis::x86_64

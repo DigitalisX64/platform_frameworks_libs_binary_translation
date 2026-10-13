@@ -29,6 +29,18 @@ constexpr uint32_t kSmull2V3V1V2 = 0x4e22c023;     // smull2 v3.8h, v1.16b, v2.1
 constexpr uint32_t kSubsX4X4Imm1 = 0xf1000484;     // subs x4, x4, #1
 constexpr uint32_t kSubsX5X5Imm1 = 0xf10004a5;     // subs x5, x5, #1
 constexpr uint32_t kAddX6X6X7 = 0x8b0700c6;        // add x6, x6, x7
+constexpr uint32_t kLdrS1X0 = 0xbd400001;          // ldr s1, [x0]
+constexpr uint32_t kLdrS2X0Imm4 = 0xbd400402;      // ldr s2, [x0, #4]
+constexpr uint32_t kFaddS3S3S1 = 0x1e212863;       // fadd s3, s3, s1
+constexpr uint32_t kFaddS3S3S2 = 0x1e222863;       // fadd s3, s3, s2
+constexpr uint32_t kStrS3X1 = 0xbd000023;          // str s3, [x1]
+constexpr uint32_t kStrS3X1Imm4 = 0xbd000423;      // str s3, [x1, #4]
+constexpr uint32_t kAddX0X0Imm8 = 0x91002000;      // add x0, x0, #8
+constexpr uint32_t kAddX1X1Imm8 = 0x91002021;      // add x1, x1, #8
+constexpr uint32_t kLd1V1D1X0 = 0x4d408401;        // ld1 {v1.d}[1], [x0]
+constexpr uint32_t kAddV3V1V2_16B = 0x4e228423;    // add v3.16b, v1.16b, v2.16b
+constexpr uint32_t kLdrX9X0 = 0xf9400009;          // ldr x9, [x0]
+constexpr uint32_t kAddX6X6X9 = 0x8b0900c6;        // add x6, x6, x9
 
 // MOVZ Xd, #imm16.
 constexpr uint32_t MovzX(uint8_t rd, uint16_t imm16) {
@@ -186,6 +198,116 @@ TEST_F(Arm64HeavyLoopContextTest, WideningMultiplyLeavesSourcesIntact) {
   EXPECT_EQ(memcmp(actual_v2, v2_bytes, sizeof(actual_v2)), 0);
   EXPECT_EQ(memcmp(actual_v3, expected_v3, sizeof(actual_v3)), 0);
   EXPECT_EQ(memcmp(actual_v4, expected_v4, sizeof(actual_v4)), 0);
+}
+
+// Guest loads and stores end their host basic block (the fault recovery
+// split), and guest-register reads are forwarded across those splits: the
+// scalar accumulator s3 is written, stored to memory and read again between
+// guest loads. v3 is accessed at 64 and 128 bits, so the loop pass leaves it
+// in memory and only the forwarding carries it.
+TEST_F(Arm64HeavyLoopContextTest, ScalarChainAcrossGuestMemoryAccesses) {
+  static const uint32_t code[] = {
+      kLdrS1X0,       // [0] loop top
+      kFaddS3S3S1,    // [1]
+      kStrS3X1,       // [2]
+      kLdrS2X0Imm4,   // [3]
+      kFaddS3S3S2,    // [4]
+      kStrS3X1Imm4,   // [5]
+      kAddX0X0Imm8,   // [6]
+      kAddX1X1Imm8,   // [7]
+      kSubsX5X5Imm1,  // [8]
+      BneBy(-36),     // [9] -> [0]
+  };
+  float in[8] = {1.5f, 2.25f, -3.0f, 4.0f, 0.125f, 6.0f, -7.5f, 8.0f};
+  float out[8] = {};
+  state_.cpu.x[0] = ToGuestAddr(in);
+  state_.cpu.x[1] = ToGuestAddr(out);
+  state_.cpu.x[5] = 4;
+  float s3 = 0.5f;
+  uint32_t s3_bits;
+  memcpy(&s3_bits, &s3, sizeof(s3_bits));
+  // Garbage above the scalar: the first FADD's write must zero it.
+  state_.cpu.v[3] = (static_cast<__uint128_t>(~uint64_t{0}) << 64) | s3_bits;
+  Run(code);
+
+  float expected_out[8];
+  for (int i = 0; i < 8; i++) {
+    s3 += in[i];
+    expected_out[i] = s3;
+  }
+  memcpy(&s3_bits, &s3, sizeof(s3_bits));
+  EXPECT_EQ(memcmp(out, expected_out, sizeof(out)), 0);
+  EXPECT_TRUE(state_.cpu.v[3] == s3_bits);
+  EXPECT_EQ(state_.cpu.x[0], ToGuestAddr(in + 8));
+  EXPECT_EQ(state_.cpu.x[1], ToGuestAddr(out + 8));
+}
+
+// A full-width write of v1, then a guest load into its upper half, then a
+// full-width read: the read must see the loaded half, not the value the
+// full-width write left in a host register before the split.
+TEST_F(Arm64HeavyLoopContextTest, LaneLoadAfterFullWidthWriteAcrossSplit) {
+  static const uint32_t code[] = {
+      kAddV1V1V2_16B,  // [0] loop top: v1.16b += 1
+      kLd1V1D1X0,      // [1] v1.d[1] = *x0
+      kAddV3V1V2_16B,  // [2] v3.16b = v1.16b + 1
+      kLdrX9X0,        // [3]
+      kAddX6X6X9,      // [4]
+      kSubsX5X5Imm1,   // [5]
+      BneBy(-24),      // [6] -> [0]
+  };
+  uint64_t lane = 0x0807060504030201;
+  __uint128_t ones = 0;
+  for (int i = 0; i < 16; i++) {
+    ones |= static_cast<__uint128_t>(1) << (i * 8);
+  }
+  state_.cpu.x[0] = ToGuestAddr(&lane);
+  state_.cpu.x[5] = 3;
+  state_.cpu.x[6] = 0;
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = ones;
+  Run(code);
+
+  // Bytes never carry here, so the byte-wise adds are plain additions.
+  __uint128_t expected_v1 = (static_cast<__uint128_t>(lane) << 64) | uint64_t{0x0303030303030303};
+  EXPECT_TRUE(state_.cpu.v[1] == expected_v1);
+  EXPECT_TRUE(state_.cpu.v[3] == expected_v1 + ones);
+  EXPECT_EQ(state_.cpu.x[6], 3 * lane);
+}
+
+// A full-width vector write, a guest load, then a 64-bit read of the same
+// register: the read sees the low half the vector write produced.
+TEST_F(Arm64HeavyLoopContextTest, VectorWriteThenScalarReadAcrossSplit) {
+  static const uint32_t code[] = {
+      kAddV1V1V2_4S,   // [0] loop top
+      kLdrX9X0,        // [1]
+      kFaddD3D3D1,     // [2]
+      kAddX6X6X9,      // [3]
+      kSubsX5X5Imm1,   // [4]
+      BneBy(-20),      // [5] -> [0]
+  };
+  uint64_t value = 7;
+  state_.cpu.x[0] = ToGuestAddr(&value);
+  state_.cpu.x[5] = 5;
+  state_.cpu.x[6] = 0;
+  state_.cpu.v[1] = 0;
+  state_.cpu.v[2] = SplatU32(1);
+  state_.cpu.v[3] = 0;
+  Run(code);
+
+  __uint128_t v1 = 0;
+  double d3 = 0;
+  for (int i = 0; i < 5; i++) {
+    v1 += SplatU32(1);
+    double d1;
+    uint64_t low = static_cast<uint64_t>(v1);
+    memcpy(&d1, &low, sizeof(d1));
+    d3 += d1;
+  }
+  uint64_t d3_bits;
+  memcpy(&d3_bits, &d3, sizeof(d3_bits));
+  EXPECT_TRUE(state_.cpu.v[1] == v1);
+  EXPECT_TRUE(state_.cpu.v[3] == d3_bits);
+  EXPECT_EQ(state_.cpu.x[6], 35u);
 }
 
 }  // namespace
