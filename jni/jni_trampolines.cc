@@ -17,6 +17,8 @@
 #include "berberis/jni/jni_trampolines.h"
 
 #include <bit>
+#include <sys/mman.h>
+
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -486,16 +488,76 @@ void WrapJvmtiExtensionFunctionInfosIfNeeded(int extension_count,
 // addresses.
 std::mutex g_jni_wrap_mutex;
 
-void WrapJNIEnvTableOnce(JNIEnv* host_jni_env) {
+// A JNIEnv is little more than a pointer to its JNINativeInterface dispatch
+// table, so copying the JNIEnv struct for the guest left the guest pointing at
+// the host runtime's own live table. Host code in the same process dispatches
+// through that same table -- libhwui's SkJavaOutputStream::write reaches
+// CallVoidMethodV that way -- so a guest that installs a JNI hook, by writing a
+// GUEST function pointer over a table entry, redirects host callers into guest
+// code. The host then fetches guest instructions from a page it cannot execute
+// and takes SIGSEGV with pc == si_addr and si_code == SEGV_ACCERR. Seen with
+// Kuaishou's libweapon anti-tamper SDK hooking a single entry: host callers of
+// it died outright, and a host-created thread that entered the hook was left
+// parked where ART could not suspend it, which ART ends with a "SuspendAll
+// timeout" abort.
+//
+// So hand the guest its own copy of the table. The copy holds the same host
+// function addresses, which is what WrapJNIEnv registers as guest-callable
+// trampolines, so guest calls behave exactly as before; a guest-installed hook
+// now lands in the guest's copy, where its pointers are callable, and the
+// host's table keeps the host's own entries. One copy per host table, shared by
+// every guest env pointing at that table, so a guest hook applies across guest
+// threads as it would on a real device.
+//
+// Copy a dispatch table onto pages of its own, then make them read-only.
+//
+// Both properties matter for a guest that hooks the table. A hooking SDK calls
+// mprotect() to open the table for writing and then restores the protection it
+// found, exactly as it would on a real device where the runtime's table sits in
+// read-only data. Had the copy lived in the heap, that restore would turn a
+// page of unrelated allocations read-only and the next write to any of them
+// would fault; and leaving the copy writable would mislead the SDK into
+// restoring PROT_READ over a page that was never read-only to begin with. So
+// the copy gets its own mapping, with the protection the host's table has.
+//
+// Never unmapped: a dispatch table lives as long as the runtime that owns it,
+// and guest envs pointing at this copy outlive any scope here.
+const JNINativeInterface* CopyJNIEnvTableToOwnPages(const JNINativeInterface* table) {
+  void* pages = mmap(nullptr,
+                     sizeof(JNINativeInterface),
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS,
+                     -1,
+                     0);
+  if (pages == MAP_FAILED) {
+    // Nothing useful to fall back to: handing back the host's own table is the
+    // very aliasing this copy exists to prevent.
+    LOG_ALWAYS_FATAL("Failed to allocate a guest copy of the JNIEnv dispatch table");
+  }
+  memcpy(pages, table, sizeof(JNINativeInterface));
+  if (mprotect(pages, sizeof(JNINativeInterface), PROT_READ) != 0) {
+    // Writable is still correct for dispatch; it only means a hooking guest
+    // sees a protection the host's table would not have had.
+    TRACE("Could not make the guest JNIEnv dispatch table read-only");
+  }
+  return static_cast<const JNINativeInterface*>(pages);
+}
+
+// Returns the table the guest env should use.
+const JNINativeInterface* WrapJNIEnvTableOnce(JNIEnv* host_jni_env) {
   if (host_jni_env == nullptr) {
-    return;
+    return nullptr;
   }
-  static auto* g_wrapped_jni_tables = new std::map<const void*, char>();
-  const void* table = *reinterpret_cast<const void* const*>(host_jni_env);
+  static auto* g_wrapped_jni_tables =
+      new std::map<const JNINativeInterface*, const JNINativeInterface*>();
+  const JNINativeInterface* table = host_jni_env->functions;
   std::lock_guard<std::mutex> lock(g_jni_wrap_mutex);
-  if (g_wrapped_jni_tables->emplace(table, 0).second) {
+  auto [it, inserted] = g_wrapped_jni_tables->emplace(table, nullptr);
+  if (inserted) {
     WrapJNIEnv(host_jni_env);
+    it->second = CopyJNIEnvTableToOwnPages(table);
   }
+  return it->second;
 }
 // endregion
 
@@ -506,10 +568,11 @@ GuestType<JNIEnv*> ToGuestJNIEnv(JNIEnv* host_jni_env) {
     return 0;
   }
   // region digitalis
-  // Wrap this host env's JNINativeInterface table the first time we see it.
-  // Per-table (not a single process-global flag) so a second Java runtime's
-  // fresh table — e.g. Chromium's forked sandboxed renderer — is wrapped too.
-  WrapJNIEnvTableOnce(host_jni_env);
+  // Wrap this host env's JNINativeInterface table the first time we see it, and
+  // take the guest-private copy of it to point the guest env at. Per-table (not
+  // a single process-global flag) so a second Java runtime's fresh table — e.g.
+  // Chromium's forked sandboxed renderer — is wrapped too.
+  const JNINativeInterface* guest_table = WrapJNIEnvTableOnce(host_jni_env);
   // endregion
 
   std::lock_guard<std::mutex> lock(g_jni_guard_mutex);
@@ -518,11 +581,23 @@ GuestType<JNIEnv*> ToGuestJNIEnv(JNIEnv* host_jni_env) {
 
   auto it = mapping.host_to_guest_jni_env.find(host_jni_env);
   if (it != mapping.host_to_guest_jni_env.end()) {
+    // region digitalis
+    // ART swaps a thread's table in place to turn CheckJNI on or off and on
+    // runtime shutdown, so a cached guest env can be pointing at the copy of a
+    // table the host no longer uses. Re-point it at the current table's copy.
+    JNIEnv* cached_guest_jni_env = ToHostAddr(it->second);
+    if (cached_guest_jni_env->functions != guest_table) {
+      cached_guest_jni_env->functions = guest_table;
+    }
+    // endregion
     return it->second;
   }
 
   mapping.guest_jni_envs.emplace_back(*host_jni_env);
   JNIEnv* guest_jni_env = &mapping.guest_jni_envs.back();
+  // region digitalis
+  guest_jni_env->functions = guest_table;
+  // endregion
   auto [unused_it1, host_to_guest_inserted] =
       mapping.host_to_guest_jni_env.try_emplace(host_jni_env, guest_jni_env);
   CHECK(host_to_guest_inserted);
