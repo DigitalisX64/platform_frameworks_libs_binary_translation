@@ -57,6 +57,9 @@ class GuestContext {
   }
 
   void* ptr() { return &ctx_; }
+  // region digitalis
+  size_t size() const { return sizeof(ctx_); }
+  // endregion
 
  private:
   // See bionic/libc/kernel/uapi/asm-riscv/asm/ptrace.h

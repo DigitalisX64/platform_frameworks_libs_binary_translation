@@ -195,6 +195,34 @@ TEST(Signal, AsyncSigsegv) {
   ASSERT_TRUE(g_async_sigsegv_received);
 }
 
+uintptr_t g_handler_var_addr;
+uintptr_t g_ucontext_addr;
+
+void UcontextLocationHandler(int /* sig */, siginfo_t* /* info */, void* ctx) {
+  char handler_var;
+  g_handler_var_addr = reinterpret_cast<uintptr_t>(&handler_var);
+  g_ucontext_addr = reinterpret_cast<uintptr_t>(ctx);
+}
+
+// The kernel saves the interrupted context on the stack the handler runs on,
+// between the handler's frame and the interrupted one. Stop-the-world garbage
+// collectors rely on it to find references held in registers of the threads
+// they suspend.
+TEST(Signal, UcontextIsOnHandlerStack) {
+  struct sigaction sa{};
+  sa.sa_flags = SA_SIGINFO;
+  sa.sa_sigaction = UcontextLocationHandler;
+  ScopedSigaction scoped_sa(SIGUSR1, &sa);
+
+  char interrupted_var;
+  g_ucontext_addr = 0;
+  ASSERT_EQ(raise(SIGUSR1), 0);
+  EnsureSignalsChecked();
+  ASSERT_NE(g_ucontext_addr, 0u);
+  EXPECT_GT(g_ucontext_addr, g_handler_var_addr);
+  EXPECT_LT(g_ucontext_addr, reinterpret_cast<uintptr_t>(&interrupted_var));
+}
+
 // Must be valid instruction address. 0 is invalid as the compiler optimizes call(0) to UD.
 constexpr uintptr_t kNoExecAddr = 4096;
 
