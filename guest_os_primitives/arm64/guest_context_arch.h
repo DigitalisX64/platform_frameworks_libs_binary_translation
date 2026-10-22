@@ -96,6 +96,7 @@ class GuestContext {
   }
 
   void* ptr() { return &ctx_; }
+  size_t size() const { return sizeof(ctx_); }
 
  private:
   static constexpr uint32_t FPSIMD_MAGIC = 0x46508001;
