@@ -28,6 +28,9 @@
 
 #include "berberis/base/gettid.h"
 #endif
+#include <cstring>
+
+#include "berberis/base/bit_util.h"
 // endregion
 #include "berberis/base/host_signal.h"
 #include "berberis/base/tracing.h"
@@ -121,13 +124,26 @@ void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_si
   // If this is actually
   //   void (*sa_handler)(int);
   // then extra args will be just ignored.
+  // region digitalis
+  // Like the kernel, put the ucontext on the stack the handler runs on, right
+  // above the handler's frames. A stop-the-world GC (e.g. Boehm in IL2CPP)
+  // suspends a thread in a signal handler and scans its stack from the
+  // handler's SP up, so the interrupted registers must be saved in that range.
+  CPUState& cpu = GetCPUState(*state);
+  GuestAddr ucontext_addr = AlignDown(GetStackRegister(cpu) - ctx.size(), 16);
+  memcpy(ToHostAddr<void>(ucontext_addr), ctx.ptr(), ctx.size());
+  SetStackRegister(cpu, ucontext_addr);
+  // endregion
   GuestCall guest_call;
   guest_call.AddArgInt32(info->si_signo);
   guest_call.AddArgGuestAddr(ToGuestAddr(info));
-  guest_call.AddArgGuestAddr(ToGuestAddr(ctx.ptr()));
+  guest_call.AddArgGuestAddr(ucontext_addr);
   guest_call.RunVoid(sa->guest_sa_sigaction);
   TRACE("signal %d delivered", info->si_signo);
 
+  // region digitalis
+  memcpy(ctx.ptr(), ToHostAddr<void>(ucontext_addr), ctx.size());
+  // endregion
   // Restore state from ucontext, it may be updated by the handler.
   ctx.Restore(&state->cpu);
 }
