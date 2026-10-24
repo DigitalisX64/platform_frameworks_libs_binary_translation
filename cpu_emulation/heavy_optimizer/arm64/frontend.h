@@ -34,7 +34,6 @@
 #include "berberis/intrinsics/macro_assembler.h"
 #include "berberis/runtime_primitives/platform.h"
 
-#include "call_intrinsic.h"
 #include "inline_intrinsic.h"
 #include "simd_register.h"
 

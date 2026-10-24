@@ -38,8 +38,9 @@ cc_library_headers {
 // and a broad NEON/SIMD subset translate for real; anything unhandled bails
 // to the lite translator/interpreter.
 //
-// inline_intrinsic.h / call_intrinsic.h drive the guest-agnostic
-// intrinsic->x86_64-SSE lowering (ProcessBindings). That machinery and the
+// inline_intrinsic.h drives the guest-agnostic intrinsic->x86_64-SSE lowering
+// (ProcessBindings); the frontend inlines intrinsics and never emits a call to
+// one, so it needs no call-intrinsic lowering. That machinery and the
 // host x86_64 intrinsic implementations live in the riscv64 intrinsics header
 // set (intrinsics-inl.h / intrinsics_process_bindings-inl.h / macro_assembler.h
 // are host code-generation, not guest code), so the ARM64 backend reuses
