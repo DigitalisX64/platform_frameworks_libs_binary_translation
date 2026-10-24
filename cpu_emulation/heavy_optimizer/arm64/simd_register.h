@@ -17,11 +17,30 @@
 #ifndef BERBERIS_HEAVY_OPTIMIZER_ARM64_SIMD_REGISTER_H_
 #define BERBERIS_HEAVY_OPTIMIZER_ARM64_SIMD_REGISTER_H_
 
-// Guest-agnostic MachineReg wrapper for SIMD/FP values. The SimdReg class body
-// was identical to heavy_optimizer/riscv64/simd_register.h (differing only by
-// copyright/guard/comment) and silently drifted. Forward to the riscv64 copy
-// rather than forking it. Do NOT copy content back here - edit the riscv64
-// file; both guests share it.
-#include "../riscv64/simd_register.h"
+#include "berberis/backend/common/machine_ir.h"
+
+namespace berberis {
+
+// Guest-agnostic MachineReg wrapper for SIMD/FP values. This used to forward to
+// heavy_optimizer/riscv64/simd_register.h so both guests shared one copy, but
+// that header is gone and SimdReg exists nowhere upstream, so the class lives
+// here now. Not to be confused with intrinsics/simd_register.h's SimdRegister,
+// which is a 128-bit value type rather than a register reference.
+class SimdReg {
+ public:
+  constexpr SimdReg() = default;
+  constexpr SimdReg(const SimdReg&) = default;
+  constexpr SimdReg& operator=(const SimdReg&) = default;
+  constexpr SimdReg(SimdReg&&) = default;
+  constexpr SimdReg& operator=(SimdReg&&) = default;
+  explicit constexpr SimdReg(MachineReg reg) : machine_reg_{reg} {}
+
+  [[nodiscard]] MachineReg constexpr machine_reg() const { return machine_reg_; }
+
+ private:
+  MachineReg machine_reg_;
+};
+
+}  // namespace berberis
 
 #endif  // BERBERIS_HEAVY_OPTIMIZER_ARM64_SIMD_REGISTER_H_
