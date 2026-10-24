@@ -672,9 +672,9 @@ bool HeavyOptimizerFrontend::IsNZCVStore(const MachineInsn* insn) {
 // cpu.flags through the ThreadState.
 bool HeavyOptimizerFrontend::IsNZCVGapInsn(const MachineInsn* insn) {
   if (insn->recovery_bb() != nullptr || insn->recovery_pc() != 0 ||
-      insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpCallImmArg ||
-      insn->opcode() == kMachineOpJump || insn->opcode() == kMachineOpBranch ||
-      insn->opcode() == kMachineOpCondBranch || insn->opcode() == kMachineOpIndirectJump) {
+      insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpJump ||
+      insn->opcode() == kMachineOpBranch || insn->opcode() == kMachineOpCondBranch ||
+      insn->opcode() == kMachineOpIndirectJump) {
     return false;
   }
   bool uses_thread_state = false;
@@ -2379,8 +2379,8 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         auto res = Gen<x86_64::LockCmpXchg16bRegRegRegRegOp>(
             exp_lo, exp_hi, des_lo, des_hi, {.base = base});
         GenRecoveryBlockForLastInsn();
-        Register old_lo = res[0];  // RAX
-        Register old_hi = res[1];  // RDX
+        Register old_lo = std::get<0>(res);  // RAX
+        Register old_hi = std::get<1>(res);  // RDX
         if (rs_lo != 31) {
           SetReg(rs_lo, old_lo);
         }
@@ -2451,8 +2451,8 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         auto res = Gen<x86_64::LockCmpXchg16bRegRegRegRegOp>(
             zero_a, zero_b, zero_c, zero_d, {.base = base});
         GenRecoveryBlockForLastInsn();
-        Register old_lo = res[0];  // RAX
-        Register old_hi = res[1];  // RDX
+        Register old_lo = std::get<0>(res);  // RAX
+        Register old_hi = std::get<1>(res);  // RDX
         // reservation_address = base; reservation_value = full 128-bit pair.
         GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
         GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, old_lo);
@@ -2570,7 +2570,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
             {.base = x86_64::kMachineRegRBP, .disp = resv_val_off + 8}));
         auto res = Gen<x86_64::LockCmpXchg16bRegRegRegRegOp>(
             exp_lo, exp_hi, des_lo, des_hi, {.base = base});
-        Register host_flags = res[2];  // FLAGS (== GetFlagsRegister())
+        Register host_flags = std::get<2>(res);  // FLAGS (== GetFlagsRegister())
         // No recovery split here (like STXR): FLAGS feed the status branch.
         ir->AddEdge(builder_.bb(), fail_bb);
         ir->AddEdge(builder_.bb(), swap_ok_bb);
@@ -2663,7 +2663,7 @@ bool HeavyOptimizerFrontend::IsRegionEndReached() const {
 }
 
 void HeavyOptimizerFrontend::ResolveJumps() {
-  if (!config::kLinkJumpsWithinRegion) {
+  if (IsConfigFlagSet(kDisableLinkJumpsWithinRegion)) {
     return;
   }
   auto ir = builder_.ir();
@@ -2738,7 +2738,7 @@ void HeavyOptimizerFrontend::ReplaceJumpWithBranch(MachineBasicBlock* bb,
 
   if (jump->kind() == Jump::Kind::kJumpWithoutPendingSignalsCheck) {
     // Simple branch for forward jump.
-    *jump_it = ir->NewInsn<Branch>(target_bb);
+    *jump_it = ir->NewInsn<berberis::Branch>(target_bb);
     ir->AddEdge(bb, target_bb);
   } else {
     CHECK(jump->kind() == Jump::Kind::kJumpWithPendingSignalsCheck);
@@ -5072,32 +5072,32 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
     switch (args.opcode) {
       case 0b0000:  // FMUL
       case 0b1000:  // FNMUL: -(n * m) — negate the product below.
-        EmitFpBinop<&intrinsics::FMul<Float64>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FMul<Float64>>(src1, src2);
         break;
       case 0b0001:  // FDIV
-        EmitFpBinop<&intrinsics::FDiv<Float64>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FDiv<Float64>>(src1, src2);
         break;
       case 0b0010:  // FADD
-        EmitFpBinop<&intrinsics::FAdd<Float64>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FAdd<Float64>>(src1, src2);
         break;
       case 0b0011:  // FSUB
-        EmitFpBinop<&intrinsics::FSub<Float64>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FSub<Float64>>(src1, src2);
         break;
     }
   } else {
     switch (args.opcode) {
       case 0b0000:  // FMUL
       case 0b1000:  // FNMUL: -(n * m) — negate the product below.
-        EmitFpBinop<&intrinsics::FMul<Float32>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FMul<Float32>>(src1, src2);
         break;
       case 0b0001:  // FDIV
-        EmitFpBinop<&intrinsics::FDiv<Float32>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FDiv<Float32>>(src1, src2);
         break;
       case 0b0010:  // FADD
-        EmitFpBinop<&intrinsics::FAdd<Float32>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FAdd<Float32>>(src1, src2);
         break;
       case 0b0011:  // FSUB
-        EmitFpBinop<&intrinsics::FSub<Float32>>(result, src1, src2);
+        result = EmitFpBinop<&intrinsics::FSub<Float32>>(src1, src2);
         break;
     }
   }

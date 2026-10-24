@@ -922,15 +922,23 @@ class HeavyOptimizerFrontend {
   // InlineIntrinsic forward to the FXxxHostRounding variant bound to the SSE op
   // in machine_ir_intrinsic_binding.json. frm is unused on the host-rounding
   // path; a dummy temp register satisfies the signature.
+  // Returns the register the intrinsic produced rather than writing into one
+  // the caller supplies: AOSP 17's inline-intrinsic path allocates its own
+  // result registers and assigns them into the tuple passed here, so a
+  // caller-provided destination would need a move afterwards. The tuple holds
+  // MachineReg because that is what it is assigned -- FpRegister's constructor
+  // from MachineReg is explicit, so the wrap happens on the way out.
   template <auto kFunction>
-  void EmitFpBinop(FpRegister result, FpRegister src1, FpRegister src2) {
+  [[nodiscard]] FpRegister EmitFpBinop(FpRegister src1, FpRegister src2) {
     if (!success()) {
-      return;
+      return AllocTempSimdReg();
     }
     Register frm = AllocTempReg();
     builder_.Gen<PseudoDefReg>(frm, kMeta<&x86_64::kGeneralReg64>);
+    std::tuple<MachineReg> res;
     InlineIntrinsicForHeavyOptimizer<kFunction>(
-        &builder_, result, GetFlagsRegister(), int8_t{0b111}, frm, src1, src2);
+        &builder_, res, GetFlagsRegister(), int8_t{0b111}, frm, src1, src2);
+    return FpRegister{std::get<0>(res)};
   }
 
   // VFPExpandImm (ARM ARM, FMOV scalar/vector immediate). The FP constant is a
