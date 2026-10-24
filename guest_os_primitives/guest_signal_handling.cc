@@ -369,6 +369,11 @@ bool IsReservedSignal(int signal) {
 void ConvertHostSiginfoToGuest(siginfo_t* signal_info, const ThreadState* state) {
   switch (signal_info->si_signo) {
     case SIGILL:
+    // region digitalis - BRK raises a synchronous SIGTRAP; like SIGILL/SIGFPE
+    // its faulting address is the current guest instruction (the BRK), which a
+    // guest breakpoint/sanitizer handler reads to recover the BRK immediate.
+    case SIGTRAP:
+    // endregion
     case SIGFPE:
       signal_info->si_addr = ToHostAddr<void>(GetInsnAddr(GetCPUState(*state)));
       break;
@@ -436,23 +441,7 @@ void GuestThread::EnqueueSignalFromHost(const siginfo_t& host_info, const uconte
   siginfo_t* allocated_info = pending_signals_.AllocSignal();
 
   // Convert host siginfo to guest.
-  *guest_info = host_info;
-  switch (host_info.si_signo) {
-    case SIGILL:
-    // region digitalis - BRK raises a synchronous SIGTRAP; like SIGILL/SIGFPE
-    // its faulting address is the current guest instruction (the BRK), which a
-    // guest breakpoint/sanitizer handler reads to recover the BRK immediate.
-    case SIGTRAP:
-    // endregion
-    case SIGFPE: {
-      guest_info->si_addr = ToHostAddr<void>(GetInsnAddr(GetCPUState(*state_)));
-      break;
-    }
-    case SIGSYS: {
-      guest_info->si_syscall = ToGuestSyscallNumber(host_info.si_syscall);
-      break;
-    }
-  }
+  *allocated_info = host_info;
 
   // This is never interrupted by code that clears queue or status,
   // so the order in which to set them is not important.
@@ -685,7 +674,7 @@ void HandleFaultForRecovery(int sig, siginfo_t* info, void* context) {
             (unsigned long long)cpu.sp, (unsigned long long)cpu.x[29]);
       }
       thread->TestAndEnablePendingSignals();
-      thread->SetSignalFromHost(*info);
+      thread->EnqueueSignalFromHost(*info, ucontext);
       return;
     }
   }
