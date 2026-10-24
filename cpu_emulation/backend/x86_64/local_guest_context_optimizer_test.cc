@@ -637,7 +637,7 @@ TEST(MachineIRLocalGuestContextOptimizer, KeepWiderGetAfterNarrowerGet) {
   auto wide = machine_ir.AllocVReg();
   builder.GenGetSimd<8>(narrow, GetThreadStateSimdRegOffset(0));
   builder.GenGetSimd<16>(wide, GetThreadStateSimdRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -668,7 +668,7 @@ TEST(MachineIRLocalGuestContextOptimizer, KeepWiderGetAfterNarrowerPut) {
   auto loaded = machine_ir.AllocVReg();
   builder.GenSetSimd<8>(GetThreadStateSimdRegOffset(0), stored);
   builder.GenGetSimd<16>(loaded, GetThreadStateSimdRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -695,7 +695,7 @@ TEST(MachineIRLocalGuestContextOptimizer, KeepWiderPutBeforeNarrowerPut) {
   auto narrow = machine_ir.AllocVReg();
   builder.GenSetSimd<16>(GetThreadStateSimdRegOffset(0), wide);
   builder.GenSetSimd<8>(GetThreadStateSimdRegOffset(0), narrow);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -721,7 +721,7 @@ TEST(MachineIRLocalGuestContextOptimizer, ForwardsSameWidthSimdGet) {
   auto second = machine_ir.AllocVReg();
   builder.GenGetSimd<16>(first, GetThreadStateSimdRegOffset(0));
   builder.GenGetSimd<16>(second, GetThreadStateSimdRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::RemoveLocalGuestContextAccesses(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -744,7 +744,7 @@ TEST(MachineIRRecoverySplitGetForwarding, ForwardsPutAcrossSplit) {
   builder.GenPut(GetThreadStateRegOffset(0), value);
   auto* next = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGet(read, GetThreadStateRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -770,7 +770,7 @@ TEST(MachineIRRecoverySplitGetForwarding, ForwardsGetAlongChain) {
   GenGuestLoadSplit(&machine_ir, &builder);
   auto* last = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGet(second, GetThreadStateRegOffset(1));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -800,7 +800,7 @@ TEST(MachineIRRecoverySplitGetForwarding, NarrowSimdGetZeroExtends) {
   auto* next = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGetSimd<8>(low, GetThreadStateSimdRegOffset(0));
   builder.GenGetSimd<16>(full, GetThreadStateSimdRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -828,7 +828,7 @@ TEST(MachineIRRecoverySplitGetForwarding, NarrowSimdPutDoesNotFeedWideGet) {
   builder.GenSetSimd<8>(GetThreadStateSimdRegOffset(0), machine_ir.AllocVReg());
   auto* next = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGetSimd<16>(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   EXPECT_EQ((*next->insn_list().begin())->opcode(), kMachineOpMovdqaXRegMemBaseDisp);
@@ -850,7 +850,7 @@ TEST(MachineIRRecoverySplitGetForwarding, OverlappingPutInvalidates) {
   auto* next = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenSetSimd<8>(GetThreadStateSimdRegOffset(0) + 8, machine_ir.AllocVReg());
   builder.GenGetSimd<16>(machine_ir.AllocVReg(), GetThreadStateSimdRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   EXPECT_EQ((*std::next(next->insn_list().begin()))->opcode(), kMachineOpMovdqaXRegMemBaseDisp);
@@ -880,7 +880,7 @@ TEST(MachineIRRecoverySplitGetForwarding, UnmodeledWriteRedefinitionAndCallInval
       builder.GenCallImm(0, machine_ir.AllocVReg());
     }
     builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
-    builder.Gen<PseudoJump>(kNullGuestAddr);
+    builder.Gen<Jump>(kNullGuestAddr);
 
     x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
     EXPECT_EQ((*std::next(next->insn_list().begin()))->opcode(), kMachineOpMovqRegMemBaseDisp)
@@ -900,9 +900,9 @@ TEST(MachineIRRecoverySplitGetForwarding, JoinBlockIsNotForwarded) {
   builder.GenPut(GetThreadStateRegOffset(0), machine_ir.AllocVReg());
   auto* next = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   builder.StartBasicBlock(other);
-  builder.Gen<PseudoBranch>(next);
+  builder.Gen<Branch>(next);
   machine_ir.AddEdge(other, next);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
@@ -928,7 +928,7 @@ TEST(MachineIRRecoverySplitGetForwarding, DistantValueIsReloadedAndCarriedOn) {
   builder.GenGet(reloaded, GetThreadStateRegOffset(0));
   auto* last = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGet(again, GetThreadStateRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -962,7 +962,7 @@ TEST(MachineIRRecoverySplitGetForwarding, ForwardedGetRestartsDistance) {
     builder.Gen<x86_64::MovqRegImm>(machine_ir.AllocVReg(), 0);
   }
   builder.GenGet(third, GetThreadStateRegOffset(1));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -991,7 +991,7 @@ TEST(MachineIRRecoverySplitGetForwarding, SameBlockGetIsLeftToLocalPass) {
   builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
   auto* next = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGet(later, GetThreadStateRegOffset(0));
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -1025,7 +1025,7 @@ TEST(MachineIRRecoverySplitGetForwarding, NarrowSimdZeroExtendsOnlyStoredValues)
   builder.GenSetSimd<8>(GetNarrowSimdSlotOffset(), stored);
   auto* next3 = GenGuestLoadSplit(&machine_ir, &builder);
   builder.GenGetSimd<8>(third, GetNarrowSimdSlotOffset());
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);

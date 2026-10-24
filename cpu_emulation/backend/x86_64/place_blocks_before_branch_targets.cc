@@ -20,10 +20,10 @@ const MachineBasicBlock* UncondBranchTarget(const MachineBasicBlock* bb) {
     return nullptr;
   }
   const auto* last = bb->insn_list().back();
-  if (last->opcode() != kMachineOpPseudoBranch) {
+  if (last->opcode() != kMachineOpBranch) {
     return nullptr;
   }
-  return static_cast<const PseudoBranch*>(last)->then_bb();
+  return static_cast<const Branch*>(last)->then_bb();
 }
 
 // Whether `from` falls through to `to` when `to` is laid out right after it:
@@ -33,11 +33,11 @@ bool BranchesTo(const MachineBasicBlock* from, const MachineBasicBlock* to) {
     return false;
   }
   const auto* last = from->insn_list().back();
-  if (last->opcode() == kMachineOpPseudoBranch) {
-    return static_cast<const PseudoBranch*>(last)->then_bb() == to;
+  if (last->opcode() == kMachineOpBranch) {
+    return static_cast<const Branch*>(last)->then_bb() == to;
   }
-  if (last->opcode() == kMachineOpPseudoCondBranch) {
-    const auto* branch = static_cast<const PseudoCondBranch*>(last);
+  if (last->opcode() == kMachineOpCondBranch) {
+    const auto* branch = static_cast<const CondBranch*>(last);
     return branch->then_bb() == to || branch->else_bb() == to;
   }
   return false;

@@ -33,7 +33,7 @@ class MachineIRUseLeaForCopiedAddsTest : public ::testing::Test {
     MachineReg sink = machine_ir_.AllocVReg();
     builder_.Gen<MovqRegReg>(sink, copied_);
     builder_.Gen<MovqRegReg>(sink, dst_);
-    builder_.Gen<PseudoJump>(kNullGuestAddr);
+    builder_.Gen<Jump>(kNullGuestAddr);
     ASSERT_EQ(CheckMachineIR(machine_ir_), kMachineIRCheckSuccess);
   }
 
@@ -125,7 +125,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesWhenFlagsAreOverwrittenBeforeUse)
   builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   builder_.Gen<CmpqRegReg>(copied_, other_, flags_);
-  builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, word, flags_);
+  builder_.Gen<ReadFlagsWithOverflow>(word, flags_);
   Finish();
 
   UseLeaForCopiedAdds(&machine_ir_);
@@ -137,7 +137,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseFlagsAreRead) {
   MachineReg word = machine_ir_.AllocVReg();
   builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
-  builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, word, flags_);
+  builder_.Gen<ReadFlagsWithOverflow>(word, flags_);
   Finish();
 
   UseLeaForCopiedAdds(&machine_ir_);
@@ -212,7 +212,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWithoutCopy) {
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsCopyOfVectorRegister) {
   MachineReg vector = machine_ir_.AllocVReg();
-  builder_.Gen<PseudoDefXReg>(vector);
+  builder_.Gen<PseudoDefReg>(vector, kMeta<&kXmmReg>);
   builder_.Gen<Copy>(dst_, vector, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   Finish();

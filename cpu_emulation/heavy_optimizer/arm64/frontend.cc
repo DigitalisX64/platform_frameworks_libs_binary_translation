@@ -216,18 +216,18 @@ void HeavyOptimizerFrontend::GenJump(GuestAddr target) {
 
   // Checking pending signals only on back jumps guarantees no infinite loops
   // without pending-signal checks.
-  auto kind = target <= GetInsnAddr() ? PseudoJump::Kind::kJumpWithPendingSignalsCheck
-                                      : PseudoJump::Kind::kJumpWithoutPendingSignalsCheck;
+  auto kind = target <= GetInsnAddr() ? Jump::Kind::kJumpWithPendingSignalsCheck
+                                      : Jump::Kind::kJumpWithoutPendingSignalsCheck;
 
-  builder_.Gen<PseudoJump>(target, kind);
+  builder_.Gen<Jump>(target, kind);
 }
 
 void HeavyOptimizerFrontend::ExitGeneratedCode(GuestAddr target) {
-  builder_.Gen<PseudoJump>(target, PseudoJump::Kind::kExitGeneratedCode);
+  builder_.Gen<Jump>(target, Jump::Kind::kExitGeneratedCode);
 }
 
 void HeavyOptimizerFrontend::ExitRegionIndirect(Register target) {
-  builder_.Gen<PseudoIndirectJump>(target);
+  builder_.Gen<IndirectJump>(target);
 }
 
 // After a faulting host memory access, split off a recovery basic block that
@@ -246,7 +246,7 @@ void HeavyOptimizerFrontend::GenRecoveryBlockForLastInsn() {
   // Note, even though there are two bb successors, we only explicitly branch to
   // the continue_bb, since jump to the recovery_bb is set up by the signal
   // handler.
-  builder_.Gen<PseudoBranch>(continue_bb);
+  builder_.Gen<Branch>(continue_bb);
 
   builder_.StartBasicBlock(recovery_bb);
   ExitGeneratedCode(GetInsnAddr());
@@ -448,7 +448,7 @@ void HeavyOptimizerFrontend::EmitCondBranch(Decoder::Condition cond,
       CHECK(false);
       return;
   }
-  builder_.Gen<PseudoCondBranch>(taken, then_bb, else_bb, host_flags);
+  builder_.Gen<CondBranch>(taken, then_bb, else_bb, host_flags);
 }
 
 // B.cond (conditional). AL/NV are unconditional. Otherwise split into a taken
@@ -477,11 +477,11 @@ void HeavyOptimizerFrontend::BranchCond(Decoder::Condition cond, int32_t offset)
   std::optional<NZCVStoreTail> tail = TakeNZCVStoreTail(cond);
   if (tail) {
     // StartInsn recorded this B.cond's position as the store just removed;
-    // point it at the PseudoReadFlags so the iterator stays valid. A jump to
+    // point it at the ReadFlags so the iterator stays valid. A jump to
     // this B.cond never uses it: AddFusedCondBranchEntries gives it an entry.
     branch_targets_[GetInsnAddr()] = builder_.GetMachineInsnPosition();
     fused_cond_branches_.push_back({GetInsnAddr(), cond, *tail, then_bb, else_bb});
-    builder_.Gen<PseudoCondBranch>(tail->host_cond, then_bb, else_bb, tail->host_flags);
+    builder_.Gen<CondBranch>(tail->host_cond, then_bb, else_bb, tail->host_flags);
   } else {
     EmitCondBranch(cond, then_bb, else_bb);
   }
@@ -503,11 +503,11 @@ void HeavyOptimizerFrontend::BranchCond(Decoder::Condition cond, int32_t offset)
 
 // A B.cond right after a flag-setting instruction finds the current block
 // ending with that instruction's EmitMaterializeNZCV sequence:
-//   PseudoReadFlags raw, flags   (LAHF + SETO: reads the host flags only)
+//   ReadFlags raw, flags   (LAHF + SETO: reads the host flags only)
 //   AND raw, kFlagsNZCVMask
 //   XOR raw, kFlagCarry          (only for a subtraction)
 //   MOVW cpu.flags, raw
-// The host flags still hold the setter's result at the PseudoReadFlags, and
+// The host flags still hold the setter's result at the ReadFlags, and
 // the packed NZCV is N = SF, Z = ZF, C = CF ^ is_sub, V = OF, so every ARM
 // condition is one x86 condition on them, except HI/LS when C = CF (x86 has no
 // single test for CF && !ZF). In that case the AND, XOR and store are removed
@@ -564,8 +564,10 @@ std::optional<HeavyOptimizerFrontend::NZCVStoreTail> HeavyOptimizerFrontend::Tak
   auto and_it = it;
 
   const MachineInsn* read = previous();
-  if (read == nullptr || read->opcode() != kMachineOpPseudoReadFlags ||
-      read->RegAt(0) != raw || !static_cast<const PseudoReadFlags*>(read)->with_overflow()) {
+  // The overflow variant is its own opcode now, so the opcode test alone says
+  // what with_overflow() used to.
+  if (read == nullptr || read->opcode() != kMachineOpReadFlagsWithOverflow ||
+      read->RegAt(0) != raw) {
     return std::nullopt;
   }
 
@@ -627,7 +629,7 @@ std::optional<HeavyOptimizerFrontend::NZCVStoreTail> HeavyOptimizerFrontend::Tak
   auto read_it = std::prev(and_it);
   // The guest instructions of the gap start right after the store or a gap
   // instruction. Point the ones at the store (to be erased) at the
-  // PseudoReadFlags, and find where the gap starts: a jump into it cannot
+  // ReadFlags, and find where the gap starts: a jump into it cannot
   // reach the B.cond's host flags (AddFusedCondBranchEntries).
   GuestAddr gap_begin = GetInsnAddr();
   auto in_tail = [&](const MachineInsnPosition& pos) {
@@ -668,9 +670,8 @@ bool HeavyOptimizerFrontend::IsNZCVStore(const MachineInsn* insn) {
 bool HeavyOptimizerFrontend::IsNZCVGapInsn(const MachineInsn* insn) {
   if (insn->recovery_bb() != nullptr || insn->recovery_pc() != 0 ||
       insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpCallImmArg ||
-      insn->opcode() == kMachineOpPseudoJump || insn->opcode() == kMachineOpPseudoBranch ||
-      insn->opcode() == kMachineOpPseudoCondBranch ||
-      insn->opcode() == kMachineOpPseudoIndirectJump) {
+      insn->opcode() == kMachineOpJump || insn->opcode() == kMachineOpBranch ||
+      insn->opcode() == kMachineOpCondBranch || insn->opcode() == kMachineOpIndirectJump) {
     return false;
   }
   bool uses_thread_state = false;
@@ -707,7 +708,7 @@ void HeavyOptimizerFrontend::EmitNZCVStoreTail(const NZCVStoreTail& tail) {
 }
 
 // An in-region jump to a fused B.cond arrives without the setter's host flags
-// or `raw`, so it cannot enter the setter's block at the PseudoCondBranch.
+// or `raw`, so it cannot enter the setter's block at the CondBranch.
 // Give it an entry block that loads `raw` from cpu.flags (pre-inverting C for a
 // subtraction, so the successors' AND/XOR/store write back the same NZCV) and
 // branches on the stored NZCV like an unfused B.cond, into the same
@@ -724,12 +725,11 @@ void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
       continue;
     }
     const MachineInsn* last_insn = bb->insn_list().back();
-    if (last_insn->opcode() != kMachineOpPseudoJump) {
+    if (last_insn->opcode() != kMachineOpJump) {
       continue;
     }
-    auto* jump = static_cast<const PseudoJump*>(last_insn);
-    if (jump->kind() == PseudoJump::Kind::kSyscall ||
-        jump->kind() == PseudoJump::Kind::kExitGeneratedCode) {
+    auto* jump = static_cast<const Jump*>(last_insn);
+    if (jump->kind() == Jump::Kind::kSyscall || jump->kind() == Jump::Kind::kExitGeneratedCode) {
       continue;
     }
     jump_targets.insert(jump->target());
@@ -754,7 +754,7 @@ void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
   }
 
   // A jump into a gap would run the rest of the gap and reach the
-  // PseudoCondBranch without the setter's host flags. Leave it a region exit:
+  // CondBranch without the setter's host flags. Leave it a region exit:
   // the gap's guest code is translated again from that address.
   for (const auto& fused : fused_cond_branches_) {
     for (auto target_it = branch_targets_.lower_bound(fused.tail.gap_begin);
@@ -789,7 +789,7 @@ void HeavyOptimizerFrontend::CompareAndBranch(bool is_nonzero,
   // kNotZero); CBZ branches when zero (ZF==1 -> kZero).
   Register flags = is_64bit ? std::get<0>(Gen<x86_64::TestqRegReg>(src, src))
                             : std::get<0>(Gen<x86_64::TestlRegReg>(src, src));
-  builder_.Gen<PseudoCondBranch>(
+  builder_.Gen<CondBranch>(
       is_nonzero ? x86_64::Assembler::Condition::kNotZero : x86_64::Assembler::Condition::kZero,
       then_bb,
       else_bb,
@@ -823,7 +823,7 @@ void HeavyOptimizerFrontend::TestAndBranch(bool is_nonzero,
   // BTQ src, bit -> CF = bit of src. TBNZ branches when the bit is set
   // (CF==1 -> kCarry); TBZ branches when clear (CF==0 -> kNotCarry).
   Register flags = std::get<0>(Gen<x86_64::BtqRegImm>(src, static_cast<int8_t>(bit)));
-  builder_.Gen<PseudoCondBranch>(
+  builder_.Gen<CondBranch>(
       is_nonzero ? x86_64::Assembler::Condition::kCarry : x86_64::Assembler::Condition::kNotCarry,
       then_bb,
       else_bb,
@@ -918,7 +918,7 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   builder_.StartBasicBlock(then_bb);
   builder_.Gen<Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(then_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   return result;
@@ -951,8 +951,7 @@ Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register
   // TEST sets ZF=1 when the divisor is zero -> skip the divide (result stays 0).
   Register flags = is_64bit ? std::get<0>(Gen<x86_64::TestqRegReg>(src2, src2))
                             : std::get<0>(Gen<x86_64::TestlRegReg>(src2, src2));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kZero, merge_bb, div_bb, flags);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kZero, merge_bb, div_bb, flags);
 
   builder_.StartBasicBlock(div_bb);
   // High half of the dividend is 0 for unsigned division.
@@ -965,7 +964,7 @@ Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register
   }
   builder_.Gen<Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(div_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   return result;
@@ -997,8 +996,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   ir->AddEdge(cur_bb, nonzero_bb);
   Register zflags = is_64bit ? std::get<0>(Gen<x86_64::TestqRegReg>(src2, src2))
                              : std::get<0>(Gen<x86_64::TestlRegReg>(src2, src2));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kZero, merge_bb, nonzero_bb, zflags);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kZero, merge_bb, nonzero_bb, zflags);
 
   // Divisor == -1 -> result = -Rn (= INT_MIN when Rn==INT_MIN, no IDIV).
   builder_.StartBasicBlock(nonzero_bb);
@@ -1007,8 +1005,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   Register cflags = is_64bit
                         ? std::get<0>(Gen<x86_64::CmpqRegImm>(src2, int32_t{-1}))
                         : std::get<0>(Gen<x86_64::CmplRegImm>(src2, int32_t{-1}));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kEqual, neg_one_bb, div_bb, cflags);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kEqual, neg_one_bb, div_bb, cflags);
 
   // result = 0 - Rn (the heavy IR has no NEG op; a 32-bit sub zero-extends).
   builder_.StartBasicBlock(neg_one_bb);
@@ -1021,7 +1018,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   }
   builder_.Gen<Copy>(result, neg, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(neg_one_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   // Real division: RDX = sign-extension of the dividend (CQO/CDQ equivalent).
   builder_.StartBasicBlock(div_bb);
@@ -1036,7 +1033,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   }
   builder_.Gen<Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(div_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   return result;
@@ -1119,12 +1116,12 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
   builder_.StartBasicBlock(cmp_bb);
   emit_compare_path();
   ir->AddEdge(cmp_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(imm_bb);
   emit_immediate_path();
   ir->AddEdge(imm_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
 }
@@ -1132,7 +1129,7 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
 // Map the x86 EFLAGS a UCOMIS{S,D} left in `flags_vreg` to ARM64 FP NZCV and
 // store the packed 16-bit word to ThreadState.cpu.flags. Bit-exact with
 // lite_translator.h::EmitStoreArmFpNZCV, which branches on the x86 FLAGS
-// directly; here the flags are first read into a GP register (PseudoReadFlags:
+// directly; here the flags are first read into a GP register (ReadFlags:
 // LAHF + SETO) so the branch tree can test individual bits without keeping the
 // single host FLAGS live across basic-block boundaries. In that GP word:
 // CF@8, PF@10, ZF@14 (OF@0, unused here). Priority PF > ZF > CF matches lite:
@@ -1147,7 +1144,7 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
   const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
 
   Register raw = AllocTempReg();
-  builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, raw, flags_vreg);
+  builder_.Gen<ReadFlagsWithOverflow>(raw, flags_vreg);
 
   auto* ir = builder_.ir();
   MachineBasicBlock* uo_bb = ir->NewBasicBlock();       // unordered (PF)
@@ -1164,7 +1161,7 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
     Register imm = GetImm(nzcv_word);
     builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
     ir->AddEdge(bb, merge_bb);
-    builder_.Gen<PseudoBranch>(merge_bb);
+    builder_.Gen<Branch>(merge_bb);
   };
 
   // PF (bit 10) set -> unordered, else fall to the ZF test.
@@ -1172,24 +1169,21 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
   ir->AddEdge(cur_bb, uo_bb);
   ir->AddEdge(cur_bb, chk_eq_bb);
   Register pf = std::get<0>(Gen<x86_64::TestlRegImm>(raw, int32_t{1 << 10}));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kNotZero, uo_bb, chk_eq_bb, pf);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotZero, uo_bb, chk_eq_bb, pf);
 
   // ZF (bit 14) set -> equal, else fall to the CF test.
   builder_.StartBasicBlock(chk_eq_bb);
   ir->AddEdge(chk_eq_bb, eq_bb);
   ir->AddEdge(chk_eq_bb, chk_lt_bb);
   Register zf = std::get<0>(Gen<x86_64::TestlRegImm>(raw, int32_t{1 << 14}));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kNotZero, eq_bb, chk_lt_bb, zf);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotZero, eq_bb, chk_lt_bb, zf);
 
   // CF (bit 8) set -> less, else greater.
   builder_.StartBasicBlock(chk_lt_bb);
   ir->AddEdge(chk_lt_bb, lt_bb);
   ir->AddEdge(chk_lt_bb, gt_bb);
   Register cf = std::get<0>(Gen<x86_64::TestlRegImm>(raw, int32_t{1 << 8}));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kNotZero, lt_bb, gt_bb, cf);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotZero, lt_bb, gt_bb, cf);
 
   store_leaf(kFlagsFpUnordered, uo_bb);
   store_leaf(kFlagsFpEqual, eq_bb);
@@ -1310,12 +1304,12 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
   // emit_compare_path built an NZCV sub-tree; connect its tail to merge.
   MachineBasicBlock* cmp_tail = builder_.bb();
   ir->AddEdge(cmp_tail, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(imm_bb);
   emit_immediate_path();
   ir->AddEdge(imm_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
 }
@@ -1425,8 +1419,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
 
   // TEST sets SF = bit 63; take the fix-up path when the source is >= 2^63.
   Register flags = std::get<0>(Gen<x86_64::TestqRegReg>(src, src));
-  builder_.Gen<PseudoCondBranch>(
-      x86_64::Assembler::Condition::kNegative, fixup_bb, direct_bb, flags);
+  builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNegative, fixup_bb, direct_bb, flags);
 
   // Direct: value < 2^63, signed Q-convert is exact.
   builder_.StartBasicBlock(direct_bb);
@@ -1440,7 +1433,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     builder_.Gen<x86_64::MovdqaXRegXReg>(result.machine_reg(), xd.machine_reg());
   }
   ir->AddEdge(direct_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   // Fix-up: value >= 2^63. odd = (src >> 1) | (src & 1); convert; double.
   builder_.StartBasicBlock(fixup_bb);
@@ -1459,7 +1452,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     builder_.Gen<x86_64::MovdqaXRegXReg>(result.machine_reg(), xf.machine_reg());
   }
   ir->AddEdge(fixup_bb, merge_bb);
-  builder_.Gen<PseudoBranch>(merge_bb);
+  builder_.Gen<Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   finish(result);
@@ -1471,7 +1464,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
 // with a BB-split fix-up ladder, bit-for-bit with lite_translator.h's FCVTZS /
 // FCVTZU paths. A single `result` GP vreg is merged across the fix-up branches
 // via Copy (mirrors ConditionalSelect); FLAGS never cross a basic block —
-// each UCOMI/TEST is consumed by the PseudoCondBranch in its own block.
+// each UCOMI/TEST is consumed by the CondBranch in its own block.
 void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                        bool is_double,
                                        int8_t round_imm,
@@ -1644,21 +1637,21 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
 
     ir->AddEdge(cur_bb, nan_bb);
     ir->AddEdge(cur_bb, notnan_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kParityEven, nan_bb, notnan_bb,
-                                   ucomi_self());
+    builder_.Gen<CondBranch>(
+        x86_64::Assembler::Condition::kParityEven, nan_bb, notnan_bb, ucomi_self());
 
     builder_.StartBasicBlock(nan_bb);
     builder_.Gen<Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
 
     // Non-NaN: FP < 0 keeps tmp (in-range neg or INT_MIN indefinite); FP >= 0
     // falls to the positive-overflow test.
     builder_.StartBasicBlock(notnan_bb);
     ir->AddEdge(notnan_bb, done_bb);
     ir->AddEdge(notnan_bb, pos_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNegative, done_bb, pos_bb,
-                                   fp_sign_flags());
+    builder_.Gen<CondBranch>(
+        x86_64::Assembler::Condition::kNegative, done_bb, pos_bb, fp_sign_flags());
 
     // FP >= 0: tmp >= 0 keeps it (in-range positive); tmp < 0 == INT_MIN means
     // positive overflow -> INT_MAX.
@@ -1667,14 +1660,14 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                  : std::get<0>(Gen<x86_64::TestlRegReg>(tmp, tmp));
     ir->AddEdge(pos_bb, done_bb);
     ir->AddEdge(pos_bb, ovf_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kPositiveOrZero, done_bb, ovf_bb,
-                                   tmp_flags);
+    builder_.Gen<CondBranch>(
+        x86_64::Assembler::Condition::kPositiveOrZero, done_bb, ovf_bb, tmp_flags);
 
     builder_.StartBasicBlock(ovf_bb);
     const uint64_t int_max = args.sf ? static_cast<uint64_t>(INT64_MAX) : uint64_t{0x7FFFFFFF};
     builder_.Gen<Copy>(result, GetImm(int_max), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(ovf_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
 
     builder_.StartBasicBlock(done_bb);
     commit(result);
@@ -1689,8 +1682,8 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
   auto* cur_bb = builder_.bb();
   ir->AddEdge(cur_bb, zero_bb);
   ir->AddEdge(cur_bb, notnan_bb);
-  builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kParityEven, zero_bb, notnan_bb,
-                                 ucomi_self());
+  builder_.Gen<CondBranch>(
+      x86_64::Assembler::Condition::kParityEven, zero_bb, notnan_bb, ucomi_self());
 
   if (!args.sf) {
     // sf=0 (uint32): Q-form cvtt always fits int64. Upper-32 zero -> in-range
@@ -1701,8 +1694,8 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.StartBasicBlock(notnan_bb);
     ir->AddEdge(notnan_bb, zero_bb);
     ir->AddEdge(notnan_bb, pos_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNegative, zero_bb, pos_bb,
-                                   fp_sign_flags());
+    builder_.Gen<CondBranch>(
+        x86_64::Assembler::Condition::kNegative, zero_bb, pos_bb, fp_sign_flags());
 
     builder_.StartBasicBlock(pos_bb);
     Register tmp = cvtt_q(xmm);
@@ -1711,12 +1704,12 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     Register hi_flags = std::get<0>(Gen<x86_64::TestqRegReg>(hi, hi));
     ir->AddEdge(pos_bb, done_bb);
     ir->AddEdge(pos_bb, ovf_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kZero, done_bb, ovf_bb, hi_flags);
+    builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kZero, done_bb, ovf_bb, hi_flags);
 
     builder_.StartBasicBlock(ovf_bb);
     builder_.Gen<Copy>(result, GetImm(uint64_t{0xFFFFFFFF}), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(ovf_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
   } else {
     // sf=1 (uint64): cvtt-Q covers [0, 2^63) directly. FP >= 2^63 uses the
     // offset trick (subtract 2^63, cvtt, set bit 63); FP >= 2^64 saturates.
@@ -1732,8 +1725,8 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.StartBasicBlock(notnan_bb);
     ir->AddEdge(notnan_bb, zero_bb);
     ir->AddEdge(notnan_bb, cmp_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNegative, zero_bb, cmp_bb,
-                                   fp_sign_flags());
+    builder_.Gen<CondBranch>(
+        x86_64::Assembler::Condition::kNegative, zero_bb, cmp_bb, fp_sign_flags());
 
     // FP >= 0: FP < 2^63 -> direct cvtt-Q; else check the upper bound.
     builder_.StartBasicBlock(cmp_bb);
@@ -1745,13 +1738,12 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                                                        bound63.machine_reg()));
     ir->AddEdge(cmp_bb, direct_bb);
     ir->AddEdge(cmp_bb, ge63_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kBelow, direct_bb, ge63_bb,
-                                   lt_flags);
+    builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kBelow, direct_bb, ge63_bb, lt_flags);
 
     builder_.StartBasicBlock(direct_bb);
     builder_.Gen<Copy>(result, cvtt_q(xmm), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(direct_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
 
     // FP >= 2^63: FP >= 2^64 (or +Inf) saturates; else the offset trick.
     builder_.StartBasicBlock(ge63_bb);
@@ -1763,13 +1755,13 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                                                        bound64.machine_reg()));
     ir->AddEdge(ge63_bb, satmax_bb);
     ir->AddEdge(ge63_bb, inrange_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kAboveEqual, satmax_bb, inrange_bb,
-                                   ge_flags);
+    builder_.Gen<CondBranch>(
+        x86_64::Assembler::Condition::kAboveEqual, satmax_bb, inrange_bb, ge_flags);
 
     builder_.StartBasicBlock(satmax_bb);
     builder_.Gen<Copy>(result, GetImm(~uint64_t{0}), kMeta<&x86_64::kGeneralReg64>);  // UINT64_MAX
     ir->AddEdge(satmax_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
 
     // FP in [2^63, 2^64): subtract 2^63 (exact), cvtt to int64, set bit 63.
     // Subss/Subsd is use_def; copy the source into a temp first.
@@ -1786,13 +1778,13 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     tmp = std::get<0>(Gen<x86_64::BtsqRegImm, kNoSSA>(tmp, int8_t{63}));
     builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(inrange_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
   }
 
   builder_.StartBasicBlock(zero_bb);
   builder_.Gen<Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(zero_bb, done_bb);
-  builder_.Gen<PseudoBranch>(done_bb);
+  builder_.Gen<Branch>(done_bb);
 
   builder_.StartBasicBlock(done_bb);
   commit(result);
@@ -1903,11 +1895,10 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       ir->AddEdge(cur_bb, fail_bb);
 
       // if (reservation_address != base) goto fail_bb (status = 1).
-      builder_.Gen<PseudoCondBranch>(
-          x86_64::Assembler::Condition::kNotEqual,
-          fail_bb,
-          match_bb,
-          std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
+      builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotEqual,
+                               fail_bb,
+                               match_bb,
+                               std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
 
       // --- match path: sized LOCK CMPXCHG(expected, [base], new_val). ---
       builder_.StartBasicBlock(match_bb);
@@ -1947,21 +1938,21 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       // swap_ok_bb (status = 0).
       ir->AddEdge(builder_.bb(), fail_bb);
       ir->AddEdge(builder_.bb(), swap_ok_bb);
-      builder_.Gen<PseudoCondBranch>(
+      builder_.Gen<CondBranch>(
           x86_64::Assembler::Condition::kNotZero, fail_bb, swap_ok_bb, host_flags);
 
       // --- success: status = 0 (XOR self, with a PseudoDef to seat the value). ---
       builder_.StartBasicBlock(swap_ok_bb);
-      builder_.Gen<PseudoDefReg>(status);
+      builder_.Gen<PseudoDefReg>(status, kMeta<&x86_64::kGeneralReg64>);
       builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
       ir->AddEdge(swap_ok_bb, merge_bb);
-      builder_.Gen<PseudoBranch>(merge_bb);
+      builder_.Gen<Branch>(merge_bb);
 
       // --- failure (addr mismatch or CMPXCHG miss): status = 1. ---
       builder_.StartBasicBlock(fail_bb);
       builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
       ir->AddEdge(fail_bb, merge_bb);
-      builder_.Gen<PseudoBranch>(merge_bb);
+      builder_.Gen<Branch>(merge_bb);
 
       builder_.StartBasicBlock(merge_bb);
       if (args.rs != 31) {
@@ -2139,7 +2130,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       MachineBasicBlock* loop_bb = ir->NewBasicBlock();
       MachineBasicBlock* exit_bb = ir->NewBasicBlock();
       ir->AddEdge(builder_.bb(), loop_bb);
-      builder_.Gen<PseudoBranch>(loop_bb);
+      builder_.Gen<Branch>(loop_bb);
 
       builder_.StartBasicBlock(loop_bb);
       // Relaxed, zero-extended load of the current memory value (the CMPXCHG
@@ -2199,7 +2190,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       UNUSED_ARGS(unused_rax);
       ir->AddEdge(loop_bb, loop_bb);
       ir->AddEdge(loop_bb, exit_bb);
-      builder_.Gen<PseudoCondBranch>(
+      builder_.Gen<CondBranch>(
           x86_64::Assembler::Condition::kNotZero, loop_bb, exit_bb, cmpxchg_flags);
 
       builder_.StartBasicBlock(exit_bb);
@@ -2249,7 +2240,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       MachineBasicBlock* cmpxchg_bb = ir->NewBasicBlock();
       MachineBasicBlock* exit_bb = ir->NewBasicBlock();
       ir->AddEdge(builder_.bb(), loop_bb);
-      builder_.Gen<PseudoBranch>(loop_bb);
+      builder_.Gen<Branch>(loop_bb);
 
       builder_.StartBasicBlock(loop_bb);
       Register old;
@@ -2311,17 +2302,17 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       Register new_val = AllocTempReg();
       ir->AddEdge(loop_bb, pick_old_bb);
       ir->AddEdge(loop_bb, pick_op_bb);
-      builder_.Gen<PseudoCondBranch>(keep_old, pick_old_bb, pick_op_bb, cmp_flags);
+      builder_.Gen<CondBranch>(keep_old, pick_old_bb, pick_op_bb, cmp_flags);
 
       builder_.StartBasicBlock(pick_old_bb);
       builder_.Gen<Copy>(new_val, old, kMeta<&x86_64::kGeneralReg64>);
       ir->AddEdge(pick_old_bb, cmpxchg_bb);
-      builder_.Gen<PseudoBranch>(cmpxchg_bb);
+      builder_.Gen<Branch>(cmpxchg_bb);
 
       builder_.StartBasicBlock(pick_op_bb);
       builder_.Gen<Copy>(new_val, operand, kMeta<&x86_64::kGeneralReg64>);
       ir->AddEdge(pick_op_bb, cmpxchg_bb);
-      builder_.Gen<PseudoBranch>(cmpxchg_bb);
+      builder_.Gen<Branch>(cmpxchg_bb);
 
       builder_.StartBasicBlock(cmpxchg_bb);
       Register expected = Copy(old);
@@ -2348,7 +2339,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       UNUSED_ARGS(unused_rax);
       ir->AddEdge(cmpxchg_bb, loop_bb);
       ir->AddEdge(cmpxchg_bb, exit_bb);
-      builder_.Gen<PseudoCondBranch>(
+      builder_.Gen<CondBranch>(
           x86_64::Assembler::Condition::kNotZero, loop_bb, exit_bb, cmpxchg_flags);
 
       builder_.StartBasicBlock(exit_bb);
@@ -2518,9 +2509,10 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         MachineBasicBlock* merge_bb = ir->NewBasicBlock();
         ir->AddEdge(cur_bb, match_bb);
         ir->AddEdge(cur_bb, fail_bb);
-        builder_.Gen<PseudoCondBranch>(
-            x86_64::Assembler::Condition::kNotEqual, fail_bb, match_bb,
-            std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
+        builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotEqual,
+                                 fail_bb,
+                                 match_bb,
+                                 std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
 
         builder_.StartBasicBlock(match_bb);
         Register expected = std::get<0>(
@@ -2530,19 +2522,19 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         UNUSED_ARGS(unused_rax);
         ir->AddEdge(builder_.bb(), fail_bb);
         ir->AddEdge(builder_.bb(), swap_ok_bb);
-        builder_.Gen<PseudoCondBranch>(
+        builder_.Gen<CondBranch>(
             x86_64::Assembler::Condition::kNotZero, fail_bb, swap_ok_bb, host_flags);
 
         builder_.StartBasicBlock(swap_ok_bb);
-        builder_.Gen<PseudoDefReg>(status);
+        builder_.Gen<PseudoDefReg>(status, kMeta<&x86_64::kGeneralReg64>);
         builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
         ir->AddEdge(swap_ok_bb, merge_bb);
-        builder_.Gen<PseudoBranch>(merge_bb);
+        builder_.Gen<Branch>(merge_bb);
 
         builder_.StartBasicBlock(fail_bb);
         builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
         ir->AddEdge(fail_bb, merge_bb);
-        builder_.Gen<PseudoBranch>(merge_bb);
+        builder_.Gen<Branch>(merge_bb);
 
         builder_.StartBasicBlock(merge_bb);
         if (args.rs != 31) {
@@ -2569,9 +2561,10 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         MachineBasicBlock* merge_bb = ir->NewBasicBlock();
         ir->AddEdge(cur_bb, match_bb);
         ir->AddEdge(cur_bb, fail_bb);
-        builder_.Gen<PseudoCondBranch>(
-            x86_64::Assembler::Condition::kNotEqual, fail_bb, match_bb,
-            std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
+        builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotEqual,
+                                 fail_bb,
+                                 match_bb,
+                                 std::get<0>(Gen<x86_64::CmpqRegReg>(resv_addr, base)));
 
         builder_.StartBasicBlock(match_bb);
         // expected = reservation_value (low @ resv_val_off, high @ +8).
@@ -2585,19 +2578,19 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         // No recovery split here (like STXR): FLAGS feed the status branch.
         ir->AddEdge(builder_.bb(), fail_bb);
         ir->AddEdge(builder_.bb(), swap_ok_bb);
-        builder_.Gen<PseudoCondBranch>(
+        builder_.Gen<CondBranch>(
             x86_64::Assembler::Condition::kNotZero, fail_bb, swap_ok_bb, host_flags);
 
         builder_.StartBasicBlock(swap_ok_bb);
-        builder_.Gen<PseudoDefReg>(status);
+        builder_.Gen<PseudoDefReg>(status, kMeta<&x86_64::kGeneralReg64>);
         builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
         ir->AddEdge(swap_ok_bb, merge_bb);
-        builder_.Gen<PseudoBranch>(merge_bb);
+        builder_.Gen<Branch>(merge_bb);
 
         builder_.StartBasicBlock(fail_bb);
         builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
         ir->AddEdge(fail_bb, merge_bb);
-        builder_.Gen<PseudoBranch>(merge_bb);
+        builder_.Gen<Branch>(merge_bb);
 
         builder_.StartBasicBlock(merge_bb);
         if (args.rs != 31) {
@@ -2687,20 +2680,19 @@ void HeavyOptimizerFrontend::ResolveJumps() {
     }
 
     const MachineInsn* last_insn = bb->insn_list().back();
-    if (last_insn->opcode() != kMachineOpPseudoJump) {
+    if (last_insn->opcode() != kMachineOpJump) {
       continue;
     }
 
-    auto* jump = static_cast<const PseudoJump*>(last_insn);
-    if (jump->kind() == PseudoJump::Kind::kSyscall ||
-        jump->kind() == PseudoJump::Kind::kExitGeneratedCode) {
+    auto* jump = static_cast<const Jump*>(last_insn);
+    if (jump->kind() == Jump::Kind::kSyscall || jump->kind() == Jump::Kind::kExitGeneratedCode) {
       // Syscall or generated-code exit must always exit the region.
       continue;
     }
 
     GuestAddr target = jump->target();
     auto map_it = branch_targets_.find(target);
-    // All PseudoJump insns must add their targets to branch_targets.
+    // All Jump insns must add their targets to branch_targets.
     CHECK(map_it != branch_targets_.end());
 
     MachineInsnPosition pos = map_it->second;
@@ -2741,19 +2733,19 @@ void HeavyOptimizerFrontend::ReplaceJumpWithBranch(MachineBasicBlock* bb,
                                                    MachineBasicBlock* target_bb) {
   auto ir = builder_.ir();
   const auto* last_insn = bb->insn_list().back();
-  CHECK_EQ(last_insn->opcode(), kMachineOpPseudoJump);
-  auto* jump = static_cast<const PseudoJump*>(last_insn);
-  GuestAddr target = static_cast<const PseudoJump*>(jump)->target();
+  CHECK_EQ(last_insn->opcode(), kMachineOpJump);
+  auto* jump = static_cast<const Jump*>(last_insn);
+  GuestAddr target = static_cast<const Jump*>(jump)->target();
   // Do not invalidate this iterator as it may be a target for another jump.
   // Instead overwrite the instruction.
   auto jump_it = std::prev(bb->insn_list().end());
 
-  if (jump->kind() == PseudoJump::Kind::kJumpWithoutPendingSignalsCheck) {
+  if (jump->kind() == Jump::Kind::kJumpWithoutPendingSignalsCheck) {
     // Simple branch for forward jump.
-    *jump_it = ir->NewInsn<PseudoBranch>(target_bb);
+    *jump_it = ir->NewInsn<Branch>(target_bb);
     ir->AddEdge(bb, target_bb);
   } else {
-    CHECK(jump->kind() == PseudoJump::Kind::kJumpWithPendingSignalsCheck);
+    CHECK(jump->kind() == Jump::Kind::kJumpWithPendingSignalsCheck);
     // This is a backward branch resolved into an in-region target, i.e. an
     // in-region loop back-edge. Record that the region captured a hot loop.
     has_in_region_backedge_ = true;
@@ -2769,7 +2761,7 @@ void HeavyOptimizerFrontend::ReplaceJumpWithBranch(MachineBasicBlock* bb,
                                                 kPendingSignalsPresent,
                                                 GetFlagsRegister());
     *jump_it = cmpb;
-    auto* cond_branch = ir->NewInsn<PseudoCondBranch>(
+    auto* cond_branch = ir->NewInsn<CondBranch>(
         x86_64::Assembler::Condition::kEqual, exit_bb, target_bb, GetFlagsRegister());
     bb->insn_list().push_back(cond_branch);
 
@@ -3472,7 +3464,7 @@ void HeavyOptimizerFrontend::StoreReg(Decoder::LoadStoreSize size,
   Store(size, addr, 0, data);
 }
 
-// SVC #imm: lowered as a region exit of kind PseudoJump::Kind::kSyscall, which
+// SVC #imm: lowered as a region exit of kind Jump::Kind::kSyscall, which
 // the backend emits through code_gen_lib's EmitSyscall, the same call
 // LiteTranslator::Svc ends its region with: store the SVC's PC to
 // cpu.insn_addr, call RunGuestSyscall(ThreadState*), then direct-dispatch to
@@ -3498,7 +3490,7 @@ void HeavyOptimizerFrontend::Svc(uint16_t imm) {
   if (!success()) {
     return;
   }
-  builder_.Gen<PseudoJump>(GetInsnAddr(), PseudoJump::Kind::kSyscall);
+  builder_.Gen<Jump>(GetInsnAddr(), Jump::Kind::kSyscall);
   // Control never falls through to pc+4 inside this region: EmitSyscall
   // dispatches there itself. Like an unconditional B, the region ends here
   // unless an in-region branch targets pc+4, in which case translation
@@ -4807,8 +4799,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     auto* cur_bb = builder_.bb();
     ir->AddEdge(cur_bb, checkmant_bb);
     ir->AddEdge(cur_bb, rtne_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kZero, checkmant_bb,
-                                   rtne_bb, exp_flags);
+    builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kZero, checkmant_bb, rtne_bb, exp_flags);
 
     // exp all-ones: mantissa != 0 -> NaN, else (±Inf) -> RTNE.
     builder_.StartBasicBlock(checkmant_bb);
@@ -4817,8 +4808,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     Register mant_flags = std::get<0>(Gen<x86_64::TestlRegReg>(mant, mant));
     ir->AddEdge(checkmant_bb, nan_bb);
     ir->AddEdge(checkmant_bb, rtne_bb);
-    builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNotZero, nan_bb,
-                                   rtne_bb, mant_flags);
+    builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kNotZero, nan_bb, rtne_bb, mant_flags);
 
     // RTNE: out = (bits + 0x7FFF + ((bits>>16)&1)) >> 16.
     builder_.StartBasicBlock(rtne_bb);
@@ -4829,7 +4819,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     r = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(r, int8_t{16}));
     builder_.Gen<Copy>(out, r, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(rtne_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
 
     // NaN: out = (bits >> 16) | 0x0040 (force BF16 mantissa MSB -> quiet).
     builder_.StartBasicBlock(nan_bb);
@@ -4837,7 +4827,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     n = std::get<0>(Gen<x86_64::OrlRegImm, kNoSSA>(n, int32_t{0x0040}));
     builder_.Gen<Copy>(out, n, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
-    builder_.Gen<PseudoBranch>(done_bb);
+    builder_.Gen<Branch>(done_bb);
 
     // Commit: BF16 in bits[15:0] of V[rd] (out's high 16 are already 0), rest
     // zeroed. MOVD zero-extends into lane 0; SetVRegScalar zeroes the upper bytes.

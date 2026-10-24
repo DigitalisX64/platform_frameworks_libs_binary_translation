@@ -30,7 +30,7 @@ void ReorderBasicBlocksInReversePostOrder(MachineIR* machine_ir);
 
 // region digitalis
 // Forwards guest-context reads along chains of basic blocks that a faulting
-// guest memory access split (the access's block ends in a PseudoBranch to a
+// guest memory access split (the access's block ends in a Branch to a
 // continuation with no other predecessor, and its other successor is the
 // recovery block). Stores are kept: the recovery block exits the region and
 // reads the whole guest state. Runs before RenameVRegs, which connects the

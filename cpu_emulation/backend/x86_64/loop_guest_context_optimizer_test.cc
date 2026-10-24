@@ -1304,27 +1304,27 @@ TEST(MachineIRLoopGuestContextOptimizer, SiblingInnerloopsAreOptimizedSeparately
   MachineIRBuilder builder(&machine_ir);
 
   builder.StartBasicBlock(preloop);
-  builder.Gen<PseudoBranch>(head);
+  builder.Gen<Branch>(head);
 
   builder.StartBasicBlock(head);
-  builder.Gen<PseudoBranch>(inner1);
+  builder.Gen<Branch>(inner1);
 
   builder.StartBasicBlock(inner1);
   builder.GenPut(GetThreadStateRegOffset(0), vreg1);
-  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, inner1, middle, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner1, middle, kMachineRegFLAGS);
 
   builder.StartBasicBlock(middle);
-  builder.Gen<PseudoBranch>(inner2);
+  builder.Gen<Branch>(inner2);
 
   builder.StartBasicBlock(inner2);
   builder.GenPut(GetThreadStateRegOffset(1), vreg2);
-  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, inner2, latch, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner2, latch, kMachineRegFLAGS);
 
   builder.StartBasicBlock(latch);
-  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
 
   builder.StartBasicBlock(afterloop);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   RemoveLoopGuestContextAccesses(&machine_ir);
   ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -1501,20 +1501,20 @@ TEST(MachineIRLoopGuestContextOptimizer, SingleInnerloopNestIsOptimizedAsAWhole)
   MachineIRBuilder builder(&machine_ir);
 
   builder.StartBasicBlock(preloop);
-  builder.Gen<PseudoBranch>(head);
+  builder.Gen<Branch>(head);
 
   builder.StartBasicBlock(head);
-  builder.Gen<PseudoBranch>(inner);
+  builder.Gen<Branch>(inner);
 
   builder.StartBasicBlock(inner);
   builder.GenPut(GetThreadStateRegOffset(0), vreg1);
-  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, inner, latch, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner, latch, kMachineRegFLAGS);
 
   builder.StartBasicBlock(latch);
-  builder.Gen<PseudoCondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
 
   builder.StartBasicBlock(afterloop);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   RemoveLoopGuestContextAccesses(&machine_ir);
   ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);

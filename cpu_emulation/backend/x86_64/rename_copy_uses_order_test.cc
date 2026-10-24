@@ -70,7 +70,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseOfRegisterTheSameInsnRedefines) {
   auto* widen = builder.Gen<PmovsxbwXRegXReg>(copy, copy);
   builder.Gen<PmullwXRegXReg>(copy, src);
   builder.Gen<MovdqaXRegXReg>(out, copy);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
 
   RenameCopyUses(&machine_ir);
@@ -97,7 +97,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseNotRenamedToRegisterTheSameInsnRedefin
   builder.Gen<SubqRegImm>(src, 1, kMachineRegFLAGS);
   // The copy's source changed after the copy: the old value lives only in `copy`.
   auto* add = builder.Gen<AddqRegReg>(sum, copy, kMachineRegFLAGS);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   RenameCopyUses(&machine_ir);
 
@@ -117,7 +117,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseNotRenamedToEarlyClobberDef) {
   builder.Gen<Copy>(copy, src, kMeta<&kGeneralReg64>);
   // The clobber is written before `copy` is read, so `copy` must not become `src`.
   auto* insn = builder.Gen<EarlyClobberTestInsn>(copy, src);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
 
   RenameCopyUses(&machine_ir);
 

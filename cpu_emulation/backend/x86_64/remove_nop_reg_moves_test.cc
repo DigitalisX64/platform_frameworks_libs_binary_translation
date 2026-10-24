@@ -29,14 +29,14 @@ TEST(MachineIRRemoveNopRegMovesTest, RemovesHostRegisterMovedToItself) {
   builder.Gen<MovsdXRegXReg>(kMachineRegXMM4, kMachineRegXMM4);
   builder.Gen<MovssXRegXReg>(kMachineRegXMM5, kMachineRegXMM5);
   builder.Gen<MovqRegReg>(kMachineRegRBX, kMachineRegRBX);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
 
   RemoveNopRegMoves(&machine_ir);
 
   EXPECT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
   ASSERT_EQ(bb->insn_list().size(), 1u);
-  EXPECT_EQ(bb->insn_list().front()->opcode(), kMachineOpPseudoJump);
+  EXPECT_EQ(bb->insn_list().front()->opcode(), kMachineOpJump);
 }
 
 TEST(MachineIRRemoveNopRegMovesTest, KeepsMovesThatChangeTheirDestination) {
@@ -51,7 +51,7 @@ TEST(MachineIRRemoveNopRegMovesTest, KeepsMovesThatChangeTheirDestination) {
   builder.Gen<MovqRegReg>(kMachineRegRBX, kMachineRegRCX);
   // MOVL clears bits 32..63 of its destination.
   builder.Gen<MovlRegReg>(kMachineRegRBX, kMachineRegRBX);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
 
   RemoveNopRegMoves(&machine_ir);
@@ -61,7 +61,7 @@ TEST(MachineIRRemoveNopRegMovesTest, KeepsMovesThatChangeTheirDestination) {
   EXPECT_EQ((*it++)->opcode(), kMachineOpMovdqaXRegXReg);
   EXPECT_EQ((*it++)->opcode(), kMachineOpMovqRegReg);
   EXPECT_EQ((*it++)->opcode(), kMachineOpMovlRegReg);
-  EXPECT_EQ((*it)->opcode(), kMachineOpPseudoJump);
+  EXPECT_EQ((*it)->opcode(), kMachineOpJump);
 }
 
 TEST(MachineIRRemoveNopRegMovesTest, KeepsVirtualRegisterMovedToItself) {
@@ -75,7 +75,7 @@ TEST(MachineIRRemoveNopRegMovesTest, KeepsVirtualRegisterMovedToItself) {
   // Before allocation this defines vreg.
   builder.Gen<MovdqaXRegXReg>(vreg, vreg);
   builder.Gen<MovdqaXRegXReg>(kMachineRegXMM0, vreg);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
 
   RemoveNopRegMoves(&machine_ir);

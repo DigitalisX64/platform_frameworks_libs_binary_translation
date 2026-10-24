@@ -215,7 +215,7 @@ class HeavyOptimizerFrontend {
   //
   // The direct branch family translates to MachineIR control flow exactly like
   // the riscv64 frontend: a conditional branch creates then_bb/else_bb basic
-  // blocks ending in a PseudoCondBranch, the taken path GenJumps to the target
+  // blocks ending in a CondBranch, the taken path GenJumps to the target
   // (which links in-region back-edges and adds the pending-signal check), and
   // the not-taken path continues translating in else_bb. An unconditional B /
   // BR sets is_uncond_branch_ so StartInsn opens a fresh block for whatever
@@ -696,7 +696,7 @@ class HeavyOptimizerFrontend {
   // Materialize ARM64 NZCV into ThreadState.cpu.flags from the host EFLAGS that
   // a preceding x86 ALU op left in `flags_vreg`. Bit-exact with
   // lite_translator.h::EmitStoreArmNZCV:
-  //   PseudoReadFlags (LAHF + SETO) -> raw has N@15, Z@14, C@8, V@0
+  //   ReadFlags (LAHF + SETO) -> raw has N@15, Z@14, C@8, V@0
   //   AND kFlagsNZCVMask            -> keep only N, Z, C, V
   //   if is_sub: XOR kFlagCarry     -> ARM borrow is inverted (ARM C = !x86 CF)
   //   MOVW [rbp + cpu.flags], raw   -> 16-bit store of the packed NZCV
@@ -705,7 +705,7 @@ class HeavyOptimizerFrontend {
   // touches a neighbouring field.
   void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
     Register raw = AllocTempReg();
-    builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, raw, flags_vreg);
+    builder_.Gen<ReadFlagsWithOverflow>(raw, flags_vreg);
     raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
     if (is_sub) {
       raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
@@ -857,7 +857,7 @@ class HeavyOptimizerFrontend {
   // riscv64 frontend's self-XOR zeroing idiom).
   [[nodiscard]] FpRegister AllocZeroedSimdReg() {
     FpRegister zero = AllocTempSimdReg();
-    builder_.Gen<PseudoDefReg>(zero.machine_reg());
+    builder_.Gen<PseudoDefReg>(zero.machine_reg(), kMeta<&x86_64::kXmmReg>);
     builder_.Gen<x86_64::PxorXRegXReg>(zero.machine_reg(), zero.machine_reg());
     return zero;
   }
@@ -905,7 +905,7 @@ class HeavyOptimizerFrontend {
       return;
     }
     Register frm = AllocTempReg();
-    builder_.Gen<PseudoDefReg>(frm);
+    builder_.Gen<PseudoDefReg>(frm, kMeta<&x86_64::kGeneralReg64>);
     InlineIntrinsicForHeavyOptimizer<kFunction>(
         &builder_, result, GetFlagsRegister(), int8_t{0b111}, frm, src1, src2);
   }
@@ -958,7 +958,7 @@ class HeavyOptimizerFrontend {
 
   // The AND, optional XOR and store of an EmitMaterializeNZCV sequence that
   // ends the current block, or is followed only by gap instructions, taken out
-  // so that a B.cond can test the host flags its PseudoReadFlags still sees.
+  // so that a B.cond can test the host flags its ReadFlags still sees.
   // EmitNZCVStoreTail re-emits them in a successor. The guest instructions in
   // [gap_begin, B.cond) emitted the gap.
   struct NZCVStoreTail {
@@ -1029,7 +1029,7 @@ class HeavyOptimizerFrontend {
     auto* cont_bb = builder_.ir()->NewBasicBlock();
     builder_.ir()->AddEdge(region_entry_bb, cont_bb);
     builder_.StartBasicBlock(region_entry_bb);
-    builder_.Gen<PseudoBranch>(cont_bb);
+    builder_.Gen<Branch>(cont_bb);
     builder_.StartBasicBlock(cont_bb);
   }
 

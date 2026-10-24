@@ -3027,7 +3027,7 @@ TEST_F(Arm64HeavyDifferentialFuzz, FlagSettersAcrossGapRegion) {
 }
 
 // A jump into the gap between a setter and its fused B.cond arrives without
-// the setter's host flags, so it must not reach the B.cond's PseudoCondBranch:
+// the setter's host flags, so it must not reach the B.cond's CondBranch:
 // a forward CBZ over the setter, and a loop back-edge from a later setter.
 TEST_F(Arm64HeavyDifferentialFuzz, JumpIntoFusedCondBranchGap) {
   static const uint32_t kForward[] = {

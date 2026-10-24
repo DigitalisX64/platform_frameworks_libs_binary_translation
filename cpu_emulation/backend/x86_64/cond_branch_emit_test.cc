@@ -35,7 +35,7 @@ std::vector<uint8_t> EmitCondBranch(Condition cond, Layout layout) {
   auto* then_bb = machine_ir.NewBasicBlock();
   auto* else_bb = machine_ir.NewBasicBlock();
   auto* other_bb = machine_ir.NewBasicBlock();
-  auto* insn = machine_ir.NewInsn<PseudoCondBranch>(cond, then_bb, else_bb, kMachineRegFLAGS);
+  auto* insn = machine_ir.NewInsn<CondBranch>(cond, then_bb, else_bb, kMachineRegFLAGS);
 
   MachineCode machine_code;
   CodeEmitter as(&machine_code, 0, machine_ir.NumBasicBlocks(), machine_ir.arena());

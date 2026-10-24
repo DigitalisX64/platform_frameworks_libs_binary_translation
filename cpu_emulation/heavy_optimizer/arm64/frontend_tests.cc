@@ -2034,7 +2034,7 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MultiAluRegionExecutes) {
 }
 
 // A flag-setting SUBS inside a multi-insn region must produce valid IR (the
-// EmitMaterializeNZCV sequence — PseudoReadFlags + AND + store — must survive
+// EmitMaterializeNZCV sequence — ReadFlags + AND + store — must survive
 // GenCode's CheckMachineIR). A following ADC bails, ending the region.
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiFlagSetterThenBailRegion) {
   // MOVZ X0,#10; SUBS X1,X0,#3; PACGA X0,X1,X0 (bails: this DataProc2Src opcode
@@ -2681,7 +2681,7 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchRegisterRet) {
 }
 
 //
-// SVC. Lowered as a syscall region exit (PseudoJump kSyscall, emitted through
+// SVC. Lowered as a syscall region exit (Jump kSyscall, emitted through
 // the same EmitSyscall the lite tier uses), not a bail. Running the syscall
 // itself needs a live guest thread for RunGuestSyscall, so execution through
 // the SVC is covered by runtime/arm64/translator_x86_64_test.cc; these tests pin

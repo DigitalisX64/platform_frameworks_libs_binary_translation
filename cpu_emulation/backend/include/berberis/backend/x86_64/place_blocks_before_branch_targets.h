@@ -5,7 +5,7 @@
 
 namespace berberis::x86_64 {
 
-// Moves a basic block that ends in an unconditional PseudoBranch to just
+// Moves a basic block that ends in an unconditional Branch to just
 // before the block it branches to, so the emitter can drop that JMP, when
 // fewer jumps run after the move. Each jump is weighted by the loop nesting
 // depth of the block that runs it. Only the layout changes: every block keeps

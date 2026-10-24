@@ -34,14 +34,13 @@ TEST(MachineIRPlaceBlocksBeforeBranchTargetsTest, MovesLoopHeaderBeforeItsBody) 
 
   MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(bb0);
-  builder.Gen<PseudoBranch>(bb3);
+  builder.Gen<Branch>(bb3);
   builder.StartBasicBlock(bb1);
-  builder.Gen<PseudoCondBranch>(
-      CodeEmitter::Condition::kZero, bb3, bb2, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, bb3, bb2, kMachineRegFLAGS);
   builder.StartBasicBlock(bb2);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   builder.StartBasicBlock(bb3);
-  builder.Gen<PseudoBranch>(bb1);
+  builder.Gen<Branch>(bb1);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
 
   PlaceBlocksBeforeBranchTargets(&machine_ir);
@@ -66,14 +65,13 @@ TEST(MachineIRPlaceBlocksBeforeBranchTargetsTest, KeepsLayoutWhenNoJumpIsSaved) 
 
   MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(bb0);
-  builder.Gen<PseudoCondBranch>(
-      CodeEmitter::Condition::kZero, bb1, bb2, kMachineRegFLAGS);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, bb1, bb2, kMachineRegFLAGS);
   builder.StartBasicBlock(bb1);
-  builder.Gen<PseudoBranch>(bb3);
+  builder.Gen<Branch>(bb3);
   builder.StartBasicBlock(bb2);
-  builder.Gen<PseudoBranch>(bb3);
+  builder.Gen<Branch>(bb3);
   builder.StartBasicBlock(bb3);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
 
   PlaceBlocksBeforeBranchTargets(&machine_ir);
@@ -96,13 +94,13 @@ TEST(MachineIRPlaceBlocksBeforeBranchTargetsTest, KeepsEntryAndRecoveryBlocksInP
 
   MachineIRBuilder builder(&machine_ir);
   builder.StartBasicBlock(bb0);
-  builder.Gen<PseudoBranch>(bb2);
+  builder.Gen<Branch>(bb2);
   builder.StartBasicBlock(bb1);
-  builder.Gen<PseudoBranch>(bb2);
+  builder.Gen<Branch>(bb2);
   builder.StartBasicBlock(bb2);
-  builder.Gen<PseudoJump>(kNullGuestAddr);
+  builder.Gen<Jump>(kNullGuestAddr);
   builder.StartBasicBlock(bb3);
-  builder.Gen<PseudoBranch>(bb2);
+  builder.Gen<Branch>(bb2);
   bb3->MarkAsRecovery();
 
   PlaceBlocksBeforeBranchTargets(&machine_ir);

@@ -21,8 +21,8 @@ class MachineIRUseVexThreeOperandFormsTest : public ::testing::Test {
     copied_ = machine_ir_.AllocVReg();
     dst_ = machine_ir_.AllocVReg();
     other_ = machine_ir_.AllocVReg();
-    builder_.Gen<PseudoDefXReg>(copied_);
-    builder_.Gen<PseudoDefXReg>(other_);
+    builder_.Gen<PseudoDefReg>(copied_, kMeta<&kXmmReg>);
+    builder_.Gen<PseudoDefReg>(other_, kMeta<&kXmmReg>);
   }
 
   // Ends the block with reads of copied_ and dst_.
@@ -30,7 +30,7 @@ class MachineIRUseVexThreeOperandFormsTest : public ::testing::Test {
     MachineReg sink = machine_ir_.AllocVReg();
     builder_.Gen<MovdqaXRegXReg>(sink, copied_);
     builder_.Gen<MovdqaXRegXReg>(sink, dst_);
-    builder_.Gen<PseudoJump>(kNullGuestAddr);
+    builder_.Gen<Jump>(kNullGuestAddr);
     ASSERT_EQ(CheckMachineIR(machine_ir_), kMachineIRCheckSuccess);
   }
 
@@ -153,13 +153,13 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsOperationWhoseDestinationIsUse
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsOperationWithoutCopy) {
-  builder_.Gen<PseudoDefXReg>(dst_);
+  builder_.Gen<PseudoDefReg>(dst_, kMeta<&kXmmReg>);
   builder_.Gen<PadddXRegXReg>(dst_, other_);
   Finish();
 
   UseVexThreeOperandForms(&machine_ir_);
 
-  EXPECT_EQ(InsnAt(2)->opcode(), kMachineOpPseudoDefXReg);
+  EXPECT_EQ(InsnAt(2)->opcode(), kMachineOpPseudoDefReg);
   EXPECT_EQ(InsnAt(3)->opcode(), kMachineOpPadddXRegXReg);
 }
 
