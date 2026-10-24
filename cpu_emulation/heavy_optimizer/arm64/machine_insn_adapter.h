@@ -36,8 +36,8 @@
 // argument that 263 of its call sites set explicitly, and MachineInsn must do
 // no splitting of its own underneath that. Expressing those two requirements
 // needs the pre-split shape of the macro, which upstream no longer has, so it
-// lives here. x86_64::MachineInsn<DeviceInsnInfo> leaves the backend's
-// kSSAMode defaulted to false, which is exactly "do not split".
+// lives here. It pins the backend's kSSAMode to x86_64::kForceNoSSA, which
+// keeps a kUseDef operand in a single register the way Android 16 did.
 //
 // Should the frontend ever adopt the backend's splitting -- dropping its own
 // Gen() for a forwarder to MachineIRBuilder::GenMachineInsn, the way the
@@ -287,10 +287,12 @@
         Args...>(args...);                                                                         \
   }
 
-#define BERBERIS_DECLARE_ARM64_MACHINE_INSN_TUPLE(N, TupleClass, TupleName) \
-  std::tuple_element_t<N,                                             \
-                       typename x86_64::TupleClass<typename InsnType< \
-                           typename CodeEmitter::Assemblers>::DeviceInsnInfo>::TupleName>
+#define BERBERIS_DECLARE_ARM64_MACHINE_INSN_TUPLE(N, TupleClass, TupleName)  \
+  std::tuple_element_t<N,                                                    \
+                       typename x86_64::TupleClass<                          \
+                           typename InsnType<                                \
+                               typename CodeEmitter::Assemblers>::DeviceInsnInfo, \
+                           BERBERIS_ARM64_INSN_SSA_MODE>::TupleName>
 
 #define BERBERIS_DECLARE_ARM64_MACHINE_INSN_UNBRACE(...) __VA_ARGS__
 
