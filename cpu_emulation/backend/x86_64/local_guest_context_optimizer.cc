@@ -465,7 +465,7 @@ void RecoverySplitGetForwarder::ForwardInsn(const MachineBasicBlock* bb,
   auto* insn = AsMachineInsnX86_64(*insn_it);
   // No guest-context pass models a call as reading or writing guest state;
   // forget everything rather than carry a value across one.
-  if (insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpCallImmArg) {
+  if (insn->opcode() == kMachineOpCallImm) {
     for (size_t offset : optimized_offset_list_) {
       map_[offset] = std::nullopt;
     }
@@ -593,7 +593,5 @@ void ForwardGuestContextGetsAcrossRecoverySplits(x86_64::MachineIR* machine_ir,
   }
 }
 // endregion digitalis
-
-}  // namespace berberis::x86_64
 
 }  // namespace berberis::x86_64
